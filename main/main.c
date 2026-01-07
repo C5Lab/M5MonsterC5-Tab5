@@ -147,6 +147,10 @@ static lv_obj_t *evil_twin_html_dropdown = NULL;
 static lv_obj_t *evil_twin_status_label = NULL;
 static lv_obj_t *evil_twin_close_btn = NULL;
 static int evil_twin_html_count = 0;
+
+// SAE Overflow attack state
+static lv_obj_t *sae_popup_overlay = NULL;
+static lv_obj_t *sae_popup_obj = NULL;
 static char evil_twin_html_files[20][64];  // Max 20 files, 64 chars each
 static volatile bool evil_twin_monitoring = false;
 static TaskHandle_t evil_twin_monitor_task_handle = NULL;
@@ -231,6 +235,8 @@ static void show_evil_twin_popup(void);
 static void evil_twin_start_cb(lv_event_t *e);
 static void evil_twin_close_cb(lv_event_t *e);
 static void evil_twin_monitor_task(void *arg);
+static void show_sae_popup(int network_idx);
+static void sae_popup_close_cb(lv_event_t *e);
 
 //==================================================================================
 // INA226 Power Monitor Driver
@@ -955,8 +961,36 @@ static void attack_tile_event_cb(lv_event_t *e)
         return;
     }
     
+    // Handle SAE Overflow attack
+    if (strcmp(attack_name, "SAE Overflow") == 0) {
+        if (selected_network_count != 1) {
+            ESP_LOGW(TAG, "SAE Overflow requires exactly one network, selected: %d", selected_network_count);
+            // Show error in status label if available
+            if (status_label) {
+                lv_label_set_text(status_label, "Please select just one network");
+                lv_obj_set_style_text_color(status_label, COLOR_MATERIAL_RED, 0);
+            }
+            return;
+        }
+        
+        int idx = selected_network_indices[0];
+        int net_1based = networks[idx].index;
+        
+        // Send select_networks command
+        char cmd[32];
+        snprintf(cmd, sizeof(cmd), "select_networks %d", net_1based);
+        uart_send_command(cmd);
+        vTaskDelay(pdMS_TO_TICKS(100));
+        
+        // Send sae_overflow command
+        uart_send_command("sae_overflow");
+        
+        // Show popup
+        show_sae_popup(idx);
+        return;
+    }
+    
     // TODO: Implement other attack types
-    // - SAE Overflow
     // - Handshaker
     // - Sniffer
 }
@@ -1070,6 +1104,96 @@ static void show_scan_deauth_popup(void)
     lv_label_set_text(btn_label, "STOP ATTACK");
     lv_obj_set_style_text_font(btn_label, &lv_font_montserrat_18, 0);
     lv_obj_center(btn_label);
+}
+
+// ======================= SAE Overflow Attack Functions =======================
+
+// Close SAE popup
+static void sae_popup_close_cb(lv_event_t *e)
+{
+    (void)e;
+    ESP_LOGI(TAG, "SAE popup closed - sending stop command");
+    
+    // Send stop command
+    uart_send_command("stop");
+    
+    // Delete overlay (popup is child, will be deleted too)
+    if (sae_popup_overlay) {
+        lv_obj_del(sae_popup_overlay);
+        sae_popup_overlay = NULL;
+        sae_popup_obj = NULL;
+    }
+}
+
+// Show SAE Overflow popup
+static void show_sae_popup(int network_idx)
+{
+    if (sae_popup_obj != NULL) return;  // Already showing
+    
+    if (network_idx < 0 || network_idx >= network_count) return;
+    
+    wifi_network_t *net = &networks[network_idx];
+    const char *ssid_display = strlen(net->ssid) > 0 ? net->ssid : "(Hidden)";
+    
+    lv_obj_t *scr = lv_scr_act();
+    
+    // Create modal overlay (full screen, semi-transparent, blocks input behind)
+    sae_popup_overlay = lv_obj_create(scr);
+    lv_obj_remove_style_all(sae_popup_overlay);
+    lv_obj_set_size(sae_popup_overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(sae_popup_overlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(sae_popup_overlay, LV_OPA_50, 0);
+    lv_obj_clear_flag(sae_popup_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(sae_popup_overlay, LV_OBJ_FLAG_CLICKABLE);  // Capture clicks
+    
+    // Create popup as child of overlay
+    sae_popup_obj = lv_obj_create(sae_popup_overlay);
+    lv_obj_set_size(sae_popup_obj, 500, 300);
+    lv_obj_center(sae_popup_obj);
+    lv_obj_set_style_bg_color(sae_popup_obj, lv_color_hex(0x1A1A2A), 0);
+    lv_obj_set_style_border_color(sae_popup_obj, COLOR_MATERIAL_PINK, 0);
+    lv_obj_set_style_border_width(sae_popup_obj, 2, 0);
+    lv_obj_set_style_radius(sae_popup_obj, 16, 0);
+    lv_obj_set_style_shadow_width(sae_popup_obj, 30, 0);
+    lv_obj_set_style_shadow_color(sae_popup_obj, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_shadow_opa(sae_popup_obj, LV_OPA_50, 0);
+    lv_obj_set_style_pad_all(sae_popup_obj, 20, 0);
+    lv_obj_set_flex_flow(sae_popup_obj, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(sae_popup_obj, 16, 0);
+    lv_obj_set_flex_align(sae_popup_obj, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    
+    // Title
+    lv_obj_t *title = lv_label_create(sae_popup_obj);
+    lv_label_set_text(title, "SAE Overflow Active");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_22, 0);
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_PINK, 0);
+    
+    // Network info
+    lv_obj_t *network_label = lv_label_create(sae_popup_obj);
+    lv_label_set_text_fmt(network_label, "on network:\n\n%s %s\n%s", 
+                          LV_SYMBOL_WIFI, ssid_display, net->bssid);
+    lv_obj_set_style_text_font(network_label, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_color(network_label, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_align(network_label, LV_TEXT_ALIGN_CENTER, 0);
+    
+    // Spacer
+    lv_obj_t *spacer = lv_obj_create(sae_popup_obj);
+    lv_obj_set_size(spacer, 1, 20);
+    lv_obj_set_style_bg_opa(spacer, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(spacer, 0, 0);
+    
+    // STOP button
+    lv_obj_t *stop_btn = lv_btn_create(sae_popup_obj);
+    lv_obj_set_size(stop_btn, lv_pct(100), 50);
+    lv_obj_set_style_bg_color(stop_btn, COLOR_MATERIAL_RED, 0);
+    lv_obj_set_style_bg_color(stop_btn, lv_color_hex(0xCC0000), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(stop_btn, 8, 0);
+    lv_obj_add_event_cb(stop_btn, sae_popup_close_cb, LV_EVENT_CLICKED, NULL);
+    
+    lv_obj_t *stop_label = lv_label_create(stop_btn);
+    lv_label_set_text(stop_label, "STOP");
+    lv_obj_set_style_text_font(stop_label, &lv_font_montserrat_18, 0);
+    lv_obj_center(stop_label);
 }
 
 // ======================= Evil Twin Attack Functions =======================
