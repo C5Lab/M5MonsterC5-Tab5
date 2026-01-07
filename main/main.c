@@ -1418,6 +1418,14 @@ static void show_evil_twin_popup(void)
     }
     lv_dropdown_set_options(evil_twin_network_dropdown, network_options);
     
+    // Style dropdown list (dark background when opened)
+    lv_obj_t *net_list = lv_dropdown_get_list(evil_twin_network_dropdown);
+    if (net_list) {
+        lv_obj_set_style_bg_color(net_list, lv_color_hex(0x2D2D2D), 0);
+        lv_obj_set_style_text_color(net_list, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_set_style_border_color(net_list, lv_color_hex(0x555555), 0);
+    }
+    
     // HTML dropdown container
     lv_obj_t *html_cont = lv_obj_create(evil_twin_popup_obj);
     lv_obj_set_size(html_cont, lv_pct(100), LV_SIZE_CONTENT);
@@ -1448,6 +1456,14 @@ static void show_evil_twin_popup(void)
         strncat(html_options, evil_twin_html_files[i], sizeof(html_options) - strlen(html_options) - 1);
     }
     lv_dropdown_set_options(evil_twin_html_dropdown, html_options);
+    
+    // Style dropdown list (dark background when opened)
+    lv_obj_t *html_list = lv_dropdown_get_list(evil_twin_html_dropdown);
+    if (html_list) {
+        lv_obj_set_style_bg_color(html_list, lv_color_hex(0x2D2D2D), 0);
+        lv_obj_set_style_text_color(html_list, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_set_style_border_color(html_list, lv_color_hex(0x555555), 0);
+    }
     
     // START ATTACK button
     lv_obj_t *start_btn = lv_btn_create(evil_twin_popup_obj);
@@ -1491,6 +1507,19 @@ static void show_evil_twin_popup(void)
     lv_label_set_text(close_label, "CLOSE");
     lv_obj_set_style_text_font(close_label, &lv_font_montserrat_18, 0);
     lv_obj_center(close_label);
+    
+    // STOP button (always visible - sends stop command and closes popup)
+    lv_obj_t *stop_btn = lv_btn_create(evil_twin_popup_obj);
+    lv_obj_set_size(stop_btn, lv_pct(100), 50);
+    lv_obj_set_style_bg_color(stop_btn, COLOR_MATERIAL_RED, 0);
+    lv_obj_set_style_bg_color(stop_btn, lv_color_hex(0xB71C1C), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(stop_btn, 8, 0);
+    lv_obj_add_event_cb(stop_btn, evil_twin_close_cb, LV_EVENT_CLICKED, NULL);
+    
+    lv_obj_t *stop_label = lv_label_create(stop_btn);
+    lv_label_set_text(stop_label, "STOP");
+    lv_obj_set_style_text_font(stop_label, &lv_font_montserrat_18, 0);
+    lv_obj_center(stop_label);
 }
 
 // Back button click handler
