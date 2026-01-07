@@ -135,6 +135,9 @@ static lv_obj_t *deauth_popup_obj = NULL;
 static lv_obj_t *deauth_btn = NULL;
 static lv_obj_t *deauth_btn_label = NULL;
 
+// Scan & Attack deauth popup
+static lv_obj_t *scan_deauth_popup_obj = NULL;
+
 // PSRAM buffers for observer (allocated once)
 static char *observer_rx_buffer = NULL;
 static char *observer_line_buffer = NULL;
@@ -208,6 +211,8 @@ static void deauth_btn_click_cb(lv_event_t *e);
 static void update_observer_table(void);
 static bool parse_sniffer_network_line(const char *line, observer_network_t *net);
 static bool parse_sniffer_client_line(const char *line, char *mac_out, size_t mac_size);
+static void show_scan_deauth_popup(void);
+static void scan_deauth_popup_close_cb(lv_event_t *e);
 
 //==================================================================================
 // INA226 Power Monitor Driver
@@ -887,12 +892,137 @@ static void attack_tile_event_cb(lv_event_t *e)
         }
     }
     
-    // TODO: Implement actual attack logic for each type
-    // - Deauth
+    // Handle Deauth attack
+    if (strcmp(attack_name, "Deauth") == 0) {
+        // Build select_networks command with 1-based indices
+        char cmd[128];
+        snprintf(cmd, sizeof(cmd), "select_networks");
+        for (int i = 0; i < selected_network_count; i++) {
+            int idx = selected_network_indices[i];
+            if (idx >= 0 && idx < network_count) {
+                char num[8];
+                snprintf(num, sizeof(num), " %d", networks[idx].index);  // .index is 1-based
+                strncat(cmd, num, sizeof(cmd) - strlen(cmd) - 1);
+            }
+        }
+        
+        // Send select_networks command
+        uart_send_command(cmd);
+        vTaskDelay(pdMS_TO_TICKS(100));
+        
+        // Send start_deauth command
+        uart_send_command("start_deauth");
+        
+        // Show popup with attacking networks
+        show_scan_deauth_popup();
+        return;
+    }
+    
+    // TODO: Implement other attack types
     // - Evil Twin  
     // - SAE Overflow
     // - Handshaker
     // - Sniffer
+}
+
+// Close callback for scan deauth popup - sends stop command
+static void scan_deauth_popup_close_cb(lv_event_t *e)
+{
+    (void)e;
+    ESP_LOGI(TAG, "Deauth popup closed - sending stop command");
+    
+    // Send stop command
+    uart_send_command("stop");
+    
+    // Delete popup
+    if (scan_deauth_popup_obj) {
+        lv_obj_del(scan_deauth_popup_obj);
+        scan_deauth_popup_obj = NULL;
+    }
+}
+
+// Show deauth popup with list of selected networks being attacked
+static void show_scan_deauth_popup(void)
+{
+    if (scan_deauth_popup_obj != NULL) return;  // Already showing
+    
+    // Create popup overlay
+    lv_obj_t *scr = lv_scr_act();
+    scan_deauth_popup_obj = lv_obj_create(scr);
+    lv_obj_set_size(scan_deauth_popup_obj, 550, 450);
+    lv_obj_center(scan_deauth_popup_obj);
+    lv_obj_set_style_bg_color(scan_deauth_popup_obj, lv_color_hex(0x1A1A2A), 0);
+    lv_obj_set_style_border_color(scan_deauth_popup_obj, COLOR_MATERIAL_RED, 0);
+    lv_obj_set_style_border_width(scan_deauth_popup_obj, 2, 0);
+    lv_obj_set_style_radius(scan_deauth_popup_obj, 16, 0);
+    lv_obj_set_style_shadow_width(scan_deauth_popup_obj, 30, 0);
+    lv_obj_set_style_shadow_color(scan_deauth_popup_obj, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_shadow_opa(scan_deauth_popup_obj, LV_OPA_50, 0);
+    lv_obj_set_style_pad_all(scan_deauth_popup_obj, 16, 0);
+    lv_obj_set_flex_flow(scan_deauth_popup_obj, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(scan_deauth_popup_obj, 12, 0);
+    
+    // Title
+    lv_obj_t *title = lv_label_create(scan_deauth_popup_obj);
+    lv_label_set_text(title, "Attacking networks:");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_RED, 0);
+    
+    // Scrollable container for network list
+    lv_obj_t *list_cont = lv_obj_create(scan_deauth_popup_obj);
+    lv_obj_set_size(list_cont, lv_pct(100), 280);
+    lv_obj_set_style_bg_color(list_cont, lv_color_hex(0x0A0A1A), 0);
+    lv_obj_set_style_border_width(list_cont, 0, 0);
+    lv_obj_set_style_radius(list_cont, 8, 0);
+    lv_obj_set_style_pad_all(list_cont, 12, 0);
+    lv_obj_set_flex_flow(list_cont, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(list_cont, 8, 0);
+    lv_obj_add_flag(list_cont, LV_OBJ_FLAG_SCROLLABLE);
+    
+    // Add each selected network to the list
+    for (int i = 0; i < selected_network_count; i++) {
+        int idx = selected_network_indices[i];
+        if (idx >= 0 && idx < network_count) {
+            wifi_network_t *net = &networks[idx];
+            
+            // Network item container
+            lv_obj_t *item = lv_obj_create(list_cont);
+            lv_obj_set_size(item, lv_pct(100), LV_SIZE_CONTENT);
+            lv_obj_set_style_bg_color(item, lv_color_hex(0x2D2D2D), 0);
+            lv_obj_set_style_border_width(item, 0, 0);
+            lv_obj_set_style_radius(item, 6, 0);
+            lv_obj_set_style_pad_all(item, 10, 0);
+            lv_obj_set_flex_flow(item, LV_FLEX_FLOW_COLUMN);
+            lv_obj_set_style_pad_row(item, 4, 0);
+            lv_obj_clear_flag(item, LV_OBJ_FLAG_SCROLLABLE);
+            
+            // SSID
+            const char *ssid_display = strlen(net->ssid) > 0 ? net->ssid : "(Hidden)";
+            lv_obj_t *ssid_label = lv_label_create(item);
+            lv_label_set_text_fmt(ssid_label, "%s %s", LV_SYMBOL_WIFI, ssid_display);
+            lv_obj_set_style_text_font(ssid_label, &lv_font_montserrat_16, 0);
+            lv_obj_set_style_text_color(ssid_label, lv_color_hex(0xFFFFFF), 0);
+            
+            // BSSID and Band
+            lv_obj_t *info_label = lv_label_create(item);
+            lv_label_set_text_fmt(info_label, "BSSID: %s | %s", net->bssid, net->band);
+            lv_obj_set_style_text_font(info_label, &lv_font_montserrat_12, 0);
+            lv_obj_set_style_text_color(info_label, lv_color_hex(0xAAAAAA), 0);
+        }
+    }
+    
+    // STOP button
+    lv_obj_t *stop_btn = lv_btn_create(scan_deauth_popup_obj);
+    lv_obj_set_size(stop_btn, lv_pct(100), 50);
+    lv_obj_set_style_bg_color(stop_btn, COLOR_MATERIAL_RED, 0);
+    lv_obj_set_style_bg_color(stop_btn, lv_color_hex(0xCC0000), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(stop_btn, 8, 0);
+    lv_obj_add_event_cb(stop_btn, scan_deauth_popup_close_cb, LV_EVENT_CLICKED, NULL);
+    
+    lv_obj_t *btn_label = lv_label_create(stop_btn);
+    lv_label_set_text(btn_label, "STOP ATTACK");
+    lv_obj_set_style_text_font(btn_label, &lv_font_montserrat_18, 0);
+    lv_obj_center(btn_label);
 }
 
 // Back button click handler
