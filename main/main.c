@@ -566,10 +566,16 @@ static void wifi_scan_task(void *arg)
             // Checkbox (on the left) - made bigger for better touch accuracy
             lv_obj_t *cb = lv_checkbox_create(item);
             lv_checkbox_set_text(cb, "");  // Empty text - we use separate labels
-            lv_obj_set_style_pad_all(cb, 8, 0);
-            // Make checkbox indicator bigger
-            lv_obj_set_style_width(cb, 40, LV_PART_INDICATOR);
-            lv_obj_set_style_height(cb, 40, LV_PART_INDICATOR);
+            lv_obj_set_style_pad_all(cb, 4, 0);
+            // Scale up the indicator moderately
+            lv_obj_set_style_transform_width(cb, 10, LV_PART_INDICATOR);
+            lv_obj_set_style_transform_height(cb, 10, LV_PART_INDICATOR);
+            // Style the indicator - dark when unchecked, green when checked
+            lv_obj_set_style_bg_color(cb, lv_color_hex(0x3D3D3D), LV_PART_INDICATOR);
+            lv_obj_set_style_bg_color(cb, lv_color_hex(0x4CAF50), LV_PART_INDICATOR | LV_STATE_CHECKED);
+            lv_obj_set_style_border_color(cb, lv_color_hex(0x888888), LV_PART_INDICATOR);
+            lv_obj_set_style_border_width(cb, 2, LV_PART_INDICATOR);
+            lv_obj_set_style_radius(cb, 4, LV_PART_INDICATOR);
             // Pass 0-based index as user data
             lv_obj_add_event_cb(cb, network_checkbox_event_cb, LV_EVENT_VALUE_CHANGED, (void*)(intptr_t)i);
             
