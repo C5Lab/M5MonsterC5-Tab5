@@ -241,6 +241,17 @@ static lv_obj_t *esp_modem_spinner = NULL;
 static lv_obj_t *blackout_popup_overlay = NULL;
 static lv_obj_t *blackout_popup_obj = NULL;
 
+// LVGL UI elements - SnifferDog popup
+static lv_obj_t *snifferdog_popup_overlay = NULL;
+static lv_obj_t *snifferdog_popup_obj = NULL;
+
+// LVGL UI elements - Global Handshaker popup
+static lv_obj_t *global_handshaker_popup_overlay = NULL;
+static lv_obj_t *global_handshaker_popup_obj = NULL;
+static lv_obj_t *global_handshaker_status_label = NULL;
+static volatile bool global_handshaker_monitoring = false;
+static TaskHandle_t global_handshaker_monitor_task_handle = NULL;
+
 // Forward declarations
 static void show_main_tiles(void);
 static void show_scan_page(void);
@@ -305,6 +316,17 @@ static void blackout_confirm_yes_cb(lv_event_t *e);
 static void blackout_confirm_no_cb(lv_event_t *e);
 static void show_blackout_active_popup(void);
 static void blackout_stop_cb(lv_event_t *e);
+static void show_snifferdog_confirm_popup(void);
+static void snifferdog_confirm_yes_cb(lv_event_t *e);
+static void snifferdog_confirm_no_cb(lv_event_t *e);
+static void show_snifferdog_active_popup(void);
+static void snifferdog_stop_cb(lv_event_t *e);
+static void show_global_handshaker_confirm_popup(void);
+static void global_handshaker_confirm_yes_cb(lv_event_t *e);
+static void global_handshaker_confirm_no_cb(lv_event_t *e);
+static void show_global_handshaker_active_popup(void);
+static void global_handshaker_stop_cb(lv_event_t *e);
+static void global_handshaker_monitor_task(void *arg);
 
 //==================================================================================
 // INA226 Power Monitor Driver
@@ -4420,6 +4442,514 @@ static void show_blackout_active_popup(void)
     lv_obj_center(stop_label);
 }
 
+//==================================================================================
+// SnifferDog Attack Popup
+//==================================================================================
+
+// Close snifferdog popup helper
+static void close_snifferdog_popup(void)
+{
+    if (snifferdog_popup_overlay) {
+        lv_obj_del(snifferdog_popup_overlay);
+        snifferdog_popup_overlay = NULL;
+        snifferdog_popup_obj = NULL;
+    }
+}
+
+// Callback when user confirms "Yes" on snifferdog confirmation
+static void snifferdog_confirm_yes_cb(lv_event_t *e)
+{
+    (void)e;
+    ESP_LOGI(TAG, "SnifferDog confirmed - starting attack");
+    
+    // Close confirmation popup
+    close_snifferdog_popup();
+    
+    // Show active attack popup
+    show_snifferdog_active_popup();
+}
+
+// Callback when user clicks "No" on snifferdog confirmation
+static void snifferdog_confirm_no_cb(lv_event_t *e)
+{
+    (void)e;
+    ESP_LOGI(TAG, "SnifferDog cancelled by user");
+    
+    // Just close popup
+    close_snifferdog_popup();
+}
+
+// Callback when user clicks "Stop" during snifferdog attack
+static void snifferdog_stop_cb(lv_event_t *e)
+{
+    (void)e;
+    ESP_LOGI(TAG, "SnifferDog stopped by user - sending stop command");
+    
+    // Send stop command via UART1 (always UART1)
+    uart_send_command("stop");
+    
+    // Close popup
+    close_snifferdog_popup();
+    
+    // Return to main screen
+    show_main_tiles();
+}
+
+// Show snifferdog confirmation popup with icon and warning
+static void show_snifferdog_confirm_popup(void)
+{
+    if (snifferdog_popup_obj != NULL) return;  // Already showing
+    
+    lv_obj_t *scr = lv_scr_act();
+    
+    // Create modal overlay (full screen, semi-transparent, blocks input behind)
+    snifferdog_popup_overlay = lv_obj_create(scr);
+    lv_obj_remove_style_all(snifferdog_popup_overlay);
+    lv_obj_set_size(snifferdog_popup_overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(snifferdog_popup_overlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(snifferdog_popup_overlay, LV_OPA_50, 0);
+    lv_obj_clear_flag(snifferdog_popup_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(snifferdog_popup_overlay, LV_OBJ_FLAG_CLICKABLE);  // Capture clicks
+    
+    // Create popup as child of overlay
+    snifferdog_popup_obj = lv_obj_create(snifferdog_popup_overlay);
+    lv_obj_set_size(snifferdog_popup_obj, 500, 350);
+    lv_obj_center(snifferdog_popup_obj);
+    lv_obj_set_style_bg_color(snifferdog_popup_obj, lv_color_hex(0x1A1A2A), 0);
+    lv_obj_set_style_border_color(snifferdog_popup_obj, COLOR_MATERIAL_PURPLE, 0);
+    lv_obj_set_style_border_width(snifferdog_popup_obj, 3, 0);
+    lv_obj_set_style_radius(snifferdog_popup_obj, 16, 0);
+    lv_obj_set_style_shadow_width(snifferdog_popup_obj, 30, 0);
+    lv_obj_set_style_shadow_color(snifferdog_popup_obj, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_shadow_opa(snifferdog_popup_obj, LV_OPA_50, 0);
+    lv_obj_set_style_pad_all(snifferdog_popup_obj, 20, 0);
+    lv_obj_set_flex_flow(snifferdog_popup_obj, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(snifferdog_popup_obj, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(snifferdog_popup_obj, 16, 0);
+    lv_obj_clear_flag(snifferdog_popup_obj, LV_OBJ_FLAG_SCROLLABLE);
+    
+    // Eye icon (sniffing/watching)
+    lv_obj_t *icon_label = lv_label_create(snifferdog_popup_obj);
+    lv_label_set_text(icon_label, LV_SYMBOL_EYE_OPEN);
+    lv_obj_set_style_text_font(icon_label, &lv_font_montserrat_44, 0);
+    lv_obj_set_style_text_color(icon_label, COLOR_MATERIAL_PURPLE, 0);
+    
+    // Title
+    lv_obj_t *title = lv_label_create(snifferdog_popup_obj);
+    lv_label_set_text(title, "SNIFFER DOG");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_PURPLE, 0);
+    
+    // Warning message
+    lv_obj_t *message = lv_label_create(snifferdog_popup_obj);
+    lv_label_set_text(message, "This will deauth all clients\naround you. Are you sure?");
+    lv_obj_set_style_text_font(message, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_color(message, lv_color_hex(0xCCCCCC), 0);
+    lv_obj_set_style_text_align(message, LV_TEXT_ALIGN_CENTER, 0);
+    
+    // Button container
+    lv_obj_t *btn_container = lv_obj_create(snifferdog_popup_obj);
+    lv_obj_remove_style_all(btn_container);
+    lv_obj_set_size(btn_container, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(btn_container, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btn_container, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(btn_container, 30, 0);
+    lv_obj_set_style_pad_top(btn_container, 10, 0);
+    
+    // No button (green, safe option)
+    lv_obj_t *no_btn = lv_btn_create(btn_container);
+    lv_obj_set_size(no_btn, 120, 50);
+    lv_obj_set_style_bg_color(no_btn, COLOR_MATERIAL_GREEN, 0);
+    lv_obj_set_style_radius(no_btn, 8, 0);
+    lv_obj_add_event_cb(no_btn, snifferdog_confirm_no_cb, LV_EVENT_CLICKED, NULL);
+    
+    lv_obj_t *no_label = lv_label_create(no_btn);
+    lv_label_set_text(no_label, "No");
+    lv_obj_set_style_text_font(no_label, &lv_font_montserrat_18, 0);
+    lv_obj_center(no_label);
+    
+    // Yes button (purple, dangerous option)
+    lv_obj_t *yes_btn = lv_btn_create(btn_container);
+    lv_obj_set_size(yes_btn, 120, 50);
+    lv_obj_set_style_bg_color(yes_btn, COLOR_MATERIAL_PURPLE, 0);
+    lv_obj_set_style_radius(yes_btn, 8, 0);
+    lv_obj_add_event_cb(yes_btn, snifferdog_confirm_yes_cb, LV_EVENT_CLICKED, NULL);
+    
+    lv_obj_t *yes_label = lv_label_create(yes_btn);
+    lv_label_set_text(yes_label, "Yes");
+    lv_obj_set_style_text_font(yes_label, &lv_font_montserrat_18, 0);
+    lv_obj_center(yes_label);
+}
+
+// Show snifferdog active popup with Attack in Progress and Stop button
+static void show_snifferdog_active_popup(void)
+{
+    if (snifferdog_popup_obj != NULL) return;  // Already showing
+    
+    lv_obj_t *scr = lv_scr_act();
+    
+    // Send start_sniffer_dog command via UART1 (always UART1)
+    ESP_LOGI(TAG, "Sending start_sniffer_dog command via UART1");
+    uart_send_command("start_sniffer_dog");
+    
+    // Create modal overlay
+    snifferdog_popup_overlay = lv_obj_create(scr);
+    lv_obj_remove_style_all(snifferdog_popup_overlay);
+    lv_obj_set_size(snifferdog_popup_overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(snifferdog_popup_overlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(snifferdog_popup_overlay, LV_OPA_70, 0);
+    lv_obj_clear_flag(snifferdog_popup_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(snifferdog_popup_overlay, LV_OBJ_FLAG_CLICKABLE);
+    
+    // Create popup
+    snifferdog_popup_obj = lv_obj_create(snifferdog_popup_overlay);
+    lv_obj_set_size(snifferdog_popup_obj, 450, 300);
+    lv_obj_center(snifferdog_popup_obj);
+    lv_obj_set_style_bg_color(snifferdog_popup_obj, lv_color_hex(0x1A1A2A), 0);
+    lv_obj_set_style_border_color(snifferdog_popup_obj, COLOR_MATERIAL_PURPLE, 0);
+    lv_obj_set_style_border_width(snifferdog_popup_obj, 3, 0);
+    lv_obj_set_style_radius(snifferdog_popup_obj, 16, 0);
+    lv_obj_set_style_shadow_width(snifferdog_popup_obj, 30, 0);
+    lv_obj_set_style_shadow_color(snifferdog_popup_obj, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_shadow_opa(snifferdog_popup_obj, LV_OPA_50, 0);
+    lv_obj_set_style_pad_all(snifferdog_popup_obj, 20, 0);
+    lv_obj_set_flex_flow(snifferdog_popup_obj, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(snifferdog_popup_obj, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(snifferdog_popup_obj, 20, 0);
+    lv_obj_clear_flag(snifferdog_popup_obj, LV_OBJ_FLAG_SCROLLABLE);
+    
+    // Eye icon
+    lv_obj_t *icon_label = lv_label_create(snifferdog_popup_obj);
+    lv_label_set_text(icon_label, LV_SYMBOL_EYE_OPEN);
+    lv_obj_set_style_text_font(icon_label, &lv_font_montserrat_44, 0);
+    lv_obj_set_style_text_color(icon_label, COLOR_MATERIAL_PURPLE, 0);
+    
+    // Attack in progress title
+    lv_obj_t *title = lv_label_create(snifferdog_popup_obj);
+    lv_label_set_text(title, "Attack in Progress");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_PURPLE, 0);
+    
+    // Subtitle
+    lv_obj_t *subtitle = lv_label_create(snifferdog_popup_obj);
+    lv_label_set_text(subtitle, "Deauthing all clients...");
+    lv_obj_set_style_text_font(subtitle, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(subtitle, lv_color_hex(0xAAAAAA), 0);
+    
+    // Stop button
+    lv_obj_t *stop_btn = lv_btn_create(snifferdog_popup_obj);
+    lv_obj_set_size(stop_btn, 180, 55);
+    lv_obj_set_style_bg_color(stop_btn, COLOR_MATERIAL_PURPLE, 0);
+    lv_obj_set_style_radius(stop_btn, 8, 0);
+    lv_obj_add_event_cb(stop_btn, snifferdog_stop_cb, LV_EVENT_CLICKED, NULL);
+    
+    lv_obj_t *stop_label = lv_label_create(stop_btn);
+    lv_label_set_text(stop_label, LV_SYMBOL_STOP " Stop");
+    lv_obj_set_style_text_font(stop_label, &lv_font_montserrat_20, 0);
+    lv_obj_center(stop_label);
+}
+
+//==================================================================================
+// Global Handshaker Attack Popup
+//==================================================================================
+
+// Close global handshaker popup helper
+static void close_global_handshaker_popup(void)
+{
+    // Stop monitoring task first
+    global_handshaker_monitoring = false;
+    if (global_handshaker_monitor_task_handle != NULL) {
+        vTaskDelay(pdMS_TO_TICKS(100));  // Give task time to exit
+        global_handshaker_monitor_task_handle = NULL;
+    }
+    
+    if (global_handshaker_popup_overlay) {
+        lv_obj_del(global_handshaker_popup_overlay);
+        global_handshaker_popup_overlay = NULL;
+        global_handshaker_popup_obj = NULL;
+        global_handshaker_status_label = NULL;
+    }
+}
+
+// Callback when user confirms "Yes" on global handshaker confirmation
+static void global_handshaker_confirm_yes_cb(lv_event_t *e)
+{
+    (void)e;
+    ESP_LOGI(TAG, "Global Handshaker confirmed - starting attack");
+    
+    // Close confirmation popup
+    close_global_handshaker_popup();
+    
+    // Show active attack popup
+    show_global_handshaker_active_popup();
+}
+
+// Callback when user clicks "No" on global handshaker confirmation
+static void global_handshaker_confirm_no_cb(lv_event_t *e)
+{
+    (void)e;
+    ESP_LOGI(TAG, "Global Handshaker cancelled by user");
+    
+    // Just close popup
+    close_global_handshaker_popup();
+}
+
+// Callback when user clicks "Stop" during global handshaker attack
+static void global_handshaker_stop_cb(lv_event_t *e)
+{
+    (void)e;
+    ESP_LOGI(TAG, "Global Handshaker stopped by user - sending stop command");
+    
+    // Send stop command via UART1 (always UART1)
+    uart_send_command("stop");
+    
+    // Close popup (also stops monitoring task)
+    close_global_handshaker_popup();
+    
+    // Return to main screen
+    show_main_tiles();
+}
+
+// Global handshaker monitor task - reads UART for handshake capture
+static void global_handshaker_monitor_task(void *arg)
+{
+    (void)arg;
+    ESP_LOGI(TAG, "Global Handshaker monitor task started");
+    
+    static char rx_buffer[512];
+    static char line_buffer[512];
+    int line_pos = 0;
+    
+    while (global_handshaker_monitoring) {
+        int len = uart_read_bytes(UART_NUM, rx_buffer, sizeof(rx_buffer) - 1, pdMS_TO_TICKS(100));
+        
+        if (len > 0) {
+            rx_buffer[len] = '\0';
+            
+            for (int i = 0; i < len; i++) {
+                char c = rx_buffer[i];
+                
+                if (c == '\n' || c == '\r') {
+                    if (line_pos > 0) {
+                        line_buffer[line_pos] = '\0';
+                        
+                        // Check for complete handshake message
+                        // Pattern: "Complete 4-way handshake saved for SSID: AX3_2.4 (MAC: ...)"
+                        // Note: line may start with checkmark character (✓)
+                        const char *pattern = "handshake saved for SSID:";
+                        char *found = strstr(line_buffer, pattern);
+                        if (found != NULL) {
+                            // Extract SSID from the message
+                            char *ssid_start = found + strlen(pattern);
+                            // Skip leading spaces
+                            while (*ssid_start == ' ') ssid_start++;
+                            
+                            // Copy SSID and trim at first space or parenthesis (removes "(MAC: ...)")
+                            char ssid[64];
+                            int j = 0;
+                            while (ssid_start[j] && ssid_start[j] != ' ' && ssid_start[j] != '(' && j < 63) {
+                                ssid[j] = ssid_start[j];
+                                j++;
+                            }
+                            ssid[j] = '\0';
+                            
+                            // Create status message
+                            char status_msg[128];
+                            snprintf(status_msg, sizeof(status_msg), "Handshake captured: %s", ssid);
+                            
+                            ESP_LOGI(TAG, "%s", status_msg);
+                            
+                            // Update status label on UI thread
+                            bsp_display_lock(0);
+                            if (global_handshaker_status_label) {
+                                lv_label_set_text(global_handshaker_status_label, status_msg);
+                                lv_obj_set_style_text_color(global_handshaker_status_label, COLOR_MATERIAL_GREEN, 0);
+                            }
+                            bsp_display_unlock();
+                        }
+                        
+                        // Also check for "Handshake #X captured!" as alternative pattern
+                        if (strstr(line_buffer, "Handshake #") != NULL && strstr(line_buffer, "captured") != NULL) {
+                            ESP_LOGI(TAG, "Handshake capture confirmed: %s", line_buffer);
+                        }
+                        
+                        line_pos = 0;
+                    }
+                } else if (line_pos < (int)sizeof(line_buffer) - 1) {
+                    line_buffer[line_pos++] = c;
+                }
+            }
+        }
+        
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    
+    ESP_LOGI(TAG, "Global Handshaker monitor task ended");
+    global_handshaker_monitor_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+// Show global handshaker confirmation popup with icon and warning
+static void show_global_handshaker_confirm_popup(void)
+{
+    if (global_handshaker_popup_obj != NULL) return;  // Already showing
+    
+    lv_obj_t *scr = lv_scr_act();
+    
+    // Create modal overlay (full screen, semi-transparent, blocks input behind)
+    global_handshaker_popup_overlay = lv_obj_create(scr);
+    lv_obj_remove_style_all(global_handshaker_popup_overlay);
+    lv_obj_set_size(global_handshaker_popup_overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(global_handshaker_popup_overlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(global_handshaker_popup_overlay, LV_OPA_50, 0);
+    lv_obj_clear_flag(global_handshaker_popup_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(global_handshaker_popup_overlay, LV_OBJ_FLAG_CLICKABLE);  // Capture clicks
+    
+    // Create popup as child of overlay
+    global_handshaker_popup_obj = lv_obj_create(global_handshaker_popup_overlay);
+    lv_obj_set_size(global_handshaker_popup_obj, 520, 380);
+    lv_obj_center(global_handshaker_popup_obj);
+    lv_obj_set_style_bg_color(global_handshaker_popup_obj, lv_color_hex(0x1A1A2A), 0);
+    lv_obj_set_style_border_color(global_handshaker_popup_obj, COLOR_MATERIAL_AMBER, 0);
+    lv_obj_set_style_border_width(global_handshaker_popup_obj, 3, 0);
+    lv_obj_set_style_radius(global_handshaker_popup_obj, 16, 0);
+    lv_obj_set_style_shadow_width(global_handshaker_popup_obj, 30, 0);
+    lv_obj_set_style_shadow_color(global_handshaker_popup_obj, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_shadow_opa(global_handshaker_popup_obj, LV_OPA_50, 0);
+    lv_obj_set_style_pad_all(global_handshaker_popup_obj, 20, 0);
+    lv_obj_set_flex_flow(global_handshaker_popup_obj, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(global_handshaker_popup_obj, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(global_handshaker_popup_obj, 14, 0);
+    lv_obj_clear_flag(global_handshaker_popup_obj, LV_OBJ_FLAG_SCROLLABLE);
+    
+    // Download icon (file save icon - same as tile)
+    lv_obj_t *icon_label = lv_label_create(global_handshaker_popup_obj);
+    lv_label_set_text(icon_label, LV_SYMBOL_DOWNLOAD);
+    lv_obj_set_style_text_font(icon_label, &lv_font_montserrat_44, 0);
+    lv_obj_set_style_text_color(icon_label, COLOR_MATERIAL_AMBER, 0);
+    
+    // Title
+    lv_obj_t *title = lv_label_create(global_handshaker_popup_obj);
+    lv_label_set_text(title, "HANDSHAKER");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_AMBER, 0);
+    
+    // Warning message
+    lv_obj_t *message = lv_label_create(global_handshaker_popup_obj);
+    lv_label_set_text(message, "This will deauth all networks around\nyou in order to grab handshakes.\nAre you sure?");
+    lv_obj_set_style_text_font(message, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(message, lv_color_hex(0xCCCCCC), 0);
+    lv_obj_set_style_text_align(message, LV_TEXT_ALIGN_CENTER, 0);
+    
+    // Button container
+    lv_obj_t *btn_container = lv_obj_create(global_handshaker_popup_obj);
+    lv_obj_remove_style_all(btn_container);
+    lv_obj_set_size(btn_container, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(btn_container, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btn_container, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(btn_container, 30, 0);
+    lv_obj_set_style_pad_top(btn_container, 10, 0);
+    
+    // No button (green, safe option)
+    lv_obj_t *no_btn = lv_btn_create(btn_container);
+    lv_obj_set_size(no_btn, 120, 50);
+    lv_obj_set_style_bg_color(no_btn, COLOR_MATERIAL_GREEN, 0);
+    lv_obj_set_style_radius(no_btn, 8, 0);
+    lv_obj_add_event_cb(no_btn, global_handshaker_confirm_no_cb, LV_EVENT_CLICKED, NULL);
+    
+    lv_obj_t *no_label = lv_label_create(no_btn);
+    lv_label_set_text(no_label, "No");
+    lv_obj_set_style_text_font(no_label, &lv_font_montserrat_18, 0);
+    lv_obj_center(no_label);
+    
+    // Yes button (amber, dangerous option)
+    lv_obj_t *yes_btn = lv_btn_create(btn_container);
+    lv_obj_set_size(yes_btn, 120, 50);
+    lv_obj_set_style_bg_color(yes_btn, COLOR_MATERIAL_AMBER, 0);
+    lv_obj_set_style_radius(yes_btn, 8, 0);
+    lv_obj_add_event_cb(yes_btn, global_handshaker_confirm_yes_cb, LV_EVENT_CLICKED, NULL);
+    
+    lv_obj_t *yes_label = lv_label_create(yes_btn);
+    lv_label_set_text(yes_label, "Yes");
+    lv_obj_set_style_text_font(yes_label, &lv_font_montserrat_18, 0);
+    lv_obj_center(yes_label);
+}
+
+// Show global handshaker active popup with Attack in Progress and Stop button
+static void show_global_handshaker_active_popup(void)
+{
+    if (global_handshaker_popup_obj != NULL) return;  // Already showing
+    
+    lv_obj_t *scr = lv_scr_act();
+    
+    // Send start_handshake command via UART1 (always UART1)
+    ESP_LOGI(TAG, "Sending start_handshake command via UART1");
+    uart_send_command("start_handshake");
+    
+    // Create modal overlay
+    global_handshaker_popup_overlay = lv_obj_create(scr);
+    lv_obj_remove_style_all(global_handshaker_popup_overlay);
+    lv_obj_set_size(global_handshaker_popup_overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(global_handshaker_popup_overlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(global_handshaker_popup_overlay, LV_OPA_70, 0);
+    lv_obj_clear_flag(global_handshaker_popup_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(global_handshaker_popup_overlay, LV_OBJ_FLAG_CLICKABLE);
+    
+    // Create popup
+    global_handshaker_popup_obj = lv_obj_create(global_handshaker_popup_overlay);
+    lv_obj_set_size(global_handshaker_popup_obj, 480, 350);
+    lv_obj_center(global_handshaker_popup_obj);
+    lv_obj_set_style_bg_color(global_handshaker_popup_obj, lv_color_hex(0x1A1A2A), 0);
+    lv_obj_set_style_border_color(global_handshaker_popup_obj, COLOR_MATERIAL_AMBER, 0);
+    lv_obj_set_style_border_width(global_handshaker_popup_obj, 3, 0);
+    lv_obj_set_style_radius(global_handshaker_popup_obj, 16, 0);
+    lv_obj_set_style_shadow_width(global_handshaker_popup_obj, 30, 0);
+    lv_obj_set_style_shadow_color(global_handshaker_popup_obj, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_shadow_opa(global_handshaker_popup_obj, LV_OPA_50, 0);
+    lv_obj_set_style_pad_all(global_handshaker_popup_obj, 20, 0);
+    lv_obj_set_flex_flow(global_handshaker_popup_obj, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(global_handshaker_popup_obj, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(global_handshaker_popup_obj, 16, 0);
+    lv_obj_clear_flag(global_handshaker_popup_obj, LV_OBJ_FLAG_SCROLLABLE);
+    
+    // Download icon
+    lv_obj_t *icon_label = lv_label_create(global_handshaker_popup_obj);
+    lv_label_set_text(icon_label, LV_SYMBOL_DOWNLOAD);
+    lv_obj_set_style_text_font(icon_label, &lv_font_montserrat_44, 0);
+    lv_obj_set_style_text_color(icon_label, COLOR_MATERIAL_AMBER, 0);
+    
+    // Attack in progress title
+    lv_obj_t *title = lv_label_create(global_handshaker_popup_obj);
+    lv_label_set_text(title, "Attack in Progress");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_AMBER, 0);
+    
+    // Status label for handshake captures
+    global_handshaker_status_label = lv_label_create(global_handshaker_popup_obj);
+    lv_label_set_text(global_handshaker_status_label, "Waiting for handshakes...");
+    lv_obj_set_style_text_font(global_handshaker_status_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(global_handshaker_status_label, lv_color_hex(0xAAAAAA), 0);
+    lv_obj_set_style_text_align(global_handshaker_status_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(global_handshaker_status_label, lv_pct(90));
+    lv_label_set_long_mode(global_handshaker_status_label, LV_LABEL_LONG_WRAP);
+    
+    // Stop button
+    lv_obj_t *stop_btn = lv_btn_create(global_handshaker_popup_obj);
+    lv_obj_set_size(stop_btn, 180, 55);
+    lv_obj_set_style_bg_color(stop_btn, COLOR_MATERIAL_AMBER, 0);
+    lv_obj_set_style_radius(stop_btn, 8, 0);
+    lv_obj_add_event_cb(stop_btn, global_handshaker_stop_cb, LV_EVENT_CLICKED, NULL);
+    
+    lv_obj_t *stop_label = lv_label_create(stop_btn);
+    lv_label_set_text(stop_label, LV_SYMBOL_STOP " Stop");
+    lv_obj_set_style_text_font(stop_label, &lv_font_montserrat_20, 0);
+    lv_obj_center(stop_label);
+    
+    // Start monitoring task
+    global_handshaker_monitoring = true;
+    xTaskCreate(global_handshaker_monitor_task, "gh_monitor", 4096, NULL, 5, &global_handshaker_monitor_task_handle);
+}
+
 // Global attack tile event handler
 static void global_attack_tile_event_cb(lv_event_t *e)
 {
@@ -4432,10 +4962,20 @@ static void global_attack_tile_event_cb(lv_event_t *e)
         return;
     }
     
+    // Handle SnifferDog attack
+    if (strcmp(attack_name, "Snifferdog") == 0) {
+        show_snifferdog_confirm_popup();
+        return;
+    }
+    
+    // Handle Handshaker attack (global - all networks)
+    if (strcmp(attack_name, "Handshakes") == 0) {
+        show_global_handshaker_confirm_popup();
+        return;
+    }
+    
     // TODO: Implement actual attack logic for other types
-    // - Handshakes
     // - Portal
-    // - Snifferdog
     // - Wardrive
 }
 
