@@ -300,6 +300,21 @@ typedef struct {
 static arp_host_t arp_hosts[ARP_MAX_HOSTS];
 static int arp_host_count = 0;
 
+// Evil Twin -> ARP integration (auto-connect mode)
+static char arp_target_password[65] = {0};  // Password from Evil Twin
+static bool arp_auto_mode = false;          // True when coming from Evil Twin
+static lv_obj_t *evil_twin_connect_popup_overlay = NULL;
+static lv_obj_t *evil_twin_connect_popup_obj = NULL;
+
+// Evil Twin entry storage for row clicks
+#define EVIL_TWIN_MAX_ENTRIES 32
+typedef struct {
+    char ssid[33];
+    char password[65];
+} evil_twin_entry_t;
+static evil_twin_entry_t evil_twin_entries[EVIL_TWIN_MAX_ENTRIES];
+static int evil_twin_entry_count = 0;
+
 // Karma Attack page
 static lv_obj_t *karma_page = NULL;
 static lv_obj_t *karma_probes_container = NULL;
@@ -428,6 +443,11 @@ static void arp_connect_cb(lv_event_t *e);
 static void arp_list_hosts_cb(lv_event_t *e);
 static void arp_host_click_cb(lv_event_t *e);
 static void arp_attack_popup_close_cb(lv_event_t *e);
+static void evil_twin_row_click_cb(lv_event_t *e);
+static void show_evil_twin_connect_popup(const char *ssid, const char *password);
+static void evil_twin_connect_popup_yes_cb(lv_event_t *e);
+static void evil_twin_connect_popup_cancel_cb(lv_event_t *e);
+static void arp_auto_connect_timer_cb(lv_timer_t *timer);
 static void show_karma_page(void);
 static void karma_back_cb(lv_event_t *e);
 static void karma_start_sniffer_cb(lv_event_t *e);
@@ -2289,6 +2309,101 @@ static void arp_attack_popup_close_cb(lv_event_t *e)
     }
 }
 
+// Auto connect timer callback - runs wifi_connect and then list_hosts
+static void arp_auto_connect_timer_cb(lv_timer_t *timer)
+{
+    lv_timer_del(timer);  // One-shot timer
+    
+    if (!arp_auto_mode) return;
+    
+    ESP_LOGI(TAG, "ARP Auto mode: Connecting to %s with password %s", arp_target_ssid, arp_target_password);
+    
+    // Update status
+    if (arp_status_label) {
+        lv_label_set_text_fmt(arp_status_label, "Connecting to %s...", arp_target_ssid);
+        lv_obj_set_style_text_color(arp_status_label, COLOR_MATERIAL_AMBER, 0);
+    }
+    
+    // Force UI refresh
+    bsp_display_lock(0);
+    bsp_display_unlock();
+    vTaskDelay(pdMS_TO_TICKS(50));
+    
+    // Send wifi_connect command
+    char cmd[128];
+    snprintf(cmd, sizeof(cmd), "wifi_connect %s %s", arp_target_ssid, arp_target_password);
+    uart_send_command(cmd);
+    
+    // Wait for response (up to 15 seconds)
+    static char rx_buffer[1024];
+    int total_len = 0;
+    int timeout_ms = 15000;
+    int elapsed_ms = 0;
+    bool success = false;
+    
+    while (elapsed_ms < timeout_ms) {
+        int len = uart_read_bytes(UART_NUM, rx_buffer + total_len, sizeof(rx_buffer) - total_len - 1, pdMS_TO_TICKS(200));
+        if (len > 0) {
+            total_len += len;
+            rx_buffer[total_len] = '\0';
+            
+            // Check for success message
+            if (strstr(rx_buffer, "Connected to") != NULL || strstr(rx_buffer, "connected to") != NULL) {
+                success = true;
+                break;
+            }
+            // Check for failure
+            if (strstr(rx_buffer, "Failed") != NULL || strstr(rx_buffer, "failed") != NULL) {
+                break;
+            }
+        }
+        elapsed_ms += 200;
+    }
+    
+    ESP_LOGI(TAG, "ARP Auto mode: wifi_connect response: %s", rx_buffer);
+    
+    bsp_display_lock(0);
+    
+    if (success) {
+        ESP_LOGI(TAG, "ARP Auto mode: Connected successfully");
+        arp_wifi_connected = true;
+        
+        if (arp_status_label) {
+            lv_label_set_text_fmt(arp_status_label, "Connected to %s - Click 'List Hosts' to scan", arp_target_ssid);
+            lv_obj_set_style_text_color(arp_status_label, COLOR_MATERIAL_GREEN, 0);
+        }
+        
+        // Show List Hosts button
+        if (arp_list_hosts_btn) {
+            lv_obj_clear_flag(arp_list_hosts_btn, LV_OBJ_FLAG_HIDDEN);
+        }
+        
+        // Update placeholder text
+        if (arp_hosts_container) {
+            lv_obj_clean(arp_hosts_container);
+            lv_obj_t *placeholder = lv_label_create(arp_hosts_container);
+            lv_label_set_text(placeholder, "Click 'List Hosts' to scan network for targets");
+            lv_obj_set_style_text_font(placeholder, &lv_font_montserrat_14, 0);
+            lv_obj_set_style_text_color(placeholder, lv_color_hex(0x888888), 0);
+        }
+        
+        bsp_display_unlock();
+    } else {
+        ESP_LOGW(TAG, "ARP Auto mode: Failed to connect");
+        
+        if (arp_status_label) {
+            lv_label_set_text(arp_status_label, "Connection failed!");
+            lv_obj_set_style_text_color(arp_status_label, COLOR_MATERIAL_RED, 0);
+        }
+        
+        bsp_display_unlock();
+    }
+    
+    // Reset auto mode flag
+    arp_auto_mode = false;
+    memset(arp_target_password, 0, sizeof(arp_target_password));
+}
+
 // Show ARP Poison page
 static void show_arp_poison_page(void)
 {
@@ -2352,74 +2467,107 @@ static void show_arp_poison_page(void)
     lv_obj_set_style_text_font(target_label, &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_color(target_label, lv_color_hex(0xCCCCCC), 0);
     
-    // Password input section
-    lv_obj_t *pass_section = lv_obj_create(arp_poison_page);
-    lv_obj_set_size(pass_section, lv_pct(100), LV_SIZE_CONTENT);
-    lv_obj_set_style_bg_color(pass_section, lv_color_hex(0x252525), 0);
-    lv_obj_set_style_border_width(pass_section, 0, 0);
-    lv_obj_set_style_radius(pass_section, 8, 0);
-    lv_obj_set_style_pad_all(pass_section, 15, 0);
-    lv_obj_set_flex_flow(pass_section, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(pass_section, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_column(pass_section, 15, 0);
-    lv_obj_clear_flag(pass_section, LV_OBJ_FLAG_SCROLLABLE);
+    // Password input section (only shown in manual mode)
+    lv_obj_t *pass_section = NULL;
     
-    // Password label + input
-    lv_obj_t *pass_left = lv_obj_create(pass_section);
-    lv_obj_set_size(pass_left, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
-    lv_obj_set_style_bg_opa(pass_left, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(pass_left, 0, 0);
-    lv_obj_set_style_pad_all(pass_left, 0, 0);
-    lv_obj_set_flex_flow(pass_left, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(pass_left, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_column(pass_left, 10, 0);
-    lv_obj_clear_flag(pass_left, LV_OBJ_FLAG_SCROLLABLE);
+    if (!arp_auto_mode) {
+        pass_section = lv_obj_create(arp_poison_page);
+        lv_obj_set_size(pass_section, lv_pct(100), LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_color(pass_section, lv_color_hex(0x252525), 0);
+        lv_obj_set_style_border_width(pass_section, 0, 0);
+        lv_obj_set_style_radius(pass_section, 8, 0);
+        lv_obj_set_style_pad_all(pass_section, 15, 0);
+        lv_obj_set_flex_flow(pass_section, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(pass_section, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_column(pass_section, 15, 0);
+        lv_obj_clear_flag(pass_section, LV_OBJ_FLAG_SCROLLABLE);
+        
+        // Password label + input
+        lv_obj_t *pass_left = lv_obj_create(pass_section);
+        lv_obj_set_size(pass_left, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_opa(pass_left, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(pass_left, 0, 0);
+        lv_obj_set_style_pad_all(pass_left, 0, 0);
+        lv_obj_set_flex_flow(pass_left, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(pass_left, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_column(pass_left, 10, 0);
+        lv_obj_clear_flag(pass_left, LV_OBJ_FLAG_SCROLLABLE);
+        
+        lv_obj_t *pass_label = lv_label_create(pass_left);
+        lv_label_set_text(pass_label, "Password:");
+        lv_obj_set_style_text_font(pass_label, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(pass_label, lv_color_hex(0xFFFFFF), 0);
+        
+        arp_password_input = lv_textarea_create(pass_left);
+        lv_obj_set_size(arp_password_input, 300, 40);
+        lv_textarea_set_one_line(arp_password_input, true);
+        lv_textarea_set_placeholder_text(arp_password_input, "WiFi password");
+        lv_obj_set_style_bg_color(arp_password_input, lv_color_hex(0x1A1A1A), 0);
+        lv_obj_set_style_border_color(arp_password_input, COLOR_MATERIAL_PURPLE, 0);
+        lv_obj_set_style_border_width(arp_password_input, 1, 0);
+        lv_obj_set_style_text_color(arp_password_input, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_add_event_cb(arp_password_input, arp_password_input_cb, LV_EVENT_CLICKED, NULL);
+        
+        // Connect button
+        arp_connect_btn = lv_btn_create(pass_section);
+        lv_obj_set_size(arp_connect_btn, 120, 40);
+        lv_obj_set_style_bg_color(arp_connect_btn, COLOR_MATERIAL_GREEN, 0);
+        lv_obj_set_style_radius(arp_connect_btn, 8, 0);
+        lv_obj_add_event_cb(arp_connect_btn, arp_connect_cb, LV_EVENT_CLICKED, NULL);
+        
+        lv_obj_t *connect_label = lv_label_create(arp_connect_btn);
+        lv_label_set_text(connect_label, "Connect");
+        lv_obj_set_style_text_font(connect_label, &lv_font_montserrat_16, 0);
+        lv_obj_center(connect_label);
+        
+        // List Hosts button (hidden initially)
+        arp_list_hosts_btn = lv_btn_create(pass_section);
+        lv_obj_set_size(arp_list_hosts_btn, 120, 40);
+        lv_obj_set_style_bg_color(arp_list_hosts_btn, COLOR_MATERIAL_CYAN, 0);
+        lv_obj_set_style_radius(arp_list_hosts_btn, 8, 0);
+        lv_obj_add_event_cb(arp_list_hosts_btn, arp_list_hosts_cb, LV_EVENT_CLICKED, NULL);
+        lv_obj_add_flag(arp_list_hosts_btn, LV_OBJ_FLAG_HIDDEN);
+        
+        lv_obj_t *list_hosts_label = lv_label_create(arp_list_hosts_btn);
+        lv_label_set_text(list_hosts_label, "List Hosts");
+        lv_obj_set_style_text_font(list_hosts_label, &lv_font_montserrat_16, 0);
+        lv_obj_center(list_hosts_label);
+    }
     
-    lv_obj_t *pass_label = lv_label_create(pass_left);
-    lv_label_set_text(pass_label, "Password:");
-    lv_obj_set_style_text_font(pass_label, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(pass_label, lv_color_hex(0xFFFFFF), 0);
-    
-    arp_password_input = lv_textarea_create(pass_left);
-    lv_obj_set_size(arp_password_input, 300, 40);
-    lv_textarea_set_one_line(arp_password_input, true);
-    lv_textarea_set_placeholder_text(arp_password_input, "WiFi password");
-    lv_obj_set_style_bg_color(arp_password_input, lv_color_hex(0x1A1A1A), 0);
-    lv_obj_set_style_border_color(arp_password_input, COLOR_MATERIAL_PURPLE, 0);
-    lv_obj_set_style_border_width(arp_password_input, 1, 0);
-    lv_obj_set_style_text_color(arp_password_input, lv_color_hex(0xFFFFFF), 0);
-    lv_obj_add_event_cb(arp_password_input, arp_password_input_cb, LV_EVENT_CLICKED, NULL);
-    
-    // Connect button
-    arp_connect_btn = lv_btn_create(pass_section);
-    lv_obj_set_size(arp_connect_btn, 120, 40);
-    lv_obj_set_style_bg_color(arp_connect_btn, COLOR_MATERIAL_GREEN, 0);
-    lv_obj_set_style_radius(arp_connect_btn, 8, 0);
-    lv_obj_add_event_cb(arp_connect_btn, arp_connect_cb, LV_EVENT_CLICKED, NULL);
-    
-    lv_obj_t *connect_label = lv_label_create(arp_connect_btn);
-    lv_label_set_text(connect_label, "Connect");
-    lv_obj_set_style_text_font(connect_label, &lv_font_montserrat_16, 0);
-    lv_obj_center(connect_label);
-    
-    // List Hosts button (hidden initially)
-    arp_list_hosts_btn = lv_btn_create(pass_section);
-    lv_obj_set_size(arp_list_hosts_btn, 120, 40);
-    lv_obj_set_style_bg_color(arp_list_hosts_btn, COLOR_MATERIAL_CYAN, 0);
-    lv_obj_set_style_radius(arp_list_hosts_btn, 8, 0);
-    lv_obj_add_event_cb(arp_list_hosts_btn, arp_list_hosts_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_add_flag(arp_list_hosts_btn, LV_OBJ_FLAG_HIDDEN);
-    
-    lv_obj_t *list_hosts_label = lv_label_create(arp_list_hosts_btn);
-    lv_label_set_text(list_hosts_label, "List Hosts");
-    lv_obj_set_style_text_font(list_hosts_label, &lv_font_montserrat_16, 0);
-    lv_obj_center(list_hosts_label);
+    // In auto mode, create List Hosts button here (since pass_section is not created)
+    if (arp_auto_mode) {
+        lv_obj_t *btn_container = lv_obj_create(arp_poison_page);
+        lv_obj_set_size(btn_container, lv_pct(100), LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_opa(btn_container, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(btn_container, 0, 0);
+        lv_obj_set_style_pad_all(btn_container, 0, 0);
+        lv_obj_set_flex_flow(btn_container, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(btn_container, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_clear_flag(btn_container, LV_OBJ_FLAG_SCROLLABLE);
+        
+        arp_list_hosts_btn = lv_btn_create(btn_container);
+        lv_obj_set_size(arp_list_hosts_btn, 150, 45);
+        lv_obj_set_style_bg_color(arp_list_hosts_btn, COLOR_MATERIAL_CYAN, 0);
+        lv_obj_set_style_radius(arp_list_hosts_btn, 8, 0);
+        lv_obj_add_event_cb(arp_list_hosts_btn, arp_list_hosts_cb, LV_EVENT_CLICKED, NULL);
+        lv_obj_add_flag(arp_list_hosts_btn, LV_OBJ_FLAG_HIDDEN);  // Hidden until connected
+        
+        lv_obj_t *list_hosts_label = lv_label_create(arp_list_hosts_btn);
+        lv_label_set_text(list_hosts_label, LV_SYMBOL_REFRESH " List Hosts");
+        lv_obj_set_style_text_font(list_hosts_label, &lv_font_montserrat_16, 0);
+        lv_obj_center(list_hosts_label);
+    }
     
     // Status label
     arp_status_label = lv_label_create(arp_poison_page);
-    lv_label_set_text(arp_status_label, "Enter WiFi password to connect");
+    if (arp_auto_mode) {
+        lv_label_set_text_fmt(arp_status_label, "Auto-connecting to %s...", arp_target_ssid);
+        lv_obj_set_style_text_color(arp_status_label, COLOR_MATERIAL_AMBER, 0);
+    } else {
+        lv_label_set_text(arp_status_label, "Enter WiFi password to connect");
+        lv_obj_set_style_text_color(arp_status_label, lv_color_hex(0x888888), 0);
+    }
     lv_obj_set_style_text_font(arp_status_label, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(arp_status_label, lv_color_hex(0x888888), 0);
     
     // Hosts container (scrollable)
     arp_hosts_container = lv_obj_create(arp_poison_page);
@@ -2433,16 +2581,28 @@ static void show_arp_poison_page(void)
     lv_obj_set_style_pad_row(arp_hosts_container, 6, 0);
     
     lv_obj_t *placeholder = lv_label_create(arp_hosts_container);
-    lv_label_set_text(placeholder, "Connect to WiFi and click 'List Hosts' to scan network");
+    if (arp_auto_mode) {
+        lv_label_set_text(placeholder, "Connecting to network...");
+    } else {
+        lv_label_set_text(placeholder, "Connect to WiFi and click 'List Hosts' to scan network");
+    }
     lv_obj_set_style_text_font(placeholder, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(placeholder, lv_color_hex(0x666666), 0);
     
-    // Create keyboard (hidden initially)
-    arp_keyboard = lv_keyboard_create(arp_poison_page);
-    lv_obj_set_size(arp_keyboard, lv_pct(100), 200);
-    lv_keyboard_set_textarea(arp_keyboard, arp_password_input);
-    lv_obj_add_event_cb(arp_keyboard, arp_keyboard_cb, LV_EVENT_ALL, NULL);
-    lv_obj_add_flag(arp_keyboard, LV_OBJ_FLAG_HIDDEN);
+    // Create keyboard (hidden initially, only in manual mode)
+    if (!arp_auto_mode) {
+        arp_keyboard = lv_keyboard_create(arp_poison_page);
+        lv_obj_set_size(arp_keyboard, lv_pct(100), 200);
+        lv_keyboard_set_textarea(arp_keyboard, arp_password_input);
+        lv_obj_add_event_cb(arp_keyboard, arp_keyboard_cb, LV_EVENT_ALL, NULL);
+        lv_obj_add_flag(arp_keyboard, LV_OBJ_FLAG_HIDDEN);
+    }
+    
+    // In auto mode, start connection immediately
+    if (arp_auto_mode) {
+        // Use a small delay to let UI render first, then trigger auto connect
+        lv_timer_create(arp_auto_connect_timer_cb, 100, NULL);
+    }
 }
 
 // ======================= Karma Attack Functions =======================
@@ -7285,6 +7445,10 @@ static void show_evil_twin_passwords_page(void)
     
     ESP_LOGI(TAG, "Evil Twin passwords response (%d bytes): %s", total_len, rx_buffer);
     
+    // Reset entry storage
+    evil_twin_entry_count = 0;
+    memset(evil_twin_entries, 0, sizeof(evil_twin_entries));
+    
     // Parse response - format: "SSID", "password"
     int entry_count = 0;
     char *line = strtok(rx_buffer, "\n\r");
@@ -7327,17 +7491,24 @@ static void show_evil_twin_passwords_page(void)
             }
         }
         
-        if (strlen(ssid) > 0) {
-            // Create entry row
+        if (strlen(ssid) > 0 && evil_twin_entry_count < EVIL_TWIN_MAX_ENTRIES) {
+            // Store entry for later use (use snprintf to avoid truncation warnings)
+            snprintf(evil_twin_entries[evil_twin_entry_count].ssid, sizeof(evil_twin_entries[0].ssid), "%s", ssid);
+            snprintf(evil_twin_entries[evil_twin_entry_count].password, sizeof(evil_twin_entries[0].password), "%s", password);
+            
+            // Create clickable entry row
             lv_obj_t *row = lv_obj_create(list_container);
             lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
             lv_obj_set_style_bg_color(row, lv_color_hex(0x2D2D2D), 0);
+            lv_obj_set_style_bg_color(row, lv_color_hex(0x3D3D3D), LV_STATE_PRESSED);
             lv_obj_set_style_border_width(row, 0, 0);
             lv_obj_set_style_radius(row, 6, 0);
             lv_obj_set_style_pad_all(row, 8, 0);
             lv_obj_set_flex_flow(row, LV_FLEX_FLOW_COLUMN);
             lv_obj_set_style_pad_row(row, 4, 0);
             lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_add_event_cb(row, evil_twin_row_click_cb, LV_EVENT_CLICKED, (void*)(intptr_t)evil_twin_entry_count);
             
             lv_obj_t *ssid_lbl = lv_label_create(row);
             lv_label_set_text_fmt(ssid_lbl, "SSID: %s", ssid);
@@ -7349,13 +7520,170 @@ static void show_evil_twin_passwords_page(void)
             lv_obj_set_style_text_font(pass_lbl, &lv_font_montserrat_14, 0);
             lv_obj_set_style_text_color(pass_lbl, COLOR_MATERIAL_AMBER, 0);
             
+            evil_twin_entry_count++;
             entry_count++;
         }
         
         line = strtok(NULL, "\n\r");
     }
     
-    lv_label_set_text_fmt(status_label, "Found %d password(s)", entry_count);
+    lv_label_set_text_fmt(status_label, "Found %d password(s) - tap to connect", entry_count);
+}
+
+// Evil Twin row click callback - show connect popup
+static void evil_twin_row_click_cb(lv_event_t *e)
+{
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    
+    if (idx < 0 || idx >= evil_twin_entry_count) {
+        ESP_LOGW(TAG, "Evil Twin: Invalid entry index %d", idx);
+        return;
+    }
+    
+    ESP_LOGI(TAG, "Evil Twin: Row clicked - SSID: %s", evil_twin_entries[idx].ssid);
+    show_evil_twin_connect_popup(evil_twin_entries[idx].ssid, evil_twin_entries[idx].password);
+}
+
+// Show connect confirmation popup
+static void show_evil_twin_connect_popup(const char *ssid, const char *password)
+{
+    // Store credentials for use in callback
+    strncpy(arp_target_ssid, ssid, sizeof(arp_target_ssid) - 1);
+    arp_target_ssid[sizeof(arp_target_ssid) - 1] = '\0';
+    strncpy(arp_target_password, password, sizeof(arp_target_password) - 1);
+    arp_target_password[sizeof(arp_target_password) - 1] = '\0';
+    
+    lv_obj_t *scr = lv_scr_act();
+    
+    // Create overlay
+    evil_twin_connect_popup_overlay = lv_obj_create(scr);
+    lv_obj_remove_style_all(evil_twin_connect_popup_overlay);
+    lv_obj_set_size(evil_twin_connect_popup_overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(evil_twin_connect_popup_overlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(evil_twin_connect_popup_overlay, LV_OPA_70, 0);
+    lv_obj_clear_flag(evil_twin_connect_popup_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    
+    // Create popup container
+    evil_twin_connect_popup_obj = lv_obj_create(evil_twin_connect_popup_overlay);
+    lv_obj_set_size(evil_twin_connect_popup_obj, 320, LV_SIZE_CONTENT);
+    lv_obj_center(evil_twin_connect_popup_obj);
+    lv_obj_set_style_bg_color(evil_twin_connect_popup_obj, lv_color_hex(0x2A2A2A), 0);
+    lv_obj_set_style_border_color(evil_twin_connect_popup_obj, COLOR_MATERIAL_AMBER, 0);
+    lv_obj_set_style_border_width(evil_twin_connect_popup_obj, 2, 0);
+    lv_obj_set_style_radius(evil_twin_connect_popup_obj, 12, 0);
+    lv_obj_set_style_pad_all(evil_twin_connect_popup_obj, 20, 0);
+    lv_obj_set_flex_flow(evil_twin_connect_popup_obj, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(evil_twin_connect_popup_obj, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(evil_twin_connect_popup_obj, 15, 0);
+    lv_obj_clear_flag(evil_twin_connect_popup_obj, LV_OBJ_FLAG_SCROLLABLE);
+    
+    // Title
+    lv_obj_t *title = lv_label_create(evil_twin_connect_popup_obj);
+    lv_label_set_text(title, LV_SYMBOL_WIFI " Connect to Network?");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_AMBER, 0);
+    
+    // SSID info
+    lv_obj_t *ssid_label = lv_label_create(evil_twin_connect_popup_obj);
+    lv_label_set_text_fmt(ssid_label, "SSID: %s", ssid);
+    lv_obj_set_style_text_font(ssid_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(ssid_label, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_width(ssid_label, lv_pct(100));
+    lv_label_set_long_mode(ssid_label, LV_LABEL_LONG_WRAP);
+    
+    // Password info (masked)
+    lv_obj_t *pass_label = lv_label_create(evil_twin_connect_popup_obj);
+    lv_label_set_text_fmt(pass_label, "Password: %s", password);
+    lv_obj_set_style_text_font(pass_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(pass_label, lv_color_hex(0xAAAAAA), 0);
+    lv_obj_set_width(pass_label, lv_pct(100));
+    lv_label_set_long_mode(pass_label, LV_LABEL_LONG_WRAP);
+    
+    // Description
+    lv_obj_t *desc = lv_label_create(evil_twin_connect_popup_obj);
+    lv_label_set_text(desc, "Connect and scan for hosts to perform ARP poisoning attack");
+    lv_obj_set_style_text_font(desc, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(desc, lv_color_hex(0x888888), 0);
+    lv_obj_set_width(desc, lv_pct(100));
+    lv_label_set_long_mode(desc, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(desc, LV_TEXT_ALIGN_CENTER, 0);
+    
+    // Button row
+    lv_obj_t *btn_row = lv_obj_create(evil_twin_connect_popup_obj);
+    lv_obj_set_size(btn_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(btn_row, 0, 0);
+    lv_obj_set_style_pad_all(btn_row, 0, 0);
+    lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(btn_row, 20, 0);
+    lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
+    
+    // Cancel button
+    lv_obj_t *cancel_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(cancel_btn, 100, 45);
+    lv_obj_set_style_bg_color(cancel_btn, lv_color_hex(0x444444), 0);
+    lv_obj_set_style_radius(cancel_btn, 8, 0);
+    lv_obj_add_event_cb(cancel_btn, evil_twin_connect_popup_cancel_cb, LV_EVENT_CLICKED, NULL);
+    
+    lv_obj_t *cancel_label = lv_label_create(cancel_btn);
+    lv_label_set_text(cancel_label, "Cancel");
+    lv_obj_set_style_text_font(cancel_label, &lv_font_montserrat_14, 0);
+    lv_obj_center(cancel_label);
+    
+    // Yes/Connect button
+    lv_obj_t *yes_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(yes_btn, 120, 45);
+    lv_obj_set_style_bg_color(yes_btn, COLOR_MATERIAL_AMBER, 0);
+    lv_obj_set_style_radius(yes_btn, 8, 0);
+    lv_obj_add_event_cb(yes_btn, evil_twin_connect_popup_yes_cb, LV_EVENT_CLICKED, NULL);
+    
+    lv_obj_t *yes_label = lv_label_create(yes_btn);
+    lv_label_set_text(yes_label, "Connect");
+    lv_obj_set_style_text_font(yes_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(yes_label, lv_color_hex(0x000000), 0);
+    lv_obj_center(yes_label);
+}
+
+// Cancel button callback
+static void evil_twin_connect_popup_cancel_cb(lv_event_t *e)
+{
+    (void)e;
+    if (evil_twin_connect_popup_overlay) {
+        lv_obj_del(evil_twin_connect_popup_overlay);
+        evil_twin_connect_popup_overlay = NULL;
+        evil_twin_connect_popup_obj = NULL;
+    }
+    // Clear stored credentials
+    memset(arp_target_ssid, 0, sizeof(arp_target_ssid));
+    memset(arp_target_password, 0, sizeof(arp_target_password));
+}
+
+// Yes/Connect button callback - go to ARP page in auto mode
+static void evil_twin_connect_popup_yes_cb(lv_event_t *e)
+{
+    (void)e;
+    
+    ESP_LOGI(TAG, "Evil Twin: Connecting to %s with known password", arp_target_ssid);
+    
+    // Close popup
+    if (evil_twin_connect_popup_overlay) {
+        lv_obj_del(evil_twin_connect_popup_overlay);
+        evil_twin_connect_popup_overlay = NULL;
+        evil_twin_connect_popup_obj = NULL;
+    }
+    
+    // Close Evil Twin passwords page
+    if (compromised_data_page) {
+        lv_obj_del(compromised_data_page);
+        compromised_data_page = NULL;
+    }
+    
+    // Set auto mode flag
+    arp_auto_mode = true;
+    
+    // Show ARP Poison page (will auto-connect and scan)
+    show_arp_poison_page();
 }
 
 //==================================================================================
