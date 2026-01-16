@@ -203,6 +203,12 @@ static bool observer_page_visible = false;     // Observer page is currently sho
 static TaskHandle_t kraken_scan_task_handle = NULL;
 static lv_obj_t *kraken_eye_icon = NULL;       // Eye icon in status bar
 
+// Portal background mode
+static bool portal_background_mode = false;     // Portal running in background
+static int portal_new_data_count = 0;           // Count of new passwords since last view
+static lv_obj_t *portal_icon = NULL;            // Portal icon in status bar
+static lv_obj_t *portal_data_popup = NULL;      // Popup for portal data
+
 // ESP Modem global variables
 static wifi_ap_record_t *esp_modem_networks = NULL;  // Allocated in PSRAM
 static uint16_t esp_modem_network_count = 0;
@@ -573,6 +579,10 @@ static void kraken_scan_task(void *arg);
 static void start_kraken_scanning(void);
 static void stop_kraken_scanning(void);
 static void update_kraken_eye_icon(void);
+static void update_portal_icon(void);
+static void portal_icon_click_cb(lv_event_t *e);
+static void karma2_attack_background_cb(lv_event_t *e);
+static void close_portal_data_popup(lv_event_t *e);
 static void show_blackout_confirm_popup(void);
 static void blackout_confirm_yes_cb(lv_event_t *e);
 static void blackout_confirm_no_cb(lv_event_t *e);
@@ -1403,6 +1413,16 @@ static void create_status_bar(void)
     lv_obj_set_style_text_color(kraken_eye_icon, COLOR_MATERIAL_CYAN, 0);
     lv_obj_align(kraken_eye_icon, LV_ALIGN_RIGHT_MID, -160, 0);  // Left of battery container
     lv_obj_add_flag(kraken_eye_icon, LV_OBJ_FLAG_HIDDEN);  // Hidden by default
+    
+    // Portal icon (shown when portal runs in background) - next to eye icon
+    portal_icon = lv_label_create(status_bar);
+    lv_label_set_text(portal_icon, LV_SYMBOL_WIFI);
+    lv_obj_set_style_text_font(portal_icon, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_color(portal_icon, COLOR_MATERIAL_ORANGE, 0);
+    lv_obj_align(portal_icon, LV_ALIGN_RIGHT_MID, -190, 0);  // Left of eye icon
+    lv_obj_add_flag(portal_icon, LV_OBJ_FLAG_HIDDEN);  // Hidden by default
+    lv_obj_add_flag(portal_icon, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(portal_icon, portal_icon_click_cb, LV_EVENT_CLICKED, NULL);
     
     // Battery status container on the right - use fixed width to ensure visibility
     lv_obj_t *battery_cont = lv_obj_create(status_bar);
@@ -3349,6 +3369,7 @@ static void show_karma_page(void)
     
     create_status_bar();
     update_kraken_eye_icon();
+    update_portal_icon();
     
     karma_page = lv_obj_create(scr);
     lv_coord_t scr_height = lv_disp_get_ver_res(NULL);
@@ -4017,6 +4038,7 @@ static void show_main_tiles(void)
     
     // Update eye icon visibility (show if Kraken is scanning in background)
     update_kraken_eye_icon();
+    update_portal_icon();
     
     // Create tiles container below the status bar
     tiles_container = lv_obj_create(scr);
@@ -4069,6 +4091,7 @@ static void show_scan_page(void)
     
     // Update eye icon visibility (Kraken background scanning)
     update_kraken_eye_icon();
+    update_portal_icon();
     
     // Create scan page container below status bar
     scan_page = lv_obj_create(scr);
@@ -5387,6 +5410,7 @@ static void observer_back_btn_event_cb(lv_event_t *e)
     
     // Update eye icon visibility (show if Kraken scanning active)
     update_kraken_eye_icon();
+    update_portal_icon();
     
     show_main_tiles();
 }
@@ -5549,6 +5573,7 @@ static void show_observer_page(void)
     
     // Hide eye icon since we're on the observer page
     update_kraken_eye_icon();
+    update_portal_icon();
     
     // In Kraken mode, start background scanning on UART2 if not already running
     // In Kraken mode, auto-start display and use UART2 background scanning
@@ -5571,6 +5596,7 @@ static void show_observer_page(void)
             
             // Hide eye icon since we're on the observer page
             update_kraken_eye_icon();
+            update_portal_icon();
         }
     }
 }
@@ -5920,6 +5946,7 @@ static void show_esp_modem_page(void)
     
     // Update eye icon visibility (Kraken background scanning)
     update_kraken_eye_icon();
+    update_portal_icon();
     
     // Create ESP Modem page container below status bar
     esp_modem_page = lv_obj_create(scr);
@@ -7405,6 +7432,7 @@ static void show_compromised_data_page(void)
     
     create_status_bar();
     update_kraken_eye_icon();
+    update_portal_icon();
     
     // Create page container
     compromised_data_page = lv_obj_create(scr);
@@ -7480,6 +7508,7 @@ static void show_evil_twin_passwords_page(void)
     
     create_status_bar();
     update_kraken_eye_icon();
+    update_portal_icon();
     
     // Create page
     compromised_data_page = lv_obj_create(scr);
@@ -8238,6 +8267,10 @@ static void save_portal_data(const char *ssid, const char *form_data)
         fprintf(f, "SSID: %s\nData: %s\n---\n", ssid, form_data);
         fclose(f);
         ESP_LOGI(TAG, "Portal data saved for SSID: %s", ssid);
+        
+        // Increment new data counter and update portal icon
+        portal_new_data_count++;
+        update_portal_icon();
     } else {
         ESP_LOGW(TAG, "Cannot open portals.txt for writing");
     }
@@ -8856,8 +8889,29 @@ static void show_karma2_attack_popup(const char *ssid)
     lv_obj_set_width(karma2_attack_status_label, lv_pct(100));
     lv_label_set_long_mode(karma2_attack_status_label, LV_LABEL_LONG_WRAP);
     
+    // Buttons container
+    lv_obj_t *btn_cont = lv_obj_create(karma2_attack_popup_obj);
+    lv_obj_remove_style_all(btn_cont);
+    lv_obj_set_size(btn_cont, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(btn_cont, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btn_cont, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(btn_cont, 15, 0);
+    lv_obj_clear_flag(btn_cont, LV_OBJ_FLAG_SCROLLABLE);
+    
+    // Background button
+    lv_obj_t *bg_btn = lv_btn_create(btn_cont);
+    lv_obj_set_size(bg_btn, 150, 50);
+    lv_obj_set_style_bg_color(bg_btn, COLOR_MATERIAL_TEAL, 0);
+    lv_obj_set_style_radius(bg_btn, 8, 0);
+    lv_obj_add_event_cb(bg_btn, karma2_attack_background_cb, LV_EVENT_CLICKED, NULL);
+    
+    lv_obj_t *bg_label = lv_label_create(bg_btn);
+    lv_label_set_text(bg_label, LV_SYMBOL_EYE_CLOSE " Background");
+    lv_obj_set_style_text_font(bg_label, &lv_font_montserrat_16, 0);
+    lv_obj_center(bg_label);
+    
     // Stop button
-    lv_obj_t *stop_btn = lv_btn_create(karma2_attack_popup_obj);
+    lv_obj_t *stop_btn = lv_btn_create(btn_cont);
     lv_obj_set_size(stop_btn, 150, 50);
     lv_obj_set_style_bg_color(stop_btn, COLOR_MATERIAL_RED, 0);
     lv_obj_set_style_radius(stop_btn, 8, 0);
@@ -8875,6 +8929,10 @@ static void karma2_attack_stop_cb(lv_event_t *e)
     
     ESP_LOGI(TAG, "Stopping Karma attack...");
     
+    // Reset background mode
+    portal_background_mode = false;
+    update_portal_icon();
+    
     // Stop captive portal
     stop_captive_portal();
     
@@ -8885,6 +8943,25 @@ static void karma2_attack_stop_cb(lv_event_t *e)
         karma2_attack_popup_obj = NULL;
         karma2_attack_status_label = NULL;
     }
+}
+
+static void karma2_attack_background_cb(lv_event_t *e)
+{
+    (void)e;
+    ESP_LOGI(TAG, "Portal moved to background");
+    
+    portal_background_mode = true;
+    portal_new_data_count = 0;
+    
+    // Close popup but keep portal running
+    if (karma2_attack_popup_overlay) {
+        lv_obj_del(karma2_attack_popup_overlay);
+        karma2_attack_popup_overlay = NULL;
+        karma2_attack_popup_obj = NULL;
+        karma2_attack_status_label = NULL;
+    }
+    
+    update_portal_icon();
 }
 
 //==================================================================================
@@ -8903,6 +8980,7 @@ static void show_portal_data_page(void)
     
     create_status_bar();
     update_kraken_eye_icon();
+    update_portal_icon();
     
     // Create page
     compromised_data_page = lv_obj_create(scr);
@@ -9075,6 +9153,7 @@ static void show_handshakes_page(void)
     
     create_status_bar();
     update_kraken_eye_icon();
+    update_portal_icon();
     
     // Create page
     compromised_data_page = lv_obj_create(scr);
@@ -9451,6 +9530,7 @@ static void show_deauth_detector_page(void)
     
     create_status_bar();
     update_kraken_eye_icon();
+    update_portal_icon();
     
     // Create page container
     deauth_detector_page = lv_obj_create(scr);
@@ -9608,6 +9688,7 @@ static void show_bluetooth_menu_page(void)
     
     create_status_bar();
     update_kraken_eye_icon();
+    update_portal_icon();
     
     bt_menu_page = lv_obj_create(scr);
     lv_coord_t scr_height = lv_disp_get_ver_res(NULL);
@@ -9756,6 +9837,7 @@ static void show_airtag_scan_page(void)
     
     create_status_bar();
     update_kraken_eye_icon();
+    update_portal_icon();
     
     bt_airtag_page = lv_obj_create(scr);
     lv_coord_t scr_height = lv_disp_get_ver_res(NULL);
@@ -9969,6 +10051,7 @@ static void show_bt_scan_page(void)
     
     create_status_bar();
     update_kraken_eye_icon();
+    update_portal_icon();
     
     bt_scan_page = lv_obj_create(scr);
     lv_coord_t scr_height = lv_disp_get_ver_res(NULL);
@@ -10320,6 +10403,7 @@ static void show_bt_locator_tracking_page(int device_idx)
     
     create_status_bar();
     update_kraken_eye_icon();
+    update_portal_icon();
     
     bt_locator_tracking_page = lv_obj_create(scr);
     lv_coord_t scr_height = lv_disp_get_ver_res(NULL);
@@ -10523,6 +10607,7 @@ static void show_global_attacks_page(void)
     
     // Update eye icon visibility (Kraken background scanning)
     update_kraken_eye_icon();
+    update_portal_icon();
     
     // Create global attacks page container below status bar
     global_attacks_page = lv_obj_create(scr);
@@ -10784,6 +10869,166 @@ static void update_kraken_eye_icon(void)
     }
 }
 
+// Update portal icon visibility and color based on background mode state
+static void update_portal_icon(void)
+{
+    if (portal_icon == NULL) return;
+    
+    if (portal_background_mode && portal_active) {
+        lv_obj_clear_flag(portal_icon, LV_OBJ_FLAG_HIDDEN);
+        // Green when new data available, orange otherwise
+        if (portal_new_data_count > 0) {
+            lv_obj_set_style_text_color(portal_icon, COLOR_MATERIAL_GREEN, 0);
+        } else {
+            lv_obj_set_style_text_color(portal_icon, COLOR_MATERIAL_ORANGE, 0);
+        }
+    } else {
+        lv_obj_add_flag(portal_icon, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+// Close portal data popup callback
+static void close_portal_data_popup(lv_event_t *e)
+{
+    (void)e;
+    if (portal_data_popup) {
+        lv_obj_del(portal_data_popup);
+        portal_data_popup = NULL;
+    }
+}
+
+// Portal icon click callback - show popup with captured data
+static void portal_icon_click_cb(lv_event_t *e)
+{
+    (void)e;
+    
+    // Reset new data counter
+    portal_new_data_count = 0;
+    update_portal_icon();
+    
+    // Close existing popup if any
+    if (portal_data_popup) {
+        lv_obj_del(portal_data_popup);
+        portal_data_popup = NULL;
+    }
+    
+    lv_obj_t *scr = lv_scr_act();
+    
+    // Create popup overlay
+    portal_data_popup = lv_obj_create(scr);
+    lv_obj_remove_style_all(portal_data_popup);
+    lv_obj_set_size(portal_data_popup, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(portal_data_popup, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(portal_data_popup, LV_OPA_80, 0);
+    lv_obj_clear_flag(portal_data_popup, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(portal_data_popup, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(portal_data_popup, close_portal_data_popup, LV_EVENT_CLICKED, NULL);
+    
+    // Popup content box
+    lv_obj_t *popup_box = lv_obj_create(portal_data_popup);
+    lv_obj_set_size(popup_box, 450, 350);
+    lv_obj_center(popup_box);
+    lv_obj_set_style_bg_color(popup_box, lv_color_hex(0x1A1A1A), 0);
+    lv_obj_set_style_border_color(popup_box, COLOR_MATERIAL_GREEN, 0);
+    lv_obj_set_style_border_width(popup_box, 2, 0);
+    lv_obj_set_style_radius(popup_box, 12, 0);
+    lv_obj_set_style_pad_all(popup_box, 15, 0);
+    lv_obj_set_flex_flow(popup_box, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(popup_box, 10, 0);
+    lv_obj_clear_flag(popup_box, LV_OBJ_FLAG_SCROLLABLE);
+    
+    // Title
+    lv_obj_t *title = lv_label_create(popup_box);
+    lv_label_set_text(title, LV_SYMBOL_WIFI " Captured Portal Data");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_GREEN, 0);
+    
+    // Scrollable content area
+    lv_obj_t *content_area = lv_obj_create(popup_box);
+    lv_obj_set_size(content_area, lv_pct(100), 230);
+    lv_obj_set_style_bg_opa(content_area, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(content_area, 0, 0);
+    lv_obj_set_style_pad_all(content_area, 5, 0);
+    lv_obj_set_flex_flow(content_area, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(content_area, 5, 0);
+    
+    // Read portal data from file
+    FILE *f = fopen("/sdcard/lab/portals.txt", "r");
+    if (f) {
+        char line[256];
+        lv_obj_t *entry_label = NULL;
+        char entry_buf[512] = "";
+        
+        while (fgets(line, sizeof(line), f)) {
+            // Remove newline
+            size_t len = strlen(line);
+            if (len > 0 && line[len-1] == '\n') line[len-1] = '\0';
+            
+            if (strncmp(line, "---", 3) == 0) {
+                // End of entry, create label
+                if (strlen(entry_buf) > 0) {
+                    entry_label = lv_label_create(content_area);
+                    lv_label_set_text(entry_label, entry_buf);
+                    lv_obj_set_style_text_font(entry_label, &lv_font_montserrat_14, 0);
+                    lv_obj_set_style_text_color(entry_label, lv_color_hex(0xCCCCCC), 0);
+                    lv_obj_set_width(entry_label, lv_pct(100));
+                    lv_label_set_long_mode(entry_label, LV_LABEL_LONG_WRAP);
+                    
+                    // Add separator
+                    lv_obj_t *sep = lv_obj_create(content_area);
+                    lv_obj_set_size(sep, lv_pct(100), 1);
+                    lv_obj_set_style_bg_color(sep, lv_color_hex(0x444444), 0);
+                    lv_obj_set_style_border_width(sep, 0, 0);
+                    lv_obj_set_style_pad_all(sep, 0, 0);
+                    
+                    entry_buf[0] = '\0';
+                }
+            } else {
+                // Append to current entry
+                if (strlen(entry_buf) + strlen(line) + 2 < sizeof(entry_buf)) {
+                    if (strlen(entry_buf) > 0) strcat(entry_buf, "\n");
+                    strcat(entry_buf, line);
+                }
+            }
+        }
+        
+        // Handle last entry if no trailing ---
+        if (strlen(entry_buf) > 0) {
+            entry_label = lv_label_create(content_area);
+            lv_label_set_text(entry_label, entry_buf);
+            lv_obj_set_style_text_font(entry_label, &lv_font_montserrat_14, 0);
+            lv_obj_set_style_text_color(entry_label, lv_color_hex(0xCCCCCC), 0);
+            lv_obj_set_width(entry_label, lv_pct(100));
+            lv_label_set_long_mode(entry_label, LV_LABEL_LONG_WRAP);
+        }
+        
+        fclose(f);
+    } else {
+        lv_obj_t *no_data = lv_label_create(content_area);
+        lv_label_set_text(no_data, "No data captured yet");
+        lv_obj_set_style_text_font(no_data, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(no_data, lv_color_hex(0x888888), 0);
+    }
+    
+    // Close button container for centering
+    lv_obj_t *btn_cont = lv_obj_create(popup_box);
+    lv_obj_remove_style_all(btn_cont);
+    lv_obj_set_size(btn_cont, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(btn_cont, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btn_cont, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    
+    lv_obj_t *close_btn = lv_btn_create(btn_cont);
+    lv_obj_set_size(close_btn, 120, 40);
+    lv_obj_set_style_bg_color(close_btn, COLOR_MATERIAL_ORANGE, 0);
+    lv_obj_set_style_radius(close_btn, 8, 0);
+    lv_obj_add_event_cb(close_btn, close_portal_data_popup, LV_EVENT_CLICKED, NULL);
+    
+    lv_obj_t *close_label = lv_label_create(close_btn);
+    lv_label_set_text(close_label, "Close");
+    lv_obj_set_style_text_font(close_label, &lv_font_montserrat_14, 0);
+    lv_obj_center(close_label);
+}
+
 // Start Kraken background scanning on UART2
 static void start_kraken_scanning(void)
 {
@@ -10806,6 +11051,7 @@ static void start_kraken_scanning(void)
     }
     
     update_kraken_eye_icon();
+    update_portal_icon();
 }
 
 // Stop Kraken background scanning
@@ -10830,6 +11076,7 @@ static void stop_kraken_scanning(void)
     }
     
     update_kraken_eye_icon();
+    update_portal_icon();
     ESP_LOGI(TAG, "[UART2] Kraken background scanning stopped");
 }
 
@@ -11133,6 +11380,7 @@ static void uart_pins_save_cb(lv_event_t *e)
             }
             deinit_uart2();
             update_kraken_eye_icon();  // Hide eye icon
+            update_portal_icon();
         }
     }
     
@@ -11613,6 +11861,7 @@ static void show_settings_page(void)
     
     // Update eye icon visibility (Kraken background scanning)
     update_kraken_eye_icon();
+    update_portal_icon();
     
     // Create settings page container below status bar
     settings_page = lv_obj_create(scr);
