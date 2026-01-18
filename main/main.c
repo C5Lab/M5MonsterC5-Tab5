@@ -117,12 +117,303 @@ typedef struct {
     char clients[MAX_CLIENTS_PER_NETWORK][18];  // MAC addresses of clients
 } observer_network_t;
 
-// Global variables
-static wifi_network_t networks[MAX_NETWORKS];
+// Deauth Detector entry
+#define DEAUTH_DETECTOR_MAX_ENTRIES 200
+typedef struct {
+    int channel;
+    char ap_name[33];
+    char bssid[18];
+    int rssi;
+} deauth_entry_t;
+
+// BT device storage
+#define BT_MAX_DEVICES 50
+typedef struct {
+    char mac[18];
+    int rssi;
+    char name[64];
+} bt_device_t;
+
+// Karma probe storage
+#define KARMA_MAX_PROBES 64
+typedef struct {
+    int index;
+    char ssid[33];
+} karma_probe_t;
+
+// Evil Twin entry storage
+#define EVIL_TWIN_MAX_ENTRIES 32
+typedef struct {
+    char ssid[33];
+    char password[65];
+} evil_twin_entry_t;
+
+// ARP Host storage
+#define ARP_MAX_HOSTS 64
+typedef struct {
+    char ip[20];
+    char mac[18];
+} arp_host_t;
+
+// Karma2 constants (for Observer)
+#define KARMA2_MAX_PROBES 64
+#define KARMA2_MAX_HTML_FILES 20
+
+// ============================================================================
+// COMPLETE TAB CONTEXT - All UI, data, and state for one tab (UART1/UART2/INTERNAL)
+// Each tab is a fully independent space with its own LVGL objects and state
+// ============================================================================
+typedef struct {
+    // =====================================================================
+    // MAIN CONTAINER AND NAVIGATION
+    // =====================================================================
+    lv_obj_t *container;           // Main container for this tab
+    lv_obj_t *tiles;               // Main tiles
+    lv_obj_t *current_visible_page;
+    
+    // =====================================================================
+    // WIFI SCAN & ATTACK - Page and all elements
+    // =====================================================================
+    lv_obj_t *scan_page;
+    lv_obj_t *scan_btn;
+    lv_obj_t *scan_status_label;
+    lv_obj_t *network_list;
+    lv_obj_t *spinner;
+    
+    wifi_network_t *networks;           // PSRAM
+    int network_count;
+    int selected_indices[MAX_NETWORKS];
+    int selected_count;
+    bool scan_in_progress;
+    
+    // Network popup (clients, deauth)
+    lv_obj_t *network_popup;
+    lv_obj_t *popup_clients_container;
+    int popup_network_idx;
+    bool popup_open;
+    TimerHandle_t popup_timer;
+    
+    // Deauth popup
+    lv_obj_t *deauth_popup;
+    lv_obj_t *deauth_btn;
+    lv_obj_t *deauth_btn_label;
+    int deauth_network_idx;
+    int deauth_client_idx;
+    bool deauth_active;
+    
+    // Scan Deauth popup
+    lv_obj_t *scan_deauth_overlay;
+    lv_obj_t *scan_deauth_popup;
+    
+    // Evil Twin popup
+    lv_obj_t *evil_twin_overlay;
+    lv_obj_t *evil_twin_popup;
+    lv_obj_t *evil_twin_network_dropdown;
+    lv_obj_t *evil_twin_html_dropdown;
+    lv_obj_t *evil_twin_status_label;
+    char evil_twin_html_files[20][64];
+    int evil_twin_html_count;
+    volatile bool evil_twin_monitoring;
+    TaskHandle_t evil_twin_task;
+    
+    // SAE popup
+    lv_obj_t *sae_popup_overlay;
+    lv_obj_t *sae_popup;
+    
+    // Handshaker popup (per-network)
+    lv_obj_t *handshaker_popup_overlay;
+    lv_obj_t *handshaker_popup;
+    lv_obj_t *handshaker_status_label;
+    volatile bool handshaker_monitoring;
+    TaskHandle_t handshaker_task;
+    
+    // =====================================================================
+    // NETWORK OBSERVER - Page and all elements
+    // =====================================================================
+    lv_obj_t *observer_page;
+    lv_obj_t *observer_start_btn;
+    lv_obj_t *observer_stop_btn;
+    lv_obj_t *observer_table;
+    lv_obj_t *observer_status_label;
+    
+    observer_network_t *observer_networks;  // PSRAM
+    int observer_network_count;
+    bool observer_running;
+    bool observer_page_visible;
+    TaskHandle_t observer_task;
+    TimerHandle_t observer_timer;
+    
+    // Karma2 (Probes & Karma on Observer)
+    lv_obj_t *karma2_probes_popup_overlay;
+    lv_obj_t *karma2_probes_popup;
+    lv_obj_t *karma2_html_popup_overlay;
+    lv_obj_t *karma2_html_popup;
+    lv_obj_t *karma2_html_dropdown;
+    lv_obj_t *karma2_attack_popup_overlay;
+    lv_obj_t *karma2_attack_popup;
+    lv_obj_t *karma2_attack_status_label;
+    char karma2_probes[KARMA2_MAX_PROBES][33];
+    int karma2_probe_count;
+    int karma2_selected_probe_idx;
+    char karma2_html_files[KARMA2_MAX_HTML_FILES][64];
+    int karma2_html_count;
+    
+    // =====================================================================
+    // GLOBAL WIFI ATTACKS - Page and all attacks
+    // =====================================================================
+    lv_obj_t *global_attacks_page;
+    
+    // Blackout
+    lv_obj_t *blackout_popup_overlay;
+    lv_obj_t *blackout_popup;
+    bool blackout_running;
+    
+    // SnifferDog
+    lv_obj_t *snifferdog_popup_overlay;
+    lv_obj_t *snifferdog_popup;
+    bool snifferdog_running;
+    
+    // Global Handshaker
+    lv_obj_t *global_handshaker_popup_overlay;
+    lv_obj_t *global_handshaker_popup;
+    lv_obj_t *global_handshaker_status_label;
+    volatile bool global_handshaker_monitoring;
+    TaskHandle_t global_handshaker_task;
+    
+    // Phishing Portal (from Global Attacks)
+    lv_obj_t *phishing_portal_popup_overlay;
+    lv_obj_t *phishing_portal_popup;
+    lv_obj_t *phishing_portal_ssid_textarea;
+    lv_obj_t *phishing_portal_keyboard;
+    lv_obj_t *phishing_portal_html_dropdown;
+    lv_obj_t *phishing_portal_status_label;
+    lv_obj_t *phishing_portal_data_label;
+    char phishing_portal_ssid[64];
+    int phishing_portal_submit_count;
+    volatile bool phishing_portal_monitoring;
+    TaskHandle_t phishing_portal_task;
+    
+    // Wardrive
+    lv_obj_t *wardrive_popup_overlay;
+    lv_obj_t *wardrive_popup;
+    lv_obj_t *wardrive_status_label;
+    lv_obj_t *wardrive_log_label;
+    volatile bool wardrive_monitoring;
+    bool wardrive_gps_fix;
+    TaskHandle_t wardrive_task;
+    
+    // =====================================================================
+    // COMPROMISED DATA - Page and sub-pages
+    // =====================================================================
+    lv_obj_t *compromised_data_page;
+    lv_obj_t *evil_twin_passwords_page;
+    lv_obj_t *portal_data_page;
+    lv_obj_t *handshakes_page;
+    
+    evil_twin_entry_t *evil_twin_entries;  // PSRAM
+    int evil_twin_entry_count;
+    
+    // Evil Twin -> ARP integration popup
+    lv_obj_t *evil_twin_connect_popup_overlay;
+    lv_obj_t *evil_twin_connect_popup;
+    
+    // =====================================================================
+    // DEAUTH DETECTOR - Page and data
+    // =====================================================================
+    lv_obj_t *deauth_detector_page;
+    lv_obj_t *deauth_detector_table;
+    lv_obj_t *deauth_detector_start_btn;
+    lv_obj_t *deauth_detector_stop_btn;
+    
+    deauth_entry_t *deauth_entries;  // PSRAM
+    int deauth_entry_count;
+    volatile bool deauth_detector_running;
+    TaskHandle_t deauth_detector_task;
+    
+    // =====================================================================
+    // BLUETOOTH - Menu and sub-pages
+    // =====================================================================
+    lv_obj_t *bt_menu_page;
+    
+    // AirTag Scan
+    lv_obj_t *bt_airtag_page;
+    lv_obj_t *airtag_count_label;
+    lv_obj_t *smarttag_count_label;
+    volatile bool airtag_scanning;
+    TaskHandle_t airtag_task;
+    
+    // BT Scan & Locate
+    lv_obj_t *bt_scan_page;
+    bt_device_t *bt_devices;  // PSRAM
+    int bt_device_count;
+    
+    // BT Locator Tracking
+    lv_obj_t *bt_locator_page;
+    lv_obj_t *bt_locator_rssi_label;
+    char bt_locator_target_mac[18];
+    char bt_locator_target_name[64];
+    volatile bool bt_locator_tracking;
+    TaskHandle_t bt_locator_task;
+    
+    // =====================================================================
+    // KARMA - Page and data
+    // =====================================================================
+    lv_obj_t *karma_page;
+    lv_obj_t *karma_status_label;
+    lv_obj_t *karma_probes_container;
+    lv_obj_t *karma_start_btn;
+    lv_obj_t *karma_stop_btn;
+    lv_obj_t *karma_show_probes_btn;
+    lv_obj_t *karma_html_popup_overlay;
+    lv_obj_t *karma_html_popup;
+    lv_obj_t *karma_html_dropdown;
+    lv_obj_t *karma_attack_popup_overlay;
+    lv_obj_t *karma_attack_popup;
+    lv_obj_t *karma_attack_ssid_label;
+    lv_obj_t *karma_attack_mac_label;
+    lv_obj_t *karma_attack_password_label;
+    
+    karma_probe_t *karma_probes;  // PSRAM
+    int karma_probe_count;
+    int karma_selected_probe_idx;
+    volatile bool karma_sniffer_running;
+    volatile bool karma_monitoring;
+    char karma_html_files[20][64];
+    int karma_html_count;
+    TaskHandle_t karma_task;
+    
+    // =====================================================================
+    // ARP POISON - Page and data (accessible from Evil Twin)
+    // =====================================================================
+    lv_obj_t *arp_poison_page;
+    lv_obj_t *arp_password_input;
+    lv_obj_t *arp_keyboard;
+    lv_obj_t *arp_connect_btn;
+    lv_obj_t *arp_status_label;
+    lv_obj_t *arp_hosts_container;
+    lv_obj_t *arp_list_hosts_btn;
+    lv_obj_t *arp_attack_popup_overlay;
+    lv_obj_t *arp_attack_popup;
+    
+    char arp_target_ssid[33];
+    char arp_target_password[65];
+    char arp_our_ip[20];
+    bool arp_wifi_connected;
+    bool arp_auto_mode;
+    arp_host_t *arp_hosts;  // PSRAM
+    int arp_host_count;
+    
+} tab_context_t;
+
+// Three independent tab contexts
+static tab_context_t uart1_ctx = {0};
+static tab_context_t uart2_ctx = {0};
+static tab_context_t internal_ctx = {0};
+
+// Legacy compatibility - kept for minimal code changes
+static wifi_network_t networks[MAX_NETWORKS];  // Temporary buffer during scan
 static int network_count = 0;
 static bool scan_in_progress = false;
-
-// Selected network indices (0-based)
 static int selected_network_indices[MAX_NETWORKS];
 static int selected_network_count = 0;
 
@@ -201,13 +492,159 @@ static bool uart2_initialized = false;
 static bool kraken_scanning_active = false;    // UART2 scanning running
 static bool observer_page_visible = false;     // Observer page is currently shown
 static TaskHandle_t kraken_scan_task_handle = NULL;
-static lv_obj_t *kraken_eye_icon = NULL;       // Eye icon in status bar
 
 // Portal background mode
 static bool portal_background_mode = false;     // Portal running in background
 static int portal_new_data_count = 0;           // Count of new passwords since last view
 static lv_obj_t *portal_icon = NULL;            // Portal icon in status bar
-static lv_obj_t *portal_data_popup = NULL;      // Popup for portal data
+
+// Tab-based UI state
+static uint8_t current_tab = 0;                 // 0=UART1, 1=UART2, 2=INTERNAL
+static uint8_t portal_started_by_uart = 0;      // 0=none, 1=UART1, 2=UART2
+static lv_obj_t *tab_bar = NULL;                // Tab bar container
+static lv_obj_t *uart1_tab_btn = NULL;          // UART 1 tab button
+static lv_obj_t *uart2_tab_btn = NULL;          // UART 2 tab button
+static lv_obj_t *internal_tab_btn = NULL;       // INTERNAL tab button
+
+// Tab content containers (persistent, hidden/shown)
+static lv_obj_t *uart1_container = NULL;
+static lv_obj_t *uart2_container = NULL;
+static lv_obj_t *internal_container = NULL;
+
+// INTERNAL tab page objects
+static lv_obj_t *internal_tiles = NULL;
+static lv_obj_t *internal_settings_page = NULL;
+
+// Helper to get current tab's context
+static tab_context_t* get_current_ctx(void) {
+    switch (current_tab) {
+        case 0: return &uart1_ctx;
+        case 1: return &uart2_ctx;
+        case 2: return &internal_ctx;
+        default: return &uart1_ctx;
+    }
+}
+
+// Helper to get current tab's container (from global variables)
+static lv_obj_t* get_current_tab_container(void) {
+    switch (current_tab) {
+        case 0: return uart1_container;
+        case 1: return uart2_container;
+        case 2: return internal_container;
+        default: return uart1_container;
+    }
+}
+
+// Helper to hide all pages in a tab's context (call before showing a new page)
+static void hide_all_pages(tab_context_t *ctx) {
+    if (ctx->tiles) lv_obj_add_flag(ctx->tiles, LV_OBJ_FLAG_HIDDEN);
+    if (ctx->scan_page) lv_obj_add_flag(ctx->scan_page, LV_OBJ_FLAG_HIDDEN);
+    if (ctx->observer_page) lv_obj_add_flag(ctx->observer_page, LV_OBJ_FLAG_HIDDEN);
+    if (ctx->global_attacks_page) lv_obj_add_flag(ctx->global_attacks_page, LV_OBJ_FLAG_HIDDEN);
+    if (ctx->karma_page) lv_obj_add_flag(ctx->karma_page, LV_OBJ_FLAG_HIDDEN);
+    if (ctx->compromised_data_page) lv_obj_add_flag(ctx->compromised_data_page, LV_OBJ_FLAG_HIDDEN);
+    if (ctx->evil_twin_passwords_page) lv_obj_add_flag(ctx->evil_twin_passwords_page, LV_OBJ_FLAG_HIDDEN);
+    if (ctx->portal_data_page) lv_obj_add_flag(ctx->portal_data_page, LV_OBJ_FLAG_HIDDEN);
+    if (ctx->handshakes_page) lv_obj_add_flag(ctx->handshakes_page, LV_OBJ_FLAG_HIDDEN);
+    if (ctx->deauth_detector_page) lv_obj_add_flag(ctx->deauth_detector_page, LV_OBJ_FLAG_HIDDEN);
+    if (ctx->bt_menu_page) lv_obj_add_flag(ctx->bt_menu_page, LV_OBJ_FLAG_HIDDEN);
+    if (ctx->bt_airtag_page) lv_obj_add_flag(ctx->bt_airtag_page, LV_OBJ_FLAG_HIDDEN);
+    if (ctx->bt_scan_page) lv_obj_add_flag(ctx->bt_scan_page, LV_OBJ_FLAG_HIDDEN);
+    if (ctx->bt_locator_page) lv_obj_add_flag(ctx->bt_locator_page, LV_OBJ_FLAG_HIDDEN);
+    if (ctx->arp_poison_page) lv_obj_add_flag(ctx->arp_poison_page, LV_OBJ_FLAG_HIDDEN);
+}
+
+// Initialize tab context - allocate PSRAM for large data arrays
+static void init_tab_context(tab_context_t *ctx) {
+    // WiFi scan results
+    if (!ctx->networks) {
+        ctx->networks = heap_caps_calloc(MAX_NETWORKS, sizeof(wifi_network_t), MALLOC_CAP_SPIRAM);
+        if (!ctx->networks) {
+            ESP_LOGE(TAG, "Failed to allocate networks in PSRAM");
+        }
+    }
+    
+    // Observer networks
+    if (!ctx->observer_networks) {
+        ctx->observer_networks = heap_caps_calloc(MAX_OBSERVER_NETWORKS, sizeof(observer_network_t), MALLOC_CAP_SPIRAM);
+        if (!ctx->observer_networks) {
+            ESP_LOGE(TAG, "Failed to allocate observer_networks in PSRAM");
+        }
+    }
+    
+    // Deauth detector entries
+    if (!ctx->deauth_entries) {
+        ctx->deauth_entries = heap_caps_calloc(DEAUTH_DETECTOR_MAX_ENTRIES, sizeof(deauth_entry_t), MALLOC_CAP_SPIRAM);
+        if (!ctx->deauth_entries) {
+            ESP_LOGE(TAG, "Failed to allocate deauth_entries in PSRAM");
+        }
+    }
+    
+    // BT devices
+    if (!ctx->bt_devices) {
+        ctx->bt_devices = heap_caps_calloc(BT_MAX_DEVICES, sizeof(bt_device_t), MALLOC_CAP_SPIRAM);
+        if (!ctx->bt_devices) {
+            ESP_LOGE(TAG, "Failed to allocate bt_devices in PSRAM");
+        }
+    }
+    
+    // Karma probes
+    if (!ctx->karma_probes) {
+        ctx->karma_probes = heap_caps_calloc(KARMA_MAX_PROBES, sizeof(karma_probe_t), MALLOC_CAP_SPIRAM);
+        if (!ctx->karma_probes) {
+            ESP_LOGE(TAG, "Failed to allocate karma_probes in PSRAM");
+        }
+    }
+    
+    // Evil twin entries
+    if (!ctx->evil_twin_entries) {
+        ctx->evil_twin_entries = heap_caps_calloc(EVIL_TWIN_MAX_ENTRIES, sizeof(evil_twin_entry_t), MALLOC_CAP_SPIRAM);
+        if (!ctx->evil_twin_entries) {
+            ESP_LOGE(TAG, "Failed to allocate evil_twin_entries in PSRAM");
+        }
+    }
+    
+    // ARP hosts
+    if (!ctx->arp_hosts) {
+        ctx->arp_hosts = heap_caps_calloc(ARP_MAX_HOSTS, sizeof(arp_host_t), MALLOC_CAP_SPIRAM);
+        if (!ctx->arp_hosts) {
+            ESP_LOGE(TAG, "Failed to allocate arp_hosts in PSRAM");
+        }
+    }
+    
+    ESP_LOGI(TAG, "Tab context initialized with PSRAM allocations");
+}
+
+// Initialize all tab contexts
+static void init_all_tab_contexts(void) {
+    ESP_LOGI(TAG, "Initializing all tab contexts with PSRAM...");
+    init_tab_context(&uart1_ctx);
+    init_tab_context(&uart2_ctx);
+    // internal_ctx doesn't need most allocations, but init anyway for safety
+    init_tab_context(&internal_ctx);
+}
+
+// Restore a tab's context to global variables (for legacy code compatibility)
+static void restore_tab_context_to_globals(tab_context_t *ctx) {
+    if (!ctx) return;
+    
+    // Restore WiFi scan results
+    if (ctx->networks && ctx->network_count > 0) {
+        memcpy(networks, ctx->networks, sizeof(wifi_network_t) * MAX_NETWORKS);
+        network_count = ctx->network_count;
+        memcpy(selected_network_indices, ctx->selected_indices, sizeof(selected_network_indices));
+        selected_network_count = ctx->selected_count;
+        ESP_LOGI(TAG, "Restored %d scan results from context to globals", network_count);
+    }
+    
+    // Restore observer results
+    if (ctx->observer_networks && ctx->observer_network_count > 0) {
+        memcpy(observer_networks, ctx->observer_networks, sizeof(observer_network_t) * MAX_OBSERVER_NETWORKS);
+        observer_network_count = ctx->observer_network_count;
+        ESP_LOGI(TAG, "Restored %d observer results from context to globals", observer_network_count);
+    }
+    
+}
 
 // ESP Modem global variables
 static wifi_ap_record_t *esp_modem_networks = NULL;  // Allocated in PSRAM
@@ -305,12 +742,7 @@ static bool arp_wifi_connected = false;
 static lv_obj_t *arp_attack_popup_overlay = NULL;
 static lv_obj_t *arp_attack_popup_obj = NULL;
 
-// ARP Host storage
-#define ARP_MAX_HOSTS 64
-typedef struct {
-    char ip[20];
-    char mac[18];
-} arp_host_t;
+// ARP Host storage (global legacy - type defined earlier)
 static arp_host_t arp_hosts[ARP_MAX_HOSTS];
 static int arp_host_count = 0;
 
@@ -320,12 +752,7 @@ static bool arp_auto_mode = false;          // True when coming from Evil Twin
 static lv_obj_t *evil_twin_connect_popup_overlay = NULL;
 static lv_obj_t *evil_twin_connect_popup_obj = NULL;
 
-// Evil Twin entry storage for row clicks
-#define EVIL_TWIN_MAX_ENTRIES 32
-typedef struct {
-    char ssid[33];
-    char password[65];
-} evil_twin_entry_t;
+// Evil Twin entry storage for row clicks (global legacy - type defined earlier)
 static evil_twin_entry_t evil_twin_entries[EVIL_TWIN_MAX_ENTRIES];
 static int evil_twin_entry_count = 0;
 
@@ -352,12 +779,7 @@ static lv_obj_t *karma_attack_password_label = NULL;
 static volatile bool karma_monitoring = false;
 static TaskHandle_t karma_monitor_task_handle = NULL;
 
-// Karma probe storage
-#define KARMA_MAX_PROBES 64
-typedef struct {
-    int index;
-    char ssid[33];
-} karma_probe_t;
+// Karma probe storage (global legacy - type defined earlier)
 static karma_probe_t karma_probes[KARMA_MAX_PROBES];
 static int karma_probe_count = 0;
 
@@ -389,14 +811,12 @@ static lv_obj_t *karma2_attack_popup_overlay = NULL;
 static lv_obj_t *karma2_attack_popup_obj = NULL;
 static lv_obj_t *karma2_attack_status_label = NULL;
 
-// Probes storage (from UART)
-#define KARMA2_MAX_PROBES 64
+// Probes storage (from UART) - constant defined earlier
 static char karma2_probes[KARMA2_MAX_PROBES][33];
 static int karma2_probe_count = 0;
 static int karma2_selected_probe_idx = -1;
 
-// HTML files for captive portal
-#define KARMA2_MAX_HTML_FILES 20
+// HTML files for captive portal - constant defined earlier
 static char karma2_html_files[KARMA2_MAX_HTML_FILES][64];
 static int karma2_html_count = 0;
 
@@ -426,15 +846,7 @@ static const char *default_portal_html =
     "</div>"
     "</body></html>";
 
-// Deauth Detector
-#define DEAUTH_DETECTOR_MAX_ENTRIES 200
-typedef struct {
-    int channel;
-    char ap_name[33];
-    char bssid[18];
-    int rssi;
-} deauth_entry_t;
-
+// Deauth Detector (global legacy - type defined earlier)
 static deauth_entry_t deauth_entries[DEAUTH_DETECTOR_MAX_ENTRIES];
 static int deauth_entry_count = 0;
 static lv_obj_t *deauth_detector_page = NULL;
@@ -448,7 +860,7 @@ static TaskHandle_t deauth_detector_task_handle = NULL;
 static lv_obj_t *bt_menu_page = NULL;
 static lv_obj_t *bt_airtag_page = NULL;
 static lv_obj_t *bt_scan_page = NULL;
-static lv_obj_t *bt_locator_tracking_page = NULL;
+static lv_obj_t *bt_locator_page = NULL;
 
 // AirTag scan
 static lv_obj_t *airtag_count_label = NULL;
@@ -463,15 +875,25 @@ static lv_obj_t *bt_locator_rssi_label = NULL;
 static volatile bool bt_locator_tracking = false;
 static TaskHandle_t bt_locator_task_handle = NULL;
 
-// BT device storage (shared between scan and locator)
-#define BT_MAX_DEVICES 50
-typedef struct {
-    char mac[18];
-    int rssi;
-    char name[64];
-} bt_device_t;
+// BT device storage (global legacy - type defined earlier)
 static bt_device_t bt_devices[BT_MAX_DEVICES];
 static int bt_device_count = 0;
+
+// Restore LVGL object pointers from context to globals (call after tab switch)
+// This is needed because update_xxx functions use global pointers
+static void restore_ui_pointers_from_ctx(tab_context_t *ctx) {
+    if (!ctx) return;
+    
+    if (ctx->observer_table) {
+        observer_table = ctx->observer_table;
+    }
+    if (ctx->scan_page) {
+        scan_page = ctx->scan_page;
+    }
+    if (ctx->observer_page) {
+        observer_page = ctx->observer_page;
+    }
+}
 
 // Forward declarations
 static void show_main_tiles(void);
@@ -578,11 +1000,18 @@ static void load_hw_config_from_nvs(void);
 static void kraken_scan_task(void *arg);
 static void start_kraken_scanning(void);
 static void stop_kraken_scanning(void);
-static void update_kraken_eye_icon(void);
 static void update_portal_icon(void);
-static void portal_icon_click_cb(lv_event_t *e);
 static void karma2_attack_background_cb(lv_event_t *e);
-static void close_portal_data_popup(lv_event_t *e);
+
+// Tab-based UI functions
+static void create_tab_bar(void);
+static void tab_click_cb(lv_event_t *e);
+static void show_uart1_tiles(void);
+static void show_uart2_tiles(void);
+static void show_internal_tiles(void);
+static void update_tab_styles(void);
+static uart_port_t get_current_uart(void);
+static void uart_send_command_for_tab(const char *cmd);
 static void show_blackout_confirm_popup(void);
 static void blackout_confirm_yes_cb(lv_event_t *e);
 static void blackout_confirm_no_cb(lv_event_t *e);
@@ -629,7 +1058,7 @@ static void show_bt_scan_page(void);
 static void bt_scan_back_btn_event_cb(lv_event_t *e);
 static void bt_scan_rescan_cb(lv_event_t *e);
 static void bt_scan_device_click_cb(lv_event_t *e);
-static void show_bt_locator_tracking_page(int device_idx);
+static void show_bt_locator_page(int device_idx);
 static void bt_locator_tracking_back_btn_event_cb(lv_event_t *e);
 static void bt_locator_tracking_task(void *arg);
 
@@ -916,11 +1345,14 @@ static void wifi_scan_task(void *arg)
     network_count = 0;
     memset(networks, 0, sizeof(networks));
     
+    // Get the UART for current tab
+    uart_port_t uart_port = get_current_uart();
+    
     // Flush UART buffer
-    uart_flush(UART_NUM);
+    uart_flush(uart_port);
     
     // Send scan command
-    uart_send_command("scan_networks");
+    uart_send_command_for_tab("scan_networks");
     
     // Buffer for receiving data
     static char rx_buffer[UART_BUF_SIZE];
@@ -932,7 +1364,7 @@ static void wifi_scan_task(void *arg)
     TickType_t timeout_ticks = pdMS_TO_TICKS(UART_RX_TIMEOUT);
     
     while (!scan_complete && (xTaskGetTickCount() - start_time) < timeout_ticks) {
-        int len = uart_read_bytes(UART_NUM, rx_buffer, UART_BUF_SIZE - 1, pdMS_TO_TICKS(100));
+        int len = uart_read_bytes(uart_port, rx_buffer, UART_BUF_SIZE - 1, pdMS_TO_TICKS(100));
         
         if (len > 0) {
             rx_buffer[len] = '\0';
@@ -1075,6 +1507,16 @@ static void wifi_scan_task(void *arg)
     hide_scan_overlay();
     
     scan_in_progress = false;
+    
+    // Copy scan results to current tab's context for independent state
+    tab_context_t *ctx = get_current_ctx();
+    if (ctx && ctx->networks) {
+        memcpy(ctx->networks, networks, sizeof(wifi_network_t) * MAX_NETWORKS);
+        ctx->network_count = network_count;
+        memcpy(ctx->selected_indices, selected_network_indices, sizeof(selected_network_indices));
+        ctx->selected_count = selected_network_count;
+        ESP_LOGI(TAG, "Copied %d scan results to tab %d context", network_count, current_tab);
+    }
     
     bsp_display_unlock();
     
@@ -1386,7 +1828,7 @@ static void create_status_bar(void)
         status_bar = NULL;
         battery_voltage_label = NULL;
         charging_status_label = NULL;
-        kraken_eye_icon = NULL;  // Reset eye icon pointer
+        portal_icon = NULL;
     }
     
     // Create status bar at top of screen
@@ -1406,23 +1848,13 @@ static void create_status_bar(void)
     lv_obj_set_style_text_color(app_title, lv_color_make(255, 255, 255), 0);
     lv_obj_align(app_title, LV_ALIGN_CENTER, 0, 0);
     
-    // Kraken eye icon (shown when background scanning is active) - left of battery
-    kraken_eye_icon = lv_label_create(status_bar);
-    lv_label_set_text(kraken_eye_icon, LV_SYMBOL_EYE_OPEN);
-    lv_obj_set_style_text_font(kraken_eye_icon, &lv_font_montserrat_18, 0);
-    lv_obj_set_style_text_color(kraken_eye_icon, COLOR_MATERIAL_CYAN, 0);
-    lv_obj_align(kraken_eye_icon, LV_ALIGN_RIGHT_MID, -160, 0);  // Left of battery container
-    lv_obj_add_flag(kraken_eye_icon, LV_OBJ_FLAG_HIDDEN);  // Hidden by default
-    
-    // Portal icon (shown when portal runs in background) - next to eye icon
+    // Portal icon (shown when portal is active) - left of battery, non-clickable
     portal_icon = lv_label_create(status_bar);
     lv_label_set_text(portal_icon, LV_SYMBOL_WIFI);
     lv_obj_set_style_text_font(portal_icon, &lv_font_montserrat_18, 0);
     lv_obj_set_style_text_color(portal_icon, COLOR_MATERIAL_ORANGE, 0);
-    lv_obj_align(portal_icon, LV_ALIGN_RIGHT_MID, -190, 0);  // Left of eye icon
+    lv_obj_align(portal_icon, LV_ALIGN_RIGHT_MID, -160, 0);  // Left of battery container
     lv_obj_add_flag(portal_icon, LV_OBJ_FLAG_HIDDEN);  // Hidden by default
-    lv_obj_add_flag(portal_icon, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(portal_icon, portal_icon_click_cb, LV_EVENT_CLICKED, NULL);
     
     // Battery status container on the right - use fixed width to ensure visibility
     lv_obj_t *battery_cont = lv_obj_create(status_bar);
@@ -1465,6 +1897,261 @@ static void create_status_bar(void)
     
     ESP_LOGI(TAG, "Status bar created: voltage_label=%p, charging_label=%p, timer=%p",
              (void*)battery_voltage_label, (void*)charging_status_label, (void*)battery_update_timer);
+}
+
+// Get current UART port based on active tab
+static uart_port_t get_current_uart(void)
+{
+    if (current_tab == 1 && uart2_initialized) {
+        return UART2_NUM;
+    }
+    return UART_NUM;
+}
+
+// Send command to the UART corresponding to current tab
+static void uart_send_command_for_tab(const char *cmd)
+{
+    if (current_tab == 1 && uart2_initialized) {
+        uart_write_bytes(UART2_NUM, cmd, strlen(cmd));
+        uart_write_bytes(UART2_NUM, "\r\n", 2);
+        ESP_LOGI(TAG, "[UART2/Tab] Sent command: %s", cmd);
+    } else {
+        uart_write_bytes(UART_NUM, cmd, strlen(cmd));
+        uart_write_bytes(UART_NUM, "\r\n", 2);
+        ESP_LOGI(TAG, "[UART1/Tab] Sent command: %s", cmd);
+    }
+}
+
+// Update tab button styles to show active tab
+static void update_tab_styles(void)
+{
+    if (!uart1_tab_btn || !internal_tab_btn) return;
+    
+    // Reset all tabs to inactive style
+    lv_obj_set_style_bg_color(uart1_tab_btn, lv_color_hex(0x2A2A2A), 0);
+    lv_obj_set_style_border_width(uart1_tab_btn, 0, 0);
+    
+    if (uart2_tab_btn) {
+        lv_obj_set_style_bg_color(uart2_tab_btn, lv_color_hex(0x2A2A2A), 0);
+        lv_obj_set_style_border_width(uart2_tab_btn, 0, 0);
+    }
+    
+    lv_obj_set_style_bg_color(internal_tab_btn, lv_color_hex(0x2A2A2A), 0);
+    lv_obj_set_style_border_width(internal_tab_btn, 0, 0);
+    
+    // Highlight active tab
+    lv_obj_t *active_btn = NULL;
+    switch (current_tab) {
+        case 0: active_btn = uart1_tab_btn; break;
+        case 1: active_btn = uart2_tab_btn; break;
+        case 2: active_btn = internal_tab_btn; break;
+    }
+    
+    if (active_btn) {
+        lv_obj_set_style_bg_color(active_btn, lv_color_hex(0x1A1A1A), 0);
+        lv_obj_set_style_border_width(active_btn, 2, 0);
+        lv_obj_set_style_border_color(active_btn, COLOR_MATERIAL_CYAN, 0);
+        lv_obj_set_style_border_side(active_btn, LV_BORDER_SIDE_BOTTOM, 0);
+    }
+}
+
+// Tab click callback - hide/show containers instead of recreating
+static void tab_click_cb(lv_event_t *e)
+{
+    uint32_t tab_id = (uint32_t)(uintptr_t)lv_event_get_user_data(e);
+    
+    if (tab_id == current_tab) return;  // Already on this tab
+    
+    ESP_LOGI(TAG, "Switching from tab %d to tab %lu", current_tab, (unsigned long)tab_id);
+    
+    // Hide current container (don't delete - preserve state)
+    switch (current_tab) {
+        case 0:
+            if (uart1_container) lv_obj_add_flag(uart1_container, LV_OBJ_FLAG_HIDDEN);
+            break;
+        case 1:
+            if (uart2_container) lv_obj_add_flag(uart2_container, LV_OBJ_FLAG_HIDDEN);
+            break;
+        case 2:
+            if (internal_container) lv_obj_add_flag(internal_container, LV_OBJ_FLAG_HIDDEN);
+            break;
+    }
+    
+    current_tab = tab_id;
+    update_tab_styles();
+    
+    // Restore tab's context data to globals (for legacy code compatibility)
+    tab_context_t *new_ctx = get_current_ctx();
+    restore_tab_context_to_globals(new_ctx);
+    restore_ui_pointers_from_ctx(new_ctx);
+    
+    // Show new container and restore its visible content
+    switch (current_tab) {
+        case 0:
+            if (uart1_container) {
+                lv_obj_clear_flag(uart1_container, LV_OBJ_FLAG_HIDDEN);
+                // First visit - create tiles
+                if (!uart1_ctx.tiles) {
+                    show_uart1_tiles();
+                } else {
+                    // Restore last visible page (or show tiles if none)
+                    if (uart1_ctx.current_visible_page) {
+                        lv_obj_clear_flag(uart1_ctx.current_visible_page, LV_OBJ_FLAG_HIDDEN);
+                    } else {
+                        lv_obj_clear_flag(uart1_ctx.tiles, LV_OBJ_FLAG_HIDDEN);
+                        uart1_ctx.current_visible_page = uart1_ctx.tiles;
+                    }
+                }
+            }
+            break;
+        case 1:
+            if (uart2_container) {
+                lv_obj_clear_flag(uart2_container, LV_OBJ_FLAG_HIDDEN);
+                // First visit - create tiles
+                if (!uart2_ctx.tiles) {
+                    show_uart2_tiles();
+                } else {
+                    // Restore last visible page (or show tiles if none)
+                    if (uart2_ctx.current_visible_page) {
+                        lv_obj_clear_flag(uart2_ctx.current_visible_page, LV_OBJ_FLAG_HIDDEN);
+                    } else {
+                        lv_obj_clear_flag(uart2_ctx.tiles, LV_OBJ_FLAG_HIDDEN);
+                        uart2_ctx.current_visible_page = uart2_ctx.tiles;
+                    }
+                }
+            }
+            break;
+        case 2:
+            if (internal_container) {
+                lv_obj_clear_flag(internal_container, LV_OBJ_FLAG_HIDDEN);
+                // Ensure tiles exist
+                if (!internal_tiles) {
+                    show_internal_tiles();
+                }
+            }
+            break;
+    }
+}
+
+// Create persistent tab containers (called once at startup)
+static void create_tab_containers(void)
+{
+    lv_obj_t *scr = lv_scr_act();
+    lv_coord_t height = lv_disp_get_ver_res(NULL) - 85;  // Below status bar + tab bar
+    
+    // UART1 container
+    uart1_container = lv_obj_create(scr);
+    lv_obj_set_size(uart1_container, lv_pct(100), height);
+    lv_obj_align(uart1_container, LV_ALIGN_TOP_MID, 0, 85);
+    lv_obj_set_style_bg_color(uart1_container, COLOR_MATERIAL_BG, 0);
+    lv_obj_set_style_border_width(uart1_container, 0, 0);
+    lv_obj_set_style_radius(uart1_container, 0, 0);
+    lv_obj_set_style_pad_all(uart1_container, 0, 0);
+    lv_obj_clear_flag(uart1_container, LV_OBJ_FLAG_SCROLLABLE);
+    
+    // UART2 container - hidden initially
+    if (hw_config == 1) {
+        uart2_container = lv_obj_create(scr);
+        lv_obj_set_size(uart2_container, lv_pct(100), height);
+        lv_obj_align(uart2_container, LV_ALIGN_TOP_MID, 0, 85);
+        lv_obj_set_style_bg_color(uart2_container, COLOR_MATERIAL_BG, 0);
+        lv_obj_set_style_border_width(uart2_container, 0, 0);
+        lv_obj_set_style_radius(uart2_container, 0, 0);
+        lv_obj_set_style_pad_all(uart2_container, 0, 0);
+        lv_obj_clear_flag(uart2_container, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(uart2_container, LV_OBJ_FLAG_HIDDEN);
+    }
+    
+    // INTERNAL container - hidden initially
+    internal_container = lv_obj_create(scr);
+    lv_obj_set_size(internal_container, lv_pct(100), height);
+    lv_obj_align(internal_container, LV_ALIGN_TOP_MID, 0, 85);
+    lv_obj_set_style_bg_color(internal_container, COLOR_MATERIAL_BG, 0);
+    lv_obj_set_style_border_width(internal_container, 0, 0);
+    lv_obj_set_style_radius(internal_container, 0, 0);
+    lv_obj_set_style_pad_all(internal_container, 0, 0);
+    lv_obj_clear_flag(internal_container, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(internal_container, LV_OBJ_FLAG_HIDDEN);
+    
+    ESP_LOGI(TAG, "Tab containers created");
+}
+
+// Create tab bar below status bar
+static void create_tab_bar(void)
+{
+    lv_obj_t *scr = lv_scr_act();
+    
+    // Delete existing tab bar if present
+    if (tab_bar) {
+        lv_obj_del(tab_bar);
+        tab_bar = NULL;
+        uart1_tab_btn = NULL;
+        uart2_tab_btn = NULL;
+        internal_tab_btn = NULL;
+    }
+    
+    // Create tab bar container
+    tab_bar = lv_obj_create(scr);
+    lv_obj_set_size(tab_bar, lv_pct(100), 45);
+    lv_obj_align(tab_bar, LV_ALIGN_TOP_MID, 0, 40);  // Below status bar
+    lv_obj_set_style_bg_color(tab_bar, lv_color_hex(0x2A2A2A), 0);
+    lv_obj_set_style_border_width(tab_bar, 0, 0);
+    lv_obj_set_style_radius(tab_bar, 0, 0);
+    lv_obj_set_style_pad_all(tab_bar, 0, 0);
+    lv_obj_set_flex_flow(tab_bar, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(tab_bar, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(tab_bar, LV_OBJ_FLAG_SCROLLABLE);
+    
+    // Calculate tab width based on whether UART2 is available
+    bool uart2_available = (hw_config == 1);
+    int tab_count = uart2_available ? 3 : 2;
+    int tab_width = lv_disp_get_hor_res(NULL) / tab_count;
+    
+    // UART 1 tab
+    uart1_tab_btn = lv_btn_create(tab_bar);
+    lv_obj_set_size(uart1_tab_btn, tab_width, 45);
+    lv_obj_set_style_bg_color(uart1_tab_btn, lv_color_hex(0x2A2A2A), 0);
+    lv_obj_set_style_radius(uart1_tab_btn, 0, 0);
+    lv_obj_add_event_cb(uart1_tab_btn, tab_click_cb, LV_EVENT_CLICKED, (void*)(uintptr_t)0);
+    
+    lv_obj_t *uart1_label = lv_label_create(uart1_tab_btn);
+    lv_label_set_text(uart1_label, "UART 1");
+    lv_obj_set_style_text_font(uart1_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(uart1_label, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_center(uart1_label);
+    
+    // UART 2 tab (only if Kraken mode)
+    if (uart2_available) {
+        uart2_tab_btn = lv_btn_create(tab_bar);
+        lv_obj_set_size(uart2_tab_btn, tab_width, 45);
+        lv_obj_set_style_bg_color(uart2_tab_btn, lv_color_hex(0x2A2A2A), 0);
+        lv_obj_set_style_radius(uart2_tab_btn, 0, 0);
+        lv_obj_add_event_cb(uart2_tab_btn, tab_click_cb, LV_EVENT_CLICKED, (void*)(uintptr_t)1);
+        
+        lv_obj_t *uart2_label = lv_label_create(uart2_tab_btn);
+        lv_label_set_text(uart2_label, "UART 2");
+        lv_obj_set_style_text_font(uart2_label, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(uart2_label, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_center(uart2_label);
+    }
+    
+    // INTERNAL tab
+    internal_tab_btn = lv_btn_create(tab_bar);
+    lv_obj_set_size(internal_tab_btn, tab_width, 45);
+    lv_obj_set_style_bg_color(internal_tab_btn, lv_color_hex(0x2A2A2A), 0);
+    lv_obj_set_style_radius(internal_tab_btn, 0, 0);
+    lv_obj_add_event_cb(internal_tab_btn, tab_click_cb, LV_EVENT_CLICKED, (void*)(uintptr_t)2);
+    
+    lv_obj_t *internal_label = lv_label_create(internal_tab_btn);
+    lv_label_set_text(internal_label, "INTERNAL");
+    lv_obj_set_style_text_font(internal_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(internal_label, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_center(internal_label);
+    
+    // Apply active tab styling
+    update_tab_styles();
+    
+    ESP_LOGI(TAG, "Tab bar created: tabs=%d, uart2_available=%d", tab_count, uart2_available);
 }
 
 // Main tile click handler
@@ -1568,11 +2255,11 @@ static void attack_tile_event_cb(lv_event_t *e)
         }
         
         // Send select_networks command
-        uart_send_command(cmd);
+        uart_send_command_for_tab(cmd);
         vTaskDelay(pdMS_TO_TICKS(100));
         
         // Send start_deauth command
-        uart_send_command("start_deauth");
+        uart_send_command_for_tab("start_deauth");
         
         // Show popup with attacking networks
         show_scan_deauth_popup();
@@ -1603,11 +2290,11 @@ static void attack_tile_event_cb(lv_event_t *e)
         // Send select_networks command
         char cmd[32];
         snprintf(cmd, sizeof(cmd), "select_networks %d", net_1based);
-        uart_send_command(cmd);
+        uart_send_command_for_tab(cmd);
         vTaskDelay(pdMS_TO_TICKS(100));
         
         // Send sae_overflow command
-        uart_send_command("sae_overflow");
+        uart_send_command_for_tab("sae_overflow");
         
         // Show popup
         show_sae_popup(idx);
@@ -1652,8 +2339,8 @@ static void scan_deauth_popup_close_cb(lv_event_t *e)
     (void)e;
     ESP_LOGI(TAG, "Deauth popup closed - sending stop command");
     
-    // Send stop command
-    uart_send_command("stop");
+    // Send stop command to current tab's UART
+    uart_send_command_for_tab("stop");
     
     // Delete overlay (popup is child, will be deleted too)
     if (scan_deauth_overlay) {
@@ -1668,10 +2355,11 @@ static void show_scan_deauth_popup(void)
 {
     if (scan_deauth_popup_obj != NULL) return;  // Already showing
     
-    lv_obj_t *scr = lv_scr_act();
+    lv_obj_t *container = get_current_tab_container();
+    if (!container) return;
     
-    // Create modal overlay (full screen, semi-transparent, blocks input behind)
-    scan_deauth_overlay = lv_obj_create(scr);
+    // Create modal overlay (fills container, semi-transparent, blocks input behind)
+    scan_deauth_overlay = lv_obj_create(container);
     lv_obj_remove_style_all(scan_deauth_overlay);
     lv_obj_set_size(scan_deauth_overlay, lv_pct(100), lv_pct(100));
     lv_obj_set_style_bg_color(scan_deauth_overlay, lv_color_hex(0x000000), 0);
@@ -1765,8 +2453,8 @@ static void sae_popup_close_cb(lv_event_t *e)
     (void)e;
     ESP_LOGI(TAG, "SAE popup closed - sending stop command");
     
-    // Send stop command
-    uart_send_command("stop");
+    // Send stop command to current tab's UART
+    uart_send_command_for_tab("stop");
     
     // Delete overlay (popup is child, will be deleted too)
     if (sae_popup_overlay) {
@@ -1786,10 +2474,11 @@ static void show_sae_popup(int network_idx)
     wifi_network_t *net = &networks[network_idx];
     const char *ssid_display = strlen(net->ssid) > 0 ? net->ssid : "(Hidden)";
     
-    lv_obj_t *scr = lv_scr_act();
+    lv_obj_t *container = get_current_tab_container();
+    if (!container) return;
     
-    // Create modal overlay (full screen, semi-transparent, blocks input behind)
-    sae_popup_overlay = lv_obj_create(scr);
+    // Create modal overlay (fills container, semi-transparent, blocks input behind)
+    sae_popup_overlay = lv_obj_create(container);
     lv_obj_remove_style_all(sae_popup_overlay);
     lv_obj_set_size(sae_popup_overlay, lv_pct(100), lv_pct(100));
     lv_obj_set_style_bg_color(sae_popup_overlay, lv_color_hex(0x000000), 0);
@@ -1862,8 +2551,8 @@ static void handshaker_popup_close_cb(lv_event_t *e)
         handshaker_monitor_task_handle = NULL;
     }
     
-    // Send stop command
-    uart_send_command("stop");
+    // Send stop command to current tab's UART
+    uart_send_command_for_tab("stop");
     
     // Delete overlay (popup is child, will be deleted too)
     if (handshaker_popup_overlay) {
@@ -1930,10 +2619,11 @@ static void show_handshaker_popup(void)
 {
     if (handshaker_popup_obj != NULL) return;  // Already showing
     
-    lv_obj_t *scr = lv_scr_act();
+    lv_obj_t *container = get_current_tab_container();
+    if (!container) return;
     
-    // Create modal overlay (full screen, semi-transparent, blocks input behind)
-    handshaker_popup_overlay = lv_obj_create(scr);
+    // Create modal overlay (fills container, semi-transparent, blocks input behind)
+    handshaker_popup_overlay = lv_obj_create(container);
     lv_obj_remove_style_all(handshaker_popup_overlay);
     lv_obj_set_size(handshaker_popup_overlay, lv_pct(100), lv_pct(100));
     lv_obj_set_style_bg_color(handshaker_popup_overlay, lv_color_hex(0x000000), 0);
@@ -2027,12 +2717,12 @@ static void show_handshaker_popup(void)
         }
     }
     
-    // Send select_networks command
-    uart_send_command(cmd);
+    // Send select_networks command to current tab's UART
+    uart_send_command_for_tab(cmd);
     vTaskDelay(pdMS_TO_TICKS(100));
     
-    // Send start_handshake command
-    uart_send_command("start_handshake");
+    // Send start_handshake command to current tab's UART
+    uart_send_command_for_tab("start_handshake");
     
     // Start monitoring task
     handshaker_monitoring = true;
@@ -2123,10 +2813,10 @@ static void arp_connect_cb(lv_event_t *e)
     bsp_display_unlock();
     vTaskDelay(pdMS_TO_TICKS(50));
     
-    // Send wifi_connect command
+    // Send wifi_connect command to current tab's UART
     char cmd[128];
     snprintf(cmd, sizeof(cmd), "wifi_connect %s %s", arp_target_ssid, password);
-    uart_send_command(cmd);
+    uart_send_command_for_tab(cmd);
     
     // Wait for response (up to 15 seconds)
     static char rx_buffer[2048];
@@ -2202,8 +2892,8 @@ static void arp_list_hosts_cb(lv_event_t *e)
     bsp_display_unlock();
     vTaskDelay(pdMS_TO_TICKS(50));
     
-    // Send list_hosts command
-    uart_send_command("list_hosts");
+    // Send list_hosts command to current tab's UART
+    uart_send_command_for_tab("list_hosts");
     
     // Wait for response (up to 30 seconds for ARP scan)
     static char rx_buffer[4096];
@@ -2347,15 +3037,16 @@ static void arp_host_click_cb(lv_event_t *e)
     arp_host_t *host = &arp_hosts[idx];
     ESP_LOGI(TAG, "ARP Poison: Starting attack on %s (%s)", host->ip, host->mac);
     
-    // Send arp_ban command
+    // Send arp_ban command to current tab's UART
     char cmd[64];
     snprintf(cmd, sizeof(cmd), "arp_ban %s %s", host->mac, host->ip);
-    uart_send_command(cmd);
+    uart_send_command_for_tab(cmd);
     
     // Create attack popup
-    lv_obj_t *scr = lv_scr_act();
+    lv_obj_t *container = get_current_tab_container();
+    if (!container) return;
     
-    arp_attack_popup_overlay = lv_obj_create(scr);
+    arp_attack_popup_overlay = lv_obj_create(container);
     lv_obj_remove_style_all(arp_attack_popup_overlay);
     lv_obj_set_size(arp_attack_popup_overlay, lv_pct(100), lv_pct(100));
     lv_obj_set_style_bg_color(arp_attack_popup_overlay, lv_color_hex(0x000000), 0);
@@ -2413,8 +3104,8 @@ static void arp_attack_popup_close_cb(lv_event_t *e)
     (void)e;
     ESP_LOGI(TAG, "ARP Poison: Stopping attack");
     
-    // Send stop command
-    uart_send_command("stop");
+    // Send stop command to current tab's UART
+    uart_send_command_for_tab("stop");
     
     // Close popup
     if (arp_attack_popup_overlay) {
@@ -2444,10 +3135,10 @@ static void arp_auto_connect_timer_cb(lv_timer_t *timer)
     bsp_display_unlock();
     vTaskDelay(pdMS_TO_TICKS(50));
     
-    // Send wifi_connect command
+    // Send wifi_connect command to current tab's UART
     char cmd[128];
     snprintf(cmd, sizeof(cmd), "wifi_connect %s %s", arp_target_ssid, arp_target_password);
-    uart_send_command(cmd);
+    uart_send_command_for_tab(cmd);
     
     // Wait for response (up to 15 seconds)
     static char rx_buffer[1024];
@@ -2534,12 +3225,13 @@ static void show_arp_poison_page(void)
         lv_obj_add_flag(scan_page, LV_OBJ_FLAG_HIDDEN);
     }
     
-    lv_obj_t *scr = lv_scr_act();
+    lv_obj_t *container = get_current_tab_container();
+    if (!container) return;
     
-    arp_poison_page = lv_obj_create(scr);
+    arp_poison_page = lv_obj_create(container);
     lv_coord_t scr_height = lv_disp_get_ver_res(NULL);
-    lv_obj_set_size(arp_poison_page, lv_pct(100), scr_height - 40);
-    lv_obj_align(arp_poison_page, LV_ALIGN_TOP_MID, 0, 40);
+    lv_obj_set_size(arp_poison_page, lv_pct(100), scr_height - 85);
+    lv_obj_align(arp_poison_page, LV_ALIGN_TOP_MID, 0, 85);
     lv_obj_set_style_bg_color(arp_poison_page, lv_color_hex(0x1A1A1A), 0);
     lv_obj_set_style_border_width(arp_poison_page, 0, 0);
     lv_obj_set_style_pad_all(arp_poison_page, 15, 0);
@@ -2722,28 +3414,33 @@ static void show_arp_poison_page(void)
 
 // ======================= Karma Attack Functions =======================
 
-// Back button callback
+// Back button callback - hide karma page and show tiles
 static void karma_back_cb(lv_event_t *e)
 {
     (void)e;
-    ESP_LOGI(TAG, "Karma: back button pressed");
+    ESP_LOGI(TAG, "Karma: back button pressed, returning to tiles for tab %d", current_tab);
     
     // Stop any monitoring
     if (karma_monitoring) {
         karma_monitoring = false;
-        uart_send_command("stop");
+        uart_send_command_for_tab("stop");
     }
     
     karma_probe_count = 0;
     
-    if (karma_page) {
-        lv_obj_del(karma_page);
-        karma_page = NULL;
-        karma_probes_container = NULL;
-        karma_status_label = NULL;
+    // Get current tab's data and show tiles
+    tab_context_t *ctx = get_current_ctx();
+    
+    // Hide karma page
+    if (ctx->karma_page) {
+        lv_obj_add_flag(ctx->karma_page, LV_OBJ_FLAG_HIDDEN);
     }
     
-    show_main_tiles();
+    // Show tiles
+    if (ctx->tiles) {
+        lv_obj_clear_flag(ctx->tiles, LV_OBJ_FLAG_HIDDEN);
+        ctx->current_visible_page = ctx->tiles;
+    }
 }
 
 // Start Sniffer button callback
@@ -2752,7 +3449,7 @@ static void karma_start_sniffer_cb(lv_event_t *e)
     (void)e;
     ESP_LOGI(TAG, "Karma: Starting sniffer");
     
-    uart_send_command("start_sniffer");
+    uart_send_command_for_tab("start_sniffer");
     karma_sniffer_running = true;
     
     // Update button states
@@ -2775,7 +3472,7 @@ static void karma_stop_sniffer_cb(lv_event_t *e)
     (void)e;
     ESP_LOGI(TAG, "Karma: Stopping sniffer");
     
-    uart_send_command("stop");
+    uart_send_command_for_tab("stop");
     karma_sniffer_running = false;
     
     // Update button states
@@ -2808,8 +3505,8 @@ static void karma_show_probes_cb(lv_event_t *e)
     bsp_display_unlock();
     vTaskDelay(pdMS_TO_TICKS(50));
     
-    // Send list_probes command
-    uart_send_command("list_probes");
+    // Send list_probes command to current tab's UART
+    uart_send_command_for_tab("list_probes");
     vTaskDelay(pdMS_TO_TICKS(500));
     
     // Read response
@@ -2926,8 +3623,9 @@ static void karma_fetch_html_files(void)
     karma_html_count = 0;
     memset(karma_html_files, 0, sizeof(karma_html_files));
     
-    uart_flush(UART_NUM);
-    uart_send_command("list_sd");
+    uart_port_t uart_port = (current_tab == 1 && uart2_initialized) ? UART2_NUM : UART_NUM;
+    uart_flush(uart_port);
+    uart_send_command_for_tab("list_sd");
     
     static char rx_buffer[2048];
     static char line_buffer[256];
@@ -2986,10 +3684,11 @@ static void karma_probe_click_cb(lv_event_t *e)
     karma_selected_probe_idx = idx;
     ESP_LOGI(TAG, "Karma: Selected probe %d: %s", idx, karma_probes[idx].ssid);
     
-    lv_obj_t *scr = lv_scr_act();
+    lv_obj_t *container = get_current_tab_container();
+    if (!container) return;
     
     // Create overlay
-    karma_html_popup_overlay = lv_obj_create(scr);
+    karma_html_popup_overlay = lv_obj_create(container);
     lv_obj_remove_style_all(karma_html_popup_overlay);
     lv_obj_set_size(karma_html_popup_overlay, lv_pct(100), lv_pct(100));
     lv_obj_set_style_bg_color(karma_html_popup_overlay, lv_color_hex(0x000000), 0);
@@ -3145,23 +3844,24 @@ static void karma_html_select_cb(lv_event_t *e)
     }
     
     // Stop any running operation first
-    uart_send_command("stop");
+    uart_send_command_for_tab("stop");
     vTaskDelay(pdMS_TO_TICKS(200));
     
     // Send select_html command (1-based index)
     char cmd[32];
     snprintf(cmd, sizeof(cmd), "select_html %d", html_idx + 1);
-    uart_send_command(cmd);
+    uart_send_command_for_tab(cmd);
     vTaskDelay(pdMS_TO_TICKS(200));
     
     // Send start_karma command
     snprintf(cmd, sizeof(cmd), "start_karma %d", probe_idx);
-    uart_send_command(cmd);
+    uart_send_command_for_tab(cmd);
     
     // Create attack popup
-    lv_obj_t *scr = lv_scr_act();
+    lv_obj_t *container = get_current_tab_container();
+    if (!container) return;
     
-    karma_attack_popup_overlay = lv_obj_create(scr);
+    karma_attack_popup_overlay = lv_obj_create(container);
     lv_obj_remove_style_all(karma_attack_popup_overlay);
     lv_obj_set_size(karma_attack_popup_overlay, lv_pct(100), lv_pct(100));
     lv_obj_set_style_bg_color(karma_attack_popup_overlay, lv_color_hex(0x000000), 0);
@@ -3236,8 +3936,8 @@ static void karma_attack_popup_close_cb(lv_event_t *e)
         karma_monitor_task_handle = NULL;
     }
     
-    // Send stop command
-    uart_send_command("stop");
+    // Send stop command to current tab's UART
+    uart_send_command_for_tab("stop");
     
     // Close popup
     if (karma_attack_popup_overlay) {
@@ -3349,7 +4049,7 @@ static void karma_monitor_task(void *arg)
     vTaskDelete(NULL);
 }
 
-// Show Karma page
+// Show Karma page (inside current tab's container)
 static void show_karma_page(void)
 {
     ESP_LOGI(TAG, "Showing Karma page");
@@ -3358,23 +4058,33 @@ static void show_karma_page(void)
     karma_probe_count = 0;
     karma_selected_probe_idx = -1;
     
-    // Delete main tiles if present
-    if (tiles_container) {
-        lv_obj_del(tiles_container);
-        tiles_container = NULL;
+    // Get current tab's data and container
+    tab_context_t *ctx = get_current_ctx();
+    lv_obj_t *container = get_current_tab_container();
+    
+    if (!container) {
+        ESP_LOGE(TAG, "Container not initialized for tab %d", current_tab);
+        return;
     }
     
-    lv_obj_t *scr = lv_scr_act();
-    lv_obj_set_style_bg_color(scr, lv_color_hex(0x1A1A1A), 0);
+    // Hide all other pages
+    hide_all_pages(ctx);
     
-    create_status_bar();
-    update_kraken_eye_icon();
-    update_portal_icon();
+    // If page already exists for this tab, just show it
+    if (ctx->karma_page) {
+        lv_obj_clear_flag(ctx->karma_page, LV_OBJ_FLAG_HIDDEN);
+        ctx->current_visible_page = ctx->karma_page;
+        karma_page = ctx->karma_page;  // Update legacy reference
+        ESP_LOGI(TAG, "Showing existing karma page for tab %d", current_tab);
+        return;
+    }
     
-    karma_page = lv_obj_create(scr);
-    lv_coord_t scr_height = lv_disp_get_ver_res(NULL);
-    lv_obj_set_size(karma_page, lv_pct(100), scr_height - 40);
-    lv_obj_align(karma_page, LV_ALIGN_TOP_MID, 0, 40);
+    ESP_LOGI(TAG, "Creating new karma page for tab %d", current_tab);
+    
+    // Create karma page container inside tab container
+    ctx->karma_page = lv_obj_create(container);
+    karma_page = ctx->karma_page;  // Keep legacy reference
+    lv_obj_set_size(karma_page, lv_pct(100), lv_pct(100));
     lv_obj_set_style_bg_color(karma_page, lv_color_hex(0x1A1A1A), 0);
     lv_obj_set_style_border_width(karma_page, 0, 0);
     lv_obj_set_style_pad_all(karma_page, 15, 0);
@@ -3485,6 +4195,9 @@ static void show_karma_page(void)
     lv_label_set_text(placeholder, "Click 'Show Probes' after sniffing to see collected probe requests");
     lv_obj_set_style_text_font(placeholder, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(placeholder, lv_color_hex(0x666666), 0);
+    
+    // Set current visible page
+    ctx->current_visible_page = ctx->karma_page;
 }
 
 // ======================= Evil Twin Attack Functions =======================
@@ -3496,10 +4209,11 @@ static void fetch_html_files_from_sd(void)
     memset(evil_twin_html_files, 0, sizeof(evil_twin_html_files));
     
     // Flush UART buffer
-    uart_flush(UART_NUM);
+    uart_port_t uart_port = (current_tab == 1 && uart2_initialized) ? UART2_NUM : UART_NUM;
+    uart_flush(uart_port);
     
-    // Send list_sd command
-    uart_send_command("list_sd");
+    // Send list_sd command to current tab's UART
+    uart_send_command_for_tab("list_sd");
     
     // Buffer for receiving data
     static char rx_buffer[2048];
@@ -3559,8 +4273,8 @@ static void evil_twin_close_cb(lv_event_t *e)
     // Stop monitoring
     evil_twin_monitoring = false;
     
-    // Send stop command
-    uart_send_command("stop");
+    // Send stop command to current tab's UART
+    uart_send_command_for_tab("stop");
     
     // Delete overlay (popup is child, will be deleted too)
     if (evil_twin_overlay) {
@@ -3733,20 +4447,20 @@ static void evil_twin_start_cb(lv_event_t *e)
         }
     }
     
-    ESP_LOGI(TAG, "[UART1] Evil Twin: sending %s", cmd);
-    uart_send_command(cmd);
+    ESP_LOGI(TAG, "[UART%d] Evil Twin: sending %s", current_tab == 1 ? 2 : 1, cmd);
+    uart_send_command_for_tab(cmd);
     vTaskDelay(pdMS_TO_TICKS(100));
     
     // Send select_html command (1-based index)
     char html_cmd[32];
     snprintf(html_cmd, sizeof(html_cmd), "select_html %d", selected_html_idx + 1);
-    ESP_LOGI(TAG, "[UART1] Evil Twin: sending %s", html_cmd);
-    uart_send_command(html_cmd);
+    ESP_LOGI(TAG, "[UART%d] Evil Twin: sending %s", current_tab == 1 ? 2 : 1, html_cmd);
+    uart_send_command_for_tab(html_cmd);
     vTaskDelay(pdMS_TO_TICKS(100));
     
     // Send start_evil_twin
-    ESP_LOGI(TAG, "[UART1] Evil Twin: sending start_evil_twin");
-    uart_send_command("start_evil_twin");
+    ESP_LOGI(TAG, "[UART%d] Evil Twin: sending start_evil_twin", current_tab == 1 ? 2 : 1);
+    uart_send_command_for_tab("start_evil_twin");
     
     // Build status text
     wifi_network_t *et_net = &networks[evil_twin_net_idx];
@@ -3801,10 +4515,11 @@ static void show_evil_twin_popup(void)
         return;
     }
     
-    lv_obj_t *scr = lv_scr_act();
+    lv_obj_t *container = get_current_tab_container();
+    if (!container) return;
     
-    // Create modal overlay (full screen, semi-transparent, blocks input behind)
-    evil_twin_overlay = lv_obj_create(scr);
+    // Create modal overlay (fills container, semi-transparent, blocks input behind)
+    evil_twin_overlay = lv_obj_create(container);
     lv_obj_remove_style_all(evil_twin_overlay);
     lv_obj_set_size(evil_twin_overlay, lv_pct(100), lv_pct(100));
     lv_obj_set_style_bg_color(evil_twin_overlay, lv_color_hex(0x000000), 0);
@@ -3972,132 +4687,206 @@ static void show_evil_twin_popup(void)
     lv_obj_center(stop_label);
 }
 
-// Back button click handler
+// Back button click handler - hide current page and show tiles
 static void back_btn_event_cb(lv_event_t *e)
 {
     (void)e;
-    ESP_LOGI(TAG, "Back button clicked");
-    show_main_tiles();
+    ESP_LOGI(TAG, "Back button clicked, returning to tiles for tab %d", current_tab);
+    
+    // Get current tab's data
+    tab_context_t *ctx = get_current_ctx();
+    
+    // Hide current page
+    if (ctx->current_visible_page) {
+        lv_obj_add_flag(ctx->current_visible_page, LV_OBJ_FLAG_HIDDEN);
+    }
+    
+    // Show tiles
+    if (ctx->tiles) {
+        lv_obj_clear_flag(ctx->tiles, LV_OBJ_FLAG_HIDDEN);
+        ctx->current_visible_page = ctx->tiles;
+    }
 }
 
-// Show main tiles screen (7 tiles)
+// Create tiles for UART tabs inside given container
+static void create_uart_tiles_in_container(lv_obj_t *container, lv_obj_t **tiles_ptr)
+{
+    if (*tiles_ptr) {
+        // Tiles already exist, just show them
+        lv_obj_clear_flag(*tiles_ptr, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+    
+    *tiles_ptr = lv_obj_create(container);
+    lv_obj_set_size(*tiles_ptr, lv_pct(100), lv_pct(100));
+    lv_obj_align(*tiles_ptr, LV_ALIGN_TOP_MID, 0, 0);
+    lv_obj_set_style_bg_color(*tiles_ptr, COLOR_MATERIAL_BG, 0);
+    lv_obj_set_style_border_width(*tiles_ptr, 0, 0);
+    lv_obj_set_style_radius(*tiles_ptr, 0, 0);
+    lv_obj_set_style_pad_all(*tiles_ptr, 20, 0);
+    lv_obj_set_style_pad_gap(*tiles_ptr, 20, 0);
+    lv_obj_set_flex_flow(*tiles_ptr, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_flex_align(*tiles_ptr, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(*tiles_ptr, LV_OBJ_FLAG_SCROLLABLE);
+    
+    // Create 7 tiles for UART tabs (same for both UART1 and UART2)
+    create_tile(*tiles_ptr, LV_SYMBOL_WIFI, "WiFi Scan\n& Attack", COLOR_MATERIAL_BLUE, main_tile_event_cb, "WiFi Scan & Attack");
+    create_tile(*tiles_ptr, LV_SYMBOL_WARNING, "Global WiFi\nAttacks", COLOR_MATERIAL_RED, main_tile_event_cb, "Global WiFi Attacks");
+    create_tile(*tiles_ptr, LV_SYMBOL_SAVE, "Compromised\nData", COLOR_MATERIAL_GREEN, main_tile_event_cb, "Compromised Data");
+    create_tile(*tiles_ptr, LV_SYMBOL_EYE_OPEN, "Deauth\nDetector", COLOR_MATERIAL_AMBER, main_tile_event_cb, "Deauth Detector");
+    create_tile(*tiles_ptr, LV_SYMBOL_BLUETOOTH, "Bluetooth", COLOR_MATERIAL_CYAN, main_tile_event_cb, "Bluetooth");
+    create_tile(*tiles_ptr, LV_SYMBOL_LOOP, "Network\nObserver", COLOR_MATERIAL_TEAL, main_tile_event_cb, "Network Observer");
+    create_tile(*tiles_ptr, LV_SYMBOL_WIFI, "Karma", COLOR_MATERIAL_ORANGE, main_tile_event_cb, "Karma");
+}
+
+// Show UART 1 tiles (inside persistent container)
+static void show_uart1_tiles(void)
+{
+    ESP_LOGI(TAG, "Showing UART 1 tiles");
+    
+    if (!uart1_container) {
+        ESP_LOGE(TAG, "UART1 container not initialized!");
+        return;
+    }
+    
+    // Hide other pages in this container, show tiles
+    tab_context_t *ctx = &uart1_ctx;
+    if (ctx->scan_page) lv_obj_add_flag(ctx->scan_page, LV_OBJ_FLAG_HIDDEN);
+    if (ctx->observer_page) lv_obj_add_flag(ctx->observer_page, LV_OBJ_FLAG_HIDDEN);
+    if (ctx->global_attacks_page) lv_obj_add_flag(ctx->global_attacks_page, LV_OBJ_FLAG_HIDDEN);
+    if (ctx->karma_page) lv_obj_add_flag(ctx->karma_page, LV_OBJ_FLAG_HIDDEN);
+    
+    create_uart_tiles_in_container(uart1_container, &ctx->tiles);
+    ctx->current_visible_page = ctx->tiles;
+}
+
+// Show UART 2 tiles (inside persistent container)
+static void show_uart2_tiles(void)
+{
+    ESP_LOGI(TAG, "Showing UART 2 tiles");
+    
+    if (!uart2_container) {
+        ESP_LOGE(TAG, "UART2 container not initialized!");
+        return;
+    }
+    
+    // Hide other pages in this container, show tiles
+    tab_context_t *ctx = &uart2_ctx;
+    if (ctx->scan_page) lv_obj_add_flag(ctx->scan_page, LV_OBJ_FLAG_HIDDEN);
+    if (ctx->observer_page) lv_obj_add_flag(ctx->observer_page, LV_OBJ_FLAG_HIDDEN);
+    if (ctx->global_attacks_page) lv_obj_add_flag(ctx->global_attacks_page, LV_OBJ_FLAG_HIDDEN);
+    if (ctx->karma_page) lv_obj_add_flag(ctx->karma_page, LV_OBJ_FLAG_HIDDEN);
+    
+    create_uart_tiles_in_container(uart2_container, &ctx->tiles);
+    ctx->current_visible_page = ctx->tiles;
+}
+
+// Internal tab tile click handler
+static void internal_tile_event_cb(lv_event_t *e)
+{
+    const char *tile_name = (const char *)lv_event_get_user_data(e);
+    ESP_LOGI(TAG, "Internal tile clicked: %s", tile_name);
+    
+    if (strcmp(tile_name, "Settings") == 0) {
+        show_settings_page();
+    } else if (strcmp(tile_name, "Ad Hoc Portal") == 0) {
+        // Show portal status page
+        show_karma_page();
+    }
+}
+
+// Show INTERNAL tiles (Settings, Ad Hoc Portal) inside persistent container
+static void show_internal_tiles(void)
+{
+    ESP_LOGI(TAG, "Showing INTERNAL tiles");
+    
+    if (!internal_container) {
+        ESP_LOGE(TAG, "INTERNAL container not initialized!");
+        return;
+    }
+    
+    // Hide settings page if visible, show tiles
+    if (internal_settings_page) lv_obj_add_flag(internal_settings_page, LV_OBJ_FLAG_HIDDEN);
+    
+    if (internal_tiles) {
+        // Already exists, just show it
+        lv_obj_clear_flag(internal_tiles, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+    
+    // Create tiles inside internal container
+    internal_tiles = lv_obj_create(internal_container);
+    lv_obj_set_size(internal_tiles, lv_pct(100), lv_pct(100));
+    lv_obj_align(internal_tiles, LV_ALIGN_TOP_MID, 0, 0);
+    lv_obj_set_style_bg_color(internal_tiles, COLOR_MATERIAL_BG, 0);
+    lv_obj_set_style_border_width(internal_tiles, 0, 0);
+    lv_obj_set_style_radius(internal_tiles, 0, 0);
+    lv_obj_set_style_pad_all(internal_tiles, 20, 0);
+    lv_obj_set_style_pad_gap(internal_tiles, 20, 0);
+    lv_obj_set_flex_flow(internal_tiles, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_flex_align(internal_tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(internal_tiles, LV_OBJ_FLAG_SCROLLABLE);
+    
+    // Create 2 tiles for INTERNAL tab
+    create_tile(internal_tiles, LV_SYMBOL_SETTINGS, "Settings", COLOR_MATERIAL_PURPLE, internal_tile_event_cb, "Settings");
+    create_tile(internal_tiles, LV_SYMBOL_WIFI, "Ad Hoc\nPortal & Karma", COLOR_MATERIAL_ORANGE, internal_tile_event_cb, "Ad Hoc Portal");
+}
+
+// Show main tiles screen with tab bar (persistent containers)
 static void show_main_tiles(void)
 {
-    // Delete scan page if present
-    if (scan_page) {
-        lv_obj_del(scan_page);
-        scan_page = NULL;
-        // Reset scan page child pointers
-        scan_btn = NULL;
-        status_label = NULL;
-        network_list = NULL;
-        spinner = NULL;
-    }
-    
-    // Delete observer page if present
-    if (observer_page) {
-        lv_obj_del(observer_page);
-        observer_page = NULL;
-        // Reset observer page child pointers
-        observer_start_btn = NULL;
-        observer_stop_btn = NULL;
-        observer_table = NULL;
-        observer_status_label = NULL;
-    }
-    
-    // Delete ESP Modem page if present
-    if (esp_modem_page) {
-        lv_obj_del(esp_modem_page);
-        esp_modem_page = NULL;
-        // Reset ESP Modem page child pointers
-        esp_modem_scan_btn = NULL;
-        esp_modem_status_label = NULL;
-        esp_modem_network_list = NULL;
-        esp_modem_spinner = NULL;
-    }
-    
-    // Delete Global Attacks page if present
-    if (global_attacks_page) {
-        lv_obj_del(global_attacks_page);
-        global_attacks_page = NULL;
-    }
-    
-    // Delete existing tiles container if present
-    if (tiles_container) {
-        lv_obj_del(tiles_container);
-        tiles_container = NULL;
-    }
-    
     lv_obj_t *scr = lv_scr_act();
     
     // Set dark background
     lv_obj_set_style_bg_color(scr, COLOR_MATERIAL_BG, 0);
     
-    // Create status bar using helper
+    // Create status bar and tab bar
     create_status_bar();
-    
-    // Update eye icon visibility (show if Kraken is scanning in background)
-    update_kraken_eye_icon();
+    create_tab_bar();
     update_portal_icon();
     
-    // Create tiles container below the status bar
-    tiles_container = lv_obj_create(scr);
-    lv_coord_t tiles_scr_height = lv_disp_get_ver_res(NULL);
-    lv_obj_set_size(tiles_container, lv_pct(100), tiles_scr_height - 40);  // Subtract status bar height
-    lv_obj_align(tiles_container, LV_ALIGN_TOP_MID, 0, 40);  // Position below status bar
-    lv_obj_set_style_bg_color(tiles_container, COLOR_MATERIAL_BG, 0);
-    lv_obj_set_style_border_width(tiles_container, 0, 0);
-    lv_obj_set_style_radius(tiles_container, 0, 0);
-    lv_obj_set_style_pad_all(tiles_container, 20, 0);
-    lv_obj_set_style_pad_gap(tiles_container, 20, 0);
-    lv_obj_set_flex_flow(tiles_container, LV_FLEX_FLOW_ROW_WRAP);
-    lv_obj_set_flex_align(tiles_container, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_clear_flag(tiles_container, LV_OBJ_FLAG_SCROLLABLE);
+    // Create persistent tab containers (only once)
+    if (!uart1_container) {
+        create_tab_containers();
+    }
     
-    // Create main tiles with Material colors
-    create_tile(tiles_container, LV_SYMBOL_WIFI, "WiFi Scan\n& Attack", COLOR_MATERIAL_BLUE, main_tile_event_cb, "WiFi Scan & Attack");
-    create_tile(tiles_container, LV_SYMBOL_WARNING, "Global WiFi\nAttacks", COLOR_MATERIAL_RED, main_tile_event_cb, "Global WiFi Attacks");
-    create_tile(tiles_container, LV_SYMBOL_SAVE, "Compromised\nData", COLOR_MATERIAL_GREEN, main_tile_event_cb, "Compromised Data");
-    create_tile(tiles_container, LV_SYMBOL_EYE_OPEN, "Deauth\nDetector", COLOR_MATERIAL_AMBER, main_tile_event_cb, "Deauth Detector");
-    create_tile(tiles_container, LV_SYMBOL_BLUETOOTH, "Bluetooth", COLOR_MATERIAL_CYAN, main_tile_event_cb, "Bluetooth");
-    create_tile(tiles_container, LV_SYMBOL_LOOP, "Network\nObserver", COLOR_MATERIAL_TEAL, main_tile_event_cb, "Network Observer");
-    create_tile(tiles_container, LV_SYMBOL_SETTINGS, "Settings", COLOR_MATERIAL_PURPLE, main_tile_event_cb, "Settings");
-    create_tile(tiles_container, LV_SYMBOL_WIFI, "Karma", COLOR_MATERIAL_ORANGE, main_tile_event_cb, "Karma");
-    // Hidden: create_tile(tiles_container, LV_SYMBOL_CHARGE, "Internal\nC6 Test", lv_color_make(255, 87, 34), main_tile_event_cb, "Internal C6 Test");
+    // Show tiles for current tab
+    switch (current_tab) {
+        case 0: show_uart1_tiles(); break;
+        case 1: show_uart2_tiles(); break;
+        case 2: show_internal_tiles(); break;
+    }
 }
 
-// Show WiFi Scanner page with Back button
+// Show WiFi Scanner page with Back button (inside current tab's container)
 static void show_scan_page(void)
 {
-    // Delete tiles container if present
-    if (tiles_container) {
-        lv_obj_del(tiles_container);
-        tiles_container = NULL;
+    // Get current tab's data and container
+    tab_context_t *ctx = get_current_ctx();
+    lv_obj_t *container = get_current_tab_container();
+    
+    if (!container) {
+        ESP_LOGE(TAG, "Container not initialized for tab %d", current_tab);
+        return;
     }
     
-    // Delete existing scan page if present
-    if (scan_page) {
-        lv_obj_del(scan_page);
-        scan_page = NULL;
+    // Hide all other pages
+    hide_all_pages(ctx);
+    
+    // If scan page already exists for this tab, just show it
+    if (ctx->scan_page) {
+        lv_obj_clear_flag(ctx->scan_page, LV_OBJ_FLAG_HIDDEN);
+        ctx->current_visible_page = ctx->scan_page;
+        ESP_LOGI(TAG, "Showing existing scan page for tab %d", current_tab);
+        return;
     }
     
-    lv_obj_t *scr = lv_scr_act();
+    ESP_LOGI(TAG, "Creating new scan page for tab %d", current_tab);
     
-    // Set dark background
-    lv_obj_set_style_bg_color(scr, lv_color_hex(0x1A1A1A), 0);
-    
-    // Create/update status bar
-    create_status_bar();
-    
-    // Update eye icon visibility (Kraken background scanning)
-    update_kraken_eye_icon();
-    update_portal_icon();
-    
-    // Create scan page container below status bar
-    scan_page = lv_obj_create(scr);
-    lv_coord_t scr_height = lv_disp_get_ver_res(NULL);
-    lv_obj_set_size(scan_page, lv_pct(100), scr_height - 40);  // Full height minus status bar
-    lv_obj_align(scan_page, LV_ALIGN_TOP_MID, 0, 40);  // Position below status bar
+    // Create scan page container inside tab container
+    ctx->scan_page = lv_obj_create(container);
+    scan_page = ctx->scan_page;  // Keep legacy reference for compatibility
+    lv_obj_set_size(scan_page, lv_pct(100), lv_pct(100));
     lv_obj_set_style_bg_color(scan_page, lv_color_hex(0x1A1A1A), 0);
     lv_obj_set_style_border_width(scan_page, 0, 0);
     lv_obj_set_style_pad_all(scan_page, 4, 0);  // Minimal padding for maximum list space
@@ -4212,6 +5001,9 @@ static void show_scan_page(void)
     
     // Auto-start scan when entering the page
     lv_obj_send_event(scan_btn, LV_EVENT_CLICKED, NULL);
+    
+    // Set current visible page
+    ctx->current_visible_page = ctx->scan_page;
 }
 
 // ======================= Network Observer Page =======================
@@ -4281,18 +5073,10 @@ static void close_network_popup(void)
     }
     
     // Send unselect_networks to monitor all networks again
-    // Use UART2 in Kraken mode, UART1 in Monster mode
-    if (hw_config == 1) {
-        // Kraken mode - use UART2
-        uart2_send_command("unselect_networks");
+    // Use UART based on current tab
+    uart_send_command_for_tab("unselect_networks");
         vTaskDelay(pdMS_TO_TICKS(100));
-        uart2_send_command("start_sniffer_noscan");
-    } else {
-        // Monster mode - use UART1
-    uart_send_command("unselect_networks");
-    vTaskDelay(pdMS_TO_TICKS(100));
-    uart_send_command("start_sniffer_noscan");
-    }
+    uart_send_command_for_tab("start_sniffer_noscan");
     
     // Close popup UI
     if (popup_obj) {
@@ -4335,29 +5119,20 @@ static void show_network_popup(int network_idx)
     }
     
     // Send commands to focus on this network
-    // Use UART2 in Kraken mode, UART1 in Monster mode
+    // Use UART based on current tab
     char cmd[32];
     snprintf(cmd, sizeof(cmd), "select_networks %d", net->scan_index);
     
-    if (hw_config == 1) {
-        // Kraken mode - use UART2
-        uart2_send_command("stop");
+    uart_send_command_for_tab("stop");
         vTaskDelay(pdMS_TO_TICKS(200));
-        uart2_send_command(cmd);
+    uart_send_command_for_tab(cmd);
         vTaskDelay(pdMS_TO_TICKS(100));
-        uart2_send_command("start_sniffer");
-    } else {
-        // Monster mode - use UART1
-        uart_send_command("stop");
-        vTaskDelay(pdMS_TO_TICKS(200));
-    uart_send_command(cmd);
-    vTaskDelay(pdMS_TO_TICKS(100));
-    uart_send_command("start_sniffer");
-    }
+    uart_send_command_for_tab("start_sniffer");
     
     // Create popup overlay
-    lv_obj_t *scr = lv_scr_act();
-    popup_obj = lv_obj_create(scr);
+    lv_obj_t *container = get_current_tab_container();
+    if (!container) return;
+    popup_obj = lv_obj_create(container);
     lv_obj_set_size(popup_obj, 600, 400);
     lv_obj_center(popup_obj);
     lv_obj_set_style_bg_color(popup_obj, lv_color_hex(0x1A2A2A), 0);
@@ -4515,15 +5290,11 @@ static void popup_poll_task(void *arg)
         return;
     }
     
-    // Use UART2 in Kraken mode, UART1 in Monster mode
-    uart_port_t uart_port = (hw_config == 1) ? UART2_NUM : UART_NUM;
+    // Use UART based on current tab
+    uart_port_t uart_port = get_current_uart();
     
     uart_flush(uart_port);
-    if (hw_config == 1) {
-        uart2_send_command("show_sniffer_results");
-    } else {
-    uart_send_command("show_sniffer_results");
-    }
+    uart_send_command_for_tab("show_sniffer_results");
     
     char *rx_buffer = observer_rx_buffer;
     char *line_buffer = observer_line_buffer;
@@ -4738,8 +5509,9 @@ static void show_deauth_popup(int network_idx, int client_idx)
     }
     
     // Create popup overlay
-    lv_obj_t *scr = lv_scr_act();
-    deauth_popup_obj = lv_obj_create(scr);
+    lv_obj_t *container = get_current_tab_container();
+    if (!container) return;
+    deauth_popup_obj = lv_obj_create(container);
     lv_obj_set_size(deauth_popup_obj, 550, 320);
     lv_obj_center(deauth_popup_obj);
     lv_obj_set_style_bg_color(deauth_popup_obj, lv_color_hex(0x1A1A2A), 0);
@@ -4832,10 +5604,10 @@ static void close_deauth_popup(void)
 {
     ESP_LOGI(TAG, "Closing deauth popup");
     
-    // Send stop commands
-    uart_send_command("stop");
+    // Send stop commands to current tab's UART
+    uart_send_command_for_tab("stop");
     vTaskDelay(pdMS_TO_TICKS(100));
-    uart_send_command("start_sniffer_noscan");
+    uart_send_command_for_tab("start_sniffer_noscan");
     
     // Delete popup UI
     if (deauth_popup_obj != NULL) {
@@ -4878,20 +5650,20 @@ static void deauth_btn_click_cb(lv_event_t *e)
             ESP_LOGI(TAG, "Starting deauth: network=%d (scan_idx=%d), client=%s", 
                      deauth_network_idx, net->scan_index, client_mac);
             
-            // Send UART commands
-            uart_send_command("stop");
+            // Send UART commands to current tab's UART
+            uart_send_command_for_tab("stop");
             vTaskDelay(pdMS_TO_TICKS(100));
             
             char cmd[64];
             snprintf(cmd, sizeof(cmd), "select_networks %d", net->scan_index);
-            uart_send_command(cmd);
+            uart_send_command_for_tab(cmd);
             vTaskDelay(pdMS_TO_TICKS(100));
             
             snprintf(cmd, sizeof(cmd), "select_stations %s", client_mac);
-            uart_send_command(cmd);
+            uart_send_command_for_tab(cmd);
             vTaskDelay(pdMS_TO_TICKS(100));
             
-            uart_send_command("start_deauth");
+            uart_send_command_for_tab("start_deauth");
             
             // Change button to STOP
             deauth_active = true;
@@ -4974,11 +5746,14 @@ static void observer_poll_task(void *arg)
         return;
     }
     
+    // Get the UART for current tab
+    uart_port_t uart_port = get_current_uart();
+    
     // Flush UART buffer
-    uart_flush(UART_NUM);
+    uart_flush(uart_port);
     
     // Send show_sniffer_results command
-    uart_send_command("show_sniffer_results");
+    uart_send_command_for_tab("show_sniffer_results");
     
     // Use PSRAM-allocated buffers
     char *rx_buffer = observer_rx_buffer;
@@ -4994,7 +5769,7 @@ static void observer_poll_task(void *arg)
     TickType_t timeout_ticks = pdMS_TO_TICKS(5000);  // 5 second timeout for response
     
     while ((xTaskGetTickCount() - start_time) < timeout_ticks) {
-        int len = uart_read_bytes(UART_NUM, rx_buffer, UART_BUF_SIZE - 1, pdMS_TO_TICKS(100));
+        int len = uart_read_bytes(uart_port, rx_buffer, UART_BUF_SIZE - 1, pdMS_TO_TICKS(100));
         
         if (len > 0) {
             rx_buffer[len] = '\0';
@@ -5178,6 +5953,9 @@ static void observer_start_task(void *arg)
         return;
     }
     
+    // Get the UART for current tab
+    uart_port_t uart_port = get_current_uart();
+    
     // Update UI
     bsp_display_lock(0);
     if (observer_status_label) {
@@ -5190,10 +5968,10 @@ static void observer_start_task(void *arg)
     memset(observer_networks, 0, sizeof(observer_network_t) * MAX_NETWORKS);
     
     // Flush UART buffer
-    uart_flush(UART_NUM);
+    uart_flush(uart_port);
     
     // Step 1: Run scan_networks
-    uart_send_command("scan_networks");
+    uart_send_command_for_tab("scan_networks");
     
     // Wait for scan to complete - use PSRAM buffers
     char *rx_buffer = observer_rx_buffer;
@@ -5206,7 +5984,7 @@ static void observer_start_task(void *arg)
     TickType_t timeout_ticks = pdMS_TO_TICKS(UART_RX_TIMEOUT);
     
     while (!scan_complete && (xTaskGetTickCount() - start_time) < timeout_ticks && observer_running) {
-        int len = uart_read_bytes(UART_NUM, rx_buffer, UART_BUF_SIZE - 1, pdMS_TO_TICKS(100));
+        int len = uart_read_bytes(uart_port, rx_buffer, UART_BUF_SIZE - 1, pdMS_TO_TICKS(100));
         
         if (len > 0) {
             rx_buffer[len] = '\0';
@@ -5251,6 +6029,16 @@ static void observer_start_task(void *arg)
     observer_network_count = scanned_count;
     ESP_LOGI(TAG, "Scan complete: %d networks added to observer list", observer_network_count);
     
+    // Copy observer results to current tab's context for independent state
+    {
+        tab_context_t *ctx = get_current_ctx();
+        if (ctx && ctx->observer_networks) {
+            memcpy(ctx->observer_networks, observer_networks, sizeof(observer_network_t) * MAX_OBSERVER_NETWORKS);
+            ctx->observer_network_count = observer_network_count;
+            ESP_LOGI(TAG, "Copied %d observer results to tab %d context", observer_network_count, current_tab);
+        }
+    }
+    
     // Update UI immediately with scanned networks (all with 0 clients)
     bsp_display_lock(0);
     if (observer_status_label) {
@@ -5274,8 +6062,8 @@ static void observer_start_task(void *arg)
     bsp_display_unlock();
     
     vTaskDelay(pdMS_TO_TICKS(500));  // Short delay
-    uart_flush(UART_NUM);
-    uart_send_command("start_sniffer_noscan");
+    uart_flush(uart_port);
+    uart_send_command_for_tab("start_sniffer_noscan");
     
     vTaskDelay(pdMS_TO_TICKS(1000));  // Wait for sniffer to start
     
@@ -5332,20 +6120,20 @@ static void observer_start_btn_cb(lv_event_t *e)
         lv_obj_clean(observer_table);
     }
     
-    // In Kraken mode, use UART2 background scanning only - don't start UART1 task
-    if (hw_config == 1 && kraken_scanning_active) {
-        ESP_LOGI(TAG, "Kraken mode: using UART2 background scanning only");
-        lv_label_set_text(observer_status_label, "Kraken: UART2 scanning...");
+    // In UART2 tab with active Kraken scanning, use existing background scan
+    if (current_tab == 1 && kraken_scanning_active) {
+        ESP_LOGI(TAG, "UART2 tab: using background scanning");
+        lv_label_set_text(observer_status_label, "UART2: Scanning...");
         lv_obj_set_style_text_color(observer_status_label, COLOR_MATERIAL_CYAN, 0);
         
         // Show existing data if available
         if (observer_network_count > 0) {
             update_observer_table();
         }
-        return;  // Don't start UART1 task
+        return;  // Don't start new task
     }
     
-    // Monster mode: use UART1 observer task
+    // Start observer task for current tab's UART
     xTaskCreate(observer_start_task, "obs_start", 8192, NULL, 5, NULL);
 }
 
@@ -5367,30 +6155,23 @@ static void observer_stop_btn_cb(lv_event_t *e)
         xTimerStop(observer_timer, 0);
     }
     
-    // Send stop command only in Monster mode (UART1)
-    // In Kraken mode, UART2 background scanning continues
-    if (hw_config == 0) {
-    uart_send_command("stop");
-    }
+    // Send stop command to current tab's UART
+    uart_send_command_for_tab("stop");
     
     // Update UI
     lv_obj_clear_state(observer_start_btn, LV_STATE_DISABLED);
     lv_obj_add_state(observer_stop_btn, LV_STATE_DISABLED);
     
     if (observer_status_label) {
-        if (hw_config == 1) {
-            lv_label_set_text(observer_status_label, "Paused (UART2 scanning in background)");
-        } else {
         lv_label_set_text(observer_status_label, "Stopped");
-        }
     }
 }
 
-// Observer page back button handler
+// Observer page back button handler - hide page and show tiles
 static void observer_back_btn_event_cb(lv_event_t *e)
 {
     (void)e;
-    ESP_LOGI(TAG, "Observer back button clicked");
+    ESP_LOGI(TAG, "Observer back button clicked, returning to tiles for tab %d", current_tab);
     
     // Mark observer page as not visible
     observer_page_visible = false;
@@ -5404,55 +6185,61 @@ static void observer_back_btn_event_cb(lv_event_t *e)
         }
         // Only send stop command for UART1 scanning (non-Kraken mode)
         if (hw_config == 0) {  // Monster mode
-        uart_send_command("stop");
+            uart_send_command_for_tab("stop");
         }
     }
     
-    // Update eye icon visibility (show if Kraken scanning active)
-    update_kraken_eye_icon();
+    // Update portal icon visibility
     update_portal_icon();
     
-    show_main_tiles();
+    // Get current tab's data and show tiles
+    tab_context_t *ctx = get_current_ctx();
+    
+    // Hide observer page
+    if (ctx->observer_page) {
+        lv_obj_add_flag(ctx->observer_page, LV_OBJ_FLAG_HIDDEN);
+    }
+    
+    // Show tiles
+    if (ctx->tiles) {
+        lv_obj_clear_flag(ctx->tiles, LV_OBJ_FLAG_HIDDEN);
+        ctx->current_visible_page = ctx->tiles;
+    }
 }
 
-// Show Network Observer page
+// Show Network Observer page (inside current tab's container)
 static void show_observer_page(void)
 {
-    // Delete tiles container if present
-    if (tiles_container) {
-        lv_obj_del(tiles_container);
-        tiles_container = NULL;
+    // Get current tab's data and container
+    tab_context_t *ctx = get_current_ctx();
+    lv_obj_t *container = get_current_tab_container();
+    
+    if (!container) {
+        ESP_LOGE(TAG, "Container not initialized for tab %d", current_tab);
+        return;
     }
     
-    // Delete scan page if present
-    if (scan_page) {
-        lv_obj_del(scan_page);
-        scan_page = NULL;
-        scan_btn = NULL;
-        status_label = NULL;
-        network_list = NULL;
-        spinner = NULL;
+    // Hide all other pages
+    hide_all_pages(ctx);
+    
+    // If observer page already exists for this tab, just show it
+    if (ctx->observer_page) {
+        lv_obj_clear_flag(ctx->observer_page, LV_OBJ_FLAG_HIDDEN);
+        ctx->current_visible_page = ctx->observer_page;
+        observer_page = ctx->observer_page;  // Update legacy reference
+        ESP_LOGI(TAG, "Showing existing observer page for tab %d", current_tab);
+        return;
     }
     
-    // Delete existing observer page if present
-    if (observer_page) {
-        lv_obj_del(observer_page);
-        observer_page = NULL;
-    }
+    ESP_LOGI(TAG, "Creating new observer page for tab %d", current_tab);
     
-    lv_obj_t *scr = lv_scr_act();
+    // Mark observer page as visible
+    observer_page_visible = true;
     
-    // Set dark background
-    lv_obj_set_style_bg_color(scr, lv_color_hex(0x0A1A1A), 0);  // Dark teal-tinted
-    
-    // Create/update status bar
-    create_status_bar();
-    
-    // Create observer page container below status bar
-    observer_page = lv_obj_create(scr);
-    lv_coord_t obs_scr_height = lv_disp_get_ver_res(NULL);
-    lv_obj_set_size(observer_page, lv_pct(100), obs_scr_height - 40);  // Account for status bar
-    lv_obj_align(observer_page, LV_ALIGN_TOP_MID, 0, 40);  // Position below status bar
+    // Create observer page container inside tab container
+    ctx->observer_page = lv_obj_create(container);
+    observer_page = ctx->observer_page;  // Keep legacy reference for compatibility
+    lv_obj_set_size(observer_page, lv_pct(100), lv_pct(100));
     lv_obj_set_style_bg_color(observer_page, lv_color_hex(0x0A1A1A), 0);
     lv_obj_set_style_border_width(observer_page, 0, 0);
     lv_obj_set_style_pad_all(observer_page, 16, 0);
@@ -5543,17 +6330,18 @@ static void show_observer_page(void)
     lv_obj_set_style_text_color(observer_status_label, lv_color_hex(0x888888), 0);
     
     // Network table container (scrollable)
-    observer_table = lv_obj_create(observer_page);
-    lv_obj_set_size(observer_table, lv_pct(100), lv_pct(100));
-    lv_obj_set_flex_grow(observer_table, 1);
-    lv_obj_set_style_bg_color(observer_table, lv_color_hex(0x0A1A1A), 0);
-    lv_obj_set_style_border_color(observer_table, lv_color_hex(0x1A3333), 0);
-    lv_obj_set_style_border_width(observer_table, 1, 0);
-    lv_obj_set_style_radius(observer_table, 12, 0);
-    lv_obj_set_style_pad_all(observer_table, 8, 0);
-    lv_obj_set_flex_flow(observer_table, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_pad_row(observer_table, 6, 0);
-    lv_obj_set_scroll_dir(observer_table, LV_DIR_VER);
+    ctx->observer_table = lv_obj_create(observer_page);
+    observer_table = ctx->observer_table;  // Keep global reference for legacy code
+    lv_obj_set_size(ctx->observer_table, lv_pct(100), lv_pct(100));
+    lv_obj_set_flex_grow(ctx->observer_table, 1);
+    lv_obj_set_style_bg_color(ctx->observer_table, lv_color_hex(0x0A1A1A), 0);
+    lv_obj_set_style_border_color(ctx->observer_table, lv_color_hex(0x1A3333), 0);
+    lv_obj_set_style_border_width(ctx->observer_table, 1, 0);
+    lv_obj_set_style_radius(ctx->observer_table, 12, 0);
+    lv_obj_set_style_pad_all(ctx->observer_table, 8, 0);
+    lv_obj_set_flex_flow(ctx->observer_table, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(ctx->observer_table, 6, 0);
+    lv_obj_set_scroll_dir(ctx->observer_table, LV_DIR_VER);
     
     // If we have existing data, show it
     if (observer_network_count > 0) {
@@ -5571,18 +6359,15 @@ static void show_observer_page(void)
     // Mark observer page as visible
     observer_page_visible = true;
     
-    // Hide eye icon since we're on the observer page
-    update_kraken_eye_icon();
     update_portal_icon();
     
-    // In Kraken mode, start background scanning on UART2 if not already running
-    // In Kraken mode, auto-start display and use UART2 background scanning
-    if (hw_config == 1 && uart2_initialized) {
+    // In UART2 tab, start background scanning if not already running
+    if (current_tab == 1 && uart2_initialized) {
         if (!kraken_scanning_active) {
             start_kraken_scanning();
         }
         
-        // Auto-start display in Kraken mode - no need to click Start button
+        // Auto-start display in UART2 tab
         if (kraken_scanning_active) {
             observer_running = true;
             observer_page_visible = true;
@@ -5591,14 +6376,14 @@ static void show_observer_page(void)
             lv_obj_add_state(observer_start_btn, LV_STATE_DISABLED);
             lv_obj_clear_state(observer_stop_btn, LV_STATE_DISABLED);
             
-            lv_label_set_text(observer_status_label, "Kraken: UART2 continuous scanning...");
+            lv_label_set_text(observer_status_label, "UART2: Continuous scanning...");
             lv_obj_set_style_text_color(observer_status_label, COLOR_MATERIAL_CYAN, 0);
-            
-            // Hide eye icon since we're on the observer page
-            update_kraken_eye_icon();
             update_portal_icon();
         }
     }
+    
+    // Set current visible page
+    ctx->current_visible_page = ctx->observer_page;
 }
 
 // ======================= ESP Modem Page =======================
@@ -5897,8 +6682,18 @@ static void esp_modem_scan_btn_click_cb(lv_event_t *e)
 static void esp_modem_back_btn_event_cb(lv_event_t *e)
 {
     (void)e;
-    ESP_LOGI(TAG, "ESP Modem back button clicked");
-    show_main_tiles();
+    ESP_LOGI(TAG, "ESP Modem back button clicked, returning to tiles for tab %d", current_tab);
+    
+    tab_context_t *ctx = get_current_ctx();
+    
+    if (ctx->current_visible_page) {
+        lv_obj_add_flag(ctx->current_visible_page, LV_OBJ_FLAG_HIDDEN);
+    }
+    
+    if (ctx->tiles) {
+        lv_obj_clear_flag(ctx->tiles, LV_OBJ_FLAG_HIDDEN);
+        ctx->current_visible_page = ctx->tiles;
+    }
 }
 
 // Show ESP Modem page
@@ -5941,18 +6736,19 @@ static void show_esp_modem_page(void)
     // Set dark background with orange tint
     lv_obj_set_style_bg_color(scr, lv_color_hex(0x1A1410), 0);
     
-    // Create/update status bar
+    // Create/update status bar and tab bar
     create_status_bar();
-    
-    // Update eye icon visibility (Kraken background scanning)
-    update_kraken_eye_icon();
+    create_tab_bar();
     update_portal_icon();
     
-    // Create ESP Modem page container below status bar
-    esp_modem_page = lv_obj_create(scr);
+    lv_obj_t *container = get_current_tab_container();
+    if (!container) return;
+    
+    // Create ESP Modem page container inside tab container
+    esp_modem_page = lv_obj_create(container);
     lv_coord_t modem_scr_height = lv_disp_get_ver_res(NULL);
-    lv_obj_set_size(esp_modem_page, lv_pct(100), modem_scr_height - 40);  // Account for status bar
-    lv_obj_align(esp_modem_page, LV_ALIGN_TOP_MID, 0, 40);  // Position below status bar
+    lv_obj_set_size(esp_modem_page, lv_pct(100), modem_scr_height - 85);  // Account for status bar + tab bar
+    lv_obj_align(esp_modem_page, LV_ALIGN_TOP_MID, 0, 85);  // Position below status bar + tab bar
     lv_obj_set_style_bg_color(esp_modem_page, lv_color_hex(0x1A1410), 0);
     lv_obj_set_style_border_width(esp_modem_page, 0, 0);
     lv_obj_set_style_pad_all(esp_modem_page, 16, 0);
@@ -6115,10 +6911,11 @@ static void show_blackout_confirm_popup(void)
 {
     if (blackout_popup_obj != NULL) return;  // Already showing
     
-    lv_obj_t *scr = lv_scr_act();
+    lv_obj_t *container = get_current_tab_container();
+    if (!container) return;
     
-    // Create modal overlay (full screen, semi-transparent, blocks input behind)
-    blackout_popup_overlay = lv_obj_create(scr);
+    // Create modal overlay (fills container, semi-transparent, blocks input behind)
+    blackout_popup_overlay = lv_obj_create(container);
     lv_obj_remove_style_all(blackout_popup_overlay);
     lv_obj_set_size(blackout_popup_overlay, lv_pct(100), lv_pct(100));
     lv_obj_set_style_bg_color(blackout_popup_overlay, lv_color_hex(0x000000), 0);
@@ -6201,14 +6998,15 @@ static void show_blackout_active_popup(void)
 {
     if (blackout_popup_obj != NULL) return;  // Already showing
     
-    lv_obj_t *scr = lv_scr_act();
+    lv_obj_t *container = get_current_tab_container();
+    if (!container) return;
     
     // Send start_blackout command via UART1 (always UART1, regardless of Monster/Kraken)
     ESP_LOGI(TAG, "Sending start_blackout command via UART1");
     uart_send_command("start_blackout");
     
     // Create modal overlay
-    blackout_popup_overlay = lv_obj_create(scr);
+    blackout_popup_overlay = lv_obj_create(container);
     lv_obj_remove_style_all(blackout_popup_overlay);
     lv_obj_set_size(blackout_popup_overlay, lv_pct(100), lv_pct(100));
     lv_obj_set_style_bg_color(blackout_popup_overlay, lv_color_hex(0x000000), 0);
@@ -6322,10 +7120,11 @@ static void show_snifferdog_confirm_popup(void)
 {
     if (snifferdog_popup_obj != NULL) return;  // Already showing
     
-    lv_obj_t *scr = lv_scr_act();
+    lv_obj_t *container = get_current_tab_container();
+    if (!container) return;
     
-    // Create modal overlay (full screen, semi-transparent, blocks input behind)
-    snifferdog_popup_overlay = lv_obj_create(scr);
+    // Create modal overlay (fills container, semi-transparent, blocks input behind)
+    snifferdog_popup_overlay = lv_obj_create(container);
     lv_obj_remove_style_all(snifferdog_popup_overlay);
     lv_obj_set_size(snifferdog_popup_overlay, lv_pct(100), lv_pct(100));
     lv_obj_set_style_bg_color(snifferdog_popup_overlay, lv_color_hex(0x000000), 0);
@@ -6408,14 +7207,15 @@ static void show_snifferdog_active_popup(void)
 {
     if (snifferdog_popup_obj != NULL) return;  // Already showing
     
-    lv_obj_t *scr = lv_scr_act();
+    lv_obj_t *container = get_current_tab_container();
+    if (!container) return;
     
     // Send start_sniffer_dog command via UART1 (always UART1)
     ESP_LOGI(TAG, "Sending start_sniffer_dog command via UART1");
     uart_send_command("start_sniffer_dog");
     
     // Create modal overlay
-    snifferdog_popup_overlay = lv_obj_create(scr);
+    snifferdog_popup_overlay = lv_obj_create(container);
     lv_obj_remove_style_all(snifferdog_popup_overlay);
     lv_obj_set_size(snifferdog_popup_overlay, lv_pct(100), lv_pct(100));
     lv_obj_set_style_bg_color(snifferdog_popup_overlay, lv_color_hex(0x000000), 0);
@@ -6616,10 +7416,11 @@ static void show_global_handshaker_confirm_popup(void)
 {
     if (global_handshaker_popup_obj != NULL) return;  // Already showing
     
-    lv_obj_t *scr = lv_scr_act();
+    lv_obj_t *container = get_current_tab_container();
+    if (!container) return;
     
-    // Create modal overlay (full screen, semi-transparent, blocks input behind)
-    global_handshaker_popup_overlay = lv_obj_create(scr);
+    // Create modal overlay (fills container, semi-transparent, blocks input behind)
+    global_handshaker_popup_overlay = lv_obj_create(container);
     lv_obj_remove_style_all(global_handshaker_popup_overlay);
     lv_obj_set_size(global_handshaker_popup_overlay, lv_pct(100), lv_pct(100));
     lv_obj_set_style_bg_color(global_handshaker_popup_overlay, lv_color_hex(0x000000), 0);
@@ -6702,14 +7503,15 @@ static void show_global_handshaker_active_popup(void)
 {
     if (global_handshaker_popup_obj != NULL) return;  // Already showing
     
-    lv_obj_t *scr = lv_scr_act();
+    lv_obj_t *container = get_current_tab_container();
+    if (!container) return;
     
     // Send start_handshake command via UART1 (always UART1)
     ESP_LOGI(TAG, "Sending start_handshake command via UART1");
     uart_send_command("start_handshake");
     
     // Create modal overlay
-    global_handshaker_popup_overlay = lv_obj_create(scr);
+    global_handshaker_popup_overlay = lv_obj_create(container);
     lv_obj_remove_style_all(global_handshaker_popup_overlay);
     lv_obj_set_size(global_handshaker_popup_overlay, lv_pct(100), lv_pct(100));
     lv_obj_set_style_bg_color(global_handshaker_popup_overlay, lv_color_hex(0x000000), 0);
@@ -6905,13 +7707,14 @@ static void show_phishing_portal_active_popup(void)
 {
     if (phishing_portal_popup_obj != NULL) return;
     
-    lv_obj_t *scr = lv_scr_act();
+    lv_obj_t *container = get_current_tab_container();
+    if (!container) return;
     
     // Reset submit count
     phishing_portal_submit_count = 0;
     
     // Create modal overlay
-    phishing_portal_popup_overlay = lv_obj_create(scr);
+    phishing_portal_popup_overlay = lv_obj_create(container);
     lv_obj_remove_style_all(phishing_portal_popup_overlay);
     lv_obj_set_size(phishing_portal_popup_overlay, lv_pct(100), lv_pct(100));
     lv_obj_set_style_bg_color(phishing_portal_popup_overlay, lv_color_hex(0x000000), 0);
@@ -7006,14 +7809,14 @@ static void phishing_portal_start_cb(lv_event_t *e)
     // Close setup popup first
     close_phishing_portal_popup();
     
-    // Send commands via UART1
+    // Send commands to current tab's UART
     char cmd[128];
     snprintf(cmd, sizeof(cmd), "select_html %d", html_idx);
-    uart_send_command(cmd);
+    uart_send_command_for_tab(cmd);
     vTaskDelay(pdMS_TO_TICKS(100));
     
     snprintf(cmd, sizeof(cmd), "start_portal %s", phishing_portal_ssid);
-    uart_send_command(cmd);
+    uart_send_command_for_tab(cmd);
     
     // Show active popup
     show_phishing_portal_active_popup();
@@ -7067,10 +7870,11 @@ static void show_phishing_portal_popup(void)
         return;
     }
     
-    lv_obj_t *scr = lv_scr_act();
+    lv_obj_t *container = get_current_tab_container();
+    if (!container) return;
     
     // Create modal overlay
-    phishing_portal_popup_overlay = lv_obj_create(scr);
+    phishing_portal_popup_overlay = lv_obj_create(container);
     lv_obj_remove_style_all(phishing_portal_popup_overlay);
     lv_obj_set_size(phishing_portal_popup_overlay, lv_pct(100), lv_pct(100));
     lv_obj_set_style_bg_color(phishing_portal_popup_overlay, lv_color_hex(0x000000), 0);
@@ -7293,7 +8097,8 @@ static void show_wardrive_popup(void)
 {
     if (wardrive_popup_obj != NULL) return;
     
-    lv_obj_t *scr = lv_scr_act();
+    lv_obj_t *container = get_current_tab_container();
+    if (!container) return;
     
     // Reset state
     wardrive_gps_fix_obtained = false;
@@ -7303,7 +8108,7 @@ static void show_wardrive_popup(void)
     uart_send_command("start_wardrive");
     
     // Create modal overlay
-    wardrive_popup_overlay = lv_obj_create(scr);
+    wardrive_popup_overlay = lv_obj_create(container);
     lv_obj_remove_style_all(wardrive_popup_overlay);
     lv_obj_set_size(wardrive_popup_overlay, lv_pct(100), lv_pct(100));
     lv_obj_set_style_bg_color(wardrive_popup_overlay, lv_color_hex(0x000000), 0);
@@ -7386,15 +8191,22 @@ static void compromised_data_back_btn_event_cb(lv_event_t *e)
     show_compromised_data_page();
 }
 
-// Back to main from compromised data page
+// Back to main from compromised data page - hide page and show tiles
 static void compromised_data_main_back_btn_event_cb(lv_event_t *e)
 {
     (void)e;
-    if (compromised_data_page) {
-        lv_obj_del(compromised_data_page);
-        compromised_data_page = NULL;
+    tab_context_t *ctx = get_current_ctx();
+    
+    // Hide compromised data page
+    if (ctx->compromised_data_page) {
+        lv_obj_add_flag(ctx->compromised_data_page, LV_OBJ_FLAG_HIDDEN);
     }
-    show_main_tiles();
+    
+    // Show tiles
+    if (ctx->tiles) {
+        lv_obj_clear_flag(ctx->tiles, LV_OBJ_FLAG_HIDDEN);
+        ctx->current_visible_page = ctx->tiles;
+    }
 }
 
 // Tile click handler for compromised data sub-tiles
@@ -7412,33 +8224,35 @@ static void compromised_data_tile_event_cb(lv_event_t *e)
     }
 }
 
-// Show Compromised Data page with 3 tiles
+// Show Compromised Data page with 3 tiles (inside current tab's container)
 static void show_compromised_data_page(void)
 {
-    // Delete tiles container if present
-    if (tiles_container) {
-        lv_obj_del(tiles_container);
-        tiles_container = NULL;
+    tab_context_t *ctx = get_current_ctx();
+    lv_obj_t *container = get_current_tab_container();
+    
+    if (!container) {
+        ESP_LOGE(TAG, "Container not initialized for tab %d", current_tab);
+        return;
     }
     
-    // Delete existing page if present
-    if (compromised_data_page) {
-        lv_obj_del(compromised_data_page);
-        compromised_data_page = NULL;
+    // Hide all other pages
+    hide_all_pages(ctx);
+    
+    // If page already exists, just show it
+    if (ctx->compromised_data_page) {
+        lv_obj_clear_flag(ctx->compromised_data_page, LV_OBJ_FLAG_HIDDEN);
+        ctx->current_visible_page = ctx->compromised_data_page;
+        compromised_data_page = ctx->compromised_data_page;
+        ESP_LOGI(TAG, "Showing existing compromised data page for tab %d", current_tab);
+        return;
     }
     
-    lv_obj_t *scr = lv_scr_act();
-    lv_obj_set_style_bg_color(scr, lv_color_hex(0x1A1A1A), 0);
+    ESP_LOGI(TAG, "Creating new compromised data page for tab %d", current_tab);
     
-    create_status_bar();
-    update_kraken_eye_icon();
-    update_portal_icon();
-    
-    // Create page container
-    compromised_data_page = lv_obj_create(scr);
-    lv_coord_t scr_height = lv_disp_get_ver_res(NULL);
-    lv_obj_set_size(compromised_data_page, lv_pct(100), scr_height - 40);
-    lv_obj_align(compromised_data_page, LV_ALIGN_TOP_MID, 0, 40);
+    // Create page container inside tab container
+    ctx->compromised_data_page = lv_obj_create(container);
+    compromised_data_page = ctx->compromised_data_page;
+    lv_obj_set_size(compromised_data_page, lv_pct(100), lv_pct(100));
     lv_obj_set_style_bg_color(compromised_data_page, lv_color_hex(0x1A1A1A), 0);
     lv_obj_set_style_border_width(compromised_data_page, 0, 0);
     lv_obj_set_style_pad_all(compromised_data_page, 10, 0);
@@ -7490,6 +8304,9 @@ static void show_compromised_data_page(void)
     create_tile(tiles, LV_SYMBOL_LIST, "Evil Twin\nPasswords", COLOR_MATERIAL_AMBER, compromised_data_tile_event_cb, "Evil Twin Passwords");
     create_tile(tiles, LV_SYMBOL_FILE, "Portal\nData", COLOR_MATERIAL_TEAL, compromised_data_tile_event_cb, "Portal Data");
     create_tile(tiles, LV_SYMBOL_DOWNLOAD, "Handshakes", COLOR_MATERIAL_PURPLE, compromised_data_tile_event_cb, "Handshakes");
+    
+    // Set current visible page
+    ctx->current_visible_page = ctx->compromised_data_page;
 }
 
 //==================================================================================
@@ -7507,14 +8324,17 @@ static void show_evil_twin_passwords_page(void)
     lv_obj_set_style_bg_color(scr, lv_color_hex(0x1A1A1A), 0);
     
     create_status_bar();
-    update_kraken_eye_icon();
+    create_tab_bar();
     update_portal_icon();
     
+    lv_obj_t *container = get_current_tab_container();
+    if (!container) return;
+    
     // Create page
-    compromised_data_page = lv_obj_create(scr);
+    compromised_data_page = lv_obj_create(container);
     lv_coord_t scr_height = lv_disp_get_ver_res(NULL);
-    lv_obj_set_size(compromised_data_page, lv_pct(100), scr_height - 40);
-    lv_obj_align(compromised_data_page, LV_ALIGN_TOP_MID, 0, 40);
+    lv_obj_set_size(compromised_data_page, lv_pct(100), scr_height - 85);
+    lv_obj_align(compromised_data_page, LV_ALIGN_TOP_MID, 0, 85);
     lv_obj_set_style_bg_color(compromised_data_page, lv_color_hex(0x1A1A1A), 0);
     lv_obj_set_style_border_width(compromised_data_page, 0, 0);
     lv_obj_set_style_pad_all(compromised_data_page, 10, 0);
@@ -7566,15 +8386,16 @@ static void show_evil_twin_passwords_page(void)
     lv_obj_set_style_pad_row(list_container, 8, 0);
     
     // Send UART command and read response
-    uart_send_command("show_pass evil");
+    uart_send_command_for_tab("show_pass evil");
     vTaskDelay(pdMS_TO_TICKS(500));
     
     static char rx_buffer[2048];
     int total_len = 0;
     int retries = 5;
+    uart_port_t uart_port = (current_tab == 1 && uart2_initialized) ? UART2_NUM : UART_NUM;
     
     while (retries-- > 0) {
-        int len = uart_read_bytes(UART_NUM, rx_buffer + total_len, sizeof(rx_buffer) - total_len - 1, pdMS_TO_TICKS(200));
+        int len = uart_read_bytes(uart_port, rx_buffer + total_len, sizeof(rx_buffer) - total_len - 1, pdMS_TO_TICKS(200));
         if (len > 0) {
             total_len += len;
         }
@@ -7692,10 +8513,11 @@ static void show_evil_twin_connect_popup(const char *ssid, const char *password)
     strncpy(arp_target_password, password, sizeof(arp_target_password) - 1);
     arp_target_password[sizeof(arp_target_password) - 1] = '\0';
     
-    lv_obj_t *scr = lv_scr_act();
+    lv_obj_t *container = get_current_tab_container();
+    if (!container) return;
     
     // Create overlay
-    evil_twin_connect_popup_overlay = lv_obj_create(scr);
+    evil_twin_connect_popup_overlay = lv_obj_create(container);
     lv_obj_remove_style_all(evil_twin_connect_popup_overlay);
     lv_obj_set_size(evil_twin_connect_popup_overlay, lv_pct(100), lv_pct(100));
     lv_obj_set_style_bg_color(evil_twin_connect_popup_overlay, lv_color_hex(0x000000), 0);
@@ -7842,18 +8664,14 @@ static void karma2_fetch_probes(void)
 {
     ESP_LOGI(TAG, "Fetching probes from UART...");
     
-    // Determine which UART to use
-    uart_port_t uart_port = (hw_config == 1) ? UART2_NUM : UART_NUM;
+    // Determine which UART to use based on current tab
+    uart_port_t uart_port = get_current_uart();
     
     // Flush UART buffer
     uart_flush(uart_port);
     
-    // Send list_probes command
-    if (hw_config == 1) {
-        uart2_send_command("list_probes");
-    } else {
-        uart_send_command("list_probes");
-    }
+    // Send list_probes command to current tab's UART
+    uart_send_command_for_tab("list_probes");
     
     // Wait for response
     static char rx_buffer[2048];
@@ -7908,9 +8726,10 @@ static void karma2_fetch_probes(void)
     ESP_LOGI(TAG, "Found %d probes", karma2_probe_count);
     
     // Show popup with probes list
-    lv_obj_t *scr = lv_scr_act();
+    lv_obj_t *container = get_current_tab_container();
+    if (!container) return;
     
-    karma2_probes_popup_overlay = lv_obj_create(scr);
+    karma2_probes_popup_overlay = lv_obj_create(container);
     lv_obj_remove_style_all(karma2_probes_popup_overlay);
     lv_obj_set_size(karma2_probes_popup_overlay, lv_pct(100), lv_pct(100));
     lv_obj_set_style_bg_color(karma2_probes_popup_overlay, lv_color_hex(0x000000), 0);
@@ -8097,9 +8916,10 @@ static void show_karma2_html_popup(void)
     // Fetch HTML files first
     karma2_fetch_html_files();
     
-    lv_obj_t *scr = lv_scr_act();
+    lv_obj_t *container = get_current_tab_container();
+    if (!container) return;
     
-    karma2_html_popup_overlay = lv_obj_create(scr);
+    karma2_html_popup_overlay = lv_obj_create(container);
     lv_obj_remove_style_all(karma2_html_popup_overlay);
     lv_obj_set_size(karma2_html_popup_overlay, lv_pct(100), lv_pct(100));
     lv_obj_set_style_bg_color(karma2_html_popup_overlay, lv_color_hex(0x000000), 0);
@@ -8518,42 +9338,42 @@ static void dns_server_task(void *pvParameters)
         while (!portal_active) {
             vTaskDelay(pdMS_TO_TICKS(100));
         }
-        
-        // Create UDP socket
-        dns_server_socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-        if (dns_server_socket < 0) {
-            ESP_LOGE(TAG, "DNS: Failed to create socket");
+    
+    // Create UDP socket
+    dns_server_socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (dns_server_socket < 0) {
+        ESP_LOGE(TAG, "DNS: Failed to create socket");
             vTaskDelay(pdMS_TO_TICKS(1000));
             continue;
-        }
-        
-        // Bind to port 53
-        memset(&server_addr, 0, sizeof(server_addr));
-        server_addr.sin_family = AF_INET;
-        server_addr.sin_port = htons(53);
-        server_addr.sin_addr.s_addr = INADDR_ANY;
-        
-        if (bind(dns_server_socket, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
-            ESP_LOGE(TAG, "DNS: Failed to bind socket");
-            close(dns_server_socket);
-            dns_server_socket = -1;
+    }
+    
+    // Bind to port 53
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(53);
+    server_addr.sin_addr.s_addr = INADDR_ANY;
+    
+    if (bind(dns_server_socket, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+        ESP_LOGE(TAG, "DNS: Failed to bind socket");
+        close(dns_server_socket);
+        dns_server_socket = -1;
             vTaskDelay(pdMS_TO_TICKS(1000));
             continue;
-        }
-        
-        ESP_LOGI(TAG, "DNS server started on port 53");
-        
-        // Set socket timeout
-        struct timeval timeout;
-        timeout.tv_sec = 1;
-        timeout.tv_usec = 0;
-        setsockopt(dns_server_socket, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-        
+    }
+    
+    ESP_LOGI(TAG, "DNS server started on port 53");
+    
+    // Set socket timeout
+    struct timeval timeout;
+    timeout.tv_sec = 1;
+    timeout.tv_usec = 0;
+    setsockopt(dns_server_socket, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    
         // Inner loop - handle DNS requests while portal is active
-        while (portal_active && dns_server_socket >= 0) {
+    while (portal_active && dns_server_socket >= 0) {
             int len = recvfrom(dns_server_socket, rx_buffer, DNS_MAX_PACKET_SIZE, 0,
-                              (struct sockaddr *)&client_addr, &client_addr_len);
-            
+                          (struct sockaddr *)&client_addr, &client_addr_len);
+        
             if (len < 0) {
                 // Check if it's just a timeout (EAGAIN/EWOULDBLOCK) - ignore and continue
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -8562,68 +9382,68 @@ static void dns_server_task(void *pvParameters)
                 break;  // Real socket error
             }
             if (!portal_active || dns_server_socket < 0) break;  // Portal stopped
-            if (len < 12) continue;  // Invalid DNS packet
-            
-            // Build DNS response - redirect all queries to 172.0.0.1
-            memcpy(tx_buffer, rx_buffer, len);
-            
-            // Set response flags
-            tx_buffer[2] = 0x81;  // QR=1 (response), Opcode=0, AA=1
-            tx_buffer[3] = 0x80;  // RA=1
-            
-            // Set answer count = 1
-            tx_buffer[6] = 0x00;
-            tx_buffer[7] = 0x01;
-            
-            // Find end of question section
-            int question_end = 12;
-            while (question_end < len && rx_buffer[question_end] != 0) {
-                question_end += rx_buffer[question_end] + 1;
-            }
-            question_end += 5;  // Skip null byte + QTYPE (2) + QCLASS (2)
-            
-            // Build answer section
-            int answer_offset = question_end;
-            
-            // Name pointer to question
-            tx_buffer[answer_offset++] = 0xC0;
-            tx_buffer[answer_offset++] = 0x0C;
-            
-            // Type A
-            tx_buffer[answer_offset++] = 0x00;
-            tx_buffer[answer_offset++] = 0x01;
-            
-            // Class IN
-            tx_buffer[answer_offset++] = 0x00;
-            tx_buffer[answer_offset++] = 0x01;
-            
-            // TTL (60 seconds)
-            tx_buffer[answer_offset++] = 0x00;
-            tx_buffer[answer_offset++] = 0x00;
-            tx_buffer[answer_offset++] = 0x00;
-            tx_buffer[answer_offset++] = 0x3C;
-            
-            // Data length (4 bytes for IPv4)
-            tx_buffer[answer_offset++] = 0x00;
-            tx_buffer[answer_offset++] = 0x04;
-            
-            // IP address: 172.0.0.1
-            tx_buffer[answer_offset++] = 172;
-            tx_buffer[answer_offset++] = 0;
-            tx_buffer[answer_offset++] = 0;
-            tx_buffer[answer_offset++] = 1;
-            
-            sendto(dns_server_socket, tx_buffer, answer_offset, 0,
-                   (struct sockaddr *)&client_addr, client_addr_len);
-        }
+        if (len < 12) continue;  // Invalid DNS packet
         
+        // Build DNS response - redirect all queries to 172.0.0.1
+        memcpy(tx_buffer, rx_buffer, len);
+        
+        // Set response flags
+        tx_buffer[2] = 0x81;  // QR=1 (response), Opcode=0, AA=1
+        tx_buffer[3] = 0x80;  // RA=1
+        
+        // Set answer count = 1
+        tx_buffer[6] = 0x00;
+        tx_buffer[7] = 0x01;
+        
+        // Find end of question section
+        int question_end = 12;
+        while (question_end < len && rx_buffer[question_end] != 0) {
+            question_end += rx_buffer[question_end] + 1;
+        }
+        question_end += 5;  // Skip null byte + QTYPE (2) + QCLASS (2)
+        
+        // Build answer section
+        int answer_offset = question_end;
+        
+        // Name pointer to question
+        tx_buffer[answer_offset++] = 0xC0;
+        tx_buffer[answer_offset++] = 0x0C;
+        
+        // Type A
+        tx_buffer[answer_offset++] = 0x00;
+        tx_buffer[answer_offset++] = 0x01;
+        
+        // Class IN
+        tx_buffer[answer_offset++] = 0x00;
+        tx_buffer[answer_offset++] = 0x01;
+        
+        // TTL (60 seconds)
+        tx_buffer[answer_offset++] = 0x00;
+        tx_buffer[answer_offset++] = 0x00;
+        tx_buffer[answer_offset++] = 0x00;
+        tx_buffer[answer_offset++] = 0x3C;
+        
+        // Data length (4 bytes for IPv4)
+        tx_buffer[answer_offset++] = 0x00;
+        tx_buffer[answer_offset++] = 0x04;
+        
+        // IP address: 172.0.0.1
+        tx_buffer[answer_offset++] = 172;
+        tx_buffer[answer_offset++] = 0;
+        tx_buffer[answer_offset++] = 0;
+        tx_buffer[answer_offset++] = 1;
+        
+        sendto(dns_server_socket, tx_buffer, answer_offset, 0,
+               (struct sockaddr *)&client_addr, client_addr_len);
+    }
+    
         // Close socket when portal stops
         if (dns_server_socket >= 0) {
             close(dns_server_socket);
             dns_server_socket = -1;
         }
-        
-        ESP_LOGI(TAG, "DNS server stopped");
+    
+    ESP_LOGI(TAG, "DNS server stopped");
         
         // Don't exit - go back to waiting for portal_active
         // This avoids pthread TLS cleanup issues with vTaskDelete
@@ -8642,6 +9462,9 @@ static esp_err_t start_captive_portal(const char *ssid)
     }
     
     ESP_LOGI(TAG, "Starting captive portal with SSID: %s", ssid);
+    
+    // Track which tab (UART) started the portal
+    portal_started_by_uart = current_tab + 1;  // 1=UART1, 2=UART2 (INTERNAL tab uses 0)
     
     // Ensure WiFi is initialized via ESP-Hosted
     if (!esp_modem_wifi_initialized) {
@@ -8738,52 +9561,52 @@ static esp_err_t start_captive_portal(const char *ssid)
     
     // Start HTTP server only if not already running (we never stop it to avoid TLS crash)
     if (portal_server == NULL) {
-        httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-        config.server_port = 80;
-        config.max_open_sockets = 7;
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.server_port = 80;
+    config.max_open_sockets = 7;
         config.max_uri_handlers = 12;  // We have 10 handlers, default is 8
-        config.uri_match_fn = httpd_uri_match_wildcard;
+    config.uri_match_fn = httpd_uri_match_wildcard;
         config.stack_size = 8192;      // Increase stack for larger requests
         config.recv_wait_timeout = 10; // Increase timeout for slow clients
-        
-        ret = httpd_start(&portal_server, &config);
-        if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to start HTTP server: %s", esp_err_to_name(ret));
-            return ret;
-        }
-        
-        ESP_LOGI(TAG, "HTTP server started on port 80");
-        
+    
+    ret = httpd_start(&portal_server, &config);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start HTTP server: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    
+    ESP_LOGI(TAG, "HTTP server started on port 80");
+    
         // Register URI handlers (only once, handlers stay registered)
-        httpd_uri_t root_uri = { .uri = "/", .method = HTTP_GET, .handler = portal_root_handler };
-        httpd_register_uri_handler(portal_server, &root_uri);
-        
-        httpd_uri_t root_post_uri = { .uri = "/", .method = HTTP_POST, .handler = portal_root_handler };
-        httpd_register_uri_handler(portal_server, &root_post_uri);
-        
-        httpd_uri_t portal_uri = { .uri = "/portal", .method = HTTP_GET, .handler = portal_page_handler };
-        httpd_register_uri_handler(portal_server, &portal_uri);
-        
-        httpd_uri_t login_uri = { .uri = "/login", .method = HTTP_POST, .handler = portal_login_handler };
-        httpd_register_uri_handler(portal_server, &login_uri);
-        
-        httpd_uri_t get_uri = { .uri = "/get", .method = HTTP_GET, .handler = portal_get_handler };
-        httpd_register_uri_handler(portal_server, &get_uri);
-        
-        httpd_uri_t save_uri = { .uri = "/save", .method = HTTP_POST, .handler = portal_save_handler };
-        httpd_register_uri_handler(portal_server, &save_uri);
-        
-        httpd_uri_t android_uri = { .uri = "/generate_204", .method = HTTP_GET, .handler = android_captive_handler };
-        httpd_register_uri_handler(portal_server, &android_uri);
-        
-        httpd_uri_t ios_uri = { .uri = "/hotspot-detect.html", .method = HTTP_GET, .handler = ios_captive_handler };
-        httpd_register_uri_handler(portal_server, &ios_uri);
-        
-        httpd_uri_t ncsi_uri = { .uri = "/ncsi.txt", .method = HTTP_GET, .handler = captive_detection_handler };
-        httpd_register_uri_handler(portal_server, &ncsi_uri);
-        
-        httpd_uri_t wildcard_uri = { .uri = "/*", .method = HTTP_GET, .handler = captive_portal_redirect_handler };
-        httpd_register_uri_handler(portal_server, &wildcard_uri);
+    httpd_uri_t root_uri = { .uri = "/", .method = HTTP_GET, .handler = portal_root_handler };
+    httpd_register_uri_handler(portal_server, &root_uri);
+    
+    httpd_uri_t root_post_uri = { .uri = "/", .method = HTTP_POST, .handler = portal_root_handler };
+    httpd_register_uri_handler(portal_server, &root_post_uri);
+    
+    httpd_uri_t portal_uri = { .uri = "/portal", .method = HTTP_GET, .handler = portal_page_handler };
+    httpd_register_uri_handler(portal_server, &portal_uri);
+    
+    httpd_uri_t login_uri = { .uri = "/login", .method = HTTP_POST, .handler = portal_login_handler };
+    httpd_register_uri_handler(portal_server, &login_uri);
+    
+    httpd_uri_t get_uri = { .uri = "/get", .method = HTTP_GET, .handler = portal_get_handler };
+    httpd_register_uri_handler(portal_server, &get_uri);
+    
+    httpd_uri_t save_uri = { .uri = "/save", .method = HTTP_POST, .handler = portal_save_handler };
+    httpd_register_uri_handler(portal_server, &save_uri);
+    
+    httpd_uri_t android_uri = { .uri = "/generate_204", .method = HTTP_GET, .handler = android_captive_handler };
+    httpd_register_uri_handler(portal_server, &android_uri);
+    
+    httpd_uri_t ios_uri = { .uri = "/hotspot-detect.html", .method = HTTP_GET, .handler = ios_captive_handler };
+    httpd_register_uri_handler(portal_server, &ios_uri);
+    
+    httpd_uri_t ncsi_uri = { .uri = "/ncsi.txt", .method = HTTP_GET, .handler = captive_detection_handler };
+    httpd_register_uri_handler(portal_server, &ncsi_uri);
+    
+    httpd_uri_t wildcard_uri = { .uri = "/*", .method = HTTP_GET, .handler = captive_portal_redirect_handler };
+    httpd_register_uri_handler(portal_server, &wildcard_uri);
     } else {
         ESP_LOGI(TAG, "HTTP server already running, reusing");
     }
@@ -8809,6 +9632,7 @@ static void stop_captive_portal(void)
     
     // Signal task to stop
     portal_active = false;
+    portal_started_by_uart = 0;  // Reset which UART started portal
     
     // Don't delete DNS server task - it has an outer loop and will wait for portal_active
     // Deleting tasks that use sockets causes pthread TLS cleanup issues on ESP32
@@ -8851,9 +9675,10 @@ static void stop_captive_portal(void)
 
 static void show_karma2_attack_popup(const char *ssid)
 {
-    lv_obj_t *scr = lv_scr_act();
+    lv_obj_t *container = get_current_tab_container();
+    if (!container) return;
     
-    karma2_attack_popup_overlay = lv_obj_create(scr);
+    karma2_attack_popup_overlay = lv_obj_create(container);
     lv_obj_remove_style_all(karma2_attack_popup_overlay);
     lv_obj_set_size(karma2_attack_popup_overlay, lv_pct(100), lv_pct(100));
     lv_obj_set_style_bg_color(karma2_attack_popup_overlay, lv_color_hex(0x000000), 0);
@@ -8979,14 +9804,17 @@ static void show_portal_data_page(void)
     lv_obj_set_style_bg_color(scr, lv_color_hex(0x1A1A1A), 0);
     
     create_status_bar();
-    update_kraken_eye_icon();
+    create_tab_bar();
     update_portal_icon();
     
+    lv_obj_t *container = get_current_tab_container();
+    if (!container) return;
+    
     // Create page
-    compromised_data_page = lv_obj_create(scr);
+    compromised_data_page = lv_obj_create(container);
     lv_coord_t scr_height = lv_disp_get_ver_res(NULL);
-    lv_obj_set_size(compromised_data_page, lv_pct(100), scr_height - 40);
-    lv_obj_align(compromised_data_page, LV_ALIGN_TOP_MID, 0, 40);
+    lv_obj_set_size(compromised_data_page, lv_pct(100), scr_height - 85);
+    lv_obj_align(compromised_data_page, LV_ALIGN_TOP_MID, 0, 85);
     lv_obj_set_style_bg_color(compromised_data_page, lv_color_hex(0x1A1A1A), 0);
     lv_obj_set_style_border_width(compromised_data_page, 0, 0);
     lv_obj_set_style_pad_all(compromised_data_page, 10, 0);
@@ -9038,15 +9866,16 @@ static void show_portal_data_page(void)
     lv_obj_set_style_pad_row(list_container, 8, 0);
     
     // Send UART command and read response
-    uart_send_command("show_pass portal");
+    uart_send_command_for_tab("show_pass portal");
     vTaskDelay(pdMS_TO_TICKS(500));
     
     static char rx_buffer[4096];
     int total_len = 0;
     int retries = 5;
+    uart_port_t uart_port = (current_tab == 1 && uart2_initialized) ? UART2_NUM : UART_NUM;
     
     while (retries-- > 0) {
-        int len = uart_read_bytes(UART_NUM, rx_buffer + total_len, sizeof(rx_buffer) - total_len - 1, pdMS_TO_TICKS(200));
+        int len = uart_read_bytes(uart_port, rx_buffer + total_len, sizeof(rx_buffer) - total_len - 1, pdMS_TO_TICKS(200));
         if (len > 0) {
             total_len += len;
         }
@@ -9152,14 +9981,17 @@ static void show_handshakes_page(void)
     lv_obj_set_style_bg_color(scr, lv_color_hex(0x1A1A1A), 0);
     
     create_status_bar();
-    update_kraken_eye_icon();
+    create_tab_bar();
     update_portal_icon();
     
+    lv_obj_t *container = get_current_tab_container();
+    if (!container) return;
+    
     // Create page
-    compromised_data_page = lv_obj_create(scr);
+    compromised_data_page = lv_obj_create(container);
     lv_coord_t scr_height = lv_disp_get_ver_res(NULL);
-    lv_obj_set_size(compromised_data_page, lv_pct(100), scr_height - 40);
-    lv_obj_align(compromised_data_page, LV_ALIGN_TOP_MID, 0, 40);
+    lv_obj_set_size(compromised_data_page, lv_pct(100), scr_height - 85);
+    lv_obj_align(compromised_data_page, LV_ALIGN_TOP_MID, 0, 85);
     lv_obj_set_style_bg_color(compromised_data_page, lv_color_hex(0x1A1A1A), 0);
     lv_obj_set_style_border_width(compromised_data_page, 0, 0);
     lv_obj_set_style_pad_all(compromised_data_page, 10, 0);
@@ -9211,15 +10043,16 @@ static void show_handshakes_page(void)
     lv_obj_set_style_pad_row(list_container, 8, 0);
     
     // Send UART command and read response
-    uart_send_command("list_dir /sdcard/lab/handshakes");
+    uart_send_command_for_tab("list_dir /sdcard/lab/handshakes");
     vTaskDelay(pdMS_TO_TICKS(500));
     
     static char rx_buffer[4096];
     int total_len = 0;
     int retries = 5;
+    uart_port_t uart_port = (current_tab == 1 && uart2_initialized) ? UART2_NUM : UART_NUM;
     
     while (retries-- > 0) {
-        int len = uart_read_bytes(UART_NUM, rx_buffer + total_len, sizeof(rx_buffer) - total_len - 1, pdMS_TO_TICKS(200));
+        int len = uart_read_bytes(uart_port, rx_buffer + total_len, sizeof(rx_buffer) - total_len - 1, pdMS_TO_TICKS(200));
         if (len > 0) {
             total_len += len;
         }
@@ -9454,7 +10287,7 @@ static void deauth_detector_start_cb(lv_event_t *e)
     if (deauth_detector_running) return;
     
     ESP_LOGI(TAG, "Starting deauth detector");
-    uart_send_command("deauth_detector");
+    uart_send_command_for_tab("deauth_detector");
     
     deauth_detector_running = true;
     xTaskCreate(deauth_detector_task, "deauth_det", 4096, NULL, 5, &deauth_detector_task_handle);
@@ -9471,7 +10304,7 @@ static void deauth_detector_stop_cb(lv_event_t *e)
     if (!deauth_detector_running) return;
     
     ESP_LOGI(TAG, "Stopping deauth detector");
-    uart_send_command("stop");
+    uart_send_command_for_tab("stop");
     
     deauth_detector_running = false;
     if (deauth_detector_task_handle != NULL) {
@@ -9484,14 +10317,14 @@ static void deauth_detector_stop_cb(lv_event_t *e)
     lv_obj_add_state(deauth_stop_btn, LV_STATE_DISABLED);
 }
 
-// Back button callback
+// Back button callback - hide page and show tiles
 static void deauth_detector_back_btn_event_cb(lv_event_t *e)
 {
     (void)e;
     
     // Stop detector if running
     if (deauth_detector_running) {
-        uart_send_command("stop");
+        uart_send_command_for_tab("stop");
         deauth_detector_running = false;
         if (deauth_detector_task_handle != NULL) {
             vTaskDelay(pdMS_TO_TICKS(100));
@@ -9499,44 +10332,49 @@ static void deauth_detector_back_btn_event_cb(lv_event_t *e)
         }
     }
     
-    // Delete page
-    if (deauth_detector_page) {
-        lv_obj_del(deauth_detector_page);
-        deauth_detector_page = NULL;
-        deauth_table = NULL;
-        deauth_start_btn = NULL;
-        deauth_stop_btn = NULL;
+    tab_context_t *ctx = get_current_ctx();
+    
+    // Hide deauth detector page
+    if (ctx->deauth_detector_page) {
+        lv_obj_add_flag(ctx->deauth_detector_page, LV_OBJ_FLAG_HIDDEN);
     }
     
-    show_main_tiles();
+    // Show tiles
+    if (ctx->tiles) {
+        lv_obj_clear_flag(ctx->tiles, LV_OBJ_FLAG_HIDDEN);
+        ctx->current_visible_page = ctx->tiles;
+    }
 }
 
-// Show Deauth Detector page
+// Show Deauth Detector page (inside current tab's container)
 static void show_deauth_detector_page(void)
 {
-    // Delete tiles container if present
-    if (tiles_container) {
-        lv_obj_del(tiles_container);
-        tiles_container = NULL;
+    tab_context_t *ctx = get_current_ctx();
+    lv_obj_t *container = get_current_tab_container();
+    
+    if (!container) {
+        ESP_LOGE(TAG, "Container not initialized for tab %d", current_tab);
+        return;
     }
     
-    if (deauth_detector_page) {
-        lv_obj_del(deauth_detector_page);
-        deauth_detector_page = NULL;
+    // Hide all other pages
+    hide_all_pages(ctx);
+    
+    // If page already exists, just show it
+    if (ctx->deauth_detector_page) {
+        lv_obj_clear_flag(ctx->deauth_detector_page, LV_OBJ_FLAG_HIDDEN);
+        ctx->current_visible_page = ctx->deauth_detector_page;
+        deauth_detector_page = ctx->deauth_detector_page;
+        ESP_LOGI(TAG, "Showing existing deauth detector page for tab %d", current_tab);
+        return;
     }
     
-    lv_obj_t *scr = lv_scr_act();
-    lv_obj_set_style_bg_color(scr, lv_color_hex(0x1A1A1A), 0);
+    ESP_LOGI(TAG, "Creating new deauth detector page for tab %d", current_tab);
     
-    create_status_bar();
-    update_kraken_eye_icon();
-    update_portal_icon();
-    
-    // Create page container
-    deauth_detector_page = lv_obj_create(scr);
-    lv_coord_t scr_height = lv_disp_get_ver_res(NULL);
-    lv_obj_set_size(deauth_detector_page, lv_pct(100), scr_height - 40);
-    lv_obj_align(deauth_detector_page, LV_ALIGN_TOP_MID, 0, 40);
+    // Create page container inside tab container
+    ctx->deauth_detector_page = lv_obj_create(container);
+    deauth_detector_page = ctx->deauth_detector_page;
+    lv_obj_set_size(deauth_detector_page, lv_pct(100), lv_pct(100));
     lv_obj_set_style_bg_color(deauth_detector_page, lv_color_hex(0x1A1A1A), 0);
     lv_obj_set_style_border_width(deauth_detector_page, 0, 0);
     lv_obj_set_style_pad_all(deauth_detector_page, 10, 0);
@@ -9640,21 +10478,31 @@ static void show_deauth_detector_page(void)
     
     // Populate table with existing entries (if any from previous session)
     update_deauth_table();
+    
+    // Set current visible page
+    ctx->current_visible_page = ctx->deauth_detector_page;
 }
 
 //==================================================================================
 // Bluetooth Menu
 //==================================================================================
 
-// Back button for BT menu -> main tiles
+// Back button for BT menu -> hide page and show tiles
 static void bt_menu_back_btn_event_cb(lv_event_t *e)
 {
     (void)e;
-    if (bt_menu_page) {
-        lv_obj_del(bt_menu_page);
-        bt_menu_page = NULL;
+    tab_context_t *ctx = get_current_ctx();
+    
+    // Hide BT menu page
+    if (ctx->bt_menu_page) {
+        lv_obj_add_flag(ctx->bt_menu_page, LV_OBJ_FLAG_HIDDEN);
     }
-    show_main_tiles();
+    
+    // Show tiles
+    if (ctx->tiles) {
+        lv_obj_clear_flag(ctx->tiles, LV_OBJ_FLAG_HIDDEN);
+        ctx->current_visible_page = ctx->tiles;
+    }
 }
 
 // Tile click handler for BT menu sub-tiles
@@ -9670,30 +10518,35 @@ static void bt_menu_tile_event_cb(lv_event_t *e)
     }
 }
 
-// Show Bluetooth menu page with 3 tiles
+// Show Bluetooth menu page with 3 tiles (inside current tab's container)
 static void show_bluetooth_menu_page(void)
 {
-    if (tiles_container) {
-        lv_obj_del(tiles_container);
-        tiles_container = NULL;
+    tab_context_t *ctx = get_current_ctx();
+    lv_obj_t *container = get_current_tab_container();
+    
+    if (!container) {
+        ESP_LOGE(TAG, "Container not initialized for tab %d", current_tab);
+        return;
     }
     
-    if (bt_menu_page) {
-        lv_obj_del(bt_menu_page);
-        bt_menu_page = NULL;
+    // Hide all other pages
+    hide_all_pages(ctx);
+    
+    // If page already exists, just show it
+    if (ctx->bt_menu_page) {
+        lv_obj_clear_flag(ctx->bt_menu_page, LV_OBJ_FLAG_HIDDEN);
+        ctx->current_visible_page = ctx->bt_menu_page;
+        bt_menu_page = ctx->bt_menu_page;
+        ESP_LOGI(TAG, "Showing existing BT menu page for tab %d", current_tab);
+        return;
     }
     
-    lv_obj_t *scr = lv_scr_act();
-    lv_obj_set_style_bg_color(scr, lv_color_hex(0x1A1A1A), 0);
+    ESP_LOGI(TAG, "Creating new BT menu page for tab %d", current_tab);
     
-    create_status_bar();
-    update_kraken_eye_icon();
-    update_portal_icon();
-    
-    bt_menu_page = lv_obj_create(scr);
-    lv_coord_t scr_height = lv_disp_get_ver_res(NULL);
-    lv_obj_set_size(bt_menu_page, lv_pct(100), scr_height - 40);
-    lv_obj_align(bt_menu_page, LV_ALIGN_TOP_MID, 0, 40);
+    // Create page container inside tab container
+    ctx->bt_menu_page = lv_obj_create(container);
+    bt_menu_page = ctx->bt_menu_page;
+    lv_obj_set_size(bt_menu_page, lv_pct(100), lv_pct(100));
     lv_obj_set_style_bg_color(bt_menu_page, lv_color_hex(0x1A1A1A), 0);
     lv_obj_set_style_border_width(bt_menu_page, 0, 0);
     lv_obj_set_style_pad_all(bt_menu_page, 10, 0);
@@ -9742,19 +10595,23 @@ static void show_bluetooth_menu_page(void)
     
     create_tile(tiles, LV_SYMBOL_GPS, "AirTag\nScan", COLOR_MATERIAL_AMBER, bt_menu_tile_event_cb, "AirTag Scan");
     create_tile(tiles, LV_SYMBOL_BLUETOOTH, "BT Scan\n& Locate", COLOR_MATERIAL_CYAN, bt_menu_tile_event_cb, "BT Scan & Locate");
+    
+    // Set current visible page
+    ctx->current_visible_page = ctx->bt_menu_page;
 }
 
 //==================================================================================
 // AirTag Scan Page
 //==================================================================================
 
+// Back to BT menu from AirTag page - hide page and show BT menu
 static void airtag_scan_back_btn_event_cb(lv_event_t *e)
 {
     (void)e;
     
     // Stop scanning
     if (airtag_scanning) {
-        uart_send_command("stop");
+        uart_send_command_for_tab("stop");
         airtag_scanning = false;
         if (airtag_scan_task_handle != NULL) {
             vTaskDelay(pdMS_TO_TICKS(100));
@@ -9762,14 +10619,18 @@ static void airtag_scan_back_btn_event_cb(lv_event_t *e)
         }
     }
     
-    if (bt_airtag_page) {
-        lv_obj_del(bt_airtag_page);
-        bt_airtag_page = NULL;
-        airtag_count_label = NULL;
-        smarttag_count_label = NULL;
+    tab_context_t *ctx = get_current_ctx();
+    
+    // Hide AirTag page
+    if (ctx->bt_airtag_page) {
+        lv_obj_add_flag(ctx->bt_airtag_page, LV_OBJ_FLAG_HIDDEN);
     }
     
-    show_bluetooth_menu_page();
+    // Show BT menu
+    if (ctx->bt_menu_page) {
+        lv_obj_clear_flag(ctx->bt_menu_page, LV_OBJ_FLAG_HIDDEN);
+        ctx->current_visible_page = ctx->bt_menu_page;
+    }
 }
 
 static void airtag_scan_task(void *arg)
@@ -9825,24 +10686,35 @@ static void airtag_scan_task(void *arg)
     vTaskDelete(NULL);
 }
 
+// Show AirTag scan page (inside current tab's container)
 static void show_airtag_scan_page(void)
 {
-    if (bt_menu_page) {
-        lv_obj_del(bt_menu_page);
-        bt_menu_page = NULL;
+    tab_context_t *ctx = get_current_ctx();
+    lv_obj_t *container = get_current_tab_container();
+    
+    if (!container) {
+        ESP_LOGE(TAG, "Container not initialized for tab %d", current_tab);
+        return;
     }
     
-    lv_obj_t *scr = lv_scr_act();
-    lv_obj_set_style_bg_color(scr, lv_color_hex(0x1A1A1A), 0);
+    // Hide all other pages
+    hide_all_pages(ctx);
     
-    create_status_bar();
-    update_kraken_eye_icon();
-    update_portal_icon();
+    // If page already exists, just show it
+    if (ctx->bt_airtag_page) {
+        lv_obj_clear_flag(ctx->bt_airtag_page, LV_OBJ_FLAG_HIDDEN);
+        ctx->current_visible_page = ctx->bt_airtag_page;
+        bt_airtag_page = ctx->bt_airtag_page;
+        ESP_LOGI(TAG, "Showing existing AirTag scan page for tab %d", current_tab);
+        return;
+    }
     
-    bt_airtag_page = lv_obj_create(scr);
-    lv_coord_t scr_height = lv_disp_get_ver_res(NULL);
-    lv_obj_set_size(bt_airtag_page, lv_pct(100), scr_height - 40);
-    lv_obj_align(bt_airtag_page, LV_ALIGN_TOP_MID, 0, 40);
+    ESP_LOGI(TAG, "Creating new AirTag scan page for tab %d", current_tab);
+    
+    // Create page container inside tab container
+    ctx->bt_airtag_page = lv_obj_create(container);
+    bt_airtag_page = ctx->bt_airtag_page;
+    lv_obj_set_size(bt_airtag_page, lv_pct(100), lv_pct(100));
     lv_obj_set_style_bg_color(bt_airtag_page, lv_color_hex(0x1A1A1A), 0);
     lv_obj_set_style_border_width(bt_airtag_page, 0, 0);
     lv_obj_set_style_pad_all(bt_airtag_page, 10, 0);
@@ -9934,9 +10806,12 @@ static void show_airtag_scan_page(void)
     
     // Start scanning
     ESP_LOGI(TAG, "Starting AirTag scan");
-    uart_send_command("scan_airtag");
+    uart_send_command_for_tab("scan_airtag");
     airtag_scanning = true;
     xTaskCreate(airtag_scan_task, "airtag_scan", 4096, NULL, 5, &airtag_scan_task_handle);
+    
+    // Set current visible page
+    ctx->current_visible_page = ctx->bt_airtag_page;
 }
 
 //==================================================================================
@@ -10007,14 +10882,22 @@ static bool parse_bt_device_line(const char *line, bt_device_t *dev)
     return true;
 }
 
+// Back to BT menu from BT scan page - hide page and show BT menu
 static void bt_scan_back_btn_event_cb(lv_event_t *e)
 {
     (void)e;
-    if (bt_scan_page) {
-        lv_obj_del(bt_scan_page);
-        bt_scan_page = NULL;
+    tab_context_t *ctx = get_current_ctx();
+    
+    // Hide BT scan page
+    if (ctx->bt_scan_page) {
+        lv_obj_add_flag(ctx->bt_scan_page, LV_OBJ_FLAG_HIDDEN);
     }
-    show_bluetooth_menu_page();
+    
+    // Show BT menu
+    if (ctx->bt_menu_page) {
+        lv_obj_clear_flag(ctx->bt_menu_page, LV_OBJ_FLAG_HIDDEN);
+        ctx->current_visible_page = ctx->bt_menu_page;
+    }
 }
 
 // Rescan button callback
@@ -10030,33 +10913,39 @@ static void bt_scan_device_click_cb(lv_event_t *e)
 {
     int device_idx = (int)(intptr_t)lv_event_get_user_data(e);
     if (device_idx >= 0 && device_idx < bt_device_count) {
-        show_bt_locator_tracking_page(device_idx);
+        show_bt_locator_page(device_idx);
     }
 }
 
+// Show BT Scan page (inside current tab's container)
 static void show_bt_scan_page(void)
 {
-    if (bt_menu_page) {
-        lv_obj_del(bt_menu_page);
-        bt_menu_page = NULL;
+    tab_context_t *ctx = get_current_ctx();
+    lv_obj_t *container = get_current_tab_container();
+    
+    if (!container) {
+        ESP_LOGE(TAG, "Container not initialized for tab %d", current_tab);
+        return;
     }
     
-    if (bt_scan_page) {
-        lv_obj_del(bt_scan_page);
-        bt_scan_page = NULL;
+    // Hide all other pages
+    hide_all_pages(ctx);
+    
+    // If page already exists, just show it
+    if (ctx->bt_scan_page) {
+        lv_obj_clear_flag(ctx->bt_scan_page, LV_OBJ_FLAG_HIDDEN);
+        ctx->current_visible_page = ctx->bt_scan_page;
+        bt_scan_page = ctx->bt_scan_page;
+        ESP_LOGI(TAG, "Showing existing BT scan page for tab %d", current_tab);
+        return;
     }
     
-    lv_obj_t *scr = lv_scr_act();
-    lv_obj_set_style_bg_color(scr, lv_color_hex(0x1A1A1A), 0);
+    ESP_LOGI(TAG, "Creating new BT scan page for tab %d", current_tab);
     
-    create_status_bar();
-    update_kraken_eye_icon();
-    update_portal_icon();
-    
-    bt_scan_page = lv_obj_create(scr);
-    lv_coord_t scr_height = lv_disp_get_ver_res(NULL);
-    lv_obj_set_size(bt_scan_page, lv_pct(100), scr_height - 40);
-    lv_obj_align(bt_scan_page, LV_ALIGN_TOP_MID, 0, 40);
+    // Create page container inside tab container
+    ctx->bt_scan_page = lv_obj_create(container);
+    bt_scan_page = ctx->bt_scan_page;
+    lv_obj_set_size(bt_scan_page, lv_pct(100), lv_pct(100));
     lv_obj_set_style_bg_color(bt_scan_page, lv_color_hex(0x1A1A1A), 0);
     lv_obj_set_style_border_width(bt_scan_page, 0, 0);
     lv_obj_set_style_pad_all(bt_scan_page, 10, 0);
@@ -10141,10 +11030,11 @@ static void show_bt_scan_page(void)
     vTaskDelay(pdMS_TO_TICKS(100));
     
     // Flush any stale UART data before scanning
-    uart_flush_input(UART_NUM);
+    uart_port_t uart_port = (current_tab == 1 && uart2_initialized) ? UART2_NUM : UART_NUM;
+    uart_flush_input(uart_port);
     
-    // Send scan command
-    uart_send_command("scan_bt");
+    // Send scan command to current tab's UART
+    uart_send_command_for_tab("scan_bt");
     ESP_LOGI(TAG, "BT Scan: waiting for results (up to 15s)...");
     
     // Read data until we see "Summary:" or timeout
@@ -10262,19 +11152,23 @@ static void show_bt_scan_page(void)
     }
     
     lv_label_set_text_fmt(status_label, "Tap device to locate (%d found)", bt_device_count);
+    
+    // Set current visible page
+    ctx->current_visible_page = ctx->bt_scan_page;
 }
 
 //==================================================================================
 // BT Locator Tracking Page
 //==================================================================================
 
+// Back to BT scan from locator tracking - hide page and show BT scan
 static void bt_locator_tracking_back_btn_event_cb(lv_event_t *e)
 {
     (void)e;
     
     // Stop tracking
     if (bt_locator_tracking) {
-        uart_send_command("stop");
+        uart_send_command_for_tab("stop");
         bt_locator_tracking = false;
         if (bt_locator_task_handle != NULL) {
             vTaskDelay(pdMS_TO_TICKS(100));
@@ -10282,14 +11176,18 @@ static void bt_locator_tracking_back_btn_event_cb(lv_event_t *e)
         }
     }
     
-    if (bt_locator_tracking_page) {
-        lv_obj_del(bt_locator_tracking_page);
-        bt_locator_tracking_page = NULL;
-        bt_locator_rssi_label = NULL;
+    tab_context_t *ctx = get_current_ctx();
+    
+    // Hide locator tracking page
+    if (ctx->bt_locator_page) {
+        lv_obj_add_flag(ctx->bt_locator_page, LV_OBJ_FLAG_HIDDEN);
     }
     
-    // Return to BT Scan & Locate page
-    show_bt_scan_page();
+    // Show BT scan page
+    if (ctx->bt_scan_page) {
+        lv_obj_clear_flag(ctx->bt_scan_page, LV_OBJ_FLAG_HIDDEN);
+        ctx->current_visible_page = ctx->bt_scan_page;
+    }
 }
 
 static void bt_locator_tracking_task(void *arg)
@@ -10383,7 +11281,8 @@ static void bt_locator_tracking_task(void *arg)
     vTaskDelete(NULL);
 }
 
-static void show_bt_locator_tracking_page(int device_idx)
+// Show BT Locator Tracking page (inside current tab's container)
+static void show_bt_locator_page(int device_idx)
 {
     if (device_idx < 0 || device_idx >= bt_device_count) return;
     
@@ -10393,30 +11292,38 @@ static void show_bt_locator_tracking_page(int device_idx)
     strncpy(bt_locator_target_mac, dev->mac, sizeof(bt_locator_target_mac) - 1);
     strncpy(bt_locator_target_name, dev->name, sizeof(bt_locator_target_name) - 1);
     
-    if (bt_scan_page) {
-        lv_obj_del(bt_scan_page);
-        bt_scan_page = NULL;
+    tab_context_t *ctx = get_current_ctx();
+    lv_obj_t *container = get_current_tab_container();
+    
+    if (!container) {
+        ESP_LOGE(TAG, "Container not initialized for tab %d", current_tab);
+        return;
     }
     
-    lv_obj_t *scr = lv_scr_act();
-    lv_obj_set_style_bg_color(scr, lv_color_hex(0x1A1A1A), 0);
+    // Hide all other pages
+    hide_all_pages(ctx);
     
-    create_status_bar();
-    update_kraken_eye_icon();
-    update_portal_icon();
+    // Note: Locator tracking page is not cached - always recreate
+    // because it depends on the selected device
+    if (ctx->bt_locator_page) {
+        lv_obj_del(ctx->bt_locator_page);
+        ctx->bt_locator_page = NULL;
+    }
     
-    bt_locator_tracking_page = lv_obj_create(scr);
-    lv_coord_t scr_height = lv_disp_get_ver_res(NULL);
-    lv_obj_set_size(bt_locator_tracking_page, lv_pct(100), scr_height - 40);
-    lv_obj_align(bt_locator_tracking_page, LV_ALIGN_TOP_MID, 0, 40);
-    lv_obj_set_style_bg_color(bt_locator_tracking_page, lv_color_hex(0x1A1A1A), 0);
-    lv_obj_set_style_border_width(bt_locator_tracking_page, 0, 0);
-    lv_obj_set_style_pad_all(bt_locator_tracking_page, 10, 0);
-    lv_obj_set_flex_flow(bt_locator_tracking_page, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_pad_row(bt_locator_tracking_page, 10, 0);
+    ESP_LOGI(TAG, "Creating new BT locator tracking page for tab %d", current_tab);
+    
+    // Create page container inside tab container
+    ctx->bt_locator_page = lv_obj_create(container);
+    bt_locator_page = ctx->bt_locator_page;
+    lv_obj_set_size(bt_locator_page, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(bt_locator_page, lv_color_hex(0x1A1A1A), 0);
+    lv_obj_set_style_border_width(bt_locator_page, 0, 0);
+    lv_obj_set_style_pad_all(bt_locator_page, 10, 0);
+    lv_obj_set_flex_flow(bt_locator_page, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(bt_locator_page, 10, 0);
     
     // Header
-    lv_obj_t *header = lv_obj_create(bt_locator_tracking_page);
+    lv_obj_t *header = lv_obj_create(bt_locator_page);
     lv_obj_set_size(header, lv_pct(100), LV_SIZE_CONTENT);
     lv_obj_set_style_bg_opa(header, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(header, 0, 0);
@@ -10444,7 +11351,7 @@ static void show_bt_locator_tracking_page(int device_idx)
     lv_obj_set_style_text_color(title, COLOR_MATERIAL_PURPLE, 0);
     
     // Content container - centered
-    lv_obj_t *content = lv_obj_create(bt_locator_tracking_page);
+    lv_obj_t *content = lv_obj_create(bt_locator_page);
     lv_obj_set_size(content, lv_pct(100), LV_SIZE_CONTENT);
     lv_obj_set_flex_grow(content, 1);
     lv_obj_set_style_bg_opa(content, LV_OPA_TRANSP, 0);
@@ -10506,13 +11413,16 @@ static void show_bt_locator_tracking_page(int device_idx)
     char cmd[64];
     snprintf(cmd, sizeof(cmd), "scan_bt %s", bt_locator_target_mac);
     ESP_LOGI(TAG, "[BT_LOC] Sending UART command: '%s'", cmd);
-    uart_send_command(cmd);
+    uart_send_command_for_tab(cmd);
     ESP_LOGI(TAG, "[BT_LOC] Command sent, starting monitor task");
     
     bt_locator_tracking = true;
     xTaskCreate(bt_locator_tracking_task, "bt_locator", 4096, NULL, 5, &bt_locator_task_handle);
     ESP_LOGI(TAG, "[BT_LOC] Monitor task created, tracking_page=%p, rssi_label=%p", 
-             (void*)bt_locator_tracking_page, (void*)bt_locator_rssi_label);
+             (void*)bt_locator_page, (void*)bt_locator_rssi_label);
+    
+    // Set current visible page
+    ctx->current_visible_page = ctx->bt_locator_page;
 }
 
 // Global attack tile event handler
@@ -10555,65 +11465,33 @@ static void global_attack_tile_event_cb(lv_event_t *e)
 // Show Global WiFi Attacks page
 static void show_global_attacks_page(void)
 {
-    // Delete tiles container if present
-    if (tiles_container) {
-        lv_obj_del(tiles_container);
-        tiles_container = NULL;
+    // Get current tab's data and container
+    tab_context_t *ctx = get_current_ctx();
+    lv_obj_t *container = get_current_tab_container();
+    
+    if (!container) {
+        ESP_LOGE(TAG, "Container not initialized for tab %d", current_tab);
+        return;
     }
     
-    // Delete scan page if present
-    if (scan_page) {
-        lv_obj_del(scan_page);
-        scan_page = NULL;
-        scan_btn = NULL;
-        status_label = NULL;
-        network_list = NULL;
-        spinner = NULL;
+    // Hide all other pages
+    hide_all_pages(ctx);
+    
+    // If page already exists for this tab, just show it
+    if (ctx->global_attacks_page) {
+        lv_obj_clear_flag(ctx->global_attacks_page, LV_OBJ_FLAG_HIDDEN);
+        ctx->current_visible_page = ctx->global_attacks_page;
+        global_attacks_page = ctx->global_attacks_page;  // Update legacy reference
+        ESP_LOGI(TAG, "Showing existing global attacks page for tab %d", current_tab);
+        return;
     }
     
-    // Delete observer page if present
-    if (observer_page) {
-        lv_obj_del(observer_page);
-        observer_page = NULL;
-        observer_start_btn = NULL;
-        observer_stop_btn = NULL;
-        observer_table = NULL;
-        observer_status_label = NULL;
-    }
+    ESP_LOGI(TAG, "Creating new global attacks page for tab %d", current_tab);
     
-    // Delete ESP Modem page if present
-    if (esp_modem_page) {
-        lv_obj_del(esp_modem_page);
-        esp_modem_page = NULL;
-        esp_modem_scan_btn = NULL;
-        esp_modem_status_label = NULL;
-        esp_modem_network_list = NULL;
-        esp_modem_spinner = NULL;
-    }
-    
-    // Delete existing global attacks page if present
-    if (global_attacks_page) {
-        lv_obj_del(global_attacks_page);
-        global_attacks_page = NULL;
-    }
-    
-    lv_obj_t *scr = lv_scr_act();
-    
-    // Set dark background
-    lv_obj_set_style_bg_color(scr, COLOR_MATERIAL_BG, 0);
-    
-    // Create/update status bar
-    create_status_bar();
-    
-    // Update eye icon visibility (Kraken background scanning)
-    update_kraken_eye_icon();
-    update_portal_icon();
-    
-    // Create global attacks page container below status bar
-    global_attacks_page = lv_obj_create(scr);
-    lv_coord_t attacks_scr_height = lv_disp_get_ver_res(NULL);
-    lv_obj_set_size(global_attacks_page, lv_pct(100), attacks_scr_height - 40);  // Account for status bar
-    lv_obj_align(global_attacks_page, LV_ALIGN_TOP_MID, 0, 40);  // Position below status bar
+    // Create global attacks page container inside tab container
+    ctx->global_attacks_page = lv_obj_create(container);
+    global_attacks_page = ctx->global_attacks_page;  // Keep legacy reference
+    lv_obj_set_size(global_attacks_page, lv_pct(100), lv_pct(100));
     lv_obj_set_style_bg_color(global_attacks_page, COLOR_MATERIAL_BG, 0);
     lv_obj_set_style_border_width(global_attacks_page, 0, 0);
     lv_obj_set_style_pad_all(global_attacks_page, 16, 0);
@@ -10675,6 +11553,9 @@ static void show_global_attacks_page(void)
     
     // Wardrive - Teal
     create_tile(tiles, LV_SYMBOL_GPS, "Wardrive", COLOR_MATERIAL_TEAL, global_attack_tile_event_cb, "Wardrive");
+    
+    // Set current visible page
+    ctx->current_visible_page = ctx->global_attacks_page;
 }
 
 //==================================================================================
@@ -10856,30 +11737,18 @@ static void reinit_uart2(void)
 // Kraken Background Scanning (UART2)
 //==================================================================================
 
-// Update eye icon visibility based on scanning state
-static void update_kraken_eye_icon(void)
-{
-    if (kraken_eye_icon == NULL) return;
-    
-    // Show eye icon when background scanning is active AND observer page is not visible
-    if (kraken_scanning_active && !observer_page_visible) {
-        lv_obj_clear_flag(kraken_eye_icon, LV_OBJ_FLAG_HIDDEN);
-    } else {
-        lv_obj_add_flag(kraken_eye_icon, LV_OBJ_FLAG_HIDDEN);
-    }
-}
-
-// Update portal icon visibility and color based on background mode state
+// Update portal icon visibility and color based on portal state
 static void update_portal_icon(void)
 {
     if (portal_icon == NULL) return;
     
-    if (portal_background_mode && portal_active) {
+    // Show portal icon whenever portal is active
+    if (portal_active) {
         lv_obj_clear_flag(portal_icon, LV_OBJ_FLAG_HIDDEN);
         // Green when new data available, orange otherwise
         if (portal_new_data_count > 0) {
             lv_obj_set_style_text_color(portal_icon, COLOR_MATERIAL_GREEN, 0);
-        } else {
+    } else {
             lv_obj_set_style_text_color(portal_icon, COLOR_MATERIAL_ORANGE, 0);
         }
     } else {
@@ -10887,147 +11756,6 @@ static void update_portal_icon(void)
     }
 }
 
-// Close portal data popup callback
-static void close_portal_data_popup(lv_event_t *e)
-{
-    (void)e;
-    if (portal_data_popup) {
-        lv_obj_del(portal_data_popup);
-        portal_data_popup = NULL;
-    }
-}
-
-// Portal icon click callback - show popup with captured data
-static void portal_icon_click_cb(lv_event_t *e)
-{
-    (void)e;
-    
-    // Reset new data counter
-    portal_new_data_count = 0;
-    update_portal_icon();
-    
-    // Close existing popup if any
-    if (portal_data_popup) {
-        lv_obj_del(portal_data_popup);
-        portal_data_popup = NULL;
-    }
-    
-    lv_obj_t *scr = lv_scr_act();
-    
-    // Create popup overlay
-    portal_data_popup = lv_obj_create(scr);
-    lv_obj_remove_style_all(portal_data_popup);
-    lv_obj_set_size(portal_data_popup, lv_pct(100), lv_pct(100));
-    lv_obj_set_style_bg_color(portal_data_popup, lv_color_hex(0x000000), 0);
-    lv_obj_set_style_bg_opa(portal_data_popup, LV_OPA_80, 0);
-    lv_obj_clear_flag(portal_data_popup, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(portal_data_popup, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(portal_data_popup, close_portal_data_popup, LV_EVENT_CLICKED, NULL);
-    
-    // Popup content box
-    lv_obj_t *popup_box = lv_obj_create(portal_data_popup);
-    lv_obj_set_size(popup_box, 450, 350);
-    lv_obj_center(popup_box);
-    lv_obj_set_style_bg_color(popup_box, lv_color_hex(0x1A1A1A), 0);
-    lv_obj_set_style_border_color(popup_box, COLOR_MATERIAL_GREEN, 0);
-    lv_obj_set_style_border_width(popup_box, 2, 0);
-    lv_obj_set_style_radius(popup_box, 12, 0);
-    lv_obj_set_style_pad_all(popup_box, 15, 0);
-    lv_obj_set_flex_flow(popup_box, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_pad_row(popup_box, 10, 0);
-    lv_obj_clear_flag(popup_box, LV_OBJ_FLAG_SCROLLABLE);
-    
-    // Title
-    lv_obj_t *title = lv_label_create(popup_box);
-    lv_label_set_text(title, LV_SYMBOL_WIFI " Captured Portal Data");
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_18, 0);
-    lv_obj_set_style_text_color(title, COLOR_MATERIAL_GREEN, 0);
-    
-    // Scrollable content area
-    lv_obj_t *content_area = lv_obj_create(popup_box);
-    lv_obj_set_size(content_area, lv_pct(100), 230);
-    lv_obj_set_style_bg_opa(content_area, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(content_area, 0, 0);
-    lv_obj_set_style_pad_all(content_area, 5, 0);
-    lv_obj_set_flex_flow(content_area, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_pad_row(content_area, 5, 0);
-    
-    // Read portal data from file
-    FILE *f = fopen("/sdcard/lab/portals.txt", "r");
-    if (f) {
-        char line[256];
-        lv_obj_t *entry_label = NULL;
-        char entry_buf[512] = "";
-        
-        while (fgets(line, sizeof(line), f)) {
-            // Remove newline
-            size_t len = strlen(line);
-            if (len > 0 && line[len-1] == '\n') line[len-1] = '\0';
-            
-            if (strncmp(line, "---", 3) == 0) {
-                // End of entry, create label
-                if (strlen(entry_buf) > 0) {
-                    entry_label = lv_label_create(content_area);
-                    lv_label_set_text(entry_label, entry_buf);
-                    lv_obj_set_style_text_font(entry_label, &lv_font_montserrat_14, 0);
-                    lv_obj_set_style_text_color(entry_label, lv_color_hex(0xCCCCCC), 0);
-                    lv_obj_set_width(entry_label, lv_pct(100));
-                    lv_label_set_long_mode(entry_label, LV_LABEL_LONG_WRAP);
-                    
-                    // Add separator
-                    lv_obj_t *sep = lv_obj_create(content_area);
-                    lv_obj_set_size(sep, lv_pct(100), 1);
-                    lv_obj_set_style_bg_color(sep, lv_color_hex(0x444444), 0);
-                    lv_obj_set_style_border_width(sep, 0, 0);
-                    lv_obj_set_style_pad_all(sep, 0, 0);
-                    
-                    entry_buf[0] = '\0';
-                }
-            } else {
-                // Append to current entry
-                if (strlen(entry_buf) + strlen(line) + 2 < sizeof(entry_buf)) {
-                    if (strlen(entry_buf) > 0) strcat(entry_buf, "\n");
-                    strcat(entry_buf, line);
-                }
-            }
-        }
-        
-        // Handle last entry if no trailing ---
-        if (strlen(entry_buf) > 0) {
-            entry_label = lv_label_create(content_area);
-            lv_label_set_text(entry_label, entry_buf);
-            lv_obj_set_style_text_font(entry_label, &lv_font_montserrat_14, 0);
-            lv_obj_set_style_text_color(entry_label, lv_color_hex(0xCCCCCC), 0);
-            lv_obj_set_width(entry_label, lv_pct(100));
-            lv_label_set_long_mode(entry_label, LV_LABEL_LONG_WRAP);
-        }
-        
-        fclose(f);
-    } else {
-        lv_obj_t *no_data = lv_label_create(content_area);
-        lv_label_set_text(no_data, "No data captured yet");
-        lv_obj_set_style_text_font(no_data, &lv_font_montserrat_16, 0);
-        lv_obj_set_style_text_color(no_data, lv_color_hex(0x888888), 0);
-    }
-    
-    // Close button container for centering
-    lv_obj_t *btn_cont = lv_obj_create(popup_box);
-    lv_obj_remove_style_all(btn_cont);
-    lv_obj_set_size(btn_cont, lv_pct(100), LV_SIZE_CONTENT);
-    lv_obj_set_flex_flow(btn_cont, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(btn_cont, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    
-    lv_obj_t *close_btn = lv_btn_create(btn_cont);
-    lv_obj_set_size(close_btn, 120, 40);
-    lv_obj_set_style_bg_color(close_btn, COLOR_MATERIAL_ORANGE, 0);
-    lv_obj_set_style_radius(close_btn, 8, 0);
-    lv_obj_add_event_cb(close_btn, close_portal_data_popup, LV_EVENT_CLICKED, NULL);
-    
-    lv_obj_t *close_label = lv_label_create(close_btn);
-    lv_label_set_text(close_label, "Close");
-    lv_obj_set_style_text_font(close_label, &lv_font_montserrat_14, 0);
-    lv_obj_center(close_label);
-}
 
 // Start Kraken background scanning on UART2
 static void start_kraken_scanning(void)
@@ -11050,7 +11778,6 @@ static void start_kraken_scanning(void)
         ESP_LOGI(TAG, "[UART2] Kraken background scanning started");
     }
     
-    update_kraken_eye_icon();
     update_portal_icon();
 }
 
@@ -11075,7 +11802,6 @@ static void stop_kraken_scanning(void)
         }
     }
     
-    update_kraken_eye_icon();
     update_portal_icon();
     ESP_LOGI(TAG, "[UART2] Kraken background scanning stopped");
 }
@@ -11175,6 +11901,13 @@ static void kraken_scan_task(void *arg)
     
     observer_network_count = scanned_count;
     ESP_LOGI(TAG, "[UART2] Phase 1 complete: %d networks found", observer_network_count);
+    
+    // Copy observer results to UART2 tab context (Kraken always uses UART2)
+    if (uart2_ctx.observer_networks) {
+        memcpy(uart2_ctx.observer_networks, observer_networks, sizeof(observer_network_t) * MAX_OBSERVER_NETWORKS);
+        uart2_ctx.observer_network_count = observer_network_count;
+        ESP_LOGI(TAG, "[UART2] Copied %d observer results to uart2_ctx", observer_network_count);
+    }
     
     // Update UI with scanned networks
     if (observer_page_visible) {
@@ -11379,7 +12112,6 @@ static void uart_pins_save_cb(lv_event_t *e)
                 stop_kraken_scanning();
             }
             deinit_uart2();
-            update_kraken_eye_icon();  // Hide eye icon
             update_portal_icon();
         }
     }
@@ -11472,10 +12204,11 @@ static void spinbox_decrement_event_cb(lv_event_t *e)
 
 static void show_scan_time_popup(void)
 {
-    lv_obj_t *scr = lv_scr_act();
+    lv_obj_t *container = get_current_tab_container();
+    if (!container) return;
     
     // Create modal overlay
-    scan_time_popup_overlay = lv_obj_create(scr);
+    scan_time_popup_overlay = lv_obj_create(container);
     lv_obj_remove_style_all(scan_time_popup_overlay);
     lv_obj_set_size(scan_time_popup_overlay, lv_pct(100), lv_pct(100));
     lv_obj_set_style_bg_color(scan_time_popup_overlay, lv_color_hex(0x000000), 0);
@@ -11643,10 +12376,11 @@ static void show_scan_time_popup(void)
 
 static void show_uart_pins_popup(void)
 {
-    lv_obj_t *scr = lv_scr_act();
+    lv_obj_t *container = get_current_tab_container();
+    if (!container) return;
     
     // Create modal overlay
-    settings_popup_overlay = lv_obj_create(scr);
+    settings_popup_overlay = lv_obj_create(container);
     lv_obj_remove_style_all(settings_popup_overlay);
     lv_obj_set_size(settings_popup_overlay, lv_pct(100), lv_pct(100));
     lv_obj_set_style_bg_color(settings_popup_overlay, lv_color_hex(0x000000), 0);
@@ -11796,8 +12530,18 @@ static void show_uart_pins_popup(void)
 
 static void settings_back_btn_event_cb(lv_event_t *e)
 {
-    ESP_LOGI(TAG, "Settings back button clicked");
-    show_main_tiles();
+    (void)e;
+    ESP_LOGI(TAG, "Settings back button clicked, returning to internal tiles");
+    
+    // Hide settings page
+    if (internal_settings_page) {
+        lv_obj_add_flag(internal_settings_page, LV_OBJ_FLAG_HIDDEN);
+    }
+    
+    // Show internal tiles
+    if (internal_tiles) {
+        lv_obj_clear_flag(internal_tiles, LV_OBJ_FLAG_HIDDEN);
+    }
 }
 
 static void settings_tile_event_cb(lv_event_t *e)
@@ -11812,62 +12556,31 @@ static void settings_tile_event_cb(lv_event_t *e)
     }
 }
 
-// Show Settings page with UART Pins and Scan Time tiles
+// Show Settings page with UART Pins and Scan Time tiles (inside INTERNAL container)
 static void show_settings_page(void)
 {
-    // Delete tiles container if present
-    if (tiles_container) {
-        lv_obj_del(tiles_container);
-        tiles_container = NULL;
+    if (!internal_container) {
+        ESP_LOGE(TAG, "Internal container not initialized!");
+        return;
     }
     
-    // Delete scan page if present  
-    if (scan_page) {
-        lv_obj_del(scan_page);
-        scan_page = NULL;
+    // Hide internal tiles, show settings page
+    if (internal_tiles) lv_obj_add_flag(internal_tiles, LV_OBJ_FLAG_HIDDEN);
+    
+    // If settings page already exists, just show it
+    if (internal_settings_page) {
+        lv_obj_clear_flag(internal_settings_page, LV_OBJ_FLAG_HIDDEN);
+        settings_page = internal_settings_page;  // Update legacy reference
+        ESP_LOGI(TAG, "Showing existing settings page");
+        return;
     }
     
-    // Delete observer page if present
-    if (observer_page) {
-        lv_obj_del(observer_page);
-        observer_page = NULL;
-    }
+    ESP_LOGI(TAG, "Creating new settings page");
     
-    // Delete ESP modem page if present
-    if (esp_modem_page) {
-        lv_obj_del(esp_modem_page);
-        esp_modem_page = NULL;
-    }
-    
-    // Delete global attacks page if present
-    if (global_attacks_page) {
-        lv_obj_del(global_attacks_page);
-        global_attacks_page = NULL;
-    }
-    
-    // Delete existing settings page if present
-    if (settings_page) {
-        lv_obj_del(settings_page);
-        settings_page = NULL;
-    }
-    
-    lv_obj_t *scr = lv_scr_act();
-    
-    // Set dark background
-    lv_obj_set_style_bg_color(scr, lv_color_hex(0x121212), 0);
-    
-    // Create/update status bar
-    create_status_bar();
-    
-    // Update eye icon visibility (Kraken background scanning)
-    update_kraken_eye_icon();
-    update_portal_icon();
-    
-    // Create settings page container below status bar
-    settings_page = lv_obj_create(scr);
-    lv_coord_t settings_scr_height = lv_disp_get_ver_res(NULL);
-    lv_obj_set_size(settings_page, lv_pct(100), settings_scr_height - 40);
-    lv_obj_align(settings_page, LV_ALIGN_TOP_MID, 0, 40);
+    // Create settings page container inside internal container
+    internal_settings_page = lv_obj_create(internal_container);
+    settings_page = internal_settings_page;  // Keep legacy reference
+    lv_obj_set_size(settings_page, lv_pct(100), lv_pct(100));
     lv_obj_set_style_bg_color(settings_page, lv_color_hex(0x121212), 0);
     lv_obj_set_style_border_width(settings_page, 0, 0);
     lv_obj_set_style_pad_all(settings_page, 16, 0);
@@ -11930,16 +12643,16 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
     
-    // Allocate large buffers in PSRAM for Network Observer
-    ESP_LOGI(TAG, "Allocating observer buffers in PSRAM...");
+    // Initialize all tab contexts with PSRAM allocations
+    init_all_tab_contexts();
+    
+    // Legacy observer buffers (shared between tabs for UART I/O)
     observer_networks = heap_caps_calloc(MAX_OBSERVER_NETWORKS, sizeof(observer_network_t), MALLOC_CAP_SPIRAM);
     observer_rx_buffer = heap_caps_malloc(UART_BUF_SIZE, MALLOC_CAP_SPIRAM);
     observer_line_buffer = heap_caps_malloc(OBSERVER_LINE_BUFFER_SIZE, MALLOC_CAP_SPIRAM);
     
     if (!observer_networks || !observer_rx_buffer || !observer_line_buffer) {
-        ESP_LOGE(TAG, "Failed to allocate PSRAM buffers for observer!");
-    } else {
-        ESP_LOGI(TAG, "Observer PSRAM buffers allocated successfully");
+        ESP_LOGE(TAG, "Failed to allocate legacy observer PSRAM buffers!");
     }
     
     // Allocate buffer for ESP Modem WiFi scan results
