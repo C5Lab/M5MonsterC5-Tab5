@@ -5679,7 +5679,7 @@ static void show_network_popup(int network_idx)
         // Do first poll after a short delay
         vTaskDelay(pdMS_TO_TICKS(2000));
         if (popup_open && observer_task_handle == NULL) {
-            xTaskCreate(popup_poll_task, "popup_poll", 8192, NULL, 5, &observer_task_handle);
+            xTaskCreate(popup_poll_task, "popup_poll", 8192, (void*)ctx, 5, &observer_task_handle);
         }
     }
 }
@@ -5928,7 +5928,8 @@ static void client_row_click_cb(lv_event_t *e)
     
     ESP_LOGI(TAG, "Client row clicked: network=%d, client=%d", network_idx, client_idx);
     
-    if (network_idx >= 0 && network_idx < observer_network_count &&
+    tab_context_t *ctx = get_current_ctx();
+    if (ctx && network_idx >= 0 && network_idx < ctx->observer_network_count &&
         client_idx >= 0 && client_idx < MAX_CLIENTS_PER_NETWORK) {
         show_deauth_popup(network_idx, client_idx);
     }
