@@ -6,22 +6,6 @@ on:
       release_tag:
         description: "Optional tag name to upload assets to a release (example 'v1.2.3')"
         required: false
-      rebuild_release:
-        description: "Delete existing assets for the tag before uploading (rebuild release)"
-        required: false
-        type: choice
-        options:
-          - "false"
-          - "true"
-        default: "false"
-      build_pages:
-        description: "Build and deploy GitHub Pages"
-        required: false
-        type: choice
-        options:
-          - "false"
-          - "true"
-        default: "false"
   push:
     branches: [main, master]
     paths:
@@ -32,6 +16,38 @@ on:
     types: [published, edited]
 
 jobs:
+  changes:
+    name: Detect workflow changes
+    runs-on: ubuntu-24.04
+    outputs:
+      workflow_changed: ${{ steps.filter.outputs.workflow_changed }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check workflow diff
+        id: filter
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_EVENT_NAME:-}" != "push" ]; then
+            echo "workflow_changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          base="${{ github.event.before }}"
+          head="${{ github.sha }}"
+          if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ]; then
+            base="$(git rev-parse HEAD~1 2>/dev/null || git rev-parse HEAD)"
+          fi
+
+          if git diff --name-only "$base" "$head" | grep -qE '^\.github/workflows/'; then
+            echo "workflow_changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "workflow_changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
   firmware:
     name: M5MonsterC5-Tab5
     permissions:
@@ -57,19 +73,29 @@ jobs:
       - name: Build firmware (IDF 5.4.1)
         run: bash .github/scripts/container_build.sh --no-docker
 
-      - name: Stamp artifacts with version
+      - name: Stamp firmware with JANOS_TAB_VERSION
         id: version
         run: |
-          set -euo pipefail
-          version=$(git rev-parse --short HEAD)
-          echo "version=${version}" >> "$GITHUB_OUTPUT"
-
+          set -e
+          version=$(python - <<'PY'
+          from pathlib import Path
+          import re
+          text = Path("main/main.c").read_text()
+          m = re.search(r'JANOS_TAB_VERSION\\s*\\"([^\\"]+)\\"', text)
+          if not m:
+              raise SystemExit("JANOS_TAB_VERSION not found")
+          print(m.group(1))
+          PY
+          )
           src="binaries-esp32p4/M5MonsterC5-Tab5.bin"
+          dst="binaries-esp32p4/M5MonsterC5-Tab5-${version}.bin"
           if [ ! -f "$src" ]; then
             echo "Missing firmware: $src" >&2
             exit 1
           fi
-          cp "$src" "binaries-esp32p4/M5MonsterC5-Tab5-${version}.bin"
+          cp "$src" "$dst"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "release_asset=${dst}" >> "$GITHUB_OUTPUT"
 
       - name: Merge full flash image (ESP32P4)
         shell: bash
@@ -93,7 +119,7 @@ jobs:
       - name: Package firmware zip
         id: bundle
         run: |
-          set -euo pipefail
+          set -e
           cd binaries-esp32p4
           out="M5MonsterC5-Tab5-${{ steps.version.outputs.version }}.zip"
           rm -f "$out"
@@ -107,7 +133,7 @@ jobs:
             M5MonsterC5-Tab5.bin
           echo "bundle_zip=$(pwd)/$out" >> "$GITHUB_OUTPUT"
 
-      - name: Upload build artifacts
+      - name: Upload firmware artifacts
         uses: actions/upload-artifact@v4
         with:
           name: esp32p4-firmware
@@ -116,24 +142,13 @@ jobs:
 
   release:
     name: Release
-    needs: [firmware]
+    needs: [changes, firmware]
     runs-on: ubuntu-24.04
-    if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
+    permissions:
+      contents: write
+      pull-requests: read
+    if: (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')) && needs.changes.outputs.workflow_changed != 'true'
     steps:
-      - name: Resolve release tag
-        id: meta
-        env:
-          EVENT_TAG: ${{ github.event.release.tag_name }}
-          INPUT_TAG: ${{ inputs.release_tag }}
-          FW_VERSION: ${{ needs.firmware.outputs.fw_version }}
-        run: |
-          set -euo pipefail
-          TAG="${EVENT_TAG:-}"
-          if [ -z "$TAG" ]; then TAG="${INPUT_TAG:-}"; fi
-          if [ -z "$TAG" ]; then TAG="v${FW_VERSION}"; fi
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "Using tag: $TAG"
-
       - name: Download firmware artifacts
         uses: actions/download-artifact@v4
         with:
@@ -142,7 +157,7 @@ jobs:
 
       - name: Package full bundle
         run: |
-          set -euo pipefail
+          set -e
           cd release_artifacts
           mkdir -p bundle
           FW_VERSION="${{ needs.firmware.outputs.fw_version }}"
@@ -164,37 +179,71 @@ jobs:
           fi
 
           out="bundle/M5MonsterC5-Tab5-${FW_VERSION}.zip"
-          rm -f "$out"
           zip -9 "$out" "${files[@]}"
 
-      - name: Delete existing assets (rebuild)
-        if: github.event_name == 'workflow_dispatch' && inputs.rebuild_release == 'true'
+      - name: Build release notes
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ steps.meta.outputs.tag }}
+          FW_VERSION: ${{ needs.firmware.outputs.fw_version }}
+          REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.release_tag || format('v{0}', needs.firmware.outputs.fw_version) }}
         run: |
           set -euo pipefail
-          assets=(
-            "bootloader.bin"
-            "partition-table.bin"
-            "flash_board.py"
-            "M5MonsterC5-Tab5-full.bin"
-            "M5MonsterC5-Tab5-full-${{ needs.firmware.outputs.fw_version }}.bin"
-            "M5MonsterC5-Tab5.bin"
-            "M5MonsterC5-Tab5-${{ needs.firmware.outputs.fw_version }}.bin"
-            "M5MonsterC5-Tab5-${{ needs.firmware.outputs.fw_version }}.zip"
-          )
-          for name in "${assets[@]}"; do
-            if gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json assets --jq ".assets[].name" | grep -qx "$name"; then
-              gh release delete-asset "$TAG" "$name" -R "$GITHUB_REPOSITORY" -y
-            fi
-          done
+          notes_file="release_notes.md"
+          TAG="${RELEASE_TAG:-$FW_VERSION}"
+          BASE_URL="https://github.com/$REPO/releases/download/$TAG"
+          FW_ZIP="$BASE_URL/M5MonsterC5-Tab5-${FW_VERSION}.zip"
+          BUNDLE_ZIP="$BASE_URL/M5MonsterC5-Tab5-${FW_VERSION}.zip"
+          RELEASE_PAGE="https://github.com/$REPO/releases/tag/$TAG"
+          PAGES_LINK="https://${REPO%/*}.github.io/${REPO#*/}/"
 
-      - name: Upload binaries to GitHub Release
+          {
+            printf '%s\n\n' "Release ${TAG} published."
+            printf '%s\n' "Release page: ${RELEASE_PAGE}"
+            printf '%s\n' "Web flasher: ${PAGES_LINK}"
+            printf '%s\n' "Firmware (${FW_VERSION}): ${FW_ZIP}"
+            printf '%s\n\n' "Bundle: ${BUNDLE_ZIP}"
+          } > "$notes_file"
+
+          if [ "${GITHUB_EVENT_NAME:-}" = "release" ]; then
+            if [ -n "${GITHUB_EVENT_PATH:-}" ] && [ -f "${GITHUB_EVENT_PATH:-}" ]; then
+              release_body="$(jq -r '.release.body // \"\"' "$GITHUB_EVENT_PATH")"
+              if [ -n "$(printf '%s' "$release_body" | tr -d '\r\n[:space:]')" ]; then
+                printf '%s\n' "$release_body" >> "$notes_file"
+              fi
+            fi
+            exit 0
+          fi
+
+          if command -v gh >/dev/null 2>&1; then
+            api="/repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/pulls"
+            pr_json="$(gh api -H \"Accept: application/vnd.github+json\" \"$api\" 2>/dev/null || echo '[]')"
+            pr_title="$(printf '%s' "$pr_json" | jq -r '.[0].title // \"\"')"
+            pr_body="$(printf '%s' "$pr_json" | jq -r '.[0].body // \"\"')"
+
+            if [ -n "$(printf '%s' "$pr_body" | tr -d '\r\n[:space:]')" ]; then
+              if [ -n "$pr_title" ]; then
+                printf '%s\n\n' "$pr_title" >> "$notes_file"
+              fi
+              printf '%s\n' "$pr_body" >> "$notes_file"
+              exit 0
+            fi
+
+            gen_json="$(gh api -X POST -H \"Accept: application/vnd.github+json\" \
+              "/repos/${GITHUB_REPOSITORY}/releases/generate-notes" \
+              -f tag_name="$TAG" -f target_commitish="$GITHUB_SHA" 2>/dev/null || echo '')"
+            gen_body="$(printf '%s' "$gen_json" | jq -r '.body // \"\"')"
+            if [ -n "$(printf '%s' "$gen_body" | tr -d '\r\n[:space:]')" ]; then
+              printf '%s\n' "$gen_body" >> "$notes_file"
+            fi
+          fi
+
+      - name: Upload binaries to GitHub Release (notes)
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.meta.outputs.tag }}
+          tag_name: ${{ github.event.release.tag_name || inputs.release_tag || format('v{0}', needs.firmware.outputs.fw_version) }}
           name: ${{ format('M5MonsterC5-Tab5 {0}', needs.firmware.outputs.fw_version) }}
+          body_path: release_notes.md
           files: |
             release_artifacts/firmware/bootloader.bin
             release_artifacts/firmware/partition-table.bin
@@ -204,13 +253,14 @@ jobs:
             release_artifacts/firmware/M5MonsterC5-Tab5.bin
             release_artifacts/firmware/M5MonsterC5-Tab5-${{ needs.firmware.outputs.fw_version }}.bin
             release_artifacts/firmware/M5MonsterC5-Tab5-${{ needs.firmware.outputs.fw_version }}.zip
+            release_artifacts/bundle/M5MonsterC5-Tab5-${{ needs.firmware.outputs.fw_version }}.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   pages:
     name: Pages Web Flasher
     needs: [release, firmware]
-    if: ${{ needs.release.result == 'success' && (github.event_name != 'workflow_dispatch' || inputs.build_pages == 'true') }}
+    if: ${{ needs.release.result == 'success' }}
     runs-on: ubuntu-24.04
     permissions:
       contents: read
