@@ -1,0 +1,299 @@
+name: ESP32P4 Build (IDF 5.4.1)
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Optional tag name to upload assets to a release (example 'v1.2.3')"
+        required: false
+      rebuild_release:
+        description: "Delete existing assets for the tag before uploading (rebuild release)"
+        required: false
+        type: choice
+        options:
+          - "false"
+          - "true"
+        default: "false"
+      build_pages:
+        description: "Build and deploy GitHub Pages"
+        required: false
+        type: choice
+        options:
+          - "false"
+          - "true"
+        default: "false"
+  push:
+    branches: [main, master]
+    paths:
+      - "main/main.c"
+      - ".github/scripts/**"
+      - ".github/workflows/esp32p4-build-master.yml"
+  release:
+    types: [published, edited]
+
+jobs:
+  firmware:
+    name: M5MonsterC5-Tab5
+    permissions:
+      contents: write
+    runs-on: ubuntu-24.04
+    container:
+      image: espressif/idf:v5.4.1
+    outputs:
+      fw_version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cache ESP-IDF artifacts
+        uses: actions/cache@v4
+        with:
+          path: /root/.espressif
+          key: espidf-5.4.1-${{ runner.os }}-${{ hashFiles('sdkconfig', 'dependencies.lock') }}
+          restore-keys: |
+            espidf-5.4.1-${{ runner.os }}-
+            espidf-5.4.1-
+
+      - name: Build firmware (IDF 5.4.1)
+        run: bash .github/scripts/container_build.sh --no-docker
+
+      - name: Stamp artifacts with version
+        id: version
+        run: |
+          set -euo pipefail
+          version=$(git rev-parse --short HEAD)
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+          src="binaries-esp32p4/M5MonsterC5-Tab5.bin"
+          if [ ! -f "$src" ]; then
+            echo "Missing firmware: $src" >&2
+            exit 1
+          fi
+          cp "$src" "binaries-esp32p4/M5MonsterC5-Tab5-${version}.bin"
+
+      - name: Merge full flash image (ESP32P4)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! python3 -c "import venv" >/dev/null 2>&1; then
+            apt-get update
+            apt-get install -y python3-venv
+          fi
+          python3 -m venv /tmp/esptool-venv
+          /tmp/esptool-venv/bin/python -m pip install --no-cache-dir esptool
+          /tmp/esptool-venv/bin/python -m esptool --chip esp32p4 merge_bin \
+            -o "binaries-esp32p4/M5MonsterC5-Tab5-full-${{ steps.version.outputs.version }}.bin" \
+            --flash_mode dio --flash_freq 80m --flash_size 16MB \
+            0x2000 "binaries-esp32p4/bootloader.bin" \
+            0x8000 "binaries-esp32p4/partition-table.bin" \
+            0x10000 "binaries-esp32p4/M5MonsterC5-Tab5.bin"
+          cp "binaries-esp32p4/M5MonsterC5-Tab5-full-${{ steps.version.outputs.version }}.bin" \
+            "binaries-esp32p4/M5MonsterC5-Tab5-full.bin"
+
+      - name: Package firmware zip
+        id: bundle
+        run: |
+          set -euo pipefail
+          cd binaries-esp32p4
+          out="M5MonsterC5-Tab5-${{ steps.version.outputs.version }}.zip"
+          rm -f "$out"
+          zip -9 "$out" \
+            bootloader.bin \
+            partition-table.bin \
+            flash_board.py \
+            M5MonsterC5-Tab5-full.bin \
+            "M5MonsterC5-Tab5-full-${{ steps.version.outputs.version }}.bin" \
+            "M5MonsterC5-Tab5-${{ steps.version.outputs.version }}.bin" \
+            M5MonsterC5-Tab5.bin
+          echo "bundle_zip=$(pwd)/$out" >> "$GITHUB_OUTPUT"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: esp32p4-firmware
+          path: binaries-esp32p4
+          if-no-files-found: error
+
+  release:
+    name: Release
+    needs: [firmware]
+    runs-on: ubuntu-24.04
+    if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
+    steps:
+      - name: Resolve release tag
+        id: meta
+        env:
+          EVENT_TAG: ${{ github.event.release.tag_name }}
+          INPUT_TAG: ${{ inputs.release_tag }}
+          FW_VERSION: ${{ needs.firmware.outputs.fw_version }}
+        run: |
+          set -euo pipefail
+          TAG="${EVENT_TAG:-}"
+          if [ -z "$TAG" ]; then TAG="${INPUT_TAG:-}"; fi
+          if [ -z "$TAG" ]; then TAG="v${FW_VERSION}"; fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Using tag: $TAG"
+
+      - name: Download firmware artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: esp32p4-firmware
+          path: release_artifacts/firmware
+
+      - name: Package full bundle
+        run: |
+          set -euo pipefail
+          cd release_artifacts
+          mkdir -p bundle
+          FW_VERSION="${{ needs.firmware.outputs.fw_version }}"
+
+          shopt -s nullglob
+
+          files=(
+            firmware/bootloader.bin
+            firmware/partition-table.bin
+            firmware/flash_board.py
+            firmware/M5MonsterC5-Tab5-full.bin
+            "firmware/M5MonsterC5-Tab5-full-${FW_VERSION}.bin"
+            firmware/M5MonsterC5-Tab5.bin
+            "firmware/M5MonsterC5-Tab5-${FW_VERSION}.bin"
+          )
+
+          if [ -f "firmware/M5MonsterC5-Tab5-${FW_VERSION}.zip" ]; then
+            files+=("firmware/M5MonsterC5-Tab5-${FW_VERSION}.zip")
+          fi
+
+          out="bundle/M5MonsterC5-Tab5-${FW_VERSION}.zip"
+          rm -f "$out"
+          zip -9 "$out" "${files[@]}"
+
+      - name: Delete existing assets (rebuild)
+        if: github.event_name == 'workflow_dispatch' && inputs.rebuild_release == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          set -euo pipefail
+          assets=(
+            "bootloader.bin"
+            "partition-table.bin"
+            "flash_board.py"
+            "M5MonsterC5-Tab5-full.bin"
+            "M5MonsterC5-Tab5-full-${{ needs.firmware.outputs.fw_version }}.bin"
+            "M5MonsterC5-Tab5.bin"
+            "M5MonsterC5-Tab5-${{ needs.firmware.outputs.fw_version }}.bin"
+            "M5MonsterC5-Tab5-${{ needs.firmware.outputs.fw_version }}.zip"
+          )
+          for name in "${assets[@]}"; do
+            if gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json assets --jq ".assets[].name" | grep -qx "$name"; then
+              gh release delete-asset "$TAG" "$name" -R "$GITHUB_REPOSITORY" -y
+            fi
+          done
+
+      - name: Upload binaries to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: ${{ format('M5MonsterC5-Tab5 {0}', needs.firmware.outputs.fw_version) }}
+          files: |
+            release_artifacts/firmware/bootloader.bin
+            release_artifacts/firmware/partition-table.bin
+            release_artifacts/firmware/flash_board.py
+            release_artifacts/firmware/M5MonsterC5-Tab5-full.bin
+            release_artifacts/firmware/M5MonsterC5-Tab5-full-${{ needs.firmware.outputs.fw_version }}.bin
+            release_artifacts/firmware/M5MonsterC5-Tab5.bin
+            release_artifacts/firmware/M5MonsterC5-Tab5-${{ needs.firmware.outputs.fw_version }}.bin
+            release_artifacts/firmware/M5MonsterC5-Tab5-${{ needs.firmware.outputs.fw_version }}.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  pages:
+    name: Pages Web Flasher
+    needs: [release, firmware]
+    if: ${{ needs.release.result == 'success' && (github.event_name != 'workflow_dispatch' || inputs.build_pages == 'true') }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    outputs:
+      page_url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v4
+        with:
+          enablement: true
+
+      - name: Resolve release tag
+        id: meta
+        env:
+          EVENT_TAG: ${{ github.event.release.tag_name }}
+          INPUT_TAG: ${{ inputs.release_tag }}
+          FW_VERSION: ${{ needs.firmware.outputs.fw_version }}
+        run: |
+          set -euo pipefail
+          TAG="${EVENT_TAG:-}"
+          if [ -z "$TAG" ]; then TAG="${INPUT_TAG:-}"; fi
+          if [ -z "$TAG" ]; then TAG="v${FW_VERSION}"; fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Using tag: $TAG"
+
+      - name: Download release assets
+        id: download
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.meta.outputs.tag }}"
+          rm -rf docs/firmware
+          mkdir -p docs/firmware
+
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" --dir docs/firmware \
+            --pattern "bootloader.bin" \
+            --pattern "partition-table.bin" \
+            --pattern "M5MonsterC5-Tab5*.bin"
+
+          ls -lh docs/firmware
+
+          if [ ! -f docs/firmware/M5MonsterC5-Tab5.bin ]; then
+            alt=$(ls docs/firmware/M5MonsterC5-Tab5-*.bin 2>/dev/null | head -n1 || true)
+            if [ -n "$alt" ]; then
+              cp "$alt" docs/firmware/M5MonsterC5-Tab5.bin
+            fi
+          fi
+
+          for f in bootloader.bin partition-table.bin M5MonsterC5-Tab5.bin; do
+            if [ ! -f "docs/firmware/$f" ]; then
+              echo "Missing $f in release assets for tag ${TAG}" >&2
+              exit 1
+            fi
+          done
+
+          fw_version=$(ls docs/firmware/M5MonsterC5-Tab5-*.bin 2>/dev/null | head -n1 | xargs -n1 basename | sed -E 's/^M5MonsterC5-Tab5-([^.]*)\\.bin$/\\1/')
+          if [ -z "$fw_version" ]; then
+            fw_version="${TAG}"
+          fi
+          echo "fw_version=$fw_version" >> "$GITHUB_OUTPUT"
+
+      - name: Build manifest.json
+        env:
+          FW_VERSION: ${{ steps.download.outputs.fw_version }}
+          BUILD_TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          set -euo pipefail
+          python -c "import os, json; from pathlib import Path; version=os.getenv('FW_VERSION') or os.getenv('BUILD_TAG'); build=os.getenv('BUILD_TAG','manual'); manifest={'name':'M5MonsterC5-Tab5 ESP32-P4','version':version,'build':build,'chipFamily':'ESP32-P4','parts':[{'path':'firmware/bootloader.bin','offset':8192},{'path':'firmware/partition-table.bin','offset':32768},{'path':'firmware/M5MonsterC5-Tab5.bin','offset':65536}]}; Path('docs/manifest.json').write_text(json.dumps(manifest, indent=2))"
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

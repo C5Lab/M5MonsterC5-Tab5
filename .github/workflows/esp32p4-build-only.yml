@@ -1,0 +1,41 @@
+name: ESP32P4 Build Only (IDF 5.4.1)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    paths:
+      - "main/main.c"
+      - ".github/scripts/**"
+      - ".github/workflows/esp32p4-build-only.yml"
+
+jobs:
+  firmware:
+    name: M5MonsterC5-Tab5
+    permissions:
+      contents: read
+    runs-on: [self-hosted, linux, x64]
+    container:
+      image: espressif/idf:v5.4.1
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cache ESP-IDF artifacts
+        uses: actions/cache@v4
+        with:
+          path: /root/.espressif
+          key: espidf-5.4.1-${{ runner.os }}-${{ hashFiles('sdkconfig', 'dependencies.lock') }}
+          restore-keys: |
+            espidf-5.4.1-${{ runner.os }}-
+            espidf-5.4.1-
+
+      - name: Build firmware (IDF 5.4.1)
+        run: bash .github/scripts/container_build.sh --no-docker
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: esp32p4-firmware
+          path: binaries-esp32p4
+          if-no-files-found: error

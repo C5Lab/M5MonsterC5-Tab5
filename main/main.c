@@ -30,6 +30,8 @@
 // Captive portal includes
 #include "esp_http_server.h"
 #include "lwip/sockets.h"
+
+#define JANOS_TAB_VERSION "0.9"
 #include "lwip/netdb.h"
 #include <dirent.h>
 #include <sys/stat.h>
