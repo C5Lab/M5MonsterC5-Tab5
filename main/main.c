@@ -422,6 +422,9 @@ static tab_context_t uart1_ctx = {0};
 static tab_context_t uart2_ctx = {0};
 static tab_context_t internal_ctx = {0};
 
+// Red Team mode - controls visibility of offensive features (declared early for use in all functions)
+static bool enable_red_team = false;  // Default: false (safe mode)
+
 // Legacy compatibility - kept for minimal code changes
 static wifi_network_t networks[MAX_NETWORKS];  // Temporary buffer during scan
 static int network_count = 0;
@@ -1053,6 +1056,7 @@ static void settings_tile_event_cb(lv_event_t *e);
 static void settings_back_btn_event_cb(lv_event_t *e);
 static void show_uart_pins_popup(void);
 static void show_scan_time_popup(void);
+static void show_red_team_settings_page(void);
 static void get_uart1_pins(uint8_t mode, int *tx_pin, int *rx_pin);
 static void get_uart2_pins(uint8_t uart1_mode, int *tx_pin, int *rx_pin);
 static void init_uart2(void);
@@ -3423,6 +3427,16 @@ static void arp_host_click_cb(lv_event_t *e)
     tab_context_t *ctx = get_current_ctx();
     if (!ctx) return;
     
+    // Block ARP poisoning if Red Team mode is disabled
+    if (!enable_red_team) {
+        ESP_LOGW(TAG, "ARP Poisoning blocked - Red Team mode disabled");
+        if (arp_status_label) {
+            lv_label_set_text(arp_status_label, "ARP Poisoning requires Red Team mode");
+            lv_obj_set_style_text_color(arp_status_label, COLOR_MATERIAL_RED, 0);
+        }
+        return;
+    }
+    
     arp_host_t *host = &arp_hosts[idx];
     ESP_LOGI(TAG, "ARP Poison: Starting attack on %s (%s)", host->ip, host->mac);
     
@@ -3653,9 +3667,9 @@ static void show_arp_poison_page(void)
     lv_obj_set_style_text_color(back_icon, lv_color_hex(0xFFFFFF), 0);
     lv_obj_center(back_icon);
     
-    // Title
+    // Title - use "Tests" instead of "Attacks" when Red Team is disabled
     lv_obj_t *title = lv_label_create(header);
-    lv_label_set_text(title, "Internal WiFi Attacks");
+    lv_label_set_text(title, enable_red_team ? "Internal WiFi Attacks" : "Internal WiFi Tests");
     lv_obj_set_style_text_font(title, &lv_font_montserrat_22, 0);
     lv_obj_set_style_text_color(title, COLOR_MATERIAL_PURPLE, 0);
     
@@ -5159,8 +5173,13 @@ static void create_uart_tiles_in_container(lv_obj_t *container, lv_obj_t **tiles
     lv_obj_clear_flag(*tiles_ptr, LV_OBJ_FLAG_SCROLLABLE);
     
     // Create 7 tiles for UART tabs (same for both UART1 and UART2)
-    create_tile(*tiles_ptr, LV_SYMBOL_WIFI, "WiFi Scan\n& Attack", COLOR_MATERIAL_BLUE, main_tile_event_cb, "WiFi Scan & Attack");
-    create_tile(*tiles_ptr, LV_SYMBOL_WARNING, "Global WiFi\nAttacks", COLOR_MATERIAL_RED, main_tile_event_cb, "Global WiFi Attacks");
+    // Use "Test" instead of "Attack" when Red Team is disabled
+    create_tile(*tiles_ptr, LV_SYMBOL_WIFI, 
+        enable_red_team ? "WiFi Scan\n& Attack" : "WiFi Scan\n& Test", 
+        COLOR_MATERIAL_BLUE, main_tile_event_cb, "WiFi Scan & Attack");
+    create_tile(*tiles_ptr, LV_SYMBOL_WARNING, 
+        enable_red_team ? "Global WiFi\nAttacks" : "Global WiFi\nTests", 
+        COLOR_MATERIAL_RED, main_tile_event_cb, "Global WiFi Attacks");
     create_tile(*tiles_ptr, LV_SYMBOL_SAVE, "Compromised\nData", COLOR_MATERIAL_GREEN, main_tile_event_cb, "Compromised Data");
     create_tile(*tiles_ptr, LV_SYMBOL_EYE_OPEN, "Deauth\nDetector", COLOR_MATERIAL_AMBER, main_tile_event_cb, "Deauth Detector");
     create_tile(*tiles_ptr, LV_SYMBOL_BLUETOOTH, "Bluetooth", COLOR_MATERIAL_CYAN, main_tile_event_cb, "Bluetooth");
@@ -5354,9 +5373,9 @@ static void show_scan_page(void)
     lv_obj_set_style_text_color(back_icon, lv_color_hex(0xFFFFFF), 0);
     lv_obj_center(back_icon);
     
-    // Title
+    // Title - use "Test" instead of "Attack" when Red Team is disabled
     lv_obj_t *title = lv_label_create(left_cont);
-    lv_label_set_text(title, "Scan & Attack");
+    lv_label_set_text(title, enable_red_team ? "Scan & Attack" : "Scan & Test");
     lv_obj_set_style_text_font(title, &lv_font_montserrat_24, 0);
     lv_obj_set_style_text_color(title, COLOR_MATERIAL_BLUE, 0);
     
@@ -5421,11 +5440,14 @@ static void show_scan_page(void)
     lv_obj_set_flex_align(attack_bar, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_clear_flag(attack_bar, LV_OBJ_FLAG_SCROLLABLE);
     
-    // Create attack tiles in the bottom bar (5 tiles)
-    create_small_tile(attack_bar, LV_SYMBOL_CHARGE, "Deauth", COLOR_MATERIAL_RED, attack_tile_event_cb, "Deauth");
-    create_small_tile(attack_bar, LV_SYMBOL_WARNING, "EvilTwin", COLOR_MATERIAL_ORANGE, attack_tile_event_cb, "Evil Twin");
-    create_small_tile(attack_bar, LV_SYMBOL_POWER, "SAE", COLOR_MATERIAL_PINK, attack_tile_event_cb, "SAE Overflow");
-    create_small_tile(attack_bar, LV_SYMBOL_DOWNLOAD, "Handshake", COLOR_MATERIAL_AMBER, attack_tile_event_cb, "Handshaker");
+    // Create attack tiles in the bottom bar (some only visible when Red Team enabled)
+    if (enable_red_team) {
+        create_small_tile(attack_bar, LV_SYMBOL_CHARGE, "Deauth", COLOR_MATERIAL_RED, attack_tile_event_cb, "Deauth");
+        create_small_tile(attack_bar, LV_SYMBOL_WARNING, "EvilTwin", COLOR_MATERIAL_ORANGE, attack_tile_event_cb, "Evil Twin");
+        create_small_tile(attack_bar, LV_SYMBOL_POWER, "SAE", COLOR_MATERIAL_PINK, attack_tile_event_cb, "SAE Overflow");
+        create_small_tile(attack_bar, LV_SYMBOL_DOWNLOAD, "Handshake", COLOR_MATERIAL_AMBER, attack_tile_event_cb, "Handshaker");
+    }
+    // ARP tile always visible (but poisoning blocked when Red Team disabled)
     create_small_tile(attack_bar, LV_SYMBOL_SHUFFLE, "ARP", COLOR_MATERIAL_PURPLE, attack_tile_event_cb, "ARP Poison");
     
     // Auto-start scan when entering the page
@@ -5446,7 +5468,7 @@ static void popup_timer_callback(TimerHandle_t xTimer)
     (void)xTimer;
     
     tab_context_t *ctx = get_current_ctx();
-    if (!popup_open || !ctx || !ctx->observer_running) return;
+    if (!ctx || !ctx->popup_open || !ctx->observer_running) return;
     
     // Only start new poll if previous one finished
     if (observer_task_handle == NULL) {
@@ -5455,26 +5477,25 @@ static void popup_timer_callback(TimerHandle_t xTimer)
 }
 
 // Update popup content with current network data
-static void update_popup_content(void)
+static void update_popup_content(tab_context_t *ctx)
 {
-    tab_context_t *ctx = get_current_ctx();
     if (!ctx) return;
-    if (!popup_obj || popup_network_idx < 0 || popup_network_idx >= ctx->observer_network_count) return;
+    if (!ctx->network_popup || ctx->popup_network_idx < 0 || ctx->popup_network_idx >= ctx->observer_network_count) return;
     
-    observer_network_t *net = &ctx->observer_networks[popup_network_idx];
+    observer_network_t *net = &ctx->observer_networks[ctx->popup_network_idx];
     
     // Update clients container
-    if (popup_clients_container) {
-        lv_obj_clean(popup_clients_container);
+    if (ctx->popup_clients_container) {
+        lv_obj_clean(ctx->popup_clients_container);
         
         if (net->client_count == 0) {
-            lv_obj_t *no_clients = lv_label_create(popup_clients_container);
+            lv_obj_t *no_clients = lv_label_create(ctx->popup_clients_container);
             lv_label_set_text(no_clients, "No clients detected yet...");
             lv_obj_set_style_text_color(no_clients, lv_color_hex(0x666666), 0);
         } else {
             for (int j = 0; j < net->client_count && j < MAX_CLIENTS_PER_NETWORK; j++) {
                 if (net->clients[j][0] != '\0') {
-                    lv_obj_t *client_label = lv_label_create(popup_clients_container);
+                    lv_obj_t *client_label = lv_label_create(ctx->popup_clients_container);
                     lv_label_set_text_fmt(client_label, "  %s", net->clients[j]);
                     lv_obj_set_style_text_font(client_label, &lv_font_montserrat_14, 0);
                     lv_obj_set_style_text_color(client_label, lv_color_hex(0xAAAAAA), 0);
@@ -5495,13 +5516,14 @@ static void popup_close_btn_cb(lv_event_t *e)
 // Close network popup and resume normal monitoring
 static void close_network_popup(void)
 {
-    if (!popup_open) return;
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx || !ctx->popup_open) return;
     
     ESP_LOGI(TAG, "Closing network popup");
     
     // Stop popup timer
-    if (popup_timer != NULL) {
-        xTimerStop(popup_timer, 0);
+    if (ctx->popup_timer != NULL) {
+        xTimerStop(ctx->popup_timer, 0);
     }
     
     // Send unselect_networks to monitor all networks again
@@ -5511,27 +5533,23 @@ static void close_network_popup(void)
     uart_send_command_for_tab("start_sniffer_noscan");
     
     // Close popup UI
-    if (popup_obj) {
-        lv_obj_del(popup_obj);
-        popup_obj = NULL;
-        popup_clients_container = NULL;
+    if (ctx->network_popup) {
+        lv_obj_del(ctx->network_popup);
+        ctx->network_popup = NULL;
+        ctx->popup_clients_container = NULL;
     }
     
-    popup_open = false;
-    popup_network_idx = -1;
+    ctx->popup_open = false;
+    ctx->popup_network_idx = -1;
     
-    // Refresh main table and restart timer
-    tab_context_t *ctx = get_current_ctx();
-    if (ctx) {
-        // Restart main observer timer (20s) for this context
-        if (ctx->observer_timer != NULL && ctx->observer_running) {
-            xTimerStart(ctx->observer_timer, 0);
-            ESP_LOGI(TAG, "Resumed observer timer for tab %d (20s)", current_tab);
-        }
-        
-        if (ctx->observer_table) {
-            update_observer_table(ctx);
-        }
+    // Restart main observer timer (20s) for this context
+    if (ctx->observer_timer != NULL && ctx->observer_running) {
+        xTimerStart(ctx->observer_timer, 0);
+        ESP_LOGI(TAG, "Resumed observer timer for tab %d (20s)", current_tab);
+    }
+    
+    if (ctx->observer_table) {
+        update_observer_table(ctx);
     }
 }
 
@@ -5542,13 +5560,13 @@ static void show_network_popup(int network_idx)
     if (!ctx) return;
     
     if (network_idx < 0 || network_idx >= ctx->observer_network_count) return;
-    if (popup_open) return;  // Already showing a popup
+    if (ctx->popup_open) return;  // Already showing a popup on this tab
     
     observer_network_t *net = &ctx->observer_networks[network_idx];
     ESP_LOGI(TAG, "Opening popup for network: %s (scan_index=%d)", net->ssid, net->scan_index);
     
-    popup_open = true;
-    popup_network_idx = network_idx;
+    ctx->popup_open = true;
+    ctx->popup_network_idx = network_idx;
     
     // Stop main observer timer for this context
     if (ctx->observer_timer != NULL) {
@@ -5570,22 +5588,22 @@ static void show_network_popup(int network_idx)
     // Create popup overlay
     lv_obj_t *container = get_current_tab_container();
     if (!container) return;
-    popup_obj = lv_obj_create(container);
-    lv_obj_set_size(popup_obj, 600, 400);
-    lv_obj_center(popup_obj);
-    lv_obj_set_style_bg_color(popup_obj, lv_color_hex(0x1A2A2A), 0);
-    lv_obj_set_style_border_color(popup_obj, COLOR_MATERIAL_TEAL, 0);
-    lv_obj_set_style_border_width(popup_obj, 2, 0);
-    lv_obj_set_style_radius(popup_obj, 16, 0);
-    lv_obj_set_style_shadow_width(popup_obj, 30, 0);
-    lv_obj_set_style_shadow_color(popup_obj, lv_color_hex(0x000000), 0);
-    lv_obj_set_style_shadow_opa(popup_obj, LV_OPA_50, 0);
-    lv_obj_set_style_pad_all(popup_obj, 16, 0);
-    lv_obj_set_flex_flow(popup_obj, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_pad_row(popup_obj, 8, 0);
+    ctx->network_popup = lv_obj_create(container);
+    lv_obj_set_size(ctx->network_popup, 600, 400);
+    lv_obj_center(ctx->network_popup);
+    lv_obj_set_style_bg_color(ctx->network_popup, lv_color_hex(0x1A2A2A), 0);
+    lv_obj_set_style_border_color(ctx->network_popup, COLOR_MATERIAL_TEAL, 0);
+    lv_obj_set_style_border_width(ctx->network_popup, 2, 0);
+    lv_obj_set_style_radius(ctx->network_popup, 16, 0);
+    lv_obj_set_style_shadow_width(ctx->network_popup, 30, 0);
+    lv_obj_set_style_shadow_color(ctx->network_popup, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_shadow_opa(ctx->network_popup, LV_OPA_50, 0);
+    lv_obj_set_style_pad_all(ctx->network_popup, 16, 0);
+    lv_obj_set_flex_flow(ctx->network_popup, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(ctx->network_popup, 8, 0);
     
     // Header with title and close button
-    lv_obj_t *header = lv_obj_create(popup_obj);
+    lv_obj_t *header = lv_obj_create(ctx->network_popup);
     lv_obj_set_size(header, lv_pct(100), 40);
     lv_obj_set_style_bg_opa(header, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(header, 0, 0);
@@ -5615,7 +5633,7 @@ static void show_network_popup(int network_idx)
     lv_obj_center(close_icon);
     
     // Network info section
-    lv_obj_t *info_container = lv_obj_create(popup_obj);
+    lv_obj_t *info_container = lv_obj_create(ctx->network_popup);
     lv_obj_set_size(info_container, lv_pct(100), LV_SIZE_CONTENT);
     lv_obj_set_style_bg_color(info_container, lv_color_hex(0x0A1A1A), 0);
     lv_obj_set_style_border_width(info_container, 0, 0);
@@ -5644,42 +5662,42 @@ static void show_network_popup(int network_idx)
     lv_obj_set_style_text_color(channel_label, lv_color_hex(0xCCCCCC), 0);
     
     // Clients section header
-    lv_obj_t *clients_header = lv_label_create(popup_obj);
+    lv_obj_t *clients_header = lv_label_create(ctx->network_popup);
     lv_label_set_text_fmt(clients_header, "Clients (%d):", net->client_count);
     lv_obj_set_style_text_font(clients_header, &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_color(clients_header, COLOR_MATERIAL_TEAL, 0);
     
     // Clients scrollable container
-    popup_clients_container = lv_obj_create(popup_obj);
-    lv_obj_set_size(popup_clients_container, lv_pct(100), lv_pct(100));
-    lv_obj_set_flex_grow(popup_clients_container, 1);
-    lv_obj_set_style_bg_color(popup_clients_container, lv_color_hex(0x0A1A1A), 0);
-    lv_obj_set_style_border_width(popup_clients_container, 0, 0);
-    lv_obj_set_style_radius(popup_clients_container, 8, 0);
-    lv_obj_set_style_pad_all(popup_clients_container, 8, 0);
-    lv_obj_set_flex_flow(popup_clients_container, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_pad_row(popup_clients_container, 4, 0);
-    lv_obj_set_scroll_dir(popup_clients_container, LV_DIR_VER);
+    ctx->popup_clients_container = lv_obj_create(ctx->network_popup);
+    lv_obj_set_size(ctx->popup_clients_container, lv_pct(100), lv_pct(100));
+    lv_obj_set_flex_grow(ctx->popup_clients_container, 1);
+    lv_obj_set_style_bg_color(ctx->popup_clients_container, lv_color_hex(0x0A1A1A), 0);
+    lv_obj_set_style_border_width(ctx->popup_clients_container, 0, 0);
+    lv_obj_set_style_radius(ctx->popup_clients_container, 8, 0);
+    lv_obj_set_style_pad_all(ctx->popup_clients_container, 8, 0);
+    lv_obj_set_flex_flow(ctx->popup_clients_container, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(ctx->popup_clients_container, 4, 0);
+    lv_obj_set_scroll_dir(ctx->popup_clients_container, LV_DIR_VER);
     
     // Initial client list
-    update_popup_content();
+    update_popup_content(ctx);
     
     // Create and start popup timer (10s polling)
-    if (popup_timer == NULL) {
-        popup_timer = xTimerCreate("popup_timer", 
+    if (ctx->popup_timer == NULL) {
+        ctx->popup_timer = xTimerCreate("popup_timer", 
                                    pdMS_TO_TICKS(POPUP_POLL_INTERVAL_MS),
                                    pdTRUE,  // Auto-reload
                                    NULL,
                                    popup_timer_callback);
     }
     
-    if (popup_timer != NULL) {
-        xTimerStart(popup_timer, 0);
+    if (ctx->popup_timer != NULL) {
+        xTimerStart(ctx->popup_timer, 0);
         ESP_LOGI(TAG, "Started popup timer (10s polling)");
         
         // Do first poll after a short delay
         vTaskDelay(pdMS_TO_TICKS(2000));
-        if (popup_open && observer_task_handle == NULL) {
+        if (ctx->popup_open && observer_task_handle == NULL) {
             xTaskCreate(popup_poll_task, "popup_poll", 8192, (void*)ctx, 5, &observer_task_handle);
         }
     }
@@ -5727,7 +5745,7 @@ static void popup_poll_task(void *arg)
         return;
     }
     
-    ESP_LOGI(TAG, "Popup poll task started for network idx %d", popup_network_idx);
+    ESP_LOGI(TAG, "Popup poll task started for network idx %d", ctx->popup_network_idx);
     
     if (!observer_rx_buffer || !observer_line_buffer || !ctx->observer_networks) {
         ESP_LOGE(TAG, "PSRAM buffers not allocated!");
@@ -5806,16 +5824,16 @@ static void popup_poll_task(void *arg)
             }
         }
         
-        if (!popup_open) {
+        if (!ctx->popup_open) {
             ESP_LOGI(TAG, "Popup closed during poll");
             break;
         }
     }
     
     // Update popup UI
-    if (popup_open) {
+    if (ctx->popup_open) {
         bsp_display_lock(0);
-        update_popup_content();
+        update_popup_content(ctx);
         bsp_display_unlock();
     }
     
@@ -5941,6 +5959,16 @@ static void show_deauth_popup(int network_idx, int client_idx)
 {
     tab_context_t *ctx = get_current_ctx();
     if (!ctx) return;
+    
+    // Block deauth if Red Team mode is disabled
+    if (!enable_red_team) {
+        ESP_LOGW(TAG, "Deauth blocked - Red Team mode disabled");
+        if (ctx->observer_status_label) {
+            lv_label_set_text(ctx->observer_status_label, "Deauth requires Red Team mode");
+            lv_obj_set_style_text_color(ctx->observer_status_label, COLOR_MATERIAL_RED, 0);
+        }
+        return;
+    }
     
     if (network_idx < 0 || network_idx >= ctx->observer_network_count) return;
     if (deauth_popup_obj != NULL) return;  // Already showing a popup
@@ -12717,9 +12745,9 @@ static void show_global_attacks_page(void)
     lv_obj_set_style_text_color(back_icon, lv_color_hex(0xFFFFFF), 0);
     lv_obj_center(back_icon);
     
-    // Title
+    // Title - use "Tests" instead of "Attacks" when Red Team is disabled
     lv_obj_t *title = lv_label_create(header);
-    lv_label_set_text(title, "Global WiFi Attacks");
+    lv_label_set_text(title, enable_red_team ? "Global WiFi Attacks" : "Global WiFi Tests");
     lv_obj_set_style_text_font(title, &lv_font_montserrat_24, 0);
     lv_obj_set_style_text_color(title, COLOR_MATERIAL_RED, 0);
     
@@ -12734,20 +12762,27 @@ static void show_global_attacks_page(void)
     lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
     lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER);
     
-    // Create 5 attack tiles
-    // Blackout - Red (dangerous)
-    create_tile(tiles, LV_SYMBOL_POWER, "Blackout", COLOR_MATERIAL_RED, global_attack_tile_event_cb, "Blackout");
+    // Create attack tiles (some only visible when Red Team enabled)
     
-    // Handshaker - Amber
-    create_tile(tiles, LV_SYMBOL_DOWNLOAD, "Handshaker", COLOR_MATERIAL_AMBER, global_attack_tile_event_cb, "Handshakes");
+    // Blackout - Red (dangerous) - Red Team only
+    if (enable_red_team) {
+        create_tile(tiles, LV_SYMBOL_POWER, "Blackout", COLOR_MATERIAL_RED, global_attack_tile_event_cb, "Blackout");
+    }
     
-    // Portal - Orange
+    // Handshaker - Amber - Red Team only
+    if (enable_red_team) {
+        create_tile(tiles, LV_SYMBOL_DOWNLOAD, "Handshaker", COLOR_MATERIAL_AMBER, global_attack_tile_event_cb, "Handshakes");
+    }
+    
+    // Portal - Orange (always visible)
     create_tile(tiles, LV_SYMBOL_WIFI, "Portal", COLOR_MATERIAL_ORANGE, global_attack_tile_event_cb, "Portal");
     
-    // SnifferDog - Purple
-    create_tile(tiles, LV_SYMBOL_EYE_OPEN, "SnifferDog", COLOR_MATERIAL_PURPLE, global_attack_tile_event_cb, "Snifferdog");
+    // SnifferDog - Purple - Red Team only
+    if (enable_red_team) {
+        create_tile(tiles, LV_SYMBOL_EYE_OPEN, "SnifferDog", COLOR_MATERIAL_PURPLE, global_attack_tile_event_cb, "Snifferdog");
+    }
     
-    // Wardrive - Teal
+    // Wardrive - Teal (always visible)
     create_tile(tiles, LV_SYMBOL_GPS, "Wardrive", COLOR_MATERIAL_TEAL, global_attack_tile_event_cb, "Wardrive");
     
     // Set current visible page
@@ -12770,6 +12805,7 @@ static lv_obj_t *uart2_info_label = NULL;
 #define NVS_NAMESPACE "settings"
 #define NVS_KEY_HW_CONFIG   "hw_config"
 #define NVS_KEY_UART1_PINS  "uart1_pins"
+#define NVS_KEY_RED_TEAM    "red_team"
 
 // Load UART mode from NVS (called on startup)
 // Load hardware configuration from NVS (called on startup)
@@ -12799,9 +12835,19 @@ static void load_hw_config_from_nvs(void)
             ESP_LOGI(TAG, "No UART1 pins in NVS, using default: Grove (TX=53, RX=54)");
         }
         
+        // Load red_team setting
+        uint8_t red_team = 0;
+        err = nvs_get_u8(nvs, NVS_KEY_RED_TEAM, &red_team);
+        if (err == ESP_OK) {
+            enable_red_team = (red_team != 0);
+            ESP_LOGI(TAG, "Loaded Red Team from NVS: %s", enable_red_team ? "Enabled" : "Disabled");
+        } else {
+            ESP_LOGI(TAG, "No Red Team in NVS, using default: Disabled");
+        }
+        
         nvs_close(nvs);
     } else {
-        ESP_LOGI(TAG, "NVS not available, using defaults: Monster mode, UART1=Grove");
+        ESP_LOGI(TAG, "NVS not available, using defaults: Monster mode, UART1=Grove, Red Team=Disabled");
     }
 }
 
@@ -12820,6 +12866,21 @@ static void save_hw_config_to_nvs(uint8_t config, uint8_t pins)
                  pins == 0 ? "M5Bus" : "Grove");
     } else {
         ESP_LOGE(TAG, "Failed to open NVS for writing: %s", esp_err_to_name(err));
+    }
+}
+
+// Save Red Team setting to NVS
+static void save_red_team_to_nvs(bool enabled)
+{
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs);
+    if (err == ESP_OK) {
+        nvs_set_u8(nvs, NVS_KEY_RED_TEAM, enabled ? 1 : 0);
+        nvs_commit(nvs);
+        nvs_close(nvs);
+        ESP_LOGI(TAG, "Saved Red Team to NVS: %s", enabled ? "Enabled" : "Disabled");
+    } else {
+        ESP_LOGE(TAG, "Failed to open NVS for writing Red Team: %s", esp_err_to_name(err));
     }
 }
 
@@ -13579,6 +13640,355 @@ static void show_scan_time_popup(void)
     lv_obj_center(save_label);
 }
 
+// ======================= Red Team Settings Page =======================
+
+static lv_obj_t *red_team_page = NULL;
+static lv_obj_t *red_team_switch = NULL;
+static lv_obj_t *red_team_disclaimer_overlay = NULL;
+static lv_obj_t *red_team_disclaimer_popup = NULL;
+
+// Invalidate cached pages that depend on Red Team setting
+// This forces them to be recreated with updated labels/tiles
+static void invalidate_red_team_dependent_pages(void)
+{
+    ESP_LOGI(TAG, "Invalidating Red Team dependent pages");
+    
+    // Invalidate pages for both UART tab contexts
+    tab_context_t *contexts[] = { &uart1_ctx, &uart2_ctx };
+    
+    for (int i = 0; i < 2; i++) {
+        tab_context_t *ctx = contexts[i];
+        
+        // Delete cached scan page (has Attack/Test tiles)
+        if (ctx->scan_page) {
+            lv_obj_del(ctx->scan_page);
+            ctx->scan_page = NULL;
+        }
+        
+        // Delete cached global attacks page (has conditional tiles)
+        if (ctx->global_attacks_page) {
+            lv_obj_del(ctx->global_attacks_page);
+            ctx->global_attacks_page = NULL;
+        }
+        
+        // Delete cached main tiles (has Attack/Test labels)
+        if (ctx->tiles) {
+            lv_obj_del(ctx->tiles);
+            ctx->tiles = NULL;
+        }
+    }
+    
+    // Also invalidate global legacy references
+    global_attacks_page = NULL;
+}
+
+// Close Red Team disclaimer popup without enabling
+static void red_team_disclaimer_cancel_cb(lv_event_t *e)
+{
+    (void)e;
+    ESP_LOGI(TAG, "Red Team disclaimer cancelled");
+    
+    // Reset switch to OFF
+    if (red_team_switch) {
+        lv_obj_remove_state(red_team_switch, LV_STATE_CHECKED);
+    }
+    
+    // Close popup
+    if (red_team_disclaimer_overlay) {
+        lv_obj_del(red_team_disclaimer_overlay);
+        red_team_disclaimer_overlay = NULL;
+        red_team_disclaimer_popup = NULL;
+    }
+}
+
+// Confirm Red Team disclaimer - enable Red Team mode
+static void red_team_disclaimer_confirm_cb(lv_event_t *e)
+{
+    (void)e;
+    ESP_LOGI(TAG, "Red Team disclaimer confirmed - enabling Red Team mode");
+    
+    // Enable Red Team mode
+    enable_red_team = true;
+    save_red_team_to_nvs(true);
+    
+    // Invalidate cached pages so they get recreated with new labels
+    invalidate_red_team_dependent_pages();
+    
+    // Close popup
+    if (red_team_disclaimer_overlay) {
+        lv_obj_del(red_team_disclaimer_overlay);
+        red_team_disclaimer_overlay = NULL;
+        red_team_disclaimer_popup = NULL;
+    }
+}
+
+// Show Red Team disclaimer popup
+static void show_red_team_disclaimer_popup(void)
+{
+    if (red_team_disclaimer_popup != NULL) return;  // Already showing
+    
+    lv_obj_t *container = get_current_tab_container();
+    if (!container) return;
+    
+    // Create modal overlay
+    red_team_disclaimer_overlay = lv_obj_create(container);
+    lv_obj_remove_style_all(red_team_disclaimer_overlay);
+    lv_obj_set_size(red_team_disclaimer_overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(red_team_disclaimer_overlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(red_team_disclaimer_overlay, LV_OPA_70, 0);
+    lv_obj_clear_flag(red_team_disclaimer_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(red_team_disclaimer_overlay, LV_OBJ_FLAG_CLICKABLE);
+    
+    // Create popup
+    red_team_disclaimer_popup = lv_obj_create(red_team_disclaimer_overlay);
+    lv_obj_set_size(red_team_disclaimer_popup, 550, 400);
+    lv_obj_center(red_team_disclaimer_popup);
+    lv_obj_set_style_bg_color(red_team_disclaimer_popup, lv_color_hex(0x1A1A2A), 0);
+    lv_obj_set_style_border_color(red_team_disclaimer_popup, COLOR_MATERIAL_RED, 0);
+    lv_obj_set_style_border_width(red_team_disclaimer_popup, 3, 0);
+    lv_obj_set_style_radius(red_team_disclaimer_popup, 16, 0);
+    lv_obj_set_style_shadow_width(red_team_disclaimer_popup, 30, 0);
+    lv_obj_set_style_shadow_color(red_team_disclaimer_popup, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_shadow_opa(red_team_disclaimer_popup, LV_OPA_50, 0);
+    lv_obj_set_style_pad_all(red_team_disclaimer_popup, 24, 0);
+    lv_obj_set_flex_flow(red_team_disclaimer_popup, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(red_team_disclaimer_popup, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(red_team_disclaimer_popup, 16, 0);
+    lv_obj_clear_flag(red_team_disclaimer_popup, LV_OBJ_FLAG_SCROLLABLE);
+    
+    // Warning icon
+    lv_obj_t *icon = lv_label_create(red_team_disclaimer_popup);
+    lv_label_set_text(icon, LV_SYMBOL_WARNING);
+    lv_obj_set_style_text_font(icon, &lv_font_montserrat_48, 0);
+    lv_obj_set_style_text_color(icon, COLOR_MATERIAL_RED, 0);
+    
+    // Title
+    lv_obj_t *title = lv_label_create(red_team_disclaimer_popup);
+    lv_label_set_text(title, "WARNING - Red Team Mode");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_22, 0);
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_RED, 0);
+    
+    // Warning message
+    lv_obj_t *message = lv_label_create(red_team_disclaimer_popup);
+    lv_label_set_text(message, 
+        "Red Team features include offensive WiFi\n"
+        "testing capabilities such as deauthentication,\n"
+        "evil twin attacks, and ARP poisoning.\n\n"
+        "Only use these features on networks you own\n"
+        "or have explicit written permission to test.\n\n"
+        "Unauthorized use may be illegal.");
+    lv_obj_set_style_text_font(message, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(message, lv_color_hex(0xCCCCCC), 0);
+    lv_obj_set_style_text_align(message, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(message, lv_pct(90));
+    lv_label_set_long_mode(message, LV_LABEL_LONG_WRAP);
+    
+    // Button container
+    lv_obj_t *btn_container = lv_obj_create(red_team_disclaimer_popup);
+    lv_obj_set_size(btn_container, lv_pct(100), 50);
+    lv_obj_set_style_bg_opa(btn_container, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(btn_container, 0, 0);
+    lv_obj_set_flex_flow(btn_container, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btn_container, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(btn_container, 30, 0);
+    lv_obj_clear_flag(btn_container, LV_OBJ_FLAG_SCROLLABLE);
+    
+    // Cancel button
+    lv_obj_t *cancel_btn = lv_btn_create(btn_container);
+    lv_obj_set_size(cancel_btn, 120, 45);
+    lv_obj_set_style_bg_color(cancel_btn, lv_color_hex(0x555555), 0);
+    lv_obj_set_style_radius(cancel_btn, 8, 0);
+    lv_obj_add_event_cb(cancel_btn, red_team_disclaimer_cancel_cb, LV_EVENT_CLICKED, NULL);
+    
+    lv_obj_t *cancel_label = lv_label_create(cancel_btn);
+    lv_label_set_text(cancel_label, "Cancel");
+    lv_obj_set_style_text_font(cancel_label, &lv_font_montserrat_16, 0);
+    lv_obj_center(cancel_label);
+    
+    // I Understand button
+    lv_obj_t *confirm_btn = lv_btn_create(btn_container);
+    lv_obj_set_size(confirm_btn, 150, 45);
+    lv_obj_set_style_bg_color(confirm_btn, COLOR_MATERIAL_RED, 0);
+    lv_obj_set_style_radius(confirm_btn, 8, 0);
+    lv_obj_add_event_cb(confirm_btn, red_team_disclaimer_confirm_cb, LV_EVENT_CLICKED, NULL);
+    
+    lv_obj_t *confirm_label = lv_label_create(confirm_btn);
+    lv_label_set_text(confirm_label, "I Understand");
+    lv_obj_set_style_text_font(confirm_label, &lv_font_montserrat_16, 0);
+    lv_obj_center(confirm_label);
+}
+
+// Red Team switch event handler
+static void red_team_switch_event_cb(lv_event_t *e)
+{
+    lv_obj_t *sw = lv_event_get_target(e);
+    bool is_checked = lv_obj_has_state(sw, LV_STATE_CHECKED);
+    
+    ESP_LOGI(TAG, "Red Team switch changed: %s", is_checked ? "ON" : "OFF");
+    
+    if (is_checked && !enable_red_team) {
+        // Trying to enable - show disclaimer first
+        show_red_team_disclaimer_popup();
+    } else if (!is_checked && enable_red_team) {
+        // Disabling - no confirmation needed
+        enable_red_team = false;
+        save_red_team_to_nvs(false);
+        
+        // Invalidate cached pages so they get recreated with new labels
+        invalidate_red_team_dependent_pages();
+        
+        ESP_LOGI(TAG, "Red Team mode disabled");
+    }
+}
+
+// Back button for Red Team page
+static void red_team_back_cb(lv_event_t *e)
+{
+    (void)e;
+    ESP_LOGI(TAG, "Red Team settings back button clicked");
+    
+    if (red_team_page) {
+        lv_obj_del(red_team_page);
+        red_team_page = NULL;
+        red_team_switch = NULL;
+    }
+    
+    // Show settings page again
+    if (internal_settings_page) {
+        lv_obj_clear_flag(internal_settings_page, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+// Show Red Team settings page
+static void show_red_team_settings_page(void)
+{
+    if (!internal_container) {
+        ESP_LOGE(TAG, "Internal container not initialized!");
+        return;
+    }
+    
+    // Hide settings page
+    if (internal_settings_page) {
+        lv_obj_add_flag(internal_settings_page, LV_OBJ_FLAG_HIDDEN);
+    }
+    
+    // If Red Team page already exists, just show it
+    if (red_team_page) {
+        lv_obj_clear_flag(red_team_page, LV_OBJ_FLAG_HIDDEN);
+        // Update switch state
+        if (red_team_switch) {
+            if (enable_red_team) {
+                lv_obj_add_state(red_team_switch, LV_STATE_CHECKED);
+            } else {
+                lv_obj_remove_state(red_team_switch, LV_STATE_CHECKED);
+            }
+        }
+        return;
+    }
+    
+    ESP_LOGI(TAG, "Creating Red Team settings page");
+    
+    // Create Red Team page container
+    red_team_page = lv_obj_create(internal_container);
+    lv_obj_set_size(red_team_page, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(red_team_page, lv_color_hex(0x121212), 0);
+    lv_obj_set_style_border_width(red_team_page, 0, 0);
+    lv_obj_set_style_pad_all(red_team_page, 20, 0);
+    lv_obj_set_flex_flow(red_team_page, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(red_team_page, 20, 0);
+    lv_obj_clear_flag(red_team_page, LV_OBJ_FLAG_SCROLLABLE);
+    
+    // Header with back button and title
+    lv_obj_t *header = lv_obj_create(red_team_page);
+    lv_obj_set_size(header, lv_pct(100), 50);
+    lv_obj_set_style_bg_opa(header, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(header, 0, 0);
+    lv_obj_clear_flag(header, LV_OBJ_FLAG_SCROLLABLE);
+    
+    // Back button
+    lv_obj_t *back_btn = lv_btn_create(header);
+    lv_obj_set_size(back_btn, 80, 40);
+    lv_obj_align(back_btn, LV_ALIGN_LEFT_MID, 0, 0);
+    lv_obj_set_style_bg_color(back_btn, COLOR_MATERIAL_RED, 0);
+    lv_obj_add_event_cb(back_btn, red_team_back_cb, LV_EVENT_CLICKED, NULL);
+    
+    lv_obj_t *back_label = lv_label_create(back_btn);
+    lv_label_set_text(back_label, LV_SYMBOL_LEFT " Back");
+    lv_obj_center(back_label);
+    
+    // Title
+    lv_obj_t *title = lv_label_create(header);
+    lv_label_set_text(title, "Red Team Settings");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_RED, 0);
+    lv_obj_align(title, LV_ALIGN_CENTER, 0, 0);
+    
+    // Content container with card-like style
+    lv_obj_t *content = lv_obj_create(red_team_page);
+    lv_obj_set_size(content, lv_pct(90), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_color(content, lv_color_hex(0x1E1E1E), 0);
+    lv_obj_set_style_border_width(content, 1, 0);
+    lv_obj_set_style_border_color(content, lv_color_hex(0x333333), 0);
+    lv_obj_set_style_radius(content, 12, 0);
+    lv_obj_set_style_pad_all(content, 20, 0);
+    lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(content, 15, 0);
+    lv_obj_align(content, LV_ALIGN_TOP_MID, 0, 0);
+    lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLLABLE);
+    
+    // Switch row
+    lv_obj_t *switch_row = lv_obj_create(content);
+    lv_obj_set_size(switch_row, lv_pct(100), 60);
+    lv_obj_set_style_bg_opa(switch_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(switch_row, 0, 0);
+    lv_obj_set_flex_flow(switch_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(switch_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(switch_row, LV_OBJ_FLAG_SCROLLABLE);
+    
+    // Switch label
+    lv_obj_t *switch_label = lv_label_create(switch_row);
+    lv_label_set_text(switch_label, "Enable Red team features");
+    lv_obj_set_style_text_font(switch_label, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_color(switch_label, lv_color_hex(0xFFFFFF), 0);
+    
+    // Switch
+    red_team_switch = lv_switch_create(switch_row);
+    lv_obj_set_size(red_team_switch, 60, 30);
+    lv_obj_set_style_bg_color(red_team_switch, lv_color_hex(0x555555), 0);
+    lv_obj_set_style_bg_color(red_team_switch, COLOR_MATERIAL_RED, LV_PART_INDICATOR | LV_STATE_CHECKED);
+    lv_obj_set_style_bg_color(red_team_switch, lv_color_hex(0x333333), LV_PART_INDICATOR);
+    lv_obj_add_event_cb(red_team_switch, red_team_switch_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
+    
+    // Set initial state
+    if (enable_red_team) {
+        lv_obj_add_state(red_team_switch, LV_STATE_CHECKED);
+    }
+    
+    // Description text
+    lv_obj_t *desc = lv_label_create(content);
+    lv_label_set_text(desc, 
+        "When enabled, offensive testing features become\n"
+        "available including deauthentication attacks,\n"
+        "evil twin, ARP poisoning, and more.\n\n"
+        "When disabled, these features are hidden and\n"
+        "'Attack' labels become 'Test'.");
+    lv_obj_set_style_text_font(desc, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(desc, lv_color_hex(0x888888), 0);
+    lv_obj_set_width(desc, lv_pct(100));
+    lv_label_set_long_mode(desc, LV_LABEL_LONG_WRAP);
+    
+    // Status indicator
+    lv_obj_t *status = lv_label_create(content);
+    if (enable_red_team) {
+        lv_label_set_text(status, "Status: ENABLED - All features available");
+        lv_obj_set_style_text_color(status, COLOR_MATERIAL_RED, 0);
+    } else {
+        lv_label_set_text(status, "Status: DISABLED - Safe mode active");
+        lv_obj_set_style_text_color(status, COLOR_MATERIAL_GREEN, 0);
+    }
+    lv_obj_set_style_text_font(status, &lv_font_montserrat_16, 0);
+}
+
 static void show_uart_pins_popup(void)
 {
     lv_obj_t *container = get_current_tab_container();
@@ -13758,6 +14168,8 @@ static void settings_tile_event_cb(lv_event_t *e)
         show_uart_pins_popup();
     } else if (strcmp(tile_name, "Scan Time") == 0) {
         show_scan_time_popup();
+    } else if (strcmp(tile_name, "Red Team") == 0) {
+        show_red_team_settings_page();
     }
 }
 
@@ -13834,6 +14246,9 @@ static void show_settings_page(void)
     
     // Scan Time tile
     create_tile(tiles, LV_SYMBOL_REFRESH, "Scan\nTime", COLOR_MATERIAL_GREEN, settings_tile_event_cb, "Scan Time");
+    
+    // Red Team tile
+    create_tile(tiles, LV_SYMBOL_WARNING, "Red\nTeam", COLOR_MATERIAL_RED, settings_tile_event_cb, "Red Team");
 }
 
 void app_main(void)
