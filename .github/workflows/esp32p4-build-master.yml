@@ -81,7 +81,7 @@ jobs:
           from pathlib import Path
           import re
           text = Path("main/main.c").read_text()
-          m = re.search(r'JANOS_TAB_VERSION\\s*\\"([^\\"]+)\\"', text)
+          m = re.search(r'JANOS_TAB_VERSION\s*"([^"]+)"', text)
           if not m:
               raise SystemExit("JANOS_TAB_VERSION not found")
           print(m.group(1))
