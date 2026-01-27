@@ -1348,12 +1348,14 @@ static bool usb_transport_ready = false;
 static bool usb_transport_warned = false;
 static usbh_cdc_handle_t usb_cdc_handle = NULL;
 static bool usb_cdc_connected = false;
+static bool uart1_force_grove = false;
 static bool usb_host_checked = false;
 static bool usb_host_installed = false;
 static bool usb_host_started_by_us = false;
 static uint32_t usb_next_retry_ms = 0;
 static bool usb_log_tuned = false;
 static lv_obj_t *uart1_tab_label = NULL;
+static bool board_redetect_pending = false;
 
 static void uart1_tab_label_set_cb(void *user_data)
 {
@@ -1371,14 +1373,47 @@ static void uart1_update_tab_label(const char *text)
     lv_async_call(uart1_tab_label_set_cb, (void *)text);
 }
 
+static void board_redetect_cb(void *user_data)
+{
+    (void)user_data;
+    board_redetect_pending = false;
+
+    bool prev_uart1 = uart1_detected;
+    bool prev_uart2 = uart2_detected;
+    bool prev_force_grove = uart1_force_grove;
+
+    detect_boards();
+
+    bool changed = (prev_uart1 != uart1_detected) ||
+                   (prev_uart2 != uart2_detected) ||
+                   (prev_force_grove != uart1_force_grove);
+
+    if (changed && (uart1_detected || uart2_detected) && !board_detection_popup_open) {
+        reload_gui_for_hw_config();
+        show_main_tiles();
+    }
+}
+
+static void schedule_board_redetect(void)
+{
+    if (board_redetect_pending) {
+        return;
+    }
+    board_redetect_pending = true;
+    lv_async_call(board_redetect_cb, NULL);
+}
+
 static const char *uart1_transport_name(void)
 {
+    if (uart1_force_grove) {
+        return "Grove";
+    }
     return usb_cdc_connected ? "USB" : "UART1";
 }
 
 static const char *uart1_connector_name(void)
 {
-    return usb_cdc_connected ? "USB" : "Grove";
+    return uart1_force_grove ? "Grove" : (usb_cdc_connected ? "USB" : "Grove");
 }
 
 static const char *tab_transport_name(int tab)
@@ -1388,7 +1423,7 @@ static const char *tab_transport_name(int tab)
 
 static bool uart1_use_usb(void)
 {
-    return usb_cdc_connected;
+    return usb_cdc_connected && !uart1_force_grove;
 }
 
 static void usb_check_host_installed(void)
@@ -1409,6 +1444,7 @@ static void usb_cdc_connect_cb(usbh_cdc_handle_t cdc_handle, void *user_data)
     usb_cdc_connected = true;
     ESP_LOGI(TAG, "[USB] CDC device connected");
     uart1_update_tab_label("USB");
+    schedule_board_redetect();
 }
 
 static void usb_cdc_disconnect_cb(usbh_cdc_handle_t cdc_handle, void *user_data)
@@ -1418,6 +1454,7 @@ static void usb_cdc_disconnect_cb(usbh_cdc_handle_t cdc_handle, void *user_data)
     usb_cdc_connected = false;
     ESP_LOGW(TAG, "[USB] CDC device disconnected");
     uart1_update_tab_label("Grove");
+    schedule_board_redetect();
 }
 
 static void usb_cdc_recv_cb(usbh_cdc_handle_t cdc_handle, void *user_data)
@@ -13323,7 +13360,7 @@ static __attribute__((unused)) void deinit_uart2(void)
 // Board Detection via ping/pong protocol
 //==================================================================================
 
-// Send ping and wait for pong response on specified UART
+// Send ping and wait for pong response on specified transport
 static bool ping_uart(uart_port_t uart_port, const char *uart_name)
 {
     uint8_t rx_buffer[64];
@@ -13361,6 +13398,39 @@ static bool ping_uart(uart_port_t uart_port, const char *uart_name)
     return false;
 }
 
+// Send ping and wait for pong response using raw UART (bypass USB transport)
+static bool ping_uart_direct(uart_port_t uart_port, const char *uart_name)
+{
+    uint8_t rx_buffer[64];
+
+    uart_flush(uart_port);
+
+    const char *ping_cmd = "ping\r\n";
+    uart_write_bytes(uart_port, ping_cmd, strlen(ping_cmd));
+    ESP_LOGI(TAG, "[%s] Sent ping (raw)", uart_name);
+
+    int total_len = 0;
+    int64_t start_time = esp_timer_get_time();
+    int64_t timeout_us = 500000;
+
+    while ((esp_timer_get_time() - start_time) < timeout_us) {
+        int len = uart_read_bytes(uart_port, rx_buffer + total_len,
+                                  sizeof(rx_buffer) - total_len - 1, pdMS_TO_TICKS(50));
+        if (len > 0) {
+            total_len += len;
+            rx_buffer[total_len] = '\0';
+            if (strstr((char*)rx_buffer, "pong") != NULL) {
+                log_memory_stats(uart_name);
+                ESP_LOGI(TAG, "[%s] Received pong - board detected!", uart_name);
+                return true;
+            }
+        }
+    }
+
+    ESP_LOGW(TAG, "[%s] No pong response - board not detected", uart_name);
+    return false;
+}
+
 // Detect connected boards via ping/pong on both UARTs
 static void detect_boards(void)
 {
@@ -13369,11 +13439,20 @@ static void detect_boards(void)
     // Ensure USB CDC host is started before detection
     usb_transport_init();
 
-    // Ping UART1 unless USB CDC is already connected
+    // Detect UART1 transport (prefer Grove if it answers even when USB is connected)
     if (usb_cdc_connected) {
-        uart1_detected = true;
-        ESP_LOGI(TAG, "[USB] CDC connected - treating transport as present");
+        bool grove_detected = ping_uart_direct(UART_NUM, "Grove");
+        if (grove_detected) {
+            uart1_force_grove = true;
+            uart1_detected = true;
+            ESP_LOGI(TAG, "[USB] CDC connected - Grove detected, preferring Grove transport");
+        } else {
+            uart1_force_grove = false;
+            uart1_detected = true;
+            ESP_LOGI(TAG, "[USB] CDC connected - using USB transport");
+        }
     } else {
+        uart1_force_grove = false;
         uart1_detected = ping_uart(UART_NUM, uart1_transport_name());
     }
     uart2_detected = ping_uart(UART2_NUM, "UART2");
