@@ -31,7 +31,7 @@
 #include "esp_http_server.h"
 #include "lwip/sockets.h"
 
-#define JANOS_TAB_VERSION "0.9"
+#define JANOS_TAB_VERSION "0.9.1"
 #include "lwip/netdb.h"
 #include <dirent.h>
 #include <sys/stat.h>
@@ -13440,11 +13440,65 @@ static void uart_radio_event_cb(lv_event_t *e)
     update_uart2_info_label();
 }
 
+// ======================= Scan Time Settings =======================
+
+// Helper function to read channel_time value from a specific UART
+static int read_channel_time_from_uart(uart_port_t uart_port, const char *param)
+{
+    char cmd[32];
+    snprintf(cmd, sizeof(cmd), "channel_time read %s", param);
+    
+    // Flush and send command
+    uart_flush(uart_port);
+    uart_write_bytes(uart_port, cmd, strlen(cmd));
+    uart_write_bytes(uart_port, "\r\n", 2);
+    ESP_LOGI(TAG, "[UART%d] Sent command: %s", uart_port == UART_NUM ? 1 : 2, cmd);
+    
+    // Read response (numeric value expected)
+    char rx_buffer[64];
+    int total_len = 0;
+    int retries = 5;
+    
+    while (retries-- > 0 && total_len < (int)sizeof(rx_buffer) - 1) {
+        int len = uart_read_bytes(uart_port, rx_buffer + total_len, sizeof(rx_buffer) - total_len - 1, pdMS_TO_TICKS(100));
+        if (len > 0) {
+            total_len += len;
+        }
+        if (len <= 0 && total_len > 0) break;  // Got data, no more coming
+    }
+    
+    if (total_len > 0) {
+        rx_buffer[total_len] = '\0';
+        
+        // Parse line by line to find the numeric response (skip command echo)
+        char *line = strtok(rx_buffer, "\r\n");
+        while (line != NULL) {
+            // Skip leading whitespace
+            while (*line == ' ') line++;
+            
+            // Check if line starts with a digit
+            if (isdigit((unsigned char)*line)) {
+                int value = atoi(line);
+                if (value > 0) {
+                    ESP_LOGI(TAG, "[UART%d] Read channel_time %s = %d", uart_port == UART_NUM ? 1 : 2, param, value);
+                    return value;
+                }
+            }
+            line = strtok(NULL, "\r\n");
+        }
+    }
+    
+    ESP_LOGW(TAG, "[UART%d] Failed to read channel_time %s", uart_port == UART_NUM ? 1 : 2, param);
+    return -1; // Error/timeout
+}
+
 // Scan Time popup variables
 static lv_obj_t *scan_time_popup_overlay = NULL;
 static lv_obj_t *scan_time_popup_obj = NULL;
 static lv_obj_t *scan_time_min_spinbox = NULL;
 static lv_obj_t *scan_time_max_spinbox = NULL;
+static lv_obj_t *scan_time_uart2_min_spinbox = NULL;
+static lv_obj_t *scan_time_uart2_max_spinbox = NULL;
 static lv_obj_t *scan_time_error_label = NULL;
 
 static void scan_time_popup_close_cb(lv_event_t *e)
@@ -13455,6 +13509,8 @@ static void scan_time_popup_close_cb(lv_event_t *e)
         scan_time_popup_obj = NULL;
         scan_time_min_spinbox = NULL;
         scan_time_max_spinbox = NULL;
+        scan_time_uart2_min_spinbox = NULL;
+        scan_time_uart2_max_spinbox = NULL;
         scan_time_error_label = NULL;
     }
 }
@@ -13466,16 +13522,31 @@ static void scan_time_save_cb(lv_event_t *e)
     int min_val = lv_spinbox_get_value(scan_time_min_spinbox);
     int max_val = lv_spinbox_get_value(scan_time_max_spinbox);
     
-    // Validation
+    // Validation for UART1
     if (min_val >= max_val) {
         if (scan_time_error_label) {
-            lv_label_set_text(scan_time_error_label, "Error: min must be less than max");
+            lv_label_set_text(scan_time_error_label, "Error: UART1 min must be less than max");
             lv_obj_set_style_text_color(scan_time_error_label, COLOR_MATERIAL_RED, 0);
         }
         return;
     }
     
-    // Send UART commands
+    // Validation for UART2 if Kraken mode
+    int uart2_min_val = 0, uart2_max_val = 0;
+    if (hw_config == 1 && scan_time_uart2_min_spinbox && scan_time_uart2_max_spinbox) {
+        uart2_min_val = lv_spinbox_get_value(scan_time_uart2_min_spinbox);
+        uart2_max_val = lv_spinbox_get_value(scan_time_uart2_max_spinbox);
+        
+        if (uart2_min_val >= uart2_max_val) {
+            if (scan_time_error_label) {
+                lv_label_set_text(scan_time_error_label, "Error: UART2 min must be less than max");
+                lv_obj_set_style_text_color(scan_time_error_label, COLOR_MATERIAL_RED, 0);
+            }
+            return;
+        }
+    }
+    
+    // Send UART1 commands
     char cmd[64];
     snprintf(cmd, sizeof(cmd), "channel_time set min %d", min_val);
     uart_send_command(cmd);
@@ -13484,7 +13555,21 @@ static void scan_time_save_cb(lv_event_t *e)
     snprintf(cmd, sizeof(cmd), "channel_time set max %d", max_val);
     uart_send_command(cmd);
     
-    ESP_LOGI(TAG, "Scan time set: min=%d, max=%d", min_val, max_val);
+    ESP_LOGI(TAG, "UART1 scan time set: min=%d, max=%d", min_val, max_val);
+    
+    // Send UART2 commands if Kraken mode
+    if (hw_config == 1 && uart2_initialized && scan_time_uart2_min_spinbox && scan_time_uart2_max_spinbox) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        
+        snprintf(cmd, sizeof(cmd), "channel_time set min %d", uart2_min_val);
+        uart2_send_command(cmd);
+        vTaskDelay(pdMS_TO_TICKS(100));
+        
+        snprintf(cmd, sizeof(cmd), "channel_time set max %d", uart2_max_val);
+        uart2_send_command(cmd);
+        
+        ESP_LOGI(TAG, "UART2 scan time set: min=%d, max=%d", uart2_min_val, uart2_max_val);
+    }
     
     scan_time_popup_close_cb(e);
 }
@@ -13501,10 +13586,90 @@ static void spinbox_decrement_event_cb(lv_event_t *e)
     lv_spinbox_decrement(spinbox);
 }
 
+// Helper to create a spinbox row with label, dec/inc buttons
+static lv_obj_t* create_scan_time_spinbox_row(lv_obj_t *parent, const char *label_text, int initial_value, lv_obj_t **spinbox_out)
+{
+    lv_obj_t *row = lv_obj_create(parent);
+    lv_obj_set_size(row, lv_pct(100), 50);
+    lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(row, 0, 0);
+    lv_obj_set_style_pad_all(row, 0, 0);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+    
+    lv_obj_t *label = lv_label_create(row);
+    lv_label_set_text(label, label_text);
+    lv_obj_set_style_text_font(label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(label, lv_color_hex(0xFFFFFF), 0);
+    
+    // Spinbox container
+    lv_obj_t *spin_cont = lv_obj_create(row);
+    lv_obj_set_size(spin_cont, 160, 40);
+    lv_obj_set_style_bg_opa(spin_cont, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(spin_cont, 0, 0);
+    lv_obj_set_style_pad_all(spin_cont, 0, 0);
+    lv_obj_set_flex_flow(spin_cont, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(spin_cont, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(spin_cont, 5, 0);
+    lv_obj_clear_flag(spin_cont, LV_OBJ_FLAG_SCROLLABLE);
+    
+    lv_obj_t *dec_btn = lv_btn_create(spin_cont);
+    lv_obj_set_size(dec_btn, 35, 35);
+    lv_obj_set_style_bg_color(dec_btn, lv_color_hex(0x555555), 0);
+    lv_obj_t *dec_label = lv_label_create(dec_btn);
+    lv_label_set_text(dec_label, LV_SYMBOL_MINUS);
+    lv_obj_center(dec_label);
+    
+    lv_obj_t *spinbox = lv_spinbox_create(spin_cont);
+    lv_spinbox_set_range(spinbox, 100, 1500);
+    lv_spinbox_set_digit_format(spinbox, 4, 0);
+    lv_spinbox_set_value(spinbox, initial_value > 0 ? initial_value : 200);
+    lv_spinbox_set_step(spinbox, 50);
+    lv_obj_set_width(spinbox, 70);
+    lv_obj_set_style_text_font(spinbox, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_bg_color(spinbox, lv_color_hex(0x3D3D3D), 0);
+    lv_obj_set_style_text_color(spinbox, lv_color_hex(0xFFFFFF), 0);
+    
+    lv_obj_t *inc_btn = lv_btn_create(spin_cont);
+    lv_obj_set_size(inc_btn, 35, 35);
+    lv_obj_set_style_bg_color(inc_btn, lv_color_hex(0x555555), 0);
+    lv_obj_t *inc_label = lv_label_create(inc_btn);
+    lv_label_set_text(inc_label, LV_SYMBOL_PLUS);
+    lv_obj_center(inc_label);
+    
+    lv_obj_add_event_cb(dec_btn, spinbox_decrement_event_cb, LV_EVENT_CLICKED, spinbox);
+    lv_obj_add_event_cb(inc_btn, spinbox_increment_event_cb, LV_EVENT_CLICKED, spinbox);
+    
+    *spinbox_out = spinbox;
+    return row;
+}
+
 static void show_scan_time_popup(void)
 {
     lv_obj_t *container = get_current_tab_container();
     if (!container) return;
+    
+    bool is_kraken = (hw_config == 1);
+    
+    // Read current values from UART1
+    ESP_LOGI(TAG, "Reading channel_time values from UART1...");
+    int uart1_min = read_channel_time_from_uart(UART_NUM, "min");
+    int uart1_max = read_channel_time_from_uart(UART_NUM, "max");
+    
+    // Use defaults if read failed
+    if (uart1_min <= 0) uart1_min = 200;
+    if (uart1_max <= 0) uart1_max = 500;
+    
+    // Read from UART2 if Kraken mode
+    int uart2_min = 200, uart2_max = 500;
+    if (is_kraken && uart2_initialized) {
+        ESP_LOGI(TAG, "Reading channel_time values from UART2...");
+        uart2_min = read_channel_time_from_uart(UART2_NUM, "min");
+        uart2_max = read_channel_time_from_uart(UART2_NUM, "max");
+        if (uart2_min <= 0) uart2_min = 200;
+        if (uart2_max <= 0) uart2_max = 500;
+    }
     
     // Create modal overlay
     scan_time_popup_overlay = lv_obj_create(container);
@@ -13515,17 +13680,18 @@ static void show_scan_time_popup(void)
     lv_obj_clear_flag(scan_time_popup_overlay, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(scan_time_popup_overlay, LV_OBJ_FLAG_CLICKABLE);
     
-    // Create popup
+    // Create popup - larger for Kraken mode
     scan_time_popup_obj = lv_obj_create(scan_time_popup_overlay);
-    lv_obj_set_size(scan_time_popup_obj, 450, 380);
+    int popup_height = is_kraken ? 480 : 320;
+    lv_obj_set_size(scan_time_popup_obj, 420, popup_height);
     lv_obj_center(scan_time_popup_obj);
     lv_obj_set_style_bg_color(scan_time_popup_obj, lv_color_hex(0x2D2D2D), 0);
     lv_obj_set_style_border_color(scan_time_popup_obj, COLOR_MATERIAL_GREEN, 0);
     lv_obj_set_style_border_width(scan_time_popup_obj, 2, 0);
     lv_obj_set_style_radius(scan_time_popup_obj, 12, 0);
-    lv_obj_set_style_pad_all(scan_time_popup_obj, 20, 0);
+    lv_obj_set_style_pad_all(scan_time_popup_obj, 15, 0);
     lv_obj_set_flex_flow(scan_time_popup_obj, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_pad_row(scan_time_popup_obj, 15, 0);
+    lv_obj_set_style_pad_row(scan_time_popup_obj, is_kraken ? 8 : 12, 0);
     lv_obj_clear_flag(scan_time_popup_obj, LV_OBJ_FLAG_SCROLLABLE);
     
     // Title
@@ -13534,107 +13700,29 @@ static void show_scan_time_popup(void)
     lv_obj_set_style_text_font(title, &lv_font_montserrat_18, 0);
     lv_obj_set_style_text_color(title, lv_color_hex(0xFFFFFF), 0);
     
-    // Min scan time row
-    lv_obj_t *min_row = lv_obj_create(scan_time_popup_obj);
-    lv_obj_set_size(min_row, lv_pct(100), 60);
-    lv_obj_set_style_bg_opa(min_row, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(min_row, 0, 0);
-    lv_obj_set_flex_flow(min_row, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(min_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_clear_flag(min_row, LV_OBJ_FLAG_SCROLLABLE);
-    
-    lv_obj_t *min_label = lv_label_create(min_row);
-    lv_label_set_text(min_label, "Min time:");
-    lv_obj_set_style_text_font(min_label, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(min_label, lv_color_hex(0xFFFFFF), 0);
-    
-    // Spinbox container for min
-    lv_obj_t *min_spin_cont = lv_obj_create(min_row);
-    lv_obj_set_size(min_spin_cont, 180, 50);
-    lv_obj_set_style_bg_opa(min_spin_cont, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(min_spin_cont, 0, 0);
-    lv_obj_set_flex_flow(min_spin_cont, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(min_spin_cont, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_column(min_spin_cont, 5, 0);
-    lv_obj_clear_flag(min_spin_cont, LV_OBJ_FLAG_SCROLLABLE);
-    
-    lv_obj_t *min_dec_btn = lv_btn_create(min_spin_cont);
-    lv_obj_set_size(min_dec_btn, 40, 40);
-    lv_obj_set_style_bg_color(min_dec_btn, lv_color_hex(0x555555), 0);
-    lv_obj_t *min_dec_label = lv_label_create(min_dec_btn);
-    lv_label_set_text(min_dec_label, LV_SYMBOL_MINUS);
-    lv_obj_center(min_dec_label);
-    
-    scan_time_min_spinbox = lv_spinbox_create(min_spin_cont);
-    lv_spinbox_set_range(scan_time_min_spinbox, 100, 1500);
-    lv_spinbox_set_digit_format(scan_time_min_spinbox, 4, 0);
-    lv_spinbox_set_value(scan_time_min_spinbox, 200);  // Default value
-    lv_spinbox_set_step(scan_time_min_spinbox, 50);
-    lv_obj_set_width(scan_time_min_spinbox, 80);
-    lv_obj_set_style_text_font(scan_time_min_spinbox, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_bg_color(scan_time_min_spinbox, lv_color_hex(0x3D3D3D), 0);
-    lv_obj_set_style_text_color(scan_time_min_spinbox, lv_color_hex(0xFFFFFF), 0);
-    
-    lv_obj_t *min_inc_btn = lv_btn_create(min_spin_cont);
-    lv_obj_set_size(min_inc_btn, 40, 40);
-    lv_obj_set_style_bg_color(min_inc_btn, lv_color_hex(0x555555), 0);
-    lv_obj_t *min_inc_label = lv_label_create(min_inc_btn);
-    lv_label_set_text(min_inc_label, LV_SYMBOL_PLUS);
-    lv_obj_center(min_inc_label);
-    
-    lv_obj_add_event_cb(min_dec_btn, spinbox_decrement_event_cb, LV_EVENT_CLICKED, scan_time_min_spinbox);
-    lv_obj_add_event_cb(min_inc_btn, spinbox_increment_event_cb, LV_EVENT_CLICKED, scan_time_min_spinbox);
-    
-    // Max scan time row
-    lv_obj_t *max_row = lv_obj_create(scan_time_popup_obj);
-    lv_obj_set_size(max_row, lv_pct(100), 60);
-    lv_obj_set_style_bg_opa(max_row, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(max_row, 0, 0);
-    lv_obj_set_flex_flow(max_row, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(max_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_clear_flag(max_row, LV_OBJ_FLAG_SCROLLABLE);
-    
-    lv_obj_t *max_label = lv_label_create(max_row);
-    lv_label_set_text(max_label, "Max time:");
-    lv_obj_set_style_text_font(max_label, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(max_label, lv_color_hex(0xFFFFFF), 0);
-    
-    // Spinbox container for max
-    lv_obj_t *max_spin_cont = lv_obj_create(max_row);
-    lv_obj_set_size(max_spin_cont, 180, 50);
-    lv_obj_set_style_bg_opa(max_spin_cont, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(max_spin_cont, 0, 0);
-    lv_obj_set_flex_flow(max_spin_cont, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(max_spin_cont, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_column(max_spin_cont, 5, 0);
-    lv_obj_clear_flag(max_spin_cont, LV_OBJ_FLAG_SCROLLABLE);
-    
-    lv_obj_t *max_dec_btn = lv_btn_create(max_spin_cont);
-    lv_obj_set_size(max_dec_btn, 40, 40);
-    lv_obj_set_style_bg_color(max_dec_btn, lv_color_hex(0x555555), 0);
-    lv_obj_t *max_dec_label = lv_label_create(max_dec_btn);
-    lv_label_set_text(max_dec_label, LV_SYMBOL_MINUS);
-    lv_obj_center(max_dec_label);
-    
-    scan_time_max_spinbox = lv_spinbox_create(max_spin_cont);
-    lv_spinbox_set_range(scan_time_max_spinbox, 100, 1500);
-    lv_spinbox_set_digit_format(scan_time_max_spinbox, 4, 0);
-    lv_spinbox_set_value(scan_time_max_spinbox, 500);  // Default value
-    lv_spinbox_set_step(scan_time_max_spinbox, 50);
-    lv_obj_set_width(scan_time_max_spinbox, 80);
-    lv_obj_set_style_text_font(scan_time_max_spinbox, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_bg_color(scan_time_max_spinbox, lv_color_hex(0x3D3D3D), 0);
-    lv_obj_set_style_text_color(scan_time_max_spinbox, lv_color_hex(0xFFFFFF), 0);
-    
-    lv_obj_t *max_inc_btn = lv_btn_create(max_spin_cont);
-    lv_obj_set_size(max_inc_btn, 40, 40);
-    lv_obj_set_style_bg_color(max_inc_btn, lv_color_hex(0x555555), 0);
-    lv_obj_t *max_inc_label = lv_label_create(max_inc_btn);
-    lv_label_set_text(max_inc_label, LV_SYMBOL_PLUS);
-    lv_obj_center(max_inc_label);
-    
-    lv_obj_add_event_cb(max_dec_btn, spinbox_decrement_event_cb, LV_EVENT_CLICKED, scan_time_max_spinbox);
-    lv_obj_add_event_cb(max_inc_btn, spinbox_increment_event_cb, LV_EVENT_CLICKED, scan_time_max_spinbox);
+    if (is_kraken) {
+        // ========== UART1 Section ==========
+        lv_obj_t *uart1_header = lv_label_create(scan_time_popup_obj);
+        lv_label_set_text(uart1_header, "UART1");
+        lv_obj_set_style_text_font(uart1_header, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(uart1_header, COLOR_MATERIAL_BLUE, 0);
+        
+        create_scan_time_spinbox_row(scan_time_popup_obj, "Min time:", uart1_min, &scan_time_min_spinbox);
+        create_scan_time_spinbox_row(scan_time_popup_obj, "Max time:", uart1_max, &scan_time_max_spinbox);
+        
+        // ========== UART2 Section ==========
+        lv_obj_t *uart2_header = lv_label_create(scan_time_popup_obj);
+        lv_label_set_text(uart2_header, "UART2");
+        lv_obj_set_style_text_font(uart2_header, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(uart2_header, COLOR_MATERIAL_ORANGE, 0);
+        
+        create_scan_time_spinbox_row(scan_time_popup_obj, "Min time:", uart2_min, &scan_time_uart2_min_spinbox);
+        create_scan_time_spinbox_row(scan_time_popup_obj, "Max time:", uart2_max, &scan_time_uart2_max_spinbox);
+    } else {
+        // ========== Monster mode - single UART ==========
+        create_scan_time_spinbox_row(scan_time_popup_obj, "Min time:", uart1_min, &scan_time_min_spinbox);
+        create_scan_time_spinbox_row(scan_time_popup_obj, "Max time:", uart1_max, &scan_time_max_spinbox);
+    }
     
     // Error label
     scan_time_error_label = lv_label_create(scan_time_popup_obj);
