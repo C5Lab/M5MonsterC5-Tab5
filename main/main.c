@@ -102,8 +102,8 @@ static const char *TAG = "wifi_scanner";
 // Tab bar colors
 #define TAB_COLOR_UART1_ACTIVE    0x00BCD4  // Cyan
 #define TAB_COLOR_UART1_INACTIVE  0x006064  // Dark Cyan
-#define TAB_COLOR_UART2_ACTIVE    0xFF9800  // Orange
-#define TAB_COLOR_UART2_INACTIVE  0x804D00  // Dark Orange
+#define TAB_COLOR_MBUS_ACTIVE    0xFF9800  // Orange
+#define TAB_COLOR_MBUS_INACTIVE  0x804D00  // Dark Orange
 #define TAB_COLOR_INTERNAL_ACTIVE 0x9C27B0  // Purple
 #define TAB_COLOR_INTERNAL_INACTIVE 0x4A148C  // Dark Purple
 
@@ -176,7 +176,7 @@ typedef struct {
 #define KARMA2_MAX_HTML_FILES 20
 
 // ============================================================================
-// COMPLETE TAB CONTEXT - All UI, data, and state for one tab (UART1/UART2/INTERNAL)
+// COMPLETE TAB CONTEXT - All UI, data, and state for one tab (Grove/USB/MBus/INTERNAL)
 // Each tab is a fully independent space with its own LVGL objects and state
 // ============================================================================
 typedef struct {
@@ -420,27 +420,27 @@ typedef struct {
     int arp_host_count;
     
     // Transport type for this tab context
-    uint8_t transport_kind;  // 0=Grove, 1=USB, 2=UART2, 3=INTERNAL
+    uint8_t transport_kind;  // 0=Grove, 1=USB, 2=MBus, 3=INTERNAL
 } tab_context_t;
 
 typedef enum {
     TAB_GROVE = 0,
     TAB_USB = 1,
-    TAB_UART2 = 2,
+    TAB_MBUS = 2,
     TAB_INTERNAL = 3,
 } tab_id_t;
 
 typedef enum {
     TRANSPORT_GROVE = 0,
     TRANSPORT_USB = 1,
-    TRANSPORT_UART2 = 2,
+    TRANSPORT_MBUS = 2,
     TRANSPORT_INTERNAL = 3,
 } transport_kind_t;
 
-// Tab contexts (Grove, USB, UART2, INTERNAL)
+// Tab contexts (Grove, USB, MBus, INTERNAL)
 static tab_context_t grove_ctx = {0};
 static tab_context_t usb_ctx = {0};
-static tab_context_t uart2_ctx = {0};
+static tab_context_t mbus_ctx = {0};
 static tab_context_t internal_ctx = {0};
 
 // Red Team mode - controls visibility of offensive features (declared early for use in all functions)
@@ -456,7 +456,7 @@ static int selected_network_count = 0;
 // Observer global variables (large arrays in PSRAM)
 static observer_network_t *observer_networks = NULL;  // Allocated in PSRAM
 static TimerHandle_t observer_timer = NULL;
-static TaskHandle_t observer_task_handle = NULL;
+// Note: observer_task_handle is now per-context (ctx->observer_task)
 #define POPUP_POLL_INTERVAL_MS  10000  // 10 seconds
 
 // Deauth popup state
@@ -491,27 +491,26 @@ static lv_obj_t *esp_modem_page = NULL;
 static lv_obj_t *global_attacks_page = NULL;
 static lv_obj_t *settings_page = NULL;
 
-// Hardware configuration - auto-detected via ping/pong
-static uint8_t hw_config = 0;         // 0=Monster (single UART), 1=Kraken (dual UART)
-
-// UART2 for Kraken mode
+// MBus port (UART2)
 #define UART2_NUM UART_NUM_2
 static bool uart2_initialized = false;
 
-// Board detection state
+// Board detection state - 3 independent devices
 static bool grove_detected = false;
 static bool usb_detected = false;
 static bool uart1_detected = false;  // Derived: Grove or USB
-static bool uart2_detected = false;
+static bool mbus_detected = false;
 static bool board_detection_popup_open = false;
 static lv_timer_t *board_detect_retry_timer = NULL;
 static lv_obj_t *board_detect_popup = NULL;
 static lv_obj_t *board_detect_overlay = NULL;
 
-// Kraken background scanning state
-static bool kraken_scanning_active = false;    // UART2 scanning running
+// Initial detection popup (shown before building UI)
+static lv_obj_t *detection_popup_overlay = NULL;
+static lv_timer_t *detection_timer = NULL;
+
+// Observer state
 static bool observer_page_visible = false;     // Observer page is currently shown
-static TaskHandle_t kraken_scan_task_handle = NULL;
 
 // Portal background mode
 static bool portal_background_mode = false;     // Portal running in background
@@ -520,17 +519,17 @@ static lv_obj_t *portal_icon = NULL;            // Portal icon in status bar
 
 // Tab-based UI state
 static tab_id_t current_tab = TAB_INTERNAL;     // Active tab id
-static uint8_t portal_started_by_uart = 0;      // 0=none, 1=UART1 (Grove/USB), 2=UART2
+static uint8_t portal_started_by_uart = 0;      // 0=none/Internal, 1=Grove/USB, 2=MBus
 static lv_obj_t *tab_bar = NULL;                // Tab bar container
 static lv_obj_t *grove_tab_btn = NULL;          // Grove tab button
 static lv_obj_t *usb_tab_btn = NULL;            // USB tab button
-static lv_obj_t *uart2_tab_btn = NULL;          // UART 2 tab button
+static lv_obj_t *mbus_tab_btn = NULL;          // MBus tab button
 static lv_obj_t *internal_tab_btn = NULL;       // INTERNAL tab button
 
 // Tab content containers (persistent, hidden/shown)
 static lv_obj_t *grove_container = NULL;
 static lv_obj_t *usb_container = NULL;
-static lv_obj_t *uart2_container = NULL;
+static lv_obj_t *mbus_container = NULL;
 static lv_obj_t *internal_container = NULL;
 
 // INTERNAL tab page objects
@@ -542,7 +541,7 @@ static tab_context_t* get_current_ctx(void) {
     switch (current_tab) {
         case TAB_GROVE: return &grove_ctx;
         case TAB_USB: return &usb_ctx;
-        case TAB_UART2: return &uart2_ctx;
+        case TAB_MBUS: return &mbus_ctx;
         case TAB_INTERNAL: return &internal_ctx;
         default: return &internal_ctx;
     }
@@ -551,7 +550,7 @@ static tab_context_t* get_current_ctx(void) {
 static tab_id_t tab_id_for_ctx(const tab_context_t *ctx) {
     if (ctx == &grove_ctx) return TAB_GROVE;
     if (ctx == &usb_ctx) return TAB_USB;
-    if (ctx == &uart2_ctx) return TAB_UART2;
+    if (ctx == &mbus_ctx) return TAB_MBUS;
     return TAB_INTERNAL;
 }
 
@@ -560,7 +559,7 @@ static lv_obj_t* get_current_tab_container(void) {
     switch (current_tab) {
         case TAB_GROVE: return grove_container;
         case TAB_USB: return usb_container;
-        case TAB_UART2: return uart2_container;
+        case TAB_MBUS: return mbus_container;
         case TAB_INTERNAL: return internal_container;
         default: return internal_container;
     }
@@ -570,7 +569,7 @@ static tab_context_t* get_ctx_for_tab(tab_id_t tab) {
     switch (tab) {
         case TAB_GROVE: return &grove_ctx;
         case TAB_USB: return &usb_ctx;
-        case TAB_UART2: return &uart2_ctx;
+        case TAB_MBUS: return &mbus_ctx;
         case TAB_INTERNAL: return &internal_ctx;
         default: return &internal_ctx;
     }
@@ -580,7 +579,7 @@ static lv_obj_t* get_container_for_tab(tab_id_t tab) {
     switch (tab) {
         case TAB_GROVE: return grove_container;
         case TAB_USB: return usb_container;
-        case TAB_UART2: return uart2_container;
+        case TAB_MBUS: return mbus_container;
         case TAB_INTERNAL: return internal_container;
         default: return internal_container;
     }
@@ -590,8 +589,8 @@ static bool tab_is_uart1(tab_id_t tab) {
     return (tab == TAB_GROVE || tab == TAB_USB);
 }
 
-static bool tab_is_uart2(tab_id_t tab) {
-    return (tab == TAB_UART2);
+static bool tab_is_mbus(tab_id_t tab) {
+    return (tab == TAB_MBUS);
 }
 
 static bool tab_is_internal(tab_id_t tab) {
@@ -602,7 +601,7 @@ static const char* tab_transport_name(tab_id_t tab) {
     switch (tab) {
         case TAB_GROVE: return "Grove";
         case TAB_USB: return "USB";
-        case TAB_UART2: return "UART2";
+        case TAB_MBUS: return "MBus";
         case TAB_INTERNAL: return "INTERNAL";
         default: return "INTERNAL";
     }
@@ -610,12 +609,12 @@ static const char* tab_transport_name(tab_id_t tab) {
 
 static uint8_t uart_index_for_tab(tab_id_t tab) {
     if (tab_is_uart1(tab)) return 1;
-    if (tab_is_uart2(tab)) return 2;
+    if (tab_is_mbus(tab)) return 2;
     return 0;
 }
 
 static uart_port_t uart_port_for_tab(tab_id_t tab) {
-    return tab_is_uart2(tab) ? UART2_NUM : UART_NUM;
+    return tab_is_mbus(tab) ? UART2_NUM : UART_NUM;
 }
 
 // Helper to hide all pages in a tab's context (call before showing a new page)
@@ -703,7 +702,7 @@ static void init_all_tab_contexts(void) {
     ESP_LOGI(TAG, "Initializing all tab contexts with PSRAM...");
     init_tab_context(&grove_ctx);
     init_tab_context(&usb_ctx);
-    init_tab_context(&uart2_ctx);
+    init_tab_context(&mbus_ctx);
     // internal_ctx doesn't need most allocations, but init anyway for safety
     init_tab_context(&internal_ctx);
 }
@@ -1140,9 +1139,9 @@ static void detect_boards(void);
 static void show_no_board_popup(void);
 static void board_detect_retry_cb(lv_timer_t *timer);
 static void board_detect_popup_close_cb(lv_event_t *e);
-static void reload_gui_for_hw_config(void);
-static void kraken_scan_task(void *arg);
-static void stop_kraken_scanning(void);
+static void reload_gui_for_detection(void);
+static void show_detection_popup(void);
+static void detection_complete_cb(lv_timer_t *timer);
 static void update_portal_icon(void);
 static void karma2_attack_background_cb(lv_event_t *e);
 
@@ -1150,7 +1149,7 @@ static void karma2_attack_background_cb(lv_event_t *e);
 static void create_tab_bar(void);
 static void tab_click_cb(lv_event_t *e);
 static void show_uart1_tiles(void);
-static void show_uart2_tiles(void);
+static void show_mbus_tiles(void);
 static void show_internal_tiles(void);
 static void update_tab_styles(void);
 static uart_port_t get_current_uart(void);
@@ -1441,21 +1440,28 @@ static bool board_redetect_pending = false;
 static void board_redetect_cb(void *user_data)
 {
     (void)user_data;
+    ESP_LOGI(TAG, "board_redetect_cb called");
     board_redetect_pending = false;
 
     bool prev_grove = grove_detected;
     bool prev_usb = usb_detected;
-    bool prev_uart2 = uart2_detected;
+    bool prev_uart2 = mbus_detected;
 
     detect_boards();
 
     bool changed = (prev_grove != grove_detected) ||
                    (prev_usb != usb_detected) ||
-                   (prev_uart2 != uart2_detected);
+                   (prev_uart2 != mbus_detected);
 
-    if (changed && (uart1_detected || uart2_detected) && !board_detection_popup_open) {
-        reload_gui_for_hw_config();
+    ESP_LOGI(TAG, "Redetect: changed=%d, uart1=%d, mbus=%d, popup_open=%d",
+             changed, uart1_detected, mbus_detected, board_detection_popup_open);
+
+    if (changed && (uart1_detected || mbus_detected) && !board_detection_popup_open) {
+        ESP_LOGI(TAG, "Redetect: calling reload_gui_for_detection + show_main_tiles");
+        reload_gui_for_detection();
         show_main_tiles();
+    } else if (changed) {
+        ESP_LOGW(TAG, "Redetect: changed but conditions not met for reload");
     }
 }
 
@@ -1468,20 +1474,6 @@ static void schedule_board_redetect(void)
     lv_async_call(board_redetect_cb, NULL);
 }
 
-static const char *uart1_transport_name(void)
-{
-    if (current_tab == TAB_USB) {
-        return "USB";
-    }
-    if (current_tab == TAB_GROVE) {
-        return "Grove";
-    }
-    if (usb_detected && !grove_detected) {
-        return "USB";
-    }
-    return "Grove";
-}
-
 static tab_id_t uart1_preferred_tab(void)
 {
     if (grove_detected) {
@@ -1491,14 +1483,6 @@ static tab_id_t uart1_preferred_tab(void)
         return TAB_USB;
     }
     return TAB_GROVE;
-}
-
-static const char *uart1_connector_name(void)
-{
-    if (current_tab == TAB_USB) {
-        return "USB";
-    }
-    return "Grove";
 }
 
 static void usb_check_host_installed(void)
@@ -1514,10 +1498,18 @@ static void usb_check_host_installed(void)
 
 static void usb_cdc_connect_cb(usbh_cdc_handle_t cdc_handle, void *user_data)
 {
-    (void)cdc_handle;
     (void)user_data;
     usb_cdc_connected = true;
     ESP_LOGI(TAG, "[USB] CDC device connected");
+    
+    // Note: SET_LINE_CODING and SET_CONTROL_LINE_STATE are skipped because:
+    // 1. They cause 5-second blocking timeouts
+    // 2. ESP32 USB Serial/JTAG doesn't support these CDC class requests (returns STALL)
+    // 3. Data transfer works without them for this device type
+    
+    // Flush any stale data in the RX buffer
+    usbh_cdc_flush_rx_buffer(cdc_handle);
+    
     schedule_board_redetect();
 }
 
@@ -1646,37 +1638,107 @@ static __attribute__((unused)) void usb_transport_deinit(void)
 static int usb_transport_write(const char *data, size_t len)
 {
     if (!usb_transport_ready) {
+        ESP_LOGD(TAG, "[USB] Transport not ready, initializing...");
         usb_transport_init();
     }
     if (!usb_cdc_handle || !usb_cdc_connected) {
         if (!usb_transport_warned) {
-            ESP_LOGW(TAG, "[USB] No CDC device connected");
+            ESP_LOGW(TAG, "[USB] No CDC device connected (handle=%p, connected=%d)", 
+                     (void*)usb_cdc_handle, usb_cdc_connected);
             usb_transport_warned = true;
         }
         return 0;
     }
+    
+    ESP_LOGD(TAG, "[USB] Writing %zu bytes: %.*s", len, (int)(len > 50 ? 50 : len), data);
+    
     esp_err_t err = usbh_cdc_write_bytes(usb_cdc_handle, (const uint8_t *)data, len, pdMS_TO_TICKS(200));
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "[USB] CDC write failed: %s", esp_err_to_name(err));
         return 0;
     }
+    
+    ESP_LOGD(TAG, "[USB] Write successful: %zu bytes", len);
     return (int)len;
 }
 
 static int usb_transport_read(void *data, size_t len, TickType_t ticks_to_wait)
 {
     if (!usb_transport_ready) {
+        ESP_LOGD(TAG, "[USB] Transport not ready for read, initializing...");
         usb_transport_init();
     }
     if (!usb_cdc_handle || !usb_cdc_connected) {
+        ESP_LOGD(TAG, "[USB] Read failed: no CDC device (handle=%p, connected=%d)",
+                 (void*)usb_cdc_handle, usb_cdc_connected);
         return 0;
     }
     size_t read_len = len;
     esp_err_t err = usbh_cdc_read_bytes(usb_cdc_handle, (uint8_t *)data, &read_len, ticks_to_wait);
     if (err != ESP_OK) {
+        // ESP_FAIL often means no data available - treat as timeout (normal during polling)
+        // ESP_ERR_TIMEOUT is also normal
+        // Only log actual unexpected errors
+        if (err != ESP_ERR_TIMEOUT && err != ESP_FAIL) {
+            ESP_LOGW(TAG, "[USB] CDC read error: %s (0x%x)", esp_err_to_name(err), err);
+        }
         return 0;
     }
+    if (read_len > 0) {
+        // Log raw bytes received from USB (hex + ASCII for debugging)
+        char hex_buf[128];
+        char ascii_buf[64];
+        size_t log_len = read_len > 32 ? 32 : read_len;  // Limit to 32 bytes in log
+        for (size_t i = 0; i < log_len; i++) {
+            uint8_t b = ((uint8_t*)data)[i];
+            snprintf(hex_buf + i*3, 4, "%02X ", b);
+            ascii_buf[i] = (b >= 32 && b < 127) ? (char)b : '.';
+        }
+        hex_buf[log_len * 3] = '\0';
+        ascii_buf[log_len] = '\0';
+        ESP_LOGI(TAG, "[USB] Read %zu bytes: [%s] \"%s\"%s", 
+                 read_len, hex_buf, ascii_buf, read_len > 32 ? "..." : "");
+    }
     return (int)read_len;
+}
+
+// Ping USB device to verify it responds (similar to ping_uart_direct for Grove/MBus)
+static bool ping_usb(void)
+{
+    if (!usb_cdc_handle || !usb_cdc_connected) {
+        ESP_LOGW(TAG, "[USB] Cannot ping - no CDC device connected");
+        return false;
+    }
+    
+    // Flush RX buffer before ping
+    usbh_cdc_flush_rx_buffer(usb_cdc_handle);
+    
+    // Send ping command
+    const char *ping_cmd = "ping\r\n";
+    int written = usb_transport_write(ping_cmd, strlen(ping_cmd));
+    if (written <= 0) {
+        ESP_LOGW(TAG, "[USB] Failed to send ping");
+        return false;
+    }
+    ESP_LOGI(TAG, "[USB] Sent ping");
+    
+    // Wait for pong response (timeout ~500ms, 10 x 50ms reads)
+    char buf[64];
+    int total = 0;
+    for (int i = 0; i < 10; i++) {
+        int n = usb_transport_read(buf + total, sizeof(buf) - total - 1, pdMS_TO_TICKS(50));
+        if (n > 0) {
+            total += n;
+            buf[total] = '\0';
+            if (strstr(buf, "pong")) {
+                ESP_LOGI(TAG, "[USB] Received pong - device detected!");
+                return true;
+            }
+        }
+    }
+    
+    ESP_LOGW(TAG, "[USB] No pong response - device not detected");
+    return false;
 }
 
 static int transport_write_bytes_tab(tab_id_t tab, uart_port_t port, const char *data, size_t len)
@@ -1726,8 +1788,8 @@ static void uart_init(void)
     ESP_ERROR_CHECK(uart_set_pin(UART_NUM, tx_pin, rx_pin, 
                                   UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
     
-    ESP_LOGI(TAG, "[%s] Initialized: TX=%d, RX=%d, baud=%d (%s)",
-             uart1_transport_name(), tx_pin, rx_pin, UART_BAUD_RATE, uart1_connector_name());
+    ESP_LOGI(TAG, "[Grove] Initialized: TX=%d, RX=%d, baud=%d (Grove connector)",
+             tx_pin, rx_pin, UART_BAUD_RATE);
 
     usb_transport_init();
 }
@@ -1759,17 +1821,17 @@ static void uart_send_command(const char *cmd)
     ESP_LOGI(TAG, "[%s] Sent command: %s", tab_transport_name(uart1_tab), cmd);
 }
 
-// Send command over UART2 (secondary, Kraken mode only)
+// Send command over MBus (UART2)
 static void uart2_send_command(const char *cmd)
 {
     if (!uart2_initialized) {
-        ESP_LOGW(TAG, "[M-Bus] Not initialized");
+        ESP_LOGW(TAG, "[MBus] Not initialized");
         return;
     }
     log_memory_stats("TX2");
     transport_write_bytes(UART2_NUM, cmd, strlen(cmd));
     transport_write_bytes(UART2_NUM, "\r\n", 2);
-    ESP_LOGI(TAG, "[M-Bus] Sent command: %s", cmd);
+    ESP_LOGI(TAG, "[MBus] Sent command: %s", cmd);
 }
 
 // Parse a single network line like: "1","SSID","","C4:2B:44:12:29:21","1","WPA2","-53","2.4GHz"
@@ -1846,10 +1908,15 @@ static void wifi_scan_task(void *arg)
     
     ESP_LOGI(TAG, "[%s] Using transport on port %d for scan", uart_name, uart_port);
     
-    // Flush UART buffer
-    uart_flush(uart_port);
+    // Flush buffer before scan
+    if (scan_tab == TAB_USB && usb_cdc_handle) {
+        usbh_cdc_flush_rx_buffer(usb_cdc_handle);
+        ESP_LOGI(TAG, "[USB] Flushed RX buffer before scan");
+    } else {
+        uart_flush(uart_port);
+    }
     
-    // Send scan command to the correct UART
+    // Send scan command to the correct transport
     log_memory_stats("TX-scan");
     transport_write_bytes_tab(scan_tab, uart_port, "scan_networks\r\n", 15);
     ESP_LOGI(TAG, "[%s] Sent command: scan_networks", tab_transport_name(scan_tab));
@@ -2130,7 +2197,9 @@ static void splash_timer_cb(lv_timer_t *timer)
             lv_obj_align(splash_label, LV_ALIGN_CENTER, 0, 0);
         }
     } else {
-        // End splash and run board detection
+        // End splash and show detection popup
+        ESP_LOGI(TAG, "Splash complete, showing detection popup");
+        
         if (splash_timer) {
             lv_timer_del(splash_timer);
             splash_timer = NULL;
@@ -2142,18 +2211,77 @@ static void splash_timer_cb(lv_timer_t *timer)
             splash_label = NULL;
         }
         
-        // Run board detection
-        detect_boards();
-        
-        // Check detection results
-        if (!uart1_detected && !uart2_detected) {
-            // No boards detected - show popup and keep retrying
-            show_no_board_popup();
-        } else {
-            // At least one board detected - show main UI
-            show_main_tiles();
-        }
+        // Show detection popup - it will wait for devices and then build UI
+        show_detection_popup();
     }
+}
+
+// Detection complete callback - called after waiting for devices to stabilize
+static void detection_complete_cb(lv_timer_t *timer)
+{
+    (void)timer;
+    detection_timer = NULL;
+    
+    ESP_LOGI(TAG, "Detection timer complete, running board detection");
+    
+    // Run board detection
+    detect_boards();
+    
+    ESP_LOGI(TAG, "Detection complete: uart1=%d, mbus=%d, grove=%d, usb=%d",
+             uart1_detected, mbus_detected, grove_detected, usb_detected);
+    
+    // Remove detection popup
+    if (detection_popup_overlay) {
+        lv_obj_del(detection_popup_overlay);
+        detection_popup_overlay = NULL;
+    }
+    
+    // Show appropriate UI based on detection results
+    if (!uart1_detected && !mbus_detected) {
+        ESP_LOGI(TAG, "No boards detected - showing popup");
+        show_no_board_popup();
+    } else {
+        ESP_LOGI(TAG, "Board(s) detected - showing main tiles");
+        show_main_tiles();
+    }
+}
+
+// Show detection popup while waiting for devices to stabilize
+static void show_detection_popup(void)
+{
+    ESP_LOGI(TAG, "Showing detection popup (waiting for devices)");
+    
+    lv_obj_t *scr = lv_scr_act();
+    
+    // Create full-screen overlay
+    detection_popup_overlay = lv_obj_create(scr);
+    lv_obj_remove_style_all(detection_popup_overlay);
+    lv_obj_set_size(detection_popup_overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(detection_popup_overlay, lv_color_hex(0x121212), 0);
+    lv_obj_set_style_bg_opa(detection_popup_overlay, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(detection_popup_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(detection_popup_overlay, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(detection_popup_overlay, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    
+    // Spinner animation (LVGL 9.x API)
+    lv_obj_t *spinner = lv_spinner_create(detection_popup_overlay);
+    lv_spinner_set_anim_params(spinner, 1000, 60);  // 1000ms rotation, 60 degree arc
+    lv_obj_set_size(spinner, 80, 80);
+    lv_obj_set_style_arc_color(spinner, lv_color_hex(0x00FFFF), LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(spinner, lv_color_hex(0x333333), LV_PART_MAIN);
+    
+    // Label
+    lv_obj_t *label = lv_label_create(detection_popup_overlay);
+    lv_label_set_text(label, "Detecting devices...");
+    lv_obj_set_style_text_color(label, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_font(label, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_pad_top(label, 20, 0);
+    
+    // Start timer - wait 2.5 seconds for USB and other devices to stabilize
+    detection_timer = lv_timer_create(detection_complete_cb, 2500, NULL);
+    lv_timer_set_repeat_count(detection_timer, 1);
+    
+    ESP_LOGI(TAG, "Detection timer started (2.5s)");
 }
 
 // Play startup beep (audio disabled due to linker issues - just log)
@@ -2599,7 +2727,7 @@ static void create_status_bar(void)
 // Get current UART port based on active tab
 static uart_port_t get_current_uart(void)
 {
-    if (tab_is_uart2(current_tab) && uart2_initialized) {
+    if (tab_is_mbus(current_tab) && uart2_initialized) {
         return UART2_NUM;
     }
     return UART_NUM;
@@ -2671,25 +2799,25 @@ static void update_tab_styles(void)
     }
     
     // ========== UART 2 tab styling ==========
-    if (uart2_tab_btn) {
-        if (current_tab == TAB_UART2) {
+    if (mbus_tab_btn) {
+        if (current_tab == TAB_MBUS) {
             // Active state - bright color with glow + border
-            lv_obj_set_style_bg_color(uart2_tab_btn, lv_color_hex(TAB_COLOR_UART2_ACTIVE), 0);
-            lv_obj_set_style_bg_grad_color(uart2_tab_btn, lv_color_hex(0xF57C00), 0);
-            lv_obj_set_style_bg_grad_dir(uart2_tab_btn, LV_GRAD_DIR_VER, 0);
-            lv_obj_set_style_shadow_opa(uart2_tab_btn, LV_OPA_80, 0);
-            lv_obj_set_style_shadow_spread(uart2_tab_btn, 4, 0);
+            lv_obj_set_style_bg_color(mbus_tab_btn, lv_color_hex(TAB_COLOR_MBUS_ACTIVE), 0);
+            lv_obj_set_style_bg_grad_color(mbus_tab_btn, lv_color_hex(0xF57C00), 0);
+            lv_obj_set_style_bg_grad_dir(mbus_tab_btn, LV_GRAD_DIR_VER, 0);
+            lv_obj_set_style_shadow_opa(mbus_tab_btn, LV_OPA_80, 0);
+            lv_obj_set_style_shadow_spread(mbus_tab_btn, 4, 0);
             // Active indicator - white top border
-            lv_obj_set_style_border_width(uart2_tab_btn, 3, 0);
-            lv_obj_set_style_border_color(uart2_tab_btn, lv_color_hex(0xFFFFFF), 0);
-            lv_obj_set_style_border_side(uart2_tab_btn, LV_BORDER_SIDE_TOP, 0);
+            lv_obj_set_style_border_width(mbus_tab_btn, 3, 0);
+            lv_obj_set_style_border_color(mbus_tab_btn, lv_color_hex(0xFFFFFF), 0);
+            lv_obj_set_style_border_side(mbus_tab_btn, LV_BORDER_SIDE_TOP, 0);
         } else {
             // Inactive state - dark muted color, no border
-            lv_obj_set_style_bg_color(uart2_tab_btn, lv_color_hex(TAB_COLOR_UART2_INACTIVE), 0);
-            lv_obj_set_style_bg_grad_dir(uart2_tab_btn, LV_GRAD_DIR_NONE, 0);
-            lv_obj_set_style_shadow_opa(uart2_tab_btn, LV_OPA_20, 0);
-            lv_obj_set_style_shadow_spread(uart2_tab_btn, 0, 0);
-            lv_obj_set_style_border_width(uart2_tab_btn, 0, 0);
+            lv_obj_set_style_bg_color(mbus_tab_btn, lv_color_hex(TAB_COLOR_MBUS_INACTIVE), 0);
+            lv_obj_set_style_bg_grad_dir(mbus_tab_btn, LV_GRAD_DIR_NONE, 0);
+            lv_obj_set_style_shadow_opa(mbus_tab_btn, LV_OPA_20, 0);
+            lv_obj_set_style_shadow_spread(mbus_tab_btn, 0, 0);
+            lv_obj_set_style_border_width(mbus_tab_btn, 0, 0);
         }
     }
     
@@ -2755,14 +2883,14 @@ static void tab_click_cb(lv_event_t *e)
         return;
     }
 
-    if (tab_is_uart2(current_tab)) {
-        if (!uart2_ctx.tiles) {
-            show_uart2_tiles();
-        } else if (uart2_ctx.current_visible_page) {
-            lv_obj_clear_flag(uart2_ctx.current_visible_page, LV_OBJ_FLAG_HIDDEN);
+    if (tab_is_mbus(current_tab)) {
+        if (!mbus_ctx.tiles) {
+            show_mbus_tiles();
+        } else if (mbus_ctx.current_visible_page) {
+            lv_obj_clear_flag(mbus_ctx.current_visible_page, LV_OBJ_FLAG_HIDDEN);
         } else {
-            lv_obj_clear_flag(uart2_ctx.tiles, LV_OBJ_FLAG_HIDDEN);
-            uart2_ctx.current_visible_page = uart2_ctx.tiles;
+            lv_obj_clear_flag(mbus_ctx.tiles, LV_OBJ_FLAG_HIDDEN);
+            mbus_ctx.current_visible_page = mbus_ctx.tiles;
         }
         return;
     }
@@ -2789,8 +2917,8 @@ static void create_tab_containers(void)
         current_tab = TAB_GROVE;
     } else if (usb_detected) {
         current_tab = TAB_USB;
-    } else if (uart2_detected) {
-        current_tab = TAB_UART2;
+    } else if (mbus_detected) {
+        current_tab = TAB_MBUS;
     } else {
         current_tab = TAB_INTERNAL;  // INTERNAL if no boards detected
     }
@@ -2825,19 +2953,19 @@ static void create_tab_containers(void)
         }
     }
 
-    // UART2 container
-    if (uart2_detected) {
-        uart2_container = lv_obj_create(scr);
-        lv_obj_set_size(uart2_container, lv_pct(100), height);
-        lv_obj_align(uart2_container, LV_ALIGN_TOP_MID, 0, 85);
-        lv_obj_set_style_bg_color(uart2_container, COLOR_MATERIAL_BG, 0);
-        lv_obj_set_style_border_width(uart2_container, 0, 0);
-        lv_obj_set_style_radius(uart2_container, 0, 0);
-        lv_obj_set_style_pad_all(uart2_container, 0, 0);
-        lv_obj_clear_flag(uart2_container, LV_OBJ_FLAG_SCROLLABLE);
+    // MBus container
+    if (mbus_detected) {
+        mbus_container = lv_obj_create(scr);
+        lv_obj_set_size(mbus_container, lv_pct(100), height);
+        lv_obj_align(mbus_container, LV_ALIGN_TOP_MID, 0, 85);
+        lv_obj_set_style_bg_color(mbus_container, COLOR_MATERIAL_BG, 0);
+        lv_obj_set_style_border_width(mbus_container, 0, 0);
+        lv_obj_set_style_radius(mbus_container, 0, 0);
+        lv_obj_set_style_pad_all(mbus_container, 0, 0);
+        lv_obj_clear_flag(mbus_container, LV_OBJ_FLAG_SCROLLABLE);
         // Hide if not the initial tab
-        if (current_tab != TAB_UART2) {
-            lv_obj_add_flag(uart2_container, LV_OBJ_FLAG_HIDDEN);
+        if (current_tab != TAB_MBUS) {
+            lv_obj_add_flag(mbus_container, LV_OBJ_FLAG_HIDDEN);
         }
     }
     
@@ -2855,20 +2983,20 @@ static void create_tab_containers(void)
         lv_obj_add_flag(internal_container, LV_OBJ_FLAG_HIDDEN);
     }
     
-    ESP_LOGI(TAG, "Tab containers created (Grove=%s, USB=%s, UART2=%s, initial_tab=%d)",
+    ESP_LOGI(TAG, "Tab containers created (Grove=%s, USB=%s, MBus=%s, initial_tab=%d)",
              grove_detected ? "YES" : "NO",
              usb_detected ? "YES" : "NO",
-             uart2_detected ? "YES" : "NO",
+             mbus_detected ? "YES" : "NO",
              current_tab);
 }
 
 // Reload GUI when hardware config changes (e.g., after board detection)
-static void reload_gui_for_hw_config(void)
+static void reload_gui_for_detection(void)
 {
-    ESP_LOGI(TAG, "Reloading GUI (Grove=%s, USB=%s, UART2=%s)",
+    ESP_LOGI(TAG, "Reloading GUI (Grove=%s, USB=%s, MBus=%s)",
              grove_detected ? "YES" : "NO",
              usb_detected ? "YES" : "NO",
-             uart2_detected ? "YES" : "NO");
+             mbus_detected ? "YES" : "NO");
     
     lv_obj_t *scr = lv_scr_act();
     lv_coord_t height = lv_disp_get_ver_res(NULL) - 85;
@@ -2899,18 +3027,18 @@ static void reload_gui_for_hw_config(void)
         ESP_LOGI(TAG, "Created USB container");
     }
     
-    // Handle UART2 container based on detection
-    if (uart2_detected && !uart2_container) {
-        uart2_container = lv_obj_create(scr);
-        lv_obj_set_size(uart2_container, lv_pct(100), height);
-        lv_obj_align(uart2_container, LV_ALIGN_TOP_MID, 0, 85);
-        lv_obj_set_style_bg_color(uart2_container, COLOR_MATERIAL_BG, 0);
-        lv_obj_set_style_border_width(uart2_container, 0, 0);
-        lv_obj_set_style_radius(uart2_container, 0, 0);
-        lv_obj_set_style_pad_all(uart2_container, 0, 0);
-        lv_obj_clear_flag(uart2_container, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_add_flag(uart2_container, LV_OBJ_FLAG_HIDDEN);
-        ESP_LOGI(TAG, "Created UART2 container");
+    // Handle MBus container based on detection
+    if (mbus_detected && !mbus_container) {
+        mbus_container = lv_obj_create(scr);
+        lv_obj_set_size(mbus_container, lv_pct(100), height);
+        lv_obj_align(mbus_container, LV_ALIGN_TOP_MID, 0, 85);
+        lv_obj_set_style_bg_color(mbus_container, COLOR_MATERIAL_BG, 0);
+        lv_obj_set_style_border_width(mbus_container, 0, 0);
+        lv_obj_set_style_radius(mbus_container, 0, 0);
+        lv_obj_set_style_pad_all(mbus_container, 0, 0);
+        lv_obj_clear_flag(mbus_container, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(mbus_container, LV_OBJ_FLAG_HIDDEN);
+        ESP_LOGI(TAG, "Created MBus container");
     }
     
     // Recreate tab bar with correct number of tabs
@@ -2921,8 +3049,8 @@ static void reload_gui_for_hw_config(void)
         current_tab = TAB_GROVE;
     } else if (usb_detected) {
         current_tab = TAB_USB;
-    } else if (uart2_detected) {
-        current_tab = TAB_UART2;
+    } else if (mbus_detected) {
+        current_tab = TAB_MBUS;
     } else {
         current_tab = TAB_INTERNAL;  // INTERNAL if no boards detected
     }
@@ -2942,7 +3070,7 @@ static void create_tab_bar(void)
         tab_bar = NULL;
         grove_tab_btn = NULL;
         usb_tab_btn = NULL;
-        uart2_tab_btn = NULL;
+        mbus_tab_btn = NULL;
         internal_tab_btn = NULL;
     }
     
@@ -2962,7 +3090,7 @@ static void create_tab_bar(void)
     lv_obj_clear_flag(tab_bar, LV_OBJ_FLAG_SCROLLABLE);
     
     // Calculate tab count based on detected transports
-    int tab_count = (grove_detected ? 1 : 0) + (usb_detected ? 1 : 0) + (uart2_detected ? 1 : 0) + 1;
+    int tab_count = (grove_detected ? 1 : 0) + (usb_detected ? 1 : 0) + (mbus_detected ? 1 : 0) + 1;
     int tab_width = (lv_disp_get_hor_res(NULL) - 24) / tab_count;  // Account for padding and gaps
     
     // ========== Grove tab (only if detected) ==========
@@ -3027,35 +3155,35 @@ static void create_tab_bar(void)
         lv_obj_set_style_text_color(usb_label, lv_color_hex(0xFFFFFF), 0);
     }
     
-    // ========== UART 2 tab (only if UART2 detected) ==========
-    if (uart2_detected) {
-        uart2_tab_btn = lv_btn_create(tab_bar);
-        lv_obj_set_size(uart2_tab_btn, tab_width, 37);
-        lv_obj_set_style_radius(uart2_tab_btn, 8, 0);
-        lv_obj_set_style_shadow_width(uart2_tab_btn, 8, 0);
-        lv_obj_set_style_shadow_color(uart2_tab_btn, lv_color_hex(TAB_COLOR_UART2_ACTIVE), 0);
-        lv_obj_set_style_shadow_opa(uart2_tab_btn, LV_OPA_30, 0);
-        lv_obj_add_event_cb(uart2_tab_btn, tab_click_cb, LV_EVENT_CLICKED, (void*)(uintptr_t)TAB_UART2);
+    // ========== MBus tab (only if MBus detected) ==========
+    if (mbus_detected) {
+        mbus_tab_btn = lv_btn_create(tab_bar);
+        lv_obj_set_size(mbus_tab_btn, tab_width, 37);
+        lv_obj_set_style_radius(mbus_tab_btn, 8, 0);
+        lv_obj_set_style_shadow_width(mbus_tab_btn, 8, 0);
+        lv_obj_set_style_shadow_color(mbus_tab_btn, lv_color_hex(TAB_COLOR_MBUS_ACTIVE), 0);
+        lv_obj_set_style_shadow_opa(mbus_tab_btn, LV_OPA_30, 0);
+        lv_obj_add_event_cb(mbus_tab_btn, tab_click_cb, LV_EVENT_CLICKED, (void*)(uintptr_t)TAB_MBUS);
         
         // Icon + Label container
-        lv_obj_t *uart2_content = lv_obj_create(uart2_tab_btn);
-        lv_obj_remove_style_all(uart2_content);
-        lv_obj_set_size(uart2_content, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
-        lv_obj_set_flex_flow(uart2_content, LV_FLEX_FLOW_ROW);
-        lv_obj_set_flex_align(uart2_content, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-        lv_obj_set_style_pad_gap(uart2_content, 6, 0);
-        lv_obj_center(uart2_content);
-        lv_obj_clear_flag(uart2_content, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_t *mbus_content = lv_obj_create(mbus_tab_btn);
+        lv_obj_remove_style_all(mbus_content);
+        lv_obj_set_size(mbus_content, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+        lv_obj_set_flex_flow(mbus_content, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(mbus_content, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_gap(mbus_content, 6, 0);
+        lv_obj_center(mbus_content);
+        lv_obj_clear_flag(mbus_content, LV_OBJ_FLAG_CLICKABLE);
         
-        lv_obj_t *uart2_icon = lv_label_create(uart2_content);
-        lv_label_set_text(uart2_icon, LV_SYMBOL_GPS);
-        lv_obj_set_style_text_font(uart2_icon, &lv_font_montserrat_18, 0);
-        lv_obj_set_style_text_color(uart2_icon, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_t *mbus_icon = lv_label_create(mbus_content);
+        lv_label_set_text(mbus_icon, LV_SYMBOL_GPS);
+        lv_obj_set_style_text_font(mbus_icon, &lv_font_montserrat_18, 0);
+        lv_obj_set_style_text_color(mbus_icon, lv_color_hex(0xFFFFFF), 0);
         
-        lv_obj_t *uart2_label = lv_label_create(uart2_content);
-        lv_label_set_text(uart2_label, "M-Bus");
-        lv_obj_set_style_text_font(uart2_label, &lv_font_montserrat_14, 0);
-        lv_obj_set_style_text_color(uart2_label, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_t *mbus_label = lv_label_create(mbus_content);
+        lv_label_set_text(mbus_label, "MBUS");
+        lv_obj_set_style_text_font(mbus_label, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(mbus_label, lv_color_hex(0xFFFFFF), 0);
     }
     
     // ========== INTERNAL tab ==========
@@ -3090,11 +3218,11 @@ static void create_tab_bar(void)
     // Apply active tab styling
     update_tab_styles();
     
-    ESP_LOGI(TAG, "Tab bar created: tabs=%d (Grove=%s, USB=%s, UART2=%s)",
+    ESP_LOGI(TAG, "Tab bar created: tabs=%d (Grove=%s, USB=%s, MBus=%s)",
              tab_count,
              grove_detected ? "YES" : "NO",
              usb_detected ? "YES" : "NO",
-             uart2_detected ? "YES" : "NO");
+             mbus_detected ? "YES" : "NO");
 }
 
 // Main tile click handler
@@ -3522,8 +3650,8 @@ static void handshaker_monitor_task(void *arg)
     tab_context_t *ctx = (tab_context_t *)arg;
     
     // Determine UART from context
-    int task_tab = (ctx == &uart2_ctx) ? 1 : 0;
-    uart_port_t uart_port = (task_tab == 1 && uart2_initialized) ? UART2_NUM : UART_NUM;
+    tab_id_t task_tab = tab_id_for_ctx(ctx);
+    uart_port_t uart_port = (task_tab == TAB_MBUS && uart2_initialized) ? UART2_NUM : UART_NUM;
     const char *uart_name = tab_transport_name(task_tab);
     
     ESP_LOGI(TAG, "[%s] Handshaker monitor task started for tab %d", uart_name, task_tab);
@@ -4952,8 +5080,8 @@ static void karma_monitor_task(void *arg)
     tab_context_t *ctx = (tab_context_t *)arg;
     
     // Determine UART from context
-    int task_tab = (ctx == &uart2_ctx) ? 1 : 0;
-    uart_port_t uart_port = (task_tab == 1 && uart2_initialized) ? UART2_NUM : UART_NUM;
+    tab_id_t task_tab = tab_id_for_ctx(ctx);
+    uart_port_t uart_port = (task_tab == TAB_MBUS && uart2_initialized) ? UART2_NUM : UART_NUM;
     const char *uart_name = tab_transport_name(task_tab);
     
     ESP_LOGI(TAG, "[%s] Karma monitor task started for tab %d", uart_name, task_tab);
@@ -5753,7 +5881,7 @@ static void create_uart_tiles_in_container(lv_obj_t *container, lv_obj_t **tiles
     lv_obj_set_flex_align(*tiles_ptr, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_clear_flag(*tiles_ptr, LV_OBJ_FLAG_SCROLLABLE);
     
-    // Create 7 tiles for UART tabs (same for both UART1 and UART2)
+    // Create 7 tiles for device tabs (same for Grove, USB, MBus)
     // Use "Test" instead of "Attack" when Red Team is disabled
     create_tile(*tiles_ptr, LV_SYMBOL_WIFI, 
         enable_red_team ? "WiFi Scan\n& Attack" : "WiFi Scan\n& Test", 
@@ -5766,6 +5894,9 @@ static void create_uart_tiles_in_container(lv_obj_t *container, lv_obj_t **tiles
     create_tile(*tiles_ptr, LV_SYMBOL_BLUETOOTH, "Bluetooth", COLOR_MATERIAL_CYAN, main_tile_event_cb, "Bluetooth");
     create_tile(*tiles_ptr, LV_SYMBOL_LOOP, "Network\nObserver", COLOR_MATERIAL_TEAL, main_tile_event_cb, "Network Observer");
     create_tile(*tiles_ptr, LV_SYMBOL_WIFI, "Karma", COLOR_MATERIAL_ORANGE, main_tile_event_cb, "Karma");
+    
+    // Ensure tiles are visible after creation (fixes initial display issue)
+    lv_obj_clear_flag(*tiles_ptr, LV_OBJ_FLAG_HIDDEN);
 }
 
 // Show UART 1 tiles (inside persistent container)
@@ -5791,23 +5922,23 @@ static void show_uart1_tiles(void)
 }
 
 // Show UART 2 tiles (inside persistent container)
-static void show_uart2_tiles(void)
+static void show_mbus_tiles(void)
 {
     ESP_LOGI(TAG, "Showing UART 2 tiles");
     
-    if (!uart2_container) {
-        ESP_LOGE(TAG, "UART2 container not initialized!");
+    if (!mbus_container) {
+        ESP_LOGE(TAG, "MBus container not initialized!");
         return;
     }
     
     // Hide other pages in this container, show tiles
-    tab_context_t *ctx = &uart2_ctx;
+    tab_context_t *ctx = &mbus_ctx;
     if (ctx->scan_page) lv_obj_add_flag(ctx->scan_page, LV_OBJ_FLAG_HIDDEN);
     if (ctx->observer_page) lv_obj_add_flag(ctx->observer_page, LV_OBJ_FLAG_HIDDEN);
     if (ctx->global_attacks_page) lv_obj_add_flag(ctx->global_attacks_page, LV_OBJ_FLAG_HIDDEN);
     if (ctx->karma_page) lv_obj_add_flag(ctx->karma_page, LV_OBJ_FLAG_HIDDEN);
     
-    create_uart_tiles_in_container(uart2_container, &ctx->tiles);
+    create_uart_tiles_in_container(mbus_container, &ctx->tiles);
     ctx->current_visible_page = ctx->tiles;
 }
 
@@ -5860,6 +5991,9 @@ static void show_internal_tiles(void)
     // Create 2 tiles for INTERNAL tab
     create_tile(internal_tiles, LV_SYMBOL_SETTINGS, "Settings", COLOR_MATERIAL_PURPLE, internal_tile_event_cb, "Settings");
     create_tile(internal_tiles, LV_SYMBOL_WIFI, "Ad Hoc\nPortal & Karma", COLOR_MATERIAL_ORANGE, internal_tile_event_cb, "Ad Hoc Portal");
+    
+    // Ensure tiles are visible after creation (fixes initial display issue)
+    lv_obj_clear_flag(internal_tiles, LV_OBJ_FLAG_HIDDEN);
 }
 
 // Show main tiles screen with tab bar (persistent containers)
@@ -5879,6 +6013,50 @@ static void show_main_tiles(void)
     // Check internal_container since it's always created
     if (!internal_container) {
         create_tab_containers();
+        update_tab_styles();  // Apply styles after current_tab is set
+    } else {
+        // Containers might be missing if detection changed after first create
+        // Create any missing containers for newly detected devices
+        lv_coord_t height = lv_disp_get_ver_res(NULL) - 85;
+        
+        if (grove_detected && !grove_container) {
+            grove_container = lv_obj_create(scr);
+            lv_obj_set_size(grove_container, lv_pct(100), height);
+            lv_obj_align(grove_container, LV_ALIGN_TOP_MID, 0, 85);
+            lv_obj_set_style_bg_color(grove_container, COLOR_MATERIAL_BG, 0);
+            lv_obj_set_style_border_width(grove_container, 0, 0);
+            lv_obj_set_style_radius(grove_container, 0, 0);
+            lv_obj_set_style_pad_all(grove_container, 0, 0);
+            lv_obj_clear_flag(grove_container, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_add_flag(grove_container, LV_OBJ_FLAG_HIDDEN);
+            ESP_LOGI(TAG, "Late-created Grove container");
+        }
+        
+        if (usb_detected && !usb_container) {
+            usb_container = lv_obj_create(scr);
+            lv_obj_set_size(usb_container, lv_pct(100), height);
+            lv_obj_align(usb_container, LV_ALIGN_TOP_MID, 0, 85);
+            lv_obj_set_style_bg_color(usb_container, COLOR_MATERIAL_BG, 0);
+            lv_obj_set_style_border_width(usb_container, 0, 0);
+            lv_obj_set_style_radius(usb_container, 0, 0);
+            lv_obj_set_style_pad_all(usb_container, 0, 0);
+            lv_obj_clear_flag(usb_container, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_add_flag(usb_container, LV_OBJ_FLAG_HIDDEN);
+            ESP_LOGI(TAG, "Late-created USB container");
+        }
+        
+        if (mbus_detected && !mbus_container) {
+            mbus_container = lv_obj_create(scr);
+            lv_obj_set_size(mbus_container, lv_pct(100), height);
+            lv_obj_align(mbus_container, LV_ALIGN_TOP_MID, 0, 85);
+            lv_obj_set_style_bg_color(mbus_container, COLOR_MATERIAL_BG, 0);
+            lv_obj_set_style_border_width(mbus_container, 0, 0);
+            lv_obj_set_style_radius(mbus_container, 0, 0);
+            lv_obj_set_style_pad_all(mbus_container, 0, 0);
+            lv_obj_clear_flag(mbus_container, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_add_flag(mbus_container, LV_OBJ_FLAG_HIDDEN);
+            ESP_LOGI(TAG, "Late-created MBus container");
+        }
     }
     
     // Show tiles for current tab and make container visible
@@ -5889,8 +6067,8 @@ static void show_main_tiles(void)
 
     if (tab_is_internal(current_tab)) {
         show_internal_tiles();
-    } else if (tab_is_uart2(current_tab)) {
-        show_uart2_tiles();
+    } else if (tab_is_mbus(current_tab)) {
+        show_mbus_tiles();
     } else {
         show_uart1_tiles();
     }
@@ -6061,8 +6239,8 @@ static void popup_timer_callback(TimerHandle_t xTimer)
     if (!ctx || !ctx->popup_open || !ctx->observer_running) return;
     
     // Only start new poll if previous one finished
-    if (observer_task_handle == NULL) {
-        xTaskCreate(popup_poll_task, "popup_poll", 8192, (void*)ctx, 5, &observer_task_handle);
+    if (ctx->observer_task == NULL) {
+        xTaskCreate(popup_poll_task, "popup_poll", 8192, (void*)ctx, 5, &ctx->observer_task);
     }
 }
 
@@ -6287,8 +6465,8 @@ static void show_network_popup(int network_idx)
         
         // Do first poll after a short delay
         vTaskDelay(pdMS_TO_TICKS(2000));
-        if (ctx->popup_open && observer_task_handle == NULL) {
-            xTaskCreate(popup_poll_task, "popup_poll", 8192, (void*)ctx, 5, &observer_task_handle);
+        if (ctx->popup_open && ctx->observer_task == NULL) {
+            xTaskCreate(popup_poll_task, "popup_poll", 8192, (void*)ctx, 5, &ctx->observer_task);
         }
     }
 }
@@ -6330,7 +6508,6 @@ static void popup_poll_task(void *arg)
     tab_context_t *ctx = (tab_context_t *)arg;
     if (!ctx) {
         ESP_LOGE(TAG, "Popup poll task: NULL context!");
-        observer_task_handle = NULL;
         vTaskDelete(NULL);
         return;
     }
@@ -6339,18 +6516,18 @@ static void popup_poll_task(void *arg)
     
     if (!observer_rx_buffer || !observer_line_buffer || !ctx->observer_networks) {
         ESP_LOGE(TAG, "PSRAM buffers not allocated!");
-        observer_task_handle = NULL;
+        ctx->observer_task = NULL;
         vTaskDelete(NULL);
         return;
     }
     
     // Determine UART from context
-    int task_tab = (ctx == &uart2_ctx) ? 1 : 0;
-    uart_port_t uart_port = (task_tab == 1 && uart2_initialized) ? UART2_NUM : UART_NUM;
+    tab_id_t task_tab = tab_id_for_ctx(ctx);
+    uart_port_t uart_port = (task_tab == TAB_MBUS && uart2_initialized) ? UART2_NUM : UART_NUM;
     
     uart_flush(uart_port);
     char cmd[] = "show_sniffer_results\r\n";
-    transport_write_bytes(uart_port, cmd, strlen(cmd));
+    transport_write_bytes_tab(task_tab, uart_port, cmd, strlen(cmd));
     
     char *rx_buffer = observer_rx_buffer;
     char *line_buffer = observer_line_buffer;
@@ -6363,7 +6540,7 @@ static void popup_poll_task(void *arg)
     TickType_t timeout_ticks = pdMS_TO_TICKS(5000);
     
     while ((xTaskGetTickCount() - start_time) < timeout_ticks) {
-        int len = transport_read_bytes(uart_port, (uint8_t*)rx_buffer, UART_BUF_SIZE - 1, pdMS_TO_TICKS(100));
+        int len = transport_read_bytes_tab(task_tab, uart_port, (uint8_t*)rx_buffer, UART_BUF_SIZE - 1, pdMS_TO_TICKS(100));
         
         if (len > 0) {
             rx_buffer[len] = '\0';
@@ -6428,7 +6605,7 @@ static void popup_poll_task(void *arg)
     }
     
     ESP_LOGI(TAG, "Popup poll task finished");
-    observer_task_handle = NULL;
+    ctx->observer_task = NULL;
     vTaskDelete(NULL);
 }
 
@@ -6813,14 +6990,13 @@ static void observer_poll_task(void *arg)
     tab_context_t *ctx = (tab_context_t *)arg;
     if (!ctx) {
         ESP_LOGE(TAG, "Observer poll task: NULL context!");
-        observer_task_handle = NULL;
         vTaskDelete(NULL);
         return;
     }
     
     // Determine UART from context
-    int task_tab = (ctx == &uart2_ctx) ? 1 : 0;
-    uart_port_t uart_port = (task_tab == 1 && uart2_initialized) ? UART2_NUM : UART_NUM;
+    tab_id_t task_tab = tab_id_for_ctx(ctx);
+    uart_port_t uart_port = (task_tab == TAB_MBUS && uart2_initialized) ? UART2_NUM : UART_NUM;
     const char *uart_name = tab_transport_name(task_tab);
     
     ESP_LOGI(TAG, "[%s] Observer poll task started", uart_name);
@@ -6828,7 +7004,7 @@ static void observer_poll_task(void *arg)
     // Check if PSRAM buffers are allocated
     if (!observer_rx_buffer || !observer_line_buffer || !ctx->observer_networks) {
         ESP_LOGE(TAG, "[%s] PSRAM buffers not allocated!", uart_name);
-        observer_task_handle = NULL;
+        ctx->observer_task = NULL;
         vTaskDelete(NULL);
         return;
     }
@@ -6838,7 +7014,7 @@ static void observer_poll_task(void *arg)
     
     // Send show_sniffer_results command to correct UART
     char cmd[] = "show_sniffer_results\r\n";
-    transport_write_bytes(uart_port, cmd, strlen(cmd));
+    transport_write_bytes_tab(task_tab, uart_port, cmd, strlen(cmd));
     ESP_LOGI(TAG, "[%s] Sent: show_sniffer_results", uart_name);
     
     // Use PSRAM-allocated buffers
@@ -6855,7 +7031,7 @@ static void observer_poll_task(void *arg)
     TickType_t timeout_ticks = pdMS_TO_TICKS(5000);  // 5 second timeout for response
     
     while ((xTaskGetTickCount() - start_time) < timeout_ticks) {
-        int len = transport_read_bytes(uart_port, rx_buffer, UART_BUF_SIZE - 1, pdMS_TO_TICKS(100));
+        int len = transport_read_bytes_tab(task_tab, uart_port, rx_buffer, UART_BUF_SIZE - 1, pdMS_TO_TICKS(100));
         
         if (len > 0) {
             rx_buffer[len] = '\0';
@@ -6956,7 +7132,7 @@ static void observer_poll_task(void *arg)
     }
     
     ESP_LOGI(TAG, "[%s] Observer poll task finished", uart_name);
-    observer_task_handle = NULL;
+    ctx->observer_task = NULL;
     vTaskDelete(NULL);
 }
 
@@ -6968,8 +7144,8 @@ static void observer_timer_callback(TimerHandle_t xTimer)
     if (!ctx || !ctx->observer_running) return;
     
     // Only start new poll if previous one finished
-    if (observer_task_handle == NULL) {
-        xTaskCreate(observer_poll_task, "obs_poll", 8192, (void*)ctx, 5, &observer_task_handle);
+    if (ctx->observer_task == NULL) {
+        xTaskCreate(observer_poll_task, "obs_poll", 8192, (void*)ctx, 5, &ctx->observer_task);
     }
 }
 
@@ -7038,8 +7214,8 @@ static void observer_start_task(void *arg)
     }
     
     // Determine UART from context
-    int task_tab = (ctx == &uart2_ctx) ? 1 : 0;
-    uart_port_t uart_port = (task_tab == 1 && uart2_initialized) ? UART2_NUM : UART_NUM;
+    tab_id_t task_tab = tab_id_for_ctx(ctx);
+    uart_port_t uart_port = (task_tab == TAB_MBUS && uart2_initialized) ? UART2_NUM : UART_NUM;
     const char *uart_name = tab_transport_name(task_tab);
     
     ESP_LOGI(TAG, "[%s] Observer start task - scanning networks first", uart_name);
@@ -7067,7 +7243,7 @@ static void observer_start_task(void *arg)
     
     // Step 1: Run scan_networks
     char scan_cmd[] = "scan_networks\r\n";
-    transport_write_bytes(uart_port, scan_cmd, strlen(scan_cmd));
+    transport_write_bytes_tab(task_tab, uart_port, scan_cmd, strlen(scan_cmd));
     ESP_LOGI(TAG, "[%s] Sent: scan_networks", uart_name);
     
     // Wait for scan to complete - use PSRAM buffers
@@ -7081,7 +7257,7 @@ static void observer_start_task(void *arg)
     TickType_t timeout_ticks = pdMS_TO_TICKS(UART_RX_TIMEOUT);
     
     while (!scan_complete && (xTaskGetTickCount() - start_time) < timeout_ticks && ctx->observer_running) {
-        int len = transport_read_bytes(uart_port, rx_buffer, UART_BUF_SIZE - 1, pdMS_TO_TICKS(100));
+        int len = transport_read_bytes_tab(task_tab, uart_port, rx_buffer, UART_BUF_SIZE - 1, pdMS_TO_TICKS(100));
         
         if (len > 0) {
             rx_buffer[len] = '\0';
@@ -7151,7 +7327,7 @@ static void observer_start_task(void *arg)
     vTaskDelay(pdMS_TO_TICKS(500));  // Short delay
     uart_flush(uart_port);
     char sniffer_cmd[] = "start_sniffer_noscan\r\n";
-    transport_write_bytes(uart_port, sniffer_cmd, strlen(sniffer_cmd));
+    transport_write_bytes_tab(task_tab, uart_port, sniffer_cmd, strlen(sniffer_cmd));
     ESP_LOGI(TAG, "[%s] Sent: start_sniffer_noscan", uart_name);
     
     vTaskDelay(pdMS_TO_TICKS(1000));  // Wait for sniffer to start
@@ -7182,7 +7358,7 @@ static void observer_start_task(void *arg)
             xTimerStart(ctx->observer_timer, 0);
             
             // Do first poll immediately, pass ctx
-            xTaskCreate(observer_poll_task, "obs_poll", 8192, (void*)ctx, 5, &observer_task_handle);
+            xTaskCreate(observer_poll_task, "obs_poll", 8192, (void*)ctx, 5, &ctx->observer_task);
         }
     }
     
@@ -7220,7 +7396,7 @@ static void observer_start_btn_cb(lv_event_t *e)
     }
     
     // Start observer task for current tab's UART, pass ctx
-    // Both UART1 and UART2 use the same flow - fully independent
+    // All devices use the same flow - fully independent
     xTaskCreate(observer_start_task, "obs_start", 8192, (void*)ctx, 5, NULL);
 }
 
@@ -7273,20 +7449,14 @@ static void observer_back_btn_event_cb(lv_event_t *e)
     // Mark observer page as not visible in context
     ctx->observer_page_visible = false;
     
-    // In Kraken mode (UART2), keep scanning running in background
-    // Only stop UART1-based scanning
+    // Stop observer for current tab
     if (ctx->observer_running) {
-        // For UART1 (tab 0, Monster mode), stop observer
-        // For UART2 (tab 1, Kraken mode), keep running in background
-        if (tab_is_uart1(current_tab)) {
-            ctx->observer_running = false;
-            
-            if (ctx->observer_timer != NULL) {
-                xTimerStop(ctx->observer_timer, 0);
-            }
-            uart_send_command_for_tab("stop");
+        ctx->observer_running = false;
+        
+        if (ctx->observer_timer != NULL) {
+            xTimerStop(ctx->observer_timer, 0);
         }
-        // UART2/Kraken keeps running in background (don't stop)
+        uart_send_command_for_tab("stop");
     }
     
     // Update portal icon visibility
@@ -7458,7 +7628,7 @@ static void show_observer_page(void)
     update_portal_icon();
     
     // NO auto-start! User must click Start button manually
-    // Both UART1 and UART2 work the same way - fully independent
+    // All devices work the same way - fully independent
     
     // Set current visible page
     ctx->current_visible_page = ctx->observer_page;
@@ -8079,8 +8249,8 @@ static void show_blackout_active_popup(void)
     lv_obj_t *container = get_current_tab_container();
     if (!container) return;
     
-    // Send start_blackout command via UART1 (always UART1, regardless of Monster/Kraken)
-    ESP_LOGI(TAG, "Sending start_blackout command via %s", uart1_transport_name());
+    // Send start_blackout command via Grove/USB
+    ESP_LOGI(TAG, "Sending start_blackout command via %s", tab_transport_name(uart1_preferred_tab()));
     uart_send_command("start_blackout");
     
     // Create modal overlay
@@ -8289,7 +8459,7 @@ static void show_snifferdog_active_popup(void)
     if (!container) return;
     
     // Send start_sniffer_dog command via UART1 (always UART1)
-    ESP_LOGI(TAG, "Sending start_sniffer_dog command via %s", uart1_transport_name());
+    ESP_LOGI(TAG, "Sending start_sniffer_dog command via %s", tab_transport_name(uart1_preferred_tab()));
     uart_send_command("start_sniffer_dog");
     
     // Create modal overlay
@@ -8586,7 +8756,7 @@ static void show_global_handshaker_active_popup(void)
     if (!container) return;
     
     // Send start_handshake command via UART1 (always UART1)
-    ESP_LOGI(TAG, "Sending start_handshake command via %s", uart1_transport_name());
+    ESP_LOGI(TAG, "Sending start_handshake command via %s", tab_transport_name(uart1_preferred_tab()));
     uart_send_command("start_handshake");
     
     // Create modal overlay
@@ -9185,7 +9355,7 @@ static void show_wardrive_popup(void)
     wardrive_gps_fix_obtained = false;
     
     // Send start_wardrive command via UART1
-    ESP_LOGI(TAG, "Sending start_wardrive command via %s", uart1_transport_name());
+    ESP_LOGI(TAG, "Sending start_wardrive command via %s", tab_transport_name(uart1_preferred_tab()));
     uart_send_command("start_wardrive");
     
     // Create modal overlay
@@ -10552,7 +10722,7 @@ static esp_err_t start_captive_portal(const char *ssid)
     ESP_LOGI(TAG, "Starting captive portal with SSID: %s", ssid);
     
     // Track which tab (UART) started the portal
-    portal_started_by_uart = uart_index_for_tab(current_tab);  // 1=UART1, 2=UART2, 0=Internal
+    portal_started_by_uart = uart_index_for_tab(current_tab);  // 1=Grove/USB, 2=MBus, 0=Internal
     
     // Ensure WiFi is initialized via ESP-Hosted
     if (!esp_modem_wifi_initialized) {
@@ -10866,7 +11036,7 @@ static void karma2_attack_background_cb(lv_event_t *e)
     portal_background_mode = true;
     portal_new_data_count = 0;
     
-    // Remember which UART started the portal (1=UART1, 2=UART2)
+    // Remember which device started the portal (1=Grove/USB, 2=MBus)
     portal_started_by_uart = uart_index_for_tab(current_tab);
     ESP_LOGI(TAG, "Portal started by UART%d", portal_started_by_uart);
     
@@ -10962,7 +11132,7 @@ static void adhoc_portal_stop_cb(lv_event_t *e)
     show_adhoc_portal_page();
 }
 
-// Fetch probes from UART1, and optionally UART2 if Kraken mode
+// Fetch probes from all connected devices (Grove/USB and MBus)
 // Helper function to parse probes from buffer - format: "1 SSID_Name" (number space SSID)
 static void parse_probes_from_buffer(char *buffer, const char *source_tag)
 {
@@ -11017,7 +11187,7 @@ static void parse_probes_from_buffer(char *buffer, const char *source_tag)
 static void adhoc_fetch_probes_from_all_uarts(void)
 {
     tab_id_t uart1_tab = uart1_preferred_tab();
-    ESP_LOGI(TAG, "Fetching probes from %s/UART2...", tab_transport_name(uart1_tab));
+    ESP_LOGI(TAG, "Fetching probes from all devices...");
     
     adhoc_probe_count = 0;
     memset(adhoc_probes, 0, sizeof(adhoc_probes));
@@ -11055,13 +11225,13 @@ static void adhoc_fetch_probes_from_all_uarts(void)
         ESP_LOGW(TAG, "[%s] No response received", tab_transport_name(uart1_tab));
     }
     
-    // ========== Fetch from UART2 if Kraken mode ==========
-    if (hw_config == 1 && uart2_initialized) {
-        ESP_LOGI(TAG, "Kraken mode - also fetching from UART2");
+    // ========== Fetch from MBus if detected ==========
+    if (mbus_detected && uart2_initialized) {
+        ESP_LOGI(TAG, "Fetching probes from MBus");
         
         uart_flush(UART2_NUM);
         transport_write_bytes(UART2_NUM, "list_probes\r\n", 13);
-        ESP_LOGI(TAG, "[UART2] Sent: list_probes");
+        ESP_LOGI(TAG, "[MBus] Sent: list_probes");
         
         vTaskDelay(pdMS_TO_TICKS(500));
         
@@ -11078,13 +11248,13 @@ static void adhoc_fetch_probes_from_all_uarts(void)
         
         if (total_len > 0) {
             rx_buffer[total_len] = '\0';
-            ESP_LOGI(TAG, "[UART2] Received %d bytes", total_len);
-            ESP_LOGI(TAG, "[UART2] Raw response:\n%s", rx_buffer);
+            ESP_LOGI(TAG, "[MBus] Received %d bytes", total_len);
+            ESP_LOGI(TAG, "[MBus] Raw response:\n%s", rx_buffer);
             
             // Parse probes using the same format as karma_show_probes_cb
-            parse_probes_from_buffer(rx_buffer, "UART2");
+            parse_probes_from_buffer(rx_buffer, "MBus");
         } else {
-            ESP_LOGW(TAG, "[UART2] No response received");
+            ESP_LOGW(TAG, "[MBus] No response received");
         }
     }
     
@@ -11130,8 +11300,8 @@ static void adhoc_show_probes_cb(lv_event_t *e)
     
     // Subtitle showing source
     lv_obj_t *subtitle = lv_label_create(adhoc_probes_popup_obj);
-    if (hw_config == 1) {
-        lv_label_set_text_fmt(subtitle, "Found %d unique probes (%s + UART2)",
+    if (mbus_detected) {
+        lv_label_set_text_fmt(subtitle, "Found %d unique probes (%s + MBus)",
                               adhoc_probe_count, tab_transport_name(uart1_tab));
     } else {
         lv_label_set_text_fmt(subtitle, "Found %d probes (%s)", adhoc_probe_count, tab_transport_name(uart1_tab));
@@ -11439,8 +11609,8 @@ static void show_adhoc_portal_page(void)
         // Started by
         lv_obj_t *started_label = lv_label_create(status_box);
         lv_label_set_text_fmt(started_label, "Started by: %s", 
-            portal_started_by_uart == 1 ? uart1_transport_name() : 
-            portal_started_by_uart == 2 ? "UART2" : "Internal");
+            portal_started_by_uart == 1 ? tab_transport_name(uart1_preferred_tab()) : 
+            portal_started_by_uart == 2 ? "MBus" : "Internal");
         lv_obj_set_style_text_font(started_label, &lv_font_montserrat_14, 0);
         lv_obj_set_style_text_color(started_label, lv_color_hex(0xAAAAAA), 0);
         
@@ -11491,19 +11661,17 @@ static void show_adhoc_portal_page(void)
         lv_obj_clear_flag(info_box, LV_OBJ_FLAG_SCROLLABLE);
         
         lv_obj_t *info_label = lv_label_create(info_box);
-        if (hw_config == 1) {
-            lv_label_set_text_fmt(info_label,
+        int device_count = (grove_detected ? 1 : 0) + (usb_detected ? 1 : 0) + (mbus_detected ? 1 : 0);
+        if (device_count > 1) {
+            lv_label_set_text(info_label,
                 "Start a Karma captive portal using probe requests\n"
                 "collected by Network Observer.\n\n"
-                "Kraken mode: Probes from both %s and UART2\n"
-                "will be combined (duplicates removed).",
-                uart1_transport_name());
+                "Probes from all connected devices will be\n"
+                "combined (duplicates removed).");
         } else {
-            lv_label_set_text_fmt(info_label,
+            lv_label_set_text(info_label,
                 "Start a Karma captive portal using probe requests\n"
-                "collected by Network Observer.\n\n"
-                "Monster mode: Probes from %s only.",
-                uart1_transport_name());
+                "collected by Network Observer.");
         }
         lv_obj_set_style_text_font(info_label, &lv_font_montserrat_14, 0);
         lv_obj_set_style_text_color(info_label, lv_color_hex(0xAAAAAA), 0);
@@ -11986,8 +12154,8 @@ static void deauth_detector_task(void *arg)
     tab_context_t *ctx = (tab_context_t *)arg;
     
     // Determine UART from context
-    int task_tab = (ctx == &uart2_ctx) ? 1 : 0;
-    uart_port_t uart_port = (task_tab == 1 && uart2_initialized) ? UART2_NUM : UART_NUM;
+    tab_id_t task_tab = tab_id_for_ctx(ctx);
+    uart_port_t uart_port = (task_tab == TAB_MBUS && uart2_initialized) ? UART2_NUM : UART_NUM;
     const char *uart_name = tab_transport_name(task_tab);
     
     ESP_LOGI(TAG, "[%s] Deauth detector task started for tab %d", uart_name, task_tab);
@@ -12425,8 +12593,8 @@ static void airtag_scan_task(void *arg)
     tab_context_t *ctx = (tab_context_t *)arg;
     
     // Determine UART from context
-    int task_tab = (ctx == &uart2_ctx) ? 1 : 0;
-    uart_port_t uart_port = (task_tab == 1 && uart2_initialized) ? UART2_NUM : UART_NUM;
+    tab_id_t task_tab = tab_id_for_ctx(ctx);
+    uart_port_t uart_port = (task_tab == TAB_MBUS && uart2_initialized) ? UART2_NUM : UART_NUM;
     const char *uart_name = tab_transport_name(task_tab);
     
     ESP_LOGI(TAG, "[%s] AirTag scan task started for tab %d", uart_name, task_tab);
@@ -12996,8 +13164,8 @@ static void bt_locator_tracking_task(void *arg)
     tab_context_t *ctx = (tab_context_t *)arg;
     
     // Determine UART from context
-    int task_tab = (ctx == &uart2_ctx) ? 1 : 0;
-    uart_port_t uart_port = (task_tab == 1 && uart2_initialized) ? UART2_NUM : UART_NUM;
+    tab_id_t task_tab = tab_id_for_ctx(ctx);
+    uart_port_t uart_port = (task_tab == TAB_MBUS && uart2_initialized) ? UART2_NUM : UART_NUM;
     const char *uart_name = tab_transport_name(task_tab);
     
     ESP_LOGI(TAG, "[%s][BT_LOC] Task started for tab %d, target MAC: '%s'", uart_name, task_tab, bt_locator_target_mac);
@@ -13388,12 +13556,12 @@ static void show_global_attacks_page(void)
 static __attribute__((unused)) lv_obj_t *settings_popup_overlay = NULL;
 static __attribute__((unused)) lv_obj_t *settings_popup_obj = NULL;
 
-// NVS keys (hw_config and uart1_pins removed - now auto-detected)
+// NVS keys
 #define NVS_NAMESPACE "settings"
 #define NVS_KEY_RED_TEAM    "red_team"
 
 // Load Red Team setting from NVS (called on startup)
-// Note: Hardware config (Monster/Kraken) is now auto-detected via ping/pong
+// Note: Device detection is automatic via ping/pong
 static void load_red_team_from_nvs(void)
 {
     nvs_handle_t nvs;
@@ -13470,10 +13638,10 @@ static void init_uart2(void)
     ESP_ERROR_CHECK(uart_set_pin(UART2_NUM, tx_pin, rx_pin, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
     
     uart2_initialized = true;
-    ESP_LOGI(TAG, "[UART2] Initialized: TX=%d, RX=%d (M5Bus)", tx_pin, rx_pin);
+    ESP_LOGI(TAG, "[MBus] Initialized: TX=%d, RX=%d (M5Bus)", tx_pin, rx_pin);
 }
 
-// Deinitialize UART2 when switching to Monster mode
+// Deinitialize UART2 (MBus)
 static __attribute__((unused)) void deinit_uart2(void)
 {
     if (!uart2_initialized) {
@@ -13482,7 +13650,7 @@ static __attribute__((unused)) void deinit_uart2(void)
     
     uart_driver_delete(UART2_NUM);
     uart2_initialized = false;
-    ESP_LOGI(TAG, "[UART2] Deinitialized (Monster mode)");
+    ESP_LOGI(TAG, "[MBus] Deinitialized");
 }
 
 //==================================================================================
@@ -13560,7 +13728,7 @@ static bool ping_uart_direct(uart_port_t uart_port, const char *uart_name)
     return false;
 }
 
-// Detect connected boards via ping/pong on both UARTs
+// Detect connected boards via ping/pong - 3 independent devices
 static void detect_boards(void)
 {
     ESP_LOGI(TAG, "=== Starting board detection ===");
@@ -13568,39 +13736,27 @@ static void detect_boards(void)
     // Ensure USB CDC host is started before detection
     usb_transport_init();
 
-    // Detect Grove on UART1 and USB CDC independently
+    // Detect each device independently using ping/pong
     grove_detected = ping_uart_direct(UART_NUM, "Grove");
-    usb_detected = usb_cdc_connected;
-    uart1_detected = (grove_detected || usb_detected);
+    usb_detected = usb_cdc_connected ? ping_usb() : false;  // Must respond to ping, not just be connected
+    uart1_detected = (grove_detected || usb_detected);  // For legacy compatibility
+    mbus_detected = ping_uart(UART2_NUM, "MBus");
 
-    if (usb_detected && grove_detected) {
-        ESP_LOGI(TAG, "[USB] CDC connected and Grove detected - both transports available");
-    } else if (usb_detected) {
-        ESP_LOGI(TAG, "[USB] CDC connected - USB transport available");
+    // Log detection results (ping functions already log success)
+    if (grove_detected) {
+        ESP_LOGI(TAG, "[Grove] Device detected");
     }
-
-    uart2_detected = ping_uart(UART2_NUM, "UART2");
-    
-    // Determine hardware configuration
-    if (uart1_detected && uart2_detected) {
-        hw_config = 1;  // Kraken mode - both UARTs
-        ESP_LOGI(TAG, "Hardware config: Kraken (Grove/USB + UART2)");
-    } else if (uart1_detected) {
-        hw_config = 0;  // Monster mode - only UART1
-        ESP_LOGI(TAG, "Hardware config: Monster (Grove/USB only)");
-    } else if (uart2_detected) {
-        // Only UART2 detected - treat as Monster but log warning
-        hw_config = 0;
-        ESP_LOGW(TAG, "Only UART2 detected - unusual config, treating as Monster");
-    } else {
-        hw_config = 0;  // No boards detected
-        ESP_LOGW(TAG, "No boards detected on either port!");
+    if (mbus_detected) {
+        ESP_LOGI(TAG, "[MBus] Device detected");
+    }
+    if (!grove_detected && !usb_detected && !mbus_detected) {
+        ESP_LOGW(TAG, "No devices detected!");
     }
     
-    ESP_LOGI(TAG, "=== Board detection complete: Grove=%s, USB=%s, UART2=%s ===",
+    ESP_LOGI(TAG, "=== Board detection complete: Grove=%s, USB=%s, MBus=%s ===",
              grove_detected ? "YES" : "NO",
              usb_detected ? "YES" : "NO",
-             uart2_detected ? "YES" : "NO");
+             mbus_detected ? "YES" : "NO");
 }
 
 // Forward declarations for popup
@@ -13648,7 +13804,7 @@ static void board_detect_retry_cb(lv_timer_t *timer)
     detect_boards();
     
     // If any board detected, close popup and show main tiles
-    if (uart1_detected || uart2_detected) {
+    if (uart1_detected || mbus_detected) {
         ESP_LOGI(TAG, "Board detected! Closing popup and showing main UI.");
         
         // Stop retry timer
@@ -13667,7 +13823,7 @@ static void board_detect_retry_cb(lv_timer_t *timer)
         board_detection_popup_open = false;
         
         // Reload GUI to reflect detected config and show main tiles
-        reload_gui_for_hw_config();
+        reload_gui_for_detection();
         show_main_tiles();
     }
 }
@@ -13746,7 +13902,7 @@ static void show_no_board_popup(void)
 }
 
 //==================================================================================
-// Kraken Background Scanning (UART2)
+// Portal icon update
 //==================================================================================
 
 // Update portal icon visibility and color based on portal state
@@ -13768,299 +13924,6 @@ static void update_portal_icon(void)
     }
 }
 
-
-// Start Kraken background scanning on UART2
-static void __attribute__((unused)) start_kraken_scanning(void)
-{
-    if (hw_config != 1 || !uart2_initialized) {
-        ESP_LOGW(TAG, "Cannot start Kraken scanning: not in Kraken mode or UART2 not initialized");
-        return;
-    }
-    
-    if (kraken_scanning_active) {
-        ESP_LOGI(TAG, "[UART2] Kraken scanning already active");
-        return;
-    }
-    
-    kraken_scanning_active = true;
-    
-    // Also mark in uart2 context
-    uart2_ctx.observer_running = true;
-    
-    // Create the background scanning task (always for UART2)
-    if (kraken_scan_task_handle == NULL) {
-        xTaskCreate(kraken_scan_task, "kraken_scan", 8192, (void*)&uart2_ctx, 5, &kraken_scan_task_handle);
-        ESP_LOGI(TAG, "[UART2] Kraken background scanning started");
-    }
-    
-    update_portal_icon();
-}
-
-// Stop Kraken background scanning
-static __attribute__((unused)) void stop_kraken_scanning(void)
-{
-    if (!kraken_scanning_active) {
-        return;
-    }
-    
-    kraken_scanning_active = false;
-    
-    // Also clear in uart2 context
-    uart2_ctx.observer_running = false;
-    
-    // Notify task to stop
-    if (kraken_scan_task_handle != NULL) {
-        // Give task time to clean up
-        vTaskDelay(pdMS_TO_TICKS(200));
-        
-        // Only delete if still exists
-        if (kraken_scan_task_handle != NULL) {
-            vTaskDelete(kraken_scan_task_handle);
-            kraken_scan_task_handle = NULL;
-        }
-    }
-    
-    update_portal_icon();
-    ESP_LOGI(TAG, "[UART2] Kraken background scanning stopped");
-}
-
-// Kraken background scanning task - continuously scans networks on UART2
-static void kraken_scan_task(void *arg)
-{
-    // Get context passed to task (should be uart2_ctx)
-    tab_context_t *ctx = (tab_context_t *)arg;
-    if (!ctx) {
-        ESP_LOGE(TAG, "[UART2] Kraken scan task: NULL context!");
-        kraken_scan_task_handle = NULL;
-        vTaskDelete(NULL);
-        return;
-    }
-    
-    ESP_LOGI(TAG, "[UART2] Kraken scan task running for uart2_ctx");
-    
-    // Check if PSRAM buffers are allocated
-    if (!observer_rx_buffer || !observer_line_buffer || !ctx->observer_networks) {
-        ESP_LOGE(TAG, "[UART2] PSRAM buffers not allocated!");
-        kraken_scan_task_handle = NULL;
-        ctx->observer_running = false;
-        vTaskDelete(NULL);
-        return;
-    }
-    
-    char *rx_buffer = observer_rx_buffer;
-    char *line_buffer = observer_line_buffer;
-    int line_pos = 0;
-    
-    // ============================================================
-    // PHASE 1: Scan networks (ONCE at start)
-    // ============================================================
-    ESP_LOGI(TAG, "[UART2] Phase 1: Scanning networks...");
-    
-    // Update UI
-    if (ctx->observer_page_visible) {
-        bsp_display_lock(0);
-        if (ctx->observer_status_label) {
-            lv_label_set_text(ctx->observer_status_label, "Kraken: Scanning networks...");
-        }
-        bsp_display_unlock();
-    }
-    
-    // Clear previous results in context
-    ctx->observer_network_count = 0;
-    memset(ctx->observer_networks, 0, sizeof(observer_network_t) * MAX_OBSERVER_NETWORKS);
-    
-    // Flush UART2 buffer
-    uart_flush(UART2_NUM);
-    
-    // Send scan_networks command
-    uart2_send_command("scan_networks");
-    
-    // Wait for scan results
-    line_pos = 0;
-    bool scan_complete = false;
-    int scanned_count = 0;
-    
-    TickType_t start_time = xTaskGetTickCount();
-    TickType_t timeout_ticks = pdMS_TO_TICKS(UART_RX_TIMEOUT);
-    
-    while (!scan_complete && kraken_scanning_active && 
-           (xTaskGetTickCount() - start_time) < timeout_ticks) {
-        
-        int len = transport_read_bytes(UART2_NUM, (uint8_t*)rx_buffer, UART_BUF_SIZE - 1, pdMS_TO_TICKS(100));
-        
-        if (len > 0) {
-            rx_buffer[len] = '\0';
-            
-            for (int i = 0; i < len; i++) {
-                char c = rx_buffer[i];
-                
-                if (c == '\n' || c == '\r') {
-                    if (line_pos > 0) {
-                        line_buffer[line_pos] = '\0';
-                        
-                        ESP_LOGI(TAG, "[UART2] SCAN: '%s'", line_buffer);
-                        
-                        // Check for scan completion marker
-                        if (strstr(line_buffer, "Scan results printed") != NULL) {
-                            scan_complete = true;
-                            ESP_LOGI(TAG, "[UART2] Scan complete marker found");
-                            break;
-                        }
-                        
-                        // Parse network line from scan (starts with ")
-                        if (line_buffer[0] == '"' && scanned_count < MAX_OBSERVER_NETWORKS) {
-                            observer_network_t net = {0};
-                            if (parse_scan_to_observer(line_buffer, &net)) {
-                                ctx->observer_networks[scanned_count] = net;
-                                scanned_count++;
-                                ESP_LOGI(TAG, "[UART2] Parsed network #%d: '%s' BSSID=%s CH%d", 
-                                         net.scan_index, net.ssid, net.bssid, net.channel);
-                            }
-                        }
-                        
-                        line_pos = 0;
-                    }
-                } else if (line_pos < OBSERVER_LINE_BUFFER_SIZE - 1) {
-                    line_buffer[line_pos++] = c;
-                }
-            }
-        }
-    }
-    
-    ctx->observer_network_count = scanned_count;
-    ESP_LOGI(TAG, "[UART2] Phase 1 complete: %d networks found", ctx->observer_network_count);
-    
-    // Update UI with scanned networks
-    if (ctx->observer_page_visible) {
-        bsp_display_lock(0);
-        if (ctx->observer_status_label) {
-            lv_label_set_text_fmt(ctx->observer_status_label, "Kraken: %d networks, starting sniffer...", ctx->observer_network_count);
-        }
-        update_observer_table(ctx);
-        bsp_display_unlock();
-    }
-    
-    if (!kraken_scanning_active) {
-        ESP_LOGI(TAG, "[UART2] Kraken stopped during scan phase");
-        kraken_scan_task_handle = NULL;
-        vTaskDelete(NULL);
-        return;
-    }
-    
-    // ============================================================
-    // PHASE 2: Start sniffer (no rescan)
-    // ============================================================
-    ESP_LOGI(TAG, "[UART2] Phase 2: Starting sniffer...");
-    
-    vTaskDelay(pdMS_TO_TICKS(500));
-    uart_flush(UART2_NUM);
-    uart2_send_command("start_sniffer_noscan");
-    
-    vTaskDelay(pdMS_TO_TICKS(1000));  // Wait for sniffer to start
-    
-    if (ctx->observer_page_visible) {
-        bsp_display_lock(0);
-        if (ctx->observer_status_label) {
-            lv_label_set_text_fmt(ctx->observer_status_label, "Kraken: %d networks, observing...", ctx->observer_network_count);
-            lv_obj_set_style_text_color(ctx->observer_status_label, COLOR_MATERIAL_CYAN, 0);
-        }
-        bsp_display_unlock();
-    }
-    
-    // ============================================================
-    // PHASE 3: Polling loop - show_sniffer_results every 20s
-    // ============================================================
-    ESP_LOGI(TAG, "[UART2] Phase 3: Starting polling loop (every %d ms)", OBSERVER_POLL_INTERVAL_MS);
-    
-    while (kraken_scanning_active) {
-        // Flush and send show_sniffer_results
-        uart_flush(UART2_NUM);
-        uart2_send_command("show_sniffer_results");
-        
-        // Parse sniffer results
-        line_pos = 0;
-        int current_network_idx = -1;
-        
-        start_time = xTaskGetTickCount();
-        timeout_ticks = pdMS_TO_TICKS(5000);  // 5 second timeout for response
-        
-        while ((xTaskGetTickCount() - start_time) < timeout_ticks && kraken_scanning_active) {
-            int len = transport_read_bytes(UART2_NUM, (uint8_t*)rx_buffer, UART_BUF_SIZE - 1, pdMS_TO_TICKS(100));
-            
-            if (len > 0) {
-                rx_buffer[len] = '\0';
-                
-                for (int i = 0; i < len; i++) {
-                    char c = rx_buffer[i];
-                    
-                    if (c == '\n' || c == '\r') {
-                        if (line_pos > 0) {
-                            line_buffer[line_pos] = '\0';
-                            
-                            ESP_LOGD(TAG, "[UART2] SNIFFER: '%s'", line_buffer);
-                            
-                            // Check for network line (doesn't start with space)
-                            if (line_buffer[0] != ' ' && line_buffer[0] != '\t') {
-                                observer_network_t parsed_net = {0};
-                                if (parse_sniffer_network_line(line_buffer, &parsed_net)) {
-                                    // Find this network in our list by SSID
-                                    current_network_idx = -1;
-                                    for (int n = 0; n < ctx->observer_network_count; n++) {
-                                        if (strcmp(ctx->observer_networks[n].ssid, parsed_net.ssid) == 0) {
-                                            current_network_idx = n;
-                                            break;
-                                        }
-                                    }
-                                } else {
-                                    current_network_idx = -1;
-                                }
-                            }
-                            // Check for client MAC line (starts with space)
-                            else if ((line_buffer[0] == ' ' || line_buffer[0] == '\t') && current_network_idx >= 0) {
-                                observer_network_t *net = &ctx->observer_networks[current_network_idx];
-                                char mac[18];
-                                if (parse_sniffer_client_line(line_buffer, mac, sizeof(mac))) {
-                                    if (add_client_mac(net, mac)) {
-                                        ESP_LOGI(TAG, "[UART2] New client: %s for '%s' (total: %d)", 
-                                                 mac, net->ssid, net->client_count);
-                                    }
-                                }
-                            }
-                            
-                            line_pos = 0;
-                        }
-                    } else if (line_pos < OBSERVER_LINE_BUFFER_SIZE - 1) {
-                        line_buffer[line_pos++] = c;
-                    }
-                }
-            }
-        }
-        
-        // Update UI if observer page is visible (use ctx)
-        if (ctx->observer_page_visible && ctx->observer_table != NULL) {
-            bsp_display_lock(0);
-            update_observer_table(ctx);
-            if (ctx->observer_status_label) {
-                int clients_total = 0;
-                for (int i = 0; i < ctx->observer_network_count; i++) {
-                    clients_total += ctx->observer_networks[i].client_count;
-                }
-                lv_label_set_text_fmt(ctx->observer_status_label, "Kraken: %d networks, %d clients", 
-                                      ctx->observer_network_count, clients_total);
-            }
-            bsp_display_unlock();
-        }
-        
-        // Wait before next poll (OBSERVER_POLL_INTERVAL_MS = 20 seconds)
-        for (int i = 0; i < (OBSERVER_POLL_INTERVAL_MS / 100) && kraken_scanning_active; i++) {
-            vTaskDelay(pdMS_TO_TICKS(100));
-        }
-    }
-    
-    ESP_LOGI(TAG, "[UART2] Kraken scan task exiting");
-    kraken_scan_task_handle = NULL;
-    vTaskDelete(NULL);
-}
 
 // ======================= Scan Time Settings =======================
 
@@ -14114,13 +13977,15 @@ static int read_channel_time_from_uart(uart_port_t uart_port, const char *param)
     return -1; // Error/timeout
 }
 
-// Scan Time popup variables
+// Scan Time popup variables - 3 independent device sections
 static lv_obj_t *scan_time_popup_overlay = NULL;
 static lv_obj_t *scan_time_popup_obj = NULL;
-static lv_obj_t *scan_time_min_spinbox = NULL;
-static lv_obj_t *scan_time_max_spinbox = NULL;
-static lv_obj_t *scan_time_uart2_min_spinbox = NULL;
-static lv_obj_t *scan_time_uart2_max_spinbox = NULL;
+static lv_obj_t *scan_time_grove_min_spinbox = NULL;
+static lv_obj_t *scan_time_grove_max_spinbox = NULL;
+static lv_obj_t *scan_time_usb_min_spinbox = NULL;
+static lv_obj_t *scan_time_usb_max_spinbox = NULL;
+static lv_obj_t *scan_time_mbus_min_spinbox = NULL;
+static lv_obj_t *scan_time_mbus_max_spinbox = NULL;
 static lv_obj_t *scan_time_error_label = NULL;
 
 static void scan_time_popup_close_cb(lv_event_t *e)
@@ -14129,69 +13994,92 @@ static void scan_time_popup_close_cb(lv_event_t *e)
         lv_obj_del(scan_time_popup_overlay);
         scan_time_popup_overlay = NULL;
         scan_time_popup_obj = NULL;
-        scan_time_min_spinbox = NULL;
-        scan_time_max_spinbox = NULL;
-        scan_time_uart2_min_spinbox = NULL;
-        scan_time_uart2_max_spinbox = NULL;
+        scan_time_grove_min_spinbox = NULL;
+        scan_time_grove_max_spinbox = NULL;
+        scan_time_usb_min_spinbox = NULL;
+        scan_time_usb_max_spinbox = NULL;
+        scan_time_mbus_min_spinbox = NULL;
+        scan_time_mbus_max_spinbox = NULL;
         scan_time_error_label = NULL;
     }
 }
 
 static void scan_time_save_cb(lv_event_t *e)
 {
-    if (!scan_time_min_spinbox || !scan_time_max_spinbox) return;
+    char cmd[64];
     
-    int min_val = lv_spinbox_get_value(scan_time_min_spinbox);
-    int max_val = lv_spinbox_get_value(scan_time_max_spinbox);
-    
-    // Validation for UART1/USB
-    if (min_val >= max_val) {
-        if (scan_time_error_label) {
-            lv_label_set_text_fmt(scan_time_error_label, "Error: %s min must be less than max",
-                                  uart1_transport_name());
-            lv_obj_set_style_text_color(scan_time_error_label, COLOR_MATERIAL_RED, 0);
-        }
-        return;
-    }
-    
-    // Validation for UART2 if Kraken mode
-    int uart2_min_val = 0, uart2_max_val = 0;
-    if (hw_config == 1 && scan_time_uart2_min_spinbox && scan_time_uart2_max_spinbox) {
-        uart2_min_val = lv_spinbox_get_value(scan_time_uart2_min_spinbox);
-        uart2_max_val = lv_spinbox_get_value(scan_time_uart2_max_spinbox);
+    // Validate and send Grove settings
+    if (grove_detected && scan_time_grove_min_spinbox && scan_time_grove_max_spinbox) {
+        int min_val = lv_spinbox_get_value(scan_time_grove_min_spinbox);
+        int max_val = lv_spinbox_get_value(scan_time_grove_max_spinbox);
         
-        if (uart2_min_val >= uart2_max_val) {
+        if (min_val >= max_val) {
             if (scan_time_error_label) {
-                lv_label_set_text(scan_time_error_label, "Error: UART2 min must be less than max");
-                lv_obj_set_style_text_color(scan_time_error_label, COLOR_MATERIAL_RED, 0);
+                lv_label_set_text(scan_time_error_label, "Error: Grove min must be < max");
             }
             return;
         }
+        
+        // Send to Grove via UART1
+        uart_flush(UART_NUM);
+        snprintf(cmd, sizeof(cmd), "channel_time set min %d", min_val);
+        uart_write_bytes(UART_NUM, cmd, strlen(cmd));
+        uart_write_bytes(UART_NUM, "\r\n", 2);
+        vTaskDelay(pdMS_TO_TICKS(100));
+        
+        snprintf(cmd, sizeof(cmd), "channel_time set max %d", max_val);
+        uart_write_bytes(UART_NUM, cmd, strlen(cmd));
+        uart_write_bytes(UART_NUM, "\r\n", 2);
+        
+        ESP_LOGI(TAG, "[Grove] Scan time set: min=%d, max=%d", min_val, max_val);
     }
     
-    // Send UART1 commands
-    char cmd[64];
-    snprintf(cmd, sizeof(cmd), "channel_time set min %d", min_val);
-    uart_send_command(cmd);
-    vTaskDelay(pdMS_TO_TICKS(100));
-    
-    snprintf(cmd, sizeof(cmd), "channel_time set max %d", max_val);
-    uart_send_command(cmd);
-    
-    ESP_LOGI(TAG, "%s scan time set: min=%d, max=%d", uart1_transport_name(), min_val, max_val);
-    
-    // Send UART2 commands if Kraken mode
-    if (hw_config == 1 && uart2_initialized && scan_time_uart2_min_spinbox && scan_time_uart2_max_spinbox) {
+    // Validate and send USB settings  
+    if (usb_detected && scan_time_usb_min_spinbox && scan_time_usb_max_spinbox) {
+        int min_val = lv_spinbox_get_value(scan_time_usb_min_spinbox);
+        int max_val = lv_spinbox_get_value(scan_time_usb_max_spinbox);
+        
+        if (min_val >= max_val) {
+            if (scan_time_error_label) {
+                lv_label_set_text(scan_time_error_label, "Error: USB min must be < max");
+            }
+            return;
+        }
+        
+        // Send to USB via USB CDC
+        vTaskDelay(pdMS_TO_TICKS(100));
+        snprintf(cmd, sizeof(cmd), "channel_time set min %d\r\n", min_val);
+        usb_transport_write(cmd, strlen(cmd));
         vTaskDelay(pdMS_TO_TICKS(100));
         
-        snprintf(cmd, sizeof(cmd), "channel_time set min %d", uart2_min_val);
+        snprintf(cmd, sizeof(cmd), "channel_time set max %d\r\n", max_val);
+        usb_transport_write(cmd, strlen(cmd));
+        
+        ESP_LOGI(TAG, "[USB] Scan time set: min=%d, max=%d", min_val, max_val);
+    }
+    
+    // Validate and send MBus settings
+    if (mbus_detected && uart2_initialized && scan_time_mbus_min_spinbox && scan_time_mbus_max_spinbox) {
+        int min_val = lv_spinbox_get_value(scan_time_mbus_min_spinbox);
+        int max_val = lv_spinbox_get_value(scan_time_mbus_max_spinbox);
+        
+        if (min_val >= max_val) {
+            if (scan_time_error_label) {
+                lv_label_set_text(scan_time_error_label, "Error: MBus min must be < max");
+            }
+            return;
+        }
+        
+        // Send to MBus via UART2
+        vTaskDelay(pdMS_TO_TICKS(100));
+        snprintf(cmd, sizeof(cmd), "channel_time set min %d", min_val);
         uart2_send_command(cmd);
         vTaskDelay(pdMS_TO_TICKS(100));
         
-        snprintf(cmd, sizeof(cmd), "channel_time set max %d", uart2_max_val);
+        snprintf(cmd, sizeof(cmd), "channel_time set max %d", max_val);
         uart2_send_command(cmd);
         
-        ESP_LOGI(TAG, "UART2 scan time set: min=%d, max=%d", uart2_min_val, uart2_max_val);
+        ESP_LOGI(TAG, "[MBus] Scan time set: min=%d, max=%d", min_val, max_val);
     }
     
     scan_time_popup_close_cb(e);
@@ -14273,25 +14161,35 @@ static void show_scan_time_popup(void)
     lv_obj_t *container = get_current_tab_container();
     if (!container) return;
     
-    bool is_kraken = (hw_config == 1);
+    // Count detected devices to calculate popup height
+    int device_count = (grove_detected ? 1 : 0) + (usb_detected ? 1 : 0) + (mbus_detected ? 1 : 0);
+    if (device_count == 0) {
+        ESP_LOGW(TAG, "No devices detected for scan time settings");
+        return;
+    }
     
-    // Read current values from UART1/USB
-    ESP_LOGI(TAG, "Reading channel_time values from %s...", uart1_transport_name());
-    int uart1_min = read_channel_time_from_uart(UART_NUM, "min");
-    int uart1_max = read_channel_time_from_uart(UART_NUM, "max");
+    // Read values from each detected device
+    int grove_min = 200, grove_max = 500;
+    int usb_min = 200, usb_max = 500;
+    int mbus_min = 200, mbus_max = 500;
     
-    // Use defaults if read failed
-    if (uart1_min <= 0) uart1_min = 200;
-    if (uart1_max <= 0) uart1_max = 500;
+    if (grove_detected) {
+        ESP_LOGI(TAG, "[Grove] Reading channel_time values...");
+        grove_min = read_channel_time_from_uart(UART_NUM, "min");
+        grove_max = read_channel_time_from_uart(UART_NUM, "max");
+        if (grove_min <= 0) grove_min = 200;
+        if (grove_max <= 0) grove_max = 500;
+    }
     
-    // Read from UART2 if Kraken mode
-    int uart2_min = 200, uart2_max = 500;
-    if (is_kraken && uart2_initialized) {
-        ESP_LOGI(TAG, "Reading channel_time values from UART2...");
-        uart2_min = read_channel_time_from_uart(UART2_NUM, "min");
-        uart2_max = read_channel_time_from_uart(UART2_NUM, "max");
-        if (uart2_min <= 0) uart2_min = 200;
-        if (uart2_max <= 0) uart2_max = 500;
+    // Note: USB reading would need separate implementation via USB CDC
+    // For now, use defaults for USB
+    
+    if (mbus_detected && uart2_initialized) {
+        ESP_LOGI(TAG, "[MBus] Reading channel_time values...");
+        mbus_min = read_channel_time_from_uart(UART2_NUM, "min");
+        mbus_max = read_channel_time_from_uart(UART2_NUM, "max");
+        if (mbus_min <= 0) mbus_min = 200;
+        if (mbus_max <= 0) mbus_max = 500;
     }
     
     // Create modal overlay
@@ -14303,9 +14201,9 @@ static void show_scan_time_popup(void)
     lv_obj_clear_flag(scan_time_popup_overlay, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(scan_time_popup_overlay, LV_OBJ_FLAG_CLICKABLE);
     
-    // Create popup - larger for Kraken mode
+    // Create popup - dynamic height based on device count
     scan_time_popup_obj = lv_obj_create(scan_time_popup_overlay);
-    int popup_height = is_kraken ? 480 : 320;
+    int popup_height = 180 + (device_count * 140);  // Base + per-device section
     lv_obj_set_size(scan_time_popup_obj, 420, popup_height);
     lv_obj_center(scan_time_popup_obj);
     lv_obj_set_style_bg_color(scan_time_popup_obj, lv_color_hex(0x2D2D2D), 0);
@@ -14314,7 +14212,7 @@ static void show_scan_time_popup(void)
     lv_obj_set_style_radius(scan_time_popup_obj, 12, 0);
     lv_obj_set_style_pad_all(scan_time_popup_obj, 15, 0);
     lv_obj_set_flex_flow(scan_time_popup_obj, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_pad_row(scan_time_popup_obj, is_kraken ? 8 : 12, 0);
+    lv_obj_set_style_pad_row(scan_time_popup_obj, 8, 0);
     lv_obj_clear_flag(scan_time_popup_obj, LV_OBJ_FLAG_SCROLLABLE);
     
     // Title
@@ -14323,28 +14221,37 @@ static void show_scan_time_popup(void)
     lv_obj_set_style_text_font(title, &lv_font_montserrat_18, 0);
     lv_obj_set_style_text_color(title, lv_color_hex(0xFFFFFF), 0);
     
-    if (is_kraken) {
-        // ========== UART1 Section ==========
-        lv_obj_t *uart1_header = lv_label_create(scan_time_popup_obj);
-        lv_label_set_text_fmt(uart1_header, "%s", uart1_transport_name());
-        lv_obj_set_style_text_font(uart1_header, &lv_font_montserrat_16, 0);
-        lv_obj_set_style_text_color(uart1_header, COLOR_MATERIAL_BLUE, 0);
+    // ========== Grove Section ==========
+    if (grove_detected) {
+        lv_obj_t *grove_header = lv_label_create(scan_time_popup_obj);
+        lv_label_set_text(grove_header, "Grove");
+        lv_obj_set_style_text_font(grove_header, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(grove_header, COLOR_MATERIAL_CYAN, 0);
         
-        create_scan_time_spinbox_row(scan_time_popup_obj, "Min time:", uart1_min, &scan_time_min_spinbox);
-        create_scan_time_spinbox_row(scan_time_popup_obj, "Max time:", uart1_max, &scan_time_max_spinbox);
+        create_scan_time_spinbox_row(scan_time_popup_obj, "Min time:", grove_min, &scan_time_grove_min_spinbox);
+        create_scan_time_spinbox_row(scan_time_popup_obj, "Max time:", grove_max, &scan_time_grove_max_spinbox);
+    }
+    
+    // ========== USB Section ==========
+    if (usb_detected) {
+        lv_obj_t *usb_header = lv_label_create(scan_time_popup_obj);
+        lv_label_set_text(usb_header, "USB");
+        lv_obj_set_style_text_font(usb_header, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(usb_header, COLOR_MATERIAL_BLUE, 0);
         
-        // ========== UART2 Section ==========
-        lv_obj_t *uart2_header = lv_label_create(scan_time_popup_obj);
-        lv_label_set_text(uart2_header, "UART2");
-        lv_obj_set_style_text_font(uart2_header, &lv_font_montserrat_16, 0);
-        lv_obj_set_style_text_color(uart2_header, COLOR_MATERIAL_ORANGE, 0);
+        create_scan_time_spinbox_row(scan_time_popup_obj, "Min time:", usb_min, &scan_time_usb_min_spinbox);
+        create_scan_time_spinbox_row(scan_time_popup_obj, "Max time:", usb_max, &scan_time_usb_max_spinbox);
+    }
+    
+    // ========== MBus Section ==========
+    if (mbus_detected) {
+        lv_obj_t *mbus_header = lv_label_create(scan_time_popup_obj);
+        lv_label_set_text(mbus_header, "MBus");
+        lv_obj_set_style_text_font(mbus_header, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(mbus_header, COLOR_MATERIAL_ORANGE, 0);
         
-        create_scan_time_spinbox_row(scan_time_popup_obj, "Min time:", uart2_min, &scan_time_uart2_min_spinbox);
-        create_scan_time_spinbox_row(scan_time_popup_obj, "Max time:", uart2_max, &scan_time_uart2_max_spinbox);
-    } else {
-        // ========== Monster mode - single UART ==========
-        create_scan_time_spinbox_row(scan_time_popup_obj, "Min time:", uart1_min, &scan_time_min_spinbox);
-        create_scan_time_spinbox_row(scan_time_popup_obj, "Max time:", uart1_max, &scan_time_max_spinbox);
+        create_scan_time_spinbox_row(scan_time_popup_obj, "Min time:", mbus_min, &scan_time_mbus_min_spinbox);
+        create_scan_time_spinbox_row(scan_time_popup_obj, "Max time:", mbus_max, &scan_time_mbus_max_spinbox);
     }
     
     // Error label
@@ -14398,7 +14305,7 @@ static void invalidate_red_team_dependent_pages(void)
     ESP_LOGI(TAG, "Invalidating Red Team dependent pages");
     
     // Invalidate pages for transport tab contexts
-    tab_context_t *contexts[] = { &grove_ctx, &usb_ctx, &uart2_ctx };
+    tab_context_t *contexts[] = { &grove_ctx, &usb_ctx, &mbus_ctx };
     
     for (int i = 0; i < 3; i++) {
         tab_context_t *ctx = contexts[i];
@@ -14894,9 +14801,9 @@ void app_main(void)
     
     // Initialize both UARTs for board detection
     // UART1: Grove (TX=53, RX=54) - always initialized
-    // UART2: M5Bus (TX=37, RX=38) - always initialized for detection
+    // MBus port: M5Bus connector (TX=37, RX=38)
     uart_init();   // Initialize UART1
-    init_uart2();  // Initialize UART2 (for detection, may be used if Kraken detected)
+    init_uart2();  // Initialize MBus port (UART2)
     
     // Initialize display
     lv_display_t *disp = bsp_display_start();
