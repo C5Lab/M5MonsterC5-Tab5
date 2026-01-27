@@ -472,13 +472,20 @@ static lv_obj_t *esp_modem_page = NULL;
 static lv_obj_t *global_attacks_page = NULL;
 static lv_obj_t *settings_page = NULL;
 
-// Settings state - Dual UART configuration
+// Hardware configuration - auto-detected via ping/pong
 static uint8_t hw_config = 0;         // 0=Monster (single UART), 1=Kraken (dual UART)
-static uint8_t uart1_pins_mode = 1;   // 0=M5Bus(37/38), 1=Grove(53/54) - default Grove
 
 // UART2 for Kraken mode
 #define UART2_NUM UART_NUM_2
 static bool uart2_initialized = false;
+
+// Board detection state
+static bool uart1_detected = false;
+static bool uart2_detected = false;
+static bool board_detection_popup_open = false;
+static lv_timer_t *board_detect_retry_timer = NULL;
+static lv_obj_t *board_detect_popup = NULL;
+static lv_obj_t *board_detect_overlay = NULL;
 
 // Kraken background scanning state
 static bool kraken_scanning_active = false;    // UART2 scanning running
@@ -1037,14 +1044,18 @@ static void splash_timer_cb(lv_timer_t *timer);
 static void play_startup_beep(void);
 static void settings_tile_event_cb(lv_event_t *e);
 static void settings_back_btn_event_cb(lv_event_t *e);
-static void show_uart_pins_popup(void);
 static void show_scan_time_popup(void);
 static void show_red_team_settings_page(void);
-static void get_uart1_pins(uint8_t mode, int *tx_pin, int *rx_pin);
-static void get_uart2_pins(uint8_t uart1_mode, int *tx_pin, int *rx_pin);
+static void get_uart1_pins(int *tx_pin, int *rx_pin);
+static void get_uart2_pins(int *tx_pin, int *rx_pin);
 static void init_uart2(void);
 static void deinit_uart2(void);
-static void load_hw_config_from_nvs(void);
+static void load_red_team_from_nvs(void);
+static void detect_boards(void);
+static void show_no_board_popup(void);
+static void board_detect_retry_cb(lv_timer_t *timer);
+static void board_detect_popup_close_cb(lv_event_t *e);
+static void reload_gui_for_hw_config(void);
 static void kraken_scan_task(void *arg);
 static void stop_kraken_scanning(void);
 static void update_portal_icon(void);
@@ -1343,19 +1354,17 @@ static void uart_init(void)
         .source_clk = UART_SCLK_DEFAULT,
     };
     
-    // Get UART1 pins based on saved mode
+    // Get UART1 pins (fixed to Grove connector)
     int tx_pin, rx_pin;
-    get_uart1_pins(uart1_pins_mode, &tx_pin, &rx_pin);
+    get_uart1_pins(&tx_pin, &rx_pin);
     
     ESP_ERROR_CHECK(uart_driver_install(UART_NUM, UART_BUF_SIZE * 2, 0, 0, NULL, 0));
     ESP_ERROR_CHECK(uart_param_config(UART_NUM, &uart_config));
     ESP_ERROR_CHECK(uart_set_pin(UART_NUM, tx_pin, rx_pin, 
                                   UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
     
-    ESP_LOGI(TAG, "[UART1] Initialized: TX=%d, RX=%d, baud=%d (%s) [%s mode]", 
-             tx_pin, rx_pin, UART_BAUD_RATE, 
-             uart1_pins_mode == 0 ? "M5Bus" : "Grove",
-             hw_config == 0 ? "Monster" : "Kraken");
+    ESP_LOGI(TAG, "[UART1] Initialized: TX=%d, RX=%d, baud=%d (Grove)", 
+             tx_pin, rx_pin, UART_BAUD_RATE);
 }
 
 // Send command over UART1 (primary)
@@ -1744,7 +1753,7 @@ static void splash_timer_cb(lv_timer_t *timer)
             lv_obj_align(splash_label, LV_ALIGN_CENTER, 0, 0);
         }
     } else {
-        // End splash and show main tiles
+        // End splash and run board detection
         if (splash_timer) {
             lv_timer_del(splash_timer);
             splash_timer = NULL;
@@ -1756,8 +1765,17 @@ static void splash_timer_cb(lv_timer_t *timer)
             splash_label = NULL;
         }
         
-        // Now show main tiles
-        show_main_tiles();
+        // Run board detection
+        detect_boards();
+        
+        // Check detection results
+        if (!uart1_detected && !uart2_detected) {
+            // No boards detected - show popup and keep retrying
+            show_no_board_popup();
+        } else {
+            // At least one board detected - show main UI
+            show_main_tiles();
+        }
     }
 }
 
@@ -2227,27 +2245,29 @@ static void uart_send_command_for_tab(const char *cmd)
 // Update tab button styles to show active tab
 static void update_tab_styles(void)
 {
-    if (!uart1_tab_btn || !internal_tab_btn) return;
+    if (!internal_tab_btn) return;  // Need at least INTERNAL tab
     
-    // ========== UART 1 tab styling ==========
-    if (current_tab == 0) {
-        // Active state - bright color with glow + border
-        lv_obj_set_style_bg_color(uart1_tab_btn, lv_color_hex(TAB_COLOR_UART1_ACTIVE), 0);
-        lv_obj_set_style_bg_grad_color(uart1_tab_btn, lv_color_hex(0x0097A7), 0);
-        lv_obj_set_style_bg_grad_dir(uart1_tab_btn, LV_GRAD_DIR_VER, 0);
-        lv_obj_set_style_shadow_opa(uart1_tab_btn, LV_OPA_80, 0);
-        lv_obj_set_style_shadow_spread(uart1_tab_btn, 4, 0);
-        // Active indicator - white top border
-        lv_obj_set_style_border_width(uart1_tab_btn, 3, 0);
-        lv_obj_set_style_border_color(uart1_tab_btn, lv_color_hex(0xFFFFFF), 0);
-        lv_obj_set_style_border_side(uart1_tab_btn, LV_BORDER_SIDE_TOP, 0);
-    } else {
-        // Inactive state - dark muted color, no border
-        lv_obj_set_style_bg_color(uart1_tab_btn, lv_color_hex(TAB_COLOR_UART1_INACTIVE), 0);
-        lv_obj_set_style_bg_grad_dir(uart1_tab_btn, LV_GRAD_DIR_NONE, 0);
-        lv_obj_set_style_shadow_opa(uart1_tab_btn, LV_OPA_20, 0);
-        lv_obj_set_style_shadow_spread(uart1_tab_btn, 0, 0);
-        lv_obj_set_style_border_width(uart1_tab_btn, 0, 0);
+    // ========== UART 1 tab styling (only if exists) ==========
+    if (uart1_tab_btn) {
+        if (current_tab == 0) {
+            // Active state - bright color with glow + border
+            lv_obj_set_style_bg_color(uart1_tab_btn, lv_color_hex(TAB_COLOR_UART1_ACTIVE), 0);
+            lv_obj_set_style_bg_grad_color(uart1_tab_btn, lv_color_hex(0x0097A7), 0);
+            lv_obj_set_style_bg_grad_dir(uart1_tab_btn, LV_GRAD_DIR_VER, 0);
+            lv_obj_set_style_shadow_opa(uart1_tab_btn, LV_OPA_80, 0);
+            lv_obj_set_style_shadow_spread(uart1_tab_btn, 4, 0);
+            // Active indicator - white top border
+            lv_obj_set_style_border_width(uart1_tab_btn, 3, 0);
+            lv_obj_set_style_border_color(uart1_tab_btn, lv_color_hex(0xFFFFFF), 0);
+            lv_obj_set_style_border_side(uart1_tab_btn, LV_BORDER_SIDE_TOP, 0);
+        } else {
+            // Inactive state - dark muted color, no border
+            lv_obj_set_style_bg_color(uart1_tab_btn, lv_color_hex(TAB_COLOR_UART1_INACTIVE), 0);
+            lv_obj_set_style_bg_grad_dir(uart1_tab_btn, LV_GRAD_DIR_NONE, 0);
+            lv_obj_set_style_shadow_opa(uart1_tab_btn, LV_OPA_20, 0);
+            lv_obj_set_style_shadow_spread(uart1_tab_btn, 0, 0);
+            lv_obj_set_style_border_width(uart1_tab_btn, 0, 0);
+        }
     }
     
     // ========== UART 2 tab styling ==========
@@ -2383,18 +2403,89 @@ static void create_tab_containers(void)
     lv_obj_t *scr = lv_scr_act();
     lv_coord_t height = lv_disp_get_ver_res(NULL) - 85;  // Below status bar + tab bar
     
-    // UART1 container
-    uart1_container = lv_obj_create(scr);
-    lv_obj_set_size(uart1_container, lv_pct(100), height);
-    lv_obj_align(uart1_container, LV_ALIGN_TOP_MID, 0, 85);
-    lv_obj_set_style_bg_color(uart1_container, COLOR_MATERIAL_BG, 0);
-    lv_obj_set_style_border_width(uart1_container, 0, 0);
-    lv_obj_set_style_radius(uart1_container, 0, 0);
-    lv_obj_set_style_pad_all(uart1_container, 0, 0);
-    lv_obj_clear_flag(uart1_container, LV_OBJ_FLAG_SCROLLABLE);
+    // Set initial tab to first detected UART
+    if (uart1_detected) {
+        current_tab = 0;
+    } else if (uart2_detected) {
+        current_tab = 1;
+    } else {
+        current_tab = 2;  // INTERNAL if no UARTs detected
+    }
     
-    // UART2 container - hidden initially
-    if (hw_config == 1) {
+    // UART1 container - only if UART1 detected
+    if (uart1_detected) {
+        uart1_container = lv_obj_create(scr);
+        lv_obj_set_size(uart1_container, lv_pct(100), height);
+        lv_obj_align(uart1_container, LV_ALIGN_TOP_MID, 0, 85);
+        lv_obj_set_style_bg_color(uart1_container, COLOR_MATERIAL_BG, 0);
+        lv_obj_set_style_border_width(uart1_container, 0, 0);
+        lv_obj_set_style_radius(uart1_container, 0, 0);
+        lv_obj_set_style_pad_all(uart1_container, 0, 0);
+        lv_obj_clear_flag(uart1_container, LV_OBJ_FLAG_SCROLLABLE);
+        // Hide if not the initial tab
+        if (current_tab != 0) {
+            lv_obj_add_flag(uart1_container, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    
+    // UART2 container - only if UART2 detected
+    if (uart2_detected) {
+        uart2_container = lv_obj_create(scr);
+        lv_obj_set_size(uart2_container, lv_pct(100), height);
+        lv_obj_align(uart2_container, LV_ALIGN_TOP_MID, 0, 85);
+        lv_obj_set_style_bg_color(uart2_container, COLOR_MATERIAL_BG, 0);
+        lv_obj_set_style_border_width(uart2_container, 0, 0);
+        lv_obj_set_style_radius(uart2_container, 0, 0);
+        lv_obj_set_style_pad_all(uart2_container, 0, 0);
+        lv_obj_clear_flag(uart2_container, LV_OBJ_FLAG_SCROLLABLE);
+        // Hide if not the initial tab
+        if (current_tab != 1) {
+            lv_obj_add_flag(uart2_container, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    
+    // INTERNAL container - always created
+    internal_container = lv_obj_create(scr);
+    lv_obj_set_size(internal_container, lv_pct(100), height);
+    lv_obj_align(internal_container, LV_ALIGN_TOP_MID, 0, 85);
+    lv_obj_set_style_bg_color(internal_container, COLOR_MATERIAL_BG, 0);
+    lv_obj_set_style_border_width(internal_container, 0, 0);
+    lv_obj_set_style_radius(internal_container, 0, 0);
+    lv_obj_set_style_pad_all(internal_container, 0, 0);
+    lv_obj_clear_flag(internal_container, LV_OBJ_FLAG_SCROLLABLE);
+    // Hide if not the initial tab
+    if (current_tab != 2) {
+        lv_obj_add_flag(internal_container, LV_OBJ_FLAG_HIDDEN);
+    }
+    
+    ESP_LOGI(TAG, "Tab containers created (UART1=%s, UART2=%s, initial_tab=%d)", 
+             uart1_detected ? "YES" : "NO", uart2_detected ? "YES" : "NO", current_tab);
+}
+
+// Reload GUI when hardware config changes (e.g., after board detection)
+static void reload_gui_for_hw_config(void)
+{
+    ESP_LOGI(TAG, "Reloading GUI (UART1=%s, UART2=%s)", 
+             uart1_detected ? "YES" : "NO", uart2_detected ? "YES" : "NO");
+    
+    lv_obj_t *scr = lv_scr_act();
+    lv_coord_t height = lv_disp_get_ver_res(NULL) - 85;
+    
+    // Handle UART1 container based on detection
+    if (uart1_detected && !uart1_container) {
+        uart1_container = lv_obj_create(scr);
+        lv_obj_set_size(uart1_container, lv_pct(100), height);
+        lv_obj_align(uart1_container, LV_ALIGN_TOP_MID, 0, 85);
+        lv_obj_set_style_bg_color(uart1_container, COLOR_MATERIAL_BG, 0);
+        lv_obj_set_style_border_width(uart1_container, 0, 0);
+        lv_obj_set_style_radius(uart1_container, 0, 0);
+        lv_obj_set_style_pad_all(uart1_container, 0, 0);
+        lv_obj_clear_flag(uart1_container, LV_OBJ_FLAG_SCROLLABLE);
+        ESP_LOGI(TAG, "Created UART1 container");
+    }
+    
+    // Handle UART2 container based on detection
+    if (uart2_detected && !uart2_container) {
         uart2_container = lv_obj_create(scr);
         lv_obj_set_size(uart2_container, lv_pct(100), height);
         lv_obj_align(uart2_container, LV_ALIGN_TOP_MID, 0, 85);
@@ -2404,20 +2495,23 @@ static void create_tab_containers(void)
         lv_obj_set_style_pad_all(uart2_container, 0, 0);
         lv_obj_clear_flag(uart2_container, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_add_flag(uart2_container, LV_OBJ_FLAG_HIDDEN);
+        ESP_LOGI(TAG, "Created UART2 container");
     }
     
-    // INTERNAL container - hidden initially
-    internal_container = lv_obj_create(scr);
-    lv_obj_set_size(internal_container, lv_pct(100), height);
-    lv_obj_align(internal_container, LV_ALIGN_TOP_MID, 0, 85);
-    lv_obj_set_style_bg_color(internal_container, COLOR_MATERIAL_BG, 0);
-    lv_obj_set_style_border_width(internal_container, 0, 0);
-    lv_obj_set_style_radius(internal_container, 0, 0);
-    lv_obj_set_style_pad_all(internal_container, 0, 0);
-    lv_obj_clear_flag(internal_container, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(internal_container, LV_OBJ_FLAG_HIDDEN);
+    // Recreate tab bar with correct number of tabs
+    create_tab_bar();
     
-    ESP_LOGI(TAG, "Tab containers created");
+    // Set initial tab to first detected UART
+    if (uart1_detected) {
+        current_tab = 0;
+    } else if (uart2_detected) {
+        current_tab = 1;
+    } else {
+        current_tab = 2;  // INTERNAL if no UARTs detected
+    }
+    update_tab_styles();
+    
+    ESP_LOGI(TAG, "GUI reloaded successfully, current_tab=%d", current_tab);
 }
 
 // Create tab bar below status bar
@@ -2449,42 +2543,45 @@ static void create_tab_bar(void)
     lv_obj_set_flex_align(tab_bar, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_clear_flag(tab_bar, LV_OBJ_FLAG_SCROLLABLE);
     
-    // Calculate tab width based on whether UART2 is available
-    bool uart2_available = (hw_config == 1);
-    int tab_count = uart2_available ? 3 : 2;
+    // Calculate tab count based on detected UARTs
+    // Show tabs only for detected UARTs
+    int uart_tab_count = (uart1_detected ? 1 : 0) + (uart2_detected ? 1 : 0);
+    int tab_count = uart_tab_count + 1;  // +1 for INTERNAL tab
     int tab_width = (lv_disp_get_hor_res(NULL) - 24) / tab_count;  // Account for padding and gaps
     
-    // ========== UART 1 tab ==========
-    uart1_tab_btn = lv_btn_create(tab_bar);
-    lv_obj_set_size(uart1_tab_btn, tab_width, 37);
-    lv_obj_set_style_radius(uart1_tab_btn, 8, 0);
-    lv_obj_set_style_shadow_width(uart1_tab_btn, 8, 0);
-    lv_obj_set_style_shadow_color(uart1_tab_btn, lv_color_hex(TAB_COLOR_UART1_ACTIVE), 0);
-    lv_obj_set_style_shadow_opa(uart1_tab_btn, LV_OPA_30, 0);
-    lv_obj_add_event_cb(uart1_tab_btn, tab_click_cb, LV_EVENT_CLICKED, (void*)(uintptr_t)0);
+    // ========== UART 1 tab (only if UART1 detected) ==========
+    if (uart1_detected) {
+        uart1_tab_btn = lv_btn_create(tab_bar);
+        lv_obj_set_size(uart1_tab_btn, tab_width, 37);
+        lv_obj_set_style_radius(uart1_tab_btn, 8, 0);
+        lv_obj_set_style_shadow_width(uart1_tab_btn, 8, 0);
+        lv_obj_set_style_shadow_color(uart1_tab_btn, lv_color_hex(TAB_COLOR_UART1_ACTIVE), 0);
+        lv_obj_set_style_shadow_opa(uart1_tab_btn, LV_OPA_30, 0);
+        lv_obj_add_event_cb(uart1_tab_btn, tab_click_cb, LV_EVENT_CLICKED, (void*)(uintptr_t)0);
+        
+        // Icon + Label container
+        lv_obj_t *uart1_content = lv_obj_create(uart1_tab_btn);
+        lv_obj_remove_style_all(uart1_content);
+        lv_obj_set_size(uart1_content, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+        lv_obj_set_flex_flow(uart1_content, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(uart1_content, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_gap(uart1_content, 6, 0);
+        lv_obj_center(uart1_content);
+        lv_obj_clear_flag(uart1_content, LV_OBJ_FLAG_CLICKABLE);
+        
+        lv_obj_t *uart1_icon = lv_label_create(uart1_content);
+        lv_label_set_text(uart1_icon, LV_SYMBOL_WIFI);
+        lv_obj_set_style_text_font(uart1_icon, &lv_font_montserrat_18, 0);
+        lv_obj_set_style_text_color(uart1_icon, lv_color_hex(0xFFFFFF), 0);
+        
+        lv_obj_t *uart1_label = lv_label_create(uart1_content);
+        lv_label_set_text(uart1_label, "Grove");
+        lv_obj_set_style_text_font(uart1_label, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(uart1_label, lv_color_hex(0xFFFFFF), 0);
+    }
     
-    // Icon + Label container
-    lv_obj_t *uart1_content = lv_obj_create(uart1_tab_btn);
-    lv_obj_remove_style_all(uart1_content);
-    lv_obj_set_size(uart1_content, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
-    lv_obj_set_flex_flow(uart1_content, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(uart1_content, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_gap(uart1_content, 6, 0);
-    lv_obj_center(uart1_content);
-    lv_obj_clear_flag(uart1_content, LV_OBJ_FLAG_CLICKABLE);
-    
-    lv_obj_t *uart1_icon = lv_label_create(uart1_content);
-    lv_label_set_text(uart1_icon, LV_SYMBOL_WIFI);
-    lv_obj_set_style_text_font(uart1_icon, &lv_font_montserrat_18, 0);
-    lv_obj_set_style_text_color(uart1_icon, lv_color_hex(0xFFFFFF), 0);
-    
-    lv_obj_t *uart1_label = lv_label_create(uart1_content);
-    lv_label_set_text(uart1_label, "UART 1");
-    lv_obj_set_style_text_font(uart1_label, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(uart1_label, lv_color_hex(0xFFFFFF), 0);
-    
-    // ========== UART 2 tab (only if Kraken mode) ==========
-    if (uart2_available) {
+    // ========== UART 2 tab (only if UART2 detected) ==========
+    if (uart2_detected) {
         uart2_tab_btn = lv_btn_create(tab_bar);
         lv_obj_set_size(uart2_tab_btn, tab_width, 37);
         lv_obj_set_style_radius(uart2_tab_btn, 8, 0);
@@ -2509,7 +2606,7 @@ static void create_tab_bar(void)
         lv_obj_set_style_text_color(uart2_icon, lv_color_hex(0xFFFFFF), 0);
         
         lv_obj_t *uart2_label = lv_label_create(uart2_content);
-        lv_label_set_text(uart2_label, "UART 2");
+        lv_label_set_text(uart2_label, "M-Bus");
         lv_obj_set_style_text_font(uart2_label, &lv_font_montserrat_14, 0);
         lv_obj_set_style_text_color(uart2_label, lv_color_hex(0xFFFFFF), 0);
     }
@@ -2546,7 +2643,8 @@ static void create_tab_bar(void)
     // Apply active tab styling
     update_tab_styles();
     
-    ESP_LOGI(TAG, "Tab bar created: tabs=%d, uart2_available=%d", tab_count, uart2_available);
+    ESP_LOGI(TAG, "Tab bar created: tabs=%d (UART1=%s, UART2=%s)", 
+             tab_count, uart1_detected ? "YES" : "NO", uart2_detected ? "YES" : "NO");
 }
 
 // Main tile click handler
@@ -5327,15 +5425,31 @@ static void show_main_tiles(void)
     update_portal_icon();
     
     // Create persistent tab containers (only once)
-    if (!uart1_container) {
+    // Check internal_container since it's always created
+    if (!internal_container) {
         create_tab_containers();
     }
     
-    // Show tiles for current tab
+    // Show tiles for current tab and make container visible
     switch (current_tab) {
-        case 0: show_uart1_tiles(); break;
-        case 1: show_uart2_tiles(); break;
-        case 2: show_internal_tiles(); break;
+        case 0: 
+            if (uart1_detected && uart1_container) {
+                lv_obj_clear_flag(uart1_container, LV_OBJ_FLAG_HIDDEN);
+                show_uart1_tiles();
+            }
+            break;
+        case 1: 
+            if (uart2_detected && uart2_container) {
+                lv_obj_clear_flag(uart2_container, LV_OBJ_FLAG_HIDDEN);
+                show_uart2_tiles();
+            }
+            break;
+        case 2: 
+            if (internal_container) {
+                lv_obj_clear_flag(internal_container, LV_OBJ_FLAG_HIDDEN);
+            }
+            show_internal_tiles(); 
+            break;
     }
 }
 
@@ -12829,45 +12943,18 @@ static void show_global_attacks_page(void)
 // Settings popup variables
 static lv_obj_t *settings_popup_overlay = NULL;
 static lv_obj_t *settings_popup_obj = NULL;
-static lv_obj_t *hw_config_dropdown = NULL;
-static lv_obj_t *uart_radio_m5bus = NULL;
-static lv_obj_t *uart_radio_grove = NULL;
-static lv_obj_t *uart2_info_label = NULL;
 
-// NVS keys
+// NVS keys (hw_config and uart1_pins removed - now auto-detected)
 #define NVS_NAMESPACE "settings"
-#define NVS_KEY_HW_CONFIG   "hw_config"
-#define NVS_KEY_UART1_PINS  "uart1_pins"
 #define NVS_KEY_RED_TEAM    "red_team"
 
-// Load UART mode from NVS (called on startup)
-// Load hardware configuration from NVS (called on startup)
-static void load_hw_config_from_nvs(void)
+// Load Red Team setting from NVS (called on startup)
+// Note: Hardware config (Monster/Kraken) is now auto-detected via ping/pong
+static void load_red_team_from_nvs(void)
 {
     nvs_handle_t nvs;
     esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs);
     if (err == ESP_OK) {
-        uint8_t config = 0;
-        uint8_t pins = 1;  // Default Grove
-        
-        // Load hw_config (Monster/Kraken)
-        err = nvs_get_u8(nvs, NVS_KEY_HW_CONFIG, &config);
-        if (err == ESP_OK) {
-            hw_config = config;
-            ESP_LOGI(TAG, "Loaded hw_config from NVS: %s", config == 0 ? "Monster" : "Kraken");
-        } else {
-            ESP_LOGI(TAG, "No hw_config in NVS, using default: Monster");
-        }
-        
-        // Load uart1_pins (M5Bus/Grove)
-        err = nvs_get_u8(nvs, NVS_KEY_UART1_PINS, &pins);
-        if (err == ESP_OK) {
-            uart1_pins_mode = pins;
-            ESP_LOGI(TAG, "Loaded UART1 pins from NVS: %s", pins == 0 ? "M5Bus" : "Grove");
-        } else {
-            ESP_LOGI(TAG, "No UART1 pins in NVS, using default: Grove (TX=53, RX=54)");
-        }
-        
         // Load red_team setting
         uint8_t red_team = 0;
         err = nvs_get_u8(nvs, NVS_KEY_RED_TEAM, &red_team);
@@ -12880,25 +12967,7 @@ static void load_hw_config_from_nvs(void)
         
         nvs_close(nvs);
     } else {
-        ESP_LOGI(TAG, "NVS not available, using defaults: Monster mode, UART1=Grove, Red Team=Disabled");
-    }
-}
-
-// Save hardware configuration to NVS
-static void save_hw_config_to_nvs(uint8_t config, uint8_t pins)
-{
-    nvs_handle_t nvs;
-    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs);
-    if (err == ESP_OK) {
-        nvs_set_u8(nvs, NVS_KEY_HW_CONFIG, config);
-        nvs_set_u8(nvs, NVS_KEY_UART1_PINS, pins);
-        nvs_commit(nvs);
-        nvs_close(nvs);
-        ESP_LOGI(TAG, "Saved to NVS: hw_config=%s, UART1=%s", 
-                 config == 0 ? "Monster" : "Kraken",
-                 pins == 0 ? "M5Bus" : "Grove");
-    } else {
-        ESP_LOGE(TAG, "Failed to open NVS for writing: %s", esp_err_to_name(err));
+        ESP_LOGI(TAG, "NVS not available, using default: Red Team=Disabled");
     }
 }
 
@@ -12917,36 +12986,23 @@ static void save_red_team_to_nvs(bool enabled)
     }
 }
 
-// Get UART TX/RX pins based on mode
-// Get UART1 pins based on mode
-static void get_uart1_pins(uint8_t mode, int *tx_pin, int *rx_pin)
+// Get UART1 pins - fixed to Grove connector
+static void get_uart1_pins(int *tx_pin, int *rx_pin)
 {
-    if (mode == 0) {
-        // M5Bus
-        *tx_pin = 37;
-        *rx_pin = 38;
-    } else {
-        // Grove
-        *tx_pin = 53;
-        *rx_pin = 54;
-    }
+    // UART1 always uses Grove connector
+    *tx_pin = 53;
+    *rx_pin = 54;
 }
 
-// Get UART2 pins (opposite of UART1)
-static void get_uart2_pins(uint8_t uart1_mode, int *tx_pin, int *rx_pin)
+// Get UART2 pins - fixed to M5Bus connector
+static void get_uart2_pins(int *tx_pin, int *rx_pin)
 {
-    if (uart1_mode == 0) {
-        // UART1 is M5Bus, so UART2 is Grove
-        *tx_pin = 53;
-        *rx_pin = 54;
-    } else {
-        // UART1 is Grove, so UART2 is M5Bus
-        *tx_pin = 37;
-        *rx_pin = 38;
-    }
+    // UART2 always uses M5Bus connector
+    *tx_pin = 37;
+    *rx_pin = 38;
 }
 
-// Initialize UART2 for Kraken mode
+// Initialize UART2 (fixed to M5Bus connector)
 static void init_uart2(void)
 {
     if (uart2_initialized) {
@@ -12954,7 +13010,7 @@ static void init_uart2(void)
     }
     
     int tx_pin, rx_pin;
-    get_uart2_pins(uart1_pins_mode, &tx_pin, &rx_pin);
+    get_uart2_pins(&tx_pin, &rx_pin);
     
     uart_config_t uart_config = {
         .baud_rate = UART_BAUD_RATE,
@@ -12970,7 +13026,7 @@ static void init_uart2(void)
     ESP_ERROR_CHECK(uart_set_pin(UART2_NUM, tx_pin, rx_pin, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
     
     uart2_initialized = true;
-    ESP_LOGI(TAG, "[UART2] Initialized for Kraken mode: TX=%d, RX=%d", tx_pin, rx_pin);
+    ESP_LOGI(TAG, "[UART2] Initialized: TX=%d, RX=%d (M5Bus)", tx_pin, rx_pin);
 }
 
 // Deinitialize UART2 when switching to Monster mode
@@ -12985,42 +13041,216 @@ static void deinit_uart2(void)
     ESP_LOGI(TAG, "[UART2] Deinitialized (Monster mode)");
 }
 
-// Reinitialize UART with new pins
-// Reinitialize UART1 with new pins
-static void reinit_uart1_with_mode(uint8_t mode)
+//==================================================================================
+// Board Detection via ping/pong protocol
+//==================================================================================
+
+// Send ping and wait for pong response on specified UART
+static bool ping_uart(uart_port_t uart_port, const char *uart_name)
 {
-    int tx_pin, rx_pin;
-    get_uart1_pins(mode, &tx_pin, &rx_pin);
+    uint8_t rx_buffer[64];
     
-    // Delete existing UART driver
-    uart_driver_delete(UART_NUM);
+    // Flush any existing data
+    uart_flush(uart_port);
     
-    // Reconfigure with new pins
-    uart_config_t uart_config = {
-        .baud_rate = UART_BAUD_RATE,
-        .data_bits = UART_DATA_8_BITS,
-        .parity = UART_PARITY_DISABLE,
-        .stop_bits = UART_STOP_BITS_1,
-        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
-        .source_clk = UART_SCLK_DEFAULT,
-    };
+    // Send ping command
+    const char *ping_cmd = "ping\r\n";
+    uart_write_bytes(uart_port, ping_cmd, strlen(ping_cmd));
+    ESP_LOGI(TAG, "[%s] Sent ping", uart_name);
     
-    uart_driver_install(UART_NUM, UART_BUF_SIZE * 2, 0, 0, NULL, 0);
-    uart_param_config(UART_NUM, &uart_config);
-    uart_set_pin(UART_NUM, tx_pin, rx_pin, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    // Wait for pong response (up to 500ms)
+    int total_len = 0;
+    int64_t start_time = esp_timer_get_time();
+    int64_t timeout_us = 500000; // 500ms
     
-    ESP_LOGI(TAG, "[UART1] Reinitialized: TX=%d, RX=%d (%s)", tx_pin, rx_pin, 
-             mode == 0 ? "M5Bus" : "Grove");
+    while ((esp_timer_get_time() - start_time) < timeout_us) {
+        int len = uart_read_bytes(uart_port, rx_buffer + total_len, 
+                                   sizeof(rx_buffer) - total_len - 1, pdMS_TO_TICKS(50));
+        if (len > 0) {
+            total_len += len;
+            rx_buffer[total_len] = '\0';
+            
+            // Check if we received "pong"
+            if (strstr((char*)rx_buffer, "pong") != NULL) {
+                ESP_LOGI(TAG, "[%s] Received pong - board detected!", uart_name);
+                return true;
+            }
+        }
+    }
+    
+    ESP_LOGW(TAG, "[%s] No pong response - board not detected", uart_name);
+    return false;
 }
 
-// Reinitialize UART2 with new pins (for Kraken mode)
-static void reinit_uart2(void)
+// Detect connected boards via ping/pong on both UARTs
+static void detect_boards(void)
 {
-    if (uart2_initialized) {
-        uart_driver_delete(UART2_NUM);
-        uart2_initialized = false;
+    ESP_LOGI(TAG, "=== Starting board detection ===");
+    
+    // Ping both UARTs
+    uart1_detected = ping_uart(UART_NUM, "UART1");
+    uart2_detected = ping_uart(UART2_NUM, "UART2");
+    
+    // Determine hardware configuration
+    if (uart1_detected && uart2_detected) {
+        hw_config = 1;  // Kraken mode - both UARTs
+        ESP_LOGI(TAG, "Hardware config: Kraken (UART1 + UART2)");
+    } else if (uart1_detected) {
+        hw_config = 0;  // Monster mode - only UART1
+        ESP_LOGI(TAG, "Hardware config: Monster (UART1 only)");
+    } else if (uart2_detected) {
+        // Only UART2 detected - treat as Monster but log warning
+        hw_config = 0;
+        ESP_LOGW(TAG, "Only UART2 detected - unusual config, treating as Monster");
+    } else {
+        hw_config = 0;  // No boards detected
+        ESP_LOGW(TAG, "No boards detected on either UART!");
     }
-    init_uart2();
+    
+    ESP_LOGI(TAG, "=== Board detection complete: UART1=%s, UART2=%s ===",
+             uart1_detected ? "YES" : "NO", uart2_detected ? "YES" : "NO");
+}
+
+// Forward declarations for popup
+static void show_main_tiles(void);
+
+// Close the "No Board Detected" popup
+static void board_detect_popup_close_cb(lv_event_t *e)
+{
+    ESP_LOGI(TAG, "User closed 'No Board Detected' popup");
+    
+    // Stop retry timer
+    if (board_detect_retry_timer) {
+        lv_timer_del(board_detect_retry_timer);
+        board_detect_retry_timer = NULL;
+    }
+    
+    // Close popup
+    if (board_detect_overlay) {
+        lv_obj_del(board_detect_overlay);
+        board_detect_overlay = NULL;
+        board_detect_popup = NULL;
+    }
+    
+    board_detection_popup_open = false;
+    
+    // Show main tiles even without boards (user chose to continue)
+    show_main_tiles();
+}
+
+// Retry board detection callback (called every 1s while popup is open)
+static void board_detect_retry_cb(lv_timer_t *timer)
+{
+    if (!board_detection_popup_open) {
+        // Popup was closed, stop timer
+        if (board_detect_retry_timer) {
+            lv_timer_del(board_detect_retry_timer);
+            board_detect_retry_timer = NULL;
+        }
+        return;
+    }
+    
+    ESP_LOGI(TAG, "Retrying board detection...");
+    
+    // Try detection again
+    detect_boards();
+    
+    // If any board detected, close popup and show main tiles
+    if (uart1_detected || uart2_detected) {
+        ESP_LOGI(TAG, "Board detected! Closing popup and showing main UI.");
+        
+        // Stop retry timer
+        if (board_detect_retry_timer) {
+            lv_timer_del(board_detect_retry_timer);
+            board_detect_retry_timer = NULL;
+        }
+        
+        // Close popup
+        if (board_detect_overlay) {
+            lv_obj_del(board_detect_overlay);
+            board_detect_overlay = NULL;
+            board_detect_popup = NULL;
+        }
+        
+        board_detection_popup_open = false;
+        
+        // Reload GUI to reflect detected config and show main tiles
+        reload_gui_for_hw_config();
+        show_main_tiles();
+    }
+}
+
+// Show "No Board Detected" popup with retry logic
+static void show_no_board_popup(void)
+{
+    ESP_LOGI(TAG, "Showing 'No Board Detected' popup");
+    
+    board_detection_popup_open = true;
+    
+    lv_obj_t *scr = lv_scr_act();
+    
+    // Create modal overlay
+    board_detect_overlay = lv_obj_create(scr);
+    lv_obj_remove_style_all(board_detect_overlay);
+    lv_obj_set_size(board_detect_overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(board_detect_overlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(board_detect_overlay, LV_OPA_70, 0);
+    lv_obj_clear_flag(board_detect_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(board_detect_overlay, LV_OBJ_FLAG_CLICKABLE);
+    
+    // Create popup container
+    board_detect_popup = lv_obj_create(board_detect_overlay);
+    lv_obj_set_size(board_detect_popup, 400, 280);
+    lv_obj_center(board_detect_popup);
+    lv_obj_set_style_bg_color(board_detect_popup, lv_color_hex(0x2D2D2D), 0);
+    lv_obj_set_style_border_color(board_detect_popup, COLOR_MATERIAL_AMBER, 0);
+    lv_obj_set_style_border_width(board_detect_popup, 3, 0);
+    lv_obj_set_style_radius(board_detect_popup, 16, 0);
+    lv_obj_set_style_pad_all(board_detect_popup, 24, 0);
+    lv_obj_set_flex_flow(board_detect_popup, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(board_detect_popup, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(board_detect_popup, 16, 0);
+    lv_obj_clear_flag(board_detect_popup, LV_OBJ_FLAG_SCROLLABLE);
+    
+    // Warning icon
+    lv_obj_t *icon = lv_label_create(board_detect_popup);
+    lv_label_set_text(icon, LV_SYMBOL_WARNING);
+    lv_obj_set_style_text_font(icon, &lv_font_montserrat_44, 0);
+    lv_obj_set_style_text_color(icon, COLOR_MATERIAL_AMBER, 0);
+    
+    // Title
+    lv_obj_t *title = lv_label_create(board_detect_popup);
+    lv_label_set_text(title, "No Board Detected");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_color(title, lv_color_hex(0xFFFFFF), 0);
+    
+    // Subtitle
+    lv_obj_t *subtitle = lv_label_create(board_detect_popup);
+    lv_label_set_text(subtitle, "Connect ESP32-C5 board via UART");
+    lv_obj_set_style_text_font(subtitle, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(subtitle, lv_color_hex(0xAAAAAA), 0);
+    
+    // Status label (shows retry status)
+    lv_obj_t *status = lv_label_create(board_detect_popup);
+    lv_label_set_text(status, "Retrying every 1 second...");
+    lv_obj_set_style_text_font(status, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(status, lv_color_hex(0x888888), 0);
+    
+    // Close button
+    lv_obj_t *close_btn = lv_btn_create(board_detect_popup);
+    lv_obj_set_size(close_btn, 160, 50);
+    lv_obj_set_style_bg_color(close_btn, COLOR_MATERIAL_PURPLE, 0);
+    lv_obj_set_style_radius(close_btn, 8, 0);
+    lv_obj_add_event_cb(close_btn, board_detect_popup_close_cb, LV_EVENT_CLICKED, NULL);
+    
+    lv_obj_t *btn_label = lv_label_create(close_btn);
+    lv_label_set_text(btn_label, "Continue Anyway");
+    lv_obj_set_style_text_font(btn_label, &lv_font_montserrat_14, 0);
+    lv_obj_center(btn_label);
+    
+    // Start retry timer (1 second interval)
+    board_detect_retry_timer = lv_timer_create(board_detect_retry_cb, 1000, NULL);
+    ESP_LOGI(TAG, "Started board detection retry timer (1s interval)");
 }
 
 //==================================================================================
@@ -13338,106 +13568,6 @@ static void kraken_scan_task(void *arg)
     ESP_LOGI(TAG, "[UART2] Kraken scan task exiting");
     kraken_scan_task_handle = NULL;
     vTaskDelete(NULL);
-}
-
-static void uart_pins_popup_close_cb(lv_event_t *e)
-{
-    if (settings_popup_overlay) {
-        lv_obj_del(settings_popup_overlay);
-        settings_popup_overlay = NULL;
-        settings_popup_obj = NULL;
-        hw_config_dropdown = NULL;
-        uart_radio_m5bus = NULL;
-        uart_radio_grove = NULL;
-        uart2_info_label = NULL;
-    }
-}
-
-// Update the UART2 info label based on current selections
-static void update_uart2_info_label(void)
-{
-    if (!uart2_info_label || !hw_config_dropdown) return;
-    
-    uint16_t selected = lv_dropdown_get_selected(hw_config_dropdown);
-    
-    if (selected == 0) {
-        // Monster mode - hide UART2 info
-        lv_label_set_text(uart2_info_label, "");
-    } else {
-        // Kraken mode - show UART2 on opposite pins
-        bool grove_selected = uart_radio_grove && lv_obj_has_state(uart_radio_grove, LV_STATE_CHECKED);
-        if (grove_selected) {
-            lv_label_set_text(uart2_info_label, "Kraken enables UART2 on: M5Bus (TX:37, RX:38)");
-        } else {
-            lv_label_set_text(uart2_info_label, "Kraken enables UART2 on: Grove (TX:53, RX:54)");
-        }
-    }
-}
-
-static void uart_pins_save_cb(lv_event_t *e)
-{
-    // Get hardware config
-    uint8_t new_hw_config = 0;
-    if (hw_config_dropdown) {
-        new_hw_config = lv_dropdown_get_selected(hw_config_dropdown);
-    }
-    
-    // Get UART1 pins mode
-    uint8_t new_pins_mode = 0;
-    if (uart_radio_grove && lv_obj_has_state(uart_radio_grove, LV_STATE_CHECKED)) {
-        new_pins_mode = 1;
-    }
-    
-    // Check if anything changed
-    bool config_changed = (new_hw_config != hw_config) || (new_pins_mode != uart1_pins_mode);
-    
-    if (config_changed) {
-        hw_config = new_hw_config;
-        uart1_pins_mode = new_pins_mode;
-        save_hw_config_to_nvs(new_hw_config, new_pins_mode);
-        reinit_uart1_with_mode(new_pins_mode);
-        
-        // Handle UART2 based on mode
-        if (hw_config == 1) {
-            // Kraken mode - init/reinit UART2
-            if (uart2_initialized) {
-                reinit_uart2();
-            } else {
-                init_uart2();
-            }
-        } else {
-            // Monster mode - stop Kraken scanning and deinit UART2
-            if (kraken_scanning_active) {
-                stop_kraken_scanning();
-            }
-            deinit_uart2();
-            update_portal_icon();
-        }
-    }
-    
-    uart_pins_popup_close_cb(e);
-}
-
-static void hw_config_dropdown_event_cb(lv_event_t *e)
-{
-    update_uart2_info_label();
-}
-
-static void uart_radio_event_cb(lv_event_t *e)
-{
-    lv_obj_t *target = lv_event_get_target(e);
-    
-    // Uncheck the other radio button
-    if (target == uart_radio_m5bus) {
-        lv_obj_add_state(uart_radio_m5bus, LV_STATE_CHECKED);
-        lv_obj_clear_state(uart_radio_grove, LV_STATE_CHECKED);
-    } else if (target == uart_radio_grove) {
-        lv_obj_add_state(uart_radio_grove, LV_STATE_CHECKED);
-        lv_obj_clear_state(uart_radio_m5bus, LV_STATE_CHECKED);
-    }
-    
-    // Update UART2 info when pins change
-    update_uart2_info_label();
 }
 
 // ======================= Scan Time Settings =======================
@@ -14110,160 +14240,6 @@ static void show_red_team_settings_page(void)
     lv_obj_set_style_text_font(status, &lv_font_montserrat_16, 0);
 }
 
-static void show_uart_pins_popup(void)
-{
-    lv_obj_t *container = get_current_tab_container();
-    if (!container) return;
-    
-    // Create modal overlay
-    settings_popup_overlay = lv_obj_create(container);
-    lv_obj_remove_style_all(settings_popup_overlay);
-    lv_obj_set_size(settings_popup_overlay, lv_pct(100), lv_pct(100));
-    lv_obj_set_style_bg_color(settings_popup_overlay, lv_color_hex(0x000000), 0);
-    lv_obj_set_style_bg_opa(settings_popup_overlay, LV_OPA_50, 0);
-    lv_obj_clear_flag(settings_popup_overlay, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(settings_popup_overlay, LV_OBJ_FLAG_CLICKABLE);
-    
-    // Create popup - taller to fit new elements
-    settings_popup_obj = lv_obj_create(settings_popup_overlay);
-    lv_obj_set_size(settings_popup_obj, 450, 400);
-    lv_obj_center(settings_popup_obj);
-    lv_obj_set_style_bg_color(settings_popup_obj, lv_color_hex(0x2D2D2D), 0);
-    lv_obj_set_style_border_color(settings_popup_obj, COLOR_MATERIAL_BLUE, 0);
-    lv_obj_set_style_border_width(settings_popup_obj, 2, 0);
-    lv_obj_set_style_radius(settings_popup_obj, 12, 0);
-    lv_obj_set_style_pad_all(settings_popup_obj, 20, 0);
-    lv_obj_set_flex_flow(settings_popup_obj, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_pad_row(settings_popup_obj, 12, 0);
-    lv_obj_clear_flag(settings_popup_obj, LV_OBJ_FLAG_SCROLLABLE);
-    
-    // Title
-    lv_obj_t *title = lv_label_create(settings_popup_obj);
-    lv_label_set_text(title, "UART Pin Configuration");
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_18, 0);
-    lv_obj_set_style_text_color(title, lv_color_hex(0xFFFFFF), 0);
-    
-    // Hardware Configuration dropdown row
-    lv_obj_t *hw_row = lv_obj_create(settings_popup_obj);
-    lv_obj_set_size(hw_row, lv_pct(100), 50);
-    lv_obj_set_style_bg_opa(hw_row, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(hw_row, 0, 0);
-    lv_obj_set_flex_flow(hw_row, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(hw_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_clear_flag(hw_row, LV_OBJ_FLAG_SCROLLABLE);
-    
-    lv_obj_t *hw_label = lv_label_create(hw_row);
-    lv_label_set_text(hw_label, "Hardware Config:");
-    lv_obj_set_style_text_font(hw_label, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(hw_label, lv_color_hex(0xFFFFFF), 0);
-    
-    hw_config_dropdown = lv_dropdown_create(hw_row);
-    lv_dropdown_set_options(hw_config_dropdown, "Monster\nKraken");
-    lv_dropdown_set_selected(hw_config_dropdown, hw_config);
-    lv_obj_set_width(hw_config_dropdown, 150);
-    lv_obj_set_style_bg_color(hw_config_dropdown, lv_color_hex(0x3D3D3D), 0);
-    lv_obj_set_style_text_color(hw_config_dropdown, lv_color_hex(0xFFFFFF), 0);
-    lv_obj_add_event_cb(hw_config_dropdown, hw_config_dropdown_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
-    
-    // Style dropdown list
-    lv_obj_t *dropdown_list = lv_dropdown_get_list(hw_config_dropdown);
-    if (dropdown_list) {
-        lv_obj_set_style_bg_color(dropdown_list, lv_color_hex(0x3D3D3D), 0);
-        lv_obj_set_style_text_color(dropdown_list, lv_color_hex(0xFFFFFF), 0);
-    }
-    
-    // UART1 Pins label
-    lv_obj_t *uart1_title = lv_label_create(settings_popup_obj);
-    lv_label_set_text(uart1_title, "UART1 Pins:");
-    lv_obj_set_style_text_font(uart1_title, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(uart1_title, lv_color_hex(0xAAAAAA), 0);
-    
-    // M5Bus radio option
-    lv_obj_t *m5bus_row = lv_obj_create(settings_popup_obj);
-    lv_obj_set_size(m5bus_row, lv_pct(100), 40);
-    lv_obj_set_style_bg_opa(m5bus_row, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(m5bus_row, 0, 0);
-    lv_obj_set_flex_flow(m5bus_row, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(m5bus_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_column(m5bus_row, 15, 0);
-    lv_obj_clear_flag(m5bus_row, LV_OBJ_FLAG_SCROLLABLE);
-    
-    uart_radio_m5bus = lv_checkbox_create(m5bus_row);
-    lv_checkbox_set_text(uart_radio_m5bus, "");
-    lv_obj_set_style_bg_color(uart_radio_m5bus, lv_color_hex(0x555555), LV_PART_INDICATOR);
-    lv_obj_set_style_bg_color(uart_radio_m5bus, COLOR_MATERIAL_BLUE, LV_PART_INDICATOR | LV_STATE_CHECKED);
-    lv_obj_add_event_cb(uart_radio_m5bus, uart_radio_event_cb, LV_EVENT_CLICKED, NULL);
-    
-    lv_obj_t *m5bus_label = lv_label_create(m5bus_row);
-    lv_label_set_text(m5bus_label, "M5Bus (TX:37, RX:38)");
-    lv_obj_set_style_text_font(m5bus_label, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(m5bus_label, lv_color_hex(0xFFFFFF), 0);
-    
-    // Grove radio option
-    lv_obj_t *grove_row = lv_obj_create(settings_popup_obj);
-    lv_obj_set_size(grove_row, lv_pct(100), 40);
-    lv_obj_set_style_bg_opa(grove_row, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(grove_row, 0, 0);
-    lv_obj_set_flex_flow(grove_row, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(grove_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_column(grove_row, 15, 0);
-    lv_obj_clear_flag(grove_row, LV_OBJ_FLAG_SCROLLABLE);
-    
-    uart_radio_grove = lv_checkbox_create(grove_row);
-    lv_checkbox_set_text(uart_radio_grove, "");
-    lv_obj_set_style_bg_color(uart_radio_grove, lv_color_hex(0x555555), LV_PART_INDICATOR);
-    lv_obj_set_style_bg_color(uart_radio_grove, COLOR_MATERIAL_BLUE, LV_PART_INDICATOR | LV_STATE_CHECKED);
-    lv_obj_add_event_cb(uart_radio_grove, uart_radio_event_cb, LV_EVENT_CLICKED, NULL);
-    
-    lv_obj_t *grove_label = lv_label_create(grove_row);
-    lv_label_set_text(grove_label, "Grove (TX:53, RX:54)");
-    lv_obj_set_style_text_font(grove_label, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(grove_label, lv_color_hex(0xFFFFFF), 0);
-    
-    // Set initial state based on uart1_pins_mode
-    if (uart1_pins_mode == 0) {
-        lv_obj_add_state(uart_radio_m5bus, LV_STATE_CHECKED);
-    } else {
-        lv_obj_add_state(uart_radio_grove, LV_STATE_CHECKED);
-    }
-    
-    // UART2 info label (for Kraken mode)
-    uart2_info_label = lv_label_create(settings_popup_obj);
-    lv_obj_set_style_text_font(uart2_info_label, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(uart2_info_label, COLOR_MATERIAL_CYAN, 0);
-    update_uart2_info_label();  // Set initial text
-    
-    // Button row
-    lv_obj_t *btn_row = lv_obj_create(settings_popup_obj);
-    lv_obj_set_size(btn_row, lv_pct(100), 50);
-    lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(btn_row, 0, 0);
-    lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_column(btn_row, 20, 0);
-    lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
-    
-    // Cancel button
-    lv_obj_t *cancel_btn = lv_btn_create(btn_row);
-    lv_obj_set_size(cancel_btn, 100, 40);
-    lv_obj_set_style_bg_color(cancel_btn, lv_color_hex(0x555555), 0);
-    lv_obj_add_event_cb(cancel_btn, uart_pins_popup_close_cb, LV_EVENT_CLICKED, NULL);
-    
-    lv_obj_t *cancel_label = lv_label_create(cancel_btn);
-    lv_label_set_text(cancel_label, "Cancel");
-    lv_obj_center(cancel_label);
-    
-    // Save button
-    lv_obj_t *save_btn = lv_btn_create(btn_row);
-    lv_obj_set_size(save_btn, 100, 40);
-    lv_obj_set_style_bg_color(save_btn, COLOR_MATERIAL_GREEN, 0);
-    lv_obj_add_event_cb(save_btn, uart_pins_save_cb, LV_EVENT_CLICKED, NULL);
-    
-    lv_obj_t *save_label = lv_label_create(save_btn);
-    lv_label_set_text(save_label, "Save");
-    lv_obj_center(save_label);
-}
-
 static void settings_back_btn_event_cb(lv_event_t *e)
 {
     (void)e;
@@ -14285,9 +14261,7 @@ static void settings_tile_event_cb(lv_event_t *e)
     const char *tile_name = (const char *)lv_event_get_user_data(e);
     ESP_LOGI(TAG, "Settings tile clicked: %s", tile_name);
     
-    if (strcmp(tile_name, "UART Pins") == 0) {
-        show_uart_pins_popup();
-    } else if (strcmp(tile_name, "Scan Time") == 0) {
+    if (strcmp(tile_name, "Scan Time") == 0) {
         show_scan_time_popup();
     } else if (strcmp(tile_name, "Red Team") == 0) {
         show_red_team_settings_page();
@@ -14362,9 +14336,6 @@ static void show_settings_page(void)
     lv_obj_set_style_pad_row(tiles, 20, 0);
     lv_obj_clear_flag(tiles, LV_OBJ_FLAG_SCROLLABLE);
     
-    // UART Pins tile
-    create_tile(tiles, LV_SYMBOL_USB, "UART\nPins", COLOR_MATERIAL_BLUE, settings_tile_event_cb, "UART Pins");
-    
     // Scan Time tile
     create_tile(tiles, LV_SYMBOL_REFRESH, "Scan\nTime", COLOR_MATERIAL_GREEN, settings_tile_event_cb, "Scan Time");
     
@@ -14425,14 +14396,14 @@ void app_main(void)
     bsp_set_charge_en(true);
     bsp_set_charge_qc_en(true);
     
-    // Load hardware config from NVS and initialize UARTs
-    load_hw_config_from_nvs();
-    uart_init();  // Initialize UART1
+    // Load Red Team setting from NVS (hardware config is now auto-detected)
+    load_red_team_from_nvs();
     
-    // If Kraken mode, also initialize UART2
-    if (hw_config == 1) {
-        init_uart2();
-    }
+    // Initialize both UARTs for board detection
+    // UART1: Grove (TX=53, RX=54) - always initialized
+    // UART2: M5Bus (TX=37, RX=38) - always initialized for detection
+    uart_init();   // Initialize UART1
+    init_uart2();  // Initialize UART2 (for detection, may be used if Kraken detected)
     
     // Initialize display
     lv_display_t *disp = bsp_display_start();
