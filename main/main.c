@@ -20,6 +20,8 @@
 #include "driver/gpio.h"
 #include "bsp/m5stack_tab5.h"
 #include "lvgl.h"
+#include "iot_usbh_cdc.h"
+#include "usb/usb_host.h"
 
 // ESP-Hosted includes for WiFi via ESP32C6 SDIO
 #include "esp_hosted.h"
@@ -1342,6 +1344,247 @@ static void touch_activity_cb(lv_event_t *e)
     }
 }
 
+static bool usb_transport_ready = false;
+static bool usb_transport_warned = false;
+static usbh_cdc_handle_t usb_cdc_handle = NULL;
+static bool usb_cdc_connected = false;
+static bool usb_host_checked = false;
+static bool usb_host_installed = false;
+static bool usb_host_started_by_us = false;
+static uint32_t usb_next_retry_ms = 0;
+static bool usb_log_tuned = false;
+static lv_obj_t *uart1_tab_label = NULL;
+
+static void uart1_tab_label_set_cb(void *user_data)
+{
+    const char *text = (const char *)user_data;
+    if (uart1_tab_label) {
+        lv_label_set_text(uart1_tab_label, text);
+    }
+}
+
+static void uart1_update_tab_label(const char *text)
+{
+    if (!uart1_tab_label) {
+        return;
+    }
+    lv_async_call(uart1_tab_label_set_cb, (void *)text);
+}
+
+static const char *uart1_transport_name(void)
+{
+    return usb_cdc_connected ? "USB" : "UART1";
+}
+
+static const char *uart1_connector_name(void)
+{
+    return usb_cdc_connected ? "USB" : "Grove";
+}
+
+static const char *tab_transport_name(int tab)
+{
+    return (tab == 1) ? "UART2" : uart1_transport_name();
+}
+
+static bool uart1_use_usb(void)
+{
+    return usb_cdc_connected;
+}
+
+static void usb_check_host_installed(void)
+{
+    if (usb_host_checked) {
+        return;
+    }
+    usb_host_lib_info_t info = { 0 };
+    esp_err_t err = usb_host_lib_info(&info);
+    usb_host_installed = (err == ESP_OK);
+    usb_host_checked = true;
+}
+
+static void usb_cdc_connect_cb(usbh_cdc_handle_t cdc_handle, void *user_data)
+{
+    (void)cdc_handle;
+    (void)user_data;
+    usb_cdc_connected = true;
+    ESP_LOGI(TAG, "[USB] CDC device connected");
+    uart1_update_tab_label("USB");
+}
+
+static void usb_cdc_disconnect_cb(usbh_cdc_handle_t cdc_handle, void *user_data)
+{
+    (void)cdc_handle;
+    (void)user_data;
+    usb_cdc_connected = false;
+    ESP_LOGW(TAG, "[USB] CDC device disconnected");
+    uart1_update_tab_label("Grove");
+}
+
+static void usb_cdc_recv_cb(usbh_cdc_handle_t cdc_handle, void *user_data)
+{
+    (void)cdc_handle;
+    (void)user_data;
+}
+
+static void usb_cdc_notif_cb(usbh_cdc_handle_t cdc_handle, iot_cdc_notification_t *notif, void *user_data)
+{
+    (void)cdc_handle;
+    (void)notif;
+    (void)user_data;
+}
+
+static void usb_transport_init(void)
+{
+    if (usb_transport_ready) {
+        return;
+    }
+
+    if (usb_cdc_handle) {
+        usb_transport_ready = true;
+        return;
+    }
+
+    uint32_t now_ms = lv_tick_get();
+    if (now_ms < usb_next_retry_ms) {
+        return;
+    }
+
+    if (!usb_log_tuned) {
+        esp_log_level_set("USBH_CDC", ESP_LOG_NONE);
+        esp_log_level_set("USBH", ESP_LOG_NONE);
+        esp_log_level_set("USB HOST", ESP_LOG_NONE);
+        usb_log_tuned = true;
+    }
+
+    ESP_LOGI(TAG, "[USB] Starting USB host for CDC...");
+    usb_check_host_installed();
+    if (!usb_host_installed) {
+        esp_err_t err = bsp_usb_host_start(BSP_USB_HOST_POWER_MODE_USB_DEV, false);
+        if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+            ESP_LOGE(TAG, "[USB] USB host start failed: %s", esp_err_to_name(err));
+            return;
+        }
+        usb_host_installed = true;
+        usb_host_started_by_us = true;
+    } else {
+        ESP_LOGI(TAG, "[USB] USB host already installed");
+    }
+
+    usbh_cdc_driver_config_t config = {
+        .task_stack_size = 4096,
+        .task_priority = 5,
+        .task_coreid = -1,
+        .skip_init_usb_host_driver = true,
+        .new_dev_cb = NULL,
+        .user_data = NULL,
+    };
+
+    esp_err_t err = usbh_cdc_driver_install(&config);
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "[USB] CDC driver install failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    usbh_cdc_device_config_t dev_config = {
+        .vid = CDC_HOST_ANY_VID,
+        .pid = CDC_HOST_ANY_PID,
+        .itf_num = 0,
+        .rx_buffer_size = UART_BUF_SIZE,
+        .tx_buffer_size = UART_BUF_SIZE,
+        .cbs = {
+            .connect = usb_cdc_connect_cb,
+            .disconnect = usb_cdc_disconnect_cb,
+            .recv_data = usb_cdc_recv_cb,
+            .notif_cb = usb_cdc_notif_cb,
+            .user_data = NULL,
+        },
+    };
+
+    err = usbh_cdc_create(&dev_config, &usb_cdc_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "[USB] CDC create failed: %s", esp_err_to_name(err));
+        usb_next_retry_ms = now_ms + 1000;
+        return;
+    }
+
+    usb_transport_ready = true;
+    usb_transport_warned = false;
+    ESP_LOGI(TAG, "[USB] USB CDC host ready, waiting for device...");
+}
+
+static __attribute__((unused)) void usb_transport_deinit(void)
+{
+    if (!usb_transport_ready) {
+        return;
+    }
+
+    if (usb_cdc_handle) {
+        usbh_cdc_delete(usb_cdc_handle);
+        usb_cdc_handle = NULL;
+    }
+
+    usbh_cdc_driver_uninstall();
+    if (usb_host_started_by_us) {
+        bsp_usb_host_stop();
+        usb_host_started_by_us = false;
+    }
+
+    usb_transport_ready = false;
+    ESP_LOGI(TAG, "[USB] USB CDC host stopped");
+}
+
+static int usb_transport_write(const char *data, size_t len)
+{
+    if (!usb_transport_ready) {
+        usb_transport_init();
+    }
+    if (!usb_cdc_handle || !usb_cdc_connected) {
+        if (!usb_transport_warned) {
+            ESP_LOGW(TAG, "[USB] No CDC device connected");
+            usb_transport_warned = true;
+        }
+        return 0;
+    }
+    esp_err_t err = usbh_cdc_write_bytes(usb_cdc_handle, (const uint8_t *)data, len, pdMS_TO_TICKS(200));
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "[USB] CDC write failed: %s", esp_err_to_name(err));
+        return 0;
+    }
+    return (int)len;
+}
+
+static int usb_transport_read(void *data, size_t len, TickType_t ticks_to_wait)
+{
+    if (!usb_transport_ready) {
+        usb_transport_init();
+    }
+    if (!usb_cdc_handle || !usb_cdc_connected) {
+        return 0;
+    }
+    size_t read_len = len;
+    esp_err_t err = usbh_cdc_read_bytes(usb_cdc_handle, (uint8_t *)data, &read_len, ticks_to_wait);
+    if (err != ESP_OK) {
+        return 0;
+    }
+    return (int)read_len;
+}
+
+static int transport_write_bytes(uart_port_t port, const char *data, size_t len)
+{
+    if (port == UART_NUM && uart1_use_usb()) {
+        return usb_transport_write(data, len);
+    }
+    return uart_write_bytes(port, data, len);
+}
+
+static int transport_read_bytes(uart_port_t port, void *data, size_t len, TickType_t ticks_to_wait)
+{
+    if (port == UART_NUM && uart1_use_usb()) {
+        return usb_transport_read(data, len, ticks_to_wait);
+    }
+    return uart_read_bytes(port, (uint8_t *)data, len, ticks_to_wait);
+}
+
 // UART initialization
 static void uart_init(void)
 {
@@ -1363,8 +1606,10 @@ static void uart_init(void)
     ESP_ERROR_CHECK(uart_set_pin(UART_NUM, tx_pin, rx_pin, 
                                   UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
     
-    ESP_LOGI(TAG, "[UART1] Initialized: TX=%d, RX=%d, baud=%d (Grove)", 
-             tx_pin, rx_pin, UART_BAUD_RATE);
+    ESP_LOGI(TAG, "[%s] Initialized: TX=%d, RX=%d, baud=%d (%s)",
+             uart1_transport_name(), tx_pin, rx_pin, UART_BAUD_RATE, uart1_connector_name());
+
+    usb_transport_init();
 }
 
 // Log memory statistics
@@ -1388,9 +1633,9 @@ static void log_memory_stats(const char *context)
 static void uart_send_command(const char *cmd)
 {
     log_memory_stats("TX1");
-    uart_write_bytes(UART_NUM, cmd, strlen(cmd));
-    uart_write_bytes(UART_NUM, "\r\n", 2);
-    ESP_LOGI(TAG, "[Grove] Sent command: %s", cmd);
+    transport_write_bytes(UART_NUM, cmd, strlen(cmd));
+    transport_write_bytes(UART_NUM, "\r\n", 2);
+    ESP_LOGI(TAG, "[%s] Sent command: %s", uart1_transport_name(), cmd);
 }
 
 // Send command over UART2 (secondary, Kraken mode only)
@@ -1401,8 +1646,8 @@ static void uart2_send_command(const char *cmd)
         return;
     }
     log_memory_stats("TX2");
-    uart_write_bytes(UART2_NUM, cmd, strlen(cmd));
-    uart_write_bytes(UART2_NUM, "\r\n", 2);
+    transport_write_bytes(UART2_NUM, cmd, strlen(cmd));
+    transport_write_bytes(UART2_NUM, "\r\n", 2);
     ESP_LOGI(TAG, "[M-Bus] Sent command: %s", cmd);
 }
 
@@ -1467,7 +1712,7 @@ static void wifi_scan_task(void *arg)
 {
     // Save the tab that initiated this scan (so we store results to correct context)
     int scan_tab = current_tab;
-    const char *uart_name = (scan_tab == 1) ? "UART2" : "UART1";
+    const char *uart_name = tab_transport_name(scan_tab);
     
     ESP_LOGI(TAG, "Starting WiFi scan task for tab %d (%s)", scan_tab, uart_name);
     
@@ -1478,7 +1723,7 @@ static void wifi_scan_task(void *arg)
     // Get the UART for current tab
     uart_port_t uart_port = (scan_tab == 1 && uart2_initialized) ? UART2_NUM : UART_NUM;
     
-    ESP_LOGI(TAG, "[%s] Using UART port %d for scan", uart_name, uart_port);
+    ESP_LOGI(TAG, "[%s] Using transport on port %d for scan", uart_name, uart_port);
     
     // Flush UART buffer
     uart_flush(uart_port);
@@ -1486,11 +1731,11 @@ static void wifi_scan_task(void *arg)
     // Send scan command to the correct UART
     log_memory_stats("TX-scan");
     if (scan_tab == 1 && uart2_initialized) {
-        uart_write_bytes(UART2_NUM, "scan_networks\r\n", 15);
+        transport_write_bytes(UART2_NUM, "scan_networks\r\n", 15);
         ESP_LOGI(TAG, "[M-Bus] Sent command: scan_networks");
     } else {
-        uart_write_bytes(UART_NUM, "scan_networks\r\n", 15);
-        ESP_LOGI(TAG, "[Grove] Sent command: scan_networks");
+        transport_write_bytes(UART_NUM, "scan_networks\r\n", 15);
+        ESP_LOGI(TAG, "[%s] Sent command: scan_networks", uart1_connector_name());
     }
     
     // Buffer for receiving data
@@ -1503,7 +1748,7 @@ static void wifi_scan_task(void *arg)
     TickType_t timeout_ticks = pdMS_TO_TICKS(UART_RX_TIMEOUT);
     
     while (!scan_complete && (xTaskGetTickCount() - start_time) < timeout_ticks) {
-        int len = uart_read_bytes(uart_port, rx_buffer, UART_BUF_SIZE - 1, pdMS_TO_TICKS(100));
+        int len = transport_read_bytes(uart_port, rx_buffer, UART_BUF_SIZE - 1, pdMS_TO_TICKS(100));
         
         if (len > 0) {
             rx_buffer[len] = '\0';
@@ -2253,13 +2498,13 @@ static uart_port_t get_current_uart(void)
 static void uart_send_command_for_tab(const char *cmd)
 {
     if (current_tab == 1 && uart2_initialized) {
-        uart_write_bytes(UART2_NUM, cmd, strlen(cmd));
-        uart_write_bytes(UART2_NUM, "\r\n", 2);
+        transport_write_bytes(UART2_NUM, cmd, strlen(cmd));
+        transport_write_bytes(UART2_NUM, "\r\n", 2);
         ESP_LOGI(TAG, "[UART2/Tab] Sent command: %s", cmd);
     } else {
-        uart_write_bytes(UART_NUM, cmd, strlen(cmd));
-        uart_write_bytes(UART_NUM, "\r\n", 2);
-        ESP_LOGI(TAG, "[UART1/Tab] Sent command: %s", cmd);
+        transport_write_bytes(UART_NUM, cmd, strlen(cmd));
+        transport_write_bytes(UART_NUM, "\r\n", 2);
+        ESP_LOGI(TAG, "[%s/Tab] Sent command: %s", uart1_transport_name(), cmd);
     }
 }
 
@@ -2479,15 +2724,20 @@ static void create_tab_containers(void)
         lv_obj_add_flag(internal_container, LV_OBJ_FLAG_HIDDEN);
     }
     
-    ESP_LOGI(TAG, "Tab containers created (UART1=%s, UART2=%s, initial_tab=%d)", 
-             uart1_detected ? "YES" : "NO", uart2_detected ? "YES" : "NO", current_tab);
+    ESP_LOGI(TAG, "Tab containers created (%s=%s, UART2=%s, initial_tab=%d)",
+             uart1_transport_name(),
+             uart1_detected ? "YES" : "NO",
+             uart2_detected ? "YES" : "NO",
+             current_tab);
 }
 
 // Reload GUI when hardware config changes (e.g., after board detection)
 static void reload_gui_for_hw_config(void)
 {
-    ESP_LOGI(TAG, "Reloading GUI (UART1=%s, UART2=%s)", 
-             uart1_detected ? "YES" : "NO", uart2_detected ? "YES" : "NO");
+    ESP_LOGI(TAG, "Reloading GUI (%s=%s, UART2=%s)",
+             uart1_transport_name(),
+             uart1_detected ? "YES" : "NO",
+             uart2_detected ? "YES" : "NO");
     
     lv_obj_t *scr = lv_scr_act();
     lv_coord_t height = lv_disp_get_ver_res(NULL) - 85;
@@ -2502,7 +2752,7 @@ static void reload_gui_for_hw_config(void)
         lv_obj_set_style_radius(uart1_container, 0, 0);
         lv_obj_set_style_pad_all(uart1_container, 0, 0);
         lv_obj_clear_flag(uart1_container, LV_OBJ_FLAG_SCROLLABLE);
-        ESP_LOGI(TAG, "Created UART1 container");
+        ESP_LOGI(TAG, "Created %s container", uart1_transport_name());
     }
     
     // Handle UART2 container based on detection
@@ -2596,7 +2846,8 @@ static void create_tab_bar(void)
         lv_obj_set_style_text_color(uart1_icon, lv_color_hex(0xFFFFFF), 0);
         
         lv_obj_t *uart1_label = lv_label_create(uart1_content);
-        lv_label_set_text(uart1_label, "Grove");
+        uart1_tab_label = uart1_label;
+        lv_label_set_text(uart1_label, uart1_connector_name());
         lv_obj_set_style_text_font(uart1_label, &lv_font_montserrat_14, 0);
         lv_obj_set_style_text_color(uart1_label, lv_color_hex(0xFFFFFF), 0);
     }
@@ -2664,8 +2915,11 @@ static void create_tab_bar(void)
     // Apply active tab styling
     update_tab_styles();
     
-    ESP_LOGI(TAG, "Tab bar created: tabs=%d (UART1=%s, UART2=%s)", 
-             tab_count, uart1_detected ? "YES" : "NO", uart2_detected ? "YES" : "NO");
+    ESP_LOGI(TAG, "Tab bar created: tabs=%d (%s=%s, UART2=%s)",
+             tab_count,
+             uart1_transport_name(),
+             uart1_detected ? "YES" : "NO",
+             uart2_detected ? "YES" : "NO");
 }
 
 // Main tile click handler
@@ -3095,7 +3349,7 @@ static void handshaker_monitor_task(void *arg)
     // Determine UART from context
     int task_tab = (ctx == &uart2_ctx) ? 1 : 0;
     uart_port_t uart_port = (task_tab == 1 && uart2_initialized) ? UART2_NUM : UART_NUM;
-    const char *uart_name = (task_tab == 1) ? "UART2" : "UART1";
+    const char *uart_name = tab_transport_name(task_tab);
     
     ESP_LOGI(TAG, "[%s] Handshaker monitor task started for tab %d", uart_name, task_tab);
     
@@ -3105,7 +3359,7 @@ static void handshaker_monitor_task(void *arg)
     
     // Use context's flag instead of global
     while (ctx && ctx->handshaker_monitoring) {
-        int len = uart_read_bytes(uart_port, rx_buffer, sizeof(rx_buffer) - 1, pdMS_TO_TICKS(100));
+        int len = transport_read_bytes(uart_port, rx_buffer, sizeof(rx_buffer) - 1, pdMS_TO_TICKS(100));
         
         if (len > 0) {
             rx_buffer[len] = '\0';
@@ -3367,7 +3621,7 @@ static void arp_connect_cb(lv_event_t *e)
     int elapsed_ms = 0;
     
     while (elapsed_ms < timeout_ms && total_len < (int)sizeof(rx_buffer) - 256) {
-        int len = uart_read_bytes(uart_port, rx_buffer + total_len, sizeof(rx_buffer) - total_len - 1, pdMS_TO_TICKS(200));
+        int len = transport_read_bytes(uart_port, rx_buffer + total_len, sizeof(rx_buffer) - total_len - 1, pdMS_TO_TICKS(200));
         if (len > 0) {
             total_len += len;
             rx_buffer[total_len] = '\0';
@@ -3444,7 +3698,7 @@ static void arp_list_hosts_cb(lv_event_t *e)
     int elapsed_ms = 0;
     
     while (elapsed_ms < timeout_ms && total_len < (int)sizeof(rx_buffer) - 256) {
-        int len = uart_read_bytes(uart_port, rx_buffer + total_len, sizeof(rx_buffer) - total_len - 1, pdMS_TO_TICKS(200));
+        int len = transport_read_bytes(uart_port, rx_buffer + total_len, sizeof(rx_buffer) - total_len - 1, pdMS_TO_TICKS(200));
         if (len > 0) {
             total_len += len;
             rx_buffer[total_len] = '\0';
@@ -3453,7 +3707,7 @@ static void arp_list_hosts_cb(lv_event_t *e)
             if (strstr(rx_buffer, "Discovered Hosts") != NULL) {
                 // Wait a bit more for all hosts
                 vTaskDelay(pdMS_TO_TICKS(2000));
-                len = uart_read_bytes(uart_port, rx_buffer + total_len, sizeof(rx_buffer) - total_len - 1, pdMS_TO_TICKS(500));
+                len = transport_read_bytes(uart_port, rx_buffer + total_len, sizeof(rx_buffer) - total_len - 1, pdMS_TO_TICKS(500));
                 if (len > 0) {
                     total_len += len;
                     rx_buffer[total_len] = '\0';
@@ -3705,7 +3959,7 @@ static void arp_auto_connect_timer_cb(lv_timer_t *timer)
     bool success = false;
     
     while (elapsed_ms < timeout_ms) {
-        int len = uart_read_bytes(uart_port, rx_buffer + total_len, sizeof(rx_buffer) - total_len - 1, pdMS_TO_TICKS(200));
+        int len = transport_read_bytes(uart_port, rx_buffer + total_len, sizeof(rx_buffer) - total_len - 1, pdMS_TO_TICKS(200));
         if (len > 0) {
             total_len += len;
             rx_buffer[total_len] = '\0';
@@ -4074,7 +4328,7 @@ static void karma_show_probes_cb(lv_event_t *e)
     int retries = 10;
     
     while (retries-- > 0) {
-        int len = uart_read_bytes(uart_port, rx_buffer + total_len, sizeof(rx_buffer) - total_len - 1, pdMS_TO_TICKS(200));
+        int len = transport_read_bytes(uart_port, rx_buffer + total_len, sizeof(rx_buffer) - total_len - 1, pdMS_TO_TICKS(200));
         if (len > 0) {
             total_len += len;
         }
@@ -4195,7 +4449,7 @@ static void karma_fetch_html_files(void)
     TickType_t timeout_ticks = pdMS_TO_TICKS(3000);
     
     while ((xTaskGetTickCount() - start_time) < timeout_ticks && karma_html_count < 20) {
-        int len = uart_read_bytes(uart_port, rx_buffer, sizeof(rx_buffer) - 1, pdMS_TO_TICKS(100));
+        int len = transport_read_bytes(uart_port, rx_buffer, sizeof(rx_buffer) - 1, pdMS_TO_TICKS(100));
         
         if (len > 0) {
             rx_buffer[len] = '\0';
@@ -4525,7 +4779,7 @@ static void karma_monitor_task(void *arg)
     // Determine UART from context
     int task_tab = (ctx == &uart2_ctx) ? 1 : 0;
     uart_port_t uart_port = (task_tab == 1 && uart2_initialized) ? UART2_NUM : UART_NUM;
-    const char *uart_name = (task_tab == 1) ? "UART2" : "UART1";
+    const char *uart_name = tab_transport_name(task_tab);
     
     ESP_LOGI(TAG, "[%s] Karma monitor task started for tab %d", uart_name, task_tab);
     
@@ -4535,7 +4789,7 @@ static void karma_monitor_task(void *arg)
     
     // Use context's flag instead of global
     while (ctx && ctx->karma_monitoring) {
-        int len = uart_read_bytes(uart_port, rx_buffer, sizeof(rx_buffer) - 1, pdMS_TO_TICKS(100));
+        int len = transport_read_bytes(uart_port, rx_buffer, sizeof(rx_buffer) - 1, pdMS_TO_TICKS(100));
         
         if (len > 0) {
             rx_buffer[len] = '\0';
@@ -4799,7 +5053,7 @@ static void fetch_html_files_from_sd(void)
     TickType_t timeout_ticks = pdMS_TO_TICKS(3000);  // 3 second timeout
     
     while ((xTaskGetTickCount() - start_time) < timeout_ticks && evil_twin_html_count < 20) {
-        int len = uart_read_bytes(uart_port, rx_buffer, sizeof(rx_buffer) - 1, pdMS_TO_TICKS(100));
+        int len = transport_read_bytes(uart_port, rx_buffer, sizeof(rx_buffer) - 1, pdMS_TO_TICKS(100));
         
         if (len > 0) {
             rx_buffer[len] = '\0';
@@ -4878,7 +5132,7 @@ static void evil_twin_monitor_task(void *arg)
     // Determine UART from context
     int task_tab = (ctx == &uart2_ctx) ? 1 : 0;
     uart_port_t uart_port = (task_tab == 1 && uart2_initialized) ? UART2_NUM : UART_NUM;
-    const char *uart_name = (task_tab == 1) ? "UART2" : "UART1";
+    const char *uart_name = tab_transport_name(task_tab);
     
     static char rx_buffer[1024];
     static char line_buffer[512];
@@ -4888,7 +5142,7 @@ static void evil_twin_monitor_task(void *arg)
     
     // Use context field instead of global
     while (ctx->evil_twin_monitoring) {
-        int len = uart_read_bytes(uart_port, rx_buffer, sizeof(rx_buffer) - 1, pdMS_TO_TICKS(200));
+        int len = transport_read_bytes(uart_port, rx_buffer, sizeof(rx_buffer) - 1, pdMS_TO_TICKS(200));
         
         if (len > 0) {
             rx_buffer[len] = '\0';
@@ -5342,10 +5596,10 @@ static void create_uart_tiles_in_container(lv_obj_t *container, lv_obj_t **tiles
 // Show UART 1 tiles (inside persistent container)
 static void show_uart1_tiles(void)
 {
-    ESP_LOGI(TAG, "Showing UART 1 tiles");
+    ESP_LOGI(TAG, "Showing %s tiles", uart1_transport_name());
     
     if (!uart1_container) {
-        ESP_LOGE(TAG, "UART1 container not initialized!");
+        ESP_LOGE(TAG, "%s container not initialized!", uart1_transport_name());
         return;
     }
     
@@ -5928,7 +6182,7 @@ static void popup_poll_task(void *arg)
     
     uart_flush(uart_port);
     char cmd[] = "show_sniffer_results\r\n";
-    uart_write_bytes(uart_port, cmd, strlen(cmd));
+    transport_write_bytes(uart_port, cmd, strlen(cmd));
     
     char *rx_buffer = observer_rx_buffer;
     char *line_buffer = observer_line_buffer;
@@ -5941,7 +6195,7 @@ static void popup_poll_task(void *arg)
     TickType_t timeout_ticks = pdMS_TO_TICKS(5000);
     
     while ((xTaskGetTickCount() - start_time) < timeout_ticks) {
-        int len = uart_read_bytes(uart_port, (uint8_t*)rx_buffer, UART_BUF_SIZE - 1, pdMS_TO_TICKS(100));
+        int len = transport_read_bytes(uart_port, (uint8_t*)rx_buffer, UART_BUF_SIZE - 1, pdMS_TO_TICKS(100));
         
         if (len > 0) {
             rx_buffer[len] = '\0';
@@ -6399,7 +6653,7 @@ static void observer_poll_task(void *arg)
     // Determine UART from context
     int task_tab = (ctx == &uart2_ctx) ? 1 : 0;
     uart_port_t uart_port = (task_tab == 1 && uart2_initialized) ? UART2_NUM : UART_NUM;
-    const char *uart_name = (task_tab == 1) ? "UART2" : "UART1";
+    const char *uart_name = tab_transport_name(task_tab);
     
     ESP_LOGI(TAG, "[%s] Observer poll task started", uart_name);
     
@@ -6416,7 +6670,7 @@ static void observer_poll_task(void *arg)
     
     // Send show_sniffer_results command to correct UART
     char cmd[] = "show_sniffer_results\r\n";
-    uart_write_bytes(uart_port, cmd, strlen(cmd));
+    transport_write_bytes(uart_port, cmd, strlen(cmd));
     ESP_LOGI(TAG, "[%s] Sent: show_sniffer_results", uart_name);
     
     // Use PSRAM-allocated buffers
@@ -6433,7 +6687,7 @@ static void observer_poll_task(void *arg)
     TickType_t timeout_ticks = pdMS_TO_TICKS(5000);  // 5 second timeout for response
     
     while ((xTaskGetTickCount() - start_time) < timeout_ticks) {
-        int len = uart_read_bytes(uart_port, rx_buffer, UART_BUF_SIZE - 1, pdMS_TO_TICKS(100));
+        int len = transport_read_bytes(uart_port, rx_buffer, UART_BUF_SIZE - 1, pdMS_TO_TICKS(100));
         
         if (len > 0) {
             rx_buffer[len] = '\0';
@@ -6618,7 +6872,7 @@ static void observer_start_task(void *arg)
     // Determine UART from context
     int task_tab = (ctx == &uart2_ctx) ? 1 : 0;
     uart_port_t uart_port = (task_tab == 1 && uart2_initialized) ? UART2_NUM : UART_NUM;
-    const char *uart_name = (task_tab == 1) ? "UART2" : "UART1";
+    const char *uart_name = tab_transport_name(task_tab);
     
     ESP_LOGI(TAG, "[%s] Observer start task - scanning networks first", uart_name);
     
@@ -6645,7 +6899,7 @@ static void observer_start_task(void *arg)
     
     // Step 1: Run scan_networks
     char scan_cmd[] = "scan_networks\r\n";
-    uart_write_bytes(uart_port, scan_cmd, strlen(scan_cmd));
+    transport_write_bytes(uart_port, scan_cmd, strlen(scan_cmd));
     ESP_LOGI(TAG, "[%s] Sent: scan_networks", uart_name);
     
     // Wait for scan to complete - use PSRAM buffers
@@ -6659,7 +6913,7 @@ static void observer_start_task(void *arg)
     TickType_t timeout_ticks = pdMS_TO_TICKS(UART_RX_TIMEOUT);
     
     while (!scan_complete && (xTaskGetTickCount() - start_time) < timeout_ticks && ctx->observer_running) {
-        int len = uart_read_bytes(uart_port, rx_buffer, UART_BUF_SIZE - 1, pdMS_TO_TICKS(100));
+        int len = transport_read_bytes(uart_port, rx_buffer, UART_BUF_SIZE - 1, pdMS_TO_TICKS(100));
         
         if (len > 0) {
             rx_buffer[len] = '\0';
@@ -6729,7 +6983,7 @@ static void observer_start_task(void *arg)
     vTaskDelay(pdMS_TO_TICKS(500));  // Short delay
     uart_flush(uart_port);
     char sniffer_cmd[] = "start_sniffer_noscan\r\n";
-    uart_write_bytes(uart_port, sniffer_cmd, strlen(sniffer_cmd));
+    transport_write_bytes(uart_port, sniffer_cmd, strlen(sniffer_cmd));
     ESP_LOGI(TAG, "[%s] Sent: start_sniffer_noscan", uart_name);
     
     vTaskDelay(pdMS_TO_TICKS(1000));  // Wait for sniffer to start
@@ -7658,7 +7912,7 @@ static void show_blackout_active_popup(void)
     if (!container) return;
     
     // Send start_blackout command via UART1 (always UART1, regardless of Monster/Kraken)
-    ESP_LOGI(TAG, "Sending start_blackout command via UART1");
+    ESP_LOGI(TAG, "Sending start_blackout command via %s", uart1_transport_name());
     uart_send_command("start_blackout");
     
     // Create modal overlay
@@ -7867,7 +8121,7 @@ static void show_snifferdog_active_popup(void)
     if (!container) return;
     
     // Send start_sniffer_dog command via UART1 (always UART1)
-    ESP_LOGI(TAG, "Sending start_sniffer_dog command via UART1");
+    ESP_LOGI(TAG, "Sending start_sniffer_dog command via %s", uart1_transport_name());
     uart_send_command("start_sniffer_dog");
     
     // Create modal overlay
@@ -7999,7 +8253,7 @@ static void global_handshaker_monitor_task(void *arg)
     int line_pos = 0;
     
     while (global_handshaker_monitoring) {
-        int len = uart_read_bytes(UART_NUM, rx_buffer, sizeof(rx_buffer) - 1, pdMS_TO_TICKS(100));
+        int len = transport_read_bytes(UART_NUM, rx_buffer, sizeof(rx_buffer) - 1, pdMS_TO_TICKS(100));
         
         if (len > 0) {
             rx_buffer[len] = '\0';
@@ -8163,7 +8417,7 @@ static void show_global_handshaker_active_popup(void)
     if (!container) return;
     
     // Send start_handshake command via UART1 (always UART1)
-    ESP_LOGI(TAG, "Sending start_handshake command via UART1");
+    ESP_LOGI(TAG, "Sending start_handshake command via %s", uart1_transport_name());
     uart_send_command("start_handshake");
     
     // Create modal overlay
@@ -8291,7 +8545,7 @@ static void phishing_portal_monitor_task(void *arg)
     int line_pos = 0;
     
     while (phishing_portal_monitoring) {
-        int len = uart_read_bytes(UART_NUM, rx_buffer, sizeof(rx_buffer) - 1, pdMS_TO_TICKS(100));
+        int len = transport_read_bytes(UART_NUM, rx_buffer, sizeof(rx_buffer) - 1, pdMS_TO_TICKS(100));
         
         if (len > 0) {
             rx_buffer[len] = '\0';
@@ -8693,7 +8947,7 @@ static void wardrive_monitor_task(void *arg)
     int line_pos = 0;
     
     while (wardrive_monitoring) {
-        int len = uart_read_bytes(UART_NUM, rx_buffer, sizeof(rx_buffer) - 1, pdMS_TO_TICKS(100));
+        int len = transport_read_bytes(UART_NUM, rx_buffer, sizeof(rx_buffer) - 1, pdMS_TO_TICKS(100));
         
         if (len > 0) {
             rx_buffer[len] = '\0';
@@ -8760,7 +9014,7 @@ static void show_wardrive_popup(void)
     wardrive_gps_fix_obtained = false;
     
     // Send start_wardrive command via UART1
-    ESP_LOGI(TAG, "Sending start_wardrive command via UART1");
+    ESP_LOGI(TAG, "Sending start_wardrive command via %s", uart1_transport_name());
     uart_send_command("start_wardrive");
     
     // Create modal overlay
@@ -9056,7 +9310,7 @@ static void show_evil_twin_passwords_page(void)
     int empty_reads = 0;
     
     while (retries-- > 0 && empty_reads < 3) {
-        int len = uart_read_bytes(uart_port, rx_buffer + total_len, sizeof(rx_buffer) - total_len - 1, pdMS_TO_TICKS(200));
+        int len = transport_read_bytes(uart_port, rx_buffer + total_len, sizeof(rx_buffer) - total_len - 1, pdMS_TO_TICKS(200));
         if (len > 0) {
             total_len += len;
             empty_reads = 0;  // Reset on successful read
@@ -9344,7 +9598,7 @@ static void karma2_fetch_probes(void)
     vTaskDelay(pdMS_TO_TICKS(300));
     
     while (retries-- > 0) {
-        int len = uart_read_bytes(uart_port, (uint8_t*)rx_buffer + total_len, sizeof(rx_buffer) - total_len - 1, pdMS_TO_TICKS(200));
+        int len = transport_read_bytes(uart_port, (uint8_t*)rx_buffer + total_len, sizeof(rx_buffer) - total_len - 1, pdMS_TO_TICKS(200));
         if (len > 0) {
             total_len += len;
         }
@@ -10598,7 +10852,7 @@ static void parse_probes_from_buffer(char *buffer, const char *source_tag)
 
 static void adhoc_fetch_probes_from_all_uarts(void)
 {
-    ESP_LOGI(TAG, "Fetching probes from UART(s)...");
+    ESP_LOGI(TAG, "Fetching probes from %s/UART2...", uart1_transport_name());
     
     adhoc_probe_count = 0;
     memset(adhoc_probes, 0, sizeof(adhoc_probes));
@@ -10609,8 +10863,8 @@ static void adhoc_fetch_probes_from_all_uarts(void)
     
     // ========== Fetch from UART1 ==========
     uart_flush(UART_NUM);
-    uart_write_bytes(UART_NUM, "list_probes\r\n", 13);
-    ESP_LOGI(TAG, "[UART1] Sent: list_probes");
+    transport_write_bytes(UART_NUM, "list_probes\r\n", 13);
+    ESP_LOGI(TAG, "[%s] Sent: list_probes", uart1_transport_name());
     
     vTaskDelay(pdMS_TO_TICKS(500));
     
@@ -10618,7 +10872,7 @@ static void adhoc_fetch_probes_from_all_uarts(void)
     total_len = 0;
     retries = 10;
     while (retries-- > 0) {
-        int len = uart_read_bytes(UART_NUM, rx_buffer + total_len, sizeof(rx_buffer) - total_len - 1, pdMS_TO_TICKS(200));
+        int len = transport_read_bytes(UART_NUM, rx_buffer + total_len, sizeof(rx_buffer) - total_len - 1, pdMS_TO_TICKS(200));
         if (len > 0) {
             total_len += len;
         }
@@ -10627,13 +10881,13 @@ static void adhoc_fetch_probes_from_all_uarts(void)
     
     if (total_len > 0) {
         rx_buffer[total_len] = '\0';
-        ESP_LOGI(TAG, "[UART1] Received %d bytes", total_len);
-        ESP_LOGI(TAG, "[UART1] Raw response:\n%s", rx_buffer);
+        ESP_LOGI(TAG, "[%s] Received %d bytes", uart1_transport_name(), total_len);
+        ESP_LOGI(TAG, "[%s] Raw response:\n%s", uart1_transport_name(), rx_buffer);
         
         // Parse probes using the same format as karma_show_probes_cb
-        parse_probes_from_buffer(rx_buffer, "UART1");
+        parse_probes_from_buffer(rx_buffer, uart1_transport_name());
     } else {
-        ESP_LOGW(TAG, "[UART1] No response received");
+        ESP_LOGW(TAG, "[%s] No response received", uart1_transport_name());
     }
     
     // ========== Fetch from UART2 if Kraken mode ==========
@@ -10641,7 +10895,7 @@ static void adhoc_fetch_probes_from_all_uarts(void)
         ESP_LOGI(TAG, "Kraken mode - also fetching from UART2");
         
         uart_flush(UART2_NUM);
-        uart_write_bytes(UART2_NUM, "list_probes\r\n", 13);
+        transport_write_bytes(UART2_NUM, "list_probes\r\n", 13);
         ESP_LOGI(TAG, "[UART2] Sent: list_probes");
         
         vTaskDelay(pdMS_TO_TICKS(500));
@@ -10650,7 +10904,7 @@ static void adhoc_fetch_probes_from_all_uarts(void)
         total_len = 0;
         retries = 10;
         while (retries-- > 0) {
-            int len = uart_read_bytes(UART2_NUM, rx_buffer + total_len, sizeof(rx_buffer) - total_len - 1, pdMS_TO_TICKS(200));
+            int len = transport_read_bytes(UART2_NUM, rx_buffer + total_len, sizeof(rx_buffer) - total_len - 1, pdMS_TO_TICKS(200));
             if (len > 0) {
                 total_len += len;
             }
@@ -10711,9 +10965,10 @@ static void adhoc_show_probes_cb(lv_event_t *e)
     // Subtitle showing source
     lv_obj_t *subtitle = lv_label_create(adhoc_probes_popup_obj);
     if (hw_config == 1) {
-        lv_label_set_text_fmt(subtitle, "Found %d unique probes (UART1 + UART2)", adhoc_probe_count);
+        lv_label_set_text_fmt(subtitle, "Found %d unique probes (%s + UART2)",
+                              adhoc_probe_count, uart1_transport_name());
     } else {
-        lv_label_set_text_fmt(subtitle, "Found %d probes (UART1)", adhoc_probe_count);
+        lv_label_set_text_fmt(subtitle, "Found %d probes (%s)", adhoc_probe_count, uart1_transport_name());
     }
     lv_obj_set_style_text_font(subtitle, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(subtitle, lv_color_hex(0x888888), 0);
@@ -11018,7 +11273,7 @@ static void show_adhoc_portal_page(void)
         // Started by
         lv_obj_t *started_label = lv_label_create(status_box);
         lv_label_set_text_fmt(started_label, "Started by: %s", 
-            portal_started_by_uart == 1 ? "UART1" : 
+            portal_started_by_uart == 1 ? uart1_transport_name() : 
             portal_started_by_uart == 2 ? "UART2" : "Internal");
         lv_obj_set_style_text_font(started_label, &lv_font_montserrat_14, 0);
         lv_obj_set_style_text_color(started_label, lv_color_hex(0xAAAAAA), 0);
@@ -11071,16 +11326,18 @@ static void show_adhoc_portal_page(void)
         
         lv_obj_t *info_label = lv_label_create(info_box);
         if (hw_config == 1) {
-            lv_label_set_text(info_label, 
+            lv_label_set_text_fmt(info_label,
                 "Start a Karma captive portal using probe requests\n"
                 "collected by Network Observer.\n\n"
-                "Kraken mode: Probes from both UART1 and UART2\n"
-                "will be combined (duplicates removed).");
+                "Kraken mode: Probes from both %s and UART2\n"
+                "will be combined (duplicates removed).",
+                uart1_transport_name());
         } else {
-            lv_label_set_text(info_label, 
+            lv_label_set_text_fmt(info_label,
                 "Start a Karma captive portal using probe requests\n"
                 "collected by Network Observer.\n\n"
-                "Monster mode: Probes from UART1 only.");
+                "Monster mode: Probes from %s only.",
+                uart1_transport_name());
         }
         lv_obj_set_style_text_font(info_label, &lv_font_montserrat_14, 0);
         lv_obj_set_style_text_color(info_label, lv_color_hex(0xAAAAAA), 0);
@@ -11200,7 +11457,7 @@ static void show_portal_data_page(void)
     int empty_reads = 0;
     
     while (retries-- > 0 && empty_reads < 3) {
-        int len = uart_read_bytes(uart_port, rx_buffer + total_len, sizeof(rx_buffer) - total_len - 1, pdMS_TO_TICKS(200));
+        int len = transport_read_bytes(uart_port, rx_buffer + total_len, sizeof(rx_buffer) - total_len - 1, pdMS_TO_TICKS(200));
         if (len > 0) {
             total_len += len;
             empty_reads = 0;  // Reset on successful read
@@ -11384,7 +11641,7 @@ static void show_handshakes_page(void)
     int empty_reads = 0;
     
     while (retries-- > 0 && empty_reads < 3) {
-        int len = uart_read_bytes(uart_port, rx_buffer + total_len, sizeof(rx_buffer) - total_len - 1, pdMS_TO_TICKS(200));
+        int len = transport_read_bytes(uart_port, rx_buffer + total_len, sizeof(rx_buffer) - total_len - 1, pdMS_TO_TICKS(200));
         if (len > 0) {
             total_len += len;
             empty_reads = 0;  // Reset on successful read
@@ -11565,7 +11822,7 @@ static void deauth_detector_task(void *arg)
     // Determine UART from context
     int task_tab = (ctx == &uart2_ctx) ? 1 : 0;
     uart_port_t uart_port = (task_tab == 1 && uart2_initialized) ? UART2_NUM : UART_NUM;
-    const char *uart_name = (task_tab == 1) ? "UART2" : "UART1";
+    const char *uart_name = tab_transport_name(task_tab);
     
     ESP_LOGI(TAG, "[%s] Deauth detector task started for tab %d", uart_name, task_tab);
     
@@ -11575,7 +11832,7 @@ static void deauth_detector_task(void *arg)
     
     // Use context's flag
     while (ctx && ctx->deauth_detector_running) {
-        int len = uart_read_bytes(uart_port, rx_buffer, sizeof(rx_buffer) - 1, pdMS_TO_TICKS(100));
+        int len = transport_read_bytes(uart_port, rx_buffer, sizeof(rx_buffer) - 1, pdMS_TO_TICKS(100));
         
         if (len > 0) {
             rx_buffer[len] = '\0';
@@ -12004,7 +12261,7 @@ static void airtag_scan_task(void *arg)
     // Determine UART from context
     int task_tab = (ctx == &uart2_ctx) ? 1 : 0;
     uart_port_t uart_port = (task_tab == 1 && uart2_initialized) ? UART2_NUM : UART_NUM;
-    const char *uart_name = (task_tab == 1) ? "UART2" : "UART1";
+    const char *uart_name = tab_transport_name(task_tab);
     
     ESP_LOGI(TAG, "[%s] AirTag scan task started for tab %d", uart_name, task_tab);
     
@@ -12014,7 +12271,7 @@ static void airtag_scan_task(void *arg)
     
     // Use context's flag
     while (ctx && ctx->airtag_scanning) {
-        int len = uart_read_bytes(uart_port, rx_buffer, sizeof(rx_buffer) - 1, pdMS_TO_TICKS(100));
+        int len = transport_read_bytes(uart_port, rx_buffer, sizeof(rx_buffer) - 1, pdMS_TO_TICKS(100));
         
         if (len > 0) {
             rx_buffer[len] = '\0';
@@ -12422,7 +12679,7 @@ static void show_bt_scan_page(void)
     int elapsed_ms = 0;
     
     while (!summary_found && elapsed_ms < timeout_ms && total_len < (int)sizeof(rx_buffer) - 256) {
-        int len = uart_read_bytes(uart_port, rx_buffer + total_len, sizeof(rx_buffer) - total_len - 1, pdMS_TO_TICKS(200));
+        int len = transport_read_bytes(uart_port, rx_buffer + total_len, sizeof(rx_buffer) - total_len - 1, pdMS_TO_TICKS(200));
         if (len > 0) {
             total_len += len;
             rx_buffer[total_len] = '\0';
@@ -12575,7 +12832,7 @@ static void bt_locator_tracking_task(void *arg)
     // Determine UART from context
     int task_tab = (ctx == &uart2_ctx) ? 1 : 0;
     uart_port_t uart_port = (task_tab == 1 && uart2_initialized) ? UART2_NUM : UART_NUM;
-    const char *uart_name = (task_tab == 1) ? "UART2" : "UART1";
+    const char *uart_name = tab_transport_name(task_tab);
     
     ESP_LOGI(TAG, "[%s][BT_LOC] Task started for tab %d, target MAC: '%s'", uart_name, task_tab, bt_locator_target_mac);
     
@@ -12588,7 +12845,7 @@ static void bt_locator_tracking_task(void *arg)
     
     // Use context's flag
     while (ctx && ctx->bt_locator_tracking) {
-        int len = uart_read_bytes(uart_port, rx_buffer, sizeof(rx_buffer) - 1, pdMS_TO_TICKS(100));
+        int len = transport_read_bytes(uart_port, rx_buffer, sizeof(rx_buffer) - 1, pdMS_TO_TICKS(100));
         
         if (len > 0) {
             rx_buffer[len] = '\0';
@@ -12962,8 +13219,8 @@ static void show_global_attacks_page(void)
 //==================================================================================
 
 // Settings popup variables
-static lv_obj_t *settings_popup_overlay = NULL;
-static lv_obj_t *settings_popup_obj = NULL;
+static __attribute__((unused)) lv_obj_t *settings_popup_overlay = NULL;
+static __attribute__((unused)) lv_obj_t *settings_popup_obj = NULL;
 
 // NVS keys (hw_config and uart1_pins removed - now auto-detected)
 #define NVS_NAMESPACE "settings"
@@ -13051,7 +13308,7 @@ static void init_uart2(void)
 }
 
 // Deinitialize UART2 when switching to Monster mode
-static void deinit_uart2(void)
+static __attribute__((unused)) void deinit_uart2(void)
 {
     if (!uart2_initialized) {
         return;
@@ -13076,7 +13333,7 @@ static bool ping_uart(uart_port_t uart_port, const char *uart_name)
     
     // Send ping command
     const char *ping_cmd = "ping\r\n";
-    uart_write_bytes(uart_port, ping_cmd, strlen(ping_cmd));
+    transport_write_bytes(uart_port, ping_cmd, strlen(ping_cmd));
     ESP_LOGI(TAG, "[%s] Sent ping", uart_name);
     
     // Wait for pong response (up to 500ms)
@@ -13085,7 +13342,7 @@ static bool ping_uart(uart_port_t uart_port, const char *uart_name)
     int64_t timeout_us = 500000; // 500ms
     
     while ((esp_timer_get_time() - start_time) < timeout_us) {
-        int len = uart_read_bytes(uart_port, rx_buffer + total_len, 
+        int len = transport_read_bytes(uart_port, rx_buffer + total_len, 
                                    sizeof(rx_buffer) - total_len - 1, pdMS_TO_TICKS(50));
         if (len > 0) {
             total_len += len;
@@ -13108,29 +13365,39 @@ static bool ping_uart(uart_port_t uart_port, const char *uart_name)
 static void detect_boards(void)
 {
     ESP_LOGI(TAG, "=== Starting board detection ===");
-    
-    // Ping both UARTs
-    uart1_detected = ping_uart(UART_NUM, "UART1");
+
+    // Ensure USB CDC host is started before detection
+    usb_transport_init();
+
+    // Ping UART1 unless USB CDC is already connected
+    if (usb_cdc_connected) {
+        uart1_detected = true;
+        ESP_LOGI(TAG, "[USB] CDC connected - treating transport as present");
+    } else {
+        uart1_detected = ping_uart(UART_NUM, uart1_transport_name());
+    }
     uart2_detected = ping_uart(UART2_NUM, "UART2");
     
     // Determine hardware configuration
     if (uart1_detected && uart2_detected) {
         hw_config = 1;  // Kraken mode - both UARTs
-        ESP_LOGI(TAG, "Hardware config: Kraken (UART1 + UART2)");
+        ESP_LOGI(TAG, "Hardware config: Kraken (%s + UART2)", uart1_transport_name());
     } else if (uart1_detected) {
         hw_config = 0;  // Monster mode - only UART1
-        ESP_LOGI(TAG, "Hardware config: Monster (UART1 only)");
+        ESP_LOGI(TAG, "Hardware config: Monster (%s only)", uart1_transport_name());
     } else if (uart2_detected) {
         // Only UART2 detected - treat as Monster but log warning
         hw_config = 0;
         ESP_LOGW(TAG, "Only UART2 detected - unusual config, treating as Monster");
     } else {
         hw_config = 0;  // No boards detected
-        ESP_LOGW(TAG, "No boards detected on either UART!");
+        ESP_LOGW(TAG, "No boards detected on either port!");
     }
     
-    ESP_LOGI(TAG, "=== Board detection complete: UART1=%s, UART2=%s ===",
-             uart1_detected ? "YES" : "NO", uart2_detected ? "YES" : "NO");
+    ESP_LOGI(TAG, "=== Board detection complete: %s=%s, UART2=%s ===",
+             uart1_transport_name(),
+             uart1_detected ? "YES" : "NO",
+             uart2_detected ? "YES" : "NO");
 }
 
 // Forward declarations for popup
@@ -13327,7 +13594,7 @@ static void __attribute__((unused)) start_kraken_scanning(void)
 }
 
 // Stop Kraken background scanning
-static void stop_kraken_scanning(void)
+static __attribute__((unused)) void stop_kraken_scanning(void)
 {
     if (!kraken_scanning_active) {
         return;
@@ -13416,7 +13683,7 @@ static void kraken_scan_task(void *arg)
     while (!scan_complete && kraken_scanning_active && 
            (xTaskGetTickCount() - start_time) < timeout_ticks) {
         
-        int len = uart_read_bytes(UART2_NUM, (uint8_t*)rx_buffer, UART_BUF_SIZE - 1, pdMS_TO_TICKS(100));
+        int len = transport_read_bytes(UART2_NUM, (uint8_t*)rx_buffer, UART_BUF_SIZE - 1, pdMS_TO_TICKS(100));
         
         if (len > 0) {
             rx_buffer[len] = '\0';
@@ -13515,7 +13782,7 @@ static void kraken_scan_task(void *arg)
         timeout_ticks = pdMS_TO_TICKS(5000);  // 5 second timeout for response
         
         while ((xTaskGetTickCount() - start_time) < timeout_ticks && kraken_scanning_active) {
-            int len = uart_read_bytes(UART2_NUM, (uint8_t*)rx_buffer, UART_BUF_SIZE - 1, pdMS_TO_TICKS(100));
+            int len = transport_read_bytes(UART2_NUM, (uint8_t*)rx_buffer, UART_BUF_SIZE - 1, pdMS_TO_TICKS(100));
             
             if (len > 0) {
                 rx_buffer[len] = '\0';
@@ -13602,8 +13869,8 @@ static int read_channel_time_from_uart(uart_port_t uart_port, const char *param)
     
     // Flush and send command
     uart_flush(uart_port);
-    uart_write_bytes(uart_port, cmd, strlen(cmd));
-    uart_write_bytes(uart_port, "\r\n", 2);
+    transport_write_bytes(uart_port, cmd, strlen(cmd));
+    transport_write_bytes(uart_port, "\r\n", 2);
     ESP_LOGI(TAG, "[UART%d] Sent command: %s", uart_port == UART_NUM ? 1 : 2, cmd);
     
     // Read response (numeric value expected)
@@ -13612,7 +13879,7 @@ static int read_channel_time_from_uart(uart_port_t uart_port, const char *param)
     int retries = 5;
     
     while (retries-- > 0 && total_len < (int)sizeof(rx_buffer) - 1) {
-        int len = uart_read_bytes(uart_port, rx_buffer + total_len, sizeof(rx_buffer) - total_len - 1, pdMS_TO_TICKS(100));
+        int len = transport_read_bytes(uart_port, rx_buffer + total_len, sizeof(rx_buffer) - total_len - 1, pdMS_TO_TICKS(100));
         if (len > 0) {
             total_len += len;
         }
@@ -13674,10 +13941,11 @@ static void scan_time_save_cb(lv_event_t *e)
     int min_val = lv_spinbox_get_value(scan_time_min_spinbox);
     int max_val = lv_spinbox_get_value(scan_time_max_spinbox);
     
-    // Validation for UART1
+    // Validation for UART1/USB
     if (min_val >= max_val) {
         if (scan_time_error_label) {
-            lv_label_set_text(scan_time_error_label, "Error: UART1 min must be less than max");
+            lv_label_set_text_fmt(scan_time_error_label, "Error: %s min must be less than max",
+                                  uart1_transport_name());
             lv_obj_set_style_text_color(scan_time_error_label, COLOR_MATERIAL_RED, 0);
         }
         return;
@@ -13707,7 +13975,7 @@ static void scan_time_save_cb(lv_event_t *e)
     snprintf(cmd, sizeof(cmd), "channel_time set max %d", max_val);
     uart_send_command(cmd);
     
-    ESP_LOGI(TAG, "UART1 scan time set: min=%d, max=%d", min_val, max_val);
+    ESP_LOGI(TAG, "%s scan time set: min=%d, max=%d", uart1_transport_name(), min_val, max_val);
     
     // Send UART2 commands if Kraken mode
     if (hw_config == 1 && uart2_initialized && scan_time_uart2_min_spinbox && scan_time_uart2_max_spinbox) {
@@ -13804,8 +14072,8 @@ static void show_scan_time_popup(void)
     
     bool is_kraken = (hw_config == 1);
     
-    // Read current values from UART1
-    ESP_LOGI(TAG, "Reading channel_time values from UART1...");
+    // Read current values from UART1/USB
+    ESP_LOGI(TAG, "Reading channel_time values from %s...", uart1_transport_name());
     int uart1_min = read_channel_time_from_uart(UART_NUM, "min");
     int uart1_max = read_channel_time_from_uart(UART_NUM, "max");
     
@@ -13855,7 +14123,7 @@ static void show_scan_time_popup(void)
     if (is_kraken) {
         // ========== UART1 Section ==========
         lv_obj_t *uart1_header = lv_label_create(scan_time_popup_obj);
-        lv_label_set_text(uart1_header, "UART1");
+        lv_label_set_text_fmt(uart1_header, "%s", uart1_transport_name());
         lv_obj_set_style_text_font(uart1_header, &lv_font_montserrat_16, 0);
         lv_obj_set_style_text_color(uart1_header, COLOR_MATERIAL_BLUE, 0);
         

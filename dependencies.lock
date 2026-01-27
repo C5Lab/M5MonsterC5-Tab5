@@ -154,6 +154,25 @@ dependencies:
       registry_url: https://components.espressif.com/
       type: service
     version: 1.2.2
+  espressif/iot_usbh_cdc:
+    component_hash: 
+      3cd0f9f63fba11ac2903b61d0497f19a39f2f0286e58e9d73286ea8edd0fade9
+    dependencies:
+    - name: espressif/cmake_utilities
+      registry_url: https://components.espressif.com
+      require: private
+      version: '*'
+    - name: idf
+      require: private
+      version: '>=4.4.1'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    targets:
+    - esp32s2
+    - esp32s3
+    - esp32p4
+    version: 2.0.1
   espressif/wifi_remote_over_eppp:
     component_hash: 
       e1b4c485ed5afe36615b9b555dfdcbe4be33898dc3732b5bedf235bba45bd286
@@ -189,8 +208,9 @@ direct_dependencies:
 - espressif/esp_lcd_touch_gt911
 - espressif/esp_lcd_touch_st7123
 - espressif/esp_wifi_remote
+- espressif/iot_usbh_cdc
 - idf
 - lvgl/lvgl
-manifest_hash: 7678bf470f309226af94a8fe917d03f8da00b163ab34d9c9b53b70138df138de
+manifest_hash: 0d6072c61c7338e4aaf0ebf92e8285e4c1aedf9acf58d4a5688b55e5c1363b98
 target: esp32p4
 version: 2.0.0
