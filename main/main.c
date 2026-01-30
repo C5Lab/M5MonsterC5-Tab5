@@ -423,6 +423,9 @@ typedef struct {
     
     // Transport type for this tab context
     uint8_t transport_kind;  // 0=Grove, 1=USB, 2=MBus, 3=INTERNAL
+    
+    // SD card presence (detected via list_sd command)
+    bool sd_card_present;  // true if SD card detected on this UART/device
 } tab_context_t;
 
 typedef enum {
@@ -502,6 +505,9 @@ static bool grove_detected = false;
 static bool usb_detected = false;
 static bool uart1_detected = false;  // Derived: Grove or USB
 static bool mbus_detected = false;
+
+// SD card presence on Tab5 itself (checked via /sdcard mount point)
+static bool internal_sd_present = false;
 static bool board_detection_popup_open = false;
 static lv_timer_t *board_detect_retry_timer = NULL;
 static lv_obj_t *board_detect_popup = NULL;
@@ -814,6 +820,13 @@ static lv_obj_t *blackout_popup_obj = NULL;
 static lv_obj_t *snifferdog_popup_overlay = NULL;
 static lv_obj_t *snifferdog_popup_obj = NULL;
 
+// LVGL UI elements - SD card warning popup
+static lv_obj_t *sd_warning_popup_overlay = NULL;
+static lv_obj_t *sd_warning_popup_obj = NULL;
+typedef void (*sd_warning_continue_cb_t)(void);
+static sd_warning_continue_cb_t sd_warning_pending_action = NULL;
+static bool sd_warning_acknowledged = false;  // Set to true when user clicks "Continue Anyway"
+
 // LVGL UI elements - Global Handshaker popup
 static lv_obj_t *global_handshaker_popup_overlay = NULL;
 static lv_obj_t *global_handshaker_popup_obj = NULL;
@@ -1058,6 +1071,7 @@ static void scan_deauth_popup_close_cb(lv_event_t *e);
 static void fetch_html_files_from_sd(void);
 static void show_evil_twin_popup(void);
 static void evil_twin_start_cb(lv_event_t *e);
+static void do_evil_twin_start(void);
 static void evil_twin_close_cb(lv_event_t *e);
 static void evil_twin_monitor_task(void *arg);
 static void show_sae_popup(int network_idx);
@@ -1093,6 +1107,7 @@ static void karma_show_probes_cb(lv_event_t *e);
 static void karma_probe_click_cb(lv_event_t *e);
 static void karma_html_popup_close_cb(lv_event_t *e);
 static void karma_html_select_cb(lv_event_t *e);
+static void do_karma_attack_start(void);
 static void karma_attack_popup_close_cb(lv_event_t *e);
 static void karma_monitor_task(void *arg);
 
@@ -1138,6 +1153,8 @@ static void init_uart2(void);
 static void deinit_uart2(void);
 static void load_red_team_from_nvs(void);
 static void detect_boards(void);
+static bool check_sd_card_for_tab(tab_id_t tab);
+static void check_all_sd_cards(void);
 static void show_no_board_popup(void);
 static void board_detect_retry_cb(lv_timer_t *timer);
 static void board_detect_popup_close_cb(lv_event_t *e);
@@ -1164,6 +1181,10 @@ static void blackout_stop_cb(lv_event_t *e);
 static void show_snifferdog_confirm_popup(void);
 static void snifferdog_confirm_yes_cb(lv_event_t *e);
 static void snifferdog_confirm_no_cb(lv_event_t *e);
+static void show_sd_warning_popup(sd_warning_continue_cb_t continue_action);
+static void sd_warning_continue_cb(lv_event_t *e);
+static void sd_warning_cancel_cb(lv_event_t *e);
+static bool current_tab_has_sd_card(void);
 static void show_snifferdog_active_popup(void);
 static void snifferdog_stop_cb(lv_event_t *e);
 static void show_global_handshaker_confirm_popup(void);
@@ -1174,10 +1195,12 @@ static void global_handshaker_stop_cb(lv_event_t *e);
 static void global_handshaker_monitor_task(void *arg);
 static void show_phishing_portal_popup(void);
 static void phishing_portal_start_cb(lv_event_t *e);
+static void do_phishing_portal_start(void);
 static void phishing_portal_close_cb(lv_event_t *e);
 static void phishing_portal_stop_cb(lv_event_t *e);
 static void phishing_portal_monitor_task(void *arg);
 static void show_wardrive_popup(void);
+static void do_wardrive_start(void);
 static void wardrive_stop_cb(lv_event_t *e);
 static void wardrive_monitor_task(void *arg);
 static void show_compromised_data_page(void);
@@ -2552,6 +2575,9 @@ static void detection_complete_cb(lv_timer_t *timer)
     // Run board detection
     detect_boards();
     
+    // Check SD card presence on all detected devices
+    check_all_sd_cards();
+    
     ESP_LOGI(TAG, "Detection complete: uart1=%d, mbus=%d, grove=%d, usb=%d",
              uart1_detected, mbus_detected, grove_detected, usb_detected);
     
@@ -3447,6 +3473,14 @@ static void create_tab_bar(void)
         lv_label_set_text(grove_label, "GROVE");
         lv_obj_set_style_text_font(grove_label, &lv_font_montserrat_14, 0);
         lv_obj_set_style_text_color(grove_label, lv_color_hex(0xFFFFFF), 0);
+        
+        // SD card warning icon (if no SD card)
+        if (!grove_ctx.sd_card_present) {
+            lv_obj_t *sd_warn = lv_label_create(grove_content);
+            lv_label_set_text(sd_warn, LV_SYMBOL_WARNING);
+            lv_obj_set_style_text_font(sd_warn, &lv_font_montserrat_14, 0);
+            lv_obj_set_style_text_color(sd_warn, lv_color_hex(0xFF5722), 0);  // Orange warning
+        }
     }
 
     // ========== USB tab (only if detected) ==========
@@ -3478,6 +3512,14 @@ static void create_tab_bar(void)
         lv_label_set_text(usb_label, "USB");
         lv_obj_set_style_text_font(usb_label, &lv_font_montserrat_14, 0);
         lv_obj_set_style_text_color(usb_label, lv_color_hex(0xFFFFFF), 0);
+        
+        // SD card warning icon (if no SD card)
+        if (!usb_ctx.sd_card_present) {
+            lv_obj_t *sd_warn = lv_label_create(usb_content);
+            lv_label_set_text(sd_warn, LV_SYMBOL_WARNING);
+            lv_obj_set_style_text_font(sd_warn, &lv_font_montserrat_14, 0);
+            lv_obj_set_style_text_color(sd_warn, lv_color_hex(0xFF5722), 0);  // Orange warning
+        }
     }
     
     // ========== MBus tab (only if MBus detected) ==========
@@ -3509,6 +3551,14 @@ static void create_tab_bar(void)
         lv_label_set_text(mbus_label, "MBUS");
         lv_obj_set_style_text_font(mbus_label, &lv_font_montserrat_14, 0);
         lv_obj_set_style_text_color(mbus_label, lv_color_hex(0xFFFFFF), 0);
+        
+        // SD card warning icon (if no SD card)
+        if (!mbus_ctx.sd_card_present) {
+            lv_obj_t *sd_warn = lv_label_create(mbus_content);
+            lv_label_set_text(sd_warn, LV_SYMBOL_WARNING);
+            lv_obj_set_style_text_font(sd_warn, &lv_font_montserrat_14, 0);
+            lv_obj_set_style_text_color(sd_warn, lv_color_hex(0xFF5722), 0);  // Orange warning
+        }
     }
     
     // ========== INTERNAL tab ==========
@@ -3539,6 +3589,14 @@ static void create_tab_bar(void)
     lv_label_set_text(internal_label, "INTERNAL");
     lv_obj_set_style_text_font(internal_label, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(internal_label, lv_color_hex(0xFFFFFF), 0);
+    
+    // SD card warning icon (if no SD card on Tab5)
+    if (!internal_sd_present) {
+        lv_obj_t *sd_warn = lv_label_create(internal_content);
+        lv_label_set_text(sd_warn, LV_SYMBOL_WARNING);
+        lv_obj_set_style_text_font(sd_warn, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(sd_warn, lv_color_hex(0xFF5722), 0);  // Orange warning
+    }
     
     // Apply active tab styling
     update_tab_styles();
@@ -3664,6 +3722,11 @@ static void attack_tile_event_cb(lv_event_t *e)
     
     // Handle Evil Twin attack
     if (strcmp(attack_name, "Evil Twin") == 0) {
+        // Check SD card before opening Evil Twin popup
+        if (!current_tab_has_sd_card()) {
+            show_sd_warning_popup(show_evil_twin_popup);
+            return;
+        }
         show_evil_twin_popup();
         return;
     }
@@ -5264,11 +5327,9 @@ static void karma_html_popup_close_cb(lv_event_t *e)
     }
 }
 
-// HTML select callback - start karma attack
-static void karma_html_select_cb(lv_event_t *e)
+// Karma attack actual start logic
+static void do_karma_attack_start(void)
 {
-    (void)e;
-    
     if (!karma_html_dropdown || karma_selected_probe_idx < 0) return;
     
     int html_idx = lv_dropdown_get_selected(karma_html_dropdown);
@@ -5369,6 +5430,20 @@ static void karma_html_select_cb(lv_event_t *e)
     }
     
     xTaskCreate(karma_monitor_task, "karma_mon", 4096, (void*)ctx, 5, &karma_monitor_task_handle);
+}
+
+// HTML select callback - start karma attack
+static void karma_html_select_cb(lv_event_t *e)
+{
+    (void)e;
+    
+    // Check SD card presence
+    if (!current_tab_has_sd_card() && !sd_warning_acknowledged) {
+        show_sd_warning_popup(do_karma_attack_start);
+        return;
+    }
+    
+    do_karma_attack_start();
 }
 
 // Karma attack popup close callback
@@ -5875,11 +5950,9 @@ static void evil_twin_monitor_task(void *arg)
     vTaskDelete(NULL);
 }
 
-// Evil Twin start button callback
-static void evil_twin_start_cb(lv_event_t *e)
+// Evil Twin actual start logic (called from callback or SD warning continue)
+static void do_evil_twin_start(void)
 {
-    (void)e;
-    
     tab_context_t *ctx = get_current_ctx();
     if (!ctx) return;
     
@@ -5971,6 +6044,14 @@ static void evil_twin_start_cb(lv_event_t *e)
     ctx->evil_twin_monitoring = true;
     
     xTaskCreate(evil_twin_monitor_task, "et_monitor", 4096, (void*)ctx, 5, &evil_twin_monitor_task_handle);
+}
+
+// Evil Twin start button callback
+static void evil_twin_start_cb(lv_event_t *e)
+{
+    (void)e;
+    // SD check is done before opening popup, so we can start directly
+    do_evil_twin_start();
 }
 
 // Show Evil Twin popup with dropdowns
@@ -8676,6 +8757,153 @@ static void snifferdog_confirm_no_cb(lv_event_t *e)
     close_snifferdog_popup();
 }
 
+// ============================================================================
+// SD CARD WARNING POPUP
+// ============================================================================
+
+// Helper to check if current tab has SD card
+static bool current_tab_has_sd_card(void)
+{
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx) return false;
+    
+    if (tab_is_internal(current_tab)) {
+        return internal_sd_present;
+    }
+    return ctx->sd_card_present;
+}
+
+// Close SD warning popup
+static void close_sd_warning_popup(void)
+{
+    if (sd_warning_popup_overlay) {
+        lv_obj_del(sd_warning_popup_overlay);
+        sd_warning_popup_overlay = NULL;
+        sd_warning_popup_obj = NULL;
+    }
+    sd_warning_pending_action = NULL;
+}
+
+// Callback when user clicks "Continue Anyway" on SD warning
+static void sd_warning_continue_cb(lv_event_t *e)
+{
+    (void)e;
+    ESP_LOGI(TAG, "User chose to continue without SD card");
+    
+    // Set flag so that the action can proceed without showing warning again
+    sd_warning_acknowledged = true;
+    
+    sd_warning_continue_cb_t action = sd_warning_pending_action;
+    close_sd_warning_popup();
+    
+    // Execute the pending action if set
+    if (action) {
+        action();
+    }
+    
+    // Reset flag after action completes
+    sd_warning_acknowledged = false;
+}
+
+// Callback when user clicks "Cancel" on SD warning
+static void sd_warning_cancel_cb(lv_event_t *e)
+{
+    (void)e;
+    ESP_LOGI(TAG, "User cancelled action due to missing SD card");
+    close_sd_warning_popup();
+}
+
+// Show SD card warning popup
+// continue_action: callback to execute if user clicks "Continue Anyway"
+static void show_sd_warning_popup(sd_warning_continue_cb_t continue_action)
+{
+    if (sd_warning_popup_obj != NULL) return;  // Already showing
+    
+    lv_obj_t *container = get_current_tab_container();
+    if (!container) return;
+    
+    // Store the pending action
+    sd_warning_pending_action = continue_action;
+    
+    // Create modal overlay
+    sd_warning_popup_overlay = lv_obj_create(container);
+    lv_obj_remove_style_all(sd_warning_popup_overlay);
+    lv_obj_set_size(sd_warning_popup_overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(sd_warning_popup_overlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(sd_warning_popup_overlay, LV_OPA_50, 0);
+    lv_obj_clear_flag(sd_warning_popup_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(sd_warning_popup_overlay, LV_OBJ_FLAG_CLICKABLE);
+    
+    // Create popup
+    sd_warning_popup_obj = lv_obj_create(sd_warning_popup_overlay);
+    lv_obj_set_size(sd_warning_popup_obj, 500, 320);
+    lv_obj_center(sd_warning_popup_obj);
+    lv_obj_set_style_bg_color(sd_warning_popup_obj, lv_color_hex(0x1A1A2A), 0);
+    lv_obj_set_style_border_color(sd_warning_popup_obj, lv_color_hex(0xFF5722), 0);  // Orange
+    lv_obj_set_style_border_width(sd_warning_popup_obj, 3, 0);
+    lv_obj_set_style_radius(sd_warning_popup_obj, 16, 0);
+    lv_obj_set_style_shadow_width(sd_warning_popup_obj, 30, 0);
+    lv_obj_set_style_shadow_color(sd_warning_popup_obj, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_shadow_opa(sd_warning_popup_obj, LV_OPA_50, 0);
+    lv_obj_set_style_pad_all(sd_warning_popup_obj, 20, 0);
+    lv_obj_set_flex_flow(sd_warning_popup_obj, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(sd_warning_popup_obj, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(sd_warning_popup_obj, 16, 0);
+    lv_obj_clear_flag(sd_warning_popup_obj, LV_OBJ_FLAG_SCROLLABLE);
+    
+    // Warning icon
+    lv_obj_t *icon_label = lv_label_create(sd_warning_popup_obj);
+    lv_label_set_text(icon_label, LV_SYMBOL_WARNING);
+    lv_obj_set_style_text_font(icon_label, &lv_font_montserrat_44, 0);
+    lv_obj_set_style_text_color(icon_label, lv_color_hex(0xFF5722), 0);  // Orange
+    
+    // Title
+    lv_obj_t *title = lv_label_create(sd_warning_popup_obj);
+    lv_label_set_text(title, "NO SD CARD DETECTED");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_22, 0);
+    lv_obj_set_style_text_color(title, lv_color_hex(0xFF5722), 0);
+    
+    // Warning message
+    lv_obj_t *message = lv_label_create(sd_warning_popup_obj);
+    lv_label_set_text(message, "This feature requires SD card\nfor HTML portal files.\nContinue anyway?");
+    lv_obj_set_style_text_font(message, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_color(message, lv_color_hex(0xCCCCCC), 0);
+    lv_obj_set_style_text_align(message, LV_TEXT_ALIGN_CENTER, 0);
+    
+    // Button container
+    lv_obj_t *btn_container = lv_obj_create(sd_warning_popup_obj);
+    lv_obj_remove_style_all(btn_container);
+    lv_obj_set_size(btn_container, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(btn_container, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btn_container, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(btn_container, 30, 0);
+    lv_obj_set_style_pad_top(btn_container, 10, 0);
+    
+    // Cancel button (green, safe option)
+    lv_obj_t *cancel_btn = lv_btn_create(btn_container);
+    lv_obj_set_size(cancel_btn, 120, 50);
+    lv_obj_set_style_bg_color(cancel_btn, COLOR_MATERIAL_GREEN, 0);
+    lv_obj_set_style_radius(cancel_btn, 8, 0);
+    lv_obj_add_event_cb(cancel_btn, sd_warning_cancel_cb, LV_EVENT_CLICKED, NULL);
+    
+    lv_obj_t *cancel_label = lv_label_create(cancel_btn);
+    lv_label_set_text(cancel_label, "Cancel");
+    lv_obj_set_style_text_font(cancel_label, &lv_font_montserrat_18, 0);
+    lv_obj_center(cancel_label);
+    
+    // Continue button (orange, risky option)
+    lv_obj_t *continue_btn = lv_btn_create(btn_container);
+    lv_obj_set_size(continue_btn, 150, 50);
+    lv_obj_set_style_bg_color(continue_btn, lv_color_hex(0xFF5722), 0);  // Orange
+    lv_obj_set_style_radius(continue_btn, 8, 0);
+    lv_obj_add_event_cb(continue_btn, sd_warning_continue_cb, LV_EVENT_CLICKED, NULL);
+    
+    lv_obj_t *continue_label = lv_label_create(continue_btn);
+    lv_label_set_text(continue_label, "Continue");
+    lv_obj_set_style_text_font(continue_label, &lv_font_montserrat_18, 0);
+    lv_obj_center(continue_label);
+}
+
 // Callback when user clicks "Stop" during snifferdog attack
 static void snifferdog_stop_cb(lv_event_t *e)
 {
@@ -9364,11 +9592,9 @@ static void show_phishing_portal_active_popup(void)
     xTaskCreate(phishing_portal_monitor_task, "pp_monitor", 4096, NULL, 5, &phishing_portal_monitor_task_handle);
 }
 
-// Callback when user clicks OK to start portal
-static void phishing_portal_start_cb(lv_event_t *e)
+// Phishing Portal actual start logic
+static void do_phishing_portal_start(void)
 {
-    (void)e;
-    
     // Get SSID from textarea
     const char *ssid = lv_textarea_get_text(phishing_portal_ssid_textarea);
     if (ssid == NULL || strlen(ssid) == 0) {
@@ -9399,6 +9625,14 @@ static void phishing_portal_start_cb(lv_event_t *e)
     
     // Show active popup
     show_phishing_portal_active_popup();
+}
+
+// Callback when user clicks OK to start portal
+static void phishing_portal_start_cb(lv_event_t *e)
+{
+    (void)e;
+    // SD check is done before opening popup, so we can start directly
+    do_phishing_portal_start();
 }
 
 // Keyboard event handler - hide keyboard when done
@@ -9672,8 +9906,8 @@ static void wardrive_monitor_task(void *arg)
     vTaskDelete(NULL);
 }
 
-// Show wardrive popup
-static void show_wardrive_popup(void)
+// Wardrive actual start logic
+static void do_wardrive_start(void)
 {
     if (wardrive_popup_obj != NULL) return;
     
@@ -9756,6 +9990,13 @@ static void show_wardrive_popup(void)
     // Start monitoring task
     wardrive_monitoring = true;
     xTaskCreate(wardrive_monitor_task, "wd_monitor", 4096, NULL, 5, &wardrive_monitor_task_handle);
+}
+
+// Show wardrive popup
+static void show_wardrive_popup(void)
+{
+    // SD check is done before calling this function
+    do_wardrive_start();
 }
 
 //==================================================================================
@@ -13763,12 +14004,22 @@ static void global_attack_tile_event_cb(lv_event_t *e)
     
     // Handle Phishing Portal attack
     if (strcmp(attack_name, "Portal") == 0) {
+        // Check SD card before opening Phishing Portal popup
+        if (!current_tab_has_sd_card()) {
+            show_sd_warning_popup(show_phishing_portal_popup);
+            return;
+        }
         show_phishing_portal_popup();
         return;
     }
     
     // Handle Wardrive attack
     if (strcmp(attack_name, "Wardrive") == 0) {
+        // Check SD card before opening Wardrive popup
+        if (!current_tab_has_sd_card()) {
+            show_sd_warning_popup(do_wardrive_start);
+            return;
+        }
         show_wardrive_popup();
         return;
     }
@@ -14089,6 +14340,93 @@ static void detect_boards(void)
              grove_detected ? "YES" : "NO",
              usb_detected ? "YES" : "NO",
              mbus_detected ? "YES" : "NO");
+}
+
+// Check SD card presence on a specific tab by sending 'list_sd' command
+// Returns true if SD card is present, false otherwise
+static bool check_sd_card_for_tab(tab_id_t tab)
+{
+    if (tab == TAB_INTERNAL) {
+        // For internal tab, check if Tab5's SD card is mounted
+        struct stat st;
+        bool mounted = (stat("/sdcard", &st) == 0);
+        ESP_LOGI(TAG, "[INTERNAL] SD card %s", mounted ? "mounted" : "NOT mounted");
+        return mounted;
+    }
+    
+    // Determine UART port for this tab
+    uart_port_t uart_port = uart_port_for_tab(tab);
+    const char *tab_name = tab_transport_name(tab);
+    
+    ESP_LOGI(TAG, "[%s] Checking SD card presence...", tab_name);
+    
+    // Send list_sd command
+    const char *cmd = "list_sd\r\n";
+    transport_write_bytes_tab(tab, uart_port, cmd, strlen(cmd));
+    
+    // Read response with timeout (up to 2 seconds, SD init can be slow)
+    static char rx_buffer[512];
+    int total_len = 0;
+    uint32_t start_time = xTaskGetTickCount();
+    uint32_t timeout_ticks = pdMS_TO_TICKS(2000);
+    
+    while ((xTaskGetTickCount() - start_time) < timeout_ticks && total_len < (int)sizeof(rx_buffer) - 1) {
+        int len = transport_read_bytes_tab(tab, uart_port, rx_buffer + total_len, 
+                                           sizeof(rx_buffer) - 1 - total_len, pdMS_TO_TICKS(100));
+        if (len > 0) {
+            total_len += len;
+            rx_buffer[total_len] = '\0';
+            
+            // Check for success or failure patterns
+            if (strstr(rx_buffer, "HTML files found on SD card") != NULL) {
+                ESP_LOGI(TAG, "[%s] SD card detected (HTML files found)", tab_name);
+                return true;
+            }
+            if (strstr(rx_buffer, "Failed to initialize SD card") != NULL) {
+                ESP_LOGW(TAG, "[%s] SD card NOT detected (init failed)", tab_name);
+                return false;
+            }
+        }
+    }
+    
+    // Timeout without clear response - assume no SD
+    ESP_LOGW(TAG, "[%s] SD card check timeout, assuming not present", tab_name);
+    return false;
+}
+
+// Check SD cards on all detected UARTs and Tab5 internal
+static void check_all_sd_cards(void)
+{
+    ESP_LOGI(TAG, "=== Checking SD cards ===");
+    
+    // Check each detected UART
+    if (grove_detected) {
+        grove_ctx.sd_card_present = check_sd_card_for_tab(TAB_GROVE);
+    } else {
+        grove_ctx.sd_card_present = false;
+    }
+    
+    if (usb_detected) {
+        usb_ctx.sd_card_present = check_sd_card_for_tab(TAB_USB);
+    } else {
+        usb_ctx.sd_card_present = false;
+    }
+    
+    if (mbus_detected) {
+        mbus_ctx.sd_card_present = check_sd_card_for_tab(TAB_MBUS);
+    } else {
+        mbus_ctx.sd_card_present = false;
+    }
+    
+    // Check Tab5's own SD card
+    internal_sd_present = check_sd_card_for_tab(TAB_INTERNAL);
+    internal_ctx.sd_card_present = internal_sd_present;
+    
+    ESP_LOGI(TAG, "=== SD card check complete: Grove=%s, USB=%s, MBus=%s, Internal=%s ===",
+             grove_ctx.sd_card_present ? "YES" : "NO",
+             usb_ctx.sd_card_present ? "YES" : "NO",
+             mbus_ctx.sd_card_present ? "YES" : "NO",
+             internal_sd_present ? "YES" : "NO");
 }
 
 // Forward declarations for popup
