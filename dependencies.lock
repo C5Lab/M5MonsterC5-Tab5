@@ -1,7 +1,6 @@
 dependencies:
   espressif/cmake_utilities:
-    component_hash: 
-      351350613ceafba240b761b4ea991e0f231ac7a9f59a9ee901f751bddc0bb18f
+    component_hash: 351350613ceafba240b761b4ea991e0f231ac7a9f59a9ee901f751bddc0bb18f
     dependencies:
     - name: idf
       require: private
@@ -11,8 +10,7 @@ dependencies:
       type: service
     version: 0.5.3
   espressif/eppp_link:
-    component_hash: 
-      9472e6825f4bb71eca2b39cf1bc92659c1ac60bfd7416560ad033a7dd8641b17
+    component_hash: 9472e6825f4bb71eca2b39cf1bc92659c1ac60bfd7416560ad033a7dd8641b17
     dependencies:
     - name: espressif/esp_serial_slave_link
       registry_url: https://components.espressif.com
@@ -26,8 +24,7 @@ dependencies:
       type: service
     version: 1.1.4
   espressif/esp_codec_dev:
-    component_hash: 
-      0d9e9bc288156eb55f79338d312e1ebf8c9dfbd5e7d13ef0f20ccb031b4e15cf
+    component_hash: 0d9e9bc288156eb55f79338d312e1ebf8c9dfbd5e7d13ef0f20ccb031b4e15cf
     dependencies:
     - name: idf
       require: private
@@ -37,8 +34,7 @@ dependencies:
       type: service
     version: 1.5.4
   espressif/esp_hosted:
-    component_hash: 
-      57fb1a7e106d8a1a13fafa535ea63a2e57a94877a789690fb24d93ef111d5ec5
+    component_hash: 57fb1a7e106d8a1a13fafa535ea63a2e57a94877a789690fb24d93ef111d5ec5
     dependencies:
     - name: idf
       require: private
@@ -48,8 +44,7 @@ dependencies:
       type: service
     version: 2.8.5
   espressif/esp_lcd_ili9881c:
-    component_hash: 
-      0288df12755c95d406ccea245a427595f314df0b14a61846286d926ea6f3698e
+    component_hash: 0288df12755c95d406ccea245a427595f314df0b14a61846286d926ea6f3698e
     dependencies:
     - name: idf
       require: private
@@ -61,8 +56,7 @@ dependencies:
     - esp32p4
     version: 1.1.0
   espressif/esp_lcd_st7703:
-    component_hash: 
-      c0453f7558215700729c1d6540915ba49ec2c4daffb895fae84c534da5c74672
+    component_hash: c0453f7558215700729c1d6540915ba49ec2c4daffb895fae84c534da5c74672
     dependencies:
     - name: idf
       require: private
@@ -78,8 +72,7 @@ dependencies:
     - esp32p4
     version: 1.0.5
   espressif/esp_lcd_touch:
-    component_hash: 
-      3f85a7d95af876f1a6ecca8eb90a81614890d0f03a038390804e5a77e2caf862
+    component_hash: 3f85a7d95af876f1a6ecca8eb90a81614890d0f03a038390804e5a77e2caf862
     dependencies:
     - name: idf
       require: private
@@ -89,8 +82,7 @@ dependencies:
       type: service
     version: 1.2.1
   espressif/esp_lcd_touch_gt911:
-    component_hash: 
-      be02e243d18b9a661bc13b0d22c0a5cfa3f708cf04d6eb059772276c8c8a4d76
+    component_hash: be02e243d18b9a661bc13b0d22c0a5cfa3f708cf04d6eb059772276c8c8a4d76
     dependencies:
     - name: espressif/esp_lcd_touch
       registry_url: https://components.espressif.com
@@ -104,8 +96,7 @@ dependencies:
       type: service
     version: 1.2.0~1
   espressif/esp_lcd_touch_st7123:
-    component_hash: 
-      717080a55368a5ca3e3704081a75ddab3e0b8884e335e73b7094beb8ae55f195
+    component_hash: 717080a55368a5ca3e3704081a75ddab3e0b8884e335e73b7094beb8ae55f195
     dependencies:
     - name: espressif/cmake_utilities
       registry_url: https://components.espressif.com
@@ -123,8 +114,7 @@ dependencies:
       type: service
     version: 1.0.1
   espressif/esp_serial_slave_link:
-    component_hash: 
-      ac1776806de0a6e371c84e87898bb983e19ce62aa7f1e2e5c4a3b0234a575d2c
+    component_hash: ac1776806de0a6e371c84e87898bb983e19ce62aa7f1e2e5c4a3b0234a575d2c
     dependencies:
     - name: idf
       require: private
@@ -134,8 +124,7 @@ dependencies:
       type: service
     version: 1.1.2
   espressif/esp_wifi_remote:
-    component_hash: 
-      655ca258940f71c102e035af65181f24f4bd989e0b60c8e96a1c70513b81fb25
+    component_hash: 655ca258940f71c102e035af65181f24f4bd989e0b60c8e96a1c70513b81fb25
     dependencies:
     - name: idf
       require: private
@@ -155,8 +144,7 @@ dependencies:
       type: service
     version: 1.2.2
   espressif/iot_usbh_cdc:
-    component_hash: 
-      3cd0f9f63fba11ac2903b61d0497f19a39f2f0286e58e9d73286ea8edd0fade9
+    component_hash: 3cd0f9f63fba11ac2903b61d0497f19a39f2f0286e58e9d73286ea8edd0fade9
     dependencies:
     - name: espressif/cmake_utilities
       registry_url: https://components.espressif.com
@@ -174,8 +162,7 @@ dependencies:
     - esp32p4
     version: 2.0.1
   espressif/wifi_remote_over_eppp:
-    component_hash: 
-      e1b4c485ed5afe36615b9b555dfdcbe4be33898dc3732b5bedf235bba45bd286
+    component_hash: e1b4c485ed5afe36615b9b555dfdcbe4be33898dc3732b5bedf235bba45bd286
     dependencies:
     - name: espressif/eppp_link
       registry_url: https://components.espressif.com
@@ -193,8 +180,7 @@ dependencies:
       type: idf
     version: 5.4.1
   lvgl/lvgl:
-    component_hash: 
-      17e68bfd21f0edf4c3ee838e2273da840bf3930e5dbc3bfa6c1190c3aed41f9f
+    component_hash: 17e68bfd21f0edf4c3ee838e2273da840bf3930e5dbc3bfa6c1190c3aed41f9f
     dependencies: []
     source:
       registry_url: https://components.espressif.com/

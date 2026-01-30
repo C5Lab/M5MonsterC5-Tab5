@@ -19,7 +19,6 @@
 #include "driver/uart.h"
 #include "driver/gpio.h"
 #include "bsp/m5stack_tab5.h"
-#include "bsp/touch.h"
 #include "lvgl.h"
 #include "iot_usbh_cdc.h"
 #include "usb/usb_host.h"
@@ -1404,18 +1403,8 @@ static void screen_timeout_timer_cb(lv_timer_t *timer)
 {
     (void)timer;
     
-    // If screen is dimmed, check for wake events
+    // If screen is dimmed, touch overlay handles wake via sleep_overlay_click_cb
     if (screen_dimmed) {
-        // On ST7123: Check proximity sensor for wake
-        if (bsp_touch_has_proximity()) {
-            bool proximity_detected = false;
-            esp_err_t ret = bsp_touch_read_proximity(&proximity_detected);
-            if (ret == ESP_OK && proximity_detected) {
-                wake_screen("proximity");
-                return;
-            }
-        }
-        // Both ST7123 and GT911: Touch overlay handles wake via sleep_overlay_click_cb
         return;
     }
     
@@ -1424,8 +1413,7 @@ static void screen_timeout_timer_cb(lv_timer_t *timer)
         bsp_display_brightness_set(0);  // Turn off backlight
         screen_dimmed = true;
         
-        // Create invisible overlay to capture wake touch (both GT911 and ST7123)
-        // On ST7123: Also polls proximity sensor for wake
+        // Create invisible overlay to capture wake touch
         sleep_overlay = lv_obj_create(lv_layer_top());
         lv_obj_remove_style_all(sleep_overlay);
         lv_obj_set_size(sleep_overlay, LV_PCT(100), LV_PCT(100));
@@ -1433,11 +1421,7 @@ static void screen_timeout_timer_cb(lv_timer_t *timer)
         lv_obj_add_flag(sleep_overlay, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_add_event_cb(sleep_overlay, sleep_overlay_click_cb, LV_EVENT_CLICKED, NULL);
         
-        if (bsp_touch_has_proximity()) {
-            ESP_LOGI(TAG, "Screen dimmed (ST7123 - proximity or touch to wake)");
-        } else {
-            ESP_LOGI(TAG, "Screen dimmed (GT911 - touch to wake)");
-        }
+        ESP_LOGI(TAG, "Screen dimmed (touch to wake)");
     }
 }
 

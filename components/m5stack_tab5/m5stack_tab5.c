@@ -1568,64 +1568,6 @@ esp_lcd_touch_handle_t bsp_display_get_touch_handle(void)
     return _lcd_touch_handle;
 }
 
-bool bsp_touch_has_proximity(void)
-{
-    return (_current_display_type == BSP_DISPLAY_TYPE_ST7123);
-}
-
-esp_err_t bsp_touch_read_proximity(bool *proximity_detected)
-{
-    if (!proximity_detected) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    
-    *proximity_detected = false;
-    
-    // Proximity sensor only available on ST7123
-    if (_current_display_type != BSP_DISPLAY_TYPE_ST7123) {
-        return ESP_ERR_NOT_SUPPORTED;
-    }
-    
-    if (!_lcd_touch_handle || !_lcd_touch_handle->io) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    
-    // Read advanced info from ST7123 register 0x0010
-    // Bit layout:
-    //   bit 0-1: reserved
-    //   bit 2: with_prox (proximity data available)
-    //   bit 3: with_coord (coordinate data available)
-    //   bit 4-6: prox_status (proximity status, 0 = far, >0 = near)
-    //   bit 7: rst_chip
-    uint8_t adv_info = 0;
-    esp_err_t ret = esp_lcd_panel_io_rx_param(_lcd_touch_handle->io, 0x0010, &adv_info, 1);
-    if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to read ST7123 proximity register: %s", esp_err_to_name(ret));
-        return ret;
-    }
-    
-    // Parse adv_info bits:
-    // bit 2: with_prox (proximity data available)
-    // bit 3: with_coord (coordinate data available)  
-    // bits 4-6: prox_status (0 = far, >0 = near)
-    bool with_prox = (adv_info >> 2) & 0x01;
-    bool with_coord = (adv_info >> 3) & 0x01;
-    uint8_t prox_status = (adv_info >> 4) & 0x07;
-    
-    // Log every read for debugging
-    static uint32_t read_count = 0;
-    if ((read_count++ % 50) == 0) {  // Log every 50th read to avoid spam
-        ESP_LOGI(TAG, "ST7123 prox read: adv_info=0x%02X, with_prox=%d, with_coord=%d, prox_status=%d", 
-                 adv_info, with_prox, with_coord, prox_status);
-    }
-    
-    // Proximity detected if status > 0 (regardless of with_prox flag)
-    // Some firmware versions may not set with_prox correctly
-    *proximity_detected = (prox_status > 0);
-    
-    return ESP_OK;
-}
-
 static void lvgl_read_cb(lv_indev_t* indev, lv_indev_data_t* data)
 {
     if (_lcd_touch_handle == NULL) {
