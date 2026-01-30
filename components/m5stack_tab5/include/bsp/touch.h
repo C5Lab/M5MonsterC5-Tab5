@@ -46,6 +46,31 @@ typedef struct {
  */
 esp_err_t bsp_touch_new(const bsp_touch_config_t *config, esp_lcd_touch_handle_t *ret_touch);
 
+/**
+ * @brief Check if proximity sensor is available
+ *
+ * @note Proximity sensor is only available on ST7123 touch controller (new Tab5 version)
+ *
+ * @return
+ *      - true   Proximity sensor available (ST7123)
+ *      - false  Proximity sensor not available (GT911 or unknown)
+ */
+bool bsp_touch_has_proximity(void);
+
+/**
+ * @brief Read proximity sensor status
+ *
+ * @note Only available on ST7123 touch controller. On GT911, always returns false.
+ *
+ * @param[out] proximity_detected Set to true if proximity detected, false otherwise
+ * @return
+ *      - ESP_OK                 On success
+ *      - ESP_ERR_NOT_SUPPORTED  Proximity not available (GT911)
+ *      - ESP_ERR_INVALID_STATE  Touch not initialized
+ *      - Other                  I2C communication error
+ */
+esp_err_t bsp_touch_read_proximity(bool *proximity_detected);
+
 #ifdef __cplusplus
 }
 #endif

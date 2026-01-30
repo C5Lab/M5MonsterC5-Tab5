@@ -19,6 +19,7 @@
 #include "driver/uart.h"
 #include "driver/gpio.h"
 #include "bsp/m5stack_tab5.h"
+#include "bsp/touch.h"
 #include "lvgl.h"
 #include "iot_usbh_cdc.h"
 #include "usb/usb_host.h"
@@ -1377,11 +1378,9 @@ static void battery_status_timer_cb(lv_timer_t *timer)
     }
 }
 
-// Sleep overlay click callback - wakes screen and removes overlay
-static void sleep_overlay_click_cb(lv_event_t *e)
+// Wake screen helper - restores brightness and clears dimmed state
+static void wake_screen(const char *source)
 {
-    (void)e;
-    
     if (sleep_overlay) {
         lv_obj_delete(sleep_overlay);
         sleep_overlay = NULL;
@@ -1390,19 +1389,43 @@ static void sleep_overlay_click_cb(lv_event_t *e)
     bsp_display_brightness_set(80);  // Restore brightness
     screen_dimmed = false;
     last_activity_time = lv_tick_get();
-    ESP_LOGI(TAG, "Screen woken by touch");
+    ESP_LOGI(TAG, "Screen woken by %s", source);
 }
 
-// Screen timeout timer callback - dims screen after inactivity
+// Sleep overlay click callback - wakes screen and removes overlay (GT911 only)
+static void sleep_overlay_click_cb(lv_event_t *e)
+{
+    (void)e;
+    wake_screen("touch");
+}
+
+// Screen timeout timer callback - dims screen after inactivity and handles wake
 static void screen_timeout_timer_cb(lv_timer_t *timer)
 {
     (void)timer;
     
-    if (screen_dimmed) return;
+    // If screen is dimmed, check for wake events
+    if (screen_dimmed) {
+        // On ST7123: Check proximity sensor for wake
+        if (bsp_touch_has_proximity()) {
+            bool proximity_detected = false;
+            esp_err_t ret = bsp_touch_read_proximity(&proximity_detected);
+            if (ret == ESP_OK && proximity_detected) {
+                wake_screen("proximity");
+                return;
+            }
+        }
+        // Both ST7123 and GT911: Touch overlay handles wake via sleep_overlay_click_cb
+        return;
+    }
     
     uint32_t now = lv_tick_get();
     if ((now - last_activity_time) >= SCREEN_TIMEOUT_MS) {
-        // Create invisible overlay to capture wake touch
+        bsp_display_brightness_set(0);  // Turn off backlight
+        screen_dimmed = true;
+        
+        // Create invisible overlay to capture wake touch (both GT911 and ST7123)
+        // On ST7123: Also polls proximity sensor for wake
         sleep_overlay = lv_obj_create(lv_layer_top());
         lv_obj_remove_style_all(sleep_overlay);
         lv_obj_set_size(sleep_overlay, LV_PCT(100), LV_PCT(100));
@@ -1410,9 +1433,11 @@ static void screen_timeout_timer_cb(lv_timer_t *timer)
         lv_obj_add_flag(sleep_overlay, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_add_event_cb(sleep_overlay, sleep_overlay_click_cb, LV_EVENT_CLICKED, NULL);
         
-        bsp_display_brightness_set(0);  // Turn off backlight
-        screen_dimmed = true;
-        ESP_LOGI(TAG, "Screen dimmed due to inactivity");
+        if (bsp_touch_has_proximity()) {
+            ESP_LOGI(TAG, "Screen dimmed (ST7123 - proximity or touch to wake)");
+        } else {
+            ESP_LOGI(TAG, "Screen dimmed (GT911 - touch to wake)");
+        }
     }
 }
 
@@ -5792,8 +5817,10 @@ static void evil_twin_monitor_task(void *arg)
                                 "Client connected!\n\n"
                                 "MAC: %s\n\n"
                                 "Waiting for password...", mac);
+                            bsp_display_lock(0);
                             lv_label_set_text(ctx->evil_twin_status_label, status_text);
                             lv_obj_set_style_text_color(ctx->evil_twin_status_label, COLOR_MATERIAL_AMBER, 0);
+                            bsp_display_unlock();
                         }
                         
                         // Look for password capture pattern:
@@ -5837,8 +5864,10 @@ static void evil_twin_monitor_task(void *arg)
                                     "SSID: %s\n"
                                     "Password: %s",
                                     captured_ssid, captured_pwd);
+                                bsp_display_lock(0);
                                 lv_label_set_text(ctx->evil_twin_status_label, result_text);
                                 lv_obj_set_style_text_color(ctx->evil_twin_status_label, COLOR_MATERIAL_GREEN, 0);
+                                bsp_display_unlock();
                             }
                             
                             // Stop monitoring in context
