@@ -241,7 +241,9 @@ typedef struct {
     // Handshaker popup (per-network)
     lv_obj_t *handshaker_popup_overlay;
     lv_obj_t *handshaker_popup;
-    lv_obj_t *handshaker_status_label;
+    lv_obj_t *handshaker_log_container;  // Scrollable container for log
+    lv_obj_t *handshaker_status_label;   // Label inside log container
+    char handshaker_log_buffer[2048];    // Accumulated log messages
     volatile bool handshaker_monitoring;
     TaskHandle_t handshaker_task;
     
@@ -294,7 +296,9 @@ typedef struct {
     // Global Handshaker
     lv_obj_t *global_handshaker_popup_overlay;
     lv_obj_t *global_handshaker_popup;
+    lv_obj_t *global_handshaker_log_container;
     lv_obj_t *global_handshaker_status_label;
+    char global_handshaker_log_buffer[2048];
     volatile bool global_handshaker_monitoring;
     TaskHandle_t global_handshaker_task;
     
@@ -477,7 +481,9 @@ static lv_obj_t *evil_twin_loading_overlay = NULL;  // Loading overlay while fet
 static int evil_twin_html_count = 0;
 
 // Handshaker attack state
+static lv_obj_t *handshaker_log_container = NULL;
 static lv_obj_t *handshaker_status_label = NULL;
+static char handshaker_log_buffer[2048] = {0};
 static volatile bool handshaker_monitoring = false;
 static TaskHandle_t handshaker_monitor_task_handle = NULL;
 static char evil_twin_html_files[20][64];  // Max 20 files, 64 chars each
@@ -812,13 +818,8 @@ static lv_obj_t *esp_modem_status_label = NULL;
 static lv_obj_t *esp_modem_network_list = NULL;
 static lv_obj_t *esp_modem_spinner = NULL;
 
-// LVGL UI elements - Blackout popup
-static lv_obj_t *blackout_popup_overlay = NULL;
-static lv_obj_t *blackout_popup_obj = NULL;
-
-// LVGL UI elements - SnifferDog popup
-static lv_obj_t *snifferdog_popup_overlay = NULL;
-static lv_obj_t *snifferdog_popup_obj = NULL;
+// Blackout - uses per-tab context (ctx->blackout_*)
+// SnifferDog - uses per-tab context (ctx->snifferdog_*)
 
 // LVGL UI elements - SD card warning popup
 static lv_obj_t *sd_warning_popup_overlay = NULL;
@@ -827,12 +828,7 @@ typedef void (*sd_warning_continue_cb_t)(void);
 static sd_warning_continue_cb_t sd_warning_pending_action = NULL;
 static bool sd_warning_acknowledged = false;  // Set to true when user clicks "Continue Anyway"
 
-// LVGL UI elements - Global Handshaker popup
-static lv_obj_t *global_handshaker_popup_overlay = NULL;
-static lv_obj_t *global_handshaker_popup_obj = NULL;
-static lv_obj_t *global_handshaker_status_label = NULL;
-static volatile bool global_handshaker_monitoring = false;
-static TaskHandle_t global_handshaker_monitor_task_handle = NULL;
+// Global Handshaker - uses per-tab context (ctx->global_handshaker_*)
 
 // LVGL UI elements - Phishing Portal popup
 static lv_obj_t *phishing_portal_popup_overlay = NULL;
@@ -847,14 +843,7 @@ static TaskHandle_t phishing_portal_monitor_task_handle = NULL;
 static int phishing_portal_submit_count = 0;
 static char phishing_portal_ssid[64] = {0};
 
-// LVGL UI elements - Wardrive popup
-static lv_obj_t *wardrive_popup_overlay = NULL;
-static lv_obj_t *wardrive_popup_obj = NULL;
-static lv_obj_t *wardrive_status_label = NULL;
-static lv_obj_t *wardrive_log_label = NULL;
-static volatile bool wardrive_monitoring = false;
-static TaskHandle_t wardrive_monitor_task_handle = NULL;
-static bool wardrive_gps_fix_obtained = false;
+// Wardrive - uses per-tab context (ctx->wardrive_*)
 
 // ARP Poison page
 static lv_obj_t *arp_poison_page = NULL;
@@ -4027,8 +4016,83 @@ static void handshaker_popup_close_cb(lv_event_t *e)
         lv_obj_del(ctx->handshaker_popup_overlay);
         ctx->handshaker_popup_overlay = NULL;
         ctx->handshaker_popup = NULL;
+        ctx->handshaker_log_container = NULL;
         ctx->handshaker_status_label = NULL;
     }
+    
+    // Clear global pointers
+    handshaker_log_container = NULL;
+    handshaker_status_label = NULL;
+    handshaker_log_buffer[0] = '\0';
+}
+
+// Handshaker log message type for color coding
+typedef enum {
+    HS_LOG_PROGRESS,    // Gray - normal progress
+    HS_LOG_SUCCESS,     // Green - handshake captured
+    HS_LOG_ALREADY,     // Amber - already captured
+    HS_LOG_ERROR        // Red - error/failure
+} hs_log_type_t;
+
+// Append message to handshaker log with color coding
+static void append_handshaker_log(const char *message, hs_log_type_t log_type)
+{
+    if (!message || strlen(message) == 0) return;
+    
+    // Determine color based on log type
+    lv_color_t text_color;
+    switch (log_type) {
+        case HS_LOG_SUCCESS:
+            text_color = COLOR_MATERIAL_GREEN;
+            break;
+        case HS_LOG_ALREADY:
+            text_color = COLOR_MATERIAL_AMBER;
+            break;
+        case HS_LOG_ERROR:
+            text_color = COLOR_MATERIAL_RED;
+            break;
+        case HS_LOG_PROGRESS:
+        default:
+            text_color = lv_color_hex(0xAAAAAA);
+            break;
+    }
+    
+    // Append to log buffer (keep last messages if buffer full)
+    size_t current_len = strlen(handshaker_log_buffer);
+    size_t msg_len = strlen(message);
+    size_t max_len = sizeof(handshaker_log_buffer) - 2;  // Reserve space for newline + null
+    
+    // If adding this message would overflow, remove oldest lines
+    while (current_len + msg_len + 1 > max_len && current_len > 0) {
+        char *newline = strchr(handshaker_log_buffer, '\n');
+        if (newline) {
+            memmove(handshaker_log_buffer, newline + 1, strlen(newline));
+            current_len = strlen(handshaker_log_buffer);
+        } else {
+            handshaker_log_buffer[0] = '\0';
+            current_len = 0;
+            break;
+        }
+    }
+    
+    // Append new message
+    if (current_len > 0) {
+        strncat(handshaker_log_buffer, "\n", sizeof(handshaker_log_buffer) - current_len - 1);
+    }
+    strncat(handshaker_log_buffer, message, sizeof(handshaker_log_buffer) - strlen(handshaker_log_buffer) - 1);
+    
+    // Update UI
+    bsp_display_lock(0);
+    if (handshaker_status_label) {
+        lv_label_set_text(handshaker_status_label, handshaker_log_buffer);
+        // Set color for last message (entire label gets same color - latest determines it)
+        lv_obj_set_style_text_color(handshaker_status_label, text_color, 0);
+    }
+    // Auto-scroll to bottom
+    if (handshaker_log_container) {
+        lv_obj_scroll_to_y(handshaker_log_container, LV_COORD_MAX, LV_ANIM_ON);
+    }
+    bsp_display_unlock();
 }
 
 // Handshaker monitor task - reads UART for handshake capture
@@ -4045,8 +4109,12 @@ static void handshaker_monitor_task(void *arg)
     ESP_LOGI(TAG, "[%s] Handshaker monitor task started for tab %d", uart_name, task_tab);
     
     static char rx_buffer[512];
-    static char line_buffer[256];
+    static char line_buffer[512];
     int line_pos = 0;
+    
+    // Track state for detecting "already captured" scenario
+    int networks_attacked_this_cycle = -1;
+    int handshakes_so_far = -1;
     
     // Use context's flag instead of global
     while (ctx && ctx->handshaker_monitoring) {
@@ -4063,18 +4131,191 @@ static void handshaker_monitor_task(void *arg)
                         line_buffer[line_pos] = '\0';
                         ESP_LOGI(TAG, "Handshaker UART: %s", line_buffer);
                         
-                        // Check for handshake captured message
-                        if (strstr(line_buffer, "Handshake captured") != NULL ||
-                            strstr(line_buffer, "handshake saved") != NULL ||
-                            strstr(line_buffer, "EAPOL") != NULL) {
-                            
-                            // Update status label on UI thread
-                            bsp_display_lock(0);
-                            if (handshaker_status_label) {
-                                lv_label_set_text(handshaker_status_label, line_buffer);
-                                lv_obj_set_style_text_color(handshaker_status_label, COLOR_MATERIAL_GREEN, 0);
+                        // Determine message type and log it
+                        hs_log_type_t log_type = HS_LOG_PROGRESS;
+                        bool should_log = false;
+                        char display_msg[256] = {0};
+                        
+                        // ===== SUCCESS INDICATORS (green) =====
+                        if (strstr(line_buffer, "Handshake captured for") != NULL) {
+                            // Extract SSID: "Handshake captured for 'SSID'"
+                            char *start = strchr(line_buffer, '\'');
+                            if (start) {
+                                char *end = strchr(start + 1, '\'');
+                                if (end) {
+                                    int len = end - start - 1;
+                                    if (len > 0 && len < 64) {
+                                        char ssid[64];
+                                        strncpy(ssid, start + 1, len);
+                                        ssid[len] = '\0';
+                                        snprintf(display_msg, sizeof(display_msg), "Handshake captured: %s", ssid);
+                                    }
+                                }
                             }
-                            bsp_display_unlock();
+                            if (display_msg[0] == '\0') {
+                                strncpy(display_msg, "Handshake captured!", sizeof(display_msg) - 1);
+                            }
+                            log_type = HS_LOG_SUCCESS;
+                            should_log = true;
+                        }
+                        else if (strstr(line_buffer, "HANDSHAKE IS COMPLETE AND VALID") != NULL) {
+                            strncpy(display_msg, "Handshake validated!", sizeof(display_msg) - 1);
+                            log_type = HS_LOG_SUCCESS;
+                            should_log = true;
+                        }
+                        else if (strstr(line_buffer, "PCAP saved:") != NULL || 
+                                 strstr(line_buffer, "HCCAPX saved:") != NULL) {
+                            // Extract filename from path
+                            char *path = strstr(line_buffer, "/sdcard/");
+                            if (path) {
+                                char *slash = strrchr(path, '/');
+                                if (slash) {
+                                    snprintf(display_msg, sizeof(display_msg), "Saved: %s", slash + 1);
+                                }
+                            }
+                            if (display_msg[0] == '\0') {
+                                strncpy(display_msg, "File saved to SD card", sizeof(display_msg) - 1);
+                            }
+                            log_type = HS_LOG_SUCCESS;
+                            should_log = true;
+                        }
+                        else if (strstr(line_buffer, "Handshake #") != NULL && 
+                                 strstr(line_buffer, "captured") != NULL) {
+                            strncpy(display_msg, "Handshake captured!", sizeof(display_msg) - 1);
+                            log_type = HS_LOG_SUCCESS;
+                            should_log = true;
+                        }
+                        else if (strstr(line_buffer, "All selected networks captured") != NULL) {
+                            strncpy(display_msg, "All networks captured! Attack complete.", sizeof(display_msg) - 1);
+                            log_type = HS_LOG_SUCCESS;
+                            should_log = true;
+                        }
+                        else if (strstr(line_buffer, "handshake saved for SSID:") != NULL) {
+                            // Extract SSID
+                            char *ssid_start = strstr(line_buffer, "SSID:");
+                            if (ssid_start) {
+                                ssid_start += 5;
+                                while (*ssid_start == ' ') ssid_start++;
+                                char ssid[64];
+                                int j = 0;
+                                while (ssid_start[j] && ssid_start[j] != ' ' && ssid_start[j] != '(' && j < 63) {
+                                    ssid[j] = ssid_start[j];
+                                    j++;
+                                }
+                                ssid[j] = '\0';
+                                snprintf(display_msg, sizeof(display_msg), "Handshake saved: %s", ssid);
+                            } else {
+                                strncpy(display_msg, "Handshake saved!", sizeof(display_msg) - 1);
+                            }
+                            log_type = HS_LOG_SUCCESS;
+                            should_log = true;
+                        }
+                        
+                        // ===== ALREADY CAPTURED DETECTION (amber) =====
+                        else if (strstr(line_buffer, "Networks attacked this cycle:") != NULL) {
+                            // Parse count: "Networks attacked this cycle: 0"
+                            char *num = strstr(line_buffer, "cycle:");
+                            if (num) {
+                                networks_attacked_this_cycle = atoi(num + 6);
+                            }
+                            // Check if handshake already existed
+                            if (networks_attacked_this_cycle == 0 && handshakes_so_far > 0) {
+                                snprintf(display_msg, sizeof(display_msg), "Handshake already on SD card!");
+                                log_type = HS_LOG_ALREADY;
+                                should_log = true;
+                            }
+                        }
+                        else if (strstr(line_buffer, "Handshakes captured so far:") != NULL) {
+                            // Parse count: "Handshakes captured so far: 1"
+                            char *num = strstr(line_buffer, "so far:");
+                            if (num) {
+                                handshakes_so_far = atoi(num + 7);
+                            }
+                        }
+                        
+                        // ===== PROGRESS INDICATORS (gray) =====
+                        else if (strstr(line_buffer, "Attacking '") != NULL || 
+                                 strstr(line_buffer, ">>> [") != NULL) {
+                            // Extract network being attacked
+                            char *start = strchr(line_buffer, '\'');
+                            if (start) {
+                                char *end = strchr(start + 1, '\'');
+                                if (end) {
+                                    int len = end - start - 1;
+                                    if (len > 0 && len < 64) {
+                                        char ssid[64];
+                                        strncpy(ssid, start + 1, len);
+                                        ssid[len] = '\0';
+                                        snprintf(display_msg, sizeof(display_msg), "Attacking: %s", ssid);
+                                    }
+                                }
+                            }
+                            if (display_msg[0] == '\0') {
+                                strncpy(display_msg, "Attacking network...", sizeof(display_msg) - 1);
+                            }
+                            log_type = HS_LOG_PROGRESS;
+                            should_log = true;
+                        }
+                        else if (strstr(line_buffer, "Burst #") != NULL && 
+                                 strstr(line_buffer, "complete") != NULL) {
+                            // Extract burst number
+                            char *num = strstr(line_buffer, "Burst #");
+                            if (num) {
+                                int burst = atoi(num + 7);
+                                snprintf(display_msg, sizeof(display_msg), "Burst #%d sent", burst);
+                            } else {
+                                strncpy(display_msg, "Deauth burst sent", sizeof(display_msg) - 1);
+                            }
+                            log_type = HS_LOG_PROGRESS;
+                            should_log = true;
+                        }
+                        else if (strstr(line_buffer, "Handshake attack task started") != NULL) {
+                            strncpy(display_msg, "Attack started...", sizeof(display_msg) - 1);
+                            log_type = HS_LOG_PROGRESS;
+                            should_log = true;
+                        }
+                        else if (strstr(line_buffer, "Attack Cycle Complete") != NULL) {
+                            strncpy(display_msg, "Attack cycle complete", sizeof(display_msg) - 1);
+                            log_type = HS_LOG_PROGRESS;
+                            should_log = true;
+                        }
+                        
+                        // ===== ERROR/FAILURE INDICATORS (red) =====
+                        else if (strstr(line_buffer, "No handshake for") != NULL) {
+                            // Extract SSID
+                            char *start = strchr(line_buffer, '\'');
+                            if (start) {
+                                char *end = strchr(start + 1, '\'');
+                                if (end) {
+                                    int len = end - start - 1;
+                                    if (len > 0 && len < 64) {
+                                        char ssid[64];
+                                        strncpy(ssid, start + 1, len);
+                                        ssid[len] = '\0';
+                                        snprintf(display_msg, sizeof(display_msg), "No handshake yet: %s", ssid);
+                                    }
+                                }
+                            }
+                            if (display_msg[0] == '\0') {
+                                strncpy(display_msg, "No handshake captured, retrying...", sizeof(display_msg) - 1);
+                            }
+                            log_type = HS_LOG_ERROR;
+                            should_log = true;
+                        }
+                        else if (strstr(line_buffer, "SAVE FAILED") != NULL) {
+                            strncpy(display_msg, "Save failed - no data available", sizeof(display_msg) - 1);
+                            log_type = HS_LOG_ERROR;
+                            should_log = true;
+                        }
+                        else if (strstr(line_buffer, "Handshake attack cleanup complete") != NULL) {
+                            strncpy(display_msg, "Attack finished.", sizeof(display_msg) - 1);
+                            log_type = HS_LOG_PROGRESS;
+                            should_log = true;
+                        }
+                        
+                        // Log the message if it's relevant
+                        if (should_log && display_msg[0] != '\0') {
+                            append_handshaker_log(display_msg, log_type);
                         }
                         
                         line_pos = 0;
@@ -4112,7 +4353,7 @@ static void show_handshaker_popup(void)
     
     // Create popup as child of overlay
     ctx->handshaker_popup = lv_obj_create(ctx->handshaker_popup_overlay);
-    lv_obj_set_size(ctx->handshaker_popup, 550, 450);
+    lv_obj_set_size(ctx->handshaker_popup, 550, 500);
     lv_obj_center(ctx->handshaker_popup);
     lv_obj_set_style_bg_color(ctx->handshaker_popup, lv_color_hex(0x1A1A2A), 0);
     lv_obj_set_style_border_color(ctx->handshaker_popup, COLOR_MATERIAL_AMBER, 0);
@@ -4139,7 +4380,7 @@ static void show_handshaker_popup(void)
     
     // Scrollable container for network list
     lv_obj_t *network_scroll = lv_obj_create(ctx->handshaker_popup);
-    lv_obj_set_size(network_scroll, lv_pct(100), 180);
+    lv_obj_set_size(network_scroll, lv_pct(100), 100);
     lv_obj_set_style_bg_color(network_scroll, lv_color_hex(0x252535), 0);
     lv_obj_set_style_border_width(network_scroll, 0, 0);
     lv_obj_set_style_radius(network_scroll, 8, 0);
@@ -4163,11 +4404,29 @@ static void show_handshaker_popup(void)
         }
     }
     
-    // Status label (for handshake capture messages)
-    ctx->handshaker_status_label = lv_label_create(ctx->handshaker_popup);
+    // Scrollable log container for handshake status messages
+    ctx->handshaker_log_container = lv_obj_create(ctx->handshaker_popup);
+    lv_obj_set_size(ctx->handshaker_log_container, lv_pct(100), 120);
+    lv_obj_set_style_bg_color(ctx->handshaker_log_container, lv_color_hex(0x151520), 0);
+    lv_obj_set_style_border_width(ctx->handshaker_log_container, 1, 0);
+    lv_obj_set_style_border_color(ctx->handshaker_log_container, lv_color_hex(0x333344), 0);
+    lv_obj_set_style_radius(ctx->handshaker_log_container, 8, 0);
+    lv_obj_set_style_pad_all(ctx->handshaker_log_container, 8, 0);
+    lv_obj_set_scroll_dir(ctx->handshaker_log_container, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(ctx->handshaker_log_container, LV_SCROLLBAR_MODE_AUTO);
+    
+    // Status label inside the log container (multi-line)
+    ctx->handshaker_status_label = lv_label_create(ctx->handshaker_log_container);
     lv_label_set_text(ctx->handshaker_status_label, "Waiting for handshake...");
-    lv_obj_set_style_text_font(ctx->handshaker_status_label, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(ctx->handshaker_status_label, lv_color_hex(0x888888), 0);
+    lv_obj_set_width(ctx->handshaker_status_label, lv_pct(100));
+    lv_label_set_long_mode(ctx->handshaker_status_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(ctx->handshaker_status_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(ctx->handshaker_status_label, lv_color_hex(0xAAAAAA), 0);
+    
+    // Clear log buffer and set global pointers for monitor task
+    handshaker_log_buffer[0] = '\0';
+    handshaker_log_container = ctx->handshaker_log_container;
+    handshaker_status_label = ctx->handshaker_status_label;
     
     // STOP button
     lv_obj_t *stop_btn = lv_btn_create(ctx->handshaker_popup);
@@ -8516,23 +8775,26 @@ static void show_esp_modem_page(void)
 //==================================================================================
 
 // Close blackout popup helper
-static void close_blackout_popup(void)
+static void close_blackout_popup_ctx(tab_context_t *ctx)
 {
-    if (blackout_popup_overlay) {
-        lv_obj_del(blackout_popup_overlay);
-        blackout_popup_overlay = NULL;
-        blackout_popup_obj = NULL;
+    if (!ctx) return;
+    ctx->blackout_running = false;
+    if (ctx->blackout_popup_overlay) {
+        lv_obj_del(ctx->blackout_popup_overlay);
+        ctx->blackout_popup_overlay = NULL;
+        ctx->blackout_popup = NULL;
     }
 }
 
 // Callback when user confirms "Yes" on blackout confirmation
 static void blackout_confirm_yes_cb(lv_event_t *e)
 {
-    (void)e;
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx) ctx = get_current_ctx();
     ESP_LOGI(TAG, "Blackout confirmed - starting attack");
     
     // Close confirmation popup
-    close_blackout_popup();
+    close_blackout_popup_ctx(ctx);
     
     // Show active attack popup
     show_blackout_active_popup();
@@ -8541,24 +8803,31 @@ static void blackout_confirm_yes_cb(lv_event_t *e)
 // Callback when user clicks "No" on blackout confirmation
 static void blackout_confirm_no_cb(lv_event_t *e)
 {
-    (void)e;
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx) ctx = get_current_ctx();
     ESP_LOGI(TAG, "Blackout cancelled by user");
     
     // Just close popup
-    close_blackout_popup();
+    close_blackout_popup_ctx(ctx);
 }
 
 // Callback when user clicks "Stop" during blackout attack
 static void blackout_stop_cb(lv_event_t *e)
 {
-    (void)e;
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx) ctx = get_current_ctx();
     ESP_LOGI(TAG, "Blackout stopped by user - sending stop command");
     
-    // Send stop command via UART1 (always UART1)
-    uart_send_command("stop");
+    // Send stop command to the correct UART based on this tab
+    tab_id_t active_tab = tab_id_for_ctx(ctx);
+    if (active_tab == TAB_MBUS) {
+        uart2_send_command("stop");
+    } else {
+        uart_send_command("stop");
+    }
     
     // Close popup
-    close_blackout_popup();
+    close_blackout_popup_ctx(ctx);
     
     // Return to main screen
     show_main_tiles();
@@ -8567,58 +8836,60 @@ static void blackout_stop_cb(lv_event_t *e)
 // Show blackout confirmation popup with skull and warning
 static void show_blackout_confirm_popup(void)
 {
-    if (blackout_popup_obj != NULL) return;  // Already showing
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx) return;
+    if (ctx->blackout_popup != NULL) return;  // Already showing
     
     lv_obj_t *container = get_current_tab_container();
     if (!container) return;
     
     // Create modal overlay (fills container, semi-transparent, blocks input behind)
-    blackout_popup_overlay = lv_obj_create(container);
-    lv_obj_remove_style_all(blackout_popup_overlay);
-    lv_obj_set_size(blackout_popup_overlay, lv_pct(100), lv_pct(100));
-    lv_obj_set_style_bg_color(blackout_popup_overlay, lv_color_hex(0x000000), 0);
-    lv_obj_set_style_bg_opa(blackout_popup_overlay, LV_OPA_50, 0);
-    lv_obj_clear_flag(blackout_popup_overlay, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(blackout_popup_overlay, LV_OBJ_FLAG_CLICKABLE);  // Capture clicks
+    ctx->blackout_popup_overlay = lv_obj_create(container);
+    lv_obj_remove_style_all(ctx->blackout_popup_overlay);
+    lv_obj_set_size(ctx->blackout_popup_overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(ctx->blackout_popup_overlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(ctx->blackout_popup_overlay, LV_OPA_50, 0);
+    lv_obj_clear_flag(ctx->blackout_popup_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(ctx->blackout_popup_overlay, LV_OBJ_FLAG_CLICKABLE);  // Capture clicks
     
     // Create popup as child of overlay
-    blackout_popup_obj = lv_obj_create(blackout_popup_overlay);
-    lv_obj_set_size(blackout_popup_obj, 500, 350);
-    lv_obj_center(blackout_popup_obj);
-    lv_obj_set_style_bg_color(blackout_popup_obj, lv_color_hex(0x1A1A2A), 0);
-    lv_obj_set_style_border_color(blackout_popup_obj, COLOR_MATERIAL_RED, 0);
-    lv_obj_set_style_border_width(blackout_popup_obj, 3, 0);
-    lv_obj_set_style_radius(blackout_popup_obj, 16, 0);
-    lv_obj_set_style_shadow_width(blackout_popup_obj, 30, 0);
-    lv_obj_set_style_shadow_color(blackout_popup_obj, lv_color_hex(0x000000), 0);
-    lv_obj_set_style_shadow_opa(blackout_popup_obj, LV_OPA_50, 0);
-    lv_obj_set_style_pad_all(blackout_popup_obj, 20, 0);
-    lv_obj_set_flex_flow(blackout_popup_obj, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(blackout_popup_obj, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_row(blackout_popup_obj, 16, 0);
-    lv_obj_clear_flag(blackout_popup_obj, LV_OBJ_FLAG_SCROLLABLE);
+    ctx->blackout_popup = lv_obj_create(ctx->blackout_popup_overlay);
+    lv_obj_set_size(ctx->blackout_popup, 500, 350);
+    lv_obj_center(ctx->blackout_popup);
+    lv_obj_set_style_bg_color(ctx->blackout_popup, lv_color_hex(0x1A1A2A), 0);
+    lv_obj_set_style_border_color(ctx->blackout_popup, COLOR_MATERIAL_RED, 0);
+    lv_obj_set_style_border_width(ctx->blackout_popup, 3, 0);
+    lv_obj_set_style_radius(ctx->blackout_popup, 16, 0);
+    lv_obj_set_style_shadow_width(ctx->blackout_popup, 30, 0);
+    lv_obj_set_style_shadow_color(ctx->blackout_popup, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_shadow_opa(ctx->blackout_popup, LV_OPA_50, 0);
+    lv_obj_set_style_pad_all(ctx->blackout_popup, 20, 0);
+    lv_obj_set_flex_flow(ctx->blackout_popup, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(ctx->blackout_popup, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(ctx->blackout_popup, 16, 0);
+    lv_obj_clear_flag(ctx->blackout_popup, LV_OBJ_FLAG_SCROLLABLE);
     
     // Warning icon (skull not available in font, use warning symbol)
-    lv_obj_t *skull_label = lv_label_create(blackout_popup_obj);
+    lv_obj_t *skull_label = lv_label_create(ctx->blackout_popup);
     lv_label_set_text(skull_label, LV_SYMBOL_WARNING);
     lv_obj_set_style_text_font(skull_label, &lv_font_montserrat_44, 0);
     lv_obj_set_style_text_color(skull_label, COLOR_MATERIAL_RED, 0);
     
     // Warning title
-    lv_obj_t *title = lv_label_create(blackout_popup_obj);
+    lv_obj_t *title = lv_label_create(ctx->blackout_popup);
     lv_label_set_text(title, "BLACKOUT");
     lv_obj_set_style_text_font(title, &lv_font_montserrat_24, 0);
     lv_obj_set_style_text_color(title, COLOR_MATERIAL_RED, 0);
     
     // Warning message
-    lv_obj_t *message = lv_label_create(blackout_popup_obj);
+    lv_obj_t *message = lv_label_create(ctx->blackout_popup);
     lv_label_set_text(message, "This will deauth all networks\naround you. Are you sure?");
     lv_obj_set_style_text_font(message, &lv_font_montserrat_18, 0);
     lv_obj_set_style_text_color(message, lv_color_hex(0xCCCCCC), 0);
     lv_obj_set_style_text_align(message, LV_TEXT_ALIGN_CENTER, 0);
     
     // Button container
-    lv_obj_t *btn_container = lv_obj_create(blackout_popup_obj);
+    lv_obj_t *btn_container = lv_obj_create(ctx->blackout_popup);
     lv_obj_remove_style_all(btn_container);
     lv_obj_set_size(btn_container, lv_pct(100), LV_SIZE_CONTENT);
     lv_obj_set_flex_flow(btn_container, LV_FLEX_FLOW_ROW);
@@ -8631,7 +8902,7 @@ static void show_blackout_confirm_popup(void)
     lv_obj_set_size(no_btn, 120, 50);
     lv_obj_set_style_bg_color(no_btn, COLOR_MATERIAL_GREEN, 0);
     lv_obj_set_style_radius(no_btn, 8, 0);
-    lv_obj_add_event_cb(no_btn, blackout_confirm_no_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(no_btn, blackout_confirm_no_cb, LV_EVENT_CLICKED, ctx);
     
     lv_obj_t *no_label = lv_label_create(no_btn);
     lv_label_set_text(no_label, "No");
@@ -8643,7 +8914,7 @@ static void show_blackout_confirm_popup(void)
     lv_obj_set_size(yes_btn, 120, 50);
     lv_obj_set_style_bg_color(yes_btn, COLOR_MATERIAL_RED, 0);
     lv_obj_set_style_radius(yes_btn, 8, 0);
-    lv_obj_add_event_cb(yes_btn, blackout_confirm_yes_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(yes_btn, blackout_confirm_yes_cb, LV_EVENT_CLICKED, ctx);
     
     lv_obj_t *yes_label = lv_label_create(yes_btn);
     lv_label_set_text(yes_label, "Yes");
@@ -8654,65 +8925,75 @@ static void show_blackout_confirm_popup(void)
 // Show blackout active popup with Attack in Progress and Stop button
 static void show_blackout_active_popup(void)
 {
-    if (blackout_popup_obj != NULL) return;  // Already showing
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx) return;
+    if (ctx->blackout_popup != NULL) return;  // Already showing
     
     lv_obj_t *container = get_current_tab_container();
     if (!container) return;
     
-    // Send start_blackout command via Grove/USB
-    ESP_LOGI(TAG, "Sending start_blackout command via %s", tab_transport_name(uart1_preferred_tab()));
-    uart_send_command("start_blackout");
+    // Determine which UART to use based on this tab
+    tab_id_t active_tab = tab_id_for_ctx(ctx);
+    
+    // Send start_blackout command to this tab's UART
+    if (active_tab == TAB_MBUS) {
+        uart2_send_command("start_blackout");
+    } else {
+        uart_send_command("start_blackout");
+    }
+    ESP_LOGI(TAG, "Blackout using tab %d (%s)", active_tab, tab_transport_name(active_tab));
+    ctx->blackout_running = true;
     
     // Create modal overlay
-    blackout_popup_overlay = lv_obj_create(container);
-    lv_obj_remove_style_all(blackout_popup_overlay);
-    lv_obj_set_size(blackout_popup_overlay, lv_pct(100), lv_pct(100));
-    lv_obj_set_style_bg_color(blackout_popup_overlay, lv_color_hex(0x000000), 0);
-    lv_obj_set_style_bg_opa(blackout_popup_overlay, LV_OPA_70, 0);
-    lv_obj_clear_flag(blackout_popup_overlay, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(blackout_popup_overlay, LV_OBJ_FLAG_CLICKABLE);
+    ctx->blackout_popup_overlay = lv_obj_create(container);
+    lv_obj_remove_style_all(ctx->blackout_popup_overlay);
+    lv_obj_set_size(ctx->blackout_popup_overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(ctx->blackout_popup_overlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(ctx->blackout_popup_overlay, LV_OPA_70, 0);
+    lv_obj_clear_flag(ctx->blackout_popup_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(ctx->blackout_popup_overlay, LV_OBJ_FLAG_CLICKABLE);
     
     // Create popup
-    blackout_popup_obj = lv_obj_create(blackout_popup_overlay);
-    lv_obj_set_size(blackout_popup_obj, 450, 300);
-    lv_obj_center(blackout_popup_obj);
-    lv_obj_set_style_bg_color(blackout_popup_obj, lv_color_hex(0x1A1A2A), 0);
-    lv_obj_set_style_border_color(blackout_popup_obj, COLOR_MATERIAL_RED, 0);
-    lv_obj_set_style_border_width(blackout_popup_obj, 3, 0);
-    lv_obj_set_style_radius(blackout_popup_obj, 16, 0);
-    lv_obj_set_style_shadow_width(blackout_popup_obj, 30, 0);
-    lv_obj_set_style_shadow_color(blackout_popup_obj, lv_color_hex(0x000000), 0);
-    lv_obj_set_style_shadow_opa(blackout_popup_obj, LV_OPA_50, 0);
-    lv_obj_set_style_pad_all(blackout_popup_obj, 20, 0);
-    lv_obj_set_flex_flow(blackout_popup_obj, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(blackout_popup_obj, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_row(blackout_popup_obj, 20, 0);
-    lv_obj_clear_flag(blackout_popup_obj, LV_OBJ_FLAG_SCROLLABLE);
+    ctx->blackout_popup = lv_obj_create(ctx->blackout_popup_overlay);
+    lv_obj_set_size(ctx->blackout_popup, 450, 300);
+    lv_obj_center(ctx->blackout_popup);
+    lv_obj_set_style_bg_color(ctx->blackout_popup, lv_color_hex(0x1A1A2A), 0);
+    lv_obj_set_style_border_color(ctx->blackout_popup, COLOR_MATERIAL_RED, 0);
+    lv_obj_set_style_border_width(ctx->blackout_popup, 3, 0);
+    lv_obj_set_style_radius(ctx->blackout_popup, 16, 0);
+    lv_obj_set_style_shadow_width(ctx->blackout_popup, 30, 0);
+    lv_obj_set_style_shadow_color(ctx->blackout_popup, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_shadow_opa(ctx->blackout_popup, LV_OPA_50, 0);
+    lv_obj_set_style_pad_all(ctx->blackout_popup, 20, 0);
+    lv_obj_set_flex_flow(ctx->blackout_popup, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(ctx->blackout_popup, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(ctx->blackout_popup, 20, 0);
+    lv_obj_clear_flag(ctx->blackout_popup, LV_OBJ_FLAG_SCROLLABLE);
     
     // Warning icon
-    lv_obj_t *skull_label = lv_label_create(blackout_popup_obj);
+    lv_obj_t *skull_label = lv_label_create(ctx->blackout_popup);
     lv_label_set_text(skull_label, LV_SYMBOL_WARNING);
     lv_obj_set_style_text_font(skull_label, &lv_font_montserrat_44, 0);
     lv_obj_set_style_text_color(skull_label, COLOR_MATERIAL_RED, 0);
     
     // Attack in progress title
-    lv_obj_t *title = lv_label_create(blackout_popup_obj);
+    lv_obj_t *title = lv_label_create(ctx->blackout_popup);
     lv_label_set_text(title, "Attack in Progress");
     lv_obj_set_style_text_font(title, &lv_font_montserrat_24, 0);
     lv_obj_set_style_text_color(title, COLOR_MATERIAL_RED, 0);
     
     // Subtitle
-    lv_obj_t *subtitle = lv_label_create(blackout_popup_obj);
+    lv_obj_t *subtitle = lv_label_create(ctx->blackout_popup);
     lv_label_set_text(subtitle, "Deauthing all networks...");
     lv_obj_set_style_text_font(subtitle, &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_color(subtitle, lv_color_hex(0xAAAAAA), 0);
     
     // Stop button
-    lv_obj_t *stop_btn = lv_btn_create(blackout_popup_obj);
+    lv_obj_t *stop_btn = lv_btn_create(ctx->blackout_popup);
     lv_obj_set_size(stop_btn, 180, 55);
     lv_obj_set_style_bg_color(stop_btn, COLOR_MATERIAL_RED, 0);
     lv_obj_set_style_radius(stop_btn, 8, 0);
-    lv_obj_add_event_cb(stop_btn, blackout_stop_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(stop_btn, blackout_stop_cb, LV_EVENT_CLICKED, ctx);
     
     lv_obj_t *stop_label = lv_label_create(stop_btn);
     lv_label_set_text(stop_label, LV_SYMBOL_STOP " Stop");
@@ -8725,23 +9006,26 @@ static void show_blackout_active_popup(void)
 //==================================================================================
 
 // Close snifferdog popup helper
-static void close_snifferdog_popup(void)
+static void close_snifferdog_popup_ctx(tab_context_t *ctx)
 {
-    if (snifferdog_popup_overlay) {
-        lv_obj_del(snifferdog_popup_overlay);
-        snifferdog_popup_overlay = NULL;
-        snifferdog_popup_obj = NULL;
+    if (!ctx) return;
+    ctx->snifferdog_running = false;
+    if (ctx->snifferdog_popup_overlay) {
+        lv_obj_del(ctx->snifferdog_popup_overlay);
+        ctx->snifferdog_popup_overlay = NULL;
+        ctx->snifferdog_popup = NULL;
     }
 }
 
 // Callback when user confirms "Yes" on snifferdog confirmation
 static void snifferdog_confirm_yes_cb(lv_event_t *e)
 {
-    (void)e;
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx) ctx = get_current_ctx();
     ESP_LOGI(TAG, "SnifferDog confirmed - starting attack");
     
     // Close confirmation popup
-    close_snifferdog_popup();
+    close_snifferdog_popup_ctx(ctx);
     
     // Show active attack popup
     show_snifferdog_active_popup();
@@ -8750,11 +9034,12 @@ static void snifferdog_confirm_yes_cb(lv_event_t *e)
 // Callback when user clicks "No" on snifferdog confirmation
 static void snifferdog_confirm_no_cb(lv_event_t *e)
 {
-    (void)e;
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx) ctx = get_current_ctx();
     ESP_LOGI(TAG, "SnifferDog cancelled by user");
     
     // Just close popup
-    close_snifferdog_popup();
+    close_snifferdog_popup_ctx(ctx);
 }
 
 // ============================================================================
@@ -8907,14 +9192,20 @@ static void show_sd_warning_popup(sd_warning_continue_cb_t continue_action)
 // Callback when user clicks "Stop" during snifferdog attack
 static void snifferdog_stop_cb(lv_event_t *e)
 {
-    (void)e;
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx) ctx = get_current_ctx();
     ESP_LOGI(TAG, "SnifferDog stopped by user - sending stop command");
     
-    // Send stop command via UART1 (always UART1)
-    uart_send_command("stop");
+    // Send stop command to the correct UART based on this tab
+    tab_id_t active_tab = tab_id_for_ctx(ctx);
+    if (active_tab == TAB_MBUS) {
+        uart2_send_command("stop");
+    } else {
+        uart_send_command("stop");
+    }
     
     // Close popup
-    close_snifferdog_popup();
+    close_snifferdog_popup_ctx(ctx);
     
     // Return to main screen
     show_main_tiles();
@@ -8923,58 +9214,60 @@ static void snifferdog_stop_cb(lv_event_t *e)
 // Show snifferdog confirmation popup with icon and warning
 static void show_snifferdog_confirm_popup(void)
 {
-    if (snifferdog_popup_obj != NULL) return;  // Already showing
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx) return;
+    if (ctx->snifferdog_popup != NULL) return;  // Already showing
     
     lv_obj_t *container = get_current_tab_container();
     if (!container) return;
     
     // Create modal overlay (fills container, semi-transparent, blocks input behind)
-    snifferdog_popup_overlay = lv_obj_create(container);
-    lv_obj_remove_style_all(snifferdog_popup_overlay);
-    lv_obj_set_size(snifferdog_popup_overlay, lv_pct(100), lv_pct(100));
-    lv_obj_set_style_bg_color(snifferdog_popup_overlay, lv_color_hex(0x000000), 0);
-    lv_obj_set_style_bg_opa(snifferdog_popup_overlay, LV_OPA_50, 0);
-    lv_obj_clear_flag(snifferdog_popup_overlay, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(snifferdog_popup_overlay, LV_OBJ_FLAG_CLICKABLE);  // Capture clicks
+    ctx->snifferdog_popup_overlay = lv_obj_create(container);
+    lv_obj_remove_style_all(ctx->snifferdog_popup_overlay);
+    lv_obj_set_size(ctx->snifferdog_popup_overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(ctx->snifferdog_popup_overlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(ctx->snifferdog_popup_overlay, LV_OPA_50, 0);
+    lv_obj_clear_flag(ctx->snifferdog_popup_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(ctx->snifferdog_popup_overlay, LV_OBJ_FLAG_CLICKABLE);  // Capture clicks
     
     // Create popup as child of overlay
-    snifferdog_popup_obj = lv_obj_create(snifferdog_popup_overlay);
-    lv_obj_set_size(snifferdog_popup_obj, 500, 350);
-    lv_obj_center(snifferdog_popup_obj);
-    lv_obj_set_style_bg_color(snifferdog_popup_obj, lv_color_hex(0x1A1A2A), 0);
-    lv_obj_set_style_border_color(snifferdog_popup_obj, COLOR_MATERIAL_PURPLE, 0);
-    lv_obj_set_style_border_width(snifferdog_popup_obj, 3, 0);
-    lv_obj_set_style_radius(snifferdog_popup_obj, 16, 0);
-    lv_obj_set_style_shadow_width(snifferdog_popup_obj, 30, 0);
-    lv_obj_set_style_shadow_color(snifferdog_popup_obj, lv_color_hex(0x000000), 0);
-    lv_obj_set_style_shadow_opa(snifferdog_popup_obj, LV_OPA_50, 0);
-    lv_obj_set_style_pad_all(snifferdog_popup_obj, 20, 0);
-    lv_obj_set_flex_flow(snifferdog_popup_obj, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(snifferdog_popup_obj, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_row(snifferdog_popup_obj, 16, 0);
-    lv_obj_clear_flag(snifferdog_popup_obj, LV_OBJ_FLAG_SCROLLABLE);
+    ctx->snifferdog_popup = lv_obj_create(ctx->snifferdog_popup_overlay);
+    lv_obj_set_size(ctx->snifferdog_popup, 500, 350);
+    lv_obj_center(ctx->snifferdog_popup);
+    lv_obj_set_style_bg_color(ctx->snifferdog_popup, lv_color_hex(0x1A1A2A), 0);
+    lv_obj_set_style_border_color(ctx->snifferdog_popup, COLOR_MATERIAL_PURPLE, 0);
+    lv_obj_set_style_border_width(ctx->snifferdog_popup, 3, 0);
+    lv_obj_set_style_radius(ctx->snifferdog_popup, 16, 0);
+    lv_obj_set_style_shadow_width(ctx->snifferdog_popup, 30, 0);
+    lv_obj_set_style_shadow_color(ctx->snifferdog_popup, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_shadow_opa(ctx->snifferdog_popup, LV_OPA_50, 0);
+    lv_obj_set_style_pad_all(ctx->snifferdog_popup, 20, 0);
+    lv_obj_set_flex_flow(ctx->snifferdog_popup, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(ctx->snifferdog_popup, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(ctx->snifferdog_popup, 16, 0);
+    lv_obj_clear_flag(ctx->snifferdog_popup, LV_OBJ_FLAG_SCROLLABLE);
     
     // Eye icon (sniffing/watching)
-    lv_obj_t *icon_label = lv_label_create(snifferdog_popup_obj);
+    lv_obj_t *icon_label = lv_label_create(ctx->snifferdog_popup);
     lv_label_set_text(icon_label, LV_SYMBOL_EYE_OPEN);
     lv_obj_set_style_text_font(icon_label, &lv_font_montserrat_44, 0);
     lv_obj_set_style_text_color(icon_label, COLOR_MATERIAL_PURPLE, 0);
     
     // Title
-    lv_obj_t *title = lv_label_create(snifferdog_popup_obj);
+    lv_obj_t *title = lv_label_create(ctx->snifferdog_popup);
     lv_label_set_text(title, "SNIFFER DOG");
     lv_obj_set_style_text_font(title, &lv_font_montserrat_24, 0);
     lv_obj_set_style_text_color(title, COLOR_MATERIAL_PURPLE, 0);
     
     // Warning message
-    lv_obj_t *message = lv_label_create(snifferdog_popup_obj);
+    lv_obj_t *message = lv_label_create(ctx->snifferdog_popup);
     lv_label_set_text(message, "This will deauth all clients\naround you. Are you sure?");
     lv_obj_set_style_text_font(message, &lv_font_montserrat_18, 0);
     lv_obj_set_style_text_color(message, lv_color_hex(0xCCCCCC), 0);
     lv_obj_set_style_text_align(message, LV_TEXT_ALIGN_CENTER, 0);
     
     // Button container
-    lv_obj_t *btn_container = lv_obj_create(snifferdog_popup_obj);
+    lv_obj_t *btn_container = lv_obj_create(ctx->snifferdog_popup);
     lv_obj_remove_style_all(btn_container);
     lv_obj_set_size(btn_container, lv_pct(100), LV_SIZE_CONTENT);
     lv_obj_set_flex_flow(btn_container, LV_FLEX_FLOW_ROW);
@@ -8987,7 +9280,7 @@ static void show_snifferdog_confirm_popup(void)
     lv_obj_set_size(no_btn, 120, 50);
     lv_obj_set_style_bg_color(no_btn, COLOR_MATERIAL_GREEN, 0);
     lv_obj_set_style_radius(no_btn, 8, 0);
-    lv_obj_add_event_cb(no_btn, snifferdog_confirm_no_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(no_btn, snifferdog_confirm_no_cb, LV_EVENT_CLICKED, ctx);
     
     lv_obj_t *no_label = lv_label_create(no_btn);
     lv_label_set_text(no_label, "No");
@@ -8999,7 +9292,7 @@ static void show_snifferdog_confirm_popup(void)
     lv_obj_set_size(yes_btn, 120, 50);
     lv_obj_set_style_bg_color(yes_btn, COLOR_MATERIAL_PURPLE, 0);
     lv_obj_set_style_radius(yes_btn, 8, 0);
-    lv_obj_add_event_cb(yes_btn, snifferdog_confirm_yes_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(yes_btn, snifferdog_confirm_yes_cb, LV_EVENT_CLICKED, ctx);
     
     lv_obj_t *yes_label = lv_label_create(yes_btn);
     lv_label_set_text(yes_label, "Yes");
@@ -9010,65 +9303,75 @@ static void show_snifferdog_confirm_popup(void)
 // Show snifferdog active popup with Attack in Progress and Stop button
 static void show_snifferdog_active_popup(void)
 {
-    if (snifferdog_popup_obj != NULL) return;  // Already showing
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx) return;
+    if (ctx->snifferdog_popup != NULL) return;  // Already showing
     
     lv_obj_t *container = get_current_tab_container();
     if (!container) return;
     
-    // Send start_sniffer_dog command via UART1 (always UART1)
-    ESP_LOGI(TAG, "Sending start_sniffer_dog command via %s", tab_transport_name(uart1_preferred_tab()));
-    uart_send_command("start_sniffer_dog");
+    // Determine which UART to use based on this tab
+    tab_id_t active_tab = tab_id_for_ctx(ctx);
+    
+    // Send start_sniffer_dog command to this tab's UART
+    if (active_tab == TAB_MBUS) {
+        uart2_send_command("start_sniffer_dog");
+    } else {
+        uart_send_command("start_sniffer_dog");
+    }
+    ESP_LOGI(TAG, "SnifferDog using tab %d (%s)", active_tab, tab_transport_name(active_tab));
+    ctx->snifferdog_running = true;
     
     // Create modal overlay
-    snifferdog_popup_overlay = lv_obj_create(container);
-    lv_obj_remove_style_all(snifferdog_popup_overlay);
-    lv_obj_set_size(snifferdog_popup_overlay, lv_pct(100), lv_pct(100));
-    lv_obj_set_style_bg_color(snifferdog_popup_overlay, lv_color_hex(0x000000), 0);
-    lv_obj_set_style_bg_opa(snifferdog_popup_overlay, LV_OPA_70, 0);
-    lv_obj_clear_flag(snifferdog_popup_overlay, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(snifferdog_popup_overlay, LV_OBJ_FLAG_CLICKABLE);
+    ctx->snifferdog_popup_overlay = lv_obj_create(container);
+    lv_obj_remove_style_all(ctx->snifferdog_popup_overlay);
+    lv_obj_set_size(ctx->snifferdog_popup_overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(ctx->snifferdog_popup_overlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(ctx->snifferdog_popup_overlay, LV_OPA_70, 0);
+    lv_obj_clear_flag(ctx->snifferdog_popup_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(ctx->snifferdog_popup_overlay, LV_OBJ_FLAG_CLICKABLE);
     
     // Create popup
-    snifferdog_popup_obj = lv_obj_create(snifferdog_popup_overlay);
-    lv_obj_set_size(snifferdog_popup_obj, 450, 300);
-    lv_obj_center(snifferdog_popup_obj);
-    lv_obj_set_style_bg_color(snifferdog_popup_obj, lv_color_hex(0x1A1A2A), 0);
-    lv_obj_set_style_border_color(snifferdog_popup_obj, COLOR_MATERIAL_PURPLE, 0);
-    lv_obj_set_style_border_width(snifferdog_popup_obj, 3, 0);
-    lv_obj_set_style_radius(snifferdog_popup_obj, 16, 0);
-    lv_obj_set_style_shadow_width(snifferdog_popup_obj, 30, 0);
-    lv_obj_set_style_shadow_color(snifferdog_popup_obj, lv_color_hex(0x000000), 0);
-    lv_obj_set_style_shadow_opa(snifferdog_popup_obj, LV_OPA_50, 0);
-    lv_obj_set_style_pad_all(snifferdog_popup_obj, 20, 0);
-    lv_obj_set_flex_flow(snifferdog_popup_obj, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(snifferdog_popup_obj, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_row(snifferdog_popup_obj, 20, 0);
-    lv_obj_clear_flag(snifferdog_popup_obj, LV_OBJ_FLAG_SCROLLABLE);
+    ctx->snifferdog_popup = lv_obj_create(ctx->snifferdog_popup_overlay);
+    lv_obj_set_size(ctx->snifferdog_popup, 450, 300);
+    lv_obj_center(ctx->snifferdog_popup);
+    lv_obj_set_style_bg_color(ctx->snifferdog_popup, lv_color_hex(0x1A1A2A), 0);
+    lv_obj_set_style_border_color(ctx->snifferdog_popup, COLOR_MATERIAL_PURPLE, 0);
+    lv_obj_set_style_border_width(ctx->snifferdog_popup, 3, 0);
+    lv_obj_set_style_radius(ctx->snifferdog_popup, 16, 0);
+    lv_obj_set_style_shadow_width(ctx->snifferdog_popup, 30, 0);
+    lv_obj_set_style_shadow_color(ctx->snifferdog_popup, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_shadow_opa(ctx->snifferdog_popup, LV_OPA_50, 0);
+    lv_obj_set_style_pad_all(ctx->snifferdog_popup, 20, 0);
+    lv_obj_set_flex_flow(ctx->snifferdog_popup, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(ctx->snifferdog_popup, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(ctx->snifferdog_popup, 20, 0);
+    lv_obj_clear_flag(ctx->snifferdog_popup, LV_OBJ_FLAG_SCROLLABLE);
     
     // Eye icon
-    lv_obj_t *icon_label = lv_label_create(snifferdog_popup_obj);
+    lv_obj_t *icon_label = lv_label_create(ctx->snifferdog_popup);
     lv_label_set_text(icon_label, LV_SYMBOL_EYE_OPEN);
     lv_obj_set_style_text_font(icon_label, &lv_font_montserrat_44, 0);
     lv_obj_set_style_text_color(icon_label, COLOR_MATERIAL_PURPLE, 0);
     
     // Attack in progress title
-    lv_obj_t *title = lv_label_create(snifferdog_popup_obj);
+    lv_obj_t *title = lv_label_create(ctx->snifferdog_popup);
     lv_label_set_text(title, "Attack in Progress");
     lv_obj_set_style_text_font(title, &lv_font_montserrat_24, 0);
     lv_obj_set_style_text_color(title, COLOR_MATERIAL_PURPLE, 0);
     
     // Subtitle
-    lv_obj_t *subtitle = lv_label_create(snifferdog_popup_obj);
+    lv_obj_t *subtitle = lv_label_create(ctx->snifferdog_popup);
     lv_label_set_text(subtitle, "Deauthing all clients...");
     lv_obj_set_style_text_font(subtitle, &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_color(subtitle, lv_color_hex(0xAAAAAA), 0);
     
     // Stop button
-    lv_obj_t *stop_btn = lv_btn_create(snifferdog_popup_obj);
+    lv_obj_t *stop_btn = lv_btn_create(ctx->snifferdog_popup);
     lv_obj_set_size(stop_btn, 180, 55);
     lv_obj_set_style_bg_color(stop_btn, COLOR_MATERIAL_PURPLE, 0);
     lv_obj_set_style_radius(stop_btn, 8, 0);
-    lv_obj_add_event_cb(stop_btn, snifferdog_stop_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(stop_btn, snifferdog_stop_cb, LV_EVENT_CLICKED, ctx);
     
     lv_obj_t *stop_label = lv_label_create(stop_btn);
     lv_label_set_text(stop_label, LV_SYMBOL_STOP " Stop");
@@ -9081,31 +9384,36 @@ static void show_snifferdog_active_popup(void)
 //==================================================================================
 
 // Close global handshaker popup helper
-static void close_global_handshaker_popup(void)
+static void close_global_handshaker_popup_ctx(tab_context_t *ctx)
 {
+    if (!ctx) return;
+    
     // Stop monitoring task first
-    global_handshaker_monitoring = false;
-    if (global_handshaker_monitor_task_handle != NULL) {
+    ctx->global_handshaker_monitoring = false;
+    if (ctx->global_handshaker_task != NULL) {
         vTaskDelay(pdMS_TO_TICKS(100));  // Give task time to exit
-        global_handshaker_monitor_task_handle = NULL;
+        ctx->global_handshaker_task = NULL;
     }
     
-    if (global_handshaker_popup_overlay) {
-        lv_obj_del(global_handshaker_popup_overlay);
-        global_handshaker_popup_overlay = NULL;
-        global_handshaker_popup_obj = NULL;
-        global_handshaker_status_label = NULL;
+    if (ctx->global_handshaker_popup_overlay) {
+        lv_obj_del(ctx->global_handshaker_popup_overlay);
+        ctx->global_handshaker_popup_overlay = NULL;
+        ctx->global_handshaker_popup = NULL;
+        ctx->global_handshaker_log_container = NULL;
+        ctx->global_handshaker_status_label = NULL;
+        ctx->global_handshaker_log_buffer[0] = '\0';
     }
 }
 
 // Callback when user confirms "Yes" on global handshaker confirmation
 static void global_handshaker_confirm_yes_cb(lv_event_t *e)
 {
-    (void)e;
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx) ctx = get_current_ctx();
     ESP_LOGI(TAG, "Global Handshaker confirmed - starting attack");
     
     // Close confirmation popup
-    close_global_handshaker_popup();
+    close_global_handshaker_popup_ctx(ctx);
     
     // Show active attack popup
     show_global_handshaker_active_popup();
@@ -9114,42 +9422,136 @@ static void global_handshaker_confirm_yes_cb(lv_event_t *e)
 // Callback when user clicks "No" on global handshaker confirmation
 static void global_handshaker_confirm_no_cb(lv_event_t *e)
 {
-    (void)e;
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx) ctx = get_current_ctx();
     ESP_LOGI(TAG, "Global Handshaker cancelled by user");
     
     // Just close popup
-    close_global_handshaker_popup();
+    close_global_handshaker_popup_ctx(ctx);
 }
 
 // Callback when user clicks "Stop" during global handshaker attack
 static void global_handshaker_stop_cb(lv_event_t *e)
 {
-    (void)e;
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx) ctx = get_current_ctx();
     ESP_LOGI(TAG, "Global Handshaker stopped by user - sending stop command");
     
-    // Send stop command via UART1 (always UART1)
-    uart_send_command("stop");
+    // Send stop command to the correct UART based on which tab was used
+    tab_id_t active_tab = tab_id_for_ctx(ctx);
+    if (active_tab == TAB_MBUS) {
+        uart2_send_command("stop");
+    } else {
+        uart_send_command("stop");
+    }
     
     // Close popup (also stops monitoring task)
-    close_global_handshaker_popup();
+    close_global_handshaker_popup_ctx(ctx);
     
     // Return to main screen
     show_main_tiles();
 }
 
-// Global handshaker monitor task - reads UART for handshake capture
+// Append message to global handshaker log with color coding (per-tab context)
+static void append_global_handshaker_log_ctx(tab_context_t *ctx, const char *message, hs_log_type_t log_type)
+{
+    if (!ctx || !message || strlen(message) == 0) return;
+    
+    // Determine color based on log type
+    lv_color_t text_color;
+    switch (log_type) {
+        case HS_LOG_SUCCESS:
+            text_color = COLOR_MATERIAL_GREEN;
+            break;
+        case HS_LOG_ALREADY:
+            text_color = COLOR_MATERIAL_AMBER;
+            break;
+        case HS_LOG_ERROR:
+            text_color = COLOR_MATERIAL_RED;
+            break;
+        case HS_LOG_PROGRESS:
+        default:
+            text_color = lv_color_hex(0xAAAAAA);
+            break;
+    }
+    
+    // Append to log buffer (keep last messages if buffer full)
+    size_t current_len = strlen(ctx->global_handshaker_log_buffer);
+    size_t msg_len = strlen(message);
+    size_t max_len = sizeof(ctx->global_handshaker_log_buffer) - 2;
+    
+    // If adding this message would overflow, remove oldest lines
+    while (current_len + msg_len + 1 > max_len && current_len > 0) {
+        char *newline = strchr(ctx->global_handshaker_log_buffer, '\n');
+        if (newline) {
+            memmove(ctx->global_handshaker_log_buffer, newline + 1, strlen(newline));
+            current_len = strlen(ctx->global_handshaker_log_buffer);
+        } else {
+            ctx->global_handshaker_log_buffer[0] = '\0';
+            current_len = 0;
+            break;
+        }
+    }
+    
+    // Append new message
+    if (current_len > 0) {
+        strncat(ctx->global_handshaker_log_buffer, "\n", sizeof(ctx->global_handshaker_log_buffer) - current_len - 1);
+    }
+    strncat(ctx->global_handshaker_log_buffer, message, sizeof(ctx->global_handshaker_log_buffer) - strlen(ctx->global_handshaker_log_buffer) - 1);
+    
+    // Update UI
+    bsp_display_lock(0);
+    if (ctx->global_handshaker_status_label) {
+        lv_label_set_text(ctx->global_handshaker_status_label, ctx->global_handshaker_log_buffer);
+        lv_obj_set_style_text_color(ctx->global_handshaker_status_label, text_color, 0);
+    }
+    // Auto-scroll to bottom
+    if (ctx->global_handshaker_log_container) {
+        lv_obj_scroll_to_y(ctx->global_handshaker_log_container, LV_COORD_MAX, LV_ANIM_ON);
+    }
+    bsp_display_unlock();
+}
+
+// Helper to extract SSID from quotes in a line
+static bool extract_ssid_from_quotes(const char *line, char *ssid, size_t ssid_size)
+{
+    char *start = strchr(line, '\'');
+    if (start) {
+        char *end = strchr(start + 1, '\'');
+        if (end) {
+            int slen = end - start - 1;
+            if (slen > 0 && slen < (int)ssid_size - 1) {
+                strncpy(ssid, start + 1, slen);
+                ssid[slen] = '\0';
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// Global handshaker monitor task - reads UART for handshake capture (per-tab context)
 static void global_handshaker_monitor_task(void *arg)
 {
-    (void)arg;
-    ESP_LOGI(TAG, "Global Handshaker monitor task started");
+    tab_context_t *ctx = (tab_context_t *)arg;
+    if (!ctx) {
+        ESP_LOGE(TAG, "Global Handshaker monitor task: no context");
+        vTaskDelete(NULL);
+        return;
+    }
     
-    tab_id_t uart1_tab = uart1_preferred_tab();
+    // Determine which UART port to read from based on tab
+    tab_id_t active_tab = tab_id_for_ctx(ctx);
+    uart_port_t uart_port = (active_tab == TAB_MBUS) ? UART2_NUM : UART_NUM;
+    
+    ESP_LOGI(TAG, "Global Handshaker monitor task started (tab=%d, uart=%d)", active_tab, uart_port);
+    
     static char rx_buffer[512];
     static char line_buffer[512];
     int line_pos = 0;
     
-    while (global_handshaker_monitoring) {
-        int len = transport_read_bytes_tab(uart1_tab, UART_NUM, rx_buffer, sizeof(rx_buffer) - 1, pdMS_TO_TICKS(100));
+    while (ctx->global_handshaker_monitoring) {
+        int len = transport_read_bytes_tab(active_tab, uart_port, rx_buffer, sizeof(rx_buffer) - 1, pdMS_TO_TICKS(100));
         
         if (len > 0) {
             rx_buffer[len] = '\0';
@@ -9160,45 +9562,170 @@ static void global_handshaker_monitor_task(void *arg)
                 if (c == '\n' || c == '\r') {
                     if (line_pos > 0) {
                         line_buffer[line_pos] = '\0';
+                        ESP_LOGI(TAG, "Global Handshaker UART: %s", line_buffer);
                         
-                        // Check for complete handshake message
-                        // Pattern: "Complete 4-way handshake saved for SSID: AX3_2.4 (MAC: ...)"
-                        // Note: line may start with checkmark character (✓)
-                        const char *pattern = "handshake saved for SSID:";
-                        char *found = strstr(line_buffer, pattern);
-                        if (found != NULL) {
-                            // Extract SSID from the message
-                            char *ssid_start = found + strlen(pattern);
-                            // Skip leading spaces
-                            while (*ssid_start == ' ') ssid_start++;
-                            
-                            // Copy SSID and trim at first space or parenthesis (removes "(MAC: ...)")
-                            char ssid[64];
-                            int j = 0;
-                            while (ssid_start[j] && ssid_start[j] != ' ' && ssid_start[j] != '(' && j < 63) {
-                                ssid[j] = ssid_start[j];
-                                j++;
+                        // Determine message type and log it
+                        hs_log_type_t log_type = HS_LOG_PROGRESS;
+                        bool should_log = false;
+                        char display_msg[256] = {0};
+                        char ssid[64] = {0};
+                        
+                        // ===== PHASE/ATTACK START =====
+                        if (strstr(line_buffer, "PHASE") != NULL && strstr(line_buffer, "Attack") != NULL) {
+                            // "===== PHASE 2: Attack All Networks ====="
+                            strncpy(display_msg, "Starting attack on all networks...", sizeof(display_msg) - 1);
+                            log_type = HS_LOG_PROGRESS;
+                            should_log = true;
+                        }
+                        else if (strstr(line_buffer, "Attacking") != NULL && strstr(line_buffer, "networks...") != NULL) {
+                            // "Attacking 16 networks..."
+                            char *num = strstr(line_buffer, "Attacking ");
+                            if (num) {
+                                int count = atoi(num + 10);
+                                snprintf(display_msg, sizeof(display_msg), "Attacking %d networks...", count);
                             }
-                            ssid[j] = '\0';
-                            
-                            // Create status message
-                            char status_msg[128];
-                            snprintf(status_msg, sizeof(status_msg), "Handshake captured: %s", ssid);
-                            
-                            ESP_LOGI(TAG, "%s", status_msg);
-                            
-                            // Update status label on UI thread
-                            bsp_display_lock(0);
-                            if (global_handshaker_status_label) {
-                                lv_label_set_text(global_handshaker_status_label, status_msg);
-                                lv_obj_set_style_text_color(global_handshaker_status_label, COLOR_MATERIAL_GREEN, 0);
-                            }
-                            bsp_display_unlock();
+                            log_type = HS_LOG_PROGRESS;
+                            should_log = true;
                         }
                         
-                        // Also check for "Handshake #X captured!" as alternative pattern
-                        if (strstr(line_buffer, "Handshake #") != NULL && strstr(line_buffer, "captured") != NULL) {
-                            ESP_LOGI(TAG, "Handshake capture confirmed: %s", line_buffer);
+                        // ===== CURRENT TARGET (>>> [N/M] Attacking 'SSID' <<<) =====
+                        else if (strstr(line_buffer, ">>> [") != NULL && strstr(line_buffer, "Attacking") != NULL) {
+                            // Parse: ">>> [1/16] Attacking 'Horizon Wi-Free' (Ch 6, RSSI: -51 dBm) <<<"
+                            int current = 0, total = 0;
+                            char *bracket = strstr(line_buffer, "[");
+                            if (bracket) {
+                                sscanf(bracket, "[%d/%d]", &current, &total);
+                            }
+                            if (extract_ssid_from_quotes(line_buffer, ssid, sizeof(ssid))) {
+                                if (current > 0 && total > 0) {
+                                    snprintf(display_msg, sizeof(display_msg), "[%d/%d] Attacking: %s", current, total, ssid);
+                                } else {
+                                    snprintf(display_msg, sizeof(display_msg), "Attacking: %s", ssid);
+                                }
+                            } else {
+                                snprintf(display_msg, sizeof(display_msg), "[%d/%d] Attacking network...", current, total);
+                            }
+                            log_type = HS_LOG_PROGRESS;
+                            should_log = true;
+                        }
+                        
+                        // ===== SKIPPING (already captured) =====
+                        else if (strstr(line_buffer, "Skipping") != NULL && strstr(line_buffer, "PCAP already exists") != NULL) {
+                            // "[2/16] Skipping 'VMA84A66C-2.4' - PCAP already exists"
+                            int current = 0, total = 0;
+                            char *bracket = strstr(line_buffer, "[");
+                            if (bracket) {
+                                sscanf(bracket, "[%d/%d]", &current, &total);
+                            }
+                            if (extract_ssid_from_quotes(line_buffer, ssid, sizeof(ssid))) {
+                                if (strlen(ssid) > 0) {
+                                    snprintf(display_msg, sizeof(display_msg), "[%d/%d] Already have: %s", current, total, ssid);
+                                } else {
+                                    snprintf(display_msg, sizeof(display_msg), "[%d/%d] Already have (hidden)", current, total);
+                                }
+                            } else {
+                                snprintf(display_msg, sizeof(display_msg), "[%d/%d] Already captured", current, total);
+                            }
+                            log_type = HS_LOG_ALREADY;
+                            should_log = true;
+                        }
+                        
+                        // ===== SUCCESS INDICATORS (green) =====
+                        else if (strstr(line_buffer, "Handshake captured for") != NULL ||
+                                 (strstr(line_buffer, "Handshake captured") != NULL && strstr(line_buffer, "after burst") != NULL)) {
+                            // "✓ Handshake captured for 'SSID' after burst #N!"
+                            if (extract_ssid_from_quotes(line_buffer, ssid, sizeof(ssid))) {
+                                snprintf(display_msg, sizeof(display_msg), "CAPTURED: %s", ssid);
+                            } else {
+                                strncpy(display_msg, "Handshake captured!", sizeof(display_msg) - 1);
+                            }
+                            log_type = HS_LOG_SUCCESS;
+                            should_log = true;
+                        }
+                        else if (strstr(line_buffer, "HANDSHAKE IS COMPLETE AND VALID") != NULL) {
+                            strncpy(display_msg, "Handshake validated!", sizeof(display_msg) - 1);
+                            log_type = HS_LOG_SUCCESS;
+                            should_log = true;
+                        }
+                        else if (strstr(line_buffer, "PCAP saved:") != NULL) {
+                            // Extract filename
+                            char *path = strstr(line_buffer, "/sdcard/");
+                            if (path) {
+                                char *slash = strrchr(path, '/');
+                                if (slash) {
+                                    snprintf(display_msg, sizeof(display_msg), "Saved: %s", slash + 1);
+                                }
+                            }
+                            if (display_msg[0] == '\0') {
+                                strncpy(display_msg, "PCAP saved to SD", sizeof(display_msg) - 1);
+                            }
+                            log_type = HS_LOG_SUCCESS;
+                            should_log = true;
+                        }
+                        else if (strstr(line_buffer, "handshake saved for SSID:") != NULL) {
+                            char *ssid_start = strstr(line_buffer, "SSID:");
+                            if (ssid_start) {
+                                ssid_start += 5;
+                                while (*ssid_start == ' ') ssid_start++;
+                                int j = 0;
+                                while (ssid_start[j] && ssid_start[j] != ' ' && ssid_start[j] != '(' && j < 63) {
+                                    ssid[j] = ssid_start[j];
+                                    j++;
+                                }
+                                ssid[j] = '\0';
+                                snprintf(display_msg, sizeof(display_msg), "SAVED: %s", ssid);
+                            } else {
+                                strncpy(display_msg, "Handshake saved!", sizeof(display_msg) - 1);
+                            }
+                            log_type = HS_LOG_SUCCESS;
+                            should_log = true;
+                        }
+                        
+                        // ===== FAILURE INDICATORS (red) =====
+                        else if (strstr(line_buffer, "No handshake for") != NULL) {
+                            // "✗ No handshake for 'SSID' after 3 bursts"
+                            if (extract_ssid_from_quotes(line_buffer, ssid, sizeof(ssid))) {
+                                snprintf(display_msg, sizeof(display_msg), "No handshake: %s", ssid);
+                            } else {
+                                strncpy(display_msg, "No handshake captured", sizeof(display_msg) - 1);
+                            }
+                            log_type = HS_LOG_ERROR;
+                            should_log = true;
+                        }
+                        
+                        // ===== PHASE/SCAN INFO =====
+                        else if (strstr(line_buffer, "PHASE 1") != NULL || strstr(line_buffer, "Scanning") != NULL) {
+                            strncpy(display_msg, "Scanning for networks...", sizeof(display_msg) - 1);
+                            log_type = HS_LOG_PROGRESS;
+                            should_log = true;
+                        }
+                        else if (strstr(line_buffer, "Found") != NULL && strstr(line_buffer, "networks") != NULL) {
+                            char *num = strstr(line_buffer, "Found ");
+                            if (num) {
+                                int count = atoi(num + 6);
+                                snprintf(display_msg, sizeof(display_msg), "Found %d networks", count);
+                                log_type = HS_LOG_PROGRESS;
+                                should_log = true;
+                            }
+                        }
+                        
+                        // ===== COOLDOWN (just log for awareness) =====
+                        else if (strstr(line_buffer, "Cooling down") != NULL) {
+                            // Don't spam cooldown messages, just skip
+                            should_log = false;
+                        }
+                        
+                        // ===== ATTACK CYCLE INFO =====
+                        else if (strstr(line_buffer, "Attack Cycle Complete") != NULL ||
+                                 strstr(line_buffer, "Restarting attack cycle") != NULL) {
+                            strncpy(display_msg, "Cycle complete, restarting...", sizeof(display_msg) - 1);
+                            log_type = HS_LOG_PROGRESS;
+                            should_log = true;
+                        }
+                        
+                        // Log the message if it's relevant
+                        if (should_log && display_msg[0] != '\0') {
+                            append_global_handshaker_log_ctx(ctx, display_msg, log_type);
                         }
                         
                         line_pos = 0;
@@ -9213,65 +9740,67 @@ static void global_handshaker_monitor_task(void *arg)
     }
     
     ESP_LOGI(TAG, "Global Handshaker monitor task ended");
-    global_handshaker_monitor_task_handle = NULL;
+    ctx->global_handshaker_task = NULL;
     vTaskDelete(NULL);
 }
 
 // Show global handshaker confirmation popup with icon and warning
 static void show_global_handshaker_confirm_popup(void)
 {
-    if (global_handshaker_popup_obj != NULL) return;  // Already showing
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx) return;
+    if (ctx->global_handshaker_popup != NULL) return;  // Already showing
     
     lv_obj_t *container = get_current_tab_container();
     if (!container) return;
     
     // Create modal overlay (fills container, semi-transparent, blocks input behind)
-    global_handshaker_popup_overlay = lv_obj_create(container);
-    lv_obj_remove_style_all(global_handshaker_popup_overlay);
-    lv_obj_set_size(global_handshaker_popup_overlay, lv_pct(100), lv_pct(100));
-    lv_obj_set_style_bg_color(global_handshaker_popup_overlay, lv_color_hex(0x000000), 0);
-    lv_obj_set_style_bg_opa(global_handshaker_popup_overlay, LV_OPA_50, 0);
-    lv_obj_clear_flag(global_handshaker_popup_overlay, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(global_handshaker_popup_overlay, LV_OBJ_FLAG_CLICKABLE);  // Capture clicks
+    ctx->global_handshaker_popup_overlay = lv_obj_create(container);
+    lv_obj_remove_style_all(ctx->global_handshaker_popup_overlay);
+    lv_obj_set_size(ctx->global_handshaker_popup_overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(ctx->global_handshaker_popup_overlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(ctx->global_handshaker_popup_overlay, LV_OPA_50, 0);
+    lv_obj_clear_flag(ctx->global_handshaker_popup_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(ctx->global_handshaker_popup_overlay, LV_OBJ_FLAG_CLICKABLE);  // Capture clicks
     
     // Create popup as child of overlay
-    global_handshaker_popup_obj = lv_obj_create(global_handshaker_popup_overlay);
-    lv_obj_set_size(global_handshaker_popup_obj, 520, 380);
-    lv_obj_center(global_handshaker_popup_obj);
-    lv_obj_set_style_bg_color(global_handshaker_popup_obj, lv_color_hex(0x1A1A2A), 0);
-    lv_obj_set_style_border_color(global_handshaker_popup_obj, COLOR_MATERIAL_AMBER, 0);
-    lv_obj_set_style_border_width(global_handshaker_popup_obj, 3, 0);
-    lv_obj_set_style_radius(global_handshaker_popup_obj, 16, 0);
-    lv_obj_set_style_shadow_width(global_handshaker_popup_obj, 30, 0);
-    lv_obj_set_style_shadow_color(global_handshaker_popup_obj, lv_color_hex(0x000000), 0);
-    lv_obj_set_style_shadow_opa(global_handshaker_popup_obj, LV_OPA_50, 0);
-    lv_obj_set_style_pad_all(global_handshaker_popup_obj, 20, 0);
-    lv_obj_set_flex_flow(global_handshaker_popup_obj, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(global_handshaker_popup_obj, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_row(global_handshaker_popup_obj, 14, 0);
-    lv_obj_clear_flag(global_handshaker_popup_obj, LV_OBJ_FLAG_SCROLLABLE);
+    ctx->global_handshaker_popup = lv_obj_create(ctx->global_handshaker_popup_overlay);
+    lv_obj_set_size(ctx->global_handshaker_popup, 520, 380);
+    lv_obj_center(ctx->global_handshaker_popup);
+    lv_obj_set_style_bg_color(ctx->global_handshaker_popup, lv_color_hex(0x1A1A2A), 0);
+    lv_obj_set_style_border_color(ctx->global_handshaker_popup, COLOR_MATERIAL_AMBER, 0);
+    lv_obj_set_style_border_width(ctx->global_handshaker_popup, 3, 0);
+    lv_obj_set_style_radius(ctx->global_handshaker_popup, 16, 0);
+    lv_obj_set_style_shadow_width(ctx->global_handshaker_popup, 30, 0);
+    lv_obj_set_style_shadow_color(ctx->global_handshaker_popup, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_shadow_opa(ctx->global_handshaker_popup, LV_OPA_50, 0);
+    lv_obj_set_style_pad_all(ctx->global_handshaker_popup, 20, 0);
+    lv_obj_set_flex_flow(ctx->global_handshaker_popup, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(ctx->global_handshaker_popup, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(ctx->global_handshaker_popup, 14, 0);
+    lv_obj_clear_flag(ctx->global_handshaker_popup, LV_OBJ_FLAG_SCROLLABLE);
     
     // Download icon (file save icon - same as tile)
-    lv_obj_t *icon_label = lv_label_create(global_handshaker_popup_obj);
+    lv_obj_t *icon_label = lv_label_create(ctx->global_handshaker_popup);
     lv_label_set_text(icon_label, LV_SYMBOL_DOWNLOAD);
     lv_obj_set_style_text_font(icon_label, &lv_font_montserrat_44, 0);
     lv_obj_set_style_text_color(icon_label, COLOR_MATERIAL_AMBER, 0);
     
     // Title
-    lv_obj_t *title = lv_label_create(global_handshaker_popup_obj);
+    lv_obj_t *title = lv_label_create(ctx->global_handshaker_popup);
     lv_label_set_text(title, "HANDSHAKER");
     lv_obj_set_style_text_font(title, &lv_font_montserrat_24, 0);
     lv_obj_set_style_text_color(title, COLOR_MATERIAL_AMBER, 0);
     
     // Warning message
-    lv_obj_t *message = lv_label_create(global_handshaker_popup_obj);
+    lv_obj_t *message = lv_label_create(ctx->global_handshaker_popup);
     lv_label_set_text(message, "This will deauth all networks around\nyou in order to grab handshakes.\nAre you sure?");
     lv_obj_set_style_text_font(message, &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_color(message, lv_color_hex(0xCCCCCC), 0);
     lv_obj_set_style_text_align(message, LV_TEXT_ALIGN_CENTER, 0);
     
     // Button container
-    lv_obj_t *btn_container = lv_obj_create(global_handshaker_popup_obj);
+    lv_obj_t *btn_container = lv_obj_create(ctx->global_handshaker_popup);
     lv_obj_remove_style_all(btn_container);
     lv_obj_set_size(btn_container, lv_pct(100), LV_SIZE_CONTENT);
     lv_obj_set_flex_flow(btn_container, LV_FLEX_FLOW_ROW);
@@ -9284,7 +9813,7 @@ static void show_global_handshaker_confirm_popup(void)
     lv_obj_set_size(no_btn, 120, 50);
     lv_obj_set_style_bg_color(no_btn, COLOR_MATERIAL_GREEN, 0);
     lv_obj_set_style_radius(no_btn, 8, 0);
-    lv_obj_add_event_cb(no_btn, global_handshaker_confirm_no_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(no_btn, global_handshaker_confirm_no_cb, LV_EVENT_CLICKED, ctx);
     
     lv_obj_t *no_label = lv_label_create(no_btn);
     lv_label_set_text(no_label, "No");
@@ -9296,7 +9825,7 @@ static void show_global_handshaker_confirm_popup(void)
     lv_obj_set_size(yes_btn, 120, 50);
     lv_obj_set_style_bg_color(yes_btn, COLOR_MATERIAL_AMBER, 0);
     lv_obj_set_style_radius(yes_btn, 8, 0);
-    lv_obj_add_event_cb(yes_btn, global_handshaker_confirm_yes_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(yes_btn, global_handshaker_confirm_yes_cb, LV_EVENT_CLICKED, ctx);
     
     lv_obj_t *yes_label = lv_label_create(yes_btn);
     lv_label_set_text(yes_label, "Yes");
@@ -9307,77 +9836,99 @@ static void show_global_handshaker_confirm_popup(void)
 // Show global handshaker active popup with Attack in Progress and Stop button
 static void show_global_handshaker_active_popup(void)
 {
-    if (global_handshaker_popup_obj != NULL) return;  // Already showing
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx) return;
+    if (ctx->global_handshaker_popup != NULL) return;  // Already showing
     
     lv_obj_t *container = get_current_tab_container();
     if (!container) return;
     
-    // Send start_handshake command via UART1 (always UART1)
-    ESP_LOGI(TAG, "Sending start_handshake command via %s", tab_transport_name(uart1_preferred_tab()));
-    uart_send_command("start_handshake");
+    // Determine which UART to use based on this tab
+    tab_id_t active_tab = tab_id_for_ctx(ctx);
+    
+    // Send start_handshake command to this tab's UART
+    if (active_tab == TAB_MBUS) {
+        uart2_send_command("start_handshake");
+    } else {
+        uart_send_command("start_handshake");
+    }
+    ESP_LOGI(TAG, "Global Handshaker using tab %d (%s)", active_tab, tab_transport_name(active_tab));
     
     // Create modal overlay
-    global_handshaker_popup_overlay = lv_obj_create(container);
-    lv_obj_remove_style_all(global_handshaker_popup_overlay);
-    lv_obj_set_size(global_handshaker_popup_overlay, lv_pct(100), lv_pct(100));
-    lv_obj_set_style_bg_color(global_handshaker_popup_overlay, lv_color_hex(0x000000), 0);
-    lv_obj_set_style_bg_opa(global_handshaker_popup_overlay, LV_OPA_70, 0);
-    lv_obj_clear_flag(global_handshaker_popup_overlay, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(global_handshaker_popup_overlay, LV_OBJ_FLAG_CLICKABLE);
+    ctx->global_handshaker_popup_overlay = lv_obj_create(container);
+    lv_obj_remove_style_all(ctx->global_handshaker_popup_overlay);
+    lv_obj_set_size(ctx->global_handshaker_popup_overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(ctx->global_handshaker_popup_overlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(ctx->global_handshaker_popup_overlay, LV_OPA_70, 0);
+    lv_obj_clear_flag(ctx->global_handshaker_popup_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(ctx->global_handshaker_popup_overlay, LV_OBJ_FLAG_CLICKABLE);
     
     // Create popup
-    global_handshaker_popup_obj = lv_obj_create(global_handshaker_popup_overlay);
-    lv_obj_set_size(global_handshaker_popup_obj, 480, 350);
-    lv_obj_center(global_handshaker_popup_obj);
-    lv_obj_set_style_bg_color(global_handshaker_popup_obj, lv_color_hex(0x1A1A2A), 0);
-    lv_obj_set_style_border_color(global_handshaker_popup_obj, COLOR_MATERIAL_AMBER, 0);
-    lv_obj_set_style_border_width(global_handshaker_popup_obj, 3, 0);
-    lv_obj_set_style_radius(global_handshaker_popup_obj, 16, 0);
-    lv_obj_set_style_shadow_width(global_handshaker_popup_obj, 30, 0);
-    lv_obj_set_style_shadow_color(global_handshaker_popup_obj, lv_color_hex(0x000000), 0);
-    lv_obj_set_style_shadow_opa(global_handshaker_popup_obj, LV_OPA_50, 0);
-    lv_obj_set_style_pad_all(global_handshaker_popup_obj, 20, 0);
-    lv_obj_set_flex_flow(global_handshaker_popup_obj, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(global_handshaker_popup_obj, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_row(global_handshaker_popup_obj, 16, 0);
-    lv_obj_clear_flag(global_handshaker_popup_obj, LV_OBJ_FLAG_SCROLLABLE);
+    ctx->global_handshaker_popup = lv_obj_create(ctx->global_handshaker_popup_overlay);
+    lv_obj_set_size(ctx->global_handshaker_popup, 520, 420);
+    lv_obj_center(ctx->global_handshaker_popup);
+    lv_obj_set_style_bg_color(ctx->global_handshaker_popup, lv_color_hex(0x1A1A2A), 0);
+    lv_obj_set_style_border_color(ctx->global_handshaker_popup, COLOR_MATERIAL_AMBER, 0);
+    lv_obj_set_style_border_width(ctx->global_handshaker_popup, 3, 0);
+    lv_obj_set_style_radius(ctx->global_handshaker_popup, 16, 0);
+    lv_obj_set_style_shadow_width(ctx->global_handshaker_popup, 30, 0);
+    lv_obj_set_style_shadow_color(ctx->global_handshaker_popup, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_shadow_opa(ctx->global_handshaker_popup, LV_OPA_50, 0);
+    lv_obj_set_style_pad_all(ctx->global_handshaker_popup, 20, 0);
+    lv_obj_set_flex_flow(ctx->global_handshaker_popup, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(ctx->global_handshaker_popup, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(ctx->global_handshaker_popup, 12, 0);
+    lv_obj_clear_flag(ctx->global_handshaker_popup, LV_OBJ_FLAG_SCROLLABLE);
     
     // Download icon
-    lv_obj_t *icon_label = lv_label_create(global_handshaker_popup_obj);
+    lv_obj_t *icon_label = lv_label_create(ctx->global_handshaker_popup);
     lv_label_set_text(icon_label, LV_SYMBOL_DOWNLOAD);
     lv_obj_set_style_text_font(icon_label, &lv_font_montserrat_44, 0);
     lv_obj_set_style_text_color(icon_label, COLOR_MATERIAL_AMBER, 0);
     
     // Attack in progress title
-    lv_obj_t *title = lv_label_create(global_handshaker_popup_obj);
+    lv_obj_t *title = lv_label_create(ctx->global_handshaker_popup);
     lv_label_set_text(title, "Attack in Progress");
     lv_obj_set_style_text_font(title, &lv_font_montserrat_24, 0);
     lv_obj_set_style_text_color(title, COLOR_MATERIAL_AMBER, 0);
     
-    // Status label for handshake captures
-    global_handshaker_status_label = lv_label_create(global_handshaker_popup_obj);
-    lv_label_set_text(global_handshaker_status_label, "Waiting for handshakes...");
-    lv_obj_set_style_text_font(global_handshaker_status_label, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(global_handshaker_status_label, lv_color_hex(0xAAAAAA), 0);
-    lv_obj_set_style_text_align(global_handshaker_status_label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_width(global_handshaker_status_label, lv_pct(90));
-    lv_label_set_long_mode(global_handshaker_status_label, LV_LABEL_LONG_WRAP);
+    // Scrollable log container for handshake status messages
+    ctx->global_handshaker_log_container = lv_obj_create(ctx->global_handshaker_popup);
+    lv_obj_set_size(ctx->global_handshaker_log_container, lv_pct(100), 150);
+    lv_obj_set_style_bg_color(ctx->global_handshaker_log_container, lv_color_hex(0x151520), 0);
+    lv_obj_set_style_border_width(ctx->global_handshaker_log_container, 1, 0);
+    lv_obj_set_style_border_color(ctx->global_handshaker_log_container, lv_color_hex(0x333344), 0);
+    lv_obj_set_style_radius(ctx->global_handshaker_log_container, 8, 0);
+    lv_obj_set_style_pad_all(ctx->global_handshaker_log_container, 10, 0);
+    lv_obj_set_scroll_dir(ctx->global_handshaker_log_container, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(ctx->global_handshaker_log_container, LV_SCROLLBAR_MODE_AUTO);
+    
+    // Status label inside the log container (multi-line)
+    ctx->global_handshaker_status_label = lv_label_create(ctx->global_handshaker_log_container);
+    lv_label_set_text(ctx->global_handshaker_status_label, "Waiting for handshakes...");
+    lv_obj_set_width(ctx->global_handshaker_status_label, lv_pct(100));
+    lv_label_set_long_mode(ctx->global_handshaker_status_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(ctx->global_handshaker_status_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(ctx->global_handshaker_status_label, lv_color_hex(0xAAAAAA), 0);
+    
+    // Clear log buffer
+    ctx->global_handshaker_log_buffer[0] = '\0';
     
     // Stop button
-    lv_obj_t *stop_btn = lv_btn_create(global_handshaker_popup_obj);
+    lv_obj_t *stop_btn = lv_btn_create(ctx->global_handshaker_popup);
     lv_obj_set_size(stop_btn, 180, 55);
     lv_obj_set_style_bg_color(stop_btn, COLOR_MATERIAL_AMBER, 0);
     lv_obj_set_style_radius(stop_btn, 8, 0);
-    lv_obj_add_event_cb(stop_btn, global_handshaker_stop_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(stop_btn, global_handshaker_stop_cb, LV_EVENT_CLICKED, ctx);
     
     lv_obj_t *stop_label = lv_label_create(stop_btn);
     lv_label_set_text(stop_label, LV_SYMBOL_STOP " Stop");
     lv_obj_set_style_text_font(stop_label, &lv_font_montserrat_20, 0);
     lv_obj_center(stop_label);
     
-    // Start monitoring task
-    global_handshaker_monitoring = true;
-    xTaskCreate(global_handshaker_monitor_task, "gh_monitor", 4096, NULL, 5, &global_handshaker_monitor_task_handle);
+    // Start monitoring task with context
+    ctx->global_handshaker_monitoring = true;
+    xTaskCreate(global_handshaker_monitor_task, "gh_monitor", 4096, (void*)ctx, 5, &ctx->global_handshaker_task);
 }
 
 //==================================================================================
@@ -9804,55 +10355,72 @@ static void show_phishing_portal_popup(void)
 //==================================================================================
 
 // Close wardrive popup helper
-static void close_wardrive_popup(void)
+static void close_wardrive_popup_ctx(tab_context_t *ctx)
 {
+    if (!ctx) return;
+    
     // Stop monitoring task first
-    wardrive_monitoring = false;
-    if (wardrive_monitor_task_handle != NULL) {
+    ctx->wardrive_monitoring = false;
+    if (ctx->wardrive_task != NULL) {
         vTaskDelay(pdMS_TO_TICKS(100));  // Give task time to exit
-        wardrive_monitor_task_handle = NULL;
+        ctx->wardrive_task = NULL;
     }
     
-    if (wardrive_popup_overlay) {
-        lv_obj_del(wardrive_popup_overlay);
-        wardrive_popup_overlay = NULL;
-        wardrive_popup_obj = NULL;
-        wardrive_status_label = NULL;
-        wardrive_log_label = NULL;
+    if (ctx->wardrive_popup_overlay) {
+        lv_obj_del(ctx->wardrive_popup_overlay);
+        ctx->wardrive_popup_overlay = NULL;
+        ctx->wardrive_popup = NULL;
+        ctx->wardrive_status_label = NULL;
+        ctx->wardrive_log_label = NULL;
     }
     
-    wardrive_gps_fix_obtained = false;
+    ctx->wardrive_gps_fix = false;
 }
 
 // Callback when user clicks Stop
 static void wardrive_stop_cb(lv_event_t *e)
 {
-    (void)e;
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx) ctx = get_current_ctx();
     ESP_LOGI(TAG, "Wardrive stopped - sending stop command");
     
-    // Send stop command via UART1
-    uart_send_command("stop");
+    // Send stop command to the correct UART based on this tab
+    tab_id_t active_tab = tab_id_for_ctx(ctx);
+    if (active_tab == TAB_MBUS) {
+        uart2_send_command("stop");
+    } else {
+        uart_send_command("stop");
+    }
     
     // Close popup
-    close_wardrive_popup();
+    close_wardrive_popup_ctx(ctx);
     
     // Return to main screen
     show_main_tiles();
 }
 
-// Wardrive monitor task - reads UART for GPS fix and log messages
+// Wardrive monitor task - reads UART for GPS fix and log messages (per-tab context)
 static void wardrive_monitor_task(void *arg)
 {
-    (void)arg;
-    ESP_LOGI(TAG, "Wardrive monitor task started");
+    tab_context_t *ctx = (tab_context_t *)arg;
+    if (!ctx) {
+        ESP_LOGE(TAG, "Wardrive monitor task: no context");
+        vTaskDelete(NULL);
+        return;
+    }
     
-    tab_id_t uart1_tab = uart1_preferred_tab();
+    // Determine which UART port to read from based on tab
+    tab_id_t active_tab = tab_id_for_ctx(ctx);
+    uart_port_t uart_port = (active_tab == TAB_MBUS) ? UART2_NUM : UART_NUM;
+    
+    ESP_LOGI(TAG, "Wardrive monitor task started (tab=%d, uart=%d)", active_tab, uart_port);
+    
     static char rx_buffer[512];
     static char line_buffer[512];
     int line_pos = 0;
     
-    while (wardrive_monitoring) {
-        int len = transport_read_bytes_tab(uart1_tab, UART_NUM, rx_buffer, sizeof(rx_buffer) - 1, pdMS_TO_TICKS(100));
+    while (ctx->wardrive_monitoring) {
+        int len = transport_read_bytes_tab(active_tab, uart_port, rx_buffer, sizeof(rx_buffer) - 1, pdMS_TO_TICKS(100));
         
         if (len > 0) {
             rx_buffer[len] = '\0';
@@ -9865,14 +10433,14 @@ static void wardrive_monitor_task(void *arg)
                         line_buffer[line_pos] = '\0';
                         
                         // Check for GPS fix obtained
-                        if (!wardrive_gps_fix_obtained && strstr(line_buffer, "GPS fix obtained") != NULL) {
-                            wardrive_gps_fix_obtained = true;
+                        if (!ctx->wardrive_gps_fix && strstr(line_buffer, "GPS fix obtained") != NULL) {
+                            ctx->wardrive_gps_fix = true;
                             ESP_LOGI(TAG, "Wardrive: GPS fix obtained");
                             
                             bsp_display_lock(0);
-                            if (wardrive_status_label) {
-                                lv_label_set_text(wardrive_status_label, "GPS Fix Acquired");
-                                lv_obj_set_style_text_color(wardrive_status_label, COLOR_MATERIAL_GREEN, 0);
+                            if (ctx->wardrive_status_label) {
+                                lv_label_set_text(ctx->wardrive_status_label, "GPS Fix Acquired");
+                                lv_obj_set_style_text_color(ctx->wardrive_status_label, COLOR_MATERIAL_GREEN, 0);
                             }
                             bsp_display_unlock();
                         }
@@ -9884,9 +10452,9 @@ static void wardrive_monitor_task(void *arg)
                             ESP_LOGI(TAG, "Wardrive: %s", line_buffer);
                             
                             bsp_display_lock(0);
-                            if (wardrive_log_label) {
-                                lv_label_set_text(wardrive_log_label, line_buffer);
-                                lv_obj_set_style_text_color(wardrive_log_label, COLOR_MATERIAL_GREEN, 0);
+                            if (ctx->wardrive_log_label) {
+                                lv_label_set_text(ctx->wardrive_log_label, line_buffer);
+                                lv_obj_set_style_text_color(ctx->wardrive_log_label, COLOR_MATERIAL_GREEN, 0);
                             }
                             bsp_display_unlock();
                         }
@@ -9903,94 +10471,103 @@ static void wardrive_monitor_task(void *arg)
     }
     
     ESP_LOGI(TAG, "Wardrive monitor task ended");
-    wardrive_monitor_task_handle = NULL;
+    ctx->wardrive_task = NULL;
     vTaskDelete(NULL);
 }
 
 // Wardrive actual start logic
 static void do_wardrive_start(void)
 {
-    if (wardrive_popup_obj != NULL) return;
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx) return;
+    if (ctx->wardrive_popup != NULL) return;
     
     lv_obj_t *container = get_current_tab_container();
     if (!container) return;
     
     // Reset state
-    wardrive_gps_fix_obtained = false;
+    ctx->wardrive_gps_fix = false;
     
-    // Send start_wardrive command via UART1
-    ESP_LOGI(TAG, "Sending start_wardrive command via %s", tab_transport_name(uart1_preferred_tab()));
-    uart_send_command("start_wardrive");
+    // Determine which UART to use based on this tab
+    tab_id_t active_tab = tab_id_for_ctx(ctx);
+    
+    // Send start_wardrive command to this tab's UART
+    if (active_tab == TAB_MBUS) {
+        uart2_send_command("start_wardrive");
+    } else {
+        uart_send_command("start_wardrive");
+    }
+    ESP_LOGI(TAG, "Wardrive using tab %d (%s)", active_tab, tab_transport_name(active_tab));
     
     // Create modal overlay
-    wardrive_popup_overlay = lv_obj_create(container);
-    lv_obj_remove_style_all(wardrive_popup_overlay);
-    lv_obj_set_size(wardrive_popup_overlay, lv_pct(100), lv_pct(100));
-    lv_obj_set_style_bg_color(wardrive_popup_overlay, lv_color_hex(0x000000), 0);
-    lv_obj_set_style_bg_opa(wardrive_popup_overlay, LV_OPA_70, 0);
-    lv_obj_clear_flag(wardrive_popup_overlay, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(wardrive_popup_overlay, LV_OBJ_FLAG_CLICKABLE);
+    ctx->wardrive_popup_overlay = lv_obj_create(container);
+    lv_obj_remove_style_all(ctx->wardrive_popup_overlay);
+    lv_obj_set_size(ctx->wardrive_popup_overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(ctx->wardrive_popup_overlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(ctx->wardrive_popup_overlay, LV_OPA_70, 0);
+    lv_obj_clear_flag(ctx->wardrive_popup_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(ctx->wardrive_popup_overlay, LV_OBJ_FLAG_CLICKABLE);
     
     // Create popup
-    wardrive_popup_obj = lv_obj_create(wardrive_popup_overlay);
-    lv_obj_set_size(wardrive_popup_obj, 550, 380);
-    lv_obj_center(wardrive_popup_obj);
-    lv_obj_set_style_bg_color(wardrive_popup_obj, lv_color_hex(0x1A1A2A), 0);
-    lv_obj_set_style_border_color(wardrive_popup_obj, COLOR_MATERIAL_TEAL, 0);
-    lv_obj_set_style_border_width(wardrive_popup_obj, 3, 0);
-    lv_obj_set_style_radius(wardrive_popup_obj, 16, 0);
-    lv_obj_set_style_shadow_width(wardrive_popup_obj, 30, 0);
-    lv_obj_set_style_shadow_color(wardrive_popup_obj, lv_color_hex(0x000000), 0);
-    lv_obj_set_style_shadow_opa(wardrive_popup_obj, LV_OPA_50, 0);
-    lv_obj_set_style_pad_all(wardrive_popup_obj, 20, 0);
-    lv_obj_set_flex_flow(wardrive_popup_obj, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(wardrive_popup_obj, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_row(wardrive_popup_obj, 16, 0);
-    lv_obj_clear_flag(wardrive_popup_obj, LV_OBJ_FLAG_SCROLLABLE);
+    ctx->wardrive_popup = lv_obj_create(ctx->wardrive_popup_overlay);
+    lv_obj_set_size(ctx->wardrive_popup, 550, 380);
+    lv_obj_center(ctx->wardrive_popup);
+    lv_obj_set_style_bg_color(ctx->wardrive_popup, lv_color_hex(0x1A1A2A), 0);
+    lv_obj_set_style_border_color(ctx->wardrive_popup, COLOR_MATERIAL_TEAL, 0);
+    lv_obj_set_style_border_width(ctx->wardrive_popup, 3, 0);
+    lv_obj_set_style_radius(ctx->wardrive_popup, 16, 0);
+    lv_obj_set_style_shadow_width(ctx->wardrive_popup, 30, 0);
+    lv_obj_set_style_shadow_color(ctx->wardrive_popup, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_shadow_opa(ctx->wardrive_popup, LV_OPA_50, 0);
+    lv_obj_set_style_pad_all(ctx->wardrive_popup, 20, 0);
+    lv_obj_set_flex_flow(ctx->wardrive_popup, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(ctx->wardrive_popup, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(ctx->wardrive_popup, 16, 0);
+    lv_obj_clear_flag(ctx->wardrive_popup, LV_OBJ_FLAG_SCROLLABLE);
     
     // GPS icon
-    lv_obj_t *icon_label = lv_label_create(wardrive_popup_obj);
+    lv_obj_t *icon_label = lv_label_create(ctx->wardrive_popup);
     lv_label_set_text(icon_label, LV_SYMBOL_GPS);
     lv_obj_set_style_text_font(icon_label, &lv_font_montserrat_44, 0);
     lv_obj_set_style_text_color(icon_label, COLOR_MATERIAL_TEAL, 0);
     
     // Title
-    lv_obj_t *title = lv_label_create(wardrive_popup_obj);
+    lv_obj_t *title = lv_label_create(ctx->wardrive_popup);
     lv_label_set_text(title, "Wardrive Active");
     lv_obj_set_style_text_font(title, &lv_font_montserrat_24, 0);
     lv_obj_set_style_text_color(title, COLOR_MATERIAL_TEAL, 0);
     
     // Status label (GPS fix status)
-    wardrive_status_label = lv_label_create(wardrive_popup_obj);
-    lv_label_set_text(wardrive_status_label, "Acquiring GPS Fix,\nneed clear view of the sky.");
-    lv_obj_set_style_text_font(wardrive_status_label, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(wardrive_status_label, COLOR_MATERIAL_AMBER, 0);
-    lv_obj_set_style_text_align(wardrive_status_label, LV_TEXT_ALIGN_CENTER, 0);
+    ctx->wardrive_status_label = lv_label_create(ctx->wardrive_popup);
+    lv_label_set_text(ctx->wardrive_status_label, "Acquiring GPS Fix,\nneed clear view of the sky.");
+    lv_obj_set_style_text_font(ctx->wardrive_status_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(ctx->wardrive_status_label, COLOR_MATERIAL_AMBER, 0);
+    lv_obj_set_style_text_align(ctx->wardrive_status_label, LV_TEXT_ALIGN_CENTER, 0);
     
     // Log label (shows "Logged X networks..." messages)
-    wardrive_log_label = lv_label_create(wardrive_popup_obj);
-    lv_label_set_text(wardrive_log_label, "Waiting for scan results...");
-    lv_obj_set_style_text_font(wardrive_log_label, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(wardrive_log_label, lv_color_hex(0x888888), 0);
-    lv_obj_set_style_text_align(wardrive_log_label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_width(wardrive_log_label, lv_pct(90));
-    lv_label_set_long_mode(wardrive_log_label, LV_LABEL_LONG_WRAP);
+    ctx->wardrive_log_label = lv_label_create(ctx->wardrive_popup);
+    lv_label_set_text(ctx->wardrive_log_label, "Waiting for scan results...");
+    lv_obj_set_style_text_font(ctx->wardrive_log_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(ctx->wardrive_log_label, lv_color_hex(0x888888), 0);
+    lv_obj_set_style_text_align(ctx->wardrive_log_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(ctx->wardrive_log_label, lv_pct(90));
+    lv_label_set_long_mode(ctx->wardrive_log_label, LV_LABEL_LONG_WRAP);
     
     // Stop button
-    lv_obj_t *stop_btn = lv_btn_create(wardrive_popup_obj);
+    lv_obj_t *stop_btn = lv_btn_create(ctx->wardrive_popup);
     lv_obj_set_size(stop_btn, 180, 55);
     lv_obj_set_style_bg_color(stop_btn, COLOR_MATERIAL_TEAL, 0);
     lv_obj_set_style_radius(stop_btn, 8, 0);
-    lv_obj_add_event_cb(stop_btn, wardrive_stop_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(stop_btn, wardrive_stop_cb, LV_EVENT_CLICKED, ctx);
     
     lv_obj_t *stop_label = lv_label_create(stop_btn);
     lv_label_set_text(stop_label, LV_SYMBOL_STOP " Stop");
     lv_obj_set_style_text_font(stop_label, &lv_font_montserrat_20, 0);
     lv_obj_center(stop_label);
     
-    // Start monitoring task
-    wardrive_monitoring = true;
-    xTaskCreate(wardrive_monitor_task, "wd_monitor", 4096, NULL, 5, &wardrive_monitor_task_handle);
+    // Start monitoring task with context
+    ctx->wardrive_monitoring = true;
+    xTaskCreate(wardrive_monitor_task, "wd_monitor", 4096, (void*)ctx, 5, &ctx->wardrive_task);
 }
 
 // Show wardrive popup
