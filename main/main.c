@@ -5072,7 +5072,7 @@ static void show_arp_poison_page(void)
     
     // Back button
     lv_obj_t *back_btn = lv_btn_create(header);
-    lv_obj_set_size(back_btn, 48, 40);
+    lv_obj_set_size(back_btn, 72, 60);
     lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x333333), 0);
     lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x444444), LV_STATE_PRESSED);
     lv_obj_set_style_radius(back_btn, 8, 0);
@@ -6077,7 +6077,7 @@ static void show_karma_page(void)
     
     // Back button
     lv_obj_t *back_btn = lv_btn_create(header);
-    lv_obj_set_size(back_btn, 48, 40);
+    lv_obj_set_size(back_btn, 72, 60);
     lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x333333), 0);
     lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x444444), LV_STATE_PRESSED);
     lv_obj_set_style_radius(back_btn, 8, 0);
@@ -6982,7 +6982,7 @@ static void show_scan_page(void)
     
     // Back button
     lv_obj_t *back_btn = lv_btn_create(left_cont);
-    lv_obj_set_size(back_btn, 48, 40);
+    lv_obj_set_size(back_btn, 72, 60);
     lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x333333), 0);
     lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x444444), LV_STATE_PRESSED);
     lv_obj_set_style_radius(back_btn, 8, 0);
@@ -8379,7 +8379,7 @@ static void show_observer_page(void)
     
     // Back button - positioned left
     lv_obj_t *back_btn = lv_btn_create(header);
-    lv_obj_set_size(back_btn, 48, 40);
+    lv_obj_set_size(back_btn, 72, 60);
     lv_obj_align(back_btn, LV_ALIGN_LEFT_MID, 0, 0);
     lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x1A3333), 0);
     lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x2A4444), LV_STATE_PRESSED);
@@ -8880,7 +8880,7 @@ static void show_esp_modem_page(void)
     
     // Back button
     lv_obj_t *back_btn = lv_btn_create(left_cont);
-    lv_obj_set_size(back_btn, 48, 40);
+    lv_obj_set_size(back_btn, 72, 60);
     lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x333333), 0);
     lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x444444), LV_STATE_PRESSED);
     lv_obj_set_style_radius(back_btn, 8, 0);
@@ -10857,7 +10857,7 @@ static void show_compromised_data_page(void)
     
     // Back button (arrow style like other pages)
     lv_obj_t *back_btn = lv_btn_create(header);
-    lv_obj_set_size(back_btn, 48, 40);
+    lv_obj_set_size(back_btn, 72, 60);
     lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x333333), 0);
     lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x444444), LV_STATE_PRESSED);
     lv_obj_set_style_radius(back_btn, 8, 0);
@@ -10939,7 +10939,7 @@ static void show_evil_twin_passwords_page(void)
     lv_obj_set_style_pad_column(header, 12, 0);
     
     lv_obj_t *back_btn = lv_btn_create(header);
-    lv_obj_set_size(back_btn, 48, 40);
+    lv_obj_set_size(back_btn, 72, 60);
     lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x333333), 0);
     lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x444444), LV_STATE_PRESSED);
     lv_obj_set_style_radius(back_btn, 8, 0);
@@ -11615,7 +11615,7 @@ static void show_rogue_ap_page(void)
     
     // Back button
     lv_obj_t *back_btn = lv_btn_create(header);
-    lv_obj_set_size(back_btn, 48, 40);
+    lv_obj_set_size(back_btn, 72, 60);
     lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x333333), 0);
     lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x444444), LV_STATE_PRESSED);
     lv_obj_set_style_radius(back_btn, 8, 0);
@@ -13527,7 +13527,7 @@ static void show_adhoc_portal_page(void)
     
     // Back button
     lv_obj_t *back_btn = lv_btn_create(header);
-    lv_obj_set_size(back_btn, 48, 40);
+    lv_obj_set_size(back_btn, 72, 60);
     lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x333333), 0);
     lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x444444), LV_STATE_PRESSED);
     lv_obj_set_style_radius(back_btn, 8, 0);
@@ -13716,7 +13716,7 @@ static void show_portal_data_page(void)
     lv_obj_set_style_pad_column(header, 12, 0);
     
     lv_obj_t *back_btn = lv_btn_create(header);
-    lv_obj_set_size(back_btn, 48, 40);
+    lv_obj_set_size(back_btn, 72, 60);
     lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x333333), 0);
     lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x444444), LV_STATE_PRESSED);
     lv_obj_set_style_radius(back_btn, 8, 0);
@@ -13900,7 +13900,7 @@ static void show_handshakes_page(void)
     lv_obj_set_style_pad_column(header, 12, 0);
     
     lv_obj_t *back_btn = lv_btn_create(header);
-    lv_obj_set_size(back_btn, 48, 40);
+    lv_obj_set_size(back_btn, 72, 60);
     lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x333333), 0);
     lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x444444), LV_STATE_PRESSED);
     lv_obj_set_style_radius(back_btn, 8, 0);
@@ -14331,7 +14331,7 @@ static void show_deauth_detector_page(void)
     
     // Back button (arrow style)
     lv_obj_t *back_btn = lv_btn_create(left_cont);
-    lv_obj_set_size(back_btn, 48, 40);
+    lv_obj_set_size(back_btn, 72, 60);
     lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x333333), 0);
     lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x444444), LV_STATE_PRESSED);
     lv_obj_set_style_radius(back_btn, 8, 0);
@@ -14491,7 +14491,7 @@ static void show_bluetooth_menu_page(void)
     lv_obj_clear_flag(header, LV_OBJ_FLAG_SCROLLABLE);
     
     lv_obj_t *back_btn = lv_btn_create(header);
-    lv_obj_set_size(back_btn, 48, 40);
+    lv_obj_set_size(back_btn, 72, 60);
     lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x333333), 0);
     lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x444444), LV_STATE_PRESSED);
     lv_obj_set_style_radius(back_btn, 8, 0);
@@ -14667,7 +14667,7 @@ static void show_airtag_scan_page(void)
     lv_obj_clear_flag(header, LV_OBJ_FLAG_SCROLLABLE);
     
     lv_obj_t *back_btn = lv_btn_create(header);
-    lv_obj_set_size(back_btn, 48, 40);
+    lv_obj_set_size(back_btn, 72, 60);
     lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x333333), 0);
     lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x444444), LV_STATE_PRESSED);
     lv_obj_set_style_radius(back_btn, 8, 0);
@@ -14915,7 +14915,7 @@ static void show_bt_scan_page(void)
     lv_obj_clear_flag(left_cont, LV_OBJ_FLAG_SCROLLABLE);
     
     lv_obj_t *back_btn = lv_btn_create(left_cont);
-    lv_obj_set_size(back_btn, 48, 40);
+    lv_obj_set_size(back_btn, 72, 60);
     lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x333333), 0);
     lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x444444), LV_STATE_PRESSED);
     lv_obj_set_style_radius(back_btn, 8, 0);
@@ -15282,7 +15282,7 @@ static void show_bt_locator_page(int device_idx)
     lv_obj_clear_flag(header, LV_OBJ_FLAG_SCROLLABLE);
     
     lv_obj_t *back_btn = lv_btn_create(header);
-    lv_obj_set_size(back_btn, 48, 40);
+    lv_obj_set_size(back_btn, 72, 60);
     lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x333333), 0);
     lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x444444), LV_STATE_PRESSED);
     lv_obj_set_style_radius(back_btn, 8, 0);
@@ -15475,7 +15475,7 @@ static void show_global_attacks_page(void)
     
     // Back button
     lv_obj_t *back_btn = lv_btn_create(header);
-    lv_obj_set_size(back_btn, 48, 40);
+    lv_obj_set_size(back_btn, 72, 60);
     lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x333333), 0);
     lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x444444), LV_STATE_PRESSED);
     lv_obj_set_style_radius(back_btn, 8, 0);
