@@ -1,0 +1,40 @@
+menu "IoT USB Host CDC"
+
+    config USBH_TASK_CORE_ID
+        int "usbh task core_id"
+        default 0
+        range -1 1
+        help
+            usb host task to specified core
+
+    config USBH_TASK_BASE_PRIORITY
+        int "usbh task base priority"
+        default 5
+        help
+            usb task base priority
+
+    config CONTROL_TRANSFER_BUFFER_SIZE
+        int "usbh control transfer size"
+        default 512
+        help
+            usb host control transfer size
+
+    config IN_TRANSFER_BUFFER_SIZE
+        int "usbh IN transfer buffer size"
+        default 512
+        help
+            usb host IN transfer buffer size
+
+    config OUT_TRANSFER_BUFFER_SIZE
+        int "usbh OUT transfer buffer size"
+        default 512
+        help
+            usb host OUT transfer buffer size
+
+    config DEVICE_ADDRESS_LIST_NUM
+        int "usbh device address list num"
+        default 10
+        help
+            usb host device address list num
+
+endmenu

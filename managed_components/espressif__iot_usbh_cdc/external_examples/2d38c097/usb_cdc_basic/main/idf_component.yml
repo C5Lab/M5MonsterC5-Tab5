@@ -1,0 +1,8 @@
+dependencies:
+  espressif/esp32_s3_usb_otg:
+    rules:
+    - if: target in [esp32s3]
+    version: ^1.5.1
+  idf: '>=4.4.1'
+  iot_usbh_cdc:
+    version: ^2.0.0

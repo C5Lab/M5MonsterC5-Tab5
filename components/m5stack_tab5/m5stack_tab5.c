@@ -1561,6 +1561,7 @@ static lv_display_t* bsp_display_lcd_init(const bsp_display_cfg_t* cfg)
 }
 
 esp_lcd_touch_handle_t _lcd_touch_handle;
+static bsp_display_type_t _current_display_type = BSP_DISPLAY_TYPE_UNKNOWN;
 
 esp_lcd_touch_handle_t bsp_display_get_touch_handle(void)
 {
@@ -1717,6 +1718,7 @@ lv_display_t* bsp_display_start_with_config(const bsp_display_cfg_t* cfg)
 
     // 动态检测显示屏类型并初始化对应的触摸屏
     bsp_display_type_t display_type = bsp_detect_display_type();
+    _current_display_type = display_type;  // Store for proximity sensor API
 
     if (display_type == BSP_DISPLAY_TYPE_ST7123) {
         BSP_NULL_CHECK(disp_indev = bsp_display_indev_init_to_st7123(disp), NULL);

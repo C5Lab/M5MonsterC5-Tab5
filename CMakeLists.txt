@@ -11,6 +11,9 @@ set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,-zmuldefs")
 # Bootstrap ESP-IDF build system
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 
+# Prevent discarded .sdata sections with non-contiguous regions
+idf_build_set_property(COMPILE_OPTIONS "-msmall-data-limit=0" APPEND)
+
 project(M5MonsterC5-Tab5)
 
 # ===== POST-BUILD: copy binaries to binaries-esp32s3 =====
