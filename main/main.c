@@ -425,6 +425,22 @@ typedef struct {
     arp_host_t *arp_hosts;  // PSRAM
     int arp_host_count;
     
+    // =====================================================================
+    // ROGUE AP - Page and data
+    // =====================================================================
+    lv_obj_t *rogue_ap_page;
+    lv_obj_t *rogue_ap_password_input;
+    lv_obj_t *rogue_ap_keyboard;
+    lv_obj_t *rogue_ap_html_dropdown;
+    lv_obj_t *rogue_ap_start_btn;
+    lv_obj_t *rogue_ap_popup_overlay;
+    lv_obj_t *rogue_ap_popup;
+    lv_obj_t *rogue_ap_status_label;
+    char rogue_ap_ssid[33];
+    char rogue_ap_password[65];
+    volatile bool rogue_ap_monitoring;
+    TaskHandle_t rogue_ap_task;
+    
     // Transport type for this tab context
     uint8_t transport_kind;  // 0=Grove, 1=USB, 2=MBus, 3=INTERNAL
     
@@ -857,6 +873,17 @@ static char arp_target_ssid[33] = {0};
 static char arp_our_ip[20] = {0};
 static bool arp_wifi_connected = false;
 
+// Rogue AP page (legacy globals for compatibility)
+static lv_obj_t *rogue_ap_page = NULL;
+static lv_obj_t *rogue_ap_password_input = NULL;
+static lv_obj_t *rogue_ap_keyboard = NULL;
+static lv_obj_t *rogue_ap_html_dropdown = NULL;
+static lv_obj_t *rogue_ap_start_btn = NULL;
+static char rogue_ap_ssid[33] = {0};
+static char rogue_ap_password[65] = {0};
+static volatile bool rogue_ap_monitoring = false;
+static TaskHandle_t rogue_ap_monitor_task_handle = NULL;
+
 // ARP Poison popup (attack active)
 
 // ARP Host storage (global legacy - type defined earlier)
@@ -1069,6 +1096,8 @@ static void show_handshaker_popup(void);
 static void handshaker_popup_close_cb(lv_event_t *e);
 static void handshaker_monitor_task(void *arg);
 static void show_arp_poison_page(void);
+static void show_rogue_ap_page(void);
+static void show_rogue_ap_popup(tab_context_t *ctx);
 static void arp_poison_back_cb(lv_event_t *e);
 static void arp_connect_cb(lv_event_t *e);
 static void arp_list_hosts_cb(lv_event_t *e);
@@ -3777,6 +3806,29 @@ static void attack_tile_event_cb(lv_event_t *e)
         }
         
         show_arp_poison_page();
+        return;
+    }
+    
+    // Handle Rogue AP attack - requires exactly 1 network selected
+    if (strcmp(attack_name, "Rogue AP") == 0) {
+        if (selected_network_count != 1) {
+            ESP_LOGW(TAG, "Rogue AP requires exactly 1 network, selected: %d", selected_network_count);
+            if (status_label) {
+                bsp_display_lock(0);
+                lv_label_set_text(status_label, "Select exactly 1 network for Rogue AP");
+                lv_obj_set_style_text_color(status_label, COLOR_MATERIAL_RED, 0);
+                bsp_display_unlock();
+            }
+            return;
+        }
+        
+        // Check SD card before opening popup
+        if (!current_tab_has_sd_card()) {
+            show_sd_warning_popup(show_rogue_ap_page);
+            return;
+        }
+        
+        show_rogue_ap_page();
         return;
     }
 }
@@ -6886,6 +6938,10 @@ static void show_scan_page(void)
     }
     // ARP tile always visible (but poisoning blocked when Red Team disabled)
     create_small_tile(attack_bar, LV_SYMBOL_SHUFFLE, "ARP", COLOR_MATERIAL_PURPLE, attack_tile_event_cb, "ARP Poison");
+    // Rogue AP tile (always visible when Red Team enabled)
+    if (enable_red_team) {
+        create_small_tile(attack_bar, LV_SYMBOL_WIFI, "RogueAP", COLOR_MATERIAL_CYAN, attack_tile_event_cb, "Rogue AP");
+    }
     
     // Auto-start scan when entering the page
     lv_obj_send_event(scan_btn, LV_EVENT_CLICKED, NULL);
@@ -11051,6 +11107,643 @@ static void evil_twin_connect_popup_yes_cb(lv_event_t *e)
     
     // Show ARP Poison page (will auto-connect and scan)
     show_arp_poison_page();
+}
+
+//==================================================================================
+// Rogue AP Attack Functions
+//==================================================================================
+
+// Rogue AP back button callback
+static void rogue_ap_back_cb(lv_event_t *e)
+{
+    (void)e;
+    ESP_LOGI(TAG, "Rogue AP: back button pressed, returning to scan page");
+    
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx) return;
+    
+    // Hide rogue AP page
+    if (ctx->rogue_ap_page) {
+        lv_obj_del(ctx->rogue_ap_page);
+        ctx->rogue_ap_page = NULL;
+        rogue_ap_page = NULL;
+    }
+    
+    // Show scan page
+    show_scan_page();
+}
+
+// Rogue AP password input focus callback - show keyboard
+static void rogue_ap_password_focus_cb(lv_event_t *e)
+{
+    lv_obj_t *ta = lv_event_get_target(e);
+    tab_context_t *ctx = get_current_ctx();
+    if (ctx && ctx->rogue_ap_keyboard) {
+        lv_obj_clear_flag(ctx->rogue_ap_keyboard, LV_OBJ_FLAG_HIDDEN);
+        lv_keyboard_set_textarea(ctx->rogue_ap_keyboard, ta);
+    }
+}
+
+
+// Rogue AP monitor task - watches UART for client connections and passwords
+static void rogue_ap_monitor_task(void *arg)
+{
+    tab_context_t *ctx = (tab_context_t *)arg;
+    if (!ctx) {
+        ESP_LOGE(TAG, "Rogue AP monitor task: NULL context!");
+        vTaskDelete(NULL);
+        return;
+    }
+    
+    // Determine UART from context
+    tab_id_t task_tab = tab_id_for_ctx(ctx);
+    uart_port_t uart_port = uart_port_for_tab(task_tab);
+    const char *uart_name = tab_transport_name(task_tab);
+    
+    static char rx_buffer[512];
+    static char line_buffer[256];
+    int line_pos = 0;
+    
+    int client_count = 0;
+    char current_mac[20] = {0};
+    
+    ESP_LOGI(TAG, "[%s] Rogue AP monitor task started for tab %d", uart_name, task_tab);
+    
+    while (ctx->rogue_ap_monitoring) {
+        int len = transport_read_bytes(uart_port, rx_buffer, sizeof(rx_buffer) - 1, pdMS_TO_TICKS(200));
+        
+        if (len > 0) {
+            rx_buffer[len] = '\0';
+            
+            for (int i = 0; i < len; i++) {
+                char c = rx_buffer[i];
+                
+                if (c == '\n' || c == '\r') {
+                    if (line_pos > 0) {
+                        line_buffer[line_pos] = '\0';
+                        ESP_LOGI(TAG, "[%s] RogueAP: %s", uart_name, line_buffer);
+                        
+                        // Parse memory info: "[MEM] start_rogueap: Internal=200/257KB, DMA=185/241KB, PSRAM=7436/8192KB"
+                        // Parse client connections: "AP: Client connected - MAC: XX:XX:XX:XX:XX:XX"
+                        char *mac_ptr = strstr(line_buffer, "Client connected - MAC:");
+                        if (mac_ptr != NULL) {
+                            mac_ptr += 24;  // Skip "Client connected - MAC: "
+                            while (*mac_ptr == ' ') mac_ptr++;
+                            
+                            char mac[20] = {0};
+                            int j = 0;
+                            while (mac_ptr[j] && mac_ptr[j] != ' ' && mac_ptr[j] != '\n' && j < 17) {
+                                mac[j] = mac_ptr[j];
+                                j++;
+                            }
+                            mac[j] = '\0';
+                            snprintf(current_mac, sizeof(current_mac), "%s", mac);
+                            client_count++;
+                            
+                            bsp_display_lock(0);
+                            if (ctx->rogue_ap_status_label) {
+                                char status[512];
+                                snprintf(status, sizeof(status),
+                                    "AP: Rogue AP Running\n\n"
+                                    "SSID: %s\n"
+                                    "Clients Connected: %d\n"
+                                    "Last MAC: %s\n\n"
+                                    "Waiting for password capture...",
+                                    rogue_ap_ssid, client_count, current_mac);
+                                lv_label_set_text(ctx->rogue_ap_status_label, status);
+                            }
+                            bsp_display_unlock();
+                        }
+                        
+                        // Parse client count: "Portal: Client count = X"
+                        char *count_ptr = strstr(line_buffer, "Portal: Client count =");
+                        if (count_ptr != NULL) {
+                            count_ptr += 22;  // Skip "Portal: Client count = "
+                            int parsed_count = atoi(count_ptr);
+                            if (parsed_count != client_count) {
+                                client_count = parsed_count;
+                                bsp_display_lock(0);
+                                if (ctx->rogue_ap_status_label) {
+                                    char status[512];
+                                    snprintf(status, sizeof(status),
+                                        "AP: Rogue AP Running\n\n"
+                                        "SSID: %s\n"
+                                        "Clients Connected: %d\n"
+                                        "Last MAC: %s\n\n"
+                                        "Waiting for password capture...",
+                                        rogue_ap_ssid, client_count, current_mac);
+                                    lv_label_set_text(ctx->rogue_ap_status_label, status);
+                                }
+                                bsp_display_unlock();
+                            }
+                        }
+                        
+                        // Parse password: "Portal password received: XXXX" or "Password: XXXX"
+                        char *pass_ptr = strstr(line_buffer, "Portal password received:");
+                        int skip_len = 25;  // Length of "Portal password received: "
+                        
+                        if (pass_ptr == NULL) {
+                            // Try alternative pattern "Password: "
+                            pass_ptr = strstr(line_buffer, "Password:");
+                            skip_len = 9;  // Length of "Password: "
+                        }
+                        
+                        if (pass_ptr != NULL) {
+                            pass_ptr += skip_len;
+                            while (*pass_ptr == ' ') pass_ptr++;
+                            
+                            char pass[128] = {0};
+                            int j = 0;
+                            while (pass_ptr[j] && pass_ptr[j] != '\n' && pass_ptr[j] != '\r' && j < 127) {
+                                pass[j] = pass_ptr[j];
+                                j++;
+                            }
+                            // Trim trailing whitespace
+                            while (j > 0 && isspace((unsigned char)pass[j - 1])) {
+                                pass[--j] = '\0';
+                            }
+                            
+                            if (strlen(pass) > 0) {
+                                bsp_display_lock(0);
+                                if (ctx->rogue_ap_status_label) {
+                                    char status[512];
+                                    snprintf(status, sizeof(status),
+                                        "PASSWORD CAPTURED!\n\n"
+                                        "SSID: %s\n"
+                                        "Clients Connected: %d\n"
+                                        "Last MAC: %s\n\n"
+                                        "Password: %s",
+                                        rogue_ap_ssid, client_count, current_mac, pass);
+                                    lv_label_set_text(ctx->rogue_ap_status_label, status);
+                                    lv_obj_set_style_text_color(ctx->rogue_ap_status_label, COLOR_MATERIAL_GREEN, 0);
+                                }
+                                bsp_display_unlock();
+                            }
+                        }
+                        
+                        line_pos = 0;
+                    }
+                } else if (line_pos < (int)sizeof(line_buffer) - 1) {
+                    line_buffer[line_pos++] = c;
+                }
+            }
+        }
+        
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    
+    ESP_LOGI(TAG, "Rogue AP monitor task ended");
+    rogue_ap_monitor_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+// Rogue AP popup close callback - sends stop command
+static void rogue_ap_popup_close_cb(lv_event_t *e)
+{
+    (void)e;
+    ESP_LOGI(TAG, "Rogue AP popup closed - sending stop command");
+    
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx) return;
+    
+    // Stop monitoring
+    ctx->rogue_ap_monitoring = false;
+    
+    // Send stop command to current tab's UART
+    uart_send_command_for_tab("stop");
+    
+    // Delete overlay (popup is child, will be deleted too)
+    if (ctx->rogue_ap_popup_overlay) {
+        lv_obj_del(ctx->rogue_ap_popup_overlay);
+        ctx->rogue_ap_popup_overlay = NULL;
+        ctx->rogue_ap_popup = NULL;
+        ctx->rogue_ap_status_label = NULL;
+    }
+}
+
+// Start Rogue AP button callback
+static void rogue_ap_start_cb(lv_event_t *e)
+{
+    (void)e;
+    ESP_LOGI(TAG, "Rogue AP: Starting attack");
+    
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx) return;
+    
+    // Get selected HTML file index from dropdown
+    int html_idx = lv_dropdown_get_selected(ctx->rogue_ap_html_dropdown);
+    
+    if (html_idx < 0 || html_idx >= evil_twin_html_count) {
+        ESP_LOGW(TAG, "Invalid HTML file selection");
+        return;
+    }
+    
+    // Get password from input (if not already known)
+    if (strlen(rogue_ap_password) == 0 && ctx->rogue_ap_password_input) {
+        const char *password_text = lv_textarea_get_text(ctx->rogue_ap_password_input);
+        if (!password_text || strlen(password_text) == 0) {
+            ESP_LOGW(TAG, "Password is empty");
+            return;
+        }
+        strncpy(rogue_ap_password, password_text, sizeof(rogue_ap_password) - 1);
+        rogue_ap_password[sizeof(rogue_ap_password) - 1] = '\0';
+    }
+    
+    // Send select_html command (1-based index)
+    char html_cmd[32];
+    snprintf(html_cmd, sizeof(html_cmd), "select_html %d", html_idx + 1);
+    ESP_LOGI(TAG, "[UART%d] Rogue AP: sending %s", uart_index_for_tab(current_tab), html_cmd);
+    uart_send_command_for_tab(html_cmd);
+    vTaskDelay(pdMS_TO_TICKS(100));
+    
+    // Send start_rogueap command: start_rogueap SSID password
+    char ap_cmd[256];
+    snprintf(ap_cmd, sizeof(ap_cmd), "start_rogueap %s %s", rogue_ap_ssid, rogue_ap_password);
+    ESP_LOGI(TAG, "[UART%d] Rogue AP: sending start_rogueap %s XXXX", uart_index_for_tab(current_tab), rogue_ap_ssid);
+    uart_send_command_for_tab(ap_cmd);
+    
+    // Show monitoring popup
+    show_rogue_ap_popup(ctx);
+}
+
+// Show Rogue AP monitoring popup
+static void show_rogue_ap_popup(tab_context_t *ctx)
+{
+    if (!ctx) return;
+    if (ctx->rogue_ap_popup_overlay != NULL) return;  // Already showing in this tab
+    
+    lv_obj_t *container = get_current_tab_container();
+    if (!container) return;
+    
+    // Create modal overlay
+    ctx->rogue_ap_popup_overlay = lv_obj_create(container);
+    lv_obj_remove_style_all(ctx->rogue_ap_popup_overlay);
+    lv_obj_set_size(ctx->rogue_ap_popup_overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(ctx->rogue_ap_popup_overlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(ctx->rogue_ap_popup_overlay, LV_OPA_50, 0);
+    lv_obj_clear_flag(ctx->rogue_ap_popup_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(ctx->rogue_ap_popup_overlay, LV_OBJ_FLAG_CLICKABLE);  // Capture clicks
+    
+    // Create popup as child of overlay
+    ctx->rogue_ap_popup = lv_obj_create(ctx->rogue_ap_popup_overlay);
+    lv_obj_set_size(ctx->rogue_ap_popup, 550, 450);
+    lv_obj_center(ctx->rogue_ap_popup);
+    lv_obj_set_style_bg_color(ctx->rogue_ap_popup, lv_color_hex(0x1A1A2A), 0);
+    lv_obj_set_style_border_color(ctx->rogue_ap_popup, COLOR_MATERIAL_CYAN, 0);
+    lv_obj_set_style_border_width(ctx->rogue_ap_popup, 2, 0);
+    lv_obj_set_style_radius(ctx->rogue_ap_popup, 16, 0);
+    lv_obj_set_style_shadow_width(ctx->rogue_ap_popup, 30, 0);
+    lv_obj_set_style_shadow_color(ctx->rogue_ap_popup, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_shadow_opa(ctx->rogue_ap_popup, LV_OPA_50, 0);
+    lv_obj_set_style_pad_all(ctx->rogue_ap_popup, 16, 0);
+    lv_obj_set_flex_flow(ctx->rogue_ap_popup, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(ctx->rogue_ap_popup, 12, 0);
+    
+    // Title
+    lv_obj_t *title = lv_label_create(ctx->rogue_ap_popup);
+    lv_label_set_text(title, "Rogue AP Running");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_CYAN, 0);
+    
+    // Status label (scrollable)
+    ctx->rogue_ap_status_label = lv_label_create(ctx->rogue_ap_popup);
+    lv_label_set_text(ctx->rogue_ap_status_label, "Starting Rogue AP...");
+    lv_obj_set_style_text_font(ctx->rogue_ap_status_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(ctx->rogue_ap_status_label, lv_color_hex(0xAAAAAA), 0);
+    lv_obj_set_width(ctx->rogue_ap_status_label, lv_pct(100));
+    lv_label_set_long_mode(ctx->rogue_ap_status_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_flex_grow(ctx->rogue_ap_status_label, 1);
+    
+    // Close button
+    lv_obj_t *close_btn = lv_btn_create(ctx->rogue_ap_popup);
+    lv_obj_set_size(close_btn, lv_pct(100), 50);
+    lv_obj_set_style_bg_color(close_btn, COLOR_MATERIAL_RED, 0);
+    lv_obj_set_style_bg_color(close_btn, lv_color_lighten(COLOR_MATERIAL_RED, 30), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(close_btn, 8, 0);
+    lv_obj_add_event_cb(close_btn, rogue_ap_popup_close_cb, LV_EVENT_CLICKED, NULL);
+    
+    lv_obj_t *close_label = lv_label_create(close_btn);
+    lv_label_set_text(close_label, "Stop Rogue AP");
+    lv_obj_set_style_text_font(close_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(close_label, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_center(close_label);
+    
+    // Start monitoring task
+    ctx->rogue_ap_monitoring = true;
+    xTaskCreate(rogue_ap_monitor_task, "rogue_ap_mon", 4096, (void*)ctx, 5, &rogue_ap_monitor_task_handle);
+}
+
+// Show Rogue AP page
+static void show_rogue_ap_page(void)
+{
+    ESP_LOGI(TAG, "Showing Rogue AP page");
+    
+    tab_context_t *ctx = get_current_ctx();
+    lv_obj_t *container = get_current_tab_container();
+    
+    if (!container) {
+        ESP_LOGE(TAG, "Container not initialized for tab %d", current_tab);
+        return;
+    }
+    
+    hide_all_pages(ctx);
+    
+    // If page already exists for this tab, just show it
+    if (ctx->rogue_ap_page) {
+        lv_obj_clear_flag(ctx->rogue_ap_page, LV_OBJ_FLAG_HIDDEN);
+        ctx->current_visible_page = ctx->rogue_ap_page;
+        rogue_ap_page = ctx->rogue_ap_page;
+        ESP_LOGI(TAG, "Showing existing rogue AP page for tab %d", current_tab);
+        return;
+    }
+    
+    ESP_LOGI(TAG, "Creating new rogue AP page for tab %d", current_tab);
+    
+    // Create rogue AP page
+    ctx->rogue_ap_page = lv_obj_create(container);
+    rogue_ap_page = ctx->rogue_ap_page;
+    lv_coord_t scr_height = lv_disp_get_ver_res(NULL);
+    lv_obj_set_size(ctx->rogue_ap_page, lv_pct(100), scr_height - 85);
+    lv_obj_align(ctx->rogue_ap_page, LV_ALIGN_TOP_MID, 0, 85);
+    lv_obj_set_style_bg_color(ctx->rogue_ap_page, lv_color_hex(0x1A1A1A), 0);
+    lv_obj_set_style_border_width(ctx->rogue_ap_page, 0, 0);
+    lv_obj_set_style_pad_all(ctx->rogue_ap_page, 15, 0);
+    lv_obj_set_flex_flow(ctx->rogue_ap_page, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(ctx->rogue_ap_page, 10, 0);
+    
+    // Header
+    lv_obj_t *header = lv_obj_create(ctx->rogue_ap_page);
+    lv_obj_set_size(header, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(header, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(header, 0, 0);
+    lv_obj_set_style_pad_all(header, 0, 0);
+    lv_obj_set_flex_flow(header, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(header, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(header, 15, 0);
+    lv_obj_clear_flag(header, LV_OBJ_FLAG_SCROLLABLE);
+    
+    // Back button
+    lv_obj_t *back_btn = lv_btn_create(header);
+    lv_obj_set_size(back_btn, 48, 40);
+    lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x333333), 0);
+    lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x444444), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(back_btn, 8, 0);
+    lv_obj_add_event_cb(back_btn, rogue_ap_back_cb, LV_EVENT_CLICKED, NULL);
+    
+    lv_obj_t *back_icon = lv_label_create(back_btn);
+    lv_label_set_text(back_icon, LV_SYMBOL_LEFT);
+    lv_obj_set_style_text_color(back_icon, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_center(back_icon);
+    
+    // Title
+    lv_obj_t *title = lv_label_create(header);
+    lv_label_set_text(title, "Rogue AP Attack");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_22, 0);
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_CYAN, 0);
+    
+    // Get selected network SSID and try to find known password
+    int idx = selected_network_indices[0];
+    if (idx >= 0 && idx < network_count) {
+        strncpy(rogue_ap_ssid, networks[idx].ssid, sizeof(rogue_ap_ssid) - 1);
+        rogue_ap_ssid[sizeof(rogue_ap_ssid) - 1] = '\0';
+    }
+    memset(rogue_ap_password, 0, sizeof(rogue_ap_password));
+    
+    // Flush and get Evil Twin passwords (load known passwords)
+    evil_twin_entry_count = 0;
+    uart_port_t uart_port = uart_port_for_tab(current_tab);
+    uart_flush(uart_port);
+    uart_send_command_for_tab("show_pass evil");
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    
+    static char rx_buffer[2048];
+    int total_len = 0;
+    int retries = 10;
+    int empty_reads = 0;
+    
+    while (retries-- > 0 && empty_reads < 3) {
+        int len = transport_read_bytes(uart_port, rx_buffer + total_len, sizeof(rx_buffer) - total_len - 1, pdMS_TO_TICKS(200));
+        if (len > 0) {
+            total_len += len;
+            empty_reads = 0;
+        } else {
+            empty_reads++;
+        }
+    }
+    rx_buffer[total_len] = '\0';
+    
+    ESP_LOGI(TAG, "Rogue AP: Evil Twin passwords response (%d bytes)", total_len);
+    
+    // Parse Evil Twin passwords
+    memset(evil_twin_entries, 0, sizeof(evil_twin_entries));
+    char *line = strtok(rx_buffer, "\n\r");
+    while (line != NULL) {
+        if (strlen(line) < 5 || strstr(line, "show_pass") != NULL) {
+            line = strtok(NULL, "\n\r");
+            continue;
+        }
+        
+        char ssid[64] = {0};
+        char password[64] = {0};
+        
+        // Parse "SSID", "password" format
+        char *p1 = strchr(line, '"');
+        if (p1) {
+            p1++;
+            char *p2 = strchr(p1, '"');
+            if (p2) {
+                size_t len = p2 - p1;
+                if (len < sizeof(ssid)) {
+                    strncpy(ssid, p1, len);
+                    ssid[len] = '\0';
+                }
+                
+                char *p3 = strchr(p2 + 1, '"');
+                if (p3) {
+                    p3++;
+                    char *p4 = strchr(p3, '"');
+                    if (p4) {
+                        len = p4 - p3;
+                        if (len < sizeof(password)) {
+                            strncpy(password, p3, len);
+                            password[len] = '\0';
+                        }
+                    }
+                }
+            }
+        }
+        
+        if (strlen(ssid) > 0 && evil_twin_entry_count < EVIL_TWIN_MAX_ENTRIES) {
+            snprintf(evil_twin_entries[evil_twin_entry_count].ssid, sizeof(evil_twin_entries[0].ssid), "%s", ssid);
+            snprintf(evil_twin_entries[evil_twin_entry_count].password, sizeof(evil_twin_entries[0].password), "%s", password);
+            evil_twin_entry_count++;
+        }
+        
+        line = strtok(NULL, "\n\r");
+    }
+    
+    // Target network info
+    lv_obj_t *target_label = lv_label_create(ctx->rogue_ap_page);
+    lv_label_set_text_fmt(target_label, "Target SSID: %s", rogue_ap_ssid);
+    lv_obj_set_style_text_font(target_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(target_label, lv_color_hex(0xCCCCCC), 0);
+    
+    // Password section
+    lv_obj_t *pass_section = lv_obj_create(ctx->rogue_ap_page);
+    lv_obj_set_size(pass_section, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_color(pass_section, lv_color_hex(0x252525), 0);
+    lv_obj_set_style_border_width(pass_section, 0, 0);
+    lv_obj_set_style_radius(pass_section, 8, 0);
+    lv_obj_set_style_pad_all(pass_section, 15, 0);
+    lv_obj_set_flex_flow(pass_section, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(pass_section, 10, 0);
+    lv_obj_clear_flag(pass_section, LV_OBJ_FLAG_SCROLLABLE);
+    
+    // Check if password is known
+    bool password_known = false;
+    for (int i = 0; i < evil_twin_entry_count; i++) {
+        if (strcmp(evil_twin_entries[i].ssid, rogue_ap_ssid) == 0) {
+            strncpy(rogue_ap_password, evil_twin_entries[i].password, sizeof(rogue_ap_password) - 1);
+            rogue_ap_password[sizeof(rogue_ap_password) - 1] = '\0';
+            password_known = true;
+            break;
+        }
+    }
+    
+    if (password_known) {
+        // Show known password as label
+        lv_obj_t *pass_label = lv_label_create(pass_section);
+        lv_label_set_text(pass_label, "Known Password:");
+        lv_obj_set_style_text_font(pass_label, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(pass_label, lv_color_hex(0xFFFFFF), 0);
+        
+        lv_obj_t *pass_value = lv_label_create(pass_section);
+        lv_label_set_text_fmt(pass_value, "%s", rogue_ap_password);
+        lv_obj_set_style_text_font(pass_value, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(pass_value, COLOR_MATERIAL_GREEN, 0);
+    } else {
+        // Show password input
+        lv_obj_t *pass_label = lv_label_create(pass_section);
+        lv_label_set_text(pass_label, "Enter WiFi Password:");
+        lv_obj_set_style_text_font(pass_label, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(pass_label, lv_color_hex(0xFFFFFF), 0);
+        
+        ctx->rogue_ap_password_input = lv_textarea_create(pass_section);
+        lv_obj_set_size(ctx->rogue_ap_password_input, lv_pct(100), 45);
+        lv_textarea_set_one_line(ctx->rogue_ap_password_input, true);
+        lv_textarea_set_placeholder_text(ctx->rogue_ap_password_input, "WiFi password");
+        lv_obj_set_style_bg_color(ctx->rogue_ap_password_input, lv_color_hex(0x1A1A1A), 0);
+        lv_obj_set_style_border_color(ctx->rogue_ap_password_input, COLOR_MATERIAL_CYAN, 0);
+        lv_obj_set_style_border_width(ctx->rogue_ap_password_input, 1, 0);
+        lv_obj_set_style_text_color(ctx->rogue_ap_password_input, lv_color_hex(0xFFFFFF), 0);
+        
+        // Keyboard (hidden, activated on click)
+        ctx->rogue_ap_keyboard = lv_keyboard_create(container);
+        lv_obj_set_size(ctx->rogue_ap_keyboard, lv_pct(100), 260);
+        lv_obj_align(ctx->rogue_ap_keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
+        lv_keyboard_set_textarea(ctx->rogue_ap_keyboard, ctx->rogue_ap_password_input);
+        lv_obj_add_flag(ctx->rogue_ap_keyboard, LV_OBJ_FLAG_HIDDEN);
+        
+        // Add event handler to show keyboard when textarea is clicked
+        lv_obj_add_event_cb(ctx->rogue_ap_password_input, rogue_ap_password_focus_cb, LV_EVENT_FOCUSED, NULL);
+    }
+    
+    // Fetch HTML files
+    evil_twin_html_count = 0;
+    memset(evil_twin_html_files, 0, sizeof(evil_twin_html_files));
+    
+    uart_flush(uart_port);
+    uart_send_command_for_tab("list_sd");
+    
+    total_len = 0;
+    retries = 10;
+    empty_reads = 0;
+    bool header_found = false;
+    static char line_buffer[256];
+    static int line_pos = 0;
+    
+    while (retries-- > 0 && evil_twin_html_count < 20) {
+        int len = transport_read_bytes(uart_port, rx_buffer, sizeof(rx_buffer) - 1, pdMS_TO_TICKS(100));
+        
+        if (len > 0) {
+            rx_buffer[len] = '\0';
+            
+            for (int i = 0; i < len; i++) {
+                char c = rx_buffer[i];
+                
+                if (c == '\n' || c == '\r') {
+                    if (line_pos > 0) {
+                        line_buffer[line_pos] = '\0';
+                        
+                        if (strstr(line_buffer, "HTML files found") != NULL) {
+                            header_found = true;
+                        } else if (header_found && line_pos > 2) {
+                            int file_num;
+                            char filename[64];
+                            if (sscanf(line_buffer, "%d %63s", &file_num, filename) == 2) {
+                                snprintf(evil_twin_html_files[evil_twin_html_count], 
+                                         sizeof(evil_twin_html_files[0]), "%s", filename);
+                                ESP_LOGI(TAG, "Found HTML file %d: %s", file_num, filename);
+                                evil_twin_html_count++;
+                            }
+                        }
+                        
+                        line_pos = 0;
+                    }
+                } else if (line_pos < (int)sizeof(line_buffer) - 1) {
+                    line_buffer[line_pos++] = c;
+                }
+            }
+        }
+    }
+    
+    ESP_LOGI(TAG, "Rogue AP: Fetched %d HTML files", evil_twin_html_count);
+    
+    // HTML dropdown
+    lv_obj_t *html_label = lv_label_create(ctx->rogue_ap_page);
+    lv_label_set_text(html_label, "Select Portal HTML:");
+    lv_obj_set_style_text_font(html_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(html_label, lv_color_hex(0xFFFFFF), 0);
+    
+    ctx->rogue_ap_html_dropdown = lv_dropdown_create(ctx->rogue_ap_page);
+    lv_obj_set_width(ctx->rogue_ap_html_dropdown, lv_pct(100));
+    lv_obj_set_height(ctx->rogue_ap_html_dropdown, 45);
+    lv_obj_set_style_bg_color(ctx->rogue_ap_html_dropdown, lv_color_hex(0x2D2D2D), 0);
+    lv_obj_set_style_text_color(ctx->rogue_ap_html_dropdown, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_border_color(ctx->rogue_ap_html_dropdown, lv_color_hex(0x555555), 0);
+    
+    // Build HTML dropdown options
+    char html_options[2048] = "";
+    for (int i = 0; i < evil_twin_html_count; i++) {
+        if (i > 0) strncat(html_options, "\n", sizeof(html_options) - strlen(html_options) - 1);
+        strncat(html_options, evil_twin_html_files[i], sizeof(html_options) - strlen(html_options) - 1);
+    }
+    lv_dropdown_set_options(ctx->rogue_ap_html_dropdown, html_options);
+    
+    // Style dropdown list
+    lv_obj_t *html_list = lv_dropdown_get_list(ctx->rogue_ap_html_dropdown);
+    if (html_list) {
+        lv_obj_set_style_bg_color(html_list, lv_color_hex(0x2D2D2D), 0);
+        lv_obj_set_style_text_color(html_list, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_set_style_border_color(html_list, lv_color_hex(0x555555), 0);
+    }
+    
+    // Start Rogue AP button
+    ctx->rogue_ap_start_btn = lv_btn_create(ctx->rogue_ap_page);
+    lv_obj_set_size(ctx->rogue_ap_start_btn, lv_pct(100), 50);
+    lv_obj_set_style_bg_color(ctx->rogue_ap_start_btn, COLOR_MATERIAL_CYAN, 0);
+    lv_obj_set_style_bg_color(ctx->rogue_ap_start_btn, lv_color_lighten(COLOR_MATERIAL_CYAN, 30), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(ctx->rogue_ap_start_btn, 8, 0);
+    lv_obj_add_event_cb(ctx->rogue_ap_start_btn, rogue_ap_start_cb, LV_EVENT_CLICKED, NULL);
+    
+    lv_obj_t *btn_label = lv_label_create(ctx->rogue_ap_start_btn);
+    lv_label_set_text(btn_label, LV_SYMBOL_POWER " Start Rogue AP");
+    lv_obj_set_style_text_font(btn_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(btn_label, lv_color_hex(0x000000), 0);
+    lv_obj_center(btn_label);
+    
+    // Set current visible page
+    ctx->current_visible_page = ctx->rogue_ap_page;
 }
 
 //==================================================================================
