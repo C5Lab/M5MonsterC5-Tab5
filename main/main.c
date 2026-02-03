@@ -14941,12 +14941,13 @@ static bool check_sd_card_for_tab(tab_id_t tab)
     // Send list_sd command
     const char *cmd = "list_sd\r\n";
     transport_write_bytes_tab(tab, uart_port, cmd, strlen(cmd));
+    vTaskDelay(pdMS_TO_TICKS(1000));
     
-    // Read response with timeout (up to 2 seconds, SD init can be slow)
+    // Read response with timeout (up to 4 seconds, SD init can be slow)
     static char rx_buffer[512];
     int total_len = 0;
     uint32_t start_time = xTaskGetTickCount();
-    uint32_t timeout_ticks = pdMS_TO_TICKS(2000);
+    uint32_t timeout_ticks = pdMS_TO_TICKS(4000);
     
     while ((xTaskGetTickCount() - start_time) < timeout_ticks && total_len < (int)sizeof(rx_buffer) - 1) {
         int len = transport_read_bytes_tab(tab, uart_port, rx_buffer + total_len, 
@@ -15145,8 +15146,8 @@ static void show_no_board_popup(void)
     lv_obj_center(btn_label);
     
     // Start retry timer (1 second interval)
-    board_detect_retry_timer = lv_timer_create(board_detect_retry_cb, 1000, NULL);
-    ESP_LOGI(TAG, "Started board detection retry timer (1s interval)");
+    board_detect_retry_timer = lv_timer_create(board_detect_retry_cb, 3000, NULL);
+    ESP_LOGI(TAG, "Started board detection retry timer (3s interval)");
 }
 
 //==================================================================================
