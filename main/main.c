@@ -4580,9 +4580,17 @@ static void arp_connect_cb(lv_event_t *e)
 {
     (void)e;
     
-    if (!arp_password_input) return;
+    const char *password = NULL;
     
-    const char *password = lv_textarea_get_text(arp_password_input);
+    // Check if we have a known password (from Evil Twin database)
+    if (strlen(arp_target_password) > 0) {
+        password = arp_target_password;
+        ESP_LOGI(TAG, "ARP Poison: Using known password from Evil Twin database");
+    } else if (arp_password_input) {
+        // Get password from input field
+        password = lv_textarea_get_text(arp_password_input);
+    }
+    
     if (password == NULL || strlen(password) == 0) {
         if (arp_status_label) {
             lv_label_set_text(arp_status_label, "Enter password first");
@@ -5087,7 +5095,76 @@ static void show_arp_poison_page(void)
     lv_obj_set_style_text_font(target_label, &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_color(target_label, lv_color_hex(0xCCCCCC), 0);
     
-    // Password input section (only shown in manual mode)
+    // Check if password is known from Evil Twin database (only in manual mode)
+    bool password_known = false;
+    if (!arp_auto_mode) {
+        // Load Evil Twin passwords to check if we know this network
+        evil_twin_entry_count = 0;
+        memset(evil_twin_entries, 0, sizeof(evil_twin_entries));
+        
+        uart_port_t uart_port = get_current_uart();
+        uart_flush(uart_port);
+        uart_send_command_for_tab("show_pass evil");
+        
+        char rx_buffer[512];
+        int total_len = 0;
+        int retries = 10;
+        int empty_reads = 0;
+        
+        while (retries-- > 0 && evil_twin_entry_count < 50) {
+            int len = transport_read_bytes(uart_port, rx_buffer, sizeof(rx_buffer) - 1, pdMS_TO_TICKS(100));
+            
+            if (len > 0) {
+                rx_buffer[len] = '\0';
+                total_len += len;
+                empty_reads = 0;
+                
+                // Parse lines: "SSID", "password"
+                char *line = strtok(rx_buffer, "\n\r");
+                while (line != NULL && evil_twin_entry_count < 50) {
+                    // Skip empty lines and headers
+                    if (strlen(line) > 3 && line[0] == '\"') {
+                        // Extract SSID
+                        char *ssid_start = line + 1;
+                        char *ssid_end = strchr(ssid_start, '\"');
+                        if (ssid_end && *(ssid_end + 1) == ',' && *(ssid_end + 2) == ' ' && *(ssid_end + 3) == '\"') {
+                            *ssid_end = '\0';
+                            char *pass_start = ssid_end + 4;
+                            char *pass_end = strchr(pass_start, '\"');
+                            if (pass_end) {
+                                *pass_end = '\0';
+                                strncpy(evil_twin_entries[evil_twin_entry_count].ssid, ssid_start, 32);
+                                evil_twin_entries[evil_twin_entry_count].ssid[32] = '\0';
+                                strncpy(evil_twin_entries[evil_twin_entry_count].password, pass_start, 64);
+                                evil_twin_entries[evil_twin_entry_count].password[64] = '\0';
+                                evil_twin_entry_count++;
+                            }
+                        }
+                    }
+                    line = strtok(NULL, "\n\r");
+                }
+            } else {
+                empty_reads++;
+                if (empty_reads >= 3) break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+        
+        ESP_LOGI(TAG, "ARP: Loaded %d Evil Twin password entries", evil_twin_entry_count);
+        
+        // Check if password is known
+        for (int i = 0; i < evil_twin_entry_count; i++) {
+            if (strcmp(evil_twin_entries[i].ssid, arp_target_ssid) == 0) {
+                strncpy(arp_target_password, evil_twin_entries[i].password, sizeof(arp_target_password) - 1);
+                arp_target_password[sizeof(arp_target_password) - 1] = '\0';
+                password_known = true;
+                ESP_LOGI(TAG, "ARP: Found password for %s in Evil Twin database", arp_target_ssid);
+                break;
+            }
+        }
+    }
+    
+    // Password section (only shown in manual mode)
     lv_obj_t *pass_section = NULL;
     
     if (!arp_auto_mode) {
@@ -5097,61 +5174,115 @@ static void show_arp_poison_page(void)
         lv_obj_set_style_border_width(pass_section, 0, 0);
         lv_obj_set_style_radius(pass_section, 8, 0);
         lv_obj_set_style_pad_all(pass_section, 15, 0);
-        lv_obj_set_flex_flow(pass_section, LV_FLEX_FLOW_ROW);
-        lv_obj_set_flex_align(pass_section, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-        lv_obj_set_style_pad_column(pass_section, 15, 0);
+        lv_obj_set_style_pad_row(pass_section, 10, 0);
         lv_obj_clear_flag(pass_section, LV_OBJ_FLAG_SCROLLABLE);
         
-        // Password label + input
-        lv_obj_t *pass_left = lv_obj_create(pass_section);
-        lv_obj_set_size(pass_left, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
-        lv_obj_set_style_bg_opa(pass_left, LV_OPA_TRANSP, 0);
-        lv_obj_set_style_border_width(pass_left, 0, 0);
-        lv_obj_set_style_pad_all(pass_left, 0, 0);
-        lv_obj_set_flex_flow(pass_left, LV_FLEX_FLOW_ROW);
-        lv_obj_set_flex_align(pass_left, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-        lv_obj_set_style_pad_column(pass_left, 10, 0);
-        lv_obj_clear_flag(pass_left, LV_OBJ_FLAG_SCROLLABLE);
-        
-        lv_obj_t *pass_label = lv_label_create(pass_left);
-        lv_label_set_text(pass_label, "Password:");
-        lv_obj_set_style_text_font(pass_label, &lv_font_montserrat_16, 0);
-        lv_obj_set_style_text_color(pass_label, lv_color_hex(0xFFFFFF), 0);
-        
-        arp_password_input = lv_textarea_create(pass_left);
-        lv_obj_set_size(arp_password_input, 300, 40);
-        lv_textarea_set_one_line(arp_password_input, true);
-        lv_textarea_set_placeholder_text(arp_password_input, "WiFi password");
-        lv_obj_set_style_bg_color(arp_password_input, lv_color_hex(0x1A1A1A), 0);
-        lv_obj_set_style_border_color(arp_password_input, COLOR_MATERIAL_PURPLE, 0);
-        lv_obj_set_style_border_width(arp_password_input, 1, 0);
-        lv_obj_set_style_text_color(arp_password_input, lv_color_hex(0xFFFFFF), 0);
-        lv_obj_add_event_cb(arp_password_input, arp_password_input_cb, LV_EVENT_CLICKED, NULL);
-        
-        // Connect button
-        arp_connect_btn = lv_btn_create(pass_section);
-        lv_obj_set_size(arp_connect_btn, 120, 40);
-        lv_obj_set_style_bg_color(arp_connect_btn, COLOR_MATERIAL_GREEN, 0);
-        lv_obj_set_style_radius(arp_connect_btn, 8, 0);
-        lv_obj_add_event_cb(arp_connect_btn, arp_connect_cb, LV_EVENT_CLICKED, NULL);
-        
-        lv_obj_t *connect_label = lv_label_create(arp_connect_btn);
-        lv_label_set_text(connect_label, "Connect");
-        lv_obj_set_style_text_font(connect_label, &lv_font_montserrat_16, 0);
-        lv_obj_center(connect_label);
-        
-        // List Hosts button (hidden initially)
-        arp_list_hosts_btn = lv_btn_create(pass_section);
-        lv_obj_set_size(arp_list_hosts_btn, 120, 40);
-        lv_obj_set_style_bg_color(arp_list_hosts_btn, COLOR_MATERIAL_CYAN, 0);
-        lv_obj_set_style_radius(arp_list_hosts_btn, 8, 0);
-        lv_obj_add_event_cb(arp_list_hosts_btn, arp_list_hosts_cb, LV_EVENT_CLICKED, NULL);
-        lv_obj_add_flag(arp_list_hosts_btn, LV_OBJ_FLAG_HIDDEN);
-        
-        lv_obj_t *list_hosts_label = lv_label_create(arp_list_hosts_btn);
-        lv_label_set_text(list_hosts_label, "List Hosts");
-        lv_obj_set_style_text_font(list_hosts_label, &lv_font_montserrat_16, 0);
-        lv_obj_center(list_hosts_label);
+        if (password_known) {
+            // Show known password as label
+            lv_obj_set_flex_flow(pass_section, LV_FLEX_FLOW_COLUMN);
+            
+            lv_obj_t *pass_title = lv_label_create(pass_section);
+            lv_label_set_text(pass_title, "Known Password:");
+            lv_obj_set_style_text_font(pass_title, &lv_font_montserrat_14, 0);
+            lv_obj_set_style_text_color(pass_title, lv_color_hex(0xFFFFFF), 0);
+            
+            lv_obj_t *pass_value = lv_label_create(pass_section);
+            lv_label_set_text_fmt(pass_value, "%s", arp_target_password);
+            lv_obj_set_style_text_font(pass_value, &lv_font_montserrat_16, 0);
+            lv_obj_set_style_text_color(pass_value, COLOR_MATERIAL_GREEN, 0);
+            
+            // Buttons row
+            lv_obj_t *btn_row = lv_obj_create(pass_section);
+            lv_obj_set_size(btn_row, lv_pct(100), LV_SIZE_CONTENT);
+            lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
+            lv_obj_set_style_border_width(btn_row, 0, 0);
+            lv_obj_set_style_pad_all(btn_row, 0, 0);
+            lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
+            lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+            lv_obj_set_style_pad_column(btn_row, 15, 0);
+            lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
+            
+            // Connect button
+            arp_connect_btn = lv_btn_create(btn_row);
+            lv_obj_set_size(arp_connect_btn, 120, 40);
+            lv_obj_set_style_bg_color(arp_connect_btn, COLOR_MATERIAL_GREEN, 0);
+            lv_obj_set_style_radius(arp_connect_btn, 8, 0);
+            lv_obj_add_event_cb(arp_connect_btn, arp_connect_cb, LV_EVENT_CLICKED, NULL);
+            
+            lv_obj_t *connect_label = lv_label_create(arp_connect_btn);
+            lv_label_set_text(connect_label, "Connect");
+            lv_obj_set_style_text_font(connect_label, &lv_font_montserrat_16, 0);
+            lv_obj_center(connect_label);
+            
+            // List Hosts button (hidden initially)
+            arp_list_hosts_btn = lv_btn_create(btn_row);
+            lv_obj_set_size(arp_list_hosts_btn, 120, 40);
+            lv_obj_set_style_bg_color(arp_list_hosts_btn, COLOR_MATERIAL_CYAN, 0);
+            lv_obj_set_style_radius(arp_list_hosts_btn, 8, 0);
+            lv_obj_add_event_cb(arp_list_hosts_btn, arp_list_hosts_cb, LV_EVENT_CLICKED, NULL);
+            lv_obj_add_flag(arp_list_hosts_btn, LV_OBJ_FLAG_HIDDEN);
+            
+            lv_obj_t *list_hosts_label = lv_label_create(arp_list_hosts_btn);
+            lv_label_set_text(list_hosts_label, "List Hosts");
+            lv_obj_set_style_text_font(list_hosts_label, &lv_font_montserrat_16, 0);
+            lv_obj_center(list_hosts_label);
+        } else {
+            // Show password input
+            lv_obj_set_flex_flow(pass_section, LV_FLEX_FLOW_ROW);
+            lv_obj_set_flex_align(pass_section, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+            lv_obj_set_style_pad_column(pass_section, 15, 0);
+            
+            // Password label + input
+            lv_obj_t *pass_left = lv_obj_create(pass_section);
+            lv_obj_set_size(pass_left, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+            lv_obj_set_style_bg_opa(pass_left, LV_OPA_TRANSP, 0);
+            lv_obj_set_style_border_width(pass_left, 0, 0);
+            lv_obj_set_style_pad_all(pass_left, 0, 0);
+            lv_obj_set_flex_flow(pass_left, LV_FLEX_FLOW_ROW);
+            lv_obj_set_flex_align(pass_left, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+            lv_obj_set_style_pad_column(pass_left, 10, 0);
+            lv_obj_clear_flag(pass_left, LV_OBJ_FLAG_SCROLLABLE);
+            
+            lv_obj_t *pass_label = lv_label_create(pass_left);
+            lv_label_set_text(pass_label, "Password:");
+            lv_obj_set_style_text_font(pass_label, &lv_font_montserrat_16, 0);
+            lv_obj_set_style_text_color(pass_label, lv_color_hex(0xFFFFFF), 0);
+            
+            arp_password_input = lv_textarea_create(pass_left);
+            lv_obj_set_size(arp_password_input, 300, 40);
+            lv_textarea_set_one_line(arp_password_input, true);
+            lv_textarea_set_placeholder_text(arp_password_input, "WiFi password");
+            lv_obj_set_style_bg_color(arp_password_input, lv_color_hex(0x1A1A1A), 0);
+            lv_obj_set_style_border_color(arp_password_input, COLOR_MATERIAL_PURPLE, 0);
+            lv_obj_set_style_border_width(arp_password_input, 1, 0);
+            lv_obj_set_style_text_color(arp_password_input, lv_color_hex(0xFFFFFF), 0);
+            lv_obj_add_event_cb(arp_password_input, arp_password_input_cb, LV_EVENT_CLICKED, NULL);
+            
+            // Connect button
+            arp_connect_btn = lv_btn_create(pass_section);
+            lv_obj_set_size(arp_connect_btn, 120, 40);
+            lv_obj_set_style_bg_color(arp_connect_btn, COLOR_MATERIAL_GREEN, 0);
+            lv_obj_set_style_radius(arp_connect_btn, 8, 0);
+            lv_obj_add_event_cb(arp_connect_btn, arp_connect_cb, LV_EVENT_CLICKED, NULL);
+            
+            lv_obj_t *connect_label = lv_label_create(arp_connect_btn);
+            lv_label_set_text(connect_label, "Connect");
+            lv_obj_set_style_text_font(connect_label, &lv_font_montserrat_16, 0);
+            lv_obj_center(connect_label);
+            
+            // List Hosts button (hidden initially)
+            arp_list_hosts_btn = lv_btn_create(pass_section);
+            lv_obj_set_size(arp_list_hosts_btn, 120, 40);
+            lv_obj_set_style_bg_color(arp_list_hosts_btn, COLOR_MATERIAL_CYAN, 0);
+            lv_obj_set_style_radius(arp_list_hosts_btn, 8, 0);
+            lv_obj_add_event_cb(arp_list_hosts_btn, arp_list_hosts_cb, LV_EVENT_CLICKED, NULL);
+            lv_obj_add_flag(arp_list_hosts_btn, LV_OBJ_FLAG_HIDDEN);
+            
+            lv_obj_t *list_hosts_label = lv_label_create(arp_list_hosts_btn);
+            lv_label_set_text(list_hosts_label, "List Hosts");
+            lv_obj_set_style_text_font(list_hosts_label, &lv_font_montserrat_16, 0);
+            lv_obj_center(list_hosts_label);
+        }
     }
     
     // In auto mode, create List Hosts button here (since pass_section is not created)
