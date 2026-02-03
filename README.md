@@ -1,6 +1,6 @@
 # M5MonsterC5-Tab5
 
-<img alt="Zrzut ekranu 2026-01-16 o 21 21 41" src="https://github.com/user-attachments/assets/7d3689f8-049c-478a-a428-a4f81a8aa322" />
+![IMG_8095](https://github.com/user-attachments/assets/40db0663-ff23-4420-b6fd-5f4a6f0641b1)
 ---
 
 ## Info / Flash 
