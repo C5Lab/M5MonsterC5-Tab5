@@ -1,0 +1,569 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Network Observer & Karma on internal C6 — Tab5 Lab</title>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600&family=Space+Grotesk:wght@500;600;700&family=JetBrains+Mono:wght@500&display=swap');
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        :root {
+            color-scheme: dark;
+            --bg: #0b111b;
+            --bg-alt: #0f1724;
+            --ink: #e6eef8;
+            --muted: #95a4bc;
+            --line: rgba(148, 163, 184, 0.2);
+            --card: #141f30;
+            --accent: #ff8a63;
+            --accent-dark: #ff6d42;
+            --accent-soft: rgba(255, 138, 99, 0.15);
+            --navy: #1a2d4a;
+            --info: #7db2ff;
+            --shadow-lg: 0 24px 60px rgba(6, 10, 18, 0.6);
+            --shadow-md: 0 16px 30px rgba(6, 10, 18, 0.4);
+            --shadow-sm: 0 6px 16px rgba(6, 10, 18, 0.4);
+        }
+
+        body {
+            font-family: 'Manrope', 'Segoe UI', sans-serif;
+            color: var(--ink);
+            background:
+                radial-gradient(circle at 12% 8%, rgba(255, 138, 99, 0.18), transparent 40%),
+                radial-gradient(circle at 88% 14%, rgba(125, 178, 255, 0.18), transparent 45%),
+                linear-gradient(180deg, var(--bg-alt) 0%, var(--bg) 100%);
+            min-height: 100vh;
+            padding: 32px 20px 80px;
+        }
+
+        body::before {
+            content: "";
+            position: fixed;
+            inset: 0;
+            background-image:
+                linear-gradient(90deg, rgba(148, 163, 184, 0.08) 1px, transparent 1px),
+                linear-gradient(180deg, rgba(148, 163, 184, 0.08) 1px, transparent 1px);
+            background-size: 36px 36px;
+            opacity: 0.22;
+            pointer-events: none;
+            z-index: 0;
+        }
+
+        .container {
+            position: relative;
+            z-index: 1;
+            max-width: 1100px;
+            margin: 0 auto;
+        }
+
+        .brand {
+            display: flex;
+            align-items: center;
+            gap: 14px;
+            font-family: 'Space Grotesk', sans-serif;
+            font-weight: 700;
+            letter-spacing: -0.02em;
+        }
+
+                .brand-mark {
+            position: relative;
+            width: 44px;
+            height: 44px;
+            border-radius: 14px;
+            display: grid;
+            place-items: center;
+            background: linear-gradient(160deg, rgba(255, 138, 99, 0.98) 0%, rgba(255, 195, 174, 0.92) 100%);
+            color: #2a1b16;
+            font-size: 0.9rem;
+            font-family: 'JetBrains Mono', monospace;
+            border: 1px solid rgba(255, 255, 255, 0.18);
+            box-shadow:
+                0 18px 28px rgba(7, 11, 18, 0.35),
+                0 10px 18px rgba(255, 122, 89, 0.28),
+                inset 0 2px 6px rgba(255, 255, 255, 0.35),
+                inset 0 -6px 10px rgba(122, 63, 45, 0.35);
+            overflow: hidden;
+        }
+
+        .brand-mark::after {
+            content: "";
+            position: absolute;
+            inset: 3px;
+            border-radius: 11px;
+            box-shadow: inset 0 1px 2px rgba(255, 255, 255, 0.35);
+            pointer-events: none;
+        }
+
+                .brand-mark img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            display: block;
+            transform: scale(1.06);
+        }
+
+        .brand small {
+            display: block;
+            font-weight: 500;
+            color: var(--muted);
+            font-size: 0.75rem;
+            margin-top: 2px;
+        }
+
+        .sub-header {
+            display: grid;
+            gap: 18px;
+            padding: 20px 22px;
+            background: rgba(20, 31, 48, 0.9);
+            border: 1px solid var(--line);
+            border-radius: 18px;
+            box-shadow: var(--shadow-sm);
+            backdrop-filter: blur(14px);
+            margin-bottom: 28px;
+        }
+
+        .sub-header-top {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 16px;
+            flex-wrap: wrap;
+        }
+
+        .back-button {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 10px 18px;
+            border-radius: 999px;
+            border: 1px solid rgba(255, 138, 99, 0.4);
+            color: var(--accent);
+            text-decoration: none;
+            font-weight: 600;
+            font-size: 0.9rem;
+            background: rgba(255, 138, 99, 0.08);
+            transition: transform 0.2s ease, box-shadow 0.2s ease, color 0.2s ease;
+        }
+
+        .back-button:hover {
+            transform: translateY(-2px);
+            box-shadow: var(--shadow-sm);
+            color: var(--ink);
+        }
+
+        .eyebrow {
+            font-family: 'JetBrains Mono', monospace;
+            text-transform: uppercase;
+            letter-spacing: 0.2em;
+            font-size: 0.7rem;
+            color: var(--info);
+            margin-bottom: 12px;
+        }
+
+        h1 {
+            font-family: 'Space Grotesk', sans-serif;
+            font-size: 2.2rem;
+            line-height: 1.1;
+            margin-bottom: 12px;
+        }
+
+        .lede {
+            font-size: 1rem;
+            color: var(--muted);
+            line-height: 1.7;
+        }
+
+        .section-head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 18px;
+        }
+
+        .section-head h2 {
+            font-family: 'Space Grotesk', sans-serif;
+            font-size: 1.4rem;
+        }
+
+        .section-head span {
+            color: var(--muted);
+            font-size: 0.9rem;
+        }
+
+        .timeline {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 22px;
+        }
+
+                .step-card {
+            position: relative;
+            display: grid;
+            grid-template-columns: 1fr;
+            gap: 18px;
+            padding: 24px;
+            background:
+                linear-gradient(180deg, rgba(8, 14, 24, 0.15) 0%, rgba(8, 14, 24, 0.15) 100%),
+                linear-gradient(180deg, rgba(8, 14, 24, 0.92) 0%, rgba(8, 14, 24, 0.55) 38%, rgba(8, 14, 24, 0.18) 68%, rgba(8, 14, 24, 0) 100%),
+                linear-gradient(90deg, rgba(8, 14, 24, 0.7) 0%, transparent 16%, transparent 84%, rgba(8, 14, 24, 0.7) 100%),
+                url('step.jpg');
+            background-size: cover;
+            background-position: center;
+            background-repeat: no-repeat;
+            border-radius: 22px;
+            border: 1px solid var(--line);
+            box-shadow: var(--shadow-md);
+            animation: rise 0.6s ease forwards;
+            opacity: 0;
+            transform: translateY(18px);
+            animation-delay: calc(var(--stagger) * 0.08s);
+            overflow: hidden;
+        }
+
+        @keyframes rise {
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .step-index {
+            display: grid;
+            align-content: start;
+            gap: 12px;
+        }
+
+        .step-number {
+            width: 52px;
+            height: 52px;
+            border-radius: 16px;
+            display: grid;
+            place-items: center;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.95rem;
+            color: var(--accent-dark);
+            background: var(--accent-soft);
+            border: 1px solid rgba(255, 122, 89, 0.5);
+        }
+
+        .step-body {
+            display: grid;
+            gap: 16px;
+        }
+
+        .step-header {
+            display: grid;
+            gap: 2px;
+        }
+
+        .step-kicker {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.75rem;
+            color: var(--info);
+            text-transform: uppercase;
+            letter-spacing: 0.2em;
+        }
+
+        .step-title {
+            font-family: 'Space Grotesk', sans-serif;
+            font-size: 1.3rem;
+            margin: 6px 0 8px;
+        }
+
+        .step-caption {
+            color: var(--muted);
+            font-size: 0.95rem;
+            line-height: 1.6;
+        }
+
+        .step-media {
+            border-radius: 18px;
+            border: 1px solid var(--line);
+            overflow: hidden;
+            cursor: pointer;
+            position: relative;
+            background: #0b111b;
+            box-shadow: var(--shadow-sm);
+            transition: transform 0.3s ease, box-shadow 0.3s ease;
+            padding: 0;
+            width: 100%;
+            text-align: left;
+            appearance: none;
+        }
+
+        .step-media img {
+            width: 100%;
+            height: 260px;
+            object-fit: cover;
+            display: block;
+            transition: transform 0.4s ease;
+        }
+
+        .step-media:hover {
+            transform: translateY(-6px);
+            box-shadow: var(--shadow-lg);
+        }
+
+        .step-media:hover img {
+            transform: scale(1.03);
+        }
+
+        .zoom-hint {
+            position: absolute;
+            right: 16px;
+            bottom: 16px;
+            background: rgba(6, 10, 18, 0.78);
+            color: #fff;
+            font-size: 0.75rem;
+            padding: 6px 12px;
+            border-radius: 999px;
+            letter-spacing: 0.05em;
+            text-transform: uppercase;
+        }
+
+        .modal {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(10, 15, 23, 0.8);
+            backdrop-filter: blur(10px);
+            z-index: 1000;
+            align-items: center;
+            justify-content: center;
+            animation: fadeIn 0.3s ease;
+        }
+
+        .modal.active {
+            display: flex;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; }
+            to { opacity: 1; }
+        }
+
+        .modal-content {
+            position: relative;
+            max-width: min(92vw, 960px);
+            max-height: 90%;
+            animation: slideIn 0.3s ease;
+            text-align: left;
+        }
+
+        @keyframes slideIn {
+            from {
+                transform: scale(0.8);
+                opacity: 0;
+            }
+            to {
+                transform: scale(1);
+                opacity: 1;
+            }
+        }
+
+        .modal-image {
+            max-width: 100%;
+            max-height: 90vh;
+            border-radius: 18px;
+            box-shadow: 0 18px 50px rgba(0, 0, 0, 0.45);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .modal-close {
+            position: absolute;
+            top: -48px;
+            right: 0;
+            font-size: 2.2em;
+            color: white;
+            cursor: pointer;
+            transition: color 0.3s ease;
+        }
+
+        .modal-close:hover {
+            color: #667eea;
+        }
+
+        .modal-info {
+            position: absolute;
+            bottom: -40px;
+            left: 0;
+            color: white;
+            font-size: 1.05rem;
+            font-weight: 600;
+        }
+
+        @media (max-width: 768px) {
+            body {
+                padding: 24px 16px 60px;
+            }
+
+            h1 {
+                font-size: 1.8rem;
+            }
+
+            .step-media img {
+                height: 220px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header class="sub-header">
+            <div class="sub-header-top">
+                <div class="brand">
+                    <div class="brand-mark">
+                        <img src="LAB5_logo.png" alt="Tab5 logo">
+                    </div>
+                    <div>
+                        Tab5 Lab
+                        <small>Visual documentation</small>
+                    </div>
+                </div>
+                <a class="back-button" href="../index.html">Back</a>
+            </div>
+            <div class="sub-header-body">
+                <p class="eyebrow">Tutorial</p>
+                <h1>Network Observer & Karma on internal C6</h1>
+                <p class="lede">Network Observer with internal C6 Karma.</p>
+            </div>
+        </header>
+
+        <section id="steps">
+            <div class="section-head">
+                <h2>Steps</h2>
+                <span>Quick overview</span>
+            </div>
+            <div class="timeline" id="timeline"></div>
+        </section>
+    </div>
+
+    <div class="modal" id="modal">
+        <div class="modal-content">
+            <span class="modal-close" onclick="closeModal()">&times;</span>
+            <img class="modal-image" id="modalImage" alt="Full size">
+            <div class="modal-info" id="modalInfo"></div>
+        </div>
+    </div>
+
+    <script>
+        const IMAGE_BASE = 'network-observer-karma/';
+        const images = [
+            { file: "network observer list clients.jpeg", text: "List networks and clients" },
+            { file: "network observer zoom on 1 network.jpeg", text: "Zoom to one network" },
+            { file: "deauth station.jpeg", text: "Deauth a single station" },
+            { file: "network observer probes list 4 karma.jpeg", text: "Select probe for Karma" },
+            { file: "network observer start c6 karma.jpeg", text: "Start portal on internal C6" },
+            { file: "c6 karma active from network observer.jpeg", text: "Karma running in background" },
+            { file: "c6 karma in internal tab.jpeg", text: "Portal running in Internal tab" },
+            { file: "c6 karma got password.jpeg", text: "Password captured" }
+        ];
+
+        function initGallery() {
+            const timeline = document.getElementById('timeline');
+
+            images.forEach((image, index) => {
+                const card = document.createElement('article');
+                card.className = 'step-card';
+                card.style.setProperty('--stagger', index);
+
+                const indexWrap = document.createElement('div');
+                indexWrap.className = 'step-index';
+
+                const number = document.createElement('div');
+                number.className = 'step-number';
+                number.textContent = String(index + 1).padStart(2, '0');
+
+                indexWrap.appendChild(number);
+
+                const body = document.createElement('div');
+                body.className = 'step-body';
+
+                const header = document.createElement('div');
+                header.className = 'step-header';
+
+                const kicker = document.createElement('span');
+                kicker.className = 'step-kicker';
+                kicker.textContent = `Step ${index + 1}`;
+
+                const title = document.createElement('h3');
+                title.className = 'step-title';
+                title.textContent = image.text;
+
+                const caption = document.createElement('p');
+                caption.className = 'step-caption';
+                caption.textContent = 'Click to zoom.';
+
+                header.appendChild(kicker);
+                header.appendChild(title);
+                header.appendChild(caption);
+
+                const media = document.createElement('button');
+                media.className = 'step-media';
+                media.type = 'button';
+                const imagePath = IMAGE_BASE + image.file;
+                media.onclick = () => openModal(imagePath, image.text);
+
+                const img = document.createElement('img');
+                img.src = imagePath;
+                img.alt = image.text;
+
+                const zoom = document.createElement('span');
+                zoom.className = 'zoom-hint';
+                zoom.textContent = 'Zoom';
+
+                media.appendChild(img);
+                media.appendChild(zoom);
+
+                body.appendChild(header);
+                body.appendChild(media);
+
+                card.appendChild(indexWrap);
+                card.appendChild(body);
+
+                timeline.appendChild(card);
+            });
+        }
+
+        function openModal(imagePath, imageText) {
+            const modal = document.getElementById('modal');
+            const modalImage = document.getElementById('modalImage');
+            const modalInfo = document.getElementById('modalInfo');
+
+            modalImage.src = imagePath;
+            modalInfo.textContent = imageText;
+            modal.classList.add('active');
+            document.body.style.overflow = 'hidden';
+        }
+
+        function closeModal() {
+            const modal = document.getElementById('modal');
+            modal.classList.remove('active');
+            document.body.style.overflow = 'auto';
+        }
+
+        document.getElementById('modal').addEventListener('click', function(event) {
+            if (event.target === this) {
+                closeModal();
+            }
+        });
+
+        document.addEventListener('keydown', function(event) {
+            if (event.key === 'Escape') {
+                closeModal();
+            }
+        });
+
+        window.addEventListener('load', initGallery);
+    </script>
+</body>
+</html>

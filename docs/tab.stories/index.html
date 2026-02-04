@@ -1,0 +1,511 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tab5 Lab — Visual Guide</title>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600&family=Space+Grotesk:wght@500;600;700&family=JetBrains+Mono:wght@500&display=swap');
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        :root {
+            color-scheme: dark;
+            --bg: #0b111b;
+            --bg-alt: #0f1724;
+            --ink: #e6eef8;
+            --muted: #95a4bc;
+            --line: rgba(148, 163, 184, 0.2);
+            --card: #141f30;
+            --accent: #ff8a63;
+            --accent-dark: #ff6d42;
+            --accent-soft: rgba(255, 138, 99, 0.15);
+            --navy: #1a2d4a;
+            --info: #7db2ff;
+            --shadow-lg: 0 24px 60px rgba(6, 10, 18, 0.6);
+            --shadow-md: 0 16px 30px rgba(6, 10, 18, 0.4);
+            --shadow-sm: 0 6px 16px rgba(6, 10, 18, 0.4);
+        }
+
+        body {
+            font-family: 'Manrope', 'Segoe UI', sans-serif;
+            color: var(--ink);
+            background:
+                radial-gradient(circle at 12% 8%, rgba(255, 138, 99, 0.18), transparent 40%),
+                radial-gradient(circle at 88% 14%, rgba(125, 178, 255, 0.18), transparent 45%),
+                linear-gradient(180deg, var(--bg-alt) 0%, var(--bg) 100%);
+            min-height: 100vh;
+            padding: 32px 20px 80px;
+        }
+
+        body::before {
+            content: "";
+            position: fixed;
+            inset: 0;
+            background-image:
+                linear-gradient(90deg, rgba(148, 163, 184, 0.08) 1px, transparent 1px),
+                linear-gradient(180deg, rgba(148, 163, 184, 0.08) 1px, transparent 1px);
+            background-size: 36px 36px;
+            opacity: 0.22;
+            pointer-events: none;
+            z-index: 0;
+        }
+
+        .container {
+            position: relative;
+            z-index: 1;
+            max-width: 1100px;
+            margin: 0 auto;
+        }
+
+        .topbar {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 18px 22px;
+            background: rgba(20, 31, 48, 0.9);
+            border: 1px solid var(--line);
+            border-radius: 16px;
+            box-shadow: var(--shadow-sm);
+            backdrop-filter: blur(14px);
+            margin-bottom: 32px;
+        }
+
+        .brand {
+            display: flex;
+            align-items: center;
+            gap: 14px;
+            font-family: 'Space Grotesk', sans-serif;
+            font-weight: 700;
+            letter-spacing: -0.02em;
+        }
+
+        .brand-mark {
+            position: relative;
+            width: 44px;
+            height: 44px;
+            border-radius: 14px;
+            display: grid;
+            place-items: center;
+            background: linear-gradient(160deg, rgba(255, 138, 99, 0.98) 0%, rgba(255, 195, 174, 0.92) 100%);
+            color: #2a1b16;
+            font-size: 0.9rem;
+            font-family: 'JetBrains Mono', monospace;
+            border: 1px solid rgba(255, 255, 255, 0.18);
+            box-shadow:
+                0 18px 28px rgba(7, 11, 18, 0.35),
+                0 10px 18px rgba(255, 122, 89, 0.28),
+                inset 0 2px 6px rgba(255, 255, 255, 0.35),
+                inset 0 -6px 10px rgba(122, 63, 45, 0.35);
+            overflow: hidden;
+        }
+
+        .brand-mark::after {
+            content: "";
+            position: absolute;
+            inset: 3px;
+            border-radius: 11px;
+            box-shadow: inset 0 1px 2px rgba(255, 255, 255, 0.35);
+            pointer-events: none;
+        }
+
+        .brand-mark img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            display: block;
+            transform: scale(1.06);
+        }
+
+        .brand small {
+            display: block;
+            font-weight: 500;
+            color: var(--muted);
+            font-size: 0.75rem;
+            margin-top: 2px;
+        }
+
+        .topbar nav {
+            display: flex;
+            gap: 18px;
+            font-size: 0.9rem;
+        }
+
+        .topbar a {
+            text-decoration: none;
+            color: var(--muted);
+            font-weight: 600;
+            transition: color 0.2s ease;
+        }
+
+        .topbar a:hover {
+            color: var(--ink);
+        }
+
+        .hero {
+            display: grid;
+            grid-template-columns: minmax(0, 1.1fr) minmax(0, 0.9fr);
+            gap: 28px;
+            margin-bottom: 40px;
+        }
+
+        .hero-content {
+            position: relative;
+            background: var(--card);
+            border: 1px solid var(--line);
+            border-radius: 22px;
+            padding: 34px;
+            box-shadow: var(--shadow-md);
+            overflow: hidden;
+        }
+
+        .hero-content::before {
+            content: "";
+            position: absolute;
+            inset: 0;
+            background:
+                linear-gradient(180deg, rgba(8, 14, 24, 0.9) 0%, rgba(8, 14, 24, 0.5) 42%, rgba(8, 14, 24, 0.2) 72%, rgba(8, 14, 24, 0) 100%),
+                linear-gradient(90deg, rgba(8, 14, 24, 0.55) 0%, transparent 20%, transparent 80%, rgba(8, 14, 24, 0.55) 100%);
+            pointer-events: none;
+            z-index: 1;
+        }
+
+        .hero-media {
+            position: absolute;
+            inset: 0;
+            z-index: 0;
+        }
+
+        .hero-media img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            display: block;
+        }
+
+        .hero-body {
+            position: relative;
+            z-index: 2;
+            display: grid;
+            gap: 16px;
+        }
+
+        .eyebrow {
+            font-family: 'JetBrains Mono', monospace;
+            text-transform: uppercase;
+            letter-spacing: 0.2em;
+            font-size: 0.7rem;
+            color: var(--info);
+            margin-bottom: 12px;
+        }
+
+        h1 {
+            font-family: 'Space Grotesk', sans-serif;
+            font-size: 2.6rem;
+            line-height: 1.05;
+            margin-bottom: 16px;
+        }
+
+        .lede {
+            font-size: 1.05rem;
+            color: var(--muted);
+            line-height: 1.7;
+            margin-bottom: 20px;
+        }
+
+        .hero-panel {
+            display: grid;
+            gap: 16px;
+        }
+
+        .panel-card {
+            background: linear-gradient(160deg, rgba(255, 138, 99, 0.16) 0%, rgba(20, 31, 48, 0.98) 100%);
+            border: 1px solid rgba(255, 138, 99, 0.35);
+            border-radius: 20px;
+            padding: 22px;
+            box-shadow: 0 18px 30px rgba(255, 122, 89, 0.12);
+        }
+
+        .panel-card h2 {
+            font-family: 'Space Grotesk', sans-serif;
+            font-size: 1.3rem;
+            margin-bottom: 12px;
+        }
+
+        .panel-card p {
+            color: var(--muted);
+            font-size: 0.95rem;
+            line-height: 1.6;
+        }
+
+        .panel-pill {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            background: var(--accent-soft);
+            color: var(--accent-dark);
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.75rem;
+            padding: 6px 12px;
+            border-radius: 999px;
+            margin-bottom: 12px;
+        }
+
+        .about-card {
+            position: relative;
+            overflow: hidden;
+        }
+
+        .about-card::before {
+            content: "";
+            position: absolute;
+            inset: 0;
+            background:
+                linear-gradient(180deg, rgba(8, 14, 24, 0.92) 0%, rgba(8, 14, 24, 0.55) 38%, rgba(8, 14, 24, 0.18) 68%, rgba(8, 14, 24, 0) 100%),
+                linear-gradient(90deg, rgba(8, 14, 24, 0.7) 0%, transparent 16%, transparent 84%, rgba(8, 14, 24, 0.7) 100%);
+            pointer-events: none;
+            z-index: 1;
+        }
+
+        .about-media {
+            position: absolute;
+            inset: 0;
+            z-index: 0;
+        }
+
+        .about-media img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            display: block;
+        }
+
+        .about-body {
+            position: relative;
+            z-index: 2;
+            display: grid;
+            gap: 12px;
+        }
+
+        .about-card a {
+            color: var(--info);
+            text-decoration: none;
+            font-weight: 600;
+        }
+
+        .flow-card {
+            position: relative;
+            overflow: hidden;
+        }
+
+        .flow-card::before {
+            content: "";
+            position: absolute;
+            inset: 0;
+            background:
+                linear-gradient(180deg, rgba(8, 14, 24, 0.92) 0%, rgba(8, 14, 24, 0.55) 38%, rgba(8, 14, 24, 0.18) 68%, rgba(8, 14, 24, 0) 100%),
+                linear-gradient(90deg, rgba(8, 14, 24, 0.7) 0%, transparent 16%, transparent 84%, rgba(8, 14, 24, 0.7) 100%);
+            pointer-events: none;
+            z-index: 1;
+        }
+
+        .flow-media {
+            position: absolute;
+            inset: 0;
+            z-index: 0;
+        }
+
+        .flow-media img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            display: block;
+        }
+
+        .flow-body {
+            position: relative;
+            z-index: 2;
+            display: grid;
+            gap: 12px;
+        }
+
+        .tutorial-links {
+            display: grid;
+            gap: 12px;
+        }
+
+        .tutorial-link {
+            position: relative;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 16px;
+            padding: 14px 18px;
+            border-radius: 16px;
+            border: 1px solid var(--line);
+            background: rgba(15, 23, 36, 0.85);
+            text-decoration: none;
+            color: var(--ink);
+            transition: transform 0.2s ease, box-shadow 0.2s ease, border-color 0.2s ease;
+            overflow: hidden;
+        }
+
+        .tutorial-link::after {
+            content: "";
+            position: absolute;
+            inset: 0;
+            background: linear-gradient(90deg, rgba(255, 138, 99, 0) 0%, rgba(255, 138, 99, 0) 55%, rgba(255, 138, 99, 0.16) 100%);
+            opacity: 0.9;
+            pointer-events: none;
+        }
+
+        .tutorial-link:hover {
+            transform: translateY(-2px);
+            border-color: rgba(255, 138, 99, 0.4);
+            box-shadow: var(--shadow-sm);
+        }
+
+        .tutorial-link-content {
+            display: grid;
+            gap: 4px;
+        }
+
+        .tutorial-link-content strong {
+            font-size: 1rem;
+        }
+
+        .tutorial-link-content span {
+            color: var(--muted);
+            font-size: 0.85rem;
+        }
+
+        .tutorial-arrow {
+            font-family: 'JetBrains Mono', monospace;
+            color: var(--accent);
+            font-size: 1.2rem;
+        }
+
+        @media (max-width: 768px) {
+            body {
+                padding: 24px 16px 60px;
+            }
+
+            .topbar {
+                flex-direction: column;
+                align-items: flex-start;
+                gap: 12px;
+            }
+
+            .hero {
+                grid-template-columns: 1fr;
+            }
+
+            h1 {
+                font-size: 2rem;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header class="topbar">
+            <div class="brand">
+                <div class="brand-mark">
+                    <img src="src/LAB5_logo.png" alt="Tab5 logo">
+                </div>
+                <div>
+                    LAB5 docs
+                    <small>visual documentation for M5Stack Tab5 x MonsterC5</small>
+                </div>
+            </div>
+            <nav>
+                <a href="#overview">Overview</a>
+            </nav>
+        </header>
+
+        <section class="hero" id="overview">
+            <div class="hero-content">
+                <div class="hero-media">
+                    <img src="src/step.jpg" alt="Tutorial overview">
+                </div>
+                <div class="hero-body">
+                    <p class="eyebrow">Tutorial</p>
+                    <h1>Step-by-step visual guide</h1>
+                    <p class="lede">
+                        Open a module to view its image walkthrough.
+                    </p>
+                    <div class="tutorial-links">
+                        <a class="tutorial-link" href="src/scan-attacks.html">
+                            <div class="tutorial-link-content">
+                                <strong>Scan & Attacks</strong>
+                            </div>
+                            <span class="tutorial-arrow">→</span>
+                        </a>
+                        <a class="tutorial-link" href="src/global-attacks.html">
+                            <div class="tutorial-link-content">
+                                <strong>Global Attacks</strong>
+                            </div>
+                            <span class="tutorial-arrow">→</span>
+                        </a>
+                        <a class="tutorial-link" href="src/network-observer-karma.html">
+                            <div class="tutorial-link-content">
+                                <strong>Network Observer & Karma on internal C6</strong>
+                            </div>
+                            <span class="tutorial-arrow">→</span>
+                        </a>
+                        <a class="tutorial-link" href="src/karma-monsters-c5.html">
+                            <div class="tutorial-link-content">
+                                <strong>Karma on Monsters C5</strong>
+                            </div>
+                            <span class="tutorial-arrow">→</span>
+                        </a>
+                        <a class="tutorial-link" href="src/bluetooth-scan.html">
+                            <div class="tutorial-link-content">
+                                <strong>Bluetooth scan</strong>
+                            </div>
+                            <span class="tutorial-arrow">→</span>
+                        </a>
+                        <a class="tutorial-link" href="src/settings-compromised-data.html">
+                            <div class="tutorial-link-content">
+                                <strong>Settings and Compromised Data</strong>
+                            </div>
+                            <span class="tutorial-arrow">→</span>
+                        </a>
+                    </div>
+                </div>
+            </div>
+            <div class="hero-panel">
+                <div class="panel-card about-card">
+                    <div class="about-media">
+                        <img src="src/about.jpg" alt="ProjectZero overview">
+                    </div>
+                    <div class="about-body">
+                        <span class="panel-pill">MonsterC5</span>
+                        <p>
+                            modular Wi-Fi offensive and research toolkit for M5Stack Tab5.
+                            Acts as a wrapper for ESP32C5 with <a href="https://github.com/C5Lab/projectZero">JanOS software</a>.
+                        </p>
+                    </div>
+                </div>
+                <div class="panel-card flow-card">
+                    <div class="flow-media">
+                        <img src="src/modular.jpg" alt="Modular flow">
+                    </div>
+                    <div class="flow-body">
+                        <span class="panel-pill">Modular</span>
+                        <p>
+                            Full compatibility with M5 modules and zero soldering required.
+Designed for plug-and-play use
+                        </p>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+    </div>
+</body>
+</html>
