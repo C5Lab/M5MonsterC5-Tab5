@@ -178,7 +178,7 @@ jobs:
             files+=("firmware/M5MonsterC5-Tab5-${FW_VERSION}.zip")
           fi
 
-          out="bundle/M5MonsterC5-Tab5-${FW_VERSION}.zip"
+          out="bundle/M5MonsterC5-Tab5-${FW_VERSION}-bundle.zip"
           zip -9 "$out" "${files[@]}"
 
       - name: Build release notes
@@ -193,7 +193,7 @@ jobs:
           TAG="${RELEASE_TAG:-$FW_VERSION}"
           BASE_URL="https://github.com/$REPO/releases/download/$TAG"
           FW_ZIP="$BASE_URL/M5MonsterC5-Tab5-${FW_VERSION}.zip"
-          BUNDLE_ZIP="$BASE_URL/M5MonsterC5-Tab5-${FW_VERSION}.zip"
+          BUNDLE_ZIP="$BASE_URL/M5MonsterC5-Tab5-${FW_VERSION}-bundle.zip"
           RELEASE_PAGE="https://github.com/$REPO/releases/tag/$TAG"
           PAGES_LINK="https://${REPO%/*}.github.io/${REPO#*/}/"
 
@@ -207,7 +207,7 @@ jobs:
 
           if [ "${GITHUB_EVENT_NAME:-}" = "release" ]; then
             if [ -n "${GITHUB_EVENT_PATH:-}" ] && [ -f "${GITHUB_EVENT_PATH:-}" ]; then
-              release_body="$(jq -r '.release.body // \"\"' "$GITHUB_EVENT_PATH")"
+              release_body="$(jq -r '.release.body // ""' "$GITHUB_EVENT_PATH")"
               if [ -n "$(printf '%s' "$release_body" | tr -d '\r\n[:space:]')" ]; then
                 printf '%s\n' "$release_body" >> "$notes_file"
               fi
@@ -218,8 +218,8 @@ jobs:
           if command -v gh >/dev/null 2>&1; then
             api="/repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/pulls"
             pr_json="$(gh api -H \"Accept: application/vnd.github+json\" \"$api\" 2>/dev/null || echo '[]')"
-            pr_title="$(printf '%s' "$pr_json" | jq -r '.[0].title // \"\"')"
-            pr_body="$(printf '%s' "$pr_json" | jq -r '.[0].body // \"\"')"
+            pr_title="$(printf '%s' "$pr_json" | jq -r '.[0].title // ""')"
+            pr_body="$(printf '%s' "$pr_json" | jq -r '.[0].body // ""')"
 
             if [ -n "$(printf '%s' "$pr_body" | tr -d '\r\n[:space:]')" ]; then
               if [ -n "$pr_title" ]; then
@@ -232,7 +232,7 @@ jobs:
             gen_json="$(gh api -X POST -H \"Accept: application/vnd.github+json\" \
               "/repos/${GITHUB_REPOSITORY}/releases/generate-notes" \
               -f tag_name="$TAG" -f target_commitish="$GITHUB_SHA" 2>/dev/null || echo '')"
-            gen_body="$(printf '%s' "$gen_json" | jq -r '.body // \"\"')"
+            gen_body="$(printf '%s' "$gen_json" | jq -r '.body // ""')"
             if [ -n "$(printf '%s' "$gen_body" | tr -d '\r\n[:space:]')" ]; then
               printf '%s\n' "$gen_body" >> "$notes_file"
             fi
@@ -253,7 +253,7 @@ jobs:
             release_artifacts/firmware/M5MonsterC5-Tab5.bin
             release_artifacts/firmware/M5MonsterC5-Tab5-${{ needs.firmware.outputs.fw_version }}.bin
             release_artifacts/firmware/M5MonsterC5-Tab5-${{ needs.firmware.outputs.fw_version }}.zip
-            release_artifacts/bundle/M5MonsterC5-Tab5-${{ needs.firmware.outputs.fw_version }}.zip
+            release_artifacts/bundle/M5MonsterC5-Tab5-${{ needs.firmware.outputs.fw_version }}-bundle.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
