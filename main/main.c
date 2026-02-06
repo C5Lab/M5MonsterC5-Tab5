@@ -35,7 +35,7 @@
 #include "esp_http_server.h"
 #include "lwip/sockets.h"
 
-#define JANOS_TAB_VERSION "1.0.1"
+#define JANOS_TAB_VERSION "1.0.2"
 #include "lwip/netdb.h"
 #include <dirent.h>
 #include <sys/stat.h>
@@ -11460,6 +11460,16 @@ static void rogue_ap_start_cb(lv_event_t *e)
     
     tab_context_t *ctx = get_current_ctx();
     if (!ctx) return;
+
+    // Validate: Rogue AP requires exactly 1 selected network
+    if (selected_network_count != 1) {
+        ESP_LOGW(TAG, "Rogue AP requires exactly 1 network, selected: %d", selected_network_count);
+        if (ctx->rogue_ap_status_label) {
+            lv_label_set_text(ctx->rogue_ap_status_label, "Select exactly 1 network for Rogue AP");
+            lv_obj_set_style_text_color(ctx->rogue_ap_status_label, COLOR_MATERIAL_RED, 0);
+        }
+        return;
+    }
     
     // Get selected HTML file index from dropdown
     int html_idx = lv_dropdown_get_selected(ctx->rogue_ap_html_dropdown);
@@ -11486,6 +11496,15 @@ static void rogue_ap_start_cb(lv_event_t *e)
     ESP_LOGI(TAG, "[UART%d] Rogue AP: sending %s", uart_index_for_tab(current_tab), html_cmd);
     uart_send_command_for_tab(html_cmd);
     vTaskDelay(pdMS_TO_TICKS(100));
+
+    // Send select_networks command (1-based index)
+    int idx = selected_network_indices[0];
+    if (idx >= 0 && idx < network_count) {
+        char sel_cmd[32];
+        snprintf(sel_cmd, sizeof(sel_cmd), "select_networks %d", networks[idx].index);
+        uart_send_command_for_tab(sel_cmd);
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
     
     // Send start_rogueap command: start_rogueap SSID password
     char ap_cmd[256];
