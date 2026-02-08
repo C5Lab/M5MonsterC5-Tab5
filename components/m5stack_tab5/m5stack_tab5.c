@@ -12,6 +12,7 @@
 #include "esp_check.h"
 #include "esp_spiffs.h"
 #include "esp_lcd_panel_ops.h"
+#include "esp_lcd_panel_io.h"
 #include "esp_lcd_mipi_dsi.h"
 #include "esp_ldo_regulator.h"
 #include "esp_vfs_fat.h"
@@ -1039,6 +1040,9 @@ static bsp_display_type_t bsp_detect_display_type(void)
 //==================================================================================
 // Bit number used to represent command and parameter
 #define LCD_LEDC_CH LEDC_CHANNEL_1  // CONFIG_BSP_DISPLAY_BRIGHTNESS_LEDC_CH
+
+// Global panel IO handle for DCS brightness control
+static esp_lcd_panel_io_handle_t s_lcd_panel_io = NULL;
 esp_err_t bsp_display_brightness_init(void)
 {
     // gpio_config_t io_conf = {};
@@ -1053,12 +1057,15 @@ esp_err_t bsp_display_brightness_init(void)
     // gpio_set_level(BSP_LCD_BACKLIGHT, 1);
 
     // Setup LEDC peripheral for PWM backlight control
+    // Using 60Hz for deep dimming. The backlight circuit has a smoothing capacitor -
+    // lower frequency lets it discharge between pulses for true dimming.
+    // 60Hz matches common camera frame rates (Logitech Brio at 30/60fps) so the camera
+    // captures exactly 1 or 2 complete PWM cycles per frame, avoiding rolling shutter banding.
+    // At high duty cycles (normal use) any residual flicker is imperceptible.
     const ledc_timer_config_t lcd_backlight_timer = {.speed_mode = LEDC_LOW_SPEED_MODE,
-                                                     //  .duty_resolution = LEDC_TIMER_10_BIT,
                                                      .duty_resolution = LEDC_TIMER_12_BIT,
                                                      .timer_num       = LEDC_TIMER_0,
-                                                     .freq_hz         = 5000,
-                                                     // .freq_hz = 20000,
+                                                     .freq_hz         = 60,
                                                      .clk_cfg = LEDC_AUTO_CLK};
     ESP_ERROR_CHECK(ledc_timer_config(&lcd_backlight_timer));
 
@@ -1100,6 +1107,25 @@ esp_err_t bsp_display_backlight_off(void)
 esp_err_t bsp_display_backlight_on(void)
 {
     return bsp_display_brightness_set(100);
+}
+
+esp_err_t bsp_display_brightness_set_dcs(uint8_t brightness)
+{
+    ESP_RETURN_ON_FALSE(s_lcd_panel_io, ESP_ERR_INVALID_STATE, TAG, "Panel IO not initialized");
+
+    static bool dcs_bl_enabled = false;
+    if (!dcs_bl_enabled) {
+        // Enable DCS backlight control: BL on, DD on, BCTRL on
+        ESP_RETURN_ON_ERROR(esp_lcd_panel_io_tx_param(s_lcd_panel_io, 0x53, (uint8_t[]){0x24}, 1),
+                            TAG, "DCS WRCTRLD failed");
+        dcs_bl_enabled = true;
+        ESP_LOGI(TAG, "DCS backlight control enabled");
+    }
+
+    ESP_LOGI(TAG, "Setting DCS brightness: %d/255", brightness);
+    ESP_RETURN_ON_ERROR(esp_lcd_panel_io_tx_param(s_lcd_panel_io, 0x51, (uint8_t[]){brightness}, 1),
+                        TAG, "DCS WRDISBV failed");
+    return ESP_OK;
 }
 
 static esp_err_t bsp_enable_dsi_phy_power(void)
@@ -1257,6 +1283,9 @@ esp_err_t bsp_display_new_with_handles(const bsp_display_config_t* config, bsp_l
     ret_handles->mipi_dsi_bus = mipi_dsi_bus;
     ret_handles->panel        = disp_panel;
     ret_handles->control      = NULL;
+
+    /* Store IO handle globally for DCS brightness control */
+    s_lcd_panel_io = io;
 
     ESP_LOGI(TAG, "Display initialized with resolution %dx%d", BSP_LCD_H_RES, BSP_LCD_V_RES);
 
@@ -1440,6 +1469,9 @@ esp_err_t bsp_display_new_with_handles_to_st7123(const bsp_display_config_t* con
     ret_handles->mipi_dsi_bus = mipi_dsi_bus;
     ret_handles->panel        = disp_panel;
     ret_handles->control      = NULL;
+
+    /* Store IO handle globally for DCS brightness control */
+    s_lcd_panel_io = io;
 
     ESP_LOGI(TAG, "ST7123 Display initialized with resolution %dx%d", 720, 1280);
 
