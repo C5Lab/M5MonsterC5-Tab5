@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <ctype.h>
 #include <errno.h>
+#include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/timers.h"
@@ -35,7 +36,7 @@
 #include "esp_http_server.h"
 #include "lwip/sockets.h"
 
-#define JANOS_TAB_VERSION "1.0.3"
+#define JANOS_TAB_VERSION "1.0.4"
 #include "lwip/netdb.h"
 #include <dirent.h>
 #include <sys/stat.h>
@@ -815,12 +816,17 @@ static lv_timer_t *splash_timer = NULL;
 static int glitch_frame = 0;
 
 // Screen timeout/dimming
-#define SCREEN_TIMEOUT_MS       30000  // 30 seconds
+#define SCREEN_TIMEOUT_MS       30000  // 30 seconds (default, overridden by setting)
 #define SCREEN_CHECK_INTERVAL   1000   // Check every 1 second
 static uint32_t last_activity_time = 0;
 static bool screen_dimmed = false;
 static lv_timer_t *screen_timeout_timer = NULL;
 static lv_obj_t *sleep_overlay = NULL;  // Invisible overlay to capture wake touch
+
+// Screen settings (loaded from NVS)
+// screen_timeout_setting: 0=10s, 1=30s, 2=1min, 3=5min, 4=StaysOn
+static uint8_t screen_timeout_setting = 1;  // Default: 30s (index 1)
+static uint8_t screen_brightness_setting = 80;  // Default: 80%
 
 // LVGL UI elements - observer page
 static lv_obj_t *observer_start_btn = NULL;
@@ -1155,6 +1161,8 @@ static void settings_tile_event_cb(lv_event_t *e);
 static void settings_back_btn_event_cb(lv_event_t *e);
 static void show_scan_time_popup(void);
 static void show_red_team_settings_page(void);
+static void show_screen_timeout_popup(void);
+static void show_screen_brightness_popup(void);
 static void get_uart1_pins(int *tx_pin, int *rx_pin);
 static void get_uart2_pins(int *tx_pin, int *rx_pin);
 static void init_uart2(void);
@@ -1408,6 +1416,37 @@ static void battery_status_timer_cb(lv_timer_t *timer)
     }
 }
 
+// Get screen timeout in milliseconds based on setting
+static uint32_t get_screen_timeout_ms(void)
+{
+    switch (screen_timeout_setting) {
+        case 0: return 10000;      // 10s
+        case 1: return 30000;      // 30s
+        case 2: return 60000;      // 1min
+        case 3: return 300000;     // 5min
+        case 4: return UINT32_MAX; // Stays On (effectively never)
+        default: break;
+    }
+    return 30000;  // Default fallback
+}
+
+// Apply gamma correction for perceptually linear brightness
+// Human perception is logarithmic, so we apply gamma 2.2 to make slider feel linear
+static uint8_t apply_gamma_brightness(uint8_t percent)
+{
+    if (percent == 0) return 0;
+    if (percent >= 100) return 100;
+    
+    // Gamma 2.2 correction
+    float normalized = percent / 100.0f;
+    float corrected = powf(normalized, 2.2f);
+    uint8_t result = (uint8_t)(corrected * 100.0f + 0.5f);
+    
+    // Minimum floor to prevent flicker
+    if (result < 1) result = 1;
+    return result;
+}
+
 // Wake screen helper - restores brightness and clears dimmed state
 static void wake_screen(const char *source)
 {
@@ -1416,10 +1455,10 @@ static void wake_screen(const char *source)
         sleep_overlay = NULL;
     }
     
-    bsp_display_brightness_set(80);  // Restore brightness
+    bsp_display_brightness_set(apply_gamma_brightness(screen_brightness_setting));  // Restore brightness with gamma correction
     screen_dimmed = false;
     last_activity_time = lv_tick_get();
-    ESP_LOGI(TAG, "Screen woken by %s", source);
+    ESP_LOGI(TAG, "Screen woken by %s (brightness %d%%)", source, screen_brightness_setting);
 }
 
 // Sleep overlay click callback - wakes screen and removes overlay (GT911 only)
@@ -1440,7 +1479,8 @@ static void screen_timeout_timer_cb(lv_timer_t *timer)
     }
     
     uint32_t now = lv_tick_get();
-    if ((now - last_activity_time) >= SCREEN_TIMEOUT_MS) {
+    uint32_t timeout_ms = get_screen_timeout_ms();
+    if (timeout_ms != UINT32_MAX && (now - last_activity_time) >= timeout_ms) {
         bsp_display_brightness_set(0);  // Turn off backlight
         screen_dimmed = true;
         
@@ -15703,7 +15743,9 @@ static __attribute__((unused)) lv_obj_t *settings_popup_obj = NULL;
 
 // NVS keys
 #define NVS_NAMESPACE "settings"
-#define NVS_KEY_RED_TEAM    "red_team"
+#define NVS_KEY_RED_TEAM        "red_team"
+#define NVS_KEY_SCREEN_TIMEOUT  "scr_timeout"
+#define NVS_KEY_SCREEN_BRIGHT   "scr_bright"
 
 // Load Red Team setting from NVS (called on startup)
 // Note: Device detection is automatic via ping/pong
@@ -15740,6 +15782,68 @@ static void save_red_team_to_nvs(bool enabled)
         ESP_LOGI(TAG, "Saved Red Team to NVS: %s", enabled ? "Enabled" : "Disabled");
     } else {
         ESP_LOGE(TAG, "Failed to open NVS for writing Red Team: %s", esp_err_to_name(err));
+    }
+}
+
+// Load screen settings from NVS (called on startup)
+static void load_screen_settings_from_nvs(void)
+{
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs);
+    if (err == ESP_OK) {
+        // Load screen timeout setting
+        uint8_t timeout = 1;
+        err = nvs_get_u8(nvs, NVS_KEY_SCREEN_TIMEOUT, &timeout);
+        if (err == ESP_OK && timeout <= 4) {
+            screen_timeout_setting = timeout;
+            ESP_LOGI(TAG, "Loaded Screen Timeout from NVS: %d", screen_timeout_setting);
+        } else {
+            ESP_LOGI(TAG, "No Screen Timeout in NVS, using default: 30s");
+        }
+        
+        // Load screen brightness setting
+        uint8_t brightness = 80;
+        err = nvs_get_u8(nvs, NVS_KEY_SCREEN_BRIGHT, &brightness);
+        if (err == ESP_OK && brightness >= 1 && brightness <= 100) {
+            screen_brightness_setting = brightness;
+            ESP_LOGI(TAG, "Loaded Screen Brightness from NVS: %d%%", screen_brightness_setting);
+        } else {
+            ESP_LOGI(TAG, "No Screen Brightness in NVS, using default: 80%%");
+        }
+        
+        nvs_close(nvs);
+    } else {
+        ESP_LOGI(TAG, "NVS not available, using default screen settings");
+    }
+}
+
+// Save screen timeout setting to NVS
+static void save_screen_timeout_to_nvs(uint8_t setting)
+{
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs);
+    if (err == ESP_OK) {
+        nvs_set_u8(nvs, NVS_KEY_SCREEN_TIMEOUT, setting);
+        nvs_commit(nvs);
+        nvs_close(nvs);
+        ESP_LOGI(TAG, "Saved Screen Timeout to NVS: %d", setting);
+    } else {
+        ESP_LOGE(TAG, "Failed to open NVS for writing Screen Timeout: %s", esp_err_to_name(err));
+    }
+}
+
+// Save screen brightness setting to NVS
+static void save_screen_brightness_to_nvs(uint8_t brightness)
+{
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs);
+    if (err == ESP_OK) {
+        nvs_set_u8(nvs, NVS_KEY_SCREEN_BRIGHT, brightness);
+        nvs_commit(nvs);
+        nvs_close(nvs);
+        ESP_LOGI(TAG, "Saved Screen Brightness to NVS: %d%%", brightness);
+    } else {
+        ESP_LOGE(TAG, "Failed to open NVS for writing Screen Brightness: %s", esp_err_to_name(err));
     }
 }
 
@@ -16890,6 +16994,217 @@ static void show_red_team_settings_page(void)
     lv_obj_set_style_text_font(status, &lv_font_montserrat_16, 0);
 }
 
+// Screen Timeout popup variables
+static lv_obj_t *screen_timeout_popup_overlay = NULL;
+static lv_obj_t *screen_timeout_popup_obj = NULL;
+
+// Screen Brightness popup variables  
+static lv_obj_t *screen_brightness_popup_overlay = NULL;
+static lv_obj_t *screen_brightness_popup_obj = NULL;
+static lv_obj_t *screen_brightness_slider = NULL;
+static lv_obj_t *screen_brightness_value_label = NULL;
+
+// Close Screen Timeout popup
+static void close_screen_timeout_popup(void)
+{
+    if (screen_timeout_popup_overlay) {
+        lv_obj_del(screen_timeout_popup_overlay);
+        screen_timeout_popup_overlay = NULL;
+        screen_timeout_popup_obj = NULL;
+    }
+}
+
+// Screen timeout dropdown change callback
+static void screen_timeout_dropdown_cb(lv_event_t *e)
+{
+    lv_obj_t *dropdown = lv_event_get_target(e);
+    uint16_t sel = lv_dropdown_get_selected(dropdown);
+    
+    if (sel <= 4) {
+        screen_timeout_setting = (uint8_t)sel;
+        save_screen_timeout_to_nvs(screen_timeout_setting);
+        
+        const char *options[] = {"10s", "30s", "1min", "5min", "Stays On"};
+        ESP_LOGI(TAG, "Screen timeout changed to: %s", options[sel]);
+    }
+}
+
+// Screen timeout close button callback
+static void screen_timeout_close_cb(lv_event_t *e)
+{
+    (void)e;
+    close_screen_timeout_popup();
+}
+
+// Show Screen Timeout popup with dropdown
+static void show_screen_timeout_popup(void)
+{
+    lv_obj_t *container = get_current_tab_container();
+    if (!container) return;
+    
+    // Create modal overlay
+    screen_timeout_popup_overlay = lv_obj_create(container);
+    lv_obj_remove_style_all(screen_timeout_popup_overlay);
+    lv_obj_set_size(screen_timeout_popup_overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(screen_timeout_popup_overlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(screen_timeout_popup_overlay, LV_OPA_50, 0);
+    lv_obj_clear_flag(screen_timeout_popup_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(screen_timeout_popup_overlay, LV_OBJ_FLAG_CLICKABLE);
+    
+    // Create popup
+    screen_timeout_popup_obj = lv_obj_create(screen_timeout_popup_overlay);
+    lv_obj_set_size(screen_timeout_popup_obj, 350, 220);
+    lv_obj_center(screen_timeout_popup_obj);
+    lv_obj_set_style_bg_color(screen_timeout_popup_obj, lv_color_hex(0x2D2D2D), 0);
+    lv_obj_set_style_border_color(screen_timeout_popup_obj, COLOR_MATERIAL_AMBER, 0);
+    lv_obj_set_style_border_width(screen_timeout_popup_obj, 2, 0);
+    lv_obj_set_style_radius(screen_timeout_popup_obj, 12, 0);
+    lv_obj_set_style_pad_all(screen_timeout_popup_obj, 20, 0);
+    lv_obj_set_flex_flow(screen_timeout_popup_obj, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(screen_timeout_popup_obj, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(screen_timeout_popup_obj, 15, 0);
+    lv_obj_clear_flag(screen_timeout_popup_obj, LV_OBJ_FLAG_SCROLLABLE);
+    
+    // Title
+    lv_obj_t *title = lv_label_create(screen_timeout_popup_obj);
+    lv_label_set_text(title, "Screen Timeout");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_AMBER, 0);
+    
+    // Dropdown
+    lv_obj_t *dropdown = lv_dropdown_create(screen_timeout_popup_obj);
+    lv_dropdown_set_options(dropdown, "10 seconds\n30 seconds\n1 minute\n5 minutes\nStays On");
+    lv_dropdown_set_selected(dropdown, screen_timeout_setting);
+    lv_obj_set_width(dropdown, 200);
+    lv_obj_set_style_text_font(dropdown, &lv_font_montserrat_16, 0);
+    lv_obj_add_event_cb(dropdown, screen_timeout_dropdown_cb, LV_EVENT_VALUE_CHANGED, NULL);
+    
+    // Close button
+    lv_obj_t *close_btn = lv_btn_create(screen_timeout_popup_obj);
+    lv_obj_set_size(close_btn, 100, 40);
+    lv_obj_set_style_bg_color(close_btn, COLOR_MATERIAL_AMBER, 0);
+    lv_obj_add_event_cb(close_btn, screen_timeout_close_cb, LV_EVENT_CLICKED, NULL);
+    
+    lv_obj_t *close_label = lv_label_create(close_btn);
+    lv_label_set_text(close_label, "Close");
+    lv_obj_set_style_text_font(close_label, &lv_font_montserrat_16, 0);
+    lv_obj_center(close_label);
+}
+
+// Close Screen Brightness popup
+static void close_screen_brightness_popup(void)
+{
+    if (screen_brightness_popup_overlay) {
+        lv_obj_del(screen_brightness_popup_overlay);
+        screen_brightness_popup_overlay = NULL;
+        screen_brightness_popup_obj = NULL;
+        screen_brightness_slider = NULL;
+        screen_brightness_value_label = NULL;
+    }
+}
+
+// Screen brightness slider change callback
+static void screen_brightness_slider_cb(lv_event_t *e)
+{
+    lv_obj_t *slider = lv_event_get_target(e);
+    int32_t value = lv_slider_get_value(slider);
+    
+    // Update brightness immediately with gamma correction
+    screen_brightness_setting = (uint8_t)value;
+    bsp_display_brightness_set(apply_gamma_brightness(screen_brightness_setting));
+    
+    // Update label
+    if (screen_brightness_value_label) {
+        char buf[16];
+        snprintf(buf, sizeof(buf), "%d%%", screen_brightness_setting);
+        lv_label_set_text(screen_brightness_value_label, buf);
+    }
+}
+
+// Screen brightness slider release callback - save to NVS
+static void screen_brightness_slider_release_cb(lv_event_t *e)
+{
+    lv_obj_t *slider = lv_event_get_target(e);
+    int32_t value = lv_slider_get_value(slider);
+    
+    screen_brightness_setting = (uint8_t)value;
+    save_screen_brightness_to_nvs(screen_brightness_setting);
+    ESP_LOGI(TAG, "Screen brightness saved: %d%%", screen_brightness_setting);
+}
+
+// Screen brightness close button callback
+static void screen_brightness_close_cb(lv_event_t *e)
+{
+    (void)e;
+    close_screen_brightness_popup();
+}
+
+// Show Screen Brightness popup with slider
+static void show_screen_brightness_popup(void)
+{
+    lv_obj_t *container = get_current_tab_container();
+    if (!container) return;
+    
+    // Create modal overlay
+    screen_brightness_popup_overlay = lv_obj_create(container);
+    lv_obj_remove_style_all(screen_brightness_popup_overlay);
+    lv_obj_set_size(screen_brightness_popup_overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(screen_brightness_popup_overlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(screen_brightness_popup_overlay, LV_OPA_50, 0);
+    lv_obj_clear_flag(screen_brightness_popup_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(screen_brightness_popup_overlay, LV_OBJ_FLAG_CLICKABLE);
+    
+    // Create popup
+    screen_brightness_popup_obj = lv_obj_create(screen_brightness_popup_overlay);
+    lv_obj_set_size(screen_brightness_popup_obj, 400, 250);
+    lv_obj_center(screen_brightness_popup_obj);
+    lv_obj_set_style_bg_color(screen_brightness_popup_obj, lv_color_hex(0x2D2D2D), 0);
+    lv_obj_set_style_border_color(screen_brightness_popup_obj, COLOR_MATERIAL_CYAN, 0);
+    lv_obj_set_style_border_width(screen_brightness_popup_obj, 2, 0);
+    lv_obj_set_style_radius(screen_brightness_popup_obj, 12, 0);
+    lv_obj_set_style_pad_all(screen_brightness_popup_obj, 20, 0);
+    lv_obj_set_flex_flow(screen_brightness_popup_obj, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(screen_brightness_popup_obj, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(screen_brightness_popup_obj, 15, 0);
+    lv_obj_clear_flag(screen_brightness_popup_obj, LV_OBJ_FLAG_SCROLLABLE);
+    
+    // Title
+    lv_obj_t *title = lv_label_create(screen_brightness_popup_obj);
+    lv_label_set_text(title, "Screen Brightness");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_CYAN, 0);
+    
+    // Value label
+    screen_brightness_value_label = lv_label_create(screen_brightness_popup_obj);
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%d%%", screen_brightness_setting);
+    lv_label_set_text(screen_brightness_value_label, buf);
+    lv_obj_set_style_text_font(screen_brightness_value_label, &lv_font_montserrat_32, 0);
+    lv_obj_set_style_text_color(screen_brightness_value_label, lv_color_hex(0xFFFFFF), 0);
+    
+    // Slider
+    screen_brightness_slider = lv_slider_create(screen_brightness_popup_obj);
+    lv_obj_set_width(screen_brightness_slider, 300);
+    lv_slider_set_range(screen_brightness_slider, 1, 100);
+    lv_slider_set_value(screen_brightness_slider, screen_brightness_setting, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(screen_brightness_slider, lv_color_hex(0x444444), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(screen_brightness_slider, COLOR_MATERIAL_CYAN, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(screen_brightness_slider, COLOR_MATERIAL_CYAN, LV_PART_KNOB);
+    lv_obj_add_event_cb(screen_brightness_slider, screen_brightness_slider_cb, LV_EVENT_VALUE_CHANGED, NULL);
+    lv_obj_add_event_cb(screen_brightness_slider, screen_brightness_slider_release_cb, LV_EVENT_RELEASED, NULL);
+    
+    // Close button
+    lv_obj_t *close_btn = lv_btn_create(screen_brightness_popup_obj);
+    lv_obj_set_size(close_btn, 100, 40);
+    lv_obj_set_style_bg_color(close_btn, COLOR_MATERIAL_CYAN, 0);
+    lv_obj_add_event_cb(close_btn, screen_brightness_close_cb, LV_EVENT_CLICKED, NULL);
+    
+    lv_obj_t *close_label = lv_label_create(close_btn);
+    lv_label_set_text(close_label, "Close");
+    lv_obj_set_style_text_font(close_label, &lv_font_montserrat_16, 0);
+    lv_obj_center(close_label);
+}
+
 static void settings_back_btn_event_cb(lv_event_t *e)
 {
     (void)e;
@@ -16915,6 +17230,10 @@ static void settings_tile_event_cb(lv_event_t *e)
         show_scan_time_popup();
     } else if (strcmp(tile_name, "Red Team") == 0) {
         show_red_team_settings_page();
+    } else if (strcmp(tile_name, "Screen Timeout") == 0) {
+        show_screen_timeout_popup();
+    } else if (strcmp(tile_name, "Screen Brightness") == 0) {
+        show_screen_brightness_popup();
     }
 }
 
@@ -16991,6 +17310,12 @@ static void show_settings_page(void)
     
     // Red Team tile
     create_tile(tiles, LV_SYMBOL_WARNING, "Red\nTeam", COLOR_MATERIAL_RED, settings_tile_event_cb, "Red Team");
+    
+    // Screen Timeout tile
+    create_tile(tiles, LV_SYMBOL_EYE_CLOSE, "Screen\nTimeout", COLOR_MATERIAL_AMBER, settings_tile_event_cb, "Screen Timeout");
+    
+    // Screen Brightness tile
+    create_tile(tiles, LV_SYMBOL_IMAGE, "Screen\nBrightness", COLOR_MATERIAL_CYAN, settings_tile_event_cb, "Screen Brightness");
 }
 
 void app_main(void)
@@ -17049,6 +17374,9 @@ void app_main(void)
     // Load Red Team setting from NVS (hardware config is now auto-detected)
     load_red_team_from_nvs();
     
+    // Load screen settings from NVS (timeout and brightness)
+    load_screen_settings_from_nvs();
+    
     // Initialize both UARTs for board detection
     // UART1: Grove (TX=53, RX=54) - always initialized
     // MBus port: M5Bus connector (TX=37, RX=38)
@@ -17062,15 +17390,21 @@ void app_main(void)
         return;
     }
     
-    // Set display brightness
-    bsp_display_brightness_set(80);
+    // Set display brightness from saved setting with gamma correction
+    bsp_display_brightness_set(apply_gamma_brightness(screen_brightness_setting));
+    ESP_LOGI(TAG, "Display brightness set to %d%% (gamma corrected: %d%%)", screen_brightness_setting, apply_gamma_brightness(screen_brightness_setting));
     
     // Initialize screen timeout
     last_activity_time = lv_tick_get();
     lv_indev_t *touch_indev = bsp_display_get_input_dev();
     if (touch_indev) {
         lv_indev_add_event_cb(touch_indev, touch_activity_cb, LV_EVENT_PRESSED, NULL);
-        ESP_LOGI(TAG, "Screen timeout enabled: %d seconds", SCREEN_TIMEOUT_MS / 1000);
+        uint32_t timeout_ms = get_screen_timeout_ms();
+        if (timeout_ms == UINT32_MAX) {
+            ESP_LOGI(TAG, "Screen timeout disabled (Stays On)");
+        } else {
+            ESP_LOGI(TAG, "Screen timeout enabled: %lu ms", (unsigned long)timeout_ms);
+        }
     } else {
         ESP_LOGW(TAG, "Touch input device not available, screen timeout disabled");
     }
