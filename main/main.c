@@ -36,7 +36,7 @@
 #include "esp_http_server.h"
 #include "lwip/sockets.h"
 
-#define JANOS_TAB_VERSION "1.0.4"
+#define JANOS_TAB_VERSION "1.0.5"
 #include "lwip/netdb.h"
 #include <dirent.h>
 #include <sys/stat.h>
@@ -1431,15 +1431,16 @@ static uint32_t get_screen_timeout_ms(void)
 }
 
 // Apply gamma correction for perceptually linear brightness
-// Human perception is logarithmic, so we apply gamma 2.2 to make slider feel linear
+// Human perception is logarithmic, so we apply gamma correction to make slider feel linear
+// Using gamma 3.0 for more aggressive dimming at low values (LED backlights need higher gamma)
 static uint8_t apply_gamma_brightness(uint8_t percent)
 {
     if (percent == 0) return 0;
     if (percent >= 100) return 100;
     
-    // Gamma 2.2 correction
+    // Gamma 3.0 correction - more aggressive for LED backlight
     float normalized = percent / 100.0f;
-    float corrected = powf(normalized, 2.2f);
+    float corrected = powf(normalized, 3.0f);
     uint8_t result = (uint8_t)(corrected * 100.0f + 0.5f);
     
     // Minimum floor to prevent flicker
@@ -17136,6 +17137,8 @@ static void screen_brightness_slider_release_cb(lv_event_t *e)
 static void screen_brightness_close_cb(lv_event_t *e)
 {
     (void)e;
+    // Ensure brightness is set to saved value before closing (prevents jumps from slider cleanup)
+    bsp_display_brightness_set(apply_gamma_brightness(screen_brightness_setting));
     close_screen_brightness_popup();
 }
 
@@ -17145,12 +17148,11 @@ static void show_screen_brightness_popup(void)
     lv_obj_t *container = get_current_tab_container();
     if (!container) return;
     
-    // Create modal overlay
+    // Create modal overlay (transparent - no dimming, so user sees actual brightness effect)
     screen_brightness_popup_overlay = lv_obj_create(container);
     lv_obj_remove_style_all(screen_brightness_popup_overlay);
     lv_obj_set_size(screen_brightness_popup_overlay, lv_pct(100), lv_pct(100));
-    lv_obj_set_style_bg_color(screen_brightness_popup_overlay, lv_color_hex(0x000000), 0);
-    lv_obj_set_style_bg_opa(screen_brightness_popup_overlay, LV_OPA_50, 0);
+    lv_obj_set_style_bg_opa(screen_brightness_popup_overlay, LV_OPA_TRANSP, 0);
     lv_obj_clear_flag(screen_brightness_popup_overlay, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(screen_brightness_popup_overlay, LV_OBJ_FLAG_CLICKABLE);
     
