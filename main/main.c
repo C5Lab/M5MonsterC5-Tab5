@@ -19,6 +19,7 @@
 #include "nvs.h"
 #include "driver/uart.h"
 #include "driver/gpio.h"
+#include "driver/ledc.h"
 #include "bsp/m5stack_tab5.h"
 #include "lvgl.h"
 #include "iot_usbh_cdc.h"
@@ -36,7 +37,7 @@
 #include "esp_http_server.h"
 #include "lwip/sockets.h"
 
-#define JANOS_TAB_VERSION "1.0.5"
+#define JANOS_TAB_VERSION "1.0.6"
 #include "lwip/netdb.h"
 #include <dirent.h>
 #include <sys/stat.h>
@@ -1430,22 +1431,27 @@ static uint32_t get_screen_timeout_ms(void)
     return 30000;  // Default fallback
 }
 
-// Apply gamma correction for perceptually linear brightness
-// Human perception is logarithmic, so we apply gamma correction to make slider feel linear
-// Using gamma 3.0 for more aggressive dimming at low values (LED backlights need higher gamma)
-static uint8_t apply_gamma_brightness(uint8_t percent)
+// Set display brightness with gamma correction using full 12-bit LEDC precision.
+// Direct LEDC control gives 4096 steps (0-4095) with 200Hz PWM for proper LED dimming.
+// Gamma 2.2 maps slider percentage to perceived linear brightness.
+#define BRIGHTNESS_LEDC_CH      LEDC_CHANNEL_1
+#define BRIGHTNESS_LEDC_MAX     4095  // 12-bit resolution
+static void set_brightness_gamma(uint8_t percent)
 {
-    if (percent == 0) return 0;
-    if (percent >= 100) return 100;
-    
-    // Gamma 3.0 correction - more aggressive for LED backlight
-    float normalized = percent / 100.0f;
-    float corrected = powf(normalized, 3.0f);
-    uint8_t result = (uint8_t)(corrected * 100.0f + 0.5f);
-    
-    // Minimum floor to prevent flicker
-    if (result < 1) result = 1;
-    return result;
+    uint32_t duty;
+    if (percent == 0) {
+        duty = 0;
+    } else if (percent >= 100) {
+        duty = BRIGHTNESS_LEDC_MAX;
+    } else {
+        float normalized = percent / 100.0f;
+        float corrected = powf(normalized, 2.2f);
+        duty = (uint32_t)(corrected * BRIGHTNESS_LEDC_MAX + 0.5f);
+        if (duty < 1) duty = 1;
+    }
+    ESP_LOGI(TAG, "Brightness: slider %d%% -> duty %lu/4095", percent, (unsigned long)duty);
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, BRIGHTNESS_LEDC_CH, duty);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, BRIGHTNESS_LEDC_CH);
 }
 
 // Wake screen helper - restores brightness and clears dimmed state
@@ -1456,7 +1462,7 @@ static void wake_screen(const char *source)
         sleep_overlay = NULL;
     }
     
-    bsp_display_brightness_set(apply_gamma_brightness(screen_brightness_setting));  // Restore brightness with gamma correction
+    set_brightness_gamma(screen_brightness_setting);  // Restore brightness with gamma correction
     screen_dimmed = false;
     last_activity_time = lv_tick_get();
     ESP_LOGI(TAG, "Screen woken by %s (brightness %d%%)", source, screen_brightness_setting);
@@ -17110,9 +17116,9 @@ static void screen_brightness_slider_cb(lv_event_t *e)
     lv_obj_t *slider = lv_event_get_target(e);
     int32_t value = lv_slider_get_value(slider);
     
-    // Update brightness immediately with gamma correction
+    // Update brightness immediately with gamma correction (full 12-bit precision)
     screen_brightness_setting = (uint8_t)value;
-    bsp_display_brightness_set(apply_gamma_brightness(screen_brightness_setting));
+    set_brightness_gamma(screen_brightness_setting);
     
     // Update label
     if (screen_brightness_value_label) {
@@ -17137,8 +17143,8 @@ static void screen_brightness_slider_release_cb(lv_event_t *e)
 static void screen_brightness_close_cb(lv_event_t *e)
 {
     (void)e;
-    // Ensure brightness is set to saved value before closing (prevents jumps from slider cleanup)
-    bsp_display_brightness_set(apply_gamma_brightness(screen_brightness_setting));
+    // Ensure brightness is set to saved value before closing
+    set_brightness_gamma(screen_brightness_setting);
     close_screen_brightness_popup();
 }
 
@@ -17393,8 +17399,7 @@ void app_main(void)
     }
     
     // Set display brightness from saved setting with gamma correction
-    bsp_display_brightness_set(apply_gamma_brightness(screen_brightness_setting));
-    ESP_LOGI(TAG, "Display brightness set to %d%% (gamma corrected: %d%%)", screen_brightness_setting, apply_gamma_brightness(screen_brightness_setting));
+    set_brightness_gamma(screen_brightness_setting);
     
     // Initialize screen timeout
     last_activity_time = lv_tick_get();

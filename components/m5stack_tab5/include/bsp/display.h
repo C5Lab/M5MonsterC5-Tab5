@@ -153,6 +153,20 @@ esp_err_t bsp_display_brightness_init(void);
 esp_err_t bsp_display_brightness_set(int brightness_percent);
 
 /**
+ * @brief Set display brightness via MIPI DCS command
+ *
+ * Uses ILI9881C's built-in brightness control (DCS command 0x51) for
+ * true brightness dimming with 256 steps. PWM backlight should be set
+ * to 100% when using this function.
+ *
+ * @param[in] brightness Brightness value 0-255 (0=darkest, 255=brightest)
+ * @return
+ *      - ESP_OK                On success
+ *      - ESP_ERR_INVALID_STATE Panel IO not initialized
+ */
+esp_err_t bsp_display_brightness_set_dcs(uint8_t brightness);
+
+/**
  * @brief Turn on display backlight
  *
  * Brightness is controlled with PWM signal to a pin controlling backlight.
