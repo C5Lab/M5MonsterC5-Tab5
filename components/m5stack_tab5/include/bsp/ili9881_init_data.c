@@ -210,6 +210,11 @@ static const ili9881c_lcd_init_cmd_t tab5_lcd_ili9881c_specific_init_code_defaul
     {0xFF, (uint8_t[]){0x98, 0x81, 0x00}, 3, 0},
     {0x35, (uint8_t[]){0x00}, 0, 0},
     // {0x11, (uint8_t []){0x00}, 0},
+
+    // Enable DCS brightness control
+    {0x53, (uint8_t[]){0x24}, 1, 0},  // WRCTRLD: BL on, DD on, BCTRL on
+    {0x51, (uint8_t[]){0xFF}, 1, 0},  // WRDISBV: Max brightness initially
+
     {0xFE, (uint8_t[]){0x00}, 0, 0},
     {0x29, (uint8_t[]){0x00}, 0, 0},
     //============ Gamma END===========
