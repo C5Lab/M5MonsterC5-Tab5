@@ -37,7 +37,7 @@
 #include "esp_http_server.h"
 #include "lwip/sockets.h"
 
-#define JANOS_TAB_VERSION "1.0.7"
+#define JANOS_TAB_VERSION "1.0.8"
 #include "lwip/netdb.h"
 #include <dirent.h>
 #include <sys/stat.h>
@@ -342,6 +342,9 @@ typedef struct {
     wardrive_network_t wardrive_networks[WARDRIVE_MAX_NETWORKS];
     int wardrive_net_count;
     int wardrive_net_head;
+    lv_obj_t *wardrive_gps_type_btn;
+    lv_obj_t *wardrive_gps_type_overlay;
+    lv_obj_t *wardrive_gps_type_response_label;
     
     // =====================================================================
     // COMPROMISED DATA - Page and sub-pages
@@ -1241,6 +1244,10 @@ static void wardrive_back_cb(lv_event_t *e);
 static void wardrive_monitor_task(void *arg);
 static void update_wardrive_table(tab_context_t *ctx);
 static void close_wardrive_gps_overlay(tab_context_t *ctx);
+static void wardrive_gps_type_btn_cb(lv_event_t *e);
+static void wardrive_gps_type_close_cb(lv_event_t *e);
+static void wardrive_gps_set_m5_cb(lv_event_t *e);
+static void wardrive_gps_set_atgm_cb(lv_event_t *e);
 static void show_compromised_data_page(void);
 static void compromised_data_tile_event_cb(lv_event_t *e);
 static void compromised_data_back_btn_event_cb(lv_event_t *e);
@@ -10953,6 +10960,241 @@ static bool parse_wardrive_network_line(tab_context_t *ctx, const char *line)
     return true;
 }
 
+// Close GPS type popup
+static void wardrive_gps_type_close_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx) ctx = get_current_ctx();
+    
+    if (ctx->wardrive_gps_type_overlay) {
+        lv_obj_del(ctx->wardrive_gps_type_overlay);
+        ctx->wardrive_gps_type_overlay = NULL;
+        ctx->wardrive_gps_type_response_label = NULL;
+    }
+}
+
+// GPS set M5 callback
+static void wardrive_gps_set_m5_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx) ctx = get_current_ctx();
+    
+    // Show "sending..." immediately
+    if (ctx->wardrive_gps_type_response_label) {
+        lv_label_set_text(ctx->wardrive_gps_type_response_label, "Sending command...");
+        lv_obj_set_style_text_color(ctx->wardrive_gps_type_response_label, COLOR_MATERIAL_AMBER, 0);
+    }
+    lv_refr_now(NULL);
+    
+    // Send command
+    tab_id_t active_tab = tab_id_for_ctx(ctx);
+    if (active_tab == TAB_MBUS) {
+        uart2_send_command("gps_set m5");
+    } else {
+        uart_send_command("gps_set m5");
+    }
+    
+    // Read response - try multiple times
+    uart_port_t uart_port = (active_tab == TAB_MBUS) ? UART2_NUM : UART_NUM;
+    char rx_buffer[512];
+    char response[256] = "";
+    int total_len = 0;
+    
+    // Try reading for up to 1.5 seconds
+    for (int attempt = 0; attempt < 15 && strlen(response) == 0; attempt++) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        int len = transport_read_bytes_tab(active_tab, uart_port, rx_buffer + total_len, 
+                                           sizeof(rx_buffer) - 1 - total_len, pdMS_TO_TICKS(50));
+        if (len > 0) {
+            total_len += len;
+            rx_buffer[total_len] = '\0';
+            
+            // Look for response line (skip echo of command)
+            char *line = strtok(rx_buffer, "\r\n");
+            while (line) {
+                // Skip empty lines and command echo
+                if (strlen(line) > 0 && strstr(line, "gps_set") == NULL) {
+                    snprintf(response, sizeof(response), "%.255s", line);
+                    break;
+                }
+                line = strtok(NULL, "\r\n");
+            }
+        }
+    }
+    
+    if (ctx->wardrive_gps_type_response_label) {
+        if (strlen(response) > 0) {
+            lv_label_set_text(ctx->wardrive_gps_type_response_label, response);
+            lv_obj_set_style_text_color(ctx->wardrive_gps_type_response_label, COLOR_MATERIAL_GREEN, 0);
+        } else {
+            lv_label_set_text(ctx->wardrive_gps_type_response_label, "Command sent (no response received)");
+            lv_obj_set_style_text_color(ctx->wardrive_gps_type_response_label, COLOR_MATERIAL_AMBER, 0);
+        }
+    }
+}
+
+// GPS set ATGM callback
+static void wardrive_gps_set_atgm_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx) ctx = get_current_ctx();
+    
+    // Show "sending..." immediately
+    if (ctx->wardrive_gps_type_response_label) {
+        lv_label_set_text(ctx->wardrive_gps_type_response_label, "Sending command...");
+        lv_obj_set_style_text_color(ctx->wardrive_gps_type_response_label, COLOR_MATERIAL_AMBER, 0);
+    }
+    lv_refr_now(NULL);
+    
+    // Send command
+    tab_id_t active_tab = tab_id_for_ctx(ctx);
+    if (active_tab == TAB_MBUS) {
+        uart2_send_command("gps_set atgm");
+    } else {
+        uart_send_command("gps_set atgm");
+    }
+    
+    // Read response - try multiple times
+    uart_port_t uart_port = (active_tab == TAB_MBUS) ? UART2_NUM : UART_NUM;
+    char rx_buffer[512];
+    char response[256] = "";
+    int total_len = 0;
+    
+    // Try reading for up to 1.5 seconds
+    for (int attempt = 0; attempt < 15 && strlen(response) == 0; attempt++) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        int len = transport_read_bytes_tab(active_tab, uart_port, rx_buffer + total_len, 
+                                           sizeof(rx_buffer) - 1 - total_len, pdMS_TO_TICKS(50));
+        if (len > 0) {
+            total_len += len;
+            rx_buffer[total_len] = '\0';
+            
+            // Look for response line (skip echo of command)
+            char *line = strtok(rx_buffer, "\r\n");
+            while (line) {
+                // Skip empty lines and command echo
+                if (strlen(line) > 0 && strstr(line, "gps_set") == NULL) {
+                    snprintf(response, sizeof(response), "%.255s", line);
+                    break;
+                }
+                line = strtok(NULL, "\r\n");
+            }
+        }
+    }
+    
+    if (ctx->wardrive_gps_type_response_label) {
+        if (strlen(response) > 0) {
+            lv_label_set_text(ctx->wardrive_gps_type_response_label, response);
+            lv_obj_set_style_text_color(ctx->wardrive_gps_type_response_label, COLOR_MATERIAL_GREEN, 0);
+        } else {
+            lv_label_set_text(ctx->wardrive_gps_type_response_label, "Command sent (no response received)");
+            lv_obj_set_style_text_color(ctx->wardrive_gps_type_response_label, COLOR_MATERIAL_AMBER, 0);
+        }
+    }
+}
+
+// GPS type button callback - show popup
+static void wardrive_gps_type_btn_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx) ctx = get_current_ctx();
+    if (!ctx->wardrive_page) return;
+    
+    // Close existing overlay if any
+    if (ctx->wardrive_gps_type_overlay) {
+        lv_obj_del(ctx->wardrive_gps_type_overlay);
+        ctx->wardrive_gps_type_overlay = NULL;
+    }
+    
+    // Create overlay
+    ctx->wardrive_gps_type_overlay = lv_obj_create(ctx->wardrive_page);
+    lv_obj_remove_style_all(ctx->wardrive_gps_type_overlay);
+    lv_obj_set_size(ctx->wardrive_gps_type_overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(ctx->wardrive_gps_type_overlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(ctx->wardrive_gps_type_overlay, LV_OPA_70, 0);
+    lv_obj_clear_flag(ctx->wardrive_gps_type_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(ctx->wardrive_gps_type_overlay, LV_OBJ_FLAG_CLICKABLE);
+    
+    // Create popup
+    lv_obj_t *popup = lv_obj_create(ctx->wardrive_gps_type_overlay);
+    lv_obj_set_size(popup, 450, 280);
+    lv_obj_center(popup);
+    lv_obj_set_style_bg_color(popup, lv_color_hex(0x1A1A2A), 0);
+    lv_obj_set_style_border_color(popup, COLOR_MATERIAL_TEAL, 0);
+    lv_obj_set_style_border_width(popup, 3, 0);
+    lv_obj_set_style_radius(popup, 16, 0);
+    lv_obj_set_style_shadow_width(popup, 30, 0);
+    lv_obj_set_style_shadow_color(popup, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_shadow_opa(popup, LV_OPA_50, 0);
+    lv_obj_set_style_pad_all(popup, 20, 0);
+    lv_obj_set_flex_flow(popup, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(popup, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(popup, 12, 0);
+    lv_obj_clear_flag(popup, LV_OBJ_FLAG_SCROLLABLE);
+    
+    // Title
+    lv_obj_t *title = lv_label_create(popup);
+    lv_label_set_text(title, "GPS Type");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_TEAL, 0);
+    
+    // Buttons row
+    lv_obj_t *btn_row = lv_obj_create(popup);
+    lv_obj_set_size(btn_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(btn_row, 0, 0);
+    lv_obj_set_style_pad_all(btn_row, 0, 0);
+    lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(btn_row, 20, 0);
+    lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
+    
+    // Set M5 button
+    lv_obj_t *m5_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(m5_btn, 140, 50);
+    lv_obj_set_style_bg_color(m5_btn, COLOR_MATERIAL_TEAL, 0);
+    lv_obj_set_style_radius(m5_btn, 8, 0);
+    lv_obj_add_event_cb(m5_btn, wardrive_gps_set_m5_cb, LV_EVENT_CLICKED, ctx);
+    
+    lv_obj_t *m5_label = lv_label_create(m5_btn);
+    lv_label_set_text(m5_label, "Set M5");
+    lv_obj_set_style_text_font(m5_label, &lv_font_montserrat_16, 0);
+    lv_obj_center(m5_label);
+    
+    // Set ATGM button
+    lv_obj_t *atgm_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(atgm_btn, 140, 50);
+    lv_obj_set_style_bg_color(atgm_btn, COLOR_MATERIAL_TEAL, 0);
+    lv_obj_set_style_radius(atgm_btn, 8, 0);
+    lv_obj_add_event_cb(atgm_btn, wardrive_gps_set_atgm_cb, LV_EVENT_CLICKED, ctx);
+    
+    lv_obj_t *atgm_label = lv_label_create(atgm_btn);
+    lv_label_set_text(atgm_label, "Set ATGM");
+    lv_obj_set_style_text_font(atgm_label, &lv_font_montserrat_16, 0);
+    lv_obj_center(atgm_label);
+    
+    // Response label
+    ctx->wardrive_gps_type_response_label = lv_label_create(popup);
+    lv_label_set_text(ctx->wardrive_gps_type_response_label, "");
+    lv_obj_set_style_text_font(ctx->wardrive_gps_type_response_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(ctx->wardrive_gps_type_response_label, lv_color_hex(0x888888), 0);
+    lv_obj_set_style_text_align(ctx->wardrive_gps_type_response_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(ctx->wardrive_gps_type_response_label, lv_pct(95));
+    lv_label_set_long_mode(ctx->wardrive_gps_type_response_label, LV_LABEL_LONG_WRAP);
+    
+    // Close button
+    lv_obj_t *close_btn = lv_btn_create(popup);
+    lv_obj_set_size(close_btn, 120, 45);
+    lv_obj_set_style_bg_color(close_btn, lv_color_hex(0x444444), 0);
+    lv_obj_set_style_radius(close_btn, 8, 0);
+    lv_obj_add_event_cb(close_btn, wardrive_gps_type_close_cb, LV_EVENT_CLICKED, ctx);
+    
+    lv_obj_t *close_label = lv_label_create(close_btn);
+    lv_label_set_text(close_label, "Close");
+    lv_obj_set_style_text_font(close_label, &lv_font_montserrat_16, 0);
+    lv_obj_center(close_label);
+}
+
 // Callback when user clicks Stop
 static void wardrive_stop_cb(lv_event_t *e)
 {
@@ -10981,6 +11223,7 @@ static void wardrive_stop_cb(lv_event_t *e)
     // Toggle buttons
     if (ctx->wardrive_start_btn) lv_obj_clear_state(ctx->wardrive_start_btn, LV_STATE_DISABLED);
     if (ctx->wardrive_stop_btn) lv_obj_add_state(ctx->wardrive_stop_btn, LV_STATE_DISABLED);
+    if (ctx->wardrive_gps_type_btn) lv_obj_clear_state(ctx->wardrive_gps_type_btn, LV_STATE_DISABLED);
 
     // Update status
     int display_count = ctx->wardrive_net_count < WARDRIVE_MAX_NETWORKS ? ctx->wardrive_net_count : WARDRIVE_MAX_NETWORKS;
@@ -11113,6 +11356,7 @@ static void wardrive_start_cb(lv_event_t *e)
     // Toggle buttons
     if (ctx->wardrive_start_btn) lv_obj_add_state(ctx->wardrive_start_btn, LV_STATE_DISABLED);
     if (ctx->wardrive_stop_btn) lv_obj_clear_state(ctx->wardrive_stop_btn, LV_STATE_DISABLED);
+    if (ctx->wardrive_gps_type_btn) lv_obj_add_state(ctx->wardrive_gps_type_btn, LV_STATE_DISABLED);
 
     // Update status
     if (ctx->wardrive_status_label) {
@@ -11270,6 +11514,19 @@ static void show_wardrive_page(void)
     lv_label_set_text(stop_label, LV_SYMBOL_STOP " Stop");
     lv_obj_set_style_text_font(stop_label, &lv_font_montserrat_14, 0);
     lv_obj_center(stop_label);
+
+    // GPS Type button (initially enabled - disabled when running)
+    ctx->wardrive_gps_type_btn = lv_btn_create(btn_cont);
+    lv_obj_set_size(ctx->wardrive_gps_type_btn, 100, 40);
+    lv_obj_set_style_bg_color(ctx->wardrive_gps_type_btn, COLOR_MATERIAL_TEAL, 0);
+    lv_obj_set_style_bg_color(ctx->wardrive_gps_type_btn, lv_color_hex(0x555555), LV_STATE_DISABLED);
+    lv_obj_set_style_radius(ctx->wardrive_gps_type_btn, 8, 0);
+    lv_obj_add_event_cb(ctx->wardrive_gps_type_btn, wardrive_gps_type_btn_cb, LV_EVENT_CLICKED, ctx);
+
+    lv_obj_t *gps_type_label = lv_label_create(ctx->wardrive_gps_type_btn);
+    lv_label_set_text(gps_type_label, LV_SYMBOL_GPS " GPS");
+    lv_obj_set_style_text_font(gps_type_label, &lv_font_montserrat_14, 0);
+    lv_obj_center(gps_type_label);
 
     // ---- Status label ----
     ctx->wardrive_status_label = lv_label_create(ctx->wardrive_page);
