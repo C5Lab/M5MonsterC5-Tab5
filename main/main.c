@@ -37,7 +37,7 @@
 #include "esp_http_server.h"
 #include "lwip/sockets.h"
 
-#define JANOS_TAB_VERSION "1.0.6"
+#define JANOS_TAB_VERSION "1.0.7"
 #include "lwip/netdb.h"
 #include <dirent.h>
 #include <sys/stat.h>
@@ -174,6 +174,16 @@ typedef struct {
     char ip[20];
     char mac[18];
 } arp_host_t;
+
+// Wardrive network storage
+#define WARDRIVE_MAX_NETWORKS 100
+typedef struct {
+    char ssid[33];
+    char bssid[18];
+    char security[28];
+    char lat[14];
+    char lon[14];
+} wardrive_network_t;
 
 // Karma2 constants (for Observer)
 #define KARMA2_MAX_PROBES 64
@@ -318,13 +328,20 @@ typedef struct {
     TaskHandle_t phishing_portal_task;
     
     // Wardrive
-    lv_obj_t *wardrive_popup_overlay;
-    lv_obj_t *wardrive_popup;
+    lv_obj_t *wardrive_page;
+    lv_obj_t *wardrive_start_btn;
+    lv_obj_t *wardrive_stop_btn;
     lv_obj_t *wardrive_status_label;
-    lv_obj_t *wardrive_log_label;
+    lv_obj_t *wardrive_table;
+    lv_obj_t *wardrive_gps_overlay;
+    lv_obj_t *wardrive_gps_popup;
+    lv_obj_t *wardrive_gps_label;
     volatile bool wardrive_monitoring;
     bool wardrive_gps_fix;
     TaskHandle_t wardrive_task;
+    wardrive_network_t wardrive_networks[WARDRIVE_MAX_NETWORKS];
+    int wardrive_net_count;
+    int wardrive_net_head;
     
     // =====================================================================
     // COMPROMISED DATA - Page and sub-pages
@@ -666,6 +683,7 @@ static void hide_all_pages(tab_context_t *ctx) {
     if (ctx->bt_scan_page) lv_obj_add_flag(ctx->bt_scan_page, LV_OBJ_FLAG_HIDDEN);
     if (ctx->bt_locator_page) lv_obj_add_flag(ctx->bt_locator_page, LV_OBJ_FLAG_HIDDEN);
     if (ctx->arp_poison_page) lv_obj_add_flag(ctx->arp_poison_page, LV_OBJ_FLAG_HIDDEN);
+    if (ctx->wardrive_page) lv_obj_add_flag(ctx->wardrive_page, LV_OBJ_FLAG_HIDDEN);
 }
 
 // Initialize tab context - allocate PSRAM for large data arrays
@@ -1216,10 +1234,13 @@ static void do_phishing_portal_start(tab_context_t *ctx);
 static void phishing_portal_close_cb(lv_event_t *e);
 static void phishing_portal_stop_cb(lv_event_t *e);
 static void phishing_portal_monitor_task(void *arg);
-static void show_wardrive_popup(void);
-static void do_wardrive_start(void);
+static void show_wardrive_page(void);
+static void wardrive_start_cb(lv_event_t *e);
 static void wardrive_stop_cb(lv_event_t *e);
+static void wardrive_back_cb(lv_event_t *e);
 static void wardrive_monitor_task(void *arg);
+static void update_wardrive_table(tab_context_t *ctx);
+static void close_wardrive_gps_overlay(tab_context_t *ctx);
 static void show_compromised_data_page(void);
 static void compromised_data_tile_event_cb(lv_event_t *e);
 static void compromised_data_back_btn_event_cb(lv_event_t *e);
@@ -10729,30 +10750,207 @@ static void show_phishing_portal_popup(void)
 }
 
 //==================================================================================
-// Wardrive Attack Popup
+// Wardrive Page (full page with Start/Stop, GPS overlay, network table)
 //==================================================================================
 
-// Close wardrive popup helper
-static void close_wardrive_popup_ctx(tab_context_t *ctx)
+// Close GPS fix overlay helper
+static void close_wardrive_gps_overlay(tab_context_t *ctx)
 {
     if (!ctx) return;
-    
-    // Stop monitoring task first
-    ctx->wardrive_monitoring = false;
-    if (ctx->wardrive_task != NULL) {
-        vTaskDelay(pdMS_TO_TICKS(100));  // Give task time to exit
-        ctx->wardrive_task = NULL;
+    if (ctx->wardrive_gps_overlay) {
+        lv_obj_del(ctx->wardrive_gps_overlay);
+        ctx->wardrive_gps_overlay = NULL;
+        ctx->wardrive_gps_popup = NULL;
+        ctx->wardrive_gps_label = NULL;
     }
-    
-    if (ctx->wardrive_popup_overlay) {
-        lv_obj_del(ctx->wardrive_popup_overlay);
-        ctx->wardrive_popup_overlay = NULL;
-        ctx->wardrive_popup = NULL;
-        ctx->wardrive_status_label = NULL;
-        ctx->wardrive_log_label = NULL;
+}
+
+// Show GPS fix waiting overlay on top of wardrive page
+static void show_wardrive_gps_overlay(tab_context_t *ctx)
+{
+    if (!ctx || !ctx->wardrive_page) return;
+    close_wardrive_gps_overlay(ctx);
+
+    // Semi-transparent overlay covering the wardrive page
+    ctx->wardrive_gps_overlay = lv_obj_create(ctx->wardrive_page);
+    lv_obj_remove_style_all(ctx->wardrive_gps_overlay);
+    lv_obj_set_size(ctx->wardrive_gps_overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(ctx->wardrive_gps_overlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(ctx->wardrive_gps_overlay, LV_OPA_70, 0);
+    lv_obj_clear_flag(ctx->wardrive_gps_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(ctx->wardrive_gps_overlay, LV_OBJ_FLAG_CLICKABLE);
+
+    // Small centered popup card
+    ctx->wardrive_gps_popup = lv_obj_create(ctx->wardrive_gps_overlay);
+    lv_obj_set_size(ctx->wardrive_gps_popup, 420, 220);
+    lv_obj_center(ctx->wardrive_gps_popup);
+    lv_obj_set_style_bg_color(ctx->wardrive_gps_popup, lv_color_hex(0x1A1A2A), 0);
+    lv_obj_set_style_border_color(ctx->wardrive_gps_popup, COLOR_MATERIAL_TEAL, 0);
+    lv_obj_set_style_border_width(ctx->wardrive_gps_popup, 3, 0);
+    lv_obj_set_style_radius(ctx->wardrive_gps_popup, 16, 0);
+    lv_obj_set_style_shadow_width(ctx->wardrive_gps_popup, 30, 0);
+    lv_obj_set_style_shadow_color(ctx->wardrive_gps_popup, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_shadow_opa(ctx->wardrive_gps_popup, LV_OPA_50, 0);
+    lv_obj_set_style_pad_all(ctx->wardrive_gps_popup, 20, 0);
+    lv_obj_set_flex_flow(ctx->wardrive_gps_popup, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(ctx->wardrive_gps_popup, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(ctx->wardrive_gps_popup, 12, 0);
+    lv_obj_clear_flag(ctx->wardrive_gps_popup, LV_OBJ_FLAG_SCROLLABLE);
+
+    // GPS icon
+    lv_obj_t *icon_label = lv_label_create(ctx->wardrive_gps_popup);
+    lv_label_set_text(icon_label, LV_SYMBOL_GPS);
+    lv_obj_set_style_text_font(icon_label, &lv_font_montserrat_44, 0);
+    lv_obj_set_style_text_color(icon_label, COLOR_MATERIAL_TEAL, 0);
+
+    // GPS status label
+    ctx->wardrive_gps_label = lv_label_create(ctx->wardrive_gps_popup);
+    lv_label_set_text(ctx->wardrive_gps_label, "Acquiring GPS Fix...");
+    lv_obj_set_style_text_font(ctx->wardrive_gps_label, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_color(ctx->wardrive_gps_label, COLOR_MATERIAL_AMBER, 0);
+    lv_obj_set_style_text_align(ctx->wardrive_gps_label, LV_TEXT_ALIGN_CENTER, 0);
+
+    // Subtitle
+    lv_obj_t *subtitle = lv_label_create(ctx->wardrive_gps_popup);
+    lv_label_set_text(subtitle, "Need clear view of the sky");
+    lv_obj_set_style_text_font(subtitle, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(subtitle, lv_color_hex(0x888888), 0);
+    lv_obj_set_style_text_align(subtitle, LV_TEXT_ALIGN_CENTER, 0);
+}
+
+// Update wardrive network table (newest first)
+static void update_wardrive_table(tab_context_t *ctx)
+{
+    if (!ctx || !ctx->wardrive_table) return;
+
+    lv_coord_t scroll_y = lv_obj_get_scroll_y(ctx->wardrive_table);
+    lv_obj_clean(ctx->wardrive_table);
+
+    int display_count = ctx->wardrive_net_count < WARDRIVE_MAX_NETWORKS ? ctx->wardrive_net_count : WARDRIVE_MAX_NETWORKS;
+
+    for (int i = 0; i < display_count; i++) {
+        // Walk backwards from head-1 (newest) through ring buffer
+        int idx = (ctx->wardrive_net_head - 1 - i + WARDRIVE_MAX_NETWORKS) % WARDRIVE_MAX_NETWORKS;
+        wardrive_network_t *net = &ctx->wardrive_networks[idx];
+
+        // Row container
+        lv_obj_t *row = lv_obj_create(ctx->wardrive_table);
+        lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_color(row, lv_color_hex(0x2D2D2D), 0);
+        lv_obj_set_style_border_width(row, 0, 0);
+        lv_obj_set_style_radius(row, 6, 0);
+        lv_obj_set_style_pad_all(row, 6, 0);
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_column(row, 6, 0);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+        // SSID
+        lv_obj_t *ssid_lbl = lv_label_create(row);
+        if (net->ssid[0] == '\0') {
+            lv_label_set_text(ssid_lbl, "<hidden>");
+            lv_obj_set_style_text_color(ssid_lbl, lv_color_hex(0x666666), 0);
+        } else {
+            lv_label_set_text(ssid_lbl, net->ssid);
+            lv_obj_set_style_text_color(ssid_lbl, lv_color_hex(0xFFFFFF), 0);
+        }
+        lv_obj_set_style_text_font(ssid_lbl, &lv_font_montserrat_12, 0);
+        lv_obj_set_flex_grow(ssid_lbl, 1);
+        lv_label_set_long_mode(ssid_lbl, LV_LABEL_LONG_DOT);
+
+        // BSSID
+        lv_obj_t *bssid_lbl = lv_label_create(row);
+        lv_label_set_text(bssid_lbl, net->bssid);
+        lv_obj_set_style_text_font(bssid_lbl, &lv_font_montserrat_10, 0);
+        lv_obj_set_style_text_color(bssid_lbl, lv_color_hex(0xAAAAAA), 0);
+        lv_obj_set_width(bssid_lbl, 130);
+
+        // Security (color-coded)
+        lv_obj_t *sec_lbl = lv_label_create(row);
+        lv_label_set_text(sec_lbl, net->security);
+        lv_obj_set_style_text_font(sec_lbl, &lv_font_montserrat_10, 0);
+        if (strstr(net->security, "WPA3") != NULL) {
+            lv_obj_set_style_text_color(sec_lbl, COLOR_MATERIAL_GREEN, 0);
+        } else if (strstr(net->security, "WPA2") != NULL || strstr(net->security, "WPA_") != NULL) {
+            lv_obj_set_style_text_color(sec_lbl, COLOR_MATERIAL_AMBER, 0);
+        } else if (strstr(net->security, "OPEN") != NULL || net->security[0] == '\0') {
+            lv_obj_set_style_text_color(sec_lbl, COLOR_MATERIAL_RED, 0);
+        } else {
+            lv_obj_set_style_text_color(sec_lbl, COLOR_MATERIAL_AMBER, 0);
+        }
+        lv_obj_set_width(sec_lbl, 120);
+        lv_label_set_long_mode(sec_lbl, LV_LABEL_LONG_DOT);
+
+        // Coordinates
+        lv_obj_t *coord_lbl = lv_label_create(row);
+        lv_label_set_text_fmt(coord_lbl, "%s, %s", net->lat, net->lon);
+        lv_obj_set_style_text_font(coord_lbl, &lv_font_montserrat_10, 0);
+        lv_obj_set_style_text_color(coord_lbl, COLOR_MATERIAL_TEAL, 0);
+        lv_obj_set_width(coord_lbl, 170);
     }
-    
-    ctx->wardrive_gps_fix = false;
+
+    lv_obj_scroll_to_y(ctx->wardrive_table, scroll_y, LV_ANIM_OFF);
+}
+
+// Parse a wardrive CSV network line and add to ring buffer
+// Format: BSSID,SSID,[SECURITY],timestamp,channel,rssi,lat,lon,alt,acc,WIFI
+static bool parse_wardrive_network_line(tab_context_t *ctx, const char *line)
+{
+    // Must end with ,WIFI
+    if (!strstr(line, ",WIFI")) return false;
+
+    // Quick validation: must have MAC-like pattern at start (XX:XX:XX:XX:XX:XX)
+    if (strlen(line) < 17 || line[2] != ':' || line[5] != ':') return false;
+
+    char buf[512];
+    strncpy(buf, line, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+
+    // Split by commas - we need fields: 0=BSSID, 1=SSID, 2=SECURITY, 6=lat, 7=lon
+    char *fields[12] = {0};
+    int field_count = 0;
+    char *p = buf;
+    fields[0] = p;
+    field_count = 1;
+
+    while (*p && field_count < 12) {
+        if (*p == ',') {
+            *p = '\0';
+            fields[field_count++] = p + 1;
+        }
+        p++;
+    }
+
+    // Need at least 11 fields (0..10)
+    if (field_count < 11) return false;
+
+    wardrive_network_t *net = &ctx->wardrive_networks[ctx->wardrive_net_head];
+
+    // BSSID (field 0) - max 17 chars + null
+    snprintf(net->bssid, sizeof(net->bssid), "%.17s", fields[0]);
+
+    // SSID (field 1, may be empty) - max 32 chars + null
+    snprintf(net->ssid, sizeof(net->ssid), "%.32s", fields[1]);
+
+    // Security (field 2, strip brackets) - max 27 chars + null
+    char *sec = fields[2];
+    if (sec[0] == '[') sec++;
+    snprintf(net->security, sizeof(net->security), "%.27s", sec);
+    // Remove trailing ']'
+    char *bracket = strchr(net->security, ']');
+    if (bracket) *bracket = '\0';
+
+    // Lat (field 6) - max 13 chars + null
+    snprintf(net->lat, sizeof(net->lat), "%.13s", fields[6]);
+
+    // Lon (field 7) - max 13 chars + null
+    snprintf(net->lon, sizeof(net->lon), "%.13s", fields[7]);
+
+    // Advance ring buffer
+    ctx->wardrive_net_head = (ctx->wardrive_net_head + 1) % WARDRIVE_MAX_NETWORKS;
+    ctx->wardrive_net_count++;
+
+    return true;
 }
 
 // Callback when user clicks Stop
@@ -10761,7 +10959,7 @@ static void wardrive_stop_cb(lv_event_t *e)
     tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
     if (!ctx) ctx = get_current_ctx();
     ESP_LOGI(TAG, "Wardrive stopped - sending stop command");
-    
+
     // Send stop command to the correct UART based on this tab
     tab_id_t active_tab = tab_id_for_ctx(ctx);
     if (active_tab == TAB_MBUS) {
@@ -10769,15 +10967,30 @@ static void wardrive_stop_cb(lv_event_t *e)
     } else {
         uart_send_command("stop");
     }
-    
-    // Close popup
-    close_wardrive_popup_ctx(ctx);
-    
-    // Return to main screen
-    show_main_tiles();
+
+    // Stop monitoring task
+    ctx->wardrive_monitoring = false;
+    if (ctx->wardrive_task != NULL) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        ctx->wardrive_task = NULL;
+    }
+
+    // Dismiss GPS overlay if showing
+    close_wardrive_gps_overlay(ctx);
+
+    // Toggle buttons
+    if (ctx->wardrive_start_btn) lv_obj_clear_state(ctx->wardrive_start_btn, LV_STATE_DISABLED);
+    if (ctx->wardrive_stop_btn) lv_obj_add_state(ctx->wardrive_stop_btn, LV_STATE_DISABLED);
+
+    // Update status
+    int display_count = ctx->wardrive_net_count < WARDRIVE_MAX_NETWORKS ? ctx->wardrive_net_count : WARDRIVE_MAX_NETWORKS;
+    if (ctx->wardrive_status_label) {
+        lv_label_set_text_fmt(ctx->wardrive_status_label, "Wardrive stopped. Networks found: %d", display_count);
+        lv_obj_set_style_text_color(ctx->wardrive_status_label, lv_color_hex(0x888888), 0);
+    }
 }
 
-// Wardrive monitor task - reads UART for GPS fix and log messages (per-tab context)
+// Wardrive monitor task - reads UART for GPS fix, network CSV lines, log messages
 static void wardrive_monitor_task(void *arg)
 {
     tab_context_t *ctx = (tab_context_t *)arg;
@@ -10786,173 +10999,296 @@ static void wardrive_monitor_task(void *arg)
         vTaskDelete(NULL);
         return;
     }
-    
-    // Determine which UART port to read from based on tab
+
     tab_id_t active_tab = tab_id_for_ctx(ctx);
     uart_port_t uart_port = (active_tab == TAB_MBUS) ? UART2_NUM : UART_NUM;
-    
+
     ESP_LOGI(TAG, "Wardrive monitor task started (tab=%d, uart=%d)", active_tab, uart_port);
-    
-    static char rx_buffer[512];
-    static char line_buffer[512];
+
+    char rx_buffer[512];
+    char line_buffer[512];
     int line_pos = 0;
-    
+    bool batch_has_new_networks = false;
+
     while (ctx->wardrive_monitoring) {
         int len = transport_read_bytes_tab(active_tab, uart_port, rx_buffer, sizeof(rx_buffer) - 1, pdMS_TO_TICKS(100));
-        
+
         if (len > 0) {
             rx_buffer[len] = '\0';
-            
+            batch_has_new_networks = false;
+
             for (int i = 0; i < len; i++) {
                 char c = rx_buffer[i];
-                
+
                 if (c == '\n' || c == '\r') {
                     if (line_pos > 0) {
                         line_buffer[line_pos] = '\0';
-                        
-                        // Check for GPS fix obtained
+
+                        // GPS fix obtained -> dismiss overlay, update status
                         if (!ctx->wardrive_gps_fix && strstr(line_buffer, "GPS fix obtained") != NULL) {
                             ctx->wardrive_gps_fix = true;
                             ESP_LOGI(TAG, "Wardrive: GPS fix obtained");
-                            
+
                             bsp_display_lock(0);
+                            close_wardrive_gps_overlay(ctx);
                             if (ctx->wardrive_status_label) {
-                                lv_label_set_text(ctx->wardrive_status_label, "GPS Fix Acquired");
+                                lv_label_set_text(ctx->wardrive_status_label, "GPS Fix Acquired - Scanning...");
                                 lv_obj_set_style_text_color(ctx->wardrive_status_label, COLOR_MATERIAL_GREEN, 0);
                             }
                             bsp_display_unlock();
                         }
-                        
-                        // Check for logged networks message
-                        // Pattern: "Logged X networks to /path/file.log"
-                        char *logged_ptr = strstr(line_buffer, "Logged ");
-                        if (logged_ptr != NULL && strstr(line_buffer, " networks to ") != NULL) {
+
+                        // Logged networks message -> update status
+                        if (strstr(line_buffer, "Logged ") != NULL && strstr(line_buffer, " networks to ") != NULL) {
                             ESP_LOGI(TAG, "Wardrive: %s", line_buffer);
-                            
+                            int display_count = ctx->wardrive_net_count < WARDRIVE_MAX_NETWORKS ? ctx->wardrive_net_count : WARDRIVE_MAX_NETWORKS;
+
                             bsp_display_lock(0);
-                            if (ctx->wardrive_log_label) {
-                                lv_label_set_text(ctx->wardrive_log_label, line_buffer);
-                                lv_obj_set_style_text_color(ctx->wardrive_log_label, COLOR_MATERIAL_GREEN, 0);
+                            if (ctx->wardrive_status_label) {
+                                lv_label_set_text_fmt(ctx->wardrive_status_label, "Scanning... Networks: %d", display_count);
+                                lv_obj_set_style_text_color(ctx->wardrive_status_label, COLOR_MATERIAL_GREEN, 0);
                             }
                             bsp_display_unlock();
                         }
-                        
+
+                        // Try to parse as CSV network line
+                        if (parse_wardrive_network_line(ctx, line_buffer)) {
+                            batch_has_new_networks = true;
+                        }
+
                         line_pos = 0;
                     }
                 } else if (line_pos < (int)sizeof(line_buffer) - 1) {
                     line_buffer[line_pos++] = c;
                 }
             }
+
+            // Update table once per batch if we got new networks
+            if (batch_has_new_networks) {
+                bsp_display_lock(0);
+                update_wardrive_table(ctx);
+                int display_count = ctx->wardrive_net_count < WARDRIVE_MAX_NETWORKS ? ctx->wardrive_net_count : WARDRIVE_MAX_NETWORKS;
+                if (ctx->wardrive_status_label) {
+                    lv_label_set_text_fmt(ctx->wardrive_status_label, "Scanning... Networks: %d", display_count);
+                    lv_obj_set_style_text_color(ctx->wardrive_status_label, COLOR_MATERIAL_GREEN, 0);
+                }
+                bsp_display_unlock();
+            }
         }
-        
+
         vTaskDelay(pdMS_TO_TICKS(50));
     }
-    
+
     ESP_LOGI(TAG, "Wardrive monitor task ended");
     ctx->wardrive_task = NULL;
     vTaskDelete(NULL);
 }
 
-// Wardrive actual start logic
-static void do_wardrive_start(void)
+// Callback when user clicks Start
+static void wardrive_start_cb(lv_event_t *e)
 {
-    tab_context_t *ctx = get_current_ctx();
-    if (!ctx) return;
-    if (ctx->wardrive_popup != NULL) return;
-    
-    lv_obj_t *container = get_current_tab_container();
-    if (!container) return;
-    
-    // Reset state
-    ctx->wardrive_gps_fix = false;
-    
-    // Determine which UART to use based on this tab
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx) ctx = get_current_ctx();
+    if (ctx->wardrive_monitoring) return;  // Already running
+
+    ESP_LOGI(TAG, "Wardrive start - sending start_wardrive command");
+
+    // Send start_wardrive command
     tab_id_t active_tab = tab_id_for_ctx(ctx);
-    
-    // Send start_wardrive command to this tab's UART
     if (active_tab == TAB_MBUS) {
         uart2_send_command("start_wardrive");
     } else {
         uart_send_command("start_wardrive");
     }
-    ESP_LOGI(TAG, "Wardrive using tab %d (%s)", active_tab, tab_transport_name(active_tab));
-    
-    // Create modal overlay
-    ctx->wardrive_popup_overlay = lv_obj_create(container);
-    lv_obj_remove_style_all(ctx->wardrive_popup_overlay);
-    lv_obj_set_size(ctx->wardrive_popup_overlay, lv_pct(100), lv_pct(100));
-    lv_obj_set_style_bg_color(ctx->wardrive_popup_overlay, lv_color_hex(0x000000), 0);
-    lv_obj_set_style_bg_opa(ctx->wardrive_popup_overlay, LV_OPA_70, 0);
-    lv_obj_clear_flag(ctx->wardrive_popup_overlay, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(ctx->wardrive_popup_overlay, LV_OBJ_FLAG_CLICKABLE);
-    
-    // Create popup
-    ctx->wardrive_popup = lv_obj_create(ctx->wardrive_popup_overlay);
-    lv_obj_set_size(ctx->wardrive_popup, 550, 380);
-    lv_obj_center(ctx->wardrive_popup);
-    lv_obj_set_style_bg_color(ctx->wardrive_popup, lv_color_hex(0x1A1A2A), 0);
-    lv_obj_set_style_border_color(ctx->wardrive_popup, COLOR_MATERIAL_TEAL, 0);
-    lv_obj_set_style_border_width(ctx->wardrive_popup, 3, 0);
-    lv_obj_set_style_radius(ctx->wardrive_popup, 16, 0);
-    lv_obj_set_style_shadow_width(ctx->wardrive_popup, 30, 0);
-    lv_obj_set_style_shadow_color(ctx->wardrive_popup, lv_color_hex(0x000000), 0);
-    lv_obj_set_style_shadow_opa(ctx->wardrive_popup, LV_OPA_50, 0);
-    lv_obj_set_style_pad_all(ctx->wardrive_popup, 20, 0);
-    lv_obj_set_flex_flow(ctx->wardrive_popup, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(ctx->wardrive_popup, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_row(ctx->wardrive_popup, 16, 0);
-    lv_obj_clear_flag(ctx->wardrive_popup, LV_OBJ_FLAG_SCROLLABLE);
-    
-    // GPS icon
-    lv_obj_t *icon_label = lv_label_create(ctx->wardrive_popup);
-    lv_label_set_text(icon_label, LV_SYMBOL_GPS);
-    lv_obj_set_style_text_font(icon_label, &lv_font_montserrat_44, 0);
-    lv_obj_set_style_text_color(icon_label, COLOR_MATERIAL_TEAL, 0);
-    
-    // Title
-    lv_obj_t *title = lv_label_create(ctx->wardrive_popup);
-    lv_label_set_text(title, "Wardrive Active");
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_24, 0);
-    lv_obj_set_style_text_color(title, COLOR_MATERIAL_TEAL, 0);
-    
-    // Status label (GPS fix status)
-    ctx->wardrive_status_label = lv_label_create(ctx->wardrive_popup);
-    lv_label_set_text(ctx->wardrive_status_label, "Acquiring GPS Fix,\nneed clear view of the sky.");
-    lv_obj_set_style_text_font(ctx->wardrive_status_label, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(ctx->wardrive_status_label, COLOR_MATERIAL_AMBER, 0);
-    lv_obj_set_style_text_align(ctx->wardrive_status_label, LV_TEXT_ALIGN_CENTER, 0);
-    
-    // Log label (shows "Logged X networks..." messages)
-    ctx->wardrive_log_label = lv_label_create(ctx->wardrive_popup);
-    lv_label_set_text(ctx->wardrive_log_label, "Waiting for scan results...");
-    lv_obj_set_style_text_font(ctx->wardrive_log_label, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(ctx->wardrive_log_label, lv_color_hex(0x888888), 0);
-    lv_obj_set_style_text_align(ctx->wardrive_log_label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_width(ctx->wardrive_log_label, lv_pct(90));
-    lv_label_set_long_mode(ctx->wardrive_log_label, LV_LABEL_LONG_WRAP);
-    
-    // Stop button
-    lv_obj_t *stop_btn = lv_btn_create(ctx->wardrive_popup);
-    lv_obj_set_size(stop_btn, 180, 55);
-    lv_obj_set_style_bg_color(stop_btn, COLOR_MATERIAL_TEAL, 0);
-    lv_obj_set_style_radius(stop_btn, 8, 0);
-    lv_obj_add_event_cb(stop_btn, wardrive_stop_cb, LV_EVENT_CLICKED, ctx);
-    
-    lv_obj_t *stop_label = lv_label_create(stop_btn);
-    lv_label_set_text(stop_label, LV_SYMBOL_STOP " Stop");
-    lv_obj_set_style_text_font(stop_label, &lv_font_montserrat_20, 0);
-    lv_obj_center(stop_label);
-    
-    // Start monitoring task with context
+
+    // Reset ring buffer
+    ctx->wardrive_net_count = 0;
+    ctx->wardrive_net_head = 0;
+    ctx->wardrive_gps_fix = false;
+
+    // Clear table
+    bsp_display_lock(0);
+    if (ctx->wardrive_table) lv_obj_clean(ctx->wardrive_table);
+
+    // Toggle buttons
+    if (ctx->wardrive_start_btn) lv_obj_add_state(ctx->wardrive_start_btn, LV_STATE_DISABLED);
+    if (ctx->wardrive_stop_btn) lv_obj_clear_state(ctx->wardrive_stop_btn, LV_STATE_DISABLED);
+
+    // Update status
+    if (ctx->wardrive_status_label) {
+        lv_label_set_text(ctx->wardrive_status_label, "Starting wardrive...");
+        lv_obj_set_style_text_color(ctx->wardrive_status_label, COLOR_MATERIAL_AMBER, 0);
+    }
+
+    // Show GPS fix overlay
+    show_wardrive_gps_overlay(ctx);
+    bsp_display_unlock();
+
+    // Start monitor task
     ctx->wardrive_monitoring = true;
-    xTaskCreate(wardrive_monitor_task, "wd_monitor", 4096, (void*)ctx, 5, &ctx->wardrive_task);
+    xTaskCreate(wardrive_monitor_task, "wd_monitor", 8192, (void*)ctx, 5, &ctx->wardrive_task);
 }
 
-// Show wardrive popup
-static void show_wardrive_popup(void)
+// Wardrive back button - stop if running, return to tiles
+static void wardrive_back_cb(lv_event_t *e)
 {
-    // SD check is done before calling this function
-    do_wardrive_start();
+    (void)e;
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx) return;
+
+    // Stop if running
+    if (ctx->wardrive_monitoring) {
+        tab_id_t active_tab = tab_id_for_ctx(ctx);
+        if (active_tab == TAB_MBUS) {
+            uart2_send_command("stop");
+        } else {
+            uart_send_command("stop");
+        }
+        ctx->wardrive_monitoring = false;
+        if (ctx->wardrive_task != NULL) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            ctx->wardrive_task = NULL;
+        }
+    }
+
+    // Dismiss GPS overlay
+    close_wardrive_gps_overlay(ctx);
+
+    // Hide wardrive page
+    if (ctx->wardrive_page) {
+        lv_obj_add_flag(ctx->wardrive_page, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    // Show tiles
+    if (ctx->tiles) {
+        lv_obj_clear_flag(ctx->tiles, LV_OBJ_FLAG_HIDDEN);
+        ctx->current_visible_page = ctx->tiles;
+    }
+}
+
+// Show wardrive full page
+static void show_wardrive_page(void)
+{
+    tab_context_t *ctx = get_current_ctx();
+    lv_obj_t *container = get_current_tab_container();
+    if (!container) return;
+
+    hide_all_pages(ctx);
+
+    // If page already exists, just show it
+    if (ctx->wardrive_page) {
+        lv_obj_clear_flag(ctx->wardrive_page, LV_OBJ_FLAG_HIDDEN);
+        ctx->current_visible_page = ctx->wardrive_page;
+        return;
+    }
+
+    ESP_LOGI(TAG, "Creating new wardrive page for tab %d", current_tab);
+
+    // Page container
+    ctx->wardrive_page = lv_obj_create(container);
+    lv_obj_set_size(ctx->wardrive_page, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(ctx->wardrive_page, lv_color_hex(0x0A1A1A), 0);
+    lv_obj_set_style_border_width(ctx->wardrive_page, 0, 0);
+    lv_obj_set_style_pad_all(ctx->wardrive_page, 10, 0);
+    lv_obj_set_flex_flow(ctx->wardrive_page, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(ctx->wardrive_page, 8, 0);
+
+    // ---- Header row ----
+    lv_obj_t *header = lv_obj_create(ctx->wardrive_page);
+    lv_obj_set_size(header, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(header, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(header, 0, 0);
+    lv_obj_set_style_pad_all(header, 0, 0);
+    lv_obj_set_flex_flow(header, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(header, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(header, 10, 0);
+    lv_obj_clear_flag(header, LV_OBJ_FLAG_SCROLLABLE);
+
+    // Left side: Back + Title
+    lv_obj_t *left_cont = lv_obj_create(header);
+    lv_obj_set_size(left_cont, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(left_cont, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(left_cont, 0, 0);
+    lv_obj_set_style_pad_all(left_cont, 0, 0);
+    lv_obj_set_flex_flow(left_cont, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(left_cont, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(left_cont, 10, 0);
+    lv_obj_clear_flag(left_cont, LV_OBJ_FLAG_SCROLLABLE);
+
+    // Back button
+    lv_obj_t *back_btn = lv_btn_create(left_cont);
+    lv_obj_set_size(back_btn, 72, 60);
+    lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x333333), 0);
+    lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x444444), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(back_btn, 8, 0);
+    lv_obj_add_event_cb(back_btn, wardrive_back_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *back_icon = lv_label_create(back_btn);
+    lv_label_set_text(back_icon, LV_SYMBOL_LEFT);
+    lv_obj_set_style_text_color(back_icon, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_center(back_icon);
+
+    // Title
+    lv_obj_t *title = lv_label_create(left_cont);
+    lv_label_set_text(title, "Wardrive");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_TEAL, 0);
+
+    // Right side: Start + Stop buttons
+    lv_obj_t *btn_cont = lv_obj_create(header);
+    lv_obj_set_size(btn_cont, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(btn_cont, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(btn_cont, 0, 0);
+    lv_obj_set_style_pad_all(btn_cont, 0, 0);
+    lv_obj_set_flex_flow(btn_cont, LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_column(btn_cont, 10, 0);
+    lv_obj_clear_flag(btn_cont, LV_OBJ_FLAG_SCROLLABLE);
+
+    // Start button
+    ctx->wardrive_start_btn = lv_btn_create(btn_cont);
+    lv_obj_set_size(ctx->wardrive_start_btn, 90, 40);
+    lv_obj_set_style_bg_color(ctx->wardrive_start_btn, COLOR_MATERIAL_GREEN, 0);
+    lv_obj_set_style_bg_color(ctx->wardrive_start_btn, lv_color_hex(0x555555), LV_STATE_DISABLED);
+    lv_obj_set_style_radius(ctx->wardrive_start_btn, 8, 0);
+    lv_obj_add_event_cb(ctx->wardrive_start_btn, wardrive_start_cb, LV_EVENT_CLICKED, ctx);
+
+    lv_obj_t *start_label = lv_label_create(ctx->wardrive_start_btn);
+    lv_label_set_text(start_label, LV_SYMBOL_PLAY " Start");
+    lv_obj_set_style_text_font(start_label, &lv_font_montserrat_14, 0);
+    lv_obj_center(start_label);
+
+    // Stop button (initially disabled)
+    ctx->wardrive_stop_btn = lv_btn_create(btn_cont);
+    lv_obj_set_size(ctx->wardrive_stop_btn, 90, 40);
+    lv_obj_set_style_bg_color(ctx->wardrive_stop_btn, COLOR_MATERIAL_RED, 0);
+    lv_obj_set_style_bg_color(ctx->wardrive_stop_btn, lv_color_hex(0x555555), LV_STATE_DISABLED);
+    lv_obj_set_style_radius(ctx->wardrive_stop_btn, 8, 0);
+    lv_obj_add_event_cb(ctx->wardrive_stop_btn, wardrive_stop_cb, LV_EVENT_CLICKED, ctx);
+    lv_obj_add_state(ctx->wardrive_stop_btn, LV_STATE_DISABLED);
+
+    lv_obj_t *stop_label = lv_label_create(ctx->wardrive_stop_btn);
+    lv_label_set_text(stop_label, LV_SYMBOL_STOP " Stop");
+    lv_obj_set_style_text_font(stop_label, &lv_font_montserrat_14, 0);
+    lv_obj_center(stop_label);
+
+    // ---- Status label ----
+    ctx->wardrive_status_label = lv_label_create(ctx->wardrive_page);
+    lv_label_set_text(ctx->wardrive_status_label, "Press Start to begin wardrive");
+    lv_obj_set_style_text_font(ctx->wardrive_status_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(ctx->wardrive_status_label, lv_color_hex(0x888888), 0);
+
+    // ---- Scrollable table container ----
+    ctx->wardrive_table = lv_obj_create(ctx->wardrive_page);
+    lv_obj_set_size(ctx->wardrive_table, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_flex_grow(ctx->wardrive_table, 1);
+    lv_obj_set_style_bg_color(ctx->wardrive_table, lv_color_hex(0x252525), 0);
+    lv_obj_set_style_border_width(ctx->wardrive_table, 0, 0);
+    lv_obj_set_style_radius(ctx->wardrive_table, 8, 0);
+    lv_obj_set_style_pad_all(ctx->wardrive_table, 8, 0);
+    lv_obj_set_flex_flow(ctx->wardrive_table, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(ctx->wardrive_table, 6, 0);
+
+    ctx->current_visible_page = ctx->wardrive_page;
 }
 
 //==================================================================================
@@ -15627,12 +15963,12 @@ static void global_attack_tile_event_cb(lv_event_t *e)
     
     // Handle Wardrive attack
     if (strcmp(attack_name, "Wardrive") == 0) {
-        // Check SD card before opening Wardrive popup
+        // Check SD card before opening Wardrive page
         if (!current_tab_has_sd_card()) {
-            show_sd_warning_popup(do_wardrive_start);
+            show_sd_warning_popup(show_wardrive_page);
             return;
         }
-        show_wardrive_popup();
+        show_wardrive_page();
         return;
     }
 }
