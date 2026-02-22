@@ -37,7 +37,7 @@
 #include "esp_http_server.h"
 #include "lwip/sockets.h"
 
-#define JANOS_TAB_VERSION "1.0.8"
+#define JANOS_TAB_VERSION "1.1.0"
 #include "lwip/netdb.h"
 #include <dirent.h>
 #include <sys/stat.h>
@@ -11298,8 +11298,8 @@ static void wardrive_monitor_task(void *arg)
                             bsp_display_unlock();
                         }
 
-                        // Logged networks message -> update status
-                        if (strstr(line_buffer, "Logged ") != NULL && strstr(line_buffer, " networks to ") != NULL) {
+                        // Flushed networks message -> update status
+                        if (strstr(line_buffer, "Flushed ") != NULL && strstr(line_buffer, " networks to ") != NULL) {
                             ESP_LOGI(TAG, "Wardrive: %s", line_buffer);
                             int display_count = ctx->wardrive_net_count < WARDRIVE_MAX_NETWORKS ? ctx->wardrive_net_count : WARDRIVE_MAX_NETWORKS;
 
@@ -11307,6 +11307,118 @@ static void wardrive_monitor_task(void *arg)
                             if (ctx->wardrive_status_label) {
                                 lv_label_set_text_fmt(ctx->wardrive_status_label, "Scanning... Networks: %d", display_count);
                                 lv_obj_set_style_text_color(ctx->wardrive_status_label, COLOR_MATERIAL_GREEN, 0);
+                            }
+                            bsp_display_unlock();
+                        }
+
+                        // GPS fix lost -> re-show overlay, pause status
+                        if (ctx->wardrive_gps_fix && strstr(line_buffer, "GPS fix lost") != NULL) {
+                            ctx->wardrive_gps_fix = false;
+                            ESP_LOGW(TAG, "Wardrive: GPS fix lost");
+
+                            bsp_display_lock(0);
+                            show_wardrive_gps_overlay(ctx);
+                            if (ctx->wardrive_gps_label) {
+                                lv_label_set_text(ctx->wardrive_gps_label, "GPS Fix Lost - Pausing...");
+                                lv_obj_set_style_text_color(ctx->wardrive_gps_label, COLOR_MATERIAL_RED, 0);
+                            }
+                            if (ctx->wardrive_status_label) {
+                                lv_label_set_text(ctx->wardrive_status_label, "GPS lost - wardrive paused");
+                                lv_obj_set_style_text_color(ctx->wardrive_status_label, COLOR_MATERIAL_RED, 0);
+                            }
+                            bsp_display_unlock();
+                        }
+
+                        // GPS fix recovered -> dismiss overlay, resume scanning
+                        if (!ctx->wardrive_gps_fix && strstr(line_buffer, "GPS fix recovered") != NULL) {
+                            ctx->wardrive_gps_fix = true;
+                            ESP_LOGI(TAG, "Wardrive: GPS fix recovered");
+
+                            bsp_display_lock(0);
+                            close_wardrive_gps_overlay(ctx);
+                            if (ctx->wardrive_status_label) {
+                                lv_label_set_text(ctx->wardrive_status_label, "GPS Recovered - Scanning...");
+                                lv_obj_set_style_text_color(ctx->wardrive_status_label, COLOR_MATERIAL_GREEN, 0);
+                            }
+                            bsp_display_unlock();
+                        }
+
+                        // No GPS fix obtained -> timeout, stop wardrive
+                        if (strstr(line_buffer, "No GPS fix obtained") != NULL) {
+                            ESP_LOGW(TAG, "Wardrive: No GPS fix - timed out");
+
+                            bsp_display_lock(0);
+                            if (ctx->wardrive_gps_label) {
+                                lv_label_set_text(ctx->wardrive_gps_label, "No GPS Fix - Timed Out");
+                                lv_obj_set_style_text_color(ctx->wardrive_gps_label, COLOR_MATERIAL_RED, 0);
+                            }
+                            if (ctx->wardrive_status_label) {
+                                lv_label_set_text(ctx->wardrive_status_label, "No GPS fix - wardrive cancelled");
+                                lv_obj_set_style_text_color(ctx->wardrive_status_label, COLOR_MATERIAL_RED, 0);
+                            }
+                            bsp_display_unlock();
+
+                            vTaskDelay(pdMS_TO_TICKS(2000));
+
+                            ctx->wardrive_monitoring = false;
+                            bsp_display_lock(0);
+                            close_wardrive_gps_overlay(ctx);
+                            if (ctx->wardrive_start_btn) lv_obj_clear_state(ctx->wardrive_start_btn, LV_STATE_DISABLED);
+                            if (ctx->wardrive_stop_btn) lv_obj_add_state(ctx->wardrive_stop_btn, LV_STATE_DISABLED);
+                            if (ctx->wardrive_gps_type_btn) lv_obj_clear_state(ctx->wardrive_gps_type_btn, LV_STATE_DISABLED);
+                            bsp_display_unlock();
+                        }
+
+                        // Still waiting for GPS fix -> update overlay with progress
+                        if (strstr(line_buffer, "Still waiting for GPS fix") != NULL) {
+                            int elapsed = 0, total = 0;
+                            const char *paren = strchr(line_buffer, '(');
+                            if (paren) {
+                                sscanf(paren, "(%d/%d", &elapsed, &total);
+                            }
+
+                            bsp_display_lock(0);
+                            if (ctx->wardrive_gps_label) {
+                                if (total > 0) {
+                                    lv_label_set_text_fmt(ctx->wardrive_gps_label, "Acquiring GPS Fix... (%d/%ds)", elapsed, total);
+                                } else {
+                                    lv_label_set_text(ctx->wardrive_gps_label, "Acquiring GPS Fix...");
+                                }
+                            }
+                            bsp_display_unlock();
+                        }
+
+                        // Promiscuous wardrive started -> confirm active scanning
+                        if (strstr(line_buffer, "Promiscuous wardrive started") != NULL) {
+                            ESP_LOGI(TAG, "Wardrive: %s", line_buffer);
+
+                            bsp_display_lock(0);
+                            if (ctx->wardrive_status_label) {
+                                lv_label_set_text(ctx->wardrive_status_label, "Wardrive active - Scanning...");
+                                lv_obj_set_style_text_color(ctx->wardrive_status_label, COLOR_MATERIAL_GREEN, 0);
+                            }
+                            bsp_display_unlock();
+                        }
+
+                        // Wardrive promisc stopped (remote) -> graceful stop
+                        if (strstr(line_buffer, "Wardrive promisc stopped") != NULL) {
+                            ESP_LOGI(TAG, "Wardrive: remote stop - %s", line_buffer);
+
+                            int total_nets = 0;
+                            const char *total_str = strstr(line_buffer, "Total unique networks: ");
+                            if (total_str) {
+                                sscanf(total_str, "Total unique networks: %d", &total_nets);
+                            }
+
+                            ctx->wardrive_monitoring = false;
+                            bsp_display_lock(0);
+                            close_wardrive_gps_overlay(ctx);
+                            if (ctx->wardrive_start_btn) lv_obj_clear_state(ctx->wardrive_start_btn, LV_STATE_DISABLED);
+                            if (ctx->wardrive_stop_btn) lv_obj_add_state(ctx->wardrive_stop_btn, LV_STATE_DISABLED);
+                            if (ctx->wardrive_gps_type_btn) lv_obj_clear_state(ctx->wardrive_gps_type_btn, LV_STATE_DISABLED);
+                            if (ctx->wardrive_status_label) {
+                                lv_label_set_text_fmt(ctx->wardrive_status_label, "Wardrive stopped. Networks: %d", total_nets);
+                                lv_obj_set_style_text_color(ctx->wardrive_status_label, lv_color_hex(0x888888), 0);
                             }
                             bsp_display_unlock();
                         }
@@ -11351,14 +11463,14 @@ static void wardrive_start_cb(lv_event_t *e)
     if (!ctx) ctx = get_current_ctx();
     if (ctx->wardrive_monitoring) return;  // Already running
 
-    ESP_LOGI(TAG, "Wardrive start - sending start_wardrive command");
+    ESP_LOGI(TAG, "Wardrive start - sending start_wardrive_promisc command");
 
-    // Send start_wardrive command
+    // Send start_wardrive_promisc command
     tab_id_t active_tab = tab_id_for_ctx(ctx);
     if (active_tab == TAB_MBUS) {
-        uart2_send_command("start_wardrive");
+        uart2_send_command("start_wardrive_promisc");
     } else {
-        uart_send_command("start_wardrive");
+        uart_send_command("start_wardrive_promisc");
     }
 
     // Reset ring buffer
