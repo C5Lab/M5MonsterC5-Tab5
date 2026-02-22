@@ -37,7 +37,7 @@
 #include "esp_http_server.h"
 #include "lwip/sockets.h"
 
-#define JANOS_TAB_VERSION "1.1.0"
+#define JANOS_TAB_VERSION "1.1.1"
 #include "lwip/netdb.h"
 #include <dirent.h>
 #include <sys/stat.h>
@@ -11243,9 +11243,8 @@ static void wardrive_stop_cb(lv_event_t *e)
     if (ctx->wardrive_gps_type_btn) lv_obj_clear_state(ctx->wardrive_gps_type_btn, LV_STATE_DISABLED);
 
     // Update status
-    int display_count = ctx->wardrive_net_count < WARDRIVE_MAX_NETWORKS ? ctx->wardrive_net_count : WARDRIVE_MAX_NETWORKS;
     if (ctx->wardrive_status_label) {
-        lv_label_set_text_fmt(ctx->wardrive_status_label, "Wardrive stopped. Networks found: %d", display_count);
+        lv_label_set_text_fmt(ctx->wardrive_status_label, "Wardrive stopped. Networks found: %d", ctx->wardrive_net_count);
         lv_obj_set_style_text_color(ctx->wardrive_status_label, lv_color_hex(0x888888), 0);
     }
 }
@@ -11301,11 +11300,10 @@ static void wardrive_monitor_task(void *arg)
                         // Flushed networks message -> update status
                         if (strstr(line_buffer, "Flushed ") != NULL && strstr(line_buffer, " networks to ") != NULL) {
                             ESP_LOGI(TAG, "Wardrive: %s", line_buffer);
-                            int display_count = ctx->wardrive_net_count < WARDRIVE_MAX_NETWORKS ? ctx->wardrive_net_count : WARDRIVE_MAX_NETWORKS;
 
                             bsp_display_lock(0);
                             if (ctx->wardrive_status_label) {
-                                lv_label_set_text_fmt(ctx->wardrive_status_label, "Scanning... Networks: %d", display_count);
+                                lv_label_set_text_fmt(ctx->wardrive_status_label, "Scanning... Networks: %d", ctx->wardrive_net_count);
                                 lv_obj_set_style_text_color(ctx->wardrive_status_label, COLOR_MATERIAL_GREEN, 0);
                             }
                             bsp_display_unlock();
@@ -11439,9 +11437,8 @@ static void wardrive_monitor_task(void *arg)
             if (batch_has_new_networks) {
                 bsp_display_lock(0);
                 update_wardrive_table(ctx);
-                int display_count = ctx->wardrive_net_count < WARDRIVE_MAX_NETWORKS ? ctx->wardrive_net_count : WARDRIVE_MAX_NETWORKS;
                 if (ctx->wardrive_status_label) {
-                    lv_label_set_text_fmt(ctx->wardrive_status_label, "Scanning... Networks: %d", display_count);
+                    lv_label_set_text_fmt(ctx->wardrive_status_label, "Scanning... Networks: %d", ctx->wardrive_net_count);
                     lv_obj_set_style_text_color(ctx->wardrive_status_label, COLOR_MATERIAL_GREEN, 0);
                 }
                 bsp_display_unlock();
