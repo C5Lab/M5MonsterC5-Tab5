@@ -37,7 +37,7 @@
 #include "esp_http_server.h"
 #include "lwip/sockets.h"
 
-#define JANOS_TAB_VERSION "1.1.1"
+#define JANOS_TAB_VERSION "1.1.2"
 #include "lwip/netdb.h"
 #include <dirent.h>
 #include <sys/stat.h>
@@ -332,6 +332,7 @@ typedef struct {
     lv_obj_t *wardrive_start_btn;
     lv_obj_t *wardrive_stop_btn;
     lv_obj_t *wardrive_status_label;
+    lv_obj_t *wardrive_net_count_label;
     lv_obj_t *wardrive_table;
     lv_obj_t *wardrive_gps_overlay;
     lv_obj_t *wardrive_gps_popup;
@@ -11244,8 +11245,11 @@ static void wardrive_stop_cb(lv_event_t *e)
 
     // Update status
     if (ctx->wardrive_status_label) {
-        lv_label_set_text_fmt(ctx->wardrive_status_label, "Wardrive stopped. Networks found: %d", ctx->wardrive_net_count);
+        lv_label_set_text(ctx->wardrive_status_label, "Wardrive stopped");
         lv_obj_set_style_text_color(ctx->wardrive_status_label, lv_color_hex(0x888888), 0);
+    }
+    if (ctx->wardrive_net_count_label) {
+        lv_label_set_text_fmt(ctx->wardrive_net_count_label, "Networks: %d", ctx->wardrive_net_count);
     }
 }
 
@@ -11297,14 +11301,17 @@ static void wardrive_monitor_task(void *arg)
                             bsp_display_unlock();
                         }
 
-                        // Flushed networks message -> update status
+                        // Flushed networks message -> update status + count
                         if (strstr(line_buffer, "Flushed ") != NULL && strstr(line_buffer, " networks to ") != NULL) {
                             ESP_LOGI(TAG, "Wardrive: %s", line_buffer);
 
                             bsp_display_lock(0);
                             if (ctx->wardrive_status_label) {
-                                lv_label_set_text_fmt(ctx->wardrive_status_label, "Scanning... Networks: %d", ctx->wardrive_net_count);
+                                lv_label_set_text(ctx->wardrive_status_label, "Scanning...");
                                 lv_obj_set_style_text_color(ctx->wardrive_status_label, COLOR_MATERIAL_GREEN, 0);
+                            }
+                            if (ctx->wardrive_net_count_label) {
+                                lv_label_set_text_fmt(ctx->wardrive_net_count_label, "Networks: %d", ctx->wardrive_net_count);
                             }
                             bsp_display_unlock();
                         }
@@ -11415,8 +11422,11 @@ static void wardrive_monitor_task(void *arg)
                             if (ctx->wardrive_stop_btn) lv_obj_add_state(ctx->wardrive_stop_btn, LV_STATE_DISABLED);
                             if (ctx->wardrive_gps_type_btn) lv_obj_clear_state(ctx->wardrive_gps_type_btn, LV_STATE_DISABLED);
                             if (ctx->wardrive_status_label) {
-                                lv_label_set_text_fmt(ctx->wardrive_status_label, "Wardrive stopped. Networks: %d", total_nets);
+                                lv_label_set_text(ctx->wardrive_status_label, "Wardrive stopped");
                                 lv_obj_set_style_text_color(ctx->wardrive_status_label, lv_color_hex(0x888888), 0);
+                            }
+                            if (ctx->wardrive_net_count_label) {
+                                lv_label_set_text_fmt(ctx->wardrive_net_count_label, "Networks: %d", total_nets);
                             }
                             bsp_display_unlock();
                         }
@@ -11437,9 +11447,8 @@ static void wardrive_monitor_task(void *arg)
             if (batch_has_new_networks) {
                 bsp_display_lock(0);
                 update_wardrive_table(ctx);
-                if (ctx->wardrive_status_label) {
-                    lv_label_set_text_fmt(ctx->wardrive_status_label, "Scanning... Networks: %d", ctx->wardrive_net_count);
-                    lv_obj_set_style_text_color(ctx->wardrive_status_label, COLOR_MATERIAL_GREEN, 0);
+                if (ctx->wardrive_net_count_label) {
+                    lv_label_set_text_fmt(ctx->wardrive_net_count_label, "Networks: %d", ctx->wardrive_net_count);
                 }
                 bsp_display_unlock();
             }
@@ -11488,6 +11497,9 @@ static void wardrive_start_cb(lv_event_t *e)
     if (ctx->wardrive_status_label) {
         lv_label_set_text(ctx->wardrive_status_label, "Starting wardrive...");
         lv_obj_set_style_text_color(ctx->wardrive_status_label, COLOR_MATERIAL_AMBER, 0);
+    }
+    if (ctx->wardrive_net_count_label) {
+        lv_label_set_text(ctx->wardrive_net_count_label, "Networks: 0");
     }
 
     // Show GPS fix overlay
@@ -11654,11 +11666,26 @@ static void show_wardrive_page(void)
     lv_obj_set_style_text_font(gps_type_label, &lv_font_montserrat_14, 0);
     lv_obj_center(gps_type_label);
 
-    // ---- Status label ----
-    ctx->wardrive_status_label = lv_label_create(ctx->wardrive_page);
+    // ---- Status row: status label (left) + net count label (right) ----
+    lv_obj_t *status_row = lv_obj_create(ctx->wardrive_page);
+    lv_obj_set_size(status_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(status_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(status_row, 0, 0);
+    lv_obj_set_style_pad_all(status_row, 0, 0);
+    lv_obj_set_flex_flow(status_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(status_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(status_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    ctx->wardrive_status_label = lv_label_create(status_row);
     lv_label_set_text(ctx->wardrive_status_label, "Press Start to begin wardrive");
     lv_obj_set_style_text_font(ctx->wardrive_status_label, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(ctx->wardrive_status_label, lv_color_hex(0x888888), 0);
+
+    ctx->wardrive_net_count_label = lv_label_create(status_row);
+    lv_label_set_text(ctx->wardrive_net_count_label, "");
+    lv_obj_set_style_text_font(ctx->wardrive_net_count_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(ctx->wardrive_net_count_label, COLOR_MATERIAL_TEAL, 0);
+    lv_obj_set_style_text_align(ctx->wardrive_net_count_label, LV_TEXT_ALIGN_RIGHT, 0);
 
     // ---- Scrollable table container ----
     ctx->wardrive_table = lv_obj_create(ctx->wardrive_page);
