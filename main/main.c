@@ -22,6 +22,9 @@
 #include "driver/ledc.h"
 #include "bsp/m5stack_tab5.h"
 #include "lvgl.h"
+#if LV_USE_SNAPSHOT
+#include "src/others/snapshot/lv_snapshot.h"
+#endif
 #include "iot_usbh_cdc.h"
 #include "usb/usb_host.h"
 #include "usb/usb_helpers.h"
@@ -37,7 +40,7 @@
 #include "esp_http_server.h"
 #include "lwip/sockets.h"
 
-#define JANOS_TAB_VERSION "1.1.2"
+#define JANOS_TAB_VERSION "1.1.3"
 #include "lwip/netdb.h"
 #include <dirent.h>
 #include <sys/stat.h>
@@ -339,6 +342,7 @@ typedef struct {
     lv_obj_t *wardrive_gps_label;
     volatile bool wardrive_monitoring;
     bool wardrive_gps_fix;
+    bool wardrive_use_external_gps;
     TaskHandle_t wardrive_task;
     wardrive_network_t wardrive_networks[WARDRIVE_MAX_NETWORKS];
     int wardrive_net_count;
@@ -911,10 +915,6 @@ static bool arp_wifi_connected = false;
 
 // Rogue AP page (legacy globals for compatibility)
 static lv_obj_t *rogue_ap_page = NULL;
-static lv_obj_t *rogue_ap_password_input = NULL;
-static lv_obj_t *rogue_ap_keyboard = NULL;
-static lv_obj_t *rogue_ap_html_dropdown = NULL;
-static lv_obj_t *rogue_ap_start_btn = NULL;
 static char rogue_ap_ssid[33] = {0};
 static char rogue_ap_password[65] = {0};
 static volatile bool rogue_ap_monitoring = false;
@@ -1100,8 +1100,10 @@ static void back_btn_event_cb(lv_event_t *e);
 static void network_checkbox_event_cb(lv_event_t *e);
 static void attack_tile_event_cb(lv_event_t *e);
 static void create_status_bar(void);
+#if SCREENSHOT_ENABLED && LV_USE_SNAPSHOT
 static void screenshot_click_cb(lv_event_t *e);
 static void save_screenshot_to_sd(void);
+#endif
 static void show_global_attacks_page(void);
 static void global_attack_tile_event_cb(lv_event_t *e);
 static void observer_back_btn_event_cb(lv_event_t *e);
@@ -1266,6 +1268,9 @@ static void wardrive_gps_type_btn_cb(lv_event_t *e);
 static void wardrive_gps_type_close_cb(lv_event_t *e);
 static void wardrive_gps_set_m5_cb(lv_event_t *e);
 static void wardrive_gps_set_atgm_cb(lv_event_t *e);
+static void wardrive_gps_set_external_cb(lv_event_t *e);
+static void usb_gps_process_bytes(const uint8_t *data, size_t len);
+static void start_usb_gps_drain_task(void);
 static void show_compromised_data_page(void);
 static void compromised_data_tile_event_cb(lv_event_t *e);
 static void compromised_data_back_btn_event_cb(lv_event_t *e);
@@ -1576,6 +1581,20 @@ static bool usb_cdc_preferred_valid = false;
 static uint8_t usb_cdc_preferred_itf = 0;
 static uint16_t usb_last_vid = 0;
 static uint16_t usb_last_pid = 0;
+static bool usb_gps_fix_valid = false;
+static double usb_gps_last_lat = 0.0;
+static double usb_gps_last_lon = 0.0;
+static uint32_t usb_gps_fix_tick = 0;
+static char usb_gps_line_buffer[160];
+static size_t usb_gps_line_len = 0;
+static bool usb_nmea_device_seen = false;
+static bool usb_is_known_gps = false;
+static TaskHandle_t usb_gps_drain_task_handle = NULL;
+static volatile bool usb_rx_exclusive = false;
+
+#define USB_GPS_FIX_MAX_AGE_MS 15000
+#define USB_GPS_KNOWN_VID 0x1546
+#define USB_GPS_KNOWN_PID 0x01A7
 
 #define CP210X_VID 0x10C4
 #define CP210X_REQTYPE_HOST_TO_DEVICE 0x41
@@ -1669,6 +1688,7 @@ static void usb_cdc_new_dev_cb(usb_device_handle_t usb_dev, void *user_data)
 
     usb_last_vid = device_desc->idVendor;
     usb_last_pid = device_desc->idProduct;
+    usb_is_known_gps = (usb_last_vid == USB_GPS_KNOWN_VID && usb_last_pid == USB_GPS_KNOWN_PID);
     usb_cdc_preferred_valid = false;
     usb_cdc_preferred_itf = 0;
 
@@ -1735,6 +1755,9 @@ static void usb_cdc_new_dev_cb(usb_device_handle_t usb_dev, void *user_data)
                  device_desc->bDeviceClass,
                  usb_cdc_preferred_itf,
                  usb_cdc_preferred_valid);
+        if (usb_is_known_gps) {
+            ESP_LOGI(TAG, "[USB] Known GPS device detected by VID/PID");
+        }
     }
 }
 
@@ -1837,6 +1860,7 @@ static void usb_cdc_connect_cb(usbh_cdc_handle_t cdc_handle, void *user_data)
     (void)user_data;
     usb_cdc_handle = cdc_handle;
     usb_cdc_connected = true;
+    usb_nmea_device_seen = false;
     usb_transport_ready = true;
     usb_transport_warned = false;
     ESP_LOGI(TAG, "[USB] CDC device connected (handle=%p)", (void *)cdc_handle);
@@ -1861,7 +1885,8 @@ static void usb_cdc_connect_cb(usbh_cdc_handle_t cdc_handle, void *user_data)
     if (usb_last_vid == CP210X_VID) {
         cp210x_init_port(usb_cdc_preferred_itf);
     }
-    
+
+    start_usb_gps_drain_task();
     schedule_board_redetect();
 }
 
@@ -1875,6 +1900,10 @@ static void usb_cdc_disconnect_cb(usbh_cdc_handle_t cdc_handle, void *user_data)
     usb_cdc_connected = false;
     usb_transport_ready = false;
     usb_transport_warned = false;
+    usb_nmea_device_seen = false;
+    usb_is_known_gps = false;
+    usb_gps_fix_valid = false;
+    usb_gps_line_len = 0;
     usb_cdc_preferred_valid = false;
     usb_cdc_preferred_itf = 0;
     usb_last_vid = 0;
@@ -2119,7 +2148,7 @@ static int usb_transport_read(void *data, size_t len, TickType_t ticks_to_wait)
         }
         hex_buf[log_len * 3] = '\0';
         ascii_buf[log_len] = '\0';
-        ESP_LOGI(TAG, "[USB] Read %zu bytes: [%s] \"%s\"%s", 
+        ESP_LOGD(TAG, "[USB] Read %zu bytes: [%s] \"%s\"%s",
                  read_len, hex_buf, ascii_buf, read_len > 32 ? "..." : "");
     }
     return (int)read_len;
@@ -2145,12 +2174,27 @@ static void usb_flush_input(uint32_t max_ms)
     }
 }
 
+static bool usb_buffer_contains_nmea(const char *buf)
+{
+    if (!buf) {
+        return false;
+    }
+    return strstr(buf, "$GP") != NULL ||
+           strstr(buf, "$GN") != NULL ||
+           strstr(buf, "$GL") != NULL ||
+           strstr(buf, "$GA") != NULL;
+}
+
 // Ping USB device to verify it responds (similar to ping_uart_direct for Grove/MBus)
 static bool ping_usb(void)
 {
+    bool detected = false;
+
+    usb_rx_exclusive = true;
+
     if (!usb_cdc_handle || !usb_cdc_connected) {
         ESP_LOGW(TAG, "[USB] Cannot ping - no CDC device connected");
-        return false;
+        goto done;
     }
     
     // Flush RX buffer before ping (drain any boot/menu spam)
@@ -2161,33 +2205,288 @@ static bool ping_usb(void)
     int written = usb_transport_write(ping_cmd, strlen(ping_cmd));
     if (written <= 0) {
         ESP_LOGW(TAG, "[USB] Failed to send ping");
-        return false;
+        goto done;
     }
     ESP_LOGI(TAG, "[USB] Sent ping");
     
     // Wait for pong response (timeout ~500ms, 10 x 50ms reads)
     char buf[64];
     int total = 0;
+    bool saw_nmea = false;
     for (int i = 0; i < 10; i++) {
         int n = usb_transport_read(buf + total, sizeof(buf) - total - 1, pdMS_TO_TICKS(50));
         if (usb_debug_logs && n == 0) {
             ESP_LOGD(TAG, "[USB] Ping wait %d/10: no data", i + 1);
         }
         if (n > 0) {
+            usb_gps_process_bytes((const uint8_t *)(buf + total), (size_t)n);
             total += n;
             buf[total] = '\0';
+            if (!saw_nmea && usb_buffer_contains_nmea(buf)) {
+                saw_nmea = true;
+            }
             if (strstr(buf, "pong")) {
+                usb_nmea_device_seen = false;
                 ESP_LOGI(TAG, "[USB] Received pong - device detected!");
-                return true;
+                detected = true;
+                goto done;
             }
         }
     }
-    
-    if (usb_debug_logs && total > 0) {
-        ESP_LOGW(TAG, "[USB] No pong response, partial data: \"%s\"", buf);
+
+    usb_nmea_device_seen = saw_nmea;
+    if (saw_nmea) {
+        if (usb_debug_logs && total > 0) {
+            ESP_LOGI(TAG, "[USB] NMEA stream detected during ping probe: \"%s\"", buf);
+        }
+        ESP_LOGI(TAG, "[USB] CDC device appears to be GPS (NMEA), not scanner board");
+    } else {
+        if (usb_debug_logs && total > 0) {
+            ESP_LOGW(TAG, "[USB] No pong response, partial data: \"%s\"", buf);
+        }
+        ESP_LOGW(TAG, "[USB] No pong response - device not detected");
     }
-    ESP_LOGW(TAG, "[USB] No pong response - device not detected");
-    return false;
+
+done:
+    usb_rx_exclusive = false;
+    return detected;
+}
+
+static bool usb_gps_parse_nmea_coord(const char *field, char hemisphere, double *out)
+{
+    if (!field || !*field || !out) {
+        return false;
+    }
+
+    char *endptr = NULL;
+    double raw = strtod(field, &endptr);
+    if (endptr == field || !isfinite(raw)) {
+        return false;
+    }
+
+    int degrees = (int)(raw / 100.0);
+    double minutes = raw - ((double)degrees * 100.0);
+    if (minutes < 0.0 || minutes >= 60.0) {
+        return false;
+    }
+
+    double decimal = (double)degrees + (minutes / 60.0);
+    if (hemisphere == 'S' || hemisphere == 'W') {
+        decimal = -decimal;
+    } else if (hemisphere != 'N' && hemisphere != 'E') {
+        return false;
+    }
+
+    *out = decimal;
+    return true;
+}
+
+static bool usb_gps_parse_sentence(const char *sentence, double *lat_out, double *lon_out)
+{
+    if (!sentence || sentence[0] != '$' || !lat_out || !lon_out) {
+        return false;
+    }
+
+    char buf[160];
+    snprintf(buf, sizeof(buf), "%s", sentence);
+
+    char *checksum = strchr(buf, '*');
+    if (checksum) {
+        *checksum = '\0';
+    }
+
+    char *saveptr = NULL;
+    char *token = strtok_r(buf, ",", &saveptr);
+    if (!token) {
+        return false;
+    }
+
+    bool is_gga = strstr(token, "GGA") != NULL;
+    bool is_rmc = strstr(token, "RMC") != NULL;
+    if (!is_gga && !is_rmc) {
+        return false;
+    }
+
+    const char *lat_field = NULL;
+    const char *lat_hemi = NULL;
+    const char *lon_field = NULL;
+    const char *lon_hemi = NULL;
+    const char *fix_field = NULL;
+    const char *status_field = NULL;
+    int field_idx = 0;
+
+    while ((token = strtok_r(NULL, ",", &saveptr)) != NULL) {
+        field_idx++;
+        if (is_gga) {
+            if (field_idx == 2) lat_field = token;
+            if (field_idx == 3) lat_hemi = token;
+            if (field_idx == 4) lon_field = token;
+            if (field_idx == 5) lon_hemi = token;
+            if (field_idx == 6) fix_field = token;
+        } else {
+            if (field_idx == 2) status_field = token;
+            if (field_idx == 3) lat_field = token;
+            if (field_idx == 4) lat_hemi = token;
+            if (field_idx == 5) lon_field = token;
+            if (field_idx == 6) lon_hemi = token;
+        }
+    }
+
+    if (!lat_field || !lat_hemi || !lon_field || !lon_hemi) {
+        return false;
+    }
+
+    if (is_gga) {
+        if (!fix_field || atoi(fix_field) <= 0) {
+            return false;
+        }
+    } else {
+        if (!status_field || toupper((unsigned char)status_field[0]) != 'A') {
+            return false;
+        }
+    }
+
+    double lat = 0.0;
+    double lon = 0.0;
+    if (!usb_gps_parse_nmea_coord(lat_field, toupper((unsigned char)lat_hemi[0]), &lat)) {
+        return false;
+    }
+    if (!usb_gps_parse_nmea_coord(lon_field, toupper((unsigned char)lon_hemi[0]), &lon)) {
+        return false;
+    }
+
+    *lat_out = lat;
+    *lon_out = lon;
+    return true;
+}
+
+static void usb_gps_process_bytes(const uint8_t *data, size_t len)
+{
+    if (!data || len == 0) {
+        return;
+    }
+
+    for (size_t i = 0; i < len; i++) {
+        char c = (char)data[i];
+        if (c == '\r' || c == '\n') {
+            if (usb_gps_line_len > 0) {
+                usb_gps_line_buffer[usb_gps_line_len] = '\0';
+                double lat = 0.0;
+                double lon = 0.0;
+                if (usb_gps_parse_sentence(usb_gps_line_buffer, &lat, &lon)) {
+                    usb_gps_last_lat = lat;
+                    usb_gps_last_lon = lon;
+                    usb_gps_fix_tick = lv_tick_get();
+                    usb_gps_fix_valid = true;
+                    ESP_LOGD(TAG, "[USB][GPS] Fix %.6f, %.6f", lat, lon);
+                }
+                usb_gps_line_len = 0;
+            }
+            continue;
+        }
+
+        if (usb_gps_line_len < sizeof(usb_gps_line_buffer) - 1) {
+            usb_gps_line_buffer[usb_gps_line_len++] = c;
+        } else {
+            usb_gps_line_len = 0;
+        }
+    }
+}
+
+static void usb_gps_poll(uint32_t wait_ms)
+{
+    if (!usb_cdc_handle || !usb_cdc_connected) {
+        return;
+    }
+
+    uint8_t rx_buf[128];
+    uint32_t start = lv_tick_get();
+
+    do {
+        uint32_t elapsed = lv_tick_elaps(start);
+        uint32_t remaining = (wait_ms > elapsed) ? (wait_ms - elapsed) : 0;
+        TickType_t wait_ticks = 0;
+        if (remaining > 0) {
+            uint32_t slice_ms = remaining > 40 ? 40 : remaining;
+            wait_ticks = pdMS_TO_TICKS(slice_ms);
+        }
+
+        int read_len = usb_transport_read(rx_buf, sizeof(rx_buf), wait_ticks);
+        if (read_len > 0) {
+            usb_gps_process_bytes(rx_buf, (size_t)read_len);
+            continue;
+        }
+
+        if (usb_gps_fix_valid && lv_tick_elaps(usb_gps_fix_tick) <= USB_GPS_FIX_MAX_AGE_MS) {
+            return;
+        }
+        if (wait_ms == 0 || remaining == 0) {
+            return;
+        }
+    } while (lv_tick_elaps(start) < wait_ms);
+}
+
+static bool usb_gps_get_fix(double *lat_out, double *lon_out, uint32_t wait_ms)
+{
+    if (!lat_out || !lon_out) {
+        return false;
+    }
+
+    if (!usb_cdc_handle || !usb_cdc_connected) {
+        return false;
+    }
+
+    usb_rx_exclusive = true;
+    usb_gps_poll(wait_ms);
+    usb_rx_exclusive = false;
+
+    if (!usb_gps_fix_valid) {
+        return false;
+    }
+    if (lv_tick_elaps(usb_gps_fix_tick) > USB_GPS_FIX_MAX_AGE_MS) {
+        return false;
+    }
+
+    *lat_out = usb_gps_last_lat;
+    *lon_out = usb_gps_last_lon;
+    return true;
+}
+
+static void usb_gps_drain_task(void *arg)
+{
+    (void)arg;
+    uint8_t rx_buf[128];
+
+    while (1) {
+        bool should_drain = usb_cdc_connected &&
+                            (usb_is_known_gps || usb_nmea_device_seen) &&
+                            !usb_detected &&
+                            !usb_rx_exclusive;
+
+        if (!should_drain) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+
+        int len = usb_transport_read(rx_buf, sizeof(rx_buf), pdMS_TO_TICKS(50));
+        if (len > 0) {
+            usb_gps_process_bytes(rx_buf, (size_t)len);
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+    }
+}
+
+static void start_usb_gps_drain_task(void)
+{
+    if (usb_gps_drain_task_handle) {
+        return;
+    }
+
+    if (xTaskCreate(usb_gps_drain_task, "usb_gps_drain", 4096, NULL, 4, &usb_gps_drain_task_handle) != pdTRUE) {
+        usb_gps_drain_task_handle = NULL;
+        ESP_LOGW(TAG, "[USB] Failed to create GPS drain task");
+    }
 }
 
 static int transport_write_bytes_tab(tab_id_t tab, uart_port_t port, const char *data, size_t len)
@@ -2909,8 +3208,7 @@ static lv_obj_t *create_small_tile(lv_obj_t *parent, const char *icon, const cha
 // ============================================================================
 // SCREENSHOT FUNCTIONALITY
 // ============================================================================
-#if SCREENSHOT_ENABLED
-// lv_snapshot.h is included via lvgl.h when LV_USE_SNAPSHOT is enabled
+#if SCREENSHOT_ENABLED && LV_USE_SNAPSHOT
 
 // Global pointer to title label for visual feedback
 static lv_obj_t *screenshot_title_label = NULL;
@@ -3080,10 +3378,6 @@ static void screenshot_click_cb(lv_event_t *e)
     ESP_LOGI(TAG, "LABORATORIUM clicked - taking screenshot");
     save_screenshot_to_sd();
 }
-#else
-// Stubs when screenshot is disabled
-static void save_screenshot_to_sd(void) {}
-static void screenshot_click_cb(lv_event_t *e) { (void)e; }
 #endif
 
 // Create status bar at top of screen (reusable helper)
@@ -3118,7 +3412,7 @@ static void create_status_bar(void)
     lv_obj_set_style_text_color(app_title, lv_color_make(255, 255, 255), 0);
     lv_obj_align(app_title, LV_ALIGN_CENTER, 0, 0);
     
-#if SCREENSHOT_ENABLED
+#if SCREENSHOT_ENABLED && LV_USE_SNAPSHOT
     // Make title clickable for screenshot trigger
     lv_obj_add_flag(app_title, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(app_title, screenshot_click_cb, LV_EVENT_CLICKED, NULL);
@@ -10991,64 +11285,155 @@ static void wardrive_gps_type_close_cb(lv_event_t *e)
     }
 }
 
+static const char *wardrive_gps_mode_from_cmd(const char *cmd)
+{
+    if (!cmd) {
+        return "Unknown";
+    }
+    if (strstr(cmd, "external") != NULL || strstr(cmd, "usb") != NULL) {
+        return "External";
+    }
+    if (strstr(cmd, "atgm") != NULL) {
+        return "ATGM";
+    }
+    if (strstr(cmd, "m5") != NULL) {
+        return "M5";
+    }
+    return "Unknown";
+}
+
+static bool wardrive_is_relevant_gps_response_line(const char *line, const char *cmd)
+{
+    if (!line || !cmd) {
+        return false;
+    }
+
+    while (isspace((unsigned char)*line)) {
+        line++;
+    }
+
+    if (*line == '\0' || strcmp(line, ">") == 0) {
+        return false;
+    }
+    if (strstr(line, "gps_set") != NULL) {
+        return false;
+    }
+
+    // Ignore unrelated runtime/status lines that can be in UART buffer.
+    if (strcmp(line, "stop") == 0 ||
+        strstr(line, "Flushed ") != NULL ||
+        strstr(line, "Wardrive") != NULL ||
+        strstr(line, "wardrive") != NULL ||
+        strstr(line, "GPS fix") != NULL ||
+        strstr(line, "start_wardrive") != NULL) {
+        return false;
+    }
+
+    bool mode_token = false;
+    if (strstr(cmd, "m5") != NULL) {
+        mode_token = (strstr(line, "m5") != NULL || strstr(line, "M5") != NULL);
+    } else if (strstr(cmd, "atgm") != NULL) {
+        mode_token = (strstr(line, "atgm") != NULL || strstr(line, "ATGM") != NULL);
+    } else if (strstr(cmd, "external") != NULL || strstr(cmd, "usb") != NULL) {
+        mode_token = (strstr(line, "external") != NULL || strstr(line, "External") != NULL ||
+                      strstr(line, "usb") != NULL || strstr(line, "USB") != NULL);
+    }
+    if (mode_token) {
+        return true;
+    }
+
+    bool gps_keyword = (strstr(line, "gps") != NULL || strstr(line, "GPS") != NULL ||
+                        strstr(line, "module") != NULL || strstr(line, "Module") != NULL);
+    bool state_keyword = (strstr(line, "set") != NULL || strstr(line, "Set") != NULL ||
+                          strstr(line, "selected") != NULL || strstr(line, "Selected") != NULL ||
+                          strstr(line, "unknown") != NULL || strstr(line, "Unknown") != NULL);
+    return gps_keyword && state_keyword;
+}
+
+static void wardrive_send_gps_set_command(tab_context_t *ctx, const char *cmd)
+{
+    if (!ctx || !cmd) {
+        return;
+    }
+
+    if (strstr(cmd, "gps_set external") != NULL || strstr(cmd, "gps_set usb") != NULL) {
+        ctx->wardrive_use_external_gps = true;
+    } else if (strstr(cmd, "gps_set") != NULL) {
+        ctx->wardrive_use_external_gps = false;
+    }
+
+    const char *mode_name = wardrive_gps_mode_from_cmd(cmd);
+    char default_response[64];
+    snprintf(default_response, sizeof(default_response), "GPS set: %s", mode_name);
+
+    if (ctx->wardrive_gps_type_response_label) {
+        char pending_text[64];
+        snprintf(pending_text, sizeof(pending_text), "Setting GPS: %s...", mode_name);
+        lv_label_set_text(ctx->wardrive_gps_type_response_label, pending_text);
+        lv_obj_set_style_text_color(ctx->wardrive_gps_type_response_label, COLOR_MATERIAL_AMBER, 0);
+    }
+    lv_refr_now(NULL);
+
+    tab_id_t active_tab = tab_id_for_ctx(ctx);
+    uart_port_t uart_port = (active_tab == TAB_MBUS) ? UART2_NUM : UART_NUM;
+    if (active_tab == TAB_MBUS) {
+        uart2_send_command(cmd);
+    } else {
+        uart_send_command(cmd);
+    }
+
+    char rx_buffer[512] = {0};
+    char parse_buffer[512];
+    char response[256] = "";
+    int total_len = 0;
+
+    for (int attempt = 0; attempt < 15 && response[0] == '\0'; attempt++) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        if (total_len >= (int)sizeof(rx_buffer) - 1) {
+            break;
+        }
+
+        int len = transport_read_bytes_tab(active_tab,
+                                           uart_port,
+                                           rx_buffer + total_len,
+                                           sizeof(rx_buffer) - 1 - total_len,
+                                           pdMS_TO_TICKS(50));
+        if (len <= 0) {
+            continue;
+        }
+
+        total_len += len;
+        rx_buffer[total_len] = '\0';
+
+        snprintf(parse_buffer, sizeof(parse_buffer), "%s", rx_buffer);
+        char *saveptr = NULL;
+        char *line = strtok_r(parse_buffer, "\r\n", &saveptr);
+        while (line) {
+            if (wardrive_is_relevant_gps_response_line(line, cmd)) {
+                snprintf(response, sizeof(response), "%.255s", line);
+                break;
+            }
+            line = strtok_r(NULL, "\r\n", &saveptr);
+        }
+    }
+
+    if (ctx->wardrive_gps_type_response_label) {
+        if (response[0] != '\0') {
+            lv_label_set_text(ctx->wardrive_gps_type_response_label, response);
+            lv_obj_set_style_text_color(ctx->wardrive_gps_type_response_label, COLOR_MATERIAL_GREEN, 0);
+        } else {
+            lv_label_set_text(ctx->wardrive_gps_type_response_label, default_response);
+            lv_obj_set_style_text_color(ctx->wardrive_gps_type_response_label, COLOR_MATERIAL_GREEN, 0);
+        }
+    }
+}
+
 // GPS set M5 callback
 static void wardrive_gps_set_m5_cb(lv_event_t *e)
 {
     tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
     if (!ctx) ctx = get_current_ctx();
-    
-    // Show "sending..." immediately
-    if (ctx->wardrive_gps_type_response_label) {
-        lv_label_set_text(ctx->wardrive_gps_type_response_label, "Sending command...");
-        lv_obj_set_style_text_color(ctx->wardrive_gps_type_response_label, COLOR_MATERIAL_AMBER, 0);
-    }
-    lv_refr_now(NULL);
-    
-    // Send command
-    tab_id_t active_tab = tab_id_for_ctx(ctx);
-    if (active_tab == TAB_MBUS) {
-        uart2_send_command("gps_set m5");
-    } else {
-        uart_send_command("gps_set m5");
-    }
-    
-    // Read response - try multiple times
-    uart_port_t uart_port = (active_tab == TAB_MBUS) ? UART2_NUM : UART_NUM;
-    char rx_buffer[512];
-    char response[256] = "";
-    int total_len = 0;
-    
-    // Try reading for up to 1.5 seconds
-    for (int attempt = 0; attempt < 15 && strlen(response) == 0; attempt++) {
-        vTaskDelay(pdMS_TO_TICKS(100));
-        int len = transport_read_bytes_tab(active_tab, uart_port, rx_buffer + total_len, 
-                                           sizeof(rx_buffer) - 1 - total_len, pdMS_TO_TICKS(50));
-        if (len > 0) {
-            total_len += len;
-            rx_buffer[total_len] = '\0';
-            
-            // Look for response line (skip echo of command)
-            char *line = strtok(rx_buffer, "\r\n");
-            while (line) {
-                // Skip empty lines and command echo
-                if (strlen(line) > 0 && strstr(line, "gps_set") == NULL) {
-                    snprintf(response, sizeof(response), "%.255s", line);
-                    break;
-                }
-                line = strtok(NULL, "\r\n");
-            }
-        }
-    }
-    
-    if (ctx->wardrive_gps_type_response_label) {
-        if (strlen(response) > 0) {
-            lv_label_set_text(ctx->wardrive_gps_type_response_label, response);
-            lv_obj_set_style_text_color(ctx->wardrive_gps_type_response_label, COLOR_MATERIAL_GREEN, 0);
-        } else {
-            lv_label_set_text(ctx->wardrive_gps_type_response_label, "Command sent (no response received)");
-            lv_obj_set_style_text_color(ctx->wardrive_gps_type_response_label, COLOR_MATERIAL_AMBER, 0);
-        }
-    }
+    wardrive_send_gps_set_command(ctx, "gps_set m5");
 }
 
 // GPS set ATGM callback
@@ -11056,59 +11441,15 @@ static void wardrive_gps_set_atgm_cb(lv_event_t *e)
 {
     tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
     if (!ctx) ctx = get_current_ctx();
-    
-    // Show "sending..." immediately
-    if (ctx->wardrive_gps_type_response_label) {
-        lv_label_set_text(ctx->wardrive_gps_type_response_label, "Sending command...");
-        lv_obj_set_style_text_color(ctx->wardrive_gps_type_response_label, COLOR_MATERIAL_AMBER, 0);
-    }
-    lv_refr_now(NULL);
-    
-    // Send command
-    tab_id_t active_tab = tab_id_for_ctx(ctx);
-    if (active_tab == TAB_MBUS) {
-        uart2_send_command("gps_set atgm");
-    } else {
-        uart_send_command("gps_set atgm");
-    }
-    
-    // Read response - try multiple times
-    uart_port_t uart_port = (active_tab == TAB_MBUS) ? UART2_NUM : UART_NUM;
-    char rx_buffer[512];
-    char response[256] = "";
-    int total_len = 0;
-    
-    // Try reading for up to 1.5 seconds
-    for (int attempt = 0; attempt < 15 && strlen(response) == 0; attempt++) {
-        vTaskDelay(pdMS_TO_TICKS(100));
-        int len = transport_read_bytes_tab(active_tab, uart_port, rx_buffer + total_len, 
-                                           sizeof(rx_buffer) - 1 - total_len, pdMS_TO_TICKS(50));
-        if (len > 0) {
-            total_len += len;
-            rx_buffer[total_len] = '\0';
-            
-            // Look for response line (skip echo of command)
-            char *line = strtok(rx_buffer, "\r\n");
-            while (line) {
-                // Skip empty lines and command echo
-                if (strlen(line) > 0 && strstr(line, "gps_set") == NULL) {
-                    snprintf(response, sizeof(response), "%.255s", line);
-                    break;
-                }
-                line = strtok(NULL, "\r\n");
-            }
-        }
-    }
-    
-    if (ctx->wardrive_gps_type_response_label) {
-        if (strlen(response) > 0) {
-            lv_label_set_text(ctx->wardrive_gps_type_response_label, response);
-            lv_obj_set_style_text_color(ctx->wardrive_gps_type_response_label, COLOR_MATERIAL_GREEN, 0);
-        } else {
-            lv_label_set_text(ctx->wardrive_gps_type_response_label, "Command sent (no response received)");
-            lv_obj_set_style_text_color(ctx->wardrive_gps_type_response_label, COLOR_MATERIAL_AMBER, 0);
-        }
-    }
+    wardrive_send_gps_set_command(ctx, "gps_set atgm");
+}
+
+// GPS set External callback
+static void wardrive_gps_set_external_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx) ctx = get_current_ctx();
+    wardrive_send_gps_set_command(ctx, "gps_set external");
 }
 
 // GPS type button callback - show popup
@@ -11164,12 +11505,12 @@ static void wardrive_gps_type_btn_cb(lv_event_t *e)
     lv_obj_set_style_pad_all(btn_row, 0, 0);
     lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_column(btn_row, 20, 0);
+    lv_obj_set_style_pad_column(btn_row, 12, 0);
     lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
     
     // Set M5 button
     lv_obj_t *m5_btn = lv_btn_create(btn_row);
-    lv_obj_set_size(m5_btn, 140, 50);
+    lv_obj_set_size(m5_btn, 120, 50);
     lv_obj_set_style_bg_color(m5_btn, COLOR_MATERIAL_TEAL, 0);
     lv_obj_set_style_radius(m5_btn, 8, 0);
     lv_obj_add_event_cb(m5_btn, wardrive_gps_set_m5_cb, LV_EVENT_CLICKED, ctx);
@@ -11181,7 +11522,7 @@ static void wardrive_gps_type_btn_cb(lv_event_t *e)
     
     // Set ATGM button
     lv_obj_t *atgm_btn = lv_btn_create(btn_row);
-    lv_obj_set_size(atgm_btn, 140, 50);
+    lv_obj_set_size(atgm_btn, 120, 50);
     lv_obj_set_style_bg_color(atgm_btn, COLOR_MATERIAL_TEAL, 0);
     lv_obj_set_style_radius(atgm_btn, 8, 0);
     lv_obj_add_event_cb(atgm_btn, wardrive_gps_set_atgm_cb, LV_EVENT_CLICKED, ctx);
@@ -11190,6 +11531,18 @@ static void wardrive_gps_type_btn_cb(lv_event_t *e)
     lv_label_set_text(atgm_label, "Set ATGM");
     lv_obj_set_style_text_font(atgm_label, &lv_font_montserrat_16, 0);
     lv_obj_center(atgm_label);
+
+    // Set External button
+    lv_obj_t *usb_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(usb_btn, 120, 50);
+    lv_obj_set_style_bg_color(usb_btn, COLOR_MATERIAL_TEAL, 0);
+    lv_obj_set_style_radius(usb_btn, 8, 0);
+    lv_obj_add_event_cb(usb_btn, wardrive_gps_set_external_cb, LV_EVENT_CLICKED, ctx);
+
+    lv_obj_t *usb_label = lv_label_create(usb_btn);
+    lv_label_set_text(usb_label, "Set External");
+    lv_obj_set_style_text_font(usb_label, &lv_font_montserrat_16, 0);
+    lv_obj_center(usb_label);
     
     // Response label
     ctx->wardrive_gps_type_response_label = lv_label_create(popup);
@@ -11211,6 +11564,108 @@ static void wardrive_gps_type_btn_cb(lv_event_t *e)
     lv_label_set_text(close_label, "Close");
     lv_obj_set_style_text_font(close_label, &lv_font_montserrat_16, 0);
     lv_obj_center(close_label);
+}
+
+static bool wardrive_is_tab_gps_read_command(const char *line)
+{
+    if (!line) {
+        return false;
+    }
+
+    while (isspace((unsigned char)*line)) {
+        line++;
+    }
+
+    const char *cmd = "tab_gps_read";
+    size_t cmd_len = strlen(cmd);
+    if (strncmp(line, cmd, cmd_len) != 0) {
+        return false;
+    }
+
+    line += cmd_len;
+    return (*line == '\0' || isspace((unsigned char)*line));
+}
+
+static void wardrive_reply_tab_gps_read(tab_id_t active_tab, uart_port_t uart_port)
+{
+    char response[96];
+    double lat = 0.0;
+    double lon = 0.0;
+
+    if (usb_gps_get_fix(&lat, &lon, 1200)) {
+        snprintf(response, sizeof(response), "%.6f,%.6f\r\n", lat, lon);
+        ESP_LOGI(TAG, "Wardrive: tab_gps_read -> %.6f, %.6f", lat, lon);
+    } else {
+        snprintf(response, sizeof(response), "No GPS fix\r\n");
+        ESP_LOGW(TAG, "Wardrive: tab_gps_read -> No GPS fix");
+    }
+
+    int written = transport_write_bytes_tab(active_tab, uart_port, response, strlen(response));
+    if (written <= 0) {
+        ESP_LOGW(TAG, "Wardrive: failed to send tab_gps_read response");
+    }
+}
+
+static void wardrive_push_external_gps_update(tab_id_t active_tab,
+                                              uart_port_t uart_port,
+                                              bool *push_initialized,
+                                              bool *last_sent_fix_valid,
+                                              double *last_sent_lat,
+                                              double *last_sent_lon,
+                                              uint32_t *last_sent_tick,
+                                              uint32_t *last_probe_tick)
+{
+    if (!push_initialized || !last_sent_fix_valid || !last_sent_lat || !last_sent_lon ||
+        !last_sent_tick || !last_probe_tick) {
+        return;
+    }
+
+    const uint32_t probe_interval_ms = 300;
+    const uint32_t heartbeat_interval_ms = 5000;
+    const double movement_delta = 0.00001;
+
+    if (*push_initialized && lv_tick_elaps(*last_probe_tick) < probe_interval_ms) {
+        return;
+    }
+    *last_probe_tick = lv_tick_get();
+
+    double lat = 0.0;
+    double lon = 0.0;
+    bool has_fix = usb_gps_get_fix(&lat, &lon, 30);
+    bool should_send = false;
+    char cmd[96];
+
+    if (has_fix) {
+        bool moved = !(*last_sent_fix_valid) ||
+                     fabs(lat - *last_sent_lat) >= movement_delta ||
+                     fabs(lon - *last_sent_lon) >= movement_delta;
+        bool heartbeat_due = *push_initialized && lv_tick_elaps(*last_sent_tick) >= heartbeat_interval_ms;
+        if (!*push_initialized || moved || heartbeat_due) {
+            snprintf(cmd, sizeof(cmd), "set_gps_position %.7f %.7f", lat, lon);
+            should_send = true;
+        }
+    } else if (!*push_initialized || *last_sent_fix_valid) {
+        snprintf(cmd, sizeof(cmd), "set_gps_position");
+        should_send = true;
+    }
+
+    if (!should_send) {
+        return;
+    }
+
+    int written = transport_write_bytes_tab(active_tab, uart_port, cmd, strlen(cmd));
+    transport_write_bytes_tab(active_tab, uart_port, "\r\n", 2);
+    if (written <= 0) {
+        ESP_LOGW(TAG, "Wardrive: failed to push set_gps_position");
+    }
+
+    if (has_fix) {
+        *last_sent_lat = lat;
+        *last_sent_lon = lon;
+    }
+    *last_sent_fix_valid = has_fix;
+    *push_initialized = true;
+    *last_sent_tick = lv_tick_get();
 }
 
 // Callback when user clicks Stop
@@ -11272,8 +11727,25 @@ static void wardrive_monitor_task(void *arg)
     char line_buffer[512];
     int line_pos = 0;
     bool batch_has_new_networks = false;
+    bool gps_push_initialized = false;
+    bool gps_push_last_fix_valid = false;
+    double gps_push_last_lat = 0.0;
+    double gps_push_last_lon = 0.0;
+    uint32_t gps_push_last_sent_tick = 0;
+    uint32_t gps_push_last_probe_tick = 0;
 
     while (ctx->wardrive_monitoring) {
+        if (ctx->wardrive_use_external_gps) {
+            wardrive_push_external_gps_update(active_tab,
+                                              uart_port,
+                                              &gps_push_initialized,
+                                              &gps_push_last_fix_valid,
+                                              &gps_push_last_lat,
+                                              &gps_push_last_lon,
+                                              &gps_push_last_sent_tick,
+                                              &gps_push_last_probe_tick);
+        }
+
         int len = transport_read_bytes_tab(active_tab, uart_port, rx_buffer, sizeof(rx_buffer) - 1, pdMS_TO_TICKS(100));
 
         if (len > 0) {
@@ -11286,6 +11758,13 @@ static void wardrive_monitor_task(void *arg)
                 if (c == '\n' || c == '\r') {
                     if (line_pos > 0) {
                         line_buffer[line_pos] = '\0';
+
+                        // Tab-side GPS read request from remote CLI
+                        if (wardrive_is_tab_gps_read_command(line_buffer)) {
+                            wardrive_reply_tab_gps_read(active_tab, uart_port);
+                            line_pos = 0;
+                            continue;
+                        }
 
                         // GPS fix obtained -> dismiss overlay, update status
                         if (!ctx->wardrive_gps_fix && strstr(line_buffer, "GPS fix obtained") != NULL) {
@@ -17443,8 +17922,11 @@ static void detect_boards(void)
     // Detect each device independently using ping/pong
     grove_detected = ping_uart_direct(UART_NUM, "Grove");
     usb_detected = usb_cdc_connected ? ping_usb() : false;  // Must respond to ping, not just be connected
-    if (usb_cdc_connected && !usb_detected && usb_debug_logs) {
+    if (usb_cdc_connected && !usb_detected && usb_debug_logs && !usb_nmea_device_seen && !usb_is_known_gps) {
         usb_log_cdc_state("detect_boards_usb_ping_failed");
+    }
+    if (usb_nmea_device_seen || usb_is_known_gps) {
+        ESP_LOGI(TAG, "[USB] GPS accessory detected (NMEA stream)");
     }
     uart1_detected = (grove_detected || usb_detected);  // For legacy compatibility
     mbus_detected = ping_uart(UART2_NUM, "MBus");
@@ -18838,6 +19320,7 @@ void app_main(void)
     // MBus port: M5Bus connector (TX=37, RX=38)
     uart_init();   // Initialize UART1
     init_uart2();  // Initialize MBus port (UART2)
+    start_usb_gps_drain_task();
     
     // Initialize display
     lv_display_t *disp = bsp_display_start();
