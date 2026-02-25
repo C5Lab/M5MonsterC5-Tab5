@@ -37,7 +37,7 @@
 #include "esp_http_server.h"
 #include "lwip/sockets.h"
 
-#define JANOS_TAB_VERSION "1.0.8"
+#define JANOS_TAB_VERSION "1.1.2"
 #include "lwip/netdb.h"
 #include <dirent.h>
 #include <sys/stat.h>
@@ -332,6 +332,7 @@ typedef struct {
     lv_obj_t *wardrive_start_btn;
     lv_obj_t *wardrive_stop_btn;
     lv_obj_t *wardrive_status_label;
+    lv_obj_t *wardrive_net_count_label;
     lv_obj_t *wardrive_table;
     lv_obj_t *wardrive_gps_overlay;
     lv_obj_t *wardrive_gps_popup;
@@ -353,6 +354,23 @@ typedef struct {
     lv_obj_t *evil_twin_passwords_page;
     lv_obj_t *portal_data_page;
     lv_obj_t *handshakes_page;
+
+    // WPA-SEC upload popup
+    lv_obj_t *wpasec_popup_overlay;
+    lv_obj_t *wpasec_popup;
+    lv_obj_t *wpasec_status_label;
+    volatile bool wpasec_task_running;
+    TaskHandle_t wpasec_task;
+    
+    // WPA-SEC WiFi connect sub-widgets
+    lv_obj_t *wpasec_network_list;
+    lv_obj_t *wpasec_password_input;
+    lv_obj_t *wpasec_keyboard;
+    lv_obj_t *wpasec_connect_btn;
+    char wpasec_selected_ssid[33];
+    char wpasec_selected_password[65];
+    volatile bool wpasec_password_known;
+    volatile bool wpasec_connect_ready;   // set by Connect button callback
     
     evil_twin_entry_t *evil_twin_entries;  // PSRAM
     int evil_twin_entry_count;
@@ -11226,10 +11244,12 @@ static void wardrive_stop_cb(lv_event_t *e)
     if (ctx->wardrive_gps_type_btn) lv_obj_clear_state(ctx->wardrive_gps_type_btn, LV_STATE_DISABLED);
 
     // Update status
-    int display_count = ctx->wardrive_net_count < WARDRIVE_MAX_NETWORKS ? ctx->wardrive_net_count : WARDRIVE_MAX_NETWORKS;
     if (ctx->wardrive_status_label) {
-        lv_label_set_text_fmt(ctx->wardrive_status_label, "Wardrive stopped. Networks found: %d", display_count);
+        lv_label_set_text(ctx->wardrive_status_label, "Wardrive stopped");
         lv_obj_set_style_text_color(ctx->wardrive_status_label, lv_color_hex(0x888888), 0);
+    }
+    if (ctx->wardrive_net_count_label) {
+        lv_label_set_text_fmt(ctx->wardrive_net_count_label, "Networks: %d", ctx->wardrive_net_count);
     }
 }
 
@@ -11281,15 +11301,132 @@ static void wardrive_monitor_task(void *arg)
                             bsp_display_unlock();
                         }
 
-                        // Logged networks message -> update status
-                        if (strstr(line_buffer, "Logged ") != NULL && strstr(line_buffer, " networks to ") != NULL) {
+                        // Flushed networks message -> update status + count
+                        if (strstr(line_buffer, "Flushed ") != NULL && strstr(line_buffer, " networks to ") != NULL) {
                             ESP_LOGI(TAG, "Wardrive: %s", line_buffer);
-                            int display_count = ctx->wardrive_net_count < WARDRIVE_MAX_NETWORKS ? ctx->wardrive_net_count : WARDRIVE_MAX_NETWORKS;
 
                             bsp_display_lock(0);
                             if (ctx->wardrive_status_label) {
-                                lv_label_set_text_fmt(ctx->wardrive_status_label, "Scanning... Networks: %d", display_count);
+                                lv_label_set_text(ctx->wardrive_status_label, "Scanning...");
                                 lv_obj_set_style_text_color(ctx->wardrive_status_label, COLOR_MATERIAL_GREEN, 0);
+                            }
+                            if (ctx->wardrive_net_count_label) {
+                                lv_label_set_text_fmt(ctx->wardrive_net_count_label, "Networks: %d", ctx->wardrive_net_count);
+                            }
+                            bsp_display_unlock();
+                        }
+
+                        // GPS fix lost -> re-show overlay, pause status
+                        if (ctx->wardrive_gps_fix && strstr(line_buffer, "GPS fix lost") != NULL) {
+                            ctx->wardrive_gps_fix = false;
+                            ESP_LOGW(TAG, "Wardrive: GPS fix lost");
+
+                            bsp_display_lock(0);
+                            show_wardrive_gps_overlay(ctx);
+                            if (ctx->wardrive_gps_label) {
+                                lv_label_set_text(ctx->wardrive_gps_label, "GPS Fix Lost - Pausing...");
+                                lv_obj_set_style_text_color(ctx->wardrive_gps_label, COLOR_MATERIAL_RED, 0);
+                            }
+                            if (ctx->wardrive_status_label) {
+                                lv_label_set_text(ctx->wardrive_status_label, "GPS lost - wardrive paused");
+                                lv_obj_set_style_text_color(ctx->wardrive_status_label, COLOR_MATERIAL_RED, 0);
+                            }
+                            bsp_display_unlock();
+                        }
+
+                        // GPS fix recovered -> dismiss overlay, resume scanning
+                        if (!ctx->wardrive_gps_fix && strstr(line_buffer, "GPS fix recovered") != NULL) {
+                            ctx->wardrive_gps_fix = true;
+                            ESP_LOGI(TAG, "Wardrive: GPS fix recovered");
+
+                            bsp_display_lock(0);
+                            close_wardrive_gps_overlay(ctx);
+                            if (ctx->wardrive_status_label) {
+                                lv_label_set_text(ctx->wardrive_status_label, "GPS Recovered - Scanning...");
+                                lv_obj_set_style_text_color(ctx->wardrive_status_label, COLOR_MATERIAL_GREEN, 0);
+                            }
+                            bsp_display_unlock();
+                        }
+
+                        // No GPS fix obtained -> timeout, stop wardrive
+                        if (strstr(line_buffer, "No GPS fix obtained") != NULL) {
+                            ESP_LOGW(TAG, "Wardrive: No GPS fix - timed out");
+
+                            bsp_display_lock(0);
+                            if (ctx->wardrive_gps_label) {
+                                lv_label_set_text(ctx->wardrive_gps_label, "No GPS Fix - Timed Out");
+                                lv_obj_set_style_text_color(ctx->wardrive_gps_label, COLOR_MATERIAL_RED, 0);
+                            }
+                            if (ctx->wardrive_status_label) {
+                                lv_label_set_text(ctx->wardrive_status_label, "No GPS fix - wardrive cancelled");
+                                lv_obj_set_style_text_color(ctx->wardrive_status_label, COLOR_MATERIAL_RED, 0);
+                            }
+                            bsp_display_unlock();
+
+                            vTaskDelay(pdMS_TO_TICKS(2000));
+
+                            ctx->wardrive_monitoring = false;
+                            bsp_display_lock(0);
+                            close_wardrive_gps_overlay(ctx);
+                            if (ctx->wardrive_start_btn) lv_obj_clear_state(ctx->wardrive_start_btn, LV_STATE_DISABLED);
+                            if (ctx->wardrive_stop_btn) lv_obj_add_state(ctx->wardrive_stop_btn, LV_STATE_DISABLED);
+                            if (ctx->wardrive_gps_type_btn) lv_obj_clear_state(ctx->wardrive_gps_type_btn, LV_STATE_DISABLED);
+                            bsp_display_unlock();
+                        }
+
+                        // Still waiting for GPS fix -> update overlay with progress
+                        if (strstr(line_buffer, "Still waiting for GPS fix") != NULL) {
+                            int elapsed = 0, total = 0;
+                            const char *paren = strchr(line_buffer, '(');
+                            if (paren) {
+                                sscanf(paren, "(%d/%d", &elapsed, &total);
+                            }
+
+                            bsp_display_lock(0);
+                            if (ctx->wardrive_gps_label) {
+                                if (total > 0) {
+                                    lv_label_set_text_fmt(ctx->wardrive_gps_label, "Acquiring GPS Fix... (%d/%ds)", elapsed, total);
+                                } else {
+                                    lv_label_set_text(ctx->wardrive_gps_label, "Acquiring GPS Fix...");
+                                }
+                            }
+                            bsp_display_unlock();
+                        }
+
+                        // Promiscuous wardrive started -> confirm active scanning
+                        if (strstr(line_buffer, "Promiscuous wardrive started") != NULL) {
+                            ESP_LOGI(TAG, "Wardrive: %s", line_buffer);
+
+                            bsp_display_lock(0);
+                            if (ctx->wardrive_status_label) {
+                                lv_label_set_text(ctx->wardrive_status_label, "Wardrive active - Scanning...");
+                                lv_obj_set_style_text_color(ctx->wardrive_status_label, COLOR_MATERIAL_GREEN, 0);
+                            }
+                            bsp_display_unlock();
+                        }
+
+                        // Wardrive promisc stopped (remote) -> graceful stop
+                        if (strstr(line_buffer, "Wardrive promisc stopped") != NULL) {
+                            ESP_LOGI(TAG, "Wardrive: remote stop - %s", line_buffer);
+
+                            int total_nets = 0;
+                            const char *total_str = strstr(line_buffer, "Total unique networks: ");
+                            if (total_str) {
+                                sscanf(total_str, "Total unique networks: %d", &total_nets);
+                            }
+
+                            ctx->wardrive_monitoring = false;
+                            bsp_display_lock(0);
+                            close_wardrive_gps_overlay(ctx);
+                            if (ctx->wardrive_start_btn) lv_obj_clear_state(ctx->wardrive_start_btn, LV_STATE_DISABLED);
+                            if (ctx->wardrive_stop_btn) lv_obj_add_state(ctx->wardrive_stop_btn, LV_STATE_DISABLED);
+                            if (ctx->wardrive_gps_type_btn) lv_obj_clear_state(ctx->wardrive_gps_type_btn, LV_STATE_DISABLED);
+                            if (ctx->wardrive_status_label) {
+                                lv_label_set_text(ctx->wardrive_status_label, "Wardrive stopped");
+                                lv_obj_set_style_text_color(ctx->wardrive_status_label, lv_color_hex(0x888888), 0);
+                            }
+                            if (ctx->wardrive_net_count_label) {
+                                lv_label_set_text_fmt(ctx->wardrive_net_count_label, "Networks: %d", total_nets);
                             }
                             bsp_display_unlock();
                         }
@@ -11310,10 +11447,8 @@ static void wardrive_monitor_task(void *arg)
             if (batch_has_new_networks) {
                 bsp_display_lock(0);
                 update_wardrive_table(ctx);
-                int display_count = ctx->wardrive_net_count < WARDRIVE_MAX_NETWORKS ? ctx->wardrive_net_count : WARDRIVE_MAX_NETWORKS;
-                if (ctx->wardrive_status_label) {
-                    lv_label_set_text_fmt(ctx->wardrive_status_label, "Scanning... Networks: %d", display_count);
-                    lv_obj_set_style_text_color(ctx->wardrive_status_label, COLOR_MATERIAL_GREEN, 0);
+                if (ctx->wardrive_net_count_label) {
+                    lv_label_set_text_fmt(ctx->wardrive_net_count_label, "Networks: %d", ctx->wardrive_net_count);
                 }
                 bsp_display_unlock();
             }
@@ -11334,14 +11469,14 @@ static void wardrive_start_cb(lv_event_t *e)
     if (!ctx) ctx = get_current_ctx();
     if (ctx->wardrive_monitoring) return;  // Already running
 
-    ESP_LOGI(TAG, "Wardrive start - sending start_wardrive command");
+    ESP_LOGI(TAG, "Wardrive start - sending start_wardrive_promisc command");
 
-    // Send start_wardrive command
+    // Send start_wardrive_promisc command
     tab_id_t active_tab = tab_id_for_ctx(ctx);
     if (active_tab == TAB_MBUS) {
-        uart2_send_command("start_wardrive");
+        uart2_send_command("start_wardrive_promisc");
     } else {
-        uart_send_command("start_wardrive");
+        uart_send_command("start_wardrive_promisc");
     }
 
     // Reset ring buffer
@@ -11362,6 +11497,9 @@ static void wardrive_start_cb(lv_event_t *e)
     if (ctx->wardrive_status_label) {
         lv_label_set_text(ctx->wardrive_status_label, "Starting wardrive...");
         lv_obj_set_style_text_color(ctx->wardrive_status_label, COLOR_MATERIAL_AMBER, 0);
+    }
+    if (ctx->wardrive_net_count_label) {
+        lv_label_set_text(ctx->wardrive_net_count_label, "Networks: 0");
     }
 
     // Show GPS fix overlay
@@ -11528,11 +11666,26 @@ static void show_wardrive_page(void)
     lv_obj_set_style_text_font(gps_type_label, &lv_font_montserrat_14, 0);
     lv_obj_center(gps_type_label);
 
-    // ---- Status label ----
-    ctx->wardrive_status_label = lv_label_create(ctx->wardrive_page);
+    // ---- Status row: status label (left) + net count label (right) ----
+    lv_obj_t *status_row = lv_obj_create(ctx->wardrive_page);
+    lv_obj_set_size(status_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(status_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(status_row, 0, 0);
+    lv_obj_set_style_pad_all(status_row, 0, 0);
+    lv_obj_set_flex_flow(status_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(status_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(status_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    ctx->wardrive_status_label = lv_label_create(status_row);
     lv_label_set_text(ctx->wardrive_status_label, "Press Start to begin wardrive");
     lv_obj_set_style_text_font(ctx->wardrive_status_label, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(ctx->wardrive_status_label, lv_color_hex(0x888888), 0);
+
+    ctx->wardrive_net_count_label = lv_label_create(status_row);
+    lv_label_set_text(ctx->wardrive_net_count_label, "");
+    lv_obj_set_style_text_font(ctx->wardrive_net_count_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(ctx->wardrive_net_count_label, COLOR_MATERIAL_TEAL, 0);
+    lv_obj_set_style_text_align(ctx->wardrive_net_count_label, LV_TEXT_ALIGN_RIGHT, 0);
 
     // ---- Scrollable table container ----
     ctx->wardrive_table = lv_obj_create(ctx->wardrive_page);
@@ -14663,6 +14816,688 @@ static void show_portal_data_page(void)
 // Handshakes Page
 //==================================================================================
 
+// Forward declaration
+static void show_handshakes_page(void);
+
+// ---- WPA-SEC Upload Popup ----
+
+static void close_wpasec_popup(lv_event_t *e)
+{
+    (void)e;
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx) return;
+
+    // Signal task to stop
+    ctx->wpasec_task_running = false;
+
+    if (ctx->wpasec_popup_overlay) {
+        lv_obj_del(ctx->wpasec_popup_overlay);
+        ctx->wpasec_popup_overlay = NULL;
+        ctx->wpasec_popup = NULL;
+        ctx->wpasec_status_label = NULL;
+        ctx->wpasec_network_list = NULL;
+        ctx->wpasec_password_input = NULL;
+        ctx->wpasec_keyboard = NULL;
+        ctx->wpasec_connect_btn = NULL;
+        ctx->wpasec_selected_ssid[0] = '\0';
+        ctx->wpasec_selected_password[0] = '\0';
+        ctx->wpasec_password_known = false;
+        ctx->wpasec_connect_ready = false;
+    }
+}
+
+// ---- WPA-SEC WiFi connect callbacks ----
+
+// Network row clicked - store selected SSID and highlight row
+static void wpasec_network_row_click_cb(lv_event_t *e)
+{
+    lv_obj_t *row = lv_event_get_target(e);
+    const char *ssid = (const char *)lv_event_get_user_data(e);
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx || !ssid) return;
+
+    strncpy(ctx->wpasec_selected_ssid, ssid, sizeof(ctx->wpasec_selected_ssid) - 1);
+    ctx->wpasec_selected_ssid[sizeof(ctx->wpasec_selected_ssid) - 1] = '\0';
+
+    // Highlight selected row, reset others
+    if (ctx->wpasec_network_list) {
+        uint32_t child_cnt = lv_obj_get_child_cnt(ctx->wpasec_network_list);
+        for (uint32_t i = 0; i < child_cnt; i++) {
+            lv_obj_t *child = lv_obj_get_child(ctx->wpasec_network_list, i);
+            lv_obj_set_style_bg_color(child, lv_color_hex(0x2D2D2D), 0);
+        }
+    }
+    lv_obj_set_style_bg_color(row, COLOR_MATERIAL_PURPLE, 0);
+}
+
+// Password input clicked - show keyboard
+static void wpasec_password_input_cb(lv_event_t *e)
+{
+    (void)e;
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx) return;
+    if (ctx->wpasec_keyboard) {
+        lv_obj_clear_flag(ctx->wpasec_keyboard, LV_OBJ_FLAG_HIDDEN);
+        lv_keyboard_set_textarea(ctx->wpasec_keyboard, ctx->wpasec_password_input);
+    }
+}
+
+// Keyboard ready/cancel - hide keyboard
+static void wpasec_keyboard_cb(lv_event_t *e)
+{
+    lv_event_code_t code = lv_event_get_code(e);
+    lv_obj_t *kb = lv_event_get_target(e);
+    if (code == LV_EVENT_READY || code == LV_EVENT_CANCEL) {
+        lv_obj_add_flag(kb, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+// Connect button clicked - store password and signal task to proceed
+static void wpasec_connect_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx) return;
+
+    if (ctx->wpasec_password_input) {
+        const char *text = lv_textarea_get_text(ctx->wpasec_password_input);
+        if (text && strlen(text) > 0) {
+            strncpy(ctx->wpasec_selected_password, text, sizeof(ctx->wpasec_selected_password) - 1);
+            ctx->wpasec_selected_password[sizeof(ctx->wpasec_selected_password) - 1] = '\0';
+        }
+    }
+
+    // Hide keyboard if visible
+    if (ctx->wpasec_keyboard) {
+        lv_obj_add_flag(ctx->wpasec_keyboard, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    ctx->wpasec_connect_ready = true;
+}
+
+static void wpasec_upload_task(void *arg)
+{
+    tab_context_t *ctx = (tab_context_t *)arg;
+    if (!ctx) {
+        vTaskDelete(NULL);
+        return;
+    }
+
+    uart_port_t uart_port = uart_port_for_tab(current_tab);
+
+    // Step 1: Check WPA-SEC key
+    uart_flush_input(uart_port);
+    uart_send_command_for_tab("wpasec_key read");
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    static char rx_buf[2048];
+    int total_len = 0;
+    int empty_reads = 0;
+
+    while (empty_reads < 5 && total_len < (int)sizeof(rx_buf) - 1) {
+        int len = transport_read_bytes(uart_port, rx_buf + total_len,
+                                       sizeof(rx_buf) - total_len - 1, pdMS_TO_TICKS(300));
+        if (len > 0) {
+            total_len += len;
+            empty_reads = 0;
+        } else {
+            empty_reads++;
+        }
+    }
+    rx_buf[total_len] = '\0';
+    ESP_LOGI(TAG, "wpasec_key read response: %s", rx_buf);
+
+    if (!ctx->wpasec_task_running) goto done;
+
+    if (strstr(rx_buf, "not set") != NULL) {
+        if (ctx->wpasec_status_label) {
+            lv_label_set_text(ctx->wpasec_status_label,
+                "Add your key to /lab/wpa-sec.txt\nin C5Monster and reboot.");
+        }
+        goto done;
+    }
+
+    // Step 2: Check WiFi -- if not connected, run inline WiFi connect flow
+    if (!ctx->wpasec_task_running) goto done;
+    if (!ctx->arp_wifi_connected && !arp_wifi_connected) {
+
+        // --- Step 2a: Scan networks ---
+        // (mirrors wifi_scan_task: same flush, transport, buffer, timeout)
+        bsp_display_lock(0);
+        if (ctx->wpasec_status_label) {
+            lv_label_set_text(ctx->wpasec_status_label, "Scanning WiFi networks...");
+        }
+        bsp_display_unlock();
+
+        tab_id_t scan_tab = current_tab;
+
+        // Flush like wifi_scan_task does
+        if (scan_tab == TAB_USB && usb_cdc_handle) {
+            usbh_cdc_flush_rx_buffer(usb_cdc_handle);
+        } else {
+            uart_flush(uart_port);
+        }
+
+        transport_write_bytes_tab(scan_tab, uart_port, "scan_networks\r\n", 15);
+        ESP_LOGI(TAG, "wpasec: sent scan_networks");
+
+        // Parse scan results (same buffer sizes / timeout as wifi_scan_task)
+        static wifi_network_t wpasec_nets[MAX_NETWORKS];
+        int wpasec_net_count = 0;
+        memset(wpasec_nets, 0, sizeof(wpasec_nets));
+
+        static char scan_rx_buf[UART_BUF_SIZE];
+        static char line_buf[512];
+        int line_pos = 0;
+        bool scan_complete = false;
+        TickType_t scan_start = xTaskGetTickCount();
+        TickType_t scan_timeout = pdMS_TO_TICKS(UART_RX_TIMEOUT);  // 30 seconds
+
+        while (!scan_complete && (xTaskGetTickCount() - scan_start) < scan_timeout && ctx->wpasec_task_running) {
+            int len = transport_read_bytes_tab(scan_tab, uart_port, scan_rx_buf, UART_BUF_SIZE - 1, pdMS_TO_TICKS(100));
+            if (len > 0) {
+                scan_rx_buf[len] = '\0';
+                for (int i = 0; i < len; i++) {
+                    char c = scan_rx_buf[i];
+                    if (c == '\n' || c == '\r') {
+                        if (line_pos > 0) {
+                            line_buf[line_pos] = '\0';
+                            if (strstr(line_buf, "Scan results printed") != NULL) {
+                                scan_complete = true;
+                                break;
+                            }
+                            if (line_buf[0] == '"' && wpasec_net_count < MAX_NETWORKS) {
+                                wifi_network_t net;
+                                if (parse_network_line(line_buf, &net)) {
+                                    wpasec_nets[wpasec_net_count++] = net;
+                                    ESP_LOGI(TAG, "wpasec: parsed network %d: %s (%s)",
+                                             net.index, net.ssid, net.bssid);
+                                }
+                            }
+                            line_pos = 0;
+                        }
+                    } else if (line_pos < (int)sizeof(line_buf) - 1) {
+                        line_buf[line_pos++] = c;
+                    }
+                }
+            }
+        }
+        if (!ctx->wpasec_task_running) goto done;
+
+        ESP_LOGI(TAG, "wpasec: scan found %d networks", wpasec_net_count);
+
+        if (wpasec_net_count == 0) {
+            bsp_display_lock(0);
+            if (ctx->wpasec_status_label) {
+                lv_label_set_text(ctx->wpasec_status_label, "No WiFi networks found.");
+            }
+            bsp_display_unlock();
+            goto done;
+        }
+
+        // Build network list UI
+        ctx->wpasec_selected_ssid[0] = '\0';
+        bsp_display_lock(0);
+        if (ctx->wpasec_status_label) {
+            lv_label_set_text_fmt(ctx->wpasec_status_label, "Found %d networks - select one:", wpasec_net_count);
+        }
+
+        // Create scrollable network list inside popup
+        if (ctx->wpasec_popup) {
+            ctx->wpasec_network_list = lv_obj_create(ctx->wpasec_popup);
+            lv_obj_set_size(ctx->wpasec_network_list, lv_pct(100), LV_SIZE_CONTENT);
+            lv_obj_set_flex_grow(ctx->wpasec_network_list, 1);
+            lv_obj_set_style_bg_color(ctx->wpasec_network_list, lv_color_hex(0x111122), 0);
+            lv_obj_set_style_border_width(ctx->wpasec_network_list, 0, 0);
+            lv_obj_set_style_radius(ctx->wpasec_network_list, 8, 0);
+            lv_obj_set_style_pad_all(ctx->wpasec_network_list, 6, 0);
+            lv_obj_set_flex_flow(ctx->wpasec_network_list, LV_FLEX_FLOW_COLUMN);
+            lv_obj_set_style_pad_row(ctx->wpasec_network_list, 4, 0);
+
+            // Move network list before the close button (close button is last child)
+            lv_obj_move_to_index(ctx->wpasec_network_list, -2);
+
+            for (int i = 0; i < wpasec_net_count; i++) {
+                wifi_network_t *net = &wpasec_nets[i];
+
+                lv_obj_t *row = lv_obj_create(ctx->wpasec_network_list);
+                lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
+                lv_obj_set_style_pad_all(row, 8, 0);
+                lv_obj_set_style_bg_color(row, lv_color_hex(0x2D2D2D), 0);
+                lv_obj_set_style_bg_color(row, lv_color_hex(0x3D3D3D), LV_STATE_PRESSED);
+                lv_obj_set_style_border_width(row, 0, 0);
+                lv_obj_set_style_radius(row, 8, 0);
+                lv_obj_set_flex_flow(row, LV_FLEX_FLOW_COLUMN);
+                lv_obj_set_style_pad_row(row, 2, 0);
+                lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+
+                // SSID label
+                lv_obj_t *ssid_lbl = lv_label_create(row);
+                if (strlen(net->ssid) > 0) {
+                    lv_label_set_text(ssid_lbl, net->ssid);
+                } else {
+                    lv_label_set_text(ssid_lbl, "(Hidden)");
+                }
+                lv_obj_set_style_text_font(ssid_lbl, &lv_font_montserrat_16, 0);
+                lv_obj_set_style_text_color(ssid_lbl, lv_color_hex(0xFFFFFF), 0);
+
+                // Info line
+                lv_obj_t *info_lbl = lv_label_create(row);
+                lv_label_set_text_fmt(info_lbl, "%s | %s | %s | %d dBm",
+                                      net->bssid, net->band, net->security, net->rssi);
+                lv_obj_set_style_text_font(info_lbl, &lv_font_montserrat_12, 0);
+                lv_obj_set_style_text_color(info_lbl, lv_color_hex(0x888888), 0);
+
+                // Store SSID pointer in the static array for callback
+                lv_obj_add_event_cb(row, wpasec_network_row_click_cb, LV_EVENT_CLICKED,
+                                    (void *)wpasec_nets[i].ssid);
+            }
+        }
+        bsp_display_unlock();
+
+        // --- Wait for user to select a network ---
+        while (ctx->wpasec_selected_ssid[0] == '\0' && ctx->wpasec_task_running) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+        if (!ctx->wpasec_task_running) goto done;
+
+        ESP_LOGI(TAG, "wpasec: user selected SSID: %s", ctx->wpasec_selected_ssid);
+
+        // --- Step 2b: Check Evil Twin database for known password ---
+        bsp_display_lock(0);
+        if (ctx->wpasec_status_label) {
+            lv_label_set_text_fmt(ctx->wpasec_status_label, "Selected: %s\nChecking known passwords...", ctx->wpasec_selected_ssid);
+        }
+        // Remove network list to make room
+        if (ctx->wpasec_network_list) {
+            lv_obj_del(ctx->wpasec_network_list);
+            ctx->wpasec_network_list = NULL;
+        }
+        bsp_display_unlock();
+
+        uart_flush_input(uart_port);
+        uart_send_command_for_tab("show_pass evil");
+        vTaskDelay(pdMS_TO_TICKS(200));
+
+        evil_twin_entry_t et_entries[EVIL_TWIN_MAX_ENTRIES];
+        int et_count = 0;
+        memset(et_entries, 0, sizeof(et_entries));
+
+        {
+            char et_buf[512];
+            int et_retries = 10;
+            int et_empty = 0;
+            while (et_retries-- > 0 && et_count < EVIL_TWIN_MAX_ENTRIES) {
+                int len = transport_read_bytes(uart_port, et_buf, sizeof(et_buf) - 1, pdMS_TO_TICKS(100));
+                if (len > 0) {
+                    et_buf[len] = '\0';
+                    et_empty = 0;
+                    char *line = strtok(et_buf, "\n\r");
+                    while (line != NULL && et_count < EVIL_TWIN_MAX_ENTRIES) {
+                        if (strlen(line) > 3 && line[0] == '\"') {
+                            char *ssid_start = line + 1;
+                            char *ssid_end = strchr(ssid_start, '\"');
+                            if (ssid_end && *(ssid_end + 1) == ',' && *(ssid_end + 2) == ' ' && *(ssid_end + 3) == '\"') {
+                                *ssid_end = '\0';
+                                char *pass_start = ssid_end + 4;
+                                char *pass_end = strchr(pass_start, '\"');
+                                if (pass_end) {
+                                    *pass_end = '\0';
+                                    strncpy(et_entries[et_count].ssid, ssid_start, 32);
+                                    et_entries[et_count].ssid[32] = '\0';
+                                    strncpy(et_entries[et_count].password, pass_start, 64);
+                                    et_entries[et_count].password[64] = '\0';
+                                    et_count++;
+                                }
+                            }
+                        }
+                        line = strtok(NULL, "\n\r");
+                    }
+                } else {
+                    et_empty++;
+                    if (et_empty >= 3) break;
+                }
+                vTaskDelay(pdMS_TO_TICKS(50));
+            }
+        }
+        if (!ctx->wpasec_task_running) goto done;
+
+        ESP_LOGI(TAG, "wpasec: loaded %d evil twin entries", et_count);
+
+        // Check if password is known
+        ctx->wpasec_password_known = false;
+        ctx->wpasec_selected_password[0] = '\0';
+        for (int i = 0; i < et_count; i++) {
+            if (strcmp(et_entries[i].ssid, ctx->wpasec_selected_ssid) == 0) {
+                strncpy(ctx->wpasec_selected_password, et_entries[i].password, sizeof(ctx->wpasec_selected_password) - 1);
+                ctx->wpasec_selected_password[sizeof(ctx->wpasec_selected_password) - 1] = '\0';
+                ctx->wpasec_password_known = true;
+                ESP_LOGI(TAG, "wpasec: found known password for %s", ctx->wpasec_selected_ssid);
+                break;
+            }
+        }
+
+        if (ctx->wpasec_password_known) {
+            // Password known - show it and proceed to connect
+            bsp_display_lock(0);
+            if (ctx->wpasec_status_label) {
+                lv_label_set_text_fmt(ctx->wpasec_status_label,
+                    "Known password for %s:\n%s\n\nConnecting...",
+                    ctx->wpasec_selected_ssid, ctx->wpasec_selected_password);
+            }
+            bsp_display_unlock();
+        } else {
+            // Password NOT known - show password input + keyboard
+            ctx->wpasec_connect_ready = false;
+
+            bsp_display_lock(0);
+            if (ctx->wpasec_status_label) {
+                lv_label_set_text_fmt(ctx->wpasec_status_label,
+                    "No known password for %s\nEnter WiFi password:", ctx->wpasec_selected_ssid);
+            }
+
+            if (ctx->wpasec_popup) {
+                // Password input row
+                lv_obj_t *pass_row = lv_obj_create(ctx->wpasec_popup);
+                lv_obj_set_size(pass_row, lv_pct(100), LV_SIZE_CONTENT);
+                lv_obj_set_style_bg_opa(pass_row, LV_OPA_TRANSP, 0);
+                lv_obj_set_style_border_width(pass_row, 0, 0);
+                lv_obj_set_style_pad_all(pass_row, 0, 0);
+                lv_obj_set_flex_flow(pass_row, LV_FLEX_FLOW_ROW);
+                lv_obj_set_flex_align(pass_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+                lv_obj_set_style_pad_column(pass_row, 10, 0);
+                lv_obj_clear_flag(pass_row, LV_OBJ_FLAG_SCROLLABLE);
+                // Move before close button
+                lv_obj_move_to_index(pass_row, -2);
+
+                // Textarea
+                ctx->wpasec_password_input = lv_textarea_create(pass_row);
+                lv_obj_set_size(ctx->wpasec_password_input, 400, 44);
+                lv_textarea_set_one_line(ctx->wpasec_password_input, true);
+                lv_textarea_set_placeholder_text(ctx->wpasec_password_input, "WiFi password");
+                lv_obj_set_style_bg_color(ctx->wpasec_password_input, lv_color_hex(0x1A1A1A), 0);
+                lv_obj_set_style_border_color(ctx->wpasec_password_input, COLOR_MATERIAL_PURPLE, 0);
+                lv_obj_set_style_border_width(ctx->wpasec_password_input, 1, 0);
+                lv_obj_set_style_text_color(ctx->wpasec_password_input, lv_color_hex(0xFFFFFF), 0);
+                lv_obj_set_style_text_font(ctx->wpasec_password_input, &lv_font_montserrat_16, 0);
+                lv_obj_add_event_cb(ctx->wpasec_password_input, wpasec_password_input_cb, LV_EVENT_CLICKED, NULL);
+
+                // Connect button
+                ctx->wpasec_connect_btn = lv_btn_create(pass_row);
+                lv_obj_set_size(ctx->wpasec_connect_btn, 130, 44);
+                lv_obj_set_style_bg_color(ctx->wpasec_connect_btn, COLOR_MATERIAL_GREEN, 0);
+                lv_obj_set_style_bg_color(ctx->wpasec_connect_btn, lv_color_hex(0x388E3C), LV_STATE_PRESSED);
+                lv_obj_set_style_radius(ctx->wpasec_connect_btn, 8, 0);
+                lv_obj_add_event_cb(ctx->wpasec_connect_btn, wpasec_connect_btn_cb, LV_EVENT_CLICKED, NULL);
+
+                lv_obj_t *btn_lbl = lv_label_create(ctx->wpasec_connect_btn);
+                lv_label_set_text(btn_lbl, "Connect");
+                lv_obj_set_style_text_font(btn_lbl, &lv_font_montserrat_16, 0);
+                lv_obj_set_style_text_color(btn_lbl, lv_color_hex(0xFFFFFF), 0);
+                lv_obj_center(btn_lbl);
+
+                // Keyboard (on overlay, not inside flex popup)
+                ctx->wpasec_keyboard = lv_keyboard_create(ctx->wpasec_popup_overlay);
+                lv_obj_set_size(ctx->wpasec_keyboard, lv_pct(100), 260);
+                lv_obj_align(ctx->wpasec_keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
+                lv_keyboard_set_textarea(ctx->wpasec_keyboard, ctx->wpasec_password_input);
+                lv_obj_add_event_cb(ctx->wpasec_keyboard, wpasec_keyboard_cb, LV_EVENT_ALL, NULL);
+                lv_obj_add_flag(ctx->wpasec_keyboard, LV_OBJ_FLAG_HIDDEN);
+            }
+            bsp_display_unlock();
+
+            // Wait for user to enter password and click Connect
+            while (!ctx->wpasec_connect_ready && ctx->wpasec_task_running) {
+                vTaskDelay(pdMS_TO_TICKS(100));
+            }
+            if (!ctx->wpasec_task_running) goto done;
+
+            if (strlen(ctx->wpasec_selected_password) == 0) {
+                bsp_display_lock(0);
+                if (ctx->wpasec_status_label) {
+                    lv_label_set_text(ctx->wpasec_status_label, "No password entered.");
+                }
+                bsp_display_unlock();
+                goto done;
+            }
+        }
+
+        // --- Step 2c: Connect to WiFi ---
+        if (!ctx->wpasec_task_running) goto done;
+
+        bsp_display_lock(0);
+        if (ctx->wpasec_status_label) {
+            lv_label_set_text_fmt(ctx->wpasec_status_label, "Connecting to %s...", ctx->wpasec_selected_ssid);
+        }
+        // Clean up password input widgets
+        if (ctx->wpasec_keyboard) {
+            lv_obj_del(ctx->wpasec_keyboard);
+            ctx->wpasec_keyboard = NULL;
+        }
+        bsp_display_unlock();
+
+        char wifi_cmd[128];
+        snprintf(wifi_cmd, sizeof(wifi_cmd), "wifi_connect %s %s",
+                 ctx->wpasec_selected_ssid, ctx->wpasec_selected_password);
+
+        uart_flush_input(uart_port);
+        uart_send_command_for_tab(wifi_cmd);
+        ESP_LOGI(TAG, "wpasec: sent wifi_connect for %s", ctx->wpasec_selected_ssid);
+
+        // Wait for SUCCESS/FAILED (up to 15 seconds)
+        total_len = 0;
+        bool wifi_success = false;
+        int wifi_elapsed = 0;
+        int wifi_timeout = 15000;
+
+        while (wifi_elapsed < wifi_timeout && total_len < (int)sizeof(rx_buf) - 256 && ctx->wpasec_task_running) {
+            int len = transport_read_bytes(uart_port, rx_buf + total_len,
+                                           sizeof(rx_buf) - total_len - 1, pdMS_TO_TICKS(200));
+            if (len > 0) {
+                total_len += len;
+                rx_buf[total_len] = '\0';
+                if (strstr(rx_buf, "SUCCESS") != NULL) {
+                    wifi_success = true;
+                    break;
+                }
+                if (strstr(rx_buf, "FAILED") != NULL || strstr(rx_buf, "Error") != NULL) {
+                    break;
+                }
+            }
+            wifi_elapsed += 200;
+        }
+
+        if (!ctx->wpasec_task_running) goto done;
+
+        if (wifi_success) {
+            arp_wifi_connected = true;
+            ESP_LOGI(TAG, "wpasec: connected to %s", ctx->wpasec_selected_ssid);
+            bsp_display_lock(0);
+            if (ctx->wpasec_status_label) {
+                lv_label_set_text_fmt(ctx->wpasec_status_label, "Connected to %s!", ctx->wpasec_selected_ssid);
+            }
+            bsp_display_unlock();
+            vTaskDelay(pdMS_TO_TICKS(500));
+        } else {
+            ESP_LOGW(TAG, "wpasec: failed to connect to %s", ctx->wpasec_selected_ssid);
+            bsp_display_lock(0);
+            if (ctx->wpasec_status_label) {
+                lv_label_set_text(ctx->wpasec_status_label, "WiFi connection failed!");
+            }
+            bsp_display_unlock();
+            goto done;
+        }
+    }
+
+    // Step 3: Check SD card
+    if (!ctx->wpasec_task_running) goto done;
+    if (!current_tab_has_sd_card()) {
+        bsp_display_lock(0);
+        if (ctx->wpasec_status_label) {
+            lv_label_set_text(ctx->wpasec_status_label, "No SD card detected!");
+        }
+        bsp_display_unlock();
+        goto done;
+    }
+
+    // Step 4: Upload
+    if (!ctx->wpasec_task_running) goto done;
+    bsp_display_lock(0);
+    if (ctx->wpasec_status_label) {
+        lv_label_set_text(ctx->wpasec_status_label, "Uploading to wpa-sec.stanev.org...\nPlease wait.");
+    }
+    bsp_display_unlock();
+
+    uart_flush_input(uart_port);
+    uart_send_command_for_tab("wpasec_upload");
+    vTaskDelay(pdMS_TO_TICKS(1000));
+
+    total_len = 0;
+    empty_reads = 0;
+    int elapsed_ms = 0;
+    int timeout_ms = 60000;
+
+    while (elapsed_ms < timeout_ms && empty_reads < 10 && ctx->wpasec_task_running) {
+        int len = transport_read_bytes(uart_port, rx_buf + total_len,
+                                       sizeof(rx_buf) - total_len - 1, pdMS_TO_TICKS(500));
+        if (len > 0) {
+            total_len += len;
+            rx_buf[total_len] = '\0';
+            empty_reads = 0;
+            // Check if we got the final response
+            if (strstr(rx_buf, "Done") != NULL || strstr(rx_buf, "fail") != NULL ||
+                strstr(rx_buf, "error") != NULL || strstr(rx_buf, "Error") != NULL) {
+                break;
+            }
+        } else {
+            empty_reads++;
+        }
+        elapsed_ms += 500;
+    }
+    rx_buf[total_len] = '\0';
+    ESP_LOGI(TAG, "wpasec_upload response: %s", rx_buf);
+
+    if (!ctx->wpasec_task_running) goto done;
+
+    bsp_display_lock(0);
+    char *done_ptr = strstr(rx_buf, "Done");
+    if (done_ptr != NULL) {
+        int uploaded = 0, duplicate = 0, failed = 0;
+        if (sscanf(done_ptr, "Done: %d uploaded, %d duplicate, %d failed",
+                   &uploaded, &duplicate, &failed) == 3) {
+            if (ctx->wpasec_status_label) {
+                lv_label_set_text_fmt(ctx->wpasec_status_label,
+                    "Upload complete!\n\n"
+                    "Uploaded: %d\n"
+                    "Duplicate: %d\n"
+                    "Failed: %d",
+                    uploaded, duplicate, failed);
+            }
+        } else {
+            if (ctx->wpasec_status_label) {
+                lv_label_set_text(ctx->wpasec_status_label, "Upload complete!");
+            }
+        }
+    } else {
+        if (ctx->wpasec_status_label) {
+            lv_label_set_text(ctx->wpasec_status_label, "Failed to send.");
+        }
+    }
+    bsp_display_unlock();
+
+done:
+    ctx->wpasec_task_running = false;
+    ctx->wpasec_task = NULL;
+    vTaskDelete(NULL);
+}
+
+static void show_wpasec_popup(void)
+{
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx) return;
+
+    lv_obj_t *container = get_current_tab_container();
+    if (!container) return;
+
+    // Don't open if already open
+    if (ctx->wpasec_popup_overlay) return;
+
+    // Create overlay
+    ctx->wpasec_popup_overlay = lv_obj_create(container);
+    lv_obj_remove_style_all(ctx->wpasec_popup_overlay);
+    lv_obj_set_size(ctx->wpasec_popup_overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(ctx->wpasec_popup_overlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(ctx->wpasec_popup_overlay, LV_OPA_50, 0);
+    lv_obj_clear_flag(ctx->wpasec_popup_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(ctx->wpasec_popup_overlay, LV_OBJ_FLAG_CLICKABLE);
+
+    // Create popup box (large to fit network list + keyboard)
+    ctx->wpasec_popup = lv_obj_create(ctx->wpasec_popup_overlay);
+    lv_obj_set_size(ctx->wpasec_popup, lv_pct(85), lv_pct(85));
+    lv_obj_center(ctx->wpasec_popup);
+    lv_obj_set_style_bg_color(ctx->wpasec_popup, lv_color_hex(0x1A1A2A), 0);
+    lv_obj_set_style_border_color(ctx->wpasec_popup, COLOR_MATERIAL_PURPLE, 0);
+    lv_obj_set_style_border_width(ctx->wpasec_popup, 2, 0);
+    lv_obj_set_style_radius(ctx->wpasec_popup, 16, 0);
+    lv_obj_set_style_shadow_width(ctx->wpasec_popup, 30, 0);
+    lv_obj_set_style_shadow_color(ctx->wpasec_popup, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_shadow_opa(ctx->wpasec_popup, LV_OPA_60, 0);
+    lv_obj_set_flex_flow(ctx->wpasec_popup, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(ctx->wpasec_popup, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_all(ctx->wpasec_popup, 20, 0);
+    lv_obj_set_style_pad_row(ctx->wpasec_popup, 12, 0);
+    lv_obj_clear_flag(ctx->wpasec_popup, LV_OBJ_FLAG_SCROLLABLE);
+
+    // Title
+    lv_obj_t *title_lbl = lv_label_create(ctx->wpasec_popup);
+    lv_label_set_text(title_lbl, LV_SYMBOL_UPLOAD " WPA-SEC Upload");
+    lv_obj_set_style_text_font(title_lbl, &lv_font_montserrat_22, 0);
+    lv_obj_set_style_text_color(title_lbl, COLOR_MATERIAL_PURPLE, 0);
+
+    // Status label
+    ctx->wpasec_status_label = lv_label_create(ctx->wpasec_popup);
+    lv_label_set_text(ctx->wpasec_status_label, "Checking key...");
+    lv_obj_set_style_text_font(ctx->wpasec_status_label, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_color(ctx->wpasec_status_label, lv_color_hex(0xCCCCCC), 0);
+    lv_obj_set_style_text_align(ctx->wpasec_status_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(ctx->wpasec_status_label, lv_pct(90));
+    lv_label_set_long_mode(ctx->wpasec_status_label, LV_LABEL_LONG_WRAP);
+
+    // Close button
+    lv_obj_t *close_btn = lv_btn_create(ctx->wpasec_popup);
+    lv_obj_set_size(close_btn, 120, 44);
+    lv_obj_set_style_bg_color(close_btn, lv_color_hex(0x444444), 0);
+    lv_obj_set_style_bg_color(close_btn, lv_color_hex(0x555555), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(close_btn, 8, 0);
+    lv_obj_add_event_cb(close_btn, close_wpasec_popup, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *close_lbl = lv_label_create(close_btn);
+    lv_label_set_text(close_lbl, "Close");
+    lv_obj_set_style_text_font(close_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(close_lbl, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_center(close_lbl);
+
+    // Reset WiFi-connect state
+    ctx->wpasec_selected_ssid[0] = '\0';
+    ctx->wpasec_selected_password[0] = '\0';
+    ctx->wpasec_password_known = false;
+    ctx->wpasec_connect_ready = false;
+    ctx->wpasec_network_list = NULL;
+    ctx->wpasec_password_input = NULL;
+    ctx->wpasec_keyboard = NULL;
+    ctx->wpasec_connect_btn = NULL;
+
+    // Launch UART task (larger stack for scan/connect buffers)
+    ctx->wpasec_task_running = true;
+    xTaskCreate(wpasec_upload_task, "wpasec_task", 12288, ctx, 5, &ctx->wpasec_task);
+}
+
+static void wpasec_btn_event_cb(lv_event_t *e)
+{
+    (void)e;
+    show_wpasec_popup();
+}
+
 static void show_handshakes_page(void)
 {
     tab_context_t *ctx = get_current_ctx();
@@ -14718,7 +15553,27 @@ static void show_handshakes_page(void)
     lv_label_set_text(title, "Captured Handshakes");
     lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
     lv_obj_set_style_text_color(title, COLOR_MATERIAL_PURPLE, 0);
-    
+
+    // Spacer to push button to the right
+    lv_obj_t *spacer = lv_obj_create(header);
+    lv_obj_remove_style_all(spacer);
+    lv_obj_set_flex_grow(spacer, 1);
+    lv_obj_set_height(spacer, 1);
+
+    // "Send to wpa-sec" button
+    lv_obj_t *wpasec_btn = lv_btn_create(header);
+    lv_obj_set_size(wpasec_btn, 190, 50);
+    lv_obj_set_style_bg_color(wpasec_btn, COLOR_MATERIAL_PURPLE, 0);
+    lv_obj_set_style_bg_color(wpasec_btn, lv_color_hex(0x9C27B0), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(wpasec_btn, 8, 0);
+    lv_obj_add_event_cb(wpasec_btn, wpasec_btn_event_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *wpasec_btn_lbl = lv_label_create(wpasec_btn);
+    lv_label_set_text(wpasec_btn_lbl, LV_SYMBOL_UPLOAD " Send to wpa-sec");
+    lv_obj_set_style_text_font(wpasec_btn_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(wpasec_btn_lbl, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_center(wpasec_btn_lbl);
+
     // Status label
     lv_obj_t *status_label = lv_label_create(ctx->handshakes_page);
     lv_label_set_text(status_label, "Loading...");
