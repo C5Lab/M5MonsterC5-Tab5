@@ -117,6 +117,8 @@ static const char *TAG = "wifi_scanner";
 // Screenshot feature - set to false to disable screenshot on LABORATORIUM tap
 #define SCREENSHOT_ENABLED true
 #define SCREENSHOT_DIR "/sdcard/screenshots"
+#define WPASEC_OTHER_SSID "__WPASEC_OTHER__"
+#define WPASEC_PASSWORD_SHOW_MS 1500
 
 // WiFi network info structure
 typedef struct {
@@ -15349,16 +15351,16 @@ static void wpasec_network_row_click_cb(lv_event_t *e)
     lv_obj_set_style_bg_color(row, COLOR_MATERIAL_PURPLE, 0);
 }
 
-// Password input clicked - show keyboard
-static void wpasec_password_input_cb(lv_event_t *e)
+// Text input focused/clicked - show keyboard
+static void wpasec_text_input_cb(lv_event_t *e)
 {
-    (void)e;
     tab_context_t *ctx = get_current_ctx();
-    if (!ctx) return;
-    if (ctx->wpasec_keyboard) {
-        lv_obj_clear_flag(ctx->wpasec_keyboard, LV_OBJ_FLAG_HIDDEN);
-        lv_keyboard_set_textarea(ctx->wpasec_keyboard, ctx->wpasec_password_input);
-    }
+    if (!ctx || !ctx->wpasec_keyboard) return;
+
+    lv_obj_t *ta = lv_event_get_target(e);
+    lv_textarea_set_placeholder_text(ta, "");
+    lv_obj_clear_flag(ctx->wpasec_keyboard, LV_OBJ_FLAG_HIDDEN);
+    lv_keyboard_set_textarea(ctx->wpasec_keyboard, ta);
 }
 
 // Keyboard ready/cancel - hide keyboard
@@ -15374,9 +15376,19 @@ static void wpasec_keyboard_cb(lv_event_t *e)
 // Connect button clicked - store password and signal task to proceed
 static void wpasec_connect_btn_cb(lv_event_t *e)
 {
-    (void)e;
     tab_context_t *ctx = get_current_ctx();
     if (!ctx) return;
+
+    lv_obj_t *ssid_input = (lv_obj_t *)lv_event_get_user_data(e);
+    if (ssid_input) {
+        const char *ssid_text = lv_textarea_get_text(ssid_input);
+        if (ssid_text && strlen(ssid_text) > 0) {
+            strncpy(ctx->wpasec_selected_ssid, ssid_text, sizeof(ctx->wpasec_selected_ssid) - 1);
+            ctx->wpasec_selected_ssid[sizeof(ctx->wpasec_selected_ssid) - 1] = '\0';
+        } else {
+            ctx->wpasec_selected_ssid[0] = '\0';
+        }
+    }
 
     if (ctx->wpasec_password_input) {
         const char *text = lv_textarea_get_text(ctx->wpasec_password_input);
@@ -15392,6 +15404,113 @@ static void wpasec_connect_btn_cb(lv_event_t *e)
     }
 
     ctx->wpasec_connect_ready = true;
+}
+
+// Show/hide password callback
+static void wpasec_show_password_toggle_cb(lv_event_t *e)
+{
+    lv_obj_t *checkbox = lv_event_get_target(e);
+    lv_obj_t *password_input = (lv_obj_t *)lv_event_get_user_data(e);
+    if (!password_input) return;
+
+    bool show_password = lv_obj_has_state(checkbox, LV_STATE_CHECKED);
+    lv_textarea_set_password_mode(password_input, !show_password);
+}
+
+static void wpasec_create_credentials_prompt(tab_context_t *ctx, bool with_ssid)
+{
+    if (!ctx || !ctx->wpasec_popup) return;
+
+    lv_obj_t *credentials_col = lv_obj_create(ctx->wpasec_popup);
+    lv_obj_set_size(credentials_col, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(credentials_col, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(credentials_col, 0, 0);
+    lv_obj_set_style_pad_all(credentials_col, 0, 0);
+    lv_obj_set_flex_flow(credentials_col, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(credentials_col, 8, 0);
+    lv_obj_clear_flag(credentials_col, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_move_to_index(credentials_col, -2);
+
+    lv_obj_t *ssid_input = NULL;
+    if (with_ssid) {
+        lv_obj_t *ssid_row = lv_obj_create(credentials_col);
+        lv_obj_set_size(ssid_row, lv_pct(100), LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_opa(ssid_row, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(ssid_row, 0, 0);
+        lv_obj_set_style_pad_all(ssid_row, 0, 0);
+        lv_obj_set_flex_flow(ssid_row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(ssid_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_clear_flag(ssid_row, LV_OBJ_FLAG_SCROLLABLE);
+
+        ssid_input = lv_textarea_create(ssid_row);
+        lv_obj_set_size(ssid_input, lv_pct(100), 44);
+        lv_textarea_set_one_line(ssid_input, true);
+        lv_textarea_set_max_length(ssid_input, 32);
+        lv_textarea_set_placeholder_text(ssid_input, "SSID");
+        lv_obj_set_style_bg_color(ssid_input, lv_color_hex(0x1A1A1A), 0);
+        lv_obj_set_style_border_color(ssid_input, COLOR_MATERIAL_PURPLE, 0);
+        lv_obj_set_style_border_width(ssid_input, 1, 0);
+        lv_obj_set_style_text_color(ssid_input, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_set_style_text_font(ssid_input, &lv_font_montserrat_16, 0);
+        lv_obj_add_event_cb(ssid_input, wpasec_text_input_cb, LV_EVENT_CLICKED, NULL);
+        lv_obj_add_event_cb(ssid_input, wpasec_text_input_cb, LV_EVENT_FOCUSED, NULL);
+    }
+
+    lv_obj_t *pass_row = lv_obj_create(credentials_col);
+    lv_obj_set_size(pass_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(pass_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(pass_row, 0, 0);
+    lv_obj_set_style_pad_all(pass_row, 0, 0);
+    lv_obj_set_flex_flow(pass_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(pass_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(pass_row, 10, 0);
+    lv_obj_clear_flag(pass_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    ctx->wpasec_password_input = lv_textarea_create(pass_row);
+    lv_obj_set_size(ctx->wpasec_password_input, 380, 44);
+    lv_textarea_set_one_line(ctx->wpasec_password_input, true);
+    lv_textarea_set_max_length(ctx->wpasec_password_input, 64);
+    lv_textarea_set_placeholder_text(ctx->wpasec_password_input, "WiFi password");
+    lv_textarea_set_password_mode(ctx->wpasec_password_input, true);
+    lv_textarea_set_password_show_time(ctx->wpasec_password_input, WPASEC_PASSWORD_SHOW_MS);
+    lv_obj_set_style_bg_color(ctx->wpasec_password_input, lv_color_hex(0x1A1A1A), 0);
+    lv_obj_set_style_border_color(ctx->wpasec_password_input, COLOR_MATERIAL_PURPLE, 0);
+    lv_obj_set_style_border_width(ctx->wpasec_password_input, 1, 0);
+    lv_obj_set_style_text_color(ctx->wpasec_password_input, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_font(ctx->wpasec_password_input, &lv_font_montserrat_16, 0);
+    lv_obj_add_event_cb(ctx->wpasec_password_input, wpasec_text_input_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(ctx->wpasec_password_input, wpasec_text_input_cb, LV_EVENT_FOCUSED, NULL);
+
+    ctx->wpasec_connect_btn = lv_btn_create(pass_row);
+    lv_obj_set_size(ctx->wpasec_connect_btn, 130, 44);
+    lv_obj_set_style_bg_color(ctx->wpasec_connect_btn, COLOR_MATERIAL_GREEN, 0);
+    lv_obj_set_style_bg_color(ctx->wpasec_connect_btn, lv_color_hex(0x388E3C), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(ctx->wpasec_connect_btn, 8, 0);
+    lv_obj_add_event_cb(ctx->wpasec_connect_btn, wpasec_connect_btn_cb, LV_EVENT_CLICKED, ssid_input);
+
+    lv_obj_t *btn_lbl = lv_label_create(ctx->wpasec_connect_btn);
+    lv_label_set_text(btn_lbl, "Connect");
+    lv_obj_set_style_text_font(btn_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(btn_lbl, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_center(btn_lbl);
+
+    lv_obj_t *show_pass_checkbox = lv_checkbox_create(credentials_col);
+    lv_checkbox_set_text(show_pass_checkbox, "Show password");
+    lv_obj_set_style_text_font(show_pass_checkbox, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(show_pass_checkbox, lv_color_hex(0xDDDDDD), 0);
+    lv_obj_add_event_cb(show_pass_checkbox, wpasec_show_password_toggle_cb, LV_EVENT_VALUE_CHANGED, ctx->wpasec_password_input);
+
+    if (ctx->wpasec_keyboard) {
+        lv_obj_del(ctx->wpasec_keyboard);
+        ctx->wpasec_keyboard = NULL;
+    }
+
+    ctx->wpasec_keyboard = lv_keyboard_create(ctx->wpasec_popup_overlay);
+    lv_obj_set_size(ctx->wpasec_keyboard, lv_pct(100), 260);
+    lv_obj_align(ctx->wpasec_keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_keyboard_set_textarea(ctx->wpasec_keyboard, with_ssid ? ssid_input : ctx->wpasec_password_input);
+    lv_obj_add_event_cb(ctx->wpasec_keyboard, wpasec_keyboard_cb, LV_EVENT_ALL, NULL);
+    lv_obj_add_flag(ctx->wpasec_keyboard, LV_OBJ_FLAG_HIDDEN);
 }
 
 static void wpasec_upload_task(void *arg)
@@ -15571,6 +15690,30 @@ static void wpasec_upload_task(void *arg)
                 lv_obj_add_event_cb(row, wpasec_network_row_click_cb, LV_EVENT_CLICKED,
                                     (void *)wpasec_nets[i].ssid);
             }
+
+            // Manual entry option at the bottom
+            lv_obj_t *other_row = lv_obj_create(ctx->wpasec_network_list);
+            lv_obj_set_size(other_row, lv_pct(100), LV_SIZE_CONTENT);
+            lv_obj_set_style_pad_all(other_row, 8, 0);
+            lv_obj_set_style_bg_color(other_row, lv_color_hex(0x2D2D2D), 0);
+            lv_obj_set_style_bg_color(other_row, lv_color_hex(0x3D3D3D), LV_STATE_PRESSED);
+            lv_obj_set_style_border_width(other_row, 0, 0);
+            lv_obj_set_style_radius(other_row, 8, 0);
+            lv_obj_set_flex_flow(other_row, LV_FLEX_FLOW_COLUMN);
+            lv_obj_set_style_pad_row(other_row, 2, 0);
+            lv_obj_add_flag(other_row, LV_OBJ_FLAG_CLICKABLE);
+
+            lv_obj_t *other_ssid_lbl = lv_label_create(other_row);
+            lv_label_set_text(other_ssid_lbl, "Other");
+            lv_obj_set_style_text_font(other_ssid_lbl, &lv_font_montserrat_16, 0);
+            lv_obj_set_style_text_color(other_ssid_lbl, lv_color_hex(0xFFFFFF), 0);
+
+            lv_obj_t *other_info_lbl = lv_label_create(other_row);
+            lv_label_set_text(other_info_lbl, "Enter SSID and password manually");
+            lv_obj_set_style_text_font(other_info_lbl, &lv_font_montserrat_12, 0);
+            lv_obj_set_style_text_color(other_info_lbl, lv_color_hex(0x888888), 0);
+
+            lv_obj_add_event_cb(other_row, wpasec_network_row_click_cb, LV_EVENT_CLICKED, (void *)WPASEC_OTHER_SSID);
         }
         bsp_display_unlock();
 
@@ -15582,162 +15725,148 @@ static void wpasec_upload_task(void *arg)
 
         ESP_LOGI(TAG, "wpasec: user selected SSID: %s", ctx->wpasec_selected_ssid);
 
-        // --- Step 2b: Check Evil Twin database for known password ---
+        bool manual_credentials = (strcmp(ctx->wpasec_selected_ssid, WPASEC_OTHER_SSID) == 0);
+
+        // Remove network list to make room
         bsp_display_lock(0);
         if (ctx->wpasec_status_label) {
-            lv_label_set_text_fmt(ctx->wpasec_status_label, "Selected: %s\nChecking known passwords...", ctx->wpasec_selected_ssid);
+            if (manual_credentials) {
+                lv_label_set_text(ctx->wpasec_status_label, "Manual network selected\nEnter SSID and WiFi password:");
+            } else {
+                lv_label_set_text_fmt(ctx->wpasec_status_label, "Selected: %s\nChecking known passwords...", ctx->wpasec_selected_ssid);
+            }
         }
-        // Remove network list to make room
         if (ctx->wpasec_network_list) {
             lv_obj_del(ctx->wpasec_network_list);
             ctx->wpasec_network_list = NULL;
         }
         bsp_display_unlock();
 
-        uart_flush_input(uart_port);
-        uart_send_command_for_tab("show_pass evil");
-        vTaskDelay(pdMS_TO_TICKS(200));
-
-        evil_twin_entry_t et_entries[EVIL_TWIN_MAX_ENTRIES];
-        int et_count = 0;
-        memset(et_entries, 0, sizeof(et_entries));
-
-        {
-            char et_buf[512];
-            int et_retries = 10;
-            int et_empty = 0;
-            while (et_retries-- > 0 && et_count < EVIL_TWIN_MAX_ENTRIES) {
-                int len = transport_read_bytes(uart_port, et_buf, sizeof(et_buf) - 1, pdMS_TO_TICKS(100));
-                if (len > 0) {
-                    et_buf[len] = '\0';
-                    et_empty = 0;
-                    char *line = strtok(et_buf, "\n\r");
-                    while (line != NULL && et_count < EVIL_TWIN_MAX_ENTRIES) {
-                        if (strlen(line) > 3 && line[0] == '\"') {
-                            char *ssid_start = line + 1;
-                            char *ssid_end = strchr(ssid_start, '\"');
-                            if (ssid_end && *(ssid_end + 1) == ',' && *(ssid_end + 2) == ' ' && *(ssid_end + 3) == '\"') {
-                                *ssid_end = '\0';
-                                char *pass_start = ssid_end + 4;
-                                char *pass_end = strchr(pass_start, '\"');
-                                if (pass_end) {
-                                    *pass_end = '\0';
-                                    strncpy(et_entries[et_count].ssid, ssid_start, 32);
-                                    et_entries[et_count].ssid[32] = '\0';
-                                    strncpy(et_entries[et_count].password, pass_start, 64);
-                                    et_entries[et_count].password[64] = '\0';
-                                    et_count++;
-                                }
-                            }
-                        }
-                        line = strtok(NULL, "\n\r");
-                    }
-                } else {
-                    et_empty++;
-                    if (et_empty >= 3) break;
-                }
-                vTaskDelay(pdMS_TO_TICKS(50));
-            }
-        }
-        if (!ctx->wpasec_task_running) goto done;
-
-        ESP_LOGI(TAG, "wpasec: loaded %d evil twin entries", et_count);
-
-        // Check if password is known
-        ctx->wpasec_password_known = false;
-        ctx->wpasec_selected_password[0] = '\0';
-        for (int i = 0; i < et_count; i++) {
-            if (strcmp(et_entries[i].ssid, ctx->wpasec_selected_ssid) == 0) {
-                strncpy(ctx->wpasec_selected_password, et_entries[i].password, sizeof(ctx->wpasec_selected_password) - 1);
-                ctx->wpasec_selected_password[sizeof(ctx->wpasec_selected_password) - 1] = '\0';
-                ctx->wpasec_password_known = true;
-                ESP_LOGI(TAG, "wpasec: found known password for %s", ctx->wpasec_selected_ssid);
-                break;
-            }
-        }
-
-        if (ctx->wpasec_password_known) {
-            // Password known - show it and proceed to connect
-            bsp_display_lock(0);
-            if (ctx->wpasec_status_label) {
-                lv_label_set_text_fmt(ctx->wpasec_status_label,
-                    "Known password for %s:\n%s\n\nConnecting...",
-                    ctx->wpasec_selected_ssid, ctx->wpasec_selected_password);
-            }
-            bsp_display_unlock();
-        } else {
-            // Password NOT known - show password input + keyboard
+        if (manual_credentials) {
+            ctx->wpasec_selected_ssid[0] = '\0';
+            ctx->wpasec_selected_password[0] = '\0';
+            ctx->wpasec_password_known = false;
             ctx->wpasec_connect_ready = false;
 
             bsp_display_lock(0);
-            if (ctx->wpasec_status_label) {
-                lv_label_set_text_fmt(ctx->wpasec_status_label,
-                    "No known password for %s\nEnter WiFi password:", ctx->wpasec_selected_ssid);
-            }
-
             if (ctx->wpasec_popup) {
-                // Password input row
-                lv_obj_t *pass_row = lv_obj_create(ctx->wpasec_popup);
-                lv_obj_set_size(pass_row, lv_pct(100), LV_SIZE_CONTENT);
-                lv_obj_set_style_bg_opa(pass_row, LV_OPA_TRANSP, 0);
-                lv_obj_set_style_border_width(pass_row, 0, 0);
-                lv_obj_set_style_pad_all(pass_row, 0, 0);
-                lv_obj_set_flex_flow(pass_row, LV_FLEX_FLOW_ROW);
-                lv_obj_set_flex_align(pass_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-                lv_obj_set_style_pad_column(pass_row, 10, 0);
-                lv_obj_clear_flag(pass_row, LV_OBJ_FLAG_SCROLLABLE);
-                // Move before close button
-                lv_obj_move_to_index(pass_row, -2);
-
-                // Textarea
-                ctx->wpasec_password_input = lv_textarea_create(pass_row);
-                lv_obj_set_size(ctx->wpasec_password_input, 400, 44);
-                lv_textarea_set_one_line(ctx->wpasec_password_input, true);
-                lv_textarea_set_placeholder_text(ctx->wpasec_password_input, "WiFi password");
-                lv_obj_set_style_bg_color(ctx->wpasec_password_input, lv_color_hex(0x1A1A1A), 0);
-                lv_obj_set_style_border_color(ctx->wpasec_password_input, COLOR_MATERIAL_PURPLE, 0);
-                lv_obj_set_style_border_width(ctx->wpasec_password_input, 1, 0);
-                lv_obj_set_style_text_color(ctx->wpasec_password_input, lv_color_hex(0xFFFFFF), 0);
-                lv_obj_set_style_text_font(ctx->wpasec_password_input, &lv_font_montserrat_16, 0);
-                lv_obj_add_event_cb(ctx->wpasec_password_input, wpasec_password_input_cb, LV_EVENT_CLICKED, NULL);
-
-                // Connect button
-                ctx->wpasec_connect_btn = lv_btn_create(pass_row);
-                lv_obj_set_size(ctx->wpasec_connect_btn, 130, 44);
-                lv_obj_set_style_bg_color(ctx->wpasec_connect_btn, COLOR_MATERIAL_GREEN, 0);
-                lv_obj_set_style_bg_color(ctx->wpasec_connect_btn, lv_color_hex(0x388E3C), LV_STATE_PRESSED);
-                lv_obj_set_style_radius(ctx->wpasec_connect_btn, 8, 0);
-                lv_obj_add_event_cb(ctx->wpasec_connect_btn, wpasec_connect_btn_cb, LV_EVENT_CLICKED, NULL);
-
-                lv_obj_t *btn_lbl = lv_label_create(ctx->wpasec_connect_btn);
-                lv_label_set_text(btn_lbl, "Connect");
-                lv_obj_set_style_text_font(btn_lbl, &lv_font_montserrat_16, 0);
-                lv_obj_set_style_text_color(btn_lbl, lv_color_hex(0xFFFFFF), 0);
-                lv_obj_center(btn_lbl);
-
-                // Keyboard (on overlay, not inside flex popup)
-                ctx->wpasec_keyboard = lv_keyboard_create(ctx->wpasec_popup_overlay);
-                lv_obj_set_size(ctx->wpasec_keyboard, lv_pct(100), 260);
-                lv_obj_align(ctx->wpasec_keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
-                lv_keyboard_set_textarea(ctx->wpasec_keyboard, ctx->wpasec_password_input);
-                lv_obj_add_event_cb(ctx->wpasec_keyboard, wpasec_keyboard_cb, LV_EVENT_ALL, NULL);
-                lv_obj_add_flag(ctx->wpasec_keyboard, LV_OBJ_FLAG_HIDDEN);
+                wpasec_create_credentials_prompt(ctx, true);
             }
             bsp_display_unlock();
 
-            // Wait for user to enter password and click Connect
             while (!ctx->wpasec_connect_ready && ctx->wpasec_task_running) {
                 vTaskDelay(pdMS_TO_TICKS(100));
             }
             if (!ctx->wpasec_task_running) goto done;
 
-            if (strlen(ctx->wpasec_selected_password) == 0) {
+            if (strlen(ctx->wpasec_selected_ssid) == 0 || strlen(ctx->wpasec_selected_password) == 0) {
                 bsp_display_lock(0);
                 if (ctx->wpasec_status_label) {
-                    lv_label_set_text(ctx->wpasec_status_label, "No password entered.");
+                    lv_label_set_text(ctx->wpasec_status_label, "Enter SSID and password.");
                 }
                 bsp_display_unlock();
                 goto done;
+            }
+        } else {
+            uart_flush_input(uart_port);
+            uart_send_command_for_tab("show_pass evil");
+            vTaskDelay(pdMS_TO_TICKS(200));
+
+            evil_twin_entry_t et_entries[EVIL_TWIN_MAX_ENTRIES];
+            int et_count = 0;
+            memset(et_entries, 0, sizeof(et_entries));
+
+            {
+                char et_buf[512];
+                int et_retries = 10;
+                int et_empty = 0;
+                while (et_retries-- > 0 && et_count < EVIL_TWIN_MAX_ENTRIES) {
+                    int len = transport_read_bytes(uart_port, et_buf, sizeof(et_buf) - 1, pdMS_TO_TICKS(100));
+                    if (len > 0) {
+                        et_buf[len] = '\0';
+                        et_empty = 0;
+                        char *line = strtok(et_buf, "\n\r");
+                        while (line != NULL && et_count < EVIL_TWIN_MAX_ENTRIES) {
+                            if (strlen(line) > 3 && line[0] == '\"') {
+                                char *ssid_start = line + 1;
+                                char *ssid_end = strchr(ssid_start, '\"');
+                                if (ssid_end && *(ssid_end + 1) == ',' && *(ssid_end + 2) == ' ' && *(ssid_end + 3) == '\"') {
+                                    *ssid_end = '\0';
+                                    char *pass_start = ssid_end + 4;
+                                    char *pass_end = strchr(pass_start, '\"');
+                                    if (pass_end) {
+                                        *pass_end = '\0';
+                                        strncpy(et_entries[et_count].ssid, ssid_start, 32);
+                                        et_entries[et_count].ssid[32] = '\0';
+                                        strncpy(et_entries[et_count].password, pass_start, 64);
+                                        et_entries[et_count].password[64] = '\0';
+                                        et_count++;
+                                    }
+                                }
+                            }
+                            line = strtok(NULL, "\n\r");
+                        }
+                    } else {
+                        et_empty++;
+                        if (et_empty >= 3) break;
+                    }
+                    vTaskDelay(pdMS_TO_TICKS(50));
+                }
+            }
+            if (!ctx->wpasec_task_running) goto done;
+
+            ESP_LOGI(TAG, "wpasec: loaded %d evil twin entries", et_count);
+
+            // Check if password is known
+            ctx->wpasec_password_known = false;
+            ctx->wpasec_selected_password[0] = '\0';
+            for (int i = 0; i < et_count; i++) {
+                if (strcmp(et_entries[i].ssid, ctx->wpasec_selected_ssid) == 0) {
+                    strncpy(ctx->wpasec_selected_password, et_entries[i].password, sizeof(ctx->wpasec_selected_password) - 1);
+                    ctx->wpasec_selected_password[sizeof(ctx->wpasec_selected_password) - 1] = '\0';
+                    ctx->wpasec_password_known = true;
+                    ESP_LOGI(TAG, "wpasec: found known password for %s", ctx->wpasec_selected_ssid);
+                    break;
+                }
+            }
+
+            if (ctx->wpasec_password_known) {
+                // Password known - show it and proceed to connect
+                bsp_display_lock(0);
+                if (ctx->wpasec_status_label) {
+                    lv_label_set_text_fmt(ctx->wpasec_status_label,
+                        "Known password for %s:\n%s\n\nConnecting...",
+                        ctx->wpasec_selected_ssid, ctx->wpasec_selected_password);
+                }
+                bsp_display_unlock();
+            } else {
+                // Password NOT known - show password input + keyboard
+                ctx->wpasec_connect_ready = false;
+
+                bsp_display_lock(0);
+                if (ctx->wpasec_status_label) {
+                    lv_label_set_text_fmt(ctx->wpasec_status_label,
+                        "No known password for %s\nEnter WiFi password:", ctx->wpasec_selected_ssid);
+                }
+                if (ctx->wpasec_popup) {
+                    wpasec_create_credentials_prompt(ctx, false);
+                }
+                bsp_display_unlock();
+
+                // Wait for user to enter password and click Connect
+                while (!ctx->wpasec_connect_ready && ctx->wpasec_task_running) {
+                    vTaskDelay(pdMS_TO_TICKS(100));
+                }
+                if (!ctx->wpasec_task_running) goto done;
+
+                if (strlen(ctx->wpasec_selected_password) == 0) {
+                    bsp_display_lock(0);
+                    if (ctx->wpasec_status_label) {
+                        lv_label_set_text(ctx->wpasec_status_label, "No password entered.");
+                    }
+                    bsp_display_unlock();
+                    goto done;
+                }
             }
         }
 
