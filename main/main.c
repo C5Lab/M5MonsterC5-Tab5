@@ -12274,8 +12274,9 @@ static void wardrive_wigle_create_credentials_prompt(tab_context_t *ctx, bool wi
     }
 
     ctx->wardrive_wigle_keyboard = lv_keyboard_create(ctx->wardrive_wigle_popup_overlay);
-    lv_obj_set_size(ctx->wardrive_wigle_keyboard, lv_pct(100), 260);
-    lv_obj_align(ctx->wardrive_wigle_keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_size(ctx->wardrive_wigle_keyboard, lv_pct(100), 240);
+    lv_obj_add_flag(ctx->wardrive_wigle_keyboard, LV_OBJ_FLAG_FLOATING);
+    lv_obj_align(ctx->wardrive_wigle_keyboard, LV_ALIGN_BOTTOM_MID, 0, -8);
     lv_keyboard_set_textarea(ctx->wardrive_wigle_keyboard,
                              with_ssid ? ctx->wardrive_wigle_ssid_input : ctx->wardrive_wigle_password_input);
     lv_obj_add_event_cb(ctx->wardrive_wigle_keyboard, wardrive_wigle_keyboard_cb, LV_EVENT_ALL, NULL);
@@ -12848,13 +12849,20 @@ static void show_wardrive_wigle_popup(tab_context_t *ctx)
         return;
     }
 
-    ctx->wardrive_wigle_popup_overlay = lv_obj_create(ctx->wardrive_page);
+    lv_obj_t *container = get_current_tab_container();
+    if (!container) {
+        return;
+    }
+
+    ctx->wardrive_wigle_popup_overlay = lv_obj_create(container);
     lv_obj_remove_style_all(ctx->wardrive_wigle_popup_overlay);
     lv_obj_set_size(ctx->wardrive_wigle_popup_overlay, lv_pct(100), lv_pct(100));
     lv_obj_set_style_bg_color(ctx->wardrive_wigle_popup_overlay, lv_color_hex(0x000000), 0);
     lv_obj_set_style_bg_opa(ctx->wardrive_wigle_popup_overlay, LV_OPA_50, 0);
     lv_obj_clear_flag(ctx->wardrive_wigle_popup_overlay, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(ctx->wardrive_wigle_popup_overlay, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(ctx->wardrive_wigle_popup_overlay, LV_OBJ_FLAG_FLOATING);
+    lv_obj_move_foreground(ctx->wardrive_wigle_popup_overlay);
 
     ctx->wardrive_wigle_popup = lv_obj_create(ctx->wardrive_wigle_popup_overlay);
     lv_obj_set_size(ctx->wardrive_wigle_popup, lv_pct(85), lv_pct(85));
