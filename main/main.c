@@ -11975,11 +11975,13 @@ static void wardrive_wigle_load_file_list(tab_context_t *ctx, tab_id_t active_ta
     ctx->wardrive_wigle_selected_count = 0;
 
     static const char *dirs[] = {
+        "/sdcard/lab/wardrives",
         "/sdcard/lab/wardrive",
         "/sdcard/lab",
         "/sdcard"
     };
     static const bool require_marker[] = {
+        false,
         false,
         true,
         true
