@@ -12061,6 +12061,9 @@ static void wardrive_wigle_send_btn_cb(lv_event_t *e)
         return;
     }
 
+    ESP_LOGI(TAG, "[%s] WiGLE Send clicked, selected files: %d",
+             tab_transport_name(tab_id_for_ctx(ctx)), ctx->wardrive_wigle_selected_count);
+
     if (ctx->wardrive_wigle_selected_count <= 0) {
         if (ctx->wardrive_wigle_status_label) {
             lv_label_set_text(ctx->wardrive_wigle_status_label, "Select at least one file.");
@@ -12100,6 +12103,8 @@ static void wardrive_wigle_network_row_click_cb(lv_event_t *e)
 
     strncpy(ctx->wardrive_wigle_selected_ssid, ssid, sizeof(ctx->wardrive_wigle_selected_ssid) - 1);
     ctx->wardrive_wigle_selected_ssid[sizeof(ctx->wardrive_wigle_selected_ssid) - 1] = '\0';
+    ESP_LOGI(TAG, "[%s] WiGLE selected SSID: %s",
+             tab_transport_name(tab_id_for_ctx(ctx)), ctx->wardrive_wigle_selected_ssid);
 
     if (ctx->wardrive_wigle_list) {
         uint32_t child_cnt = lv_obj_get_child_cnt(ctx->wardrive_wigle_list);
@@ -12167,6 +12172,10 @@ static void wardrive_wigle_connect_btn_cb(lv_event_t *e)
         lv_obj_add_flag(ctx->wardrive_wigle_keyboard, LV_OBJ_FLAG_HIDDEN);
     }
 
+    ESP_LOGI(TAG, "[%s] WiGLE Connect clicked (ssid_len=%d, pass_len=%d)",
+             tab_transport_name(tab_id_for_ctx(ctx)),
+             (int)strlen(ctx->wardrive_wigle_selected_ssid),
+             (int)strlen(ctx->wardrive_wigle_selected_password));
     ctx->wardrive_wigle_connect_ready = true;
 }
 
@@ -12290,6 +12299,8 @@ static bool wardrive_wigle_ensure_wifi_connected(tab_context_t *ctx, tab_id_t ac
     }
 
     if (ctx->arp_wifi_connected || arp_wifi_connected) {
+        ESP_LOGI(TAG, "[%s] WiGLE: WiFi already connected, skipping connect flow",
+                 tab_transport_name(active_tab));
         return true;
     }
 
@@ -12305,6 +12316,7 @@ static bool wardrive_wigle_ensure_wifi_connected(tab_context_t *ctx, tab_id_t ac
         uart_flush(uart_port);
     }
     transport_write_bytes_tab(active_tab, uart_port, "scan_networks\r\n", 15);
+    ESP_LOGI(TAG, "[%s] WiGLE: sent scan_networks", tab_transport_name(active_tab));
 
     static wifi_network_t nets[MAX_NETWORKS];
     int net_count = 0;
@@ -12358,6 +12370,7 @@ static bool wardrive_wigle_ensure_wifi_connected(tab_context_t *ctx, tab_id_t ac
         bsp_display_unlock();
         return false;
     }
+    ESP_LOGI(TAG, "[%s] WiGLE: scan found %d network(s)", tab_transport_name(active_tab), net_count);
 
     ctx->wardrive_wigle_selected_ssid[0] = '\0';
     ctx->wardrive_wigle_connect_ready = false;
@@ -12447,8 +12460,12 @@ static bool wardrive_wigle_ensure_wifi_connected(tab_context_t *ctx, tab_id_t ac
     if (!ctx->wardrive_wigle_task_running) {
         return false;
     }
+    ESP_LOGI(TAG, "[%s] WiGLE: user selected '%s'",
+             tab_transport_name(active_tab), ctx->wardrive_wigle_selected_ssid);
 
     bool manual_credentials = (strcmp(ctx->wardrive_wigle_selected_ssid, WARDRIVE_WIGLE_OTHER_SSID) == 0);
+    ESP_LOGI(TAG, "[%s] WiGLE: manual credentials mode = %d",
+             tab_transport_name(active_tab), manual_credentials ? 1 : 0);
 
     bsp_display_lock(0);
     if (ctx->wardrive_wigle_list) {
@@ -12499,6 +12516,7 @@ static bool wardrive_wigle_ensure_wifi_connected(tab_context_t *ctx, tab_id_t ac
             uart_flush(uart_port);
         }
         transport_write_bytes_tab(active_tab, uart_port, "show_pass evil\r\n", 16);
+        ESP_LOGI(TAG, "[%s] WiGLE: sent show_pass evil", tab_transport_name(active_tab));
         vTaskDelay(pdMS_TO_TICKS(200));
 
         evil_twin_entry_t et_entries[EVIL_TWIN_MAX_ENTRIES];
@@ -12553,6 +12571,9 @@ static bool wardrive_wigle_ensure_wifi_connected(tab_context_t *ctx, tab_id_t ac
                 break;
             }
         }
+        ESP_LOGI(TAG, "[%s] WiGLE: loaded %d saved passwords, match=%d",
+                 tab_transport_name(active_tab), et_count,
+                 (int)(strlen(ctx->wardrive_wigle_selected_password) > 0));
     }
 
     if (strlen(ctx->wardrive_wigle_selected_password) == 0) {
@@ -12604,6 +12625,8 @@ static bool wardrive_wigle_ensure_wifi_connected(tab_context_t *ctx, tab_id_t ac
     }
     transport_write_bytes_tab(active_tab, uart_port, wifi_cmd, strlen(wifi_cmd));
     transport_write_bytes_tab(active_tab, uart_port, "\r\n", 2);
+    ESP_LOGI(TAG, "[%s] WiGLE: sent wifi_connect for SSID '%s'",
+             tab_transport_name(active_tab), ctx->wardrive_wigle_selected_ssid);
 
     char rx_buf[2048];
     int total_len = 0;
@@ -12625,6 +12648,9 @@ static bool wardrive_wigle_ensure_wifi_connected(tab_context_t *ctx, tab_id_t ac
         }
         elapsed_ms += 200;
     }
+    rx_buf[total_len] = '\0';
+    ESP_LOGI(TAG, "[%s] WiGLE: wifi_connect response: %s",
+             tab_transport_name(active_tab), rx_buf);
 
     if (!ctx->wardrive_wigle_task_running) {
         return false;
@@ -12750,6 +12776,7 @@ static void wardrive_wigle_upload_task(void *arg)
 
     transport_write_bytes_tab(active_tab, uart_port, "wigle_upload", strlen("wigle_upload"));
     transport_write_bytes_tab(active_tab, uart_port, "\r\n", 2);
+    ESP_LOGI(TAG, "[%s] WiGLE: sent wigle_upload", tab_transport_name(active_tab));
 
     char rx_buf[4096];
     int total_len = 0;
@@ -12803,6 +12830,7 @@ static void wardrive_wigle_upload_task(void *arg)
 
     bool has_error = (strstr(rx_buf, "NO WIGLE CREDENTIALS") != NULL ||
                       strstr(rx_buf, "WIFI NOT CONNECTED") != NULL ||
+                      strstr(rx_buf, "Unrecognized command") != NULL ||
                       strstr(rx_buf, "Error") != NULL ||
                       strstr(rx_buf, "ERROR") != NULL ||
                       strstr(rx_buf, "FAILED") != NULL ||
@@ -12822,8 +12850,13 @@ static void wardrive_wigle_upload_task(void *arg)
         } else if (has_success) {
             lv_label_set_text(ctx->wardrive_wigle_status_label, "WiGLE upload complete.");
         } else if (has_error) {
-            lv_label_set_text(ctx->wardrive_wigle_status_label,
-                              "WiGLE upload failed.\nCheck WiFi and WiGLE credentials.");
+            if (strstr(rx_buf, "Unrecognized command") != NULL) {
+                lv_label_set_text(ctx->wardrive_wigle_status_label,
+                                  "WiGLE upload command is not supported\nby current Monster firmware.");
+            } else {
+                lv_label_set_text(ctx->wardrive_wigle_status_label,
+                                  "WiGLE upload failed.\nCheck WiFi and WiGLE credentials.");
+            }
         } else {
             lv_label_set_text(ctx->wardrive_wigle_status_label,
                               "No final response from module.\nTry again.");
