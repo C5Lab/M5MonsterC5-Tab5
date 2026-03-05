@@ -11936,6 +11936,7 @@ static int wardrive_wigle_load_files_from_dir(tab_context_t *ctx, tab_id_t activ
 
     char cmd[128];
     snprintf(cmd, sizeof(cmd), "list_dir %s", dir);
+    ESP_LOGI(TAG, "[%s] WiGLE list: sending '%s'", tab_transport_name(active_tab), cmd);
     transport_write_bytes_tab(active_tab, uart_port, cmd, strlen(cmd));
     transport_write_bytes_tab(active_tab, uart_port, "\r\n", 2);
     vTaskDelay(pdMS_TO_TICKS(700));
@@ -11956,6 +11957,8 @@ static int wardrive_wigle_load_files_from_dir(tab_context_t *ctx, tab_id_t activ
         }
     }
     rx_buffer[total_len] = '\0';
+    ESP_LOGI(TAG, "[%s] WiGLE list response (%d bytes) from %s: %s",
+             tab_transport_name(active_tab), total_len, dir, rx_buffer);
 
     int added = 0;
     char *line = strtok(rx_buffer, "\n\r");
@@ -11980,6 +11983,8 @@ static int wardrive_wigle_load_files_from_dir(tab_context_t *ctx, tab_id_t activ
         line = strtok(NULL, "\n\r");
     }
 
+    ESP_LOGI(TAG, "[%s] WiGLE list: added %d file(s) from %s (require_marker=%d)",
+             tab_transport_name(active_tab), added, dir, require_marker ? 1 : 0);
     return added;
 }
 
@@ -12011,6 +12016,8 @@ static void wardrive_wigle_load_file_list(tab_context_t *ctx, tab_id_t active_ta
             break;
         }
     }
+    ESP_LOGI(TAG, "[%s] WiGLE list final count: %d",
+             tab_transport_name(active_tab), ctx->wardrive_wigle_file_count);
 }
 
 static void wardrive_wigle_file_checkbox_cb(lv_event_t *e)
@@ -12926,6 +12933,8 @@ static void show_wardrive_wigle_popup(tab_context_t *ctx)
         lv_obj_add_state(ctx->wardrive_upload_btn, LV_STATE_DISABLED);
     }
 
+    ESP_LOGI(TAG, "[%s] Opening Wardrive WiGLE popup", tab_transport_name(tab_id_for_ctx(ctx)));
+
     ctx->wardrive_wigle_task_running = false;
     ctx->wardrive_wigle_connect_ready = false;
     ctx->wardrive_wigle_task = NULL;
@@ -12979,6 +12988,7 @@ static void wardrive_wigle_btn_cb(lv_event_t *e)
 {
     tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
     if (!ctx) ctx = get_current_ctx();
+    ESP_LOGI(TAG, "[%s] Wardrive Upload button clicked", ctx ? tab_transport_name(tab_id_for_ctx(ctx)) : "UNKNOWN");
     if (!ctx || ctx->wardrive_wigle_popup_overlay || ctx->wardrive_wigle_task_running) {
         return;
     }
