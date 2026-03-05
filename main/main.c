@@ -40,7 +40,7 @@
 #include "esp_http_server.h"
 #include "lwip/sockets.h"
 
-#define JANOS_TAB_VERSION "1.1.3"
+#define JANOS_TAB_VERSION "1.1.4"
 #include "lwip/netdb.h"
 #include <dirent.h>
 #include <sys/stat.h>
@@ -260,7 +260,11 @@ typedef struct {
     lv_obj_t *handshaker_popup;
     lv_obj_t *handshaker_log_container;  // Scrollable container for log
     lv_obj_t *handshaker_status_label;   // Label inside log container
+    lv_obj_t *handshaker_stop_btn;       // STOP/DONE button
+    lv_obj_t *handshaker_stop_label;     // STOP/DONE label
+    lv_obj_t *handshaker_wpasec_btn;     // "Send to wpa-sec" button (shown on success)
     char handshaker_log_buffer[2048];    // Accumulated log messages
+    bool handshaker_capture_success;      // True when capture/already-captured was detected
     volatile bool handshaker_monitoring;
     TaskHandle_t handshaker_task;
     
@@ -1279,6 +1283,7 @@ static void compromised_data_back_btn_event_cb(lv_event_t *e);
 static void show_evil_twin_passwords_page(void);
 static void show_portal_data_page(void);
 static void show_handshakes_page(void);
+static void wpasec_btn_event_cb(lv_event_t *e);
 static void show_deauth_detector_page(void);
 static void deauth_detector_back_btn_event_cb(lv_event_t *e);
 static void deauth_detector_start_cb(lv_event_t *e);
@@ -4449,7 +4454,11 @@ static void handshaker_popup_close_cb(lv_event_t *e)
         ctx->handshaker_popup = NULL;
         ctx->handshaker_log_container = NULL;
         ctx->handshaker_status_label = NULL;
+        ctx->handshaker_stop_btn = NULL;
+        ctx->handshaker_stop_label = NULL;
+        ctx->handshaker_wpasec_btn = NULL;
     }
+    ctx->handshaker_capture_success = false;
     
     // Clear global pointers
     handshaker_log_container = NULL;
@@ -4464,6 +4473,31 @@ typedef enum {
     HS_LOG_ALREADY,     // Amber - already captured
     HS_LOG_ERROR        // Red - error/failure
 } hs_log_type_t;
+
+// Update handshaker popup to DONE state and optionally show WPA-SEC upload button
+static void handshaker_set_done_state(tab_context_t *ctx, bool show_wpasec_button)
+{
+    if (!ctx) return;
+
+    bsp_display_lock(0);
+
+    if (ctx->handshaker_stop_btn) {
+        lv_obj_set_style_bg_color(ctx->handshaker_stop_btn, COLOR_MATERIAL_GREEN, 0);
+        lv_obj_set_style_bg_color(ctx->handshaker_stop_btn, lv_color_hex(0x388E3C), LV_STATE_PRESSED);
+    }
+    if (ctx->handshaker_stop_label) {
+        lv_label_set_text(ctx->handshaker_stop_label, "Done");
+    }
+    if (ctx->handshaker_wpasec_btn) {
+        if (show_wpasec_button) {
+            lv_obj_clear_flag(ctx->handshaker_wpasec_btn, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(ctx->handshaker_wpasec_btn, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+
+    bsp_display_unlock();
+}
 
 // Append message to handshaker log with color coding
 static void append_handshaker_log(const char *message, hs_log_type_t log_type)
@@ -4546,6 +4580,9 @@ static void handshaker_monitor_task(void *arg)
     // Track state for detecting "already captured" scenario
     int networks_attacked_this_cycle = -1;
     int handshakes_so_far = -1;
+    if (ctx) {
+        ctx->handshaker_capture_success = false;
+    }
     
     // Use context's flag instead of global
     while (ctx && ctx->handshaker_monitoring) {
@@ -4565,6 +4602,7 @@ static void handshaker_monitor_task(void *arg)
                         // Determine message type and log it
                         hs_log_type_t log_type = HS_LOG_PROGRESS;
                         bool should_log = false;
+                        bool attack_finished = false;
                         char display_msg[256] = {0};
                         
                         // ===== SUCCESS INDICATORS (green) =====
@@ -4588,11 +4626,13 @@ static void handshaker_monitor_task(void *arg)
                             }
                             log_type = HS_LOG_SUCCESS;
                             should_log = true;
+                            ctx->handshaker_capture_success = true;
                         }
                         else if (strstr(line_buffer, "HANDSHAKE IS COMPLETE AND VALID") != NULL) {
                             strncpy(display_msg, "Handshake validated!", sizeof(display_msg) - 1);
                             log_type = HS_LOG_SUCCESS;
                             should_log = true;
+                            ctx->handshaker_capture_success = true;
                         }
                         else if (strstr(line_buffer, "PCAP saved:") != NULL || 
                                  strstr(line_buffer, "HCCAPX saved:") != NULL) {
@@ -4609,17 +4649,20 @@ static void handshaker_monitor_task(void *arg)
                             }
                             log_type = HS_LOG_SUCCESS;
                             should_log = true;
+                            ctx->handshaker_capture_success = true;
                         }
                         else if (strstr(line_buffer, "Handshake #") != NULL && 
                                  strstr(line_buffer, "captured") != NULL) {
                             strncpy(display_msg, "Handshake captured!", sizeof(display_msg) - 1);
                             log_type = HS_LOG_SUCCESS;
                             should_log = true;
+                            ctx->handshaker_capture_success = true;
                         }
                         else if (strstr(line_buffer, "All selected networks captured") != NULL) {
                             strncpy(display_msg, "All networks captured! Attack complete.", sizeof(display_msg) - 1);
                             log_type = HS_LOG_SUCCESS;
                             should_log = true;
+                            ctx->handshaker_capture_success = true;
                         }
                         else if (strstr(line_buffer, "handshake saved for SSID:") != NULL) {
                             // Extract SSID
@@ -4640,6 +4683,7 @@ static void handshaker_monitor_task(void *arg)
                             }
                             log_type = HS_LOG_SUCCESS;
                             should_log = true;
+                            ctx->handshaker_capture_success = true;
                         }
                         
                         // ===== ALREADY CAPTURED DETECTION (amber) =====
@@ -4654,6 +4698,7 @@ static void handshaker_monitor_task(void *arg)
                                 snprintf(display_msg, sizeof(display_msg), "Handshake already on SD card!");
                                 log_type = HS_LOG_ALREADY;
                                 should_log = true;
+                                ctx->handshaker_capture_success = true;
                             }
                         }
                         else if (strstr(line_buffer, "Handshakes captured so far:") != NULL) {
@@ -4742,11 +4787,18 @@ static void handshaker_monitor_task(void *arg)
                             strncpy(display_msg, "Attack finished.", sizeof(display_msg) - 1);
                             log_type = HS_LOG_PROGRESS;
                             should_log = true;
+                            attack_finished = true;
                         }
                         
                         // Log the message if it's relevant
                         if (should_log && display_msg[0] != '\0') {
                             append_handshaker_log(display_msg, log_type);
+                        }
+
+                        if (attack_finished) {
+                            handshaker_set_done_state(ctx, ctx->handshaker_capture_success);
+                            ctx->handshaker_monitoring = false;
+                            handshaker_monitoring = false;
                         }
                         
                         line_pos = 0;
@@ -4784,7 +4836,7 @@ static void show_handshaker_popup(void)
     
     // Create popup as child of overlay
     ctx->handshaker_popup = lv_obj_create(ctx->handshaker_popup_overlay);
-    lv_obj_set_size(ctx->handshaker_popup, 550, 500);
+    lv_obj_set_size(ctx->handshaker_popup, 550, 560);
     lv_obj_center(ctx->handshaker_popup);
     lv_obj_set_style_bg_color(ctx->handshaker_popup, lv_color_hex(0x1A1A2A), 0);
     lv_obj_set_style_border_color(ctx->handshaker_popup, COLOR_MATERIAL_AMBER, 0);
@@ -4859,18 +4911,34 @@ static void show_handshaker_popup(void)
     handshaker_log_container = ctx->handshaker_log_container;
     handshaker_status_label = ctx->handshaker_status_label;
     
-    // STOP button
-    lv_obj_t *stop_btn = lv_btn_create(ctx->handshaker_popup);
-    lv_obj_set_size(stop_btn, lv_pct(100), 50);
-    lv_obj_set_style_bg_color(stop_btn, COLOR_MATERIAL_RED, 0);
-    lv_obj_set_style_bg_color(stop_btn, lv_color_hex(0xCC0000), LV_STATE_PRESSED);
-    lv_obj_set_style_radius(stop_btn, 8, 0);
-    lv_obj_add_event_cb(stop_btn, handshaker_popup_close_cb, LV_EVENT_CLICKED, NULL);
+    // Stop/Done button
+    ctx->handshaker_stop_btn = lv_btn_create(ctx->handshaker_popup);
+    lv_obj_set_size(ctx->handshaker_stop_btn, lv_pct(100), 50);
+    lv_obj_set_style_bg_color(ctx->handshaker_stop_btn, COLOR_MATERIAL_RED, 0);
+    lv_obj_set_style_bg_color(ctx->handshaker_stop_btn, lv_color_hex(0xCC0000), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(ctx->handshaker_stop_btn, 8, 0);
+    lv_obj_add_event_cb(ctx->handshaker_stop_btn, handshaker_popup_close_cb, LV_EVENT_CLICKED, NULL);
     
-    lv_obj_t *stop_label = lv_label_create(stop_btn);
-    lv_label_set_text(stop_label, "STOP");
-    lv_obj_set_style_text_font(stop_label, &lv_font_montserrat_18, 0);
-    lv_obj_center(stop_label);
+    ctx->handshaker_stop_label = lv_label_create(ctx->handshaker_stop_btn);
+    lv_label_set_text(ctx->handshaker_stop_label, "Stop");
+    lv_obj_set_style_text_font(ctx->handshaker_stop_label, &lv_font_montserrat_18, 0);
+    lv_obj_center(ctx->handshaker_stop_label);
+
+    // Hidden by default, shown only when attack is done and handshake exists
+    ctx->handshaker_wpasec_btn = lv_btn_create(ctx->handshaker_popup);
+    lv_obj_set_size(ctx->handshaker_wpasec_btn, lv_pct(100), 50);
+    lv_obj_set_style_bg_color(ctx->handshaker_wpasec_btn, COLOR_MATERIAL_PURPLE, 0);
+    lv_obj_set_style_bg_color(ctx->handshaker_wpasec_btn, lv_color_hex(0x9C27B0), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(ctx->handshaker_wpasec_btn, 8, 0);
+    lv_obj_add_event_cb(ctx->handshaker_wpasec_btn, wpasec_btn_event_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_flag(ctx->handshaker_wpasec_btn, LV_OBJ_FLAG_HIDDEN);
+
+    lv_obj_t *wpasec_btn_lbl = lv_label_create(ctx->handshaker_wpasec_btn);
+    lv_label_set_text(wpasec_btn_lbl, "Send to wpa-sec");
+    lv_obj_set_style_text_font(wpasec_btn_lbl, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_color(wpasec_btn_lbl, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_center(wpasec_btn_lbl);
+    ctx->handshaker_capture_success = false;
     
     // Now send UART commands and start monitoring
     
