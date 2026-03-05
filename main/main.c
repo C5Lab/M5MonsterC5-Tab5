@@ -11837,20 +11837,38 @@ static bool wardrive_wigle_extract_csv_token(const char *line, char *out, size_t
         return false;
     }
 
-    const char *csv = strstr(line, ".csv");
-    if (!csv) {
-        return false;
-    }
-    if (*(csv + 4) != '\0') {
+    size_t line_len = strlen(line);
+    if (line_len < 4) {
         return false;
     }
 
-    const char *start = csv;
+    size_t end = line_len;
+    if (line[end - 1] == '"' || line[end - 1] == '\'') {
+        end--;
+    }
+    if (end < 4) {
+        return false;
+    }
+
+    const char *ext = line + end - 4;
+    bool is_csv = (tolower((unsigned char)ext[0]) == '.') &&
+                  (tolower((unsigned char)ext[1]) == 'c') &&
+                  (tolower((unsigned char)ext[2]) == 's') &&
+                  (tolower((unsigned char)ext[3]) == 'v');
+    bool is_txt = (tolower((unsigned char)ext[0]) == '.') &&
+                  (tolower((unsigned char)ext[1]) == 't') &&
+                  (tolower((unsigned char)ext[2]) == 'x') &&
+                  (tolower((unsigned char)ext[3]) == 't');
+    if (!is_csv && !is_txt) {
+        return false;
+    }
+
+    const char *start = ext;
     while (start > line && !isspace((unsigned char)*(start - 1))) {
         start--;
     }
 
-    size_t len = (size_t)((csv + 4) - start);
+    size_t len = (size_t)((line + end) - start);
     if (len == 0 || len >= out_sz) {
         return false;
     }
@@ -12930,7 +12948,7 @@ static void show_wardrive_wigle_popup(tab_context_t *ctx)
 
     if (ctx->wardrive_wigle_file_count <= 0) {
         if (ctx->wardrive_wigle_status_label) {
-            lv_label_set_text(ctx->wardrive_wigle_status_label, "No Wardrive CSV files found.");
+            lv_label_set_text(ctx->wardrive_wigle_status_label, "No Wardrive TXT/CSV files found.");
         }
         wardrive_wigle_update_send_btn(ctx);
         return;
