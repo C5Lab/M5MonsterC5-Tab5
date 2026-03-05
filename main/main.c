@@ -12727,6 +12727,62 @@ static void wardrive_wigle_upload_task(void *arg)
         goto done;
     }
 
+    // Step 1: Check WiGLE key
+    if (active_tab == TAB_USB && usb_cdc_handle) {
+        usbh_cdc_flush_rx_buffer(usb_cdc_handle);
+    } else {
+        uart_flush(uart_port);
+    }
+    transport_write_bytes_tab(active_tab, uart_port, "wigle_key read", strlen("wigle_key read"));
+    transport_write_bytes_tab(active_tab, uart_port, "\r\n", 2);
+    ESP_LOGI(TAG, "[%s] WiGLE: sent wigle_key read", tab_transport_name(active_tab));
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    char key_rx_buf[2048];
+    int key_total_len = 0;
+    int key_empty_reads = 0;
+    while (key_empty_reads < 5 && key_total_len < (int)sizeof(key_rx_buf) - 1 && ctx->wardrive_wigle_task_running) {
+        int len = transport_read_bytes_tab(active_tab, uart_port, key_rx_buf + key_total_len,
+                                           sizeof(key_rx_buf) - key_total_len - 1, pdMS_TO_TICKS(300));
+        if (len > 0) {
+            key_total_len += len;
+            key_empty_reads = 0;
+        } else {
+            key_empty_reads++;
+        }
+    }
+    key_rx_buf[key_total_len] = '\0';
+    ESP_LOGI(TAG, "[%s] wigle_key read response: %s", tab_transport_name(active_tab), key_rx_buf);
+
+    if (!ctx->wardrive_wigle_task_running) {
+        goto done;
+    }
+
+    if (strstr(key_rx_buf, "Unrecognized command") != NULL) {
+        bsp_display_lock(0);
+        if (ctx->wardrive_wigle_status_label) {
+            lv_label_set_text(ctx->wardrive_wigle_status_label,
+                              "WiGLE key command is not supported\nby current Monster firmware.");
+        }
+        bsp_display_unlock();
+        goto done;
+    }
+
+    bool wigle_key_missing = (strstr(key_rx_buf, "not set") != NULL ||
+                              strstr(key_rx_buf, "NOT SET") != NULL ||
+                              strstr(key_rx_buf, "NO WIGLE CREDENTIALS") != NULL ||
+                              strstr(key_rx_buf, "missing") != NULL ||
+                              strstr(key_rx_buf, "MISSING") != NULL);
+    if (wigle_key_missing) {
+        bsp_display_lock(0);
+        if (ctx->wardrive_wigle_status_label) {
+            lv_label_set_text(ctx->wardrive_wigle_status_label,
+                              "Add your key to /lab/wigle.txt\nin C5Monster and reboot.");
+        }
+        bsp_display_unlock();
+        goto done;
+    }
+
     if (ctx->wardrive_wigle_selected_count <= 0) {
         bsp_display_lock(0);
         if (ctx->wardrive_wigle_status_label) {
