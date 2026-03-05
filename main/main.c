@@ -319,7 +319,10 @@ typedef struct {
     lv_obj_t *global_handshaker_popup;
     lv_obj_t *global_handshaker_log_container;
     lv_obj_t *global_handshaker_status_label;
+    lv_obj_t *global_handshaker_stats_label;
     char global_handshaker_log_buffer[2048];
+    char global_handshaker_last_ssid[64];
+    int global_handshaker_total_captured;
     volatile bool global_handshaker_monitoring;
     TaskHandle_t global_handshaker_task;
     
@@ -10035,8 +10038,11 @@ static void close_global_handshaker_popup_ctx(tab_context_t *ctx)
         ctx->global_handshaker_popup = NULL;
         ctx->global_handshaker_log_container = NULL;
         ctx->global_handshaker_status_label = NULL;
-        ctx->global_handshaker_log_buffer[0] = '\0';
+        ctx->global_handshaker_stats_label = NULL;
     }
+    ctx->global_handshaker_log_buffer[0] = '\0';
+    ctx->global_handshaker_last_ssid[0] = '\0';
+    ctx->global_handshaker_total_captured = 0;
 }
 
 // Callback when user confirms "Yes" on global handshaker confirmation
@@ -10146,6 +10152,21 @@ static void append_global_handshaker_log_ctx(tab_context_t *ctx, const char *mes
     bsp_display_unlock();
 }
 
+static void update_global_handshaker_stats_ctx(tab_context_t *ctx)
+{
+    if (!ctx) return;
+
+    const char *last_ssid = (ctx->global_handshaker_last_ssid[0] != '\0') ? ctx->global_handshaker_last_ssid : "-";
+    char stats_text[160];
+    snprintf(stats_text, sizeof(stats_text), "Last Handshake: %s\nTotal: %d", last_ssid, ctx->global_handshaker_total_captured);
+
+    bsp_display_lock(0);
+    if (ctx->global_handshaker_stats_label) {
+        lv_label_set_text(ctx->global_handshaker_stats_label, stats_text);
+    }
+    bsp_display_unlock();
+}
+
 // Helper to extract SSID from quotes in a line
 static bool extract_ssid_from_quotes(const char *line, char *ssid, size_t ssid_size)
 {
@@ -10201,8 +10222,21 @@ static void global_handshaker_monitor_task(void *arg)
                         // Determine message type and log it
                         hs_log_type_t log_type = HS_LOG_PROGRESS;
                         bool should_log = false;
+                        bool stats_changed = false;
                         char display_msg[256] = {0};
                         char ssid[64] = {0};
+
+                        // Parse running handshake counter from UART summary lines.
+                        char *captured_count = strstr(line_buffer, "Handshakes captured so far:");
+                        if (captured_count) {
+                            captured_count += strlen("Handshakes captured so far:");
+                            while (*captured_count == ' ') captured_count++;
+                            int total_captured = atoi(captured_count);
+                            if (total_captured >= 0 && total_captured != ctx->global_handshaker_total_captured) {
+                                ctx->global_handshaker_total_captured = total_captured;
+                                stats_changed = true;
+                            }
+                        }
                         
                         // ===== PHASE/ATTACK START =====
                         if (strstr(line_buffer, "PHASE") != NULL && strstr(line_buffer, "Attack") != NULL) {
@@ -10270,6 +10304,11 @@ static void global_handshaker_monitor_task(void *arg)
                             // "✓ Handshake captured for 'SSID' after burst #N!"
                             if (extract_ssid_from_quotes(line_buffer, ssid, sizeof(ssid))) {
                                 snprintf(display_msg, sizeof(display_msg), "CAPTURED: %s", ssid);
+                                if (strcmp(ctx->global_handshaker_last_ssid, ssid) != 0) {
+                                    strncpy(ctx->global_handshaker_last_ssid, ssid, sizeof(ctx->global_handshaker_last_ssid) - 1);
+                                    ctx->global_handshaker_last_ssid[sizeof(ctx->global_handshaker_last_ssid) - 1] = '\0';
+                                    stats_changed = true;
+                                }
                             } else {
                                 strncpy(display_msg, "Handshake captured!", sizeof(display_msg) - 1);
                             }
@@ -10308,6 +10347,11 @@ static void global_handshaker_monitor_task(void *arg)
                                 }
                                 ssid[j] = '\0';
                                 snprintf(display_msg, sizeof(display_msg), "SAVED: %s", ssid);
+                                if (ssid[0] != '\0' && strcmp(ctx->global_handshaker_last_ssid, ssid) != 0) {
+                                    strncpy(ctx->global_handshaker_last_ssid, ssid, sizeof(ctx->global_handshaker_last_ssid) - 1);
+                                    ctx->global_handshaker_last_ssid[sizeof(ctx->global_handshaker_last_ssid) - 1] = '\0';
+                                    stats_changed = true;
+                                }
                             } else {
                                 strncpy(display_msg, "Handshake saved!", sizeof(display_msg) - 1);
                             }
@@ -10360,6 +10404,9 @@ static void global_handshaker_monitor_task(void *arg)
                         // Log the message if it's relevant
                         if (should_log && display_msg[0] != '\0') {
                             append_global_handshaker_log_ctx(ctx, display_msg, log_type);
+                        }
+                        if (stats_changed) {
+                            update_global_handshaker_stats_ctx(ctx);
                         }
                         
                         line_pos = 0;
@@ -10499,7 +10546,7 @@ static void show_global_handshaker_active_popup(void)
     
     // Create popup
     ctx->global_handshaker_popup = lv_obj_create(ctx->global_handshaker_popup_overlay);
-    lv_obj_set_size(ctx->global_handshaker_popup, 520, 420);
+    lv_obj_set_size(ctx->global_handshaker_popup, 520, 470);
     lv_obj_center(ctx->global_handshaker_popup);
     lv_obj_set_style_bg_color(ctx->global_handshaker_popup, lv_color_hex(0x1A1A2A), 0);
     lv_obj_set_style_border_color(ctx->global_handshaker_popup, COLOR_MATERIAL_AMBER, 0);
@@ -10545,8 +10592,29 @@ static void show_global_handshaker_active_popup(void)
     lv_obj_set_style_text_font(ctx->global_handshaker_status_label, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(ctx->global_handshaker_status_label, lv_color_hex(0xAAAAAA), 0);
     
-    // Clear log buffer
+    // Info block under log: last captured SSID and running total.
+    lv_obj_t *stats_container = lv_obj_create(ctx->global_handshaker_popup);
+    lv_obj_set_size(stats_container, lv_pct(100), 72);
+    lv_obj_set_style_bg_color(stats_container, lv_color_hex(0x151520), 0);
+    lv_obj_set_style_border_width(stats_container, 1, 0);
+    lv_obj_set_style_border_color(stats_container, lv_color_hex(0x333344), 0);
+    lv_obj_set_style_radius(stats_container, 8, 0);
+    lv_obj_set_style_pad_hor(stats_container, 10, 0);
+    lv_obj_set_style_pad_ver(stats_container, 8, 0);
+    lv_obj_clear_flag(stats_container, LV_OBJ_FLAG_SCROLLABLE);
+
+    ctx->global_handshaker_stats_label = lv_label_create(stats_container);
+    lv_obj_set_width(ctx->global_handshaker_stats_label, lv_pct(100));
+    lv_label_set_long_mode(ctx->global_handshaker_stats_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(ctx->global_handshaker_stats_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(ctx->global_handshaker_stats_label, lv_color_hex(0xDDDDDD), 0);
+    lv_label_set_text(ctx->global_handshaker_stats_label, "Last Handshake: -\nTotal: 0");
+
+    // Clear log and counters
     ctx->global_handshaker_log_buffer[0] = '\0';
+    ctx->global_handshaker_last_ssid[0] = '\0';
+    ctx->global_handshaker_total_captured = 0;
+    update_global_handshaker_stats_ctx(ctx);
     
     // Stop button
     lv_obj_t *stop_btn = lv_btn_create(ctx->global_handshaker_popup);
