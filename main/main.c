@@ -12709,6 +12709,14 @@ static bool wardrive_parse_wigle_summary(const char *rx_text, int *uploaded, int
         return true;
     }
 
+    p = strstr(rx_text, "Done:");
+    if (p && sscanf(p, "Done: %d uploaded, %d skipped, %d failed", &up, &skip, &fail) == 3) {
+        *uploaded = up;
+        *failed = fail;
+        *skipped = skip;
+        return true;
+    }
+
     return false;
 }
 
@@ -12817,102 +12825,140 @@ static void wardrive_wigle_upload_task(void *arg)
         goto done;
     }
 
-    bsp_display_lock(0);
-    if (ctx->wardrive_wigle_status_label) {
-        lv_label_set_text(ctx->wardrive_wigle_status_label,
-            "Uploading selected files to WiGLE...\nThis can take up to 90 seconds.");
-    }
-    bsp_display_unlock();
-
-    if (active_tab == TAB_USB && usb_cdc_handle) {
-        usbh_cdc_flush_rx_buffer(usb_cdc_handle);
-    } else {
-        uart_flush(uart_port);
-    }
-
-    transport_write_bytes_tab(active_tab, uart_port, "wigle_upload", strlen("wigle_upload"));
-    transport_write_bytes_tab(active_tab, uart_port, "\r\n", 2);
-    ESP_LOGI(TAG, "[%s] WiGLE: sent wigle_upload", tab_transport_name(active_tab));
-
-    char rx_buf[4096];
-    int total_len = 0;
-    int empty_reads = 0;
-    int elapsed_ms = 0;
-    const int timeout_ms = 90000;
-
-    while (ctx->wardrive_wigle_task_running &&
-           elapsed_ms < timeout_ms &&
-           total_len < (int)sizeof(rx_buf) - 1 &&
-           empty_reads < 20) {
-        int len = transport_read_bytes_tab(active_tab,
-                                           uart_port,
-                                           rx_buf + total_len,
-                                           sizeof(rx_buf) - 1 - total_len,
-                                           pdMS_TO_TICKS(500));
-        if (len > 0) {
-            total_len += len;
-            empty_reads = 0;
-            rx_buf[total_len] = '\0';
-
-            if (strstr(rx_buf, "Sync complete") != NULL ||
-                strstr(rx_buf, "Done:") != NULL ||
-                strstr(rx_buf, "UPLOAD COMPLETE") != NULL ||
-                strstr(rx_buf, "Upload complete") != NULL ||
-                strstr(rx_buf, "NO WIGLE CREDENTIALS") != NULL ||
-                strstr(rx_buf, "WIFI NOT CONNECTED") != NULL ||
-                strstr(rx_buf, "Error") != NULL ||
-                strstr(rx_buf, "ERROR") != NULL ||
-                strstr(rx_buf, "FAILED") != NULL ||
-                strstr(rx_buf, "Failed") != NULL) {
-                break;
-            }
-        } else {
-            empty_reads++;
+    int total_selected = 0;
+    for (int i = 0; i < ctx->wardrive_wigle_file_count; i++) {
+        if (ctx->wardrive_wigle_files[i].selected && ctx->wardrive_wigle_files[i].name[0] != '\0') {
+            total_selected++;
         }
-        elapsed_ms += 500;
     }
 
-    rx_buf[total_len] = '\0';
-    ESP_LOGI(TAG, "wigle_upload response: %s", rx_buf);
+    int processed_selected = 0;
+    int total_uploaded = 0;
+    int total_failed = 0;
+    int total_skipped = 0;
+    bool any_response = false;
+    bool unsupported_cmd = false;
+    bool creds_missing = false;
+    bool wifi_lost = false;
+
+    for (int i = 0; i < ctx->wardrive_wigle_file_count && ctx->wardrive_wigle_task_running; i++) {
+        wardrive_wigle_file_t *file = &ctx->wardrive_wigle_files[i];
+        if (!file->selected || file->name[0] == '\0') {
+            continue;
+        }
+
+        processed_selected++;
+        bsp_display_lock(0);
+        if (ctx->wardrive_wigle_status_label) {
+            lv_label_set_text_fmt(ctx->wardrive_wigle_status_label,
+                                  "Uploading %d/%d:\n%s",
+                                  processed_selected, total_selected, file->name);
+        }
+        bsp_display_unlock();
+
+        if (active_tab == TAB_USB && usb_cdc_handle) {
+            usbh_cdc_flush_rx_buffer(usb_cdc_handle);
+        } else {
+            uart_flush(uart_port);
+        }
+
+        char cmd[220];
+        snprintf(cmd, sizeof(cmd), "wigle_upload %s", file->name);
+        transport_write_bytes_tab(active_tab, uart_port, cmd, strlen(cmd));
+        transport_write_bytes_tab(active_tab, uart_port, "\r\n", 2);
+        ESP_LOGI(TAG, "[%s] WiGLE: sent %s", tab_transport_name(active_tab), cmd);
+
+        char rx_buf[4096];
+        int total_len = 0;
+        int empty_reads = 0;
+        int elapsed_ms = 0;
+        const int timeout_ms = 150000;
+
+        while (ctx->wardrive_wigle_task_running &&
+               elapsed_ms < timeout_ms &&
+               total_len < (int)sizeof(rx_buf) - 1 &&
+               empty_reads < 120) {
+            int len = transport_read_bytes_tab(active_tab,
+                                               uart_port,
+                                               rx_buf + total_len,
+                                               sizeof(rx_buf) - 1 - total_len,
+                                               pdMS_TO_TICKS(500));
+            if (len > 0) {
+                total_len += len;
+                empty_reads = 0;
+                rx_buf[total_len] = '\0';
+
+                if (strstr(rx_buf, "Done:") != NULL ||
+                    strstr(rx_buf, "NO WIGLE CREDENTIALS") != NULL ||
+                    strstr(rx_buf, "WIFI NOT CONNECTED") != NULL ||
+                    strstr(rx_buf, "Unrecognized command") != NULL) {
+                    break;
+                }
+            } else {
+                empty_reads++;
+            }
+            elapsed_ms += 500;
+        }
+
+        rx_buf[total_len] = '\0';
+        if (total_len > 0) {
+            any_response = true;
+        }
+        ESP_LOGI(TAG, "wigle_upload response (%s): %s", file->name, rx_buf);
+
+        if (strstr(rx_buf, "Unrecognized command") != NULL) {
+            unsupported_cmd = true;
+            break;
+        }
+        if (strstr(rx_buf, "NO WIGLE CREDENTIALS") != NULL) {
+            creds_missing = true;
+            break;
+        }
+        if (strstr(rx_buf, "WIFI NOT CONNECTED") != NULL) {
+            wifi_lost = true;
+            break;
+        }
+
+        int uploaded = 0;
+        int failed = 0;
+        int skipped = 0;
+        if (wardrive_parse_wigle_summary(rx_buf, &uploaded, &failed, &skipped)) {
+            total_uploaded += uploaded;
+            total_failed += failed;
+            total_skipped += skipped;
+        } else if (strstr(rx_buf, "-> OK") != NULL) {
+            total_uploaded++;
+        } else if (strstr(rx_buf, "-> skipped") != NULL || strstr(rx_buf, "duplicate") != NULL) {
+            total_skipped++;
+        } else if (strstr(rx_buf, "-> FAILED") != NULL || strstr(rx_buf, "FAILED") != NULL) {
+            total_failed++;
+        } else {
+            // No final marker for this file response.
+            total_failed++;
+        }
+    }
 
     if (!ctx->wardrive_wigle_task_running) {
         goto done;
     }
 
-    bool has_success = (strstr(rx_buf, "Sync complete") != NULL ||
-                        strstr(rx_buf, "Done:") != NULL ||
-                        strstr(rx_buf, "UPLOAD COMPLETE") != NULL ||
-                        strstr(rx_buf, "Upload complete") != NULL);
-
-    bool has_error = (strstr(rx_buf, "NO WIGLE CREDENTIALS") != NULL ||
-                      strstr(rx_buf, "WIFI NOT CONNECTED") != NULL ||
-                      strstr(rx_buf, "Unrecognized command") != NULL ||
-                      strstr(rx_buf, "Error") != NULL ||
-                      strstr(rx_buf, "ERROR") != NULL ||
-                      strstr(rx_buf, "FAILED") != NULL ||
-                      strstr(rx_buf, "Failed") != NULL);
-
-    int uploaded = 0;
-    int failed = 0;
-    int skipped = 0;
-    bool parsed_summary = wardrive_parse_wigle_summary(rx_buf, &uploaded, &failed, &skipped);
-
     bsp_display_lock(0);
     if (ctx->wardrive_wigle_status_label) {
-        if (parsed_summary) {
+        if (unsupported_cmd) {
+            lv_label_set_text(ctx->wardrive_wigle_status_label,
+                              "WiGLE upload command is not supported\nby current Monster firmware.");
+        } else if (creds_missing) {
+            lv_label_set_text(ctx->wardrive_wigle_status_label,
+                              "WiGLE credentials missing.\nAdd key and try again.");
+        } else if (wifi_lost) {
+            lv_label_set_text(ctx->wardrive_wigle_status_label,
+                              "WiFi disconnected during upload.\nReconnect and try again.");
+        } else if ((total_uploaded + total_skipped + total_failed) > 0) {
             lv_label_set_text_fmt(ctx->wardrive_wigle_status_label,
                                   "WiGLE sync finished.\nUploaded: %d\nSkipped: %d\nFailed: %d",
-                                  uploaded, skipped, failed);
-        } else if (has_success) {
+                                  total_uploaded, total_skipped, total_failed);
+        } else if (any_response) {
             lv_label_set_text(ctx->wardrive_wigle_status_label, "WiGLE upload complete.");
-        } else if (has_error) {
-            if (strstr(rx_buf, "Unrecognized command") != NULL) {
-                lv_label_set_text(ctx->wardrive_wigle_status_label,
-                                  "WiGLE upload command is not supported\nby current Monster firmware.");
-            } else {
-                lv_label_set_text(ctx->wardrive_wigle_status_label,
-                                  "WiGLE upload failed.\nCheck WiFi and WiGLE credentials.");
-            }
         } else {
             lv_label_set_text(ctx->wardrive_wigle_status_label,
                               "No final response from module.\nTry again.");
