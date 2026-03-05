@@ -11889,11 +11889,15 @@ static bool wardrive_wigle_store_file(tab_context_t *ctx, const char *dir, const
 
     wardrive_wigle_file_t *f = &ctx->wardrive_wigle_files[ctx->wardrive_wigle_file_count++];
     memset(f, 0, sizeof(*f));
-    strncpy(f->path, path, sizeof(f->path) - 1);
+    size_t path_len = strnlen(path, sizeof(f->path) - 1);
+    memcpy(f->path, path, path_len);
+    f->path[path_len] = '\0';
 
     const char *name = strrchr(path, '/');
     name = name ? (name + 1) : path;
-    strncpy(f->name, name, sizeof(f->name) - 1);
+    size_t name_len = strnlen(name, sizeof(f->name) - 1);
+    memcpy(f->name, name, name_len);
+    f->name[name_len] = '\0';
     f->selected = false;
     f->checkbox = NULL;
     return true;
