@@ -11859,7 +11859,11 @@ static bool wardrive_wigle_extract_csv_token(const char *line, char *out, size_t
                   (tolower((unsigned char)ext[1]) == 't') &&
                   (tolower((unsigned char)ext[2]) == 'x') &&
                   (tolower((unsigned char)ext[3]) == 't');
-    if (!is_csv && !is_txt) {
+    bool is_log = (tolower((unsigned char)ext[0]) == '.') &&
+                  (tolower((unsigned char)ext[1]) == 'l') &&
+                  (tolower((unsigned char)ext[2]) == 'o') &&
+                  (tolower((unsigned char)ext[3]) == 'g');
+    if (!is_csv && !is_txt && !is_log) {
         return false;
     }
 
@@ -12957,7 +12961,7 @@ static void show_wardrive_wigle_popup(tab_context_t *ctx)
 
     if (ctx->wardrive_wigle_file_count <= 0) {
         if (ctx->wardrive_wigle_status_label) {
-            lv_label_set_text(ctx->wardrive_wigle_status_label, "No Wardrive TXT/CSV files found.");
+            lv_label_set_text(ctx->wardrive_wigle_status_label, "No Wardrive LOG/TXT/CSV files found.");
         }
         wardrive_wigle_update_send_btn(ctx);
         return;
