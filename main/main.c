@@ -973,6 +973,15 @@ static lv_obj_t *evil_twin_connect_popup_obj = NULL;
 static evil_twin_entry_t evil_twin_entries[EVIL_TWIN_MAX_ENTRIES];
 static int evil_twin_entry_count = 0;
 
+// Hidden SSID popup (shown when user selects a hidden network)
+typedef void (*hidden_ssid_callback_t)(const char *ssid);
+static lv_obj_t *hidden_ssid_popup_overlay = NULL;
+static lv_obj_t *hidden_ssid_popup = NULL;
+static lv_obj_t *hidden_ssid_dropdown = NULL;
+static lv_obj_t *hidden_ssid_textarea = NULL;
+static lv_obj_t *hidden_ssid_keyboard = NULL;
+static hidden_ssid_callback_t hidden_ssid_on_confirm = NULL;
+
 // Karma Attack page
 static lv_obj_t *karma_page = NULL;
 static lv_obj_t *karma_probes_container = NULL;
@@ -4118,6 +4127,296 @@ static void network_checkbox_event_cb(lv_event_t *e)
     }
 }
 
+// ---- Hidden SSID popup helpers ----
+
+static void close_hidden_ssid_popup(void)
+{
+    if (hidden_ssid_popup_overlay) {
+        lv_obj_del(hidden_ssid_popup_overlay);
+        hidden_ssid_popup_overlay = NULL;
+        hidden_ssid_popup = NULL;
+        hidden_ssid_dropdown = NULL;
+        hidden_ssid_textarea = NULL;
+        hidden_ssid_keyboard = NULL;
+    }
+}
+
+static void hidden_ssid_dropdown_changed_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!hidden_ssid_dropdown || !hidden_ssid_textarea) return;
+    char buf[64];
+    lv_dropdown_get_selected_str(hidden_ssid_dropdown, buf, sizeof(buf));
+    if (strlen(buf) > 0) {
+        lv_textarea_set_text(hidden_ssid_textarea, buf);
+    }
+}
+
+static void hidden_ssid_textarea_focus_cb(lv_event_t *e)
+{
+    (void)e;
+    if (hidden_ssid_keyboard) {
+        lv_obj_clear_flag(hidden_ssid_keyboard, LV_OBJ_FLAG_HIDDEN);
+        lv_keyboard_set_textarea(hidden_ssid_keyboard, hidden_ssid_textarea);
+    }
+}
+
+static void hidden_ssid_keyboard_ready_cb(lv_event_t *e)
+{
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_READY || code == LV_EVENT_CANCEL) {
+        if (hidden_ssid_keyboard) {
+            lv_obj_add_flag(hidden_ssid_keyboard, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+}
+
+static void hidden_ssid_cancel_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    hidden_ssid_on_confirm = NULL;
+    close_hidden_ssid_popup();
+}
+
+static void hidden_ssid_confirm_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!hidden_ssid_textarea) return;
+    const char *text = lv_textarea_get_text(hidden_ssid_textarea);
+    if (!text || strlen(text) == 0) return;
+
+    char ssid_buf[33];
+    strncpy(ssid_buf, text, sizeof(ssid_buf) - 1);
+    ssid_buf[sizeof(ssid_buf) - 1] = '\0';
+
+    hidden_ssid_callback_t cb = hidden_ssid_on_confirm;
+    hidden_ssid_on_confirm = NULL;
+    close_hidden_ssid_popup();
+
+    if (cb) {
+        cb(ssid_buf);
+    }
+}
+
+static void show_hidden_ssid_popup(hidden_ssid_callback_t callback)
+{
+    if (hidden_ssid_popup_overlay) {
+        close_hidden_ssid_popup();
+    }
+    hidden_ssid_on_confirm = callback;
+
+    evil_twin_entry_count = 0;
+    memset(evil_twin_entries, 0, sizeof(evil_twin_entries));
+
+    uart_port_t uart_port = get_current_uart();
+    uart_flush(uart_port);
+    uart_send_command_for_tab("show_pass evil");
+
+    char rx_buffer[512];
+    int retries = 10;
+    int empty_reads = 0;
+
+    while (retries-- > 0 && evil_twin_entry_count < EVIL_TWIN_MAX_ENTRIES) {
+        int len = transport_read_bytes(uart_port, rx_buffer, sizeof(rx_buffer) - 1, pdMS_TO_TICKS(100));
+        if (len > 0) {
+            rx_buffer[len] = '\0';
+            empty_reads = 0;
+            char *line = strtok(rx_buffer, "\n\r");
+            while (line != NULL && evil_twin_entry_count < EVIL_TWIN_MAX_ENTRIES) {
+                if (strlen(line) > 3 && line[0] == '\"') {
+                    char *ssid_start = line + 1;
+                    char *ssid_end = strchr(ssid_start, '\"');
+                    if (ssid_end && *(ssid_end + 1) == ',' && *(ssid_end + 2) == ' ' && *(ssid_end + 3) == '\"') {
+                        *ssid_end = '\0';
+                        char *pass_start = ssid_end + 4;
+                        char *pass_end = strchr(pass_start, '\"');
+                        if (pass_end) {
+                            *pass_end = '\0';
+                            strncpy(evil_twin_entries[evil_twin_entry_count].ssid, ssid_start, 32);
+                            evil_twin_entries[evil_twin_entry_count].ssid[32] = '\0';
+                            strncpy(evil_twin_entries[evil_twin_entry_count].password, pass_start, 64);
+                            evil_twin_entries[evil_twin_entry_count].password[64] = '\0';
+                            evil_twin_entry_count++;
+                        }
+                    }
+                }
+                line = strtok(NULL, "\n\r");
+            }
+        } else {
+            empty_reads++;
+            if (empty_reads >= 3) break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    ESP_LOGI(TAG, "Hidden SSID popup: loaded %d known SSIDs", evil_twin_entry_count);
+
+    lv_obj_t *container = get_current_tab_container();
+    if (!container) return;
+
+    hidden_ssid_popup_overlay = lv_obj_create(container);
+    lv_obj_remove_style_all(hidden_ssid_popup_overlay);
+    lv_obj_set_size(hidden_ssid_popup_overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(hidden_ssid_popup_overlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(hidden_ssid_popup_overlay, LV_OPA_50, 0);
+    lv_obj_clear_flag(hidden_ssid_popup_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(hidden_ssid_popup_overlay, LV_OBJ_FLAG_CLICKABLE);
+
+    hidden_ssid_popup = lv_obj_create(hidden_ssid_popup_overlay);
+    lv_obj_set_size(hidden_ssid_popup, 500, LV_SIZE_CONTENT);
+    lv_obj_center(hidden_ssid_popup);
+    lv_obj_set_style_bg_color(hidden_ssid_popup, lv_color_hex(0x1A1A2A), 0);
+    lv_obj_set_style_border_color(hidden_ssid_popup, COLOR_MATERIAL_ORANGE, 0);
+    lv_obj_set_style_border_width(hidden_ssid_popup, 2, 0);
+    lv_obj_set_style_radius(hidden_ssid_popup, 16, 0);
+    lv_obj_set_style_shadow_width(hidden_ssid_popup, 30, 0);
+    lv_obj_set_style_shadow_color(hidden_ssid_popup, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_shadow_opa(hidden_ssid_popup, LV_OPA_50, 0);
+    lv_obj_set_style_pad_all(hidden_ssid_popup, 20, 0);
+    lv_obj_set_flex_flow(hidden_ssid_popup, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(hidden_ssid_popup, 12, 0);
+    lv_obj_clear_flag(hidden_ssid_popup, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(hidden_ssid_popup);
+    lv_label_set_text(title, LV_SYMBOL_EYE_CLOSE " Hidden Network");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_ORANGE, 0);
+
+    lv_obj_t *subtitle = lv_label_create(hidden_ssid_popup);
+    lv_label_set_text(subtitle, "Enter or select SSID:");
+    lv_obj_set_style_text_font(subtitle, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(subtitle, lv_color_hex(0xCCCCCC), 0);
+
+    if (evil_twin_entry_count > 0) {
+        char dropdown_opts[1024] = {0};
+        int pos = 0;
+        for (int i = 0; i < evil_twin_entry_count; i++) {
+            if (i > 0) {
+                dropdown_opts[pos++] = '\n';
+            }
+            int remain = (int)sizeof(dropdown_opts) - pos - 1;
+            if (remain <= 0) break;
+            int written = snprintf(dropdown_opts + pos, remain, "%s", evil_twin_entries[i].ssid);
+            if (written > 0) pos += written;
+        }
+
+        hidden_ssid_dropdown = lv_dropdown_create(hidden_ssid_popup);
+        lv_obj_set_width(hidden_ssid_dropdown, lv_pct(100));
+        lv_dropdown_set_options(hidden_ssid_dropdown, dropdown_opts);
+        lv_obj_set_style_bg_color(hidden_ssid_dropdown, lv_color_hex(0x2D2D2D), 0);
+        lv_obj_set_style_text_color(hidden_ssid_dropdown, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_set_style_border_color(hidden_ssid_dropdown, COLOR_MATERIAL_ORANGE, 0);
+        lv_obj_set_style_border_width(hidden_ssid_dropdown, 1, 0);
+        lv_obj_set_style_text_font(hidden_ssid_dropdown, &lv_font_montserrat_16, 0);
+
+        lv_obj_t *list = lv_dropdown_get_list(hidden_ssid_dropdown);
+        if (list) {
+            lv_obj_set_style_bg_color(list, lv_color_hex(0x2D2D2D), 0);
+            lv_obj_set_style_text_color(list, lv_color_hex(0xFFFFFF), 0);
+            lv_obj_set_style_border_color(list, COLOR_MATERIAL_ORANGE, 0);
+            lv_obj_set_style_text_font(list, &lv_font_montserrat_16, 0);
+        }
+
+        lv_obj_add_event_cb(hidden_ssid_dropdown, hidden_ssid_dropdown_changed_cb, LV_EVENT_VALUE_CHANGED, NULL);
+    }
+
+    hidden_ssid_textarea = lv_textarea_create(hidden_ssid_popup);
+    lv_obj_set_size(hidden_ssid_textarea, lv_pct(100), 44);
+    lv_textarea_set_one_line(hidden_ssid_textarea, true);
+    lv_textarea_set_max_length(hidden_ssid_textarea, 32);
+    lv_textarea_set_placeholder_text(hidden_ssid_textarea, "Type SSID here...");
+    lv_obj_set_style_bg_color(hidden_ssid_textarea, lv_color_hex(0x1A1A1A), 0);
+    lv_obj_set_style_border_color(hidden_ssid_textarea, COLOR_MATERIAL_ORANGE, 0);
+    lv_obj_set_style_border_width(hidden_ssid_textarea, 1, 0);
+    lv_obj_set_style_text_color(hidden_ssid_textarea, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_font(hidden_ssid_textarea, &lv_font_montserrat_16, 0);
+    lv_obj_add_event_cb(hidden_ssid_textarea, hidden_ssid_textarea_focus_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(hidden_ssid_textarea, hidden_ssid_textarea_focus_cb, LV_EVENT_FOCUSED, NULL);
+
+    if (evil_twin_entry_count > 0) {
+        char first_ssid[64];
+        lv_dropdown_get_selected_str(hidden_ssid_dropdown, first_ssid, sizeof(first_ssid));
+        lv_textarea_set_text(hidden_ssid_textarea, first_ssid);
+    }
+
+    lv_obj_t *btn_row = lv_obj_create(hidden_ssid_popup);
+    lv_obj_set_size(btn_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(btn_row, 0, 0);
+    lv_obj_set_style_pad_all(btn_row, 0, 0);
+    lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(btn_row, 15, 0);
+    lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *cancel_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(cancel_btn, 120, 44);
+    lv_obj_set_style_bg_color(cancel_btn, lv_color_hex(0x444444), 0);
+    lv_obj_set_style_radius(cancel_btn, 8, 0);
+    lv_obj_add_event_cb(cancel_btn, hidden_ssid_cancel_btn_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *cancel_lbl = lv_label_create(cancel_btn);
+    lv_label_set_text(cancel_lbl, "Cancel");
+    lv_obj_set_style_text_font(cancel_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_center(cancel_lbl);
+
+    lv_obj_t *confirm_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(confirm_btn, 120, 44);
+    lv_obj_set_style_bg_color(confirm_btn, COLOR_MATERIAL_GREEN, 0);
+    lv_obj_set_style_radius(confirm_btn, 8, 0);
+    lv_obj_add_event_cb(confirm_btn, hidden_ssid_confirm_btn_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *confirm_lbl = lv_label_create(confirm_btn);
+    lv_label_set_text(confirm_lbl, "Confirm");
+    lv_obj_set_style_text_font(confirm_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_center(confirm_lbl);
+
+    hidden_ssid_keyboard = lv_keyboard_create(hidden_ssid_popup_overlay);
+    lv_obj_set_size(hidden_ssid_keyboard, lv_pct(100), 260);
+    lv_obj_align(hidden_ssid_keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_keyboard_set_textarea(hidden_ssid_keyboard, hidden_ssid_textarea);
+    lv_obj_add_flag(hidden_ssid_keyboard, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(hidden_ssid_keyboard, hidden_ssid_keyboard_ready_cb, LV_EVENT_READY, NULL);
+    lv_obj_add_event_cb(hidden_ssid_keyboard, hidden_ssid_keyboard_ready_cb, LV_EVENT_CANCEL, NULL);
+}
+
+// ---- Hidden SSID context-specific confirm callbacks ----
+
+static void hidden_ssid_arp_confirm_cb(const char *ssid)
+{
+    int idx = selected_network_indices[0];
+    if (idx >= 0 && idx < network_count) {
+        strncpy(networks[idx].ssid, ssid, sizeof(networks[idx].ssid) - 1);
+        networks[idx].ssid[sizeof(networks[idx].ssid) - 1] = '\0';
+    }
+    strncpy(arp_target_ssid, ssid, sizeof(arp_target_ssid) - 1);
+    arp_target_ssid[sizeof(arp_target_ssid) - 1] = '\0';
+    show_arp_poison_page();
+}
+
+static void hidden_ssid_rogueap_confirm_cb(const char *ssid)
+{
+    int idx = selected_network_indices[0];
+    if (idx >= 0 && idx < network_count) {
+        strncpy(networks[idx].ssid, ssid, sizeof(networks[idx].ssid) - 1);
+        networks[idx].ssid[sizeof(networks[idx].ssid) - 1] = '\0';
+    }
+    show_rogue_ap_page();
+}
+
+static void hidden_ssid_wardrive_confirm_cb(const char *ssid)
+{
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx) return;
+    strncpy(ctx->wardrive_wigle_selected_ssid, ssid, sizeof(ctx->wardrive_wigle_selected_ssid) - 1);
+    ctx->wardrive_wigle_selected_ssid[sizeof(ctx->wardrive_wigle_selected_ssid) - 1] = '\0';
+}
+
+static void hidden_ssid_wpasec_confirm_cb(const char *ssid)
+{
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx) return;
+    strncpy(ctx->wpasec_selected_ssid, ssid, sizeof(ctx->wpasec_selected_ssid) - 1);
+    ctx->wpasec_selected_ssid[sizeof(ctx->wpasec_selected_ssid) - 1] = '\0';
+}
+
 // Attack tile event handler for bottom icon bar
 static void attack_tile_event_cb(lv_event_t *e)
 {
@@ -4227,6 +4526,10 @@ static void attack_tile_event_cb(lv_event_t *e)
         // Get the selected network's SSID
         int idx = selected_network_indices[0];
         if (idx >= 0 && idx < network_count) {
+            if (strlen(networks[idx].ssid) == 0) {
+                show_hidden_ssid_popup(hidden_ssid_arp_confirm_cb);
+                return;
+            }
             strncpy(arp_target_ssid, networks[idx].ssid, sizeof(arp_target_ssid) - 1);
             arp_target_ssid[sizeof(arp_target_ssid) - 1] = '\0';
         }
@@ -4251,6 +4554,12 @@ static void attack_tile_event_cb(lv_event_t *e)
         // Check SD card before opening popup
         if (!current_tab_has_sd_card()) {
             show_sd_warning_popup(show_rogue_ap_page);
+            return;
+        }
+        
+        int idx = selected_network_indices[0];
+        if (idx >= 0 && idx < network_count && strlen(networks[idx].ssid) == 0) {
+            show_hidden_ssid_popup(hidden_ssid_rogueap_confirm_cb);
             return;
         }
         
@@ -12101,6 +12410,11 @@ static void wardrive_wigle_network_row_click_cb(lv_event_t *e)
         return;
     }
 
+    if (strlen(ssid) == 0) {
+        show_hidden_ssid_popup(hidden_ssid_wardrive_confirm_cb);
+        return;
+    }
+
     strncpy(ctx->wardrive_wigle_selected_ssid, ssid, sizeof(ctx->wardrive_wigle_selected_ssid) - 1);
     ctx->wardrive_wigle_selected_ssid[sizeof(ctx->wardrive_wigle_selected_ssid) - 1] = '\0';
     ESP_LOGI(TAG, "[%s] WiGLE selected SSID: %s",
@@ -16931,6 +17245,11 @@ static void wpasec_network_row_click_cb(lv_event_t *e)
     const char *ssid = (const char *)lv_event_get_user_data(e);
     tab_context_t *ctx = get_current_ctx();
     if (!ctx || !ssid) return;
+
+    if (strlen(ssid) == 0) {
+        show_hidden_ssid_popup(hidden_ssid_wpasec_confirm_cb);
+        return;
+    }
 
     strncpy(ctx->wpasec_selected_ssid, ssid, sizeof(ctx->wpasec_selected_ssid) - 1);
     ctx->wpasec_selected_ssid[sizeof(ctx->wpasec_selected_ssid) - 1] = '\0';
