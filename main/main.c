@@ -246,6 +246,7 @@ typedef struct {
     lv_obj_t *home_storage_percent_label;
     lv_obj_t *home_files_label;
     lv_obj_t *home_files_detail_label;
+    lv_obj_t *home_quote_label;
     int home_handshake_count;
     bool home_wpasec_present;
     bool home_vendors_present;
@@ -592,6 +593,24 @@ static tab_context_t internal_ctx = {0};
 // Red Team mode - controls visibility of offensive features (declared early for use in all functions)
 static bool enable_red_team = false;  // Default: false (safe mode)
 static bool dashboard_enabled = true; // Home dashboard cards visibility
+
+// Dashboard footer quotes (10 lines)
+static const char *home_footer_quotes[] = {
+    "[scan] the air is noisy today. JanOS likes that.",
+    "[hardware] something smells like hot solder? call Oycze.",
+    "[signal] RSSI low. curiosity high.",
+    "[audit] somebody trusted default settings again.",
+    "[audit] better don't change default passwords.",
+    "[scan] the air is full of secrets today",
+    "[sniff] the packets are nervous",
+    "[warning] sansebastian energy detected nearby",
+    "[scan] another ssid enters the story",
+    "[LAB5] Control the chaos."
+};
+#define HOME_FOOTER_QUOTE_COUNT (sizeof(home_footer_quotes) / sizeof(home_footer_quotes[0]))
+static lv_timer_t *home_quote_timer = NULL;
+static int home_quote_index = -1;
+static uint32_t home_quote_rng = 0;
 
 // Legacy compatibility - kept for minimal code changes
 static wifi_network_t networks[MAX_NETWORKS];  // Temporary buffer during scan
@@ -1983,6 +2002,87 @@ static void update_home_dashboard_labels(tab_context_t *ctx, int battery_pct)
     trigger_home_meta_refresh(ctx, false);
 }
 
+static uint32_t home_quote_rand_u32(void)
+{
+    if (home_quote_rng == 0) {
+        home_quote_rng = lv_tick_get() ^ 0xA5A55A5Au;
+        if (home_quote_rng == 0) home_quote_rng = 0x6D2B79F5u;
+    }
+    home_quote_rng ^= home_quote_rng << 13;
+    home_quote_rng ^= home_quote_rng >> 17;
+    home_quote_rng ^= home_quote_rng << 5;
+    if (home_quote_rng == 0) home_quote_rng = 0x6D2B79F5u;
+    return home_quote_rng;
+}
+
+static uint32_t home_quote_next_period_ms(void)
+{
+    // Readable pace with slight irregularity: ~6.2s to ~11.2s
+    uint32_t period = 6200u + (home_quote_rand_u32() % 3200u);
+    if ((home_quote_rand_u32() % 4u) == 0u) {
+        period += 1800u;
+    }
+    return period;
+}
+
+static const char *home_quote_select_next(void)
+{
+    if (HOME_FOOTER_QUOTE_COUNT == 0) return "";
+    if (home_quote_index < 0) {
+        home_quote_index = (int)(home_quote_rand_u32() % HOME_FOOTER_QUOTE_COUNT);
+    } else {
+        int step = ((home_quote_rand_u32() % 5u) == 0u) ? 2 : 1;
+        home_quote_index = (home_quote_index + step) % (int)HOME_FOOTER_QUOTE_COUNT;
+    }
+    return home_footer_quotes[home_quote_index];
+}
+
+static void home_quote_apply_to_all(const char *quote)
+{
+    tab_context_t *ctx_list[] = { &grove_ctx, &usb_ctx, &mbus_ctx };
+    for (size_t i = 0; i < sizeof(ctx_list) / sizeof(ctx_list[0]); i++) {
+        tab_context_t *ctx = ctx_list[i];
+        if (ctx && ctx->home_quote_label) {
+            lv_label_set_text(ctx->home_quote_label, quote);
+        }
+    }
+}
+
+static void home_quote_sync_to_ctx(tab_context_t *ctx)
+{
+    if (!ctx || !ctx->home_quote_label || HOME_FOOTER_QUOTE_COUNT == 0) return;
+    if (home_quote_index < 0) {
+        home_quote_index = (int)(home_quote_rand_u32() % HOME_FOOTER_QUOTE_COUNT);
+    }
+    lv_label_set_text(ctx->home_quote_label, home_footer_quotes[home_quote_index]);
+}
+
+static void home_quote_timer_cb(lv_timer_t *timer)
+{
+    if (!timer) return;
+
+    if (!dashboard_enabled) {
+        lv_timer_set_period(timer, 9000);
+        return;
+    }
+
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx || !ctx->home_quote_label || !ctx->tiles || ctx->current_visible_page != ctx->tiles) {
+        lv_timer_set_period(timer, home_quote_next_period_ms());
+        return;
+    }
+
+    home_quote_apply_to_all(home_quote_select_next());
+    lv_timer_set_period(timer, home_quote_next_period_ms());
+}
+
+static void home_quote_start(void)
+{
+    if (home_quote_timer == NULL) {
+        home_quote_timer = lv_timer_create(home_quote_timer_cb, home_quote_next_period_ms(), NULL);
+    }
+}
+
 static void update_battery_status(void)
 {
     current_battery_voltage = ina226_read_bus_voltage();
@@ -2014,14 +2114,15 @@ static void battery_status_timer_cb(lv_timer_t *timer)
 
     // Update top bar labels
     if (battery_voltage_label) {
-        if (battery_pct >= 0) {
+        if (current_battery_voltage > 0.1f && battery_pct >= 0) {
             unsigned pct_display = (unsigned)battery_pct;
             if (pct_display > 100U) pct_display = 100U;
-            char pct_str[8];
-            snprintf(pct_str, sizeof(pct_str), "%u%%", pct_display);
-            lv_label_set_text(battery_voltage_label, pct_str);
+            char top_batt_str[24];
+            snprintf(top_batt_str, sizeof(top_batt_str), "%.2fV %u%%",
+                     current_battery_voltage, pct_display);
+            lv_label_set_text(battery_voltage_label, top_batt_str);
         } else {
-            lv_label_set_text(battery_voltage_label, "--%");
+            lv_label_set_text(battery_voltage_label, "--.--V --%");
         }
     }
 
@@ -4136,10 +4237,8 @@ static void create_status_bar(void)
     lv_obj_t *battery_chip = lv_obj_create(right_status);
     lv_obj_set_size(battery_chip, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
     lv_obj_set_style_bg_opa(battery_chip, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(battery_chip, 1, 0);
-    lv_obj_set_style_border_color(battery_chip, COLOR_LAB5_MAGENTA, 0);
-    lv_obj_set_style_border_opa(battery_chip, LV_OPA_50, 0);
-    lv_obj_set_style_radius(battery_chip, 8, 0);
+    lv_obj_set_style_border_width(battery_chip, 0, 0);
+    lv_obj_set_style_radius(battery_chip, 0, 0);
     lv_obj_set_style_pad_hor(battery_chip, tall_layout ? 8 : 6, 0);
     lv_obj_set_style_pad_ver(battery_chip, tall_layout ? 4 : 3, 0);
     lv_obj_set_style_pad_gap(battery_chip, tall_layout ? 6 : 4, 0);
@@ -4150,11 +4249,11 @@ static void create_status_bar(void)
 
     battery_icon_label = lv_label_create(battery_chip);
     lv_label_set_text(battery_icon_label, LV_SYMBOL_BATTERY_FULL);
-    lv_obj_set_style_text_font(battery_icon_label, tall_layout ? &lv_font_montserrat_20 : &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(battery_icon_label, tall_layout ? &lv_font_montserrat_22 : &lv_font_montserrat_18, 0);
     lv_obj_set_style_text_color(battery_icon_label, COLOR_LAB5_MAGENTA, 0);
 
     battery_voltage_label = lv_label_create(battery_chip);
-    lv_label_set_text(battery_voltage_label, "--%");
+    lv_label_set_text(battery_voltage_label, "--.--V --%");
     lv_obj_set_style_text_font(battery_voltage_label, tall_layout ? &lv_font_montserrat_20 : &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_color(battery_voltage_label, COLOR_NEON_TEXT, 0);
 
@@ -4165,13 +4264,15 @@ static void create_status_bar(void)
 
     // Settings button (larger hitbox for touch).
     lv_obj_t *settings_btn = lv_btn_create(right_status);
+    lv_obj_remove_style_all(settings_btn);
     lv_obj_set_size(settings_btn, tall_layout ? 52 : 46, tall_layout ? 52 : 46);
     lv_obj_set_style_bg_opa(settings_btn, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(settings_btn, 1, 0);
-    lv_obj_set_style_border_color(settings_btn, COLOR_LAB5_MAGENTA, 0);
-    lv_obj_set_style_border_opa(settings_btn, LV_OPA_70, 0);
-    lv_obj_set_style_radius(settings_btn, 10, 0);
+    lv_obj_set_style_border_width(settings_btn, 0, 0);
+    lv_obj_set_style_outline_width(settings_btn, 0, 0);
+    lv_obj_set_style_shadow_width(settings_btn, 0, 0);
+    lv_obj_set_style_radius(settings_btn, 0, 0);
     lv_obj_set_style_pad_all(settings_btn, 0, 0);
+    lv_obj_add_flag(settings_btn, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(settings_btn, header_settings_click_cb, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t *settings_icon = lv_label_create(settings_btn);
@@ -7908,6 +8009,7 @@ static void reset_home_dashboard_bindings(tab_context_t *ctx)
     ctx->home_storage_percent_label = NULL;
     ctx->home_files_label = NULL;
     ctx->home_files_detail_label = NULL;
+    ctx->home_quote_label = NULL;
 }
 
 static lv_obj_t *create_home_storage_card(lv_obj_t *parent, lv_coord_t card_h, bool large, tab_context_t *ctx)
@@ -8120,11 +8222,16 @@ static void create_uart_tiles_in_container(lv_obj_t *container, tab_context_t *c
         }
 
         lv_obj_t *signature = lv_label_create(footer);
-        lv_label_set_text(signature, "Jan ITI - the first JanOS king");
-        lv_obj_set_style_text_font(signature, &lv_font_montserrat_12, 0);
+        lv_label_set_text(signature, "");
+        lv_obj_set_style_text_font(signature, large ? &lv_font_montserrat_16 : &lv_font_montserrat_14, 0);
         lv_obj_set_style_text_color(signature, COLOR_NEON_MUTED, 0);
         lv_obj_set_width(signature, lv_pct(100));
         lv_obj_set_style_text_align(signature, LV_TEXT_ALIGN_LEFT, 0);
+        if (ctx) {
+            ctx->home_quote_label = signature;
+            home_quote_start();
+            home_quote_sync_to_ctx(ctx);
+        }
     }
 
     lv_obj_clear_flag(*tiles_ptr, LV_OBJ_FLAG_HIDDEN);
