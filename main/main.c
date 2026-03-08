@@ -50,6 +50,7 @@
 // #include "esp_codec_dev.h"
 
 static const char *TAG = "wifi_scanner";
+extern const lv_image_dsc_t intro_splash_img_lz4;
 
 // UART Configuration for ESP32C5 communication
 // Note: TX/RX pins are configured dynamically via get_uart_pins() based on NVS settings
@@ -3801,12 +3802,11 @@ static void show_splash_screen(void)
     lv_obj_set_style_bg_opa(splash_screen, LV_OPA_COVER, 0);
     lv_obj_clear_flag(splash_screen, LV_OBJ_FLAG_SCROLLABLE);
     
-    // C5Lab text with extra-large font
-    splash_label = lv_label_create(splash_screen);
-    lv_label_set_text(splash_label, "C5Lab");
-    lv_obj_set_style_text_font(splash_label, &lv_font_montserrat_44, 0);  // Largest currently available font (rebuild with fullclean for 48)
-    lv_obj_set_style_text_color(splash_label, lv_color_hex(0x00FFFF), 0);  // Start cyan
-    lv_obj_center(splash_label);
+    // Fullscreen intro image (LVGL RGB565 + LZ4 compressed C array)
+    lv_obj_t *splash_image = lv_image_create(splash_screen);
+    lv_image_set_src(splash_image, &intro_splash_img_lz4);
+    lv_obj_align(splash_image, LV_ALIGN_CENTER, 0, 0);
+    splash_label = NULL;
     
     // Add subtle scan line effect (optional decorative element)
     lv_obj_t *subtitle = lv_label_create(splash_screen);
