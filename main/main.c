@@ -1702,7 +1702,7 @@ static void home_parse_remote_list_dir(const char *buf, int *pcap_count, bool *w
                 if (wpasec_ok && strstr(line, "wpa-sec.txt")) {
                     *wpasec_ok = true;
                 }
-                if (vendors_ok && strstr(line, "oui.txt")) {
+                if (vendors_ok && strstr(line, "oui_wifi.bin")) {
                     *vendors_ok = true;
                 }
                 line_pos = 0;
@@ -1734,9 +1734,9 @@ static void home_read_local_meta(tab_context_t *ctx)
     }
     ctx->home_handshake_count = pcap_count;
     ctx->home_wpasec_present = file_exists("/sdcard/lab/wpa-sec.txt") || file_exists("/sdcard/wpa-sec.txt");
-    ctx->home_vendors_present = file_exists("/sdcard/lab/oui.txt") ||
-                                file_exists("/sdcard/lab/vendors/oui.txt") ||
-                                file_exists("/sdcard/oui.txt");
+    ctx->home_vendors_present = file_exists("/sdcard/lab/oui_wifi.bin") ||
+                                file_exists("/sdcard/lab/vendors/oui_wifi.bin") ||
+                                file_exists("/sdcard/oui_wifi.bin");
 
     uint64_t total = 0;
     uint64_t free = 0;
