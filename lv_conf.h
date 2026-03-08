@@ -827,7 +827,7 @@
 #define LV_USE_THORVG_EXTERNAL 0
 
 /*Use lvgl built-in LZ4 lib*/
-#define LV_USE_LZ4_INTERNAL  1
+#define LV_USE_LZ4_INTERNAL  0
 
 /*Use external LZ4 library*/
 #define LV_USE_LZ4_EXTERNAL  0

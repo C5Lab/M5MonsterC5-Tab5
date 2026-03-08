@@ -50,7 +50,7 @@
 // #include "esp_codec_dev.h"
 
 static const char *TAG = "wifi_scanner";
-extern const lv_image_dsc_t intro_splash_img_lz4;
+extern const lv_image_dsc_t intro_splash_img;
 
 // UART Configuration for ESP32C5 communication
 // Note: TX/RX pins are configured dynamically via get_uart_pins() based on NVS settings
@@ -1006,8 +1006,11 @@ static lv_obj_t *scan_overlay = NULL;
 // Splash screen
 static lv_obj_t *splash_screen = NULL;
 static lv_obj_t *splash_label = NULL;
+static lv_obj_t *splash_loading_label = NULL;
+static lv_obj_t *splash_detecting_label = NULL;
 static lv_timer_t *splash_timer = NULL;
 static int glitch_frame = 0;
+static bool splash_detection_started = false;
 
 // Screen timeout/dimming
 #define SCREEN_TIMEOUT_MS       30000  // 30 seconds (default, overridden by setting)
@@ -1381,7 +1384,6 @@ static void show_no_board_popup(void);
 static void board_detect_retry_cb(lv_timer_t *timer);
 static void board_detect_popup_close_cb(lv_event_t *e);
 static void reload_gui_for_detection(void);
-static void show_detection_popup(void);
 static void detection_complete_cb(lv_timer_t *timer);
 static void update_portal_icon(void);
 static void karma2_attack_background_cb(lv_event_t *e);
@@ -3652,60 +3654,41 @@ static void hide_evil_twin_loading_overlay(void) {
 }
 
 //==================================================================================
-// Startup Splash Screen with Glitch Animation
+// Startup Splash Screen Animation
 //==================================================================================
 
-// Glitch colors for cyberpunk effect
-static const lv_color_t glitch_colors[] = {
-    {.red = 0x00, .green = 0xFF, .blue = 0xFF},  // Cyan
-    {.red = 0xFF, .green = 0x00, .blue = 0xFF},  // Magenta
-    {.red = 0xFF, .green = 0xFF, .blue = 0xFF},  // White
-    {.red = 0x00, .green = 0xFF, .blue = 0x00},  // Green (matrix style)
-    {.red = 0xFF, .green = 0xFF, .blue = 0x00},  // Yellow
-};
-#define GLITCH_COLOR_COUNT (sizeof(glitch_colors) / sizeof(glitch_colors[0]))
-
-// Splash timer callback - creates glitch effect
+// Splash timer callback - animates loading intro states
 static void splash_timer_cb(lv_timer_t *timer)
 {
     (void)timer;
     
     glitch_frame++;
-    
-    if (glitch_frame < 15) {
-        // Glitch phase: rapid color and position changes
-        if (splash_label) {
-            // Random color from glitch palette
-            int color_idx = glitch_frame % GLITCH_COLOR_COUNT;
-            lv_obj_set_style_text_color(splash_label, glitch_colors[color_idx], 0);
-            
-            // Horizontal jitter effect
-            int jitter_x = (glitch_frame % 3 == 0) ? ((glitch_frame % 2) ? 8 : -8) : 0;
-            lv_obj_align(splash_label, LV_ALIGN_CENTER, jitter_x, 0);
+
+    // Animated loading text with moving dots + blink.
+    if (splash_loading_label) {
+        static const char *loading_frames[] = {
+            "LOADING",
+            "LOADING.",
+            "LOADING..",
+            "LOADING..."
+        };
+        lv_label_set_text(splash_loading_label, loading_frames[(glitch_frame / 3) % 4]);
+        lv_obj_set_style_text_opa(splash_loading_label, (glitch_frame % 10 < 6) ? LV_OPA_100 : LV_OPA_60, 0);
+    }
+
+    // Show "Detecting devices..." on the same intro screen, then start detection.
+    if (glitch_frame >= 22 && splash_detecting_label) {
+        lv_obj_clear_flag(splash_detecting_label, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    if (!splash_detection_started && glitch_frame >= 28) {
+        splash_detection_started = true;
+        if (detection_timer) {
+            lv_timer_del(detection_timer);
+            detection_timer = NULL;
         }
-    } else if (glitch_frame < 25) {
-        // Stabilize phase: settle on cyan color
-        if (splash_label) {
-            lv_obj_set_style_text_color(splash_label, lv_color_hex(0x00FFFF), 0);
-            lv_obj_align(splash_label, LV_ALIGN_CENTER, 0, 0);
-        }
-    } else {
-        // End splash and show detection popup
-        ESP_LOGI(TAG, "Splash complete, showing detection popup");
-        
-        if (splash_timer) {
-            lv_timer_del(splash_timer);
-            splash_timer = NULL;
-        }
-        
-        if (splash_screen) {
-            lv_obj_del(splash_screen);
-            splash_screen = NULL;
-            splash_label = NULL;
-        }
-        
-        // Show detection popup - it will wait for devices and then build UI
-        show_detection_popup();
+        detection_timer = lv_timer_create(detection_complete_cb, 700, NULL);
+        lv_timer_set_repeat_count(detection_timer, 1);
     }
 }
 
@@ -3716,6 +3699,11 @@ static void detection_complete_cb(lv_timer_t *timer)
     detection_timer = NULL;
     
     ESP_LOGI(TAG, "Detection timer complete, running board detection");
+
+    if (splash_timer) {
+        lv_timer_del(splash_timer);
+        splash_timer = NULL;
+    }
     
     // Run board detection
     detect_boards();
@@ -3726,10 +3714,19 @@ static void detection_complete_cb(lv_timer_t *timer)
     ESP_LOGI(TAG, "Detection complete: uart1=%d, mbus=%d, grove=%d, usb=%d",
              uart1_detected, mbus_detected, grove_detected, usb_detected);
     
-    // Remove detection popup
+    // Remove detection popup (legacy flow compatibility)
     if (detection_popup_overlay) {
         lv_obj_del(detection_popup_overlay);
         detection_popup_overlay = NULL;
+    }
+    
+    // Remove splash screen after integrated intro+loading+detecting flow.
+    if (splash_screen) {
+        lv_obj_del(splash_screen);
+        splash_screen = NULL;
+        splash_label = NULL;
+        splash_loading_label = NULL;
+        splash_detecting_label = NULL;
     }
     
     // Show appropriate UI based on detection results
@@ -3740,44 +3737,6 @@ static void detection_complete_cb(lv_timer_t *timer)
         ESP_LOGI(TAG, "Board(s) detected - showing main tiles");
         show_main_tiles();
     }
-}
-
-// Show detection popup while waiting for devices to stabilize
-static void show_detection_popup(void)
-{
-    ESP_LOGI(TAG, "Showing detection popup (waiting for devices)");
-    
-    lv_obj_t *scr = lv_scr_act();
-    
-    // Create full-screen overlay
-    detection_popup_overlay = lv_obj_create(scr);
-    lv_obj_remove_style_all(detection_popup_overlay);
-    lv_obj_set_size(detection_popup_overlay, lv_pct(100), lv_pct(100));
-    lv_obj_set_style_bg_color(detection_popup_overlay, lv_color_hex(0x121212), 0);
-    lv_obj_set_style_bg_opa(detection_popup_overlay, LV_OPA_COVER, 0);
-    lv_obj_clear_flag(detection_popup_overlay, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_flex_flow(detection_popup_overlay, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(detection_popup_overlay, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    
-    // Spinner animation (LVGL 9.x API)
-    lv_obj_t *spinner = lv_spinner_create(detection_popup_overlay);
-    lv_spinner_set_anim_params(spinner, 1000, 60);  // 1000ms rotation, 60 degree arc
-    lv_obj_set_size(spinner, 80, 80);
-    lv_obj_set_style_arc_color(spinner, lv_color_hex(0x00FFFF), LV_PART_INDICATOR);
-    lv_obj_set_style_arc_color(spinner, lv_color_hex(0x333333), LV_PART_MAIN);
-    
-    // Label
-    lv_obj_t *label = lv_label_create(detection_popup_overlay);
-    lv_label_set_text(label, "Detecting devices...");
-    lv_obj_set_style_text_color(label, lv_color_hex(0xFFFFFF), 0);
-    lv_obj_set_style_text_font(label, &lv_font_montserrat_24, 0);
-    lv_obj_set_style_pad_top(label, 20, 0);
-    
-    // Start timer - wait 2.5 seconds for USB and other devices to stabilize
-    detection_timer = lv_timer_create(detection_complete_cb, 2500, NULL);
-    lv_timer_set_repeat_count(detection_timer, 1);
-    
-    ESP_LOGI(TAG, "Detection timer started (2.5s)");
 }
 
 // Play startup beep (audio disabled due to linker issues - just log)
@@ -3793,6 +3752,7 @@ static void show_splash_screen(void)
     ESP_LOGI(TAG, "Showing splash screen...");
     
     glitch_frame = 0;
+    splash_detection_started = false;
     
     // Create full-screen black background
     splash_screen = lv_obj_create(lv_scr_act());
@@ -3802,21 +3762,36 @@ static void show_splash_screen(void)
     lv_obj_set_style_bg_opa(splash_screen, LV_OPA_COVER, 0);
     lv_obj_clear_flag(splash_screen, LV_OBJ_FLAG_SCROLLABLE);
     
-    // Fullscreen intro image (LVGL RGB565 + LZ4 compressed C array)
+    // Fullscreen intro image (LVGL RGB565 C array)
     lv_obj_t *splash_image = lv_image_create(splash_screen);
-    lv_image_set_src(splash_image, &intro_splash_img_lz4);
+    lv_image_set_src(splash_image, &intro_splash_img);
     lv_obj_align(splash_image, LV_ALIGN_CENTER, 0, 0);
-    splash_label = NULL;
     
-    // Add subtle scan line effect (optional decorative element)
-    lv_obj_t *subtitle = lv_label_create(splash_screen);
-    lv_label_set_text(subtitle, "[ INITIALIZING ]");
-    lv_obj_set_style_text_font(subtitle, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(subtitle, lv_color_hex(0x00FF00), 0);
-    lv_obj_align(subtitle, LV_ALIGN_CENTER, 0, 50);
+    // Bottom text stack: LAB5 -> LOADING... -> Detecting devices...
+    bool tall_layout = lv_disp_get_ver_res(NULL) >= 1000;
     
-    // Start glitch animation timer (50ms intervals = 20 FPS)
-    splash_timer = lv_timer_create(splash_timer_cb, 50, NULL);
+    splash_label = lv_label_create(splash_screen);
+    lv_label_set_text(splash_label, "LAB5");
+    lv_obj_set_style_text_font(splash_label, tall_layout ? &lv_font_montserrat_40 : &lv_font_montserrat_32, 0);
+    lv_obj_set_style_text_color(splash_label, COLOR_LAB5_MAGENTA, 0);
+    lv_obj_set_style_text_letter_space(splash_label, 2, 0);
+    lv_obj_align(splash_label, LV_ALIGN_BOTTOM_MID, 0, tall_layout ? -150 : -95);
+
+    splash_loading_label = lv_label_create(splash_screen);
+    lv_label_set_text(splash_loading_label, "LOADING...");
+    lv_obj_set_style_text_font(splash_loading_label, tall_layout ? &lv_font_montserrat_22 : &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_color(splash_loading_label, lv_color_hex(0xD8D8D8), 0);
+    lv_obj_align(splash_loading_label, LV_ALIGN_BOTTOM_MID, 0, tall_layout ? -112 : -64);
+
+    splash_detecting_label = lv_label_create(splash_screen);
+    lv_label_set_text(splash_detecting_label, "Detecting devices...");
+    lv_obj_set_style_text_font(splash_detecting_label, tall_layout ? &lv_font_montserrat_20 : &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(splash_detecting_label, lv_color_hex(0x9FE7D8), 0);
+    lv_obj_align(splash_detecting_label, LV_ALIGN_BOTTOM_MID, 0, tall_layout ? -80 : -38);
+    lv_obj_add_flag(splash_detecting_label, LV_OBJ_FLAG_HIDDEN);
+    
+    // Start intro animation timer (100ms gives readable loading/dot dynamics).
+    splash_timer = lv_timer_create(splash_timer_cb, 100, NULL);
     
     // Play startup beep in background task to not block UI
     xTaskCreate(
@@ -22144,7 +22119,7 @@ static void show_theme_popup(void)
     lv_obj_remove_style_all(theme_popup_overlay);
     lv_obj_set_size(theme_popup_overlay, lv_pct(100), lv_pct(100));
     lv_obj_set_style_bg_color(theme_popup_overlay, lv_color_hex(0x000000), 0);
-    lv_obj_set_style_bg_opa(theme_popup_overlay, dark_mode_enabled ? LV_OPA_50 : LV_OPA_35, 0);
+    lv_obj_set_style_bg_opa(theme_popup_overlay, dark_mode_enabled ? LV_OPA_50 : LV_OPA_30, 0);
     lv_obj_clear_flag(theme_popup_overlay, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(theme_popup_overlay, LV_OBJ_FLAG_CLICKABLE);
 
