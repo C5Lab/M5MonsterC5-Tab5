@@ -4177,7 +4177,7 @@ static void create_status_bar(void)
     lv_obj_t *settings_icon = lv_label_create(settings_btn);
     lv_label_set_text(settings_icon, LV_SYMBOL_SETTINGS);
     lv_obj_set_style_text_font(settings_icon, tall_layout ? &lv_font_montserrat_22 : &lv_font_montserrat_18, 0);
-    lv_obj_set_style_text_color(settings_icon, COLOR_LAB5_MAGENTA, 0);
+    lv_obj_set_style_text_color(settings_icon, lv_color_hex(0xA5AFBA), 0);
     lv_obj_center(settings_icon);
     
     // Initialize INA226 if not already done
