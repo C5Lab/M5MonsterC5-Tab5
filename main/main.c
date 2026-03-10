@@ -46,9 +46,6 @@
 #include <dirent.h>
 #include <sys/stat.h>
 
-// Audio codec for startup beep (commented out - causes linker issues)
-// #include "esp_codec_dev.h"
-
 static const char *TAG = "wifi_scanner";
 extern const lv_image_dsc_t intro_splash_img;
 
@@ -3739,10 +3736,82 @@ static void detection_complete_cb(lv_timer_t *timer)
     }
 }
 
-// Play startup beep (audio disabled due to linker issues - just log)
 static void play_startup_beep(void)
 {
-    ESP_LOGI(TAG, "Startup beep (audio disabled)");
+    ESP_LOGI(TAG, "Playing startup melody");
+
+    bsp_codec_config_t *codec = bsp_get_codec_handle();
+    if (!codec || !codec->i2s_write || !codec->set_volume || !codec->i2s_reconfig_clk_fn) {
+        ESP_LOGW(TAG, "Audio codec not available, skipping startup melody");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    #define MELODY_SAMPLE_RATE  48000
+    #define MELODY_CHANNELS     2
+    #define MELODY_NOTE_MS      180
+    #define MELODY_PAUSE_MS     30
+    #define MELODY_NOTES        6
+
+    static const float melody_freqs[MELODY_NOTES] = {
+        523.25f,   // C5
+        659.25f,   // E5
+        783.99f,   // G5
+        1046.50f,  // C6
+        1318.51f,  // E6
+        1567.98f,  // G6
+    };
+
+    const int samples_per_note = MELODY_SAMPLE_RATE * MELODY_NOTE_MS / 1000;
+    const int samples_pause = MELODY_SAMPLE_RATE * MELODY_PAUSE_MS / 1000;
+    const int total_samples = MELODY_NOTES * (samples_per_note + samples_pause);
+    const size_t buf_bytes = total_samples * MELODY_CHANNELS * sizeof(int16_t);
+
+    int16_t *buf = heap_caps_malloc(buf_bytes, MALLOC_CAP_SPIRAM);
+    if (!buf) {
+        ESP_LOGE(TAG, "Failed to allocate melody buffer (%d bytes)", (int)buf_bytes);
+        vTaskDelete(NULL);
+        return;
+    }
+    memset(buf, 0, buf_bytes);
+
+    const int attack_samples = MELODY_SAMPLE_RATE * 5 / 1000;  // 5ms
+    int pos = 0;
+
+    for (int n = 0; n < MELODY_NOTES; n++) {
+        float freq = melody_freqs[n];
+        float volume = 0.35f - (n * 0.02f);  // slight volume taper for higher notes
+
+        for (int i = 0; i < samples_per_note; i++) {
+            float t = (float)i / MELODY_SAMPLE_RATE;
+            float envelope = 1.0f;
+
+            if (i < attack_samples) {
+                envelope = (float)i / attack_samples;
+            } else {
+                envelope = 1.0f - (float)(i - attack_samples) / (samples_per_note - attack_samples);
+            }
+
+            float sample = sinf(2.0f * M_PI * freq * t) * envelope * volume;
+            int16_t s = (int16_t)(sample * 32767.0f);
+            buf[pos++] = s;  // L
+            buf[pos++] = s;  // R
+        }
+
+        for (int i = 0; i < samples_pause; i++) {
+            buf[pos++] = 0;  // L
+            buf[pos++] = 0;  // R
+        }
+    }
+
+    codec->set_volume(65);
+    codec->i2s_reconfig_clk_fn(MELODY_SAMPLE_RATE, 16, I2S_SLOT_MODE_STEREO);
+
+    size_t bytes_written = 0;
+    codec->i2s_write(buf, pos * sizeof(int16_t), &bytes_written, portMAX_DELAY);
+
+    heap_caps_free(buf);
+    ESP_LOGI(TAG, "Startup melody done (%d bytes written)", (int)bytes_written);
     vTaskDelete(NULL);
 }
 
@@ -3793,11 +3862,11 @@ static void show_splash_screen(void)
     // Start intro animation timer (100ms gives readable loading/dot dynamics).
     splash_timer = lv_timer_create(splash_timer_cb, 100, NULL);
     
-    // Play startup beep in background task to not block UI
+    // Play startup melody in background task to not block UI
     xTaskCreate(
         (TaskFunction_t)play_startup_beep,
-        "beep",
-        4096,
+        "melody",
+        8192,
         NULL,
         3,
         NULL
@@ -22368,6 +22437,9 @@ void app_main(void)
     
     // Initialize IO expander
     bsp_io_expander_pi4ioe_init(bsp_i2c_get_handle());
+    
+    // Initialize audio codec (ES8388 speaker + ES7210 mic)
+    bsp_codec_init();
     
     // Initialize SD card
     ESP_LOGI(TAG, "Initializing SD card...");
