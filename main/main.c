@@ -1257,6 +1257,7 @@ static void show_settings_page(void);
 static void main_tile_event_cb(lv_event_t *e);
 static void back_btn_event_cb(lv_event_t *e);
 static void network_checkbox_event_cb(lv_event_t *e);
+static void network_item_event_cb(lv_event_t *e);
 static void attack_tile_event_cb(lv_event_t *e);
 static void create_status_bar(void);
 static void header_settings_click_cb(lv_event_t *e);
@@ -3510,12 +3511,13 @@ static void wifi_scan_task(void *arg)
             lv_obj_set_size(item, lv_pct(100), LV_SIZE_CONTENT);
             lv_obj_set_style_pad_all(item, 8, 0);
             lv_obj_set_style_bg_color(item, lv_color_hex(0x2D2D2D), 0);
+            lv_obj_set_style_bg_color(item, lv_color_hex(0x3A3A3A), LV_STATE_PRESSED);
             lv_obj_set_style_border_width(item, 0, 0);
             lv_obj_set_style_radius(item, 8, 0);
             lv_obj_set_flex_flow(item, LV_FLEX_FLOW_ROW);
             lv_obj_set_flex_align(item, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
             lv_obj_set_style_pad_column(item, 12, 0);
-            lv_obj_clear_flag(item, LV_OBJ_FLAG_CLICKABLE);  // Don't steal clicks from checkbox
+            lv_obj_add_flag(item, LV_OBJ_FLAG_CLICKABLE);
             
             // Checkbox (on the left) - explicit size for better touch accuracy
             lv_obj_t *cb = lv_checkbox_create(item);
@@ -3532,6 +3534,7 @@ static void wifi_scan_task(void *arg)
             lv_obj_set_style_radius(cb, 4, LV_PART_INDICATOR);
             // Pass 0-based index as user data
             lv_obj_add_event_cb(cb, network_checkbox_event_cb, LV_EVENT_VALUE_CHANGED, (void*)(intptr_t)i);
+            lv_obj_add_event_cb(item, network_item_event_cb, LV_EVENT_CLICKED, cb);
             
             // Text container (vertical layout for SSID and info)
             lv_obj_t *text_cont = lv_obj_create(item);
@@ -4989,6 +4992,22 @@ static void network_checkbox_event_cb(lv_event_t *e)
             }
         }
     }
+}
+
+static void network_item_event_cb(lv_event_t *e)
+{
+    lv_obj_t *cb = lv_event_get_user_data(e);
+    if (cb == NULL) {
+        return;
+    }
+
+    if (lv_obj_has_state(cb, LV_STATE_CHECKED)) {
+        lv_obj_remove_state(cb, LV_STATE_CHECKED);
+    } else {
+        lv_obj_add_state(cb, LV_STATE_CHECKED);
+    }
+
+    lv_obj_send_event(cb, LV_EVENT_VALUE_CHANGED, NULL);
 }
 
 // ---- Hidden SSID popup helpers ----
