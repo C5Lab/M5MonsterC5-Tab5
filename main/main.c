@@ -3800,7 +3800,7 @@ static void play_startup_beep(void)
             else if (i > note_samples - release)
                 env = (float)(note_samples - i) / release;
 
-            int16_t s = (int16_t)(sinf(2.0f * M_PI * freq * t) * env * 0.30f * 32767.0f);
+            int16_t s = (int16_t)(sinf(2.0f * M_PI * freq * t) * env * 0.85f * 32767.0f);
             buf[pos++] = s;
             buf[pos++] = s;
         }
@@ -3812,7 +3812,7 @@ static void play_startup_beep(void)
         }
     }
 
-    codec->set_volume(65);
+    codec->set_volume(95);
     codec->i2s_reconfig_clk_fn(MELODY_SR, 16, I2S_SLOT_MODE_STEREO);
 
     size_t bytes_written = 0;
