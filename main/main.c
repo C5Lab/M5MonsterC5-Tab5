@@ -993,6 +993,7 @@ static bool ina226_initialized = false;
 static lv_obj_t *status_bar = NULL;
 static lv_obj_t *battery_voltage_label = NULL;
 static lv_obj_t *charging_status_label = NULL;
+static lv_coord_t charging_status_slot_width = 0;
 static lv_timer_t *battery_update_timer = NULL;
 static float current_battery_voltage = 0.0f;
 static float current_battery_current_a = 0.0f;
@@ -2231,10 +2232,12 @@ static void battery_status_timer_cb(lv_timer_t *timer)
     
     if (charging_status_label) {
         if (current_charging_status) {
+            lv_obj_set_width(charging_status_label, charging_status_slot_width);
             lv_label_set_text(charging_status_label, LV_SYMBOL_CHARGE);
             lv_obj_set_style_text_color(charging_status_label, COLOR_NEON_GREEN, 0);
         } else {
             lv_label_set_text(charging_status_label, "");
+            lv_obj_set_width(charging_status_label, 0);
             lv_obj_set_style_text_color(charging_status_label, ui_muted_color(), 0);
         }
     }
@@ -4340,6 +4343,7 @@ static void create_status_bar(void)
         status_bar = NULL;
         battery_voltage_label = NULL;
         charging_status_label = NULL;
+        charging_status_slot_width = 0;
         portal_icon = NULL;
     }
     
@@ -4392,7 +4396,7 @@ static void create_status_bar(void)
     lv_obj_set_size(right_status, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
     lv_obj_set_flex_flow(right_status, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(right_status, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_gap(right_status, tall_layout ? 12 : 10, 0);
+    lv_obj_set_style_pad_gap(right_status, tall_layout ? 8 : 6, 0);
     lv_obj_clear_flag(right_status, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_clear_flag(right_status, LV_OBJ_FLAG_CLICKABLE);
 
@@ -4421,6 +4425,7 @@ static void create_status_bar(void)
     lv_coord_t battery_value_width = tall_layout ? 176 : 148;
     lv_coord_t charge_slot_width = tall_layout ? 32 : 28;
     lv_coord_t battery_chip_width = battery_value_width + charge_slot_width + (tall_layout ? 6 : 4) + ((tall_layout ? 8 : 6) * 2);
+    charging_status_slot_width = charge_slot_width;
     lv_obj_set_size(battery_chip, battery_chip_width, LV_SIZE_CONTENT);
 
     battery_voltage_label = lv_label_create(battery_chip);
@@ -4437,7 +4442,7 @@ static void create_status_bar(void)
     lv_obj_set_style_text_font(charging_status_label, battery_font, 0);
     lv_obj_set_style_text_letter_space(charging_status_label, 0, 0);
     lv_obj_set_style_text_color(charging_status_label, COLOR_NEON_GREEN, 0);
-    lv_obj_set_width(charging_status_label, charge_slot_width);
+    lv_obj_set_width(charging_status_label, 0);
     lv_obj_set_style_text_align(charging_status_label, LV_TEXT_ALIGN_CENTER, 0);
 
     // Settings button (larger hitbox for touch).
