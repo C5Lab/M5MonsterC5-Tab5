@@ -3747,25 +3747,35 @@ static void play_startup_beep(void)
         return;
     }
 
-    #define MELODY_SAMPLE_RATE  48000
-    #define MELODY_CHANNELS     2
-    #define MELODY_NOTE_MS      180
-    #define MELODY_PAUSE_MS     30
-    #define MELODY_NOTES        6
+    #define MELODY_SR  48000
 
-    static const float melody_freqs[MELODY_NOTES] = {
-        523.25f,   // C5
-        659.25f,   // E5
-        783.99f,   // G5
-        1046.50f,  // C6
-        1318.51f,  // E6
-        1567.98f,  // G6
+    typedef struct { float freq; int ms; } note_t;
+
+    // Nokia Tune (Gran Vals by Francisco Tarrega)
+    static const note_t nokia_tune[] = {
+        { 659.25f, 125 },  // E5  eighth
+        { 587.33f, 125 },  // D5  eighth
+        { 369.99f, 250 },  // F#4 quarter
+        { 415.30f, 250 },  // G#4 quarter
+        { 554.37f, 125 },  // C#5 eighth
+        { 493.88f, 125 },  // B4  eighth
+        { 293.66f, 250 },  // D4  quarter
+        { 329.63f, 250 },  // E4  quarter
+        { 493.88f, 125 },  // B4  eighth
+        { 440.00f, 125 },  // A4  eighth
+        { 277.18f, 250 },  // C#4 quarter
+        { 329.63f, 250 },  // E4  quarter
+        { 440.00f, 500 },  // A4  half (held)
     };
+    #define NOKIA_NOTES (sizeof(nokia_tune) / sizeof(nokia_tune[0]))
 
-    const int samples_per_note = MELODY_SAMPLE_RATE * MELODY_NOTE_MS / 1000;
-    const int samples_pause = MELODY_SAMPLE_RATE * MELODY_PAUSE_MS / 1000;
-    const int total_samples = MELODY_NOTES * (samples_per_note + samples_pause);
-    const size_t buf_bytes = total_samples * MELODY_CHANNELS * sizeof(int16_t);
+    const int pause_ms = 20;
+    int total_ms = 0;
+    for (int n = 0; n < (int)NOKIA_NOTES; n++)
+        total_ms += nokia_tune[n].ms + pause_ms;
+
+    const int total_samples = MELODY_SR * total_ms / 1000;
+    const size_t buf_bytes = total_samples * 2 * sizeof(int16_t);
 
     int16_t *buf = heap_caps_malloc(buf_bytes, MALLOC_CAP_SPIRAM);
     if (!buf) {
@@ -3775,37 +3785,35 @@ static void play_startup_beep(void)
     }
     memset(buf, 0, buf_bytes);
 
-    const int attack_samples = MELODY_SAMPLE_RATE * 5 / 1000;  // 5ms
     int pos = 0;
+    for (int n = 0; n < (int)NOKIA_NOTES; n++) {
+        float freq = nokia_tune[n].freq;
+        int note_samples = MELODY_SR * nokia_tune[n].ms / 1000;
+        int attack = MELODY_SR * 5 / 1000;
+        int release = MELODY_SR * 15 / 1000;
 
-    for (int n = 0; n < MELODY_NOTES; n++) {
-        float freq = melody_freqs[n];
-        float volume = 0.35f - (n * 0.02f);  // slight volume taper for higher notes
+        for (int i = 0; i < note_samples; i++) {
+            float t = (float)i / MELODY_SR;
+            float env = 1.0f;
+            if (i < attack)
+                env = (float)i / attack;
+            else if (i > note_samples - release)
+                env = (float)(note_samples - i) / release;
 
-        for (int i = 0; i < samples_per_note; i++) {
-            float t = (float)i / MELODY_SAMPLE_RATE;
-            float envelope = 1.0f;
-
-            if (i < attack_samples) {
-                envelope = (float)i / attack_samples;
-            } else {
-                envelope = 1.0f - (float)(i - attack_samples) / (samples_per_note - attack_samples);
-            }
-
-            float sample = sinf(2.0f * M_PI * freq * t) * envelope * volume;
-            int16_t s = (int16_t)(sample * 32767.0f);
-            buf[pos++] = s;  // L
-            buf[pos++] = s;  // R
+            int16_t s = (int16_t)(sinf(2.0f * M_PI * freq * t) * env * 0.30f * 32767.0f);
+            buf[pos++] = s;
+            buf[pos++] = s;
         }
 
-        for (int i = 0; i < samples_pause; i++) {
-            buf[pos++] = 0;  // L
-            buf[pos++] = 0;  // R
+        int gap = MELODY_SR * pause_ms / 1000;
+        for (int i = 0; i < gap; i++) {
+            buf[pos++] = 0;
+            buf[pos++] = 0;
         }
     }
 
     codec->set_volume(65);
-    codec->i2s_reconfig_clk_fn(MELODY_SAMPLE_RATE, 16, I2S_SLOT_MODE_STEREO);
+    codec->i2s_reconfig_clk_fn(MELODY_SR, 16, I2S_SLOT_MODE_STEREO);
 
     size_t bytes_written = 0;
     codec->i2s_write(buf, pos * sizeof(int16_t), &bytes_written, portMAX_DELAY);
