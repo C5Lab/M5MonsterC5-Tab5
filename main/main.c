@@ -77,7 +77,9 @@ extern const lv_image_dsc_t intro_splash_img;
 #define INA226_REG_MFG_ID       0xFE    // Manufacturer ID (0x5449)
 #define INA226_REG_DIE_ID       0xFF    // Die ID (0x2260)
 #define INA226_BUS_VOLT_LSB     1.25f   // 1.25mV per LSB for bus voltage
+#define INA226_CURRENT_LSB_A    (INA226_MAX_CURRENT / 32767.0f)
 #define BATTERY_UPDATE_MS       2000    // Update battery status every 2 seconds
+#define BATTERY_CHARGING_THRESHOLD_A 0.05f
 
 // INA226 Calibration (from M5Tab5 official demo)
 #define INA226_SHUNT_RESISTANCE 0.005f  // 5 mOhm shunt resistor
@@ -986,11 +988,12 @@ static bool ina226_initialized = false;
 
 // Battery status bar
 static lv_obj_t *status_bar = NULL;
-static lv_obj_t *battery_icon_label = NULL;
 static lv_obj_t *battery_voltage_label = NULL;
 static lv_obj_t *charging_status_label = NULL;
 static lv_timer_t *battery_update_timer = NULL;
 static float current_battery_voltage = 0.0f;
+static float current_battery_current_a = 0.0f;
+static bool current_battery_current_valid = false;
 static bool current_charging_status = false;
 
 // LVGL UI elements - scan page
@@ -1595,15 +1598,43 @@ static float ina226_read_bus_voltage(void)
     return voltage_v;
 }
 
+static bool ina226_read_current(float *current_a)
+{
+    if (current_a) *current_a = 0.0f;
+    if (!ina226_initialized || ina226_dev_handle == NULL || current_a == NULL) {
+        return false;
+    }
+
+    uint8_t reg = INA226_REG_CURRENT;
+    uint8_t data[2];
+
+    esp_err_t ret = i2c_master_transmit_receive(ina226_dev_handle, &reg, 1, data, 2, 100);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to read INA226 current: %s", esp_err_to_name(ret));
+        return false;
+    }
+
+    int16_t raw_current = (int16_t)((data[0] << 8) | data[1]);
+    *current_a = raw_current * INA226_CURRENT_LSB_A;
+
+    ESP_LOGD(TAG, "INA226 current raw: 0x%04X (%d), current: %.3fA",
+             (uint16_t)raw_current, raw_current, *current_a);
+
+    return true;
+}
+
 //==================================================================================
 // Battery Status Functions
 //==================================================================================
 
-static bool get_charging_status(void)
+static bool get_charging_status(float current_a, bool current_valid)
 {
-    // Use USB-C detection as proxy for charging status
-    // When USB-C is connected and charging is enabled, device is charging
-    return bsp_usb_c_detect();
+    if (!current_valid) {
+        return bsp_usb_c_detect();
+    }
+
+    // Tab5's INA226 current polarity is inverted: charging reads as negative current.
+    return current_a < -BATTERY_CHARGING_THRESHOLD_A;
 }
 
 static int battery_percent_from_voltage(float voltage_v)
@@ -2150,7 +2181,8 @@ static void home_quote_start(void)
 static void update_battery_status(void)
 {
     current_battery_voltage = ina226_read_bus_voltage();
-    current_charging_status = get_charging_status();
+    current_battery_current_valid = ina226_read_current(&current_battery_current_a);
+    current_charging_status = get_charging_status(current_battery_current_a, current_battery_current_valid);
 }
 
 static void battery_status_timer_cb(lv_timer_t *timer)
@@ -2188,22 +2220,8 @@ static void battery_status_timer_cb(lv_timer_t *timer)
         } else {
             lv_label_set_text(battery_voltage_label, "--.--V --%");
         }
-    }
-
-    if (battery_icon_label) {
-        const char *icon = LV_SYMBOL_BATTERY_EMPTY;
-        if (battery_pct >= 80) {
-            icon = LV_SYMBOL_BATTERY_FULL;
-        } else if (battery_pct >= 55) {
-            icon = LV_SYMBOL_BATTERY_3;
-        } else if (battery_pct >= 30) {
-            icon = LV_SYMBOL_BATTERY_2;
-        } else if (battery_pct >= 10) {
-            icon = LV_SYMBOL_BATTERY_1;
-        }
-        lv_label_set_text(battery_icon_label, icon);
-        lv_obj_set_style_text_color(battery_icon_label,
-                                    (battery_pct >= 0 && battery_pct < 15) ? COLOR_MATERIAL_RED : COLOR_LAB5_MAGENTA, 0);
+        lv_obj_set_style_text_color(battery_voltage_label,
+                                    (battery_pct >= 0 && battery_pct < 15) ? COLOR_MATERIAL_RED : ui_text_color(), 0);
     }
     
     if (charging_status_label) {
@@ -4282,7 +4300,6 @@ static void create_status_bar(void)
 {
     ESP_LOGI(TAG, "Creating status bar...");
     lv_obj_t *scr = lv_scr_act();
-    lv_coord_t hor_res = lv_disp_get_hor_res(NULL);
     lv_coord_t ver_res = lv_disp_get_ver_res(NULL);
     bool tall_layout = ver_res >= 1000;
     
@@ -4290,7 +4307,6 @@ static void create_status_bar(void)
     if (status_bar) {
         lv_obj_del(status_bar);
         status_bar = NULL;
-        battery_icon_label = NULL;
         battery_voltage_label = NULL;
         charging_status_label = NULL;
         portal_icon = NULL;
@@ -4306,14 +4322,15 @@ static void create_status_bar(void)
     lv_obj_set_style_border_color(status_bar, ui_border_color(), 0);
     lv_obj_set_style_radius(status_bar, 0, 0);
     lv_obj_set_style_pad_hor(status_bar, 12, 0);
+    lv_obj_set_style_pad_gap(status_bar, tall_layout ? 10 : 8, 0);
+    lv_obj_set_flex_flow(status_bar, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(status_bar, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_clear_flag(status_bar, LV_OBJ_FLAG_SCROLLABLE);
     
     // Big logo hitbox for reliable screenshot trigger on touch.
     lv_obj_t *logo_btn = lv_btn_create(status_bar);
-    lv_coord_t logo_w = hor_res - (tall_layout ? 230 : 180);
-    if (logo_w < 250) logo_w = 250;
-    lv_obj_set_size(logo_btn, logo_w, UI_STATUS_BAR_HEIGHT - (tall_layout ? 8 : 6));
-    lv_obj_align(logo_btn, LV_ALIGN_LEFT_MID, 2, 0);
+    lv_obj_set_size(logo_btn, 0, UI_STATUS_BAR_HEIGHT - (tall_layout ? 8 : 6));
+    lv_obj_set_flex_grow(logo_btn, 1);
     lv_obj_set_style_bg_opa(logo_btn, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(logo_btn, 0, 0);
     lv_obj_set_style_shadow_width(logo_btn, 0, 0);
@@ -4325,6 +4342,8 @@ static void create_status_bar(void)
     lv_label_set_text(app_title, "#FF2FA3 LAB5# | control the chaos");
     lv_obj_set_style_text_font(app_title, tall_layout ? &lv_font_montserrat_24 : &lv_font_montserrat_18, 0);
     lv_obj_set_style_text_color(app_title, ui_text_color(), 0);
+    lv_obj_set_width(app_title, lv_pct(100));
+    lv_label_set_long_mode(app_title, LV_LABEL_LONG_DOT);
     lv_obj_align(app_title, LV_ALIGN_LEFT_MID, 0, 0);
     
 #if SCREENSHOT_ENABLED
@@ -4343,7 +4362,7 @@ static void create_status_bar(void)
     lv_obj_set_flex_flow(right_status, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(right_status, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_gap(right_status, tall_layout ? 12 : 10, 0);
-    lv_obj_align(right_status, LV_ALIGN_RIGHT_MID, -6, 0);
+    lv_obj_clear_flag(right_status, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_clear_flag(right_status, LV_OBJ_FLAG_CLICKABLE);
 
     // Portal icon (shown when portal is active)
@@ -4355,7 +4374,6 @@ static void create_status_bar(void)
 
     // Battery status chip next to settings: icon + percent + charging symbol.
     lv_obj_t *battery_chip = lv_obj_create(right_status);
-    lv_obj_set_size(battery_chip, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
     lv_obj_set_style_bg_opa(battery_chip, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(battery_chip, 0, 0);
     lv_obj_set_style_radius(battery_chip, 0, 0);
@@ -4367,20 +4385,29 @@ static void create_status_bar(void)
     lv_obj_clear_flag(battery_chip, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_clear_flag(battery_chip, LV_OBJ_FLAG_CLICKABLE);
 
-    battery_icon_label = lv_label_create(battery_chip);
-    lv_label_set_text(battery_icon_label, LV_SYMBOL_BATTERY_FULL);
-    lv_obj_set_style_text_font(battery_icon_label, tall_layout ? &lv_font_montserrat_22 : &lv_font_montserrat_18, 0);
-    lv_obj_set_style_text_color(battery_icon_label, COLOR_LAB5_MAGENTA, 0);
+    const lv_font_t *battery_font = tall_layout ? &lv_font_montserrat_20 : &lv_font_montserrat_16;
+    // Reserve extra room for the worst-case string: "8.40V 100%" plus font overhang.
+    lv_coord_t battery_value_width = tall_layout ? 176 : 148;
+    lv_coord_t charge_slot_width = tall_layout ? 32 : 28;
+    lv_coord_t battery_chip_width = battery_value_width + charge_slot_width + (tall_layout ? 6 : 4) + ((tall_layout ? 8 : 6) * 2);
+    lv_obj_set_size(battery_chip, battery_chip_width, LV_SIZE_CONTENT);
 
     battery_voltage_label = lv_label_create(battery_chip);
     lv_label_set_text(battery_voltage_label, "--.--V --%");
-    lv_obj_set_style_text_font(battery_voltage_label, tall_layout ? &lv_font_montserrat_20 : &lv_font_montserrat_16, 0);
+    lv_label_set_long_mode(battery_voltage_label, LV_LABEL_LONG_CLIP);
+    lv_obj_set_width(battery_voltage_label, battery_value_width);
+    lv_obj_set_style_text_font(battery_voltage_label, battery_font, 0);
+    lv_obj_set_style_text_letter_space(battery_voltage_label, 0, 0);
+    lv_obj_set_style_text_align(battery_voltage_label, LV_TEXT_ALIGN_RIGHT, 0);
     lv_obj_set_style_text_color(battery_voltage_label, ui_text_color(), 0);
 
     charging_status_label = lv_label_create(battery_chip);
     lv_label_set_text(charging_status_label, "");
-    lv_obj_set_style_text_font(charging_status_label, tall_layout ? &lv_font_montserrat_20 : &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(charging_status_label, battery_font, 0);
+    lv_obj_set_style_text_letter_space(charging_status_label, 0, 0);
     lv_obj_set_style_text_color(charging_status_label, COLOR_NEON_GREEN, 0);
+    lv_obj_set_width(charging_status_label, charge_slot_width);
+    lv_obj_set_style_text_align(charging_status_label, LV_TEXT_ALIGN_CENTER, 0);
 
     // Settings button (larger hitbox for touch).
     lv_obj_t *settings_btn = lv_btn_create(right_status);
