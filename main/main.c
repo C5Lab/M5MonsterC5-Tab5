@@ -604,6 +604,9 @@ static tab_context_t internal_ctx = {0};
 static bool enable_red_team = false;  // Default: false (safe mode)
 static bool dashboard_enabled = true; // Home dashboard cards visibility
 static bool dark_mode_enabled = true; // Default theme
+static bool boot_sound_enabled = true; // Startup melody toggle
+
+#define BOOT_SOUND_VOLUME_PERCENT 60
 
 // Dashboard footer quotes (10 lines)
 static const char *home_footer_quotes[] = {
@@ -1375,6 +1378,7 @@ static void settings_back_btn_event_cb(lv_event_t *e);
 static void show_scan_time_popup(void);
 static void show_theme_popup(void);
 static void theme_dark_mode_switch_cb(lv_event_t *e);
+static void theme_boot_sound_switch_cb(lv_event_t *e);
 static void show_red_team_settings_page(void);
 static void show_screen_timeout_popup(void);
 static void show_screen_brightness_popup(void);
@@ -1383,6 +1387,7 @@ static void get_uart2_pins(int *tx_pin, int *rx_pin);
 static void init_uart2(void);
 static void deinit_uart2(void);
 static void load_red_team_from_nvs(void);
+static void save_boot_sound_to_nvs(bool enabled);
 static void save_dashboard_to_nvs(bool enabled);
 static void save_dark_mode_to_nvs(bool enabled);
 static void load_dashboard_from_nvs(void);
@@ -3768,7 +3773,13 @@ static void detection_complete_cb(lv_timer_t *timer)
 
 static void play_startup_beep(void)
 {
-    ESP_LOGI(TAG, "Playing startup melody");
+    if (!boot_sound_enabled) {
+        ESP_LOGI(TAG, "Boot sound disabled, skipping startup melody");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    ESP_LOGI(TAG, "Playing startup melody at %d%%", BOOT_SOUND_VOLUME_PERCENT);
 
     bsp_codec_config_t *codec = bsp_get_codec_handle();
     if (!codec || !codec->i2s_write || !codec->set_volume || !codec->i2s_reconfig_clk_fn) {
@@ -3800,9 +3811,11 @@ static void play_startup_beep(void)
     #define NOKIA_NOTES (sizeof(nokia_tune) / sizeof(nokia_tune[0]))
 
     const int pause_ms = 20;
+    const int final_silence_ms = 160;
     int total_ms = 0;
     for (int n = 0; n < (int)NOKIA_NOTES; n++)
         total_ms += nokia_tune[n].ms + pause_ms;
+    total_ms += final_silence_ms;
 
     const int total_samples = MELODY_SR * total_ms / 1000;
     const size_t buf_bytes = total_samples * 2 * sizeof(int16_t);
@@ -3827,8 +3840,8 @@ static void play_startup_beep(void)
             float env = 1.0f;
             if (i < attack)
                 env = (float)i / attack;
-            else if (i > note_samples - release)
-                env = (float)(note_samples - i) / release;
+            else if (i >= note_samples - release)
+                env = (float)(note_samples - 1 - i) / (release - 1);
 
             int16_t s = (int16_t)(sinf(2.0f * M_PI * freq * t) * env * 0.85f * 32767.0f);
             buf[pos++] = s;
@@ -3842,11 +3855,27 @@ static void play_startup_beep(void)
         }
     }
 
-    codec->set_volume(95);
+    int final_gap = MELODY_SR * final_silence_ms / 1000;
+    for (int i = 0; i < final_gap; i++) {
+        buf[pos++] = 0;
+        buf[pos++] = 0;
+    }
+
+    int restore_volume = 80;
+    if (codec->get_volume) {
+        int current_volume = codec->get_volume();
+        if (current_volume >= 0 && current_volume <= 100) {
+            restore_volume = current_volume;
+        }
+    }
+
+    codec->set_volume(BOOT_SOUND_VOLUME_PERCENT);
     codec->i2s_reconfig_clk_fn(MELODY_SR, 16, I2S_SLOT_MODE_STEREO);
 
     size_t bytes_written = 0;
     codec->i2s_write(buf, pos * sizeof(int16_t), &bytes_written, portMAX_DELAY);
+    vTaskDelay(pdMS_TO_TICKS(final_silence_ms + 40));
+    codec->set_volume(restore_volume);
 
     heap_caps_free(buf);
     ESP_LOGI(TAG, "Startup melody done (%d bytes written)", (int)bytes_written);
@@ -3900,15 +3929,17 @@ static void show_splash_screen(void)
     // Start intro animation timer (100ms gives readable loading/dot dynamics).
     splash_timer = lv_timer_create(splash_timer_cb, 100, NULL);
     
-    // Play startup melody in background task to not block UI
-    xTaskCreate(
-        (TaskFunction_t)play_startup_beep,
-        "melody",
-        8192,
-        NULL,
-        3,
-        NULL
-    );
+    if (boot_sound_enabled) {
+        // Play startup melody in background task to not block UI
+        xTaskCreate(
+            (TaskFunction_t)play_startup_beep,
+            "melody",
+            8192,
+            NULL,
+            3,
+            NULL
+        );
+    }
 }
 
 // Scan button click handler
@@ -20940,6 +20971,7 @@ static __attribute__((unused)) lv_obj_t *settings_popup_obj = NULL;
 #define NVS_KEY_SCREEN_BRIGHT   "scr_bright"
 #define NVS_KEY_DASHBOARD       "dashboard"
 #define NVS_KEY_DARK_MODE       "dark_mode"
+#define NVS_KEY_BOOT_SOUND      "boot_sound"
 
 // Load Red Team setting from NVS (called on startup)
 // Note: Device detection is automatic via ping/pong
@@ -21024,6 +21056,16 @@ static void load_screen_settings_from_nvs(void)
             dark_mode_enabled = true;
             ESP_LOGI(TAG, "No Dark Mode setting in NVS, using default: ON");
         }
+
+        uint8_t boot_sound = 1;
+        err = nvs_get_u8(nvs, NVS_KEY_BOOT_SOUND, &boot_sound);
+        if (err == ESP_OK) {
+            boot_sound_enabled = (boot_sound != 0);
+            ESP_LOGI(TAG, "Loaded Boot Sound from NVS: %s", boot_sound_enabled ? "ON" : "OFF");
+        } else {
+            boot_sound_enabled = true;
+            ESP_LOGI(TAG, "No Boot Sound setting in NVS, using default: ON");
+        }
         
         nvs_close(nvs);
     } else {
@@ -21100,6 +21142,20 @@ static void save_dark_mode_to_nvs(bool enabled)
         ESP_LOGI(TAG, "Saved Dark Mode to NVS: %s", enabled ? "ON" : "OFF");
     } else {
         ESP_LOGE(TAG, "Failed to open NVS for writing Dark Mode: %s", esp_err_to_name(err));
+    }
+}
+
+static void save_boot_sound_to_nvs(bool enabled)
+{
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs);
+    if (err == ESP_OK) {
+        nvs_set_u8(nvs, NVS_KEY_BOOT_SOUND, enabled ? 1 : 0);
+        nvs_commit(nvs);
+        nvs_close(nvs);
+        ESP_LOGI(TAG, "Saved Boot Sound to NVS: %s", enabled ? "Enabled" : "Disabled");
+    } else {
+        ESP_LOGE(TAG, "Failed to open NVS for writing Boot Sound: %s", esp_err_to_name(err));
     }
 }
 
@@ -22490,6 +22546,16 @@ static void theme_dashboard_switch_cb(lv_event_t *e)
     rebuild_all_home_tiles();
 }
 
+static void theme_boot_sound_switch_cb(lv_event_t *e)
+{
+    lv_obj_t *sw = lv_event_get_target(e);
+    bool enabled = lv_obj_has_state(sw, LV_STATE_CHECKED);
+    if (boot_sound_enabled == enabled) return;
+
+    boot_sound_enabled = enabled;
+    save_boot_sound_to_nvs(boot_sound_enabled);
+}
+
 static void style_theme_switch(lv_obj_t *sw)
 {
     lv_obj_set_size(sw, 70, 36);
@@ -22566,7 +22632,7 @@ static void show_theme_popup(void)
     lv_obj_add_flag(theme_popup_overlay, LV_OBJ_FLAG_CLICKABLE);
 
     theme_popup_obj = lv_obj_create(theme_popup_overlay);
-    lv_obj_set_size(theme_popup_obj, 430, 332);
+    lv_obj_set_size(theme_popup_obj, 430, 404);
     lv_obj_center(theme_popup_obj);
     lv_obj_set_style_bg_color(theme_popup_obj, ui_panel_color(), 0);
     lv_obj_set_style_border_color(theme_popup_obj, dark_mode_enabled ? COLOR_LAB5_MAGENTA : ui_border_color(), 0);
@@ -22625,10 +22691,32 @@ static void show_theme_popup(void)
     }
     lv_obj_add_event_cb(dashboard_switch, theme_dashboard_switch_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
+    lv_obj_t *boot_sound_row = lv_obj_create(theme_popup_obj);
+    lv_obj_set_size(boot_sound_row, lv_pct(100), 56);
+    lv_obj_set_style_bg_opa(boot_sound_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(boot_sound_row, 0, 0);
+    lv_obj_set_style_pad_all(boot_sound_row, 0, 0);
+    lv_obj_set_flex_flow(boot_sound_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(boot_sound_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(boot_sound_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *boot_sound_row_label = lv_label_create(boot_sound_row);
+    lv_label_set_text(boot_sound_row_label, "Boot sound");
+    lv_obj_set_style_text_font(boot_sound_row_label, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_color(boot_sound_row_label, ui_text_color(), 0);
+
+    lv_obj_t *boot_sound_switch = lv_switch_create(boot_sound_row);
+    style_theme_switch(boot_sound_switch);
+    if (boot_sound_enabled) {
+        lv_obj_add_state(boot_sound_switch, LV_STATE_CHECKED);
+    }
+    lv_obj_add_event_cb(boot_sound_switch, theme_boot_sound_switch_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
     lv_obj_t *desc = lv_label_create(theme_popup_obj);
     lv_label_set_text(desc,
         "Dark mode switches between dark and light palette.\n"
-        "Dashboard ON/OFF toggles bottom telemetry cards on Home.");
+        "Dashboard ON/OFF toggles bottom telemetry cards on Home.\n"
+        "Boot sound toggles the startup melody at 60% volume.");
     lv_obj_set_style_text_font(desc, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(desc, ui_muted_color(), 0);
     lv_obj_set_width(desc, lv_pct(100));
