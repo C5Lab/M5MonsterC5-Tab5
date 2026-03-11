@@ -3947,26 +3947,26 @@ static void play_startup_beep(void)
         { 440.00f, 500 },  // A4  half (held)
     };
 
-    // Intel-like startup jingle.
+    // Intel-like startup jingle (short 5-note motif).
     static const note_t intel_jingle[] = {
-        { 659.25f, 110 },  // E5
-        { 659.25f, 110 },  // E5
-        { 659.25f, 130 },  // E5
-        { 523.25f, 220 },  // C5
-        { 392.00f, 320 },  // G4
+        { 622.25f, 100 },  // D#5
+        { 659.25f, 100 },  // E5
+        { 493.88f, 110 },  // B4
+        { 622.25f, 120 },  // D#5
+        { 466.16f, 280 },  // A#4
     };
 
-    // Star Wars main motif (short intro phrase).
+    // Star Wars main motif (slower intro phrase).
     static const note_t star_wars_motif[] = {
-        { 440.00f, 250 },  // A4
-        { 440.00f, 250 },  // A4
-        { 440.00f, 250 },  // A4
-        { 349.23f, 160 },  // F4
-        { 523.25f, 90  },  // C5
-        { 440.00f, 250 },  // A4
-        { 349.23f, 160 },  // F4
-        { 523.25f, 90  },  // C5
-        { 440.00f, 400 },  // A4
+        { 440.00f, 380 },  // A4
+        { 440.00f, 380 },  // A4
+        { 440.00f, 380 },  // A4
+        { 349.23f, 250 },  // F4
+        { 523.25f, 150 },  // C5
+        { 440.00f, 380 },  // A4
+        { 349.23f, 250 },  // F4
+        { 523.25f, 150 },  // C5
+        { 440.00f, 680 },  // A4
     };
 
     const note_t *melody = nokia_tune;
@@ -3999,7 +3999,7 @@ static void play_startup_beep(void)
 
     ESP_LOGI(TAG, "Playing startup melody: %s at %d%%", melody_name, BOOT_SOUND_VOLUME_PERCENT);
 
-    const int pause_ms = 20;
+    const int pause_ms = (selected_mode == BOOT_SOUND_MODE_STAR_WARS) ? 42 : 20;
     const int final_silence_ms = 160;
     int total_ms = 0;
     for (int n = 0; n < melody_notes; n++)
