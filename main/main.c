@@ -281,6 +281,9 @@ typedef struct {
     int selected_indices[MAX_NETWORKS];
     int selected_count;
     bool scan_in_progress;
+    bool observer_attack_override_active;
+    bool observer_attack_return_to_observer;
+    wifi_network_t observer_attack_network;
     
     // Network popup (clients, deauth)
     lv_obj_t *network_popup;
@@ -612,7 +615,7 @@ typedef enum {
 } boot_sound_mode_t;
 static boot_sound_mode_t boot_sound_mode = BOOT_SOUND_MODE_NOKIA;
 
-#define BOOT_SOUND_VOLUME_PERCENT 60
+#define BOOT_SOUND_VOLUME_PERCENT 69
 
 // Dashboard footer quotes (10 lines)
 static const char *home_footer_quotes[] = {
@@ -811,7 +814,6 @@ static int selected_network_count = 0;
 
 // Observer global variables (large arrays in PSRAM)
 static observer_network_t *observer_networks = NULL;  // Allocated in PSRAM
-static TimerHandle_t observer_timer = NULL;
 // Note: observer_task_handle is now per-context (ctx->observer_task)
 #define POPUP_POLL_INTERVAL_MS  10000  // 10 seconds
 
@@ -1069,13 +1071,63 @@ static void init_all_tab_contexts(void) {
     init_tab_context(&internal_ctx);
 }
 
+static void restore_tab_context_to_globals(tab_context_t *ctx);
+
+static void apply_observer_attack_override_to_globals(tab_context_t *ctx)
+{
+    if (!ctx || !ctx->observer_attack_override_active) return;
+
+    memset(networks, 0, sizeof(networks));
+    networks[0] = ctx->observer_attack_network;
+
+    memset(selected_network_indices, 0, sizeof(selected_network_indices));
+    selected_network_indices[0] = 0;
+
+    network_count = 1;
+    selected_network_count = 1;
+}
+
+static void prepare_observer_attack_override(tab_context_t *ctx, int observer_idx)
+{
+    if (!ctx || observer_idx < 0 || observer_idx >= ctx->observer_network_count) return;
+
+    observer_network_t *net = &ctx->observer_networks[observer_idx];
+
+    memset(&ctx->observer_attack_network, 0, sizeof(ctx->observer_attack_network));
+    ctx->observer_attack_network.index = net->scan_index;
+    ctx->observer_attack_network.rssi = net->rssi;
+
+    snprintf(ctx->observer_attack_network.ssid, sizeof(ctx->observer_attack_network.ssid), "%s", net->ssid);
+    snprintf(ctx->observer_attack_network.bssid, sizeof(ctx->observer_attack_network.bssid), "%s", net->bssid);
+    snprintf(ctx->observer_attack_network.band, sizeof(ctx->observer_attack_network.band), "%s", net->band);
+    snprintf(ctx->observer_attack_network.security, sizeof(ctx->observer_attack_network.security), "%s", "Unknown");
+
+    ctx->observer_attack_override_active = true;
+    apply_observer_attack_override_to_globals(ctx);
+
+    ESP_LOGI(TAG, "Prepared observer attack override for '%s' (scan_index=%d)",
+             ctx->observer_attack_network.ssid,
+             ctx->observer_attack_network.index);
+}
+
+static void clear_observer_attack_override(tab_context_t *ctx)
+{
+    if (!ctx || !ctx->observer_attack_override_active) return;
+
+    ctx->observer_attack_override_active = false;
+    restore_tab_context_to_globals(ctx);
+}
+
 // Restore a tab's context to global variables (for legacy code compatibility)
 static void restore_tab_context_to_globals(tab_context_t *ctx) {
     if (!ctx) return;
     
     // Restore WiFi scan results (only if no scan is in progress)
     if (!scan_in_progress) {
-        if (ctx->networks && ctx->network_count > 0) {
+        if (ctx->observer_attack_override_active) {
+            apply_observer_attack_override_to_globals(ctx);
+            ESP_LOGI(TAG, "Restored observer attack override to globals");
+        } else if (ctx->networks && ctx->network_count > 0) {
             memcpy(networks, ctx->networks, sizeof(wifi_network_t) * MAX_NETWORKS);
             network_count = ctx->network_count;
             memcpy(selected_network_indices, ctx->selected_indices, sizeof(selected_network_indices));
@@ -1102,6 +1154,11 @@ static void restore_tab_context_to_globals(tab_context_t *ctx) {
 // Save global variables back to tab context (call BEFORE switching tabs)
 static void save_globals_to_tab_context(tab_context_t *ctx) {
     if (!ctx) return;
+
+    if (ctx->observer_attack_override_active) {
+        ESP_LOGI(TAG, "Skipping scan state save while observer attack override is active");
+        return;
+    }
     
     // Save WiFi scan results and selections
     if (ctx->networks) {
@@ -1402,6 +1459,9 @@ static void back_btn_event_cb(lv_event_t *e);
 static void network_checkbox_event_cb(lv_event_t *e);
 static void network_item_event_cb(lv_event_t *e);
 static void attack_tile_event_cb(lv_event_t *e);
+static void observer_attack_tile_event_cb(lv_event_t *e);
+static void observer_station_attack_tile_event_cb(lv_event_t *e);
+static void create_attack_action_bar(lv_obj_t *parent, lv_event_cb_t callback);
 static void create_status_bar(void);
 static void header_settings_click_cb(lv_event_t *e);
 static void switch_to_internal_settings_page(void);
@@ -1425,7 +1485,10 @@ static void network_row_click_cb(lv_event_t *e);
 static void client_row_click_cb(lv_event_t *e);
 static void show_network_popup(int network_idx);
 static void close_network_popup(void);
+static void destroy_network_popup_ui(tab_context_t *ctx);
+static void pause_observer_for_attack(tab_context_t *ctx);
 static void show_deauth_popup(int network_idx, int client_idx);
+static void destroy_deauth_popup_ui(void);
 static void close_deauth_popup(void);
 static void deauth_btn_click_cb(lv_event_t *e);
 static void update_observer_table(tab_context_t *ctx);
@@ -4328,6 +4391,75 @@ static lv_obj_t *create_small_tile(lv_obj_t *parent, const char *icon, const cha
     return tile;
 }
 
+static void create_attack_action_bar(lv_obj_t *parent, lv_event_cb_t callback)
+{
+    lv_obj_t *attack_bar = lv_obj_create(parent);
+    lv_obj_set_size(attack_bar, lv_pct(100), 162);
+    lv_obj_set_style_bg_opa(attack_bar, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(attack_bar, 0, 0);
+    lv_obj_set_style_pad_all(attack_bar, 4, 0);
+    lv_obj_set_style_pad_gap(attack_bar, 6, 0);
+    lv_obj_set_flex_flow(attack_bar, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(attack_bar, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(attack_bar, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *attack_row1 = lv_obj_create(attack_bar);
+    lv_obj_set_size(attack_row1, lv_pct(100), 72);
+    lv_obj_set_style_bg_opa(attack_row1, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(attack_row1, 0, 0);
+    lv_obj_set_style_pad_all(attack_row1, 0, 0);
+    lv_obj_set_style_pad_gap(attack_row1, 8, 0);
+    lv_obj_set_flex_flow(attack_row1, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(attack_row1, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(attack_row1, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *attack_row2 = lv_obj_create(attack_bar);
+    lv_obj_set_size(attack_row2, lv_pct(100), 72);
+    lv_obj_set_style_bg_opa(attack_row2, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(attack_row2, 0, 0);
+    lv_obj_set_style_pad_all(attack_row2, 0, 0);
+    lv_obj_set_style_pad_gap(attack_row2, 8, 0);
+    lv_obj_set_flex_flow(attack_row2, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(attack_row2, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(attack_row2, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_update_layout(parent);
+    lv_coord_t row_inner_w = lv_obj_get_content_width(attack_row1);
+    if (row_inner_w <= 0) {
+        row_inner_w = lv_disp_get_hor_res(NULL) - 16;
+    }
+    if (row_inner_w < 280) row_inner_w = 280;
+
+    const lv_coord_t action_gap_total = 16;
+    lv_coord_t action_btn_w = (row_inner_w - action_gap_total) / 3;
+    if (action_btn_w < 90) action_btn_w = 90;
+
+    lv_coord_t action_btn_last_w = action_btn_w;
+    lv_coord_t used_width = (action_btn_w * 3) + action_gap_total;
+    if (used_width < row_inner_w) {
+        action_btn_last_w += (row_inner_w - used_width);
+    }
+
+    if (enable_red_team) {
+        lv_obj_t *btn1 = create_small_tile(attack_row1, LV_SYMBOL_CHARGE, "Deauth", COLOR_MATERIAL_RED, callback, "Deauth");
+        lv_obj_t *btn2 = create_small_tile(attack_row1, LV_SYMBOL_WARNING, "Evil Twin", COLOR_MATERIAL_ORANGE, callback, "Evil Twin");
+        lv_obj_t *btn3 = create_small_tile(attack_row1, LV_SYMBOL_POWER, "SAE Overflow", COLOR_MATERIAL_PINK, callback, "SAE Overflow");
+        lv_obj_t *btn4 = create_small_tile(attack_row2, LV_SYMBOL_DOWNLOAD, "Handshake", COLOR_MATERIAL_AMBER, callback, "Handshaker");
+        lv_obj_t *btn5 = create_small_tile(attack_row2, LV_SYMBOL_SHUFFLE, "ARP", COLOR_MATERIAL_PURPLE, callback, "ARP Poison");
+        lv_obj_t *btn6 = create_small_tile(attack_row2, LV_SYMBOL_WIFI, "RogueAP", COLOR_MATERIAL_CYAN, callback, "Rogue AP");
+
+        lv_obj_set_size(btn1, action_btn_w, 72);
+        lv_obj_set_size(btn2, action_btn_w, 72);
+        lv_obj_set_size(btn3, action_btn_last_w, 72);
+        lv_obj_set_size(btn4, action_btn_w, 72);
+        lv_obj_set_size(btn5, action_btn_w, 72);
+        lv_obj_set_size(btn6, action_btn_last_w, 72);
+    } else {
+        lv_obj_t *btn = create_small_tile(attack_row1, LV_SYMBOL_SHUFFLE, "ARP", COLOR_MATERIAL_PURPLE, callback, "ARP Poison");
+        lv_obj_set_size(btn, row_inner_w, 72);
+    }
+}
+
 // ============================================================================
 // SCREENSHOT FUNCTIONALITY
 // ============================================================================
@@ -5307,6 +5439,11 @@ static void hidden_ssid_cancel_btn_cb(lv_event_t *e)
 {
     (void)e;
     hidden_ssid_on_confirm = NULL;
+    tab_context_t *ctx = get_current_ctx();
+    if (ctx) {
+        ctx->observer_attack_return_to_observer = false;
+        clear_observer_attack_override(ctx);
+    }
     close_hidden_ssid_popup();
 }
 
@@ -5550,18 +5687,17 @@ static void hidden_ssid_wpasec_confirm_cb(const char *ssid)
     ctx->wpasec_selected_ssid[sizeof(ctx->wpasec_selected_ssid) - 1] = '\0';
 }
 
-// Attack tile event handler for bottom icon bar
-static void attack_tile_event_cb(lv_event_t *e)
+static void handle_selected_attack(const char *attack_name)
 {
-    const char *attack_name = (const char *)lv_event_get_user_data(e);
+    if (!attack_name) return;
+
     ESP_LOGI(TAG, "Attack tile clicked: %s", attack_name);
-    
+
     if (selected_network_count == 0) {
         ESP_LOGW(TAG, "No networks selected for attack");
         return;
     }
-    
-    // Log selected networks
+
     ESP_LOGI(TAG, "Selected %d network(s) for %s attack:", selected_network_count, attack_name);
     for (int i = 0; i < selected_network_count; i++) {
         int idx = selected_network_indices[i];
@@ -5569,36 +5705,27 @@ static void attack_tile_event_cb(lv_event_t *e)
             ESP_LOGI(TAG, "  [%d] %s (%s)", idx, networks[idx].ssid, networks[idx].bssid);
         }
     }
-    
-    // Handle Deauth attack
+
     if (strcmp(attack_name, "Deauth") == 0) {
-        // Build select_networks command with 1-based indices
         char cmd[128];
         snprintf(cmd, sizeof(cmd), "select_networks");
         for (int i = 0; i < selected_network_count; i++) {
             int idx = selected_network_indices[i];
             if (idx >= 0 && idx < network_count) {
                 char num[8];
-                snprintf(num, sizeof(num), " %d", networks[idx].index);  // .index is 1-based
+                snprintf(num, sizeof(num), " %d", networks[idx].index);
                 strncat(cmd, num, sizeof(cmd) - strlen(cmd) - 1);
             }
         }
-        
-        // Send select_networks command
+
         uart_send_command_for_tab(cmd);
         vTaskDelay(pdMS_TO_TICKS(100));
-        
-        // Send start_deauth command
         uart_send_command_for_tab("start_deauth");
-        
-        // Show popup with attacking networks
         show_scan_deauth_popup();
         return;
     }
-    
-    // Handle Evil Twin attack
+
     if (strcmp(attack_name, "Evil Twin") == 0) {
-        // Check SD card before opening Evil Twin popup
         if (!current_tab_has_sd_card()) {
             show_sd_warning_popup(show_evil_twin_popup);
             return;
@@ -5606,44 +5733,34 @@ static void attack_tile_event_cb(lv_event_t *e)
         show_evil_twin_popup();
         return;
     }
-    
-    // Handle SAE Overflow attack
+
     if (strcmp(attack_name, "SAE Overflow") == 0) {
         if (selected_network_count != 1) {
             ESP_LOGW(TAG, "SAE Overflow requires exactly one network, selected: %d", selected_network_count);
-            // Show error in status label if available
             if (status_label) {
                 lv_label_set_text(status_label, "Please select just one network");
                 lv_obj_set_style_text_color(status_label, COLOR_MATERIAL_RED, 0);
             }
             return;
         }
-        
+
         int idx = selected_network_indices[0];
         int net_1based = networks[idx].index;
-        
-        // Send select_networks command
+
         char cmd[32];
         snprintf(cmd, sizeof(cmd), "select_networks %d", net_1based);
         uart_send_command_for_tab(cmd);
         vTaskDelay(pdMS_TO_TICKS(100));
-        
-        // Send sae_overflow command
         uart_send_command_for_tab("sae_overflow");
-        
-        // Show popup
         show_sae_popup(idx);
         return;
     }
-    
-    // Handle Handshaker attack
+
     if (strcmp(attack_name, "Handshaker") == 0) {
-        // First show popup, then send commands and start monitoring
         show_handshaker_popup();
         return;
     }
-    
-    // Handle ARP Poison attack - requires exactly 1 network selected
+
     if (strcmp(attack_name, "ARP Poison") == 0) {
         if (selected_network_count != 1) {
             ESP_LOGW(TAG, "ARP Poison requires exactly 1 network, selected: %d", selected_network_count);
@@ -5655,8 +5772,7 @@ static void attack_tile_event_cb(lv_event_t *e)
             }
             return;
         }
-        
-        // Get the selected network's SSID
+
         int idx = selected_network_indices[0];
         if (idx >= 0 && idx < network_count) {
             if (strlen(networks[idx].ssid) == 0) {
@@ -5666,12 +5782,11 @@ static void attack_tile_event_cb(lv_event_t *e)
             strncpy(arp_target_ssid, networks[idx].ssid, sizeof(arp_target_ssid) - 1);
             arp_target_ssid[sizeof(arp_target_ssid) - 1] = '\0';
         }
-        
+
         show_arp_poison_page();
         return;
     }
-    
-    // Handle Rogue AP attack - requires exactly 1 network selected
+
     if (strcmp(attack_name, "Rogue AP") == 0) {
         if (selected_network_count != 1) {
             ESP_LOGW(TAG, "Rogue AP requires exactly 1 network, selected: %d", selected_network_count);
@@ -5683,22 +5798,42 @@ static void attack_tile_event_cb(lv_event_t *e)
             }
             return;
         }
-        
-        // Check SD card before opening popup
+
         if (!current_tab_has_sd_card()) {
             show_sd_warning_popup(show_rogue_ap_page);
             return;
         }
-        
+
         int idx = selected_network_indices[0];
         if (idx >= 0 && idx < network_count && strlen(networks[idx].ssid) == 0) {
             show_hidden_ssid_popup(hidden_ssid_rogueap_confirm_cb);
             return;
         }
-        
+
         show_rogue_ap_page();
-        return;
     }
+}
+
+// Attack tile event handler for bottom icon bar
+static void attack_tile_event_cb(lv_event_t *e)
+{
+    handle_selected_attack((const char *)lv_event_get_user_data(e));
+}
+
+static void observer_attack_tile_event_cb(lv_event_t *e)
+{
+    const char *attack_name = (const char *)lv_event_get_user_data(e);
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx || !ctx->popup_open) return;
+
+    int observer_idx = ctx->popup_network_idx;
+    if (observer_idx < 0 || observer_idx >= ctx->observer_network_count) return;
+
+    prepare_observer_attack_override(ctx, observer_idx);
+    ctx->observer_attack_return_to_observer =
+        (strcmp(attack_name, "ARP Poison") == 0 || strcmp(attack_name, "Rogue AP") == 0);
+
+    handle_selected_attack(attack_name);
 }
 
 // Close callback for scan deauth popup - sends stop command
@@ -5716,6 +5851,8 @@ static void scan_deauth_popup_close_cb(lv_event_t *e)
         lv_obj_del(ctx->scan_deauth_overlay);
         ctx->scan_deauth_overlay = NULL;
         ctx->scan_deauth_popup = NULL;
+        ctx->observer_attack_return_to_observer = false;
+        clear_observer_attack_override(ctx);
     }
 }
 
@@ -5833,6 +5970,8 @@ static void sae_popup_close_cb(lv_event_t *e)
         lv_obj_del(ctx->sae_popup_overlay);
         ctx->sae_popup_overlay = NULL;
         ctx->sae_popup = NULL;
+        ctx->observer_attack_return_to_observer = false;
+        clear_observer_attack_override(ctx);
     }
 }
 
@@ -5942,6 +6081,8 @@ static void handshaker_popup_close_cb(lv_event_t *e)
         ctx->handshaker_stop_label = NULL;
         ctx->handshaker_wpasec_btn = NULL;
     }
+    ctx->observer_attack_return_to_observer = false;
+    clear_observer_attack_override(ctx);
     ctx->handshaker_capture_success = false;
     
     // Clear global pointers
@@ -6464,11 +6605,16 @@ static void arp_poison_back_cb(lv_event_t *e)
     (void)e;
     ESP_LOGI(TAG, "ARP Poison: back button pressed");
     
+    tab_context_t *ctx = get_current_ctx();
+    bool return_to_observer = ctx && ctx->observer_attack_return_to_observer;
+
     // Reset state
     arp_wifi_connected = false;
     arp_host_count = 0;
     memset(arp_target_ssid, 0, sizeof(arp_target_ssid));
     memset(arp_our_ip, 0, sizeof(arp_our_ip));
+    memset(arp_target_password, 0, sizeof(arp_target_password));
+    arp_auto_mode = false;
     
     if (arp_poison_page) {
         lv_obj_del(arp_poison_page);
@@ -6481,7 +6627,16 @@ static void arp_poison_back_cb(lv_event_t *e)
         arp_list_hosts_btn = NULL;
     }
     
-    // Return to WiFi Scan page
+    if (ctx) {
+        ctx->observer_attack_return_to_observer = false;
+        clear_observer_attack_override(ctx);
+    }
+
+    if (return_to_observer) {
+        show_observer_page();
+        return;
+    }
+
     show_scan_page();
 }
 
@@ -6966,6 +7121,19 @@ static void arp_auto_connect_timer_cb(lv_timer_t *timer)
 static void show_arp_poison_page(void)
 {
     ESP_LOGI(TAG, "Showing ARP Poison page for SSID: %s", arp_target_ssid);
+
+    tab_context_t *ctx = get_current_ctx();
+    if (ctx && ctx->observer_attack_return_to_observer) {
+        if (ctx->observer_running) {
+            pause_observer_for_attack(ctx);
+        }
+        if (ctx->popup_open) {
+            destroy_network_popup_ui(ctx);
+        }
+        if (deauth_popup_obj != NULL) {
+            destroy_deauth_popup_ui();
+        }
+    }
     
     // Reset state
     arp_wifi_connected = false;
@@ -8187,6 +8355,8 @@ static void evil_twin_close_cb(lv_event_t *e)
         ctx->evil_twin_html_dropdown = NULL;
         ctx->evil_twin_status_label = NULL;
     }
+    ctx->observer_attack_return_to_observer = false;
+    clear_observer_attack_override(ctx);
 }
 
 // Evil Twin monitor task - watches UART for password capture
@@ -8441,7 +8611,8 @@ static void show_evil_twin_popup(void)
     
     if (evil_twin_html_count == 0) {
         ESP_LOGW(TAG, "No HTML files found on SD card");
-        // Could show an error message here
+        ctx->observer_attack_return_to_observer = false;
+        clear_observer_attack_override(ctx);
         return;
     }
     
@@ -9255,74 +9426,7 @@ static void show_scan_page(void)
     lv_obj_set_style_pad_row(network_list, 6, 0);
     lv_obj_set_scroll_dir(network_list, LV_DIR_VER);
     
-    // Bottom action bar: enforce two even rows (3 + 3 on Red Team mode).
-    lv_obj_t *attack_bar = lv_obj_create(scan_page);
-    lv_obj_set_size(attack_bar, lv_pct(100), 162);
-    lv_obj_set_style_bg_opa(attack_bar, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(attack_bar, 0, 0);
-    lv_obj_set_style_pad_all(attack_bar, 4, 0);
-    lv_obj_set_style_pad_gap(attack_bar, 6, 0);
-    lv_obj_set_flex_flow(attack_bar, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(attack_bar, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_clear_flag(attack_bar, LV_OBJ_FLAG_SCROLLABLE);
-
-    lv_obj_t *attack_row1 = lv_obj_create(attack_bar);
-    lv_obj_set_size(attack_row1, lv_pct(100), 72);
-    lv_obj_set_style_bg_opa(attack_row1, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(attack_row1, 0, 0);
-    lv_obj_set_style_pad_all(attack_row1, 0, 0);
-    lv_obj_set_style_pad_gap(attack_row1, 8, 0);
-    lv_obj_set_flex_flow(attack_row1, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(attack_row1, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_clear_flag(attack_row1, LV_OBJ_FLAG_SCROLLABLE);
-
-    lv_obj_t *attack_row2 = lv_obj_create(attack_bar);
-    lv_obj_set_size(attack_row2, lv_pct(100), 72);
-    lv_obj_set_style_bg_opa(attack_row2, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(attack_row2, 0, 0);
-    lv_obj_set_style_pad_all(attack_row2, 0, 0);
-    lv_obj_set_style_pad_gap(attack_row2, 8, 0);
-    lv_obj_set_flex_flow(attack_row2, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(attack_row2, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_clear_flag(attack_row2, LV_OBJ_FLAG_SCROLLABLE);
-
-    // Resolve %-based widths before computing exact button geometry.
-    lv_obj_update_layout(scan_page);
-    lv_coord_t row_inner_w = lv_obj_get_content_width(attack_row1);
-    if (row_inner_w <= 0) {
-        row_inner_w = lv_disp_get_hor_res(NULL) - 16;
-    }
-    if (row_inner_w < 280) row_inner_w = 280;
-
-    const lv_coord_t action_gap_total = 16; // 2 gaps x 8 px
-    lv_coord_t action_btn_w = (row_inner_w - action_gap_total) / 3;
-    if (action_btn_w < 90) action_btn_w = 90;
-
-    lv_coord_t action_btn_last_w = action_btn_w;
-    lv_coord_t used_width = (action_btn_w * 3) + action_gap_total;
-    if (used_width < row_inner_w) {
-        action_btn_last_w += (row_inner_w - used_width);
-    }
-
-    if (enable_red_team) {
-        lv_obj_t *btn1 = create_small_tile(attack_row1, LV_SYMBOL_CHARGE, "Deauth", COLOR_MATERIAL_RED, attack_tile_event_cb, "Deauth");
-        lv_obj_t *btn2 = create_small_tile(attack_row1, LV_SYMBOL_WARNING, "Evil Twin", COLOR_MATERIAL_ORANGE, attack_tile_event_cb, "Evil Twin");
-        lv_obj_t *btn3 = create_small_tile(attack_row1, LV_SYMBOL_POWER, "SAE Overflow", COLOR_MATERIAL_PINK, attack_tile_event_cb, "SAE Overflow");
-
-        lv_obj_t *btn4 = create_small_tile(attack_row2, LV_SYMBOL_DOWNLOAD, "Handshake", COLOR_MATERIAL_AMBER, attack_tile_event_cb, "Handshaker");
-        lv_obj_t *btn5 = create_small_tile(attack_row2, LV_SYMBOL_SHUFFLE, "ARP", COLOR_MATERIAL_PURPLE, attack_tile_event_cb, "ARP Poison");
-        lv_obj_t *btn6 = create_small_tile(attack_row2, LV_SYMBOL_WIFI, "RogueAP", COLOR_MATERIAL_CYAN, attack_tile_event_cb, "Rogue AP");
-
-        lv_obj_set_size(btn1, action_btn_w, 72);
-        lv_obj_set_size(btn2, action_btn_w, 72);
-        lv_obj_set_size(btn3, action_btn_last_w, 72);
-        lv_obj_set_size(btn4, action_btn_w, 72);
-        lv_obj_set_size(btn5, action_btn_w, 72);
-        lv_obj_set_size(btn6, action_btn_last_w, 72);
-    } else {
-        lv_obj_t *btn = create_small_tile(attack_row1, LV_SYMBOL_SHUFFLE, "ARP", COLOR_MATERIAL_PURPLE, attack_tile_event_cb, "ARP Poison");
-        lv_obj_set_size(btn, row_inner_w, 72);
-    }
+    create_attack_action_bar(scan_page, attack_tile_event_cb);
     
     // Auto-start scan when entering the page
     lv_obj_send_event(scan_btn, LV_EVENT_CLICKED, NULL);
@@ -9387,6 +9491,47 @@ static void popup_close_btn_cb(lv_event_t *e)
     close_network_popup();
 }
 
+static void destroy_network_popup_ui(tab_context_t *ctx)
+{
+    if (!ctx) return;
+
+    if (ctx->popup_timer != NULL) {
+        xTimerStop(ctx->popup_timer, 0);
+    }
+
+    if (ctx->network_popup) {
+        lv_obj_del(ctx->network_popup);
+        ctx->network_popup = NULL;
+        ctx->popup_clients_container = NULL;
+    }
+
+    ctx->popup_open = false;
+    ctx->popup_network_idx = -1;
+}
+
+static void pause_observer_for_attack(tab_context_t *ctx)
+{
+    if (!ctx || !ctx->observer_running) return;
+
+    ctx->observer_running = false;
+
+    if (ctx->observer_timer != NULL) {
+        xTimerStop(ctx->observer_timer, 0);
+    }
+
+    uart_send_command_for_tab("stop");
+
+    if (ctx->observer_start_btn) {
+        lv_obj_clear_state(ctx->observer_start_btn, LV_STATE_DISABLED);
+    }
+    if (ctx->observer_stop_btn) {
+        lv_obj_add_state(ctx->observer_stop_btn, LV_STATE_DISABLED);
+    }
+    if (ctx->observer_status_label) {
+        lv_label_set_text(ctx->observer_status_label, "Observer paused for attack");
+    }
+}
+
 // Close network popup and resume normal monitoring
 static void close_network_popup(void)
 {
@@ -9394,27 +9539,13 @@ static void close_network_popup(void)
     if (!ctx || !ctx->popup_open) return;
     
     ESP_LOGI(TAG, "Closing network popup");
-    
-    // Stop popup timer
-    if (ctx->popup_timer != NULL) {
-        xTimerStop(ctx->popup_timer, 0);
-    }
+
+    destroy_network_popup_ui(ctx);
     
     // Send unselect_networks to monitor all networks again
-    // Use UART based on current tab
     uart_send_command_for_tab("unselect_networks");
-        vTaskDelay(pdMS_TO_TICKS(100));
+    vTaskDelay(pdMS_TO_TICKS(100));
     uart_send_command_for_tab("start_sniffer_noscan");
-    
-    // Close popup UI
-    if (ctx->network_popup) {
-        lv_obj_del(ctx->network_popup);
-        ctx->network_popup = NULL;
-        ctx->popup_clients_container = NULL;
-    }
-    
-    ctx->popup_open = false;
-    ctx->popup_network_idx = -1;
     
     // Restart main observer timer (20s) for this context
     if (ctx->observer_timer != NULL && ctx->observer_running) {
@@ -9425,6 +9556,9 @@ static void close_network_popup(void)
     if (ctx->observer_table) {
         update_observer_table(ctx);
     }
+
+    ctx->observer_attack_return_to_observer = false;
+    clear_observer_attack_override(ctx);
 }
 
 // Show network popup for detailed view
@@ -9463,7 +9597,7 @@ static void show_network_popup(int network_idx)
     lv_obj_t *container = get_current_tab_container();
     if (!container) return;
     ctx->network_popup = lv_obj_create(container);
-    lv_obj_set_size(ctx->network_popup, 600, 400);
+    lv_obj_set_size(ctx->network_popup, 640, 620);
     lv_obj_center(ctx->network_popup);
     lv_obj_set_style_bg_color(ctx->network_popup, lv_color_hex(0x1A2A2A), 0);
     lv_obj_set_style_border_color(ctx->network_popup, COLOR_MATERIAL_TEAL, 0);
@@ -9475,6 +9609,7 @@ static void show_network_popup(int network_idx)
     lv_obj_set_style_pad_all(ctx->network_popup, 16, 0);
     lv_obj_set_flex_flow(ctx->network_popup, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_row(ctx->network_popup, 8, 0);
+    lv_obj_clear_flag(ctx->network_popup, LV_OBJ_FLAG_SCROLLABLE);
     
     // Header with title and close button
     lv_obj_t *header = lv_obj_create(ctx->network_popup);
@@ -9543,8 +9678,7 @@ static void show_network_popup(int network_idx)
     
     // Clients scrollable container
     ctx->popup_clients_container = lv_obj_create(ctx->network_popup);
-    lv_obj_set_size(ctx->popup_clients_container, lv_pct(100), lv_pct(100));
-    lv_obj_set_flex_grow(ctx->popup_clients_container, 1);
+    lv_obj_set_size(ctx->popup_clients_container, lv_pct(100), 170);
     lv_obj_set_style_bg_color(ctx->popup_clients_container, lv_color_hex(0x0A1A1A), 0);
     lv_obj_set_style_border_width(ctx->popup_clients_container, 0, 0);
     lv_obj_set_style_radius(ctx->popup_clients_container, 8, 0);
@@ -9552,6 +9686,8 @@ static void show_network_popup(int network_idx)
     lv_obj_set_flex_flow(ctx->popup_clients_container, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_row(ctx->popup_clients_container, 4, 0);
     lv_obj_set_scroll_dir(ctx->popup_clients_container, LV_DIR_VER);
+
+    create_attack_action_bar(ctx->network_popup, observer_attack_tile_event_cb);
     
     // Initial client list
     update_popup_content(ctx);
@@ -9866,7 +10002,7 @@ static void show_deauth_popup(int network_idx, int client_idx)
     lv_obj_t *container = get_current_tab_container();
     if (!container) return;
     deauth_popup_obj = lv_obj_create(container);
-    lv_obj_set_size(deauth_popup_obj, 550, 320);
+    lv_obj_set_size(deauth_popup_obj, 620, 520);
     lv_obj_center(deauth_popup_obj);
     lv_obj_set_style_bg_color(deauth_popup_obj, lv_color_hex(0x1A1A2A), 0);
     lv_obj_set_style_border_color(deauth_popup_obj, COLOR_MATERIAL_RED, 0);
@@ -9951,34 +10087,71 @@ static void show_deauth_popup(int network_idx, int client_idx)
     lv_obj_set_style_text_font(deauth_btn_label, &lv_font_montserrat_20, 0);
     lv_obj_set_style_text_color(deauth_btn_label, lv_color_hex(0xFFFFFF), 0);
     lv_obj_center(deauth_btn_label);
+
+    create_attack_action_bar(deauth_popup_obj, observer_station_attack_tile_event_cb);
+}
+
+static void destroy_deauth_popup_ui(void)
+{
+    if (deauth_popup_obj != NULL) {
+        lv_obj_del(deauth_popup_obj);
+        deauth_popup_obj = NULL;
+    }
+
+    deauth_btn = NULL;
+    deauth_btn_label = NULL;
+    deauth_active = false;
+    deauth_network_idx = -1;
+    deauth_client_idx = -1;
+}
+
+static void stop_and_close_deauth_popup(bool resume_observer)
+{
+    tab_context_t *ctx = get_current_ctx();
+
+    uart_send_command_for_tab("stop");
+    if (resume_observer) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        uart_send_command_for_tab("start_sniffer_noscan");
+    }
+
+    destroy_deauth_popup_ui();
+
+    if (resume_observer && ctx && ctx->observer_timer != NULL) {
+        xTimerStart(ctx->observer_timer, 0);
+        ESP_LOGI(TAG, "Resumed observer timer");
+    }
 }
 
 // Close deauth popup and cleanup
 static void close_deauth_popup(void)
 {
     ESP_LOGI(TAG, "Closing deauth popup");
-    
-    // Send stop commands to current tab's UART
-    uart_send_command_for_tab("stop");
-    vTaskDelay(pdMS_TO_TICKS(100));
-    uart_send_command_for_tab("start_sniffer_noscan");
-    
-    // Delete popup UI
-    if (deauth_popup_obj != NULL) {
-        lv_obj_del(deauth_popup_obj);
-        deauth_popup_obj = NULL;
+    stop_and_close_deauth_popup(true);
+}
+
+static void observer_station_attack_tile_event_cb(lv_event_t *e)
+{
+    const char *attack_name = (const char *)lv_event_get_user_data(e);
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx) return;
+    if (deauth_network_idx < 0 || deauth_network_idx >= ctx->observer_network_count) return;
+
+    bool full_page_attack =
+        (strcmp(attack_name, "ARP Poison") == 0 || strcmp(attack_name, "Rogue AP") == 0);
+
+    prepare_observer_attack_override(ctx, deauth_network_idx);
+    ctx->observer_attack_return_to_observer = full_page_attack;
+
+    if (deauth_active) {
+        uart_send_command_for_tab("stop");
+        deauth_active = false;
+        if (deauth_btn_label != NULL) {
+            lv_label_set_text(deauth_btn_label, "Deauth Station");
+        }
     }
-    deauth_btn = NULL;
-    deauth_btn_label = NULL;
-    deauth_active = false;
-    deauth_network_idx = -1;
-    deauth_client_idx = -1;
-    
-    // Resume main observer timer
-    if (observer_timer != NULL) {
-        xTimerStart(observer_timer, 0);
-        ESP_LOGI(TAG, "Resumed main observer timer");
-    }
+
+    handle_selected_attack(attack_name);
 }
 
 // Deauth button click handler
@@ -10600,6 +10773,14 @@ static void show_observer_page(void)
         lv_obj_clear_flag(ctx->observer_page, LV_OBJ_FLAG_HIDDEN);
         ctx->current_visible_page = ctx->observer_page;
         observer_page = ctx->observer_page;  // Update legacy reference
+        if (ctx->observer_start_btn) {
+            if (ctx->observer_running) lv_obj_add_state(ctx->observer_start_btn, LV_STATE_DISABLED);
+            else lv_obj_clear_state(ctx->observer_start_btn, LV_STATE_DISABLED);
+        }
+        if (ctx->observer_stop_btn) {
+            if (ctx->observer_running) lv_obj_clear_state(ctx->observer_stop_btn, LV_STATE_DISABLED);
+            else lv_obj_add_state(ctx->observer_stop_btn, LV_STATE_DISABLED);
+        }
         ESP_LOGI(TAG, "Showing existing observer page for tab %d", current_tab);
         return;
     }
@@ -11531,6 +11712,11 @@ static void sd_warning_cancel_cb(lv_event_t *e)
 {
     (void)e;
     ESP_LOGI(TAG, "User cancelled action due to missing SD card");
+    tab_context_t *ctx = get_current_ctx();
+    if (ctx) {
+        ctx->observer_attack_return_to_observer = false;
+        clear_observer_attack_override(ctx);
+    }
     close_sd_warning_popup();
 }
 
@@ -16031,6 +16217,7 @@ static void rogue_ap_back_cb(lv_event_t *e)
     
     tab_context_t *ctx = get_current_ctx();
     if (!ctx) return;
+    bool return_to_observer = ctx->observer_attack_return_to_observer;
     
     // Hide rogue AP page
     if (ctx->rogue_ap_page) {
@@ -16038,8 +16225,15 @@ static void rogue_ap_back_cb(lv_event_t *e)
         ctx->rogue_ap_page = NULL;
         rogue_ap_page = NULL;
     }
+
+    ctx->observer_attack_return_to_observer = false;
+    clear_observer_attack_override(ctx);
     
-    // Show scan page
+    if (return_to_observer) {
+        show_observer_page();
+        return;
+    }
+
     show_scan_page();
 }
 
@@ -16373,6 +16567,18 @@ static void show_rogue_ap_page(void)
     if (!container) {
         ESP_LOGE(TAG, "Container not initialized for tab %d", current_tab);
         return;
+    }
+
+    if (ctx->observer_attack_return_to_observer) {
+        if (ctx->observer_running) {
+            pause_observer_for_attack(ctx);
+        }
+        if (ctx->popup_open) {
+            destroy_network_popup_ui(ctx);
+        }
+        if (deauth_popup_obj != NULL) {
+            destroy_deauth_popup_ui();
+        }
     }
     
     hide_all_pages(ctx);
@@ -22898,7 +23104,7 @@ static void show_theme_popup(void)
     lv_label_set_text(desc,
         "Dark mode switches between dark and light palette.\n"
         "Dashboard ON/OFF toggles bottom telemetry cards on Home.\n"
-        "Boot sound selects startup melody at 60% volume.");
+        "Boot sound selects startup melody at 69% volume.");
     lv_obj_set_style_text_font(desc, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(desc, ui_muted_color(), 0);
     lv_obj_set_width(desc, lv_pct(100));
