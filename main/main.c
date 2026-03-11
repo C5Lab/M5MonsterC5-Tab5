@@ -666,6 +666,125 @@ static inline lv_color_t ui_tab_icon_color(void)
     return dark_mode_enabled ? COLOR_NEON_CYAN : COLOR_LIGHT_ACCENT;
 }
 
+static void style_on_screen_keyboard(lv_obj_t *kb)
+{
+    if (!kb) return;
+
+    lv_obj_set_style_bg_color(kb,
+                              dark_mode_enabled ? lv_color_hex(0x081524) : lv_color_hex(0xD7E4F1),
+                              LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(kb, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_width(kb, 1, LV_PART_MAIN);
+    lv_obj_set_style_border_color(kb,
+                                  dark_mode_enabled ? COLOR_LAB5_MAGENTA : ui_border_color(),
+                                  LV_PART_MAIN);
+    lv_obj_set_style_border_opa(kb, dark_mode_enabled ? LV_OPA_70 : LV_OPA_100, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(kb, 8, LV_PART_MAIN);
+    lv_obj_set_style_pad_gap(kb, 6, LV_PART_MAIN);
+
+    lv_obj_set_style_bg_color(kb,
+                              dark_mode_enabled ? lv_color_hex(0x13263C) : lv_color_hex(0xF8FBFF),
+                              LV_PART_ITEMS);
+    lv_obj_set_style_bg_color(kb,
+                              dark_mode_enabled ? lv_color_hex(0x1E3550) : lv_color_hex(0xDDE8F4),
+                              LV_PART_ITEMS | LV_STATE_PRESSED);
+    lv_obj_set_style_bg_color(kb,
+                              dark_mode_enabled ? lv_color_hex(0x3B1732) : ui_tab_icon_color(),
+                              LV_PART_ITEMS | LV_STATE_CHECKED);
+    lv_obj_set_style_text_color(kb, ui_text_color(), LV_PART_ITEMS);
+    lv_obj_set_style_text_color(kb, lv_color_hex(0xFFFFFF), LV_PART_ITEMS | LV_STATE_CHECKED);
+    lv_obj_set_style_border_width(kb, 1, LV_PART_ITEMS);
+    lv_obj_set_style_border_color(kb,
+                                  dark_mode_enabled ? lv_color_hex(0x2D4E6D) : lv_color_hex(0xA5B7CB),
+                                  LV_PART_ITEMS);
+    lv_obj_set_style_border_color(kb,
+                                  dark_mode_enabled ? COLOR_LAB5_MAGENTA : ui_tab_icon_color(),
+                                  LV_PART_ITEMS | LV_STATE_CHECKED);
+    lv_obj_set_style_radius(kb, 8, LV_PART_ITEMS);
+    lv_obj_set_style_shadow_width(kb, 0, LV_PART_ITEMS);
+}
+
+static void style_modal_overlay(lv_obj_t *overlay, lv_opa_t opacity)
+{
+    if (!overlay) return;
+    lv_obj_remove_style_all(overlay);
+    lv_obj_set_size(overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(overlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(overlay, opacity, 0);
+    lv_obj_clear_flag(overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(overlay, LV_OBJ_FLAG_CLICKABLE);
+}
+
+static void style_surface_panel(lv_obj_t *obj, lv_coord_t radius)
+{
+    if (!obj) return;
+    lv_obj_set_style_bg_color(obj, ui_panel_color(), 0);
+    lv_obj_set_style_border_width(obj, 1, 0);
+    lv_obj_set_style_border_color(obj, ui_border_color(), 0);
+    lv_obj_set_style_border_opa(obj, dark_mode_enabled ? LV_OPA_40 : LV_OPA_80, 0);
+    lv_obj_set_style_radius(obj, radius, 0);
+}
+
+static void style_popup_card(lv_obj_t *popup, lv_coord_t radius, lv_color_t accent)
+{
+    if (!popup) return;
+    style_surface_panel(popup, radius);
+    lv_obj_set_style_border_color(popup, accent, 0);
+    lv_obj_set_style_border_opa(popup, dark_mode_enabled ? LV_OPA_70 : LV_OPA_90, 0);
+    lv_obj_set_style_shadow_width(popup, dark_mode_enabled ? 20 : 10, 0);
+    lv_obj_set_style_shadow_color(popup, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_shadow_opa(popup, dark_mode_enabled ? LV_OPA_30 : LV_OPA_20, 0);
+}
+
+static void style_neutral_button(lv_obj_t *btn)
+{
+    if (!btn) return;
+    lv_obj_set_style_bg_color(btn,
+                              dark_mode_enabled ? lv_color_hex(0x13263C) : lv_color_hex(0xD4DFEA),
+                              0);
+    lv_obj_set_style_bg_color(btn,
+                              dark_mode_enabled ? lv_color_hex(0x1E3550) : lv_color_hex(0xC3D1E1),
+                              LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(btn, 1, 0);
+    lv_obj_set_style_border_color(btn, ui_border_color(), 0);
+    lv_obj_set_style_border_opa(btn, dark_mode_enabled ? LV_OPA_70 : LV_OPA_100, 0);
+    lv_obj_set_style_radius(btn, 8, 0);
+}
+
+static void style_back_nav_button(lv_obj_t *btn)
+{
+    if (!btn) return;
+    lv_obj_set_style_bg_color(btn,
+                              dark_mode_enabled ? lv_color_hex(0x34122B) : lv_color_hex(0xD4DFEA),
+                              0);
+    lv_obj_set_style_bg_color(btn,
+                              dark_mode_enabled ? lv_color_hex(0x4C1B3E) : lv_color_hex(0xC3D1E1),
+                              LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(btn, 1, 0);
+    lv_obj_set_style_border_color(btn,
+                                  dark_mode_enabled ? COLOR_LAB5_MAGENTA : ui_border_color(),
+                                  0);
+    lv_obj_set_style_border_opa(btn, dark_mode_enabled ? LV_OPA_70 : LV_OPA_90, 0);
+    lv_obj_set_style_radius(btn, 8, 0);
+}
+
+static void style_show_probes_button(lv_obj_t *btn)
+{
+    if (!btn) return;
+    lv_obj_set_style_bg_color(btn,
+                              dark_mode_enabled ? lv_color_hex(0x2C1630) : ui_tab_icon_color(),
+                              0);
+    lv_obj_set_style_bg_color(btn,
+                              dark_mode_enabled ? lv_color_hex(0x3E1F45) : lv_color_hex(0x2F5377),
+                              LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(btn, 1, 0);
+    lv_obj_set_style_border_color(btn,
+                                  dark_mode_enabled ? COLOR_LAB5_MAGENTA : ui_border_color(),
+                                  0);
+    lv_obj_set_style_border_opa(btn, dark_mode_enabled ? LV_OPA_80 : LV_OPA_100, 0);
+    lv_obj_set_style_radius(btn, 8, 0);
+}
+
 // Legacy compatibility - kept for minimal code changes
 static wifi_network_t networks[MAX_NETWORKS];  // Temporary buffer during scan
 static int network_count = 0;
@@ -5317,6 +5436,7 @@ static void show_hidden_ssid_popup(hidden_ssid_callback_t callback)
     hidden_ssid_keyboard = lv_keyboard_create(hidden_ssid_popup_overlay);
     lv_obj_set_size(hidden_ssid_keyboard, lv_pct(100), 260);
     lv_obj_align(hidden_ssid_keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
+    style_on_screen_keyboard(hidden_ssid_keyboard);
     lv_keyboard_set_textarea(hidden_ssid_keyboard, hidden_ssid_textarea);
     lv_obj_add_flag(hidden_ssid_keyboard, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_event_cb(hidden_ssid_keyboard, hidden_ssid_keyboard_ready_cb, LV_EVENT_READY, NULL);
@@ -7088,6 +7208,7 @@ static void show_arp_poison_page(void)
         arp_keyboard = lv_keyboard_create(container);  // On parent container, not flex page
         lv_obj_set_size(arp_keyboard, lv_pct(100), 260);  // Larger keys
         lv_obj_align(arp_keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);  // Pin to bottom
+        style_on_screen_keyboard(arp_keyboard);
         lv_keyboard_set_textarea(arp_keyboard, arp_password_input);
         lv_obj_add_event_cb(arp_keyboard, arp_keyboard_cb, LV_EVENT_ALL, NULL);
         lv_obj_add_flag(arp_keyboard, LV_OBJ_FLAG_HIDDEN);
@@ -7801,7 +7922,7 @@ static void show_karma_page(void)
     ctx->karma_page = lv_obj_create(container);
     karma_page = ctx->karma_page;  // Keep legacy reference
     lv_obj_set_size(karma_page, lv_pct(100), lv_pct(100));
-    lv_obj_set_style_bg_color(karma_page, lv_color_hex(0x1A1A1A), 0);
+    lv_obj_set_style_bg_color(karma_page, ui_bg_color(), 0);
     lv_obj_set_style_border_width(karma_page, 0, 0);
     lv_obj_set_style_pad_all(karma_page, 15, 0);
     lv_obj_set_flex_flow(karma_page, LV_FLEX_FLOW_COLUMN);
@@ -7821,9 +7942,7 @@ static void show_karma_page(void)
     // Back button
     lv_obj_t *back_btn = lv_btn_create(header);
     lv_obj_set_size(back_btn, 72, 60);
-    lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x333333), 0);
-    lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x444444), LV_STATE_PRESSED);
-    lv_obj_set_style_radius(back_btn, 8, 0);
+    style_back_nav_button(back_btn);
     lv_obj_add_event_cb(back_btn, karma_back_cb, LV_EVENT_CLICKED, NULL);
     
     lv_obj_t *back_icon = lv_label_create(back_btn);
@@ -7835,7 +7954,7 @@ static void show_karma_page(void)
     lv_obj_t *title = lv_label_create(header);
     lv_label_set_text(title, "Karma Attack");
     lv_obj_set_style_text_font(title, &lv_font_montserrat_22, 0);
-    lv_obj_set_style_text_color(title, COLOR_MATERIAL_ORANGE, 0);
+    lv_obj_set_style_text_color(title, dark_mode_enabled ? COLOR_LAB5_MAGENTA : ui_tab_icon_color(), 0);
     
     // Button bar
     lv_obj_t *btn_bar = lv_obj_create(karma_page);
@@ -7881,8 +8000,7 @@ static void show_karma_page(void)
     // Show Probes button
     lv_obj_t *probes_btn = lv_btn_create(btn_bar);
     lv_obj_set_size(probes_btn, 130, 45);
-    lv_obj_set_style_bg_color(probes_btn, COLOR_MATERIAL_CYAN, 0);
-    lv_obj_set_style_radius(probes_btn, 8, 0);
+    style_show_probes_button(probes_btn);
     lv_obj_add_event_cb(probes_btn, karma_show_probes_cb, LV_EVENT_CLICKED, NULL);
     
     lv_obj_t *probes_label = lv_label_create(probes_btn);
@@ -7894,15 +8012,13 @@ static void show_karma_page(void)
     karma_status_label = lv_label_create(karma_page);
     lv_label_set_text(karma_status_label, "Start sniffer to collect probe requests");
     lv_obj_set_style_text_font(karma_status_label, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(karma_status_label, lv_color_hex(0x888888), 0);
+    lv_obj_set_style_text_color(karma_status_label, ui_muted_color(), 0);
     
     // Probes container (scrollable)
     karma_probes_container = lv_obj_create(karma_page);
     lv_obj_set_size(karma_probes_container, lv_pct(100), LV_SIZE_CONTENT);
     lv_obj_set_flex_grow(karma_probes_container, 1);
-    lv_obj_set_style_bg_color(karma_probes_container, lv_color_hex(0x252525), 0);
-    lv_obj_set_style_border_width(karma_probes_container, 0, 0);
-    lv_obj_set_style_radius(karma_probes_container, 8, 0);
+    style_surface_panel(karma_probes_container, 8);
     lv_obj_set_style_pad_all(karma_probes_container, 10, 0);
     lv_obj_set_flex_flow(karma_probes_container, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_row(karma_probes_container, 6, 0);
@@ -7910,7 +8026,7 @@ static void show_karma_page(void)
     lv_obj_t *placeholder = lv_label_create(karma_probes_container);
     lv_label_set_text(placeholder, "Click 'Show Probes' after sniffing to see collected probe requests");
     lv_obj_set_style_text_font(placeholder, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(placeholder, lv_color_hex(0x666666), 0);
+    lv_obj_set_style_text_color(placeholder, ui_muted_color(), 0);
     
     // Set current visible page
     ctx->current_visible_page = ctx->karma_page;
@@ -8528,9 +8644,9 @@ static lv_obj_t *create_home_storage_card(lv_obj_t *parent, lv_coord_t card_h, b
     lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *title_label = lv_label_create(card);
-    lv_label_set_text(title_label, "SD STORAGE");
+    lv_label_set_text(title_label, LV_SYMBOL_SAVE " SD STORAGE");
     lv_obj_set_style_text_font(title_label, large ? &lv_font_montserrat_14 : &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(title_label, ui_muted_color(), 0);
+    lv_obj_set_style_text_color(title_label, ui_tab_icon_color(), 0);
 
     lv_obj_t *content = lv_obj_create(card);
     lv_obj_set_size(content, lv_pct(100), LV_SIZE_CONTENT);
@@ -8698,8 +8814,8 @@ static void create_uart_tiles_in_container(lv_obj_t *container, tab_context_t *c
             lv_obj_set_style_text_color(ctx->home_handshakes_detail_label, ui_muted_color(), 0);
         }
 
-        lv_obj_t *uptime_card = create_home_info_card(row_bottom, "UPTIME", "00:00:00",
-                                                       ui_muted_color(), row_h, large, ctx ? &ctx->home_uptime_label : NULL);
+        lv_obj_t *uptime_card = create_home_info_card(row_bottom, LV_SYMBOL_REFRESH " UPTIME", "00:00:00",
+                                                       ui_tab_icon_color(), row_h, large, ctx ? &ctx->home_uptime_label : NULL);
         lv_obj_clear_flag(uptime_card, LV_OBJ_FLAG_CLICKABLE);
         if (ctx && ctx->home_uptime_label) {
             lv_obj_set_style_text_font(ctx->home_uptime_label, large ? &lv_font_montserrat_16 : &lv_font_montserrat_14, 0);
@@ -8708,8 +8824,8 @@ static void create_uart_tiles_in_container(lv_obj_t *container, tab_context_t *c
         lv_obj_t *storage_card = create_home_storage_card(row_bottom, row_h, large, ctx);
         lv_obj_clear_flag(storage_card, LV_OBJ_FLAG_CLICKABLE);
 
-        lv_obj_t *files_card = create_home_info_card(row_bottom, "FILES", "wpa-sec: --",
-                                                      ui_muted_color(), row_h, large, ctx ? &ctx->home_files_label : NULL);
+        lv_obj_t *files_card = create_home_info_card(row_bottom, LV_SYMBOL_FILE " FILES", "wpa-sec: --",
+                                                      ui_tab_icon_color(), row_h, large, ctx ? &ctx->home_files_label : NULL);
         lv_obj_clear_flag(files_card, LV_OBJ_FLAG_CLICKABLE);
         if (ctx && ctx->home_files_label) {
             lv_obj_set_style_text_font(ctx->home_files_label, large ? &lv_font_montserrat_12 : &lv_font_montserrat_10, 0);
@@ -9103,10 +9219,23 @@ static void show_scan_page(void)
     lv_obj_set_flex_align(attack_row2, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_clear_flag(attack_row2, LV_OBJ_FLAG_SCROLLABLE);
 
-    lv_coord_t row_inner_w = lv_disp_get_hor_res(NULL) - 32;
+    // Resolve %-based widths before computing exact button geometry.
+    lv_obj_update_layout(scan_page);
+    lv_coord_t row_inner_w = lv_obj_get_content_width(attack_row1);
+    if (row_inner_w <= 0) {
+        row_inner_w = lv_disp_get_hor_res(NULL) - 16;
+    }
     if (row_inner_w < 280) row_inner_w = 280;
-    lv_coord_t action_btn_w = (row_inner_w - 16) / 3;
+
+    const lv_coord_t action_gap_total = 16; // 2 gaps x 8 px
+    lv_coord_t action_btn_w = (row_inner_w - action_gap_total) / 3;
     if (action_btn_w < 90) action_btn_w = 90;
+
+    lv_coord_t action_btn_last_w = action_btn_w;
+    lv_coord_t used_width = (action_btn_w * 3) + action_gap_total;
+    if (used_width < row_inner_w) {
+        action_btn_last_w += (row_inner_w - used_width);
+    }
 
     if (enable_red_team) {
         lv_obj_t *btn1 = create_small_tile(attack_row1, LV_SYMBOL_CHARGE, "Deauth", COLOR_MATERIAL_RED, attack_tile_event_cb, "Deauth");
@@ -9119,10 +9248,10 @@ static void show_scan_page(void)
 
         lv_obj_set_size(btn1, action_btn_w, 72);
         lv_obj_set_size(btn2, action_btn_w, 72);
-        lv_obj_set_size(btn3, action_btn_w, 72);
+        lv_obj_set_size(btn3, action_btn_last_w, 72);
         lv_obj_set_size(btn4, action_btn_w, 72);
         lv_obj_set_size(btn5, action_btn_w, 72);
-        lv_obj_set_size(btn6, action_btn_w, 72);
+        lv_obj_set_size(btn6, action_btn_last_w, 72);
     } else {
         lv_obj_t *btn = create_small_tile(attack_row1, LV_SYMBOL_SHUFFLE, "ARP", COLOR_MATERIAL_PURPLE, attack_tile_event_cb, "ARP Poison");
         lv_obj_set_size(btn, row_inner_w, 72);
@@ -12804,6 +12933,7 @@ static void show_phishing_portal_popup(void)
     ctx->phishing_portal_keyboard = lv_keyboard_create(ctx->phishing_portal_popup_overlay);
     lv_obj_set_size(ctx->phishing_portal_keyboard, lv_pct(100), 260);  // Larger keys
     lv_obj_align(ctx->phishing_portal_keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
+    style_on_screen_keyboard(ctx->phishing_portal_keyboard);
     lv_keyboard_set_textarea(ctx->phishing_portal_keyboard, ctx->phishing_portal_ssid_textarea);
     lv_obj_add_event_cb(ctx->phishing_portal_keyboard, phishing_portal_keyboard_cb, LV_EVENT_ALL, ctx);
     lv_obj_add_flag(ctx->phishing_portal_keyboard, LV_OBJ_FLAG_HIDDEN);
@@ -13855,6 +13985,7 @@ static void wardrive_wigle_create_credentials_prompt(tab_context_t *ctx, bool wi
     lv_obj_set_size(ctx->wardrive_wigle_keyboard, lv_pct(100), 240);
     lv_obj_add_flag(ctx->wardrive_wigle_keyboard, LV_OBJ_FLAG_FLOATING);
     lv_obj_align(ctx->wardrive_wigle_keyboard, LV_ALIGN_BOTTOM_MID, 0, -8);
+    style_on_screen_keyboard(ctx->wardrive_wigle_keyboard);
     lv_keyboard_set_textarea(ctx->wardrive_wigle_keyboard,
                              with_ssid ? ctx->wardrive_wigle_ssid_input : ctx->wardrive_wigle_password_input);
     lv_obj_add_event_cb(ctx->wardrive_wigle_keyboard, wardrive_wigle_keyboard_cb, LV_EVENT_ALL, NULL);
@@ -16371,6 +16502,7 @@ static void show_rogue_ap_page(void)
         ctx->rogue_ap_keyboard = lv_keyboard_create(container);
         lv_obj_set_size(ctx->rogue_ap_keyboard, lv_pct(100), 260);
         lv_obj_align(ctx->rogue_ap_keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
+        style_on_screen_keyboard(ctx->rogue_ap_keyboard);
         lv_keyboard_set_textarea(ctx->rogue_ap_keyboard, ctx->rogue_ap_password_input);
         lv_obj_add_flag(ctx->rogue_ap_keyboard, LV_OBJ_FLAG_HIDDEN);
         
@@ -16559,19 +16691,12 @@ static void karma2_fetch_probes(void)
     if (!container) return;
     
     karma2_probes_popup_overlay = lv_obj_create(container);
-    lv_obj_remove_style_all(karma2_probes_popup_overlay);
-    lv_obj_set_size(karma2_probes_popup_overlay, lv_pct(100), lv_pct(100));
-    lv_obj_set_style_bg_color(karma2_probes_popup_overlay, lv_color_hex(0x000000), 0);
-    lv_obj_set_style_bg_opa(karma2_probes_popup_overlay, LV_OPA_70, 0);
-    lv_obj_clear_flag(karma2_probes_popup_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    style_modal_overlay(karma2_probes_popup_overlay, LV_OPA_70);
     
     karma2_probes_popup_obj = lv_obj_create(karma2_probes_popup_overlay);
     lv_obj_set_size(karma2_probes_popup_obj, 400, 450);
     lv_obj_center(karma2_probes_popup_obj);
-    lv_obj_set_style_bg_color(karma2_probes_popup_obj, lv_color_hex(0x2A2A2A), 0);
-    lv_obj_set_style_border_color(karma2_probes_popup_obj, COLOR_MATERIAL_ORANGE, 0);
-    lv_obj_set_style_border_width(karma2_probes_popup_obj, 2, 0);
-    lv_obj_set_style_radius(karma2_probes_popup_obj, 12, 0);
+    style_popup_card(karma2_probes_popup_obj, 12, ui_tab_icon_color());
     lv_obj_set_style_pad_all(karma2_probes_popup_obj, 15, 0);
     lv_obj_set_flex_flow(karma2_probes_popup_obj, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_row(karma2_probes_popup_obj, 10, 0);
@@ -16580,21 +16705,19 @@ static void karma2_fetch_probes(void)
     lv_obj_t *title = lv_label_create(karma2_probes_popup_obj);
     lv_label_set_text(title, LV_SYMBOL_WIFI " Probes & Karma");
     lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
-    lv_obj_set_style_text_color(title, COLOR_MATERIAL_ORANGE, 0);
+    lv_obj_set_style_text_color(title, ui_tab_icon_color(), 0);
     
     // Subtitle
     lv_obj_t *subtitle = lv_label_create(karma2_probes_popup_obj);
     lv_label_set_text_fmt(subtitle, "Found %d probe requests - tap to start portal", karma2_probe_count);
     lv_obj_set_style_text_font(subtitle, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(subtitle, lv_color_hex(0x888888), 0);
+    lv_obj_set_style_text_color(subtitle, ui_muted_color(), 0);
     
     // Scrollable list container
     lv_obj_t *list_container = lv_obj_create(karma2_probes_popup_obj);
     lv_obj_set_size(list_container, lv_pct(100), 300);
     lv_obj_set_flex_grow(list_container, 1);
-    lv_obj_set_style_bg_color(list_container, lv_color_hex(0x1A1A1A), 0);
-    lv_obj_set_style_border_width(list_container, 0, 0);
-    lv_obj_set_style_radius(list_container, 8, 0);
+    style_surface_panel(list_container, 8);
     lv_obj_set_style_pad_all(list_container, 8, 0);
     lv_obj_set_flex_flow(list_container, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_row(list_container, 6, 0);
@@ -16603,14 +16726,16 @@ static void karma2_fetch_probes(void)
         lv_obj_t *no_probes = lv_label_create(list_container);
         lv_label_set_text(no_probes, "No probes found.\nMake sure sniffer is running.");
         lv_obj_set_style_text_font(no_probes, &lv_font_montserrat_14, 0);
-        lv_obj_set_style_text_color(no_probes, lv_color_hex(0x888888), 0);
+        lv_obj_set_style_text_color(no_probes, ui_muted_color(), 0);
     } else {
         for (int i = 0; i < karma2_probe_count; i++) {
             lv_obj_t *row = lv_obj_create(list_container);
             lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
-            lv_obj_set_style_bg_color(row, lv_color_hex(0x2D2D2D), 0);
-            lv_obj_set_style_bg_color(row, lv_color_hex(0x3D3D3D), LV_STATE_PRESSED);
-            lv_obj_set_style_border_width(row, 0, 0);
+            lv_obj_set_style_bg_color(row, ui_card_color(), 0);
+            lv_obj_set_style_bg_color(row, ui_card_pressed_color(), LV_STATE_PRESSED);
+            lv_obj_set_style_border_width(row, 1, 0);
+            lv_obj_set_style_border_color(row, ui_border_color(), 0);
+            lv_obj_set_style_border_opa(row, dark_mode_enabled ? LV_OPA_40 : LV_OPA_70, 0);
             lv_obj_set_style_radius(row, 6, 0);
             lv_obj_set_style_pad_all(row, 10, 0);
             lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
@@ -16627,8 +16752,7 @@ static void karma2_fetch_probes(void)
     // Close button
     lv_obj_t *close_btn = lv_btn_create(karma2_probes_popup_obj);
     lv_obj_set_size(close_btn, 120, 40);
-    lv_obj_set_style_bg_color(close_btn, lv_color_hex(0x444444), 0);
-    lv_obj_set_style_radius(close_btn, 8, 0);
+    style_neutral_button(close_btn);
     lv_obj_add_event_cb(close_btn, karma2_probes_popup_close_cb, LV_EVENT_CLICKED, NULL);
     
     lv_obj_t *close_label = lv_label_create(close_btn);
@@ -16749,19 +16873,12 @@ static void show_karma2_html_popup(void)
     if (!container) return;
     
     karma2_html_popup_overlay = lv_obj_create(container);
-    lv_obj_remove_style_all(karma2_html_popup_overlay);
-    lv_obj_set_size(karma2_html_popup_overlay, lv_pct(100), lv_pct(100));
-    lv_obj_set_style_bg_color(karma2_html_popup_overlay, lv_color_hex(0x000000), 0);
-    lv_obj_set_style_bg_opa(karma2_html_popup_overlay, LV_OPA_70, 0);
-    lv_obj_clear_flag(karma2_html_popup_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    style_modal_overlay(karma2_html_popup_overlay, LV_OPA_70);
     
     karma2_html_popup_obj = lv_obj_create(karma2_html_popup_overlay);
     lv_obj_set_size(karma2_html_popup_obj, 350, LV_SIZE_CONTENT);
     lv_obj_center(karma2_html_popup_obj);
-    lv_obj_set_style_bg_color(karma2_html_popup_obj, lv_color_hex(0x2A2A2A), 0);
-    lv_obj_set_style_border_color(karma2_html_popup_obj, COLOR_MATERIAL_ORANGE, 0);
-    lv_obj_set_style_border_width(karma2_html_popup_obj, 2, 0);
-    lv_obj_set_style_radius(karma2_html_popup_obj, 12, 0);
+    style_popup_card(karma2_html_popup_obj, 12, ui_tab_icon_color());
     lv_obj_set_style_pad_all(karma2_html_popup_obj, 20, 0);
     lv_obj_set_flex_flow(karma2_html_popup_obj, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(karma2_html_popup_obj, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
@@ -16772,20 +16889,20 @@ static void show_karma2_html_popup(void)
     lv_obj_t *title = lv_label_create(karma2_html_popup_obj);
     lv_label_set_text(title, "Select Portal HTML");
     lv_obj_set_style_text_font(title, &lv_font_montserrat_18, 0);
-    lv_obj_set_style_text_color(title, COLOR_MATERIAL_ORANGE, 0);
+    lv_obj_set_style_text_color(title, ui_tab_icon_color(), 0);
     
     // SSID info
     lv_obj_t *ssid_label = lv_label_create(karma2_html_popup_obj);
     lv_label_set_text_fmt(ssid_label, "SSID: %s", karma2_probes[karma2_selected_probe_idx]);
     lv_obj_set_style_text_font(ssid_label, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(ssid_label, lv_color_hex(0xCCCCCC), 0);
+    lv_obj_set_style_text_color(ssid_label, ui_muted_color(), 0);
     
     // Dropdown for HTML files
     karma2_html_dropdown = lv_dropdown_create(karma2_html_popup_obj);
     lv_obj_set_width(karma2_html_dropdown, lv_pct(100));
-    lv_obj_set_style_bg_color(karma2_html_dropdown, lv_color_hex(0x1A1A1A), 0);
-    lv_obj_set_style_border_color(karma2_html_dropdown, COLOR_MATERIAL_ORANGE, 0);
-    lv_obj_set_style_text_color(karma2_html_dropdown, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_bg_color(karma2_html_dropdown, ui_card_color(), 0);
+    lv_obj_set_style_border_color(karma2_html_dropdown, ui_border_color(), 0);
+    lv_obj_set_style_text_color(karma2_html_dropdown, ui_text_color(), 0);
     
     if (karma2_html_count > 0) {
         char options[2048] = {0};
@@ -16796,6 +16913,13 @@ static void show_karma2_html_popup(void)
         lv_dropdown_set_options(karma2_html_dropdown, options);
     } else {
         lv_dropdown_set_options(karma2_html_dropdown, "(Default portal)");
+    }
+
+    lv_obj_t *karma2_html_list = lv_dropdown_get_list(karma2_html_dropdown);
+    if (karma2_html_list) {
+        lv_obj_set_style_bg_color(karma2_html_list, ui_card_color(), 0);
+        lv_obj_set_style_text_color(karma2_html_list, ui_text_color(), 0);
+        lv_obj_set_style_border_color(karma2_html_list, ui_border_color(), 0);
     }
     
     // Button row
@@ -16812,8 +16936,7 @@ static void show_karma2_html_popup(void)
     // Cancel button
     lv_obj_t *cancel_btn = lv_btn_create(btn_row);
     lv_obj_set_size(cancel_btn, 100, 40);
-    lv_obj_set_style_bg_color(cancel_btn, lv_color_hex(0x444444), 0);
-    lv_obj_set_style_radius(cancel_btn, 8, 0);
+    style_neutral_button(cancel_btn);
     lv_obj_add_event_cb(cancel_btn, karma2_html_popup_close_cb, LV_EVENT_CLICKED, NULL);
     
     lv_obj_t *cancel_label = lv_label_create(cancel_btn);
@@ -16823,13 +16946,12 @@ static void show_karma2_html_popup(void)
     // Start button
     lv_obj_t *start_btn = lv_btn_create(btn_row);
     lv_obj_set_size(start_btn, 130, 40);
-    lv_obj_set_style_bg_color(start_btn, COLOR_MATERIAL_ORANGE, 0);
-    lv_obj_set_style_radius(start_btn, 8, 0);
+    style_show_probes_button(start_btn);
     lv_obj_add_event_cb(start_btn, karma2_html_select_cb, LV_EVENT_CLICKED, NULL);
     
     lv_obj_t *start_label = lv_label_create(start_btn);
     lv_label_set_text(start_label, "Start Portal");
-    lv_obj_set_style_text_color(start_label, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_text_color(start_label, lv_color_hex(0xFFFFFF), 0);
     lv_obj_center(start_label);
 }
 
@@ -17846,19 +17968,12 @@ static void adhoc_show_probes_cb(lv_event_t *e)
     if (!container) return;
     
     adhoc_probes_popup_overlay = lv_obj_create(container);
-    lv_obj_remove_style_all(adhoc_probes_popup_overlay);
-    lv_obj_set_size(adhoc_probes_popup_overlay, lv_pct(100), lv_pct(100));
-    lv_obj_set_style_bg_color(adhoc_probes_popup_overlay, lv_color_hex(0x000000), 0);
-    lv_obj_set_style_bg_opa(adhoc_probes_popup_overlay, LV_OPA_70, 0);
-    lv_obj_clear_flag(adhoc_probes_popup_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    style_modal_overlay(adhoc_probes_popup_overlay, LV_OPA_70);
     
     adhoc_probes_popup_obj = lv_obj_create(adhoc_probes_popup_overlay);
     lv_obj_set_size(adhoc_probes_popup_obj, 400, 450);
     lv_obj_center(adhoc_probes_popup_obj);
-    lv_obj_set_style_bg_color(adhoc_probes_popup_obj, lv_color_hex(0x2A2A2A), 0);
-    lv_obj_set_style_border_color(adhoc_probes_popup_obj, COLOR_MATERIAL_ORANGE, 0);
-    lv_obj_set_style_border_width(adhoc_probes_popup_obj, 2, 0);
-    lv_obj_set_style_radius(adhoc_probes_popup_obj, 12, 0);
+    style_popup_card(adhoc_probes_popup_obj, 12, dark_mode_enabled ? COLOR_LAB5_MAGENTA : ui_tab_icon_color());
     lv_obj_set_style_pad_all(adhoc_probes_popup_obj, 15, 0);
     lv_obj_set_flex_flow(adhoc_probes_popup_obj, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_row(adhoc_probes_popup_obj, 10, 0);
@@ -17867,7 +17982,7 @@ static void adhoc_show_probes_cb(lv_event_t *e)
     lv_obj_t *title = lv_label_create(adhoc_probes_popup_obj);
     lv_label_set_text(title, LV_SYMBOL_WIFI " Select Network (Probes)");
     lv_obj_set_style_text_font(title, &lv_font_montserrat_18, 0);
-    lv_obj_set_style_text_color(title, COLOR_MATERIAL_ORANGE, 0);
+    lv_obj_set_style_text_color(title, ui_tab_icon_color(), 0);
     
     // Subtitle showing source
     lv_obj_t *subtitle = lv_label_create(adhoc_probes_popup_obj);
@@ -17878,15 +17993,13 @@ static void adhoc_show_probes_cb(lv_event_t *e)
         lv_label_set_text_fmt(subtitle, "Found %d probes (%s)", adhoc_probe_count, tab_transport_name(uart1_tab));
     }
     lv_obj_set_style_text_font(subtitle, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(subtitle, lv_color_hex(0x888888), 0);
+    lv_obj_set_style_text_color(subtitle, ui_muted_color(), 0);
     
     // Scrollable list
     lv_obj_t *list_container = lv_obj_create(adhoc_probes_popup_obj);
     lv_obj_set_size(list_container, lv_pct(100), 300);
     lv_obj_set_flex_grow(list_container, 1);
-    lv_obj_set_style_bg_color(list_container, lv_color_hex(0x1A1A1A), 0);
-    lv_obj_set_style_border_width(list_container, 0, 0);
-    lv_obj_set_style_radius(list_container, 8, 0);
+    style_surface_panel(list_container, 8);
     lv_obj_set_style_pad_all(list_container, 8, 0);
     lv_obj_set_flex_flow(list_container, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_row(list_container, 6, 0);
@@ -17895,14 +18008,17 @@ static void adhoc_show_probes_cb(lv_event_t *e)
         lv_obj_t *empty_label = lv_label_create(list_container);
         lv_label_set_text(empty_label, "No probes found.\nRun Network Observer first\nto collect probe requests.");
         lv_obj_set_style_text_font(empty_label, &lv_font_montserrat_14, 0);
-        lv_obj_set_style_text_color(empty_label, lv_color_hex(0x666666), 0);
+        lv_obj_set_style_text_color(empty_label, ui_muted_color(), 0);
         lv_obj_set_style_text_align(empty_label, LV_TEXT_ALIGN_CENTER, 0);
     } else {
         for (int i = 0; i < adhoc_probe_count; i++) {
             lv_obj_t *btn = lv_btn_create(list_container);
             lv_obj_set_size(btn, lv_pct(100), 40);
-            lv_obj_set_style_bg_color(btn, lv_color_hex(0x333333), 0);
-            lv_obj_set_style_bg_color(btn, COLOR_MATERIAL_ORANGE, LV_STATE_PRESSED);
+            lv_obj_set_style_bg_color(btn, ui_card_color(), 0);
+            lv_obj_set_style_bg_color(btn, ui_card_pressed_color(), LV_STATE_PRESSED);
+            lv_obj_set_style_border_width(btn, 1, 0);
+            lv_obj_set_style_border_color(btn, ui_border_color(), 0);
+            lv_obj_set_style_border_opa(btn, dark_mode_enabled ? LV_OPA_40 : LV_OPA_70, 0);
             lv_obj_set_style_radius(btn, 6, 0);
             lv_obj_add_event_cb(btn, adhoc_probe_click_cb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
             
@@ -17916,8 +18032,7 @@ static void adhoc_show_probes_cb(lv_event_t *e)
     // Close button
     lv_obj_t *close_btn = lv_btn_create(adhoc_probes_popup_obj);
     lv_obj_set_size(close_btn, lv_pct(100), 45);
-    lv_obj_set_style_bg_color(close_btn, lv_color_hex(0x444444), 0);
-    lv_obj_set_style_radius(close_btn, 8, 0);
+    style_neutral_button(close_btn);
     lv_obj_add_event_cb(close_btn, adhoc_html_popup_close_cb, LV_EVENT_CLICKED, NULL);
     
     lv_obj_t *close_label = lv_label_create(close_btn);
@@ -17946,19 +18061,12 @@ static void adhoc_probe_click_cb(lv_event_t *e)
     if (!container) return;
     
     adhoc_html_popup_overlay = lv_obj_create(container);
-    lv_obj_remove_style_all(adhoc_html_popup_overlay);
-    lv_obj_set_size(adhoc_html_popup_overlay, lv_pct(100), lv_pct(100));
-    lv_obj_set_style_bg_color(adhoc_html_popup_overlay, lv_color_hex(0x000000), 0);
-    lv_obj_set_style_bg_opa(adhoc_html_popup_overlay, LV_OPA_70, 0);
-    lv_obj_clear_flag(adhoc_html_popup_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    style_modal_overlay(adhoc_html_popup_overlay, LV_OPA_70);
     
     adhoc_html_popup_obj = lv_obj_create(adhoc_html_popup_overlay);
     lv_obj_set_size(adhoc_html_popup_obj, 400, 350);
     lv_obj_center(adhoc_html_popup_obj);
-    lv_obj_set_style_bg_color(adhoc_html_popup_obj, lv_color_hex(0x2A2A2A), 0);
-    lv_obj_set_style_border_color(adhoc_html_popup_obj, COLOR_MATERIAL_TEAL, 0);
-    lv_obj_set_style_border_width(adhoc_html_popup_obj, 2, 0);
-    lv_obj_set_style_radius(adhoc_html_popup_obj, 12, 0);
+    style_popup_card(adhoc_html_popup_obj, 12, ui_tab_icon_color());
     lv_obj_set_style_pad_all(adhoc_html_popup_obj, 20, 0);
     lv_obj_set_flex_flow(adhoc_html_popup_obj, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_row(adhoc_html_popup_obj, 15, 0);
@@ -17967,19 +18075,20 @@ static void adhoc_probe_click_cb(lv_event_t *e)
     lv_obj_t *title = lv_label_create(adhoc_html_popup_obj);
     lv_label_set_text_fmt(title, "Start Portal: %s", adhoc_probes[adhoc_selected_probe_idx]);
     lv_obj_set_style_text_font(title, &lv_font_montserrat_18, 0);
-    lv_obj_set_style_text_color(title, COLOR_MATERIAL_TEAL, 0);
+    lv_obj_set_style_text_color(title, ui_tab_icon_color(), 0);
     
     // HTML selection label
     lv_obj_t *html_label = lv_label_create(adhoc_html_popup_obj);
     lv_label_set_text(html_label, "Select portal HTML template:");
     lv_obj_set_style_text_font(html_label, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(html_label, lv_color_hex(0xCCCCCC), 0);
+    lv_obj_set_style_text_color(html_label, ui_muted_color(), 0);
     
     // Dropdown for HTML files
     adhoc_html_dropdown = lv_dropdown_create(adhoc_html_popup_obj);
     lv_obj_set_width(adhoc_html_dropdown, lv_pct(100));
-    lv_obj_set_style_bg_color(adhoc_html_dropdown, lv_color_hex(0x333333), 0);
-    lv_obj_set_style_text_color(adhoc_html_dropdown, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_bg_color(adhoc_html_dropdown, ui_card_color(), 0);
+    lv_obj_set_style_border_color(adhoc_html_dropdown, ui_border_color(), 0);
+    lv_obj_set_style_text_color(adhoc_html_dropdown, ui_text_color(), 0);
     
     // Populate dropdown
     if (karma2_html_count > 0) {
@@ -17991,6 +18100,13 @@ static void adhoc_probe_click_cb(lv_event_t *e)
         lv_dropdown_set_options(adhoc_html_dropdown, options);
     } else {
         lv_dropdown_set_options(adhoc_html_dropdown, "default.html");
+    }
+
+    lv_obj_t *adhoc_html_list = lv_dropdown_get_list(adhoc_html_dropdown);
+    if (adhoc_html_list) {
+        lv_obj_set_style_bg_color(adhoc_html_list, ui_card_color(), 0);
+        lv_obj_set_style_text_color(adhoc_html_list, ui_text_color(), 0);
+        lv_obj_set_style_border_color(adhoc_html_list, ui_border_color(), 0);
     }
     
     // Button container
@@ -18006,8 +18122,7 @@ static void adhoc_probe_click_cb(lv_event_t *e)
     // Cancel button
     lv_obj_t *cancel_btn = lv_btn_create(btn_cont);
     lv_obj_set_size(cancel_btn, 150, 50);
-    lv_obj_set_style_bg_color(cancel_btn, lv_color_hex(0x444444), 0);
-    lv_obj_set_style_radius(cancel_btn, 8, 0);
+    style_neutral_button(cancel_btn);
     lv_obj_add_event_cb(cancel_btn, adhoc_html_popup_close_cb, LV_EVENT_CLICKED, NULL);
     
     lv_obj_t *cancel_label = lv_label_create(cancel_btn);
@@ -18018,13 +18133,13 @@ static void adhoc_probe_click_cb(lv_event_t *e)
     // Start button
     lv_obj_t *start_btn = lv_btn_create(btn_cont);
     lv_obj_set_size(start_btn, 150, 50);
-    lv_obj_set_style_bg_color(start_btn, COLOR_MATERIAL_GREEN, 0);
-    lv_obj_set_style_radius(start_btn, 8, 0);
+    style_show_probes_button(start_btn);
     lv_obj_add_event_cb(start_btn, adhoc_html_select_cb, LV_EVENT_CLICKED, NULL);
     
     lv_obj_t *start_label = lv_label_create(start_btn);
     lv_label_set_text(start_label, LV_SYMBOL_PLAY " Start");
     lv_obj_set_style_text_font(start_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(start_label, lv_color_hex(0xFFFFFF), 0);
     lv_obj_center(start_label);
 }
 
@@ -18107,7 +18222,7 @@ static void show_adhoc_portal_page(void)
     // Create page
     adhoc_portal_page = lv_obj_create(container);
     lv_obj_set_size(adhoc_portal_page, lv_pct(100), lv_pct(100));
-    lv_obj_set_style_bg_color(adhoc_portal_page, lv_color_hex(0x1A1A1A), 0);
+    lv_obj_set_style_bg_color(adhoc_portal_page, ui_bg_color(), 0);
     lv_obj_set_style_border_width(adhoc_portal_page, 0, 0);
     lv_obj_set_style_pad_all(adhoc_portal_page, 15, 0);
     lv_obj_set_flex_flow(adhoc_portal_page, LV_FLEX_FLOW_COLUMN);
@@ -18127,9 +18242,7 @@ static void show_adhoc_portal_page(void)
     // Back button
     lv_obj_t *back_btn = lv_btn_create(header);
     lv_obj_set_size(back_btn, 72, 60);
-    lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x333333), 0);
-    lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x444444), LV_STATE_PRESSED);
-    lv_obj_set_style_radius(back_btn, 8, 0);
+    style_back_nav_button(back_btn);
     lv_obj_add_event_cb(back_btn, adhoc_portal_back_cb, LV_EVENT_CLICKED, NULL);
     
     lv_obj_t *back_icon = lv_label_create(back_btn);
@@ -18141,7 +18254,7 @@ static void show_adhoc_portal_page(void)
     lv_obj_t *title = lv_label_create(header);
     lv_label_set_text(title, "Ad Hoc Portal & Karma");
     lv_obj_set_style_text_font(title, &lv_font_montserrat_22, 0);
-    lv_obj_set_style_text_color(title, COLOR_MATERIAL_ORANGE, 0);
+    lv_obj_set_style_text_color(title, dark_mode_enabled ? COLOR_LAB5_MAGENTA : ui_tab_icon_color(), 0);
     
     // =====================================================
     // PORTAL ACTIVE VIEW
@@ -18152,9 +18265,10 @@ static void show_adhoc_portal_page(void)
         // Status box
         lv_obj_t *status_box = lv_obj_create(adhoc_portal_page);
         lv_obj_set_size(status_box, lv_pct(100), LV_SIZE_CONTENT);
-        lv_obj_set_style_bg_color(status_box, lv_color_hex(0x1B5E20), 0);  // Dark green
-        lv_obj_set_style_border_width(status_box, 0, 0);
-        lv_obj_set_style_radius(status_box, 8, 0);
+        style_surface_panel(status_box, 8);
+        lv_obj_set_style_bg_color(status_box, dark_mode_enabled ? lv_color_hex(0x102720) : lv_color_hex(0xDDF2E8), 0);
+        lv_obj_set_style_border_color(status_box, COLOR_NEON_GREEN, 0);
+        lv_obj_set_style_border_opa(status_box, dark_mode_enabled ? LV_OPA_70 : LV_OPA_90, 0);
         lv_obj_set_style_pad_all(status_box, 15, 0);
         lv_obj_set_flex_flow(status_box, LV_FLEX_FLOW_COLUMN);
         lv_obj_set_style_pad_row(status_box, 5, 0);
@@ -18175,7 +18289,7 @@ static void show_adhoc_portal_page(void)
         lv_obj_t *html_label = lv_label_create(status_box);
         lv_label_set_text_fmt(html_label, "HTML: %s", strlen(portal_selected_html) > 0 ? portal_selected_html : "default");
         lv_obj_set_style_text_font(html_label, &lv_font_montserrat_14, 0);
-        lv_obj_set_style_text_color(html_label, lv_color_hex(0xCCCCCC), 0);
+        lv_obj_set_style_text_color(html_label, ui_muted_color(), 0);
         
         // Started by
         lv_obj_t *started_label = lv_label_create(status_box);
@@ -18183,21 +18297,19 @@ static void show_adhoc_portal_page(void)
             portal_started_by_uart == 1 ? tab_transport_name(uart1_preferred_tab()) : 
             portal_started_by_uart == 2 ? "MBus" : "Internal");
         lv_obj_set_style_text_font(started_label, &lv_font_montserrat_14, 0);
-        lv_obj_set_style_text_color(started_label, lv_color_hex(0xAAAAAA), 0);
+        lv_obj_set_style_text_color(started_label, ui_muted_color(), 0);
         
         // Data container (shows client connections, passwords)
         lv_obj_t *data_box = lv_obj_create(adhoc_portal_page);
         lv_obj_set_size(data_box, lv_pct(100), LV_SIZE_CONTENT);
         lv_obj_set_flex_grow(data_box, 1);
-        lv_obj_set_style_bg_color(data_box, lv_color_hex(0x252525), 0);
-        lv_obj_set_style_border_width(data_box, 0, 0);
-        lv_obj_set_style_radius(data_box, 8, 0);
+        style_surface_panel(data_box, 8);
         lv_obj_set_style_pad_all(data_box, 15, 0);
         
         adhoc_portal_data_label = lv_label_create(data_box);
         lv_label_set_text(adhoc_portal_data_label, "Waiting for client connections...\n\nPasswords will appear here.");
         lv_obj_set_style_text_font(adhoc_portal_data_label, &lv_font_montserrat_14, 0);
-        lv_obj_set_style_text_color(adhoc_portal_data_label, lv_color_hex(0x888888), 0);
+        lv_obj_set_style_text_color(adhoc_portal_data_label, ui_muted_color(), 0);
         lv_label_set_long_mode(adhoc_portal_data_label, LV_LABEL_LONG_WRAP);
         lv_obj_set_width(adhoc_portal_data_label, lv_pct(100));
         
@@ -18208,6 +18320,9 @@ static void show_adhoc_portal_page(void)
         lv_obj_t *stop_btn = lv_btn_create(adhoc_portal_page);
         lv_obj_set_size(stop_btn, lv_pct(100), 55);
         lv_obj_set_style_bg_color(stop_btn, COLOR_MATERIAL_RED, 0);
+        lv_obj_set_style_bg_color(stop_btn, lv_color_hex(0xB02A2A), LV_STATE_PRESSED);
+        lv_obj_set_style_border_width(stop_btn, 1, 0);
+        lv_obj_set_style_border_color(stop_btn, lv_color_hex(0xE36464), 0);
         lv_obj_set_style_radius(stop_btn, 8, 0);
         lv_obj_add_event_cb(stop_btn, adhoc_portal_stop_cb, LV_EVENT_CLICKED, NULL);
         
@@ -18225,9 +18340,7 @@ static void show_adhoc_portal_page(void)
         // Info box
         lv_obj_t *info_box = lv_obj_create(adhoc_portal_page);
         lv_obj_set_size(info_box, lv_pct(100), LV_SIZE_CONTENT);
-        lv_obj_set_style_bg_color(info_box, lv_color_hex(0x252525), 0);
-        lv_obj_set_style_border_width(info_box, 0, 0);
-        lv_obj_set_style_radius(info_box, 8, 0);
+        style_surface_panel(info_box, 8);
         lv_obj_set_style_pad_all(info_box, 15, 0);
         lv_obj_clear_flag(info_box, LV_OBJ_FLAG_SCROLLABLE);
         
@@ -18245,15 +18358,14 @@ static void show_adhoc_portal_page(void)
                 "collected by Network Observer.");
         }
         lv_obj_set_style_text_font(info_label, &lv_font_montserrat_14, 0);
-        lv_obj_set_style_text_color(info_label, lv_color_hex(0xAAAAAA), 0);
+        lv_obj_set_style_text_color(info_label, ui_muted_color(), 0);
         lv_label_set_long_mode(info_label, LV_LABEL_LONG_WRAP);
         lv_obj_set_width(info_label, lv_pct(100));
         
         // Show Probes button (NO Start/Stop Sniffer buttons!)
         lv_obj_t *probes_btn = lv_btn_create(adhoc_portal_page);
         lv_obj_set_size(probes_btn, lv_pct(100), 55);
-        lv_obj_set_style_bg_color(probes_btn, COLOR_MATERIAL_CYAN, 0);
-        lv_obj_set_style_radius(probes_btn, 8, 0);
+        style_show_probes_button(probes_btn);
         lv_obj_add_event_cb(probes_btn, adhoc_show_probes_cb, LV_EVENT_CLICKED, NULL);
         
         lv_obj_t *probes_label = lv_label_create(probes_btn);
@@ -18265,7 +18377,7 @@ static void show_adhoc_portal_page(void)
         adhoc_portal_status_label = lv_label_create(adhoc_portal_page);
         lv_label_set_text(adhoc_portal_status_label, "Select a probe request to start captive portal");
         lv_obj_set_style_text_font(adhoc_portal_status_label, &lv_font_montserrat_14, 0);
-        lv_obj_set_style_text_color(adhoc_portal_status_label, lv_color_hex(0x888888), 0);
+        lv_obj_set_style_text_color(adhoc_portal_status_label, ui_muted_color(), 0);
     }
     
     internal_ctx.current_visible_page = adhoc_portal_page;
@@ -18295,7 +18407,7 @@ static void show_portal_data_page(void)
     ctx->portal_data_page = lv_obj_create(container);
     lv_obj_set_size(ctx->portal_data_page, lv_pct(100), lv_pct(100));
     lv_obj_align(ctx->portal_data_page, LV_ALIGN_TOP_MID, 0, 0);
-    lv_obj_set_style_bg_color(ctx->portal_data_page, lv_color_hex(0x1A1A1A), 0);
+    lv_obj_set_style_bg_color(ctx->portal_data_page, ui_bg_color(), 0);
     lv_obj_set_style_border_width(ctx->portal_data_page, 0, 0);
     lv_obj_set_style_pad_all(ctx->portal_data_page, 10, 0);
     lv_obj_set_flex_flow(ctx->portal_data_page, LV_FLEX_FLOW_COLUMN);
@@ -18315,9 +18427,7 @@ static void show_portal_data_page(void)
     
     lv_obj_t *back_btn = lv_btn_create(header);
     lv_obj_set_size(back_btn, 72, 60);
-    lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x333333), 0);
-    lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x444444), LV_STATE_PRESSED);
-    lv_obj_set_style_radius(back_btn, 8, 0);
+    style_back_nav_button(back_btn);
     lv_obj_add_event_cb(back_btn, compromised_data_back_btn_event_cb, LV_EVENT_CLICKED, NULL);
     
     lv_obj_t *back_icon = lv_label_create(back_btn);
@@ -18328,21 +18438,19 @@ static void show_portal_data_page(void)
     lv_obj_t *title = lv_label_create(header);
     lv_label_set_text(title, "Portal Data");
     lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
-    lv_obj_set_style_text_color(title, COLOR_MATERIAL_TEAL, 0);
+    lv_obj_set_style_text_color(title, dark_mode_enabled ? COLOR_LAB5_MAGENTA : ui_tab_icon_color(), 0);
     
     // Status label
     lv_obj_t *status_label = lv_label_create(ctx->portal_data_page);
     lv_label_set_text(status_label, "Loading...");
     lv_obj_set_style_text_font(status_label, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(status_label, lv_color_hex(0x888888), 0);
+    lv_obj_set_style_text_color(status_label, ui_muted_color(), 0);
     
     // Scrollable list container
     lv_obj_t *list_container = lv_obj_create(ctx->portal_data_page);
     lv_obj_set_size(list_container, lv_pct(100), LV_SIZE_CONTENT);
     lv_obj_set_flex_grow(list_container, 1);
-    lv_obj_set_style_bg_color(list_container, lv_color_hex(0x252525), 0);
-    lv_obj_set_style_border_width(list_container, 0, 0);
-    lv_obj_set_style_radius(list_container, 8, 0);
+    style_surface_panel(list_container, 8);
     lv_obj_set_style_pad_all(list_container, 10, 0);
     lv_obj_set_flex_flow(list_container, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_row(list_container, 8, 0);
@@ -18425,8 +18533,10 @@ static void show_portal_data_page(void)
             // Create entry row
             lv_obj_t *row = lv_obj_create(list_container);
             lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
-            lv_obj_set_style_bg_color(row, lv_color_hex(0x2D2D2D), 0);
-            lv_obj_set_style_border_width(row, 0, 0);
+            lv_obj_set_style_bg_color(row, ui_card_color(), 0);
+            lv_obj_set_style_border_width(row, 1, 0);
+            lv_obj_set_style_border_color(row, ui_border_color(), 0);
+            lv_obj_set_style_border_opa(row, dark_mode_enabled ? LV_OPA_40 : LV_OPA_70, 0);
             lv_obj_set_style_radius(row, 6, 0);
             lv_obj_set_style_pad_all(row, 8, 0);
             lv_obj_set_flex_flow(row, LV_FLEX_FLOW_COLUMN);
@@ -18441,7 +18551,7 @@ static void show_portal_data_page(void)
             lv_obj_t *fields_lbl = lv_label_create(row);
             lv_label_set_text(fields_lbl, fields);
             lv_obj_set_style_text_font(fields_lbl, &lv_font_montserrat_14, 0);
-            lv_obj_set_style_text_color(fields_lbl, COLOR_MATERIAL_TEAL, 0);
+            lv_obj_set_style_text_color(fields_lbl, ui_tab_icon_color(), 0);
             lv_obj_set_width(fields_lbl, lv_pct(100));
             lv_label_set_long_mode(fields_lbl, LV_LABEL_LONG_WRAP);
             
@@ -18674,6 +18784,7 @@ static void wpasec_create_credentials_prompt(tab_context_t *ctx, bool with_ssid)
     ctx->wpasec_keyboard = lv_keyboard_create(ctx->wpasec_popup_overlay);
     lv_obj_set_size(ctx->wpasec_keyboard, lv_pct(100), 260);
     lv_obj_align(ctx->wpasec_keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
+    style_on_screen_keyboard(ctx->wpasec_keyboard);
     lv_keyboard_set_textarea(ctx->wpasec_keyboard, with_ssid ? ssid_input : ctx->wpasec_password_input);
     lv_obj_add_event_cb(ctx->wpasec_keyboard, wpasec_keyboard_cb, LV_EVENT_ALL, NULL);
     lv_obj_add_flag(ctx->wpasec_keyboard, LV_OBJ_FLAG_HIDDEN);
@@ -19904,7 +20015,7 @@ static void show_bluetooth_menu_page(void)
     ctx->bt_menu_page = lv_obj_create(container);
     bt_menu_page = ctx->bt_menu_page;
     lv_obj_set_size(bt_menu_page, lv_pct(100), lv_pct(100));
-    lv_obj_set_style_bg_color(bt_menu_page, lv_color_hex(0x1A1A1A), 0);
+    lv_obj_set_style_bg_color(bt_menu_page, ui_bg_color(), 0);
     lv_obj_set_style_border_width(bt_menu_page, 0, 0);
     lv_obj_set_style_pad_all(bt_menu_page, 10, 0);
     lv_obj_set_flex_flow(bt_menu_page, LV_FLEX_FLOW_COLUMN);
@@ -19923,9 +20034,7 @@ static void show_bluetooth_menu_page(void)
     
     lv_obj_t *back_btn = lv_btn_create(header);
     lv_obj_set_size(back_btn, 72, 60);
-    lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x333333), 0);
-    lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x444444), LV_STATE_PRESSED);
-    lv_obj_set_style_radius(back_btn, 8, 0);
+    style_back_nav_button(back_btn);
     lv_obj_add_event_cb(back_btn, bt_menu_back_btn_event_cb, LV_EVENT_CLICKED, NULL);
     
     lv_obj_t *back_icon = lv_label_create(back_btn);
@@ -19936,7 +20045,7 @@ static void show_bluetooth_menu_page(void)
     lv_obj_t *title = lv_label_create(header);
     lv_label_set_text(title, "Bluetooth");
     lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
-    lv_obj_set_style_text_color(title, COLOR_MATERIAL_CYAN, 0);
+    lv_obj_set_style_text_color(title, dark_mode_enabled ? COLOR_LAB5_MAGENTA : ui_tab_icon_color(), 0);
     
     // Tiles container - vertical column, centered
     lv_obj_t *tiles = lv_obj_create(bt_menu_page);
@@ -19950,8 +20059,12 @@ static void show_bluetooth_menu_page(void)
     lv_obj_set_style_pad_row(tiles, 15, 0);
     lv_obj_clear_flag(tiles, LV_OBJ_FLAG_SCROLLABLE);
     
-    create_tile(tiles, LV_SYMBOL_GPS, "AirTag\nScan", COLOR_MATERIAL_AMBER, bt_menu_tile_event_cb, "AirTag Scan");
-    create_tile(tiles, LV_SYMBOL_BLUETOOTH, "BT Scan\n& Locate", COLOR_MATERIAL_CYAN, bt_menu_tile_event_cb, "BT Scan & Locate");
+    create_tile(tiles, LV_SYMBOL_GPS, "AirTag\nScan",
+                dark_mode_enabled ? COLOR_LAB5_MAGENTA : ui_tab_icon_color(),
+                bt_menu_tile_event_cb, "AirTag Scan");
+    create_tile(tiles, LV_SYMBOL_BLUETOOTH, "BT Scan\n& Locate",
+                ui_tab_icon_color(),
+                bt_menu_tile_event_cb, "BT Scan & Locate");
     
     // Set current visible page
     ctx->current_visible_page = ctx->bt_menu_page;
@@ -20080,7 +20193,7 @@ static void show_airtag_scan_page(void)
     ctx->bt_airtag_page = lv_obj_create(container);
     bt_airtag_page = ctx->bt_airtag_page;
     lv_obj_set_size(bt_airtag_page, lv_pct(100), lv_pct(100));
-    lv_obj_set_style_bg_color(bt_airtag_page, lv_color_hex(0x1A1A1A), 0);
+    lv_obj_set_style_bg_color(bt_airtag_page, ui_bg_color(), 0);
     lv_obj_set_style_border_width(bt_airtag_page, 0, 0);
     lv_obj_set_style_pad_all(bt_airtag_page, 10, 0);
     lv_obj_set_flex_flow(bt_airtag_page, LV_FLEX_FLOW_COLUMN);
@@ -20099,9 +20212,7 @@ static void show_airtag_scan_page(void)
     
     lv_obj_t *back_btn = lv_btn_create(header);
     lv_obj_set_size(back_btn, 72, 60);
-    lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x333333), 0);
-    lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x444444), LV_STATE_PRESSED);
-    lv_obj_set_style_radius(back_btn, 8, 0);
+    style_back_nav_button(back_btn);
     lv_obj_add_event_cb(back_btn, airtag_scan_back_btn_event_cb, LV_EVENT_CLICKED, NULL);
     
     lv_obj_t *back_icon = lv_label_create(back_btn);
@@ -20112,7 +20223,7 @@ static void show_airtag_scan_page(void)
     lv_obj_t *title = lv_label_create(header);
     lv_label_set_text(title, "AirTag Scan");
     lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
-    lv_obj_set_style_text_color(title, COLOR_MATERIAL_AMBER, 0);
+    lv_obj_set_style_text_color(title, dark_mode_enabled ? COLOR_LAB5_MAGENTA : ui_tab_icon_color(), 0);
     
     // Content container - centered
     lv_obj_t *content = lv_obj_create(bt_airtag_page);
@@ -20128,10 +20239,7 @@ static void show_airtag_scan_page(void)
     // AirTags counter box
     lv_obj_t *airtag_box = lv_obj_create(content);
     lv_obj_set_size(airtag_box, 200, 180);
-    lv_obj_set_style_bg_color(airtag_box, lv_color_hex(0x252525), 0);
-    lv_obj_set_style_border_color(airtag_box, COLOR_MATERIAL_AMBER, 0);
-    lv_obj_set_style_border_width(airtag_box, 3, 0);
-    lv_obj_set_style_radius(airtag_box, 16, 0);
+    style_surface_panel(airtag_box, 16);
     lv_obj_set_style_pad_all(airtag_box, 15, 0);
     lv_obj_set_flex_flow(airtag_box, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(airtag_box, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
@@ -20140,20 +20248,17 @@ static void show_airtag_scan_page(void)
     airtag_count_label = lv_label_create(airtag_box);
     lv_label_set_text(airtag_count_label, "0");
     lv_obj_set_style_text_font(airtag_count_label, &lv_font_montserrat_44, 0);
-    lv_obj_set_style_text_color(airtag_count_label, COLOR_MATERIAL_AMBER, 0);
+    lv_obj_set_style_text_color(airtag_count_label, ui_tab_icon_color(), 0);
     
     lv_obj_t *airtag_label = lv_label_create(airtag_box);
     lv_label_set_text(airtag_label, "AirTags");
     lv_obj_set_style_text_font(airtag_label, &lv_font_montserrat_18, 0);
-    lv_obj_set_style_text_color(airtag_label, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_color(airtag_label, ui_text_color(), 0);
     
     // SmartTags counter box
     lv_obj_t *smarttag_box = lv_obj_create(content);
     lv_obj_set_size(smarttag_box, 200, 180);
-    lv_obj_set_style_bg_color(smarttag_box, lv_color_hex(0x252525), 0);
-    lv_obj_set_style_border_color(smarttag_box, COLOR_MATERIAL_TEAL, 0);
-    lv_obj_set_style_border_width(smarttag_box, 3, 0);
-    lv_obj_set_style_radius(smarttag_box, 16, 0);
+    style_surface_panel(smarttag_box, 16);
     lv_obj_set_style_pad_all(smarttag_box, 15, 0);
     lv_obj_set_flex_flow(smarttag_box, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(smarttag_box, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
@@ -20162,12 +20267,12 @@ static void show_airtag_scan_page(void)
     smarttag_count_label = lv_label_create(smarttag_box);
     lv_label_set_text(smarttag_count_label, "0");
     lv_obj_set_style_text_font(smarttag_count_label, &lv_font_montserrat_44, 0);
-    lv_obj_set_style_text_color(smarttag_count_label, COLOR_MATERIAL_TEAL, 0);
+    lv_obj_set_style_text_color(smarttag_count_label, ui_tab_icon_color(), 0);
     
     lv_obj_t *smarttag_label = lv_label_create(smarttag_box);
     lv_label_set_text(smarttag_label, "SmartTags");
     lv_obj_set_style_text_font(smarttag_label, &lv_font_montserrat_18, 0);
-    lv_obj_set_style_text_color(smarttag_label, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_color(smarttag_label, ui_text_color(), 0);
     
     // Start scanning
     ESP_LOGI(TAG, "Starting AirTag scan");
@@ -20317,7 +20422,7 @@ static void show_bt_scan_page(void)
     ctx->bt_scan_page = lv_obj_create(container);
     bt_scan_page = ctx->bt_scan_page;
     lv_obj_set_size(bt_scan_page, lv_pct(100), lv_pct(100));
-    lv_obj_set_style_bg_color(bt_scan_page, lv_color_hex(0x1A1A1A), 0);
+    lv_obj_set_style_bg_color(bt_scan_page, ui_bg_color(), 0);
     lv_obj_set_style_border_width(bt_scan_page, 0, 0);
     lv_obj_set_style_pad_all(bt_scan_page, 10, 0);
     lv_obj_set_flex_flow(bt_scan_page, LV_FLEX_FLOW_COLUMN);
@@ -20347,9 +20452,7 @@ static void show_bt_scan_page(void)
     
     lv_obj_t *back_btn = lv_btn_create(left_cont);
     lv_obj_set_size(back_btn, 72, 60);
-    lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x333333), 0);
-    lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x444444), LV_STATE_PRESSED);
-    lv_obj_set_style_radius(back_btn, 8, 0);
+    style_back_nav_button(back_btn);
     lv_obj_add_event_cb(back_btn, bt_scan_back_btn_event_cb, LV_EVENT_CLICKED, NULL);
     
     lv_obj_t *back_icon = lv_label_create(back_btn);
@@ -20360,13 +20463,12 @@ static void show_bt_scan_page(void)
     lv_obj_t *title = lv_label_create(left_cont);
     lv_label_set_text(title, "BT Scan & Locate");
     lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
-    lv_obj_set_style_text_color(title, COLOR_MATERIAL_CYAN, 0);
+    lv_obj_set_style_text_color(title, dark_mode_enabled ? COLOR_LAB5_MAGENTA : ui_tab_icon_color(), 0);
     
     // Rescan button on right
     lv_obj_t *rescan_btn = lv_btn_create(header);
     lv_obj_set_size(rescan_btn, 100, 40);
-    lv_obj_set_style_bg_color(rescan_btn, COLOR_MATERIAL_CYAN, 0);
-    lv_obj_set_style_radius(rescan_btn, 8, 0);
+    style_show_probes_button(rescan_btn);
     lv_obj_add_event_cb(rescan_btn, bt_scan_rescan_cb, LV_EVENT_CLICKED, NULL);
     
     lv_obj_t *rescan_label = lv_label_create(rescan_btn);
@@ -20392,7 +20494,7 @@ static void show_bt_scan_page(void)
     lv_obj_t *loading_label = lv_label_create(loading_container);
     lv_label_set_text(loading_label, "Scanning for BT devices...");
     lv_obj_set_style_text_font(loading_label, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(loading_label, lv_color_hex(0x888888), 0);
+    lv_obj_set_style_text_color(loading_label, ui_muted_color(), 0);
     lv_obj_set_style_pad_top(loading_label, 20, 0);
     
     // Force UI refresh to show loading state - release display lock briefly
@@ -20441,15 +20543,13 @@ static void show_bt_scan_page(void)
     // Status label
     lv_obj_t *status_label = lv_label_create(bt_scan_page);
     lv_obj_set_style_text_font(status_label, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(status_label, lv_color_hex(0x888888), 0);
+    lv_obj_set_style_text_color(status_label, ui_muted_color(), 0);
     
     // Scrollable list container
     lv_obj_t *list_container = lv_obj_create(bt_scan_page);
     lv_obj_set_size(list_container, lv_pct(100), LV_SIZE_CONTENT);
     lv_obj_set_flex_grow(list_container, 1);
-    lv_obj_set_style_bg_color(list_container, lv_color_hex(0x252525), 0);
-    lv_obj_set_style_border_width(list_container, 0, 0);
-    lv_obj_set_style_radius(list_container, 8, 0);
+    style_surface_panel(list_container, 8);
     lv_obj_set_style_pad_all(list_container, 8, 0);
     lv_obj_set_flex_flow(list_container, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_row(list_container, 6, 0);
@@ -20474,9 +20574,11 @@ static void show_bt_scan_page(void)
         
         lv_obj_t *row = lv_obj_create(list_container);
         lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
-        lv_obj_set_style_bg_color(row, lv_color_hex(0x2D2D2D), 0);
-        lv_obj_set_style_bg_color(row, lv_color_hex(0x3D3D3D), LV_STATE_PRESSED);
-        lv_obj_set_style_border_width(row, 0, 0);
+        lv_obj_set_style_bg_color(row, ui_card_color(), 0);
+        lv_obj_set_style_bg_color(row, ui_card_pressed_color(), LV_STATE_PRESSED);
+        lv_obj_set_style_border_width(row, 1, 0);
+        lv_obj_set_style_border_color(row, ui_border_color(), 0);
+        lv_obj_set_style_border_opa(row, dark_mode_enabled ? LV_OPA_40 : LV_OPA_70, 0);
         lv_obj_set_style_radius(row, 6, 0);
         lv_obj_set_style_pad_all(row, 10, 0);
         lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
@@ -20497,14 +20599,14 @@ static void show_bt_scan_page(void)
             lv_obj_set_width(name_lbl, 155);  // Fixed width for MAC
         }
         lv_obj_set_style_text_font(name_lbl, &lv_font_montserrat_14, 0);
-        lv_obj_set_style_text_color(name_lbl, COLOR_MATERIAL_CYAN, 0);
+        lv_obj_set_style_text_color(name_lbl, ui_text_color(), 0);
         
         // MAC (if name exists, show MAC too)
         if (strlen(dev->name) > 0) {
             lv_obj_t *mac_lbl = lv_label_create(row);
             lv_label_set_text(mac_lbl, dev->mac);
             lv_obj_set_style_text_font(mac_lbl, &lv_font_montserrat_12, 0);
-            lv_obj_set_style_text_color(mac_lbl, lv_color_hex(0x888888), 0);
+            lv_obj_set_style_text_color(mac_lbl, ui_muted_color(), 0);
             lv_obj_set_width(mac_lbl, 155);  // Full MAC width (17 chars)
         }
         
@@ -20611,7 +20713,7 @@ static void bt_locator_tracking_task(void *arg)
                                 if (bt_locator_rssi_label) {
                                     lv_label_set_text(bt_locator_rssi_label, "No signal");
                                     lv_obj_set_style_text_font(bt_locator_rssi_label, &lv_font_montserrat_32, 0);
-                                    lv_obj_set_style_text_color(bt_locator_rssi_label, lv_color_hex(0x666666), 0);
+                                    lv_obj_set_style_text_color(bt_locator_rssi_label, ui_muted_color(), 0);
                                 }
                                 bsp_display_unlock();
                             } else {
@@ -20695,7 +20797,7 @@ static void show_bt_locator_page(int device_idx)
     ctx->bt_locator_page = lv_obj_create(container);
     bt_locator_page = ctx->bt_locator_page;
     lv_obj_set_size(bt_locator_page, lv_pct(100), lv_pct(100));
-    lv_obj_set_style_bg_color(bt_locator_page, lv_color_hex(0x1A1A1A), 0);
+    lv_obj_set_style_bg_color(bt_locator_page, ui_bg_color(), 0);
     lv_obj_set_style_border_width(bt_locator_page, 0, 0);
     lv_obj_set_style_pad_all(bt_locator_page, 10, 0);
     lv_obj_set_flex_flow(bt_locator_page, LV_FLEX_FLOW_COLUMN);
@@ -20714,9 +20816,7 @@ static void show_bt_locator_page(int device_idx)
     
     lv_obj_t *back_btn = lv_btn_create(header);
     lv_obj_set_size(back_btn, 72, 60);
-    lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x333333), 0);
-    lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x444444), LV_STATE_PRESSED);
-    lv_obj_set_style_radius(back_btn, 8, 0);
+    style_back_nav_button(back_btn);
     lv_obj_add_event_cb(back_btn, bt_locator_tracking_back_btn_event_cb, LV_EVENT_CLICKED, NULL);
     
     lv_obj_t *back_icon = lv_label_create(back_btn);
@@ -20727,7 +20827,7 @@ static void show_bt_locator_page(int device_idx)
     lv_obj_t *title = lv_label_create(header);
     lv_label_set_text(title, "BT Locator - Tracking");
     lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
-    lv_obj_set_style_text_color(title, COLOR_MATERIAL_PURPLE, 0);
+    lv_obj_set_style_text_color(title, dark_mode_enabled ? COLOR_LAB5_MAGENTA : ui_tab_icon_color(), 0);
     
     // Content container - centered
     lv_obj_t *content = lv_obj_create(bt_locator_page);
@@ -20757,16 +20857,15 @@ static void show_bt_locator_page(int device_idx)
         lv_obj_t *mac_lbl = lv_label_create(content);
         lv_label_set_text(mac_lbl, bt_locator_target_mac);
         lv_obj_set_style_text_font(mac_lbl, &lv_font_montserrat_16, 0);
-        lv_obj_set_style_text_color(mac_lbl, lv_color_hex(0x888888), 0);
+        lv_obj_set_style_text_color(mac_lbl, ui_muted_color(), 0);
     }
     
     // RSSI display box
     lv_obj_t *rssi_box = lv_obj_create(content);
     lv_obj_set_size(rssi_box, 250, 150);
-    lv_obj_set_style_bg_color(rssi_box, lv_color_hex(0x252525), 0);
-    lv_obj_set_style_border_color(rssi_box, COLOR_MATERIAL_PURPLE, 0);
-    lv_obj_set_style_border_width(rssi_box, 3, 0);
-    lv_obj_set_style_radius(rssi_box, 16, 0);
+    style_surface_panel(rssi_box, 16);
+    lv_obj_set_style_border_color(rssi_box, ui_tab_icon_color(), 0);
+    lv_obj_set_style_border_opa(rssi_box, dark_mode_enabled ? LV_OPA_70 : LV_OPA_90, 0);
     lv_obj_set_style_pad_all(rssi_box, 15, 0);
     lv_obj_set_flex_flow(rssi_box, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(rssi_box, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
@@ -20786,7 +20885,7 @@ static void show_bt_locator_page(int device_idx)
     lv_obj_t *rssi_title = lv_label_create(rssi_box);
     lv_label_set_text(rssi_title, "Signal Strength");
     lv_obj_set_style_text_font(rssi_title, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(rssi_title, lv_color_hex(0x888888), 0);
+    lv_obj_set_style_text_color(rssi_title, ui_muted_color(), 0);
     
     // Start tracking
     char cmd[64];
@@ -21786,7 +21885,7 @@ static lv_obj_t* create_scan_time_spinbox_row(lv_obj_t *parent, const char *labe
     lv_obj_t *label = lv_label_create(row);
     lv_label_set_text(label, label_text);
     lv_obj_set_style_text_font(label, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(label, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_color(label, ui_text_color(), 0);
     
     // Spinbox container
     lv_obj_t *spin_cont = lv_obj_create(row);
@@ -21801,9 +21900,10 @@ static lv_obj_t* create_scan_time_spinbox_row(lv_obj_t *parent, const char *labe
     
     lv_obj_t *dec_btn = lv_btn_create(spin_cont);
     lv_obj_set_size(dec_btn, 35, 35);
-    lv_obj_set_style_bg_color(dec_btn, lv_color_hex(0x555555), 0);
+    style_neutral_button(dec_btn);
     lv_obj_t *dec_label = lv_label_create(dec_btn);
     lv_label_set_text(dec_label, LV_SYMBOL_MINUS);
+    lv_obj_set_style_text_color(dec_label, ui_text_color(), 0);
     lv_obj_center(dec_label);
     
     lv_obj_t *spinbox = lv_spinbox_create(spin_cont);
@@ -21813,14 +21913,17 @@ static lv_obj_t* create_scan_time_spinbox_row(lv_obj_t *parent, const char *labe
     lv_spinbox_set_step(spinbox, 50);
     lv_obj_set_width(spinbox, 70);
     lv_obj_set_style_text_font(spinbox, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_bg_color(spinbox, lv_color_hex(0x3D3D3D), 0);
-    lv_obj_set_style_text_color(spinbox, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_bg_color(spinbox, ui_card_color(), 0);
+    lv_obj_set_style_border_width(spinbox, 1, 0);
+    lv_obj_set_style_border_color(spinbox, ui_border_color(), 0);
+    lv_obj_set_style_text_color(spinbox, ui_text_color(), 0);
     
     lv_obj_t *inc_btn = lv_btn_create(spin_cont);
     lv_obj_set_size(inc_btn, 35, 35);
-    lv_obj_set_style_bg_color(inc_btn, lv_color_hex(0x555555), 0);
+    style_neutral_button(inc_btn);
     lv_obj_t *inc_label = lv_label_create(inc_btn);
     lv_label_set_text(inc_label, LV_SYMBOL_PLUS);
+    lv_obj_set_style_text_color(inc_label, ui_text_color(), 0);
     lv_obj_center(inc_label);
     
     lv_obj_add_event_cb(dec_btn, spinbox_decrement_event_cb, LV_EVENT_CLICKED, spinbox);
@@ -21868,22 +21971,14 @@ static void show_scan_time_popup(void)
     
     // Create modal overlay
     scan_time_popup_overlay = lv_obj_create(container);
-    lv_obj_remove_style_all(scan_time_popup_overlay);
-    lv_obj_set_size(scan_time_popup_overlay, lv_pct(100), lv_pct(100));
-    lv_obj_set_style_bg_color(scan_time_popup_overlay, lv_color_hex(0x000000), 0);
-    lv_obj_set_style_bg_opa(scan_time_popup_overlay, LV_OPA_50, 0);
-    lv_obj_clear_flag(scan_time_popup_overlay, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(scan_time_popup_overlay, LV_OBJ_FLAG_CLICKABLE);
+    style_modal_overlay(scan_time_popup_overlay, LV_OPA_50);
     
     // Create popup - dynamic height based on device count
     scan_time_popup_obj = lv_obj_create(scan_time_popup_overlay);
     int popup_height = 180 + (device_count * 140);  // Base + per-device section
     lv_obj_set_size(scan_time_popup_obj, 420, popup_height);
     lv_obj_center(scan_time_popup_obj);
-    lv_obj_set_style_bg_color(scan_time_popup_obj, lv_color_hex(0x2D2D2D), 0);
-    lv_obj_set_style_border_color(scan_time_popup_obj, COLOR_MATERIAL_GREEN, 0);
-    lv_obj_set_style_border_width(scan_time_popup_obj, 2, 0);
-    lv_obj_set_style_radius(scan_time_popup_obj, 12, 0);
+    style_popup_card(scan_time_popup_obj, 12, ui_tab_icon_color());
     lv_obj_set_style_pad_all(scan_time_popup_obj, 15, 0);
     lv_obj_set_flex_flow(scan_time_popup_obj, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_row(scan_time_popup_obj, 8, 0);
@@ -21893,14 +21988,14 @@ static void show_scan_time_popup(void)
     lv_obj_t *title = lv_label_create(scan_time_popup_obj);
     lv_label_set_text(title, "Channel Scan Time (ms)");
     lv_obj_set_style_text_font(title, &lv_font_montserrat_18, 0);
-    lv_obj_set_style_text_color(title, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_color(title, dark_mode_enabled ? COLOR_LAB5_MAGENTA : ui_tab_icon_color(), 0);
     
     // ========== Grove Section ==========
     if (grove_detected) {
         lv_obj_t *grove_header = lv_label_create(scan_time_popup_obj);
         lv_label_set_text(grove_header, "Grove");
         lv_obj_set_style_text_font(grove_header, &lv_font_montserrat_16, 0);
-        lv_obj_set_style_text_color(grove_header, COLOR_MATERIAL_CYAN, 0);
+        lv_obj_set_style_text_color(grove_header, ui_tab_icon_color(), 0);
         
         create_scan_time_spinbox_row(scan_time_popup_obj, "Min time:", grove_min, &scan_time_grove_min_spinbox);
         create_scan_time_spinbox_row(scan_time_popup_obj, "Max time:", grove_max, &scan_time_grove_max_spinbox);
@@ -21911,7 +22006,7 @@ static void show_scan_time_popup(void)
         lv_obj_t *usb_header = lv_label_create(scan_time_popup_obj);
         lv_label_set_text(usb_header, "USB");
         lv_obj_set_style_text_font(usb_header, &lv_font_montserrat_16, 0);
-        lv_obj_set_style_text_color(usb_header, COLOR_MATERIAL_BLUE, 0);
+        lv_obj_set_style_text_color(usb_header, ui_tab_icon_color(), 0);
         
         create_scan_time_spinbox_row(scan_time_popup_obj, "Min time:", usb_min, &scan_time_usb_min_spinbox);
         create_scan_time_spinbox_row(scan_time_popup_obj, "Max time:", usb_max, &scan_time_usb_max_spinbox);
@@ -21922,7 +22017,7 @@ static void show_scan_time_popup(void)
         lv_obj_t *mbus_header = lv_label_create(scan_time_popup_obj);
         lv_label_set_text(mbus_header, "MBus");
         lv_obj_set_style_text_font(mbus_header, &lv_font_montserrat_16, 0);
-        lv_obj_set_style_text_color(mbus_header, COLOR_MATERIAL_ORANGE, 0);
+        lv_obj_set_style_text_color(mbus_header, ui_tab_icon_color(), 0);
         
         create_scan_time_spinbox_row(scan_time_popup_obj, "Min time:", mbus_min, &scan_time_mbus_min_spinbox);
         create_scan_time_spinbox_row(scan_time_popup_obj, "Max time:", mbus_max, &scan_time_mbus_max_spinbox);
@@ -21947,7 +22042,7 @@ static void show_scan_time_popup(void)
     // Cancel button
     lv_obj_t *cancel_btn = lv_btn_create(btn_row);
     lv_obj_set_size(cancel_btn, 100, 40);
-    lv_obj_set_style_bg_color(cancel_btn, lv_color_hex(0x555555), 0);
+    style_neutral_button(cancel_btn);
     lv_obj_add_event_cb(cancel_btn, scan_time_popup_close_cb, LV_EVENT_CLICKED, NULL);
     
     lv_obj_t *cancel_label = lv_label_create(cancel_btn);
@@ -21957,7 +22052,7 @@ static void show_scan_time_popup(void)
     // Save button
     lv_obj_t *save_btn = lv_btn_create(btn_row);
     lv_obj_set_size(save_btn, 100, 40);
-    lv_obj_set_style_bg_color(save_btn, COLOR_MATERIAL_GREEN, 0);
+    style_show_probes_button(save_btn);
     lv_obj_add_event_cb(save_btn, scan_time_save_cb, LV_EVENT_CLICKED, NULL);
     
     lv_obj_t *save_label = lv_label_create(save_btn);
@@ -22368,21 +22463,13 @@ static void show_screen_timeout_popup(void)
     
     // Create modal overlay
     screen_timeout_popup_overlay = lv_obj_create(container);
-    lv_obj_remove_style_all(screen_timeout_popup_overlay);
-    lv_obj_set_size(screen_timeout_popup_overlay, lv_pct(100), lv_pct(100));
-    lv_obj_set_style_bg_color(screen_timeout_popup_overlay, lv_color_hex(0x000000), 0);
-    lv_obj_set_style_bg_opa(screen_timeout_popup_overlay, LV_OPA_50, 0);
-    lv_obj_clear_flag(screen_timeout_popup_overlay, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(screen_timeout_popup_overlay, LV_OBJ_FLAG_CLICKABLE);
+    style_modal_overlay(screen_timeout_popup_overlay, LV_OPA_50);
     
     // Create popup
     screen_timeout_popup_obj = lv_obj_create(screen_timeout_popup_overlay);
     lv_obj_set_size(screen_timeout_popup_obj, 350, 220);
     lv_obj_center(screen_timeout_popup_obj);
-    lv_obj_set_style_bg_color(screen_timeout_popup_obj, lv_color_hex(0x2D2D2D), 0);
-    lv_obj_set_style_border_color(screen_timeout_popup_obj, COLOR_MATERIAL_AMBER, 0);
-    lv_obj_set_style_border_width(screen_timeout_popup_obj, 2, 0);
-    lv_obj_set_style_radius(screen_timeout_popup_obj, 12, 0);
+    style_popup_card(screen_timeout_popup_obj, 12, ui_tab_icon_color());
     lv_obj_set_style_pad_all(screen_timeout_popup_obj, 20, 0);
     lv_obj_set_flex_flow(screen_timeout_popup_obj, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(screen_timeout_popup_obj, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
@@ -22393,7 +22480,7 @@ static void show_screen_timeout_popup(void)
     lv_obj_t *title = lv_label_create(screen_timeout_popup_obj);
     lv_label_set_text(title, "Screen Timeout");
     lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
-    lv_obj_set_style_text_color(title, COLOR_MATERIAL_AMBER, 0);
+    lv_obj_set_style_text_color(title, dark_mode_enabled ? COLOR_LAB5_MAGENTA : ui_tab_icon_color(), 0);
     
     // Dropdown
     lv_obj_t *dropdown = lv_dropdown_create(screen_timeout_popup_obj);
@@ -22401,12 +22488,21 @@ static void show_screen_timeout_popup(void)
     lv_dropdown_set_selected(dropdown, screen_timeout_setting);
     lv_obj_set_width(dropdown, 200);
     lv_obj_set_style_text_font(dropdown, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_bg_color(dropdown, ui_card_color(), 0);
+    lv_obj_set_style_border_color(dropdown, ui_border_color(), 0);
+    lv_obj_set_style_text_color(dropdown, ui_text_color(), 0);
+    lv_obj_t *timeout_list = lv_dropdown_get_list(dropdown);
+    if (timeout_list) {
+        lv_obj_set_style_bg_color(timeout_list, ui_card_color(), 0);
+        lv_obj_set_style_border_color(timeout_list, ui_border_color(), 0);
+        lv_obj_set_style_text_color(timeout_list, ui_text_color(), 0);
+    }
     lv_obj_add_event_cb(dropdown, screen_timeout_dropdown_cb, LV_EVENT_VALUE_CHANGED, NULL);
     
     // Close button
     lv_obj_t *close_btn = lv_btn_create(screen_timeout_popup_obj);
     lv_obj_set_size(close_btn, 100, 40);
-    lv_obj_set_style_bg_color(close_btn, COLOR_MATERIAL_AMBER, 0);
+    style_neutral_button(close_btn);
     lv_obj_add_event_cb(close_btn, screen_timeout_close_cb, LV_EVENT_CLICKED, NULL);
     
     lv_obj_t *close_label = lv_label_create(close_btn);
@@ -22483,10 +22579,7 @@ static void show_screen_brightness_popup(void)
     screen_brightness_popup_obj = lv_obj_create(screen_brightness_popup_overlay);
     lv_obj_set_size(screen_brightness_popup_obj, 400, 250);
     lv_obj_center(screen_brightness_popup_obj);
-    lv_obj_set_style_bg_color(screen_brightness_popup_obj, lv_color_hex(0x2D2D2D), 0);
-    lv_obj_set_style_border_color(screen_brightness_popup_obj, COLOR_MATERIAL_CYAN, 0);
-    lv_obj_set_style_border_width(screen_brightness_popup_obj, 2, 0);
-    lv_obj_set_style_radius(screen_brightness_popup_obj, 12, 0);
+    style_popup_card(screen_brightness_popup_obj, 12, ui_tab_icon_color());
     lv_obj_set_style_pad_all(screen_brightness_popup_obj, 20, 0);
     lv_obj_set_flex_flow(screen_brightness_popup_obj, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(screen_brightness_popup_obj, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
@@ -22497,7 +22590,7 @@ static void show_screen_brightness_popup(void)
     lv_obj_t *title = lv_label_create(screen_brightness_popup_obj);
     lv_label_set_text(title, "Screen Brightness");
     lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
-    lv_obj_set_style_text_color(title, COLOR_MATERIAL_CYAN, 0);
+    lv_obj_set_style_text_color(title, dark_mode_enabled ? COLOR_LAB5_MAGENTA : ui_tab_icon_color(), 0);
     
     // Value label
     screen_brightness_value_label = lv_label_create(screen_brightness_popup_obj);
@@ -22512,16 +22605,22 @@ static void show_screen_brightness_popup(void)
     lv_obj_set_width(screen_brightness_slider, 300);
     lv_slider_set_range(screen_brightness_slider, 1, 100);
     lv_slider_set_value(screen_brightness_slider, screen_brightness_setting, LV_ANIM_OFF);
-    lv_obj_set_style_bg_color(screen_brightness_slider, lv_color_hex(0x444444), LV_PART_MAIN);
-    lv_obj_set_style_bg_color(screen_brightness_slider, COLOR_MATERIAL_CYAN, LV_PART_INDICATOR);
-    lv_obj_set_style_bg_color(screen_brightness_slider, COLOR_MATERIAL_CYAN, LV_PART_KNOB);
+    lv_obj_set_style_bg_color(screen_brightness_slider,
+                              dark_mode_enabled ? lv_color_hex(0x1E2E41) : lv_color_hex(0xB8C9DA),
+                              LV_PART_MAIN);
+    lv_obj_set_style_bg_color(screen_brightness_slider,
+                              dark_mode_enabled ? COLOR_LAB5_MAGENTA : ui_tab_icon_color(),
+                              LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(screen_brightness_slider,
+                              dark_mode_enabled ? COLOR_LAB5_MAGENTA : ui_tab_icon_color(),
+                              LV_PART_KNOB);
     lv_obj_add_event_cb(screen_brightness_slider, screen_brightness_slider_cb, LV_EVENT_VALUE_CHANGED, NULL);
     lv_obj_add_event_cb(screen_brightness_slider, screen_brightness_slider_release_cb, LV_EVENT_RELEASED, NULL);
     
     // Close button
     lv_obj_t *close_btn = lv_btn_create(screen_brightness_popup_obj);
     lv_obj_set_size(close_btn, 100, 40);
-    lv_obj_set_style_bg_color(close_btn, COLOR_MATERIAL_CYAN, 0);
+    style_neutral_button(close_btn);
     lv_obj_add_event_cb(close_btn, screen_brightness_close_cb, LV_EVENT_CLICKED, NULL);
     
     lv_obj_t *close_label = lv_label_create(close_btn);
@@ -22629,21 +22728,12 @@ static void show_theme_popup(void)
     if (theme_popup_overlay) return;
 
     theme_popup_overlay = lv_obj_create(container);
-    lv_obj_remove_style_all(theme_popup_overlay);
-    lv_obj_set_size(theme_popup_overlay, lv_pct(100), lv_pct(100));
-    lv_obj_set_style_bg_color(theme_popup_overlay, lv_color_hex(0x000000), 0);
-    lv_obj_set_style_bg_opa(theme_popup_overlay, dark_mode_enabled ? LV_OPA_50 : LV_OPA_30, 0);
-    lv_obj_clear_flag(theme_popup_overlay, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(theme_popup_overlay, LV_OBJ_FLAG_CLICKABLE);
+    style_modal_overlay(theme_popup_overlay, dark_mode_enabled ? LV_OPA_50 : LV_OPA_30);
 
     theme_popup_obj = lv_obj_create(theme_popup_overlay);
     lv_obj_set_size(theme_popup_obj, 430, 404);
     lv_obj_center(theme_popup_obj);
-    lv_obj_set_style_bg_color(theme_popup_obj, ui_panel_color(), 0);
-    lv_obj_set_style_border_color(theme_popup_obj, dark_mode_enabled ? COLOR_LAB5_MAGENTA : ui_border_color(), 0);
-    lv_obj_set_style_border_width(theme_popup_obj, 2, 0);
-    lv_obj_set_style_border_opa(theme_popup_obj, dark_mode_enabled ? LV_OPA_70 : LV_OPA_90, 0);
-    lv_obj_set_style_radius(theme_popup_obj, 12, 0);
+    style_popup_card(theme_popup_obj, 12, ui_tab_icon_color());
     lv_obj_set_style_pad_all(theme_popup_obj, 18, 0);
     lv_obj_set_flex_flow(theme_popup_obj, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_row(theme_popup_obj, 14, 0);
@@ -22652,7 +22742,7 @@ static void show_theme_popup(void)
     lv_obj_t *title = lv_label_create(theme_popup_obj);
     lv_label_set_text(title, "Theme");
     lv_obj_set_style_text_font(title, &lv_font_montserrat_22, 0);
-    lv_obj_set_style_text_color(title, dark_mode_enabled ? COLOR_LAB5_MAGENTA : ui_text_color(), 0);
+    lv_obj_set_style_text_color(title, dark_mode_enabled ? COLOR_LAB5_MAGENTA : ui_tab_icon_color(), 0);
 
     lv_obj_t *dark_row = lv_obj_create(theme_popup_obj);
     lv_obj_set_size(dark_row, lv_pct(100), 56);
@@ -22729,11 +22819,7 @@ static void show_theme_popup(void)
 
     lv_obj_t *close_btn = lv_btn_create(theme_popup_obj);
     lv_obj_set_size(close_btn, 120, 40);
-    lv_obj_set_style_bg_color(close_btn, dark_mode_enabled ? lv_color_hex(0x34122B) : lv_color_hex(0xD4DFEA), 0);
-    lv_obj_set_style_bg_color(close_btn, dark_mode_enabled ? lv_color_hex(0x4C1B3E) : lv_color_hex(0xC3D1E1), LV_STATE_PRESSED);
-    lv_obj_set_style_border_width(close_btn, 1, 0);
-    lv_obj_set_style_border_color(close_btn, dark_mode_enabled ? COLOR_LAB5_MAGENTA : ui_border_color(), 0);
-    lv_obj_set_style_radius(close_btn, 8, 0);
+    style_neutral_button(close_btn);
     lv_obj_add_event_cb(close_btn, theme_popup_close_cb, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t *close_label = lv_label_create(close_btn);
