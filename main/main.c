@@ -604,7 +604,13 @@ static tab_context_t internal_ctx = {0};
 static bool enable_red_team = false;  // Default: false (safe mode)
 static bool dashboard_enabled = true; // Home dashboard cards visibility
 static bool dark_mode_enabled = true; // Default theme
-static bool boot_sound_enabled = true; // Startup melody toggle
+typedef enum {
+    BOOT_SOUND_MODE_OFF = 0,
+    BOOT_SOUND_MODE_NOKIA = 1,
+    BOOT_SOUND_MODE_INTEL = 2,
+    BOOT_SOUND_MODE_STAR_WARS = 3,
+} boot_sound_mode_t;
+static boot_sound_mode_t boot_sound_mode = BOOT_SOUND_MODE_NOKIA;
 
 #define BOOT_SOUND_VOLUME_PERCENT 60
 
@@ -664,6 +670,17 @@ static inline lv_color_t ui_muted_color(void)
 static inline lv_color_t ui_tab_icon_color(void)
 {
     return dark_mode_enabled ? COLOR_NEON_CYAN : COLOR_LIGHT_ACCENT;
+}
+
+static const char *boot_sound_mode_name(boot_sound_mode_t mode)
+{
+    switch (mode) {
+        case BOOT_SOUND_MODE_OFF: return "OFF";
+        case BOOT_SOUND_MODE_NOKIA: return "Nokia";
+        case BOOT_SOUND_MODE_INTEL: return "Intel";
+        case BOOT_SOUND_MODE_STAR_WARS: return "Star Wars";
+        default: return "Unknown";
+    }
 }
 
 static void style_on_screen_keyboard(lv_obj_t *kb)
@@ -1498,7 +1515,7 @@ static void settings_back_btn_event_cb(lv_event_t *e);
 static void show_scan_time_popup(void);
 static void show_theme_popup(void);
 static void theme_dark_mode_switch_cb(lv_event_t *e);
-static void theme_boot_sound_switch_cb(lv_event_t *e);
+static void theme_boot_sound_dropdown_cb(lv_event_t *e);
 static void show_red_team_settings_page(void);
 static void show_screen_timeout_popup(void);
 static void show_screen_brightness_popup(void);
@@ -1507,7 +1524,7 @@ static void get_uart2_pins(int *tx_pin, int *rx_pin);
 static void init_uart2(void);
 static void deinit_uart2(void);
 static void load_red_team_from_nvs(void);
-static void save_boot_sound_to_nvs(bool enabled);
+static void save_boot_sound_to_nvs(boot_sound_mode_t mode);
 static void save_dashboard_to_nvs(bool enabled);
 static void save_dark_mode_to_nvs(bool enabled);
 static void load_dashboard_from_nvs(void);
@@ -3895,13 +3912,12 @@ static void detection_complete_cb(lv_timer_t *timer)
 
 static void play_startup_beep(void)
 {
-    if (!boot_sound_enabled) {
-        ESP_LOGI(TAG, "Boot sound disabled, skipping startup melody");
+    boot_sound_mode_t selected_mode = boot_sound_mode;
+    if (selected_mode == BOOT_SOUND_MODE_OFF) {
+        ESP_LOGI(TAG, "Boot sound is OFF, skipping startup melody");
         vTaskDelete(NULL);
         return;
     }
-
-    ESP_LOGI(TAG, "Playing startup melody at %d%%", BOOT_SOUND_VOLUME_PERCENT);
 
     bsp_codec_config_t *codec = bsp_get_codec_handle();
     if (!codec || !codec->i2s_write || !codec->set_volume || !codec->i2s_reconfig_clk_fn) {
@@ -3930,13 +3946,64 @@ static void play_startup_beep(void)
         { 329.63f, 250 },  // E4  quarter
         { 440.00f, 500 },  // A4  half (held)
     };
-    #define NOKIA_NOTES (sizeof(nokia_tune) / sizeof(nokia_tune[0]))
+
+    // Intel-like startup jingle.
+    static const note_t intel_jingle[] = {
+        { 659.25f, 110 },  // E5
+        { 659.25f, 110 },  // E5
+        { 659.25f, 130 },  // E5
+        { 523.25f, 220 },  // C5
+        { 392.00f, 320 },  // G4
+    };
+
+    // Star Wars main motif (short intro phrase).
+    static const note_t star_wars_motif[] = {
+        { 440.00f, 250 },  // A4
+        { 440.00f, 250 },  // A4
+        { 440.00f, 250 },  // A4
+        { 349.23f, 160 },  // F4
+        { 523.25f, 90  },  // C5
+        { 440.00f, 250 },  // A4
+        { 349.23f, 160 },  // F4
+        { 523.25f, 90  },  // C5
+        { 440.00f, 400 },  // A4
+    };
+
+    const note_t *melody = nokia_tune;
+    int melody_notes = (int)(sizeof(nokia_tune) / sizeof(nokia_tune[0]));
+    const char *melody_name = "Nokia";
+
+    switch (selected_mode) {
+        case BOOT_SOUND_MODE_NOKIA:
+            melody = nokia_tune;
+            melody_notes = (int)(sizeof(nokia_tune) / sizeof(nokia_tune[0]));
+            melody_name = "Nokia";
+            break;
+        case BOOT_SOUND_MODE_INTEL:
+            melody = intel_jingle;
+            melody_notes = (int)(sizeof(intel_jingle) / sizeof(intel_jingle[0]));
+            melody_name = "Intel";
+            break;
+        case BOOT_SOUND_MODE_STAR_WARS:
+            melody = star_wars_motif;
+            melody_notes = (int)(sizeof(star_wars_motif) / sizeof(star_wars_motif[0]));
+            melody_name = "Star Wars";
+            break;
+        case BOOT_SOUND_MODE_OFF:
+        default:
+            melody = nokia_tune;
+            melody_notes = (int)(sizeof(nokia_tune) / sizeof(nokia_tune[0]));
+            melody_name = "Nokia";
+            break;
+    }
+
+    ESP_LOGI(TAG, "Playing startup melody: %s at %d%%", melody_name, BOOT_SOUND_VOLUME_PERCENT);
 
     const int pause_ms = 20;
     const int final_silence_ms = 160;
     int total_ms = 0;
-    for (int n = 0; n < (int)NOKIA_NOTES; n++)
-        total_ms += nokia_tune[n].ms + pause_ms;
+    for (int n = 0; n < melody_notes; n++)
+        total_ms += melody[n].ms + pause_ms;
     total_ms += final_silence_ms;
 
     const int total_samples = MELODY_SR * total_ms / 1000;
@@ -3951,9 +4018,9 @@ static void play_startup_beep(void)
     memset(buf, 0, buf_bytes);
 
     int pos = 0;
-    for (int n = 0; n < (int)NOKIA_NOTES; n++) {
-        float freq = nokia_tune[n].freq;
-        int note_samples = MELODY_SR * nokia_tune[n].ms / 1000;
+    for (int n = 0; n < melody_notes; n++) {
+        float freq = melody[n].freq;
+        int note_samples = MELODY_SR * melody[n].ms / 1000;
         int attack = MELODY_SR * 5 / 1000;
         int release = MELODY_SR * 15 / 1000;
 
@@ -4000,7 +4067,7 @@ static void play_startup_beep(void)
     codec->set_volume(restore_volume);
 
     heap_caps_free(buf);
-    ESP_LOGI(TAG, "Startup melody done (%d bytes written)", (int)bytes_written);
+    ESP_LOGI(TAG, "Startup melody done (%s, %d bytes written)", melody_name, (int)bytes_written);
     vTaskDelete(NULL);
 }
 
@@ -4051,7 +4118,7 @@ static void show_splash_screen(void)
     // Start intro animation timer (100ms gives readable loading/dot dynamics).
     splash_timer = lv_timer_create(splash_timer_cb, 100, NULL);
     
-    if (boot_sound_enabled) {
+    if (boot_sound_mode != BOOT_SOUND_MODE_OFF) {
         // Play startup melody in background task to not block UI
         xTaskCreate(
             (TaskFunction_t)play_startup_beep,
@@ -15587,19 +15654,19 @@ static void show_compromised_data_page(void)
     lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
     lv_obj_set_style_text_color(title, COLOR_MATERIAL_GREEN, 0);
     
-    // Tiles container - vertical column, centered
+    // Tiles container - match main menu grid behavior (top-aligned row wrap)
     lv_obj_t *tiles = lv_obj_create(compromised_data_page);
     lv_obj_set_size(tiles, lv_pct(100), LV_SIZE_CONTENT);
     lv_obj_set_flex_grow(tiles, 1);
     lv_obj_set_style_bg_opa(tiles, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(tiles, 0, 0);
-    lv_obj_set_style_pad_all(tiles, 10, 0);
-    lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_row(tiles, 15, 0);
+    lv_obj_set_style_pad_all(tiles, 2, 0);
+    lv_obj_set_style_pad_gap(tiles, 10, 0);
+    lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
     lv_obj_clear_flag(tiles, LV_OBJ_FLAG_SCROLLABLE);
     
-    // Create 3 tiles (stacked vertically, centered)
+    // Create 3 tiles (same flow as main menu)
     create_tile(tiles, LV_SYMBOL_LIST, "Evil Twin\nPasswords", COLOR_MATERIAL_AMBER, compromised_data_tile_event_cb, "Evil Twin Passwords");
     create_tile(tiles, LV_SYMBOL_FILE, "Portal\nData", COLOR_MATERIAL_TEAL, compromised_data_tile_event_cb, "Portal Data");
     create_tile(tiles, LV_SYMBOL_DOWNLOAD, "Handshakes", COLOR_MATERIAL_PURPLE, compromised_data_tile_event_cb, "Handshakes");
@@ -21022,16 +21089,17 @@ static void show_global_attacks_page(void)
     lv_obj_set_style_text_font(title, &lv_font_montserrat_24, 0);
     lv_obj_set_style_text_color(title, COLOR_MATERIAL_RED, 0);
     
-    // Tiles container
+    // Tiles container - match main menu grid behavior (top aligned)
     lv_obj_t *tiles = lv_obj_create(global_attacks_page);
-    lv_obj_set_size(tiles, lv_pct(100), lv_pct(100));
+    lv_obj_set_size(tiles, lv_pct(100), LV_SIZE_CONTENT);
     lv_obj_set_flex_grow(tiles, 1);
     lv_obj_set_style_bg_color(tiles, ui_bg_color(), 0);
     lv_obj_set_style_border_width(tiles, 0, 0);
     lv_obj_set_style_pad_all(tiles, 2, 0);
     lv_obj_set_style_pad_gap(tiles, 10, 0);
     lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
-    lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_clear_flag(tiles, LV_OBJ_FLAG_SCROLLABLE);
     
     // Create attack tiles (some only visible when Red Team enabled)
     
@@ -21161,14 +21229,20 @@ static void load_screen_settings_from_nvs(void)
             ESP_LOGI(TAG, "No Dark Mode setting in NVS, using default: ON");
         }
 
-        uint8_t boot_sound = 1;
+        uint8_t boot_sound = (uint8_t)BOOT_SOUND_MODE_NOKIA;
         err = nvs_get_u8(nvs, NVS_KEY_BOOT_SOUND, &boot_sound);
         if (err == ESP_OK) {
-            boot_sound_enabled = (boot_sound != 0);
-            ESP_LOGI(TAG, "Loaded Boot Sound from NVS: %s", boot_sound_enabled ? "ON" : "OFF");
+            if (boot_sound <= (uint8_t)BOOT_SOUND_MODE_STAR_WARS) {
+                boot_sound_mode = (boot_sound_mode_t)boot_sound;
+            } else {
+                // Backward compatibility / invalid values fallback:
+                // old bool-style ON => Nokia, OFF => OFF.
+                boot_sound_mode = (boot_sound == 0) ? BOOT_SOUND_MODE_OFF : BOOT_SOUND_MODE_NOKIA;
+            }
+            ESP_LOGI(TAG, "Loaded Boot Sound from NVS: %s", boot_sound_mode_name(boot_sound_mode));
         } else {
-            boot_sound_enabled = true;
-            ESP_LOGI(TAG, "No Boot Sound setting in NVS, using default: ON");
+            boot_sound_mode = BOOT_SOUND_MODE_NOKIA;
+            ESP_LOGI(TAG, "No Boot Sound setting in NVS, using default: %s", boot_sound_mode_name(boot_sound_mode));
         }
         
         nvs_close(nvs);
@@ -21249,15 +21323,15 @@ static void save_dark_mode_to_nvs(bool enabled)
     }
 }
 
-static void save_boot_sound_to_nvs(bool enabled)
+static void save_boot_sound_to_nvs(boot_sound_mode_t mode)
 {
     nvs_handle_t nvs;
     esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs);
     if (err == ESP_OK) {
-        nvs_set_u8(nvs, NVS_KEY_BOOT_SOUND, enabled ? 1 : 0);
+        nvs_set_u8(nvs, NVS_KEY_BOOT_SOUND, (uint8_t)mode);
         nvs_commit(nvs);
         nvs_close(nvs);
-        ESP_LOGI(TAG, "Saved Boot Sound to NVS: %s", enabled ? "Enabled" : "Disabled");
+        ESP_LOGI(TAG, "Saved Boot Sound to NVS: %s", boot_sound_mode_name(mode));
     } else {
         ESP_LOGE(TAG, "Failed to open NVS for writing Boot Sound: %s", esp_err_to_name(err));
     }
@@ -22650,14 +22724,18 @@ static void theme_dashboard_switch_cb(lv_event_t *e)
     rebuild_all_home_tiles();
 }
 
-static void theme_boot_sound_switch_cb(lv_event_t *e)
+static void theme_boot_sound_dropdown_cb(lv_event_t *e)
 {
-    lv_obj_t *sw = lv_event_get_target(e);
-    bool enabled = lv_obj_has_state(sw, LV_STATE_CHECKED);
-    if (boot_sound_enabled == enabled) return;
+    lv_obj_t *dropdown = lv_event_get_target(e);
+    uint16_t selected = lv_dropdown_get_selected(dropdown);
+    if (selected > (uint16_t)BOOT_SOUND_MODE_STAR_WARS) {
+        selected = (uint16_t)BOOT_SOUND_MODE_NOKIA;
+    }
+    boot_sound_mode_t mode = (boot_sound_mode_t)selected;
+    if (boot_sound_mode == mode) return;
 
-    boot_sound_enabled = enabled;
-    save_boot_sound_to_nvs(boot_sound_enabled);
+    boot_sound_mode = mode;
+    save_boot_sound_to_nvs(boot_sound_mode);
 }
 
 static void style_theme_switch(lv_obj_t *sw)
@@ -22731,7 +22809,7 @@ static void show_theme_popup(void)
     style_modal_overlay(theme_popup_overlay, dark_mode_enabled ? LV_OPA_50 : LV_OPA_30);
 
     theme_popup_obj = lv_obj_create(theme_popup_overlay);
-    lv_obj_set_size(theme_popup_obj, 430, 404);
+    lv_obj_set_size(theme_popup_obj, 430, 430);
     lv_obj_center(theme_popup_obj);
     style_popup_card(theme_popup_obj, 12, ui_tab_icon_color());
     lv_obj_set_style_pad_all(theme_popup_obj, 18, 0);
@@ -22787,7 +22865,7 @@ static void show_theme_popup(void)
     lv_obj_add_event_cb(dashboard_switch, theme_dashboard_switch_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
     lv_obj_t *boot_sound_row = lv_obj_create(theme_popup_obj);
-    lv_obj_set_size(boot_sound_row, lv_pct(100), 56);
+    lv_obj_set_size(boot_sound_row, lv_pct(100), 64);
     lv_obj_set_style_bg_opa(boot_sound_row, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(boot_sound_row, 0, 0);
     lv_obj_set_style_pad_all(boot_sound_row, 0, 0);
@@ -22800,18 +22878,27 @@ static void show_theme_popup(void)
     lv_obj_set_style_text_font(boot_sound_row_label, &lv_font_montserrat_18, 0);
     lv_obj_set_style_text_color(boot_sound_row_label, ui_text_color(), 0);
 
-    lv_obj_t *boot_sound_switch = lv_switch_create(boot_sound_row);
-    style_theme_switch(boot_sound_switch);
-    if (boot_sound_enabled) {
-        lv_obj_add_state(boot_sound_switch, LV_STATE_CHECKED);
+    lv_obj_t *boot_sound_dropdown = lv_dropdown_create(boot_sound_row);
+    lv_dropdown_set_options(boot_sound_dropdown, "OFF\nNokia\nIntel\nStar Wars");
+    lv_dropdown_set_selected(boot_sound_dropdown, (uint16_t)boot_sound_mode);
+    lv_obj_set_width(boot_sound_dropdown, 170);
+    lv_obj_set_style_text_font(boot_sound_dropdown, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_bg_color(boot_sound_dropdown, ui_card_color(), 0);
+    lv_obj_set_style_border_color(boot_sound_dropdown, ui_border_color(), 0);
+    lv_obj_set_style_text_color(boot_sound_dropdown, ui_text_color(), 0);
+    lv_obj_t *boot_sound_list = lv_dropdown_get_list(boot_sound_dropdown);
+    if (boot_sound_list) {
+        lv_obj_set_style_bg_color(boot_sound_list, ui_card_color(), 0);
+        lv_obj_set_style_border_color(boot_sound_list, ui_border_color(), 0);
+        lv_obj_set_style_text_color(boot_sound_list, ui_text_color(), 0);
     }
-    lv_obj_add_event_cb(boot_sound_switch, theme_boot_sound_switch_cb, LV_EVENT_VALUE_CHANGED, NULL);
+    lv_obj_add_event_cb(boot_sound_dropdown, theme_boot_sound_dropdown_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
     lv_obj_t *desc = lv_label_create(theme_popup_obj);
     lv_label_set_text(desc,
         "Dark mode switches between dark and light palette.\n"
         "Dashboard ON/OFF toggles bottom telemetry cards on Home.\n"
-        "Boot sound toggles the startup melody at 60% volume.");
+        "Boot sound selects startup melody at 60% volume.");
     lv_obj_set_style_text_font(desc, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(desc, ui_muted_color(), 0);
     lv_obj_set_width(desc, lv_pct(100));
