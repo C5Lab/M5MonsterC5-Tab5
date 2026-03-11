@@ -6309,13 +6309,11 @@ static void handshaker_monitor_task(void *arg)
                             }
                             log_type = HS_LOG_SUCCESS;
                             should_log = true;
-                            ctx->handshaker_capture_success = true;
                         }
                         else if (strstr(line_buffer, "HANDSHAKE IS COMPLETE AND VALID") != NULL) {
                             strncpy(display_msg, "Handshake validated!", sizeof(display_msg) - 1);
                             log_type = HS_LOG_SUCCESS;
                             should_log = true;
-                            ctx->handshaker_capture_success = true;
                         }
                         else if (strstr(line_buffer, "PCAP saved:") != NULL ||
                                  strstr(line_buffer, "HCCAPX saved:") != NULL) {
@@ -6339,13 +6337,11 @@ static void handshaker_monitor_task(void *arg)
                             strncpy(display_msg, "Handshake captured!", sizeof(display_msg) - 1);
                             log_type = HS_LOG_SUCCESS;
                             should_log = true;
-                            ctx->handshaker_capture_success = true;
                         }
                         else if (strstr(line_buffer, "All selected networks captured") != NULL) {
                             strncpy(display_msg, "All networks captured! Attack complete.", sizeof(display_msg) - 1);
                             log_type = HS_LOG_SUCCESS;
                             should_log = true;
-                            ctx->handshaker_capture_success = true;
                         }
                         else if (strstr(line_buffer, "handshake saved for SSID:") != NULL) {
                             // Extract SSID
@@ -6465,6 +6461,7 @@ static void handshaker_monitor_task(void *arg)
                             strncpy(display_msg, "Save failed - no data available", sizeof(display_msg) - 1);
                             log_type = HS_LOG_ERROR;
                             should_log = true;
+                            ctx->handshaker_capture_success = false;
                         }
                         else if (strstr(line_buffer, "Handshake attack cleanup complete") != NULL) {
                             strncpy(display_msg, "Attack finished.", sizeof(display_msg) - 1);
@@ -6504,6 +6501,14 @@ static void show_handshaker_popup(void)
     tab_context_t *ctx = get_current_ctx();
     if (!ctx) return;
     if (ctx->handshaker_popup != NULL) return;  // Already showing in this tab
+
+    if (ctx->popup_open) {
+        if (ctx->observer_running) {
+            pause_observer_for_attack(ctx);
+        }
+        destroy_network_popup_ui(ctx);
+        vTaskDelay(pdMS_TO_TICKS(150));
+    }
 
     lv_obj_t *container = get_current_tab_container();
     if (!container) return;
@@ -6624,6 +6629,14 @@ static void show_handshaker_popup(void)
     ctx->handshaker_capture_success = false;
 
     // Now send UART commands and start monitoring
+
+    tab_id_t active_tab = tab_id_for_ctx(ctx);
+    uart_port_t uart_port = uart_port_for_tab(active_tab);
+    if (active_tab == TAB_USB) {
+        usb_flush_input(120);
+    } else if (!tab_is_internal(active_tab)) {
+        uart_flush_input(uart_port);
+    }
 
     // Build select_networks command with 1-based indices
     char cmd[128];
