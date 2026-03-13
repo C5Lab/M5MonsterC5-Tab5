@@ -1600,6 +1600,11 @@ static void beacon_spam_start_cb(lv_event_t *e);
 static void beacon_spam_active_close_cb(lv_event_t *e);
 static void beacon_spam_refresh_ssids(tab_context_t *ctx);
 static void beacon_spam_rebuild_ssid_grid(tab_context_t *ctx);
+static int beacon_spam_query_ssid_list_command(const char *command, char *rx_buffer, size_t rx_size);
+static int beacon_spam_parse_ssid_list_response(tab_context_t *ctx, char *rx_buffer,
+                                                bool *unknown_command,
+                                                bool *empty_list,
+                                                bool *missing_file);
 static void close_beacon_ssids_add_popup(tab_context_t *ctx);
 static void close_beacon_spam_active_popup(tab_context_t *ctx, bool send_stop);
 static void observer_back_btn_event_cb(lv_event_t *e);
@@ -22503,6 +22508,172 @@ static void beacon_spam_rebuild_ssid_grid(tab_context_t *ctx)
     }
 }
 
+static int beacon_spam_query_ssid_list_command(const char *command, char *rx_buffer, size_t rx_size)
+{
+    if (!command || !rx_buffer || rx_size < 2) return 0;
+    if (tab_is_internal(current_tab)) return 0;
+
+    uart_port_t uart_port = uart_port_for_tab(current_tab);
+    uart_flush_input(uart_port);
+    ESP_LOGI(TAG, "Beacon Spam: sending SSID list command: %s", command);
+    uart_send_command_for_tab(command);
+    vTaskDelay(pdMS_TO_TICKS(250));
+
+    int total_len = 0;
+    int retries = 18;
+    int empty_reads = 0;
+
+    while (retries-- > 0 && empty_reads < 4 && total_len < (int)rx_size - 1) {
+        int len = transport_read_bytes(uart_port, rx_buffer + total_len,
+                                       rx_size - (size_t)total_len - 1U,
+                                       pdMS_TO_TICKS(150));
+        if (len > 0) {
+            total_len += len;
+            empty_reads = 0;
+        } else {
+            empty_reads++;
+        }
+    }
+    rx_buffer[total_len] = '\0';
+
+    ESP_LOGI(TAG, "Beacon Spam: %s response (%d bytes)", command, total_len);
+    if (total_len > 0) {
+        ESP_LOGI(TAG, "Beacon Spam: raw UART output for %s:\n%s", command, rx_buffer);
+    } else {
+        ESP_LOGW(TAG, "Beacon Spam: empty UART output for %s", command);
+    }
+    return total_len;
+}
+
+static int beacon_spam_parse_ssid_list_response(tab_context_t *ctx, char *rx_buffer,
+                                                bool *unknown_command,
+                                                bool *empty_list,
+                                                bool *missing_file)
+{
+    if (unknown_command) *unknown_command = false;
+    if (empty_list) *empty_list = false;
+    if (missing_file) *missing_file = false;
+    if (!ctx || !rx_buffer) return 0;
+
+    int count = 0;
+    bool saw_unknown = false;
+    bool saw_empty = false;
+    bool saw_missing = false;
+    int line_no = 0;
+
+    char *line = strtok(rx_buffer, "\n\r");
+    while (line != NULL && count < BEACON_SPAM_MAX_SSIDS) {
+        line_no++;
+        char *raw_line = line;
+        ESP_LOGI(TAG, "Beacon Spam parse line %d raw: '%s'", line_no, raw_line);
+
+        while (isspace((unsigned char)*line)) line++;
+        if (*line == '\0') {
+            ESP_LOGI(TAG, "Beacon Spam parse line %d: skipped (empty after trim)", line_no);
+            line = strtok(NULL, "\n\r");
+            continue;
+        }
+
+        if (strstr(line, "list_ssid") != NULL || strstr(line, "list_ssids") != NULL) {
+            ESP_LOGI(TAG, "Beacon Spam parse line %d: skipped (echo/header line)", line_no);
+            line = strtok(NULL, "\n\r");
+            continue;
+        }
+
+        if (strstr(line, "No SSID") != NULL ||
+            strstr(line, "SSID list empty") != NULL ||
+            strstr(line, "No SSIDs configured") != NULL) {
+            saw_empty = true;
+            ESP_LOGI(TAG, "Beacon Spam parse line %d: detected empty SSID list marker", line_no);
+            line = strtok(NULL, "\n\r");
+            continue;
+        }
+
+        if (strstr(line, "ssid.txt") != NULL &&
+            (strstr(line, "not found") != NULL ||
+             strstr(line, "No such file") != NULL ||
+             strstr(line, "failed") != NULL ||
+             strstr(line, "Failed") != NULL ||
+             strstr(line, "cannot open") != NULL ||
+             strstr(line, "Cannot open") != NULL)) {
+            saw_missing = true;
+            ESP_LOGW(TAG, "Beacon Spam parse line %d: detected missing ssid.txt marker", line_no);
+            line = strtok(NULL, "\n\r");
+            continue;
+        }
+
+        if (strstr(line, "Unknown command") != NULL ||
+            strstr(line, "unknown command") != NULL ||
+            strstr(line, "Invalid command") != NULL ||
+            strstr(line, "invalid command") != NULL ||
+            strstr(line, "Unknown cmd") != NULL ||
+            strstr(line, "unknown cmd") != NULL) {
+            saw_unknown = true;
+            ESP_LOGW(TAG, "Beacon Spam parse line %d: detected unsupported command marker", line_no);
+            line = strtok(NULL, "\n\r");
+            continue;
+        }
+
+        if (!isdigit((unsigned char)*line)) {
+            ESP_LOGI(TAG, "Beacon Spam parse line %d: skipped (does not start with numeric index)", line_no);
+            line = strtok(NULL, "\n\r");
+            continue;
+        }
+
+        char *endptr = NULL;
+        long index = strtol(line, &endptr, 10);
+        if (index <= 0 || endptr == line) {
+            ESP_LOGI(TAG, "Beacon Spam parse line %d: skipped (invalid numeric index)", line_no);
+            line = strtok(NULL, "\n\r");
+            continue;
+        }
+
+        while (*endptr == '.' || *endptr == ')' || *endptr == ':' || *endptr == '-') {
+            endptr++;
+        }
+        while (*endptr && isspace((unsigned char)*endptr)) endptr++;
+        if (*endptr == '\0') {
+            ESP_LOGI(TAG, "Beacon Spam parse line %d: skipped (index without SSID value)", line_no);
+            line = strtok(NULL, "\n\r");
+            continue;
+        }
+
+        char ssid[BEACON_SPAM_SSID_MAX_LEN + 1];
+        snprintf(ssid, sizeof(ssid), "%s", endptr);
+        trim_trailing_whitespace(ssid);
+        if (ssid[0] == '\0') {
+            ESP_LOGI(TAG, "Beacon Spam parse line %d: skipped (SSID empty after trim)", line_no);
+            line = strtok(NULL, "\n\r");
+            continue;
+        }
+
+        size_t ssid_len = strlen(ssid);
+        if (ssid_len >= 2 && ssid[0] == '"' && ssid[ssid_len - 1] == '"') {
+            memmove(ssid, ssid + 1, ssid_len - 2);
+            ssid[ssid_len - 2] = '\0';
+        }
+
+        ctx->beacon_spam_ssids[count].index = (int)index;
+        snprintf(ctx->beacon_spam_ssids[count].ssid, sizeof(ctx->beacon_spam_ssids[count].ssid), "%s", ssid);
+        ESP_LOGI(TAG, "Beacon Spam parse line %d: parsed entry index=%d ssid='%s'",
+                 line_no, (int)index, ssid);
+        count++;
+
+        line = strtok(NULL, "\n\r");
+    }
+
+    ESP_LOGI(TAG, "Beacon Spam parse summary: parsed=%d unknown=%s empty=%s missing_file=%s",
+             count,
+             saw_unknown ? "yes" : "no",
+             saw_empty ? "yes" : "no",
+             saw_missing ? "yes" : "no");
+
+    if (unknown_command) *unknown_command = saw_unknown;
+    if (empty_list) *empty_list = saw_empty;
+    if (missing_file) *missing_file = saw_missing;
+    return count;
+}
+
 static void beacon_spam_refresh_ssids(tab_context_t *ctx)
 {
     if (!ctx || !ctx->beacon_spam_ssids) return;
@@ -22518,87 +22689,88 @@ static void beacon_spam_refresh_ssids(tab_context_t *ctx)
         return;
     }
 
-    uart_port_t uart_port = uart_port_for_tab(current_tab);
-    uart_flush_input(uart_port);
-    uart_send_command_for_tab("list_ssids");
-    vTaskDelay(pdMS_TO_TICKS(250));
-
     static char rx_buffer[4096];
-    int total_len = 0;
-    int retries = 18;
-    int empty_reads = 0;
+    const char *commands[] = {"list_ssids", "list_ssid"};
+    const size_t command_count = sizeof(commands) / sizeof(commands[0]);
 
-    while (retries-- > 0 && empty_reads < 4 && total_len < (int)sizeof(rx_buffer) - 1) {
-        int len = transport_read_bytes(uart_port, rx_buffer + total_len,
-                                       sizeof(rx_buffer) - total_len - 1,
-                                       pdMS_TO_TICKS(150));
-        if (len > 0) {
-            total_len += len;
-            empty_reads = 0;
-        } else {
-            empty_reads++;
-        }
-    }
-    rx_buffer[total_len] = '\0';
-
-    ESP_LOGI(TAG, "Beacon Spam: list_ssids response (%d bytes)", total_len);
-
+    bool got_any_response = false;
+    bool saw_unknown_only = false;
+    bool saw_supported_output = false;
+    bool empty_list = false;
+    bool missing_file = false;
     int count = 0;
-    char *line = strtok(rx_buffer, "\n\r");
-    while (line != NULL && count < BEACON_SPAM_MAX_SSIDS) {
-        while (isspace((unsigned char)*line)) line++;
-        if (*line == '\0' ||
-            strstr(line, "list_ssids") != NULL ||
-            strstr(line, "No SSID") != NULL ||
-            strstr(line, "SSID list empty") != NULL) {
-            line = strtok(NULL, "\n\r");
+
+    for (size_t i = 0; i < command_count; i++) {
+        ESP_LOGI(TAG, "Beacon Spam: SSID list attempt %d/%d using command '%s'",
+                 (int)i + 1, (int)command_count, commands[i]);
+        int total_len = beacon_spam_query_ssid_list_command(commands[i], rx_buffer, sizeof(rx_buffer));
+        if (total_len <= 0) {
             continue;
         }
 
-        if (!isdigit((unsigned char)*line)) {
-            line = strtok(NULL, "\n\r");
-            continue;
+        got_any_response = true;
+
+        bool command_unknown = false;
+        bool command_empty = false;
+        bool command_missing = false;
+        int parsed = beacon_spam_parse_ssid_list_response(ctx, rx_buffer,
+                                                          &command_unknown,
+                                                          &command_empty,
+                                                          &command_missing);
+        ESP_LOGI(TAG, "Beacon Spam: parse result for '%s' -> parsed=%d unknown=%s empty=%s missing=%s",
+                 commands[i],
+                 parsed,
+                 command_unknown ? "yes" : "no",
+                 command_empty ? "yes" : "no",
+                 command_missing ? "yes" : "no");
+        if (parsed > 0) {
+            saw_supported_output = true;
+            count = parsed;
+            break;
         }
 
-        char *endptr = NULL;
-        long index = strtol(line, &endptr, 10);
-        if (index <= 0 || endptr == line) {
-            line = strtok(NULL, "\n\r");
-            continue;
+        if (command_unknown) {
+            saw_unknown_only = true;
+        } else {
+            saw_supported_output = true;
         }
 
-        if (*endptr == '.' || *endptr == ')') {
-            endptr++;
+        if (command_missing) {
+            missing_file = true;
+            break;
         }
-        while (*endptr && isspace((unsigned char)*endptr)) endptr++;
-        if (*endptr == '\0') {
-            line = strtok(NULL, "\n\r");
-            continue;
+        if (command_empty) {
+            empty_list = true;
+            break;
         }
-
-        char ssid[BEACON_SPAM_SSID_MAX_LEN + 1];
-        snprintf(ssid, sizeof(ssid), "%s", endptr);
-        trim_trailing_whitespace(ssid);
-        if (ssid[0] == '\0') {
-            line = strtok(NULL, "\n\r");
-            continue;
-        }
-
-        ctx->beacon_spam_ssids[count].index = (int)index;
-        snprintf(ctx->beacon_spam_ssids[count].ssid, sizeof(ctx->beacon_spam_ssids[count].ssid), "%s", ssid);
-        count++;
-
-        line = strtok(NULL, "\n\r");
     }
 
     ctx->beacon_spam_ssid_count = count;
+    ESP_LOGI(TAG, "Beacon Spam refresh summary: count=%d got_response=%s unknown_only=%s empty=%s missing_file=%s",
+             count,
+             got_any_response ? "yes" : "no",
+             saw_unknown_only ? "yes" : "no",
+             empty_list ? "yes" : "no",
+             missing_file ? "yes" : "no");
 
     if (ctx->beacon_ssids_status_label) {
         if (count > 0) {
             lv_label_set_text_fmt(ctx->beacon_ssids_status_label, "Loaded %d SSID(s)", count);
             lv_obj_set_style_text_color(ctx->beacon_ssids_status_label, COLOR_MATERIAL_GREEN, 0);
+        } else if (missing_file) {
+            lv_label_set_text(ctx->beacon_ssids_status_label, "Missing /sdcard/lab/ssid.txt on JanOS SD card.");
+            lv_obj_set_style_text_color(ctx->beacon_ssids_status_label, COLOR_MATERIAL_RED, 0);
+        } else if (saw_unknown_only && !saw_supported_output) {
+            lv_label_set_text(ctx->beacon_ssids_status_label, "SSID list command unsupported (list_ssid/list_ssids).");
+            lv_obj_set_style_text_color(ctx->beacon_ssids_status_label, COLOR_MATERIAL_RED, 0);
+        } else if (!got_any_response) {
+            lv_label_set_text(ctx->beacon_ssids_status_label, "No UART response for SSID list command.");
+            lv_obj_set_style_text_color(ctx->beacon_ssids_status_label, COLOR_MATERIAL_RED, 0);
+        } else if (empty_list) {
+            lv_label_set_text(ctx->beacon_ssids_status_label, "No SSIDs in /sdcard/lab/ssid.txt. Add one to begin.");
+            lv_obj_set_style_text_color(ctx->beacon_ssids_status_label, COLOR_MATERIAL_AMBER, 0);
         } else {
-            lv_label_set_text(ctx->beacon_ssids_status_label, "No SSIDs found. Add one to begin.");
+            lv_label_set_text(ctx->beacon_ssids_status_label, "No SSIDs found. Check list_ssid output format.");
             lv_obj_set_style_text_color(ctx->beacon_ssids_status_label, COLOR_MATERIAL_AMBER, 0);
         }
     }
@@ -22623,16 +22795,6 @@ static void beacon_ssids_textarea_focus_cb(lv_event_t *e)
 
     lv_keyboard_set_textarea(ctx->beacon_ssids_keyboard, ctx->beacon_ssids_add_textarea);
     lv_obj_clear_flag(ctx->beacon_ssids_keyboard, LV_OBJ_FLAG_HIDDEN);
-}
-
-static void beacon_ssids_polish_char_cb(lv_event_t *e)
-{
-    const char *ch = (const char *)lv_event_get_user_data(e);
-    if (!ch || ch[0] == '\0') return;
-
-    tab_context_t *ctx = get_current_ctx();
-    if (!ctx || !ctx->beacon_ssids_add_textarea) return;
-    lv_textarea_add_text(ctx->beacon_ssids_add_textarea, ch);
 }
 
 static void beacon_ssids_add_popup_cancel_cb(lv_event_t *e)
@@ -22685,7 +22847,7 @@ static void beacon_ssids_add_new_cb(lv_event_t *e)
     style_modal_overlay(ctx->beacon_ssids_add_overlay, LV_OPA_60);
 
     ctx->beacon_ssids_add_popup = lv_obj_create(ctx->beacon_ssids_add_overlay);
-    lv_obj_set_size(ctx->beacon_ssids_add_popup, 560, 420);
+    lv_obj_set_size(ctx->beacon_ssids_add_popup, 560, 360);
     lv_obj_center(ctx->beacon_ssids_add_popup);
     style_popup_card(ctx->beacon_ssids_add_popup, 12, COLOR_MATERIAL_CYAN);
     lv_obj_set_style_pad_all(ctx->beacon_ssids_add_popup, 16, 0);
@@ -22699,7 +22861,7 @@ static void beacon_ssids_add_new_cb(lv_event_t *e)
     lv_obj_set_style_text_color(title, COLOR_MATERIAL_CYAN, 0);
 
     lv_obj_t *hint = lv_label_create(ctx->beacon_ssids_add_popup);
-    lv_label_set_text(hint, "Type SSID name (UTF-8 supported)");
+    lv_label_set_text(hint, "Type SSID name");
     lv_obj_set_style_text_font(hint, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(hint, ui_muted_color(), 0);
 
@@ -22712,33 +22874,9 @@ static void beacon_ssids_add_new_cb(lv_event_t *e)
     lv_obj_set_style_border_width(ctx->beacon_ssids_add_textarea, 1, 0);
     lv_obj_set_style_border_color(ctx->beacon_ssids_add_textarea, ui_border_color(), 0);
     lv_obj_set_style_text_color(ctx->beacon_ssids_add_textarea, ui_text_color(), 0);
-    lv_obj_set_style_text_font(ctx->beacon_ssids_add_textarea, ssid_utf8_font(), 0);
+    lv_obj_set_style_text_font(ctx->beacon_ssids_add_textarea, &lv_font_montserrat_16, 0);
     lv_obj_add_event_cb(ctx->beacon_ssids_add_textarea, beacon_ssids_textarea_focus_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_add_event_cb(ctx->beacon_ssids_add_textarea, beacon_ssids_textarea_focus_cb, LV_EVENT_FOCUSED, NULL);
-
-    static const char *polish_chars[] = {"ą", "ć", "ę", "ł", "ń", "ó", "ś", "ź", "ż"};
-    lv_obj_t *chars_row = lv_obj_create(ctx->beacon_ssids_add_popup);
-    lv_obj_set_size(chars_row, lv_pct(100), LV_SIZE_CONTENT);
-    lv_obj_set_style_bg_opa(chars_row, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(chars_row, 0, 0);
-    lv_obj_set_style_pad_all(chars_row, 0, 0);
-    lv_obj_set_style_pad_gap(chars_row, 6, 0);
-    lv_obj_set_flex_flow(chars_row, LV_FLEX_FLOW_ROW_WRAP);
-    lv_obj_set_flex_align(chars_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_clear_flag(chars_row, LV_OBJ_FLAG_SCROLLABLE);
-
-    for (int i = 0; i < (int)(sizeof(polish_chars) / sizeof(polish_chars[0])); i++) {
-        lv_obj_t *char_btn = lv_btn_create(chars_row);
-        lv_obj_set_size(char_btn, 44, 36);
-        style_neutral_button(char_btn);
-        lv_obj_add_event_cb(char_btn, beacon_ssids_polish_char_cb, LV_EVENT_CLICKED, (void*)polish_chars[i]);
-
-        lv_obj_t *char_lbl = lv_label_create(char_btn);
-        lv_label_set_text(char_lbl, polish_chars[i]);
-        lv_obj_set_style_text_font(char_lbl, ssid_utf8_font(), 0);
-        lv_obj_set_style_text_color(char_lbl, ui_text_color(), 0);
-        lv_obj_center(char_lbl);
-    }
 
     lv_obj_t *btn_row = lv_obj_create(ctx->beacon_ssids_add_popup);
     lv_obj_set_size(btn_row, lv_pct(100), LV_SIZE_CONTENT);
@@ -22776,7 +22914,7 @@ static void beacon_ssids_add_new_cb(lv_event_t *e)
     lv_obj_set_size(ctx->beacon_ssids_keyboard, lv_pct(100), 260);
     lv_obj_align(ctx->beacon_ssids_keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
     style_on_screen_keyboard(ctx->beacon_ssids_keyboard);
-    lv_obj_set_style_text_font(ctx->beacon_ssids_keyboard, ssid_utf8_font(), LV_PART_ITEMS);
+    lv_obj_set_style_text_font(ctx->beacon_ssids_keyboard, &lv_font_montserrat_16, LV_PART_ITEMS);
     lv_keyboard_set_textarea(ctx->beacon_ssids_keyboard, ctx->beacon_ssids_add_textarea);
     lv_obj_add_flag(ctx->beacon_ssids_keyboard, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_event_cb(ctx->beacon_ssids_keyboard, beacon_ssids_keyboard_cb, LV_EVENT_READY, NULL);
