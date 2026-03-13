@@ -23,6 +23,9 @@
 #include "driver/ledc.h"
 #include "bsp/m5stack_tab5.h"
 #include "lvgl.h"
+#if LV_USE_TINY_TTF
+#include "src/libs/tiny_ttf/lv_tiny_ttf.h"
+#endif
 #if LV_USE_SNAPSHOT
 #include "src/others/snapshot/lv_snapshot.h"
 #endif
@@ -49,6 +52,11 @@
 
 static const char *TAG = "wifi_scanner";
 extern const lv_image_dsc_t intro_splash_img;
+#if LV_USE_TINY_TTF
+extern const unsigned char lv_font_lato_regular_ttf[];
+extern const unsigned int lv_font_lato_regular_ttf_len;
+static lv_font_t *ssid_utf8_cached_font = NULL;
+#endif
 
 // UART Configuration for ESP32C5 communication
 // Note: TX/RX pins are configured dynamically via get_uart_pins() based on NVS settings
@@ -244,6 +252,13 @@ typedef enum {
 // Karma2 constants (for Observer)
 #define KARMA2_MAX_PROBES 64
 #define KARMA2_MAX_HTML_FILES 20
+#define BEACON_SPAM_MAX_SSIDS 128
+#define BEACON_SPAM_SSID_MAX_LEN 96
+
+typedef struct {
+    int index;
+    char ssid[BEACON_SPAM_SSID_MAX_LEN + 1];
+} beacon_spam_ssid_t;
 
 // ============================================================================
 // COMPLETE TAB CONTEXT - All UI, data, and state for one tab (Grove/USB/MBus/INTERNAL)
@@ -380,6 +395,20 @@ typedef struct {
     // GLOBAL WIFI ATTACKS - Page and all attacks
     // =====================================================================
     lv_obj_t *global_attacks_page;
+
+    // Beacon Spam
+    lv_obj_t *beacon_spam_page;
+    lv_obj_t *beacon_ssids_page;
+    lv_obj_t *beacon_ssids_grid;
+    lv_obj_t *beacon_ssids_status_label;
+    lv_obj_t *beacon_ssids_add_overlay;
+    lv_obj_t *beacon_ssids_add_popup;
+    lv_obj_t *beacon_ssids_add_textarea;
+    lv_obj_t *beacon_ssids_keyboard;
+    lv_obj_t *beacon_spam_active_overlay;
+    lv_obj_t *beacon_spam_active_popup;
+    beacon_spam_ssid_t *beacon_spam_ssids;  // PSRAM
+    int beacon_spam_ssid_count;
 
     // Blackout
     lv_obj_t *blackout_popup_overlay;
@@ -708,6 +737,29 @@ static inline lv_color_t ui_tab_icon_color(void)
     return dark_mode_enabled ? COLOR_NEON_CYAN : COLOR_LIGHT_ACCENT;
 }
 
+static const lv_font_t *ssid_utf8_font(void)
+{
+#if LV_USE_TINY_TTF
+    if (ssid_utf8_cached_font == NULL && lv_font_lato_regular_ttf_len > 0U) {
+        ssid_utf8_cached_font = lv_tiny_ttf_create_data(
+            lv_font_lato_regular_ttf,
+            (size_t)lv_font_lato_regular_ttf_len,
+            16);
+        if (ssid_utf8_cached_font == NULL) {
+            ESP_LOGW(TAG, "TinyTTF font init failed; using LVGL fallback font.");
+        }
+    }
+    if (ssid_utf8_cached_font != NULL) {
+        return ssid_utf8_cached_font;
+    }
+#endif
+#if LV_FONT_DEJAVU_16_PERSIAN_HEBREW
+    return &lv_font_dejavu_16_persian_hebrew;
+#else
+    return &lv_font_montserrat_16;
+#endif
+}
+
 static const char *boot_sound_mode_name(boot_sound_mode_t mode)
 {
     switch (mode) {
@@ -1031,6 +1083,8 @@ static void hide_all_pages(tab_context_t *ctx) {
     if (ctx->scan_page) lv_obj_add_flag(ctx->scan_page, LV_OBJ_FLAG_HIDDEN);
     if (ctx->observer_page) lv_obj_add_flag(ctx->observer_page, LV_OBJ_FLAG_HIDDEN);
     if (ctx->global_attacks_page) lv_obj_add_flag(ctx->global_attacks_page, LV_OBJ_FLAG_HIDDEN);
+    if (ctx->beacon_spam_page) lv_obj_add_flag(ctx->beacon_spam_page, LV_OBJ_FLAG_HIDDEN);
+    if (ctx->beacon_ssids_page) lv_obj_add_flag(ctx->beacon_ssids_page, LV_OBJ_FLAG_HIDDEN);
     if (ctx->karma_page) lv_obj_add_flag(ctx->karma_page, LV_OBJ_FLAG_HIDDEN);
     if (ctx->compromised_data_page) lv_obj_add_flag(ctx->compromised_data_page, LV_OBJ_FLAG_HIDDEN);
     if (ctx->evil_twin_passwords_page) lv_obj_add_flag(ctx->evil_twin_passwords_page, LV_OBJ_FLAG_HIDDEN);
@@ -1093,6 +1147,14 @@ static void init_tab_context(tab_context_t *ctx) {
         ctx->evil_twin_entries = heap_caps_calloc(EVIL_TWIN_MAX_ENTRIES, sizeof(evil_twin_entry_t), MALLOC_CAP_SPIRAM);
         if (!ctx->evil_twin_entries) {
             ESP_LOGE(TAG, "Failed to allocate evil_twin_entries in PSRAM");
+        }
+    }
+
+    // Beacon spam SSIDs
+    if (!ctx->beacon_spam_ssids) {
+        ctx->beacon_spam_ssids = heap_caps_calloc(BEACON_SPAM_MAX_SSIDS, sizeof(beacon_spam_ssid_t), MALLOC_CAP_SPIRAM);
+        if (!ctx->beacon_spam_ssids) {
+            ESP_LOGE(TAG, "Failed to allocate beacon_spam_ssids in PSRAM");
         }
     }
 
@@ -1523,6 +1585,23 @@ static void home_meta_refresh_task(void *arg);
 static void rebuild_all_home_tiles(void);
 static void show_global_attacks_page(void);
 static void global_attack_tile_event_cb(lv_event_t *e);
+static void show_beacon_spam_page(void);
+static void beacon_spam_back_btn_event_cb(lv_event_t *e);
+static void beacon_spam_tile_event_cb(lv_event_t *e);
+static void show_beacon_ssids_page(void);
+static void beacon_ssids_back_btn_event_cb(lv_event_t *e);
+static void beacon_ssids_add_new_cb(lv_event_t *e);
+static void beacon_ssids_add_popup_cancel_cb(lv_event_t *e);
+static void beacon_ssids_add_popup_save_cb(lv_event_t *e);
+static void beacon_ssids_textarea_focus_cb(lv_event_t *e);
+static void beacon_ssids_keyboard_cb(lv_event_t *e);
+static void beacon_ssids_delete_cb(lv_event_t *e);
+static void beacon_spam_start_cb(lv_event_t *e);
+static void beacon_spam_active_close_cb(lv_event_t *e);
+static void beacon_spam_refresh_ssids(tab_context_t *ctx);
+static void beacon_spam_rebuild_ssid_grid(tab_context_t *ctx);
+static void close_beacon_ssids_add_popup(tab_context_t *ctx);
+static void close_beacon_spam_active_popup(tab_context_t *ctx, bool send_stop);
 static void observer_back_btn_event_cb(lv_event_t *e);
 static void esp_modem_back_btn_event_cb(lv_event_t *e);
 static void esp_modem_scan_btn_click_cb(lv_event_t *e);
@@ -9204,6 +9283,8 @@ static void show_uart1_tiles(void)
     if (ctx->scan_page) lv_obj_add_flag(ctx->scan_page, LV_OBJ_FLAG_HIDDEN);
     if (ctx->observer_page) lv_obj_add_flag(ctx->observer_page, LV_OBJ_FLAG_HIDDEN);
     if (ctx->global_attacks_page) lv_obj_add_flag(ctx->global_attacks_page, LV_OBJ_FLAG_HIDDEN);
+    if (ctx->beacon_spam_page) lv_obj_add_flag(ctx->beacon_spam_page, LV_OBJ_FLAG_HIDDEN);
+    if (ctx->beacon_ssids_page) lv_obj_add_flag(ctx->beacon_ssids_page, LV_OBJ_FLAG_HIDDEN);
     if (ctx->karma_page) lv_obj_add_flag(ctx->karma_page, LV_OBJ_FLAG_HIDDEN);
 
     create_uart_tiles_in_container(container, ctx, &ctx->tiles);
@@ -9227,6 +9308,8 @@ static void show_mbus_tiles(void)
     if (ctx->scan_page) lv_obj_add_flag(ctx->scan_page, LV_OBJ_FLAG_HIDDEN);
     if (ctx->observer_page) lv_obj_add_flag(ctx->observer_page, LV_OBJ_FLAG_HIDDEN);
     if (ctx->global_attacks_page) lv_obj_add_flag(ctx->global_attacks_page, LV_OBJ_FLAG_HIDDEN);
+    if (ctx->beacon_spam_page) lv_obj_add_flag(ctx->beacon_spam_page, LV_OBJ_FLAG_HIDDEN);
+    if (ctx->beacon_ssids_page) lv_obj_add_flag(ctx->beacon_ssids_page, LV_OBJ_FLAG_HIDDEN);
     if (ctx->karma_page) lv_obj_add_flag(ctx->karma_page, LV_OBJ_FLAG_HIDDEN);
 
     create_uart_tiles_in_container(mbus_container, ctx, &ctx->tiles);
@@ -22289,6 +22372,712 @@ static void show_bt_locator_page(int device_idx)
     ctx->current_visible_page = ctx->bt_locator_page;
 }
 
+static void beacon_spam_escape_quoted_arg(const char *src, char *dst, size_t dst_size)
+{
+    if (!dst || dst_size == 0) return;
+    dst[0] = '\0';
+    if (!src) return;
+
+    size_t out = 0;
+    for (size_t i = 0; src[i] != '\0' && out + 1 < dst_size; i++) {
+        char c = src[i];
+        if ((c == '"' || c == '\\') && out + 2 < dst_size) {
+            dst[out++] = '\\';
+        }
+        if (out + 1 < dst_size) {
+            dst[out++] = c;
+        }
+    }
+    dst[out] = '\0';
+}
+
+static void beacon_spam_trim_whitespace(char *text)
+{
+    if (!text) return;
+    char *start = text;
+    while (*start && isspace((unsigned char)*start)) {
+        start++;
+    }
+    if (start != text) {
+        memmove(text, start, strlen(start) + 1);
+    }
+    trim_trailing_whitespace(text);
+}
+
+static void close_beacon_ssids_add_popup(tab_context_t *ctx)
+{
+    if (!ctx) return;
+    if (ctx->beacon_ssids_add_overlay) {
+        lv_obj_del(ctx->beacon_ssids_add_overlay);
+    }
+    ctx->beacon_ssids_add_overlay = NULL;
+    ctx->beacon_ssids_add_popup = NULL;
+    ctx->beacon_ssids_add_textarea = NULL;
+    ctx->beacon_ssids_keyboard = NULL;
+}
+
+static void close_beacon_spam_active_popup(tab_context_t *ctx, bool send_stop)
+{
+    if (!ctx) return;
+
+    if (send_stop) {
+        tab_id_t tab = tab_id_for_ctx(ctx);
+        if (!tab_is_internal(tab)) {
+            uart_port_t uart_port = uart_port_for_tab(tab);
+            transport_write_bytes_tab(tab, uart_port, "stop", 4);
+            transport_write_bytes_tab(tab, uart_port, "\r\n", 2);
+            ESP_LOGI(TAG, "[%s/Tab] Sent command: stop (Beacon Spam)", tab_transport_name(tab));
+        }
+    }
+
+    if (ctx->beacon_spam_active_overlay) {
+        lv_obj_del(ctx->beacon_spam_active_overlay);
+    }
+    ctx->beacon_spam_active_overlay = NULL;
+    ctx->beacon_spam_active_popup = NULL;
+}
+
+static void beacon_spam_rebuild_ssid_grid(tab_context_t *ctx)
+{
+    if (!ctx || !ctx->beacon_ssids_grid) return;
+
+    lv_obj_clean(ctx->beacon_ssids_grid);
+
+    if (ctx->beacon_spam_ssid_count <= 0) {
+        lv_obj_t *empty = lv_label_create(ctx->beacon_ssids_grid);
+        lv_label_set_text(empty, "No SSIDs configured.");
+        lv_obj_set_style_text_font(empty, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(empty, ui_muted_color(), 0);
+        lv_obj_set_width(empty, lv_pct(100));
+        lv_label_set_long_mode(empty, LV_LABEL_LONG_WRAP);
+        return;
+    }
+
+    for (int i = 0; i < ctx->beacon_spam_ssid_count; i++) {
+        beacon_spam_ssid_t *entry = &ctx->beacon_spam_ssids[i];
+
+        lv_obj_t *row = lv_obj_create(ctx->beacon_ssids_grid);
+        lv_obj_set_size(row, lv_pct(48), LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_color(row, ui_card_color(), 0);
+        lv_obj_set_style_border_width(row, 1, 0);
+        lv_obj_set_style_border_color(row, ui_border_color(), 0);
+        lv_obj_set_style_border_opa(row, dark_mode_enabled ? LV_OPA_40 : LV_OPA_80, 0);
+        lv_obj_set_style_radius(row, 8, 0);
+        lv_obj_set_style_pad_all(row, 10, 0);
+        lv_obj_set_style_pad_column(row, 10, 0);
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *info = lv_obj_create(row);
+        lv_obj_remove_style_all(info);
+        lv_obj_set_flex_grow(info, 1);
+        lv_obj_set_height(info, LV_SIZE_CONTENT);
+        lv_obj_set_flex_flow(info, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_style_pad_row(info, 2, 0);
+        lv_obj_clear_flag(info, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *idx_lbl = lv_label_create(info);
+        lv_label_set_text_fmt(idx_lbl, "%d", entry->index);
+        lv_obj_set_style_text_font(idx_lbl, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(idx_lbl, ui_muted_color(), 0);
+
+        lv_obj_t *ssid_lbl = lv_label_create(info);
+        lv_label_set_text(ssid_lbl, entry->ssid);
+        lv_obj_set_style_text_font(ssid_lbl, ssid_utf8_font(), 0);
+        lv_obj_set_style_text_color(ssid_lbl, ui_text_color(), 0);
+        lv_obj_set_width(ssid_lbl, lv_pct(100));
+        lv_label_set_long_mode(ssid_lbl, LV_LABEL_LONG_WRAP);
+
+        lv_obj_t *delete_btn = lv_btn_create(row);
+        lv_obj_set_size(delete_btn, 54, 44);
+        style_danger_button(delete_btn);
+        lv_obj_add_event_cb(delete_btn, beacon_ssids_delete_cb, LV_EVENT_CLICKED,
+                            (void*)(intptr_t)entry->index);
+
+        lv_obj_t *delete_lbl = lv_label_create(delete_btn);
+        lv_label_set_text(delete_lbl, LV_SYMBOL_TRASH);
+        lv_obj_set_style_text_font(delete_lbl, &lv_font_montserrat_18, 0);
+        lv_obj_set_style_text_color(delete_lbl, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_center(delete_lbl);
+    }
+}
+
+static void beacon_spam_refresh_ssids(tab_context_t *ctx)
+{
+    if (!ctx || !ctx->beacon_spam_ssids) return;
+
+    ctx->beacon_spam_ssid_count = 0;
+    memset(ctx->beacon_spam_ssids, 0, BEACON_SPAM_MAX_SSIDS * sizeof(beacon_spam_ssid_t));
+
+    if (tab_is_internal(current_tab)) {
+        if (ctx->beacon_ssids_status_label) {
+            lv_label_set_text(ctx->beacon_ssids_status_label, "Beacon Spam is unavailable on INTERNAL tab.");
+            lv_obj_set_style_text_color(ctx->beacon_ssids_status_label, COLOR_MATERIAL_RED, 0);
+        }
+        return;
+    }
+
+    uart_port_t uart_port = uart_port_for_tab(current_tab);
+    uart_flush_input(uart_port);
+    uart_send_command_for_tab("list_ssids");
+    vTaskDelay(pdMS_TO_TICKS(250));
+
+    static char rx_buffer[4096];
+    int total_len = 0;
+    int retries = 18;
+    int empty_reads = 0;
+
+    while (retries-- > 0 && empty_reads < 4 && total_len < (int)sizeof(rx_buffer) - 1) {
+        int len = transport_read_bytes(uart_port, rx_buffer + total_len,
+                                       sizeof(rx_buffer) - total_len - 1,
+                                       pdMS_TO_TICKS(150));
+        if (len > 0) {
+            total_len += len;
+            empty_reads = 0;
+        } else {
+            empty_reads++;
+        }
+    }
+    rx_buffer[total_len] = '\0';
+
+    ESP_LOGI(TAG, "Beacon Spam: list_ssids response (%d bytes)", total_len);
+
+    int count = 0;
+    char *line = strtok(rx_buffer, "\n\r");
+    while (line != NULL && count < BEACON_SPAM_MAX_SSIDS) {
+        while (isspace((unsigned char)*line)) line++;
+        if (*line == '\0' ||
+            strstr(line, "list_ssids") != NULL ||
+            strstr(line, "No SSID") != NULL ||
+            strstr(line, "SSID list empty") != NULL) {
+            line = strtok(NULL, "\n\r");
+            continue;
+        }
+
+        if (!isdigit((unsigned char)*line)) {
+            line = strtok(NULL, "\n\r");
+            continue;
+        }
+
+        char *endptr = NULL;
+        long index = strtol(line, &endptr, 10);
+        if (index <= 0 || endptr == line) {
+            line = strtok(NULL, "\n\r");
+            continue;
+        }
+
+        if (*endptr == '.' || *endptr == ')') {
+            endptr++;
+        }
+        while (*endptr && isspace((unsigned char)*endptr)) endptr++;
+        if (*endptr == '\0') {
+            line = strtok(NULL, "\n\r");
+            continue;
+        }
+
+        char ssid[BEACON_SPAM_SSID_MAX_LEN + 1];
+        snprintf(ssid, sizeof(ssid), "%s", endptr);
+        trim_trailing_whitespace(ssid);
+        if (ssid[0] == '\0') {
+            line = strtok(NULL, "\n\r");
+            continue;
+        }
+
+        ctx->beacon_spam_ssids[count].index = (int)index;
+        snprintf(ctx->beacon_spam_ssids[count].ssid, sizeof(ctx->beacon_spam_ssids[count].ssid), "%s", ssid);
+        count++;
+
+        line = strtok(NULL, "\n\r");
+    }
+
+    ctx->beacon_spam_ssid_count = count;
+
+    if (ctx->beacon_ssids_status_label) {
+        if (count > 0) {
+            lv_label_set_text_fmt(ctx->beacon_ssids_status_label, "Loaded %d SSID(s)", count);
+            lv_obj_set_style_text_color(ctx->beacon_ssids_status_label, COLOR_MATERIAL_GREEN, 0);
+        } else {
+            lv_label_set_text(ctx->beacon_ssids_status_label, "No SSIDs found. Add one to begin.");
+            lv_obj_set_style_text_color(ctx->beacon_ssids_status_label, COLOR_MATERIAL_AMBER, 0);
+        }
+    }
+}
+
+static void beacon_ssids_keyboard_cb(lv_event_t *e)
+{
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code != LV_EVENT_READY && code != LV_EVENT_CANCEL) return;
+
+    tab_context_t *ctx = get_current_ctx();
+    if (ctx && ctx->beacon_ssids_keyboard) {
+        lv_obj_add_flag(ctx->beacon_ssids_keyboard, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void beacon_ssids_textarea_focus_cb(lv_event_t *e)
+{
+    (void)e;
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx || !ctx->beacon_ssids_keyboard || !ctx->beacon_ssids_add_textarea) return;
+
+    lv_keyboard_set_textarea(ctx->beacon_ssids_keyboard, ctx->beacon_ssids_add_textarea);
+    lv_obj_clear_flag(ctx->beacon_ssids_keyboard, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void beacon_ssids_polish_char_cb(lv_event_t *e)
+{
+    const char *ch = (const char *)lv_event_get_user_data(e);
+    if (!ch || ch[0] == '\0') return;
+
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx || !ctx->beacon_ssids_add_textarea) return;
+    lv_textarea_add_text(ctx->beacon_ssids_add_textarea, ch);
+}
+
+static void beacon_ssids_add_popup_cancel_cb(lv_event_t *e)
+{
+    (void)e;
+    tab_context_t *ctx = get_current_ctx();
+    close_beacon_ssids_add_popup(ctx);
+}
+
+static void beacon_ssids_add_popup_save_cb(lv_event_t *e)
+{
+    (void)e;
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx || !ctx->beacon_ssids_add_textarea) return;
+
+    char ssid[BEACON_SPAM_SSID_MAX_LEN + 1];
+    snprintf(ssid, sizeof(ssid), "%s", lv_textarea_get_text(ctx->beacon_ssids_add_textarea));
+    beacon_spam_trim_whitespace(ssid);
+    if (ssid[0] == '\0') {
+        if (ctx->beacon_ssids_status_label) {
+            lv_label_set_text(ctx->beacon_ssids_status_label, "SSID cannot be empty.");
+            lv_obj_set_style_text_color(ctx->beacon_ssids_status_label, COLOR_MATERIAL_RED, 0);
+        }
+        return;
+    }
+
+    char escaped[BEACON_SPAM_SSID_MAX_LEN * 2 + 1];
+    beacon_spam_escape_quoted_arg(ssid, escaped, sizeof(escaped));
+
+    char cmd[(BEACON_SPAM_SSID_MAX_LEN * 2) + 24];
+    snprintf(cmd, sizeof(cmd), "add_ssid \"%s\"", escaped);
+    uart_send_command_for_tab(cmd);
+    ESP_LOGI(TAG, "Beacon Spam: added SSID '%s'", ssid);
+
+    close_beacon_ssids_add_popup(ctx);
+    vTaskDelay(pdMS_TO_TICKS(150));
+    beacon_spam_refresh_ssids(ctx);
+    beacon_spam_rebuild_ssid_grid(ctx);
+}
+
+static void beacon_ssids_add_new_cb(lv_event_t *e)
+{
+    (void)e;
+    tab_context_t *ctx = get_current_ctx();
+    lv_obj_t *container = get_current_tab_container();
+    if (!ctx || !container) return;
+    if (ctx->beacon_ssids_add_overlay) return;
+
+    ctx->beacon_ssids_add_overlay = lv_obj_create(container);
+    style_modal_overlay(ctx->beacon_ssids_add_overlay, LV_OPA_60);
+
+    ctx->beacon_ssids_add_popup = lv_obj_create(ctx->beacon_ssids_add_overlay);
+    lv_obj_set_size(ctx->beacon_ssids_add_popup, 560, 420);
+    lv_obj_center(ctx->beacon_ssids_add_popup);
+    style_popup_card(ctx->beacon_ssids_add_popup, 12, COLOR_MATERIAL_CYAN);
+    lv_obj_set_style_pad_all(ctx->beacon_ssids_add_popup, 16, 0);
+    lv_obj_set_flex_flow(ctx->beacon_ssids_add_popup, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(ctx->beacon_ssids_add_popup, 12, 0);
+    lv_obj_clear_flag(ctx->beacon_ssids_add_popup, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(ctx->beacon_ssids_add_popup);
+    lv_label_set_text(title, "Add New SSID");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_CYAN, 0);
+
+    lv_obj_t *hint = lv_label_create(ctx->beacon_ssids_add_popup);
+    lv_label_set_text(hint, "Type SSID name (UTF-8 supported)");
+    lv_obj_set_style_text_font(hint, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(hint, ui_muted_color(), 0);
+
+    ctx->beacon_ssids_add_textarea = lv_textarea_create(ctx->beacon_ssids_add_popup);
+    lv_obj_set_size(ctx->beacon_ssids_add_textarea, lv_pct(100), 48);
+    lv_textarea_set_one_line(ctx->beacon_ssids_add_textarea, true);
+    lv_textarea_set_max_length(ctx->beacon_ssids_add_textarea, BEACON_SPAM_SSID_MAX_LEN);
+    lv_textarea_set_placeholder_text(ctx->beacon_ssids_add_textarea, "SSID");
+    lv_obj_set_style_bg_color(ctx->beacon_ssids_add_textarea, ui_panel_color(), 0);
+    lv_obj_set_style_border_width(ctx->beacon_ssids_add_textarea, 1, 0);
+    lv_obj_set_style_border_color(ctx->beacon_ssids_add_textarea, ui_border_color(), 0);
+    lv_obj_set_style_text_color(ctx->beacon_ssids_add_textarea, ui_text_color(), 0);
+    lv_obj_set_style_text_font(ctx->beacon_ssids_add_textarea, ssid_utf8_font(), 0);
+    lv_obj_add_event_cb(ctx->beacon_ssids_add_textarea, beacon_ssids_textarea_focus_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(ctx->beacon_ssids_add_textarea, beacon_ssids_textarea_focus_cb, LV_EVENT_FOCUSED, NULL);
+
+    static const char *polish_chars[] = {"ą", "ć", "ę", "ł", "ń", "ó", "ś", "ź", "ż"};
+    lv_obj_t *chars_row = lv_obj_create(ctx->beacon_ssids_add_popup);
+    lv_obj_set_size(chars_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(chars_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(chars_row, 0, 0);
+    lv_obj_set_style_pad_all(chars_row, 0, 0);
+    lv_obj_set_style_pad_gap(chars_row, 6, 0);
+    lv_obj_set_flex_flow(chars_row, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_flex_align(chars_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(chars_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    for (int i = 0; i < (int)(sizeof(polish_chars) / sizeof(polish_chars[0])); i++) {
+        lv_obj_t *char_btn = lv_btn_create(chars_row);
+        lv_obj_set_size(char_btn, 44, 36);
+        style_neutral_button(char_btn);
+        lv_obj_add_event_cb(char_btn, beacon_ssids_polish_char_cb, LV_EVENT_CLICKED, (void*)polish_chars[i]);
+
+        lv_obj_t *char_lbl = lv_label_create(char_btn);
+        lv_label_set_text(char_lbl, polish_chars[i]);
+        lv_obj_set_style_text_font(char_lbl, ssid_utf8_font(), 0);
+        lv_obj_set_style_text_color(char_lbl, ui_text_color(), 0);
+        lv_obj_center(char_lbl);
+    }
+
+    lv_obj_t *btn_row = lv_obj_create(ctx->beacon_ssids_add_popup);
+    lv_obj_set_size(btn_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(btn_row, 0, 0);
+    lv_obj_set_style_pad_all(btn_row, 0, 0);
+    lv_obj_set_style_pad_column(btn_row, 10, 0);
+    lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *cancel_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(cancel_btn, 130, 44);
+    style_neutral_button(cancel_btn);
+    lv_obj_add_event_cb(cancel_btn, beacon_ssids_add_popup_cancel_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *cancel_lbl = lv_label_create(cancel_btn);
+    lv_label_set_text(cancel_lbl, "Cancel");
+    lv_obj_set_style_text_font(cancel_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_center(cancel_lbl);
+
+    lv_obj_t *save_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(save_btn, 130, 44);
+    lv_obj_set_style_bg_color(save_btn, COLOR_MATERIAL_GREEN, 0);
+    lv_obj_set_style_bg_color(save_btn, lv_color_hex(0x2E7D32), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(save_btn, 8, 0);
+    lv_obj_add_event_cb(save_btn, beacon_ssids_add_popup_save_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *save_lbl = lv_label_create(save_btn);
+    lv_label_set_text(save_lbl, "Add");
+    lv_obj_set_style_text_font(save_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_center(save_lbl);
+
+    ctx->beacon_ssids_keyboard = lv_keyboard_create(ctx->beacon_ssids_add_overlay);
+    lv_obj_set_size(ctx->beacon_ssids_keyboard, lv_pct(100), 260);
+    lv_obj_align(ctx->beacon_ssids_keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
+    style_on_screen_keyboard(ctx->beacon_ssids_keyboard);
+    lv_obj_set_style_text_font(ctx->beacon_ssids_keyboard, ssid_utf8_font(), LV_PART_ITEMS);
+    lv_keyboard_set_textarea(ctx->beacon_ssids_keyboard, ctx->beacon_ssids_add_textarea);
+    lv_obj_add_flag(ctx->beacon_ssids_keyboard, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(ctx->beacon_ssids_keyboard, beacon_ssids_keyboard_cb, LV_EVENT_READY, NULL);
+    lv_obj_add_event_cb(ctx->beacon_ssids_keyboard, beacon_ssids_keyboard_cb, LV_EVENT_CANCEL, NULL);
+}
+
+static void beacon_ssids_delete_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx) return;
+
+    int index = (int)(intptr_t)lv_event_get_user_data(e);
+    if (index <= 0) return;
+
+    char cmd[32];
+    snprintf(cmd, sizeof(cmd), "remove_ssid %d", index);
+    uart_send_command_for_tab(cmd);
+    ESP_LOGI(TAG, "Beacon Spam: removed SSID index %d", index);
+
+    vTaskDelay(pdMS_TO_TICKS(120));
+    beacon_spam_refresh_ssids(ctx);
+    beacon_spam_rebuild_ssid_grid(ctx);
+}
+
+static void beacon_spam_active_close_cb(lv_event_t *e)
+{
+    (void)e;
+    tab_context_t *ctx = get_current_ctx();
+    close_beacon_spam_active_popup(ctx, true);
+}
+
+static void beacon_spam_start_cb(lv_event_t *e)
+{
+    (void)e;
+    tab_context_t *ctx = get_current_ctx();
+    lv_obj_t *container = get_current_tab_container();
+    if (!ctx || !container) return;
+
+    beacon_spam_refresh_ssids(ctx);
+    if (ctx->beacon_spam_ssid_count <= 0) {
+        if (ctx->beacon_ssids_status_label) {
+            lv_label_set_text(ctx->beacon_ssids_status_label, "No SSIDs configured. Add at least one.");
+            lv_obj_set_style_text_color(ctx->beacon_ssids_status_label, COLOR_MATERIAL_RED, 0);
+        }
+        return;
+    }
+
+    uart_send_command_for_tab("start_beacon_spam_ssids");
+    ESP_LOGI(TAG, "Beacon Spam started with %d SSIDs", ctx->beacon_spam_ssid_count);
+
+    if (ctx->beacon_spam_active_overlay) {
+        close_beacon_spam_active_popup(ctx, false);
+    }
+
+    ctx->beacon_spam_active_overlay = lv_obj_create(container);
+    style_modal_overlay(ctx->beacon_spam_active_overlay, LV_OPA_70);
+
+    ctx->beacon_spam_active_popup = lv_obj_create(ctx->beacon_spam_active_overlay);
+    lv_obj_set_size(ctx->beacon_spam_active_popup, 520, 320);
+    lv_obj_center(ctx->beacon_spam_active_popup);
+    style_popup_card(ctx->beacon_spam_active_popup, 12, COLOR_MATERIAL_CYAN);
+    lv_obj_set_style_pad_all(ctx->beacon_spam_active_popup, 18, 0);
+    lv_obj_set_flex_flow(ctx->beacon_spam_active_popup, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(ctx->beacon_spam_active_popup, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(ctx->beacon_spam_active_popup, 14, 0);
+    lv_obj_clear_flag(ctx->beacon_spam_active_popup, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *icon = lv_label_create(ctx->beacon_spam_active_popup);
+    lv_label_set_text(icon, LV_SYMBOL_WIFI);
+    lv_obj_set_style_text_font(icon, &lv_font_montserrat_44, 0);
+    lv_obj_set_style_text_color(icon, COLOR_MATERIAL_CYAN, 0);
+
+    lv_obj_t *title = lv_label_create(ctx->beacon_spam_active_popup);
+    lv_label_set_text(title, "Beacon Spam");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_CYAN, 0);
+
+    lv_obj_t *msg = lv_label_create(ctx->beacon_spam_active_popup);
+    lv_label_set_text_fmt(msg, "beacon spam is active with %d SSIDs.", ctx->beacon_spam_ssid_count);
+    lv_obj_set_style_text_font(msg, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(msg, ui_text_color(), 0);
+    lv_obj_set_style_text_align(msg, LV_TEXT_ALIGN_CENTER, 0);
+
+    lv_obj_t *stop_btn = lv_btn_create(ctx->beacon_spam_active_popup);
+    lv_obj_set_size(stop_btn, 190, 52);
+    style_danger_button(stop_btn);
+    lv_obj_add_event_cb(stop_btn, beacon_spam_active_close_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *stop_lbl = lv_label_create(stop_btn);
+    lv_label_set_text(stop_lbl, LV_SYMBOL_STOP " Stop");
+    lv_obj_set_style_text_font(stop_lbl, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_color(stop_lbl, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_center(stop_lbl);
+}
+
+static void beacon_ssids_back_btn_event_cb(lv_event_t *e)
+{
+    (void)e;
+    tab_context_t *ctx = get_current_ctx();
+    close_beacon_ssids_add_popup(ctx);
+    show_beacon_spam_page();
+}
+
+static void show_beacon_ssids_page(void)
+{
+    tab_context_t *ctx = get_current_ctx();
+    lv_obj_t *container = get_current_tab_container();
+    if (!ctx || !container) return;
+
+    hide_all_pages(ctx);
+
+    if (ctx->beacon_ssids_page) {
+        lv_obj_clear_flag(ctx->beacon_ssids_page, LV_OBJ_FLAG_HIDDEN);
+        ctx->current_visible_page = ctx->beacon_ssids_page;
+        beacon_spam_refresh_ssids(ctx);
+        beacon_spam_rebuild_ssid_grid(ctx);
+        return;
+    }
+
+    ctx->beacon_ssids_page = lv_obj_create(container);
+    lv_obj_set_size(ctx->beacon_ssids_page, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(ctx->beacon_ssids_page, ui_bg_color(), 0);
+    lv_obj_set_style_border_width(ctx->beacon_ssids_page, 0, 0);
+    lv_obj_set_style_pad_all(ctx->beacon_ssids_page, 10, 0);
+    lv_obj_set_flex_flow(ctx->beacon_ssids_page, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(ctx->beacon_ssids_page, 8, 0);
+
+    lv_obj_t *header = lv_obj_create(ctx->beacon_ssids_page);
+    lv_obj_set_size(header, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(header, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(header, 0, 0);
+    lv_obj_set_style_pad_all(header, 0, 0);
+    lv_obj_set_style_pad_column(header, 10, 0);
+    lv_obj_set_flex_flow(header, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(header, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(header, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *back_btn = lv_btn_create(header);
+    lv_obj_set_size(back_btn, 72, 60);
+    style_back_nav_button(back_btn);
+    lv_obj_add_event_cb(back_btn, beacon_ssids_back_btn_event_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *back_icon = lv_label_create(back_btn);
+    lv_label_set_text(back_icon, LV_SYMBOL_LEFT);
+    lv_obj_set_style_text_color(back_icon, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_center(back_icon);
+
+    lv_obj_t *title = lv_label_create(header);
+    lv_label_set_text(title, "List SSIDs");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_22, 0);
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_CYAN, 0);
+
+    lv_obj_t *spacer = lv_obj_create(header);
+    lv_obj_remove_style_all(spacer);
+    lv_obj_set_flex_grow(spacer, 1);
+    lv_obj_set_height(spacer, 1);
+
+    lv_obj_t *add_btn = lv_btn_create(header);
+    lv_obj_set_size(add_btn, 150, 48);
+    lv_obj_set_style_bg_color(add_btn, COLOR_MATERIAL_GREEN, 0);
+    lv_obj_set_style_bg_color(add_btn, lv_color_hex(0x2E7D32), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(add_btn, 8, 0);
+    lv_obj_add_event_cb(add_btn, beacon_ssids_add_new_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *add_lbl = lv_label_create(add_btn);
+    lv_label_set_text(add_lbl, LV_SYMBOL_PLUS " Add New");
+    lv_obj_set_style_text_font(add_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(add_lbl, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_center(add_lbl);
+
+    ctx->beacon_ssids_status_label = lv_label_create(ctx->beacon_ssids_page);
+    lv_label_set_text(ctx->beacon_ssids_status_label, "Loading...");
+    lv_obj_set_style_text_font(ctx->beacon_ssids_status_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(ctx->beacon_ssids_status_label, ui_muted_color(), 0);
+
+    lv_obj_t *body = lv_obj_create(ctx->beacon_ssids_page);
+    lv_obj_set_size(body, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_flex_grow(body, 1);
+    lv_obj_set_style_bg_opa(body, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(body, 0, 0);
+    lv_obj_set_style_pad_all(body, 0, 0);
+    lv_obj_set_style_pad_column(body, 10, 0);
+    lv_obj_set_flex_flow(body, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(body, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_clear_flag(body, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *list_panel = lv_obj_create(body);
+    lv_obj_set_size(list_panel, LV_SIZE_CONTENT, lv_pct(100));
+    lv_obj_set_flex_grow(list_panel, 1);
+    style_surface_panel(list_panel, 10);
+    lv_obj_set_style_pad_all(list_panel, 10, 0);
+    lv_obj_set_flex_flow(list_panel, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(list_panel, 8, 0);
+
+    ctx->beacon_ssids_grid = lv_obj_create(list_panel);
+    lv_obj_set_size(ctx->beacon_ssids_grid, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_flex_grow(ctx->beacon_ssids_grid, 1);
+    lv_obj_set_style_bg_color(ctx->beacon_ssids_grid, ui_panel_color(), 0);
+    lv_obj_set_style_border_width(ctx->beacon_ssids_grid, 1, 0);
+    lv_obj_set_style_border_color(ctx->beacon_ssids_grid, ui_border_color(), 0);
+    lv_obj_set_style_border_opa(ctx->beacon_ssids_grid, dark_mode_enabled ? LV_OPA_30 : LV_OPA_80, 0);
+    lv_obj_set_style_radius(ctx->beacon_ssids_grid, 8, 0);
+    lv_obj_set_style_pad_all(ctx->beacon_ssids_grid, 8, 0);
+    lv_obj_set_flex_flow(ctx->beacon_ssids_grid, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_flex_align(ctx->beacon_ssids_grid, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_set_style_pad_column(ctx->beacon_ssids_grid, 8, 0);
+    lv_obj_set_style_pad_row(ctx->beacon_ssids_grid, 8, 0);
+    lv_obj_set_scroll_dir(ctx->beacon_ssids_grid, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(ctx->beacon_ssids_grid, LV_SCROLLBAR_MODE_AUTO);
+
+    ctx->current_visible_page = ctx->beacon_ssids_page;
+    beacon_spam_refresh_ssids(ctx);
+    beacon_spam_rebuild_ssid_grid(ctx);
+}
+
+static void beacon_spam_tile_event_cb(lv_event_t *e)
+{
+    const char *action = (const char *)lv_event_get_user_data(e);
+    if (!action) return;
+
+    if (strcmp(action, "List SSIDs") == 0) {
+        show_beacon_ssids_page();
+    } else if (strcmp(action, "Start Spam") == 0) {
+        beacon_spam_start_cb(NULL);
+    }
+}
+
+static void beacon_spam_back_btn_event_cb(lv_event_t *e)
+{
+    (void)e;
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx) return;
+    close_beacon_ssids_add_popup(ctx);
+    close_beacon_spam_active_popup(ctx, true);
+    show_global_attacks_page();
+}
+
+static void show_beacon_spam_page(void)
+{
+    tab_context_t *ctx = get_current_ctx();
+    lv_obj_t *container = get_current_tab_container();
+    if (!ctx || !container) return;
+
+    hide_all_pages(ctx);
+
+    if (ctx->beacon_spam_page) {
+        lv_obj_clear_flag(ctx->beacon_spam_page, LV_OBJ_FLAG_HIDDEN);
+        ctx->current_visible_page = ctx->beacon_spam_page;
+        return;
+    }
+
+    ctx->beacon_spam_page = lv_obj_create(container);
+    lv_obj_set_size(ctx->beacon_spam_page, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(ctx->beacon_spam_page, ui_bg_color(), 0);
+    lv_obj_set_style_border_width(ctx->beacon_spam_page, 0, 0);
+    lv_obj_set_style_pad_all(ctx->beacon_spam_page, 10, 0);
+    lv_obj_set_flex_flow(ctx->beacon_spam_page, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(ctx->beacon_spam_page, 10, 0);
+
+    lv_obj_t *header = lv_obj_create(ctx->beacon_spam_page);
+    lv_obj_set_size(header, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(header, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(header, 0, 0);
+    lv_obj_set_style_pad_all(header, 0, 0);
+    lv_obj_set_flex_flow(header, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(header, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(header, 12, 0);
+    lv_obj_clear_flag(header, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *back_btn = lv_btn_create(header);
+    lv_obj_set_size(back_btn, 72, 60);
+    style_back_nav_button(back_btn);
+    lv_obj_add_event_cb(back_btn, beacon_spam_back_btn_event_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *back_icon = lv_label_create(back_btn);
+    lv_label_set_text(back_icon, LV_SYMBOL_LEFT);
+    lv_obj_set_style_text_color(back_icon, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_center(back_icon);
+
+    lv_obj_t *title = lv_label_create(header);
+    lv_label_set_text(title, "Beacon Spam");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_22, 0);
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_CYAN, 0);
+
+    lv_obj_t *tiles = lv_obj_create(ctx->beacon_spam_page);
+    lv_obj_set_size(tiles, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_flex_grow(tiles, 1);
+    lv_obj_set_style_bg_opa(tiles, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(tiles, 0, 0);
+    lv_obj_set_style_pad_all(tiles, 2, 0);
+    lv_obj_set_style_pad_gap(tiles, 10, 0);
+    lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_clear_flag(tiles, LV_OBJ_FLAG_SCROLLABLE);
+
+    create_tile(tiles, LV_SYMBOL_LIST, "List SSIDs", COLOR_MATERIAL_CYAN, beacon_spam_tile_event_cb, "List SSIDs");
+    create_tile(tiles, LV_SYMBOL_WIFI, "Start Spam", COLOR_MATERIAL_RED, beacon_spam_tile_event_cb, "Start Spam");
+
+    ctx->current_visible_page = ctx->beacon_spam_page;
+}
+
 // Global attack tile event handler
 static void global_attack_tile_event_cb(lv_event_t *e)
 {
@@ -22332,6 +23121,12 @@ static void global_attack_tile_event_cb(lv_event_t *e)
             return;
         }
         show_wardrive_page();
+        return;
+    }
+
+    // Handle Beacon Spam menu
+    if (strcmp(attack_name, "Beacon Spam") == 0) {
+        show_beacon_spam_page();
         return;
     }
 }
@@ -22431,6 +23226,11 @@ static void show_global_attacks_page(void)
     // SnifferDog - Purple - Red Team only
     if (enable_red_team) {
         create_tile(tiles, LV_SYMBOL_EYE_OPEN, "SnifferDog", COLOR_MATERIAL_PURPLE, global_attack_tile_event_cb, "Snifferdog");
+    }
+
+    // Beacon Spam - Cyan - Red Team only
+    if (enable_red_team) {
+        create_tile(tiles, LV_SYMBOL_WIFI, "Beacon Spam", COLOR_MATERIAL_CYAN, global_attack_tile_event_cb, "Beacon Spam");
     }
 
     // Wardrive - Teal (always visible)
