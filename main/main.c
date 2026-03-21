@@ -45,7 +45,7 @@
 #include "esp_http_server.h"
 #include "lwip/sockets.h"
 
-#define JANOS_TAB_VERSION "1.1.4"
+#define JANOS_TAB_VERSION "1.2.0"
 #include "lwip/netdb.h"
 #include <dirent.h>
 #include <sys/stat.h>
@@ -346,6 +346,15 @@ typedef struct {
     // SAE popup
     lv_obj_t *sae_popup_overlay;
     lv_obj_t *sae_popup;
+
+    // MITM PCAP popup
+    lv_obj_t *mitm_popup_overlay;
+    lv_obj_t *mitm_popup;
+    lv_obj_t *mitm_status_label;
+    lv_obj_t *mitm_password_input;
+    lv_obj_t *mitm_keyboard;
+    lv_obj_t *mitm_connect_btn;
+    lv_obj_t *mitm_stop_btn;
 
     // Handshaker popup (per-network)
     lv_obj_t *handshaker_popup_overlay;
@@ -1637,6 +1646,9 @@ static void sae_popup_close_cb(lv_event_t *e);
 static void show_handshaker_popup(void);
 static void handshaker_popup_close_cb(lv_event_t *e);
 static void handshaker_monitor_task(void *arg);
+static void show_mitm_popup(void);
+static void mitm_connect_and_start_cb(lv_event_t *e);
+static void mitm_popup_close_cb(lv_event_t *e);
 static void show_arp_poison_page(void);
 static void show_rogue_ap_page(void);
 static void show_rogue_ap_popup(tab_context_t *ctx);
@@ -4572,30 +4584,42 @@ static void create_attack_action_bar(lv_obj_t *parent, lv_event_cb_t callback)
     }
     if (row_inner_w < 280) row_inner_w = 280;
 
-    const lv_coord_t action_gap_total = 16;
-    lv_coord_t action_btn_w = (row_inner_w - action_gap_total) / 3;
-    if (action_btn_w < 90) action_btn_w = 90;
+    // Row 1: 4 tiles (3 gaps of 8px = 24px total gap)
+    const lv_coord_t row1_gap_total = 24;
+    lv_coord_t row1_btn_w = (row_inner_w - row1_gap_total) / 4;
+    if (row1_btn_w < 70) row1_btn_w = 70;
+    lv_coord_t row1_btn_last_w = row1_btn_w;
+    lv_coord_t row1_used = (row1_btn_w * 4) + row1_gap_total;
+    if (row1_used < row_inner_w) {
+        row1_btn_last_w += (row_inner_w - row1_used);
+    }
 
-    lv_coord_t action_btn_last_w = action_btn_w;
-    lv_coord_t used_width = (action_btn_w * 3) + action_gap_total;
-    if (used_width < row_inner_w) {
-        action_btn_last_w += (row_inner_w - used_width);
+    // Row 2: 3 tiles (2 gaps of 8px = 16px total gap) + MITM
+    const lv_coord_t row2_gap_total = 24;
+    lv_coord_t row2_btn_w = (row_inner_w - row2_gap_total) / 4;
+    if (row2_btn_w < 70) row2_btn_w = 70;
+    lv_coord_t row2_btn_last_w = row2_btn_w;
+    lv_coord_t row2_used = (row2_btn_w * 4) + row2_gap_total;
+    if (row2_used < row_inner_w) {
+        row2_btn_last_w += (row_inner_w - row2_used);
     }
 
     if (enable_red_team) {
         lv_obj_t *btn1 = create_small_tile(attack_row1, LV_SYMBOL_CHARGE, "Deauth", COLOR_MATERIAL_RED, callback, "Deauth");
         lv_obj_t *btn2 = create_small_tile(attack_row1, LV_SYMBOL_WARNING, "Evil Twin", COLOR_MATERIAL_ORANGE, callback, "Evil Twin");
         lv_obj_t *btn3 = create_small_tile(attack_row1, LV_SYMBOL_POWER, "SAE Overflow", COLOR_MATERIAL_PINK, callback, "SAE Overflow");
-        lv_obj_t *btn4 = create_small_tile(attack_row2, LV_SYMBOL_DOWNLOAD, "Handshake", COLOR_MATERIAL_AMBER, callback, "Handshaker");
+        lv_obj_t *btn4 = create_small_tile(attack_row1, LV_SYMBOL_DOWNLOAD, "Handshake", COLOR_MATERIAL_AMBER, callback, "Handshaker");
         lv_obj_t *btn5 = create_small_tile(attack_row2, LV_SYMBOL_SHUFFLE, "ARP", COLOR_MATERIAL_PURPLE, callback, "ARP Poison");
         lv_obj_t *btn6 = create_small_tile(attack_row2, LV_SYMBOL_WIFI, "RogueAP", COLOR_MATERIAL_CYAN, callback, "Rogue AP");
+        lv_obj_t *btn7 = create_small_tile(attack_row2, LV_SYMBOL_EYE_OPEN, "MITM", COLOR_MATERIAL_TEAL, callback, "MITM");
 
-        lv_obj_set_size(btn1, action_btn_w, 72);
-        lv_obj_set_size(btn2, action_btn_w, 72);
-        lv_obj_set_size(btn3, action_btn_last_w, 72);
-        lv_obj_set_size(btn4, action_btn_w, 72);
-        lv_obj_set_size(btn5, action_btn_w, 72);
-        lv_obj_set_size(btn6, action_btn_last_w, 72);
+        lv_obj_set_size(btn1, row1_btn_w, 72);
+        lv_obj_set_size(btn2, row1_btn_w, 72);
+        lv_obj_set_size(btn3, row1_btn_w, 72);
+        lv_obj_set_size(btn4, row1_btn_last_w, 72);
+        lv_obj_set_size(btn5, row2_btn_w, 72);
+        lv_obj_set_size(btn6, row2_btn_w, 72);
+        lv_obj_set_size(btn7, row2_btn_last_w, 72);
     } else {
         lv_obj_t *btn = create_small_tile(attack_row1, LV_SYMBOL_SHUFFLE, "ARP", COLOR_MATERIAL_PURPLE, callback, "ARP Poison");
         lv_obj_set_size(btn, row_inner_w, 72);
@@ -5929,6 +5953,21 @@ static void handle_selected_attack(const char *attack_name)
         return;
     }
 
+    if (strcmp(attack_name, "MITM") == 0) {
+        if (selected_network_count != 1) {
+            ESP_LOGW(TAG, "MITM requires exactly 1 network, selected: %d", selected_network_count);
+            if (status_label) {
+                bsp_display_lock(0);
+                lv_label_set_text(status_label, "Select exactly 1 network for MITM");
+                lv_obj_set_style_text_color(status_label, COLOR_MATERIAL_RED, 0);
+                bsp_display_unlock();
+            }
+            return;
+        }
+        show_mitm_popup();
+        return;
+    }
+
     if (strcmp(attack_name, "Rogue AP") == 0) {
         if (selected_network_count != 1) {
             ESP_LOGW(TAG, "Rogue AP requires exactly 1 network, selected: %d", selected_network_count);
@@ -6189,6 +6228,285 @@ static void show_sae_popup(int network_idx)
     lv_label_set_text(stop_label, "STOP");
     lv_obj_set_style_text_font(stop_label, &lv_font_montserrat_18, 0);
     lv_obj_center(stop_label);
+}
+
+// ======================= MITM PCAP Attack Functions =======================
+
+static void mitm_popup_close_cb(lv_event_t *e)
+{
+    (void)e;
+    ESP_LOGI(TAG, "MITM popup closed - sending stop command");
+
+    uart_send_command_for_tab("stop");
+
+    tab_context_t *ctx = get_current_ctx();
+    if (ctx && ctx->mitm_popup_overlay) {
+        lv_obj_del(ctx->mitm_popup_overlay);
+        ctx->mitm_popup_overlay = NULL;
+        ctx->mitm_popup = NULL;
+        ctx->mitm_status_label = NULL;
+        ctx->mitm_password_input = NULL;
+        ctx->mitm_keyboard = NULL;
+        ctx->mitm_connect_btn = NULL;
+        ctx->mitm_stop_btn = NULL;
+        ctx->observer_attack_return_to_observer = false;
+        clear_observer_attack_override(ctx);
+    }
+}
+
+static void mitm_keyboard_cb(lv_event_t *e)
+{
+    lv_event_code_t code = lv_event_get_code(e);
+    lv_obj_t *kb = lv_event_get_target(e);
+
+    if (code == LV_EVENT_READY || code == LV_EVENT_CANCEL) {
+        lv_obj_add_flag(kb, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void mitm_password_input_cb(lv_event_t *e)
+{
+    (void)e;
+    tab_context_t *ctx = get_current_ctx();
+    if (ctx && ctx->mitm_keyboard) {
+        lv_obj_clear_flag(ctx->mitm_keyboard, LV_OBJ_FLAG_HIDDEN);
+        lv_keyboard_set_textarea(ctx->mitm_keyboard, ctx->mitm_password_input);
+    }
+}
+
+static void mitm_connect_and_start_cb(lv_event_t *e)
+{
+    (void)e;
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx) return;
+
+    const char *password = NULL;
+    if (ctx->mitm_password_input) {
+        password = lv_textarea_get_text(ctx->mitm_password_input);
+    }
+
+    if (password == NULL || strlen(password) == 0) {
+        if (ctx->mitm_status_label) {
+            lv_label_set_text(ctx->mitm_status_label, "Enter password first");
+            lv_obj_set_style_text_color(ctx->mitm_status_label, COLOR_MATERIAL_RED, 0);
+        }
+        return;
+    }
+
+    int idx = selected_network_indices[0];
+    if (idx < 0 || idx >= network_count) return;
+    const char *ssid = networks[idx].ssid;
+
+    ESP_LOGI(TAG, "MITM: Connecting to %s", ssid);
+
+    if (ctx->mitm_keyboard) {
+        lv_obj_add_flag(ctx->mitm_keyboard, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    if (ctx->mitm_status_label) {
+        lv_label_set_text_fmt(ctx->mitm_status_label, "Connecting to %s...", ssid);
+        lv_obj_set_style_text_color(ctx->mitm_status_label, COLOR_MATERIAL_AMBER, 0);
+    }
+
+    lv_refr_now(NULL);
+    bsp_display_unlock();
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    char cmd[128];
+    snprintf(cmd, sizeof(cmd), "wifi_connect %s %s", ssid, password);
+    uart_send_command_for_tab(cmd);
+
+    uart_port_t uart_port = get_current_uart();
+    static char rx_buffer[2048];
+    int total_len = 0;
+    bool success = false;
+    int timeout_ms = 15000;
+    int elapsed_ms = 0;
+
+    while (elapsed_ms < timeout_ms && total_len < (int)sizeof(rx_buffer) - 256) {
+        int len = transport_read_bytes(uart_port, rx_buffer + total_len,
+                                       sizeof(rx_buffer) - total_len - 1, pdMS_TO_TICKS(200));
+        if (len > 0) {
+            total_len += len;
+            rx_buffer[total_len] = '\0';
+            if (strstr(rx_buffer, "SUCCESS") != NULL) {
+                success = true;
+                break;
+            }
+            if (strstr(rx_buffer, "FAILED") != NULL || strstr(rx_buffer, "Error") != NULL) {
+                break;
+            }
+        }
+        elapsed_ms += 200;
+    }
+
+    bsp_display_lock(0);
+
+    if (success) {
+        ESP_LOGI(TAG, "MITM: Connected, starting PCAP net capture");
+
+        uart_send_command_for_tab("start_pcap net");
+
+        if (ctx->mitm_password_input) {
+            lv_obj_add_flag(ctx->mitm_password_input, LV_OBJ_FLAG_HIDDEN);
+        }
+        if (ctx->mitm_connect_btn) {
+            lv_obj_add_flag(ctx->mitm_connect_btn, LV_OBJ_FLAG_HIDDEN);
+        }
+
+        if (ctx->mitm_status_label) {
+            lv_label_set_text_fmt(ctx->mitm_status_label,
+                LV_SYMBOL_EYE_OPEN "  PCAP capture active on %s\n\n"
+                "Network traffic is being captured.\nPress STOP to end capture and save.", ssid);
+            lv_obj_set_style_text_color(ctx->mitm_status_label, COLOR_MATERIAL_GREEN, 0);
+        }
+
+        if (ctx->mitm_stop_btn) {
+            lv_obj_clear_flag(ctx->mitm_stop_btn, LV_OBJ_FLAG_HIDDEN);
+        }
+    } else {
+        ESP_LOGW(TAG, "MITM: Connection failed to %s", ssid);
+        if (ctx->mitm_status_label) {
+            lv_label_set_text_fmt(ctx->mitm_status_label,
+                "Connection failed to %s\nCheck password and try again.", ssid);
+            lv_obj_set_style_text_color(ctx->mitm_status_label, COLOR_MATERIAL_RED, 0);
+        }
+    }
+}
+
+static void show_mitm_popup(void)
+{
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx) return;
+    if (ctx->mitm_popup != NULL) return;
+
+    int idx = selected_network_indices[0];
+    if (idx < 0 || idx >= network_count) return;
+
+    wifi_network_t *net = &networks[idx];
+    const char *ssid_display = strlen(net->ssid) > 0 ? net->ssid : "(Hidden)";
+
+    lv_obj_t *container = get_current_tab_container();
+    if (!container) return;
+
+    ctx->mitm_popup_overlay = lv_obj_create(container);
+    lv_obj_remove_style_all(ctx->mitm_popup_overlay);
+    lv_obj_set_size(ctx->mitm_popup_overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(ctx->mitm_popup_overlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(ctx->mitm_popup_overlay, LV_OPA_50, 0);
+    lv_obj_clear_flag(ctx->mitm_popup_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(ctx->mitm_popup_overlay, LV_OBJ_FLAG_CLICKABLE);
+
+    ctx->mitm_popup = lv_obj_create(ctx->mitm_popup_overlay);
+    lv_obj_set_size(ctx->mitm_popup, 550, 380);
+    lv_obj_center(ctx->mitm_popup);
+    lv_obj_set_style_bg_color(ctx->mitm_popup, lv_color_hex(0x1A1A2A), 0);
+    lv_obj_set_style_border_color(ctx->mitm_popup, COLOR_MATERIAL_TEAL, 0);
+    lv_obj_set_style_border_width(ctx->mitm_popup, 2, 0);
+    lv_obj_set_style_radius(ctx->mitm_popup, 16, 0);
+    lv_obj_set_style_shadow_width(ctx->mitm_popup, 30, 0);
+    lv_obj_set_style_shadow_color(ctx->mitm_popup, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_shadow_opa(ctx->mitm_popup, LV_OPA_50, 0);
+    lv_obj_set_style_pad_all(ctx->mitm_popup, 20, 0);
+    lv_obj_set_flex_flow(ctx->mitm_popup, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(ctx->mitm_popup, 12, 0);
+    lv_obj_set_flex_align(ctx->mitm_popup, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    lv_obj_t *title = lv_label_create(ctx->mitm_popup);
+    lv_label_set_text_fmt(title, LV_SYMBOL_EYE_OPEN "  MITM Capture - %s", ssid_display);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_TEAL, 0);
+
+    lv_obj_t *info_label = lv_label_create(ctx->mitm_popup);
+    lv_label_set_text_fmt(info_label, "BSSID: %s | %s | %s", net->bssid, net->band, net->security);
+    lv_obj_set_style_text_font(info_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(info_label, lv_color_hex(0xAAAAAA), 0);
+
+    lv_obj_t *pass_row = lv_obj_create(ctx->mitm_popup);
+    lv_obj_set_size(pass_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(pass_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(pass_row, 0, 0);
+    lv_obj_set_style_pad_all(pass_row, 0, 0);
+    lv_obj_set_flex_flow(pass_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(pass_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(pass_row, 10, 0);
+    lv_obj_clear_flag(pass_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *pass_label = lv_label_create(pass_row);
+    lv_label_set_text(pass_label, "Password:");
+    lv_obj_set_style_text_font(pass_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(pass_label, lv_color_hex(0xFFFFFF), 0);
+
+    ctx->mitm_password_input = lv_textarea_create(pass_row);
+    lv_obj_set_size(ctx->mitm_password_input, 320, 40);
+    lv_textarea_set_one_line(ctx->mitm_password_input, true);
+    lv_textarea_set_placeholder_text(ctx->mitm_password_input, "WiFi password");
+    lv_obj_set_style_bg_color(ctx->mitm_password_input, lv_color_hex(0x1A1A1A), 0);
+    lv_obj_set_style_border_color(ctx->mitm_password_input, COLOR_MATERIAL_TEAL, 0);
+    lv_obj_set_style_border_width(ctx->mitm_password_input, 1, 0);
+    lv_obj_set_style_text_color(ctx->mitm_password_input, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_add_event_cb(ctx->mitm_password_input, mitm_password_input_cb, LV_EVENT_CLICKED, NULL);
+
+    ctx->mitm_status_label = lv_label_create(ctx->mitm_popup);
+    lv_label_set_text(ctx->mitm_status_label, "Enter WiFi password to connect and start PCAP capture.");
+    lv_obj_set_style_text_font(ctx->mitm_status_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(ctx->mitm_status_label, lv_color_hex(0xCCCCCC), 0);
+    lv_obj_set_style_text_align(ctx->mitm_status_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(ctx->mitm_status_label, lv_pct(100));
+
+    lv_obj_t *btn_row = lv_obj_create(ctx->mitm_popup);
+    lv_obj_set_size(btn_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(btn_row, 0, 0);
+    lv_obj_set_style_pad_all(btn_row, 0, 0);
+    lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    ctx->mitm_connect_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(ctx->mitm_connect_btn, 200, 50);
+    lv_obj_set_style_bg_color(ctx->mitm_connect_btn, COLOR_MATERIAL_GREEN, 0);
+    lv_obj_set_style_bg_color(ctx->mitm_connect_btn, lv_color_hex(0x2E7D32), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(ctx->mitm_connect_btn, 8, 0);
+    lv_obj_add_event_cb(ctx->mitm_connect_btn, mitm_connect_and_start_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *connect_label = lv_label_create(ctx->mitm_connect_btn);
+    lv_label_set_text(connect_label, "Connect & Start");
+    lv_obj_set_style_text_font(connect_label, &lv_font_montserrat_16, 0);
+    lv_obj_center(connect_label);
+
+    lv_obj_t *cancel_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(cancel_btn, 120, 50);
+    lv_obj_set_style_bg_color(cancel_btn, lv_color_hex(0x444444), 0);
+    lv_obj_set_style_bg_color(cancel_btn, lv_color_hex(0x555555), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(cancel_btn, 8, 0);
+    lv_obj_add_event_cb(cancel_btn, mitm_popup_close_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *cancel_label = lv_label_create(cancel_btn);
+    lv_label_set_text(cancel_label, "Cancel");
+    lv_obj_set_style_text_font(cancel_label, &lv_font_montserrat_16, 0);
+    lv_obj_center(cancel_label);
+
+    ctx->mitm_stop_btn = lv_btn_create(ctx->mitm_popup);
+    lv_obj_set_size(ctx->mitm_stop_btn, lv_pct(100), 50);
+    lv_obj_set_style_bg_color(ctx->mitm_stop_btn, COLOR_MATERIAL_RED, 0);
+    lv_obj_set_style_bg_color(ctx->mitm_stop_btn, lv_color_hex(0xCC0000), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(ctx->mitm_stop_btn, 8, 0);
+    lv_obj_add_event_cb(ctx->mitm_stop_btn, mitm_popup_close_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_flag(ctx->mitm_stop_btn, LV_OBJ_FLAG_HIDDEN);
+
+    lv_obj_t *stop_label2 = lv_label_create(ctx->mitm_stop_btn);
+    lv_label_set_text(stop_label2, "STOP CAPTURE");
+    lv_obj_set_style_text_font(stop_label2, &lv_font_montserrat_18, 0);
+    lv_obj_center(stop_label2);
+
+    ctx->mitm_keyboard = lv_keyboard_create(ctx->mitm_popup_overlay);
+    lv_obj_set_size(ctx->mitm_keyboard, lv_pct(100), 260);
+    lv_obj_align(ctx->mitm_keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
+    style_on_screen_keyboard(ctx->mitm_keyboard);
+    lv_keyboard_set_textarea(ctx->mitm_keyboard, ctx->mitm_password_input);
+    lv_obj_add_event_cb(ctx->mitm_keyboard, mitm_keyboard_cb, LV_EVENT_ALL, NULL);
+    lv_obj_add_flag(ctx->mitm_keyboard, LV_OBJ_FLAG_HIDDEN);
 }
 
 // ======================= Handshaker Attack Functions =======================
