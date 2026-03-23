@@ -45,7 +45,7 @@
 #include "esp_http_server.h"
 #include "lwip/sockets.h"
 
-#define JANOS_TAB_VERSION "1.2.0"
+#define JANOS_TAB_VERSION "1.2.1"
 #include "lwip/netdb.h"
 #include <dirent.h>
 #include <sys/stat.h>
@@ -12029,6 +12029,14 @@ static void show_blackout_active_popup(void)
     // Determine which UART to use based on this tab
     tab_id_t active_tab = tab_id_for_ctx(ctx);
 
+    // Clear any previous network selection
+    if (active_tab == TAB_MBUS) {
+        uart2_send_command("unselect_networks");
+    } else {
+        uart_send_command("unselect_networks");
+    }
+    vTaskDelay(pdMS_TO_TICKS(100));
+
     // Send start_blackout command to this tab's UART
     if (active_tab == TAB_MBUS) {
         uart2_send_command("start_blackout");
@@ -12411,6 +12419,14 @@ static void show_snifferdog_active_popup(void)
 
     // Determine which UART to use based on this tab
     tab_id_t active_tab = tab_id_for_ctx(ctx);
+
+    // Clear any previous network selection
+    if (active_tab == TAB_MBUS) {
+        uart2_send_command("unselect_networks");
+    } else {
+        uart_send_command("unselect_networks");
+    }
+    vTaskDelay(pdMS_TO_TICKS(100));
 
     // Send start_sniffer_dog command to this tab's UART
     if (active_tab == TAB_MBUS) {
@@ -12989,6 +13005,14 @@ static void show_global_handshaker_active_popup(void)
     // Determine which UART to use based on this tab
     tab_id_t active_tab = tab_id_for_ctx(ctx);
 
+    // Clear any previous network selection
+    if (active_tab == TAB_MBUS) {
+        uart2_send_command("unselect_networks");
+    } else {
+        uart_send_command("unselect_networks");
+    }
+    vTaskDelay(pdMS_TO_TICKS(100));
+
     // Send start_handshake command to this tab's UART
     if (active_tab == TAB_MBUS) {
         uart2_send_command("start_handshake");
@@ -13473,6 +13497,10 @@ static void do_phishing_portal_start(tab_context_t *ctx)
 
     // Close setup popup first
     close_phishing_portal_popup_ctx(ctx);
+
+    // Clear any previous network selection
+    uart_send_command_for_tab("unselect_networks");
+    vTaskDelay(pdMS_TO_TICKS(100));
 
     // Send commands to current tab's UART
     char cmd[128];
@@ -15962,8 +15990,16 @@ static void wardrive_start_cb(lv_event_t *e)
 
     ESP_LOGI(TAG, "Wardrive start - sending start_wardrive_promisc command");
 
-    // Send start_wardrive_promisc command
+    // Clear any previous network selection and send start command
     tab_id_t active_tab = tab_id_for_ctx(ctx);
+    if (active_tab == TAB_MBUS) {
+        uart2_send_command("unselect_networks");
+    } else {
+        uart_send_command("unselect_networks");
+    }
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    // Send start_wardrive_promisc command
     if (active_tab == TAB_MBUS) {
         uart2_send_command("start_wardrive_promisc");
     } else {
@@ -23279,6 +23315,10 @@ static void beacon_spam_start_cb(lv_event_t *e)
         }
         return;
     }
+
+    // Clear any previous network selection
+    uart_send_command_for_tab("unselect_networks");
+    vTaskDelay(pdMS_TO_TICKS(100));
 
     uart_send_command_for_tab("start_beacon_spam_ssids");
     ESP_LOGI(TAG, "Beacon Spam started with %d SSIDs", ctx->beacon_spam_ssid_count);
