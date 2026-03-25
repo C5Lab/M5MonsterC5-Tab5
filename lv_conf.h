@@ -491,7 +491,7 @@
 
 /*Demonstrate special features*/
 #define LV_FONT_MONTSERRAT_28_COMPRESSED 0  /*bpp = 3*/
-#define LV_FONT_DEJAVU_16_PERSIAN_HEBREW 0  /*Hebrew, Arabic, Persian letters and all their forms*/
+#define LV_FONT_DEJAVU_16_PERSIAN_HEBREW 1  /*Includes broader UTF-8 coverage (used for Polish SSIDs)*/
 #define LV_FONT_SIMSUN_14_CJK            0  /*1000 most common CJK radicals*/
 #define LV_FONT_SIMSUN_16_CJK            0  /*1000 most common CJK radicals*/
 
@@ -806,7 +806,7 @@
 #endif
 
 /* Built-in TTF decoder */
-#define LV_USE_TINY_TTF 0
+#define LV_USE_TINY_TTF 1
 #if LV_USE_TINY_TTF
     /* Enable loading TTF data from files */
     #define LV_TINY_TTF_FILE_SUPPORT 0
