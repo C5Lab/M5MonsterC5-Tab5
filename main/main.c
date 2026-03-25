@@ -45,7 +45,7 @@
 #include "esp_http_server.h"
 #include "lwip/sockets.h"
 
-#define JANOS_TAB_VERSION "1.2.1"
+#define JANOS_TAB_VERSION "1.2.2"
 #include "lwip/netdb.h"
 #include <dirent.h>
 #include <sys/stat.h>
@@ -355,6 +355,8 @@ typedef struct {
     lv_obj_t *mitm_keyboard;
     lv_obj_t *mitm_connect_btn;
     lv_obj_t *mitm_stop_btn;
+    lv_obj_t *mitm_pass_row;
+    lv_obj_t *mitm_btn_row;
 
     // Handshaker popup (per-network)
     lv_obj_t *handshaker_popup_overlay;
@@ -6249,6 +6251,8 @@ static void mitm_popup_close_cb(lv_event_t *e)
         ctx->mitm_keyboard = NULL;
         ctx->mitm_connect_btn = NULL;
         ctx->mitm_stop_btn = NULL;
+        ctx->mitm_pass_row = NULL;
+        ctx->mitm_btn_row = NULL;
         ctx->observer_attack_return_to_observer = false;
         clear_observer_attack_override(ctx);
     }
@@ -6347,17 +6351,73 @@ static void mitm_connect_and_start_cb(lv_event_t *e)
 
         uart_send_command_for_tab("start_pcap net");
 
-        if (ctx->mitm_password_input) {
-            lv_obj_add_flag(ctx->mitm_password_input, LV_OBJ_FLAG_HIDDEN);
+        // Release display lock while reading UART for filename
+        bsp_display_unlock();
+
+        char pcap_filename[256] = {0};
+        {
+            uart_port_t pcap_port = get_current_uart();
+            char pcap_rx[512];
+            char pcap_line[256];
+            int pcap_line_pos = 0;
+            int pcap_retries = 20;
+            int pcap_empty = 0;
+
+            while (pcap_retries-- > 0) {
+                int plen = transport_read_bytes(pcap_port, pcap_rx, sizeof(pcap_rx) - 1, pdMS_TO_TICKS(100));
+                if (plen > 0) {
+                    pcap_rx[plen] = '\0';
+                    pcap_empty = 0;
+                    for (int pi = 0; pi < plen; pi++) {
+                        char pc = pcap_rx[pi];
+                        if (pc == '\n' || pc == '\r') {
+                            if (pcap_line_pos > 0) {
+                                pcap_line[pcap_line_pos] = '\0';
+                                char *pcap_path = strstr(pcap_line, "/sdcard/");
+                                if (pcap_path) {
+                                    char *slash = strrchr(pcap_path, '/');
+                                    if (slash) {
+                                        snprintf(pcap_filename, sizeof(pcap_filename), "%s", slash + 1);
+                                    }
+                                }
+                                if (strstr(pcap_line, ".pcap") && pcap_filename[0] == '\0') {
+                                    snprintf(pcap_filename, sizeof(pcap_filename), "%s", pcap_line);
+                                }
+                                pcap_line_pos = 0;
+                            }
+                        } else if (pcap_line_pos < (int)sizeof(pcap_line) - 1) {
+                            pcap_line[pcap_line_pos++] = pc;
+                        }
+                    }
+                    if (pcap_filename[0] != '\0') break;
+                } else {
+                    pcap_empty++;
+                    if (pcap_empty >= 3) break;
+                }
+            }
+            ESP_LOGI(TAG, "MITM: PCAP filename: %s", pcap_filename[0] ? pcap_filename : "(not yet available)");
         }
-        if (ctx->mitm_connect_btn) {
-            lv_obj_add_flag(ctx->mitm_connect_btn, LV_OBJ_FLAG_HIDDEN);
+
+        bsp_display_lock(0);
+
+        if (ctx->mitm_pass_row) {
+            lv_obj_add_flag(ctx->mitm_pass_row, LV_OBJ_FLAG_HIDDEN);
+        }
+        if (ctx->mitm_btn_row) {
+            lv_obj_add_flag(ctx->mitm_btn_row, LV_OBJ_FLAG_HIDDEN);
         }
 
         if (ctx->mitm_status_label) {
-            lv_label_set_text_fmt(ctx->mitm_status_label,
-                LV_SYMBOL_EYE_OPEN "  PCAP capture active on %s\n\n"
-                "Network traffic is being captured.\nPress STOP to end capture and save.", ssid);
+            if (pcap_filename[0]) {
+                lv_label_set_text_fmt(ctx->mitm_status_label,
+                    LV_SYMBOL_EYE_OPEN "  PCAP capture active on %s\n"
+                    "File: %s\n\n"
+                    "Network traffic is being captured.\nPress STOP to end capture and save.", ssid, pcap_filename);
+            } else {
+                lv_label_set_text_fmt(ctx->mitm_status_label,
+                    LV_SYMBOL_EYE_OPEN "  PCAP capture active on %s\n\n"
+                    "Network traffic is being captured.\nPress STOP to end capture and save.", ssid);
+            }
             lv_obj_set_style_text_color(ctx->mitm_status_label, COLOR_MATERIAL_GREEN, 0);
         }
 
@@ -6385,6 +6445,66 @@ static void show_mitm_popup(void)
 
     wifi_network_t *net = &networks[idx];
     const char *ssid_display = strlen(net->ssid) > 0 ? net->ssid : "(Hidden)";
+
+    // Check Evil Twin DB for known password
+    char mitm_found_password[65] = {0};
+    bool mitm_password_known = false;
+    {
+        evil_twin_entry_count = 0;
+        memset(evil_twin_entries, 0, sizeof(evil_twin_entries));
+
+        uart_port_t uart_port = get_current_uart();
+        uart_flush(uart_port);
+        uart_send_command_for_tab("show_pass evil");
+
+        char rx_buffer[512];
+        int retries = 10;
+        int empty_reads = 0;
+
+        while (retries-- > 0 && evil_twin_entry_count < 50) {
+            int len = transport_read_bytes(uart_port, rx_buffer, sizeof(rx_buffer) - 1, pdMS_TO_TICKS(100));
+            if (len > 0) {
+                rx_buffer[len] = '\0';
+                empty_reads = 0;
+                char *line = strtok(rx_buffer, "\n\r");
+                while (line != NULL && evil_twin_entry_count < 50) {
+                    if (strlen(line) > 3 && line[0] == '\"') {
+                        char *ssid_start = line + 1;
+                        char *ssid_end = strchr(ssid_start, '\"');
+                        if (ssid_end && *(ssid_end + 1) == ',' && *(ssid_end + 2) == ' ' && *(ssid_end + 3) == '\"') {
+                            *ssid_end = '\0';
+                            char *pass_start = ssid_end + 4;
+                            char *pass_end = strchr(pass_start, '\"');
+                            if (pass_end) {
+                                *pass_end = '\0';
+                                strncpy(evil_twin_entries[evil_twin_entry_count].ssid, ssid_start, 32);
+                                evil_twin_entries[evil_twin_entry_count].ssid[32] = '\0';
+                                strncpy(evil_twin_entries[evil_twin_entry_count].password, pass_start, 64);
+                                evil_twin_entries[evil_twin_entry_count].password[64] = '\0';
+                                evil_twin_entry_count++;
+                            }
+                        }
+                    }
+                    line = strtok(NULL, "\n\r");
+                }
+            } else {
+                empty_reads++;
+                if (empty_reads >= 3) break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+
+        ESP_LOGI(TAG, "MITM: Loaded %d Evil Twin password entries", evil_twin_entry_count);
+
+        for (int i = 0; i < evil_twin_entry_count; i++) {
+            if (strcmp(evil_twin_entries[i].ssid, net->ssid) == 0) {
+                strncpy(mitm_found_password, evil_twin_entries[i].password, sizeof(mitm_found_password) - 1);
+                mitm_password_known = true;
+                ESP_LOGI(TAG, "MITM: Found password for %s in Evil Twin database", net->ssid);
+                break;
+            }
+        }
+    }
 
     lv_obj_t *container = get_current_tab_container();
     if (!container) return;
@@ -6422,22 +6542,22 @@ static void show_mitm_popup(void)
     lv_obj_set_style_text_font(info_label, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(info_label, lv_color_hex(0xAAAAAA), 0);
 
-    lv_obj_t *pass_row = lv_obj_create(ctx->mitm_popup);
-    lv_obj_set_size(pass_row, lv_pct(100), LV_SIZE_CONTENT);
-    lv_obj_set_style_bg_opa(pass_row, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(pass_row, 0, 0);
-    lv_obj_set_style_pad_all(pass_row, 0, 0);
-    lv_obj_set_flex_flow(pass_row, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(pass_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_column(pass_row, 10, 0);
-    lv_obj_clear_flag(pass_row, LV_OBJ_FLAG_SCROLLABLE);
+    ctx->mitm_pass_row = lv_obj_create(ctx->mitm_popup);
+    lv_obj_set_size(ctx->mitm_pass_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(ctx->mitm_pass_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(ctx->mitm_pass_row, 0, 0);
+    lv_obj_set_style_pad_all(ctx->mitm_pass_row, 0, 0);
+    lv_obj_set_flex_flow(ctx->mitm_pass_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(ctx->mitm_pass_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(ctx->mitm_pass_row, 10, 0);
+    lv_obj_clear_flag(ctx->mitm_pass_row, LV_OBJ_FLAG_SCROLLABLE);
 
-    lv_obj_t *pass_label = lv_label_create(pass_row);
+    lv_obj_t *pass_label = lv_label_create(ctx->mitm_pass_row);
     lv_label_set_text(pass_label, "Password:");
     lv_obj_set_style_text_font(pass_label, &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_color(pass_label, lv_color_hex(0xFFFFFF), 0);
 
-    ctx->mitm_password_input = lv_textarea_create(pass_row);
+    ctx->mitm_password_input = lv_textarea_create(ctx->mitm_pass_row);
     lv_obj_set_size(ctx->mitm_password_input, 320, 40);
     lv_textarea_set_one_line(ctx->mitm_password_input, true);
     lv_textarea_set_placeholder_text(ctx->mitm_password_input, "WiFi password");
@@ -6447,23 +6567,30 @@ static void show_mitm_popup(void)
     lv_obj_set_style_text_color(ctx->mitm_password_input, lv_color_hex(0xFFFFFF), 0);
     lv_obj_add_event_cb(ctx->mitm_password_input, mitm_password_input_cb, LV_EVENT_CLICKED, NULL);
 
+    if (mitm_password_known) {
+        lv_textarea_set_text(ctx->mitm_password_input, mitm_found_password);
+    }
+
     ctx->mitm_status_label = lv_label_create(ctx->mitm_popup);
-    lv_label_set_text(ctx->mitm_status_label, "Enter WiFi password to connect and start PCAP capture.");
+    lv_label_set_text(ctx->mitm_status_label,
+        mitm_password_known ? "Known password found! Press Connect & Start."
+                            : "Enter WiFi password to connect and start PCAP capture.");
     lv_obj_set_style_text_font(ctx->mitm_status_label, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(ctx->mitm_status_label, lv_color_hex(0xCCCCCC), 0);
+    lv_obj_set_style_text_color(ctx->mitm_status_label,
+        mitm_password_known ? COLOR_MATERIAL_GREEN : lv_color_hex(0xCCCCCC), 0);
     lv_obj_set_style_text_align(ctx->mitm_status_label, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_width(ctx->mitm_status_label, lv_pct(100));
 
-    lv_obj_t *btn_row = lv_obj_create(ctx->mitm_popup);
-    lv_obj_set_size(btn_row, lv_pct(100), LV_SIZE_CONTENT);
-    lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(btn_row, 0, 0);
-    lv_obj_set_style_pad_all(btn_row, 0, 0);
-    lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
+    ctx->mitm_btn_row = lv_obj_create(ctx->mitm_popup);
+    lv_obj_set_size(ctx->mitm_btn_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(ctx->mitm_btn_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(ctx->mitm_btn_row, 0, 0);
+    lv_obj_set_style_pad_all(ctx->mitm_btn_row, 0, 0);
+    lv_obj_set_flex_flow(ctx->mitm_btn_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(ctx->mitm_btn_row, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(ctx->mitm_btn_row, LV_OBJ_FLAG_SCROLLABLE);
 
-    ctx->mitm_connect_btn = lv_btn_create(btn_row);
+    ctx->mitm_connect_btn = lv_btn_create(ctx->mitm_btn_row);
     lv_obj_set_size(ctx->mitm_connect_btn, 200, 50);
     lv_obj_set_style_bg_color(ctx->mitm_connect_btn, COLOR_MATERIAL_GREEN, 0);
     lv_obj_set_style_bg_color(ctx->mitm_connect_btn, lv_color_hex(0x2E7D32), LV_STATE_PRESSED);
@@ -6474,18 +6601,6 @@ static void show_mitm_popup(void)
     lv_label_set_text(connect_label, "Connect & Start");
     lv_obj_set_style_text_font(connect_label, &lv_font_montserrat_16, 0);
     lv_obj_center(connect_label);
-
-    lv_obj_t *cancel_btn = lv_btn_create(btn_row);
-    lv_obj_set_size(cancel_btn, 120, 50);
-    lv_obj_set_style_bg_color(cancel_btn, lv_color_hex(0x444444), 0);
-    lv_obj_set_style_bg_color(cancel_btn, lv_color_hex(0x555555), LV_STATE_PRESSED);
-    lv_obj_set_style_radius(cancel_btn, 8, 0);
-    lv_obj_add_event_cb(cancel_btn, mitm_popup_close_cb, LV_EVENT_CLICKED, NULL);
-
-    lv_obj_t *cancel_label = lv_label_create(cancel_btn);
-    lv_label_set_text(cancel_label, "Cancel");
-    lv_obj_set_style_text_font(cancel_label, &lv_font_montserrat_16, 0);
-    lv_obj_center(cancel_label);
 
     ctx->mitm_stop_btn = lv_btn_create(ctx->mitm_popup);
     lv_obj_set_size(ctx->mitm_stop_btn, lv_pct(100), 50);
