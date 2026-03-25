@@ -1,0 +1,107 @@
+name: Pages Only
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Existing release tag to publish on Pages (defaults to latest release)"
+        required: false
+
+concurrency:
+  group: github-pages-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pages:
+    name: Deploy Pages Only
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    outputs:
+      page_url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v4
+        with:
+          enablement: true
+
+      - name: Resolve release tag
+        id: meta
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          TAG="${INPUT_TAG:-}"
+          if [ -z "$TAG" ]; then
+            TAG="$(gh api "/repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name)"
+          fi
+          if [ -z "$TAG" ]; then
+            echo "Failed to resolve release tag" >&2
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Using tag: $TAG"
+
+      - name: Download release assets
+        id: download
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.meta.outputs.tag }}"
+          rm -rf docs/firmware
+          mkdir -p docs/firmware
+
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" --dir docs/firmware \
+            --pattern "bootloader.bin" \
+            --pattern "partition-table.bin" \
+            --pattern "M5MonsterC5-Tab5.bin" \
+            --pattern "M5MonsterC5-Tab5-*.bin"
+
+          ls -lh docs/firmware
+
+          if [ ! -f docs/firmware/M5MonsterC5-Tab5.bin ]; then
+            alt="$(ls docs/firmware/M5MonsterC5-Tab5-*.bin 2>/dev/null | head -n1 || true)"
+            if [ -n "$alt" ]; then
+              cp "$alt" docs/firmware/M5MonsterC5-Tab5.bin
+            fi
+          fi
+
+          for f in bootloader.bin partition-table.bin M5MonsterC5-Tab5.bin; do
+            if [ ! -f "docs/firmware/$f" ]; then
+              echo "Missing $f in release assets for tag ${TAG}" >&2
+              exit 1
+            fi
+          done
+
+          fw_version="$(ls docs/firmware/M5MonsterC5-Tab5-*.bin 2>/dev/null | head -n1 | xargs -n1 basename | sed -E 's/^M5MonsterC5-Tab5-([^.]*)\.bin$/\1/')"
+          if [ -z "$fw_version" ]; then
+            fw_version="${TAG}"
+          fi
+          echo "fw_version=$fw_version" >> "$GITHUB_OUTPUT"
+
+      - name: Build manifest.json
+        env:
+          FW_VERSION: ${{ steps.download.outputs.fw_version }}
+          BUILD_TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          set -euo pipefail
+          python -c "import os, json; from pathlib import Path; version=os.getenv('FW_VERSION') or os.getenv('BUILD_TAG'); build=os.getenv('BUILD_TAG', 'manual'); manifest={'name':'M5MonsterC5-Tab5 ESP32-P4','version':version,'build':build,'chipFamily':'ESP32-P4','parts':[{'path':'firmware/bootloader.bin','offset':8192},{'path':'firmware/partition-table.bin','offset':32768},{'path':'firmware/M5MonsterC5-Tab5.bin','offset':65536}]}; Path('docs/manifest.json').write_text(json.dumps(manifest, indent=2), encoding='utf-8')"
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

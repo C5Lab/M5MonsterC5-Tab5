@@ -39,7 +39,7 @@ if(EXISTS "${BOOTLOADER}" AND EXISTS "${PART_TABLE}" AND EXISTS "${APP_BIN}")
   if(PYTHON_EXE)
     execute_process(
       COMMAND "${PYTHON_EXE}" -m esptool --chip esp32p4 merge_bin -o "${FULL_OUT}"
-              --flash_mode dio --flash_freq 80m --flash_size 4MB
+              --flash_mode dio --flash_freq 80m --flash_size 16MB
               0x0 "${BOOTLOADER}"
               0x8000 "${PART_TABLE}"
               0x10000 "${APP_BIN}"
