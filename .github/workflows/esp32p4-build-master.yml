@@ -215,9 +215,22 @@ jobs:
             exit 0
           fi
 
+          if [ "${GITHUB_EVENT_NAME:-}" = "push" ] && [ -n "${GITHUB_EVENT_PATH:-}" ] && [ -f "${GITHUB_EVENT_PATH:-}" ]; then
+            merge_message="$(jq -r '.head_commit.message // ""' "$GITHUB_EVENT_PATH")"
+            merge_title="$(printf '%s' "$merge_message" | sed -n '1p')"
+            merge_body="$(printf '%s\n' "$merge_message" | tail -n +2 | sed '/./,$!d')"
+            if [ -n "$(printf '%s' "$merge_body" | tr -d '\r\n[:space:]')" ]; then
+              if [ -n "$(printf '%s' "$merge_title" | tr -d '\r\n[:space:]')" ]; then
+                printf '%s\n\n' "$merge_title" >> "$notes_file"
+              fi
+              printf '%s\n' "$merge_body" >> "$notes_file"
+              exit 0
+            fi
+          fi
+
           if command -v gh >/dev/null 2>&1; then
             api="/repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/pulls"
-            pr_json="$(gh api -H \"Accept: application/vnd.github+json\" \"$api\" 2>/dev/null || echo '[]')"
+            pr_json="$(gh api -H "Accept: application/vnd.github+json" "$api" 2>/dev/null || echo '[]')"
             pr_title="$(printf '%s' "$pr_json" | jq -r '.[0].title // ""')"
             pr_body="$(printf '%s' "$pr_json" | jq -r '.[0].body // ""')"
 
@@ -229,7 +242,7 @@ jobs:
               exit 0
             fi
 
-            gen_json="$(gh api -X POST -H \"Accept: application/vnd.github+json\" \
+            gen_json="$(gh api -X POST -H "Accept: application/vnd.github+json" \
               "/repos/${GITHUB_REPOSITORY}/releases/generate-notes" \
               -f tag_name="$TAG" -f target_commitish="$GITHUB_SHA" 2>/dev/null || echo '')"
             gen_body="$(printf '%s' "$gen_json" | jq -r '.body // ""')"
@@ -379,6 +392,18 @@ jobs:
           RELEASE_BODY=""
           if [ "${GITHUB_EVENT_NAME:-}" = "release" ] && [ -n "${GITHUB_EVENT_PATH:-}" ] && [ -f "${GITHUB_EVENT_PATH:-}" ]; then
             RELEASE_BODY="$(jq -r '.release.body // ""' "$GITHUB_EVENT_PATH")"
+          fi
+          if [ -z "$(printf '%s' "$RELEASE_BODY" | tr -d '\r\n[:space:]')" ] && [ "${GITHUB_EVENT_NAME:-}" = "push" ] && [ -n "${GITHUB_EVENT_PATH:-}" ] && [ -f "${GITHUB_EVENT_PATH:-}" ]; then
+            MERGE_MESSAGE="$(jq -r '.head_commit.message // ""' "$GITHUB_EVENT_PATH")"
+            MERGE_TITLE="$(printf '%s' "$MERGE_MESSAGE" | sed -n '1p')"
+            MERGE_BODY="$(printf '%s\n' "$MERGE_MESSAGE" | tail -n +2 | sed '/./,$!d')"
+            if [ -n "$(printf '%s' "$MERGE_BODY" | tr -d '\r\n[:space:]')" ]; then
+              if [ -n "$(printf '%s' "$MERGE_TITLE" | tr -d '\r\n[:space:]')" ]; then
+                RELEASE_BODY="$(printf '%s\n\n%s' "$MERGE_TITLE" "$MERGE_BODY")"
+              else
+                RELEASE_BODY="$MERGE_BODY"
+              fi
+            fi
           fi
           if [ -z "$(printf '%s' "$RELEASE_BODY" | tr -d '\r\n[:space:]')" ]; then
             RELEASE_BODY="$(gh release view "$TAG" -R "$REPO" --json body --jq .body 2>/dev/null || true)"

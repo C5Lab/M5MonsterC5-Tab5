@@ -23159,7 +23159,7 @@ static void beacon_spam_refresh_ssids(tab_context_t *ctx)
     }
 
     static char rx_buffer[4096];
-    const char *commands[] = {"list_ssids", "list_ssid"};
+    const char *commands[] = {"list_ssids"};
     const size_t command_count = sizeof(commands) / sizeof(commands[0]);
 
     bool got_any_response = false;
@@ -23230,7 +23230,7 @@ static void beacon_spam_refresh_ssids(tab_context_t *ctx)
             lv_label_set_text(ctx->beacon_ssids_status_label, "Missing /sdcard/lab/ssid.txt on JanOS SD card.");
             lv_obj_set_style_text_color(ctx->beacon_ssids_status_label, COLOR_MATERIAL_RED, 0);
         } else if (saw_unknown_only && !saw_supported_output) {
-            lv_label_set_text(ctx->beacon_ssids_status_label, "SSID list command unsupported (list_ssid/list_ssids).");
+            lv_label_set_text(ctx->beacon_ssids_status_label, "SSID list command unsupported (list_ssids).");
             lv_obj_set_style_text_color(ctx->beacon_ssids_status_label, COLOR_MATERIAL_RED, 0);
         } else if (!got_any_response) {
             lv_label_set_text(ctx->beacon_ssids_status_label, "No UART response for SSID list command.");
@@ -23239,7 +23239,7 @@ static void beacon_spam_refresh_ssids(tab_context_t *ctx)
             lv_label_set_text(ctx->beacon_ssids_status_label, "No SSIDs in /sdcard/lab/ssid.txt. Add one to begin.");
             lv_obj_set_style_text_color(ctx->beacon_ssids_status_label, COLOR_MATERIAL_AMBER, 0);
         } else {
-            lv_label_set_text(ctx->beacon_ssids_status_label, "No SSIDs found. Check list_ssid output format.");
+            lv_label_set_text(ctx->beacon_ssids_status_label, "No SSIDs found. Check list_ssids output format.");
             lv_obj_set_style_text_color(ctx->beacon_ssids_status_label, COLOR_MATERIAL_AMBER, 0);
         }
     }
