@@ -394,14 +394,19 @@
       }
     };
 
-    const bufferToBinaryString = (buffer) => {
-      const bytes = new Uint8Array(buffer);
-      const chunk = 0x8000;
-      let result = "";
-      for (let i = 0; i < bytes.length; i += chunk) {
-        result += String.fromCharCode(...bytes.subarray(i, i + chunk));
+    const wordArrayFromBytes = (bytes) => {
+      const words = [];
+      for (let i = 0; i < bytes.length; i += 1) {
+        words[i >>> 2] = (words[i >>> 2] || 0) | (bytes[i] << (24 - (i % 4) * 8));
       }
-      return result;
+      return CryptoJS.lib.WordArray.create(words, bytes.length);
+    };
+
+    const calculateMD5 = (image) => {
+      if (image instanceof Uint8Array) {
+        return CryptoJS.MD5(wordArrayFromBytes(image)).toString();
+      }
+      return CryptoJS.MD5(CryptoJS.enc.Latin1.parse(image)).toString();
     };
 
     const getRepoSlug = () => {
@@ -429,10 +434,13 @@
         }
         return cleaned;
       }
+      const branch = getBranch();
+      if (branch === "main") {
+        return cleaned;
+      }
       if (cleaned.startsWith("firmware/")) {
         cleaned = cleaned.replace(/^firmware\//, "binaries-esp32p4/");
       }
-      const branch = getBranch();
       return `https://raw.githubusercontent.com/${repo}/${branch}/${cleaned}`;
     };
 
@@ -620,7 +628,7 @@
         log(`Fetching ${url} @ 0x${part.offset.toString(16)}`);
         const { buf, usedUrl } = await resolveAssetUrl(url);
         log(`Fetched ${usedUrl}`);
-        files.push({ data: bufferToBinaryString(buf), address: part.offset });
+        files.push({ data: new Uint8Array(buf), address: part.offset });
       }
       return files;
     };
@@ -667,7 +675,7 @@ const flash = async () => {
             ui.progress.style.width = `${pct}%`;
             setStatus(`Flashing ${fileIndex + 1}/${files.length}  ${pct}%`);
           },
-          calculateMD5Hash: (image) => CryptoJS.MD5(CryptoJS.enc.Latin1.parse(image)),
+          calculateMD5Hash: calculateMD5,
         };
         await state.esploader.writeFlash(flashOptions);
         await state.esploader.after(FLASH_PROFILE.afterReset);
