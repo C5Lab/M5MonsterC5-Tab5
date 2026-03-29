@@ -45,7 +45,8 @@
 #include "esp_http_server.h"
 #include "lwip/sockets.h"
 
-#define JANOS_TAB_VERSION "1.2.2"
+#define JANOS_TAB_VERSION "1.2.3"
+#define JANOS_VERSION_REQUIRED "1.5.8"
 #include "lwip/netdb.h"
 #include <dirent.h>
 #include <sys/stat.h>
@@ -646,6 +647,10 @@ typedef struct {
 
     // SD card presence (detected via list_sd command)
     bool sd_card_present;  // true if SD card detected on this UART/device
+
+    // JanOS firmware version (detected via 'version' command)
+    char janos_version[16];
+    bool janos_version_mismatch;
 } tab_context_t;
 
 typedef struct {
@@ -1739,6 +1744,9 @@ static void refresh_theme_visuals(bool reopen_internal_settings);
 static void detect_boards(void);
 static bool check_sd_card_for_tab(tab_id_t tab);
 static void check_all_sd_cards(void);
+static void check_version_for_tab(tab_id_t tab);
+static void check_all_versions(void);
+static void show_version_mismatch_popup(void);
 static void show_no_board_popup(void);
 static void board_detect_retry_cb(lv_timer_t *timer);
 static void board_detect_popup_close_cb(lv_event_t *e);
@@ -4101,6 +4109,9 @@ static void detection_complete_cb(lv_timer_t *timer)
     // Check SD card presence on all detected devices
     check_all_sd_cards();
 
+    // Check JanOS firmware version on all detected devices
+    check_all_versions();
+
     ESP_LOGI(TAG, "Detection complete: uart1=%d, mbus=%d, grove=%d, usb=%d",
              uart1_detected, mbus_detected, grove_detected, usb_detected);
 
@@ -4126,6 +4137,7 @@ static void detection_complete_cb(lv_timer_t *timer)
     } else {
         ESP_LOGI(TAG, "Board(s) detected - showing main tiles");
         show_main_tiles();
+        show_version_mismatch_popup();
     }
 }
 
@@ -5356,6 +5368,13 @@ static void create_tab_bar(void)
             lv_obj_set_style_text_font(sd_warn, tab_text_font, 0);
             lv_obj_set_style_text_color(sd_warn, lv_color_hex(0xFF5722), 0);  // Orange warning
         }
+
+        if (grove_ctx.janos_version_mismatch) {
+            lv_obj_t *ver_warn = lv_label_create(grove_content);
+            lv_label_set_text(ver_warn, "V!");
+            lv_obj_set_style_text_font(ver_warn, tab_text_font, 0);
+            lv_obj_set_style_text_color(ver_warn, lv_color_hex(0xF44336), 0);
+        }
     }
 
     // ========== USB tab (only if detected) ==========
@@ -5393,6 +5412,13 @@ static void create_tab_bar(void)
             lv_obj_set_style_text_font(sd_warn, tab_text_font, 0);
             lv_obj_set_style_text_color(sd_warn, lv_color_hex(0xFF5722), 0);  // Orange warning
         }
+
+        if (usb_ctx.janos_version_mismatch) {
+            lv_obj_t *ver_warn = lv_label_create(usb_content);
+            lv_label_set_text(ver_warn, "V!");
+            lv_obj_set_style_text_font(ver_warn, tab_text_font, 0);
+            lv_obj_set_style_text_color(ver_warn, lv_color_hex(0xF44336), 0);
+        }
     }
 
     // ========== MBus tab (only if MBus detected) ==========
@@ -5429,6 +5455,13 @@ static void create_tab_bar(void)
             lv_label_set_text(sd_warn, LV_SYMBOL_WARNING);
             lv_obj_set_style_text_font(sd_warn, tab_text_font, 0);
             lv_obj_set_style_text_color(sd_warn, lv_color_hex(0xFF5722), 0);  // Orange warning
+        }
+
+        if (mbus_ctx.janos_version_mismatch) {
+            lv_obj_t *ver_warn = lv_label_create(mbus_content);
+            lv_label_set_text(ver_warn, "V!");
+            lv_obj_set_style_text_font(ver_warn, tab_text_font, 0);
+            lv_obj_set_style_text_color(ver_warn, lv_color_hex(0xF44336), 0);
         }
     }
 
@@ -24327,6 +24360,195 @@ static void check_all_sd_cards(void)
              usb_ctx.sd_card_present ? "YES" : "NO",
              mbus_ctx.sd_card_present ? "YES" : "NO",
              internal_sd_present ? "YES" : "NO");
+}
+
+// Check JanOS firmware version on a specific UART tab by sending 'version' command.
+// Older firmware that doesn't have the command responds with "Unrecognized command".
+static void check_version_for_tab(tab_id_t tab)
+{
+    if (tab == TAB_INTERNAL) return;
+
+    tab_context_t *ctx = get_ctx_for_tab(tab);
+    uart_port_t uart_port = uart_port_for_tab(tab);
+    const char *tab_name = tab_transport_name(tab);
+
+    ESP_LOGI(TAG, "[%s] Checking JanOS version...", tab_name);
+
+    if (tab == TAB_USB) {
+        usb_rx_exclusive = true;
+        usb_flush_input(100);
+    } else {
+        uart_flush_input(uart_port);
+    }
+
+    const char *cmd = "version\r\n";
+    transport_write_bytes_tab(tab, uart_port, cmd, strlen(cmd));
+    vTaskDelay(pdMS_TO_TICKS(300));
+
+    char rx_buffer[256];
+    int total_len = 0;
+    int64_t start = esp_timer_get_time();
+    int64_t timeout_us = 2000000;
+
+    while ((esp_timer_get_time() - start) < timeout_us && total_len < (int)sizeof(rx_buffer) - 1) {
+        int len = transport_read_bytes_tab(tab, uart_port, rx_buffer + total_len,
+                                           sizeof(rx_buffer) - 1 - total_len, pdMS_TO_TICKS(100));
+        if (len > 0) {
+            total_len += len;
+            rx_buffer[total_len] = '\0';
+
+            char *ver = strstr(rx_buffer, "JanOS version:");
+            if (ver) {
+                ver += strlen("JanOS version:");
+                while (*ver == ' ') ver++;
+                int i = 0;
+                while (ver[i] && ver[i] != '\r' && ver[i] != '\n' && ver[i] != ' ' && i < 15) {
+                    ctx->janos_version[i] = ver[i];
+                    i++;
+                }
+                ctx->janos_version[i] = '\0';
+                ctx->janos_version_mismatch = (strcmp(ctx->janos_version, JANOS_VERSION_REQUIRED) != 0);
+                ESP_LOGI(TAG, "[%s] JanOS version: %s (mismatch=%d)", tab_name, ctx->janos_version, ctx->janos_version_mismatch);
+                if (tab == TAB_USB) usb_rx_exclusive = false;
+                return;
+            }
+
+            if (strstr(rx_buffer, "Unrecognized command") != NULL) {
+                strncpy(ctx->janos_version, "<1.5.8", sizeof(ctx->janos_version) - 1);
+                ctx->janos_version[sizeof(ctx->janos_version) - 1] = '\0';
+                ctx->janos_version_mismatch = true;
+                ESP_LOGW(TAG, "[%s] 'version' command not recognized - firmware older than 1.5.8", tab_name);
+                if (tab == TAB_USB) usb_rx_exclusive = false;
+                return;
+            }
+        }
+    }
+
+    strncpy(ctx->janos_version, "unknown", sizeof(ctx->janos_version) - 1);
+    ctx->janos_version[sizeof(ctx->janos_version) - 1] = '\0';
+    ctx->janos_version_mismatch = true;
+    ESP_LOGW(TAG, "[%s] Could not detect JanOS version (timeout)", tab_name);
+    if (tab == TAB_USB) usb_rx_exclusive = false;
+}
+
+static void check_all_versions(void)
+{
+    ESP_LOGI(TAG, "=== Checking JanOS versions ===");
+
+    if (grove_detected) {
+        check_version_for_tab(TAB_GROVE);
+    } else {
+        grove_ctx.janos_version[0] = '\0';
+        grove_ctx.janos_version_mismatch = false;
+    }
+
+    if (usb_detected) {
+        check_version_for_tab(TAB_USB);
+    } else {
+        usb_ctx.janos_version[0] = '\0';
+        usb_ctx.janos_version_mismatch = false;
+    }
+
+    if (mbus_detected) {
+        check_version_for_tab(TAB_MBUS);
+    } else {
+        mbus_ctx.janos_version[0] = '\0';
+        mbus_ctx.janos_version_mismatch = false;
+    }
+
+    internal_ctx.janos_version[0] = '\0';
+    internal_ctx.janos_version_mismatch = false;
+
+    ESP_LOGI(TAG, "=== Version check complete: Grove=%s, USB=%s, MBus=%s ===",
+             grove_ctx.janos_version[0] ? grove_ctx.janos_version : "N/A",
+             usb_ctx.janos_version[0] ? usb_ctx.janos_version : "N/A",
+             mbus_ctx.janos_version[0] ? mbus_ctx.janos_version : "N/A");
+}
+
+static void version_popup_close_cb(lv_event_t *e)
+{
+    lv_obj_t *overlay = (lv_obj_t *)lv_event_get_user_data(e);
+    if (overlay) lv_obj_del(overlay);
+}
+
+static void show_version_mismatch_popup(void)
+{
+    bool any_mismatch = (grove_detected && grove_ctx.janos_version_mismatch) ||
+                        (usb_detected && usb_ctx.janos_version_mismatch) ||
+                        (mbus_detected && mbus_ctx.janos_version_mismatch);
+    if (!any_mismatch) return;
+
+    char msg[512] = "";
+    if (grove_detected && grove_ctx.janos_version_mismatch) {
+        snprintf(msg + strlen(msg), sizeof(msg) - strlen(msg),
+                 "Grove monster is on JanOS version: %s while %s expected.\n",
+                 grove_ctx.janos_version, JANOS_VERSION_REQUIRED);
+    }
+    if (usb_detected && usb_ctx.janos_version_mismatch) {
+        snprintf(msg + strlen(msg), sizeof(msg) - strlen(msg),
+                 "USB   monster is on JanOS version: %s while %s expected.\n",
+                 usb_ctx.janos_version, JANOS_VERSION_REQUIRED);
+    }
+    if (mbus_detected && mbus_ctx.janos_version_mismatch) {
+        snprintf(msg + strlen(msg), sizeof(msg) - strlen(msg),
+                 "MBus  monster is on JanOS version: %s while %s expected.\n",
+                 mbus_ctx.janos_version, JANOS_VERSION_REQUIRED);
+    }
+    size_t len = strlen(msg);
+    if (len > 0 && msg[len - 1] == '\n') msg[len - 1] = '\0';
+
+    ESP_LOGW(TAG, "Version mismatch detected, showing popup:\n%s", msg);
+
+    lv_obj_t *scr = lv_scr_act();
+
+    lv_obj_t *overlay = lv_obj_create(scr);
+    lv_obj_remove_style_all(overlay);
+    lv_obj_set_size(overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(overlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(overlay, LV_OPA_70, 0);
+    lv_obj_clear_flag(overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(overlay, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t *popup = lv_obj_create(overlay);
+    lv_obj_set_size(popup, 560, 300);
+    lv_obj_center(popup);
+    lv_obj_set_style_bg_color(popup, lv_color_hex(0x2D2D2D), 0);
+    lv_obj_set_style_border_color(popup, lv_color_hex(0xF44336), 0);
+    lv_obj_set_style_border_width(popup, 3, 0);
+    lv_obj_set_style_radius(popup, 16, 0);
+    lv_obj_set_style_pad_all(popup, 24, 0);
+    lv_obj_set_flex_flow(popup, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(popup, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(popup, 12, 0);
+    lv_obj_clear_flag(popup, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *icon = lv_label_create(popup);
+    lv_label_set_text(icon, LV_SYMBOL_WARNING);
+    lv_obj_set_style_text_font(icon, &lv_font_montserrat_36, 0);
+    lv_obj_set_style_text_color(icon, lv_color_hex(0xF44336), 0);
+
+    lv_obj_t *title = lv_label_create(popup);
+    lv_label_set_text(title, "JanOS Version Mismatch");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_22, 0);
+    lv_obj_set_style_text_color(title, lv_color_hex(0xFFFFFF), 0);
+
+    lv_obj_t *message = lv_label_create(popup);
+    lv_label_set_text(message, msg);
+    lv_obj_set_style_text_font(message, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(message, lv_color_hex(0xCCCCCC), 0);
+    lv_obj_set_style_text_align(message, LV_TEXT_ALIGN_LEFT, 0);
+    lv_obj_set_width(message, 500);
+
+    lv_obj_t *ok_btn = lv_btn_create(popup);
+    lv_obj_set_size(ok_btn, 140, 46);
+    lv_obj_set_style_bg_color(ok_btn, COLOR_MATERIAL_PURPLE, 0);
+    lv_obj_set_style_radius(ok_btn, 8, 0);
+    lv_obj_add_event_cb(ok_btn, version_popup_close_cb, LV_EVENT_CLICKED, overlay);
+
+    lv_obj_t *btn_label = lv_label_create(ok_btn);
+    lv_label_set_text(btn_label, "OK");
+    lv_obj_set_style_text_font(btn_label, &lv_font_montserrat_16, 0);
+    lv_obj_center(btn_label);
 }
 
 // Forward declarations for popup
