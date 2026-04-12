@@ -238,6 +238,12 @@ typedef struct {
 } wardrive_wigle_file_t;
 
 typedef enum {
+    WARDRIVE_UPLOAD_PROVIDER_NONE = 0,
+    WARDRIVE_UPLOAD_PROVIDER_WIGLE = 1,
+    WARDRIVE_UPLOAD_PROVIDER_WDGWARS = 2,
+} wardrive_upload_provider_t;
+
+typedef enum {
     COMPROMISED_FILE_KIND_HANDSHAKE = 0,
     COMPROMISED_FILE_KIND_WARDRIVE = 1,
     COMPROMISED_FILE_KIND_EVIL_TWIN = 2,
@@ -475,6 +481,9 @@ typedef struct {
     lv_obj_t *wardrive_gps_type_overlay;
     lv_obj_t *wardrive_gps_type_response_label;
     lv_obj_t *wardrive_upload_btn;
+    lv_obj_t *wardrive_upload_menu_overlay;
+    lv_obj_t *wardrive_upload_menu_popup;
+    wardrive_upload_provider_t wardrive_upload_provider;
     lv_obj_t *wardrive_wigle_popup_overlay;
     lv_obj_t *wardrive_wigle_popup;
     lv_obj_t *wardrive_wigle_status_label;
@@ -1792,10 +1801,16 @@ static void wardrive_gps_type_close_cb(lv_event_t *e);
 static void wardrive_gps_set_m5_cb(lv_event_t *e);
 static void wardrive_gps_set_atgm_cb(lv_event_t *e);
 static void wardrive_gps_set_external_cb(lv_event_t *e);
-static void wardrive_wigle_btn_cb(lv_event_t *e);
+static void wardrive_upload_btn_cb(lv_event_t *e);
+static void close_wardrive_upload_menu(tab_context_t *ctx);
+static void wardrive_upload_menu_close_cb(lv_event_t *e);
+static void wardrive_upload_wigle_btn_cb(lv_event_t *e);
+static void wardrive_upload_wdgwars_btn_cb(lv_event_t *e);
+static void show_wardrive_upload_menu(tab_context_t *ctx);
 static void wardrive_wigle_close_cb(lv_event_t *e);
 static void wardrive_wigle_upload_task(void *arg);
-static void show_wardrive_wigle_popup(tab_context_t *ctx);
+static void wardrive_wdgwars_upload_task(void *arg);
+static void show_wardrive_upload_popup(tab_context_t *ctx, wardrive_upload_provider_t provider);
 static void wardrive_wigle_send_btn_cb(lv_event_t *e);
 static void wardrive_wigle_file_checkbox_cb(lv_event_t *e);
 static void wardrive_wigle_network_row_click_cb(lv_event_t *e);
@@ -14204,6 +14219,31 @@ static bool wardrive_tab_has_sd_card(tab_id_t tab)
     return tab_ctx ? tab_ctx->sd_card_present : false;
 }
 
+static const char *wardrive_upload_provider_label(wardrive_upload_provider_t provider)
+{
+    switch (provider) {
+        case WARDRIVE_UPLOAD_PROVIDER_WIGLE:
+            return "WiGLE";
+        case WARDRIVE_UPLOAD_PROVIDER_WDGWARS:
+            return "WDGWars";
+        default:
+            return "Upload";
+    }
+}
+
+static void close_wardrive_upload_menu(tab_context_t *ctx)
+{
+    if (!ctx) {
+        return;
+    }
+
+    if (ctx->wardrive_upload_menu_overlay) {
+        lv_obj_del(ctx->wardrive_upload_menu_overlay);
+        ctx->wardrive_upload_menu_overlay = NULL;
+        ctx->wardrive_upload_menu_popup = NULL;
+    }
+}
+
 static void close_wardrive_wigle_popup_ctx(tab_context_t *ctx)
 {
     if (!ctx) {
@@ -14214,6 +14254,7 @@ static void close_wardrive_wigle_popup_ctx(tab_context_t *ctx)
     ctx->wardrive_wigle_connect_ready = false;
     ctx->wardrive_wigle_selected_ssid[0] = '\0';
     ctx->wardrive_wigle_selected_password[0] = '\0';
+    ctx->wardrive_upload_provider = WARDRIVE_UPLOAD_PROVIDER_NONE;
 
     if (ctx->wardrive_wigle_popup_overlay) {
         lv_obj_del(ctx->wardrive_wigle_popup_overlay);
@@ -14247,6 +14288,119 @@ static void wardrive_wigle_close_cb(lv_event_t *e)
     tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
     if (!ctx) ctx = get_current_ctx();
     close_wardrive_wigle_popup_ctx(ctx);
+}
+
+static void wardrive_upload_menu_close_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx) {
+        ctx = get_current_ctx();
+    }
+    close_wardrive_upload_menu(ctx);
+}
+
+static void wardrive_upload_wigle_btn_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx) {
+        ctx = get_current_ctx();
+    }
+    if (!ctx) {
+        return;
+    }
+
+    close_wardrive_upload_menu(ctx);
+    show_wardrive_upload_popup(ctx, WARDRIVE_UPLOAD_PROVIDER_WIGLE);
+}
+
+static void wardrive_upload_wdgwars_btn_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx) {
+        ctx = get_current_ctx();
+    }
+    if (!ctx) {
+        return;
+    }
+
+    close_wardrive_upload_menu(ctx);
+    show_wardrive_upload_popup(ctx, WARDRIVE_UPLOAD_PROVIDER_WDGWARS);
+}
+
+static void show_wardrive_upload_menu(tab_context_t *ctx)
+{
+    if (!ctx || !ctx->wardrive_page || ctx->wardrive_upload_menu_overlay) {
+        return;
+    }
+
+    lv_obj_t *container = get_current_tab_container();
+    if (!container) {
+        return;
+    }
+
+    ctx->wardrive_upload_menu_overlay = lv_obj_create(container);
+    style_modal_overlay(ctx->wardrive_upload_menu_overlay, LV_OPA_50);
+    lv_obj_add_flag(ctx->wardrive_upload_menu_overlay, LV_OBJ_FLAG_FLOATING);
+    lv_obj_move_foreground(ctx->wardrive_upload_menu_overlay);
+
+    ctx->wardrive_upload_menu_popup = lv_obj_create(ctx->wardrive_upload_menu_overlay);
+    lv_obj_set_size(ctx->wardrive_upload_menu_popup, 380, LV_SIZE_CONTENT);
+    lv_obj_center(ctx->wardrive_upload_menu_popup);
+    style_popup_card(ctx->wardrive_upload_menu_popup, 14, COLOR_MATERIAL_PURPLE);
+    lv_obj_set_style_pad_all(ctx->wardrive_upload_menu_popup, 20, 0);
+    lv_obj_set_style_pad_row(ctx->wardrive_upload_menu_popup, 12, 0);
+    lv_obj_set_flex_flow(ctx->wardrive_upload_menu_popup, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(ctx->wardrive_upload_menu_popup, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(ctx->wardrive_upload_menu_popup, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(ctx->wardrive_upload_menu_popup);
+    lv_label_set_text(title, LV_SYMBOL_UPLOAD " Wardrive Upload");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_PURPLE, 0);
+
+    lv_obj_t *subtitle = lv_label_create(ctx->wardrive_upload_menu_popup);
+    lv_label_set_text(subtitle, "Choose upload target");
+    lv_obj_set_style_text_font(subtitle, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(subtitle, lv_color_hex(0xCCCCCC), 0);
+
+    lv_obj_t *wigle_btn = lv_btn_create(ctx->wardrive_upload_menu_popup);
+    lv_obj_set_size(wigle_btn, lv_pct(100), 52);
+    lv_obj_set_style_bg_color(wigle_btn, COLOR_MATERIAL_TEAL, 0);
+    lv_obj_set_style_bg_color(wigle_btn, lv_color_hex(0x00897B), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(wigle_btn, 10, 0);
+    lv_obj_add_event_cb(wigle_btn, wardrive_upload_wigle_btn_cb, LV_EVENT_CLICKED, ctx);
+
+    lv_obj_t *wigle_lbl = lv_label_create(wigle_btn);
+    lv_label_set_text(wigle_lbl, "WiGLE");
+    lv_obj_set_style_text_font(wigle_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(wigle_lbl, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_center(wigle_lbl);
+
+    lv_obj_t *wdgwars_btn = lv_btn_create(ctx->wardrive_upload_menu_popup);
+    lv_obj_set_size(wdgwars_btn, lv_pct(100), 52);
+    lv_obj_set_style_bg_color(wdgwars_btn, lv_color_hex(0x455A64), 0);
+    lv_obj_set_style_bg_color(wdgwars_btn, lv_color_hex(0x37474F), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(wdgwars_btn, 10, 0);
+    lv_obj_add_event_cb(wdgwars_btn, wardrive_upload_wdgwars_btn_cb, LV_EVENT_CLICKED, ctx);
+
+    lv_obj_t *wdgwars_lbl = lv_label_create(wdgwars_btn);
+    lv_label_set_text(wdgwars_lbl, "WDGWars");
+    lv_obj_set_style_text_font(wdgwars_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(wdgwars_lbl, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_center(wdgwars_lbl);
+
+    lv_obj_t *close_btn = lv_btn_create(ctx->wardrive_upload_menu_popup);
+    lv_obj_set_size(close_btn, 120, 42);
+    lv_obj_set_style_bg_color(close_btn, lv_color_hex(0x444444), 0);
+    lv_obj_set_style_bg_color(close_btn, lv_color_hex(0x555555), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(close_btn, 8, 0);
+    lv_obj_add_event_cb(close_btn, wardrive_upload_menu_close_cb, LV_EVENT_CLICKED, ctx);
+
+    lv_obj_t *close_lbl = lv_label_create(close_btn);
+    lv_label_set_text(close_lbl, "Close");
+    lv_obj_set_style_text_font(close_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(close_lbl, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_center(close_lbl);
 }
 
 static void wardrive_wigle_update_send_btn(tab_context_t *ctx)
@@ -14498,8 +14652,9 @@ static void wardrive_wigle_file_checkbox_cb(lv_event_t *e)
 
     if (ctx->wardrive_wigle_status_label && !ctx->wardrive_wigle_task_running) {
         lv_label_set_text_fmt(ctx->wardrive_wigle_status_label,
-                              "Selected %d file(s). Tap Send to continue.",
-                              ctx->wardrive_wigle_selected_count);
+                              "Selected %d file(s). Tap Send to continue with %s.",
+                              ctx->wardrive_wigle_selected_count,
+                              wardrive_upload_provider_label(ctx->wardrive_upload_provider));
     }
 }
 
@@ -14513,8 +14668,10 @@ static void wardrive_wigle_send_btn_cb(lv_event_t *e)
         return;
     }
 
-    ESP_LOGI(TAG, "[%s] WiGLE Send clicked, selected files: %d",
-             tab_transport_name(tab_id_for_ctx(ctx)), ctx->wardrive_wigle_selected_count);
+    ESP_LOGI(TAG, "[%s] Wardrive %s Send clicked, selected files: %d",
+             tab_transport_name(tab_id_for_ctx(ctx)),
+             wardrive_upload_provider_label(ctx->wardrive_upload_provider),
+             ctx->wardrive_wigle_selected_count);
 
     if (ctx->wardrive_wigle_selected_count <= 0) {
         if (ctx->wardrive_wigle_status_label) {
@@ -14531,10 +14688,21 @@ static void wardrive_wigle_send_btn_cb(lv_event_t *e)
     wardrive_wigle_update_send_btn(ctx);
 
     if (ctx->wardrive_wigle_status_label) {
-        lv_label_set_text(ctx->wardrive_wigle_status_label, "Preparing upload...");
+        lv_label_set_text_fmt(ctx->wardrive_wigle_status_label,
+                              "Preparing %s upload...",
+                              wardrive_upload_provider_label(ctx->wardrive_upload_provider));
     }
 
-    if (xTaskCreate(wardrive_wigle_upload_task, "wd_wigle", 12288, ctx, 5, &ctx->wardrive_wigle_task) != pdTRUE) {
+    TaskFunction_t upload_task = wardrive_wigle_upload_task;
+    const char *task_name = "wd_wigle";
+    uint32_t task_stack_size = 12288;
+    if (ctx->wardrive_upload_provider == WARDRIVE_UPLOAD_PROVIDER_WDGWARS) {
+        upload_task = wardrive_wdgwars_upload_task;
+        task_name = "wd_wdgwars";
+        task_stack_size = 20480;
+    }
+
+    if (xTaskCreate(upload_task, task_name, task_stack_size, ctx, 5, &ctx->wardrive_wigle_task) != pdTRUE) {
         ctx->wardrive_wigle_task_running = false;
         ctx->wardrive_wigle_task = NULL;
         if (ctx->wardrive_wigle_status_label) {
@@ -15433,7 +15601,269 @@ done:
     vTaskDelete(NULL);
 }
 
-static void show_wardrive_wigle_popup(tab_context_t *ctx)
+static void wardrive_wdgwars_upload_task(void *arg)
+{
+    tab_context_t *ctx = (tab_context_t *)arg;
+    if (!ctx) {
+        vTaskDelete(NULL);
+        return;
+    }
+
+    tab_id_t active_tab = tab_id_for_ctx(ctx);
+    uart_port_t uart_port = uart_port_for_tab(active_tab);
+
+    if (!ctx->wardrive_wigle_task_running) {
+        goto done;
+    }
+
+    if (active_tab == TAB_USB && usb_cdc_handle) {
+        usbh_cdc_flush_rx_buffer(usb_cdc_handle);
+    } else {
+        uart_flush(uart_port);
+    }
+    transport_write_bytes_tab(active_tab, uart_port, "wdgwars_key read", strlen("wdgwars_key read"));
+    transport_write_bytes_tab(active_tab, uart_port, "\r\n", 2);
+    ESP_LOGI(TAG, "[%s] WDGWars: sent wdgwars_key read", tab_transport_name(active_tab));
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    char key_rx_buf[2048];
+    int key_total_len = 0;
+    int key_empty_reads = 0;
+    while (key_empty_reads < 5 && key_total_len < (int)sizeof(key_rx_buf) - 1 && ctx->wardrive_wigle_task_running) {
+        int len = transport_read_bytes_tab(active_tab, uart_port, key_rx_buf + key_total_len,
+                                           sizeof(key_rx_buf) - key_total_len - 1, pdMS_TO_TICKS(300));
+        if (len > 0) {
+            key_total_len += len;
+            key_empty_reads = 0;
+        } else {
+            key_empty_reads++;
+        }
+    }
+    key_rx_buf[key_total_len] = '\0';
+    ESP_LOGI(TAG, "[%s] wdgwars_key read response: %s", tab_transport_name(active_tab), key_rx_buf);
+
+    if (!ctx->wardrive_wigle_task_running) {
+        goto done;
+    }
+
+    if (strstr(key_rx_buf, "Unrecognized command") != NULL) {
+        bsp_display_lock(0);
+        if (ctx->wardrive_wigle_status_label) {
+            lv_label_set_text(ctx->wardrive_wigle_status_label,
+                              "WDGWars key command is not supported\nby current Monster firmware.");
+        }
+        bsp_display_unlock();
+        goto done;
+    }
+
+    bool wdgwars_key_missing = (strstr(key_rx_buf, "not set") != NULL ||
+                                strstr(key_rx_buf, "NOT SET") != NULL ||
+                                strstr(key_rx_buf, "NO WDGWARS CREDENTIALS") != NULL ||
+                                strstr(key_rx_buf, "missing") != NULL ||
+                                strstr(key_rx_buf, "MISSING") != NULL);
+    if (wdgwars_key_missing) {
+        bsp_display_lock(0);
+        if (ctx->wardrive_wigle_status_label) {
+            lv_label_set_text(ctx->wardrive_wigle_status_label,
+                              "Add your key to /lab/wdgwars.txt\nin C5Monster and reboot.");
+        }
+        bsp_display_unlock();
+        goto done;
+    }
+
+    if (ctx->wardrive_wigle_selected_count <= 0) {
+        bsp_display_lock(0);
+        if (ctx->wardrive_wigle_status_label) {
+            lv_label_set_text(ctx->wardrive_wigle_status_label, "Select at least one file.");
+        }
+        bsp_display_unlock();
+        goto done;
+    }
+
+    if (!wardrive_tab_has_sd_card(active_tab)) {
+        bsp_display_lock(0);
+        if (ctx->wardrive_wigle_status_label) {
+            lv_label_set_text(ctx->wardrive_wigle_status_label, "No SD card detected on this tab.");
+        }
+        bsp_display_unlock();
+        goto done;
+    }
+
+    if (ctx->wardrive_monitoring) {
+        bsp_display_lock(0);
+        if (ctx->wardrive_wigle_status_label) {
+            lv_label_set_text(ctx->wardrive_wigle_status_label, "Stop Wardrive first, then upload.");
+        }
+        bsp_display_unlock();
+        goto done;
+    }
+
+    if (!wardrive_wigle_ensure_wifi_connected(ctx, active_tab, uart_port)) {
+        goto done;
+    }
+    if (!ctx->wardrive_wigle_task_running) {
+        goto done;
+    }
+
+    int total_selected = 0;
+    for (int i = 0; i < ctx->wardrive_wigle_file_count; i++) {
+        if (ctx->wardrive_wigle_files[i].selected && ctx->wardrive_wigle_files[i].name[0] != '\0') {
+            total_selected++;
+        }
+    }
+
+    int processed_selected = 0;
+    int total_uploaded = 0;
+    int total_failed = 0;
+    int total_skipped = 0;
+    bool any_response = false;
+    bool unsupported_cmd = false;
+    bool creds_missing = false;
+    bool auth_failed = false;
+    bool wifi_lost = false;
+
+    for (int i = 0; i < ctx->wardrive_wigle_file_count && ctx->wardrive_wigle_task_running; i++) {
+        wardrive_wigle_file_t *file = &ctx->wardrive_wigle_files[i];
+        if (!file->selected || file->name[0] == '\0') {
+            continue;
+        }
+
+        processed_selected++;
+        bsp_display_lock(0);
+        if (ctx->wardrive_wigle_status_label) {
+            lv_label_set_text_fmt(ctx->wardrive_wigle_status_label,
+                                  "Uploading %d/%d:\n%s",
+                                  processed_selected, total_selected, file->name);
+        }
+        bsp_display_unlock();
+
+        if (active_tab == TAB_USB && usb_cdc_handle) {
+            usbh_cdc_flush_rx_buffer(usb_cdc_handle);
+        } else {
+            uart_flush(uart_port);
+        }
+
+        char cmd[220];
+        snprintf(cmd, sizeof(cmd), "wdgwars_upload %s", file->name);
+        transport_write_bytes_tab(active_tab, uart_port, cmd, strlen(cmd));
+        transport_write_bytes_tab(active_tab, uart_port, "\r\n", 2);
+        ESP_LOGI(TAG, "[%s] WDGWars: sent %s", tab_transport_name(active_tab), cmd);
+
+        char rx_buf[4096];
+        int total_len = 0;
+        int empty_reads = 0;
+        int elapsed_ms = 0;
+        const int timeout_ms = 150000;
+
+        while (ctx->wardrive_wigle_task_running &&
+               elapsed_ms < timeout_ms &&
+               total_len < (int)sizeof(rx_buf) - 1 &&
+               empty_reads < 120) {
+            int len = transport_read_bytes_tab(active_tab,
+                                               uart_port,
+                                               rx_buf + total_len,
+                                               sizeof(rx_buf) - 1 - total_len,
+                                               pdMS_TO_TICKS(500));
+            if (len > 0) {
+                total_len += len;
+                empty_reads = 0;
+                rx_buf[total_len] = '\0';
+
+                if (strstr(rx_buf, "Done:") != NULL ||
+                    strstr(rx_buf, "NO WDGWARS CREDENTIALS") != NULL ||
+                    strstr(rx_buf, "WDGWARS AUTH FAILED") != NULL ||
+                    strstr(rx_buf, "WIFI NOT CONNECTED") != NULL ||
+                    strstr(rx_buf, "Unrecognized command") != NULL) {
+                    break;
+                }
+            } else {
+                empty_reads++;
+            }
+            elapsed_ms += 500;
+        }
+
+        rx_buf[total_len] = '\0';
+        if (total_len > 0) {
+            any_response = true;
+        }
+        ESP_LOGI(TAG, "wdgwars_upload response (%s): %s", file->name, rx_buf);
+
+        if (strstr(rx_buf, "Unrecognized command") != NULL) {
+            unsupported_cmd = true;
+            break;
+        }
+        if (strstr(rx_buf, "NO WDGWARS CREDENTIALS") != NULL) {
+            creds_missing = true;
+            break;
+        }
+        if (strstr(rx_buf, "WDGWARS AUTH FAILED") != NULL) {
+            auth_failed = true;
+            break;
+        }
+        if (strstr(rx_buf, "WIFI NOT CONNECTED") != NULL) {
+            wifi_lost = true;
+            break;
+        }
+
+        int uploaded = 0;
+        int failed = 0;
+        int skipped = 0;
+        if (wardrive_parse_wigle_summary(rx_buf, &uploaded, &failed, &skipped)) {
+            total_uploaded += uploaded;
+            total_failed += failed;
+            total_skipped += skipped;
+        } else if (strstr(rx_buf, "-> OK") != NULL) {
+            total_uploaded++;
+        } else if (strstr(rx_buf, "-> skipped") != NULL || strstr(rx_buf, "duplicate") != NULL) {
+            total_skipped++;
+        } else if (strstr(rx_buf, "-> FAILED") != NULL || strstr(rx_buf, "FAILED") != NULL) {
+            total_failed++;
+        } else {
+            total_failed++;
+        }
+    }
+
+    if (!ctx->wardrive_wigle_task_running) {
+        goto done;
+    }
+
+    bsp_display_lock(0);
+    if (ctx->wardrive_wigle_status_label) {
+        if (unsupported_cmd) {
+            lv_label_set_text(ctx->wardrive_wigle_status_label,
+                              "WDGWars upload command is not supported\nby current Monster firmware.");
+        } else if (creds_missing) {
+            lv_label_set_text(ctx->wardrive_wigle_status_label,
+                              "WDGWars credentials missing.\nAdd key and try again.");
+        } else if (auth_failed) {
+            lv_label_set_text(ctx->wardrive_wigle_status_label,
+                              "WDGWars authentication failed.\nCheck API key and try again.");
+        } else if (wifi_lost) {
+            lv_label_set_text(ctx->wardrive_wigle_status_label,
+                              "WiFi disconnected during upload.\nReconnect and try again.");
+        } else if ((total_uploaded + total_skipped + total_failed) > 0) {
+            lv_label_set_text_fmt(ctx->wardrive_wigle_status_label,
+                                  "WDGWars sync finished.\nUploaded: %d\nSkipped: %d\nFailed: %d",
+                                  total_uploaded, total_skipped, total_failed);
+        } else if (any_response) {
+            lv_label_set_text(ctx->wardrive_wigle_status_label, "WDGWars upload complete.");
+        } else {
+            lv_label_set_text(ctx->wardrive_wigle_status_label,
+                              "No final response from module.\nTry again.");
+        }
+    }
+    bsp_display_unlock();
+
+done:
+    ctx->wardrive_wigle_task_running = false;
+    ctx->wardrive_wigle_task = NULL;
+    bsp_display_lock(0);
+    wardrive_wigle_update_send_btn(ctx);
+    bsp_display_unlock();
+    vTaskDelete(NULL);
+}
+
+static void show_wardrive_upload_popup(tab_context_t *ctx, wardrive_upload_provider_t provider)
 {
     if (!ctx || !ctx->wardrive_page) {
         return;
@@ -15441,11 +15871,16 @@ static void show_wardrive_wigle_popup(tab_context_t *ctx)
     if (ctx->wardrive_wigle_popup_overlay) {
         return;
     }
+    if (provider == WARDRIVE_UPLOAD_PROVIDER_NONE) {
+        return;
+    }
 
     lv_obj_t *container = get_current_tab_container();
     if (!container) {
         return;
     }
+
+    ctx->wardrive_upload_provider = provider;
 
     ctx->wardrive_wigle_popup_overlay = lv_obj_create(container);
     lv_obj_remove_style_all(ctx->wardrive_wigle_popup_overlay);
@@ -15475,7 +15910,8 @@ static void show_wardrive_wigle_popup(tab_context_t *ctx)
     lv_obj_clear_flag(ctx->wardrive_wigle_popup, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *title = lv_label_create(ctx->wardrive_wigle_popup);
-    lv_label_set_text(title, LV_SYMBOL_UPLOAD " WiGLE Upload");
+    lv_label_set_text_fmt(title, LV_SYMBOL_UPLOAD " %s Upload",
+                          wardrive_upload_provider_label(provider));
     lv_obj_set_style_text_font(title, &lv_font_montserrat_22, 0);
     lv_obj_set_style_text_color(title, COLOR_MATERIAL_TEAL, 0);
 
@@ -15538,7 +15974,9 @@ static void show_wardrive_wigle_popup(tab_context_t *ctx)
         lv_obj_add_state(ctx->wardrive_upload_btn, LV_STATE_DISABLED);
     }
 
-    ESP_LOGI(TAG, "[%s] Opening Wardrive WiGLE popup", tab_transport_name(tab_id_for_ctx(ctx)));
+    ESP_LOGI(TAG, "[%s] Opening Wardrive %s popup",
+             tab_transport_name(tab_id_for_ctx(ctx)),
+             wardrive_upload_provider_label(provider));
 
     ctx->wardrive_wigle_task_running = false;
     ctx->wardrive_wigle_connect_ready = false;
@@ -15583,21 +16021,23 @@ static void show_wardrive_wigle_popup(tab_context_t *ctx)
 
     if (ctx->wardrive_wigle_status_label) {
         lv_label_set_text_fmt(ctx->wardrive_wigle_status_label,
-                              "Found %d file(s). Select files and tap Send.",
-                              ctx->wardrive_wigle_file_count);
+                              "Found %d file(s). Select files and tap Send to %s.",
+                              ctx->wardrive_wigle_file_count,
+                              wardrive_upload_provider_label(provider));
     }
     wardrive_wigle_update_send_btn(ctx);
 }
 
-static void wardrive_wigle_btn_cb(lv_event_t *e)
+static void wardrive_upload_btn_cb(lv_event_t *e)
 {
     tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
     if (!ctx) ctx = get_current_ctx();
     ESP_LOGI(TAG, "[%s] Wardrive Upload button clicked", ctx ? tab_transport_name(tab_id_for_ctx(ctx)) : "UNKNOWN");
-    if (!ctx || ctx->wardrive_wigle_popup_overlay || ctx->wardrive_wigle_task_running) {
+    if (!ctx || ctx->wardrive_wigle_popup_overlay || ctx->wardrive_wigle_task_running ||
+        ctx->wardrive_upload_menu_overlay) {
         return;
     }
-    show_wardrive_wigle_popup(ctx);
+    show_wardrive_upload_menu(ctx);
 }
 
 static bool wardrive_is_tab_gps_read_command(const char *line)
@@ -16201,7 +16641,7 @@ static void show_wardrive_page(void)
     lv_obj_set_style_bg_color(ctx->wardrive_upload_btn, COLOR_MATERIAL_PURPLE, 0);
     lv_obj_set_style_bg_color(ctx->wardrive_upload_btn, lv_color_hex(0x555555), LV_STATE_DISABLED);
     lv_obj_set_style_radius(ctx->wardrive_upload_btn, 8, 0);
-    lv_obj_add_event_cb(ctx->wardrive_upload_btn, wardrive_wigle_btn_cb, LV_EVENT_CLICKED, ctx);
+    lv_obj_add_event_cb(ctx->wardrive_upload_btn, wardrive_upload_btn_cb, LV_EVENT_CLICKED, ctx);
 
     lv_obj_t *upload_label = lv_label_create(ctx->wardrive_upload_btn);
     lv_label_set_text(upload_label, LV_SYMBOL_UPLOAD " Upload");
@@ -16604,33 +17044,6 @@ static void compromised_delete_handshake_companion_locked(tab_id_t tab, uart_por
     compromised_delete_file_locked(tab, uart_port, companion,
                                    delete_path, sizeof(delete_path),
                                    rx_buffer, sizeof(rx_buffer));
-}
-
-static void compromised_delete_file_batch(tab_id_t tab, const char *const *paths, int path_count)
-{
-    if (tab_is_internal(tab) || !paths || path_count <= 0) {
-        return;
-    }
-
-    uart_port_t uart_port = uart_port_for_tab(tab);
-    bool usb_lock_set = false;
-    compromised_transport_lock_begin(tab, uart_port, &usb_lock_set);
-
-    char delete_path[WARDRIVE_WIGLE_PATH_MAX];
-    char rx_buffer[512];
-
-    for (int i = 0; i < path_count; i++) {
-        if (!paths[i] || paths[i][0] == '\0') {
-            continue;
-        }
-
-        compromised_delete_file_locked(tab, uart_port, paths[i],
-                                       delete_path, sizeof(delete_path),
-                                       rx_buffer, sizeof(rx_buffer));
-        vTaskDelay(pdMS_TO_TICKS(60));
-    }
-
-    compromised_transport_lock_end(usb_lock_set);
 }
 
 static const char *compromised_title_for_kind(compromised_file_kind_t kind)
