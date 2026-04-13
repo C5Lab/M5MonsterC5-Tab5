@@ -468,6 +468,7 @@ typedef struct {
     lv_obj_t *wardrive_page;
     lv_obj_t *wardrive_start_btn;
     lv_obj_t *wardrive_stop_btn;
+    lv_obj_t *wardrive_trace_btn;
     lv_obj_t *wardrive_status_label;
     lv_obj_t *wardrive_net_count_label;
     lv_obj_t *wardrive_table;
@@ -482,7 +483,10 @@ typedef struct {
     int wardrive_net_count;
     int wardrive_wifi_count;
     int wardrive_bt_count;
+    int wardrive_sat_count;
+    double wardrive_distance_m;
     int wardrive_net_head;
+    bool wardrive_trace_enabled;
     lv_obj_t *wardrive_gps_type_btn;
     lv_obj_t *wardrive_gps_type_overlay;
     lv_obj_t *wardrive_gps_type_response_label;
@@ -1809,6 +1813,8 @@ static void wardrive_back_cb(lv_event_t *e);
 static void wardrive_monitor_task(void *arg);
 static void update_wardrive_table(tab_context_t *ctx);
 static void update_wardrive_count_label(tab_context_t *ctx);
+static void update_wardrive_trace_button(tab_context_t *ctx);
+static void wardrive_trace_btn_cb(lv_event_t *e);
 static void close_wardrive_gps_overlay(tab_context_t *ctx);
 static void wardrive_gps_type_btn_cb(lv_event_t *e);
 static void wardrive_gps_type_close_cb(lv_event_t *e);
@@ -13938,9 +13944,42 @@ static void update_wardrive_count_label(tab_context_t *ctx)
 {
     if (!ctx || !ctx->wardrive_net_count_label) return;
     lv_label_set_text_fmt(ctx->wardrive_net_count_label,
-                          "WiFi: %d  BT: %d",
+                          "WiFi: %d  BT: %d  SAT: %d  %.2f km",
                           ctx->wardrive_wifi_count,
-                          ctx->wardrive_bt_count);
+                          ctx->wardrive_bt_count,
+                          ctx->wardrive_sat_count,
+                          ctx->wardrive_distance_m / 1000.0);
+}
+
+static void update_wardrive_trace_button(tab_context_t *ctx)
+{
+    if (!ctx || !ctx->wardrive_trace_btn) return;
+
+    lv_obj_set_style_bg_color(ctx->wardrive_trace_btn,
+                              ctx->wardrive_trace_enabled ? COLOR_MATERIAL_AMBER : lv_color_hex(0x455A64),
+                              0);
+    lv_obj_set_style_bg_color(ctx->wardrive_trace_btn, lv_color_hex(0x555555), LV_STATE_DISABLED);
+
+    lv_obj_t *label = lv_obj_get_child(ctx->wardrive_trace_btn, 0);
+    if (label) {
+        lv_label_set_text(label, ctx->wardrive_trace_enabled ? LV_SYMBOL_GPS " Trace On" : LV_SYMBOL_GPS " Trace");
+    }
+}
+
+static void wardrive_trace_btn_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx) ctx = get_current_ctx();
+    if (!ctx || ctx->wardrive_monitoring) return;
+
+    ctx->wardrive_trace_enabled = !ctx->wardrive_trace_enabled;
+
+    update_wardrive_trace_button(ctx);
+    if (ctx->wardrive_status_label) {
+        lv_label_set_text(ctx->wardrive_status_label,
+                          ctx->wardrive_trace_enabled ? "Wardrive Trace mode enabled" : "Wardrive Trace mode disabled");
+        lv_obj_set_style_text_color(ctx->wardrive_status_label, COLOR_MATERIAL_AMBER, 0);
+    }
 }
 
 static void update_wardrive_table(tab_context_t *ctx)
@@ -16495,6 +16534,7 @@ static void wardrive_stop_cb(lv_event_t *e)
     // Toggle buttons
     if (ctx->wardrive_start_btn) lv_obj_clear_state(ctx->wardrive_start_btn, LV_STATE_DISABLED);
     if (ctx->wardrive_stop_btn) lv_obj_add_state(ctx->wardrive_stop_btn, LV_STATE_DISABLED);
+    if (ctx->wardrive_trace_btn) lv_obj_clear_state(ctx->wardrive_trace_btn, LV_STATE_DISABLED);
     if (ctx->wardrive_gps_type_btn) lv_obj_clear_state(ctx->wardrive_gps_type_btn, LV_STATE_DISABLED);
     if (ctx->wardrive_upload_btn) lv_obj_clear_state(ctx->wardrive_upload_btn, LV_STATE_DISABLED);
 
@@ -16593,6 +16633,26 @@ static void wardrive_monitor_task(void *arg)
                             bsp_display_unlock();
                         }
 
+                        if (strstr(line_buffer, "Wardrive promisc:") != NULL) {
+                            char *sats_ptr = strstr(line_buffer, "sats:");
+                            if (sats_ptr) {
+                                sats_ptr += 5;
+                                while (*sats_ptr == ' ') sats_ptr++;
+                                ctx->wardrive_sat_count = atoi(sats_ptr);
+                            }
+
+                            char *dist_ptr = strstr(line_buffer, "dist:");
+                            if (dist_ptr) {
+                                dist_ptr += 5;
+                                while (*dist_ptr == ' ') dist_ptr++;
+                                ctx->wardrive_distance_m = atof(dist_ptr);
+                            }
+
+                            bsp_display_lock(0);
+                            update_wardrive_count_label(ctx);
+                            bsp_display_unlock();
+                        }
+
                         // GPS fix lost -> re-show overlay, pause status
                         if (ctx->wardrive_gps_fix && strstr(line_buffer, "GPS fix lost") != NULL) {
                             ctx->wardrive_gps_fix = false;
@@ -16647,6 +16707,7 @@ static void wardrive_monitor_task(void *arg)
                             close_wardrive_gps_overlay(ctx);
                             if (ctx->wardrive_start_btn) lv_obj_clear_state(ctx->wardrive_start_btn, LV_STATE_DISABLED);
                             if (ctx->wardrive_stop_btn) lv_obj_add_state(ctx->wardrive_stop_btn, LV_STATE_DISABLED);
+                            if (ctx->wardrive_trace_btn) lv_obj_clear_state(ctx->wardrive_trace_btn, LV_STATE_DISABLED);
                             if (ctx->wardrive_gps_type_btn) lv_obj_clear_state(ctx->wardrive_gps_type_btn, LV_STATE_DISABLED);
                             if (ctx->wardrive_upload_btn) lv_obj_clear_state(ctx->wardrive_upload_btn, LV_STATE_DISABLED);
                             bsp_display_unlock();
@@ -16677,7 +16738,9 @@ static void wardrive_monitor_task(void *arg)
 
                             bsp_display_lock(0);
                             if (ctx->wardrive_status_label) {
-                                lv_label_set_text(ctx->wardrive_status_label, "Wardrive active - Scanning...");
+                                lv_label_set_text(ctx->wardrive_status_label,
+                                                  ctx->wardrive_trace_enabled ? "Wardrive Trace active - Scanning..."
+                                                                              : "Wardrive active - Scanning...");
                                 lv_obj_set_style_text_color(ctx->wardrive_status_label, COLOR_MATERIAL_GREEN, 0);
                             }
                             bsp_display_unlock();
@@ -16692,6 +16755,7 @@ static void wardrive_monitor_task(void *arg)
                             close_wardrive_gps_overlay(ctx);
                             if (ctx->wardrive_start_btn) lv_obj_clear_state(ctx->wardrive_start_btn, LV_STATE_DISABLED);
                             if (ctx->wardrive_stop_btn) lv_obj_add_state(ctx->wardrive_stop_btn, LV_STATE_DISABLED);
+                            if (ctx->wardrive_trace_btn) lv_obj_clear_state(ctx->wardrive_trace_btn, LV_STATE_DISABLED);
                             if (ctx->wardrive_gps_type_btn) lv_obj_clear_state(ctx->wardrive_gps_type_btn, LV_STATE_DISABLED);
                             if (ctx->wardrive_upload_btn) lv_obj_clear_state(ctx->wardrive_upload_btn, LV_STATE_DISABLED);
                             if (ctx->wardrive_status_label) {
@@ -16741,7 +16805,8 @@ static void wardrive_start_cb(lv_event_t *e)
     // Stop any pending WiGLE upload popup/task when a new capture starts
     close_wardrive_wigle_popup_ctx(ctx);
 
-    ESP_LOGI(TAG, "Wardrive start - sending start_wardrive_promisc command");
+    ESP_LOGI(TAG, "Wardrive start - sending %s command",
+             ctx->wardrive_trace_enabled ? "start_wardrive_promisc_trace" : "start_wardrive_promisc");
 
     // Clear any previous network selection and send start command
     tab_id_t active_tab = tab_id_for_ctx(ctx);
@@ -16752,17 +16817,19 @@ static void wardrive_start_cb(lv_event_t *e)
     }
     vTaskDelay(pdMS_TO_TICKS(100));
 
-    // Send start_wardrive_promisc command
+    // Send start command
     if (active_tab == TAB_MBUS) {
-        uart2_send_command("start_wardrive_promisc");
+        uart2_send_command(ctx->wardrive_trace_enabled ? "start_wardrive_promisc_trace" : "start_wardrive_promisc");
     } else {
-        uart_send_command("start_wardrive_promisc");
+        uart_send_command(ctx->wardrive_trace_enabled ? "start_wardrive_promisc_trace" : "start_wardrive_promisc");
     }
 
     // Reset ring buffer
     ctx->wardrive_net_count = 0;
     ctx->wardrive_wifi_count = 0;
     ctx->wardrive_bt_count = 0;
+    ctx->wardrive_sat_count = 0;
+    ctx->wardrive_distance_m = 0.0;
     ctx->wardrive_net_head = 0;
     ctx->wardrive_gps_fix = false;
 
@@ -16773,12 +16840,14 @@ static void wardrive_start_cb(lv_event_t *e)
     // Toggle buttons
     if (ctx->wardrive_start_btn) lv_obj_add_state(ctx->wardrive_start_btn, LV_STATE_DISABLED);
     if (ctx->wardrive_stop_btn) lv_obj_clear_state(ctx->wardrive_stop_btn, LV_STATE_DISABLED);
+    if (ctx->wardrive_trace_btn) lv_obj_add_state(ctx->wardrive_trace_btn, LV_STATE_DISABLED);
     if (ctx->wardrive_gps_type_btn) lv_obj_add_state(ctx->wardrive_gps_type_btn, LV_STATE_DISABLED);
     if (ctx->wardrive_upload_btn) lv_obj_add_state(ctx->wardrive_upload_btn, LV_STATE_DISABLED);
 
     // Update status
     if (ctx->wardrive_status_label) {
-        lv_label_set_text(ctx->wardrive_status_label, "Starting wardrive...");
+        lv_label_set_text(ctx->wardrive_status_label,
+                          ctx->wardrive_trace_enabled ? "Starting wardrive trace..." : "Starting wardrive...");
         lv_obj_set_style_text_color(ctx->wardrive_status_label, COLOR_MATERIAL_AMBER, 0);
     }
     update_wardrive_count_label(ctx);
@@ -16898,7 +16967,7 @@ static void show_wardrive_page(void)
     lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
     lv_obj_set_style_text_color(title, COLOR_MATERIAL_TEAL, 0);
 
-    // Right side: Start + Stop + GPS + Upload buttons
+    // Right side: Start + Stop + Trace + GPS + Upload buttons
     lv_obj_t *btn_cont = lv_obj_create(header);
     lv_obj_set_size(btn_cont, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
     lv_obj_set_style_bg_opa(btn_cont, LV_OPA_TRANSP, 0);
@@ -16910,7 +16979,7 @@ static void show_wardrive_page(void)
 
     // Start button
     ctx->wardrive_start_btn = lv_btn_create(btn_cont);
-    lv_obj_set_size(ctx->wardrive_start_btn, 90, 40);
+    lv_obj_set_size(ctx->wardrive_start_btn, 86, 40);
     lv_obj_set_style_bg_color(ctx->wardrive_start_btn, COLOR_MATERIAL_GREEN, 0);
     lv_obj_set_style_bg_color(ctx->wardrive_start_btn, lv_color_hex(0x555555), LV_STATE_DISABLED);
     lv_obj_set_style_radius(ctx->wardrive_start_btn, 8, 0);
@@ -16923,7 +16992,7 @@ static void show_wardrive_page(void)
 
     // Stop button (initially disabled)
     ctx->wardrive_stop_btn = lv_btn_create(btn_cont);
-    lv_obj_set_size(ctx->wardrive_stop_btn, 90, 40);
+    lv_obj_set_size(ctx->wardrive_stop_btn, 86, 40);
     lv_obj_set_style_bg_color(ctx->wardrive_stop_btn, COLOR_MATERIAL_RED, 0);
     lv_obj_set_style_bg_color(ctx->wardrive_stop_btn, lv_color_hex(0x555555), LV_STATE_DISABLED);
     lv_obj_set_style_radius(ctx->wardrive_stop_btn, 8, 0);
@@ -16935,9 +17004,21 @@ static void show_wardrive_page(void)
     lv_obj_set_style_text_font(stop_label, &lv_font_montserrat_14, 0);
     lv_obj_center(stop_label);
 
+    ctx->wardrive_trace_btn = lv_btn_create(btn_cont);
+    lv_obj_set_size(ctx->wardrive_trace_btn, 104, 40);
+    lv_obj_set_style_radius(ctx->wardrive_trace_btn, 8, 0);
+    lv_obj_set_style_bg_color(ctx->wardrive_trace_btn, lv_color_hex(0x455A64), 0);
+    lv_obj_set_style_bg_color(ctx->wardrive_trace_btn, lv_color_hex(0x555555), LV_STATE_DISABLED);
+    lv_obj_add_event_cb(ctx->wardrive_trace_btn, wardrive_trace_btn_cb, LV_EVENT_CLICKED, ctx);
+
+    lv_obj_t *trace_label = lv_label_create(ctx->wardrive_trace_btn);
+    lv_label_set_text(trace_label, LV_SYMBOL_GPS " Trace");
+    lv_obj_set_style_text_font(trace_label, &lv_font_montserrat_14, 0);
+    lv_obj_center(trace_label);
+
     // GPS Type button (initially enabled - disabled when running)
     ctx->wardrive_gps_type_btn = lv_btn_create(btn_cont);
-    lv_obj_set_size(ctx->wardrive_gps_type_btn, 100, 40);
+    lv_obj_set_size(ctx->wardrive_gps_type_btn, 92, 40);
     lv_obj_set_style_bg_color(ctx->wardrive_gps_type_btn, COLOR_MATERIAL_TEAL, 0);
     lv_obj_set_style_bg_color(ctx->wardrive_gps_type_btn, lv_color_hex(0x555555), LV_STATE_DISABLED);
     lv_obj_set_style_radius(ctx->wardrive_gps_type_btn, 8, 0);
@@ -16950,7 +17031,7 @@ static void show_wardrive_page(void)
 
     // Upload button (enabled only when wardrive is not running)
     ctx->wardrive_upload_btn = lv_btn_create(btn_cont);
-    lv_obj_set_size(ctx->wardrive_upload_btn, 120, 40);
+    lv_obj_set_size(ctx->wardrive_upload_btn, 110, 40);
     lv_obj_set_style_bg_color(ctx->wardrive_upload_btn, COLOR_MATERIAL_PURPLE, 0);
     lv_obj_set_style_bg_color(ctx->wardrive_upload_btn, lv_color_hex(0x555555), LV_STATE_DISABLED);
     lv_obj_set_style_radius(ctx->wardrive_upload_btn, 8, 0);
@@ -16977,10 +17058,15 @@ static void show_wardrive_page(void)
     lv_obj_set_style_text_color(ctx->wardrive_status_label, lv_color_hex(0x888888), 0);
 
     ctx->wardrive_net_count_label = lv_label_create(status_row);
-    lv_label_set_text(ctx->wardrive_net_count_label, "WiFi: 0  BT: 0");
+    lv_label_set_text(ctx->wardrive_net_count_label, "WiFi: 0  BT: 0  SAT: 0  0.00 km");
     lv_obj_set_style_text_font(ctx->wardrive_net_count_label, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(ctx->wardrive_net_count_label, COLOR_MATERIAL_TEAL, 0);
     lv_obj_set_style_text_align(ctx->wardrive_net_count_label, LV_TEXT_ALIGN_RIGHT, 0);
+
+    ctx->wardrive_trace_enabled = true;
+    ctx->wardrive_sat_count = 0;
+    ctx->wardrive_distance_m = 0.0;
+    update_wardrive_trace_button(ctx);
 
     // ---- Scrollable table container ----
     ctx->wardrive_table = lv_obj_create(ctx->wardrive_page);
