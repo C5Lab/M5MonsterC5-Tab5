@@ -226,6 +226,7 @@ typedef struct {
     char security[28];
     char lat[14];
     char lon[14];
+    char kind[8];
 } wardrive_network_t;
 
 #define WARDRIVE_WIGLE_MAX_FILES 48
@@ -479,6 +480,8 @@ typedef struct {
     TaskHandle_t wardrive_task;
     wardrive_network_t wardrive_networks[WARDRIVE_MAX_NETWORKS];
     int wardrive_net_count;
+    int wardrive_wifi_count;
+    int wardrive_bt_count;
     int wardrive_net_head;
     lv_obj_t *wardrive_gps_type_btn;
     lv_obj_t *wardrive_gps_type_overlay;
@@ -1805,6 +1808,7 @@ static void wardrive_stop_cb(lv_event_t *e);
 static void wardrive_back_cb(lv_event_t *e);
 static void wardrive_monitor_task(void *arg);
 static void update_wardrive_table(tab_context_t *ctx);
+static void update_wardrive_count_label(tab_context_t *ctx);
 static void close_wardrive_gps_overlay(tab_context_t *ctx);
 static void wardrive_gps_type_btn_cb(lv_event_t *e);
 static void wardrive_gps_type_close_cb(lv_event_t *e);
@@ -13930,6 +13934,15 @@ static void show_wardrive_gps_overlay(tab_context_t *ctx)
 }
 
 // Update wardrive network table (newest first)
+static void update_wardrive_count_label(tab_context_t *ctx)
+{
+    if (!ctx || !ctx->wardrive_net_count_label) return;
+    lv_label_set_text_fmt(ctx->wardrive_net_count_label,
+                          "WiFi: %d  BT: %d",
+                          ctx->wardrive_wifi_count,
+                          ctx->wardrive_bt_count);
+}
+
 static void update_wardrive_table(tab_context_t *ctx)
 {
     if (!ctx || !ctx->wardrive_table) return;
@@ -13959,7 +13972,7 @@ static void update_wardrive_table(tab_context_t *ctx)
         // SSID
         lv_obj_t *ssid_lbl = lv_label_create(row);
         if (net->ssid[0] == '\0') {
-            lv_label_set_text(ssid_lbl, "<hidden>");
+            lv_label_set_text(ssid_lbl, (strcmp(net->kind, "BLE") == 0) ? "<unnamed>" : "<hidden>");
             lv_obj_set_style_text_color(ssid_lbl, lv_color_hex(0x666666), 0);
         } else {
             lv_label_set_text(ssid_lbl, net->ssid);
@@ -13968,6 +13981,15 @@ static void update_wardrive_table(tab_context_t *ctx)
         lv_obj_set_style_text_font(ssid_lbl, &lv_font_montserrat_12, 0);
         lv_obj_set_flex_grow(ssid_lbl, 1);
         lv_label_set_long_mode(ssid_lbl, LV_LABEL_LONG_DOT);
+
+        // Type
+        lv_obj_t *type_lbl = lv_label_create(row);
+        lv_label_set_text(type_lbl, net->kind[0] ? net->kind : "WIFI");
+        lv_obj_set_style_text_font(type_lbl, &lv_font_montserrat_10, 0);
+        lv_obj_set_style_text_color(type_lbl,
+                                    (strcmp(net->kind, "BLE") == 0) ? COLOR_MATERIAL_BLUE : COLOR_MATERIAL_GREEN,
+                                    0);
+        lv_obj_set_width(type_lbl, 36);
 
         // BSSID
         lv_obj_t *bssid_lbl = lv_label_create(row);
@@ -13980,7 +14002,9 @@ static void update_wardrive_table(tab_context_t *ctx)
         lv_obj_t *sec_lbl = lv_label_create(row);
         lv_label_set_text(sec_lbl, net->security);
         lv_obj_set_style_text_font(sec_lbl, &lv_font_montserrat_10, 0);
-        if (strstr(net->security, "WPA3") != NULL) {
+        if (strcmp(net->kind, "BLE") == 0) {
+            lv_obj_set_style_text_color(sec_lbl, COLOR_MATERIAL_BLUE, 0);
+        } else if (strstr(net->security, "WPA3") != NULL) {
             lv_obj_set_style_text_color(sec_lbl, COLOR_MATERIAL_GREEN, 0);
         } else if (strstr(net->security, "WPA2") != NULL || strstr(net->security, "WPA_") != NULL) {
             lv_obj_set_style_text_color(sec_lbl, COLOR_MATERIAL_AMBER, 0);
@@ -14004,11 +14028,13 @@ static void update_wardrive_table(tab_context_t *ctx)
 }
 
 // Parse a wardrive CSV network line and add to ring buffer
-// Format: BSSID,SSID,[SECURITY],timestamp,channel,rssi,lat,lon,alt,acc,WIFI
+// WiFi: BSSID,SSID,[SECURITY],timestamp,channel,rssi,lat,lon,alt,acc,WIFI
+// BLE:  MAC,NAME,TYPE,timestamp,channel,rssi,lat,lon,alt,acc,BLE
 static bool parse_wardrive_network_line(tab_context_t *ctx, const char *line)
 {
-    // Must end with ,WIFI
-    if (!strstr(line, ",WIFI")) return false;
+    bool is_wifi = strstr(line, ",WIFI") != NULL;
+    bool is_ble = strstr(line, ",BLE") != NULL;
+    if (!is_wifi && !is_ble) return false;
 
     // Quick validation: must have MAC-like pattern at start (XX:XX:XX:XX:XX:XX)
     if (strlen(line) < 17 || line[2] != ':' || line[5] != ':') return false;
@@ -14036,20 +14062,26 @@ static bool parse_wardrive_network_line(tab_context_t *ctx, const char *line)
     if (field_count < 11) return false;
 
     wardrive_network_t *net = &ctx->wardrive_networks[ctx->wardrive_net_head];
+    memset(net, 0, sizeof(*net));
 
     // BSSID (field 0) - max 17 chars + null
     snprintf(net->bssid, sizeof(net->bssid), "%.17s", fields[0]);
 
-    // SSID (field 1, may be empty) - max 32 chars + null
+    // SSID / device name (field 1, may be empty) - max 32 chars + null
     snprintf(net->ssid, sizeof(net->ssid), "%.32s", fields[1]);
 
-    // Security (field 2, strip brackets) - max 27 chars + null
-    char *sec = fields[2];
-    if (sec[0] == '[') sec++;
-    snprintf(net->security, sizeof(net->security), "%.27s", sec);
-    // Remove trailing ']'
-    char *bracket = strchr(net->security, ']');
-    if (bracket) *bracket = '\0';
+    snprintf(net->kind, sizeof(net->kind), "%s", is_ble ? "BLE" : "WIFI");
+
+    // Security / BLE device type (field 2)
+    if (is_wifi) {
+        char *sec = fields[2];
+        if (sec[0] == '[') sec++;
+        snprintf(net->security, sizeof(net->security), "%.27s", sec);
+        char *bracket = strchr(net->security, ']');
+        if (bracket) *bracket = '\0';
+    } else {
+        snprintf(net->security, sizeof(net->security), "%.27s", fields[2]);
+    }
 
     // Lat (field 6) - max 13 chars + null
     snprintf(net->lat, sizeof(net->lat), "%.13s", fields[6]);
@@ -14060,6 +14092,11 @@ static bool parse_wardrive_network_line(tab_context_t *ctx, const char *line)
     // Advance ring buffer
     ctx->wardrive_net_head = (ctx->wardrive_net_head + 1) % WARDRIVE_MAX_NETWORKS;
     ctx->wardrive_net_count++;
+    if (is_ble) {
+        ctx->wardrive_bt_count++;
+    } else {
+        ctx->wardrive_wifi_count++;
+    }
 
     return true;
 }
@@ -16326,9 +16363,7 @@ static void wardrive_stop_cb(lv_event_t *e)
         lv_label_set_text(ctx->wardrive_status_label, "Wardrive stopped");
         lv_obj_set_style_text_color(ctx->wardrive_status_label, lv_color_hex(0x888888), 0);
     }
-    if (ctx->wardrive_net_count_label) {
-        lv_label_set_text_fmt(ctx->wardrive_net_count_label, "Networks: %d", ctx->wardrive_net_count);
-    }
+    update_wardrive_count_label(ctx);
 }
 
 // Wardrive monitor task - reads UART for GPS fix, network CSV lines, log messages
@@ -16403,18 +16438,30 @@ static void wardrive_monitor_task(void *arg)
                             bsp_display_unlock();
                         }
 
-                        // Flushed networks message -> update status + count
-                        if (strstr(line_buffer, "Flushed ") != NULL && strstr(line_buffer, " networks to ") != NULL) {
+                        // Flushed networks / BT devices message -> update status + count
+                        if (strstr(line_buffer, "Flushed ") != NULL &&
+                            (strstr(line_buffer, " networks to ") != NULL ||
+                             strstr(line_buffer, " networks + ") != NULL)) {
                             ESP_LOGI(TAG, "Wardrive: %s", line_buffer);
+
+                            int reported_wifi = 0;
+                            int reported_bt = 0;
+                            if (sscanf(line_buffer, "Flushed %d networks + %d BT devices to",
+                                       &reported_wifi, &reported_bt) == 2) {
+                                ctx->wardrive_wifi_count = reported_wifi;
+                                ctx->wardrive_bt_count = reported_bt;
+                                ctx->wardrive_net_count = reported_wifi + reported_bt;
+                            } else if (sscanf(line_buffer, "Flushed %d networks to", &reported_wifi) == 1) {
+                                ctx->wardrive_wifi_count = reported_wifi;
+                                ctx->wardrive_net_count = reported_wifi + ctx->wardrive_bt_count;
+                            }
 
                             bsp_display_lock(0);
                             if (ctx->wardrive_status_label) {
                                 lv_label_set_text(ctx->wardrive_status_label, "Scanning...");
                                 lv_obj_set_style_text_color(ctx->wardrive_status_label, COLOR_MATERIAL_GREEN, 0);
                             }
-                            if (ctx->wardrive_net_count_label) {
-                                lv_label_set_text_fmt(ctx->wardrive_net_count_label, "Networks: %d", ctx->wardrive_net_count);
-                            }
+                            update_wardrive_count_label(ctx);
                             bsp_display_unlock();
                         }
 
@@ -16516,6 +16563,8 @@ static void wardrive_monitor_task(void *arg)
                             const char *total_str = strstr(line_buffer, "Total unique networks: ");
                             if (total_str) {
                                 sscanf(total_str, "Total unique networks: %d", &total_nets);
+                                ctx->wardrive_wifi_count = total_nets;
+                                ctx->wardrive_net_count = ctx->wardrive_wifi_count + ctx->wardrive_bt_count;
                             }
 
                             ctx->wardrive_monitoring = false;
@@ -16529,9 +16578,7 @@ static void wardrive_monitor_task(void *arg)
                                 lv_label_set_text(ctx->wardrive_status_label, "Wardrive stopped");
                                 lv_obj_set_style_text_color(ctx->wardrive_status_label, lv_color_hex(0x888888), 0);
                             }
-                            if (ctx->wardrive_net_count_label) {
-                                lv_label_set_text_fmt(ctx->wardrive_net_count_label, "Networks: %d", total_nets);
-                            }
+                            update_wardrive_count_label(ctx);
                             bsp_display_unlock();
                         }
 
@@ -16551,9 +16598,7 @@ static void wardrive_monitor_task(void *arg)
             if (batch_has_new_networks) {
                 bsp_display_lock(0);
                 update_wardrive_table(ctx);
-                if (ctx->wardrive_net_count_label) {
-                    lv_label_set_text_fmt(ctx->wardrive_net_count_label, "Networks: %d", ctx->wardrive_net_count);
-                }
+                update_wardrive_count_label(ctx);
                 bsp_display_unlock();
             }
         }
@@ -16596,6 +16641,8 @@ static void wardrive_start_cb(lv_event_t *e)
 
     // Reset ring buffer
     ctx->wardrive_net_count = 0;
+    ctx->wardrive_wifi_count = 0;
+    ctx->wardrive_bt_count = 0;
     ctx->wardrive_net_head = 0;
     ctx->wardrive_gps_fix = false;
 
@@ -16614,9 +16661,7 @@ static void wardrive_start_cb(lv_event_t *e)
         lv_label_set_text(ctx->wardrive_status_label, "Starting wardrive...");
         lv_obj_set_style_text_color(ctx->wardrive_status_label, COLOR_MATERIAL_AMBER, 0);
     }
-    if (ctx->wardrive_net_count_label) {
-        lv_label_set_text(ctx->wardrive_net_count_label, "Networks: 0");
-    }
+    update_wardrive_count_label(ctx);
 
     // Show GPS fix overlay
     show_wardrive_gps_overlay(ctx);
@@ -16812,7 +16857,7 @@ static void show_wardrive_page(void)
     lv_obj_set_style_text_color(ctx->wardrive_status_label, lv_color_hex(0x888888), 0);
 
     ctx->wardrive_net_count_label = lv_label_create(status_row);
-    lv_label_set_text(ctx->wardrive_net_count_label, "");
+    lv_label_set_text(ctx->wardrive_net_count_label, "WiFi: 0  BT: 0");
     lv_obj_set_style_text_font(ctx->wardrive_net_count_label, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(ctx->wardrive_net_count_label, COLOR_MATERIAL_TEAL, 0);
     lv_obj_set_style_text_align(ctx->wardrive_net_count_label, LV_TEXT_ALIGN_RIGHT, 0);
