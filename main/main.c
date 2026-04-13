@@ -14880,11 +14880,11 @@ static void wardrive_wigle_send_btn_cb(lv_event_t *e)
 
     TaskFunction_t upload_task = wardrive_wigle_upload_task;
     const char *task_name = "wd_wigle";
-    uint32_t task_stack_size = 12288;
+    uint32_t task_stack_size = 24576;
     if (ctx->wardrive_upload_provider == WARDRIVE_UPLOAD_PROVIDER_WDGWARS) {
         upload_task = wardrive_wdgwars_upload_task;
         task_name = "wd_wdgwars";
-        task_stack_size = 20480;
+        task_stack_size = 24576;
     }
 
     if (xTaskCreate(upload_task, task_name, task_stack_size, ctx, 5, &ctx->wardrive_wigle_task) != pdTRUE) {
@@ -15109,9 +15109,30 @@ static bool wardrive_wigle_ensure_wifi_connected(tab_context_t *ctx, tab_id_t ac
         return false;
     }
 
+    char *scan_rx_buf = heap_caps_malloc(UART_BUF_SIZE, MALLOC_CAP_SPIRAM);
+    char *line_buf = heap_caps_malloc(512, MALLOC_CAP_SPIRAM);
+    evil_twin_entry_t *et_entries = heap_caps_calloc(EVIL_TWIN_MAX_ENTRIES, sizeof(evil_twin_entry_t), MALLOC_CAP_SPIRAM);
+    char *et_buf = heap_caps_malloc(512, MALLOC_CAP_SPIRAM);
+    char *wifi_rx_buf = heap_caps_malloc(2048, MALLOC_CAP_SPIRAM);
+
+    if (!scan_rx_buf || !line_buf || !et_entries || !et_buf || !wifi_rx_buf) {
+        if (scan_rx_buf) heap_caps_free(scan_rx_buf);
+        if (line_buf) heap_caps_free(line_buf);
+        if (et_entries) heap_caps_free(et_entries);
+        if (et_buf) heap_caps_free(et_buf);
+        if (wifi_rx_buf) heap_caps_free(wifi_rx_buf);
+        ESP_LOGE(TAG, "[%s] WiGLE: failed to allocate upload buffers", tab_transport_name(active_tab));
+        return false;
+    }
+
     if (ctx->arp_wifi_connected || arp_wifi_connected) {
         ESP_LOGI(TAG, "[%s] WiGLE: WiFi already connected, skipping connect flow",
                  tab_transport_name(active_tab));
+        heap_caps_free(scan_rx_buf);
+        heap_caps_free(line_buf);
+        heap_caps_free(et_entries);
+        heap_caps_free(et_buf);
+        heap_caps_free(wifi_rx_buf);
         return true;
     }
 
@@ -15133,19 +15154,27 @@ static bool wardrive_wigle_ensure_wifi_connected(tab_context_t *ctx, tab_id_t ac
     int net_count = 0;
     memset(nets, 0, sizeof(nets));
 
-    char scan_rx_buf[UART_BUF_SIZE];
-    char line_buf[512];
     int line_pos = 0;
     bool scan_complete = false;
+    bool background_scan_started = false;
+    int initial_empty_reads = 0;
     TickType_t scan_start = xTaskGetTickCount();
     TickType_t scan_timeout = pdMS_TO_TICKS(UART_RX_TIMEOUT);
 
     while (!scan_complete && (xTaskGetTickCount() - scan_start) < scan_timeout && ctx->wardrive_wigle_task_running) {
         int len = transport_read_bytes_tab(active_tab, uart_port, scan_rx_buf, UART_BUF_SIZE - 1, pdMS_TO_TICKS(100));
         if (len <= 0) {
+            initial_empty_reads++;
+            if (initial_empty_reads >= 8) {
+                background_scan_started = true;
+                ESP_LOGI(TAG, "[%s] WiGLE: no immediate scan output, switching to show_scan_results polling",
+                         tab_transport_name(active_tab));
+                break;
+            }
             continue;
         }
 
+        initial_empty_reads = 0;
         scan_rx_buf[len] = '\0';
         for (int i = 0; i < len; i++) {
             char c = scan_rx_buf[i];
@@ -15155,6 +15184,10 @@ static bool wardrive_wigle_ensure_wifi_connected(tab_context_t *ctx, tab_id_t ac
                     if (strstr(line_buf, "Scan results printed") != NULL) {
                         scan_complete = true;
                         break;
+                    }
+                    if (strstr(line_buf, "Background scan started") != NULL ||
+                        strstr(line_buf, "Scan already in progress") != NULL) {
+                        background_scan_started = true;
                     }
                     if (line_buf[0] == '"' && net_count < MAX_NETWORKS) {
                         wifi_network_t net;
@@ -15170,7 +15203,77 @@ static bool wardrive_wigle_ensure_wifi_connected(tab_context_t *ctx, tab_id_t ac
         }
     }
 
+    while (!scan_complete &&
+           background_scan_started &&
+           (xTaskGetTickCount() - scan_start) < scan_timeout &&
+           ctx->wardrive_wigle_task_running) {
+        vTaskDelay(pdMS_TO_TICKS(600));
+
+        if (active_tab == TAB_USB && usb_cdc_handle) {
+            usbh_cdc_flush_rx_buffer(usb_cdc_handle);
+        } else {
+            uart_flush(uart_port);
+        }
+        transport_write_bytes_tab(active_tab, uart_port, "show_scan_results\r\n", 19);
+        ESP_LOGI(TAG, "[%s] WiGLE: polling show_scan_results", tab_transport_name(active_tab));
+
+        int poll_empty_reads = 0;
+        line_pos = 0;
+        while (!scan_complete &&
+               poll_empty_reads < 5 &&
+               (xTaskGetTickCount() - scan_start) < scan_timeout &&
+               ctx->wardrive_wigle_task_running) {
+            int len = transport_read_bytes_tab(active_tab, uart_port, scan_rx_buf, UART_BUF_SIZE - 1, pdMS_TO_TICKS(250));
+            if (len <= 0) {
+                poll_empty_reads++;
+                continue;
+            }
+
+            poll_empty_reads = 0;
+            scan_rx_buf[len] = '\0';
+            for (int i = 0; i < len; i++) {
+                char c = scan_rx_buf[i];
+                if (c == '\n' || c == '\r') {
+                    if (line_pos > 0) {
+                        line_buf[line_pos] = '\0';
+                        if (strstr(line_buf, "Scan results printed") != NULL) {
+                            scan_complete = true;
+                            break;
+                        }
+                        if (strstr(line_buf, "Scan still in progress") != NULL) {
+                            line_pos = 0;
+                            continue;
+                        }
+                        if (line_buf[0] == '"' && net_count < MAX_NETWORKS) {
+                            wifi_network_t net;
+                            if (parse_network_line(line_buf, &net)) {
+                                bool duplicate = false;
+                                for (int n = 0; n < net_count; n++) {
+                                    if (strcmp(nets[n].bssid, net.bssid) == 0) {
+                                        duplicate = true;
+                                        break;
+                                    }
+                                }
+                                if (!duplicate) {
+                                    nets[net_count++] = net;
+                                }
+                            }
+                        }
+                        line_pos = 0;
+                    }
+                } else if (line_pos < 511) {
+                    line_buf[line_pos++] = c;
+                }
+            }
+        }
+    }
+
     if (!ctx->wardrive_wigle_task_running) {
+        heap_caps_free(scan_rx_buf);
+        heap_caps_free(line_buf);
+        heap_caps_free(et_entries);
+        heap_caps_free(et_buf);
+        heap_caps_free(wifi_rx_buf);
         return false;
     }
     if (net_count == 0) {
@@ -15179,6 +15282,11 @@ static bool wardrive_wigle_ensure_wifi_connected(tab_context_t *ctx, tab_id_t ac
             lv_label_set_text(ctx->wardrive_wigle_status_label, "No WiFi networks found.");
         }
         bsp_display_unlock();
+        heap_caps_free(scan_rx_buf);
+        heap_caps_free(line_buf);
+        heap_caps_free(et_entries);
+        heap_caps_free(et_buf);
+        heap_caps_free(wifi_rx_buf);
         return false;
     }
     ESP_LOGI(TAG, "[%s] WiGLE: scan found %d network(s)", tab_transport_name(active_tab), net_count);
@@ -15307,6 +15415,11 @@ static bool wardrive_wigle_ensure_wifi_connected(tab_context_t *ctx, tab_id_t ac
             vTaskDelay(pdMS_TO_TICKS(100));
         }
         if (!ctx->wardrive_wigle_task_running) {
+            heap_caps_free(scan_rx_buf);
+            heap_caps_free(line_buf);
+            heap_caps_free(et_entries);
+            heap_caps_free(et_buf);
+            heap_caps_free(wifi_rx_buf);
             return false;
         }
 
@@ -15316,6 +15429,11 @@ static bool wardrive_wigle_ensure_wifi_connected(tab_context_t *ctx, tab_id_t ac
                 lv_label_set_text(ctx->wardrive_wigle_status_label, "Enter SSID and password.");
             }
             bsp_display_unlock();
+            heap_caps_free(scan_rx_buf);
+            heap_caps_free(line_buf);
+            heap_caps_free(et_entries);
+            heap_caps_free(et_buf);
+            heap_caps_free(wifi_rx_buf);
             return false;
         }
     } else {
@@ -15330,16 +15448,14 @@ static bool wardrive_wigle_ensure_wifi_connected(tab_context_t *ctx, tab_id_t ac
         ESP_LOGI(TAG, "[%s] WiGLE: sent show_pass evil", tab_transport_name(active_tab));
         vTaskDelay(pdMS_TO_TICKS(200));
 
-        evil_twin_entry_t et_entries[EVIL_TWIN_MAX_ENTRIES];
         int et_count = 0;
-        memset(et_entries, 0, sizeof(et_entries));
+        memset(et_entries, 0, sizeof(evil_twin_entry_t) * EVIL_TWIN_MAX_ENTRIES);
 
         {
-            char et_buf[512];
             int et_retries = 10;
             int et_empty = 0;
             while (et_retries-- > 0 && et_count < EVIL_TWIN_MAX_ENTRIES) {
-                int len = transport_read_bytes_tab(active_tab, uart_port, et_buf, sizeof(et_buf) - 1, pdMS_TO_TICKS(100));
+                int len = transport_read_bytes_tab(active_tab, uart_port, et_buf, 511, pdMS_TO_TICKS(100));
                 if (len > 0) {
                     et_buf[len] = '\0';
                     et_empty = 0;
@@ -15403,6 +15519,11 @@ static bool wardrive_wigle_ensure_wifi_connected(tab_context_t *ctx, tab_id_t ac
             vTaskDelay(pdMS_TO_TICKS(100));
         }
         if (!ctx->wardrive_wigle_task_running) {
+            heap_caps_free(scan_rx_buf);
+            heap_caps_free(line_buf);
+            heap_caps_free(et_entries);
+            heap_caps_free(et_buf);
+            heap_caps_free(wifi_rx_buf);
             return false;
         }
         if (strlen(ctx->wardrive_wigle_selected_password) == 0) {
@@ -15411,6 +15532,11 @@ static bool wardrive_wigle_ensure_wifi_connected(tab_context_t *ctx, tab_id_t ac
                 lv_label_set_text(ctx->wardrive_wigle_status_label, "No password entered.");
             }
             bsp_display_unlock();
+            heap_caps_free(scan_rx_buf);
+            heap_caps_free(line_buf);
+            heap_caps_free(et_entries);
+            heap_caps_free(et_buf);
+            heap_caps_free(wifi_rx_buf);
             return false;
         }
     }
@@ -15439,31 +15565,35 @@ static bool wardrive_wigle_ensure_wifi_connected(tab_context_t *ctx, tab_id_t ac
     ESP_LOGI(TAG, "[%s] WiGLE: sent wifi_connect for SSID '%s'",
              tab_transport_name(active_tab), ctx->wardrive_wigle_selected_ssid);
 
-    char rx_buf[2048];
     int total_len = 0;
     int elapsed_ms = 0;
     bool wifi_success = false;
-    while (elapsed_ms < 15000 && total_len < (int)sizeof(rx_buf) - 1 && ctx->wardrive_wigle_task_running) {
-        int len = transport_read_bytes_tab(active_tab, uart_port, rx_buf + total_len,
-                                           sizeof(rx_buf) - total_len - 1, pdMS_TO_TICKS(200));
+    while (elapsed_ms < 15000 && total_len < 2047 && ctx->wardrive_wigle_task_running) {
+        int len = transport_read_bytes_tab(active_tab, uart_port, wifi_rx_buf + total_len,
+                                           2048 - total_len - 1, pdMS_TO_TICKS(200));
         if (len > 0) {
             total_len += len;
-            rx_buf[total_len] = '\0';
-            if (strstr(rx_buf, "SUCCESS") != NULL) {
+            wifi_rx_buf[total_len] = '\0';
+            if (strstr(wifi_rx_buf, "SUCCESS") != NULL) {
                 wifi_success = true;
                 break;
             }
-            if (strstr(rx_buf, "FAILED") != NULL || strstr(rx_buf, "Error") != NULL) {
+            if (strstr(wifi_rx_buf, "FAILED") != NULL || strstr(wifi_rx_buf, "Error") != NULL) {
                 break;
             }
         }
         elapsed_ms += 200;
     }
-    rx_buf[total_len] = '\0';
+    wifi_rx_buf[total_len] = '\0';
     ESP_LOGI(TAG, "[%s] WiGLE: wifi_connect response: %s",
-             tab_transport_name(active_tab), rx_buf);
+             tab_transport_name(active_tab), wifi_rx_buf);
 
     if (!ctx->wardrive_wigle_task_running) {
+        heap_caps_free(scan_rx_buf);
+        heap_caps_free(line_buf);
+        heap_caps_free(et_entries);
+        heap_caps_free(et_buf);
+        heap_caps_free(wifi_rx_buf);
         return false;
     }
     if (!wifi_success) {
@@ -15472,6 +15602,11 @@ static bool wardrive_wigle_ensure_wifi_connected(tab_context_t *ctx, tab_id_t ac
             lv_label_set_text(ctx->wardrive_wigle_status_label, "WiFi connection failed!");
         }
         bsp_display_unlock();
+        heap_caps_free(scan_rx_buf);
+        heap_caps_free(line_buf);
+        heap_caps_free(et_entries);
+        heap_caps_free(et_buf);
+        heap_caps_free(wifi_rx_buf);
         return false;
     }
 
@@ -15483,6 +15618,11 @@ static bool wardrive_wigle_ensure_wifi_connected(tab_context_t *ctx, tab_id_t ac
     }
     bsp_display_unlock();
     vTaskDelay(pdMS_TO_TICKS(500));
+    heap_caps_free(scan_rx_buf);
+    heap_caps_free(line_buf);
+    heap_caps_free(et_entries);
+    heap_caps_free(et_buf);
+    heap_caps_free(wifi_rx_buf);
     return true;
 }
 
@@ -16444,18 +16584,6 @@ static void wardrive_monitor_task(void *arg)
                              strstr(line_buffer, " networks + ") != NULL)) {
                             ESP_LOGI(TAG, "Wardrive: %s", line_buffer);
 
-                            int reported_wifi = 0;
-                            int reported_bt = 0;
-                            if (sscanf(line_buffer, "Flushed %d networks + %d BT devices to",
-                                       &reported_wifi, &reported_bt) == 2) {
-                                ctx->wardrive_wifi_count = reported_wifi;
-                                ctx->wardrive_bt_count = reported_bt;
-                                ctx->wardrive_net_count = reported_wifi + reported_bt;
-                            } else if (sscanf(line_buffer, "Flushed %d networks to", &reported_wifi) == 1) {
-                                ctx->wardrive_wifi_count = reported_wifi;
-                                ctx->wardrive_net_count = reported_wifi + ctx->wardrive_bt_count;
-                            }
-
                             bsp_display_lock(0);
                             if (ctx->wardrive_status_label) {
                                 lv_label_set_text(ctx->wardrive_status_label, "Scanning...");
@@ -16558,14 +16686,6 @@ static void wardrive_monitor_task(void *arg)
                         // Wardrive promisc stopped (remote) -> graceful stop
                         if (strstr(line_buffer, "Wardrive promisc stopped") != NULL) {
                             ESP_LOGI(TAG, "Wardrive: remote stop - %s", line_buffer);
-
-                            int total_nets = 0;
-                            const char *total_str = strstr(line_buffer, "Total unique networks: ");
-                            if (total_str) {
-                                sscanf(total_str, "Total unique networks: %d", &total_nets);
-                                ctx->wardrive_wifi_count = total_nets;
-                                ctx->wardrive_net_count = ctx->wardrive_wifi_count + ctx->wardrive_bt_count;
-                            }
 
                             ctx->wardrive_monitoring = false;
                             bsp_display_lock(0);
