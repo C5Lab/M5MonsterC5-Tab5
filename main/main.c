@@ -1637,6 +1637,7 @@ static int beacon_spam_parse_ssid_list_response(tab_context_t *ctx, char *rx_buf
                                                 bool *unknown_command,
                                                 bool *empty_list,
                                                 bool *missing_file);
+static void beacon_spam_escape_quoted_arg(const char *src, char *dst, size_t dst_size);
 static void close_beacon_ssids_add_popup(tab_context_t *ctx);
 static void close_beacon_spam_active_popup(tab_context_t *ctx, bool send_stop);
 static void observer_back_btn_event_cb(lv_event_t *e);
@@ -6374,8 +6375,13 @@ static void mitm_connect_and_start_cb(lv_event_t *e)
     bsp_display_unlock();
     vTaskDelay(pdMS_TO_TICKS(50));
 
-    char cmd[128];
-    snprintf(cmd, sizeof(cmd), "wifi_connect %s %s", ssid, password);
+    char escaped_ssid[67];
+    char escaped_password[131];
+    beacon_spam_escape_quoted_arg(ssid, escaped_ssid, sizeof(escaped_ssid));
+    beacon_spam_escape_quoted_arg(password, escaped_password, sizeof(escaped_password));
+
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "wifi_connect \"%s\" \"%s\"", escaped_ssid, escaped_password);
     uart_send_command_for_tab(cmd);
 
     uart_port_t uart_port = get_current_uart();
@@ -7350,8 +7356,13 @@ static void arp_connect_cb(lv_event_t *e)
     vTaskDelay(pdMS_TO_TICKS(50));
 
     // Send wifi_connect command to current tab's UART
-    char cmd[128];
-    snprintf(cmd, sizeof(cmd), "wifi_connect %s %s", arp_target_ssid, password);
+    char escaped_ssid[67];
+    char escaped_password[131];
+    beacon_spam_escape_quoted_arg(arp_target_ssid, escaped_ssid, sizeof(escaped_ssid));
+    beacon_spam_escape_quoted_arg(password, escaped_password, sizeof(escaped_password));
+
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "wifi_connect \"%s\" \"%s\"", escaped_ssid, escaped_password);
     uart_send_command_for_tab(cmd);
 
     // Wait for response (up to 15 seconds)
@@ -7688,8 +7699,13 @@ static void arp_auto_connect_timer_cb(lv_timer_t *timer)
     vTaskDelay(pdMS_TO_TICKS(50));
 
     // Send wifi_connect command to current tab's UART
-    char cmd[128];
-    snprintf(cmd, sizeof(cmd), "wifi_connect %s %s", arp_target_ssid, arp_target_password);
+    char escaped_ssid[67];
+    char escaped_password[131];
+    beacon_spam_escape_quoted_arg(arp_target_ssid, escaped_ssid, sizeof(escaped_ssid));
+    beacon_spam_escape_quoted_arg(arp_target_password, escaped_password, sizeof(escaped_password));
+
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "wifi_connect \"%s\" \"%s\"", escaped_ssid, escaped_password);
     uart_send_command_for_tab(cmd);
     uart_port_t uart_port = get_current_uart();
 
@@ -15590,9 +15606,14 @@ static bool wardrive_wigle_ensure_wifi_connected(tab_context_t *ctx, tab_id_t ac
     }
     bsp_display_unlock();
 
-    char wifi_cmd[160];
-    snprintf(wifi_cmd, sizeof(wifi_cmd), "wifi_connect %s %s",
-             ctx->wardrive_wigle_selected_ssid, ctx->wardrive_wigle_selected_password);
+    char escaped_ssid[67];
+    char escaped_password[131];
+    beacon_spam_escape_quoted_arg(ctx->wardrive_wigle_selected_ssid, escaped_ssid, sizeof(escaped_ssid));
+    beacon_spam_escape_quoted_arg(ctx->wardrive_wigle_selected_password, escaped_password, sizeof(escaped_password));
+
+    char wifi_cmd[256];
+    snprintf(wifi_cmd, sizeof(wifi_cmd), "wifi_connect \"%s\" \"%s\"",
+             escaped_ssid, escaped_password);
 
     if (active_tab == TAB_USB && usb_cdc_handle) {
         usbh_cdc_flush_rx_buffer(usb_cdc_handle);
@@ -21951,9 +21972,14 @@ static void wpasec_upload_task(void *arg)
         }
         bsp_display_unlock();
 
-        char wifi_cmd[128];
-        snprintf(wifi_cmd, sizeof(wifi_cmd), "wifi_connect %s %s",
-                 ctx->wpasec_selected_ssid, ctx->wpasec_selected_password);
+        char escaped_ssid[67];
+        char escaped_password[131];
+        beacon_spam_escape_quoted_arg(ctx->wpasec_selected_ssid, escaped_ssid, sizeof(escaped_ssid));
+        beacon_spam_escape_quoted_arg(ctx->wpasec_selected_password, escaped_password, sizeof(escaped_password));
+
+        char wifi_cmd[256];
+        snprintf(wifi_cmd, sizeof(wifi_cmd), "wifi_connect \"%s\" \"%s\"",
+                 escaped_ssid, escaped_password);
 
         uart_flush_input(uart_port);
         uart_send_command_for_tab(wifi_cmd);
