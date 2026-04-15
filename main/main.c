@@ -45,7 +45,7 @@
 #include "esp_http_server.h"
 #include "lwip/sockets.h"
 
-#define JANOS_TAB_VERSION "1.2.3"
+#define JANOS_TAB_VERSION "1.2.2"
 #define JANOS_VERSION_REQUIRED "1.5.8"
 #include "lwip/netdb.h"
 #include <dirent.h>
@@ -166,6 +166,7 @@ typedef struct {
     int rssi;
     char band[8];  // "2.4GHz" or "5GHz"
     char security[24];
+    char vendor[48];
 } wifi_network_t;
 
 // Observer network info structure (for sniffer results)
@@ -176,6 +177,7 @@ typedef struct {
     int channel;
     int rssi;            // Signal strength in dBm
     char band[8];        // "2.4GHz" or "5GHz"
+    char vendor[48];
     int client_count;
     char clients[MAX_CLIENTS_PER_NETWORK][18];  // MAC addresses of clients
 } observer_network_t;
@@ -1655,6 +1657,8 @@ static void destroy_deauth_popup_ui(void);
 static void close_deauth_popup(void);
 static void deauth_btn_click_cb(lv_event_t *e);
 static void update_observer_table(tab_context_t *ctx);
+static void observer_export_btn_cb(lv_event_t *e);
+static bool observer_export_csv(tab_context_t *ctx, char *out_path, size_t out_path_sz, char *err_msg, size_t err_msg_sz);
 static bool parse_sniffer_network_line(const char *line, observer_network_t *net);
 static bool parse_sniffer_client_line(const char *line, char *mac_out, size_t mac_size);
 static void show_scan_deauth_popup(void);
@@ -1743,6 +1747,7 @@ static void settings_tile_event_cb(lv_event_t *e);
 static void settings_back_btn_event_cb(lv_event_t *e);
 static void show_scan_time_popup(void);
 static void show_theme_popup(void);
+static void style_theme_switch(lv_obj_t *sw);
 static void theme_dark_mode_switch_cb(lv_event_t *e);
 static void theme_boot_sound_dropdown_cb(lv_event_t *e);
 static void show_red_team_settings_page(void);
@@ -3751,38 +3756,87 @@ static void uart2_send_command(const char *cmd)
     ESP_LOGI(TAG, "[MBus] Sent command: %s", cmd);
 }
 
-// Parse a single network line like: "1","SSID","","C4:2B:44:12:29:21","1","WPA2","-53","2.4GHz"
+static void trim_ascii_whitespace(char *s)
+{
+    if (!s || s[0] == '\0') return;
+
+    char *start = s;
+    while (*start == ' ' || *start == '\t') start++;
+    if (start != s) {
+        memmove(s, start, strlen(start) + 1);
+    }
+
+    size_t len = strlen(s);
+    while (len > 0) {
+        char c = s[len - 1];
+        if (c == ' ' || c == '\t') {
+            s[--len] = '\0';
+        } else {
+            break;
+        }
+    }
+}
+
+static int parse_csv_mixed_fields(char *line, char **fields, int max_fields)
+{
+    if (!line || !fields || max_fields <= 0) return 0;
+
+    int field_idx = 0;
+    char *p = line;
+
+    while (*p != '\0' && field_idx < max_fields) {
+        if (*p == ',') {
+            p++;
+            continue;
+        }
+
+        if (*p == '"') {
+            p++;  // Skip opening quote
+            fields[field_idx++] = p;
+            while (*p != '\0') {
+                if (*p == '"' && p[1] == '"') {
+                    // Keep one quote character in-place: "" -> "
+                    memmove(p, p + 1, strlen(p));
+                    p++;
+                    continue;
+                }
+                if (*p == '"') {
+                    *p = '\0';
+                    p++;
+                    break;
+                }
+                p++;
+            }
+            if (*p == ',') p++;
+        } else {
+            fields[field_idx++] = p;
+            while (*p != '\0' && *p != ',') p++;
+            if (*p == ',') {
+                *p = '\0';
+                p++;
+            }
+            trim_ascii_whitespace(fields[field_idx - 1]);
+        }
+    }
+
+    return field_idx;
+}
+
+// Parse a single network line like:
+// "1","SSID","","C4:2B:44:12:29:21","1","WPA2","-53","2.4GHz","Vendor Name"
+// and also handles optional unquoted vendor as 9th field.
 static bool parse_network_line(const char *line, wifi_network_t *net)
 {
     // Check if line starts with quote and number
     if (line[0] != '"') return false;
 
-    char temp[256];
+    char temp[512];
     strncpy(temp, line, sizeof(temp) - 1);
     temp[sizeof(temp) - 1] = '\0';
 
-    // Parse CSV with quoted fields
-    char *fields[8] = {NULL};
-    int field_idx = 0;
-    char *p = temp;
-
-    while (*p && field_idx < 8) {
-        if (*p == '"') {
-            p++;  // Skip opening quote
-            fields[field_idx] = p;
-            // Find closing quote
-            while (*p && *p != '"') p++;
-            if (*p == '"') {
-                *p = '\0';
-                p++;
-            }
-            field_idx++;
-            // Skip comma
-            if (*p == ',') p++;
-        } else {
-            p++;
-        }
-    }
+    // Parse CSV with mixed quoted/unquoted fields
+    char *fields[10] = {NULL};
+    int field_idx = parse_csv_mixed_fields(temp, fields, 10);
 
     if (field_idx < 8) return false;
 
@@ -3803,6 +3857,17 @@ static bool parse_network_line(const char *line, wifi_network_t *net)
 
     strncpy(net->band, fields[7], sizeof(net->band) - 1);
     net->band[sizeof(net->band) - 1] = '\0';
+
+    net->vendor[0] = '\0';
+    // JanOS format in logs: vendor is usually the 3rd field (index 2).
+    if (field_idx >= 3 && fields[2] && fields[2][0] != '\0') {
+        strncpy(net->vendor, fields[2], sizeof(net->vendor) - 1);
+        net->vendor[sizeof(net->vendor) - 1] = '\0';
+    } else if (field_idx >= 9 && fields[8] && fields[8][0] != '\0') {
+        // Fallback for alternate format with vendor as 9th field.
+        strncpy(net->vendor, fields[8], sizeof(net->vendor) - 1);
+        net->vendor[sizeof(net->vendor) - 1] = '\0';
+    }
 
     return true;
 }
@@ -3971,10 +4036,11 @@ static void wifi_scan_task(void *arg)
             lv_obj_set_style_text_font(ssid_label, &lv_font_montserrat_18, 0);
             lv_obj_set_style_text_color(ssid_label, lv_color_hex(0xFFFFFF), 0);
 
-            // BSSID, Band, Security and RSSI
+            // BSSID, Band, Security, RSSI and vendor
             lv_obj_t *info_label = lv_label_create(text_cont);
-            lv_label_set_text_fmt(info_label, "%s  |  %s  |  %s  |  %d dBm",
-                                  net->bssid, net->band, net->security, net->rssi);
+            const char *vendor_display = strlen(net->vendor) > 0 ? net->vendor : "-";
+            lv_label_set_text_fmt(info_label, "%s  |  %s  |  %s  |  %d dBm\nVendor: %s",
+                                  net->bssid, net->band, net->security, net->rssi, vendor_display);
             lv_obj_set_style_text_font(info_label, &lv_font_montserrat_12, 0);
             lv_obj_set_style_text_color(info_label, lv_color_hex(0x888888), 0);
         }
@@ -6173,9 +6239,11 @@ static void show_scan_deauth_popup(void)
             lv_obj_set_style_text_font(ssid_label, &lv_font_montserrat_16, 0);
             lv_obj_set_style_text_color(ssid_label, lv_color_hex(0xFFFFFF), 0);
 
-            // BSSID, Band and Security
+            // BSSID, Band, Security and vendor
             lv_obj_t *info_label = lv_label_create(item);
-            lv_label_set_text_fmt(info_label, "BSSID: %s | %s | %s", net->bssid, net->band, net->security);
+            const char *vendor_display = strlen(net->vendor) > 0 ? net->vendor : "-";
+            lv_label_set_text_fmt(info_label, "BSSID: %s | %s | %s\nVendor: %s",
+                                  net->bssid, net->band, net->security, vendor_display);
             lv_obj_set_style_text_font(info_label, &lv_font_montserrat_12, 0);
             lv_obj_set_style_text_color(info_label, lv_color_hex(0xAAAAAA), 0);
         }
@@ -6602,7 +6670,9 @@ static void show_mitm_popup(void)
     lv_obj_set_style_text_color(title, COLOR_MATERIAL_TEAL, 0);
 
     lv_obj_t *info_label = lv_label_create(ctx->mitm_popup);
-    lv_label_set_text_fmt(info_label, "BSSID: %s | %s | %s", net->bssid, net->band, net->security);
+    const char *mitm_vendor_display = strlen(net->vendor) > 0 ? net->vendor : "-";
+    lv_label_set_text_fmt(info_label, "BSSID: %s | %s | %s\nVendor: %s",
+                          net->bssid, net->band, net->security, mitm_vendor_display);
     lv_obj_set_style_text_font(info_label, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(info_label, lv_color_hex(0xAAAAAA), 0);
 
@@ -7149,8 +7219,9 @@ static void show_handshaker_popup(void)
             const char *ssid_display = strlen(net->ssid) > 0 ? net->ssid : "(Hidden)";
 
             lv_obj_t *info_label = lv_label_create(network_scroll);
-            lv_label_set_text_fmt(info_label, "%s %s\nBSSID: %s | %s | %s",
-                                  LV_SYMBOL_WIFI, ssid_display, net->bssid, net->band, net->security);
+            const char *vendor_display = strlen(net->vendor) > 0 ? net->vendor : "-";
+            lv_label_set_text_fmt(info_label, "%s %s\nBSSID: %s | %s | %s\nVendor: %s",
+                                  LV_SYMBOL_WIFI, ssid_display, net->bssid, net->band, net->security, vendor_display);
             lv_obj_set_style_text_font(info_label, &lv_font_montserrat_14, 0);
             lv_obj_set_style_text_color(info_label, lv_color_hex(0xFFFFFF), 0);
         }
@@ -10330,6 +10401,12 @@ static void show_network_popup(int network_idx)
     lv_obj_set_style_text_font(bssid_label, &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_color(bssid_label, lv_color_hex(0xCCCCCC), 0);
 
+    // Vendor
+    lv_obj_t *vendor_label = lv_label_create(info_container);
+    lv_label_set_text_fmt(vendor_label, "Vendor: %s", strlen(net->vendor) > 0 ? net->vendor : "-");
+    lv_obj_set_style_text_font(vendor_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(vendor_label, lv_color_hex(0xCCCCCC), 0);
+
     // Channel + Band + RSSI
     lv_obj_t *channel_label = lv_label_create(info_container);
     lv_label_set_text_fmt(channel_label, "Channel: %d  |  %s  |  %d dBm", net->channel, net->band, net->rssi);
@@ -10564,10 +10641,11 @@ static void update_observer_table(tab_context_t *ctx)
         lv_obj_set_style_text_font(ssid_label, &lv_font_montserrat_18, 0);
         lv_obj_set_style_text_color(ssid_label, lv_color_hex(0xFFFFFF), 0);
 
-        // Second row: BSSID | Band | RSSI (observer_network_t doesn't have security)
+        // Second row: BSSID | Band | RSSI | Vendor
         lv_obj_t *info_label = lv_label_create(net_row);
-        lv_label_set_text_fmt(info_label, "%s  |  %s  |  %d dBm",
-                              net->bssid, net->band, net->rssi);
+        lv_label_set_text_fmt(info_label, "%s  |  %s  |  %d dBm\nVendor: %s",
+                              net->bssid, net->band, net->rssi,
+                              strlen(net->vendor) > 0 ? net->vendor : "-");
         lv_obj_set_style_text_font(info_label, &lv_font_montserrat_12, 0);
         lv_obj_set_style_text_color(info_label, lv_color_hex(0x888888), 0);
 
@@ -10733,6 +10811,11 @@ static void show_deauth_popup(int network_idx, int client_idx)
     lv_label_set_text_fmt(bssid_label, "BSSID: %s  |  CH%d", net->bssid, net->channel);
     lv_obj_set_style_text_font(bssid_label, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(bssid_label, lv_color_hex(0xAAAAAA), 0);
+
+    lv_obj_t *vendor_label = lv_label_create(info_container);
+    lv_label_set_text_fmt(vendor_label, "Vendor: %s", strlen(net->vendor) > 0 ? net->vendor : "-");
+    lv_obj_set_style_text_font(vendor_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(vendor_label, lv_color_hex(0xAAAAAA), 0);
 
     // Client MAC (highlighted)
     lv_obj_t *client_label = lv_label_create(info_container);
@@ -11095,36 +11178,19 @@ static void observer_timer_callback(TimerHandle_t xTimer)
 }
 
 // Observer start task - runs scan_networks first, then starts sniffer
-// Parse scan network line: "1","SSID","","BSSID","channel","security","rssi","band"
-// Parse scan network line: "index","SSID","","BSSID","channel","security","rssi","band"
+// Parse scan network line:
+// "index","SSID","","BSSID","channel","security","rssi","band","vendor"
 static bool parse_scan_to_observer(const char *line, observer_network_t *net)
 {
     if (line[0] != '"') return false;
 
-    char temp[256];
+    char temp[512];
     strncpy(temp, line, sizeof(temp) - 1);
     temp[sizeof(temp) - 1] = '\0';
 
-    // Parse CSV with quoted fields
-    char *fields[8] = {NULL};
-    int field_idx = 0;
-    char *p = temp;
-
-    while (*p && field_idx < 8) {
-        if (*p == '"') {
-            p++;
-            fields[field_idx] = p;
-            while (*p && *p != '"') p++;
-            if (*p == '"') {
-                *p = '\0';
-                p++;
-            }
-            field_idx++;
-            if (*p == ',') p++;
-        } else {
-            p++;
-        }
-    }
+    // Parse CSV with mixed quoted/unquoted fields
+    char *fields[10] = {NULL};
+    int field_idx = parse_csv_mixed_fields(temp, fields, 10);
 
     if (field_idx < 8) return false;
 
@@ -11142,6 +11208,17 @@ static bool parse_scan_to_observer(const char *line, observer_network_t *net)
 
     strncpy(net->band, fields[7], sizeof(net->band) - 1);
     net->band[sizeof(net->band) - 1] = '\0';
+
+    net->vendor[0] = '\0';
+    // JanOS format in logs: vendor is usually the 3rd field (index 2).
+    if (field_idx >= 3 && fields[2] && fields[2][0] != '\0') {
+        strncpy(net->vendor, fields[2], sizeof(net->vendor) - 1);
+        net->vendor[sizeof(net->vendor) - 1] = '\0';
+    } else if (field_idx >= 9 && fields[8] && fields[8][0] != '\0') {
+        // Fallback for alternate format with vendor as 9th field.
+        strncpy(net->vendor, fields[8], sizeof(net->vendor) - 1);
+        net->vendor[sizeof(net->vendor) - 1] = '\0';
+    }
 
     net->client_count = 0;  // No clients initially
     memset(net->clients, 0, sizeof(net->clients));
@@ -11382,6 +11459,149 @@ static void observer_stop_btn_cb(lv_event_t *e)
     }
 }
 
+static void observer_csv_escape(const char *src, char *dst, size_t dst_size)
+{
+    if (!dst || dst_size == 0) return;
+    if (!src) {
+        dst[0] = '\0';
+        return;
+    }
+
+    size_t out = 0;
+    for (size_t i = 0; src[i] != '\0' && out + 1 < dst_size; i++) {
+        char c = src[i];
+        if (c == '"') {
+            if (out + 2 >= dst_size) break;
+            dst[out++] = '"';
+            dst[out++] = '"';
+        } else if (c == '\n' || c == '\r') {
+            dst[out++] = ' ';
+        } else {
+            dst[out++] = c;
+        }
+    }
+    dst[out] = '\0';
+}
+
+static bool observer_ensure_dir(const char *path, char *err_msg, size_t err_msg_sz)
+{
+    if (!path) return false;
+    struct stat st;
+    if (stat(path, &st) == 0) {
+        return true;
+    }
+    if (mkdir(path, 0755) == 0) {
+        return true;
+    }
+    if (err_msg && err_msg_sz > 0) {
+        snprintf(err_msg, err_msg_sz, "mkdir failed for %s: %s", path, strerror(errno));
+    }
+    return false;
+}
+
+static bool observer_export_csv(tab_context_t *ctx, char *out_path, size_t out_path_sz, char *err_msg, size_t err_msg_sz)
+{
+    if (!ctx || !out_path || out_path_sz < 8) return false;
+    out_path[0] = '\0';
+    if (err_msg && err_msg_sz > 0) err_msg[0] = '\0';
+
+    struct stat sd_st;
+    if (stat("/sdcard", &sd_st) != 0) {
+        if (err_msg && err_msg_sz > 0) {
+            snprintf(err_msg, err_msg_sz, "SD card not mounted");
+        }
+        return false;
+    }
+
+    if (!observer_ensure_dir("/sdcard/lab", err_msg, err_msg_sz)) return false;
+    if (!observer_ensure_dir("/sdcard/lab/observer", err_msg, err_msg_sz)) return false;
+
+    time_t now;
+    struct tm timeinfo;
+    time(&now);
+    localtime_r(&now, &timeinfo);
+
+    snprintf(out_path, out_path_sz, "/sdcard/lab/observer/observer_%04d%02d%02d_%02d%02d%02d.csv",
+             timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
+             timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+
+    FILE *f = fopen(out_path, "w");
+    if (!f) {
+        if (err_msg && err_msg_sz > 0) {
+            snprintf(err_msg, err_msg_sz, "open failed: %s", strerror(errno));
+        }
+        return false;
+    }
+
+    fprintf(f, "scan_index,ssid,bssid,channel,rssi,band,vendor,client_count,clients\n");
+
+    for (int i = 0; i < ctx->observer_network_count; i++) {
+        observer_network_t *net = &ctx->observer_networks[i];
+        char ssid_esc[96], bssid_esc[32], band_esc[24], vendor_esc[96], clients_esc[640];
+        observer_csv_escape(net->ssid, ssid_esc, sizeof(ssid_esc));
+        observer_csv_escape(net->bssid, bssid_esc, sizeof(bssid_esc));
+        observer_csv_escape(net->band, band_esc, sizeof(band_esc));
+        observer_csv_escape(net->vendor, vendor_esc, sizeof(vendor_esc));
+
+        char clients_joined[512];
+        clients_joined[0] = '\0';
+        for (int j = 0; j < MAX_CLIENTS_PER_NETWORK; j++) {
+            if (net->clients[j][0] == '\0') continue;
+            if (clients_joined[0] != '\0') {
+                strncat(clients_joined, ";", sizeof(clients_joined) - strlen(clients_joined) - 1);
+            }
+            strncat(clients_joined, net->clients[j], sizeof(clients_joined) - strlen(clients_joined) - 1);
+        }
+        observer_csv_escape(clients_joined, clients_esc, sizeof(clients_esc));
+
+        fprintf(f, "%d,\"%s\",\"%s\",%d,%d,\"%s\",\"%s\",%d,\"%s\"\n",
+                net->scan_index,
+                ssid_esc,
+                bssid_esc,
+                net->channel,
+                net->rssi,
+                band_esc,
+                vendor_esc,
+                net->client_count,
+                clients_esc);
+    }
+
+    fclose(f);
+    return true;
+}
+
+static void observer_export_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx || !ctx->observer_status_label) return;
+
+    if (ctx->observer_running) {
+        lv_label_set_text(ctx->observer_status_label, "Stop observer before export");
+        lv_obj_set_style_text_color(ctx->observer_status_label, COLOR_MATERIAL_AMBER, 0);
+        return;
+    }
+    if (ctx->observer_network_count <= 0) {
+        lv_label_set_text(ctx->observer_status_label, "No observer data to export");
+        lv_obj_set_style_text_color(ctx->observer_status_label, COLOR_MATERIAL_AMBER, 0);
+        return;
+    }
+
+    char path[160];
+    char err[128];
+    if (observer_export_csv(ctx, path, sizeof(path), err, sizeof(err))) {
+        lv_label_set_text_fmt(ctx->observer_status_label, "Exported %d networks\n%s",
+                              ctx->observer_network_count, path);
+        lv_obj_set_style_text_color(ctx->observer_status_label, COLOR_MATERIAL_GREEN, 0);
+        ESP_LOGI(TAG, "Observer export completed: %s", path);
+    } else {
+        lv_label_set_text_fmt(ctx->observer_status_label, "Export failed: %s",
+                              (err[0] != '\0') ? err : "unknown error");
+        lv_obj_set_style_text_color(ctx->observer_status_label, COLOR_MATERIAL_RED, 0);
+        ESP_LOGE(TAG, "Observer export failed: %s", (err[0] != '\0') ? err : "unknown error");
+    }
+}
+
 // Observer page back button handler - hide page and show tiles
 static void observer_back_btn_event_cb(lv_event_t *e)
 {
@@ -11466,9 +11686,9 @@ static void show_observer_page(void)
     lv_obj_set_flex_flow(observer_page, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_row(observer_page, 10, 0);
 
-    // Header container - fixed height, row layout
+    // Header row: back + title
     lv_obj_t *header = lv_obj_create(observer_page);
-    lv_obj_set_size(header, lv_pct(100), 50);
+    lv_obj_set_size(header, lv_pct(100), 56);
     lv_obj_set_style_bg_opa(header, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(header, 0, 0);
     lv_obj_set_style_pad_all(header, 0, 0);
@@ -11476,7 +11696,7 @@ static void show_observer_page(void)
 
     // Back button - positioned left
     lv_obj_t *back_btn = lv_btn_create(header);
-    lv_obj_set_size(back_btn, 72, 60);
+    lv_obj_set_size(back_btn, 72, 44);
     lv_obj_align(back_btn, LV_ALIGN_LEFT_MID, 0, 0);
     lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x1A3333), 0);
     lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x2A4444), LV_STATE_PRESSED);
@@ -11495,27 +11715,48 @@ static void show_observer_page(void)
     lv_obj_set_style_text_color(title, COLOR_MATERIAL_TEAL, 0);
     lv_obj_align_to(title, back_btn, LV_ALIGN_OUT_RIGHT_MID, 12, 0);
 
-    // Stop button (red) - positioned right - store in ctx
-    ctx->observer_stop_btn = lv_btn_create(header);
-    lv_obj_set_size(ctx->observer_stop_btn, 100, 40);
-    lv_obj_align(ctx->observer_stop_btn, LV_ALIGN_RIGHT_MID, 0, 0);
-    lv_obj_set_style_bg_color(ctx->observer_stop_btn, COLOR_MATERIAL_RED, 0);
-    lv_obj_set_style_bg_color(ctx->observer_stop_btn, lv_color_lighten(COLOR_MATERIAL_RED, 30), LV_STATE_PRESSED);
-    lv_obj_set_style_bg_color(ctx->observer_stop_btn, lv_color_hex(0x444444), LV_STATE_DISABLED);
-    lv_obj_set_style_radius(ctx->observer_stop_btn, 8, 0);
-    lv_obj_add_event_cb(ctx->observer_stop_btn, observer_stop_btn_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_add_state(ctx->observer_stop_btn, LV_STATE_DISABLED);  // Initially disabled
+    // Controls row below title so buttons don't overlap header text
+    lv_obj_t *controls_row = lv_obj_create(observer_page);
+    lv_obj_set_size(controls_row, lv_pct(100), 46);
+    lv_obj_set_style_bg_opa(controls_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(controls_row, 0, 0);
+    lv_obj_set_style_pad_all(controls_row, 0, 0);
+    lv_obj_set_flex_flow(controls_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(controls_row, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(controls_row, 12, 0);
+    lv_obj_clear_flag(controls_row, LV_OBJ_FLAG_SCROLLABLE);
 
-    lv_obj_t *stop_label = lv_label_create(ctx->observer_stop_btn);
-    lv_label_set_text(stop_label, "Stop");
-    lv_obj_set_style_text_font(stop_label, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(stop_label, lv_color_hex(0xFFFFFF), 0);
-    lv_obj_center(stop_label);
+    // Export CSV button
+    lv_obj_t *export_btn = lv_btn_create(controls_row);
+    lv_obj_set_size(export_btn, 120, 40);
+    lv_obj_set_style_bg_color(export_btn, COLOR_MATERIAL_CYAN, 0);
+    lv_obj_set_style_bg_color(export_btn, lv_color_lighten(COLOR_MATERIAL_CYAN, 30), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(export_btn, 8, 0);
+    lv_obj_add_event_cb(export_btn, observer_export_btn_cb, LV_EVENT_CLICKED, NULL);
 
-    // Start button (green) - positioned left of stop button - store in ctx
-    ctx->observer_start_btn = lv_btn_create(header);
+    lv_obj_t *export_label = lv_label_create(export_btn);
+    lv_label_set_text(export_label, LV_SYMBOL_SAVE " Export");
+    lv_obj_set_style_text_font(export_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(export_label, lv_color_hex(0x000000), 0);
+    lv_obj_center(export_label);
+
+    // Probes & Karma button
+    lv_obj_t *karma_btn = lv_btn_create(controls_row);
+    lv_obj_set_size(karma_btn, 120, 40);
+    lv_obj_set_style_bg_color(karma_btn, COLOR_MATERIAL_ORANGE, 0);
+    lv_obj_set_style_bg_color(karma_btn, lv_color_lighten(COLOR_MATERIAL_ORANGE, 30), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(karma_btn, 8, 0);
+    lv_obj_add_event_cb(karma_btn, observer_karma_btn_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *karma_label = lv_label_create(karma_btn);
+    lv_label_set_text(karma_label, LV_SYMBOL_WIFI " Karma");
+    lv_obj_set_style_text_font(karma_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(karma_label, lv_color_hex(0x000000), 0);
+    lv_obj_center(karma_label);
+
+    // Start button (green)
+    ctx->observer_start_btn = lv_btn_create(controls_row);
     lv_obj_set_size(ctx->observer_start_btn, 100, 40);
-    lv_obj_align_to(ctx->observer_start_btn, ctx->observer_stop_btn, LV_ALIGN_OUT_LEFT_MID, -12, 0);
     lv_obj_set_style_bg_color(ctx->observer_start_btn, COLOR_MATERIAL_GREEN, 0);
     lv_obj_set_style_bg_color(ctx->observer_start_btn, lv_color_lighten(COLOR_MATERIAL_GREEN, 30), LV_STATE_PRESSED);
     lv_obj_set_style_bg_color(ctx->observer_start_btn, lv_color_hex(0x444444), LV_STATE_DISABLED);
@@ -11528,20 +11769,21 @@ static void show_observer_page(void)
     lv_obj_set_style_text_color(start_label, lv_color_hex(0xFFFFFF), 0);
     lv_obj_center(start_label);
 
-    // Probes & Karma button (orange) - positioned left of start button
-    lv_obj_t *karma_btn = lv_btn_create(header);
-    lv_obj_set_size(karma_btn, 120, 40);
-    lv_obj_align_to(karma_btn, ctx->observer_start_btn, LV_ALIGN_OUT_LEFT_MID, -12, 0);
-    lv_obj_set_style_bg_color(karma_btn, COLOR_MATERIAL_ORANGE, 0);
-    lv_obj_set_style_bg_color(karma_btn, lv_color_lighten(COLOR_MATERIAL_ORANGE, 30), LV_STATE_PRESSED);
-    lv_obj_set_style_radius(karma_btn, 8, 0);
-    lv_obj_add_event_cb(karma_btn, observer_karma_btn_cb, LV_EVENT_CLICKED, NULL);
+    // Stop button (red)
+    ctx->observer_stop_btn = lv_btn_create(controls_row);
+    lv_obj_set_size(ctx->observer_stop_btn, 100, 40);
+    lv_obj_set_style_bg_color(ctx->observer_stop_btn, COLOR_MATERIAL_RED, 0);
+    lv_obj_set_style_bg_color(ctx->observer_stop_btn, lv_color_lighten(COLOR_MATERIAL_RED, 30), LV_STATE_PRESSED);
+    lv_obj_set_style_bg_color(ctx->observer_stop_btn, lv_color_hex(0x444444), LV_STATE_DISABLED);
+    lv_obj_set_style_radius(ctx->observer_stop_btn, 8, 0);
+    lv_obj_add_event_cb(ctx->observer_stop_btn, observer_stop_btn_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_state(ctx->observer_stop_btn, LV_STATE_DISABLED);  // Initially disabled
 
-    lv_obj_t *karma_label = lv_label_create(karma_btn);
-    lv_label_set_text(karma_label, LV_SYMBOL_WIFI " Karma");
-    lv_obj_set_style_text_font(karma_label, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(karma_label, lv_color_hex(0x000000), 0);
-    lv_obj_center(karma_label);
+    lv_obj_t *stop_label = lv_label_create(ctx->observer_stop_btn);
+    lv_label_set_text(stop_label, "Stop");
+    lv_obj_set_style_text_font(stop_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(stop_label, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_center(stop_label);
 
     // Status label - store in ctx
     ctx->observer_status_label = lv_label_create(ctx->observer_page);
@@ -25474,6 +25716,201 @@ static lv_obj_t *scan_time_usb_max_spinbox = NULL;
 static lv_obj_t *scan_time_mbus_min_spinbox = NULL;
 static lv_obj_t *scan_time_mbus_max_spinbox = NULL;
 static lv_obj_t *scan_time_error_label = NULL;
+static lv_obj_t *scan_setup_vendor_switch = NULL;
+static tab_id_t scan_setup_vendor_tab = TAB_INTERNAL;
+static uart_port_t scan_setup_vendor_uart = UART_NUM;
+static bool scan_setup_vendor_target_valid = false;
+static bool scan_setup_vendor_sync_in_progress = false;
+
+static bool scan_setup_resolve_vendor_target(tab_id_t *tab_out, uart_port_t *uart_out)
+{
+    if (!tab_out || !uart_out) return false;
+
+    tab_id_t tab = TAB_INTERNAL;
+    bool valid = false;
+
+    if (current_tab == TAB_USB && usb_detected) {
+        tab = TAB_USB;
+        valid = true;
+    } else if (current_tab == TAB_MBUS && mbus_detected && uart2_initialized) {
+        tab = TAB_MBUS;
+        valid = true;
+    } else if (current_tab == TAB_GROVE && grove_detected) {
+        tab = TAB_GROVE;
+        valid = true;
+    } else if (grove_detected) {
+        tab = TAB_GROVE;
+        valid = true;
+    } else if (usb_detected) {
+        tab = TAB_USB;
+        valid = true;
+    } else if (mbus_detected && uart2_initialized) {
+        tab = TAB_MBUS;
+        valid = true;
+    }
+
+    if (!valid) return false;
+
+    *tab_out = tab;
+    *uart_out = uart_port_for_tab(tab);
+    return true;
+}
+
+static bool scan_setup_parse_vendor_state(const char *response, bool *enabled_out)
+{
+    if (!response || !enabled_out) return false;
+
+    char buf[512];
+    strncpy(buf, response, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+
+    char *line = strtok(buf, "\r\n");
+    while (line) {
+        while (*line == ' ' || *line == '\t') line++;
+        if (*line != '\0') {
+            char lower[256];
+            size_t n = strlen(line);
+            if (n >= sizeof(lower)) n = sizeof(lower) - 1;
+            for (size_t i = 0; i < n; i++) {
+                lower[i] = (char)tolower((unsigned char)line[i]);
+            }
+            lower[n] = '\0';
+
+            if (strcmp(lower, "off") == 0 || strcmp(lower, "0") == 0 ||
+                strcmp(lower, "false") == 0 || strcmp(lower, "disabled") == 0) {
+                *enabled_out = false;
+                return true;
+            }
+
+            if (strcmp(lower, "on") == 0 || strcmp(lower, "1") == 0 ||
+                strcmp(lower, "true") == 0 || strcmp(lower, "enabled") == 0) {
+                *enabled_out = true;
+                return true;
+            }
+
+            if (strstr(lower, "vendor")) {
+                if (strstr(lower, "off")) {
+                    *enabled_out = false;
+                    return true;
+                }
+                if (strstr(lower, "on")) {
+                    *enabled_out = true;
+                    return true;
+                }
+            }
+        }
+        line = strtok(NULL, "\r\n");
+    }
+
+    return false;
+}
+
+static bool scan_setup_vendor_read_from_target(tab_id_t tab, uart_port_t uart_port, bool *enabled_out)
+{
+    if (!enabled_out) return false;
+
+    bool usb_lock_set = false;
+    char rx_buf[512];
+
+    if (tab == TAB_USB) {
+        usb_rx_exclusive = true;
+        usb_lock_set = true;
+        usb_flush_input(120);
+    } else {
+        uart_flush_input(uart_port);
+    }
+
+    transport_write_bytes_tab(tab, uart_port, "vendor read", strlen("vendor read"));
+    transport_write_bytes_tab(tab, uart_port, "\r\n", 2);
+
+    int rx_len = home_collect_uart_response(tab, uart_port, rx_buf, sizeof(rx_buf), 1200);
+    if (usb_lock_set) {
+        usb_rx_exclusive = false;
+    }
+
+    if (rx_len <= 0) {
+        ESP_LOGW(TAG, "[%s] vendor read: no response", tab_transport_name(tab));
+        return false;
+    }
+
+    bool enabled = false;
+    bool ok = scan_setup_parse_vendor_state(rx_buf, &enabled);
+    ESP_LOGI(TAG, "[%s] vendor read response: %s", tab_transport_name(tab), rx_buf);
+    if (!ok) {
+        return false;
+    }
+    *enabled_out = enabled;
+    return true;
+}
+
+static bool scan_setup_vendor_set_on_target(tab_id_t tab, uart_port_t uart_port, bool enable)
+{
+    bool usb_lock_set = false;
+    char cmd[32];
+    snprintf(cmd, sizeof(cmd), "vendor set %s", enable ? "on" : "off");
+
+    if (tab == TAB_USB) {
+        usb_rx_exclusive = true;
+        usb_lock_set = true;
+        usb_flush_input(120);
+    } else {
+        uart_flush_input(uart_port);
+    }
+
+    transport_write_bytes_tab(tab, uart_port, cmd, strlen(cmd));
+    transport_write_bytes_tab(tab, uart_port, "\r\n", 2);
+    ESP_LOGI(TAG, "[%s] Sent command: %s", tab_transport_name(tab), cmd);
+
+    char rx_buf[256];
+    int rx_len = home_collect_uart_response(tab, uart_port, rx_buf, sizeof(rx_buf), 900);
+    if (usb_lock_set) {
+        usb_rx_exclusive = false;
+    }
+
+    if (rx_len > 0) {
+        ESP_LOGI(TAG, "[%s] vendor set response: %s", tab_transport_name(tab), rx_buf);
+    }
+    return true;
+}
+
+static void scan_setup_vendor_switch_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!scan_setup_vendor_switch || scan_setup_vendor_sync_in_progress) return;
+
+    if (!scan_setup_vendor_target_valid) {
+        if (scan_time_error_label) {
+            lv_label_set_text(scan_time_error_label, "Vendor control unavailable");
+        }
+        scan_setup_vendor_sync_in_progress = true;
+        lv_obj_remove_state(scan_setup_vendor_switch, LV_STATE_CHECKED);
+        scan_setup_vendor_sync_in_progress = false;
+        return;
+    }
+
+    bool requested_on = lv_obj_has_state(scan_setup_vendor_switch, LV_STATE_CHECKED);
+    scan_setup_vendor_set_on_target(scan_setup_vendor_tab, scan_setup_vendor_uart, requested_on);
+
+    bool actual_on = requested_on;
+    if (!scan_setup_vendor_read_from_target(scan_setup_vendor_tab, scan_setup_vendor_uart, &actual_on)) {
+        if (scan_time_error_label) {
+            lv_label_set_text(scan_time_error_label, "Vendor state read failed");
+        }
+        return;
+    }
+
+    scan_setup_vendor_sync_in_progress = true;
+    if (actual_on) {
+        lv_obj_add_state(scan_setup_vendor_switch, LV_STATE_CHECKED);
+    } else {
+        lv_obj_remove_state(scan_setup_vendor_switch, LV_STATE_CHECKED);
+    }
+    scan_setup_vendor_sync_in_progress = false;
+
+    if (scan_time_error_label) {
+        lv_label_set_text(scan_time_error_label, "");
+    }
+}
 
 static void scan_time_popup_close_cb(lv_event_t *e)
 {
@@ -25488,6 +25925,9 @@ static void scan_time_popup_close_cb(lv_event_t *e)
         scan_time_mbus_min_spinbox = NULL;
         scan_time_mbus_max_spinbox = NULL;
         scan_time_error_label = NULL;
+        scan_setup_vendor_switch = NULL;
+        scan_setup_vendor_target_valid = false;
+        scan_setup_vendor_sync_in_progress = false;
     }
 }
 
@@ -25683,13 +26123,24 @@ static void show_scan_time_popup(void)
         if (mbus_max <= 0) mbus_max = 500;
     }
 
+    bool vendor_enabled = false;
+    scan_setup_vendor_target_valid = scan_setup_resolve_vendor_target(&scan_setup_vendor_tab, &scan_setup_vendor_uart);
+    if (scan_setup_vendor_target_valid) {
+        scan_setup_vendor_sync_in_progress = true;
+        bool read_ok = scan_setup_vendor_read_from_target(scan_setup_vendor_tab, scan_setup_vendor_uart, &vendor_enabled);
+        scan_setup_vendor_sync_in_progress = false;
+        if (!read_ok) {
+            scan_setup_vendor_target_valid = false;
+        }
+    }
+
     // Create modal overlay
     scan_time_popup_overlay = lv_obj_create(container);
     style_modal_overlay(scan_time_popup_overlay, LV_OPA_50);
 
     // Create popup - dynamic height based on device count
     scan_time_popup_obj = lv_obj_create(scan_time_popup_overlay);
-    int popup_height = 180 + (device_count * 140);  // Base + per-device section
+    int popup_height = 250 + (device_count * 140);  // Base + vendor row + per-device section
     lv_obj_set_size(scan_time_popup_obj, 420, popup_height);
     lv_obj_center(scan_time_popup_obj);
     style_popup_card(scan_time_popup_obj, 12, ui_tab_icon_color());
@@ -25700,9 +26151,40 @@ static void show_scan_time_popup(void)
 
     // Title
     lv_obj_t *title = lv_label_create(scan_time_popup_obj);
-    lv_label_set_text(title, "Channel Scan Time (ms)");
+    lv_label_set_text(title, "Scan Setup");
     lv_obj_set_style_text_font(title, &lv_font_montserrat_18, 0);
     lv_obj_set_style_text_color(title, dark_mode_enabled ? COLOR_LAB5_MAGENTA : ui_tab_icon_color(), 0);
+
+    // Vendors switch row
+    lv_obj_t *vendor_row = lv_obj_create(scan_time_popup_obj);
+    lv_obj_set_size(vendor_row, lv_pct(100), 50);
+    lv_obj_set_style_bg_opa(vendor_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(vendor_row, 0, 0);
+    lv_obj_set_style_pad_all(vendor_row, 0, 0);
+    lv_obj_set_flex_flow(vendor_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(vendor_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(vendor_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *vendor_label = lv_label_create(vendor_row);
+    lv_label_set_text(vendor_label, "Show Vendors");
+    lv_obj_set_style_text_font(vendor_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(vendor_label, ui_text_color(), 0);
+
+    scan_setup_vendor_switch = lv_switch_create(vendor_row);
+    style_theme_switch(scan_setup_vendor_switch);
+    if (vendor_enabled) {
+        lv_obj_add_state(scan_setup_vendor_switch, LV_STATE_CHECKED);
+    }
+    if (!scan_setup_vendor_target_valid) {
+        lv_obj_add_state(scan_setup_vendor_switch, LV_STATE_DISABLED);
+    } else {
+        lv_obj_add_event_cb(scan_setup_vendor_switch, scan_setup_vendor_switch_cb, LV_EVENT_VALUE_CHANGED, NULL);
+    }
+
+    lv_obj_t *scan_time_header = lv_label_create(scan_time_popup_obj);
+    lv_label_set_text(scan_time_header, "Channel Scan Time (ms)");
+    lv_obj_set_style_text_font(scan_time_header, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(scan_time_header, ui_tab_icon_color(), 0);
 
     // ========== Grove Section ==========
     if (grove_detected) {
@@ -25739,7 +26221,11 @@ static void show_scan_time_popup(void)
 
     // Error label
     scan_time_error_label = lv_label_create(scan_time_popup_obj);
-    lv_label_set_text(scan_time_error_label, "");
+    if (scan_setup_vendor_target_valid) {
+        lv_label_set_text(scan_time_error_label, "");
+    } else {
+        lv_label_set_text(scan_time_error_label, "Vendor read unavailable");
+    }
     lv_obj_set_style_text_font(scan_time_error_label, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(scan_time_error_label, COLOR_MATERIAL_RED, 0);
 
@@ -26577,7 +27063,7 @@ static void settings_tile_event_cb(lv_event_t *e)
     const char *tile_name = (const char *)lv_event_get_user_data(e);
     ESP_LOGI(TAG, "Settings tile clicked: %s", tile_name);
 
-    if (strcmp(tile_name, "Scan Time") == 0) {
+    if (strcmp(tile_name, "Scan Setup") == 0) {
         show_scan_time_popup();
     } else if (strcmp(tile_name, "Red Team") == 0) {
         show_red_team_settings_page();
@@ -26662,8 +27148,8 @@ static void show_settings_page(void)
     lv_obj_set_style_pad_row(tiles, 20, 0);
     lv_obj_clear_flag(tiles, LV_OBJ_FLAG_SCROLLABLE);
 
-    // Scan Time tile
-    create_tile(tiles, LV_SYMBOL_REFRESH, "Scan\nTime", COLOR_MATERIAL_GREEN, settings_tile_event_cb, "Scan Time");
+    // Scan Setup tile
+    create_tile(tiles, LV_SYMBOL_REFRESH, "Scan\nSetup", COLOR_MATERIAL_GREEN, settings_tile_event_cb, "Scan Setup");
 
     // Red Team tile
     create_tile(tiles, LV_SYMBOL_WARNING, "Red\nTeam", COLOR_MATERIAL_RED, settings_tile_event_cb, "Red Team");
