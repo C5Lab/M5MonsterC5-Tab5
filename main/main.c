@@ -19010,9 +19010,14 @@ static void rogue_ap_start_cb(lv_event_t *e)
         vTaskDelay(pdMS_TO_TICKS(100));
     }
 
-    // Send start_rogueap command: start_rogueap SSID password
+    // Send start_rogueap command: start_rogueap "SSID" "password"
+    char escaped_ssid[67];
+    char escaped_password[131];
+    beacon_spam_escape_quoted_arg(rogue_ap_ssid, escaped_ssid, sizeof(escaped_ssid));
+    beacon_spam_escape_quoted_arg(rogue_ap_password, escaped_password, sizeof(escaped_password));
+
     char ap_cmd[256];
-    snprintf(ap_cmd, sizeof(ap_cmd), "start_rogueap %s %s", rogue_ap_ssid, rogue_ap_password);
+    snprintf(ap_cmd, sizeof(ap_cmd), "start_rogueap \"%s\" \"%s\"", escaped_ssid, escaped_password);
     ESP_LOGI(TAG, "[UART%d] Rogue AP: sending start_rogueap %s XXXX", uart_index_for_tab(current_tab), rogue_ap_ssid);
     uart_send_command_for_tab(ap_cmd);
 
