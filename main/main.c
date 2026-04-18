@@ -45,8 +45,8 @@
 #include "esp_http_server.h"
 #include "lwip/sockets.h"
 
-#define JANOS_TAB_VERSION "1.2.2"
-#define JANOS_VERSION_REQUIRED "1.5.8"
+#define JANOS_TAB_VERSION "1.2.5"
+#define JANOS_VERSION_REQUIRED "1.6.0"
 #include "lwip/netdb.h"
 #include <dirent.h>
 #include <sys/stat.h>
@@ -219,6 +219,22 @@ typedef struct {
     char ip[20];
     char mac[18];
 } arp_host_t;
+
+// Nmap host/port storage
+#define NMAP_MAX_HOSTS 64
+#define NMAP_MAX_PORTS_PER_HOST 20
+typedef struct {
+    int port;
+    char service[32];
+} nmap_port_t;
+
+typedef struct {
+    char ip[20];
+    char mac[18];
+    nmap_port_t ports[NMAP_MAX_PORTS_PER_HOST];
+    int port_count;
+    bool no_open_ports;
+} nmap_host_t;
 
 // Wardrive network storage
 #define WARDRIVE_MAX_NETWORKS 100
@@ -637,12 +653,42 @@ typedef struct {
     lv_obj_t *arp_attack_popup;
 
     char arp_target_ssid[33];
+    char arp_target_security[24];
     char arp_target_password[65];
     char arp_our_ip[20];
     bool arp_wifi_connected;
     bool arp_auto_mode;
     arp_host_t *arp_hosts;  // PSRAM
     int arp_host_count;
+
+    // =====================================================================
+    // NMAP PORT SCANNER - Page and data
+    // =====================================================================
+    lv_obj_t *nmap_page;
+    lv_obj_t *nmap_password_input;
+    lv_obj_t *nmap_keyboard;
+    lv_obj_t *nmap_connect_btn;
+    lv_obj_t *nmap_status_label;
+    lv_obj_t *nmap_hosts_container;
+    lv_obj_t *nmap_list_hosts_btn;
+    lv_obj_t *nmap_all_hosts_btn;
+    lv_obj_t *nmap_scan_popup_overlay;
+    lv_obj_t *nmap_scan_popup;
+    lv_obj_t *nmap_results_popup_overlay;
+    lv_obj_t *nmap_results_popup;
+    lv_obj_t *nmap_progress_bar;
+    lv_obj_t *nmap_progress_label;
+    lv_obj_t *nmap_results_container;
+    char nmap_target_ssid[33];
+    char nmap_target_security[24];
+    char nmap_target_password[65];
+    char nmap_our_ip[20];
+    char nmap_scan_target_ip[20];
+    bool nmap_wifi_connected;
+    volatile bool nmap_scanning;
+    TaskHandle_t nmap_scan_task;
+    nmap_host_t *nmap_hosts;  // PSRAM
+    int nmap_host_count;
 
     // =====================================================================
     // ROGUE AP - Page and data
@@ -1131,6 +1177,7 @@ static void hide_all_pages(tab_context_t *ctx) {
     if (ctx->bt_scan_page) lv_obj_add_flag(ctx->bt_scan_page, LV_OBJ_FLAG_HIDDEN);
     if (ctx->bt_locator_page) lv_obj_add_flag(ctx->bt_locator_page, LV_OBJ_FLAG_HIDDEN);
     if (ctx->arp_poison_page) lv_obj_add_flag(ctx->arp_poison_page, LV_OBJ_FLAG_HIDDEN);
+    if (ctx->nmap_page) lv_obj_add_flag(ctx->nmap_page, LV_OBJ_FLAG_HIDDEN);
     if (ctx->wardrive_page) lv_obj_add_flag(ctx->wardrive_page, LV_OBJ_FLAG_HIDDEN);
 }
 
@@ -1197,6 +1244,14 @@ static void init_tab_context(tab_context_t *ctx) {
         ctx->arp_hosts = heap_caps_calloc(ARP_MAX_HOSTS, sizeof(arp_host_t), MALLOC_CAP_SPIRAM);
         if (!ctx->arp_hosts) {
             ESP_LOGE(TAG, "Failed to allocate arp_hosts in PSRAM");
+        }
+    }
+
+    // Nmap hosts
+    if (!ctx->nmap_hosts) {
+        ctx->nmap_hosts = heap_caps_calloc(NMAP_MAX_HOSTS, sizeof(nmap_host_t), MALLOC_CAP_SPIRAM);
+        if (!ctx->nmap_hosts) {
+            ESP_LOGE(TAG, "Failed to allocate nmap_hosts in PSRAM");
         }
     }
 
@@ -1402,8 +1457,29 @@ static lv_obj_t *arp_status_label = NULL;
 static lv_obj_t *arp_hosts_container = NULL;
 static lv_obj_t *arp_list_hosts_btn = NULL;
 static char arp_target_ssid[33] = {0};
+static char arp_target_security[24] = {0};
 static char arp_our_ip[20] = {0};
 static bool arp_wifi_connected = false;
+
+// Nmap page (legacy globals)
+static lv_obj_t *nmap_page = NULL;
+static lv_obj_t *nmap_password_input = NULL;
+static lv_obj_t *nmap_keyboard = NULL;
+static lv_obj_t *nmap_connect_btn = NULL;
+static lv_obj_t *nmap_status_label = NULL;
+static lv_obj_t *nmap_hosts_container = NULL;
+static lv_obj_t *nmap_list_hosts_btn = NULL;
+static lv_obj_t *nmap_all_hosts_btn = NULL;
+static char nmap_target_ssid[33] = {0};
+static char nmap_target_security[24] = {0};
+static char nmap_target_password[65] = {0};
+static char nmap_our_ip[20] = {0};
+static char nmap_scan_target_ip[20] = {0};
+static bool nmap_wifi_connected = false;
+static volatile bool nmap_scanning = false;
+static TaskHandle_t nmap_scan_task_handle = NULL;
+static nmap_host_t *nmap_hosts_data = NULL;
+static int nmap_host_count = 0;
 
 // Rogue AP page (legacy globals for compatibility)
 static lv_obj_t *rogue_ap_page = NULL;
@@ -1685,6 +1761,18 @@ static void arp_connect_cb(lv_event_t *e);
 static void arp_list_hosts_cb(lv_event_t *e);
 static void arp_host_click_cb(lv_event_t *e);
 static void arp_attack_popup_close_cb(lv_event_t *e);
+static void show_nmap_page(void);
+static void nmap_back_cb(lv_event_t *e);
+static void nmap_connect_cb(lv_event_t *e);
+static void nmap_list_hosts_cb(lv_event_t *e);
+static void nmap_host_click_cb(lv_event_t *e);
+static void nmap_all_hosts_click_cb(lv_event_t *e);
+static void nmap_show_scan_type_popup(const char *target_ip);
+static void nmap_scan_type_cb(lv_event_t *e);
+static void nmap_scan_type_popup_close_cb(lv_event_t *e);
+static void nmap_start_scan(const char *target_ip, const char *scan_level);
+static void nmap_scan_task_fn(void *arg);
+static void nmap_results_popup_close_cb(lv_event_t *e);
 static void evil_twin_row_click_cb(lv_event_t *e);
 static void show_evil_twin_connect_popup(const char *ssid, const char *password);
 static void evil_twin_connect_popup_yes_cb(lv_event_t *e);
@@ -4690,24 +4778,14 @@ static void create_attack_action_bar(lv_obj_t *parent, lv_event_cb_t callback)
     }
     if (row_inner_w < 280) row_inner_w = 280;
 
-    // Row 1: 4 tiles (3 gaps of 8px = 24px total gap)
-    const lv_coord_t row1_gap_total = 24;
-    lv_coord_t row1_btn_w = (row_inner_w - row1_gap_total) / 4;
-    if (row1_btn_w < 70) row1_btn_w = 70;
-    lv_coord_t row1_btn_last_w = row1_btn_w;
-    lv_coord_t row1_used = (row1_btn_w * 4) + row1_gap_total;
-    if (row1_used < row_inner_w) {
-        row1_btn_last_w += (row_inner_w - row1_used);
-    }
-
-    // Row 2: 3 tiles (2 gaps of 8px = 16px total gap) + MITM
-    const lv_coord_t row2_gap_total = 24;
-    lv_coord_t row2_btn_w = (row_inner_w - row2_gap_total) / 4;
-    if (row2_btn_w < 70) row2_btn_w = 70;
-    lv_coord_t row2_btn_last_w = row2_btn_w;
-    lv_coord_t row2_used = (row2_btn_w * 4) + row2_gap_total;
-    if (row2_used < row_inner_w) {
-        row2_btn_last_w += (row_inner_w - row2_used);
+    // Both rows: 4 tiles each, 3 gaps of 8px = 24px total gap, uniform width
+    const lv_coord_t gap_total = 24;
+    lv_coord_t btn_w = (row_inner_w - gap_total) / 4;
+    if (btn_w < 60) btn_w = 60;
+    lv_coord_t btn_last_w = btn_w;
+    lv_coord_t used = (btn_w * 4) + gap_total;
+    if (used < row_inner_w) {
+        btn_last_w += (row_inner_w - used);
     }
 
     if (enable_red_team) {
@@ -4718,17 +4796,24 @@ static void create_attack_action_bar(lv_obj_t *parent, lv_event_cb_t callback)
         lv_obj_t *btn5 = create_small_tile(attack_row2, LV_SYMBOL_SHUFFLE, "ARP", COLOR_MATERIAL_PURPLE, callback, "ARP Poison");
         lv_obj_t *btn6 = create_small_tile(attack_row2, LV_SYMBOL_WIFI, "RogueAP", COLOR_MATERIAL_CYAN, callback, "Rogue AP");
         lv_obj_t *btn7 = create_small_tile(attack_row2, LV_SYMBOL_EYE_OPEN, "MITM", COLOR_MATERIAL_TEAL, callback, "MITM");
+        lv_obj_t *btn8 = create_small_tile(attack_row2, LV_SYMBOL_LIST, "Nmap", COLOR_MATERIAL_GREEN, callback, "Nmap");
 
-        lv_obj_set_size(btn1, row1_btn_w, 72);
-        lv_obj_set_size(btn2, row1_btn_w, 72);
-        lv_obj_set_size(btn3, row1_btn_w, 72);
-        lv_obj_set_size(btn4, row1_btn_last_w, 72);
-        lv_obj_set_size(btn5, row2_btn_w, 72);
-        lv_obj_set_size(btn6, row2_btn_w, 72);
-        lv_obj_set_size(btn7, row2_btn_last_w, 72);
+        lv_obj_set_size(btn1, btn_w, 72);
+        lv_obj_set_size(btn2, btn_w, 72);
+        lv_obj_set_size(btn3, btn_w, 72);
+        lv_obj_set_size(btn4, btn_last_w, 72);
+        lv_obj_set_size(btn5, btn_w, 72);
+        lv_obj_set_size(btn6, btn_w, 72);
+        lv_obj_set_size(btn7, btn_w, 72);
+        lv_obj_set_size(btn8, btn_last_w, 72);
     } else {
-        lv_obj_t *btn = create_small_tile(attack_row1, LV_SYMBOL_SHUFFLE, "ARP", COLOR_MATERIAL_PURPLE, callback, "ARP Poison");
-        lv_obj_set_size(btn, row_inner_w, 72);
+        // Non-red-team: ARP + Nmap
+        const lv_coord_t nr_gap = 8;
+        lv_coord_t nr_btn_w = (row_inner_w - nr_gap) / 2;
+        lv_obj_t *btn_arp = create_small_tile(attack_row1, LV_SYMBOL_SHUFFLE, "ARP", COLOR_MATERIAL_PURPLE, callback, "ARP Poison");
+        lv_obj_t *btn_nmap = create_small_tile(attack_row1, LV_SYMBOL_LIST, "Nmap", COLOR_MATERIAL_GREEN, callback, "Nmap");
+        lv_obj_set_size(btn_arp, nr_btn_w, 72);
+        lv_obj_set_size(btn_nmap, nr_btn_w, 72);
     }
 }
 
@@ -6074,6 +6159,8 @@ static void handle_selected_attack(const char *attack_name)
             }
             strncpy(arp_target_ssid, networks[idx].ssid, sizeof(arp_target_ssid) - 1);
             arp_target_ssid[sizeof(arp_target_ssid) - 1] = '\0';
+            strncpy(arp_target_security, networks[idx].security, sizeof(arp_target_security) - 1);
+            arp_target_security[sizeof(arp_target_security) - 1] = '\0';
         }
 
         show_arp_poison_page();
@@ -6092,6 +6179,28 @@ static void handle_selected_attack(const char *attack_name)
             return;
         }
         show_mitm_popup();
+        return;
+    }
+
+    if (strcmp(attack_name, "Nmap") == 0) {
+        if (selected_network_count != 1) {
+            ESP_LOGW(TAG, "Nmap requires exactly 1 network, selected: %d", selected_network_count);
+            if (status_label) {
+                bsp_display_lock(0);
+                lv_label_set_text(status_label, "Select exactly 1 network for Nmap");
+                lv_obj_set_style_text_color(status_label, COLOR_MATERIAL_RED, 0);
+                bsp_display_unlock();
+            }
+            return;
+        }
+
+        int idx = selected_network_indices[0];
+        if (idx >= 0 && idx < network_count) {
+            snprintf(nmap_target_ssid, sizeof(nmap_target_ssid), "%s", networks[idx].ssid);
+            snprintf(nmap_target_security, sizeof(nmap_target_security), "%s", networks[idx].security);
+        }
+
+        show_nmap_page();
         return;
     }
 
@@ -6139,7 +6248,7 @@ static void observer_attack_tile_event_cb(lv_event_t *e)
 
     prepare_observer_attack_override(ctx, observer_idx);
     ctx->observer_attack_return_to_observer =
-        (strcmp(attack_name, "ARP Poison") == 0 || strcmp(attack_name, "Rogue AP") == 0);
+        (strcmp(attack_name, "ARP Poison") == 0 || strcmp(attack_name, "Rogue AP") == 0 || strcmp(attack_name, "Nmap") == 0);
 
     handle_selected_attack(attack_name);
 }
@@ -6411,12 +6520,17 @@ static void mitm_connect_and_start_cb(lv_event_t *e)
     tab_context_t *ctx = get_current_ctx();
     if (!ctx) return;
 
+    int idx = selected_network_indices[0];
+    if (idx < 0 || idx >= network_count) return;
+    const char *ssid = networks[idx].ssid;
+    bool is_open = (strstr(networks[idx].security, "OPEN") != NULL || networks[idx].security[0] == '\0');
+
     const char *password = NULL;
     if (ctx->mitm_password_input) {
         password = lv_textarea_get_text(ctx->mitm_password_input);
     }
 
-    if (password == NULL || strlen(password) == 0) {
+    if (!is_open && (password == NULL || strlen(password) == 0)) {
         if (ctx->mitm_status_label) {
             lv_label_set_text(ctx->mitm_status_label, "Enter password first");
             lv_obj_set_style_text_color(ctx->mitm_status_label, COLOR_MATERIAL_RED, 0);
@@ -6424,11 +6538,7 @@ static void mitm_connect_and_start_cb(lv_event_t *e)
         return;
     }
 
-    int idx = selected_network_indices[0];
-    if (idx < 0 || idx >= network_count) return;
-    const char *ssid = networks[idx].ssid;
-
-    ESP_LOGI(TAG, "MITM: Connecting to %s", ssid);
+    ESP_LOGI(TAG, "MITM: Connecting to %s%s", ssid, is_open ? " (open)" : "");
 
     if (ctx->mitm_keyboard) {
         lv_obj_add_flag(ctx->mitm_keyboard, LV_OBJ_FLAG_HIDDEN);
@@ -6449,7 +6559,21 @@ static void mitm_connect_and_start_cb(lv_event_t *e)
     beacon_spam_escape_quoted_arg(password, escaped_password, sizeof(escaped_password));
 
     char cmd[256];
-    snprintf(cmd, sizeof(cmd), "wifi_connect \"%s\" \"%s\"", escaped_ssid, escaped_password);
+    int cmd_len = 0;
+    if (is_open || password == NULL || strlen(password) == 0) {
+        cmd_len = snprintf(cmd, sizeof(cmd), "wifi_connect \"%s\"", escaped_ssid);
+    } else {
+        cmd_len = snprintf(cmd, sizeof(cmd), "wifi_connect \"%s\" \"%s\"", escaped_ssid, escaped_password);
+    }
+    if (cmd_len < 0 || cmd_len >= (int)sizeof(cmd)) {
+        ESP_LOGW(TAG, "MITM: wifi_connect command too long, aborting");
+        bsp_display_lock(0);
+        if (ctx->mitm_status_label) {
+            lv_label_set_text(ctx->mitm_status_label, "SSID/password too long");
+            lv_obj_set_style_text_color(ctx->mitm_status_label, COLOR_MATERIAL_RED, 0);
+        }
+        return;
+    }
     uart_send_command_for_tab(cmd);
 
     uart_port_t uart_port = get_current_uart();
@@ -7335,6 +7459,7 @@ static void arp_poison_back_cb(lv_event_t *e)
     arp_wifi_connected = false;
     arp_host_count = 0;
     memset(arp_target_ssid, 0, sizeof(arp_target_ssid));
+    memset(arp_target_security, 0, sizeof(arp_target_security));
     memset(arp_our_ip, 0, sizeof(arp_our_ip));
     memset(arp_target_password, 0, sizeof(arp_target_password));
     arp_auto_mode = false;
@@ -7389,6 +7514,7 @@ static void arp_connect_cb(lv_event_t *e)
 {
     (void)e;
 
+    bool is_open = (strstr(arp_target_security, "OPEN") != NULL || arp_target_security[0] == '\0');
     const char *password = NULL;
 
     // Check if we have a known password (from Evil Twin database)
@@ -7396,11 +7522,10 @@ static void arp_connect_cb(lv_event_t *e)
         password = arp_target_password;
         ESP_LOGI(TAG, "ARP Poison: Using known password from Evil Twin database");
     } else if (arp_password_input) {
-        // Get password from input field
         password = lv_textarea_get_text(arp_password_input);
     }
 
-    if (password == NULL || strlen(password) == 0) {
+    if (!is_open && (password == NULL || strlen(password) == 0)) {
         if (arp_status_label) {
             lv_label_set_text(arp_status_label, "Enter password first");
             lv_obj_set_style_text_color(arp_status_label, COLOR_MATERIAL_RED, 0);
@@ -7408,32 +7533,42 @@ static void arp_connect_cb(lv_event_t *e)
         return;
     }
 
-    ESP_LOGI(TAG, "ARP Poison: Connecting to %s", arp_target_ssid);
+    ESP_LOGI(TAG, "ARP Poison: Connecting to %s%s", arp_target_ssid, is_open ? " (open)" : "");
 
-    // Hide keyboard if visible
     if (arp_keyboard) {
         lv_obj_add_flag(arp_keyboard, LV_OBJ_FLAG_HIDDEN);
     }
 
-    // Update status
     if (arp_status_label) {
         lv_label_set_text_fmt(arp_status_label, "Connecting to %s...", arp_target_ssid);
         lv_obj_set_style_text_color(arp_status_label, COLOR_MATERIAL_AMBER, 0);
     }
 
-    // Force UI refresh
     lv_refr_now(NULL);
     bsp_display_unlock();
     vTaskDelay(pdMS_TO_TICKS(50));
 
-    // Send wifi_connect command to current tab's UART
     char escaped_ssid[67];
     char escaped_password[131];
     beacon_spam_escape_quoted_arg(arp_target_ssid, escaped_ssid, sizeof(escaped_ssid));
     beacon_spam_escape_quoted_arg(password, escaped_password, sizeof(escaped_password));
 
     char cmd[256];
-    snprintf(cmd, sizeof(cmd), "wifi_connect \"%s\" \"%s\"", escaped_ssid, escaped_password);
+    int cmd_len = 0;
+    if (is_open || password == NULL || strlen(password) == 0) {
+        cmd_len = snprintf(cmd, sizeof(cmd), "wifi_connect \"%s\"", escaped_ssid);
+    } else {
+        cmd_len = snprintf(cmd, sizeof(cmd), "wifi_connect \"%s\" \"%s\"", escaped_ssid, escaped_password);
+    }
+    if (cmd_len < 0 || cmd_len >= (int)sizeof(cmd)) {
+        ESP_LOGW(TAG, "ARP Poison: wifi_connect command too long, aborting");
+        bsp_display_lock(0);
+        if (arp_status_label) {
+            lv_label_set_text(arp_status_label, "SSID/password too long");
+            lv_obj_set_style_text_color(arp_status_label, COLOR_MATERIAL_RED, 0);
+        }
+        return;
+    }
     uart_send_command_for_tab(cmd);
 
     // Wait for response (up to 15 seconds)
@@ -7521,25 +7656,26 @@ static void arp_list_hosts_cb(lv_event_t *e)
     int timeout_ms = 30000;
     int elapsed_ms = 0;
 
+    bool header_found = false;
+    int empty_reads_after_header = 0;
+
     while (elapsed_ms < timeout_ms && total_len < (int)sizeof(rx_buffer) - 256) {
-        int len = transport_read_bytes(uart_port, rx_buffer + total_len, sizeof(rx_buffer) - total_len - 1, pdMS_TO_TICKS(200));
+        int len = transport_read_bytes(uart_port, rx_buffer + total_len, sizeof(rx_buffer) - total_len - 1, pdMS_TO_TICKS(500));
         if (len > 0) {
             total_len += len;
             rx_buffer[total_len] = '\0';
+            empty_reads_after_header = 0;
 
-            // Check if scan complete (empty line after hosts or timeout pattern)
-            if (strstr(rx_buffer, "Discovered Hosts") != NULL) {
-                // Wait a bit more for all hosts
-                vTaskDelay(pdMS_TO_TICKS(2000));
-                len = transport_read_bytes(uart_port, rx_buffer + total_len, sizeof(rx_buffer) - total_len - 1, pdMS_TO_TICKS(500));
-                if (len > 0) {
-                    total_len += len;
-                    rx_buffer[total_len] = '\0';
-                }
-                break;
+            if (!header_found && strstr(rx_buffer, "Discovered Hosts") != NULL) {
+                header_found = true;
+            }
+        } else {
+            if (header_found) {
+                empty_reads_after_header++;
+                if (empty_reads_after_header >= 3) break;
             }
         }
-        elapsed_ms += 200;
+        elapsed_ms += 500;
     }
 
     ESP_LOGI(TAG, "ARP Poison: list_hosts response (%d bytes)", total_len);
@@ -7850,6 +7986,1195 @@ static void arp_auto_connect_timer_cb(lv_timer_t *timer)
     memset(arp_target_password, 0, sizeof(arp_target_password));
 }
 
+// ======================= NMAP Port Scanner Functions =======================
+
+static void nmap_keyboard_cb(lv_event_t *e)
+{
+    lv_event_code_t code = lv_event_get_code(e);
+    lv_obj_t *kb = lv_event_get_target(e);
+    if (code == LV_EVENT_READY || code == LV_EVENT_CANCEL) {
+        lv_obj_add_flag(kb, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void nmap_password_input_cb(lv_event_t *e)
+{
+    (void)e;
+    if (nmap_keyboard) {
+        lv_obj_clear_flag(nmap_keyboard, LV_OBJ_FLAG_HIDDEN);
+        lv_keyboard_set_textarea(nmap_keyboard, nmap_password_input);
+    }
+}
+
+static void nmap_back_cb(lv_event_t *e)
+{
+    (void)e;
+    ESP_LOGI(TAG, "Nmap: back button pressed");
+
+    if (nmap_scanning) {
+        nmap_scanning = false;
+        uart_send_command_for_tab("stop");
+        if (nmap_scan_task_handle) {
+            vTaskDelay(pdMS_TO_TICKS(200));
+            nmap_scan_task_handle = NULL;
+        }
+    }
+
+    nmap_wifi_connected = false;
+    nmap_host_count = 0;
+    memset(nmap_target_ssid, 0, sizeof(nmap_target_ssid));
+    memset(nmap_target_security, 0, sizeof(nmap_target_security));
+    memset(nmap_target_password, 0, sizeof(nmap_target_password));
+    memset(nmap_our_ip, 0, sizeof(nmap_our_ip));
+    memset(nmap_scan_target_ip, 0, sizeof(nmap_scan_target_ip));
+
+    if (nmap_page) {
+        lv_obj_del(nmap_page);
+        nmap_page = NULL;
+        nmap_password_input = NULL;
+        nmap_keyboard = NULL;
+        nmap_connect_btn = NULL;
+        nmap_status_label = NULL;
+        nmap_hosts_container = NULL;
+        nmap_list_hosts_btn = NULL;
+        nmap_all_hosts_btn = NULL;
+    }
+
+    tab_context_t *ctx = get_current_ctx();
+    if (ctx) {
+        ctx->nmap_page = NULL;
+    }
+
+    show_scan_page();
+}
+
+static void nmap_connect_cb(lv_event_t *e)
+{
+    (void)e;
+
+    bool is_open = (strstr(nmap_target_security, "OPEN") != NULL || nmap_target_security[0] == '\0');
+    const char *password = NULL;
+
+    if (strlen(nmap_target_password) > 0) {
+        password = nmap_target_password;
+    } else if (nmap_password_input) {
+        password = lv_textarea_get_text(nmap_password_input);
+    }
+
+    if (!is_open && (password == NULL || strlen(password) == 0)) {
+        if (nmap_status_label) {
+            lv_label_set_text(nmap_status_label, "Enter password first");
+            lv_obj_set_style_text_color(nmap_status_label, COLOR_MATERIAL_RED, 0);
+        }
+        return;
+    }
+
+    ESP_LOGI(TAG, "Nmap: Connecting to %s%s", nmap_target_ssid, is_open ? " (open)" : "");
+
+    if (nmap_keyboard) {
+        lv_obj_add_flag(nmap_keyboard, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    if (nmap_status_label) {
+        lv_label_set_text_fmt(nmap_status_label, "Connecting to %s...", nmap_target_ssid);
+        lv_obj_set_style_text_color(nmap_status_label, COLOR_MATERIAL_AMBER, 0);
+    }
+
+    lv_refr_now(NULL);
+    bsp_display_unlock();
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    char cmd[128];
+    if (is_open || password == NULL || strlen(password) == 0) {
+        snprintf(cmd, sizeof(cmd), "wifi_connect %s", nmap_target_ssid);
+    } else {
+        snprintf(cmd, sizeof(cmd), "wifi_connect %s %s", nmap_target_ssid, password);
+    }
+    uart_send_command_for_tab(cmd);
+
+    uart_port_t uart_port = get_current_uart();
+    static char rx_buffer[2048];
+    int total_len = 0;
+    bool success = false;
+    int timeout_ms = 15000;
+    int elapsed_ms = 0;
+
+    while (elapsed_ms < timeout_ms && total_len < (int)sizeof(rx_buffer) - 256) {
+        int len = transport_read_bytes(uart_port, rx_buffer + total_len, sizeof(rx_buffer) - total_len - 1, pdMS_TO_TICKS(200));
+        if (len > 0) {
+            total_len += len;
+            rx_buffer[total_len] = '\0';
+            if (strstr(rx_buffer, "SUCCESS") != NULL) {
+                success = true;
+                break;
+            }
+            if (strstr(rx_buffer, "FAILED") != NULL || strstr(rx_buffer, "TIMEOUT") != NULL) {
+                break;
+            }
+        }
+        elapsed_ms += 200;
+    }
+
+    bsp_display_lock(0);
+
+    if (success) {
+        ESP_LOGI(TAG, "Nmap: Connected to %s", nmap_target_ssid);
+        nmap_wifi_connected = true;
+
+        if (nmap_status_label) {
+            lv_label_set_text_fmt(nmap_status_label, "Connected to %s", nmap_target_ssid);
+            lv_obj_set_style_text_color(nmap_status_label, COLOR_MATERIAL_GREEN, 0);
+        }
+
+        if (nmap_list_hosts_btn) {
+            lv_obj_clear_flag(nmap_list_hosts_btn, LV_OBJ_FLAG_HIDDEN);
+        }
+
+        if (nmap_connect_btn) {
+            lv_obj_add_state(nmap_connect_btn, LV_STATE_DISABLED);
+            lv_obj_set_style_bg_opa(nmap_connect_btn, LV_OPA_50, 0);
+        }
+    } else {
+        ESP_LOGW(TAG, "Nmap: Failed to connect to %s", nmap_target_ssid);
+        if (nmap_status_label) {
+            lv_label_set_text(nmap_status_label, "Connection failed!");
+            lv_obj_set_style_text_color(nmap_status_label, COLOR_MATERIAL_RED, 0);
+        }
+    }
+}
+
+static void nmap_list_hosts_cb(lv_event_t *e)
+{
+    (void)e;
+    ESP_LOGI(TAG, "Nmap: Scanning hosts...");
+
+    if (nmap_status_label) {
+        lv_label_set_text(nmap_status_label, "Scanning network hosts...");
+        lv_obj_set_style_text_color(nmap_status_label, COLOR_MATERIAL_AMBER, 0);
+    }
+
+    lv_refr_now(NULL);
+    bsp_display_unlock();
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    uart_send_command_for_tab("list_hosts");
+    uart_port_t uart_port = get_current_uart();
+
+    static char rx_buffer[4096];
+    int total_len = 0;
+    int timeout_ms = 30000;
+    int elapsed_ms = 0;
+    bool header_found = false;
+    int empty_reads_after_header = 0;
+
+    while (elapsed_ms < timeout_ms && total_len < (int)sizeof(rx_buffer) - 256) {
+        int len = transport_read_bytes(uart_port, rx_buffer + total_len, sizeof(rx_buffer) - total_len - 1, pdMS_TO_TICKS(500));
+        if (len > 0) {
+            total_len += len;
+            rx_buffer[total_len] = '\0';
+            empty_reads_after_header = 0;
+            if (!header_found && strstr(rx_buffer, "Discovered Hosts") != NULL) {
+                header_found = true;
+            }
+        } else {
+            if (header_found) {
+                empty_reads_after_header++;
+                if (empty_reads_after_header >= 3) break;
+            }
+        }
+        elapsed_ms += 500;
+    }
+
+    ESP_LOGI(TAG, "Nmap: list_hosts response (%d bytes)", total_len);
+
+    nmap_host_count = 0;
+    memset(nmap_our_ip, 0, sizeof(nmap_our_ip));
+
+    char *line = strtok(rx_buffer, "\n\r");
+    while (line != NULL && nmap_host_count < NMAP_MAX_HOSTS) {
+        if (strstr(line, "Our IP:") != NULL) {
+            char *ip_start = strstr(line, "Our IP:") + 7;
+            while (*ip_start == ' ') ip_start++;
+            char *comma = strchr(ip_start, ',');
+            if (comma) {
+                int len = comma - ip_start;
+                if (len > 0 && len < (int)sizeof(nmap_our_ip)) {
+                    strncpy(nmap_our_ip, ip_start, len);
+                    nmap_our_ip[len] = '\0';
+                }
+            }
+        } else if (strstr(line, "->") != NULL) {
+            char ip[20] = {0};
+            char mac[18] = {0};
+            char *arrow = strstr(line, "->");
+            if (arrow) {
+                char *p = line;
+                while (*p == ' ') p++;
+                int ip_len = 0;
+                while (*p && *p != ' ' && ip_len < 19) {
+                    ip[ip_len++] = *p++;
+                }
+                ip[ip_len] = '\0';
+
+                p = arrow + 2;
+                while (*p == ' ') p++;
+                int mac_len = 0;
+                while (*p && *p != ' ' && *p != '\n' && mac_len < 17) {
+                    mac[mac_len++] = *p++;
+                }
+                mac[mac_len] = '\0';
+
+                if (strlen(ip) >= 7 && strlen(mac) == 17) {
+                    snprintf(nmap_hosts_data[nmap_host_count].ip, sizeof(nmap_hosts_data[0].ip), "%s", ip);
+                    snprintf(nmap_hosts_data[nmap_host_count].mac, sizeof(nmap_hosts_data[0].mac), "%s", mac);
+                    nmap_hosts_data[nmap_host_count].port_count = 0;
+                    nmap_hosts_data[nmap_host_count].no_open_ports = false;
+                    nmap_host_count++;
+                    ESP_LOGI(TAG, "Nmap host %d: %s -> %s", nmap_host_count, ip, mac);
+                }
+            }
+        }
+        line = strtok(NULL, "\n\r");
+    }
+
+    bsp_display_lock(0);
+
+    if (nmap_status_label) {
+        if (nmap_host_count > 0) {
+            lv_label_set_text_fmt(nmap_status_label, "Our IP: %s | Found %d hosts - select target or scan all", nmap_our_ip, nmap_host_count);
+            lv_obj_set_style_text_color(nmap_status_label, COLOR_MATERIAL_GREEN, 0);
+        } else {
+            lv_label_set_text(nmap_status_label, "No hosts found");
+            lv_obj_set_style_text_color(nmap_status_label, COLOR_MATERIAL_RED, 0);
+        }
+    }
+
+    if (nmap_hosts_container) {
+        lv_obj_clean(nmap_hosts_container);
+
+        for (int i = 0; i < nmap_host_count; i++) {
+            lv_obj_t *row = lv_obj_create(nmap_hosts_container);
+            lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
+            lv_obj_set_style_bg_color(row, lv_color_hex(0x2D2D2D), 0);
+            lv_obj_set_style_bg_color(row, lv_color_hex(0x3D3D3D), LV_STATE_PRESSED);
+            lv_obj_set_style_border_width(row, 0, 0);
+            lv_obj_set_style_radius(row, 6, 0);
+            lv_obj_set_style_pad_all(row, 10, 0);
+            lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+            lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+            lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_add_event_cb(row, nmap_host_click_cb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
+
+            lv_obj_t *ip_lbl = lv_label_create(row);
+            lv_label_set_text(ip_lbl, nmap_hosts_data[i].ip);
+            lv_obj_set_style_text_font(ip_lbl, &lv_font_montserrat_16, 0);
+            lv_obj_set_style_text_color(ip_lbl, COLOR_MATERIAL_GREEN, 0);
+            lv_obj_set_width(ip_lbl, 150);
+
+            lv_obj_t *mac_lbl = lv_label_create(row);
+            lv_label_set_text(mac_lbl, nmap_hosts_data[i].mac);
+            lv_obj_set_style_text_font(mac_lbl, &lv_font_montserrat_14, 0);
+            lv_obj_set_style_text_color(mac_lbl, lv_color_hex(0x888888), 0);
+
+            lv_obj_t *scan_lbl = lv_label_create(row);
+            lv_label_set_text(scan_lbl, LV_SYMBOL_RIGHT);
+            lv_obj_set_style_text_color(scan_lbl, COLOR_MATERIAL_GREEN, 0);
+        }
+
+        if (nmap_host_count > 0) {
+            nmap_all_hosts_btn = lv_btn_create(nmap_hosts_container);
+            lv_obj_set_size(nmap_all_hosts_btn, lv_pct(100), 45);
+            lv_obj_set_style_bg_color(nmap_all_hosts_btn, COLOR_MATERIAL_TEAL, 0);
+            lv_obj_set_style_radius(nmap_all_hosts_btn, 8, 0);
+            lv_obj_add_event_cb(nmap_all_hosts_btn, nmap_all_hosts_click_cb, LV_EVENT_CLICKED, NULL);
+
+            lv_obj_t *all_label = lv_label_create(nmap_all_hosts_btn);
+            lv_label_set_text(all_label, LV_SYMBOL_LIST "  Nmap All Hosts");
+            lv_obj_set_style_text_font(all_label, &lv_font_montserrat_16, 0);
+            lv_obj_center(all_label);
+        }
+    }
+}
+
+static void nmap_host_click_cb(lv_event_t *e)
+{
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (idx < 0 || idx >= nmap_host_count) return;
+    ESP_LOGI(TAG, "Nmap: Selected host %s for scan", nmap_hosts_data[idx].ip);
+    nmap_show_scan_type_popup(nmap_hosts_data[idx].ip);
+}
+
+static void nmap_all_hosts_click_cb(lv_event_t *e)
+{
+    (void)e;
+    ESP_LOGI(TAG, "Nmap: Scan all hosts selected");
+    nmap_show_scan_type_popup(NULL);
+}
+
+// Scan type popup
+static void nmap_scan_type_popup_close_cb(lv_event_t *e)
+{
+    (void)e;
+    tab_context_t *ctx = get_current_ctx();
+    if (ctx && ctx->nmap_scan_popup_overlay) {
+        lv_obj_del(ctx->nmap_scan_popup_overlay);
+        ctx->nmap_scan_popup_overlay = NULL;
+        ctx->nmap_scan_popup = NULL;
+    }
+}
+
+static void nmap_scan_type_cb(lv_event_t *e)
+{
+    const char *scan_level = (const char *)lv_event_get_user_data(e);
+    ESP_LOGI(TAG, "Nmap: Scan type selected: %s", scan_level);
+
+    tab_context_t *ctx = get_current_ctx();
+    if (ctx && ctx->nmap_scan_popup_overlay) {
+        lv_obj_del(ctx->nmap_scan_popup_overlay);
+        ctx->nmap_scan_popup_overlay = NULL;
+        ctx->nmap_scan_popup = NULL;
+    }
+
+    nmap_start_scan(nmap_scan_target_ip, scan_level);
+}
+
+static void nmap_show_scan_type_popup(const char *target_ip)
+{
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx) return;
+
+    if (target_ip && strlen(target_ip) > 0) {
+        snprintf(nmap_scan_target_ip, sizeof(nmap_scan_target_ip), "%s", target_ip);
+    } else {
+        memset(nmap_scan_target_ip, 0, sizeof(nmap_scan_target_ip));
+    }
+
+    lv_obj_t *container = get_current_tab_container();
+    if (!container) return;
+
+    ctx->nmap_scan_popup_overlay = lv_obj_create(container);
+    lv_obj_remove_style_all(ctx->nmap_scan_popup_overlay);
+    lv_obj_set_size(ctx->nmap_scan_popup_overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(ctx->nmap_scan_popup_overlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(ctx->nmap_scan_popup_overlay, LV_OPA_50, 0);
+    lv_obj_clear_flag(ctx->nmap_scan_popup_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(ctx->nmap_scan_popup_overlay, LV_OBJ_FLAG_CLICKABLE);
+
+    ctx->nmap_scan_popup = lv_obj_create(ctx->nmap_scan_popup_overlay);
+    lv_obj_set_size(ctx->nmap_scan_popup, 500, 360);
+    lv_obj_center(ctx->nmap_scan_popup);
+    lv_obj_set_style_bg_color(ctx->nmap_scan_popup, lv_color_hex(0x1A1A2A), 0);
+    lv_obj_set_style_border_color(ctx->nmap_scan_popup, COLOR_MATERIAL_GREEN, 0);
+    lv_obj_set_style_border_width(ctx->nmap_scan_popup, 2, 0);
+    lv_obj_set_style_radius(ctx->nmap_scan_popup, 16, 0);
+    lv_obj_set_style_shadow_width(ctx->nmap_scan_popup, 30, 0);
+    lv_obj_set_style_shadow_color(ctx->nmap_scan_popup, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_shadow_opa(ctx->nmap_scan_popup, LV_OPA_50, 0);
+    lv_obj_set_style_pad_all(ctx->nmap_scan_popup, 20, 0);
+    lv_obj_set_flex_flow(ctx->nmap_scan_popup, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(ctx->nmap_scan_popup, 12, 0);
+    lv_obj_set_flex_align(ctx->nmap_scan_popup, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    lv_obj_t *title = lv_label_create(ctx->nmap_scan_popup);
+    if (nmap_scan_target_ip[0]) {
+        lv_label_set_text_fmt(title, LV_SYMBOL_LIST "  Nmap Scan - %s", nmap_scan_target_ip);
+    } else {
+        lv_label_set_text(title, LV_SYMBOL_LIST "  Nmap Scan - All Hosts");
+    }
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_GREEN, 0);
+
+    lv_obj_t *subtitle = lv_label_create(ctx->nmap_scan_popup);
+    lv_label_set_text(subtitle, "Select scan depth:");
+    lv_obj_set_style_text_font(subtitle, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(subtitle, lv_color_hex(0xAAAAAA), 0);
+
+    // Quick button
+    lv_obj_t *quick_btn = lv_btn_create(ctx->nmap_scan_popup);
+    lv_obj_set_size(quick_btn, lv_pct(90), 60);
+    lv_obj_set_style_bg_color(quick_btn, COLOR_MATERIAL_GREEN, 0);
+    lv_obj_set_style_radius(quick_btn, 10, 0);
+    lv_obj_add_event_cb(quick_btn, nmap_scan_type_cb, LV_EVENT_CLICKED, (void*)"quick");
+    lv_obj_set_flex_flow(quick_btn, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(quick_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    lv_obj_t *ql1 = lv_label_create(quick_btn);
+    lv_label_set_text(ql1, "Quick (20 ports)");
+    lv_obj_set_style_text_font(ql1, &lv_font_montserrat_16, 0);
+    lv_obj_t *ql2 = lv_label_create(quick_btn);
+    lv_label_set_text(ql2, "FTP, SSH, HTTP, SMB, RDP");
+    lv_obj_set_style_text_font(ql2, &lv_font_montserrat_12, 0);
+
+    // Medium button
+    lv_obj_t *med_btn = lv_btn_create(ctx->nmap_scan_popup);
+    lv_obj_set_size(med_btn, lv_pct(90), 60);
+    lv_obj_set_style_bg_color(med_btn, COLOR_MATERIAL_AMBER, 0);
+    lv_obj_set_style_radius(med_btn, 10, 0);
+    lv_obj_add_event_cb(med_btn, nmap_scan_type_cb, LV_EVENT_CLICKED, (void*)"medium");
+    lv_obj_set_flex_flow(med_btn, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(med_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    lv_obj_t *ml1 = lv_label_create(med_btn);
+    lv_label_set_text(ml1, "Medium (50 ports)");
+    lv_obj_set_style_text_font(ml1, &lv_font_montserrat_16, 0);
+    lv_obj_t *ml2 = lv_label_create(med_btn);
+    lv_label_set_text(ml2, "LDAP, MQTT, Docker, Redis");
+    lv_obj_set_style_text_font(ml2, &lv_font_montserrat_12, 0);
+
+    // Heavy button
+    lv_obj_t *heavy_btn = lv_btn_create(ctx->nmap_scan_popup);
+    lv_obj_set_size(heavy_btn, lv_pct(90), 60);
+    lv_obj_set_style_bg_color(heavy_btn, COLOR_MATERIAL_RED, 0);
+    lv_obj_set_style_radius(heavy_btn, 10, 0);
+    lv_obj_add_event_cb(heavy_btn, nmap_scan_type_cb, LV_EVENT_CLICKED, (void*)"heavy");
+    lv_obj_set_flex_flow(heavy_btn, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(heavy_btn, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    lv_obj_t *hl1 = lv_label_create(heavy_btn);
+    lv_label_set_text(hl1, "Heavy (100 ports)");
+    lv_obj_set_style_text_font(hl1, &lv_font_montserrat_16, 0);
+    lv_obj_t *hl2 = lv_label_create(heavy_btn);
+    lv_label_set_text(hl2, "TFTP, BGP, Modbus, MongoDB, Minecraft");
+    lv_obj_set_style_text_font(hl2, &lv_font_montserrat_12, 0);
+
+    // Close button
+    lv_obj_t *close_btn = lv_btn_create(ctx->nmap_scan_popup);
+    lv_obj_set_size(close_btn, 100, 36);
+    lv_obj_set_style_bg_color(close_btn, lv_color_hex(0x444444), 0);
+    lv_obj_set_style_radius(close_btn, 8, 0);
+    lv_obj_add_event_cb(close_btn, nmap_scan_type_popup_close_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *close_label = lv_label_create(close_btn);
+    lv_label_set_text(close_label, "Cancel");
+    lv_obj_center(close_label);
+}
+
+// Nmap results popup close
+static void nmap_results_popup_close_cb(lv_event_t *e)
+{
+    (void)e;
+    ESP_LOGI(TAG, "Nmap: results popup closed - sending stop");
+
+    if (nmap_scanning) {
+        nmap_scanning = false;
+        uart_send_command_for_tab("stop");
+    }
+
+    tab_context_t *ctx = get_current_ctx();
+    if (ctx && ctx->nmap_results_popup_overlay) {
+        lv_obj_del(ctx->nmap_results_popup_overlay);
+        ctx->nmap_results_popup_overlay = NULL;
+        ctx->nmap_results_popup = NULL;
+        ctx->nmap_progress_bar = NULL;
+        ctx->nmap_progress_label = NULL;
+        ctx->nmap_results_container = NULL;
+    }
+}
+
+typedef struct {
+    char target_ip[20];
+    char scan_level[8];
+} nmap_task_args_t;
+
+static void nmap_scan_task_fn(void *arg)
+{
+    nmap_task_args_t *args = (nmap_task_args_t *)arg;
+    tab_context_t *ctx = get_current_ctx();
+
+    char cmd[64];
+    if (args->target_ip[0]) {
+        snprintf(cmd, sizeof(cmd), "start_nmap %s %s", args->target_ip, args->scan_level);
+    } else {
+        snprintf(cmd, sizeof(cmd), "start_nmap %s", args->scan_level);
+    }
+
+    ESP_LOGI(TAG, "Nmap task: sending %s", cmd);
+    uart_send_command_for_tab(cmd);
+
+    uart_port_t uart_port = get_current_uart();
+    char rx_buffer[1024];
+    char line_buffer[512];
+    int line_pos = 0;
+
+    int total_ports = 0;
+    int total_hosts_expected = 0;
+    int current_host_idx = -1;
+    int hosts_completed = 0;
+
+    nmap_host_t *results = nmap_hosts_data;
+    int result_count = 0;
+
+    int timeout_ms = 300000;
+    int elapsed_ms = 0;
+
+    while (nmap_scanning && elapsed_ms < timeout_ms) {
+        int len = transport_read_bytes(uart_port, rx_buffer, sizeof(rx_buffer) - 1, pdMS_TO_TICKS(200));
+        if (len > 0) {
+            rx_buffer[len] = '\0';
+
+            for (int i = 0; i < len && nmap_scanning; i++) {
+                char c = rx_buffer[i];
+                if (c == '\n' || c == '\r') {
+                    if (line_pos > 0) {
+                        line_buffer[line_pos] = '\0';
+                        char *trimmed = line_buffer;
+                        while (*trimmed == ' ') trimmed++;
+
+                        // Scan level: extract total ports
+                        if (strstr(line_buffer, "Scan level:") != NULL) {
+                            char *paren = strchr(line_buffer, '(');
+                            if (paren) {
+                                total_ports = atoi(paren + 1);
+                                ESP_LOGI(TAG, "Nmap: total ports per host: %d", total_ports);
+                            }
+                        }
+                        // Host count
+                        else if (strstr(line_buffer, "host(s),") != NULL) {
+                            sscanf(line_buffer, "Scanning %d", &total_hosts_expected);
+                            ESP_LOGI(TAG, "Nmap: scanning %d hosts", total_hosts_expected);
+                        }
+                        // Single-host mode
+                        else if (strstr(line_buffer, "Single-host mode") != NULL) {
+                            total_hosts_expected = 1;
+                        }
+                        // New host block
+                        else if (strncmp(trimmed, "Host:", 5) == 0) {
+                            if (result_count < NMAP_MAX_HOSTS) {
+                                char ip[20] = {0};
+                                char mac[18] = {0};
+                                if (sscanf(trimmed, "Host: %19s (%17[^)])", ip, mac) == 2) {
+                                    snprintf(results[result_count].ip, sizeof(results[0].ip), "%s", ip);
+                                    snprintf(results[result_count].mac, sizeof(results[0].mac), "%s", mac);
+                                } else if (sscanf(trimmed, "Host: %19s (MAC unknown)", ip) == 1) {
+                                    snprintf(results[result_count].ip, sizeof(results[0].ip), "%s", ip);
+                                    snprintf(results[result_count].mac, sizeof(results[0].mac), "unknown");
+                                }
+                                results[result_count].port_count = 0;
+                                results[result_count].no_open_ports = false;
+                                current_host_idx = result_count;
+                                result_count++;
+                            }
+                        }
+                        // Progress: "Scanning X.X.X.X ports N-M [current/total]"
+                        else if (strstr(trimmed, "Scanning") != NULL && strstr(trimmed, "ports") != NULL && strchr(trimmed, '[')) {
+                            int current = 0, total = 0;
+                            char *bracket = strchr(trimmed, '[');
+                            if (bracket) {
+                                sscanf(bracket, "[%d/%d]", &current, &total);
+                                if (total > 0) {
+                                    int overall_pct = 0;
+                                    if (total_hosts_expected > 0 && total_ports > 0) {
+                                        int completed_ports = hosts_completed * total_ports + current;
+                                        int total_all_ports = total_hosts_expected * total_ports;
+                                        overall_pct = (completed_ports * 100) / total_all_ports;
+                                    } else if (total > 0) {
+                                        overall_pct = (current * 100) / total;
+                                    }
+                                    if (overall_pct > 100) overall_pct = 100;
+
+                                    if (bsp_display_lock(0)) {
+                                        if (ctx && ctx->nmap_progress_bar) {
+                                            lv_bar_set_value(ctx->nmap_progress_bar, overall_pct, LV_ANIM_ON);
+                                        }
+                                        if (ctx && ctx->nmap_progress_label) {
+                                            lv_label_set_text_fmt(ctx->nmap_progress_label, "%d%%", overall_pct);
+                                        }
+                                        bsp_display_unlock();
+                                    }
+                                }
+                            }
+                        }
+                        // Open port: "  135/tcp  open  MSRPC"
+                        else if (strstr(trimmed, "/tcp") != NULL && strstr(trimmed, "open") != NULL) {
+                            int port = 0;
+                            char service[32] = {0};
+                            if (sscanf(trimmed, "%d/tcp %*s %31s", &port, service) >= 1 ||
+                                sscanf(trimmed, "%d/tcp  open  %31s", &port, service) >= 1) {
+                                if (current_host_idx >= 0 && current_host_idx < result_count) {
+                                    nmap_host_t *h = &results[current_host_idx];
+                                    if (h->port_count < NMAP_MAX_PORTS_PER_HOST) {
+                                        h->ports[h->port_count].port = port;
+                                        snprintf(h->ports[h->port_count].service, sizeof(h->ports[0].service), "%s", service);
+                                        h->port_count++;
+
+                                        if (bsp_display_lock(0)) {
+                                            if (ctx && ctx->nmap_results_container) {
+                                                lv_obj_t *port_row = lv_obj_create(ctx->nmap_results_container);
+                                                lv_obj_set_size(port_row, lv_pct(100), LV_SIZE_CONTENT);
+                                                lv_obj_set_style_bg_color(port_row, lv_color_hex(0x1A2A1A), 0);
+                                                lv_obj_set_style_border_width(port_row, 0, 0);
+                                                lv_obj_set_style_radius(port_row, 4, 0);
+                                                lv_obj_set_style_pad_all(port_row, 6, 0);
+                                                lv_obj_set_flex_flow(port_row, LV_FLEX_FLOW_ROW);
+                                                lv_obj_set_flex_align(port_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+                                                lv_obj_set_style_pad_column(port_row, 10, 0);
+                                                lv_obj_clear_flag(port_row, LV_OBJ_FLAG_SCROLLABLE);
+
+                                                lv_obj_t *host_lbl = lv_label_create(port_row);
+                                                lv_label_set_text_fmt(host_lbl, "  %s", h->ip);
+                                                lv_obj_set_style_text_font(host_lbl, &lv_font_montserrat_12, 0);
+                                                lv_obj_set_style_text_color(host_lbl, lv_color_hex(0xAAAAAA), 0);
+                                                lv_obj_set_width(host_lbl, 140);
+
+                                                lv_obj_t *port_lbl = lv_label_create(port_row);
+                                                lv_label_set_text_fmt(port_lbl, "%d/tcp", port);
+                                                lv_obj_set_style_text_font(port_lbl, &lv_font_montserrat_14, 0);
+                                                lv_obj_set_style_text_color(port_lbl, COLOR_MATERIAL_GREEN, 0);
+                                                lv_obj_set_width(port_lbl, 90);
+
+                                                lv_obj_t *svc_lbl = lv_label_create(port_row);
+                                                lv_label_set_text(svc_lbl, service);
+                                                lv_obj_set_style_text_font(svc_lbl, &lv_font_montserrat_14, 0);
+                                                lv_obj_set_style_text_color(svc_lbl, lv_color_hex(0xCCCCCC), 0);
+                                            }
+                                            bsp_display_unlock();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // No open ports
+                        else if (strstr(trimmed, "(no open ports)") != NULL) {
+                            if (current_host_idx >= 0 && current_host_idx < result_count) {
+                                results[current_host_idx].no_open_ports = true;
+                            }
+                            hosts_completed++;
+                        }
+                        // Completion: "Scanned N hosts, found M open ports"
+                        else if (strstr(line_buffer, "Scanned") != NULL && strstr(line_buffer, "open ports") != NULL) {
+                            int scanned_hosts = 0, found_ports = 0;
+                            sscanf(line_buffer, "Scanned %d hosts, found %d open ports", &scanned_hosts, &found_ports);
+                            ESP_LOGI(TAG, "Nmap: Complete - %d hosts, %d open ports", scanned_hosts, found_ports);
+
+                            if (bsp_display_lock(0)) {
+                                if (ctx && ctx->nmap_progress_bar) {
+                                    lv_bar_set_value(ctx->nmap_progress_bar, 100, LV_ANIM_ON);
+                                }
+                                if (ctx && ctx->nmap_progress_label) {
+                                    lv_label_set_text_fmt(ctx->nmap_progress_label,
+                                        "Done! %d hosts, %d open ports", scanned_hosts, found_ports);
+                                    lv_obj_set_style_text_color(ctx->nmap_progress_label, COLOR_MATERIAL_GREEN, 0);
+                                }
+                                bsp_display_unlock();
+                            }
+                            nmap_scanning = false;
+                            break;
+                        }
+                        // When a new Host: appears after the first, the previous is done
+                        if (strncmp(trimmed, "Host:", 5) == 0 && result_count > 1) {
+                            hosts_completed = result_count - 1;
+                        }
+
+                        line_pos = 0;
+                    }
+                } else if (line_pos < (int)sizeof(line_buffer) - 1) {
+                    line_buffer[line_pos++] = c;
+                }
+            }
+        }
+        elapsed_ms += 200;
+    }
+
+    if (nmap_scanning) {
+        nmap_scanning = false;
+        if (bsp_display_lock(0)) {
+            if (ctx && ctx->nmap_progress_label) {
+                lv_label_set_text(ctx->nmap_progress_label, "Scan timed out");
+                lv_obj_set_style_text_color(ctx->nmap_progress_label, COLOR_MATERIAL_RED, 0);
+            }
+            bsp_display_unlock();
+        }
+    }
+
+    // Build final results summary
+    if (bsp_display_lock(0)) {
+        if (ctx && ctx->nmap_results_container) {
+            // Add summary header for hosts with no ports
+            for (int h = 0; h < result_count; h++) {
+                if (results[h].no_open_ports && results[h].port_count == 0) {
+                    lv_obj_t *no_port_row = lv_obj_create(ctx->nmap_results_container);
+                    lv_obj_set_size(no_port_row, lv_pct(100), LV_SIZE_CONTENT);
+                    lv_obj_set_style_bg_color(no_port_row, lv_color_hex(0x2A1A1A), 0);
+                    lv_obj_set_style_border_width(no_port_row, 0, 0);
+                    lv_obj_set_style_radius(no_port_row, 4, 0);
+                    lv_obj_set_style_pad_all(no_port_row, 6, 0);
+                    lv_obj_clear_flag(no_port_row, LV_OBJ_FLAG_SCROLLABLE);
+
+                    lv_obj_t *lbl = lv_label_create(no_port_row);
+                    lv_label_set_text_fmt(lbl, "  %s (%s) - no open ports",
+                        results[h].ip, results[h].mac);
+                    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, 0);
+                    lv_obj_set_style_text_color(lbl, lv_color_hex(0x888888), 0);
+                }
+            }
+        }
+        bsp_display_unlock();
+    }
+
+    free(args);
+    nmap_scan_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+static void nmap_start_scan(const char *target_ip, const char *scan_level)
+{
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx) return;
+
+    nmap_scanning = true;
+    memset(nmap_hosts_data, 0, NMAP_MAX_HOSTS * sizeof(nmap_host_t));
+
+    // Create results popup
+    lv_obj_t *container = get_current_tab_container();
+    if (!container) return;
+
+    ctx->nmap_results_popup_overlay = lv_obj_create(container);
+    lv_obj_remove_style_all(ctx->nmap_results_popup_overlay);
+    lv_obj_set_size(ctx->nmap_results_popup_overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(ctx->nmap_results_popup_overlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(ctx->nmap_results_popup_overlay, LV_OPA_70, 0);
+    lv_obj_clear_flag(ctx->nmap_results_popup_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(ctx->nmap_results_popup_overlay, LV_OBJ_FLAG_CLICKABLE);
+
+    ctx->nmap_results_popup = lv_obj_create(ctx->nmap_results_popup_overlay);
+    lv_obj_set_size(ctx->nmap_results_popup, lv_pct(92), lv_pct(88));
+    lv_obj_center(ctx->nmap_results_popup);
+    lv_obj_set_style_bg_color(ctx->nmap_results_popup, lv_color_hex(0x111118), 0);
+    lv_obj_set_style_border_color(ctx->nmap_results_popup, COLOR_MATERIAL_GREEN, 0);
+    lv_obj_set_style_border_width(ctx->nmap_results_popup, 2, 0);
+    lv_obj_set_style_radius(ctx->nmap_results_popup, 16, 0);
+    lv_obj_set_style_pad_all(ctx->nmap_results_popup, 16, 0);
+    lv_obj_set_flex_flow(ctx->nmap_results_popup, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(ctx->nmap_results_popup, 8, 0);
+    lv_obj_clear_flag(ctx->nmap_results_popup, LV_OBJ_FLAG_SCROLLABLE);
+
+    // Title row
+    lv_obj_t *title_row = lv_obj_create(ctx->nmap_results_popup);
+    lv_obj_set_size(title_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(title_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(title_row, 0, 0);
+    lv_obj_set_style_pad_all(title_row, 0, 0);
+    lv_obj_set_flex_flow(title_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(title_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(title_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(title_row);
+    if (target_ip && strlen(target_ip) > 0) {
+        lv_label_set_text_fmt(title, LV_SYMBOL_LIST "  Nmap %s (%s)", target_ip, scan_level);
+    } else {
+        lv_label_set_text_fmt(title, LV_SYMBOL_LIST "  Nmap All Hosts (%s)", scan_level);
+    }
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_GREEN, 0);
+
+    lv_obj_t *stop_btn = lv_btn_create(title_row);
+    lv_obj_set_size(stop_btn, 90, 36);
+    lv_obj_set_style_bg_color(stop_btn, COLOR_MATERIAL_RED, 0);
+    lv_obj_set_style_radius(stop_btn, 8, 0);
+    lv_obj_add_event_cb(stop_btn, nmap_results_popup_close_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *stop_lbl = lv_label_create(stop_btn);
+    lv_label_set_text(stop_lbl, "STOP");
+    lv_obj_set_style_text_font(stop_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_center(stop_lbl);
+
+    // Progress bar row
+    lv_obj_t *prog_row = lv_obj_create(ctx->nmap_results_popup);
+    lv_obj_set_size(prog_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(prog_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(prog_row, 0, 0);
+    lv_obj_set_style_pad_all(prog_row, 0, 0);
+    lv_obj_set_flex_flow(prog_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(prog_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(prog_row, 12, 0);
+    lv_obj_clear_flag(prog_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    ctx->nmap_progress_bar = lv_bar_create(prog_row);
+    lv_obj_set_size(ctx->nmap_progress_bar, lv_pct(75), 20);
+    lv_bar_set_range(ctx->nmap_progress_bar, 0, 100);
+    lv_bar_set_value(ctx->nmap_progress_bar, 0, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(ctx->nmap_progress_bar, lv_color_hex(0x333333), 0);
+    lv_obj_set_style_bg_color(ctx->nmap_progress_bar, COLOR_MATERIAL_GREEN, LV_PART_INDICATOR);
+
+    ctx->nmap_progress_label = lv_label_create(prog_row);
+    lv_label_set_text(ctx->nmap_progress_label, "Scanning...");
+    lv_obj_set_style_text_font(ctx->nmap_progress_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(ctx->nmap_progress_label, COLOR_MATERIAL_AMBER, 0);
+
+    // Column header
+    lv_obj_t *hdr_row = lv_obj_create(ctx->nmap_results_popup);
+    lv_obj_set_size(hdr_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_color(hdr_row, lv_color_hex(0x222233), 0);
+    lv_obj_set_style_border_width(hdr_row, 0, 0);
+    lv_obj_set_style_radius(hdr_row, 4, 0);
+    lv_obj_set_style_pad_all(hdr_row, 6, 0);
+    lv_obj_set_flex_flow(hdr_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(hdr_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(hdr_row, 10, 0);
+    lv_obj_clear_flag(hdr_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *hdr_host = lv_label_create(hdr_row);
+    lv_label_set_text(hdr_host, "HOST");
+    lv_obj_set_style_text_font(hdr_host, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(hdr_host, lv_color_hex(0x888888), 0);
+    lv_obj_set_width(hdr_host, 140);
+
+    lv_obj_t *hdr_port = lv_label_create(hdr_row);
+    lv_label_set_text(hdr_port, "PORT");
+    lv_obj_set_style_text_font(hdr_port, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(hdr_port, lv_color_hex(0x888888), 0);
+    lv_obj_set_width(hdr_port, 90);
+
+    lv_obj_t *hdr_svc = lv_label_create(hdr_row);
+    lv_label_set_text(hdr_svc, "SERVICE");
+    lv_obj_set_style_text_font(hdr_svc, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(hdr_svc, lv_color_hex(0x888888), 0);
+
+    // Scrollable results container
+    ctx->nmap_results_container = lv_obj_create(ctx->nmap_results_popup);
+    lv_obj_set_size(ctx->nmap_results_container, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_flex_grow(ctx->nmap_results_container, 1);
+    lv_obj_set_style_bg_color(ctx->nmap_results_container, lv_color_hex(0x0D0D15), 0);
+    lv_obj_set_style_border_width(ctx->nmap_results_container, 0, 0);
+    lv_obj_set_style_radius(ctx->nmap_results_container, 6, 0);
+    lv_obj_set_style_pad_all(ctx->nmap_results_container, 4, 0);
+    lv_obj_set_style_pad_row(ctx->nmap_results_container, 3, 0);
+    lv_obj_set_flex_flow(ctx->nmap_results_container, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_scroll_dir(ctx->nmap_results_container, LV_DIR_VER);
+
+    // Start background task
+    nmap_task_args_t *args = malloc(sizeof(nmap_task_args_t));
+    if (!args) {
+        ESP_LOGE(TAG, "Nmap: failed to allocate task args");
+        nmap_scanning = false;
+        return;
+    }
+    memset(args, 0, sizeof(nmap_task_args_t));
+    if (target_ip && strlen(target_ip) > 0) {
+        snprintf(args->target_ip, sizeof(args->target_ip), "%s", target_ip);
+    }
+    snprintf(args->scan_level, sizeof(args->scan_level), "%s", scan_level);
+
+    xTaskCreate(nmap_scan_task_fn, "nmap_scan", 8192, args, 5, &nmap_scan_task_handle);
+}
+
+static void show_nmap_page(void)
+{
+    ESP_LOGI(TAG, "Showing Nmap page for SSID: %s", nmap_target_ssid);
+
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx) return;
+
+    if (!nmap_hosts_data && ctx->nmap_hosts) {
+        nmap_hosts_data = ctx->nmap_hosts;
+    }
+
+    nmap_wifi_connected = false;
+    nmap_host_count = 0;
+    memset(nmap_our_ip, 0, sizeof(nmap_our_ip));
+    memset(nmap_target_password, 0, sizeof(nmap_target_password));
+    memset(nmap_scan_target_ip, 0, sizeof(nmap_scan_target_ip));
+
+    if (scan_page) {
+        lv_obj_add_flag(scan_page, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    lv_obj_t *container = get_current_tab_container();
+    if (!container) return;
+
+    nmap_page = lv_obj_create(container);
+    ctx->nmap_page = nmap_page;
+    lv_obj_set_size(nmap_page, lv_pct(100), lv_pct(100));
+    lv_obj_align(nmap_page, LV_ALIGN_TOP_MID, 0, 0);
+    lv_obj_set_style_bg_color(nmap_page, lv_color_hex(0x1A1A1A), 0);
+    lv_obj_set_style_border_width(nmap_page, 0, 0);
+    lv_obj_set_style_pad_all(nmap_page, 15, 0);
+    lv_obj_set_flex_flow(nmap_page, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(nmap_page, 10, 0);
+
+    // Header
+    lv_obj_t *header = lv_obj_create(nmap_page);
+    lv_obj_set_size(header, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(header, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(header, 0, 0);
+    lv_obj_set_style_pad_all(header, 0, 0);
+    lv_obj_set_flex_flow(header, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(header, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(header, 15, 0);
+    lv_obj_clear_flag(header, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *back_btn = lv_btn_create(header);
+    lv_obj_set_size(back_btn, 72, 60);
+    lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x333333), 0);
+    lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x444444), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(back_btn, 8, 0);
+    lv_obj_add_event_cb(back_btn, nmap_back_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *back_icon = lv_label_create(back_btn);
+    lv_label_set_text(back_icon, LV_SYMBOL_LEFT);
+    lv_obj_set_style_text_color(back_icon, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_center(back_icon);
+
+    lv_obj_t *title = lv_label_create(header);
+    lv_label_set_text(title, LV_SYMBOL_LIST "  Nmap Port Scanner");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_22, 0);
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_GREEN, 0);
+
+    // Target info
+    lv_obj_t *target_label = lv_label_create(nmap_page);
+    lv_label_set_text_fmt(target_label, "Target: %s", nmap_target_ssid);
+    lv_obj_set_style_text_font(target_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(target_label, lv_color_hex(0xCCCCCC), 0);
+
+    bool is_open_network = (strstr(nmap_target_security, "OPEN") != NULL || nmap_target_security[0] == '\0');
+    bool password_known = false;
+
+    if (!is_open_network) {
+        evil_twin_entry_count = 0;
+        memset(evil_twin_entries, 0, sizeof(evil_twin_entries));
+
+        uart_port_t uart_port = get_current_uart();
+        uart_flush(uart_port);
+        uart_send_command_for_tab("show_pass evil");
+
+        char rx_buffer[512];
+        int total_len = 0;
+        int retries = 10;
+        int empty_reads = 0;
+
+        while (retries-- > 0 && evil_twin_entry_count < 50) {
+            int len = transport_read_bytes(uart_port, rx_buffer, sizeof(rx_buffer) - 1, pdMS_TO_TICKS(100));
+            if (len > 0) {
+                rx_buffer[len] = '\0';
+                total_len += len;
+                empty_reads = 0;
+
+                char *ln = strtok(rx_buffer, "\n\r");
+                while (ln != NULL && evil_twin_entry_count < 50) {
+                    if (strlen(ln) > 3 && ln[0] == '\"') {
+                        char *ssid_start = ln + 1;
+                        char *ssid_end = strchr(ssid_start, '\"');
+                        if (ssid_end && *(ssid_end + 1) == ',' && *(ssid_end + 2) == ' ' && *(ssid_end + 3) == '\"') {
+                            *ssid_end = '\0';
+                            char *pass_start = ssid_end + 4;
+                            char *pass_end = strchr(pass_start, '\"');
+                            if (pass_end) {
+                                *pass_end = '\0';
+                                strncpy(evil_twin_entries[evil_twin_entry_count].ssid, ssid_start, 32);
+                                evil_twin_entries[evil_twin_entry_count].ssid[32] = '\0';
+                                strncpy(evil_twin_entries[evil_twin_entry_count].password, pass_start, 64);
+                                evil_twin_entries[evil_twin_entry_count].password[64] = '\0';
+                                evil_twin_entry_count++;
+                            }
+                        }
+                    }
+                    ln = strtok(NULL, "\n\r");
+                }
+            } else {
+                empty_reads++;
+                if (empty_reads >= 3) break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+
+        for (int i = 0; i < evil_twin_entry_count; i++) {
+            if (strcmp(evil_twin_entries[i].ssid, nmap_target_ssid) == 0) {
+                snprintf(nmap_target_password, sizeof(nmap_target_password), "%s", evil_twin_entries[i].password);
+                password_known = true;
+                ESP_LOGI(TAG, "Nmap: Found password for %s in Evil Twin database", nmap_target_ssid);
+                break;
+            }
+        }
+    }
+
+    // Connect section
+    lv_obj_t *pass_section = lv_obj_create(nmap_page);
+    lv_obj_set_size(pass_section, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_color(pass_section, lv_color_hex(0x252525), 0);
+    lv_obj_set_style_border_width(pass_section, 0, 0);
+    lv_obj_set_style_radius(pass_section, 8, 0);
+    lv_obj_set_style_pad_all(pass_section, 15, 0);
+    lv_obj_set_style_pad_row(pass_section, 10, 0);
+    lv_obj_clear_flag(pass_section, LV_OBJ_FLAG_SCROLLABLE);
+
+    if (is_open_network) {
+        lv_obj_set_flex_flow(pass_section, LV_FLEX_FLOW_COLUMN);
+
+        lv_obj_t *open_label = lv_label_create(pass_section);
+        lv_label_set_text(open_label, LV_SYMBOL_WARNING "  Open Network (no password required)");
+        lv_obj_set_style_text_font(open_label, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(open_label, COLOR_MATERIAL_AMBER, 0);
+
+        lv_obj_t *btn_row = lv_obj_create(pass_section);
+        lv_obj_set_size(btn_row, lv_pct(100), LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(btn_row, 0, 0);
+        lv_obj_set_style_pad_all(btn_row, 0, 0);
+        lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_column(btn_row, 15, 0);
+        lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
+
+        nmap_connect_btn = lv_btn_create(btn_row);
+        lv_obj_set_size(nmap_connect_btn, 120, 40);
+        lv_obj_set_style_bg_color(nmap_connect_btn, COLOR_MATERIAL_GREEN, 0);
+        lv_obj_set_style_radius(nmap_connect_btn, 8, 0);
+        lv_obj_add_event_cb(nmap_connect_btn, nmap_connect_cb, LV_EVENT_CLICKED, NULL);
+
+        lv_obj_t *connect_label = lv_label_create(nmap_connect_btn);
+        lv_label_set_text(connect_label, "Connect");
+        lv_obj_set_style_text_font(connect_label, &lv_font_montserrat_16, 0);
+        lv_obj_center(connect_label);
+
+        nmap_list_hosts_btn = lv_btn_create(btn_row);
+        lv_obj_set_size(nmap_list_hosts_btn, 120, 40);
+        lv_obj_set_style_bg_color(nmap_list_hosts_btn, COLOR_MATERIAL_CYAN, 0);
+        lv_obj_set_style_radius(nmap_list_hosts_btn, 8, 0);
+        lv_obj_add_event_cb(nmap_list_hosts_btn, nmap_list_hosts_cb, LV_EVENT_CLICKED, NULL);
+        lv_obj_add_flag(nmap_list_hosts_btn, LV_OBJ_FLAG_HIDDEN);
+
+        lv_obj_t *list_hosts_label = lv_label_create(nmap_list_hosts_btn);
+        lv_label_set_text(list_hosts_label, "List Hosts");
+        lv_obj_set_style_text_font(list_hosts_label, &lv_font_montserrat_16, 0);
+        lv_obj_center(list_hosts_label);
+    } else if (password_known) {
+        lv_obj_set_flex_flow(pass_section, LV_FLEX_FLOW_COLUMN);
+
+        lv_obj_t *pass_title = lv_label_create(pass_section);
+        lv_label_set_text(pass_title, "Known Password:");
+        lv_obj_set_style_text_font(pass_title, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(pass_title, lv_color_hex(0xFFFFFF), 0);
+
+        lv_obj_t *pass_value = lv_label_create(pass_section);
+        lv_label_set_text_fmt(pass_value, "%s", nmap_target_password);
+        lv_obj_set_style_text_font(pass_value, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(pass_value, COLOR_MATERIAL_GREEN, 0);
+
+        lv_obj_t *btn_row = lv_obj_create(pass_section);
+        lv_obj_set_size(btn_row, lv_pct(100), LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(btn_row, 0, 0);
+        lv_obj_set_style_pad_all(btn_row, 0, 0);
+        lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_column(btn_row, 15, 0);
+        lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
+
+        nmap_connect_btn = lv_btn_create(btn_row);
+        lv_obj_set_size(nmap_connect_btn, 120, 40);
+        lv_obj_set_style_bg_color(nmap_connect_btn, COLOR_MATERIAL_GREEN, 0);
+        lv_obj_set_style_radius(nmap_connect_btn, 8, 0);
+        lv_obj_add_event_cb(nmap_connect_btn, nmap_connect_cb, LV_EVENT_CLICKED, NULL);
+
+        lv_obj_t *connect_label = lv_label_create(nmap_connect_btn);
+        lv_label_set_text(connect_label, "Connect");
+        lv_obj_set_style_text_font(connect_label, &lv_font_montserrat_16, 0);
+        lv_obj_center(connect_label);
+
+        nmap_list_hosts_btn = lv_btn_create(btn_row);
+        lv_obj_set_size(nmap_list_hosts_btn, 120, 40);
+        lv_obj_set_style_bg_color(nmap_list_hosts_btn, COLOR_MATERIAL_CYAN, 0);
+        lv_obj_set_style_radius(nmap_list_hosts_btn, 8, 0);
+        lv_obj_add_event_cb(nmap_list_hosts_btn, nmap_list_hosts_cb, LV_EVENT_CLICKED, NULL);
+        lv_obj_add_flag(nmap_list_hosts_btn, LV_OBJ_FLAG_HIDDEN);
+
+        lv_obj_t *list_hosts_label = lv_label_create(nmap_list_hosts_btn);
+        lv_label_set_text(list_hosts_label, "List Hosts");
+        lv_obj_set_style_text_font(list_hosts_label, &lv_font_montserrat_16, 0);
+        lv_obj_center(list_hosts_label);
+    } else {
+        lv_obj_set_flex_flow(pass_section, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(pass_section, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_column(pass_section, 15, 0);
+
+        lv_obj_t *pass_left = lv_obj_create(pass_section);
+        lv_obj_set_size(pass_left, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_opa(pass_left, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(pass_left, 0, 0);
+        lv_obj_set_style_pad_all(pass_left, 0, 0);
+        lv_obj_set_flex_flow(pass_left, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(pass_left, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_column(pass_left, 10, 0);
+        lv_obj_clear_flag(pass_left, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *pass_label = lv_label_create(pass_left);
+        lv_label_set_text(pass_label, "Password:");
+        lv_obj_set_style_text_font(pass_label, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(pass_label, lv_color_hex(0xFFFFFF), 0);
+
+        nmap_password_input = lv_textarea_create(pass_left);
+        lv_obj_set_size(nmap_password_input, 300, 40);
+        lv_textarea_set_one_line(nmap_password_input, true);
+        lv_textarea_set_placeholder_text(nmap_password_input, "WiFi password");
+        lv_obj_set_style_bg_color(nmap_password_input, lv_color_hex(0x1A1A1A), 0);
+        lv_obj_set_style_border_color(nmap_password_input, COLOR_MATERIAL_GREEN, 0);
+        lv_obj_set_style_border_width(nmap_password_input, 1, 0);
+        lv_obj_set_style_text_color(nmap_password_input, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_add_event_cb(nmap_password_input, nmap_password_input_cb, LV_EVENT_CLICKED, NULL);
+
+        nmap_connect_btn = lv_btn_create(pass_section);
+        lv_obj_set_size(nmap_connect_btn, 120, 40);
+        lv_obj_set_style_bg_color(nmap_connect_btn, COLOR_MATERIAL_GREEN, 0);
+        lv_obj_set_style_radius(nmap_connect_btn, 8, 0);
+        lv_obj_add_event_cb(nmap_connect_btn, nmap_connect_cb, LV_EVENT_CLICKED, NULL);
+
+        lv_obj_t *connect_label = lv_label_create(nmap_connect_btn);
+        lv_label_set_text(connect_label, "Connect");
+        lv_obj_set_style_text_font(connect_label, &lv_font_montserrat_16, 0);
+        lv_obj_center(connect_label);
+
+        nmap_list_hosts_btn = lv_btn_create(pass_section);
+        lv_obj_set_size(nmap_list_hosts_btn, 120, 40);
+        lv_obj_set_style_bg_color(nmap_list_hosts_btn, COLOR_MATERIAL_CYAN, 0);
+        lv_obj_set_style_radius(nmap_list_hosts_btn, 8, 0);
+        lv_obj_add_event_cb(nmap_list_hosts_btn, nmap_list_hosts_cb, LV_EVENT_CLICKED, NULL);
+        lv_obj_add_flag(nmap_list_hosts_btn, LV_OBJ_FLAG_HIDDEN);
+
+        lv_obj_t *list_hosts_label = lv_label_create(nmap_list_hosts_btn);
+        lv_label_set_text(list_hosts_label, "List Hosts");
+        lv_obj_set_style_text_font(list_hosts_label, &lv_font_montserrat_16, 0);
+        lv_obj_center(list_hosts_label);
+    }
+
+    // Status label
+    nmap_status_label = lv_label_create(nmap_page);
+    if (is_open_network) {
+        lv_label_set_text(nmap_status_label, "Press Connect to join open network");
+    } else if (password_known) {
+        lv_label_set_text(nmap_status_label, "Press Connect to join network");
+    } else {
+        lv_label_set_text(nmap_status_label, "Enter WiFi password to connect");
+    }
+    lv_obj_set_style_text_color(nmap_status_label, lv_color_hex(0x888888), 0);
+    lv_obj_set_style_text_font(nmap_status_label, &lv_font_montserrat_14, 0);
+
+    // Hosts container (scrollable)
+    nmap_hosts_container = lv_obj_create(nmap_page);
+    lv_obj_set_size(nmap_hosts_container, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_flex_grow(nmap_hosts_container, 1);
+    lv_obj_set_style_bg_color(nmap_hosts_container, lv_color_hex(0x252525), 0);
+    lv_obj_set_style_border_width(nmap_hosts_container, 0, 0);
+    lv_obj_set_style_radius(nmap_hosts_container, 8, 0);
+    lv_obj_set_style_pad_all(nmap_hosts_container, 8, 0);
+    lv_obj_set_style_pad_row(nmap_hosts_container, 5, 0);
+    lv_obj_set_flex_flow(nmap_hosts_container, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_scroll_dir(nmap_hosts_container, LV_DIR_VER);
+
+    lv_obj_t *placeholder = lv_label_create(nmap_hosts_container);
+    lv_label_set_text(placeholder, "Connect to network, then List Hosts to scan for targets");
+    lv_obj_set_style_text_font(placeholder, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(placeholder, lv_color_hex(0x888888), 0);
+
+    // Keyboard (hidden, for password entry)
+    if (!is_open_network && !password_known) {
+        nmap_keyboard = lv_keyboard_create(nmap_page);
+        lv_obj_set_size(nmap_keyboard, lv_pct(100), 200);
+        lv_obj_add_flag(nmap_keyboard, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_event_cb(nmap_keyboard, nmap_keyboard_cb, LV_EVENT_ALL, NULL);
+    }
+
+    ctx->current_visible_page = ctx->nmap_page;
+}
+
 // Show ARP Poison page
 static void show_arp_poison_page(void)
 {
@@ -7926,9 +9251,11 @@ static void show_arp_poison_page(void)
     lv_obj_set_style_text_font(target_label, &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_color(target_label, lv_color_hex(0xCCCCCC), 0);
 
-    // Check if password is known from Evil Twin database (only in manual mode)
+    bool is_open_network = (strstr(arp_target_security, "OPEN") != NULL || arp_target_security[0] == '\0');
+
+    // Check if password is known from Evil Twin database (only in manual mode, non-open)
     bool password_known = false;
-    if (!arp_auto_mode) {
+    if (!arp_auto_mode && !is_open_network) {
         // Load Evil Twin passwords to check if we know this network
         evil_twin_entry_count = 0;
         memset(evil_twin_entries, 0, sizeof(evil_twin_entries));
@@ -8008,7 +9335,47 @@ static void show_arp_poison_page(void)
         lv_obj_set_style_pad_row(pass_section, 10, 0);
         lv_obj_clear_flag(pass_section, LV_OBJ_FLAG_SCROLLABLE);
 
-        if (password_known) {
+        if (is_open_network) {
+            lv_obj_set_flex_flow(pass_section, LV_FLEX_FLOW_COLUMN);
+
+            lv_obj_t *open_label = lv_label_create(pass_section);
+            lv_label_set_text(open_label, LV_SYMBOL_WARNING "  Open Network (no password required)");
+            lv_obj_set_style_text_font(open_label, &lv_font_montserrat_14, 0);
+            lv_obj_set_style_text_color(open_label, COLOR_MATERIAL_AMBER, 0);
+
+            lv_obj_t *btn_row = lv_obj_create(pass_section);
+            lv_obj_set_size(btn_row, lv_pct(100), LV_SIZE_CONTENT);
+            lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
+            lv_obj_set_style_border_width(btn_row, 0, 0);
+            lv_obj_set_style_pad_all(btn_row, 0, 0);
+            lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
+            lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+            lv_obj_set_style_pad_column(btn_row, 15, 0);
+            lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
+
+            arp_connect_btn = lv_btn_create(btn_row);
+            lv_obj_set_size(arp_connect_btn, 120, 40);
+            lv_obj_set_style_bg_color(arp_connect_btn, COLOR_MATERIAL_GREEN, 0);
+            lv_obj_set_style_radius(arp_connect_btn, 8, 0);
+            lv_obj_add_event_cb(arp_connect_btn, arp_connect_cb, LV_EVENT_CLICKED, NULL);
+
+            lv_obj_t *connect_label = lv_label_create(arp_connect_btn);
+            lv_label_set_text(connect_label, "Connect");
+            lv_obj_set_style_text_font(connect_label, &lv_font_montserrat_16, 0);
+            lv_obj_center(connect_label);
+
+            arp_list_hosts_btn = lv_btn_create(btn_row);
+            lv_obj_set_size(arp_list_hosts_btn, 120, 40);
+            lv_obj_set_style_bg_color(arp_list_hosts_btn, COLOR_MATERIAL_CYAN, 0);
+            lv_obj_set_style_radius(arp_list_hosts_btn, 8, 0);
+            lv_obj_add_event_cb(arp_list_hosts_btn, arp_list_hosts_cb, LV_EVENT_CLICKED, NULL);
+            lv_obj_add_flag(arp_list_hosts_btn, LV_OBJ_FLAG_HIDDEN);
+
+            lv_obj_t *list_hosts_label = lv_label_create(arp_list_hosts_btn);
+            lv_label_set_text(list_hosts_label, "List Hosts");
+            lv_obj_set_style_text_font(list_hosts_label, &lv_font_montserrat_16, 0);
+            lv_obj_center(list_hosts_label);
+        } else if (password_known) {
             // Show known password as label
             lv_obj_set_flex_flow(pass_section, LV_FLEX_FLOW_COLUMN);
 
@@ -8145,6 +9512,9 @@ static void show_arp_poison_page(void)
     if (arp_auto_mode) {
         lv_label_set_text_fmt(arp_status_label, "Auto-connecting to %s...", arp_target_ssid);
         lv_obj_set_style_text_color(arp_status_label, COLOR_MATERIAL_AMBER, 0);
+    } else if (is_open_network) {
+        lv_label_set_text(arp_status_label, "Press Connect to join open network");
+        lv_obj_set_style_text_color(arp_status_label, lv_color_hex(0x888888), 0);
     } else {
         lv_label_set_text(arp_status_label, "Enter WiFi password to connect");
         lv_obj_set_style_text_color(arp_status_label, lv_color_hex(0x888888), 0);
@@ -26283,6 +27653,12 @@ static void invalidate_red_team_dependent_pages(void)
         if (ctx->scan_page) {
             lv_obj_del(ctx->scan_page);
             ctx->scan_page = NULL;
+        }
+
+        // Delete cached nmap page
+        if (ctx->nmap_page) {
+            lv_obj_del(ctx->nmap_page);
+            ctx->nmap_page = NULL;
         }
 
         // Delete cached global attacks page (has conditional tiles)
