@@ -45,8 +45,8 @@
 #include "esp_http_server.h"
 #include "lwip/sockets.h"
 
-#define JANOS_TAB_VERSION "1.2.5"
-#define JANOS_VERSION_REQUIRED "1.6.0"
+#define JANOS_TAB_VERSION "1.2.7"
+#define JANOS_VERSION_REQUIRED "1.6.1"
 #include "lwip/netdb.h"
 #include <dirent.h>
 #include <sys/stat.h>
