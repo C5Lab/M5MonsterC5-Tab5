@@ -6559,10 +6559,20 @@ static void mitm_connect_and_start_cb(lv_event_t *e)
     beacon_spam_escape_quoted_arg(password, escaped_password, sizeof(escaped_password));
 
     char cmd[256];
+    int cmd_len = 0;
     if (is_open || password == NULL || strlen(password) == 0) {
-        snprintf(cmd, sizeof(cmd), "wifi_connect \"%s\"", escaped_ssid);
+        cmd_len = snprintf(cmd, sizeof(cmd), "wifi_connect \"%s\"", escaped_ssid);
     } else {
-        snprintf(cmd, sizeof(cmd), "wifi_connect \"%s\" \"%s\"", escaped_ssid, escaped_password);
+        cmd_len = snprintf(cmd, sizeof(cmd), "wifi_connect \"%s\" \"%s\"", escaped_ssid, escaped_password);
+    }
+    if (cmd_len < 0 || cmd_len >= (int)sizeof(cmd)) {
+        ESP_LOGW(TAG, "MITM: wifi_connect command too long, aborting");
+        bsp_display_lock(0);
+        if (ctx->mitm_status_label) {
+            lv_label_set_text(ctx->mitm_status_label, "SSID/password too long");
+            lv_obj_set_style_text_color(ctx->mitm_status_label, COLOR_MATERIAL_RED, 0);
+        }
+        return;
     }
     uart_send_command_for_tab(cmd);
 
@@ -7544,10 +7554,20 @@ static void arp_connect_cb(lv_event_t *e)
     beacon_spam_escape_quoted_arg(password, escaped_password, sizeof(escaped_password));
 
     char cmd[256];
+    int cmd_len = 0;
     if (is_open || password == NULL || strlen(password) == 0) {
-        snprintf(cmd, sizeof(cmd), "wifi_connect \"%s\"", escaped_ssid);
+        cmd_len = snprintf(cmd, sizeof(cmd), "wifi_connect \"%s\"", escaped_ssid);
     } else {
-        snprintf(cmd, sizeof(cmd), "wifi_connect \"%s\" \"%s\"", escaped_ssid, escaped_password);
+        cmd_len = snprintf(cmd, sizeof(cmd), "wifi_connect \"%s\" \"%s\"", escaped_ssid, escaped_password);
+    }
+    if (cmd_len < 0 || cmd_len >= (int)sizeof(cmd)) {
+        ESP_LOGW(TAG, "ARP Poison: wifi_connect command too long, aborting");
+        bsp_display_lock(0);
+        if (arp_status_label) {
+            lv_label_set_text(arp_status_label, "SSID/password too long");
+            lv_obj_set_style_text_color(arp_status_label, COLOR_MATERIAL_RED, 0);
+        }
+        return;
     }
     uart_send_command_for_tab(cmd);
 
