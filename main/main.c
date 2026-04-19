@@ -5711,6 +5711,13 @@ static void main_tile_event_cb(lv_event_t *e)
         show_deauth_detector_page();
     } else if (strcmp(tile_name, "Bluetooth") == 0) {
         show_bluetooth_menu_page();
+    } else if (strcmp(tile_name, "Wardrive") == 0) {
+        // Check SD card before opening Wardrive page
+        if (!current_tab_has_sd_card()) {
+            show_sd_warning_popup(show_wardrive_page);
+            return;
+        }
+        show_wardrive_page();
     } else {
         // Placeholder for other tiles - show a message
         ESP_LOGI(TAG, "Feature '%s' not implemented yet", tile_name);
@@ -11093,6 +11100,7 @@ static void create_uart_tiles_in_container(lv_obj_t *container, tab_context_t *c
     create_tile(tile_grid, LV_SYMBOL_BLUETOOTH, "Bluetooth", COLOR_MATERIAL_CYAN, main_tile_event_cb, "Bluetooth");
     create_tile(tile_grid, LV_SYMBOL_LOOP, "Network\nObserver", COLOR_MATERIAL_TEAL, main_tile_event_cb, "Network Observer");
     create_tile(tile_grid, LV_SYMBOL_WIFI, "Karma", COLOR_MATERIAL_ORANGE, main_tile_event_cb, "Karma");
+    create_tile(tile_grid, LV_SYMBOL_GPS, "Wardrive", COLOR_MATERIAL_TEAL, main_tile_event_cb, "Wardrive");
 
     if (dashboard_enabled) {
         lv_obj_t *footer = lv_obj_create(*tiles_ptr);
@@ -26183,9 +26191,6 @@ static void show_global_attacks_page(void)
     if (enable_red_team) {
         create_tile(tiles, LV_SYMBOL_WIFI, "Beacon Spam", COLOR_MATERIAL_CYAN, global_attack_tile_event_cb, "Beacon Spam");
     }
-
-    // Wardrive - Teal (always visible)
-    create_tile(tiles, LV_SYMBOL_GPS, "Wardrive", COLOR_MATERIAL_TEAL, global_attack_tile_event_cb, "Wardrive");
 
     // Set current visible page
     ctx->current_visible_page = ctx->global_attacks_page;
