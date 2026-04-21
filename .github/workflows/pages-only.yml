@@ -6,6 +6,11 @@ on:
       release_tag:
         description: "Existing release tag to publish on Pages (defaults to latest release)"
         required: false
+  push:
+    branches: [main, master]
+    paths:
+      - "docs/**"
+      - ".github/workflows/pages-only.yml"
 
 concurrency:
   group: github-pages-${{ github.ref }}
