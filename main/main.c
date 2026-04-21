@@ -45,7 +45,7 @@
 #include "esp_http_server.h"
 #include "lwip/sockets.h"
 
-#define JANOS_TAB_VERSION "1.2.7"
+#define JANOS_TAB_VERSION "1.2.8"
 #define JANOS_VERSION_REQUIRED "1.6.1"
 #include "lwip/netdb.h"
 #include <dirent.h>
@@ -338,6 +338,7 @@ typedef struct {
     bool observer_attack_override_active;
     bool observer_attack_return_to_observer;
     wifi_network_t observer_attack_network;
+    int observer_attack_override_sel_index;  // always 0; storage for scan_view_t.sel_indices
 
     // Network popup (clients, deauth)
     lv_obj_t *network_popup;
@@ -982,13 +983,6 @@ static void style_danger_button(lv_obj_t *btn)
     lv_obj_set_style_radius(btn, 8, 0);
 }
 
-// Legacy compatibility - kept for minimal code changes
-static wifi_network_t networks[MAX_NETWORKS];  // Temporary buffer during scan
-static int network_count = 0;
-static bool scan_in_progress = false;
-static int selected_network_indices[MAX_NETWORKS];
-static int selected_network_count = 0;
-
 // Observer global variables (large arrays in PSRAM)
 static observer_network_t *observer_networks = NULL;  // Allocated in PSRAM
 // Note: observer_task_handle is now per-context (ctx->observer_task)
@@ -1022,7 +1016,6 @@ static char *observer_line_buffer = NULL;
 
 // LVGL UI elements - pages
 static lv_obj_t *tiles_container = NULL;
-static lv_obj_t *scan_page = NULL;
 static lv_obj_t *observer_page = NULL;
 static lv_obj_t *esp_modem_page = NULL;
 static lv_obj_t *global_attacks_page = NULL;
@@ -1270,18 +1263,35 @@ static void init_all_tab_contexts(void) {
 
 static void restore_tab_context_to_globals(tab_context_t *ctx);
 
-static void apply_observer_attack_override_to_globals(tab_context_t *ctx)
+// Per-tab scan view: either the real scan (ctx->networks/selected_indices) or a single
+// observer-attack override network. Consumers of scan/attack state must read through
+// get_scan_view(ctx) so that selection and network data come from the same context.
+typedef struct {
+    wifi_network_t *nets;
+    int net_count;
+    const int *sel_indices;
+    int sel_count;
+} scan_view_t;
+
+static scan_view_t get_scan_view(tab_context_t *ctx)
 {
-    if (!ctx || !ctx->observer_attack_override_active) return;
+    scan_view_t v = {0};
+    if (!ctx) return v;
 
-    memset(networks, 0, sizeof(networks));
-    networks[0] = ctx->observer_attack_network;
+    if (ctx->observer_attack_override_active) {
+        v.nets = &ctx->observer_attack_network;
+        v.net_count = 1;
+        ctx->observer_attack_override_sel_index = 0;
+        v.sel_indices = &ctx->observer_attack_override_sel_index;
+        v.sel_count = 1;
+        return v;
+    }
 
-    memset(selected_network_indices, 0, sizeof(selected_network_indices));
-    selected_network_indices[0] = 0;
-
-    network_count = 1;
-    selected_network_count = 1;
+    v.nets = ctx->networks;
+    v.net_count = ctx->network_count;
+    v.sel_indices = ctx->selected_indices;
+    v.sel_count = ctx->selected_count;
+    return v;
 }
 
 static void prepare_observer_attack_override(tab_context_t *ctx, int observer_idx)
@@ -1300,7 +1310,7 @@ static void prepare_observer_attack_override(tab_context_t *ctx, int observer_id
     snprintf(ctx->observer_attack_network.security, sizeof(ctx->observer_attack_network.security), "%s", "Unknown");
 
     ctx->observer_attack_override_active = true;
-    apply_observer_attack_override_to_globals(ctx);
+    ctx->observer_attack_override_sel_index = 0;
 
     ESP_LOGI(TAG, "Prepared observer attack override for '%s' (scan_index=%d)",
              ctx->observer_attack_network.ssid,
@@ -1312,61 +1322,22 @@ static void clear_observer_attack_override(tab_context_t *ctx)
     if (!ctx || !ctx->observer_attack_override_active) return;
 
     ctx->observer_attack_override_active = false;
-    restore_tab_context_to_globals(ctx);
 }
 
-// Restore a tab's context to global variables (for legacy code compatibility)
+// All scan/selection state lives per-tab in ctx; nothing to restore globally.
+// These remain as no-ops for the few remaining call sites; they will be removed
+// once those call sites are cleaned up.
 static void restore_tab_context_to_globals(tab_context_t *ctx) {
     if (!ctx) return;
-
-    // Restore WiFi scan results (only if no scan is in progress)
-    if (!scan_in_progress) {
-        if (ctx->observer_attack_override_active) {
-            apply_observer_attack_override_to_globals(ctx);
-            ESP_LOGI(TAG, "Restored observer attack override to globals");
-        } else if (ctx->networks && ctx->network_count > 0) {
-            memcpy(networks, ctx->networks, sizeof(wifi_network_t) * MAX_NETWORKS);
-            network_count = ctx->network_count;
-            memcpy(selected_network_indices, ctx->selected_indices, sizeof(selected_network_indices));
-            selected_network_count = ctx->selected_count;
-            ESP_LOGI(TAG, "Restored %d scan results (%d selected) from context to globals", network_count, selected_network_count);
-        } else {
-            // Clear globals if context has no data
-            network_count = 0;
-            selected_network_count = 0;
-        }
-    } else {
-        ESP_LOGI(TAG, "Skipping scan results restore - scan in progress");
-    }
-
-    // Observer now uses ctx-> directly, no need to restore globals
-    // Each tab has its own independent observer data in ctx->observer_networks
-    ESP_LOGI(TAG, "Tab %d observer_running=%d, network_count=%d",
+    ESP_LOGI(TAG, "Tab %d switch: observer_running=%d, network_count=%d, selected=%d",
              (int)tab_id_for_ctx(ctx),
              ctx->observer_running,
-             ctx->observer_network_count);
-
+             ctx->network_count,
+             ctx->selected_count);
 }
 
-// Save global variables back to tab context (call BEFORE switching tabs)
 static void save_globals_to_tab_context(tab_context_t *ctx) {
-    if (!ctx) return;
-
-    if (ctx->observer_attack_override_active) {
-        ESP_LOGI(TAG, "Skipping scan state save while observer attack override is active");
-        return;
-    }
-
-    // Save WiFi scan results and selections
-    if (ctx->networks) {
-        memcpy(ctx->networks, networks, sizeof(wifi_network_t) * MAX_NETWORKS);
-        ctx->network_count = network_count;
-        memcpy(ctx->selected_indices, selected_network_indices, sizeof(selected_network_indices));
-        ctx->selected_count = selected_network_count;
-        ESP_LOGI(TAG, "Saved %d scan results (%d selected) from globals to context", network_count, selected_network_count);
-    }
-
-    // Observer now uses ctx-> directly, no need to copy from globals
+    (void)ctx;
 }
 
 // ESP Modem global variables
@@ -1390,11 +1361,8 @@ static float current_battery_current_a = 0.0f;
 static bool current_battery_current_valid = false;
 static bool current_charging_status = false;
 
-// LVGL UI elements - scan page
-static lv_obj_t *scan_btn = NULL;
-static lv_obj_t *status_label = NULL;
-static lv_obj_t *network_list = NULL;
-static lv_obj_t *spinner = NULL;
+// Full-screen "Scanning..." overlay shown while a wifi_scan_task is running on the
+// active tab. Only one overlay can be visible at a time so it stays a global.
 static lv_obj_t *scan_overlay = NULL;
 
 // Splash screen
@@ -1657,9 +1625,6 @@ static void restore_ui_pointers_from_ctx(tab_context_t *ctx) {
 
     if (ctx->observer_table) {
         observer_table = ctx->observer_table;
-    }
-    if (ctx->scan_page) {
-        scan_page = ctx->scan_page;
     }
     if (ctx->observer_page) {
         observer_page = ctx->observer_page;
@@ -2378,7 +2343,7 @@ static bool home_meta_refresh_allowed(const tab_context_t *ctx)
 {
     if (!ctx) return false;
     if (!ctx->tiles || ctx->current_visible_page != ctx->tiles) return false;
-    if (scan_in_progress || ctx->scan_in_progress) return false;
+    if (ctx->scan_in_progress) return false;
     if (ctx->observer_running || ctx->deauth_detector_running) return false;
     if (ctx->handshaker_monitoring || ctx->global_handshaker_monitoring) return false;
     if (ctx->wardrive_monitoring || ctx->phishing_portal_monitoring) return false;
@@ -3963,17 +3928,24 @@ static bool parse_network_line(const char *line, wifi_network_t *net)
 // WiFi scan task
 static void wifi_scan_task(void *arg)
 {
-    // Save the tab that initiated this scan (so we store results to correct context)
-    tab_id_t scan_tab = current_tab;
+    // Tab that initiated this scan (passed via arg) - results go to that tab's context.
+    tab_id_t scan_tab = (tab_id_t)(uintptr_t)arg;
+    tab_context_t *ctx = get_ctx_for_tab(scan_tab);
     const char *uart_name = tab_transport_name(scan_tab);
+
+    if (!ctx || !ctx->networks) {
+        ESP_LOGE(TAG, "wifi_scan_task: ctx or ctx->networks is NULL for tab %d", scan_tab);
+        vTaskDelete(NULL);
+        return;
+    }
 
     ESP_LOGI(TAG, "Starting WiFi scan task for tab %d (%s)", scan_tab, uart_name);
 
-    // Clear previous results
-    network_count = 0;
-    memset(networks, 0, sizeof(networks));
+    // Clear previous results in this tab's context
+    ctx->network_count = 0;
+    memset(ctx->networks, 0, sizeof(wifi_network_t) * MAX_NETWORKS);
 
-    // Get the UART for current tab
+    // Get the UART for this tab
     uart_port_t uart_port = uart_port_for_tab(scan_tab);
 
     ESP_LOGI(TAG, "[%s] Using transport on port %d for scan", uart_name, uart_port);
@@ -4024,11 +3996,11 @@ static void wifi_scan_task(void *arg)
                         }
 
                         // Try to parse network line
-                        if (line_buffer[0] == '"' && network_count < MAX_NETWORKS) {
+                        if (line_buffer[0] == '"' && ctx->network_count < MAX_NETWORKS) {
                             wifi_network_t net;
                             if (parse_network_line(line_buffer, &net)) {
-                                networks[network_count] = net;
-                                network_count++;
+                                ctx->networks[ctx->network_count] = net;
+                                ctx->network_count++;
                                 ESP_LOGI(TAG, "[%s] Parsed network %d: %s (%s) %s",
                                          uart_name, net.index, net.ssid, net.bssid, net.band);
                             }
@@ -4048,34 +4020,34 @@ static void wifi_scan_task(void *arg)
     }
 
     log_memory_stats("RX-scan");
-    ESP_LOGI(TAG, "[%s] Scan finished. Found %d networks", uart_name, network_count);
+    ESP_LOGI(TAG, "[%s] Scan finished. Found %d networks", uart_name, ctx->network_count);
 
     // Update UI on main thread
     bsp_display_lock(0);
 
     // Hide spinner
-    if (spinner) {
-        lv_obj_add_flag(spinner, LV_OBJ_FLAG_HIDDEN);
+    if (ctx->spinner) {
+        lv_obj_add_flag(ctx->spinner, LV_OBJ_FLAG_HIDDEN);
     }
 
     // Update status
-    if (status_label) {
+    if (ctx->scan_status_label) {
         if (scan_complete) {
-            lv_label_set_text_fmt(status_label, "Found %d networks", network_count);
+            lv_label_set_text_fmt(ctx->scan_status_label, "Found %d networks", ctx->network_count);
         } else {
-            lv_label_set_text(status_label, "Scan timed out");
+            lv_label_set_text(ctx->scan_status_label, "Scan timed out");
         }
     }
 
     // Update network list
-    if (network_list) {
-        lv_obj_clean(network_list);
+    if (ctx->network_list) {
+        lv_obj_clean(ctx->network_list);
 
-        for (int i = 0; i < network_count; i++) {
-            wifi_network_t *net = &networks[i];
+        for (int i = 0; i < ctx->network_count; i++) {
+            wifi_network_t *net = &ctx->networks[i];
 
             // Create list item with horizontal layout (checkbox + text container)
-            lv_obj_t *item = lv_obj_create(network_list);
+            lv_obj_t *item = lv_obj_create(ctx->network_list);
             lv_obj_set_size(item, lv_pct(100), LV_SIZE_CONTENT);
             lv_obj_set_style_pad_all(item, 8, 0);
             lv_obj_set_style_bg_color(item, lv_color_hex(0x2D2D2D), 0);
@@ -4135,29 +4107,23 @@ static void wifi_scan_task(void *arg)
     }
 
     // Re-enable scan button
-    if (scan_btn) {
-        lv_obj_clear_state(scan_btn, LV_STATE_DISABLED);
+    if (ctx->scan_btn) {
+        lv_obj_clear_state(ctx->scan_btn, LV_STATE_DISABLED);
     }
 
     // Hide small spinner
-    if (spinner) {
-        lv_obj_add_flag(spinner, LV_OBJ_FLAG_HIDDEN);
+    if (ctx->spinner) {
+        lv_obj_add_flag(ctx->spinner, LV_OBJ_FLAG_HIDDEN);
     }
 
-    // Hide large centered overlay
-    hide_scan_overlay();
-
-    scan_in_progress = false;
-
-    // Copy scan results to the tab that initiated the scan (not necessarily current tab!)
-    tab_context_t *ctx = get_ctx_for_tab(scan_tab);
-    if (ctx && ctx->networks) {
-        memcpy(ctx->networks, networks, sizeof(wifi_network_t) * MAX_NETWORKS);
-        ctx->network_count = network_count;
-        memcpy(ctx->selected_indices, selected_network_indices, sizeof(selected_network_indices));
-        ctx->selected_count = selected_network_count;
-        ESP_LOGI(TAG, "[%s] Copied %d scan results to tab %d context", uart_name, network_count, scan_tab);
+    // Hide large centered overlay only if user is still on the same tab
+    if (current_tab == scan_tab) {
+        hide_scan_overlay();
     }
+
+    ctx->scan_in_progress = false;
+    ESP_LOGI(TAG, "[%s] Stored %d scan results in tab %d context",
+             uart_name, ctx->network_count, scan_tab);
 
     bsp_display_unlock();
 
@@ -4545,40 +4511,47 @@ static void show_splash_screen(void)
 // Scan button click handler
 static void scan_btn_click_cb(lv_event_t *e)
 {
-    if (scan_in_progress) {
-        ESP_LOGW(TAG, "Scan already in progress");
+    (void)e;
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx) return;
+
+    if (ctx->scan_in_progress) {
+        ESP_LOGW(TAG, "Scan already in progress on this tab");
         return;
     }
 
-    scan_in_progress = true;
+    ctx->scan_in_progress = true;
 
-    // Clear previous selections
-    selected_network_count = 0;
-    memset(selected_network_indices, 0, sizeof(selected_network_indices));
+    // Clear previous selections (rescan = fresh selection)
+    ctx->selected_count = 0;
+    memset(ctx->selected_indices, 0, sizeof(ctx->selected_indices));
 
     // Disable button during scan
-    lv_obj_add_state(scan_btn, LV_STATE_DISABLED);
+    if (ctx->scan_btn) {
+        lv_obj_add_state(ctx->scan_btn, LV_STATE_DISABLED);
+    }
 
     // Show large centered overlay with spinner
     show_scan_overlay();
 
     // Show small spinner next to button (optional backup)
-    if (spinner) {
-        lv_obj_clear_flag(spinner, LV_OBJ_FLAG_HIDDEN);
+    if (ctx->spinner) {
+        lv_obj_clear_flag(ctx->spinner, LV_OBJ_FLAG_HIDDEN);
     }
 
     // Update status
-    if (status_label) {
-        lv_label_set_text(status_label, "Scanning...");
+    if (ctx->scan_status_label) {
+        lv_label_set_text(ctx->scan_status_label, "Scanning...");
     }
 
     // Clear previous results
-    if (network_list) {
-        lv_obj_clean(network_list);
+    if (ctx->network_list) {
+        lv_obj_clean(ctx->network_list);
     }
 
-    // Start scan task
-    xTaskCreate(wifi_scan_task, "wifi_scan", 8192, NULL, 5, NULL);
+    // Start scan task for the tab whose scan page is currently active.
+    tab_id_t scan_tab = tab_id_for_ctx(ctx);
+    xTaskCreate(wifi_scan_task, "wifi_scan", 8192, (void*)(uintptr_t)scan_tab, 5, NULL);
 }
 
 static void style_fade_border_strip(lv_obj_t *strip, lv_color_t start_color, lv_color_t end_color, lv_grad_dir_t dir)
@@ -5731,29 +5704,34 @@ static void network_checkbox_event_cb(lv_event_t *e)
     int index = (int)(intptr_t)lv_event_get_user_data(e);  // 0-based index
     bool checked = lv_obj_has_state(cb, LV_STATE_CHECKED);
 
+    // Selection lives in the active tab's context. Checkboxes only exist on the
+    // visible scan page, so get_current_ctx() correctly identifies the owner.
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx) return;
+
     if (checked) {
         // Add to selected list if not already present and not full
         bool found = false;
-        for (int i = 0; i < selected_network_count; i++) {
-            if (selected_network_indices[i] == index) {
+        for (int i = 0; i < ctx->selected_count; i++) {
+            if (ctx->selected_indices[i] == index) {
                 found = true;
                 break;
             }
         }
-        if (!found && selected_network_count < MAX_NETWORKS) {
-            selected_network_indices[selected_network_count++] = index;
-            ESP_LOGI(TAG, "Selected network index %d (total: %d)", index, selected_network_count);
+        if (!found && ctx->selected_count < MAX_NETWORKS) {
+            ctx->selected_indices[ctx->selected_count++] = index;
+            ESP_LOGI(TAG, "Selected network index %d (total: %d)", index, ctx->selected_count);
         }
     } else {
         // Remove from selected list
-        for (int i = 0; i < selected_network_count; i++) {
-            if (selected_network_indices[i] == index) {
+        for (int i = 0; i < ctx->selected_count; i++) {
+            if (ctx->selected_indices[i] == index) {
                 // Shift remaining elements
-                for (int j = i; j < selected_network_count - 1; j++) {
-                    selected_network_indices[j] = selected_network_indices[j + 1];
+                for (int j = i; j < ctx->selected_count - 1; j++) {
+                    ctx->selected_indices[j] = ctx->selected_indices[j + 1];
                 }
-                selected_network_count--;
-                ESP_LOGI(TAG, "Deselected network index %d (total: %d)", index, selected_network_count);
+                ctx->selected_count--;
+                ESP_LOGI(TAG, "Deselected network index %d (total: %d)", index, ctx->selected_count);
                 break;
             }
         }
@@ -6036,10 +6014,16 @@ static void show_hidden_ssid_popup(hidden_ssid_callback_t callback)
 
 static void hidden_ssid_arp_confirm_cb(const char *ssid)
 {
-    int idx = selected_network_indices[0];
-    if (idx >= 0 && idx < network_count) {
-        strncpy(networks[idx].ssid, ssid, sizeof(networks[idx].ssid) - 1);
-        networks[idx].ssid[sizeof(networks[idx].ssid) - 1] = '\0';
+    tab_context_t *ctx = get_current_ctx();
+    if (ctx) {
+        scan_view_t v = get_scan_view(ctx);
+        if (v.sel_count > 0) {
+            int idx = v.sel_indices[0];
+            if (idx >= 0 && idx < v.net_count) {
+                strncpy(v.nets[idx].ssid, ssid, sizeof(v.nets[idx].ssid) - 1);
+                v.nets[idx].ssid[sizeof(v.nets[idx].ssid) - 1] = '\0';
+            }
+        }
     }
     strncpy(arp_target_ssid, ssid, sizeof(arp_target_ssid) - 1);
     arp_target_ssid[sizeof(arp_target_ssid) - 1] = '\0';
@@ -6048,10 +6032,16 @@ static void hidden_ssid_arp_confirm_cb(const char *ssid)
 
 static void hidden_ssid_rogueap_confirm_cb(const char *ssid)
 {
-    int idx = selected_network_indices[0];
-    if (idx >= 0 && idx < network_count) {
-        strncpy(networks[idx].ssid, ssid, sizeof(networks[idx].ssid) - 1);
-        networks[idx].ssid[sizeof(networks[idx].ssid) - 1] = '\0';
+    tab_context_t *ctx = get_current_ctx();
+    if (ctx) {
+        scan_view_t v = get_scan_view(ctx);
+        if (v.sel_count > 0) {
+            int idx = v.sel_indices[0];
+            if (idx >= 0 && idx < v.net_count) {
+                strncpy(v.nets[idx].ssid, ssid, sizeof(v.nets[idx].ssid) - 1);
+                v.nets[idx].ssid[sizeof(v.nets[idx].ssid) - 1] = '\0';
+            }
+        }
     }
     show_rogue_ap_page();
 }
@@ -6078,27 +6068,31 @@ static void handle_selected_attack(const char *attack_name)
 
     ESP_LOGI(TAG, "Attack tile clicked: %s", attack_name);
 
-    if (selected_network_count == 0) {
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx) return;
+    scan_view_t v = get_scan_view(ctx);
+
+    if (v.sel_count == 0) {
         ESP_LOGW(TAG, "No networks selected for attack");
         return;
     }
 
-    ESP_LOGI(TAG, "Selected %d network(s) for %s attack:", selected_network_count, attack_name);
-    for (int i = 0; i < selected_network_count; i++) {
-        int idx = selected_network_indices[i];
-        if (idx >= 0 && idx < network_count) {
-            ESP_LOGI(TAG, "  [%d] %s (%s)", idx, networks[idx].ssid, networks[idx].bssid);
+    ESP_LOGI(TAG, "Selected %d network(s) for %s attack:", v.sel_count, attack_name);
+    for (int i = 0; i < v.sel_count; i++) {
+        int idx = v.sel_indices[i];
+        if (idx >= 0 && idx < v.net_count) {
+            ESP_LOGI(TAG, "  [%d] %s (%s)", idx, v.nets[idx].ssid, v.nets[idx].bssid);
         }
     }
 
     if (strcmp(attack_name, "Deauth") == 0) {
         char cmd[128];
         snprintf(cmd, sizeof(cmd), "select_networks");
-        for (int i = 0; i < selected_network_count; i++) {
-            int idx = selected_network_indices[i];
-            if (idx >= 0 && idx < network_count) {
+        for (int i = 0; i < v.sel_count; i++) {
+            int idx = v.sel_indices[i];
+            if (idx >= 0 && idx < v.net_count) {
                 char num[8];
-                snprintf(num, sizeof(num), " %d", networks[idx].index);
+                snprintf(num, sizeof(num), " %d", v.nets[idx].index);
                 strncat(cmd, num, sizeof(cmd) - strlen(cmd) - 1);
             }
         }
@@ -6120,17 +6114,17 @@ static void handle_selected_attack(const char *attack_name)
     }
 
     if (strcmp(attack_name, "SAE Overflow") == 0) {
-        if (selected_network_count != 1) {
-            ESP_LOGW(TAG, "SAE Overflow requires exactly one network, selected: %d", selected_network_count);
-            if (status_label) {
-                lv_label_set_text(status_label, "Please select just one network");
-                lv_obj_set_style_text_color(status_label, COLOR_MATERIAL_RED, 0);
+        if (v.sel_count != 1) {
+            ESP_LOGW(TAG, "SAE Overflow requires exactly one network, selected: %d", v.sel_count);
+            if (ctx->scan_status_label) {
+                lv_label_set_text(ctx->scan_status_label, "Please select just one network");
+                lv_obj_set_style_text_color(ctx->scan_status_label, COLOR_MATERIAL_RED, 0);
             }
             return;
         }
 
-        int idx = selected_network_indices[0];
-        int net_1based = networks[idx].index;
+        int idx = v.sel_indices[0];
+        int net_1based = v.nets[idx].index;
 
         char cmd[32];
         snprintf(cmd, sizeof(cmd), "select_networks %d", net_1based);
@@ -6147,26 +6141,26 @@ static void handle_selected_attack(const char *attack_name)
     }
 
     if (strcmp(attack_name, "ARP Poison") == 0) {
-        if (selected_network_count != 1) {
-            ESP_LOGW(TAG, "ARP Poison requires exactly 1 network, selected: %d", selected_network_count);
-            if (status_label) {
+        if (v.sel_count != 1) {
+            ESP_LOGW(TAG, "ARP Poison requires exactly 1 network, selected: %d", v.sel_count);
+            if (ctx->scan_status_label) {
                 bsp_display_lock(0);
-                lv_label_set_text(status_label, "Select exactly 1 network for ARP Poison");
-                lv_obj_set_style_text_color(status_label, COLOR_MATERIAL_RED, 0);
+                lv_label_set_text(ctx->scan_status_label, "Select exactly 1 network for ARP Poison");
+                lv_obj_set_style_text_color(ctx->scan_status_label, COLOR_MATERIAL_RED, 0);
                 bsp_display_unlock();
             }
             return;
         }
 
-        int idx = selected_network_indices[0];
-        if (idx >= 0 && idx < network_count) {
-            if (strlen(networks[idx].ssid) == 0) {
+        int idx = v.sel_indices[0];
+        if (idx >= 0 && idx < v.net_count) {
+            if (strlen(v.nets[idx].ssid) == 0) {
                 show_hidden_ssid_popup(hidden_ssid_arp_confirm_cb);
                 return;
             }
-            strncpy(arp_target_ssid, networks[idx].ssid, sizeof(arp_target_ssid) - 1);
+            strncpy(arp_target_ssid, v.nets[idx].ssid, sizeof(arp_target_ssid) - 1);
             arp_target_ssid[sizeof(arp_target_ssid) - 1] = '\0';
-            strncpy(arp_target_security, networks[idx].security, sizeof(arp_target_security) - 1);
+            strncpy(arp_target_security, v.nets[idx].security, sizeof(arp_target_security) - 1);
             arp_target_security[sizeof(arp_target_security) - 1] = '\0';
         }
 
@@ -6175,12 +6169,12 @@ static void handle_selected_attack(const char *attack_name)
     }
 
     if (strcmp(attack_name, "MITM") == 0) {
-        if (selected_network_count != 1) {
-            ESP_LOGW(TAG, "MITM requires exactly 1 network, selected: %d", selected_network_count);
-            if (status_label) {
+        if (v.sel_count != 1) {
+            ESP_LOGW(TAG, "MITM requires exactly 1 network, selected: %d", v.sel_count);
+            if (ctx->scan_status_label) {
                 bsp_display_lock(0);
-                lv_label_set_text(status_label, "Select exactly 1 network for MITM");
-                lv_obj_set_style_text_color(status_label, COLOR_MATERIAL_RED, 0);
+                lv_label_set_text(ctx->scan_status_label, "Select exactly 1 network for MITM");
+                lv_obj_set_style_text_color(ctx->scan_status_label, COLOR_MATERIAL_RED, 0);
                 bsp_display_unlock();
             }
             return;
@@ -6190,21 +6184,21 @@ static void handle_selected_attack(const char *attack_name)
     }
 
     if (strcmp(attack_name, "Nmap") == 0) {
-        if (selected_network_count != 1) {
-            ESP_LOGW(TAG, "Nmap requires exactly 1 network, selected: %d", selected_network_count);
-            if (status_label) {
+        if (v.sel_count != 1) {
+            ESP_LOGW(TAG, "Nmap requires exactly 1 network, selected: %d", v.sel_count);
+            if (ctx->scan_status_label) {
                 bsp_display_lock(0);
-                lv_label_set_text(status_label, "Select exactly 1 network for Nmap");
-                lv_obj_set_style_text_color(status_label, COLOR_MATERIAL_RED, 0);
+                lv_label_set_text(ctx->scan_status_label, "Select exactly 1 network for Nmap");
+                lv_obj_set_style_text_color(ctx->scan_status_label, COLOR_MATERIAL_RED, 0);
                 bsp_display_unlock();
             }
             return;
         }
 
-        int idx = selected_network_indices[0];
-        if (idx >= 0 && idx < network_count) {
-            snprintf(nmap_target_ssid, sizeof(nmap_target_ssid), "%s", networks[idx].ssid);
-            snprintf(nmap_target_security, sizeof(nmap_target_security), "%s", networks[idx].security);
+        int idx = v.sel_indices[0];
+        if (idx >= 0 && idx < v.net_count) {
+            snprintf(nmap_target_ssid, sizeof(nmap_target_ssid), "%s", v.nets[idx].ssid);
+            snprintf(nmap_target_security, sizeof(nmap_target_security), "%s", v.nets[idx].security);
         }
 
         show_nmap_page();
@@ -6212,12 +6206,12 @@ static void handle_selected_attack(const char *attack_name)
     }
 
     if (strcmp(attack_name, "Rogue AP") == 0) {
-        if (selected_network_count != 1) {
-            ESP_LOGW(TAG, "Rogue AP requires exactly 1 network, selected: %d", selected_network_count);
-            if (status_label) {
+        if (v.sel_count != 1) {
+            ESP_LOGW(TAG, "Rogue AP requires exactly 1 network, selected: %d", v.sel_count);
+            if (ctx->scan_status_label) {
                 bsp_display_lock(0);
-                lv_label_set_text(status_label, "Select exactly 1 network for Rogue AP");
-                lv_obj_set_style_text_color(status_label, COLOR_MATERIAL_RED, 0);
+                lv_label_set_text(ctx->scan_status_label, "Select exactly 1 network for Rogue AP");
+                lv_obj_set_style_text_color(ctx->scan_status_label, COLOR_MATERIAL_RED, 0);
                 bsp_display_unlock();
             }
             return;
@@ -6228,8 +6222,8 @@ static void handle_selected_attack(const char *attack_name)
             return;
         }
 
-        int idx = selected_network_indices[0];
-        if (idx >= 0 && idx < network_count && strlen(networks[idx].ssid) == 0) {
+        int idx = v.sel_indices[0];
+        if (idx >= 0 && idx < v.net_count && strlen(v.nets[idx].ssid) == 0) {
             show_hidden_ssid_popup(hidden_ssid_rogueap_confirm_cb);
             return;
         }
@@ -6332,10 +6326,11 @@ static void show_scan_deauth_popup(void)
     lv_obj_add_flag(list_cont, LV_OBJ_FLAG_SCROLLABLE);
 
     // Add each selected network to the list
-    for (int i = 0; i < selected_network_count; i++) {
-        int idx = selected_network_indices[i];
-        if (idx >= 0 && idx < network_count) {
-            wifi_network_t *net = &networks[idx];
+    scan_view_t v = get_scan_view(ctx);
+    for (int i = 0; i < v.sel_count; i++) {
+        int idx = v.sel_indices[i];
+        if (idx >= 0 && idx < v.net_count) {
+            wifi_network_t *net = &v.nets[idx];
 
             // Network item container
             lv_obj_t *item = lv_obj_create(list_cont);
@@ -6408,9 +6403,10 @@ static void show_sae_popup(int network_idx)
     if (!ctx) return;
     if (ctx->sae_popup != NULL) return;  // Already showing in this tab
 
-    if (network_idx < 0 || network_idx >= network_count) return;
+    scan_view_t sv = get_scan_view(ctx);
+    if (network_idx < 0 || network_idx >= sv.net_count) return;
 
-    wifi_network_t *net = &networks[network_idx];
+    wifi_network_t *net = &sv.nets[network_idx];
     const char *ssid_display = strlen(net->ssid) > 0 ? net->ssid : "(Hidden)";
 
     lv_obj_t *container = get_current_tab_container();
@@ -6527,10 +6523,12 @@ static void mitm_connect_and_start_cb(lv_event_t *e)
     tab_context_t *ctx = get_current_ctx();
     if (!ctx) return;
 
-    int idx = selected_network_indices[0];
-    if (idx < 0 || idx >= network_count) return;
-    const char *ssid = networks[idx].ssid;
-    bool is_open = (strstr(networks[idx].security, "OPEN") != NULL || networks[idx].security[0] == '\0');
+    scan_view_t v = get_scan_view(ctx);
+    if (v.sel_count == 0) return;
+    int idx = v.sel_indices[0];
+    if (idx < 0 || idx >= v.net_count) return;
+    const char *ssid = v.nets[idx].ssid;
+    bool is_open = (strstr(v.nets[idx].security, "OPEN") != NULL || v.nets[idx].security[0] == '\0');
 
     const char *password = NULL;
     if (ctx->mitm_password_input) {
@@ -6703,10 +6701,12 @@ static void show_mitm_popup(void)
     if (!ctx) return;
     if (ctx->mitm_popup != NULL) return;
 
-    int idx = selected_network_indices[0];
-    if (idx < 0 || idx >= network_count) return;
+    scan_view_t v = get_scan_view(ctx);
+    if (v.sel_count == 0) return;
+    int idx = v.sel_indices[0];
+    if (idx < 0 || idx >= v.net_count) return;
 
-    wifi_network_t *net = &networks[idx];
+    wifi_network_t *net = &v.nets[idx];
     const char *ssid_display = strlen(net->ssid) > 0 ? net->ssid : "(Hidden)";
 
     // Check Evil Twin DB for known password
@@ -7343,10 +7343,11 @@ static void show_handshaker_popup(void)
     lv_obj_set_scroll_dir(network_scroll, LV_DIR_VER);
 
     // Add selected networks to list
-    for (int i = 0; i < selected_network_count; i++) {
-        int idx = selected_network_indices[i];
-        if (idx >= 0 && idx < network_count) {
-            wifi_network_t *net = &networks[idx];
+    scan_view_t hsv = get_scan_view(ctx);
+    for (int i = 0; i < hsv.sel_count; i++) {
+        int idx = hsv.sel_indices[i];
+        if (idx >= 0 && idx < hsv.net_count) {
+            wifi_network_t *net = &hsv.nets[idx];
             const char *ssid_display = strlen(net->ssid) > 0 ? net->ssid : "(Hidden)";
 
             lv_obj_t *info_label = lv_label_create(network_scroll);
@@ -7424,11 +7425,11 @@ static void show_handshaker_popup(void)
     // Build select_networks command with 1-based indices
     char cmd[128];
     snprintf(cmd, sizeof(cmd), "select_networks");
-    for (int i = 0; i < selected_network_count; i++) {
-        int idx = selected_network_indices[i];
-        if (idx >= 0 && idx < network_count) {
+    for (int i = 0; i < hsv.sel_count; i++) {
+        int idx = hsv.sel_indices[i];
+        if (idx >= 0 && idx < hsv.net_count) {
             char num[8];
-            snprintf(num, sizeof(num), " %d", networks[idx].index);  // .index is 1-based
+            snprintf(num, sizeof(num), " %d", hsv.nets[idx].index);  // .index is 1-based
             strncat(cmd, num, sizeof(cmd) - strlen(cmd) - 1);
         }
     }
@@ -8881,8 +8882,8 @@ static void show_nmap_page(void)
     memset(nmap_target_password, 0, sizeof(nmap_target_password));
     memset(nmap_scan_target_ip, 0, sizeof(nmap_scan_target_ip));
 
-    if (scan_page) {
-        lv_obj_add_flag(scan_page, LV_OBJ_FLAG_HIDDEN);
+    if (ctx->scan_page) {
+        lv_obj_add_flag(ctx->scan_page, LV_OBJ_FLAG_HIDDEN);
     }
 
     lv_obj_t *container = get_current_tab_container();
@@ -9206,8 +9207,8 @@ static void show_arp_poison_page(void)
     memset(arp_our_ip, 0, sizeof(arp_our_ip));
 
     // Hide scan page
-    if (scan_page) {
-        lv_obj_add_flag(scan_page, LV_OBJ_FLAG_HIDDEN);
+    if (ctx && ctx->scan_page) {
+        lv_obj_add_flag(ctx->scan_page, LV_OBJ_FLAG_HIDDEN);
     }
 
     lv_obj_t *container = get_current_tab_container();
@@ -10616,7 +10617,8 @@ static void do_evil_twin_start(void)
     // Get selected HTML file index from dropdown
     int selected_html_idx = lv_dropdown_get_selected(ctx->evil_twin_html_dropdown);
 
-    if (selected_dropdown_idx < 0 || selected_dropdown_idx >= selected_network_count) {
+    scan_view_t v = get_scan_view(ctx);
+    if (selected_dropdown_idx < 0 || selected_dropdown_idx >= v.sel_count) {
         ESP_LOGW(TAG, "Invalid network selection");
         return;
     }
@@ -10627,16 +10629,16 @@ static void do_evil_twin_start(void)
     }
 
     // Get the actual network index for evil twin (0-based in our array)
-    int evil_twin_net_idx = selected_network_indices[selected_dropdown_idx];
-    int evil_twin_1based = networks[evil_twin_net_idx].index;  // 1-based for UART
+    int evil_twin_net_idx = v.sel_indices[selected_dropdown_idx];
+    int evil_twin_1based = v.nets[evil_twin_net_idx].index;  // 1-based for UART
 
     // Build select_networks command: evil twin first, then others (no duplicates)
     char cmd[128];
     snprintf(cmd, sizeof(cmd), "select_networks %d", evil_twin_1based);
 
-    for (int i = 0; i < selected_network_count; i++) {
-        int idx = selected_network_indices[i];
-        int net_1based = networks[idx].index;
+    for (int i = 0; i < v.sel_count; i++) {
+        int idx = v.sel_indices[i];
+        int net_1based = v.nets[idx].index;
         if (net_1based != evil_twin_1based) {  // Skip duplicate
             char num[8];
             snprintf(num, sizeof(num), " %d", net_1based);
@@ -10660,7 +10662,7 @@ static void do_evil_twin_start(void)
     uart_send_command_for_tab("start_evil_twin");
 
     // Build status text
-    wifi_network_t *et_net = &networks[evil_twin_net_idx];
+    wifi_network_t *et_net = &v.nets[evil_twin_net_idx];
     const char *et_ssid = strlen(et_net->ssid) > 0 ? et_net->ssid : "(Hidden)";
     const char *html_file = evil_twin_html_files[selected_html_idx];
 
@@ -10668,9 +10670,9 @@ static void do_evil_twin_start(void)
     int pos = snprintf(status_text, sizeof(status_text),
         "Attacking networks:\n");
 
-    for (int i = 0; i < selected_network_count; i++) {
-        int idx = selected_network_indices[i];
-        wifi_network_t *net = &networks[idx];
+    for (int i = 0; i < v.sel_count; i++) {
+        int idx = v.sel_indices[i];
+        wifi_network_t *net = &v.nets[idx];
         const char *ssid = strlen(net->ssid) > 0 ? net->ssid : "(Hidden)";
         pos += snprintf(status_text + pos, sizeof(status_text) - pos,
             "  - %s (%s)\n", ssid, net->bssid);
@@ -10784,12 +10786,15 @@ static void show_evil_twin_popup(void)
 
     // Build network dropdown options from selected networks
     char network_options[1024] = "";
-    for (int i = 0; i < selected_network_count; i++) {
-        int idx = selected_network_indices[i];
-        if (idx >= 0 && idx < network_count) {
-            const char *ssid = strlen(networks[idx].ssid) > 0 ? networks[idx].ssid : "(Hidden)";
-            if (i > 0) strncat(network_options, "\n", sizeof(network_options) - strlen(network_options) - 1);
-            strncat(network_options, ssid, sizeof(network_options) - strlen(network_options) - 1);
+    {
+        scan_view_t v = get_scan_view(ctx);
+        for (int i = 0; i < v.sel_count; i++) {
+            int idx = v.sel_indices[i];
+            if (idx >= 0 && idx < v.net_count) {
+                const char *ssid = strlen(v.nets[idx].ssid) > 0 ? v.nets[idx].ssid : "(Hidden)";
+                if (i > 0) strncat(network_options, "\n", sizeof(network_options) - strlen(network_options) - 1);
+                strncat(network_options, ssid, sizeof(network_options) - strlen(network_options) - 1);
+            }
         }
     }
     lv_dropdown_set_options(ctx->evil_twin_network_dropdown, network_options);
@@ -11438,16 +11443,15 @@ static void show_scan_page(void)
 
     // Create scan page container inside tab container
     ctx->scan_page = lv_obj_create(container);
-    scan_page = ctx->scan_page;  // Keep legacy reference for compatibility
-    lv_obj_set_size(scan_page, lv_pct(100), lv_pct(100));
-    lv_obj_set_style_bg_color(scan_page, ui_bg_color(), 0);
-    lv_obj_set_style_border_width(scan_page, 0, 0);
-    lv_obj_set_style_pad_all(scan_page, 4, 0);  // Minimal padding for maximum list space
-    lv_obj_set_flex_flow(scan_page, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_pad_row(scan_page, 2, 0);  // Minimal gap
+    lv_obj_set_size(ctx->scan_page, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(ctx->scan_page, ui_bg_color(), 0);
+    lv_obj_set_style_border_width(ctx->scan_page, 0, 0);
+    lv_obj_set_style_pad_all(ctx->scan_page, 4, 0);  // Minimal padding for maximum list space
+    lv_obj_set_flex_flow(ctx->scan_page, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(ctx->scan_page, 2, 0);  // Minimal gap
 
     // Header container
-    lv_obj_t *header = lv_obj_create(scan_page);
+    lv_obj_t *header = lv_obj_create(ctx->scan_page);
     lv_obj_set_size(header, lv_pct(100), LV_SIZE_CONTENT);
     lv_obj_set_style_bg_opa(header, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(header, 0, 0);
@@ -11498,53 +11502,53 @@ static void show_scan_page(void)
     lv_obj_set_style_pad_column(btn_cont, 12, 0);
 
     // Spinner (hidden by default)
-    spinner = lv_spinner_create(btn_cont);
-    lv_obj_set_size(spinner, 32, 32);
-    lv_spinner_set_anim_params(spinner, 1000, 200);
-    lv_obj_add_flag(spinner, LV_OBJ_FLAG_HIDDEN);
+    ctx->spinner = lv_spinner_create(btn_cont);
+    lv_obj_set_size(ctx->spinner, 32, 32);
+    lv_spinner_set_anim_params(ctx->spinner, 1000, 200);
+    lv_obj_add_flag(ctx->spinner, LV_OBJ_FLAG_HIDDEN);
 
     // Scan button
-    scan_btn = lv_btn_create(btn_cont);
-    lv_obj_set_size(scan_btn, 120, 40);
-    lv_obj_set_style_bg_color(scan_btn, lv_color_hex(0x34122B), 0);
-    lv_obj_set_style_bg_color(scan_btn, lv_color_hex(0x4C1B3E), LV_STATE_PRESSED);
-    lv_obj_set_style_bg_color(scan_btn, lv_color_hex(0x444444), LV_STATE_DISABLED);
-    lv_obj_set_style_border_width(scan_btn, 1, 0);
-    lv_obj_set_style_border_color(scan_btn, COLOR_LAB5_MAGENTA, 0);
-    lv_obj_set_style_border_opa(scan_btn, LV_OPA_80, 0);
-    lv_obj_set_style_radius(scan_btn, 8, 0);
-    lv_obj_add_event_cb(scan_btn, scan_btn_click_cb, LV_EVENT_CLICKED, NULL);
+    ctx->scan_btn = lv_btn_create(btn_cont);
+    lv_obj_set_size(ctx->scan_btn, 120, 40);
+    lv_obj_set_style_bg_color(ctx->scan_btn, lv_color_hex(0x34122B), 0);
+    lv_obj_set_style_bg_color(ctx->scan_btn, lv_color_hex(0x4C1B3E), LV_STATE_PRESSED);
+    lv_obj_set_style_bg_color(ctx->scan_btn, lv_color_hex(0x444444), LV_STATE_DISABLED);
+    lv_obj_set_style_border_width(ctx->scan_btn, 1, 0);
+    lv_obj_set_style_border_color(ctx->scan_btn, COLOR_LAB5_MAGENTA, 0);
+    lv_obj_set_style_border_opa(ctx->scan_btn, LV_OPA_80, 0);
+    lv_obj_set_style_radius(ctx->scan_btn, 8, 0);
+    lv_obj_add_event_cb(ctx->scan_btn, scan_btn_click_cb, LV_EVENT_CLICKED, NULL);
 
-    lv_obj_t *btn_label = lv_label_create(scan_btn);
+    lv_obj_t *btn_label = lv_label_create(ctx->scan_btn);
     lv_label_set_text(btn_label, "RESCAN");
     lv_obj_set_style_text_font(btn_label, &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_color(btn_label, lv_color_hex(0xFFFFFF), 0);
     lv_obj_center(btn_label);
 
     // Status label (compact)
-    status_label = lv_label_create(scan_page);
-    lv_label_set_text(status_label, "Press RESCAN to search for networks");
-    lv_obj_set_style_text_font(status_label, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(status_label, ui_muted_color(), 0);
+    ctx->scan_status_label = lv_label_create(ctx->scan_page);
+    lv_label_set_text(ctx->scan_status_label, "Press RESCAN to search for networks");
+    lv_obj_set_style_text_font(ctx->scan_status_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(ctx->scan_status_label, ui_muted_color(), 0);
 
     // Network list container (scrollable) - fills remaining space above attack bar
-    network_list = lv_obj_create(scan_page);
-    lv_obj_set_width(network_list, lv_pct(100));
-    lv_obj_set_flex_grow(network_list, 1);  // Take all remaining vertical space
-    lv_obj_set_style_bg_color(network_list, ui_panel_color(), 0);
-    lv_obj_set_style_border_color(network_list, ui_border_color(), 0);
-    lv_obj_set_style_border_opa(network_list, dark_mode_enabled ? LV_OPA_60 : LV_OPA_90, 0);
-    lv_obj_set_style_border_width(network_list, 1, 0);
-    lv_obj_set_style_radius(network_list, 8, 0);
-    lv_obj_set_style_pad_all(network_list, 6, 0);
-    lv_obj_set_flex_flow(network_list, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_pad_row(network_list, 6, 0);
-    lv_obj_set_scroll_dir(network_list, LV_DIR_VER);
+    ctx->network_list = lv_obj_create(ctx->scan_page);
+    lv_obj_set_width(ctx->network_list, lv_pct(100));
+    lv_obj_set_flex_grow(ctx->network_list, 1);  // Take all remaining vertical space
+    lv_obj_set_style_bg_color(ctx->network_list, ui_panel_color(), 0);
+    lv_obj_set_style_border_color(ctx->network_list, ui_border_color(), 0);
+    lv_obj_set_style_border_opa(ctx->network_list, dark_mode_enabled ? LV_OPA_60 : LV_OPA_90, 0);
+    lv_obj_set_style_border_width(ctx->network_list, 1, 0);
+    lv_obj_set_style_radius(ctx->network_list, 8, 0);
+    lv_obj_set_style_pad_all(ctx->network_list, 6, 0);
+    lv_obj_set_flex_flow(ctx->network_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(ctx->network_list, 6, 0);
+    lv_obj_set_scroll_dir(ctx->network_list, LV_DIR_VER);
 
-    create_attack_action_bar(scan_page, attack_tile_event_cb);
+    create_attack_action_bar(ctx->scan_page, attack_tile_event_cb);
 
     // Auto-start scan when entering the page
-    lv_obj_send_event(scan_btn, LV_EVENT_CLICKED, NULL);
+    lv_obj_send_event(ctx->scan_btn, LV_EVENT_CLICKED, NULL);
 
     // Set current visible page
     ctx->current_visible_page = ctx->scan_page;
@@ -13526,14 +13530,17 @@ static void show_esp_modem_page(void)
         tiles_container = NULL;
     }
 
-    // Delete scan page if present
-    if (scan_page) {
-        lv_obj_del(scan_page);
-        scan_page = NULL;
-        scan_btn = NULL;
-        status_label = NULL;
-        network_list = NULL;
-        spinner = NULL;
+    // Delete scan page if present in current tab's context
+    {
+        tab_context_t *cur_ctx = get_current_ctx();
+        if (cur_ctx && cur_ctx->scan_page) {
+            lv_obj_del(cur_ctx->scan_page);
+            cur_ctx->scan_page = NULL;
+            cur_ctx->scan_btn = NULL;
+            cur_ctx->scan_status_label = NULL;
+            cur_ctx->network_list = NULL;
+            cur_ctx->spinner = NULL;
+        }
     }
 
     // Delete observer page if present
@@ -20585,9 +20592,10 @@ static void rogue_ap_start_cb(lv_event_t *e)
     tab_context_t *ctx = get_current_ctx();
     if (!ctx) return;
 
+    scan_view_t v = get_scan_view(ctx);
     // Validate: Rogue AP requires exactly 1 selected network
-    if (selected_network_count != 1) {
-        ESP_LOGW(TAG, "Rogue AP requires exactly 1 network, selected: %d", selected_network_count);
+    if (v.sel_count != 1) {
+        ESP_LOGW(TAG, "Rogue AP requires exactly 1 network, selected: %d", v.sel_count);
         if (ctx->rogue_ap_status_label) {
             lv_label_set_text(ctx->rogue_ap_status_label, "Select exactly 1 network for Rogue AP");
             lv_obj_set_style_text_color(ctx->rogue_ap_status_label, COLOR_MATERIAL_RED, 0);
@@ -20622,10 +20630,10 @@ static void rogue_ap_start_cb(lv_event_t *e)
     vTaskDelay(pdMS_TO_TICKS(100));
 
     // Send select_networks command (1-based index)
-    int idx = selected_network_indices[0];
-    if (idx >= 0 && idx < network_count) {
+    int idx = v.sel_indices[0];
+    if (idx >= 0 && idx < v.net_count) {
         char sel_cmd[32];
-        snprintf(sel_cmd, sizeof(sel_cmd), "select_networks %d", networks[idx].index);
+        snprintf(sel_cmd, sizeof(sel_cmd), "select_networks %d", v.nets[idx].index);
         uart_send_command_for_tab(sel_cmd);
         vTaskDelay(pdMS_TO_TICKS(100));
     }
@@ -20792,10 +20800,15 @@ static void show_rogue_ap_page(void)
     lv_obj_set_style_text_color(title, COLOR_MATERIAL_CYAN, 0);
 
     // Get selected network SSID and try to find known password
-    int idx = selected_network_indices[0];
-    if (idx >= 0 && idx < network_count) {
-        strncpy(rogue_ap_ssid, networks[idx].ssid, sizeof(rogue_ap_ssid) - 1);
-        rogue_ap_ssid[sizeof(rogue_ap_ssid) - 1] = '\0';
+    {
+        scan_view_t v = get_scan_view(ctx);
+        if (v.sel_count > 0) {
+            int idx = v.sel_indices[0];
+            if (idx >= 0 && idx < v.net_count) {
+                strncpy(rogue_ap_ssid, v.nets[idx].ssid, sizeof(rogue_ap_ssid) - 1);
+                rogue_ap_ssid[sizeof(rogue_ap_ssid) - 1] = '\0';
+            }
+        }
     }
     memset(rogue_ap_password, 0, sizeof(rogue_ap_password));
 
