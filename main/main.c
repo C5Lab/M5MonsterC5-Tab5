@@ -45,7 +45,7 @@
 #include "esp_http_server.h"
 #include "lwip/sockets.h"
 
-#define JANOS_TAB_VERSION "1.3.0"
+#define JANOS_TAB_VERSION "1.3.1"
 #define JANOS_VERSION_REQUIRED "1.6.1"
 #include "lwip/netdb.h"
 #include <dirent.h>
@@ -26480,33 +26480,37 @@ static __attribute__((unused)) void deinit_uart2(void)
 // Send ping and wait for pong response on specified transport
 static bool ping_uart(uart_port_t uart_port, const char *uart_name)
 {
-    uint8_t rx_buffer[64];
+    uint8_t rx_buffer[128];
 
-    // Flush any existing data
     uart_flush(uart_port);
 
-    // Send ping command
     const char *ping_cmd = "ping\r\n";
-    transport_write_bytes(uart_port, ping_cmd, strlen(ping_cmd));
-    ESP_LOGI(TAG, "[%s] Sent ping", uart_name);
-
-    // Wait for pong response (up to 500ms)
     int total_len = 0;
     int64_t start_time = esp_timer_get_time();
-    int64_t timeout_us = 500000; // 500ms
+    int64_t timeout_us = 1500000; // 1.5s total window, ping retried every 150ms
+    int64_t last_ping_us = start_time - 200000; // ensure first ping sends immediately
+
+    ESP_LOGI(TAG, "[%s] Sent ping", uart_name);
 
     while ((esp_timer_get_time() - start_time) < timeout_us) {
+        if ((esp_timer_get_time() - last_ping_us) >= 150000) {
+            transport_write_bytes(uart_port, ping_cmd, strlen(ping_cmd));
+            last_ping_us = esp_timer_get_time();
+        }
+
         int len = transport_read_bytes(uart_port, rx_buffer + total_len,
                                    sizeof(rx_buffer) - total_len - 1, pdMS_TO_TICKS(50));
         if (len > 0) {
             total_len += len;
             rx_buffer[total_len] = '\0';
 
-            // Check if we received "pong"
             if (strstr((char*)rx_buffer, "pong") != NULL) {
                 log_memory_stats(uart_name);
                 ESP_LOGI(TAG, "[%s] Received pong - board detected!", uart_name);
                 return true;
+            }
+            if (total_len >= (int)sizeof(rx_buffer) - 16) {
+                total_len = 0;
             }
         }
     }
@@ -26518,19 +26522,25 @@ static bool ping_uart(uart_port_t uart_port, const char *uart_name)
 // Send ping and wait for pong response using raw UART (bypass USB transport)
 static bool ping_uart_direct(uart_port_t uart_port, const char *uart_name)
 {
-    uint8_t rx_buffer[64];
+    uint8_t rx_buffer[128];
 
     uart_flush(uart_port);
 
     const char *ping_cmd = "ping\r\n";
-    uart_write_bytes(uart_port, ping_cmd, strlen(ping_cmd));
-    ESP_LOGI(TAG, "[%s] Sent ping (raw)", uart_name);
-
     int total_len = 0;
     int64_t start_time = esp_timer_get_time();
-    int64_t timeout_us = 500000;
+    int64_t timeout_us = 1500000; // 1.5s total window, ping retried every 150ms
+    int64_t last_ping_us = start_time - 200000; // ensure first ping sends immediately
+
+    ESP_LOGI(TAG, "[%s] Sent ping (raw)", uart_name);
 
     while ((esp_timer_get_time() - start_time) < timeout_us) {
+        // Resend ping every 150ms in case Monster was busy and missed it
+        if ((esp_timer_get_time() - last_ping_us) >= 150000) {
+            uart_write_bytes(uart_port, ping_cmd, strlen(ping_cmd));
+            last_ping_us = esp_timer_get_time();
+        }
+
         int len = uart_read_bytes(uart_port, rx_buffer + total_len,
                                   sizeof(rx_buffer) - total_len - 1, pdMS_TO_TICKS(50));
         if (len > 0) {
@@ -26540,6 +26550,10 @@ static bool ping_uart_direct(uart_port_t uart_port, const char *uart_name)
                 log_memory_stats(uart_name);
                 ESP_LOGI(TAG, "[%s] Received pong - board detected!", uart_name);
                 return true;
+            }
+            // Buffer near full - shift to avoid overflow while keeping tail
+            if (total_len >= (int)sizeof(rx_buffer) - 16) {
+                total_len = 0;
             }
         }
     }
@@ -26707,22 +26721,26 @@ static void check_version_for_tab(tab_id_t tab)
     }
 
     const char *cmd = "version\r\n";
-    transport_write_bytes_tab(tab, uart_port, cmd, strlen(cmd));
-    vTaskDelay(pdMS_TO_TICKS(300));
-
-    char rx_buffer[256];
+    uint8_t rx_buffer[512];
     int total_len = 0;
-    int64_t start = esp_timer_get_time();
-    int64_t timeout_us = 2000000;
+    int64_t start_time = esp_timer_get_time();
+    int64_t timeout_us = 2000000; // 2s total window
+    int64_t last_cmd_us = start_time - 200000; // ensure first send is immediate
 
-    while ((esp_timer_get_time() - start) < timeout_us && total_len < (int)sizeof(rx_buffer) - 1) {
+    while ((esp_timer_get_time() - start_time) < timeout_us) {
+        // Resend command every 400ms if no valid response yet
+        if ((esp_timer_get_time() - last_cmd_us) >= 400000) {
+            transport_write_bytes_tab(tab, uart_port, cmd, strlen(cmd));
+            last_cmd_us = esp_timer_get_time();
+        }
+
         int len = transport_read_bytes_tab(tab, uart_port, rx_buffer + total_len,
-                                           sizeof(rx_buffer) - 1 - total_len, pdMS_TO_TICKS(100));
+                                           sizeof(rx_buffer) - 1 - total_len, pdMS_TO_TICKS(50));
         if (len > 0) {
             total_len += len;
             rx_buffer[total_len] = '\0';
 
-            char *ver = strstr(rx_buffer, "JanOS version:");
+            char *ver = strstr((char*)rx_buffer, "JanOS version:");
             if (ver) {
                 ver += strlen("JanOS version:");
                 while (*ver == ' ') ver++;
@@ -26738,13 +26756,21 @@ static void check_version_for_tab(tab_id_t tab)
                 return;
             }
 
-            if (strstr(rx_buffer, "Unrecognized command") != NULL) {
+            if (strstr((char*)rx_buffer, "Unrecognized command") != NULL) {
                 strncpy(ctx->janos_version, "<1.5.8", sizeof(ctx->janos_version) - 1);
                 ctx->janos_version[sizeof(ctx->janos_version) - 1] = '\0';
                 ctx->janos_version_mismatch = true;
                 ESP_LOGW(TAG, "[%s] 'version' command not recognized - firmware older than 1.5.8", tab_name);
                 if (tab == TAB_USB) usb_rx_exclusive = false;
                 return;
+            }
+
+            // Buffer near full - keep only the last 128 bytes (version string is short)
+            if (total_len >= (int)sizeof(rx_buffer) - 64) {
+                int keep = 128;
+                memmove(rx_buffer, rx_buffer + total_len - keep, keep);
+                total_len = keep;
+                rx_buffer[total_len] = '\0';
             }
         }
     }
