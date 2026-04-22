@@ -45,7 +45,7 @@
 #include "esp_http_server.h"
 #include "lwip/sockets.h"
 
-#define JANOS_TAB_VERSION "1.3.0"
+#define JANOS_TAB_VERSION "1.3.2"
 #define JANOS_VERSION_REQUIRED "1.6.1"
 #include "lwip/netdb.h"
 #include <dirent.h>
@@ -238,6 +238,7 @@ typedef struct {
 
 // Wardrive network storage
 #define WARDRIVE_MAX_NETWORKS 100
+#define WARDRIVE_DISPLAY_ROWS 30
 typedef struct {
     char ssid[33];
     char bssid[18];
@@ -15632,7 +15633,17 @@ static void update_wardrive_table(tab_context_t *ctx)
     lv_coord_t scroll_y = lv_obj_get_scroll_y(ctx->wardrive_table);
     lv_obj_clean(ctx->wardrive_table);
 
-    int display_count = ctx->wardrive_net_count < WARDRIVE_MAX_NETWORKS ? ctx->wardrive_net_count : WARDRIVE_MAX_NETWORKS;
+    int display_count = ctx->wardrive_net_count < WARDRIVE_DISPLAY_ROWS ? ctx->wardrive_net_count : WARDRIVE_DISPLAY_ROWS;
+
+    if (ctx->wardrive_net_count > WARDRIVE_DISPLAY_ROWS) {
+        lv_obj_t *info_lbl = lv_label_create(ctx->wardrive_table);
+        lv_label_set_text_fmt(info_lbl, "[ showing last %d of %d networks ]", WARDRIVE_DISPLAY_ROWS, ctx->wardrive_net_count);
+        lv_obj_set_style_text_font(info_lbl, &lv_font_montserrat_10, 0);
+        lv_obj_set_style_text_color(info_lbl, lv_color_hex(0x666666), 0);
+        lv_obj_set_width(info_lbl, lv_pct(100));
+        lv_obj_set_style_text_align(info_lbl, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_pad_ver(info_lbl, 4, 0);
+    }
 
     for (int i = 0; i < display_count; i++) {
         // Walk backwards from head-1 (newest) through ring buffer
@@ -18213,6 +18224,7 @@ static void wardrive_monitor_task(void *arg)
     char line_buffer[512];
     int line_pos = 0;
     bool batch_has_new_networks = false;
+    uint32_t last_table_update_tick = 0;
     bool gps_push_initialized = false;
     bool gps_push_last_fix_valid = false;
     double gps_push_last_lat = 0.0;
@@ -18426,8 +18438,12 @@ static void wardrive_monitor_task(void *arg)
                 }
             }
 
-            // Update table once per batch if we got new networks
-            if (batch_has_new_networks) {
+            // Update table at most once per second, and only if the page is visible
+            uint32_t now_tick = xTaskGetTickCount();
+            bool page_visible = ctx->wardrive_page && !lv_obj_has_flag(ctx->wardrive_page, LV_OBJ_FLAG_HIDDEN);
+            if (batch_has_new_networks && page_visible &&
+                (now_tick - last_table_update_tick) >= pdMS_TO_TICKS(1000)) {
+                last_table_update_tick = now_tick;
                 bsp_display_lock(0);
                 update_wardrive_table(ctx);
                 update_wardrive_count_label(ctx);
