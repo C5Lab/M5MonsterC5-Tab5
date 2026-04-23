@@ -45,7 +45,7 @@
 #include "esp_http_server.h"
 #include "lwip/sockets.h"
 
-#define JANOS_TAB_VERSION "1.3.1"
+#define JANOS_TAB_VERSION "1.3.2"
 #define JANOS_VERSION_REQUIRED "1.6.1"
 #include "lwip/netdb.h"
 #include <dirent.h>
@@ -238,6 +238,7 @@ typedef struct {
 
 // Wardrive network storage
 #define WARDRIVE_MAX_NETWORKS 100
+#define WARDRIVE_DISPLAY_ROWS 30
 typedef struct {
     char ssid[33];
     char bssid[18];
@@ -518,12 +519,16 @@ typedef struct {
     lv_obj_t *wardrive_wigle_status_label;
     lv_obj_t *wardrive_wigle_list;
     lv_obj_t *wardrive_wigle_send_btn;
+    lv_obj_t *wardrive_wigle_stop_btn;
+    lv_obj_t *wardrive_wigle_spinner;
+    lv_obj_t *wardrive_wigle_close_btn;
     lv_obj_t *wardrive_wigle_keyboard;
     lv_obj_t *wardrive_wigle_ssid_input;
     lv_obj_t *wardrive_wigle_password_input;
     lv_obj_t *wardrive_wigle_connect_btn;
     volatile bool wardrive_wigle_task_running;
     volatile bool wardrive_wigle_connect_ready;
+    bool wardrive_wigle_upload_done;
     char wardrive_wigle_selected_ssid[33];
     char wardrive_wigle_selected_password[65];
     wardrive_wigle_file_t wardrive_wigle_files[WARDRIVE_WIGLE_MAX_FILES];
@@ -1891,6 +1896,7 @@ static void wardrive_wigle_upload_task(void *arg);
 static void wardrive_wdgwars_upload_task(void *arg);
 static void show_wardrive_upload_popup(tab_context_t *ctx, wardrive_upload_provider_t provider);
 static void wardrive_wigle_send_btn_cb(lv_event_t *e);
+static void wardrive_wigle_stop_btn_cb(lv_event_t *e);
 static void wardrive_wigle_file_checkbox_cb(lv_event_t *e);
 static void wardrive_wigle_network_row_click_cb(lv_event_t *e);
 static void wardrive_wigle_text_input_cb(lv_event_t *e);
@@ -15632,7 +15638,17 @@ static void update_wardrive_table(tab_context_t *ctx)
     lv_coord_t scroll_y = lv_obj_get_scroll_y(ctx->wardrive_table);
     lv_obj_clean(ctx->wardrive_table);
 
-    int display_count = ctx->wardrive_net_count < WARDRIVE_MAX_NETWORKS ? ctx->wardrive_net_count : WARDRIVE_MAX_NETWORKS;
+    int display_count = ctx->wardrive_net_count < WARDRIVE_DISPLAY_ROWS ? ctx->wardrive_net_count : WARDRIVE_DISPLAY_ROWS;
+
+    if (ctx->wardrive_net_count > WARDRIVE_DISPLAY_ROWS) {
+        lv_obj_t *info_lbl = lv_label_create(ctx->wardrive_table);
+        lv_label_set_text_fmt(info_lbl, "[ showing last %d of %d networks ]", WARDRIVE_DISPLAY_ROWS, ctx->wardrive_net_count);
+        lv_obj_set_style_text_font(info_lbl, &lv_font_montserrat_10, 0);
+        lv_obj_set_style_text_color(info_lbl, lv_color_hex(0x666666), 0);
+        lv_obj_set_width(info_lbl, lv_pct(100));
+        lv_obj_set_style_text_align(info_lbl, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_pad_ver(info_lbl, 4, 0);
+    }
 
     for (int i = 0; i < display_count; i++) {
         // Walk backwards from head-1 (newest) through ring buffer
@@ -16134,6 +16150,9 @@ static void close_wardrive_wigle_popup_ctx(tab_context_t *ctx)
         ctx->wardrive_wigle_ssid_input = NULL;
         ctx->wardrive_wigle_password_input = NULL;
         ctx->wardrive_wigle_connect_btn = NULL;
+        ctx->wardrive_wigle_close_btn = NULL;
+        ctx->wardrive_wigle_stop_btn = NULL;
+        ctx->wardrive_wigle_spinner = NULL;
     }
 
     for (int i = 0; i < WARDRIVE_WIGLE_MAX_FILES; i++) {
@@ -16276,8 +16295,43 @@ static void wardrive_wigle_update_send_btn(tab_context_t *ctx)
         return;
     }
 
-    bool disabled = (ctx->wardrive_wigle_selected_count <= 0) || ctx->wardrive_wigle_task_running;
-    if (disabled) {
+    if (ctx->wardrive_wigle_upload_done) {
+        // Upload finished successfully: hide Send, hide Stop, hide spinner, green Close
+        lv_obj_add_flag(ctx->wardrive_wigle_send_btn, LV_OBJ_FLAG_HIDDEN);
+        if (ctx->wardrive_wigle_stop_btn) {
+            lv_obj_add_flag(ctx->wardrive_wigle_stop_btn, LV_OBJ_FLAG_HIDDEN);
+        }
+        if (ctx->wardrive_wigle_spinner) {
+            lv_obj_add_flag(ctx->wardrive_wigle_spinner, LV_OBJ_FLAG_HIDDEN);
+        }
+        if (ctx->wardrive_wigle_close_btn) {
+            lv_obj_set_style_bg_color(ctx->wardrive_wigle_close_btn, COLOR_MATERIAL_GREEN, 0);
+            lv_obj_set_style_bg_color(ctx->wardrive_wigle_close_btn, lv_color_hex(0x388E3C), LV_STATE_PRESSED);
+        }
+        return;
+    }
+
+    if (ctx->wardrive_wigle_task_running) {
+        // Task in progress: hide Send, show Stop, show spinner
+        lv_obj_add_flag(ctx->wardrive_wigle_send_btn, LV_OBJ_FLAG_HIDDEN);
+        if (ctx->wardrive_wigle_stop_btn) {
+            lv_obj_clear_flag(ctx->wardrive_wigle_stop_btn, LV_OBJ_FLAG_HIDDEN);
+        }
+        if (ctx->wardrive_wigle_spinner) {
+            lv_obj_clear_flag(ctx->wardrive_wigle_spinner, LV_OBJ_FLAG_HIDDEN);
+        }
+        return;
+    }
+
+    // Idle: show Send (enabled/disabled), hide Stop, hide spinner
+    lv_obj_clear_flag(ctx->wardrive_wigle_send_btn, LV_OBJ_FLAG_HIDDEN);
+    if (ctx->wardrive_wigle_stop_btn) {
+        lv_obj_add_flag(ctx->wardrive_wigle_stop_btn, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (ctx->wardrive_wigle_spinner) {
+        lv_obj_add_flag(ctx->wardrive_wigle_spinner, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (ctx->wardrive_wigle_selected_count <= 0) {
         lv_obj_add_state(ctx->wardrive_wigle_send_btn, LV_STATE_DISABLED);
     } else {
         lv_obj_clear_state(ctx->wardrive_wigle_send_btn, LV_STATE_DISABLED);
@@ -16579,6 +16633,22 @@ static void wardrive_wigle_send_btn_cb(lv_event_t *e)
     }
 }
 
+static void wardrive_wigle_stop_btn_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx) {
+        ctx = get_current_ctx();
+    }
+    if (!ctx || !ctx->wardrive_wigle_task_running) {
+        return;
+    }
+    ctx->wardrive_wigle_task_running = false;
+    if (ctx->wardrive_wigle_status_label) {
+        lv_label_set_text(ctx->wardrive_wigle_status_label, "Upload stopped.");
+    }
+    wardrive_wigle_update_send_btn(ctx);
+}
+
 static void wardrive_wigle_network_row_click_cb(lv_event_t *e)
 {
     lv_obj_t *row = lv_event_get_target(e);
@@ -16807,7 +16877,7 @@ static bool wardrive_wigle_ensure_wifi_connected(tab_context_t *ctx, tab_id_t ac
         return false;
     }
 
-    if (ctx->arp_wifi_connected || arp_wifi_connected) {
+    if (ctx->arp_wifi_connected) {
         ESP_LOGI(TAG, "[%s] WiGLE: WiFi already connected, skipping connect flow",
                  tab_transport_name(active_tab));
         heap_caps_free(scan_rx_buf);
@@ -17053,6 +17123,9 @@ static bool wardrive_wigle_ensure_wifi_connected(tab_context_t *ctx, tab_id_t ac
         lv_obj_add_event_cb(other_row, wardrive_wigle_network_row_click_cb,
                             LV_EVENT_CLICKED, (void *)WARDRIVE_WIGLE_OTHER_SSID);
     }
+    if (ctx->wardrive_wigle_spinner) {
+        lv_obj_add_flag(ctx->wardrive_wigle_spinner, LV_OBJ_FLAG_HIDDEN);
+    }
     bsp_display_unlock();
 
     while (ctx->wardrive_wigle_selected_ssid[0] == '\0' && ctx->wardrive_wigle_task_running) {
@@ -17069,6 +17142,9 @@ static bool wardrive_wigle_ensure_wifi_connected(tab_context_t *ctx, tab_id_t ac
              tab_transport_name(active_tab), manual_credentials ? 1 : 0);
 
     bsp_display_lock(0);
+    if (ctx->wardrive_wigle_spinner) {
+        lv_obj_clear_flag(ctx->wardrive_wigle_spinner, LV_OBJ_FLAG_HIDDEN);
+    }
     if (ctx->wardrive_wigle_list) {
         lv_obj_del(ctx->wardrive_wigle_list);
         ctx->wardrive_wigle_list = NULL;
@@ -17592,10 +17668,12 @@ static void wardrive_wigle_upload_task(void *arg)
             lv_label_set_text(ctx->wardrive_wigle_status_label,
                               "WiFi disconnected during upload.\nReconnect and try again.");
         } else if ((total_uploaded + total_skipped + total_failed) > 0) {
+            ctx->wardrive_wigle_upload_done = true;
             lv_label_set_text_fmt(ctx->wardrive_wigle_status_label,
                                   "WiGLE sync finished.\nUploaded: %d\nSkipped: %d\nFailed: %d",
                                   total_uploaded, total_skipped, total_failed);
         } else if (any_response) {
+            ctx->wardrive_wigle_upload_done = true;
             lv_label_set_text(ctx->wardrive_wigle_status_label, "WiGLE upload complete.");
         } else {
             lv_label_set_text(ctx->wardrive_wigle_status_label,
@@ -17854,10 +17932,12 @@ static void wardrive_wdgwars_upload_task(void *arg)
             lv_label_set_text(ctx->wardrive_wigle_status_label,
                               "WiFi disconnected during upload.\nReconnect and try again.");
         } else if ((total_uploaded + total_skipped + total_failed) > 0) {
+            ctx->wardrive_wigle_upload_done = true;
             lv_label_set_text_fmt(ctx->wardrive_wigle_status_label,
                                   "WDGWars sync finished.\nUploaded: %d\nSkipped: %d\nFailed: %d",
                                   total_uploaded, total_skipped, total_failed);
         } else if (any_response) {
+            ctx->wardrive_wigle_upload_done = true;
             lv_label_set_text(ctx->wardrive_wigle_status_label, "WDGWars upload complete.");
         } else {
             lv_label_set_text(ctx->wardrive_wigle_status_label,
@@ -17969,7 +18049,31 @@ static void show_wardrive_upload_popup(tab_context_t *ctx, wardrive_upload_provi
     lv_obj_set_style_text_color(send_lbl, lv_color_hex(0xFFFFFF), 0);
     lv_obj_center(send_lbl);
 
-    lv_obj_t *close_btn = lv_btn_create(btn_row);
+    ctx->wardrive_wigle_stop_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(ctx->wardrive_wigle_stop_btn, 140, 44);
+    lv_obj_set_style_bg_color(ctx->wardrive_wigle_stop_btn, lv_color_hex(0xC62828), 0);
+    lv_obj_set_style_bg_color(ctx->wardrive_wigle_stop_btn, lv_color_hex(0x8E0000), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(ctx->wardrive_wigle_stop_btn, 8, 0);
+    lv_obj_add_event_cb(ctx->wardrive_wigle_stop_btn, wardrive_wigle_stop_btn_cb, LV_EVENT_CLICKED, ctx);
+    lv_obj_add_flag(ctx->wardrive_wigle_stop_btn, LV_OBJ_FLAG_HIDDEN);
+
+    lv_obj_t *stop_lbl = lv_label_create(ctx->wardrive_wigle_stop_btn);
+    lv_label_set_text(stop_lbl, "Stop");
+    lv_obj_set_style_text_font(stop_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(stop_lbl, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_center(stop_lbl);
+
+    ctx->wardrive_wigle_spinner = lv_spinner_create(btn_row);
+    lv_spinner_set_anim_params(ctx->wardrive_wigle_spinner, 1000, 60);
+    lv_obj_set_size(ctx->wardrive_wigle_spinner, 36, 36);
+    lv_obj_set_style_arc_color(ctx->wardrive_wigle_spinner, COLOR_MATERIAL_GREEN, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_width(ctx->wardrive_wigle_spinner, 4, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(ctx->wardrive_wigle_spinner, lv_color_hex(0x333333), LV_PART_MAIN);
+    lv_obj_set_style_arc_width(ctx->wardrive_wigle_spinner, 4, LV_PART_MAIN);
+    lv_obj_add_flag(ctx->wardrive_wigle_spinner, LV_OBJ_FLAG_HIDDEN);
+
+    ctx->wardrive_wigle_close_btn = lv_btn_create(btn_row);
+    lv_obj_t *close_btn = ctx->wardrive_wigle_close_btn;
     lv_obj_set_size(close_btn, 120, 44);
     lv_obj_set_style_bg_color(close_btn, lv_color_hex(0x444444), 0);
     lv_obj_set_style_bg_color(close_btn, lv_color_hex(0x555555), LV_STATE_PRESSED);
@@ -17992,6 +18096,7 @@ static void show_wardrive_upload_popup(tab_context_t *ctx, wardrive_upload_provi
 
     ctx->wardrive_wigle_task_running = false;
     ctx->wardrive_wigle_connect_ready = false;
+    ctx->wardrive_wigle_upload_done = false;
     ctx->wardrive_wigle_task = NULL;
     ctx->wardrive_wigle_selected_ssid[0] = '\0';
     ctx->wardrive_wigle_selected_password[0] = '\0';
@@ -18213,6 +18318,7 @@ static void wardrive_monitor_task(void *arg)
     char line_buffer[512];
     int line_pos = 0;
     bool batch_has_new_networks = false;
+    uint32_t last_table_update_tick = 0;
     bool gps_push_initialized = false;
     bool gps_push_last_fix_valid = false;
     double gps_push_last_lat = 0.0;
@@ -18426,8 +18532,12 @@ static void wardrive_monitor_task(void *arg)
                 }
             }
 
-            // Update table once per batch if we got new networks
-            if (batch_has_new_networks) {
+            // Update table at most once per second, and only if the page is visible
+            uint32_t now_tick = xTaskGetTickCount();
+            bool page_visible = ctx->wardrive_page && !lv_obj_has_flag(ctx->wardrive_page, LV_OBJ_FLAG_HIDDEN);
+            if (batch_has_new_networks && page_visible &&
+                (now_tick - last_table_update_tick) >= pdMS_TO_TICKS(1000)) {
+                last_table_update_tick = now_tick;
                 bsp_display_lock(0);
                 update_wardrive_table(ctx);
                 update_wardrive_count_label(ctx);
@@ -23283,7 +23393,7 @@ static void wpasec_upload_task(void *arg)
 
     // Step 2: Check WiFi -- if not connected, run inline WiFi connect flow
     if (!ctx->wpasec_task_running) goto done;
-    if (!ctx->arp_wifi_connected && !arp_wifi_connected) {
+    if (!ctx->arp_wifi_connected) {
 
         // --- Step 2a: Scan networks ---
         // (mirrors wifi_scan_task: same flush, transport, buffer, timeout)
