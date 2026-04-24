@@ -311,10 +311,18 @@ typedef struct {
     lv_obj_t *home_storage_percent_label;
     lv_obj_t *home_files_label;
     lv_obj_t *home_files_detail_label;
+    lv_obj_t *home_files_white_label;
+    lv_obj_t *home_files_wigle_label;
+    lv_obj_t *home_files_wdgwars_label;
+    lv_obj_t *home_files_spinner;
+    lv_obj_t *home_files_row;
     lv_obj_t *home_quote_label;
     int home_handshake_count;
     bool home_wpasec_present;
     bool home_vendors_present;
+    bool home_wigle_present;
+    bool home_wdgwars_present;
+    bool home_white_present;
     bool home_sd_stats_valid;
     uint64_t home_sd_total_bytes;
     uint64_t home_sd_free_bytes;
@@ -2182,7 +2190,7 @@ static int home_collect_uart_response(tab_id_t tab, uart_port_t uart_port, char 
     return total;
 }
 
-static void home_parse_remote_list_dir(const char *buf, int *pcap_count, bool *wpasec_ok, bool *vendors_ok)
+static void home_parse_remote_list_dir(const char *buf, int *pcap_count, bool *wpasec_ok, bool *vendors_ok, bool *wigle_ok, bool *wdgwars_ok, bool *white_ok)
 {
     if (!buf) return;
 
@@ -2201,6 +2209,15 @@ static void home_parse_remote_list_dir(const char *buf, int *pcap_count, bool *w
                 }
                 if (vendors_ok && strstr(line, "oui_wifi.bin")) {
                     *vendors_ok = true;
+                }
+                if (wigle_ok && strstr(line, "wigle.txt")) {
+                    *wigle_ok = true;
+                }
+                if (wdgwars_ok && strstr(line, "wdgwars.txt")) {
+                    *wdgwars_ok = true;
+                }
+                if (white_ok && strstr(line, "white.txt")) {
+                    *white_ok = true;
                 }
                 line_pos = 0;
             }
@@ -2234,6 +2251,9 @@ static void home_read_local_meta(tab_context_t *ctx)
     ctx->home_vendors_present = file_exists("/sdcard/lab/oui_wifi.bin") ||
                                 file_exists("/sdcard/lab/vendors/oui_wifi.bin") ||
                                 file_exists("/sdcard/oui_wifi.bin");
+    ctx->home_wigle_present   = file_exists("/sdcard/lab/wigle.txt");
+    ctx->home_wdgwars_present = file_exists("/sdcard/lab/wdgwars.txt");
+    ctx->home_white_present   = file_exists("/sdcard/lab/white.txt");
 
     uint64_t total = 0;
     uint64_t free = 0;
@@ -2258,6 +2278,9 @@ static void home_read_remote_meta(tab_context_t *ctx)
     int pcap_count = 0;
     bool wpasec_ok = false;
     bool vendors_ok = false;
+    bool wigle_ok = false;
+    bool wdgwars_ok = false;
+    bool white_ok = false;
     bool usb_lock_set = false;
 
     if (tab == TAB_INTERNAL) {
@@ -2282,7 +2305,7 @@ static void home_read_remote_meta(tab_context_t *ctx)
         transport_write_bytes_tab(tab, uart_port, cmd, strlen(cmd));
         transport_write_bytes_tab(tab, uart_port, "\r\n", 2);
         if (home_collect_uart_response(tab, uart_port, rx_buf, sizeof(rx_buf), 1600) > 0) {
-            home_parse_remote_list_dir(rx_buf, &pcap_count, NULL, NULL);
+            home_parse_remote_list_dir(rx_buf, &pcap_count, NULL, NULL, NULL, NULL, NULL);
             if (home_list_dir_success(rx_buf)) break;
         }
     }
@@ -2302,7 +2325,7 @@ static void home_read_remote_meta(tab_context_t *ctx)
         transport_write_bytes_tab(tab, uart_port, cmd, strlen(cmd));
         transport_write_bytes_tab(tab, uart_port, "\r\n", 2);
         if (home_collect_uart_response(tab, uart_port, rx_buf, sizeof(rx_buf), 1400) > 0) {
-            home_parse_remote_list_dir(rx_buf, NULL, &wpasec_ok, &vendors_ok);
+            home_parse_remote_list_dir(rx_buf, NULL, &wpasec_ok, &vendors_ok, &wigle_ok, &wdgwars_ok, &white_ok);
             if (home_list_dir_success(rx_buf)) break;
         }
     }
@@ -2317,7 +2340,7 @@ static void home_read_remote_meta(tab_context_t *ctx)
             transport_write_bytes_tab(tab, uart_port, cmd, strlen(cmd));
             transport_write_bytes_tab(tab, uart_port, "\r\n", 2);
             if (home_collect_uart_response(tab, uart_port, rx_buf, sizeof(rx_buf), 1200) > 0) {
-                home_parse_remote_list_dir(rx_buf, NULL, NULL, &vendors_ok);
+                home_parse_remote_list_dir(rx_buf, NULL, NULL, &vendors_ok, NULL, NULL, NULL);
                 if (vendors_ok) break;
             }
         }
@@ -2328,8 +2351,11 @@ static void home_read_remote_meta(tab_context_t *ctx)
     }
 
     ctx->home_handshake_count = pcap_count;
-    ctx->home_wpasec_present = wpasec_ok;
+    ctx->home_wpasec_present  = wpasec_ok;
     ctx->home_vendors_present = vendors_ok;
+    ctx->home_wigle_present   = wigle_ok;
+    ctx->home_wdgwars_present = wdgwars_ok;
+    ctx->home_white_present   = white_ok;
 
     // Storage ring tracks Tab5 SD free space (always local mount on this UI device).
     uint64_t total = 0;
@@ -2504,7 +2530,7 @@ static void update_home_dashboard_labels(tab_context_t *ctx, int battery_pct)
     }
 
     if (ctx->home_storage_percent_label) {
-        if (!ctx->sd_card_present) {
+        if (!internal_sd_present) {
             lv_label_set_text(ctx->home_storage_percent_label, "NO SD");
             if (ctx->home_storage_detail_label) lv_label_set_text(ctx->home_storage_detail_label, "card missing");
             if (ctx->home_storage_arc) lv_arc_set_value(ctx->home_storage_arc, 0);
@@ -2526,16 +2552,44 @@ static void update_home_dashboard_labels(tab_context_t *ctx, int battery_pct)
             if (ctx->home_storage_arc) lv_arc_set_value(ctx->home_storage_arc, 0);
         }
     } else if (ctx->home_storage_label) {
-        lv_label_set_text(ctx->home_storage_label, ctx->sd_card_present ? "Mounted\nready" : "No SD card");
+        lv_label_set_text(ctx->home_storage_label, internal_sd_present ? "Mounted\nready" : "No SD card");
     }
 
-    if (ctx->home_files_label) {
+    bool files_loaded = (ctx->home_meta_last_update_ms != 0);
+    if (ctx->home_files_spinner) {
+        if (files_loaded) {
+            lv_obj_add_flag(ctx->home_files_spinner, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_clear_flag(ctx->home_files_spinner, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    if (ctx->home_files_row) {
+        if (files_loaded) {
+            lv_obj_clear_flag(ctx->home_files_row, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(ctx->home_files_row, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+
+    if (ctx->home_files_label && files_loaded) {
         if (!ctx->sd_card_present) {
             lv_label_set_text(ctx->home_files_label, "wpa-sec: " LV_SYMBOL_CLOSE);
             lv_obj_set_style_text_color(ctx->home_files_label, COLOR_MATERIAL_RED, 0);
             if (ctx->home_files_detail_label) {
                 lv_label_set_text(ctx->home_files_detail_label, "vendors: " LV_SYMBOL_CLOSE);
                 lv_obj_set_style_text_color(ctx->home_files_detail_label, COLOR_MATERIAL_RED, 0);
+            }
+            if (ctx->home_files_white_label) {
+                lv_label_set_text(ctx->home_files_white_label, "white: " LV_SYMBOL_CLOSE);
+                lv_obj_set_style_text_color(ctx->home_files_white_label, COLOR_MATERIAL_RED, 0);
+            }
+            if (ctx->home_files_wigle_label) {
+                lv_label_set_text(ctx->home_files_wigle_label, "wigle: " LV_SYMBOL_CLOSE);
+                lv_obj_set_style_text_color(ctx->home_files_wigle_label, COLOR_MATERIAL_RED, 0);
+            }
+            if (ctx->home_files_wdgwars_label) {
+                lv_label_set_text(ctx->home_files_wdgwars_label, "wdgwars: " LV_SYMBOL_CLOSE);
+                lv_obj_set_style_text_color(ctx->home_files_wdgwars_label, COLOR_MATERIAL_RED, 0);
             }
         } else {
             lv_label_set_text(ctx->home_files_label,
@@ -2547,6 +2601,24 @@ static void update_home_dashboard_labels(tab_context_t *ctx, int battery_pct)
                                   ctx->home_vendors_present ? "vendors: " LV_SYMBOL_OK : "vendors: " LV_SYMBOL_CLOSE);
                 lv_obj_set_style_text_color(ctx->home_files_detail_label,
                                             ctx->home_vendors_present ? COLOR_MATERIAL_GREEN : COLOR_MATERIAL_RED, 0);
+            }
+            if (ctx->home_files_white_label) {
+                lv_label_set_text(ctx->home_files_white_label,
+                                  ctx->home_white_present ? "white: " LV_SYMBOL_OK : "white: " LV_SYMBOL_CLOSE);
+                lv_obj_set_style_text_color(ctx->home_files_white_label,
+                                            ctx->home_white_present ? COLOR_MATERIAL_GREEN : COLOR_MATERIAL_RED, 0);
+            }
+            if (ctx->home_files_wigle_label) {
+                lv_label_set_text(ctx->home_files_wigle_label,
+                                  ctx->home_wigle_present ? "wigle: " LV_SYMBOL_OK : "wigle: " LV_SYMBOL_CLOSE);
+                lv_obj_set_style_text_color(ctx->home_files_wigle_label,
+                                            ctx->home_wigle_present ? COLOR_MATERIAL_GREEN : COLOR_MATERIAL_RED, 0);
+            }
+            if (ctx->home_files_wdgwars_label) {
+                lv_label_set_text(ctx->home_files_wdgwars_label,
+                                  ctx->home_wdgwars_present ? "wdgwars: " LV_SYMBOL_OK : "wdgwars: " LV_SYMBOL_CLOSE);
+                lv_obj_set_style_text_color(ctx->home_files_wdgwars_label,
+                                            ctx->home_wdgwars_present ? COLOR_MATERIAL_GREEN : COLOR_MATERIAL_RED, 0);
             }
         }
     } else if (ctx->home_files_detail_label) {
@@ -10983,6 +11055,11 @@ static void reset_home_dashboard_bindings(tab_context_t *ctx)
     ctx->home_storage_percent_label = NULL;
     ctx->home_files_label = NULL;
     ctx->home_files_detail_label = NULL;
+    ctx->home_files_white_label = NULL;
+    ctx->home_files_wigle_label = NULL;
+    ctx->home_files_wdgwars_label = NULL;
+    ctx->home_files_spinner = NULL;
+    ctx->home_files_row = NULL;
     ctx->home_quote_label = NULL;
 }
 
@@ -11188,12 +11265,85 @@ static void create_uart_tiles_in_container(lv_obj_t *container, tab_context_t *c
                                                       ui_tab_icon_color(), row_h, large, ctx ? &ctx->home_files_label : NULL);
         lv_obj_clear_flag(files_card, LV_OBJ_FLAG_CLICKABLE);
         if (ctx && ctx->home_files_label) {
-            lv_obj_set_style_text_font(ctx->home_files_label, large ? &lv_font_montserrat_12 : &lv_font_montserrat_10, 0);
-            ctx->home_files_detail_label = lv_label_create(files_card);
+            // Hide the placeholder label created by create_home_info_card; we use our own in the columns
+            lv_obj_add_flag(ctx->home_files_label, LV_OBJ_FLAG_HIDDEN);
+
+            // Spinner shown while meta refresh hasn't completed yet
+            lv_obj_t *files_spinner = lv_spinner_create(files_card);
+            lv_obj_set_size(files_spinner, 28, 28);
+            lv_obj_set_style_arc_color(files_spinner, ui_tab_icon_color(), LV_PART_INDICATOR);
+            lv_obj_set_style_arc_width(files_spinner, 3, LV_PART_INDICATOR);
+            lv_obj_set_style_arc_color(files_spinner, ui_border_color(), LV_PART_MAIN);
+            lv_obj_set_style_arc_width(files_spinner, 3, LV_PART_MAIN);
+            ctx->home_files_spinner = files_spinner;
+
+            // Two-column row for file entries
+            lv_obj_t *files_row = lv_obj_create(files_card);
+            lv_obj_set_size(files_row, lv_pct(100), LV_SIZE_CONTENT);
+            lv_obj_set_style_bg_opa(files_row, LV_OPA_TRANSP, 0);
+            lv_obj_set_style_border_width(files_row, 0, 0);
+            lv_obj_set_style_pad_all(files_row, 0, 0);
+            lv_obj_set_style_pad_column(files_row, 6, 0);
+            lv_obj_set_flex_flow(files_row, LV_FLEX_FLOW_ROW);
+            lv_obj_set_flex_align(files_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+            lv_obj_clear_flag(files_row, LV_OBJ_FLAG_SCROLLABLE);
+
+            // Left column: wpa-sec, vendors, white
+            lv_obj_t *col_left = lv_obj_create(files_row);
+            lv_obj_set_flex_grow(col_left, 1);
+            lv_obj_set_height(col_left, LV_SIZE_CONTENT);
+            lv_obj_set_style_bg_opa(col_left, LV_OPA_TRANSP, 0);
+            lv_obj_set_style_border_width(col_left, 0, 0);
+            lv_obj_set_style_pad_all(col_left, 0, 0);
+            lv_obj_set_style_pad_row(col_left, 2, 0);
+            lv_obj_set_flex_flow(col_left, LV_FLEX_FLOW_COLUMN);
+            lv_obj_clear_flag(col_left, LV_OBJ_FLAG_SCROLLABLE);
+
+            // Right column: wigle, wdgwars
+            lv_obj_t *col_right = lv_obj_create(files_row);
+            lv_obj_set_flex_grow(col_right, 1);
+            lv_obj_set_height(col_right, LV_SIZE_CONTENT);
+            lv_obj_set_style_bg_opa(col_right, LV_OPA_TRANSP, 0);
+            lv_obj_set_style_border_width(col_right, 0, 0);
+            lv_obj_set_style_pad_all(col_right, 0, 0);
+            lv_obj_set_style_pad_row(col_right, 2, 0);
+            lv_obj_set_flex_flow(col_right, LV_FLEX_FLOW_COLUMN);
+            lv_obj_clear_flag(col_right, LV_OBJ_FLAG_SCROLLABLE);
+
+            const lv_font_t *small_font = large ? &lv_font_montserrat_12 : &lv_font_montserrat_10;
+
+            // Left: wpa-sec (reuse home_files_label which was placed as card title value — redirect it here)
+            // home_files_label already created by create_home_info_card; move semantics not possible in LVGL,
+            // so we reparent by just creating new labels in the columns and updating home_files_label pointer.
+            lv_obj_t *wpasec_lbl = lv_label_create(col_left);
+            lv_label_set_text(wpasec_lbl, "wpa-sec: --");
+            lv_obj_set_style_text_font(wpasec_lbl, small_font, 0);
+            lv_obj_set_style_text_color(wpasec_lbl, ui_muted_color(), 0);
+            ctx->home_files_label = wpasec_lbl;
+
+            ctx->home_files_detail_label = lv_label_create(col_left);
             lv_label_set_text(ctx->home_files_detail_label, "vendors: --");
-            lv_obj_set_width(ctx->home_files_detail_label, lv_pct(100));
-            lv_obj_set_style_text_font(ctx->home_files_detail_label, large ? &lv_font_montserrat_12 : &lv_font_montserrat_10, 0);
+            lv_obj_set_style_text_font(ctx->home_files_detail_label, small_font, 0);
             lv_obj_set_style_text_color(ctx->home_files_detail_label, ui_muted_color(), 0);
+
+            ctx->home_files_white_label = lv_label_create(col_left);
+            lv_label_set_text(ctx->home_files_white_label, "white: --");
+            lv_obj_set_style_text_font(ctx->home_files_white_label, small_font, 0);
+            lv_obj_set_style_text_color(ctx->home_files_white_label, ui_muted_color(), 0);
+
+            ctx->home_files_wigle_label = lv_label_create(col_right);
+            lv_label_set_text(ctx->home_files_wigle_label, "wigle: --");
+            lv_obj_set_style_text_font(ctx->home_files_wigle_label, small_font, 0);
+            lv_obj_set_style_text_color(ctx->home_files_wigle_label, ui_muted_color(), 0);
+
+            ctx->home_files_wdgwars_label = lv_label_create(col_right);
+            lv_label_set_text(ctx->home_files_wdgwars_label, "wdgwars: --");
+            lv_obj_set_style_text_font(ctx->home_files_wdgwars_label, small_font, 0);
+            lv_obj_set_style_text_color(ctx->home_files_wdgwars_label, ui_muted_color(), 0);
+
+            ctx->home_files_row = files_row;
+            // Initially show spinner, hide columns until first refresh completes
+            lv_obj_add_flag(files_row, LV_OBJ_FLAG_HIDDEN);
         }
 
         lv_obj_t *signature = lv_label_create(footer);
