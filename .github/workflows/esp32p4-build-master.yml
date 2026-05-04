@@ -352,6 +352,19 @@ jobs:
           set -euo pipefail
           python -c "import os, json; from pathlib import Path; version=os.getenv('FW_VERSION') or os.getenv('BUILD_TAG'); build=os.getenv('BUILD_TAG','manual'); manifest={'name':'M5MonsterC5-Tab5 ESP32-P4','version':version,'build':build,'chipFamily':'ESP32-P4','parts':[{'path':'firmware/bootloader.bin','offset':8192},{'path':'firmware/partition-table.bin','offset':32768},{'path':'firmware/M5MonsterC5-Tab5.bin','offset':65536}]}; Path('docs/manifest.json').write_text(json.dumps(manifest, indent=2))"
 
+      - name: Delete stale github-pages artifact (if re-run)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          artifact_id=$(gh api \
+            "/repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts" \
+            --jq '.artifacts[] | select(.name=="github-pages") | .id' 2>/dev/null || true)
+          for id in $artifact_id; do
+            echo "Deleting stale artifact id=$id"
+            gh api -X DELETE "/repos/$GITHUB_REPOSITORY/actions/artifacts/$id" || true
+          done
+
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
