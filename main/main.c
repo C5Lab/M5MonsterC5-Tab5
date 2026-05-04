@@ -723,7 +723,7 @@ typedef struct {
     // Transport type for this tab context
     uint8_t transport_kind;  // 0=Grove, 1=USB, 2=MBus, 3=INTERNAL
 
-    // SD card presence (detected via list_sd command)
+    // SD card presence (detected via sd_status command)
     bool sd_card_present;  // true if SD card detected on this UART/device
 
     // JanOS firmware version (detected via 'version' command)
@@ -26859,70 +26859,48 @@ static void detect_boards(void)
              mbus_detected ? "YES" : "NO");
 }
 
-// Check SD card presence on a specific tab by sending 'list_sd' command
+// Check SD card presence on a specific tab using 'sd_status' command
 // Returns true if SD card is present, false otherwise
 static bool check_sd_card_for_tab(tab_id_t tab)
 {
     if (tab == TAB_INTERNAL) {
-        // For internal tab, check if Tab5's SD card is mounted
         struct stat st;
         bool mounted = (stat("/sdcard", &st) == 0);
         ESP_LOGI(TAG, "[INTERNAL] SD card %s", mounted ? "mounted" : "NOT mounted");
         return mounted;
     }
 
-    // Determine UART port for this tab
     uart_port_t uart_port = uart_port_for_tab(tab);
     const char *tab_name = tab_transport_name(tab);
 
     ESP_LOGI(TAG, "[%s] Checking SD card presence...", tab_name);
 
-    // Try up to 3 times with 2 second delays between attempts
-    for (int attempt = 1; attempt <= 3; attempt++) {
-        if (attempt > 1) {
-            ESP_LOGI(TAG, "[%s] Retrying SD card check (attempt %d/3)...", tab_name, attempt);
-            vTaskDelay(pdMS_TO_TICKS(2000)); // 2 second delay between retries
-        }
+    const char *cmd = "sd_status\r\n";
+    transport_write_bytes_tab(tab, uart_port, cmd, strlen(cmd));
 
-        // Send list_sd command
-        const char *cmd = "list_sd\r\n";
-        transport_write_bytes_tab(tab, uart_port, cmd, strlen(cmd));
-        vTaskDelay(pdMS_TO_TICKS(1000));
+    static char rx_buffer[64];
+    int total_len = 0;
+    uint32_t start_time = xTaskGetTickCount();
+    uint32_t timeout_ticks = pdMS_TO_TICKS(500);
 
-        // Read response with timeout (up to 4 seconds, SD init can be slow)
-        static char rx_buffer[512];
-        int total_len = 0;
-        uint32_t start_time = xTaskGetTickCount();
-        uint32_t timeout_ticks = pdMS_TO_TICKS(4000);
-
-        while ((xTaskGetTickCount() - start_time) < timeout_ticks && total_len < (int)sizeof(rx_buffer) - 1) {
-            int len = transport_read_bytes_tab(tab, uart_port, rx_buffer + total_len,
-                                               sizeof(rx_buffer) - 1 - total_len, pdMS_TO_TICKS(100));
-            if (len > 0) {
-                total_len += len;
-                rx_buffer[total_len] = '\0';
-                ESP_LOGI(TAG, "[%s] Received %d bytes (total: %d): '%.*s'", tab_name, len, total_len, len, rx_buffer + total_len - len);
-
-                // Check for success or failure patterns
-                if (strstr(rx_buffer, "HTML files found on SD card") != NULL) {
-                    ESP_LOGI(TAG, "[%s] SD card detected (HTML files found) on attempt %d/3", tab_name, attempt);
-                    return true;
-                }
-                if (strstr(rx_buffer, "Failed to initialize SD card") != NULL) {
-                    ESP_LOGW(TAG, "[%s] SD card init failed on attempt %d/3", tab_name, attempt);
-                    ESP_LOGW(TAG, "[%s] Full response buffer (%d bytes): '%s'", tab_name, total_len, rx_buffer);
-                    break; // Try again after delay
-                }
+    while ((xTaskGetTickCount() - start_time) < timeout_ticks && total_len < (int)sizeof(rx_buffer) - 1) {
+        int len = transport_read_bytes_tab(tab, uart_port, rx_buffer + total_len,
+                                           sizeof(rx_buffer) - 1 - total_len, pdMS_TO_TICKS(50));
+        if (len > 0) {
+            total_len += len;
+            rx_buffer[total_len] = '\0';
+            if (strstr(rx_buffer, "SD_OK") != NULL) {
+                ESP_LOGI(TAG, "[%s] SD card present", tab_name);
+                return true;
+            }
+            if (strstr(rx_buffer, "SD_NONE") != NULL) {
+                ESP_LOGI(TAG, "[%s] SD card not present", tab_name);
+                return false;
             }
         }
-
-        // Timeout without clear response on this attempt
-        ESP_LOGW(TAG, "[%s] SD card check timeout on attempt %d/3", tab_name, attempt);
-        ESP_LOGW(TAG, "[%s] Full response buffer (%d bytes): '%s'", tab_name, total_len, rx_buffer);
     }
 
-    // All 3 attempts failed - assume no SD card
-    ESP_LOGW(TAG, "[%s] SD card NOT detected after 3 attempts", tab_name);
+    ESP_LOGW(TAG, "[%s] sd_status timeout, response: '%s'", tab_name, rx_buffer);
     return false;
 }
 
