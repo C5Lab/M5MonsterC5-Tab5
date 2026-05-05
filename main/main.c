@@ -45,8 +45,8 @@
 #include "esp_http_server.h"
 #include "lwip/sockets.h"
 
-#define JANOS_TAB_VERSION "1.3.2"
-#define JANOS_VERSION_REQUIRED "1.6.1"
+#define JANOS_TAB_VERSION "1.3.3"
+#define JANOS_VERSION_REQUIRED "1.6.3"
 #include "lwip/netdb.h"
 #include <dirent.h>
 #include <sys/stat.h>
@@ -6929,12 +6929,13 @@ static void show_mitm_popup(void)
     lv_obj_set_style_bg_opa(ctx->mitm_btn_row, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(ctx->mitm_btn_row, 0, 0);
     lv_obj_set_style_pad_all(ctx->mitm_btn_row, 0, 0);
-    lv_obj_set_flex_flow(ctx->mitm_btn_row, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(ctx->mitm_btn_row, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_flex_flow(ctx->mitm_btn_row, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(ctx->mitm_btn_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(ctx->mitm_btn_row, 8, 0);
     lv_obj_clear_flag(ctx->mitm_btn_row, LV_OBJ_FLAG_SCROLLABLE);
 
     ctx->mitm_connect_btn = lv_btn_create(ctx->mitm_btn_row);
-    lv_obj_set_size(ctx->mitm_connect_btn, 200, 50);
+    lv_obj_set_size(ctx->mitm_connect_btn, lv_pct(100), 50);
     lv_obj_set_style_bg_color(ctx->mitm_connect_btn, COLOR_MATERIAL_GREEN, 0);
     lv_obj_set_style_bg_color(ctx->mitm_connect_btn, lv_color_hex(0x2E7D32), LV_STATE_PRESSED);
     lv_obj_set_style_radius(ctx->mitm_connect_btn, 8, 0);
@@ -6944,6 +6945,18 @@ static void show_mitm_popup(void)
     lv_label_set_text(connect_label, "Connect & Start");
     lv_obj_set_style_text_font(connect_label, &lv_font_montserrat_16, 0);
     lv_obj_center(connect_label);
+
+    lv_obj_t *mitm_cancel_btn = lv_btn_create(ctx->mitm_btn_row);
+    lv_obj_set_size(mitm_cancel_btn, lv_pct(100), 50);
+    lv_obj_set_style_bg_color(mitm_cancel_btn, lv_color_hex(0x555555), 0);
+    lv_obj_set_style_bg_color(mitm_cancel_btn, lv_color_hex(0x333333), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(mitm_cancel_btn, 8, 0);
+    lv_obj_add_event_cb(mitm_cancel_btn, mitm_popup_close_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *cancel_label = lv_label_create(mitm_cancel_btn);
+    lv_label_set_text(cancel_label, "Cancel");
+    lv_obj_set_style_text_font(cancel_label, &lv_font_montserrat_16, 0);
+    lv_obj_center(cancel_label);
 
     ctx->mitm_stop_btn = lv_btn_create(ctx->mitm_popup);
     lv_obj_set_size(ctx->mitm_stop_btn, lv_pct(100), 50);
