@@ -67,6 +67,15 @@ static lv_font_t *ssid_utf8_cached_font = NULL;
 #define UART_BUF_SIZE     4096
 #define UART_RX_TIMEOUT   30000  // 30 seconds timeout for scan
 
+// SIM800L module on M5-Bus pins 15/16:
+// SIM800L SIM_TXD is M5-Bus pin 15 -> Tab5 GPIO7 (ESP RX)
+// SIM800L SIM_RXD is M5-Bus pin 16 -> Tab5 GPIO6 (ESP TX)
+// SIM800L RST is M5-Bus pin 20 -> Tab5 GPIO4
+#define SIM800_UART_TX_PIN  6
+#define SIM800_UART_RX_PIN  7
+#define SIM800_RST_PIN      4
+#define SIM800_CONSOLE_LOG_SIZE 4096
+
 // ESP Modem configuration (configurable pins for future external ESP32C5)
 #define ESP_MODEM_UART_TX_PIN  GPIO_NUM_37
 #define ESP_MODEM_UART_RX_PIN  GPIO_NUM_38
@@ -705,6 +714,21 @@ typedef struct {
     int nmap_host_count;
 
     // =====================================================================
+    // SIM800L AT CONSOLE - M5-Bus module terminal
+    // =====================================================================
+    lv_obj_t *sim800_console_page;
+    lv_obj_t *sim800_log_container;
+    lv_obj_t *sim800_log_label;
+    lv_obj_t *sim800_input;
+    lv_obj_t *sim800_keyboard;
+    lv_obj_t *sim800_status_label;
+    lv_obj_t *sim800_baud_dropdown;
+    volatile bool sim800_console_active;
+    TaskHandle_t sim800_console_task;
+    uint32_t sim800_baud_rate;
+    char *sim800_log_buffer;  // PSRAM, allocated only when console is opened
+
+    // =====================================================================
     // ROGUE AP - Page and data
     // =====================================================================
     lv_obj_t *rogue_ap_page;
@@ -1163,6 +1187,8 @@ static uart_port_t uart_port_for_tab(tab_id_t tab) {
     return tab_is_mbus(tab) ? UART2_NUM : UART_NUM;
 }
 
+static void sim800_console_cleanup(tab_context_t *ctx);
+
 // Helper to hide all pages in a tab's context (call before showing a new page)
 static void hide_all_pages(tab_context_t *ctx) {
     if (ctx->tiles) lv_obj_add_flag(ctx->tiles, LV_OBJ_FLAG_HIDDEN);
@@ -1184,6 +1210,8 @@ static void hide_all_pages(tab_context_t *ctx) {
     if (ctx->bt_locator_page) lv_obj_add_flag(ctx->bt_locator_page, LV_OBJ_FLAG_HIDDEN);
     if (ctx->arp_poison_page) lv_obj_add_flag(ctx->arp_poison_page, LV_OBJ_FLAG_HIDDEN);
     if (ctx->nmap_page) lv_obj_add_flag(ctx->nmap_page, LV_OBJ_FLAG_HIDDEN);
+    if (ctx->sim800_console_active) sim800_console_cleanup(ctx);
+    if (ctx->sim800_console_page) lv_obj_add_flag(ctx->sim800_console_page, LV_OBJ_FLAG_HIDDEN);
     if (ctx->wardrive_page) lv_obj_add_flag(ctx->wardrive_page, LV_OBJ_FLAG_HIDDEN);
 }
 
@@ -1751,6 +1779,9 @@ static void nmap_scan_type_popup_close_cb(lv_event_t *e);
 static void nmap_start_scan(const char *target_ip, const char *scan_level);
 static void nmap_scan_task_fn(void *arg);
 static void nmap_results_popup_close_cb(lv_event_t *e);
+static void show_sim800_console_page(void);
+static void sim800_console_back_cb(lv_event_t *e);
+static void sim800_console_cleanup(tab_context_t *ctx);
 static void evil_twin_row_click_cb(lv_event_t *e);
 static void show_evil_twin_connect_popup(const char *ssid, const char *password);
 static void evil_twin_connect_popup_yes_cb(lv_event_t *e);
@@ -5312,6 +5343,9 @@ static void tab_click_cb(lv_event_t *e)
 
     // *** SAVE current context BEFORE switching ***
     tab_context_t *old_ctx = get_current_ctx();
+    if (old_ctx && old_ctx->sim800_console_active) {
+        sim800_console_cleanup(old_ctx);
+    }
     save_globals_to_tab_context(old_ctx);
 
     // Hide current container (don't delete - preserve state)
@@ -5762,6 +5796,8 @@ static void main_tile_event_cb(lv_event_t *e)
         show_deauth_detector_page();
     } else if (strcmp(tile_name, "Bluetooth") == 0) {
         show_bluetooth_menu_page();
+    } else if (strcmp(tile_name, "SIM800L AT Console") == 0) {
+        show_sim800_console_page();
     } else if (strcmp(tile_name, "Wardrive") == 0) {
         // Check SD card before opening Wardrive page
         if (!current_tab_has_sd_card()) {
@@ -9274,6 +9310,497 @@ static void show_nmap_page(void)
     ctx->current_visible_page = ctx->nmap_page;
 }
 
+// ======================= SIM800L AT Console =======================
+
+static uint32_t sim800_selected_baud(tab_context_t *ctx)
+{
+    if (!ctx || !ctx->sim800_baud_dropdown) {
+        return (ctx && ctx->sim800_baud_rate) ? ctx->sim800_baud_rate : UART_BAUD_RATE;
+    }
+
+    switch (lv_dropdown_get_selected(ctx->sim800_baud_dropdown)) {
+        case 1: return 9600;
+        case 2: return 57600;
+        default: return 115200;
+    }
+}
+
+static void sim800_console_append(tab_context_t *ctx, const char *text)
+{
+    if (!ctx || !text) return;
+    if (!ctx->sim800_log_buffer) return;
+
+    size_t cur_len = strlen(ctx->sim800_log_buffer);
+    size_t add_len = strlen(text);
+    if (add_len >= SIM800_CONSOLE_LOG_SIZE) {
+        text += add_len - (SIM800_CONSOLE_LOG_SIZE - 1);
+        add_len = strlen(text);
+    }
+
+    if (cur_len + add_len >= SIM800_CONSOLE_LOG_SIZE) {
+        size_t keep = SIM800_CONSOLE_LOG_SIZE / 2;
+        if (cur_len > keep) {
+            memmove(ctx->sim800_log_buffer,
+                    ctx->sim800_log_buffer + cur_len - keep,
+                    keep + 1);
+        } else {
+            ctx->sim800_log_buffer[0] = '\0';
+        }
+    }
+
+    strncat(ctx->sim800_log_buffer, text, SIM800_CONSOLE_LOG_SIZE - strlen(ctx->sim800_log_buffer) - 1);
+
+    if (ctx->sim800_log_label) {
+        bool from_rx_task = (ctx->sim800_console_task != NULL &&
+                             xTaskGetCurrentTaskHandle() == ctx->sim800_console_task);
+        bool locked = false;
+        if (from_rx_task) {
+            locked = bsp_display_lock(0);
+            if (!locked) {
+                return;
+            }
+        }
+
+        lv_label_set_text(ctx->sim800_log_label, ctx->sim800_log_buffer);
+        if (ctx->sim800_log_container) {
+            lv_obj_scroll_to_y(ctx->sim800_log_container, LV_COORD_MAX, LV_ANIM_OFF);
+        }
+        if (locked) {
+            bsp_display_unlock();
+        }
+    }
+}
+
+static void sim800_console_configure_uart(tab_context_t *ctx)
+{
+    if (!uart2_initialized) {
+        init_uart2();
+    }
+
+    uint32_t baud = sim800_selected_baud(ctx);
+    if (ctx && ctx->sim800_console_active && ctx->sim800_baud_rate == baud) {
+        if (ctx->sim800_status_label) {
+            lv_label_set_text_fmt(ctx->sim800_status_label,
+                                  "UART2 SIM800L: TX=G%d RX=G%d RST=G%d baud=%lu",
+                                  SIM800_UART_TX_PIN, SIM800_UART_RX_PIN, SIM800_RST_PIN,
+                                  (unsigned long)baud);
+        }
+        return;
+    }
+
+    uart_wait_tx_done(UART2_NUM, pdMS_TO_TICKS(200));
+    uart_flush(UART2_NUM);
+    uart_set_baudrate(UART2_NUM, baud);
+    uart_set_pin(UART2_NUM, SIM800_UART_TX_PIN, SIM800_UART_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+
+    gpio_config_t rst_cfg = {
+        .pin_bit_mask = 1ULL << SIM800_RST_PIN,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&rst_cfg);
+    gpio_set_level(SIM800_RST_PIN, 1);
+
+    if (ctx) {
+        ctx->sim800_baud_rate = baud;
+        ctx->sim800_console_active = true;
+        if (ctx->sim800_status_label) {
+            lv_label_set_text_fmt(ctx->sim800_status_label,
+                                  "UART2 SIM800L: TX=G%d RX=G%d RST=G%d baud=%lu",
+                                  SIM800_UART_TX_PIN, SIM800_UART_RX_PIN, SIM800_RST_PIN,
+                                  (unsigned long)baud);
+        }
+    }
+    ESP_LOGI(TAG, "[SIM800] UART2 configured: TX=%d RX=%d RST=%d baud=%lu",
+             SIM800_UART_TX_PIN, SIM800_UART_RX_PIN, SIM800_RST_PIN, (unsigned long)baud);
+}
+
+static void sim800_console_restore_mbus_uart(void)
+{
+    if (!uart2_initialized) return;
+
+    int tx_pin, rx_pin;
+    get_uart2_pins(&tx_pin, &rx_pin);
+    uart_wait_tx_done(UART2_NUM, pdMS_TO_TICKS(200));
+    uart_flush(UART2_NUM);
+    uart_set_baudrate(UART2_NUM, UART_BAUD_RATE);
+    uart_set_pin(UART2_NUM, tx_pin, rx_pin, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    gpio_reset_pin(SIM800_RST_PIN);
+    ESP_LOGI(TAG, "[SIM800] Restored MBus UART2 pins: TX=%d RX=%d baud=%d",
+             tx_pin, rx_pin, UART_BAUD_RATE);
+}
+
+static void sim800_console_task_fn(void *arg)
+{
+    tab_context_t *ctx = (tab_context_t *)arg;
+    char rx_buffer[192];
+
+    while (ctx && ctx->sim800_console_active) {
+        int len = uart_read_bytes(UART2_NUM, (uint8_t *)rx_buffer, sizeof(rx_buffer) - 1, pdMS_TO_TICKS(120));
+        if (len > 0) {
+            rx_buffer[len] = '\0';
+            sim800_console_append(ctx, rx_buffer);
+        }
+    }
+
+    if (ctx) {
+        ctx->sim800_console_task = NULL;
+    }
+    vTaskDelete(NULL);
+}
+
+static void sim800_console_start_task(tab_context_t *ctx)
+{
+    if (!ctx || ctx->sim800_console_task) return;
+    if (xTaskCreate(sim800_console_task_fn, "sim800_console", 4096, ctx, 5, &ctx->sim800_console_task) != pdTRUE) {
+        ctx->sim800_console_task = NULL;
+        sim800_console_append(ctx, "\n[ERR] Failed to start RX task\n");
+    }
+}
+
+static void sim800_console_cleanup(tab_context_t *ctx)
+{
+    if (!ctx || !ctx->sim800_console_active) return;
+
+    ctx->sim800_console_active = false;
+    for (int i = 0; i < 10 && ctx->sim800_console_task; i++) {
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    if (ctx->sim800_console_task) {
+        vTaskDelete(ctx->sim800_console_task);
+        ctx->sim800_console_task = NULL;
+    }
+
+    sim800_console_restore_mbus_uart();
+    if (ctx->sim800_keyboard) {
+        lv_obj_add_flag(ctx->sim800_keyboard, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void sim800_console_send_text(tab_context_t *ctx, const char *cmd, bool append_crlf)
+{
+    if (!ctx || !cmd || cmd[0] == '\0') return;
+    sim800_console_configure_uart(ctx);
+
+    char line[192];
+    snprintf(line, sizeof(line), "\n> %s\n", cmd);
+    sim800_console_append(ctx, line);
+    uart_write_bytes(UART2_NUM, cmd, strlen(cmd));
+    if (append_crlf) {
+        uart_write_bytes(UART2_NUM, "\r\n", 2);
+    }
+}
+
+static void sim800_console_send_cb(lv_event_t *e)
+{
+    (void)e;
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx || !ctx->sim800_input) return;
+
+    const char *cmd = lv_textarea_get_text(ctx->sim800_input);
+    if (!cmd || cmd[0] == '\0') return;
+
+    sim800_console_send_text(ctx, cmd, true);
+    lv_textarea_set_text(ctx->sim800_input, "");
+}
+
+static void sim800_console_quick_cmd_cb(lv_event_t *e)
+{
+    const char *cmd = (const char *)lv_event_get_user_data(e);
+    tab_context_t *ctx = get_current_ctx();
+    if (ctx && cmd) {
+        sim800_console_send_text(ctx, cmd, true);
+    }
+}
+
+static void sim800_console_ctrl_z_cb(lv_event_t *e)
+{
+    (void)e;
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx) return;
+
+    sim800_console_configure_uart(ctx);
+    sim800_console_append(ctx, "\n> CTRL+Z\n");
+    const char ctrl_z = 0x1A;
+    uart_write_bytes(UART2_NUM, &ctrl_z, 1);
+}
+
+static void sim800_console_reset_cb(lv_event_t *e)
+{
+    (void)e;
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx) return;
+
+    sim800_console_configure_uart(ctx);
+    sim800_console_append(ctx, "\n[SIM800] Reset pulse on GPIO4\n");
+    gpio_set_level(SIM800_RST_PIN, 0);
+    vTaskDelay(pdMS_TO_TICKS(220));
+    gpio_set_level(SIM800_RST_PIN, 1);
+}
+
+static void sim800_console_clear_cb(lv_event_t *e)
+{
+    (void)e;
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx || !ctx->sim800_log_buffer) return;
+    ctx->sim800_log_buffer[0] = '\0';
+    if (ctx->sim800_log_label) {
+        lv_label_set_text(ctx->sim800_log_label, "");
+    }
+}
+
+static void sim800_console_baud_cb(lv_event_t *e)
+{
+    (void)e;
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx) return;
+    sim800_console_configure_uart(ctx);
+    sim800_console_append(ctx, "\n[SIM800] Baud changed\n");
+}
+
+static void sim800_console_input_cb(lv_event_t *e)
+{
+    (void)e;
+    tab_context_t *ctx = get_current_ctx();
+    if (ctx && ctx->sim800_keyboard) {
+        lv_obj_clear_flag(ctx->sim800_keyboard, LV_OBJ_FLAG_HIDDEN);
+        lv_keyboard_set_textarea(ctx->sim800_keyboard, ctx->sim800_input);
+    }
+}
+
+static void sim800_console_keyboard_cb(lv_event_t *e)
+{
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_READY) {
+        sim800_console_send_cb(e);
+    } else if (code == LV_EVENT_CANCEL) {
+        lv_obj_t *kb = lv_event_get_target(e);
+        lv_obj_add_flag(kb, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void sim800_console_back_cb(lv_event_t *e)
+{
+    (void)e;
+    tab_context_t *ctx = get_current_ctx();
+    sim800_console_cleanup(ctx);
+
+    if (ctx && ctx->sim800_console_page) {
+        lv_obj_add_flag(ctx->sim800_console_page, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (ctx && ctx->tiles) {
+        lv_obj_clear_flag(ctx->tiles, LV_OBJ_FLAG_HIDDEN);
+        ctx->current_visible_page = ctx->tiles;
+    }
+}
+
+static lv_obj_t *sim800_create_button(lv_obj_t *parent, const char *text, lv_color_t color,
+                                      lv_event_cb_t cb, const char *user_data)
+{
+    lv_obj_t *btn = lv_btn_create(parent);
+    lv_obj_set_size(btn, 142, 42);
+    lv_obj_set_style_bg_color(btn, ui_card_color(), 0);
+    lv_obj_set_style_bg_color(btn, ui_card_pressed_color(), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(btn, 1, 0);
+    lv_obj_set_style_border_color(btn, color, 0);
+    lv_obj_set_style_border_opa(btn, LV_OPA_80, 0);
+    lv_obj_set_style_radius(btn, 8, 0);
+    lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, (void *)user_data);
+
+    lv_obj_t *label = lv_label_create(btn);
+    lv_label_set_text(label, text);
+    lv_obj_set_style_text_font(label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(label, ui_text_color(), 0);
+    lv_obj_center(label);
+    return btn;
+}
+
+static void show_sim800_console_page(void)
+{
+    if (current_tab != TAB_MBUS) {
+        ESP_LOGW(TAG, "SIM800L console is only available on MBus tab");
+        return;
+    }
+
+    tab_context_t *ctx = get_current_ctx();
+    lv_obj_t *container = get_current_tab_container();
+    if (!ctx || !container) return;
+
+    hide_all_pages(ctx);
+    sim800_console_configure_uart(ctx);
+
+    if (ctx->sim800_console_page) {
+        lv_obj_clear_flag(ctx->sim800_console_page, LV_OBJ_FLAG_HIDDEN);
+        ctx->current_visible_page = ctx->sim800_console_page;
+        sim800_console_start_task(ctx);
+        return;
+    }
+
+    ctx->sim800_baud_rate = UART_BAUD_RATE;
+    if (!ctx->sim800_log_buffer) {
+        ctx->sim800_log_buffer = heap_caps_calloc(1, SIM800_CONSOLE_LOG_SIZE, MALLOC_CAP_SPIRAM);
+        if (!ctx->sim800_log_buffer) {
+            ctx->sim800_log_buffer = calloc(1, SIM800_CONSOLE_LOG_SIZE);
+        }
+        if (!ctx->sim800_log_buffer) {
+            ESP_LOGE(TAG, "SIM800L console: failed to allocate log buffer");
+            return;
+        }
+    }
+
+    snprintf(ctx->sim800_log_buffer, SIM800_CONSOLE_LOG_SIZE,
+             "[SIM800L AT Console]\nPins: SIM_TXD->GPIO7 RX, SIM_RXD->GPIO6 TX, RST->GPIO4\nType AT and press SEND.\n");
+
+    ctx->sim800_console_page = lv_obj_create(container);
+    lv_obj_set_size(ctx->sim800_console_page, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(ctx->sim800_console_page, ui_bg_color(), 0);
+    lv_obj_set_style_border_width(ctx->sim800_console_page, 0, 0);
+    lv_obj_set_style_pad_all(ctx->sim800_console_page, 8, 0);
+    lv_obj_set_style_pad_row(ctx->sim800_console_page, 8, 0);
+    lv_obj_set_flex_flow(ctx->sim800_console_page, LV_FLEX_FLOW_COLUMN);
+
+    lv_obj_t *header = lv_obj_create(ctx->sim800_console_page);
+    lv_obj_set_size(header, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(header, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(header, 0, 0);
+    lv_obj_set_style_pad_all(header, 0, 0);
+    lv_obj_set_style_pad_column(header, 12, 0);
+    lv_obj_set_flex_flow(header, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(header, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(header, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *left = lv_obj_create(header);
+    lv_obj_set_size(left, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(left, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(left, 0, 0);
+    lv_obj_set_style_pad_all(left, 0, 0);
+    lv_obj_set_style_pad_column(left, 12, 0);
+    lv_obj_set_flex_flow(left, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(left, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(left, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *back_btn = lv_btn_create(left);
+    lv_obj_set_size(back_btn, 72, 56);
+    lv_obj_set_style_bg_color(back_btn, ui_panel_color(), 0);
+    lv_obj_set_style_bg_color(back_btn, ui_card_pressed_color(), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(back_btn, 1, 0);
+    lv_obj_set_style_border_color(back_btn, ui_border_color(), 0);
+    lv_obj_set_style_radius(back_btn, 8, 0);
+    lv_obj_add_event_cb(back_btn, sim800_console_back_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *back_icon = lv_label_create(back_btn);
+    lv_label_set_text(back_icon, LV_SYMBOL_LEFT);
+    lv_obj_set_style_text_color(back_icon, ui_text_color(), 0);
+    lv_obj_center(back_icon);
+
+    lv_obj_t *title = lv_label_create(left);
+    lv_label_set_text(title, LV_SYMBOL_KEYBOARD "  SIM800L AT Console");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_22, 0);
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_PINK, 0);
+
+    lv_obj_t *right = lv_obj_create(header);
+    lv_obj_set_size(right, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(right, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(right, 0, 0);
+    lv_obj_set_style_pad_all(right, 0, 0);
+    lv_obj_set_style_pad_column(right, 8, 0);
+    lv_obj_set_flex_flow(right, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(right, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(right, LV_OBJ_FLAG_SCROLLABLE);
+
+    ctx->sim800_baud_dropdown = lv_dropdown_create(right);
+    lv_dropdown_set_options(ctx->sim800_baud_dropdown, "115200\n9600\n57600");
+    lv_obj_set_width(ctx->sim800_baud_dropdown, 130);
+    lv_obj_add_event_cb(ctx->sim800_baud_dropdown, sim800_console_baud_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    sim800_create_button(right, "RESET", COLOR_MATERIAL_AMBER, sim800_console_reset_cb, NULL);
+    sim800_create_button(right, "CLEAR", COLOR_MATERIAL_CYAN, sim800_console_clear_cb, NULL);
+
+    ctx->sim800_status_label = lv_label_create(ctx->sim800_console_page);
+    lv_label_set_text(ctx->sim800_status_label, "UART2 SIM800L ready");
+    lv_obj_set_style_text_font(ctx->sim800_status_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(ctx->sim800_status_label, ui_muted_color(), 0);
+
+    ctx->sim800_log_container = lv_obj_create(ctx->sim800_console_page);
+    lv_obj_set_width(ctx->sim800_log_container, lv_pct(100));
+    lv_obj_set_flex_grow(ctx->sim800_log_container, 1);
+    lv_obj_set_style_bg_color(ctx->sim800_log_container, lv_color_hex(0x05070A), 0);
+    lv_obj_set_style_border_width(ctx->sim800_log_container, 1, 0);
+    lv_obj_set_style_border_color(ctx->sim800_log_container, COLOR_MATERIAL_PINK, 0);
+    lv_obj_set_style_border_opa(ctx->sim800_log_container, LV_OPA_50, 0);
+    lv_obj_set_style_radius(ctx->sim800_log_container, 8, 0);
+    lv_obj_set_style_pad_all(ctx->sim800_log_container, 10, 0);
+    lv_obj_set_scroll_dir(ctx->sim800_log_container, LV_DIR_VER);
+
+    ctx->sim800_log_label = lv_label_create(ctx->sim800_log_container);
+    lv_label_set_text(ctx->sim800_log_label, ctx->sim800_log_buffer);
+    lv_obj_set_width(ctx->sim800_log_label, lv_pct(100));
+    lv_label_set_long_mode(ctx->sim800_log_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(ctx->sim800_log_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(ctx->sim800_log_label, lv_color_hex(0xB8F7C6), 0);
+
+    lv_obj_t *quick = lv_obj_create(ctx->sim800_console_page);
+    lv_obj_set_size(quick, lv_pct(100), 58);
+    lv_obj_set_style_bg_opa(quick, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(quick, 0, 0);
+    lv_obj_set_style_pad_all(quick, 0, 0);
+    lv_obj_set_style_pad_column(quick, 8, 0);
+    lv_obj_set_flex_flow(quick, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(quick, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_scroll_dir(quick, LV_DIR_HOR);
+    lv_obj_set_scrollbar_mode(quick, LV_SCROLLBAR_MODE_AUTO);
+
+    sim800_create_button(quick, "AT", COLOR_MATERIAL_GREEN, sim800_console_quick_cmd_cb, "AT");
+    sim800_create_button(quick, "CMEE=2", COLOR_MATERIAL_GREEN, sim800_console_quick_cmd_cb, "AT+CMEE=2");
+    sim800_create_button(quick, "CFUN=1", COLOR_MATERIAL_GREEN, sim800_console_quick_cmd_cb, "AT+CFUN=1");
+    sim800_create_button(quick, "CSQ", COLOR_MATERIAL_GREEN, sim800_console_quick_cmd_cb, "AT+CSQ");
+    sim800_create_button(quick, "CENG=1", COLOR_MATERIAL_GREEN, sim800_console_quick_cmd_cb, "AT+CENG=1");
+    sim800_create_button(quick, "CNETSCAN=1", COLOR_MATERIAL_GREEN, sim800_console_quick_cmd_cb, "AT+CNETSCAN=1");
+    sim800_create_button(quick, "CNETSCAN", COLOR_MATERIAL_GREEN, sim800_console_quick_cmd_cb, "AT+CNETSCAN");
+    sim800_create_button(quick, "CENG?", COLOR_MATERIAL_GREEN, sim800_console_quick_cmd_cb, "AT+CENG?");
+    sim800_create_button(quick, "COPS=?", COLOR_MATERIAL_AMBER, sim800_console_quick_cmd_cb, "AT+COPS=?");
+    sim800_create_button(quick, "GSMLOC", COLOR_MATERIAL_AMBER, sim800_console_quick_cmd_cb, "AT+CIPGSMLOC=1,1");
+    sim800_create_button(quick, "CTRL+Z", COLOR_MATERIAL_CYAN, sim800_console_ctrl_z_cb, NULL);
+
+    lv_obj_t *input_row = lv_obj_create(ctx->sim800_console_page);
+    lv_obj_set_size(input_row, lv_pct(100), 54);
+    lv_obj_set_style_bg_opa(input_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(input_row, 0, 0);
+    lv_obj_set_style_pad_all(input_row, 0, 0);
+    lv_obj_set_style_pad_column(input_row, 8, 0);
+    lv_obj_set_flex_flow(input_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(input_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(input_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    ctx->sim800_input = lv_textarea_create(input_row);
+    lv_obj_set_flex_grow(ctx->sim800_input, 1);
+    lv_obj_set_height(ctx->sim800_input, 48);
+    lv_textarea_set_one_line(ctx->sim800_input, true);
+    lv_textarea_set_max_length(ctx->sim800_input, 160);
+    lv_textarea_set_placeholder_text(ctx->sim800_input, "AT command");
+    lv_obj_set_style_bg_color(ctx->sim800_input, ui_panel_color(), 0);
+    lv_obj_set_style_border_width(ctx->sim800_input, 1, 0);
+    lv_obj_set_style_border_color(ctx->sim800_input, COLOR_MATERIAL_PINK, 0);
+    lv_obj_set_style_text_color(ctx->sim800_input, ui_text_color(), 0);
+    lv_obj_add_event_cb(ctx->sim800_input, sim800_console_input_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(ctx->sim800_input, sim800_console_input_cb, LV_EVENT_FOCUSED, NULL);
+
+    sim800_create_button(input_row, "SEND", COLOR_MATERIAL_PINK, sim800_console_send_cb, NULL);
+
+    ctx->sim800_keyboard = lv_keyboard_create(ctx->sim800_console_page);
+    lv_obj_set_size(ctx->sim800_keyboard, lv_pct(100), 190);
+    lv_keyboard_set_textarea(ctx->sim800_keyboard, ctx->sim800_input);
+    lv_obj_add_flag(ctx->sim800_keyboard, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(ctx->sim800_keyboard, sim800_console_keyboard_cb, LV_EVENT_READY, NULL);
+    lv_obj_add_event_cb(ctx->sim800_keyboard, sim800_console_keyboard_cb, LV_EVENT_CANCEL, NULL);
+
+    sim800_console_configure_uart(ctx);
+    sim800_console_start_task(ctx);
+    ctx->current_visible_page = ctx->sim800_console_page;
+}
+
 // Show ARP Poison page
 static void show_arp_poison_page(void)
 {
@@ -11202,6 +11729,9 @@ static void create_uart_tiles_in_container(lv_obj_t *container, tab_context_t *c
     create_tile(tile_grid, LV_SYMBOL_LOOP, "Network\nObserver", COLOR_MATERIAL_TEAL, main_tile_event_cb, "Network Observer");
     create_tile(tile_grid, LV_SYMBOL_WIFI, "Karma", COLOR_MATERIAL_ORANGE, main_tile_event_cb, "Karma");
     create_tile(tile_grid, LV_SYMBOL_GPS, "Wardrive", COLOR_MATERIAL_TEAL, main_tile_event_cb, "Wardrive");
+    if (current_tab == TAB_MBUS) {
+        create_tile(tile_grid, LV_SYMBOL_KEYBOARD, "SIM800L\nAT Console", COLOR_MATERIAL_PINK, main_tile_event_cb, "SIM800L AT Console");
+    }
 
     if (dashboard_enabled) {
         lv_obj_t *footer = lv_obj_create(*tiles_ptr);
@@ -11446,6 +11976,8 @@ static void show_mbus_tiles(void)
     if (ctx->beacon_spam_page) lv_obj_add_flag(ctx->beacon_spam_page, LV_OBJ_FLAG_HIDDEN);
     if (ctx->beacon_ssids_page) lv_obj_add_flag(ctx->beacon_ssids_page, LV_OBJ_FLAG_HIDDEN);
     if (ctx->karma_page) lv_obj_add_flag(ctx->karma_page, LV_OBJ_FLAG_HIDDEN);
+    if (ctx->sim800_console_active) sim800_console_cleanup(ctx);
+    if (ctx->sim800_console_page) lv_obj_add_flag(ctx->sim800_console_page, LV_OBJ_FLAG_HIDDEN);
 
     create_uart_tiles_in_container(mbus_container, ctx, &ctx->tiles);
     ctx->current_visible_page = ctx->tiles;
