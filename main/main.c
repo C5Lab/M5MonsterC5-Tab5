@@ -33,6 +33,7 @@
 #include "usb/usb_host.h"
 #include "usb/usb_helpers.h"
 #include "usb/usb_types_ch9.h"
+#include "screens/subghz_host.h"
 
 // ESP-Hosted includes for WiFi via ESP32C6 SDIO
 #include "esp_hosted.h"
@@ -720,6 +721,13 @@ typedef struct {
     volatile bool rogue_ap_monitoring;
     TaskHandle_t rogue_ap_task;
 
+    // =====================================================================
+    // SUB-GHZ - Listen / Transmit / Manage / Jammer / Tesla
+    // (state struct defined in screens/subghz_host.h, embedded as union of bytes
+    // here so we don't need to expose its layout to other parts of main.c)
+    // =====================================================================
+    struct subghz_tab_state *subghz;  // owned, allocated in init_tab_context
+
     // Transport type for this tab context
     uint8_t transport_kind;  // 0=Grove, 1=USB, 2=MBus, 3=INTERNAL
 
@@ -1185,6 +1193,8 @@ static void hide_all_pages(tab_context_t *ctx) {
     if (ctx->arp_poison_page) lv_obj_add_flag(ctx->arp_poison_page, LV_OBJ_FLAG_HIDDEN);
     if (ctx->nmap_page) lv_obj_add_flag(ctx->nmap_page, LV_OBJ_FLAG_HIDDEN);
     if (ctx->wardrive_page) lv_obj_add_flag(ctx->wardrive_page, LV_OBJ_FLAG_HIDDEN);
+    /* SubGHz pages (menu + sub-pages) */
+    if (ctx->subghz) subghz_hide_all_pages(ctx->subghz);
 }
 
 // Initialize tab context - allocate PSRAM for large data arrays
@@ -5261,6 +5271,118 @@ static void uart_send_command_for_tab(const char *cmd)
     ESP_LOGI(TAG, "[%s/Tab] Sent command: %s", tab_transport_name(current_tab), cmd);
 }
 
+/* ============================================================
+ * Sub-GHz host interface (consumed by main/screens/subghz_*.c)
+ * ============================================================ */
+
+subghz_tab_state_t *subghz_host_alloc_state(void)
+{
+    subghz_tab_state_t *st = heap_caps_calloc(1, sizeof(*st),
+                                              MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!st) {
+        ESP_LOGE(TAG, "Failed to allocate subghz_tab_state in PSRAM");
+        return NULL;
+    }
+    st->freq_mhz = 433.92f;
+    st->raw_mode = false;
+    return st;
+}
+
+void subghz_host_free_state(subghz_tab_state_t **pstate)
+{
+    if (!pstate || !*pstate) return;
+    heap_caps_free(*pstate);
+    *pstate = NULL;
+}
+
+subghz_tab_state_t *subghz_host_state_for_tab(int tab_id)
+{
+    tab_context_t *ctx = get_ctx_for_tab((tab_id_t)tab_id);
+    if (!ctx) return NULL;
+    if (!ctx->subghz) ctx->subghz = subghz_host_alloc_state();
+    return ctx->subghz;
+}
+
+subghz_tab_state_t *subghz_host_state(void)
+{
+    return subghz_host_state_for_tab((int)current_tab);
+}
+
+int subghz_host_current_tab(void)
+{
+    return (int)current_tab;
+}
+
+bool subghz_host_tab_is_internal(int tab_id)
+{
+    return tab_is_internal((tab_id_t)tab_id);
+}
+
+lv_obj_t *subghz_host_current_container(void)
+{
+    return get_current_tab_container();
+}
+
+lv_obj_t *subghz_host_container_for_tab(int tab_id)
+{
+    return get_container_for_tab((tab_id_t)tab_id);
+}
+
+void subghz_host_uart_send(const char *cmd)
+{
+    uart_send_command_for_tab(cmd);
+}
+
+void subghz_host_uart_send_for_tab(int tab_id, const char *cmd)
+{
+    if (tab_is_internal((tab_id_t)tab_id)) {
+        ESP_LOGW(TAG, "[INTERNAL/SubGHz] Ignoring command: %s", cmd);
+        return;
+    }
+    uart_port_t port = uart_port_for_tab((tab_id_t)tab_id);
+    transport_write_bytes_tab((tab_id_t)tab_id, port, cmd, strlen(cmd));
+    transport_write_bytes_tab((tab_id_t)tab_id, port, "\r\n", 2);
+    ESP_LOGI(TAG, "[%s/SubGHz] Sent command: %s",
+             tab_transport_name((tab_id_t)tab_id), cmd);
+}
+
+int subghz_host_uart_read_bytes(int tab_id, void *buf, size_t sz, uint32_t ticks)
+{
+    if (tab_is_internal((tab_id_t)tab_id)) return 0;
+    uart_port_t port = uart_port_for_tab((tab_id_t)tab_id);
+    return transport_read_bytes_tab((tab_id_t)tab_id, port, buf, sz, ticks);
+}
+
+void subghz_host_hide_all_pages(void)
+{
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx) return;
+    hide_all_pages(ctx);
+}
+
+void subghz_host_show_main_tiles(void)
+{
+    show_main_tiles();
+}
+
+/* Color accessors (map CoreS3 UI_ACCENT_* to Tab5 COLOR_MATERIAL_*) */
+lv_color_t subghz_host_color_red(void)    { return COLOR_MATERIAL_RED; }
+lv_color_t subghz_host_color_green(void)  { return COLOR_MATERIAL_GREEN; }
+lv_color_t subghz_host_color_blue(void)   { return COLOR_MATERIAL_BLUE; }
+lv_color_t subghz_host_color_cyan(void)   { return COLOR_MATERIAL_CYAN; }
+lv_color_t subghz_host_color_orange(void) { return COLOR_MATERIAL_ORANGE; }
+lv_color_t subghz_host_color_purple(void) { return COLOR_MATERIAL_PURPLE; }
+lv_color_t subghz_host_color_pink(void)   { return COLOR_MATERIAL_PINK; }
+lv_color_t subghz_host_color_amber(void)  { return COLOR_MATERIAL_AMBER; }
+
+lv_color_t subghz_host_ui_bg(void)            { return ui_bg_color(); }
+lv_color_t subghz_host_ui_card(void)          { return ui_card_color(); }
+lv_color_t subghz_host_ui_card_pressed(void)  { return ui_card_pressed_color(); }
+lv_color_t subghz_host_ui_panel(void)         { return ui_panel_color(); }
+lv_color_t subghz_host_ui_text(void)          { return ui_text_color(); }
+lv_color_t subghz_host_ui_muted(void)         { return ui_muted_color(); }
+lv_color_t subghz_host_ui_border(void)        { return ui_border_color(); }
+
 static void style_tab_button(lv_obj_t *btn, bool active, lv_color_t active_bg, lv_color_t active_border)
 {
     if (!btn) return;
@@ -5769,6 +5891,8 @@ static void main_tile_event_cb(lv_event_t *e)
             return;
         }
         show_wardrive_page();
+    } else if (strcmp(tile_name, "Sub-GHz") == 0) {
+        show_subghz_page();
     } else {
         // Placeholder for other tiles - show a message
         ESP_LOGI(TAG, "Feature '%s' not implemented yet", tile_name);
@@ -11202,6 +11326,7 @@ static void create_uart_tiles_in_container(lv_obj_t *container, tab_context_t *c
     create_tile(tile_grid, LV_SYMBOL_LOOP, "Network\nObserver", COLOR_MATERIAL_TEAL, main_tile_event_cb, "Network Observer");
     create_tile(tile_grid, LV_SYMBOL_WIFI, "Karma", COLOR_MATERIAL_ORANGE, main_tile_event_cb, "Karma");
     create_tile(tile_grid, LV_SYMBOL_GPS, "Wardrive", COLOR_MATERIAL_TEAL, main_tile_event_cb, "Wardrive");
+    create_tile(tile_grid, LV_SYMBOL_BARS, "Sub-GHz", COLOR_MATERIAL_PINK, main_tile_event_cb, "Sub-GHz");
 
     if (dashboard_enabled) {
         lv_obj_t *footer = lv_obj_create(*tiles_ptr);
@@ -11421,6 +11546,7 @@ static void show_uart1_tiles(void)
     if (ctx->beacon_spam_page) lv_obj_add_flag(ctx->beacon_spam_page, LV_OBJ_FLAG_HIDDEN);
     if (ctx->beacon_ssids_page) lv_obj_add_flag(ctx->beacon_ssids_page, LV_OBJ_FLAG_HIDDEN);
     if (ctx->karma_page) lv_obj_add_flag(ctx->karma_page, LV_OBJ_FLAG_HIDDEN);
+    if (ctx->subghz) subghz_hide_all_pages(ctx->subghz);
 
     create_uart_tiles_in_container(container, ctx, &ctx->tiles);
     ctx->current_visible_page = ctx->tiles;
@@ -11446,6 +11572,7 @@ static void show_mbus_tiles(void)
     if (ctx->beacon_spam_page) lv_obj_add_flag(ctx->beacon_spam_page, LV_OBJ_FLAG_HIDDEN);
     if (ctx->beacon_ssids_page) lv_obj_add_flag(ctx->beacon_ssids_page, LV_OBJ_FLAG_HIDDEN);
     if (ctx->karma_page) lv_obj_add_flag(ctx->karma_page, LV_OBJ_FLAG_HIDDEN);
+    if (ctx->subghz) subghz_hide_all_pages(ctx->subghz);
 
     create_uart_tiles_in_container(mbus_container, ctx, &ctx->tiles);
     ctx->current_visible_page = ctx->tiles;
