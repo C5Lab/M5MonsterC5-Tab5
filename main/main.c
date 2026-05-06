@@ -734,9 +734,14 @@ typedef struct {
     // SD card presence (detected via sd_status command)
     bool sd_card_present;  // true if SD card detected on this UART/device
 
-    // JanOS firmware version (detected via 'version' command)
+    // JanOS firmware version (detected via 'version' command or boot banner snoop)
     char janos_version[16];
     bool janos_version_mismatch;
+
+    // JanOS RF (Sub-GHz) firmware version - "" when not detected.
+    // Captured from "JanOS RF version: X.Y.Z" line printed by JanOS at boot.
+    char janos_rf_version[16];
+    bool has_subghz;
 } tab_context_t;
 
 typedef struct {
@@ -1844,6 +1849,11 @@ static bool check_sd_card_for_tab(tab_id_t tab);
 static void check_all_sd_cards(void);
 static void check_version_for_tab(tab_id_t tab);
 static void check_all_versions(void);
+static void janos_feed_bytes(tab_context_t *ctx, const char *uart_name,
+                             const uint8_t *data, int len,
+                             char *line_buf, int line_buf_sz, int *line_pos);
+static void janos_consume_line(tab_context_t *ctx, const char *line, const char *uart_name);
+static void janos_copy_version_token(const char *src, char *dst);
 static void show_version_mismatch_popup(void);
 static void show_no_board_popup(void);
 static void board_detect_retry_cb(lv_timer_t *timer);
@@ -3512,8 +3522,8 @@ static bool ping_usb(void)
         goto done;
     }
 
-    // Flush RX buffer before ping (drain any boot/menu spam)
-    usb_flush_input(200);
+    // NOTE: do NOT flush here - we want to keep JanOS's pre-ping boot banner so
+    // we can snoop "JanOS version:" / "JanOS RF version:" lines into usb_ctx.
 
     // Send ping command
     const char *ping_cmd = "ping\r\n";
@@ -3528,6 +3538,8 @@ static bool ping_usb(void)
     char buf[64];
     int total = 0;
     bool saw_nmea = false;
+    char line_buf[160];
+    int line_pos = 0;
     for (int i = 0; i < 10; i++) {
         int n = usb_transport_read(buf + total, sizeof(buf) - total - 1, pdMS_TO_TICKS(50));
         if (usb_debug_logs && n == 0) {
@@ -3535,6 +3547,9 @@ static bool ping_usb(void)
         }
         if (n > 0) {
             usb_gps_process_bytes((const uint8_t *)(buf + total), (size_t)n);
+            // Snoop JanOS boot banner lines into usb_ctx
+            janos_feed_bytes(&usb_ctx, "USB", (const uint8_t *)(buf + total), n,
+                             line_buf, sizeof(line_buf), &line_pos);
             total += n;
             buf[total] = '\0';
             if (!saw_nmea && usb_buffer_contains_nmea(buf)) {
@@ -5725,6 +5740,14 @@ static void create_tab_bar(void)
             lv_obj_set_style_text_font(ver_warn, tab_text_font, 0);
             lv_obj_set_style_text_color(ver_warn, lv_color_hex(0xF44336), 0);
         }
+
+        // Sub-GHz capability indicator: shown when JanOS RF firmware was detected
+        if (grove_ctx.has_subghz) {
+            lv_obj_t *rf_icon = lv_label_create(grove_content);
+            lv_label_set_text(rf_icon, LV_SYMBOL_BARS);
+            lv_obj_set_style_text_font(rf_icon, tab_text_font, 0);
+            lv_obj_set_style_text_color(rf_icon, COLOR_MATERIAL_PINK, 0);
+        }
     }
 
     // ========== USB tab (only if detected) ==========
@@ -5769,6 +5792,14 @@ static void create_tab_bar(void)
             lv_obj_set_style_text_font(ver_warn, tab_text_font, 0);
             lv_obj_set_style_text_color(ver_warn, lv_color_hex(0xF44336), 0);
         }
+
+        // Sub-GHz capability indicator: shown when JanOS RF firmware was detected
+        if (usb_ctx.has_subghz) {
+            lv_obj_t *rf_icon = lv_label_create(usb_content);
+            lv_label_set_text(rf_icon, LV_SYMBOL_BARS);
+            lv_obj_set_style_text_font(rf_icon, tab_text_font, 0);
+            lv_obj_set_style_text_color(rf_icon, COLOR_MATERIAL_PINK, 0);
+        }
     }
 
     // ========== MBus tab (only if MBus detected) ==========
@@ -5812,6 +5843,14 @@ static void create_tab_bar(void)
             lv_label_set_text(ver_warn, "V!");
             lv_obj_set_style_text_font(ver_warn, tab_text_font, 0);
             lv_obj_set_style_text_color(ver_warn, lv_color_hex(0xF44336), 0);
+        }
+
+        // Sub-GHz capability indicator: shown when JanOS RF firmware was detected
+        if (mbus_ctx.has_subghz) {
+            lv_obj_t *rf_icon = lv_label_create(mbus_content);
+            lv_label_set_text(rf_icon, LV_SYMBOL_BARS);
+            lv_obj_set_style_text_font(rf_icon, tab_text_font, 0);
+            lv_obj_set_style_text_color(rf_icon, COLOR_MATERIAL_PINK, 0);
         }
     }
 
@@ -11326,7 +11365,18 @@ static void create_uart_tiles_in_container(lv_obj_t *container, tab_context_t *c
     create_tile(tile_grid, LV_SYMBOL_LOOP, "Network\nObserver", COLOR_MATERIAL_TEAL, main_tile_event_cb, "Network Observer");
     create_tile(tile_grid, LV_SYMBOL_WIFI, "Karma", COLOR_MATERIAL_ORANGE, main_tile_event_cb, "Karma");
     create_tile(tile_grid, LV_SYMBOL_GPS, "Wardrive", COLOR_MATERIAL_TEAL, main_tile_event_cb, "Wardrive");
-    create_tile(tile_grid, LV_SYMBOL_BARS, "Sub-GHz", COLOR_MATERIAL_PINK, main_tile_event_cb, "Sub-GHz");
+    {
+        lv_obj_t *subghz_tile = create_tile(tile_grid, LV_SYMBOL_BARS, "Sub-GHz",
+                                            COLOR_MATERIAL_PINK, main_tile_event_cb, "Sub-GHz");
+        if (!ctx || !ctx->has_subghz) {
+            // No JanOS RF firmware on this UART - keep the tile visible but disabled.
+            lv_obj_remove_event_cb(subghz_tile, main_tile_event_cb);
+            lv_obj_clear_flag(subghz_tile, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_set_style_bg_opa(subghz_tile, LV_OPA_30, 0);
+            lv_obj_set_style_text_opa(subghz_tile, LV_OPA_50, LV_PART_MAIN | LV_STATE_DEFAULT);
+            lv_obj_add_state(subghz_tile, LV_STATE_DISABLED);
+        }
+    }
 
     if (dashboard_enabled) {
         lv_obj_t *footer = lv_obj_create(*tiles_ptr);
@@ -26877,18 +26927,83 @@ static __attribute__((unused)) void deinit_uart2(void)
 // Board Detection via ping/pong protocol
 //==================================================================================
 
-// Send ping and wait for pong response on specified transport
-static bool ping_uart(uart_port_t uart_port, const char *uart_name)
+// Copy a JanOS version token starting at `src` (right after the colon, possibly
+// preceded by spaces) into `dst[16]`. Stops at whitespace/CR/LF or 15 chars.
+static void janos_copy_version_token(const char *src, char *dst)
+{
+    while (*src == ' ' || *src == '\t') src++;
+    int i = 0;
+    while (src[i] && src[i] != '\r' && src[i] != '\n' && src[i] != ' ' && src[i] != '\t' && i < 15) {
+        dst[i] = src[i];
+        i++;
+    }
+    dst[i] = '\0';
+}
+
+// Scan a single completed line for JanOS boot-banner version markers and
+// store them into ctx. Order matters: check "JanOS RF version:" first because
+// "JanOS version:" is a substring of nothing here, but we don't want to
+// confuse the two markers.
+static void janos_consume_line(tab_context_t *ctx, const char *line, const char *uart_name)
+{
+    if (!ctx || !line) return;
+    const char *rf = strstr(line, "JanOS RF version:");
+    if (rf) {
+        janos_copy_version_token(rf + strlen("JanOS RF version:"), ctx->janos_rf_version);
+        if (ctx->janos_rf_version[0]) {
+            ctx->has_subghz = true;
+            ESP_LOGI(TAG, "[%s] Detected JanOS RF version: %s (Sub-GHz available)",
+                     uart_name ? uart_name : "?", ctx->janos_rf_version);
+        }
+        return;
+    }
+    const char *jv = strstr(line, "JanOS version:");
+    if (jv) {
+        janos_copy_version_token(jv + strlen("JanOS version:"), ctx->janos_version);
+        if (ctx->janos_version[0]) {
+            ESP_LOGI(TAG, "[%s] Detected JanOS version: %s (boot snoop)",
+                     uart_name ? uart_name : "?", ctx->janos_version);
+        }
+    }
+}
+
+// Feed a chunk of UART bytes through a tiny line accumulator and dispatch
+// completed lines to janos_consume_line(). `line_pos` is the in/out cursor for
+// `line_buf` so the caller can spread parsing across multiple reads.
+static void janos_feed_bytes(tab_context_t *ctx, const char *uart_name,
+                             const uint8_t *data, int len,
+                             char *line_buf, int line_buf_sz, int *line_pos)
+{
+    for (int i = 0; i < len; i++) {
+        char c = (char)data[i];
+        if (c == '\n' || c == '\r') {
+            if (*line_pos > 0) {
+                line_buf[*line_pos] = '\0';
+                janos_consume_line(ctx, line_buf, uart_name);
+                *line_pos = 0;
+            }
+        } else if (*line_pos < line_buf_sz - 1) {
+            line_buf[(*line_pos)++] = c;
+        }
+    }
+}
+
+// Send ping and wait for pong response on specified transport.
+// Also passively snoops JanOS boot banner ("JanOS version:" / "JanOS RF
+// version:") into `ctx` while waiting. Pass `ctx == NULL` to skip snoop.
+static bool ping_uart(uart_port_t uart_port, const char *uart_name, tab_context_t *ctx)
 {
     uint8_t rx_buffer[128];
+    char line_buf[160];
+    int line_pos = 0;
 
-    uart_flush(uart_port);
+    // NOTE: do NOT flush here - we want to keep JanOS's pre-ping boot banner.
 
     const char *ping_cmd = "ping\r\n";
-    int total_len = 0;
     int64_t start_time = esp_timer_get_time();
     int64_t timeout_us = 1500000; // 1.5s total window, ping retried every 150ms
     int64_t last_ping_us = start_time - 200000; // ensure first ping sends immediately
+    bool got_pong = false;
 
     ESP_LOGI(TAG, "[%s] Sent ping", uart_name);
 
@@ -26898,39 +27013,40 @@ static bool ping_uart(uart_port_t uart_port, const char *uart_name)
             last_ping_us = esp_timer_get_time();
         }
 
-        int len = transport_read_bytes(uart_port, rx_buffer + total_len,
-                                   sizeof(rx_buffer) - total_len - 1, pdMS_TO_TICKS(50));
+        int len = transport_read_bytes(uart_port, rx_buffer,
+                                       sizeof(rx_buffer) - 1, pdMS_TO_TICKS(50));
         if (len > 0) {
-            total_len += len;
-            rx_buffer[total_len] = '\0';
-
-            if (strstr((char*)rx_buffer, "pong") != NULL) {
+            rx_buffer[len] = '\0';
+            if (!got_pong && strstr((char*)rx_buffer, "pong") != NULL) {
+                got_pong = true;
                 log_memory_stats(uart_name);
                 ESP_LOGI(TAG, "[%s] Received pong - board detected!", uart_name);
-                return true;
             }
-            if (total_len >= (int)sizeof(rx_buffer) - 16) {
-                total_len = 0;
-            }
+            janos_feed_bytes(ctx, uart_name, rx_buffer, len, line_buf, sizeof(line_buf), &line_pos);
+            if (got_pong) return true;
         }
     }
 
+    if (got_pong) return true;
     ESP_LOGW(TAG, "[%s] No pong response - board not detected", uart_name);
     return false;
 }
 
-// Send ping and wait for pong response using raw UART (bypass USB transport)
-static bool ping_uart_direct(uart_port_t uart_port, const char *uart_name)
+// Send ping and wait for pong response using raw UART (bypass USB transport).
+// Also passively snoops JanOS boot banner into `ctx` while waiting.
+static bool ping_uart_direct(uart_port_t uart_port, const char *uart_name, tab_context_t *ctx)
 {
     uint8_t rx_buffer[128];
+    char line_buf[160];
+    int line_pos = 0;
 
-    uart_flush(uart_port);
+    // NOTE: do NOT flush here - we want to keep JanOS's pre-ping boot banner.
 
     const char *ping_cmd = "ping\r\n";
-    int total_len = 0;
     int64_t start_time = esp_timer_get_time();
     int64_t timeout_us = 1500000; // 1.5s total window, ping retried every 150ms
     int64_t last_ping_us = start_time - 200000; // ensure first ping sends immediately
+    bool got_pong = false;
 
     ESP_LOGI(TAG, "[%s] Sent ping (raw)", uart_name);
 
@@ -26941,23 +27057,21 @@ static bool ping_uart_direct(uart_port_t uart_port, const char *uart_name)
             last_ping_us = esp_timer_get_time();
         }
 
-        int len = uart_read_bytes(uart_port, rx_buffer + total_len,
-                                  sizeof(rx_buffer) - total_len - 1, pdMS_TO_TICKS(50));
+        int len = uart_read_bytes(uart_port, rx_buffer,
+                                  sizeof(rx_buffer) - 1, pdMS_TO_TICKS(50));
         if (len > 0) {
-            total_len += len;
-            rx_buffer[total_len] = '\0';
-            if (strstr((char*)rx_buffer, "pong") != NULL) {
+            rx_buffer[len] = '\0';
+            if (!got_pong && strstr((char*)rx_buffer, "pong") != NULL) {
+                got_pong = true;
                 log_memory_stats(uart_name);
                 ESP_LOGI(TAG, "[%s] Received pong - board detected!", uart_name);
-                return true;
             }
-            // Buffer near full - shift to avoid overflow while keeping tail
-            if (total_len >= (int)sizeof(rx_buffer) - 16) {
-                total_len = 0;
-            }
+            janos_feed_bytes(ctx, uart_name, rx_buffer, len, line_buf, sizeof(line_buf), &line_pos);
+            if (got_pong) return true;
         }
     }
 
+    if (got_pong) return true;
     ESP_LOGW(TAG, "[%s] No pong response - board not detected", uart_name);
     return false;
 }
@@ -26970,8 +27084,19 @@ static void detect_boards(void)
     // Ensure USB CDC host is started before detection
     usb_transport_init();
 
-    // Detect each device independently using ping/pong
-    grove_detected = ping_uart_direct(UART_NUM, "Grove");
+    // Reset per-tab boot-banner snoop fields before re-detecting.
+    grove_ctx.janos_version[0] = '\0';
+    grove_ctx.janos_rf_version[0] = '\0';
+    grove_ctx.has_subghz = false;
+    usb_ctx.janos_version[0] = '\0';
+    usb_ctx.janos_rf_version[0] = '\0';
+    usb_ctx.has_subghz = false;
+    mbus_ctx.janos_version[0] = '\0';
+    mbus_ctx.janos_rf_version[0] = '\0';
+    mbus_ctx.has_subghz = false;
+
+    // Detect each device independently using ping/pong (also snoops JanOS boot banner)
+    grove_detected = ping_uart_direct(UART_NUM, "Grove", &grove_ctx);
     usb_detected = usb_cdc_connected ? ping_usb() : false;  // Must respond to ping, not just be connected
     if (usb_cdc_connected && !usb_detected && usb_debug_logs && !usb_nmea_device_seen && !usb_is_known_gps) {
         usb_log_cdc_state("detect_boards_usb_ping_failed");
@@ -26980,7 +27105,7 @@ static void detect_boards(void)
         ESP_LOGI(TAG, "[USB] GPS accessory detected (NMEA stream)");
     }
     uart1_detected = (grove_detected || usb_detected);  // For legacy compatibility
-    mbus_detected = ping_uart(UART2_NUM, "MBus");
+    mbus_detected = ping_uart(UART2_NUM, "MBus", &mbus_ctx);
 
     // Log detection results (ping functions already log success)
     if (grove_detected) {
@@ -27079,8 +27204,18 @@ static void check_all_sd_cards(void)
              internal_sd_present ? "YES" : "NO");
 }
 
-// Check JanOS firmware version on a specific UART tab by sending 'version' command.
-// Older firmware that doesn't have the command responds with "Unrecognized command".
+// Check JanOS firmware version on a specific UART tab.
+//
+// Strategy:
+//  1. If we already snooped "JanOS version: X.Y.Z" (and possibly "JanOS RF
+//     version: X.Y.Z") from the boot banner during ping detection, just trust
+//     that and skip the active probe.
+//  2. Otherwise send `version\r\n` and parse the response line-by-line. Recent
+//     JanOS firmware that supports the command also includes "JanOS RF
+//     version:" on the next line, which we capture too.
+//  3. Older firmware replies with "Unrecognized command" and never reprints
+//     the version. We only fall back to "<1.5.8" if we did NOT manage to
+//     snoop the version at boot - so we never overwrite a known-good version.
 static void check_version_for_tab(tab_id_t tab)
 {
     if (tab == TAB_INTERNAL) return;
@@ -27091,6 +27226,15 @@ static void check_version_for_tab(tab_id_t tab)
 
     ESP_LOGI(TAG, "[%s] Checking JanOS version...", tab_name);
 
+    // Fast path: boot-banner snoop during ping already captured the version.
+    if (ctx->janos_version[0] != '\0') {
+        ctx->janos_version_mismatch = (strcmp(ctx->janos_version, JANOS_VERSION_REQUIRED) != 0);
+        ESP_LOGI(TAG, "[%s] JanOS version (from boot snoop): %s (mismatch=%d, has_subghz=%d, rf=%s)",
+                 tab_name, ctx->janos_version, ctx->janos_version_mismatch,
+                 ctx->has_subghz, ctx->janos_rf_version[0] ? ctx->janos_rf_version : "n/a");
+        return;
+    }
+
     if (tab == TAB_USB) {
         usb_rx_exclusive = true;
         usb_flush_input(100);
@@ -27099,65 +27243,70 @@ static void check_version_for_tab(tab_id_t tab)
     }
 
     const char *cmd = "version\r\n";
-    uint8_t rx_buffer[512];
-    int total_len = 0;
+    uint8_t rx_chunk[128];
+    char line_buf[160];
+    int line_pos = 0;
     int64_t start_time = esp_timer_get_time();
     int64_t timeout_us = 2000000; // 2s total window
     int64_t last_cmd_us = start_time - 200000; // ensure first send is immediate
+    bool saw_version = false;
+    bool saw_unrecognized = false;
+    int64_t version_seen_us = 0;
 
     while ((esp_timer_get_time() - start_time) < timeout_us) {
         // Resend command every 400ms if no valid response yet
-        if ((esp_timer_get_time() - last_cmd_us) >= 400000) {
+        if (!saw_version && (esp_timer_get_time() - last_cmd_us) >= 400000) {
             transport_write_bytes_tab(tab, uart_port, cmd, strlen(cmd));
             last_cmd_us = esp_timer_get_time();
         }
 
-        int len = transport_read_bytes_tab(tab, uart_port, rx_buffer + total_len,
-                                           sizeof(rx_buffer) - 1 - total_len, pdMS_TO_TICKS(50));
+        int len = transport_read_bytes_tab(tab, uart_port, rx_chunk,
+                                           sizeof(rx_chunk) - 1, pdMS_TO_TICKS(50));
         if (len > 0) {
-            total_len += len;
-            rx_buffer[total_len] = '\0';
+            rx_chunk[len] = '\0';
+            // Use the same snoop helper as the boot-banner path - it picks up
+            // both "JanOS version:" and "JanOS RF version:" into ctx.
+            janos_feed_bytes(ctx, tab_name, rx_chunk, len, line_buf, sizeof(line_buf), &line_pos);
 
-            char *ver = strstr((char*)rx_buffer, "JanOS version:");
-            if (ver) {
-                ver += strlen("JanOS version:");
-                while (*ver == ' ') ver++;
-                int i = 0;
-                while (ver[i] && ver[i] != '\r' && ver[i] != '\n' && ver[i] != ' ' && i < 15) {
-                    ctx->janos_version[i] = ver[i];
-                    i++;
-                }
-                ctx->janos_version[i] = '\0';
-                ctx->janos_version_mismatch = (strcmp(ctx->janos_version, JANOS_VERSION_REQUIRED) != 0);
-                ESP_LOGI(TAG, "[%s] JanOS version: %s (mismatch=%d)", tab_name, ctx->janos_version, ctx->janos_version_mismatch);
-                if (tab == TAB_USB) usb_rx_exclusive = false;
-                return;
+            if (!saw_version && ctx->janos_version[0] != '\0') {
+                saw_version = true;
+                version_seen_us = esp_timer_get_time();
             }
-
-            if (strstr((char*)rx_buffer, "Unrecognized command") != NULL) {
-                strncpy(ctx->janos_version, "<1.5.8", sizeof(ctx->janos_version) - 1);
-                ctx->janos_version[sizeof(ctx->janos_version) - 1] = '\0';
-                ctx->janos_version_mismatch = true;
-                ESP_LOGW(TAG, "[%s] 'version' command not recognized - firmware older than 1.5.8", tab_name);
-                if (tab == TAB_USB) usb_rx_exclusive = false;
-                return;
-            }
-
-            // Buffer near full - keep only the last 128 bytes (version string is short)
-            if (total_len >= (int)sizeof(rx_buffer) - 64) {
-                int keep = 128;
-                memmove(rx_buffer, rx_buffer + total_len - keep, keep);
-                total_len = keep;
-                rx_buffer[total_len] = '\0';
+            if (!saw_unrecognized && strstr((char*)rx_chunk, "Unrecognized command") != NULL) {
+                saw_unrecognized = true;
             }
         }
+
+        // Linger ~250ms after seeing the version line so we can also catch
+        // the "JanOS RF version:" line that follows it.
+        if (saw_version && (esp_timer_get_time() - version_seen_us) >= 250000) {
+            break;
+        }
+    }
+
+    if (tab == TAB_USB) usb_rx_exclusive = false;
+
+    if (ctx->janos_version[0] != '\0') {
+        ctx->janos_version_mismatch = (strcmp(ctx->janos_version, JANOS_VERSION_REQUIRED) != 0);
+        ESP_LOGI(TAG, "[%s] JanOS version: %s (mismatch=%d, has_subghz=%d, rf=%s)",
+                 tab_name, ctx->janos_version, ctx->janos_version_mismatch,
+                 ctx->has_subghz, ctx->janos_rf_version[0] ? ctx->janos_rf_version : "n/a");
+        return;
+    }
+
+    if (saw_unrecognized) {
+        strncpy(ctx->janos_version, "<1.5.8", sizeof(ctx->janos_version) - 1);
+        ctx->janos_version[sizeof(ctx->janos_version) - 1] = '\0';
+        ctx->janos_version_mismatch = true;
+        ESP_LOGW(TAG, "[%s] 'version' command not recognized and no boot banner captured "
+                 "- firmware older than 1.5.8", tab_name);
+        return;
     }
 
     strncpy(ctx->janos_version, "unknown", sizeof(ctx->janos_version) - 1);
     ctx->janos_version[sizeof(ctx->janos_version) - 1] = '\0';
     ctx->janos_version_mismatch = true;
     ESP_LOGW(TAG, "[%s] Could not detect JanOS version (timeout)", tab_name);
-    if (tab == TAB_USB) usb_rx_exclusive = false;
 }
 
 static void check_all_versions(void)
@@ -27169,6 +27318,8 @@ static void check_all_versions(void)
     } else {
         grove_ctx.janos_version[0] = '\0';
         grove_ctx.janos_version_mismatch = false;
+        grove_ctx.janos_rf_version[0] = '\0';
+        grove_ctx.has_subghz = false;
     }
 
     if (usb_detected) {
@@ -27176,6 +27327,8 @@ static void check_all_versions(void)
     } else {
         usb_ctx.janos_version[0] = '\0';
         usb_ctx.janos_version_mismatch = false;
+        usb_ctx.janos_rf_version[0] = '\0';
+        usb_ctx.has_subghz = false;
     }
 
     if (mbus_detected) {
@@ -27183,15 +27336,22 @@ static void check_all_versions(void)
     } else {
         mbus_ctx.janos_version[0] = '\0';
         mbus_ctx.janos_version_mismatch = false;
+        mbus_ctx.janos_rf_version[0] = '\0';
+        mbus_ctx.has_subghz = false;
     }
 
     internal_ctx.janos_version[0] = '\0';
     internal_ctx.janos_version_mismatch = false;
+    internal_ctx.janos_rf_version[0] = '\0';
+    internal_ctx.has_subghz = false;
 
-    ESP_LOGI(TAG, "=== Version check complete: Grove=%s, USB=%s, MBus=%s ===",
+    ESP_LOGI(TAG, "=== Version check complete: Grove=%s%s, USB=%s%s, MBus=%s%s ===",
              grove_ctx.janos_version[0] ? grove_ctx.janos_version : "N/A",
+             grove_ctx.has_subghz ? " (RF)" : "",
              usb_ctx.janos_version[0] ? usb_ctx.janos_version : "N/A",
-             mbus_ctx.janos_version[0] ? mbus_ctx.janos_version : "N/A");
+             usb_ctx.has_subghz ? " (RF)" : "",
+             mbus_ctx.janos_version[0] ? mbus_ctx.janos_version : "N/A",
+             mbus_ctx.has_subghz ? " (RF)" : "");
 }
 
 static void version_popup_close_cb(lv_event_t *e)
@@ -27211,17 +27371,20 @@ static void show_version_mismatch_popup(void)
     if (grove_detected && grove_ctx.janos_version_mismatch) {
         snprintf(msg + strlen(msg), sizeof(msg) - strlen(msg),
                  "Grove monster is on JanOS version: %s while %s expected.\n",
-                 grove_ctx.janos_version, JANOS_VERSION_REQUIRED);
+                 grove_ctx.janos_version[0] ? grove_ctx.janos_version : "unknown",
+                 JANOS_VERSION_REQUIRED);
     }
     if (usb_detected && usb_ctx.janos_version_mismatch) {
         snprintf(msg + strlen(msg), sizeof(msg) - strlen(msg),
                  "USB   monster is on JanOS version: %s while %s expected.\n",
-                 usb_ctx.janos_version, JANOS_VERSION_REQUIRED);
+                 usb_ctx.janos_version[0] ? usb_ctx.janos_version : "unknown",
+                 JANOS_VERSION_REQUIRED);
     }
     if (mbus_detected && mbus_ctx.janos_version_mismatch) {
         snprintf(msg + strlen(msg), sizeof(msg) - strlen(msg),
                  "MBus  monster is on JanOS version: %s while %s expected.\n",
-                 mbus_ctx.janos_version, JANOS_VERSION_REQUIRED);
+                 mbus_ctx.janos_version[0] ? mbus_ctx.janos_version : "unknown",
+                 JANOS_VERSION_REQUIRED);
     }
     size_t len = strlen(msg);
     if (len > 0 && msg[len - 1] == '\n') msg[len - 1] = '\0';
