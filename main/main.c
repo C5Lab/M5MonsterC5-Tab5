@@ -1340,19 +1340,6 @@ static void clear_observer_attack_override(tab_context_t *ctx)
 // All scan/selection state lives per-tab in ctx; nothing to restore globally.
 // These remain as no-ops for the few remaining call sites; they will be removed
 // once those call sites are cleaned up.
-static void restore_tab_context_to_globals(tab_context_t *ctx) {
-    if (!ctx) return;
-    ESP_LOGI(TAG, "Tab %d switch: observer_running=%d, network_count=%d, selected=%d",
-             (int)tab_id_for_ctx(ctx),
-             ctx->observer_running,
-             ctx->network_count,
-             ctx->selected_count);
-}
-
-static void save_globals_to_tab_context(tab_context_t *ctx) {
-    (void)ctx;
-}
-
 // ESP Modem global variables
 static wifi_ap_record_t *esp_modem_networks = NULL;  // Allocated in PSRAM
 static uint16_t esp_modem_network_count = 0;
@@ -1525,6 +1512,50 @@ static int karma_probe_count = 0;
 static char karma_html_files[20][64];
 static int karma_html_count = 0;
 
+static void restore_tab_context_to_globals(tab_context_t *ctx) {
+    if (!ctx) return;
+    ESP_LOGI(TAG, "Tab %d switch: observer_running=%d, network_count=%d, selected=%d",
+             (int)tab_id_for_ctx(ctx),
+             ctx->observer_running,
+             ctx->network_count,
+             ctx->selected_count);
+    // Karma state
+    karma_sniffer_running    = ctx->karma_sniffer_running;
+    karma_monitoring         = ctx->karma_monitoring;
+    karma_selected_probe_idx = ctx->karma_selected_probe_idx;
+    karma_probe_count        = ctx->karma_probe_count;
+    karma_html_count         = ctx->karma_html_count;
+    memcpy(karma_html_files, ctx->karma_html_files, sizeof(karma_html_files));
+    if (ctx->karma_probes && ctx->karma_probe_count > 0)
+        memcpy(karma_probes, ctx->karma_probes, ctx->karma_probe_count * sizeof(karma_probe_t));
+}
+
+static void save_globals_to_tab_context(tab_context_t *ctx) {
+    if (!ctx) return;
+    // Karma UI pointers
+    ctx->karma_probes_container      = karma_probes_container;
+    ctx->karma_start_btn             = karma_start_sniffer_btn;
+    ctx->karma_stop_btn              = karma_stop_sniffer_btn;
+    ctx->karma_status_label          = karma_status_label;
+    ctx->karma_html_popup_overlay    = karma_html_popup_overlay;
+    ctx->karma_html_popup            = karma_html_popup_obj;
+    ctx->karma_html_dropdown         = karma_html_dropdown;
+    ctx->karma_attack_popup_overlay  = karma_attack_popup_overlay;
+    ctx->karma_attack_popup          = karma_attack_popup_obj;
+    ctx->karma_attack_ssid_label     = karma_attack_ssid_label;
+    ctx->karma_attack_mac_label      = karma_attack_mac_label;
+    ctx->karma_attack_password_label = karma_attack_password_label;
+    // Karma state
+    ctx->karma_sniffer_running       = karma_sniffer_running;
+    ctx->karma_monitoring            = karma_monitoring;
+    ctx->karma_selected_probe_idx    = karma_selected_probe_idx;
+    ctx->karma_probe_count           = karma_probe_count;
+    ctx->karma_html_count            = karma_html_count;
+    memcpy(ctx->karma_html_files, karma_html_files, sizeof(karma_html_files));
+    if (ctx->karma_probes && karma_probe_count > 0)
+        memcpy(ctx->karma_probes, karma_probes, karma_probe_count * sizeof(karma_probe_t));
+}
+
 // ============================================================================
 // Captive Portal (for Probes & Karma on Network Observer)
 // ============================================================================
@@ -1642,6 +1673,20 @@ static void restore_ui_pointers_from_ctx(tab_context_t *ctx) {
     if (ctx->observer_page) {
         observer_page = ctx->observer_page;
     }
+
+    // Karma UI pointers
+    karma_probes_container       = ctx->karma_probes_container;
+    karma_start_sniffer_btn      = ctx->karma_start_btn;
+    karma_stop_sniffer_btn       = ctx->karma_stop_btn;
+    karma_status_label           = ctx->karma_status_label;
+    karma_html_popup_overlay     = ctx->karma_html_popup_overlay;
+    karma_html_popup_obj         = ctx->karma_html_popup;
+    karma_html_dropdown          = ctx->karma_html_dropdown;
+    karma_attack_popup_overlay   = ctx->karma_attack_popup_overlay;
+    karma_attack_popup_obj       = ctx->karma_attack_popup;
+    karma_attack_ssid_label      = ctx->karma_attack_ssid_label;
+    karma_attack_mac_label       = ctx->karma_attack_mac_label;
+    karma_attack_password_label  = ctx->karma_attack_password_label;
 }
 
 // Forward declarations
@@ -9730,9 +9775,12 @@ static void karma_stop_sniffer_cb(lv_event_t *e)
     }
 
     if (karma_status_label) {
-        lv_label_set_text(karma_status_label, "Sniffer stopped");
-        lv_obj_set_style_text_color(karma_status_label, lv_color_hex(0x888888), 0);
+        lv_label_set_text(karma_status_label, "Sniffer stopped - fetching probes...");
+        lv_obj_set_style_text_color(karma_status_label, COLOR_MATERIAL_AMBER, 0);
     }
+
+    // Auto-fetch probes after stopping
+    karma_show_probes_cb(NULL);
 }
 
 // Show Probes button callback
@@ -9751,9 +9799,13 @@ static void karma_show_probes_cb(lv_event_t *e)
     bsp_display_unlock();
     vTaskDelay(pdMS_TO_TICKS(50));
 
+    // Flush stale UART RX data (leftover sniffer output) before querying probes
+    uart_port_t uart_port = get_current_uart();
+    uart_flush_input(uart_port);
+    vTaskDelay(pdMS_TO_TICKS(50));
+
     // Send list_probes command to current tab's UART
     uart_send_command_for_tab("list_probes");
-    uart_port_t uart_port = get_current_uart();
     vTaskDelay(pdMS_TO_TICKS(500));
 
     // Read response
@@ -10328,10 +10380,6 @@ static void show_karma_page(void)
 {
     ESP_LOGI(TAG, "Showing Karma page");
 
-    // Reset state
-    karma_probe_count = 0;
-    karma_selected_probe_idx = -1;
-
     // Get current tab's data and container
     tab_context_t *ctx = get_current_ctx();
     lv_obj_t *container = get_current_tab_container();
@@ -10349,11 +10397,19 @@ static void show_karma_page(void)
         lv_obj_clear_flag(ctx->karma_page, LV_OBJ_FLAG_HIDDEN);
         ctx->current_visible_page = ctx->karma_page;
         karma_page = ctx->karma_page;  // Update legacy reference
+        karma_probes_container = ctx->karma_probes_container;
+        karma_start_sniffer_btn = ctx->karma_start_btn;
+        karma_stop_sniffer_btn  = ctx->karma_stop_btn;
+        karma_status_label      = ctx->karma_status_label;
         ESP_LOGI(TAG, "Showing existing karma page for tab %d", current_tab);
         return;
     }
 
     ESP_LOGI(TAG, "Creating new karma page for tab %d", current_tab);
+
+    // Fresh page - reset state for this tab
+    karma_probe_count = 0;
+    karma_selected_probe_idx = -1;
 
     // Create karma page container inside tab container
     ctx->karma_page = lv_obj_create(container);
@@ -10434,17 +10490,6 @@ static void show_karma_page(void)
     karma_sniffer_running = false;
     lv_obj_add_state(karma_stop_sniffer_btn, LV_STATE_DISABLED);
 
-    // Show Probes button
-    lv_obj_t *probes_btn = lv_btn_create(btn_bar);
-    lv_obj_set_size(probes_btn, 130, 45);
-    style_show_probes_button(probes_btn);
-    lv_obj_add_event_cb(probes_btn, karma_show_probes_cb, LV_EVENT_CLICKED, NULL);
-
-    lv_obj_t *probes_label = lv_label_create(probes_btn);
-    lv_label_set_text(probes_label, "Show Probes");
-    lv_obj_set_style_text_font(probes_label, &lv_font_montserrat_14, 0);
-    lv_obj_center(probes_label);
-
     // Status label
     karma_status_label = lv_label_create(karma_page);
     lv_label_set_text(karma_status_label, "Start sniffer to collect probe requests");
@@ -10464,6 +10509,20 @@ static void show_karma_page(void)
     lv_label_set_text(placeholder, "Click 'Show Probes' after sniffing to see collected probe requests");
     lv_obj_set_style_text_font(placeholder, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(placeholder, ui_muted_color(), 0);
+
+    // Mirror widget pointers into ctx so tab-switch save/restore works correctly
+    ctx->karma_probes_container      = karma_probes_container;
+    ctx->karma_start_btn             = karma_start_sniffer_btn;
+    ctx->karma_stop_btn              = karma_stop_sniffer_btn;
+    ctx->karma_status_label          = karma_status_label;
+    ctx->karma_html_popup_overlay    = karma_html_popup_overlay;
+    ctx->karma_html_popup            = karma_html_popup_obj;
+    ctx->karma_html_dropdown         = karma_html_dropdown;
+    ctx->karma_attack_popup_overlay  = karma_attack_popup_overlay;
+    ctx->karma_attack_popup          = karma_attack_popup_obj;
+    ctx->karma_attack_ssid_label     = karma_attack_ssid_label;
+    ctx->karma_attack_mac_label      = karma_attack_mac_label;
+    ctx->karma_attack_password_label = karma_attack_password_label;
 
     // Set current visible page
     ctx->current_visible_page = ctx->karma_page;
