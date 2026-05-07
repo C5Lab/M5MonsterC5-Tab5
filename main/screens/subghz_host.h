@@ -102,6 +102,7 @@ lv_obj_t *subghz_host_container_for_tab(int tab_id);
 void subghz_host_uart_send(const char *cmd);
 void subghz_host_uart_send_for_tab(int tab_id, const char *cmd);
 int  subghz_host_uart_read_bytes(int tab_id, void *buf, size_t sz, uint32_t ticks);
+void subghz_host_uart_flush_input(int tab_id);  /* drop any stale RX bytes */
 
 /* Navigation */
 void subghz_host_hide_all_pages(void);

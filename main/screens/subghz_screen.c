@@ -1,7 +1,9 @@
 #include "subghz_host.h"
 #include "subghz_internal.h"
+#include "subghz_signal_list.h"
 #include "esp_log.h"
 #include <string.h>
+#include <stdio.h>
 
 static const char *TAG = "subghz";
 
@@ -125,7 +127,117 @@ static void on_back_to_main(lv_event_t *e)
     subghz_host_show_main_tiles();
 }
 
-static void on_listen(lv_event_t *e)   { (void)e; ESP_LOGI(TAG, "Listen");   show_subghz_listen_page(); }
+static void close_listen_popup(subghz_tab_state_t *st)
+{
+    if (st && st->clear_popup) {
+        lv_obj_delete(st->clear_popup);
+        st->clear_popup = NULL;
+    }
+}
+
+static void on_listen_confirmed(lv_event_t *e)
+{
+    subghz_tab_state_t *st = (subghz_tab_state_t *)lv_event_get_user_data(e);
+    close_listen_popup(st);
+    ESP_LOGI(TAG, "Listen: user confirmed signal-list wipe, opening Listen page");
+    show_subghz_listen_page();
+}
+
+static void on_listen_cancel(lv_event_t *e)
+{
+    subghz_tab_state_t *st = (subghz_tab_state_t *)lv_event_get_user_data(e);
+    ESP_LOGI(TAG, "Listen: user cancelled");
+    close_listen_popup(st);
+}
+
+static void on_listen(lv_event_t *e)
+{
+    (void)e;
+    ESP_LOGI(TAG, "Listen");
+
+    subghz_tab_state_t *st = subghz_host_state();
+    if (!st || st->clear_popup) return;
+
+    /* Probe firmware: how many signals are currently stored? Listen will wipe them. */
+    subghz_host_uart_flush_input(subghz_host_current_tab());
+    subghz_host_uart_send("subghz_list");
+    subghz_collect_signal_list(st, 3000, true);
+
+    if (st->sigs_count == 0) {
+        ESP_LOGI(TAG, "Listen: no stored signals, opening directly");
+        show_subghz_listen_page();
+        return;
+    }
+
+    ESP_LOGI(TAG, "Listen: %d stored signal(s), asking for confirmation", st->sigs_count);
+
+    lv_obj_t *overlay = lv_obj_create(lv_scr_act());
+    lv_obj_remove_style_all(overlay);
+    lv_obj_set_size(overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(overlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(overlay, LV_OPA_50, 0);
+    lv_obj_clear_flag(overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(overlay, LV_OBJ_FLAG_CLICKABLE);
+    st->clear_popup = overlay;
+
+    lv_obj_t *popup = lv_obj_create(overlay);
+    lv_obj_set_size(popup, 540, 260);
+    lv_obj_center(popup);
+    subghz_style_popup_card(popup, 12, subghz_host_color_red());
+    lv_obj_set_flex_flow(popup, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(popup, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_all(popup, 18, 0);
+    lv_obj_set_style_pad_gap(popup, 12, 0);
+    lv_obj_clear_flag(popup, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(popup);
+    lv_label_set_text(title, "Listen will erase stored signals");
+    lv_obj_set_style_text_color(title, subghz_host_ui_text(), 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_22, 0);
+
+    lv_obj_t *body = lv_label_create(popup);
+    lv_label_set_text(body,
+        "This will empty your signals list.\nAre you sure you want to proceed?");
+    lv_obj_set_style_text_color(body, subghz_host_ui_text(), 0);
+    lv_obj_set_style_text_font(body, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_align(body, LV_TEXT_ALIGN_CENTER, 0);
+
+    lv_obj_t *hint = lv_label_create(popup);
+    lv_label_set_text_fmt(hint, "%d signal%s currently stored",
+                          st->sigs_count, st->sigs_count == 1 ? "" : "s");
+    lv_obj_set_style_text_color(hint, subghz_host_ui_muted(), 0);
+    lv_obj_set_style_text_font(hint, &lv_font_montserrat_16, 0);
+
+    lv_obj_t *brow = lv_obj_create(popup);
+    lv_obj_set_size(brow, lv_pct(100), 60);
+    lv_obj_set_flex_flow(brow, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(brow, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_bg_opa(brow, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(brow, 0, 0);
+
+    lv_obj_t *yes = lv_btn_create(brow);
+    lv_obj_set_size(yes, 180, 50);
+    lv_obj_set_style_bg_color(yes, subghz_host_color_red(), 0);
+    lv_obj_set_style_radius(yes, 8, 0);
+    lv_obj_add_event_cb(yes, on_listen_confirmed, LV_EVENT_CLICKED, st);
+    lv_obj_t *yl = lv_label_create(yes);
+    lv_label_set_text(yl, "Yes, proceed");
+    lv_obj_set_style_text_color(yl, lv_color_white(), 0);
+    lv_obj_set_style_text_font(yl, &lv_font_montserrat_18, 0);
+    lv_obj_center(yl);
+
+    lv_obj_t *no = lv_btn_create(brow);
+    lv_obj_set_size(no, 180, 50);
+    lv_obj_set_style_bg_color(no, subghz_host_ui_card(), 0);
+    lv_obj_set_style_radius(no, 8, 0);
+    lv_obj_add_event_cb(no, on_listen_cancel, LV_EVENT_CLICKED, st);
+    lv_obj_t *nl = lv_label_create(no);
+    lv_label_set_text(nl, "Cancel");
+    lv_obj_set_style_text_color(nl, subghz_host_ui_text(), 0);
+    lv_obj_set_style_text_font(nl, &lv_font_montserrat_18, 0);
+    lv_obj_center(nl);
+}
+
 static void on_transmit(lv_event_t *e) { (void)e; ESP_LOGI(TAG, "Transmit"); show_subghz_transmit_page(); }
 static void on_manage(lv_event_t *e)   { (void)e; ESP_LOGI(TAG, "Manage");   show_subghz_manage_page(); }
 static void on_jammer(lv_event_t *e)   { (void)e; ESP_LOGI(TAG, "Jammer");   show_subghz_jammer_page(); }

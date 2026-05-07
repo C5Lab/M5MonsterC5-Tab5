@@ -42,8 +42,9 @@ static void on_delete_tap(lv_event_t *e)
     ESP_LOGI(TAG, "Delete signal idx=%d", idx);
 
     /* Refresh list */
+    subghz_host_uart_flush_input(subghz_host_current_tab());
     subghz_host_uart_send("subghz_list");
-    subghz_collect_signal_list(st, 5000, true);
+    subghz_collect_signal_list(st, 3000, true);
     if (st->status_lbl) {
         lv_label_set_text_fmt(st->status_lbl, "%d signals (unique)", st->sigs_count);
         lv_obj_set_style_text_color(st->status_lbl, subghz_host_ui_muted(), 0);
@@ -254,8 +255,9 @@ static void on_import(lv_event_t *e)
     }
 
     /* Refresh list */
+    subghz_host_uart_flush_input(subghz_host_current_tab());
     subghz_host_uart_send("subghz_list");
-    subghz_collect_signal_list(st, 8000, true);
+    subghz_collect_signal_list(st, 3000, true);
     if (st->status_lbl) {
         lv_label_set_text_fmt(st->status_lbl, "%d signals (unique)", st->sigs_count);
         lv_obj_set_style_text_color(st->status_lbl, subghz_host_ui_muted(), 0);
@@ -370,8 +372,9 @@ void show_subghz_manage_page(void)
     lv_obj_set_scrollbar_mode(st->sig_list_obj, LV_SCROLLBAR_MODE_AUTO);
 
     /* Fetch the signal list */
+    subghz_host_uart_flush_input(subghz_host_current_tab());
     subghz_host_uart_send("subghz_list");
-    subghz_collect_signal_list(st, 5000, true);
+    subghz_collect_signal_list(st, 3000, true);
 
     if (st->status_lbl) {
         lv_label_set_text_fmt(st->status_lbl, "%d signals (unique)", st->sigs_count);

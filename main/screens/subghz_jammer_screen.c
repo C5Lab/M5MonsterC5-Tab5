@@ -6,11 +6,7 @@
 
 static const char *TAG = "subghz_jam";
 
-/* Frequency presets (MHz). Values stored in static so we can pass pointers via user_data. */
-static float s_p315  = 315.00f;
-static float s_p433  = 433.92f;
-static float s_p868  = 868.00f;
-static float s_p915  = 915.00f;
+static const char *s_digit_opts = "0\n1\n2\n3\n4\n5\n6\n7\n8\n9";
 
 static void on_back(lv_event_t *e);
 
@@ -30,20 +26,33 @@ static void update_jammer_freq_label(subghz_tab_state_t *st)
     lv_label_set_text_fmt(st->jammer_freq_lbl, "%d.%02d MHz", whole, frac);
 }
 
-static void on_freq_preset(lv_event_t *e)
+static void freq_decompose(float freq, int digits[5])
 {
-    subghz_tab_state_t *st = subghz_host_state();
-    float *freq = (float *)lv_event_get_user_data(e);
-    if (!st || !freq) return;
-    st->freq_mhz = *freq;
+    int val = (int)(freq * 100.0f + 0.5f);
+    digits[0] = (val / 10000) % 10;
+    digits[1] = (val / 1000) % 10;
+    digits[2] = (val / 100) % 10;
+    digits[3] = (val / 10) % 10;
+    digits[4] = val % 10;
+}
+
+static void on_freq_set(lv_event_t *e)
+{
+    subghz_tab_state_t *st = (subghz_tab_state_t *)lv_event_get_user_data(e);
+    if (!st) return;
+    int d[5];
+    for (int i = 0; i < 5; i++)
+        d[i] = (int)lv_roller_get_selected(st->rollers[i]);
+
+    st->freq_mhz = d[0] * 100.0f + d[1] * 10.0f + d[2] * 1.0f
+                 + d[3] * 0.1f + d[4] * 0.01f;
     update_jammer_freq_label(st);
     close_freq_popup(st);
 }
 
-static void on_freq_popup_close(lv_event_t *e)
+static void on_freq_cancel(lv_event_t *e)
 {
-    (void)e;
-    subghz_tab_state_t *st = subghz_host_state();
+    subghz_tab_state_t *st = (subghz_tab_state_t *)lv_event_get_user_data(e);
     if (st) close_freq_popup(st);
 }
 
@@ -53,6 +62,9 @@ static void on_freq_tap(lv_event_t *e)
     subghz_tab_state_t *st = subghz_host_state();
     if (!st || st->jamming) return;
     if (st->jammer_freq_popup) { close_freq_popup(st); return; }
+
+    int digits[5];
+    freq_decompose(st->freq_mhz, digits);
 
     lv_obj_t *overlay = lv_obj_create(lv_scr_act());
     lv_obj_remove_style_all(overlay);
@@ -64,50 +76,79 @@ static void on_freq_tap(lv_event_t *e)
     st->jammer_freq_popup = overlay;
 
     lv_obj_t *popup = lv_obj_create(overlay);
-    lv_obj_set_size(popup, 460, 280);
+    lv_obj_set_size(popup, 480, 280);
     lv_obj_center(popup);
     subghz_style_popup_card(popup, 12, subghz_host_color_red());
-    lv_obj_set_flex_flow(popup, LV_FLEX_FLOW_ROW_WRAP);
-    lv_obj_set_flex_align(popup, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_flex_flow(popup, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(popup, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_all(popup, 14, 0);
     lv_obj_set_style_pad_gap(popup, 12, 0);
     lv_obj_clear_flag(popup, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *title = lv_label_create(popup);
     lv_label_set_text(title, "Frequency (MHz)");
-    lv_obj_set_width(title, lv_pct(100));
     lv_obj_set_style_text_color(title, subghz_host_ui_text(), 0);
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_22, 0);
-    lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_18, 0);
 
-    static const struct { const char *txt; float *val; } presets[] = {
-        {"315",    &s_p315},
-        {"433.92", &s_p433},
-        {"868",    &s_p868},
-        {"915",    &s_p915},
-    };
-    for (int i = 0; i < 4; i++) {
-        lv_obj_t *btn = lv_btn_create(popup);
-        lv_obj_set_size(btn, 180, 60);
-        lv_obj_set_style_bg_color(btn, subghz_host_ui_card(), 0);
-        lv_obj_set_style_bg_color(btn, subghz_host_ui_card_pressed(), LV_STATE_PRESSED);
-        lv_obj_set_style_radius(btn, 8, 0);
-        lv_obj_add_event_cb(btn, on_freq_preset, LV_EVENT_CLICKED, presets[i].val);
+    lv_obj_t *roller_row = lv_obj_create(popup);
+    lv_obj_set_size(roller_row, lv_pct(100), 140);
+    lv_obj_set_flex_flow(roller_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(roller_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_all(roller_row, 0, 0);
+    lv_obj_set_style_pad_gap(roller_row, 4, 0);
+    lv_obj_set_style_bg_opa(roller_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(roller_row, 0, 0);
+    lv_obj_clear_flag(roller_row, LV_OBJ_FLAG_SCROLLABLE);
 
-        lv_obj_t *lbl = lv_label_create(btn);
-        lv_label_set_text(lbl, presets[i].txt);
-        lv_obj_set_style_text_color(lbl, subghz_host_ui_text(), 0);
-        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_22, 0);
-        lv_obj_center(lbl);
+    for (int i = 0; i < 5; i++) {
+        if (i == 3) {
+            lv_obj_t *dot = lv_label_create(roller_row);
+            lv_label_set_text(dot, ".");
+            lv_obj_set_style_text_font(dot, &lv_font_montserrat_36, 0);
+            lv_obj_set_style_text_color(dot, subghz_host_ui_text(), 0);
+        }
+        st->rollers[i] = lv_roller_create(roller_row);
+        lv_roller_set_options(st->rollers[i], s_digit_opts, LV_ROLLER_MODE_INFINITE);
+        lv_roller_set_visible_row_count(st->rollers[i], 3);
+        lv_obj_set_width(st->rollers[i], 64);
+        lv_obj_set_style_bg_color(st->rollers[i], subghz_host_ui_card(), 0);
+        lv_obj_set_style_bg_opa(st->rollers[i], LV_OPA_COVER, 0);
+        lv_obj_set_style_text_color(st->rollers[i], subghz_host_ui_text(), 0);
+        lv_obj_set_style_text_font(st->rollers[i], &lv_font_montserrat_28, 0);
+        lv_obj_set_style_text_color(st->rollers[i], subghz_host_color_cyan(), LV_PART_SELECTED);
+        lv_obj_set_style_bg_color(st->rollers[i], subghz_host_ui_panel(), LV_PART_SELECTED);
+        lv_obj_set_style_border_width(st->rollers[i], 0, 0);
+        lv_obj_set_style_radius(st->rollers[i], 8, 0);
+        lv_roller_set_selected(st->rollers[i], digits[i], LV_ANIM_OFF);
     }
 
-    lv_obj_t *close_btn = lv_btn_create(popup);
-    lv_obj_set_size(close_btn, 380, 50);
-    lv_obj_set_style_bg_color(close_btn, subghz_host_ui_muted(), 0);
-    lv_obj_set_style_radius(close_btn, 8, 0);
-    lv_obj_add_event_cb(close_btn, on_freq_popup_close, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *cl = lv_label_create(close_btn);
-    lv_label_set_text(cl, "Close");
+    lv_obj_t *btn_row = lv_obj_create(popup);
+    lv_obj_set_size(btn_row, lv_pct(100), 60);
+    lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(btn_row, 0, 0);
+    lv_obj_set_style_pad_all(btn_row, 0, 0);
+    lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *set_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(set_btn, 160, 50);
+    lv_obj_set_style_bg_color(set_btn, subghz_host_color_green(), 0);
+    lv_obj_set_style_radius(set_btn, 8, 0);
+    lv_obj_add_event_cb(set_btn, on_freq_set, LV_EVENT_CLICKED, st);
+    lv_obj_t *sl = lv_label_create(set_btn);
+    lv_label_set_text(sl, "Set");
+    lv_obj_set_style_text_color(sl, lv_color_white(), 0);
+    lv_obj_set_style_text_font(sl, &lv_font_montserrat_18, 0);
+    lv_obj_center(sl);
+
+    lv_obj_t *cancel_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(cancel_btn, 160, 50);
+    lv_obj_set_style_bg_color(cancel_btn, subghz_host_ui_muted(), 0);
+    lv_obj_set_style_radius(cancel_btn, 8, 0);
+    lv_obj_add_event_cb(cancel_btn, on_freq_cancel, LV_EVENT_CLICKED, st);
+    lv_obj_t *cl = lv_label_create(cancel_btn);
+    lv_label_set_text(cl, "Cancel");
     lv_obj_set_style_text_color(cl, lv_color_white(), 0);
     lv_obj_set_style_text_font(cl, &lv_font_montserrat_18, 0);
     lv_obj_center(cl);

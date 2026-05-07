@@ -693,13 +693,29 @@ static void on_start_stop(lv_event_t *e)
     ESP_LOGI(TAG, "SubGHz listen started (%.2f MHz, raw=%d)", st->freq_mhz, st->raw_mode);
 }
 
+static void update_mode_switch_labels(subghz_tab_state_t *st)
+{
+    if (!st->btn_raw) return;
+    lv_obj_t *parent = lv_obj_get_parent(st->btn_raw);
+    if (!parent) return;
+    lv_obj_t *dec_lbl = lv_obj_get_child(parent, 0);
+    lv_obj_t *raw_lbl = lv_obj_get_child(parent, 2);
+    if (dec_lbl) {
+        lv_obj_set_style_text_color(dec_lbl,
+            st->raw_mode ? subghz_host_ui_muted() : subghz_host_color_cyan(), 0);
+    }
+    if (raw_lbl) {
+        lv_obj_set_style_text_color(raw_lbl,
+            st->raw_mode ? subghz_host_color_orange() : subghz_host_ui_muted(), 0);
+    }
+}
+
 static void on_raw_toggle(lv_event_t *e)
 {
     subghz_tab_state_t *st = (subghz_tab_state_t *)lv_event_get_user_data(e);
     if (!st || !st->btn_raw) return;
-    st->raw_mode = !st->raw_mode;
-    lv_obj_t *lbl = lv_obj_get_child(st->btn_raw, 0);
-    if (lbl) lv_label_set_text(lbl, st->raw_mode ? "RAW" : "Dec");
+    st->raw_mode = lv_obj_has_state(st->btn_raw, LV_STATE_CHECKED);
+    update_mode_switch_labels(st);
 }
 
 /* ---- Cleanup ----------------------------------------------------- */
@@ -827,17 +843,35 @@ void show_subghz_listen_page(void)
     lv_obj_set_style_text_font(sl, &lv_font_montserrat_18, 0);
     lv_obj_center(sl);
 
-    st->btn_raw = lv_btn_create(ctrl);
-    lv_obj_set_size(st->btn_raw, 100, 50);
+    lv_obj_t *mode_box = lv_obj_create(ctrl);
+    lv_obj_set_size(mode_box, 240, 50);
+    lv_obj_set_flex_flow(mode_box, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(mode_box, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_all(mode_box, 0, 0);
+    lv_obj_set_style_pad_gap(mode_box, 8, 0);
+    lv_obj_set_style_bg_opa(mode_box, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(mode_box, 0, 0);
+    lv_obj_clear_flag(mode_box, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *dec_lbl = lv_label_create(mode_box);
+    lv_label_set_text(dec_lbl, "Decimal");
+    lv_obj_set_style_text_font(dec_lbl, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_color(dec_lbl,
+        st->raw_mode ? subghz_host_ui_muted() : subghz_host_color_cyan(), 0);
+
+    st->btn_raw = lv_switch_create(mode_box);
+    lv_obj_set_size(st->btn_raw, 60, 32);
     lv_obj_set_style_bg_color(st->btn_raw, subghz_host_ui_card(), 0);
-    lv_obj_set_style_bg_color(st->btn_raw, subghz_host_ui_card_pressed(), LV_STATE_PRESSED);
-    lv_obj_set_style_radius(st->btn_raw, 8, 0);
-    lv_obj_add_event_cb(st->btn_raw, on_raw_toggle, LV_EVENT_CLICKED, st);
-    lv_obj_t *rl = lv_label_create(st->btn_raw);
-    lv_label_set_text(rl, st->raw_mode ? "RAW" : "Dec");
-    lv_obj_set_style_text_color(rl, subghz_host_ui_text(), 0);
-    lv_obj_set_style_text_font(rl, &lv_font_montserrat_18, 0);
-    lv_obj_center(rl);
+    lv_obj_set_style_bg_color(st->btn_raw, subghz_host_color_orange(), LV_PART_INDICATOR | LV_STATE_CHECKED);
+    if (st->raw_mode) lv_obj_add_state(st->btn_raw, LV_STATE_CHECKED);
+    else              lv_obj_clear_state(st->btn_raw, LV_STATE_CHECKED);
+    lv_obj_add_event_cb(st->btn_raw, on_raw_toggle, LV_EVENT_VALUE_CHANGED, st);
+
+    lv_obj_t *raw_lbl = lv_label_create(mode_box);
+    lv_label_set_text(raw_lbl, "Raw");
+    lv_obj_set_style_text_font(raw_lbl, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_color(raw_lbl,
+        st->raw_mode ? subghz_host_color_orange() : subghz_host_ui_muted(), 0);
 
     st->count_lbl = lv_label_create(ctrl);
     lv_obj_set_style_text_font(st->count_lbl, &lv_font_montserrat_18, 0);

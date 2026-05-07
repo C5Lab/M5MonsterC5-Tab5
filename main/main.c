@@ -5368,6 +5368,13 @@ int subghz_host_uart_read_bytes(int tab_id, void *buf, size_t sz, uint32_t ticks
     return transport_read_bytes_tab((tab_id_t)tab_id, port, buf, sz, ticks);
 }
 
+void subghz_host_uart_flush_input(int tab_id)
+{
+    if (tab_is_internal((tab_id_t)tab_id)) return;
+    uart_port_t port = uart_port_for_tab((tab_id_t)tab_id);
+    uart_flush_input(port);
+}
+
 void subghz_host_hide_all_pages(void)
 {
     tab_context_t *ctx = get_current_ctx();
