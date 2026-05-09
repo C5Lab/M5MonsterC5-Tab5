@@ -45,8 +45,8 @@
 #include "esp_http_server.h"
 #include "lwip/sockets.h"
 
-#define JANOS_TAB_VERSION "1.3.4"
-#define JANOS_VERSION_REQUIRED "1.6.3"
+#define JANOS_TAB_VERSION "1.3.5"
+#define JANOS_VERSION_REQUIRED "1.6.4"
 #include "lwip/netdb.h"
 #include <dirent.h>
 #include <sys/stat.h>
@@ -27011,6 +27011,19 @@ static void check_all_sd_cards(void)
              internal_sd_present ? "YES" : "NO");
 }
 
+// Returns true if 'actual' version is older than 'required' (semver major.minor.patch).
+// Equal or newer versions are accepted (not a mismatch).
+static bool janos_version_too_old(const char *actual, const char *required)
+{
+    int a1 = 0, a2 = 0, a3 = 0;
+    int r1 = 0, r2 = 0, r3 = 0;
+    sscanf(actual,   "%d.%d.%d", &a1, &a2, &a3);
+    sscanf(required, "%d.%d.%d", &r1, &r2, &r3);
+    if (a1 != r1) return a1 < r1;
+    if (a2 != r2) return a2 < r2;
+    return a3 < r3;
+}
+
 // Check JanOS firmware version on a specific UART tab by sending 'version' command.
 // Older firmware that doesn't have the command responds with "Unrecognized command".
 static void check_version_for_tab(tab_id_t tab)
@@ -27060,7 +27073,7 @@ static void check_version_for_tab(tab_id_t tab)
                     i++;
                 }
                 ctx->janos_version[i] = '\0';
-                ctx->janos_version_mismatch = (strcmp(ctx->janos_version, JANOS_VERSION_REQUIRED) != 0);
+                ctx->janos_version_mismatch = janos_version_too_old(ctx->janos_version, JANOS_VERSION_REQUIRED);
                 ESP_LOGI(TAG, "[%s] JanOS version: %s (mismatch=%d)", tab_name, ctx->janos_version, ctx->janos_version_mismatch);
                 if (tab == TAB_USB) usb_rx_exclusive = false;
                 return;
