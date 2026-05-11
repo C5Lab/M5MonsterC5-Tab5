@@ -181,6 +181,9 @@ typedef struct {
     char vendor[48];
     int client_count;
     char clients[MAX_CLIENTS_PER_NETWORK][18];  // MAC addresses of clients
+    bool mfp_capable;
+    char uptime[64];
+    bool inspected;
 } observer_network_t;
 
 // Deauth Detector entry
@@ -357,6 +360,12 @@ typedef struct {
     int           inspect_label_count;
     int           inspect_tab;            // tab_id_t value (forward decl below)
 
+    // Inspect-network async for observer table
+    volatile bool observer_inspect_active;
+    TaskHandle_t  observer_inspect_task;
+    lv_obj_t    **observer_inspect_info_labels;  // PSRAM array
+    int           observer_inspect_label_count;
+
     // Network popup (clients, deauth)
     lv_obj_t *network_popup;
     lv_obj_t *popup_clients_container;
@@ -421,6 +430,7 @@ typedef struct {
     lv_obj_t *observer_page;
     lv_obj_t *observer_start_btn;
     lv_obj_t *observer_stop_btn;
+    lv_obj_t *observer_export_btn;
     lv_obj_t *observer_table;
     lv_obj_t *observer_status_label;
 
@@ -1717,7 +1727,7 @@ static void network_item_event_cb(lv_event_t *e);
 static void attack_tile_event_cb(lv_event_t *e);
 static void observer_attack_tile_event_cb(lv_event_t *e);
 static void observer_station_attack_tile_event_cb(lv_event_t *e);
-static void create_attack_action_bar(lv_obj_t *parent, lv_event_cb_t callback);
+static void create_attack_action_bar(lv_obj_t *parent, lv_event_cb_t callback, lv_event_cb_t karma_callback);
 static void create_status_bar(void);
 static void header_settings_click_cb(lv_event_t *e);
 static void switch_to_internal_settings_page(void);
@@ -1970,7 +1980,6 @@ static void wardrive_wigle_network_row_click_cb(lv_event_t *e);
 static void wardrive_wigle_text_input_cb(lv_event_t *e);
 static void wardrive_wigle_keyboard_cb(lv_event_t *e);
 static void wardrive_wigle_connect_btn_cb(lv_event_t *e);
-static void wardrive_wigle_retry_wifi_btn_cb(lv_event_t *e);
 static void wardrive_wigle_rescan_btn_cb(lv_event_t *e);
 static void wardrive_wigle_show_password_toggle_cb(lv_event_t *e);
 static bool wardrive_wigle_store_file(tab_context_t *ctx, const char *dir, const char *token);
@@ -4234,13 +4243,14 @@ static void inspect_networks_task(void *arg)
                 wifi_network_t *net = &ctx->networks[i - 1];
                 const char *vendor_display =
                     (net->vendor[0] != '\0') ? net->vendor : "-";
-                const char *mfp_text = mfp_capable ? "MFP" : "NO_MFP";
-                const char *up_text  = uptime_str[0] ? uptime_str : "?";
+                const char *up_text = uptime_str[0] ? uptime_str : "?";
 
+                lv_label_set_recolor(ctx->inspect_info_labels[i - 1], true);
                 lv_label_set_text_fmt(ctx->inspect_info_labels[i - 1],
                     "%s  |  %s  |  %s  |  %d dBm  |  %s  |  Uptime: %s\nVendor: %s",
                     net->bssid, net->band, net->security, net->rssi,
-                    mfp_text, up_text, vendor_display);
+                    mfp_capable ? "#FF5555 MFP On#" : "#55DD55 MFP Off#",
+                    up_text, vendor_display);
             }
             bsp_display_unlock();
         } else if (!got_line) {
@@ -4259,6 +4269,142 @@ static void inspect_networks_task(void *arg)
 
     ctx->inspect_task = NULL;
     ctx->inspect_active = false;
+    vTaskDeleteWithCaps(NULL);
+}
+
+static void cancel_observer_inspect_task(tab_context_t *ctx)
+{
+    if (!ctx) return;
+    if (!ctx->observer_inspect_task && !ctx->observer_inspect_active) return;
+    ctx->observer_inspect_active = false;
+    for (int w = 0; w < 25 && ctx->observer_inspect_task != NULL; w++) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+static void inspect_observer_task(void *arg)
+{
+    tab_id_t tab = (tab_id_t)(uintptr_t)arg;
+    tab_context_t *ctx = get_ctx_for_tab(tab);
+    if (!ctx) { vTaskDeleteWithCaps(NULL); return; }
+
+    uart_port_t port = uart_port_for_tab(tab);
+    const char *uart_name = tab_transport_name(tab);
+
+    char *rx   = heap_caps_malloc(UART_BUF_SIZE, MALLOC_CAP_SPIRAM);
+    char *line = heap_caps_malloc(512,           MALLOC_CAP_SPIRAM);
+    if (!rx || !line) {
+        if (rx) heap_caps_free(rx);
+        if (line) heap_caps_free(line);
+        ctx->observer_inspect_task = NULL;
+        ctx->observer_inspect_active = false;
+        vTaskDeleteWithCaps(NULL);
+        return;
+    }
+
+    int total = ctx->observer_inspect_label_count;
+    ESP_LOGI(TAG, "[%s] observer inspect task started for %d networks", uart_name, total);
+
+    for (int i = 0; ctx->observer_inspect_active && i < total; i++) {
+        if (!ctx->observer_networks || i >= ctx->observer_network_count) break;
+        observer_network_t *net = &ctx->observer_networks[i];
+
+        // Skip if already inspected
+        if (net->inspected) {
+            // Still update label in case table was just rebuilt
+            if (bsp_display_lock(50)) {
+                if (ctx->observer_inspect_info_labels &&
+                    i < ctx->observer_inspect_label_count &&
+                    ctx->observer_inspect_info_labels[i] &&
+                    lv_obj_is_valid(ctx->observer_inspect_info_labels[i])) {
+                    const char *up_text = net->uptime[0] ? net->uptime : "?";
+                    lv_label_set_recolor(ctx->observer_inspect_info_labels[i], true);
+                    lv_label_set_text_fmt(ctx->observer_inspect_info_labels[i],
+                        "%s  |  %s  |  %d dBm  |  %s  |  Uptime: %s\nVendor: %s",
+                        net->bssid, net->band, net->rssi,
+                        net->mfp_capable ? "#FF5555 MFP On#" : "#55DD55 MFP Off#",
+                        up_text, net->vendor[0] ? net->vendor : "-");
+                }
+                bsp_display_unlock();
+            }
+            continue;
+        }
+
+        if (tab == TAB_USB && usb_cdc_handle) {
+            usbh_cdc_flush_rx_buffer(usb_cdc_handle);
+        } else {
+            uart_flush(port);
+        }
+
+        char cmd[40];
+        int  n = snprintf(cmd, sizeof(cmd), "inspect_network %d\r\n", net->scan_index);
+        transport_write_bytes_tab(tab, port, cmd, n);
+
+        bool       got_line = false;
+        int        lp = 0;
+        TickType_t t0 = xTaskGetTickCount();
+        bool       mfp_capable = false;
+        char       uptime_str[64] = {0};
+
+        while (ctx->observer_inspect_active && !got_line &&
+               (xTaskGetTickCount() - t0) < pdMS_TO_TICKS(1500)) {
+            int rxlen = transport_read_bytes_tab(tab, port, rx,
+                                                 UART_BUF_SIZE - 1,
+                                                 pdMS_TO_TICKS(100));
+            if (rxlen <= 0) continue;
+            rx[rxlen] = '\0';
+            for (int b = 0; b < rxlen && !got_line; b++) {
+                char c = rx[b];
+                if (c == '\n' || c == '\r') {
+                    if (lp > 0) {
+                        line[lp] = '\0';
+                        if (strstr(line, "[INSPECT]")) {
+                            char mfp_val[8] = {0};
+                            if (extract_inspect_kv(line, "mfp_capable=", mfp_val, sizeof(mfp_val)))
+                                mfp_capable = (mfp_val[0] == '1');
+                            extract_inspect_uptime(line, uptime_str, sizeof(uptime_str));
+                            got_line = true;
+                        }
+                        lp = 0;
+                    }
+                } else if (lp < 511) {
+                    line[lp++] = c;
+                }
+            }
+        }
+
+        if (!ctx->observer_inspect_active) break;
+
+        if (got_line) {
+            net->mfp_capable = mfp_capable;
+            snprintf(net->uptime, sizeof(net->uptime), "%s", uptime_str);
+            net->inspected = true;
+
+            if (bsp_display_lock(50)) {
+                if (ctx->observer_inspect_info_labels &&
+                    i < ctx->observer_inspect_label_count &&
+                    ctx->observer_inspect_info_labels[i] &&
+                    lv_obj_is_valid(ctx->observer_inspect_info_labels[i])) {
+                        const char *up_text = uptime_str[0] ? uptime_str : "?";
+                    lv_label_set_recolor(ctx->observer_inspect_info_labels[i], true);
+                    lv_label_set_text_fmt(ctx->observer_inspect_info_labels[i],
+                        "%s  |  %s  |  %d dBm  |  %s  |  Uptime: %s\nVendor: %s",
+                        net->bssid, net->band, net->rssi,
+                        mfp_capable ? "#FF5555 MFP On#" : "#55DD55 MFP Off#",
+                        up_text, net->vendor[0] ? net->vendor : "-");
+                }
+                bsp_display_unlock();
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+
+    ESP_LOGI(TAG, "[%s] observer inspect task finished", uart_name);
+    heap_caps_free(rx);
+    heap_caps_free(line);
+    ctx->observer_inspect_task = NULL;
+    ctx->observer_inspect_active = false;
     vTaskDeleteWithCaps(NULL);
 }
 
@@ -5095,10 +5241,13 @@ static lv_obj_t *create_small_tile(lv_obj_t *parent, const char *icon, const cha
     return tile;
 }
 
-static void create_attack_action_bar(lv_obj_t *parent, lv_event_cb_t callback)
+static void create_attack_action_bar(lv_obj_t *parent, lv_event_cb_t callback, lv_event_cb_t karma_callback)
 {
+    bool three_cols = enable_red_team && (karma_callback != NULL);
+    lv_coord_t bar_h = three_cols ? 240 : 162;
+
     lv_obj_t *attack_bar = lv_obj_create(parent);
-    lv_obj_set_size(attack_bar, lv_pct(100), 162);
+    lv_obj_set_size(attack_bar, lv_pct(100), bar_h);
     lv_obj_set_style_bg_opa(attack_bar, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(attack_bar, 0, 0);
     lv_obj_set_style_pad_all(attack_bar, 4, 0);
@@ -5134,42 +5283,71 @@ static void create_attack_action_bar(lv_obj_t *parent, lv_event_cb_t callback)
     }
     if (row_inner_w < 280) row_inner_w = 280;
 
-    // Both rows: 4 tiles each, 3 gaps of 8px = 24px total gap, uniform width
-    const lv_coord_t gap_total = 24;
-    lv_coord_t btn_w = (row_inner_w - gap_total) / 4;
-    if (btn_w < 60) btn_w = 60;
-    lv_coord_t btn_last_w = btn_w;
-    lv_coord_t used = (btn_w * 4) + gap_total;
-    if (used < row_inner_w) {
-        btn_last_w += (row_inner_w - used);
-    }
-
     if (enable_red_team) {
-        lv_obj_t *btn1 = create_small_tile(attack_row1, LV_SYMBOL_CHARGE, "Deauth", COLOR_MATERIAL_RED, callback, "Deauth");
-        lv_obj_t *btn2 = create_small_tile(attack_row1, LV_SYMBOL_WARNING, "Evil Twin", COLOR_MATERIAL_ORANGE, callback, "Evil Twin");
-        lv_obj_t *btn3 = create_small_tile(attack_row1, LV_SYMBOL_POWER, "SAE Overflow", COLOR_MATERIAL_PINK, callback, "SAE Overflow");
-        lv_obj_t *btn4 = create_small_tile(attack_row1, LV_SYMBOL_DOWNLOAD, "Handshake", COLOR_MATERIAL_AMBER, callback, "Handshaker");
-        lv_obj_t *btn5 = create_small_tile(attack_row2, LV_SYMBOL_SHUFFLE, "ARP", COLOR_MATERIAL_PURPLE, callback, "ARP Poison");
-        lv_obj_t *btn6 = create_small_tile(attack_row2, LV_SYMBOL_WIFI, "RogueAP", COLOR_MATERIAL_CYAN, callback, "Rogue AP");
-        lv_obj_t *btn7 = create_small_tile(attack_row2, LV_SYMBOL_EYE_OPEN, "MITM", COLOR_MATERIAL_TEAL, callback, "MITM");
-        lv_obj_t *btn8 = create_small_tile(attack_row2, LV_SYMBOL_LIST, "Nmap", COLOR_MATERIAL_GREEN, callback, "Nmap");
+        if (three_cols) {
+            // 3x3 layout: 3 columns, 2 gaps of 8px each = 16px total
+            lv_obj_t *attack_row3 = lv_obj_create(attack_bar);
+            lv_obj_set_size(attack_row3, lv_pct(100), 72);
+            lv_obj_set_style_bg_opa(attack_row3, LV_OPA_TRANSP, 0);
+            lv_obj_set_style_border_width(attack_row3, 0, 0);
+            lv_obj_set_style_pad_all(attack_row3, 0, 0);
+            lv_obj_set_style_pad_gap(attack_row3, 8, 0);
+            lv_obj_set_flex_flow(attack_row3, LV_FLEX_FLOW_ROW);
+            lv_obj_set_flex_align(attack_row3, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+            lv_obj_clear_flag(attack_row3, LV_OBJ_FLAG_SCROLLABLE);
 
-        lv_obj_set_size(btn1, btn_w, 72);
-        lv_obj_set_size(btn2, btn_w, 72);
-        lv_obj_set_size(btn3, btn_w, 72);
-        lv_obj_set_size(btn4, btn_last_w, 72);
-        lv_obj_set_size(btn5, btn_w, 72);
-        lv_obj_set_size(btn6, btn_w, 72);
-        lv_obj_set_size(btn7, btn_w, 72);
-        lv_obj_set_size(btn8, btn_last_w, 72);
+            const lv_coord_t gap3 = 16;
+            lv_coord_t bw = (row_inner_w - gap3) / 3;
+            if (bw < 60) bw = 60;
+            lv_coord_t bw_last = bw + (row_inner_w - gap3 - bw * 3);
+
+            lv_obj_t *b1 = create_small_tile(attack_row1, LV_SYMBOL_CHARGE,    "Deauth",       COLOR_MATERIAL_RED,    callback,       "Deauth");
+            lv_obj_t *b2 = create_small_tile(attack_row1, LV_SYMBOL_WARNING,   "Evil Twin",    COLOR_MATERIAL_ORANGE, callback,       "Evil Twin");
+            lv_obj_t *b3 = create_small_tile(attack_row1, LV_SYMBOL_POWER,     "SAE Overflow", COLOR_MATERIAL_PINK,   callback,       "SAE Overflow");
+            lv_obj_t *b4 = create_small_tile(attack_row2, LV_SYMBOL_DOWNLOAD,  "Handshake",    COLOR_MATERIAL_AMBER,  callback,       "Handshaker");
+            lv_obj_t *b5 = create_small_tile(attack_row2, LV_SYMBOL_SHUFFLE,   "ARP",          COLOR_MATERIAL_PURPLE, callback,       "ARP Poison");
+            lv_obj_t *b6 = create_small_tile(attack_row2, LV_SYMBOL_EYE_OPEN,  "RogueAP",      COLOR_MATERIAL_CYAN,   callback,       "Rogue AP");
+            lv_obj_t *b7 = create_small_tile(attack_row3, LV_SYMBOL_COPY,      "MITM",         COLOR_MATERIAL_TEAL,   callback,       "MITM");
+            lv_obj_t *b8 = create_small_tile(attack_row3, LV_SYMBOL_LIST,      "Nmap",         COLOR_MATERIAL_GREEN,  callback,       "Nmap");
+            lv_obj_t *b9 = create_small_tile(attack_row3, LV_SYMBOL_WIFI,      "Karma",        COLOR_MATERIAL_AMBER,  karma_callback, "Karma");
+
+            lv_obj_set_size(b1, bw, 72); lv_obj_set_size(b2, bw, 72); lv_obj_set_size(b3, bw_last, 72);
+            lv_obj_set_size(b4, bw, 72); lv_obj_set_size(b5, bw, 72); lv_obj_set_size(b6, bw_last, 72);
+            lv_obj_set_size(b7, bw, 72); lv_obj_set_size(b8, bw, 72); lv_obj_set_size(b9, bw_last, 72);
+        } else {
+            // 2x4 layout
+            const lv_coord_t gap_total = 24;
+            lv_coord_t btn_w = (row_inner_w - gap_total) / 4;
+            if (btn_w < 60) btn_w = 60;
+            lv_coord_t btn_last_w = btn_w + (row_inner_w - gap_total - btn_w * 4);
+
+            lv_obj_t *btn1 = create_small_tile(attack_row1, LV_SYMBOL_CHARGE,   "Deauth",       COLOR_MATERIAL_RED,    callback, "Deauth");
+            lv_obj_t *btn2 = create_small_tile(attack_row1, LV_SYMBOL_WARNING,  "Evil Twin",    COLOR_MATERIAL_ORANGE, callback, "Evil Twin");
+            lv_obj_t *btn3 = create_small_tile(attack_row1, LV_SYMBOL_POWER,    "SAE Overflow", COLOR_MATERIAL_PINK,   callback, "SAE Overflow");
+            lv_obj_t *btn4 = create_small_tile(attack_row1, LV_SYMBOL_DOWNLOAD, "Handshake",    COLOR_MATERIAL_AMBER,  callback, "Handshaker");
+            lv_obj_t *btn5 = create_small_tile(attack_row2, LV_SYMBOL_SHUFFLE,  "ARP",          COLOR_MATERIAL_PURPLE, callback, "ARP Poison");
+            lv_obj_t *btn6 = create_small_tile(attack_row2, LV_SYMBOL_WIFI,     "RogueAP",      COLOR_MATERIAL_CYAN,   callback, "Rogue AP");
+            lv_obj_t *btn7 = create_small_tile(attack_row2, LV_SYMBOL_EYE_OPEN, "MITM",         COLOR_MATERIAL_TEAL,   callback, "MITM");
+            lv_obj_t *btn8 = create_small_tile(attack_row2, LV_SYMBOL_LIST,     "Nmap",         COLOR_MATERIAL_GREEN,  callback, "Nmap");
+
+            lv_obj_set_size(btn1, btn_w, 72); lv_obj_set_size(btn2, btn_w, 72);
+            lv_obj_set_size(btn3, btn_w, 72); lv_obj_set_size(btn4, btn_last_w, 72);
+            lv_obj_set_size(btn5, btn_w, 72); lv_obj_set_size(btn6, btn_w, 72);
+            lv_obj_set_size(btn7, btn_w, 72); lv_obj_set_size(btn8, btn_last_w, 72);
+        }
     } else {
-        // Non-red-team: ARP + Nmap
-        const lv_coord_t nr_gap = 8;
-        lv_coord_t nr_btn_w = (row_inner_w - nr_gap) / 2;
-        lv_obj_t *btn_arp = create_small_tile(attack_row1, LV_SYMBOL_SHUFFLE, "ARP", COLOR_MATERIAL_PURPLE, callback, "ARP Poison");
-        lv_obj_t *btn_nmap = create_small_tile(attack_row1, LV_SYMBOL_LIST, "Nmap", COLOR_MATERIAL_GREEN, callback, "Nmap");
-        lv_obj_set_size(btn_arp, nr_btn_w, 72);
+        // Non-red-team: ARP + Nmap (+ Karma if requested)
+        int nr_count = karma_callback ? 3 : 2;
+        lv_coord_t nr_gap = 8 * (nr_count - 1);
+        lv_coord_t nr_btn_w = (row_inner_w - nr_gap) / nr_count;
+        lv_obj_t *btn_arp  = create_small_tile(attack_row1, LV_SYMBOL_SHUFFLE, "ARP",  COLOR_MATERIAL_PURPLE, callback, "ARP Poison");
+        lv_obj_t *btn_nmap = create_small_tile(attack_row1, LV_SYMBOL_LIST,    "Nmap", COLOR_MATERIAL_GREEN,  callback, "Nmap");
+        lv_obj_set_size(btn_arp,  nr_btn_w, 72);
         lv_obj_set_size(btn_nmap, nr_btn_w, 72);
+        if (karma_callback) {
+            lv_obj_t *btn_karma = create_small_tile(attack_row1, LV_SYMBOL_WIFI, "Karma", COLOR_MATERIAL_AMBER, karma_callback, "Karma");
+            lv_obj_set_size(btn_karma, nr_btn_w, 72);
+        }
     }
 }
 
@@ -6639,6 +6817,16 @@ static void observer_attack_tile_event_cb(lv_event_t *e)
     prepare_observer_attack_override(ctx, observer_idx);
     ctx->observer_attack_return_to_observer =
         (strcmp(attack_name, "ARP Poison") == 0 || strcmp(attack_name, "Rogue AP") == 0 || strcmp(attack_name, "Nmap") == 0);
+
+    // Stop popup timer so it doesn't keep firing while the attack page is active
+    if (ctx->popup_timer != NULL) {
+        xTimerStop(ctx->popup_timer, 0);
+    }
+
+    // Stop the popup sniffer before launching any attack — firmware rejects
+    // commands (wifi_connect, etc.) while a sniffer/scan operation is active.
+    uart_send_command_for_tab("stop");
+    vTaskDelay(pdMS_TO_TICKS(150));
 
     handle_selected_attack(attack_name);
 }
@@ -8451,8 +8639,21 @@ static void nmap_back_cb(lv_event_t *e)
     }
 
     tab_context_t *ctx = get_current_ctx();
+    bool return_to_observer = ctx && ctx->observer_attack_return_to_observer;
+
     if (ctx) {
         ctx->nmap_page = NULL;
+        ctx->observer_attack_return_to_observer = false;
+        clear_observer_attack_override(ctx);
+    }
+
+    if (return_to_observer) {
+        show_observer_page();
+        // Restart popup timer so client polling resumes
+        if (ctx && ctx->popup_open && ctx->popup_timer != NULL) {
+            xTimerStart(ctx->popup_timer, 0);
+        }
+        return;
     }
 
     show_scan_page();
@@ -8494,11 +8695,16 @@ static void nmap_connect_cb(lv_event_t *e)
     bsp_display_unlock();
     vTaskDelay(pdMS_TO_TICKS(50));
 
-    char cmd[128];
+    char escaped_ssid[67];
+    char escaped_pass[131];
+    beacon_spam_escape_quoted_arg(nmap_target_ssid, escaped_ssid, sizeof(escaped_ssid));
+
+    char cmd[256];
     if (is_open || password == NULL || strlen(password) == 0) {
-        snprintf(cmd, sizeof(cmd), "wifi_connect %s", nmap_target_ssid);
+        snprintf(cmd, sizeof(cmd), "wifi_connect \"%s\"", escaped_ssid);
     } else {
-        snprintf(cmd, sizeof(cmd), "wifi_connect %s %s", nmap_target_ssid, password);
+        beacon_spam_escape_quoted_arg(password, escaped_pass, sizeof(escaped_pass));
+        snprintf(cmd, sizeof(cmd), "wifi_connect \"%s\" \"%s\"", escaped_ssid, escaped_pass);
     }
     uart_send_command_for_tab(cmd);
 
@@ -12045,7 +12251,7 @@ static void show_scan_page(void)
     lv_obj_set_style_pad_row(ctx->network_list, 6, 0);
     lv_obj_set_scroll_dir(ctx->network_list, LV_DIR_VER);
 
-    create_attack_action_bar(ctx->scan_page, attack_tile_event_cb);
+    create_attack_action_bar(ctx->scan_page, attack_tile_event_cb, NULL);
 
     // Auto-start scan when entering the page
     lv_obj_send_event(ctx->scan_btn, LV_EVENT_CLICKED, NULL);
@@ -12216,7 +12422,7 @@ static void show_network_popup(int network_idx)
     lv_obj_t *container = get_current_tab_container();
     if (!container) return;
     ctx->network_popup = lv_obj_create(container);
-    lv_obj_set_size(ctx->network_popup, 640, 620);
+    lv_obj_set_size(ctx->network_popup, 640, enable_red_team ? 700 : 640);
     lv_obj_center(ctx->network_popup);
     lv_obj_set_style_bg_color(ctx->network_popup, lv_color_hex(0x1A2A2A), 0);
     lv_obj_set_style_border_color(ctx->network_popup, COLOR_MATERIAL_TEAL, 0);
@@ -12312,7 +12518,7 @@ static void show_network_popup(int network_idx)
     lv_obj_set_style_pad_row(ctx->popup_clients_container, 4, 0);
     lv_obj_set_scroll_dir(ctx->popup_clients_container, LV_DIR_VER);
 
-    create_attack_action_bar(ctx->network_popup, observer_attack_tile_event_cb);
+    create_attack_action_bar(ctx->network_popup, observer_attack_tile_event_cb, observer_karma_btn_cb);
 
     // Initial client list
     update_popup_content(ctx);
@@ -12481,10 +12687,31 @@ static void update_observer_table(tab_context_t *ctx)
 {
     if (!ctx || !ctx->observer_table || !ctx->observer_networks) return;
 
+    // Show export button as soon as there are results
+    if (ctx->observer_export_btn && ctx->observer_network_count > 0) {
+        lv_obj_clear_flag(ctx->observer_export_btn, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    // Cancel running inspect before rebuilding (labels will be destroyed)
+    cancel_observer_inspect_task(ctx);
+    if (ctx->observer_inspect_info_labels) {
+        heap_caps_free(ctx->observer_inspect_info_labels);
+        ctx->observer_inspect_info_labels = NULL;
+        ctx->observer_inspect_label_count = 0;
+    }
+
     // Save current scroll position before cleaning
     lv_coord_t scroll_y = lv_obj_get_scroll_y(ctx->observer_table);
 
     lv_obj_clean(ctx->observer_table);
+
+    // Allocate inspect label array before building rows
+    if (ctx->observer_network_count > 0) {
+        ctx->observer_inspect_info_labels = heap_caps_calloc(
+            ctx->observer_network_count, sizeof(lv_obj_t *), MALLOC_CAP_SPIRAM);
+        ctx->observer_inspect_label_count = ctx->observer_inspect_info_labels
+            ? ctx->observer_network_count : 0;
+    }
 
     for (int i = 0; i < ctx->observer_network_count; i++) {
         observer_network_t *net = &ctx->observer_networks[i];
@@ -12523,13 +12750,28 @@ static void update_observer_table(tab_context_t *ctx)
         lv_obj_set_style_text_font(ssid_label, &lv_font_montserrat_18, 0);
         lv_obj_set_style_text_color(ssid_label, lv_color_hex(0xFFFFFF), 0);
 
-        // Second row: BSSID | Band | RSSI | Vendor
+        // Second row: BSSID | Band | RSSI | MFP | Uptime | Vendor
         lv_obj_t *info_label = lv_label_create(net_row);
-        lv_label_set_text_fmt(info_label, "%s  |  %s  |  %d dBm\nVendor: %s",
-                              net->bssid, net->band, net->rssi,
-                              strlen(net->vendor) > 0 ? net->vendor : "-");
+        if (net->inspected) {
+            lv_label_set_recolor(info_label, true);
+            lv_label_set_text_fmt(info_label,
+                "%s  |  %s  |  %d dBm  |  %s  |  Uptime: %s\nVendor: %s",
+                net->bssid, net->band, net->rssi,
+                net->mfp_capable ? "#FF5555 MFP On#" : "#55DD55 MFP Off#",
+                net->uptime[0] ? net->uptime : "?",
+                net->vendor[0] ? net->vendor : "-");
+        } else {
+            lv_label_set_text_fmt(info_label, "%s  |  %s  |  %d dBm\nVendor: %s",
+                net->bssid, net->band, net->rssi,
+                net->vendor[0] ? net->vendor : "-");
+        }
         lv_obj_set_style_text_font(info_label, &lv_font_montserrat_12, 0);
         lv_obj_set_style_text_color(info_label, lv_color_hex(0x888888), 0);
+
+        // Register for async inspect update
+        if (ctx->observer_inspect_info_labels && i < ctx->observer_inspect_label_count) {
+            ctx->observer_inspect_info_labels[i] = info_label;
+        }
 
         // Create client rows (indented, lighter background, clickable)
         for (int j = 0; j < MAX_CLIENTS_PER_NETWORK; j++) {
@@ -12559,6 +12801,8 @@ static void update_observer_table(tab_context_t *ctx)
 
     // Restore scroll position after rebuild
     lv_obj_scroll_to_y(ctx->observer_table, scroll_y, LV_ANIM_OFF);
+    // Inspect task is launched from observer_start_task before sniffer starts,
+    // not here — inspect_network conflicts with an active sniffer.
 }
 
 // Network row click handler
@@ -12719,7 +12963,7 @@ static void show_deauth_popup(int network_idx, int client_idx)
     lv_obj_set_style_text_color(deauth_btn_label, lv_color_hex(0xFFFFFF), 0);
     lv_obj_center(deauth_btn_label);
 
-    create_attack_action_bar(deauth_popup_obj, observer_station_attack_tile_event_cb);
+    create_attack_action_bar(deauth_popup_obj, observer_station_attack_tile_event_cb, NULL);
 }
 
 static void destroy_deauth_popup_ui(void)
@@ -13220,7 +13464,35 @@ static void observer_start_task(void *arg)
         return;
     }
 
-    // Step 2: Start sniffer
+    // Step 2: Inspect networks for MFP/uptime BEFORE starting sniffer.
+    // inspect_network commands fail while sniffer is active, so we must
+    // run inspect here while the UART is idle.
+    if (ctx->observer_network_count > 0 &&
+        ctx->observer_inspect_info_labels &&
+        ctx->observer_inspect_label_count > 0) {
+        ctx->observer_inspect_active = true;
+        BaseType_t ires = xTaskCreateWithCaps(
+            inspect_observer_task, "obs_inspect", 8192,
+            (void*)(uintptr_t)task_tab, 4,
+            &ctx->observer_inspect_task, MALLOC_CAP_SPIRAM);
+        if (ires == pdPASS) {
+            // Wait for inspect to finish before activating sniffer
+            while (ctx->observer_inspect_active && ctx->observer_running) {
+                vTaskDelay(pdMS_TO_TICKS(50));
+            }
+        } else {
+            ctx->observer_inspect_active = false;
+            ctx->observer_inspect_task = NULL;
+        }
+    }
+
+    if (!ctx->observer_running) {
+        ESP_LOGI(TAG, "[%s] Observer stopped during inspect", uart_name);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    // Step 3: Start sniffer
     ESP_LOGI(TAG, "[%s] Starting sniffer...", uart_name);
     bsp_display_lock(0);
     if (ctx->observer_status_label) {
@@ -13488,13 +13760,23 @@ static void observer_export_btn_cb(lv_event_t *e)
 static void observer_back_btn_event_cb(lv_event_t *e)
 {
     (void)e;
-    ESP_LOGI(TAG, "Observer back button clicked, returning to tiles for tab %d", current_tab);
-
     tab_context_t *ctx = get_current_ctx();
     if (!ctx) return;
 
+    // If network popup is open, close it instead of leaving the observer
+    if (ctx->network_popup != NULL) {
+        ESP_LOGI(TAG, "Observer back button: closing network popup");
+        close_network_popup();
+        return;
+    }
+
+    ESP_LOGI(TAG, "Observer back button clicked, returning to tiles for tab %d", current_tab);
+
     // Mark observer page as not visible in context
     ctx->observer_page_visible = false;
+
+    // Stop inspect task
+    cancel_observer_inspect_task(ctx);
 
     // Stop observer for current tab
     if (ctx->observer_running) {
@@ -13568,7 +13850,7 @@ static void show_observer_page(void)
     lv_obj_set_flex_flow(observer_page, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_row(observer_page, 10, 0);
 
-    // Header row: back + title
+    // Header row: back + title + buttons (all in one line)
     lv_obj_t *header = lv_obj_create(observer_page);
     lv_obj_set_size(header, lv_pct(100), 56);
     lv_obj_set_style_bg_opa(header, LV_OPA_TRANSP, 0);
@@ -13597,63 +13879,10 @@ static void show_observer_page(void)
     lv_obj_set_style_text_color(title, COLOR_MATERIAL_TEAL, 0);
     lv_obj_align_to(title, back_btn, LV_ALIGN_OUT_RIGHT_MID, 12, 0);
 
-    // Controls row below title so buttons don't overlap header text
-    lv_obj_t *controls_row = lv_obj_create(observer_page);
-    lv_obj_set_size(controls_row, lv_pct(100), 46);
-    lv_obj_set_style_bg_opa(controls_row, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(controls_row, 0, 0);
-    lv_obj_set_style_pad_all(controls_row, 0, 0);
-    lv_obj_set_flex_flow(controls_row, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(controls_row, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_column(controls_row, 12, 0);
-    lv_obj_clear_flag(controls_row, LV_OBJ_FLAG_SCROLLABLE);
-
-    // Export CSV button
-    lv_obj_t *export_btn = lv_btn_create(controls_row);
-    lv_obj_set_size(export_btn, 120, 40);
-    lv_obj_set_style_bg_color(export_btn, COLOR_MATERIAL_CYAN, 0);
-    lv_obj_set_style_bg_color(export_btn, lv_color_lighten(COLOR_MATERIAL_CYAN, 30), LV_STATE_PRESSED);
-    lv_obj_set_style_radius(export_btn, 8, 0);
-    lv_obj_add_event_cb(export_btn, observer_export_btn_cb, LV_EVENT_CLICKED, NULL);
-
-    lv_obj_t *export_label = lv_label_create(export_btn);
-    lv_label_set_text(export_label, LV_SYMBOL_SAVE " Export");
-    lv_obj_set_style_text_font(export_label, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(export_label, lv_color_hex(0x000000), 0);
-    lv_obj_center(export_label);
-
-    // Probes & Karma button
-    lv_obj_t *karma_btn = lv_btn_create(controls_row);
-    lv_obj_set_size(karma_btn, 120, 40);
-    lv_obj_set_style_bg_color(karma_btn, COLOR_MATERIAL_ORANGE, 0);
-    lv_obj_set_style_bg_color(karma_btn, lv_color_lighten(COLOR_MATERIAL_ORANGE, 30), LV_STATE_PRESSED);
-    lv_obj_set_style_radius(karma_btn, 8, 0);
-    lv_obj_add_event_cb(karma_btn, observer_karma_btn_cb, LV_EVENT_CLICKED, NULL);
-
-    lv_obj_t *karma_label = lv_label_create(karma_btn);
-    lv_label_set_text(karma_label, LV_SYMBOL_WIFI " Karma");
-    lv_obj_set_style_text_font(karma_label, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(karma_label, lv_color_hex(0x000000), 0);
-    lv_obj_center(karma_label);
-
-    // Start button (green)
-    ctx->observer_start_btn = lv_btn_create(controls_row);
-    lv_obj_set_size(ctx->observer_start_btn, 100, 40);
-    lv_obj_set_style_bg_color(ctx->observer_start_btn, COLOR_MATERIAL_GREEN, 0);
-    lv_obj_set_style_bg_color(ctx->observer_start_btn, lv_color_lighten(COLOR_MATERIAL_GREEN, 30), LV_STATE_PRESSED);
-    lv_obj_set_style_bg_color(ctx->observer_start_btn, lv_color_hex(0x444444), LV_STATE_DISABLED);
-    lv_obj_set_style_radius(ctx->observer_start_btn, 8, 0);
-    lv_obj_add_event_cb(ctx->observer_start_btn, observer_start_btn_cb, LV_EVENT_CLICKED, NULL);
-
-    lv_obj_t *start_label = lv_label_create(ctx->observer_start_btn);
-    lv_label_set_text(start_label, "Start");
-    lv_obj_set_style_text_font(start_label, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(start_label, lv_color_hex(0xFFFFFF), 0);
-    lv_obj_center(start_label);
-
-    // Stop button (red)
-    ctx->observer_stop_btn = lv_btn_create(controls_row);
-    lv_obj_set_size(ctx->observer_stop_btn, 100, 40);
+    // Stop button (red) - right edge
+    ctx->observer_stop_btn = lv_btn_create(header);
+    lv_obj_set_size(ctx->observer_stop_btn, 100, 44);
+    lv_obj_align(ctx->observer_stop_btn, LV_ALIGN_RIGHT_MID, 0, 0);
     lv_obj_set_style_bg_color(ctx->observer_stop_btn, COLOR_MATERIAL_RED, 0);
     lv_obj_set_style_bg_color(ctx->observer_stop_btn, lv_color_lighten(COLOR_MATERIAL_RED, 30), LV_STATE_PRESSED);
     lv_obj_set_style_bg_color(ctx->observer_stop_btn, lv_color_hex(0x444444), LV_STATE_DISABLED);
@@ -13666,6 +13895,38 @@ static void show_observer_page(void)
     lv_obj_set_style_text_font(stop_label, &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_color(stop_label, lv_color_hex(0xFFFFFF), 0);
     lv_obj_center(stop_label);
+
+    // Start button (green) - left of Stop
+    ctx->observer_start_btn = lv_btn_create(header);
+    lv_obj_set_size(ctx->observer_start_btn, 100, 44);
+    lv_obj_align_to(ctx->observer_start_btn, ctx->observer_stop_btn, LV_ALIGN_OUT_LEFT_MID, -10, 0);
+    lv_obj_set_style_bg_color(ctx->observer_start_btn, COLOR_MATERIAL_GREEN, 0);
+    lv_obj_set_style_bg_color(ctx->observer_start_btn, lv_color_lighten(COLOR_MATERIAL_GREEN, 30), LV_STATE_PRESSED);
+    lv_obj_set_style_bg_color(ctx->observer_start_btn, lv_color_hex(0x444444), LV_STATE_DISABLED);
+    lv_obj_set_style_radius(ctx->observer_start_btn, 8, 0);
+    lv_obj_add_event_cb(ctx->observer_start_btn, observer_start_btn_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *start_label = lv_label_create(ctx->observer_start_btn);
+    lv_label_set_text(start_label, "Start");
+    lv_obj_set_style_text_font(start_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(start_label, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_center(start_label);
+
+    // Export CSV button - left of Start, hidden until results arrive
+    ctx->observer_export_btn = lv_btn_create(header);
+    lv_obj_set_size(ctx->observer_export_btn, 120, 44);
+    lv_obj_align_to(ctx->observer_export_btn, ctx->observer_start_btn, LV_ALIGN_OUT_LEFT_MID, -10, 0);
+    lv_obj_set_style_bg_color(ctx->observer_export_btn, COLOR_MATERIAL_CYAN, 0);
+    lv_obj_set_style_bg_color(ctx->observer_export_btn, lv_color_lighten(COLOR_MATERIAL_CYAN, 30), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(ctx->observer_export_btn, 8, 0);
+    lv_obj_add_event_cb(ctx->observer_export_btn, observer_export_btn_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_flag(ctx->observer_export_btn, LV_OBJ_FLAG_HIDDEN);  // Hidden until results
+
+    lv_obj_t *export_label = lv_label_create(ctx->observer_export_btn);
+    lv_label_set_text(export_label, LV_SYMBOL_SAVE " Export");
+    lv_obj_set_style_text_font(export_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(export_label, lv_color_hex(0x000000), 0);
+    lv_obj_center(export_label);
 
     // Status label - store in ctx
     ctx->observer_status_label = lv_label_create(ctx->observer_page);
@@ -17244,18 +17505,6 @@ static void wardrive_wigle_connect_btn_cb(lv_event_t *e)
              (int)strlen(ctx->wardrive_wigle_selected_ssid),
              (int)strlen(ctx->wardrive_wigle_selected_password));
     ctx->wardrive_wigle_connect_ready = true;
-}
-
-static void wardrive_wigle_retry_wifi_btn_cb(lv_event_t *e)
-{
-    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
-    if (!ctx) {
-        ctx = get_current_ctx();
-    }
-    if (!ctx) {
-        return;
-    }
-    ctx->wardrive_wigle_retry_requested = true;
 }
 
 static void wardrive_wigle_rescan_btn_cb(lv_event_t *e)
