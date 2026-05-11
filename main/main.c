@@ -4246,9 +4246,10 @@ static void inspect_networks_task(void *arg)
                 const char *up_text = uptime_str[0] ? uptime_str : "?";
 
                 lv_label_set_recolor(ctx->inspect_info_labels[i - 1], true);
+                const char *rssi_col_s = net->rssi > -50 ? "#55DD55" : (net->rssi > -70 ? "#FFAA00" : "#FF5555");
                 lv_label_set_text_fmt(ctx->inspect_info_labels[i - 1],
-                    "%s  |  %s  |  %s  |  %d dBm  |  %s  |  Uptime: %s\nVendor: %s",
-                    net->bssid, net->band, net->security, net->rssi,
+                    "%s  |  %s  |  %s  |  %s %d dBm#  |  %s  |  Uptime: %s\nVendor: %s",
+                    net->bssid, net->band, net->security, rssi_col_s, net->rssi,
                     mfp_capable ? "#FF5555 MFP On#" : "#55DD55 MFP Off#",
                     up_text, vendor_display);
             }
@@ -4319,9 +4320,10 @@ static void inspect_observer_task(void *arg)
                     lv_obj_is_valid(ctx->observer_inspect_info_labels[i])) {
                     const char *up_text = net->uptime[0] ? net->uptime : "?";
                     lv_label_set_recolor(ctx->observer_inspect_info_labels[i], true);
+                    const char *rssi_col_oa = net->rssi > -50 ? "#55DD55" : (net->rssi > -70 ? "#FFAA00" : "#FF5555");
                     lv_label_set_text_fmt(ctx->observer_inspect_info_labels[i],
-                        "%s  |  %s  |  %d dBm  |  %s  |  Uptime: %s\nVendor: %s",
-                        net->bssid, net->band, net->rssi,
+                        "%s  |  %s  |  %s %d dBm#  |  %s  |  Uptime: %s\nVendor: %s",
+                        net->bssid, net->band, rssi_col_oa, net->rssi,
                         net->mfp_capable ? "#FF5555 MFP On#" : "#55DD55 MFP Off#",
                         up_text, net->vendor[0] ? net->vendor : "-");
                 }
@@ -4387,9 +4389,10 @@ static void inspect_observer_task(void *arg)
                     lv_obj_is_valid(ctx->observer_inspect_info_labels[i])) {
                         const char *up_text = uptime_str[0] ? uptime_str : "?";
                     lv_label_set_recolor(ctx->observer_inspect_info_labels[i], true);
+                    const char *rssi_col_ob = net->rssi > -50 ? "#55DD55" : (net->rssi > -70 ? "#FFAA00" : "#FF5555");
                     lv_label_set_text_fmt(ctx->observer_inspect_info_labels[i],
-                        "%s  |  %s  |  %d dBm  |  %s  |  Uptime: %s\nVendor: %s",
-                        net->bssid, net->band, net->rssi,
+                        "%s  |  %s  |  %s %d dBm#  |  %s  |  Uptime: %s\nVendor: %s",
+                        net->bssid, net->band, rssi_col_ob, net->rssi,
                         mfp_capable ? "#FF5555 MFP On#" : "#55DD55 MFP Off#",
                         up_text, net->vendor[0] ? net->vendor : "-");
                 }
@@ -4598,8 +4601,10 @@ static void wifi_scan_task(void *arg)
             // BSSID, Band, Security, RSSI and vendor
             lv_obj_t *info_label = lv_label_create(text_cont);
             const char *vendor_display = strlen(net->vendor) > 0 ? net->vendor : "-";
-            lv_label_set_text_fmt(info_label, "%s  |  %s  |  %s  |  %d dBm\nVendor: %s",
-                                  net->bssid, net->band, net->security, net->rssi, vendor_display);
+            const char *rssi_col = net->rssi > -50 ? "#55DD55" : (net->rssi > -70 ? "#FFAA00" : "#FF5555");
+            lv_label_set_recolor(info_label, true);
+            lv_label_set_text_fmt(info_label, "%s  |  %s  |  %s  |  %s %d dBm#\nVendor: %s",
+                                  net->bssid, net->band, net->security, rssi_col, net->rssi, vendor_display);
             lv_obj_set_style_text_font(info_label, &lv_font_montserrat_12, 0);
             lv_obj_set_style_text_color(info_label, lv_color_hex(0x888888), 0);
 
@@ -12752,17 +12757,18 @@ static void update_observer_table(tab_context_t *ctx)
 
         // Second row: BSSID | Band | RSSI | MFP | Uptime | Vendor
         lv_obj_t *info_label = lv_label_create(net_row);
+        lv_label_set_recolor(info_label, true);
+        const char *rssi_col_nr = net->rssi > -50 ? "#55DD55" : (net->rssi > -70 ? "#FFAA00" : "#FF5555");
         if (net->inspected) {
-            lv_label_set_recolor(info_label, true);
             lv_label_set_text_fmt(info_label,
-                "%s  |  %s  |  %d dBm  |  %s  |  Uptime: %s\nVendor: %s",
-                net->bssid, net->band, net->rssi,
+                "%s  |  %s  |  %s %d dBm#  |  %s  |  Uptime: %s\nVendor: %s",
+                net->bssid, net->band, rssi_col_nr, net->rssi,
                 net->mfp_capable ? "#FF5555 MFP On#" : "#55DD55 MFP Off#",
                 net->uptime[0] ? net->uptime : "?",
                 net->vendor[0] ? net->vendor : "-");
         } else {
-            lv_label_set_text_fmt(info_label, "%s  |  %s  |  %d dBm\nVendor: %s",
-                net->bssid, net->band, net->rssi,
+            lv_label_set_text_fmt(info_label, "%s  |  %s  |  %s %d dBm#\nVendor: %s",
+                net->bssid, net->band, rssi_col_nr, net->rssi,
                 net->vendor[0] ? net->vendor : "-");
         }
         lv_obj_set_style_text_font(info_label, &lv_font_montserrat_12, 0);
