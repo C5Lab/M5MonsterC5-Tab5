@@ -542,8 +542,15 @@ typedef struct {
     lv_obj_t *wardrive_wigle_ssid_input;
     lv_obj_t *wardrive_wigle_password_input;
     lv_obj_t *wardrive_wigle_connect_btn;
+    lv_obj_t *wardrive_wigle_credentials_col;
+    lv_obj_t *wardrive_wigle_btn_row;
+    lv_obj_t *wardrive_wigle_retry_btn;
+    lv_obj_t *wardrive_wigle_rescan_btn;
+    lv_obj_t *wardrive_wigle_progress_bar;
     volatile bool wardrive_wigle_task_running;
     volatile bool wardrive_wigle_connect_ready;
+    volatile bool wardrive_wigle_retry_requested;
+    volatile bool wardrive_wigle_rescan_requested;
     bool wardrive_wigle_upload_done;
     char wardrive_wigle_selected_ssid[33];
     char wardrive_wigle_selected_password[65];
@@ -1963,6 +1970,8 @@ static void wardrive_wigle_network_row_click_cb(lv_event_t *e);
 static void wardrive_wigle_text_input_cb(lv_event_t *e);
 static void wardrive_wigle_keyboard_cb(lv_event_t *e);
 static void wardrive_wigle_connect_btn_cb(lv_event_t *e);
+static void wardrive_wigle_retry_wifi_btn_cb(lv_event_t *e);
+static void wardrive_wigle_rescan_btn_cb(lv_event_t *e);
 static void wardrive_wigle_show_password_toggle_cb(lv_event_t *e);
 static bool wardrive_wigle_store_file(tab_context_t *ctx, const char *dir, const char *token);
 static void wardrive_wigle_load_file_list(tab_context_t *ctx, tab_id_t active_tab, uart_port_t uart_port);
@@ -16620,6 +16629,8 @@ static void close_wardrive_wigle_popup_ctx(tab_context_t *ctx)
 
     ctx->wardrive_wigle_task_running = false;
     ctx->wardrive_wigle_connect_ready = false;
+    ctx->wardrive_wigle_retry_requested = false;
+    ctx->wardrive_wigle_rescan_requested = false;
     ctx->wardrive_wigle_selected_ssid[0] = '\0';
     ctx->wardrive_wigle_selected_password[0] = '\0';
     ctx->wardrive_upload_provider = WARDRIVE_UPLOAD_PROVIDER_NONE;
@@ -16635,6 +16646,11 @@ static void close_wardrive_wigle_popup_ctx(tab_context_t *ctx)
         ctx->wardrive_wigle_ssid_input = NULL;
         ctx->wardrive_wigle_password_input = NULL;
         ctx->wardrive_wigle_connect_btn = NULL;
+        ctx->wardrive_wigle_credentials_col = NULL;
+        ctx->wardrive_wigle_btn_row = NULL;
+        ctx->wardrive_wigle_retry_btn = NULL;
+        ctx->wardrive_wigle_rescan_btn = NULL;
+        ctx->wardrive_wigle_progress_bar = NULL;
         ctx->wardrive_wigle_close_btn = NULL;
         ctx->wardrive_wigle_stop_btn = NULL;
         ctx->wardrive_wigle_spinner = NULL;
@@ -17219,11 +17235,39 @@ static void wardrive_wigle_connect_btn_cb(lv_event_t *e)
         lv_obj_add_flag(ctx->wardrive_wigle_keyboard, LV_OBJ_FLAG_HIDDEN);
     }
 
+    if (ctx->wardrive_wigle_connect_btn) {
+        lv_obj_add_state(ctx->wardrive_wigle_connect_btn, LV_STATE_DISABLED);
+    }
+
     ESP_LOGI(TAG, "[%s] WiGLE Connect clicked (ssid_len=%d, pass_len=%d)",
              tab_transport_name(tab_id_for_ctx(ctx)),
              (int)strlen(ctx->wardrive_wigle_selected_ssid),
              (int)strlen(ctx->wardrive_wigle_selected_password));
     ctx->wardrive_wigle_connect_ready = true;
+}
+
+static void wardrive_wigle_retry_wifi_btn_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx) {
+        ctx = get_current_ctx();
+    }
+    if (!ctx) {
+        return;
+    }
+    ctx->wardrive_wigle_retry_requested = true;
+}
+
+static void wardrive_wigle_rescan_btn_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx) {
+        ctx = get_current_ctx();
+    }
+    if (!ctx) {
+        return;
+    }
+    ctx->wardrive_wigle_rescan_requested = true;
 }
 
 static void wardrive_wigle_show_password_toggle_cb(lv_event_t *e)
@@ -17244,7 +17288,8 @@ static void wardrive_wigle_create_credentials_prompt(tab_context_t *ctx, bool wi
         return;
     }
 
-    lv_obj_t *credentials_col = lv_obj_create(ctx->wardrive_wigle_popup);
+    ctx->wardrive_wigle_credentials_col = lv_obj_create(ctx->wardrive_wigle_popup);
+    lv_obj_t *credentials_col = ctx->wardrive_wigle_credentials_col;
     lv_obj_set_size(credentials_col, lv_pct(100), LV_SIZE_CONTENT);
     lv_obj_set_style_bg_opa(credentials_col, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(credentials_col, 0, 0);
@@ -17253,6 +17298,10 @@ static void wardrive_wigle_create_credentials_prompt(tab_context_t *ctx, bool wi
     lv_obj_set_style_pad_row(credentials_col, 8, 0);
     lv_obj_clear_flag(credentials_col, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_move_to_index(credentials_col, -2);
+
+    if (ctx->wardrive_wigle_spinner) {
+        lv_obj_add_flag(ctx->wardrive_wigle_spinner, LV_OBJ_FLAG_HIDDEN);
+    }
 
     ctx->wardrive_wigle_ssid_input = NULL;
     if (with_ssid) {
@@ -17373,9 +17422,22 @@ static bool wardrive_wigle_ensure_wifi_connected(tab_context_t *ctx, tab_id_t ac
         return true;
     }
 
+    bool do_rescan = false;
+    bool wifi_success = false;
+
+    do {
+    do_rescan = false;
+    ctx->wardrive_wigle_rescan_requested = false;
+    ctx->wardrive_wigle_selected_ssid[0] = '\0';
+    ctx->wardrive_wigle_selected_password[0] = '\0';
+    ctx->wardrive_wigle_connect_ready = false;
+
     bsp_display_lock(0);
     if (ctx->wardrive_wigle_status_label) {
         lv_label_set_text(ctx->wardrive_wigle_status_label, "Scanning WiFi networks...");
+    }
+    if (ctx->wardrive_wigle_spinner) {
+        lv_obj_clear_flag(ctx->wardrive_wigle_spinner, LV_OBJ_FLAG_HIDDEN);
     }
     bsp_display_unlock();
 
@@ -17803,53 +17865,200 @@ static bool wardrive_wigle_ensure_wifi_connected(tab_context_t *ctx, tab_id_t ac
     snprintf(wifi_cmd, sizeof(wifi_cmd), "wifi_connect \"%s\" \"%s\"",
              escaped_ssid, escaped_password);
 
-    if (active_tab == TAB_USB && usb_cdc_handle) {
-        usbh_cdc_flush_rx_buffer(usb_cdc_handle);
-    } else {
-        uart_flush(uart_port);
-    }
-    transport_write_bytes_tab(active_tab, uart_port, wifi_cmd, strlen(wifi_cmd));
-    transport_write_bytes_tab(active_tab, uart_port, "\r\n", 2);
-    ESP_LOGI(TAG, "[%s] WiGLE: sent wifi_connect for SSID '%s'",
-             tab_transport_name(active_tab), ctx->wardrive_wigle_selected_ssid);
+    wifi_success = false;
+    bool do_wifi_retry = false;
+    do {
+        do_wifi_retry = false;
+        ctx->wardrive_wigle_retry_requested = false;
 
-    int total_len = 0;
-    int elapsed_ms = 0;
-    bool wifi_success = false;
-    while (elapsed_ms < 15000 && total_len < 2047 && ctx->wardrive_wigle_task_running) {
-        int len = transport_read_bytes_tab(active_tab, uart_port, wifi_rx_buf + total_len,
-                                           2048 - total_len - 1, pdMS_TO_TICKS(200));
-        if (len > 0) {
-            total_len += len;
-            wifi_rx_buf[total_len] = '\0';
-            if (strstr(wifi_rx_buf, "SUCCESS") != NULL) {
-                wifi_success = true;
-                break;
+        if (active_tab == TAB_USB && usb_cdc_handle) {
+            usbh_cdc_flush_rx_buffer(usb_cdc_handle);
+        } else {
+            uart_flush(uart_port);
+        }
+        transport_write_bytes_tab(active_tab, uart_port, wifi_cmd, strlen(wifi_cmd));
+        transport_write_bytes_tab(active_tab, uart_port, "\r\n", 2);
+        ESP_LOGI(TAG, "[%s] WiGLE: sent wifi_connect for SSID '%s'",
+                 tab_transport_name(active_tab), ctx->wardrive_wigle_selected_ssid);
+
+        int total_len = 0;
+        int elapsed_ms = 0;
+        wifi_success = false;
+        while (elapsed_ms < 15000 && total_len < 2047 && ctx->wardrive_wigle_task_running) {
+            int len = transport_read_bytes_tab(active_tab, uart_port, wifi_rx_buf + total_len,
+                                               2048 - total_len - 1, pdMS_TO_TICKS(200));
+            if (len > 0) {
+                total_len += len;
+                wifi_rx_buf[total_len] = '\0';
+                if (strstr(wifi_rx_buf, "SUCCESS") != NULL) {
+                    wifi_success = true;
+                    break;
+                }
+                if (strstr(wifi_rx_buf, "FAILED") != NULL || strstr(wifi_rx_buf, "Error") != NULL) {
+                    break;
+                }
             }
-            if (strstr(wifi_rx_buf, "FAILED") != NULL || strstr(wifi_rx_buf, "Error") != NULL) {
-                break;
+            elapsed_ms += 200;
+        }
+        wifi_rx_buf[total_len] = '\0';
+        ESP_LOGI(TAG, "[%s] WiGLE: wifi_connect response: %s",
+                 tab_transport_name(active_tab), wifi_rx_buf);
+
+        if (!ctx->wardrive_wigle_task_running) {
+            break;
+        }
+
+        if (!wifi_success) {
+            // Parse reason from firmware response
+            char fail_reason[80];
+            const char *failed_tag = strstr(wifi_rx_buf, "FAILED: ");
+            if (total_len == 0) {
+                snprintf(fail_reason, sizeof(fail_reason), "No response from module.");
+            } else if (failed_tag != NULL) {
+                const char *msg_start = failed_tag + 8;
+                const char *msg_end = strpbrk(msg_start, "\r\n");
+                size_t msg_len = msg_end ? (size_t)(msg_end - msg_start) : strlen(msg_start);
+                if (msg_len >= sizeof(fail_reason)) {
+                    msg_len = sizeof(fail_reason) - 1;
+                }
+                memcpy(fail_reason, msg_start, msg_len);
+                fail_reason[msg_len] = '\0';
+            } else if (strstr(wifi_rx_buf, "wrong password") != NULL ||
+                       strstr(wifi_rx_buf, "auth fail") != NULL ||
+                       strstr(wifi_rx_buf, "AUTH_FAIL") != NULL) {
+                snprintf(fail_reason, sizeof(fail_reason), "Wrong password.");
+            } else if (strstr(wifi_rx_buf, "not found") != NULL ||
+                       strstr(wifi_rx_buf, "NO_AP_FOUND") != NULL) {
+                snprintf(fail_reason, sizeof(fail_reason), "Network not found.");
+            } else if (strstr(wifi_rx_buf, "timeout") != NULL ||
+                       strstr(wifi_rx_buf, "TIMEOUT") != NULL) {
+                snprintf(fail_reason, sizeof(fail_reason), "Connection timed out.");
+            } else {
+                snprintf(fail_reason, sizeof(fail_reason), "Connection failed.");
+            }
+
+            bsp_display_lock(0);
+            // Keep credentials UI visible so user can edit password and retry
+            if (ctx->wardrive_wigle_connect_btn) {
+                lv_obj_clear_state(ctx->wardrive_wigle_connect_btn, LV_STATE_DISABLED);
+            }
+            if (ctx->wardrive_wigle_status_label) {
+                lv_label_set_text_fmt(ctx->wardrive_wigle_status_label,
+                                      "WiFi failed: %s\nEdit password and tap Connect, or Rescan.",
+                                      fail_reason);
+            }
+            if (ctx->wardrive_wigle_spinner) {
+                lv_obj_add_flag(ctx->wardrive_wigle_spinner, LV_OBJ_FLAG_HIDDEN);
+            }
+            // Add Rescan button into btn_row
+            ctx->wardrive_wigle_rescan_btn = NULL;
+            if (ctx->wardrive_wigle_btn_row) {
+                ctx->wardrive_wigle_rescan_btn = lv_btn_create(ctx->wardrive_wigle_btn_row);
+                lv_obj_set_size(ctx->wardrive_wigle_rescan_btn, 120, 44);
+                lv_obj_set_style_bg_color(ctx->wardrive_wigle_rescan_btn, lv_color_hex(0x0288D1), 0);
+                lv_obj_set_style_bg_color(ctx->wardrive_wigle_rescan_btn, lv_color_hex(0x01579B), LV_STATE_PRESSED);
+                lv_obj_set_style_radius(ctx->wardrive_wigle_rescan_btn, 8, 0);
+                lv_obj_add_event_cb(ctx->wardrive_wigle_rescan_btn, wardrive_wigle_rescan_btn_cb,
+                                    LV_EVENT_CLICKED, ctx);
+                lv_obj_move_to_index(ctx->wardrive_wigle_rescan_btn, 0);
+                lv_obj_t *rescan_lbl = lv_label_create(ctx->wardrive_wigle_rescan_btn);
+                lv_label_set_text(rescan_lbl, "Rescan");
+                lv_obj_set_style_text_font(rescan_lbl, &lv_font_montserrat_16, 0);
+                lv_obj_set_style_text_color(rescan_lbl, lv_color_hex(0xFFFFFF), 0);
+                lv_obj_center(rescan_lbl);
+            }
+            ctx->wardrive_wigle_connect_ready = false;
+            ctx->wardrive_wigle_retry_requested = false;
+            bsp_display_unlock();
+
+            // Wait for: Connect clicked (retry with possibly new password) or Rescan or Stop
+            while (!ctx->wardrive_wigle_connect_ready && !ctx->wardrive_wigle_rescan_requested
+                   && ctx->wardrive_wigle_task_running) {
+                vTaskDelay(pdMS_TO_TICKS(100));
+            }
+
+            bsp_display_lock(0);
+            if (ctx->wardrive_wigle_rescan_btn) {
+                lv_obj_del(ctx->wardrive_wigle_rescan_btn);
+                ctx->wardrive_wigle_rescan_btn = NULL;
+            }
+            if (ctx->wardrive_wigle_connect_ready && ctx->wardrive_wigle_task_running) {
+                // Re-read password from input in case user changed it
+                if (ctx->wardrive_wigle_password_input) {
+                    const char *new_pass = lv_textarea_get_text(ctx->wardrive_wigle_password_input);
+                    if (new_pass && strlen(new_pass) > 0) {
+                        strncpy(ctx->wardrive_wigle_selected_password, new_pass,
+                                sizeof(ctx->wardrive_wigle_selected_password) - 1);
+                        ctx->wardrive_wigle_selected_password[sizeof(ctx->wardrive_wigle_selected_password) - 1] = '\0';
+                    }
+                }
+                // Remove credentials UI before retrying
+                if (ctx->wardrive_wigle_credentials_col) {
+                    lv_obj_del(ctx->wardrive_wigle_credentials_col);
+                    ctx->wardrive_wigle_credentials_col = NULL;
+                    ctx->wardrive_wigle_ssid_input = NULL;
+                    ctx->wardrive_wigle_password_input = NULL;
+                    ctx->wardrive_wigle_connect_btn = NULL;
+                }
+                if (ctx->wardrive_wigle_keyboard) {
+                    lv_obj_del(ctx->wardrive_wigle_keyboard);
+                    ctx->wardrive_wigle_keyboard = NULL;
+                }
+                if (ctx->wardrive_wigle_spinner) {
+                    lv_obj_clear_flag(ctx->wardrive_wigle_spinner, LV_OBJ_FLAG_HIDDEN);
+                }
+                if (ctx->wardrive_wigle_status_label) {
+                    lv_label_set_text_fmt(ctx->wardrive_wigle_status_label,
+                                          "Retrying connection to %s...",
+                                          ctx->wardrive_wigle_selected_ssid);
+                }
+                // Rebuild wifi_cmd with potentially new password
+                beacon_spam_escape_quoted_arg(ctx->wardrive_wigle_selected_ssid, escaped_ssid, sizeof(escaped_ssid));
+                beacon_spam_escape_quoted_arg(ctx->wardrive_wigle_selected_password, escaped_password, sizeof(escaped_password));
+                snprintf(wifi_cmd, sizeof(wifi_cmd), "wifi_connect \"%s\" \"%s\"",
+                         escaped_ssid, escaped_password);
+            } else if (ctx->wardrive_wigle_rescan_requested) {
+                if (ctx->wardrive_wigle_credentials_col) {
+                    lv_obj_del(ctx->wardrive_wigle_credentials_col);
+                    ctx->wardrive_wigle_credentials_col = NULL;
+                    ctx->wardrive_wigle_ssid_input = NULL;
+                    ctx->wardrive_wigle_password_input = NULL;
+                    ctx->wardrive_wigle_connect_btn = NULL;
+                }
+                if (ctx->wardrive_wigle_keyboard) {
+                    lv_obj_del(ctx->wardrive_wigle_keyboard);
+                    ctx->wardrive_wigle_keyboard = NULL;
+                }
+                if (ctx->wardrive_wigle_status_label) {
+                    lv_label_set_text(ctx->wardrive_wigle_status_label, "Scanning WiFi networks...");
+                }
+            }
+            bsp_display_unlock();
+
+            if (ctx->wardrive_wigle_connect_ready && ctx->wardrive_wigle_task_running) {
+                do_wifi_retry = true;
+            } else if (ctx->wardrive_wigle_rescan_requested && ctx->wardrive_wigle_task_running) {
+                do_rescan = true;
             }
         }
-        elapsed_ms += 200;
-    }
-    wifi_rx_buf[total_len] = '\0';
-    ESP_LOGI(TAG, "[%s] WiGLE: wifi_connect response: %s",
-             tab_transport_name(active_tab), wifi_rx_buf);
+    } while (do_wifi_retry && ctx->wardrive_wigle_task_running);
 
-    if (!ctx->wardrive_wigle_task_running) {
-        heap_caps_free(scan_rx_buf);
-        heap_caps_free(line_buf);
-        heap_caps_free(et_entries);
-        heap_caps_free(et_buf);
-        heap_caps_free(wifi_rx_buf);
-        return false;
-    }
-    if (!wifi_success) {
-        bsp_display_lock(0);
-        if (ctx->wardrive_wigle_status_label) {
-            lv_label_set_text(ctx->wardrive_wigle_status_label, "WiFi connection failed!");
+    if (!ctx->wardrive_wigle_task_running || !wifi_success) {
+        if (do_rescan) {
+            // Continue to outer rescan loop
+        } else {
+            heap_caps_free(scan_rx_buf);
+            heap_caps_free(line_buf);
+            heap_caps_free(et_entries);
+            heap_caps_free(et_buf);
+            heap_caps_free(wifi_rx_buf);
+            return false;
         }
-        bsp_display_unlock();
+    }
+
+    } while (do_rescan && ctx->wardrive_wigle_task_running); // rescan loop
+
+    if (!ctx->wardrive_wigle_task_running || !wifi_success) {
         heap_caps_free(scan_rx_buf);
         heap_caps_free(line_buf);
         heap_caps_free(et_entries);
@@ -18048,10 +18257,20 @@ static void wardrive_wigle_upload_task(void *arg)
 
         processed_selected++;
         bsp_display_lock(0);
+        if (total_selected > 1 && ctx->wardrive_wigle_progress_bar) {
+            lv_obj_clear_flag(ctx->wardrive_wigle_progress_bar, LV_OBJ_FLAG_HIDDEN);
+            lv_bar_set_value(ctx->wardrive_wigle_progress_bar,
+                             (processed_selected - 1) * 100 / total_selected, LV_ANIM_OFF);
+        }
         if (ctx->wardrive_wigle_status_label) {
-            lv_label_set_text_fmt(ctx->wardrive_wigle_status_label,
-                                  "Uploading %d/%d:\n%s",
-                                  processed_selected, total_selected, file->name);
+            if (total_selected > 1) {
+                lv_label_set_text_fmt(ctx->wardrive_wigle_status_label,
+                                      "File %d/%d: %s\nUploading...",
+                                      processed_selected, total_selected, file->name);
+            } else {
+                lv_label_set_text_fmt(ctx->wardrive_wigle_status_label,
+                                      "Uploading: %s", file->name);
+            }
         }
         bsp_display_unlock();
 
@@ -18071,12 +18290,13 @@ static void wardrive_wigle_upload_task(void *arg)
         int total_len = 0;
         int empty_reads = 0;
         int elapsed_ms = 0;
+        int last_ui_ms = 0;
         const int timeout_ms = 150000;
 
         while (ctx->wardrive_wigle_task_running &&
                elapsed_ms < timeout_ms &&
                total_len < (int)sizeof(rx_buf) - 1 &&
-               empty_reads < 120) {
+               empty_reads < 300) {
             int len = transport_read_bytes_tab(active_tab,
                                                uart_port,
                                                rx_buf + total_len,
@@ -18097,6 +18317,25 @@ static void wardrive_wigle_upload_task(void *arg)
                 empty_reads++;
             }
             elapsed_ms += 500;
+
+            // Update status every 2s with elapsed time
+            if (elapsed_ms - last_ui_ms >= 2000) {
+                last_ui_ms = elapsed_ms;
+                bsp_display_lock(0);
+                if (ctx->wardrive_wigle_status_label) {
+                    if (total_selected > 1) {
+                        lv_label_set_text_fmt(ctx->wardrive_wigle_status_label,
+                                              "File %d/%d: %s\nUploading... %ds",
+                                              processed_selected, total_selected,
+                                              file->name, elapsed_ms / 1000);
+                    } else {
+                        lv_label_set_text_fmt(ctx->wardrive_wigle_status_label,
+                                              "Uploading: %s\n%ds elapsed",
+                                              file->name, elapsed_ms / 1000);
+                    }
+                }
+                bsp_display_unlock();
+            }
         }
 
         rx_buf[total_len] = '\0';
@@ -18135,6 +18374,15 @@ static void wardrive_wigle_upload_task(void *arg)
             // No final marker for this file response.
             total_failed++;
         }
+
+        if (total_selected > 1) {
+            bsp_display_lock(0);
+            if (ctx->wardrive_wigle_progress_bar) {
+                lv_bar_set_value(ctx->wardrive_wigle_progress_bar,
+                                 processed_selected * 100 / total_selected, LV_ANIM_ON);
+            }
+            bsp_display_unlock();
+        }
     }
 
     if (!ctx->wardrive_wigle_task_running) {
@@ -18142,6 +18390,9 @@ static void wardrive_wigle_upload_task(void *arg)
     }
 
     bsp_display_lock(0);
+    if (ctx->wardrive_wigle_progress_bar) {
+        lv_obj_add_flag(ctx->wardrive_wigle_progress_bar, LV_OBJ_FLAG_HIDDEN);
+    }
     if (ctx->wardrive_wigle_status_label) {
         if (unsupported_cmd) {
             lv_label_set_text(ctx->wardrive_wigle_status_label,
@@ -18305,10 +18556,20 @@ static void wardrive_wdgwars_upload_task(void *arg)
 
         processed_selected++;
         bsp_display_lock(0);
+        if (total_selected > 1 && ctx->wardrive_wigle_progress_bar) {
+            lv_obj_clear_flag(ctx->wardrive_wigle_progress_bar, LV_OBJ_FLAG_HIDDEN);
+            lv_bar_set_value(ctx->wardrive_wigle_progress_bar,
+                             (processed_selected - 1) * 100 / total_selected, LV_ANIM_OFF);
+        }
         if (ctx->wardrive_wigle_status_label) {
-            lv_label_set_text_fmt(ctx->wardrive_wigle_status_label,
-                                  "Uploading %d/%d:\n%s",
-                                  processed_selected, total_selected, file->name);
+            if (total_selected > 1) {
+                lv_label_set_text_fmt(ctx->wardrive_wigle_status_label,
+                                      "File %d/%d: %s\nUploading...",
+                                      processed_selected, total_selected, file->name);
+            } else {
+                lv_label_set_text_fmt(ctx->wardrive_wigle_status_label,
+                                      "Uploading: %s", file->name);
+            }
         }
         bsp_display_unlock();
 
@@ -18328,12 +18589,13 @@ static void wardrive_wdgwars_upload_task(void *arg)
         int total_len = 0;
         int empty_reads = 0;
         int elapsed_ms = 0;
+        int last_ui_ms = 0;
         const int timeout_ms = 150000;
 
         while (ctx->wardrive_wigle_task_running &&
                elapsed_ms < timeout_ms &&
                total_len < (int)sizeof(rx_buf) - 1 &&
-               empty_reads < 120) {
+               empty_reads < 300) {
             int len = transport_read_bytes_tab(active_tab,
                                                uart_port,
                                                rx_buf + total_len,
@@ -18355,6 +18617,24 @@ static void wardrive_wdgwars_upload_task(void *arg)
                 empty_reads++;
             }
             elapsed_ms += 500;
+
+            if (elapsed_ms - last_ui_ms >= 2000) {
+                last_ui_ms = elapsed_ms;
+                bsp_display_lock(0);
+                if (ctx->wardrive_wigle_status_label) {
+                    if (total_selected > 1) {
+                        lv_label_set_text_fmt(ctx->wardrive_wigle_status_label,
+                                              "File %d/%d: %s\nUploading... %ds",
+                                              processed_selected, total_selected,
+                                              file->name, elapsed_ms / 1000);
+                    } else {
+                        lv_label_set_text_fmt(ctx->wardrive_wigle_status_label,
+                                              "Uploading: %s\n%ds elapsed",
+                                              file->name, elapsed_ms / 1000);
+                    }
+                }
+                bsp_display_unlock();
+            }
         }
 
         rx_buf[total_len] = '\0';
@@ -18396,6 +18676,15 @@ static void wardrive_wdgwars_upload_task(void *arg)
         } else {
             total_failed++;
         }
+
+        if (total_selected > 1) {
+            bsp_display_lock(0);
+            if (ctx->wardrive_wigle_progress_bar) {
+                lv_bar_set_value(ctx->wardrive_wigle_progress_bar,
+                                 processed_selected * 100 / total_selected, LV_ANIM_ON);
+            }
+            bsp_display_unlock();
+        }
     }
 
     if (!ctx->wardrive_wigle_task_running) {
@@ -18403,6 +18692,9 @@ static void wardrive_wdgwars_upload_task(void *arg)
     }
 
     bsp_display_lock(0);
+    if (ctx->wardrive_wigle_progress_bar) {
+        lv_obj_add_flag(ctx->wardrive_wigle_progress_bar, LV_OBJ_FLAG_HIDDEN);
+    }
     if (ctx->wardrive_wigle_status_label) {
         if (unsupported_cmd) {
             lv_label_set_text(ctx->wardrive_wigle_status_label,
@@ -18500,6 +18792,17 @@ static void show_wardrive_upload_popup(tab_context_t *ctx, wardrive_upload_provi
     lv_obj_set_style_text_align(ctx->wardrive_wigle_status_label, LV_TEXT_ALIGN_CENTER, 0);
     lv_label_set_long_mode(ctx->wardrive_wigle_status_label, LV_LABEL_LONG_WRAP);
 
+    ctx->wardrive_wigle_progress_bar = lv_bar_create(ctx->wardrive_wigle_popup);
+    lv_obj_set_size(ctx->wardrive_wigle_progress_bar, lv_pct(100), 14);
+    lv_bar_set_range(ctx->wardrive_wigle_progress_bar, 0, 100);
+    lv_bar_set_value(ctx->wardrive_wigle_progress_bar, 0, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(ctx->wardrive_wigle_progress_bar, lv_color_hex(0x333344), 0);
+    lv_obj_set_style_bg_color(ctx->wardrive_wigle_progress_bar, COLOR_MATERIAL_TEAL,
+                              LV_PART_INDICATOR);
+    lv_obj_set_style_radius(ctx->wardrive_wigle_progress_bar, 6, 0);
+    lv_obj_set_style_radius(ctx->wardrive_wigle_progress_bar, 6, LV_PART_INDICATOR);
+    lv_obj_add_flag(ctx->wardrive_wigle_progress_bar, LV_OBJ_FLAG_HIDDEN);
+
     ctx->wardrive_wigle_list = lv_obj_create(ctx->wardrive_wigle_popup);
     lv_obj_set_size(ctx->wardrive_wigle_list, lv_pct(100), LV_SIZE_CONTENT);
     lv_obj_set_flex_grow(ctx->wardrive_wigle_list, 1);
@@ -18510,7 +18813,8 @@ static void show_wardrive_upload_popup(tab_context_t *ctx, wardrive_upload_provi
     lv_obj_set_flex_flow(ctx->wardrive_wigle_list, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_row(ctx->wardrive_wigle_list, 6, 0);
 
-    lv_obj_t *btn_row = lv_obj_create(ctx->wardrive_wigle_popup);
+    ctx->wardrive_wigle_btn_row = lv_obj_create(ctx->wardrive_wigle_popup);
+    lv_obj_t *btn_row = ctx->wardrive_wigle_btn_row;
     lv_obj_set_size(btn_row, lv_pct(100), LV_SIZE_CONTENT);
     lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(btn_row, 0, 0);
@@ -18598,7 +18902,16 @@ static void show_wardrive_upload_popup(tab_context_t *ctx, wardrive_upload_provi
         return;
     }
 
+    if (ctx->wardrive_wigle_spinner) {
+        lv_obj_clear_flag(ctx->wardrive_wigle_spinner, LV_OBJ_FLAG_HIDDEN);
+    }
+    lv_refr_now(NULL);
+
     wardrive_wigle_load_file_list(ctx, tab_id_for_ctx(ctx), uart_port_for_tab(tab_id_for_ctx(ctx)));
+
+    if (ctx->wardrive_wigle_spinner) {
+        lv_obj_add_flag(ctx->wardrive_wigle_spinner, LV_OBJ_FLAG_HIDDEN);
+    }
 
     if (ctx->wardrive_wigle_file_count <= 0) {
         if (ctx->wardrive_wigle_status_label) {
