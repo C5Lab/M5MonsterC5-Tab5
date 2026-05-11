@@ -13,6 +13,7 @@
 #include <stdint.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/idf_additions.h"
 #include "freertos/timers.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
@@ -45,7 +46,7 @@
 #include "esp_http_server.h"
 #include "lwip/sockets.h"
 
-#define JANOS_TAB_VERSION "1.3.5"
+#define JANOS_TAB_VERSION "1.3.6"
 #define JANOS_VERSION_REQUIRED "1.6.4"
 #include "lwip/netdb.h"
 #include <dirent.h>
@@ -348,6 +349,13 @@ typedef struct {
     bool observer_attack_return_to_observer;
     wifi_network_t observer_attack_network;
     int observer_attack_override_sel_index;  // always 0; storage for scan_view_t.sel_indices
+
+    // Inspect-network async (per tab) - decorates each scan row with MFP + uptime
+    volatile bool inspect_active;
+    TaskHandle_t  inspect_task;
+    lv_obj_t    **inspect_info_labels;   // PSRAM array, size = inspect_label_count
+    int           inspect_label_count;
+    int           inspect_tab;            // tab_id_t value (forward decl below)
 
     // Network popup (clients, deauth)
     lv_obj_t *network_popup;
@@ -4048,6 +4056,203 @@ static bool parse_network_line(const char *line, wifi_network_t *net)
     return true;
 }
 
+// ============================================================================
+// INSPECT-NETWORK ASYNC TASK
+// Runs after a successful scan; iterates 1..network_count calling
+// `inspect_network <i>` and rewriting each scanned row's info_label with
+// MFP/NO_MFP + uptime info. Allocated in PSRAM. Cooperatively cancelled
+// before any attack-initiating UART traffic so commands don't clash.
+// ============================================================================
+
+// Cooperatively stop the inspect task for the given tab.
+// Sets the active flag false and waits up to ~250 ms for the task to exit.
+static void cancel_inspect_task(tab_context_t *ctx)
+{
+    if (!ctx) return;
+    if (!ctx->inspect_task && !ctx->inspect_active) return;
+
+    ctx->inspect_active = false;
+    for (int w = 0; w < 25 && ctx->inspect_task != NULL; w++) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    if (ctx->inspect_task != NULL) {
+        ESP_LOGW(TAG, "cancel_inspect_task: task did not exit within 250 ms");
+    }
+}
+
+// Extract `key=` value into `out` (zero-terminated), copying up to `out_sz - 1`
+// bytes until the first space or end-of-string. Returns true on success.
+static bool extract_inspect_kv(const char *line, const char *key,
+                               char *out, size_t out_sz)
+{
+    if (!line || !key || !out || out_sz == 0) return false;
+    const char *p = strstr(line, key);
+    if (!p) return false;
+    p += strlen(key);
+    size_t i = 0;
+    while (*p && *p != ' ' && *p != '\r' && *p != '\n' && i + 1 < out_sz) {
+        out[i++] = *p++;
+    }
+    out[i] = '\0';
+    return i > 0;
+}
+
+// `uptime_str=` is the only multi-word value in the [INSPECT] line. Extract
+// it up to (but not including) the next ` <key>=` token, falling back to
+// end-of-line. Returns true on success.
+static bool extract_inspect_uptime(const char *line, char *out, size_t out_sz)
+{
+    if (!line || !out || out_sz == 0) return false;
+    const char *start = strstr(line, "uptime_str=");
+    if (!start) return false;
+    start += strlen("uptime_str=");
+
+    // Find the next " <something>=" boundary which terminates the value.
+    const char *end = start;
+    const char *probe = start;
+    while (*probe) {
+        if (*probe == ' ') {
+            const char *q = probe + 1;
+            while (*q && *q != ' ' && *q != '=') q++;
+            if (*q == '=') {
+                end = probe;
+                break;
+            }
+        }
+        probe++;
+    }
+    if (end == start) {
+        end = start + strlen(start);
+        while (end > start && (end[-1] == '\r' || end[-1] == '\n')) end--;
+    }
+
+    size_t len = (size_t)(end - start);
+    if (len >= out_sz) len = out_sz - 1;
+    memcpy(out, start, len);
+    out[len] = '\0';
+    return len > 0;
+}
+
+static void inspect_networks_task(void *arg)
+{
+    tab_id_t tab = (tab_id_t)(uintptr_t)arg;
+    tab_context_t *ctx = get_ctx_for_tab(tab);
+    if (!ctx) {
+        ESP_LOGE(TAG, "inspect_networks_task: no ctx for tab %d", tab);
+        vTaskDeleteWithCaps(NULL);
+        return;
+    }
+
+    uart_port_t port = uart_port_for_tab(tab);
+    const char *uart_name = tab_transport_name(tab);
+
+    char *rx   = heap_caps_malloc(UART_BUF_SIZE, MALLOC_CAP_SPIRAM);
+    char *line = heap_caps_malloc(512,           MALLOC_CAP_SPIRAM);
+    if (!rx || !line) {
+        ESP_LOGE(TAG, "[%s] inspect: PSRAM allocation failed", uart_name);
+        if (rx) heap_caps_free(rx);
+        if (line) heap_caps_free(line);
+        ctx->inspect_task = NULL;
+        ctx->inspect_active = false;
+        vTaskDeleteWithCaps(NULL);
+        return;
+    }
+
+    ESP_LOGI(TAG, "[%s] inspect task started for %d networks",
+             uart_name, ctx->inspect_label_count);
+
+    int total = ctx->inspect_label_count;
+    for (int i = 1; ctx->inspect_active && i <= total; i++) {
+        // Flush any stale bytes before sending each command so we read the
+        // matching [INSPECT] line cleanly.
+        if (tab == TAB_USB && usb_cdc_handle) {
+            usbh_cdc_flush_rx_buffer(usb_cdc_handle);
+        } else {
+            uart_flush(port);
+        }
+
+        char cmd[40];
+        int  n = snprintf(cmd, sizeof(cmd), "inspect_network %d\r\n", i);
+        transport_write_bytes_tab(tab, port, cmd, n);
+
+        bool       got_line = false;
+        int        lp = 0;
+        TickType_t t0 = xTaskGetTickCount();
+        bool       mfp_capable = false;
+        char       uptime_str[64] = {0};
+
+        while (ctx->inspect_active && !got_line &&
+               (xTaskGetTickCount() - t0) < pdMS_TO_TICKS(1500)) {
+            int rxlen = transport_read_bytes_tab(tab, port, rx,
+                                                 UART_BUF_SIZE - 1,
+                                                 pdMS_TO_TICKS(100));
+            if (rxlen <= 0) continue;
+            rx[rxlen] = '\0';
+
+            for (int b = 0; b < rxlen && !got_line; b++) {
+                char c = rx[b];
+                if (c == '\n' || c == '\r') {
+                    if (lp > 0) {
+                        line[lp] = '\0';
+                        if (strstr(line, "[INSPECT]")) {
+                            char mfp_val[8] = {0};
+                            if (extract_inspect_kv(line, "mfp_capable=",
+                                                   mfp_val, sizeof(mfp_val))) {
+                                mfp_capable = (mfp_val[0] == '1');
+                            }
+                            extract_inspect_uptime(line, uptime_str,
+                                                   sizeof(uptime_str));
+                            got_line = true;
+                        }
+                        lp = 0;
+                    }
+                } else if (lp < 511) {
+                    line[lp++] = c;
+                }
+            }
+        }
+
+        if (!ctx->inspect_active) break;
+
+        if (got_line && bsp_display_lock(50)) {
+            if (ctx->inspect_info_labels &&
+                i - 1 < ctx->inspect_label_count &&
+                ctx->inspect_info_labels[i - 1] &&
+                lv_obj_is_valid(ctx->inspect_info_labels[i - 1]) &&
+                ctx->networks &&
+                i - 1 < ctx->network_count) {
+
+                wifi_network_t *net = &ctx->networks[i - 1];
+                const char *vendor_display =
+                    (net->vendor[0] != '\0') ? net->vendor : "-";
+                const char *mfp_text = mfp_capable ? "MFP" : "NO_MFP";
+                const char *up_text  = uptime_str[0] ? uptime_str : "?";
+
+                lv_label_set_text_fmt(ctx->inspect_info_labels[i - 1],
+                    "%s  |  %s  |  %s  |  %d dBm  |  %s  |  Uptime: %s\nVendor: %s",
+                    net->bssid, net->band, net->security, net->rssi,
+                    mfp_text, up_text, vendor_display);
+            }
+            bsp_display_unlock();
+        } else if (!got_line) {
+            ESP_LOGD(TAG, "[%s] inspect %d: no response", uart_name, i);
+        }
+
+        // Small yield so the UI/UART driver can breathe.
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+
+    ESP_LOGI(TAG, "[%s] inspect task finished (active=%d)",
+             uart_name, ctx->inspect_active);
+
+    heap_caps_free(rx);
+    heap_caps_free(line);
+
+    ctx->inspect_task = NULL;
+    ctx->inspect_active = false;
+    vTaskDeleteWithCaps(NULL);
+}
+
 // WiFi scan task
 static void wifi_scan_task(void *arg)
 {
@@ -4166,6 +4371,22 @@ static void wifi_scan_task(void *arg)
     if (ctx->network_list) {
         lv_obj_clean(ctx->network_list);
 
+        // Reallocate per-row label pointer array in PSRAM so the inspect
+        // task can address each row's info_label by 0-based index.
+        if (ctx->inspect_info_labels) {
+            heap_caps_free(ctx->inspect_info_labels);
+            ctx->inspect_info_labels = NULL;
+        }
+        ctx->inspect_label_count = ctx->network_count;
+        if (ctx->network_count > 0) {
+            ctx->inspect_info_labels = heap_caps_calloc(
+                ctx->network_count, sizeof(lv_obj_t *), MALLOC_CAP_SPIRAM);
+            if (!ctx->inspect_info_labels) {
+                ESP_LOGW(TAG, "Failed to allocate inspect_info_labels in PSRAM");
+                ctx->inspect_label_count = 0;
+            }
+        }
+
         for (int i = 0; i < ctx->network_count; i++) {
             wifi_network_t *net = &ctx->networks[i];
 
@@ -4226,6 +4447,10 @@ static void wifi_scan_task(void *arg)
                                   net->bssid, net->band, net->security, net->rssi, vendor_display);
             lv_obj_set_style_text_font(info_label, &lv_font_montserrat_12, 0);
             lv_obj_set_style_text_color(info_label, lv_color_hex(0x888888), 0);
+
+            if (ctx->inspect_info_labels && i < ctx->inspect_label_count) {
+                ctx->inspect_info_labels[i] = info_label;
+            }
         }
     }
 
@@ -4249,6 +4474,28 @@ static void wifi_scan_task(void *arg)
              uart_name, ctx->network_count, scan_tab);
 
     bsp_display_unlock();
+
+    // Kick off the async inspect task in PSRAM. It walks 1..N calling
+    // `inspect_network <i>` and decorates each row with MFP/uptime info.
+    // It will be cancelled cooperatively before any attack starts.
+    if (scan_complete && ctx->network_count > 0 && ctx->inspect_info_labels) {
+        cancel_inspect_task(ctx);
+        ctx->inspect_tab    = (int)scan_tab;
+        ctx->inspect_active = true;
+        BaseType_t ok = xTaskCreateWithCaps(
+            inspect_networks_task,
+            "inspect_net",
+            8192,
+            (void *)(uintptr_t)scan_tab,
+            4,
+            &ctx->inspect_task,
+            MALLOC_CAP_SPIRAM);
+        if (ok != pdPASS) {
+            ESP_LOGE(TAG, "[%s] Failed to spawn inspect_networks_task", uart_name);
+            ctx->inspect_active = false;
+            ctx->inspect_task = NULL;
+        }
+    }
 
     // Delete this task
     vTaskDelete(NULL);
@@ -4642,6 +4889,10 @@ static void scan_btn_click_cb(lv_event_t *e)
         ESP_LOGW(TAG, "Scan already in progress on this tab");
         return;
     }
+
+    // Stop any inspect task left over from a previous scan so it doesn't
+    // race with the new scan_networks UART traffic.
+    cancel_inspect_task(ctx);
 
     ctx->scan_in_progress = true;
 
@@ -6193,6 +6444,12 @@ static void handle_selected_attack(const char *attack_name)
 
     tab_context_t *ctx = get_current_ctx();
     if (!ctx) return;
+
+    // Stop the async inspect task before sending any select_networks /
+    // start_* commands - we don't want its responses clashing with the
+    // attack's UART output.
+    cancel_inspect_task(ctx);
+
     scan_view_t v = get_scan_view(ctx);
 
     if (v.sel_count == 0) {
@@ -11061,6 +11318,12 @@ static void back_btn_event_cb(lv_event_t *e)
 
     // Get current tab's data
     tab_context_t *ctx = get_current_ctx();
+
+    // If we are leaving the scan page, stop the inspect task so it doesn't
+    // keep poking UART after the user navigated away.
+    if (ctx && ctx->current_visible_page == ctx->scan_page) {
+        cancel_inspect_task(ctx);
+    }
 
     // Hide current page
     if (ctx->current_visible_page) {
