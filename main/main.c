@@ -46,7 +46,7 @@
 #include "esp_http_server.h"
 #include "lwip/sockets.h"
 
-#define JANOS_TAB_VERSION "1.3.6"
+#define JANOS_TAB_VERSION "1.3.7"
 #define JANOS_VERSION_REQUIRED "1.6.4"
 #include "lwip/netdb.h"
 #include <dirent.h>
@@ -165,6 +165,7 @@ typedef struct {
     char ssid[33];
     char bssid[18];
     int rssi;
+    int channel;
     char band[8];  // "2.4GHz" or "5GHz"
     char security[24];
     char vendor[48];
@@ -4047,7 +4048,7 @@ static bool parse_network_line(const char *line, wifi_network_t *net)
 
     if (field_idx < 8) return false;
 
-    // fields[0] = index, fields[1] = SSID, fields[3] = BSSID, fields[5] = security, fields[6] = RSSI, fields[7] = band
+    // fields[0] = index, fields[1] = SSID, fields[3] = BSSID, fields[4] = channel, fields[5] = security, fields[6] = RSSI, fields[7] = band
     net->index = atoi(fields[0]);
     if (net->index <= 0) return false;
 
@@ -4056,6 +4057,8 @@ static bool parse_network_line(const char *line, wifi_network_t *net)
 
     strncpy(net->bssid, fields[3], sizeof(net->bssid) - 1);
     net->bssid[sizeof(net->bssid) - 1] = '\0';
+
+    net->channel = (field_idx >= 5 && fields[4]) ? atoi(fields[4]) : 0;
 
     strncpy(net->security, fields[5], sizeof(net->security) - 1);
     net->security[sizeof(net->security) - 1] = '\0';
@@ -4251,10 +4254,16 @@ static void inspect_networks_task(void *arg)
                 const char *up_text = uptime_str[0] ? uptime_str : "?";
 
                 lv_label_set_recolor(ctx->inspect_info_labels[i - 1], true);
-                const char *rssi_col_s = net->rssi > -50 ? "#55DD55" : (net->rssi > -70 ? "#FFAA00" : "#FF5555");
+                const char *rssi_col_s  = net->rssi > -50 ? "#55DD55" : (net->rssi > -70 ? "#FFAA00" : "#FF5555");
+                const char *band_col_s  = strstr(net->band, "5") ? "#CC66FF" : "#FFAA33";
+                const char *sec_col_s   = strstr(net->security, "WPA3") ? "#55DD55" :
+                                          strstr(net->security, "WPA2") ? "#00CCCC" : "#FF6666";
                 lv_label_set_text_fmt(ctx->inspect_info_labels[i - 1],
-                    "%s  |  %s  |  %s  |  %s %d dBm#  |  %s  |  Uptime: %s\nVendor: %s",
-                    net->bssid, net->band, net->security, rssi_col_s, net->rssi,
+                    "#5599FF %s#  |  #5599FF CH%d#  |  %s %s#  |  %s %s#  |  %s %d dBm#\n%s  |  Uptime: %s\nVendor: %s",
+                    net->bssid, net->channel,
+                    band_col_s, net->band,
+                    sec_col_s, net->security,
+                    rssi_col_s, net->rssi,
                     mfp_capable ? "#FF5555 MFP On#" : "#55DD55 MFP Off#",
                     up_text, vendor_display);
             }
@@ -4326,9 +4335,12 @@ static void inspect_observer_task(void *arg)
                     const char *up_text = net->uptime[0] ? net->uptime : "?";
                     lv_label_set_recolor(ctx->observer_inspect_info_labels[i], true);
                     const char *rssi_col_oa = net->rssi > -50 ? "#55DD55" : (net->rssi > -70 ? "#FFAA00" : "#FF5555");
+                    const char *band_col_oa = strstr(net->band, "5") ? "#CC66FF" : "#FFAA33";
                     lv_label_set_text_fmt(ctx->observer_inspect_info_labels[i],
-                        "%s  |  %s  |  %s %d dBm#  |  %s  |  Uptime: %s\nVendor: %s",
-                        net->bssid, net->band, rssi_col_oa, net->rssi,
+                        "#5599FF %s#  |  #5599FF CH%d#  |  %s %s#  |  %s %d dBm#\n%s  |  Uptime: %s\nVendor: %s",
+                        net->bssid, net->channel,
+                        band_col_oa, net->band,
+                        rssi_col_oa, net->rssi,
                         net->mfp_capable ? "#FF5555 MFP On#" : "#55DD55 MFP Off#",
                         up_text, net->vendor[0] ? net->vendor : "-");
                 }
@@ -4395,9 +4407,12 @@ static void inspect_observer_task(void *arg)
                         const char *up_text = uptime_str[0] ? uptime_str : "?";
                     lv_label_set_recolor(ctx->observer_inspect_info_labels[i], true);
                     const char *rssi_col_ob = net->rssi > -50 ? "#55DD55" : (net->rssi > -70 ? "#FFAA00" : "#FF5555");
+                    const char *band_col_ob = strstr(net->band, "5") ? "#CC66FF" : "#FFAA33";
                     lv_label_set_text_fmt(ctx->observer_inspect_info_labels[i],
-                        "%s  |  %s  |  %s %d dBm#  |  %s  |  Uptime: %s\nVendor: %s",
-                        net->bssid, net->band, rssi_col_ob, net->rssi,
+                        "#5599FF %s#  |  #5599FF CH%d#  |  %s %s#  |  %s %d dBm#\n%s  |  Uptime: %s\nVendor: %s",
+                        net->bssid, net->channel,
+                        band_col_ob, net->band,
+                        rssi_col_ob, net->rssi,
                         mfp_capable ? "#FF5555 MFP On#" : "#55DD55 MFP Off#",
                         up_text, net->vendor[0] ? net->vendor : "-");
                 }
@@ -4606,10 +4621,18 @@ static void wifi_scan_task(void *arg)
             // BSSID, Band, Security, RSSI and vendor
             lv_obj_t *info_label = lv_label_create(text_cont);
             const char *vendor_display = strlen(net->vendor) > 0 ? net->vendor : "-";
-            const char *rssi_col = net->rssi > -50 ? "#55DD55" : (net->rssi > -70 ? "#FFAA00" : "#FF5555");
+            const char *rssi_col   = net->rssi > -50 ? "#55DD55" : (net->rssi > -70 ? "#FFAA00" : "#FF5555");
+            const char *band_col   = strstr(net->band, "5") ? "#CC66FF" : "#FFAA33";
+            const char *sec_col    = strstr(net->security, "WPA3") ? "#55DD55" :
+                                     strstr(net->security, "WPA2") ? "#00CCCC" : "#FF6666";
             lv_label_set_recolor(info_label, true);
-            lv_label_set_text_fmt(info_label, "%s  |  %s  |  %s  |  %s %d dBm#\nVendor: %s",
-                                  net->bssid, net->band, net->security, rssi_col, net->rssi, vendor_display);
+            lv_label_set_text_fmt(info_label,
+                "#5599FF %s#  |  #5599FF CH%d#  |  %s %s#  |  %s %s#  |  %s %d dBm#\nVendor: %s",
+                net->bssid, net->channel,
+                band_col, net->band,
+                sec_col, net->security,
+                rssi_col, net->rssi,
+                vendor_display);
             lv_obj_set_style_text_font(info_label, &lv_font_montserrat_12, 0);
             lv_obj_set_style_text_color(info_label, lv_color_hex(0x888888), 0);
 
@@ -12764,16 +12787,22 @@ static void update_observer_table(tab_context_t *ctx)
         lv_obj_t *info_label = lv_label_create(net_row);
         lv_label_set_recolor(info_label, true);
         const char *rssi_col_nr = net->rssi > -50 ? "#55DD55" : (net->rssi > -70 ? "#FFAA00" : "#FF5555");
+        const char *band_col_nr = strstr(net->band, "5") ? "#CC66FF" : "#FFAA33";
         if (net->inspected) {
             lv_label_set_text_fmt(info_label,
-                "%s  |  %s  |  %s %d dBm#  |  %s  |  Uptime: %s\nVendor: %s",
-                net->bssid, net->band, rssi_col_nr, net->rssi,
+                "#5599FF %s#  |  #5599FF CH%d#  |  %s %s#  |  %s %d dBm#\n%s  |  Uptime: %s\nVendor: %s",
+                net->bssid, net->channel,
+                band_col_nr, net->band,
+                rssi_col_nr, net->rssi,
                 net->mfp_capable ? "#FF5555 MFP On#" : "#55DD55 MFP Off#",
                 net->uptime[0] ? net->uptime : "?",
                 net->vendor[0] ? net->vendor : "-");
         } else {
-            lv_label_set_text_fmt(info_label, "%s  |  %s  |  %s %d dBm#\nVendor: %s",
-                net->bssid, net->band, rssi_col_nr, net->rssi,
+            lv_label_set_text_fmt(info_label,
+                "#5599FF %s#  |  #5599FF CH%d#  |  %s %s#  |  %s %d dBm#\nVendor: %s",
+                net->bssid, net->channel,
+                band_col_nr, net->band,
+                rssi_col_nr, net->rssi,
                 net->vendor[0] ? net->vendor : "-");
         }
         lv_obj_set_style_text_font(info_label, &lv_font_montserrat_12, 0);
