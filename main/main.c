@@ -11011,7 +11011,7 @@ static void show_karma_page(void)
     lv_obj_set_style_pad_row(karma_probes_container, 6, 0);
 
     lv_obj_t *placeholder = lv_label_create(karma_probes_container);
-    lv_label_set_text(placeholder, "Click 'Show Probes' after sniffing to see collected probe requests");
+    lv_label_set_text(placeholder, "Wait a moment - the longer the better. Click Stop to see collected Probes.");
     lv_obj_set_style_text_font(placeholder, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(placeholder, ui_muted_color(), 0);
 
