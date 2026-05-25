@@ -46,7 +46,7 @@
 #include "esp_http_server.h"
 #include "lwip/sockets.h"
 
-#define JANOS_TAB_VERSION "1.3.6"
+#define JANOS_TAB_VERSION "1.3.7"
 #define JANOS_VERSION_REQUIRED "1.6.4"
 #include "lwip/netdb.h"
 #include <dirent.h>
@@ -165,6 +165,7 @@ typedef struct {
     char ssid[33];
     char bssid[18];
     int rssi;
+    int channel;
     char band[8];  // "2.4GHz" or "5GHz"
     char security[24];
     char vendor[48];
@@ -252,8 +253,9 @@ typedef struct {
     char kind[8];
 } wardrive_network_t;
 
-#define WARDRIVE_WIGLE_MAX_FILES 48
-#define WARDRIVE_WIGLE_PATH_MAX 160
+#define WARDRIVE_WIGLE_MAX_FILES 256
+#define WARDRIVE_WIGLE_PAGE_SIZE  20
+#define WARDRIVE_WIGLE_PATH_MAX  160
 #define WARDRIVE_WIGLE_OTHER_SSID "__WARDRIVE_WIGLE_OTHER__"
 typedef struct {
     char path[WARDRIVE_WIGLE_PATH_MAX];
@@ -564,9 +566,13 @@ typedef struct {
     bool wardrive_wigle_upload_done;
     char wardrive_wigle_selected_ssid[33];
     char wardrive_wigle_selected_password[65];
-    wardrive_wigle_file_t wardrive_wigle_files[WARDRIVE_WIGLE_MAX_FILES];
+    wardrive_wigle_file_t *wardrive_wigle_files; // PSRAM alloc, NULL when popup closed
     int wardrive_wigle_file_count;
     int wardrive_wigle_selected_count;
+    int wardrive_wigle_page;             // current page index (0-based)
+    lv_obj_t *wardrive_wigle_page_label; // "Page X/Y (N files)"
+    lv_obj_t *wardrive_wigle_prev_btn;
+    lv_obj_t *wardrive_wigle_next_btn;
     TaskHandle_t wardrive_wigle_task;
 
     // =====================================================================
@@ -4042,7 +4048,7 @@ static bool parse_network_line(const char *line, wifi_network_t *net)
 
     if (field_idx < 8) return false;
 
-    // fields[0] = index, fields[1] = SSID, fields[3] = BSSID, fields[5] = security, fields[6] = RSSI, fields[7] = band
+    // fields[0] = index, fields[1] = SSID, fields[3] = BSSID, fields[4] = channel, fields[5] = security, fields[6] = RSSI, fields[7] = band
     net->index = atoi(fields[0]);
     if (net->index <= 0) return false;
 
@@ -4051,6 +4057,8 @@ static bool parse_network_line(const char *line, wifi_network_t *net)
 
     strncpy(net->bssid, fields[3], sizeof(net->bssid) - 1);
     net->bssid[sizeof(net->bssid) - 1] = '\0';
+
+    net->channel = (field_idx >= 5 && fields[4]) ? atoi(fields[4]) : 0;
 
     strncpy(net->security, fields[5], sizeof(net->security) - 1);
     net->security[sizeof(net->security) - 1] = '\0';
@@ -4246,10 +4254,16 @@ static void inspect_networks_task(void *arg)
                 const char *up_text = uptime_str[0] ? uptime_str : "?";
 
                 lv_label_set_recolor(ctx->inspect_info_labels[i - 1], true);
-                const char *rssi_col_s = net->rssi > -50 ? "#55DD55" : (net->rssi > -70 ? "#FFAA00" : "#FF5555");
+                const char *rssi_col_s  = net->rssi > -50 ? "#55DD55" : (net->rssi > -70 ? "#FFAA00" : "#FF5555");
+                const char *band_col_s  = strstr(net->band, "5") ? "#CC66FF" : "#FFAA33";
+                const char *sec_col_s   = strstr(net->security, "WPA3") ? "#55DD55" :
+                                          strstr(net->security, "WPA2") ? "#00CCCC" : "#FF6666";
                 lv_label_set_text_fmt(ctx->inspect_info_labels[i - 1],
-                    "%s  |  %s  |  %s  |  %s %d dBm#  |  %s  |  Uptime: %s\nVendor: %s",
-                    net->bssid, net->band, net->security, rssi_col_s, net->rssi,
+                    "#5599FF %s#  |  #5599FF CH%d#  |  %s %s#  |  %s %s#  |  %s %d dBm#\n%s  |  Uptime: %s\nVendor: %s",
+                    net->bssid, net->channel,
+                    band_col_s, net->band,
+                    sec_col_s, net->security,
+                    rssi_col_s, net->rssi,
                     mfp_capable ? "#FF5555 MFP On#" : "#55DD55 MFP Off#",
                     up_text, vendor_display);
             }
@@ -4321,9 +4335,12 @@ static void inspect_observer_task(void *arg)
                     const char *up_text = net->uptime[0] ? net->uptime : "?";
                     lv_label_set_recolor(ctx->observer_inspect_info_labels[i], true);
                     const char *rssi_col_oa = net->rssi > -50 ? "#55DD55" : (net->rssi > -70 ? "#FFAA00" : "#FF5555");
+                    const char *band_col_oa = strstr(net->band, "5") ? "#CC66FF" : "#FFAA33";
                     lv_label_set_text_fmt(ctx->observer_inspect_info_labels[i],
-                        "%s  |  %s  |  %s %d dBm#  |  %s  |  Uptime: %s\nVendor: %s",
-                        net->bssid, net->band, rssi_col_oa, net->rssi,
+                        "#5599FF %s#  |  #5599FF CH%d#  |  %s %s#  |  %s %d dBm#\n%s  |  Uptime: %s\nVendor: %s",
+                        net->bssid, net->channel,
+                        band_col_oa, net->band,
+                        rssi_col_oa, net->rssi,
                         net->mfp_capable ? "#FF5555 MFP On#" : "#55DD55 MFP Off#",
                         up_text, net->vendor[0] ? net->vendor : "-");
                 }
@@ -4390,9 +4407,12 @@ static void inspect_observer_task(void *arg)
                         const char *up_text = uptime_str[0] ? uptime_str : "?";
                     lv_label_set_recolor(ctx->observer_inspect_info_labels[i], true);
                     const char *rssi_col_ob = net->rssi > -50 ? "#55DD55" : (net->rssi > -70 ? "#FFAA00" : "#FF5555");
+                    const char *band_col_ob = strstr(net->band, "5") ? "#CC66FF" : "#FFAA33";
                     lv_label_set_text_fmt(ctx->observer_inspect_info_labels[i],
-                        "%s  |  %s  |  %s %d dBm#  |  %s  |  Uptime: %s\nVendor: %s",
-                        net->bssid, net->band, rssi_col_ob, net->rssi,
+                        "#5599FF %s#  |  #5599FF CH%d#  |  %s %s#  |  %s %d dBm#\n%s  |  Uptime: %s\nVendor: %s",
+                        net->bssid, net->channel,
+                        band_col_ob, net->band,
+                        rssi_col_ob, net->rssi,
                         mfp_capable ? "#FF5555 MFP On#" : "#55DD55 MFP Off#",
                         up_text, net->vendor[0] ? net->vendor : "-");
                 }
@@ -4601,10 +4621,18 @@ static void wifi_scan_task(void *arg)
             // BSSID, Band, Security, RSSI and vendor
             lv_obj_t *info_label = lv_label_create(text_cont);
             const char *vendor_display = strlen(net->vendor) > 0 ? net->vendor : "-";
-            const char *rssi_col = net->rssi > -50 ? "#55DD55" : (net->rssi > -70 ? "#FFAA00" : "#FF5555");
+            const char *rssi_col   = net->rssi > -50 ? "#55DD55" : (net->rssi > -70 ? "#FFAA00" : "#FF5555");
+            const char *band_col   = strstr(net->band, "5") ? "#CC66FF" : "#FFAA33";
+            const char *sec_col    = strstr(net->security, "WPA3") ? "#55DD55" :
+                                     strstr(net->security, "WPA2") ? "#00CCCC" : "#FF6666";
             lv_label_set_recolor(info_label, true);
-            lv_label_set_text_fmt(info_label, "%s  |  %s  |  %s  |  %s %d dBm#\nVendor: %s",
-                                  net->bssid, net->band, net->security, rssi_col, net->rssi, vendor_display);
+            lv_label_set_text_fmt(info_label,
+                "#5599FF %s#  |  #5599FF CH%d#  |  %s %s#  |  %s %s#  |  %s %d dBm#\nVendor: %s",
+                net->bssid, net->channel,
+                band_col, net->band,
+                sec_col, net->security,
+                rssi_col, net->rssi,
+                vendor_display);
             lv_obj_set_style_text_font(info_label, &lv_font_montserrat_12, 0);
             lv_obj_set_style_text_color(info_label, lv_color_hex(0x888888), 0);
 
@@ -10983,7 +11011,7 @@ static void show_karma_page(void)
     lv_obj_set_style_pad_row(karma_probes_container, 6, 0);
 
     lv_obj_t *placeholder = lv_label_create(karma_probes_container);
-    lv_label_set_text(placeholder, "Click 'Show Probes' after sniffing to see collected probe requests");
+    lv_label_set_text(placeholder, "Wait a moment - the longer the better. Click Stop to see collected Probes.");
     lv_obj_set_style_text_font(placeholder, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(placeholder, ui_muted_color(), 0);
 
@@ -12759,16 +12787,22 @@ static void update_observer_table(tab_context_t *ctx)
         lv_obj_t *info_label = lv_label_create(net_row);
         lv_label_set_recolor(info_label, true);
         const char *rssi_col_nr = net->rssi > -50 ? "#55DD55" : (net->rssi > -70 ? "#FFAA00" : "#FF5555");
+        const char *band_col_nr = strstr(net->band, "5") ? "#CC66FF" : "#FFAA33";
         if (net->inspected) {
             lv_label_set_text_fmt(info_label,
-                "%s  |  %s  |  %s %d dBm#  |  %s  |  Uptime: %s\nVendor: %s",
-                net->bssid, net->band, rssi_col_nr, net->rssi,
+                "#5599FF %s#  |  #5599FF CH%d#  |  %s %s#  |  %s %d dBm#\n%s  |  Uptime: %s\nVendor: %s",
+                net->bssid, net->channel,
+                band_col_nr, net->band,
+                rssi_col_nr, net->rssi,
                 net->mfp_capable ? "#FF5555 MFP On#" : "#55DD55 MFP Off#",
                 net->uptime[0] ? net->uptime : "?",
                 net->vendor[0] ? net->vendor : "-");
         } else {
-            lv_label_set_text_fmt(info_label, "%s  |  %s  |  %s %d dBm#\nVendor: %s",
-                net->bssid, net->band, rssi_col_nr, net->rssi,
+            lv_label_set_text_fmt(info_label,
+                "#5599FF %s#  |  #5599FF CH%d#  |  %s %s#  |  %s %d dBm#\nVendor: %s",
+                net->bssid, net->channel,
+                band_col_nr, net->band,
+                rssi_col_nr, net->rssi,
                 net->vendor[0] ? net->vendor : "-");
         }
         lv_obj_set_style_text_font(info_label, &lv_font_montserrat_12, 0);
@@ -16921,16 +16955,18 @@ static void close_wardrive_wigle_popup_ctx(tab_context_t *ctx)
         ctx->wardrive_wigle_close_btn = NULL;
         ctx->wardrive_wigle_stop_btn = NULL;
         ctx->wardrive_wigle_spinner = NULL;
+        ctx->wardrive_wigle_page_label = NULL;
+        ctx->wardrive_wigle_prev_btn = NULL;
+        ctx->wardrive_wigle_next_btn = NULL;
     }
 
-    for (int i = 0; i < WARDRIVE_WIGLE_MAX_FILES; i++) {
-        ctx->wardrive_wigle_files[i].selected = false;
-        ctx->wardrive_wigle_files[i].checkbox = NULL;
-        ctx->wardrive_wigle_files[i].name[0] = '\0';
-        ctx->wardrive_wigle_files[i].path[0] = '\0';
+    if (ctx->wardrive_wigle_files) {
+        free(ctx->wardrive_wigle_files);
+        ctx->wardrive_wigle_files = NULL;
     }
     ctx->wardrive_wigle_file_count = 0;
     ctx->wardrive_wigle_selected_count = 0;
+    ctx->wardrive_wigle_page = 0;
 
     if (ctx->wardrive_upload_btn && !ctx->wardrive_monitoring) {
         lv_obj_clear_state(ctx->wardrive_upload_btn, LV_STATE_DISABLED);
@@ -17186,7 +17222,8 @@ static bool wardrive_wigle_extract_csv_token(const char *line, char *out, size_t
 
 static bool wardrive_wigle_store_file(tab_context_t *ctx, const char *dir, const char *token)
 {
-    if (!ctx || !dir || !token || ctx->wardrive_wigle_file_count >= WARDRIVE_WIGLE_MAX_FILES) {
+    if (!ctx || !dir || !token || !ctx->wardrive_wigle_files ||
+        ctx->wardrive_wigle_file_count >= WARDRIVE_WIGLE_MAX_FILES) {
         return false;
     }
 
@@ -17240,14 +17277,23 @@ static int wardrive_wigle_load_files_from_dir(tab_context_t *ctx, tab_id_t activ
     transport_write_bytes_tab(active_tab, uart_port, "\r\n", 2);
     vTaskDelay(pdMS_TO_TICKS(700));
 
-    char rx_buffer[4096];
+    const size_t rx_buf_size = 16384;
+    char *rx_buffer = heap_caps_malloc(rx_buf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!rx_buffer) {
+        ESP_LOGW(TAG, "[%s] WiGLE list: SPIRAM alloc failed, falling back to internal", tab_transport_name(active_tab));
+        rx_buffer = malloc(rx_buf_size);
+    }
+    if (!rx_buffer) {
+        ESP_LOGE(TAG, "[%s] WiGLE list: rx_buffer alloc failed", tab_transport_name(active_tab));
+        return 0;
+    }
     int total_len = 0;
     int retries = 10;
     int empty_reads = 0;
 
-    while (retries-- > 0 && empty_reads < 3 && total_len < (int)sizeof(rx_buffer) - 1) {
+    while (retries-- > 0 && empty_reads < 3 && total_len < (int)rx_buf_size - 1) {
         int len = transport_read_bytes_tab(active_tab, uart_port, rx_buffer + total_len,
-                                           sizeof(rx_buffer) - total_len - 1, pdMS_TO_TICKS(200));
+                                           rx_buf_size - total_len - 1, pdMS_TO_TICKS(200));
         if (len > 0) {
             total_len += len;
             empty_reads = 0;
@@ -17284,6 +17330,7 @@ static int wardrive_wigle_load_files_from_dir(tab_context_t *ctx, tab_id_t activ
 
     ESP_LOGI(TAG, "[%s] WiGLE list: added %d file(s) from %s (require_marker=%d)",
              tab_transport_name(active_tab), added, dir, require_marker ? 1 : 0);
+    free(rx_buffer);
     return added;
 }
 
@@ -17295,6 +17342,23 @@ static void wardrive_wigle_load_file_list(tab_context_t *ctx, tab_id_t active_ta
 
     ctx->wardrive_wigle_file_count = 0;
     ctx->wardrive_wigle_selected_count = 0;
+    ctx->wardrive_wigle_page = 0;
+
+    if (ctx->wardrive_wigle_files) {
+        free(ctx->wardrive_wigle_files);
+        ctx->wardrive_wigle_files = NULL;
+    }
+    ctx->wardrive_wigle_files = heap_caps_calloc(WARDRIVE_WIGLE_MAX_FILES,
+                                                  sizeof(wardrive_wigle_file_t),
+                                                  MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!ctx->wardrive_wigle_files) {
+        ESP_LOGW(TAG, "[%s] WiGLE: SPIRAM alloc failed, fallback to internal", tab_transport_name(active_tab));
+        ctx->wardrive_wigle_files = calloc(WARDRIVE_WIGLE_MAX_FILES, sizeof(wardrive_wigle_file_t));
+    }
+    if (!ctx->wardrive_wigle_files) {
+        ESP_LOGE(TAG, "[%s] WiGLE: file list alloc failed", tab_transport_name(active_tab));
+        return;
+    }
 
     static const char *dirs[] = {
         "/sdcard/lab/wardrives",
@@ -17375,6 +17439,10 @@ static void wardrive_wigle_send_btn_cb(lv_event_t *e)
     ctx->wardrive_wigle_selected_password[0] = '\0';
     ctx->wardrive_wigle_task_running = true;
     wardrive_wigle_update_send_btn(ctx);
+
+    if (ctx->wardrive_wigle_prev_btn)  lv_obj_add_flag(ctx->wardrive_wigle_prev_btn,  LV_OBJ_FLAG_HIDDEN);
+    if (ctx->wardrive_wigle_next_btn)  lv_obj_add_flag(ctx->wardrive_wigle_next_btn,  LV_OBJ_FLAG_HIDDEN);
+    if (ctx->wardrive_wigle_page_label) lv_obj_add_flag(ctx->wardrive_wigle_page_label, LV_OBJ_FLAG_HIDDEN);
 
     if (ctx->wardrive_wigle_status_label) {
         lv_label_set_text_fmt(ctx->wardrive_wigle_status_label,
@@ -18546,12 +18614,12 @@ static void wardrive_wigle_upload_task(void *arg)
         int empty_reads = 0;
         int elapsed_ms = 0;
         int last_ui_ms = 0;
-        const int timeout_ms = 150000;
+        const int timeout_ms = 600000; // 10 min — large files (3MB+) over WiGLE API can take 3-4 min
 
         while (ctx->wardrive_wigle_task_running &&
                elapsed_ms < timeout_ms &&
                total_len < (int)sizeof(rx_buf) - 1 &&
-               empty_reads < 300) {
+               empty_reads < 1200) {
             int len = transport_read_bytes_tab(active_tab,
                                                uart_port,
                                                rx_buf + total_len,
@@ -18845,12 +18913,12 @@ static void wardrive_wdgwars_upload_task(void *arg)
         int empty_reads = 0;
         int elapsed_ms = 0;
         int last_ui_ms = 0;
-        const int timeout_ms = 150000;
+        const int timeout_ms = 600000; // 10 min — large files (3MB+) over WiGLE API can take 3-4 min
 
         while (ctx->wardrive_wigle_task_running &&
                elapsed_ms < timeout_ms &&
                total_len < (int)sizeof(rx_buf) - 1 &&
-               empty_reads < 300) {
+               empty_reads < 1200) {
             int len = transport_read_bytes_tab(active_tab,
                                                uart_port,
                                                rx_buf + total_len,
@@ -18987,6 +19055,109 @@ done:
     vTaskDelete(NULL);
 }
 
+static void wardrive_wigle_update_page_nav(tab_context_t *ctx);
+
+static void wardrive_wigle_render_page(tab_context_t *ctx)
+{
+    if (!ctx || !ctx->wardrive_wigle_list || !ctx->wardrive_wigle_files) {
+        return;
+    }
+
+    lv_obj_clean(ctx->wardrive_wigle_list);
+
+    int total = ctx->wardrive_wigle_file_count;
+    int total_pages = (total + WARDRIVE_WIGLE_PAGE_SIZE - 1) / WARDRIVE_WIGLE_PAGE_SIZE;
+    if (total_pages < 1) total_pages = 1;
+    if (ctx->wardrive_wigle_page >= total_pages) ctx->wardrive_wigle_page = total_pages - 1;
+    if (ctx->wardrive_wigle_page < 0) ctx->wardrive_wigle_page = 0;
+
+    int start = ctx->wardrive_wigle_page * WARDRIVE_WIGLE_PAGE_SIZE;
+    int end   = start + WARDRIVE_WIGLE_PAGE_SIZE;
+    if (end > total) end = total;
+
+    for (int i = start; i < end; i++) {
+        wardrive_wigle_file_t *f = &ctx->wardrive_wigle_files[i];
+
+        lv_obj_t *cb = lv_checkbox_create(ctx->wardrive_wigle_list);
+        lv_checkbox_set_text(cb, f->name);
+        lv_obj_set_style_text_font(cb, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(cb, lv_color_hex(0xE0E0E0), 0);
+        lv_obj_set_width(cb, lv_pct(100));
+        lv_obj_set_style_min_height(cb, 44, 0);
+        lv_obj_set_style_pad_top(cb, 8, 0);
+        lv_obj_set_style_pad_bottom(cb, 8, 0);
+        if (f->selected) {
+            lv_obj_add_state(cb, LV_STATE_CHECKED);
+        }
+        lv_obj_add_event_cb(cb, wardrive_wigle_file_checkbox_cb, LV_EVENT_VALUE_CHANGED, f);
+        f->checkbox = cb;
+    }
+
+    wardrive_wigle_update_page_nav(ctx);
+}
+
+static void wardrive_wigle_prev_page_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx || ctx->wardrive_wigle_page <= 0) return;
+    ctx->wardrive_wigle_page--;
+    wardrive_wigle_render_page(ctx);
+}
+
+static void wardrive_wigle_next_page_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx) return;
+    int total_pages = (ctx->wardrive_wigle_file_count + WARDRIVE_WIGLE_PAGE_SIZE - 1) / WARDRIVE_WIGLE_PAGE_SIZE;
+    if (ctx->wardrive_wigle_page >= total_pages - 1) return;
+    ctx->wardrive_wigle_page++;
+    wardrive_wigle_render_page(ctx);
+}
+
+static void wardrive_wigle_update_page_nav(tab_context_t *ctx)
+{
+    if (!ctx) return;
+    int total = ctx->wardrive_wigle_file_count;
+    int total_pages = (total + WARDRIVE_WIGLE_PAGE_SIZE - 1) / WARDRIVE_WIGLE_PAGE_SIZE;
+    if (total_pages < 1) total_pages = 1;
+
+    bool multi_page = total_pages > 1;
+
+    if (ctx->wardrive_wigle_prev_btn) {
+        if (multi_page) {
+            lv_obj_clear_flag(ctx->wardrive_wigle_prev_btn, LV_OBJ_FLAG_HIDDEN);
+            if (ctx->wardrive_wigle_page <= 0) {
+                lv_obj_add_state(ctx->wardrive_wigle_prev_btn, LV_STATE_DISABLED);
+            } else {
+                lv_obj_clear_state(ctx->wardrive_wigle_prev_btn, LV_STATE_DISABLED);
+            }
+        } else {
+            lv_obj_add_flag(ctx->wardrive_wigle_prev_btn, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    if (ctx->wardrive_wigle_next_btn) {
+        if (multi_page) {
+            lv_obj_clear_flag(ctx->wardrive_wigle_next_btn, LV_OBJ_FLAG_HIDDEN);
+            if (ctx->wardrive_wigle_page >= total_pages - 1) {
+                lv_obj_add_state(ctx->wardrive_wigle_next_btn, LV_STATE_DISABLED);
+            } else {
+                lv_obj_clear_state(ctx->wardrive_wigle_next_btn, LV_STATE_DISABLED);
+            }
+        } else {
+            lv_obj_add_flag(ctx->wardrive_wigle_next_btn, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    if (ctx->wardrive_wigle_page_label) {
+        if (multi_page) {
+            lv_obj_clear_flag(ctx->wardrive_wigle_page_label, LV_OBJ_FLAG_HIDDEN);
+            lv_label_set_text_fmt(ctx->wardrive_wigle_page_label, "%d/%d (%d)",
+                                  ctx->wardrive_wigle_page + 1, total_pages, total);
+        } else {
+            lv_obj_add_flag(ctx->wardrive_wigle_page_label, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+}
+
 static void show_wardrive_upload_popup(tab_context_t *ctx, wardrive_upload_provider_t provider)
 {
     if (!ctx || !ctx->wardrive_page) {
@@ -19064,9 +19235,52 @@ static void show_wardrive_upload_popup(tab_context_t *ctx, wardrive_upload_provi
     lv_obj_set_style_bg_color(ctx->wardrive_wigle_list, lv_color_hex(0x111122), 0);
     lv_obj_set_style_border_width(ctx->wardrive_wigle_list, 0, 0);
     lv_obj_set_style_radius(ctx->wardrive_wigle_list, 8, 0);
-    lv_obj_set_style_pad_all(ctx->wardrive_wigle_list, 8, 0);
+    lv_obj_set_style_pad_all(ctx->wardrive_wigle_list, 6, 0);
     lv_obj_set_flex_flow(ctx->wardrive_wigle_list, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_pad_row(ctx->wardrive_wigle_list, 6, 0);
+    lv_obj_set_style_pad_row(ctx->wardrive_wigle_list, 4, 0);
+
+    // page-nav row (hidden until there are multiple pages)
+    lv_obj_t *page_nav = lv_obj_create(ctx->wardrive_wigle_popup);
+    lv_obj_set_size(page_nav, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(page_nav, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(page_nav, 0, 0);
+    lv_obj_set_style_pad_all(page_nav, 0, 0);
+    lv_obj_set_style_pad_column(page_nav, 8, 0);
+    lv_obj_set_flex_flow(page_nav, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(page_nav, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(page_nav, LV_OBJ_FLAG_SCROLLABLE);
+
+    ctx->wardrive_wigle_prev_btn = lv_btn_create(page_nav);
+    lv_obj_set_size(ctx->wardrive_wigle_prev_btn, 80, 38);
+    lv_obj_set_style_bg_color(ctx->wardrive_wigle_prev_btn, lv_color_hex(0x334466), 0);
+    lv_obj_set_style_bg_color(ctx->wardrive_wigle_prev_btn, lv_color_hex(0x555555), LV_STATE_DISABLED);
+    lv_obj_set_style_radius(ctx->wardrive_wigle_prev_btn, 8, 0);
+    lv_obj_add_event_cb(ctx->wardrive_wigle_prev_btn, wardrive_wigle_prev_page_cb, LV_EVENT_CLICKED, ctx);
+    lv_obj_t *prev_lbl = lv_label_create(ctx->wardrive_wigle_prev_btn);
+    lv_label_set_text(prev_lbl, "< Prev");
+    lv_obj_set_style_text_font(prev_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(prev_lbl, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_center(prev_lbl);
+    lv_obj_add_flag(ctx->wardrive_wigle_prev_btn, LV_OBJ_FLAG_HIDDEN);
+
+    ctx->wardrive_wigle_page_label = lv_label_create(page_nav);
+    lv_label_set_text(ctx->wardrive_wigle_page_label, "");
+    lv_obj_set_style_text_font(ctx->wardrive_wigle_page_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(ctx->wardrive_wigle_page_label, lv_color_hex(0xAAAAAA), 0);
+    lv_obj_add_flag(ctx->wardrive_wigle_page_label, LV_OBJ_FLAG_HIDDEN);
+
+    ctx->wardrive_wigle_next_btn = lv_btn_create(page_nav);
+    lv_obj_set_size(ctx->wardrive_wigle_next_btn, 80, 38);
+    lv_obj_set_style_bg_color(ctx->wardrive_wigle_next_btn, lv_color_hex(0x334466), 0);
+    lv_obj_set_style_bg_color(ctx->wardrive_wigle_next_btn, lv_color_hex(0x555555), LV_STATE_DISABLED);
+    lv_obj_set_style_radius(ctx->wardrive_wigle_next_btn, 8, 0);
+    lv_obj_add_event_cb(ctx->wardrive_wigle_next_btn, wardrive_wigle_next_page_cb, LV_EVENT_CLICKED, ctx);
+    lv_obj_t *next_lbl = lv_label_create(ctx->wardrive_wigle_next_btn);
+    lv_label_set_text(next_lbl, "Next >");
+    lv_obj_set_style_text_font(next_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(next_lbl, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_center(next_lbl);
+    lv_obj_add_flag(ctx->wardrive_wigle_next_btn, LV_OBJ_FLAG_HIDDEN);
 
     ctx->wardrive_wigle_btn_row = lv_obj_create(ctx->wardrive_wigle_popup);
     lv_obj_t *btn_row = ctx->wardrive_wigle_btn_row;
@@ -19176,18 +19390,8 @@ static void show_wardrive_upload_popup(tab_context_t *ctx, wardrive_upload_provi
         return;
     }
 
-    for (int i = 0; i < ctx->wardrive_wigle_file_count; i++) {
-        wardrive_wigle_file_t *f = &ctx->wardrive_wigle_files[i];
-        f->selected = false;
-
-        lv_obj_t *cb = lv_checkbox_create(ctx->wardrive_wigle_list);
-        lv_checkbox_set_text(cb, f->name);
-        lv_obj_set_style_text_font(cb, &lv_font_montserrat_16, 0);
-        lv_obj_set_style_text_color(cb, lv_color_hex(0xE0E0E0), 0);
-        lv_obj_set_width(cb, lv_pct(100));
-        lv_obj_add_event_cb(cb, wardrive_wigle_file_checkbox_cb, LV_EVENT_VALUE_CHANGED, f);
-        f->checkbox = cb;
-    }
+    ctx->wardrive_wigle_page = 0;
+    wardrive_wigle_render_page(ctx);
 
     if (ctx->wardrive_wigle_status_label) {
         lv_label_set_text_fmt(ctx->wardrive_wigle_status_label,
@@ -19947,11 +20151,15 @@ static void compromised_listing_reset_files(tab_context_t *ctx)
         return;
     }
 
-    for (int i = 0; i < WARDRIVE_WIGLE_MAX_FILES; i++) {
-        ctx->wardrive_wigle_files[i].selected = false;
-        ctx->wardrive_wigle_files[i].checkbox = NULL;
-        ctx->wardrive_wigle_files[i].name[0] = '\0';
-        ctx->wardrive_wigle_files[i].path[0] = '\0';
+    if (ctx->wardrive_wigle_files) {
+        free(ctx->wardrive_wigle_files);
+        ctx->wardrive_wigle_files = NULL;
+    }
+    ctx->wardrive_wigle_files = heap_caps_calloc(WARDRIVE_WIGLE_MAX_FILES,
+                                                  sizeof(wardrive_wigle_file_t),
+                                                  MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!ctx->wardrive_wigle_files) {
+        ctx->wardrive_wigle_files = calloc(WARDRIVE_WIGLE_MAX_FILES, sizeof(wardrive_wigle_file_t));
     }
     ctx->wardrive_wigle_file_count = 0;
     ctx->wardrive_wigle_selected_count = 0;
@@ -20724,7 +20932,7 @@ static void compromised_seed_single_file_listing(tab_context_t *ctx, compromised
     const char *path = compromised_primary_file_path_for_kind(kind);
 
     compromised_listing_reset_files(ctx);
-    if (!name || !path) {
+    if (!name || !path || !ctx->wardrive_wigle_files) {
         return;
     }
 
