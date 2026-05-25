@@ -1925,6 +1925,8 @@ static bool check_sd_card_for_tab(tab_id_t tab);
 static void check_all_sd_cards(void);
 static void check_version_for_tab(tab_id_t tab);
 static void check_all_versions(void);
+static bool check_subghz_status_for_tab(tab_id_t tab);
+static void check_all_subghz_status(void);
 static void janos_feed_bytes(tab_context_t *ctx, const char *uart_name,
                              const uint8_t *data, int len,
                              char *line_buf, int line_buf_sz, int *line_pos);
@@ -3209,6 +3211,9 @@ static void board_redetect_cb(void *user_data)
     bool prev_uart2 = mbus_detected;
 
     detect_boards();
+
+    // Re-probe Sub-GHz availability so the home tile reflects the new state.
+    check_all_subghz_status();
 
     bool changed = (prev_grove != grove_detected) ||
                    (prev_usb != usb_detected) ||
@@ -4840,6 +4845,9 @@ static void detection_complete_cb(lv_timer_t *timer)
 
     // Check JanOS firmware version on all detected devices
     check_all_versions();
+
+    // Probe Sub-GHz module availability per tab (sets ctx->has_subghz).
+    check_all_subghz_status();
 
     ESP_LOGI(TAG, "Detection complete: uart1=%d, mbus=%d, grove=%d, usb=%d",
              uart1_detected, mbus_detected, grove_detected, usb_detected);
@@ -28056,8 +28064,11 @@ static void janos_consume_line(tab_context_t *ctx, const char *line, const char 
     if (rf) {
         janos_copy_version_token(rf + strlen("JanOS RF version:"), ctx->janos_rf_version);
         if (ctx->janos_rf_version[0]) {
-            ctx->has_subghz = true;
-            ESP_LOGI(TAG, "[%s] Detected JanOS RF version: %s (Sub-GHz available)",
+            // Note: ctx->has_subghz is no longer set here. Sub-GHz availability
+            // is determined later by check_all_subghz_status() via subghz_status
+            // CLI probe (mirrors CardputerADV). This line just captures the
+            // version string for diagnostics.
+            ESP_LOGI(TAG, "[%s] Snooped JanOS RF version: %s",
                      uart_name ? uart_name : "?", ctx->janos_rf_version);
         }
         return;
@@ -28189,16 +28200,15 @@ static void detect_boards(void)
     // Ensure USB CDC host is started before detection
     usb_transport_init();
 
-    // Reset per-tab boot-banner snoop fields before re-detecting.
+    // Reset per-tab boot-banner snoop fields before re-detecting. has_subghz
+    // is owned by check_all_subghz_status() (run after detect_boards) and is
+    // not touched here.
     grove_ctx.janos_version[0] = '\0';
     grove_ctx.janos_rf_version[0] = '\0';
-    grove_ctx.has_subghz = false;
     usb_ctx.janos_version[0] = '\0';
     usb_ctx.janos_rf_version[0] = '\0';
-    usb_ctx.has_subghz = false;
     mbus_ctx.janos_version[0] = '\0';
     mbus_ctx.janos_rf_version[0] = '\0';
-    mbus_ctx.has_subghz = false;
 
     // Detect each device independently using ping/pong (also snoops JanOS boot banner)
     grove_detected = ping_uart_direct(UART_NUM, "Grove", &grove_ctx);
@@ -28309,6 +28319,113 @@ static void check_all_sd_cards(void)
              internal_sd_present ? "YES" : "NO");
 }
 
+// Active per-tab probe: send `subghz_status` and look for `[SUBGHZ_STATUS]`
+// reply within `timeout_ms`. Writes the result into ctx->has_subghz. Silent:
+// info logs only, no UI popups. Mirrors CardputerADV's uart_check_subghz_available
+// but operates per-tab using transport_read/write_bytes_tab and the usb_rx_exclusive
+// lock for the USB tab.
+static bool check_subghz_status_for_tab(tab_id_t tab)
+{
+    if (tab == TAB_INTERNAL) return false;
+
+    tab_context_t *ctx = get_ctx_for_tab(tab);
+    if (!ctx) return false;
+
+    uart_port_t uart_port = uart_port_for_tab(tab);
+    const char *tab_name = tab_transport_name(tab);
+
+    ESP_LOGI(TAG, "[%s] Probing for Sub-GHz module (subghz_status)...", tab_name);
+
+    if (tab == TAB_USB) {
+        usb_rx_exclusive = true;
+        usb_flush_input(100);
+    } else {
+        uart_flush_input(uart_port);
+    }
+
+    const char *cmd = "subghz_status\r\n";
+    uint8_t rx_chunk[128];
+    static char rx_buffer[256];
+    int total_len = 0;
+    int64_t start_time = esp_timer_get_time();
+    int64_t timeout_us = 800000; // 800 ms (matches CardputerADV)
+    int64_t last_cmd_us = start_time - 200000; // ensure first send is immediate
+    bool found = false;
+
+    rx_buffer[0] = '\0';
+
+    while ((esp_timer_get_time() - start_time) < timeout_us) {
+        // Resend command every 400 ms in case the firmware was busy.
+        if (!found && (esp_timer_get_time() - last_cmd_us) >= 400000) {
+            transport_write_bytes_tab(tab, uart_port, cmd, strlen(cmd));
+            last_cmd_us = esp_timer_get_time();
+        }
+
+        int len = transport_read_bytes_tab(tab, uart_port, rx_chunk,
+                                           sizeof(rx_chunk) - 1, pdMS_TO_TICKS(50));
+        if (len > 0) {
+            rx_chunk[len] = '\0';
+            // Append to the rolling buffer so substring matches survive across
+            // chunk boundaries. Keep the tail half if we'd overflow.
+            int space = (int)sizeof(rx_buffer) - 1 - total_len;
+            if (space < len) {
+                int keep = (int)sizeof(rx_buffer) / 2;
+                if (total_len > keep) {
+                    memmove(rx_buffer, rx_buffer + (total_len - keep), keep + 1);
+                    total_len = keep;
+                }
+                space = (int)sizeof(rx_buffer) - 1 - total_len;
+                if (space > len) space = len;
+            } else {
+                space = len;
+            }
+            memcpy(rx_buffer + total_len, rx_chunk, space);
+            total_len += space;
+            rx_buffer[total_len] = '\0';
+
+            if (strstr(rx_buffer, "[SUBGHZ_STATUS]") != NULL) {
+                found = true;
+                break;
+            }
+        }
+    }
+
+    if (tab == TAB_USB) usb_rx_exclusive = false;
+
+    if (found) {
+        ctx->has_subghz = true;
+        ESP_LOGI(TAG, "[%s] Sub-GHz module available", tab_name);
+        return true;
+    }
+
+    ctx->has_subghz = false;
+    ESP_LOGW(TAG, "[%s] Sub-GHz module not detected (timeout after %dms)",
+             tab_name, (int)(timeout_us / 1000));
+    return false;
+}
+
+// Probe all detected tabs for Sub-GHz availability. Sole source of truth for
+// ctx->has_subghz; replaces the previous boot-banner-based detection (which
+// now only populates ctx->janos_rf_version for diagnostics).
+static void check_all_subghz_status(void)
+{
+    ESP_LOGI(TAG, "=== Checking Sub-GHz availability ===");
+
+    grove_ctx.has_subghz = false;
+    usb_ctx.has_subghz = false;
+    mbus_ctx.has_subghz = false;
+    internal_ctx.has_subghz = false;
+
+    if (grove_detected) check_subghz_status_for_tab(TAB_GROVE);
+    if (usb_detected)   check_subghz_status_for_tab(TAB_USB);
+    if (mbus_detected)  check_subghz_status_for_tab(TAB_MBUS);
+
+    ESP_LOGI(TAG, "=== Sub-GHz check complete: Grove=%s, USB=%s, MBus=%s ===",
+             grove_ctx.has_subghz ? "YES" : "NO",
+             usb_ctx.has_subghz   ? "YES" : "NO",
+             mbus_ctx.has_subghz  ? "YES" : "NO");
+}
+
 // Check JanOS firmware version on a specific UART tab.
 //
 // Strategy:
@@ -28334,9 +28451,9 @@ static void check_version_for_tab(tab_id_t tab)
     // Fast path: boot-banner snoop during ping already captured the version.
     if (ctx->janos_version[0] != '\0') {
         ctx->janos_version_mismatch = (strcmp(ctx->janos_version, JANOS_VERSION_REQUIRED) != 0);
-        ESP_LOGI(TAG, "[%s] JanOS version (from boot snoop): %s (mismatch=%d, has_subghz=%d, rf=%s)",
+        ESP_LOGI(TAG, "[%s] JanOS version (from boot snoop): %s (mismatch=%d, rf=%s)",
                  tab_name, ctx->janos_version, ctx->janos_version_mismatch,
-                 ctx->has_subghz, ctx->janos_rf_version[0] ? ctx->janos_rf_version : "n/a");
+                 ctx->janos_rf_version[0] ? ctx->janos_rf_version : "n/a");
         return;
     }
 
@@ -28393,9 +28510,9 @@ static void check_version_for_tab(tab_id_t tab)
 
     if (ctx->janos_version[0] != '\0') {
         ctx->janos_version_mismatch = (strcmp(ctx->janos_version, JANOS_VERSION_REQUIRED) != 0);
-        ESP_LOGI(TAG, "[%s] JanOS version: %s (mismatch=%d, has_subghz=%d, rf=%s)",
+        ESP_LOGI(TAG, "[%s] JanOS version: %s (mismatch=%d, rf=%s)",
                  tab_name, ctx->janos_version, ctx->janos_version_mismatch,
-                 ctx->has_subghz, ctx->janos_rf_version[0] ? ctx->janos_rf_version : "n/a");
+                 ctx->janos_rf_version[0] ? ctx->janos_rf_version : "n/a");
         return;
     }
 
@@ -28418,13 +28535,14 @@ static void check_all_versions(void)
 {
     ESP_LOGI(TAG, "=== Checking JanOS versions ===");
 
+    // has_subghz is owned by check_all_subghz_status() and intentionally
+    // not touched here.
     if (grove_detected) {
         check_version_for_tab(TAB_GROVE);
     } else {
         grove_ctx.janos_version[0] = '\0';
         grove_ctx.janos_version_mismatch = false;
         grove_ctx.janos_rf_version[0] = '\0';
-        grove_ctx.has_subghz = false;
     }
 
     if (usb_detected) {
@@ -28433,7 +28551,6 @@ static void check_all_versions(void)
         usb_ctx.janos_version[0] = '\0';
         usb_ctx.janos_version_mismatch = false;
         usb_ctx.janos_rf_version[0] = '\0';
-        usb_ctx.has_subghz = false;
     }
 
     if (mbus_detected) {
@@ -28442,21 +28559,16 @@ static void check_all_versions(void)
         mbus_ctx.janos_version[0] = '\0';
         mbus_ctx.janos_version_mismatch = false;
         mbus_ctx.janos_rf_version[0] = '\0';
-        mbus_ctx.has_subghz = false;
     }
 
     internal_ctx.janos_version[0] = '\0';
     internal_ctx.janos_version_mismatch = false;
     internal_ctx.janos_rf_version[0] = '\0';
-    internal_ctx.has_subghz = false;
 
-    ESP_LOGI(TAG, "=== Version check complete: Grove=%s%s, USB=%s%s, MBus=%s%s ===",
+    ESP_LOGI(TAG, "=== Version check complete: Grove=%s, USB=%s, MBus=%s ===",
              grove_ctx.janos_version[0] ? grove_ctx.janos_version : "N/A",
-             grove_ctx.has_subghz ? " (RF)" : "",
              usb_ctx.janos_version[0] ? usb_ctx.janos_version : "N/A",
-             usb_ctx.has_subghz ? " (RF)" : "",
-             mbus_ctx.janos_version[0] ? mbus_ctx.janos_version : "N/A",
-             mbus_ctx.has_subghz ? " (RF)" : "");
+             mbus_ctx.janos_version[0] ? mbus_ctx.janos_version : "N/A");
 }
 
 static void version_popup_close_cb(lv_event_t *e)
@@ -28591,6 +28703,9 @@ static void board_detect_retry_cb(lv_timer_t *timer)
 
     // Try detection again
     detect_boards();
+
+    // Re-probe Sub-GHz availability so the home tile reflects the new state.
+    check_all_subghz_status();
 
     // If any board detected, close popup and show main tiles
     if (uart1_detected || mbus_detected) {

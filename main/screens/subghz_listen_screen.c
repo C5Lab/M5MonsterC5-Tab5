@@ -1,6 +1,7 @@
 #include "subghz_host.h"
 #include "subghz_internal.h"
 #include "subghz_parser.h"
+#include "subghz_rf_settings.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
@@ -11,6 +12,14 @@
 #include <stdlib.h>
 
 static const char *TAG = "subghz_listen";
+
+static void show_action_popup(subghz_tab_state_t *st, int idx);
+static void close_action_popup(subghz_tab_state_t *st);
+static void show_leave_popup(subghz_tab_state_t *st, size_t count);
+static void close_leave_popup(subghz_tab_state_t *st);
+static void perform_back(subghz_tab_state_t *st);
+static void set_status_msg(subghz_tab_state_t *st, const char *msg, lv_color_t color);
+static void apply_pending_status(subghz_tab_state_t *st);
 
 /* ---- Layout (Tab5: large) ----- */
 #define WATERFALL_W       800
@@ -40,6 +49,7 @@ typedef struct subghz_signal {
     int   btn;
     int   cnt;
     char  mf[32];
+    char  name[64];
     bool  is_raw;
 } subghz_signal_t;
 
@@ -85,6 +95,26 @@ static void fill_signal(subghz_signal_t *dst, const subghz_signal_info_t *src)
     snprintf(dst->type,   sizeof(dst->type),   "%s", src->type[0]   ? src->type   : "--");
     snprintf(dst->serial, sizeof(dst->serial), "%s", src->serial[0] ? src->serial : "--");
     snprintf(dst->mf,     sizeof(dst->mf),     "%s", src->mf[0]     ? src->mf     : "--");
+    snprintf(dst->name,   sizeof(dst->name),   "%s", src->name);
+}
+
+/* Find a captured signal by idx; copies into `out` if found. */
+static bool find_signal_by_idx(subghz_tab_state_t *st, int idx, subghz_signal_t *out)
+{
+    if (!st || !out || idx <= 0) return false;
+    bool found = false;
+    portENTER_CRITICAL(&s_signal_lock);
+    for (subghz_signal_chunk_t *chunk = st->signal_head; chunk && !found; chunk = chunk->next) {
+        for (size_t i = 0; i < chunk->used; i++) {
+            if (chunk->items[i].idx == idx) {
+                *out = chunk->items[i];
+                found = true;
+                break;
+            }
+        }
+    }
+    portEXIT_CRITICAL(&s_signal_lock);
+    return found;
 }
 
 static subghz_signal_chunk_t *alloc_signal_chunk(void)
@@ -265,6 +295,15 @@ static void update_signal_count_label(subghz_tab_state_t *st, size_t count)
     }
 }
 
+static void on_signal_row_clicked(lv_event_t *e)
+{
+    subghz_tab_state_t *st = subghz_host_state();
+    if (!st) return;
+    lv_obj_t *row = lv_event_get_current_target(e);
+    int idx = (int)(intptr_t)lv_obj_get_user_data(row);
+    if (idx > 0) show_action_popup(st, idx);
+}
+
 static void configure_signal_row(subghz_tab_state_t *st, signal_row_view_t *view)
 {
     if (!view || !st->sig_list) return;
@@ -274,6 +313,7 @@ static void configure_signal_row(subghz_tab_state_t *st, signal_row_view_t *view
     lv_obj_set_style_pad_all(view->row, 4, 0);
     lv_obj_set_style_pad_gap(view->row, 6, 0);
     lv_obj_set_style_bg_color(view->row, subghz_host_ui_card(), 0);
+    lv_obj_set_style_bg_color(view->row, subghz_host_ui_card_pressed(), LV_STATE_PRESSED);
     lv_obj_set_style_bg_opa(view->row, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(view->row, 0, 0);
     lv_obj_set_style_radius(view->row, 4, 0);
@@ -281,6 +321,9 @@ static void configure_signal_row(subghz_tab_state_t *st, signal_row_view_t *view
     lv_obj_set_flex_align(view->row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_clear_flag(view->row, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(view->row, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(view->row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_user_data(view->row, (void *)(intptr_t)-1);
+    lv_obj_add_event_cb(view->row, on_signal_row_clicked, LV_EVENT_CLICKED, NULL);
 
     view->idx = lv_label_create(view->row);
     lv_obj_set_width(view->idx, COL_IDX_W);
@@ -330,8 +373,10 @@ static void refresh_signal_list_view(subghz_tab_state_t *st)
         lv_obj_clear_flag(st->empty_lbl, LV_OBJ_FLAG_HIDDEN);
         lv_obj_set_height(st->sig_spacer, 1);
         for (int i = 0; i < SIGNAL_ROW_POOL_SIZE; i++) {
-            if (st->row_pool[i].row)
+            if (st->row_pool[i].row) {
+                lv_obj_set_user_data(st->row_pool[i].row, (void *)(intptr_t)-1);
                 lv_obj_add_flag(st->row_pool[i].row, LV_OBJ_FLAG_HIDDEN);
+            }
         }
         return;
     }
@@ -344,6 +389,7 @@ static void refresh_signal_list_view(subghz_tab_state_t *st)
         if (!view->row) continue;
 
         if ((size_t)i >= copied) {
+            lv_obj_set_user_data(view->row, (void *)(intptr_t)-1);
             lv_obj_add_flag(view->row, LV_OBJ_FLAG_HIDDEN);
             continue;
         }
@@ -352,6 +398,7 @@ static void refresh_signal_list_view(subghz_tab_state_t *st)
         const subghz_signal_t *sig = &window[i];
 
         lv_obj_set_pos(view->row, 0, (lv_coord_t)(signal_index * SIGNAL_ROW_HEIGHT));
+        lv_obj_set_user_data(view->row, (void *)(intptr_t)sig->idx);
         lv_label_set_text_fmt(view->idx, "%d", sig->idx);
         lv_label_set_text(view->type, sig->type);
         lv_obj_set_style_text_color(view->type,
@@ -367,8 +414,72 @@ static void refresh_signal_list_view(subghz_tab_state_t *st)
 
 /* ---- UART monitor task ------------------------------------------- */
 
+/* Lift name= value out of an event line into a stack buffer. */
+static void extract_event_name(const char *line, char *out, size_t out_sz)
+{
+    out[0] = '\0';
+    const char *p = strstr(line, "name=");
+    if (!p) return;
+    p += 5;
+    const char *end = strchr(p, ' ');
+    size_t len = end ? (size_t)(end - p) : strlen(p);
+    if (len >= out_sz) len = out_sz - 1;
+    memcpy(out, p, len);
+    out[len] = '\0';
+}
+
+static void handle_event_line(subghz_tab_state_t *st, const char *line)
+{
+    /* These short events are handled regardless of listen_running so the UI
+     * updates correctly when the user triggers Save/Transmit from a row
+     * popup after pausing capture. */
+    if (strstr(line, "[SUBGHZ_SAVE] ")) {
+        int idx = 0;
+        char name[64];
+        const char *p = strstr(line, "idx=");
+        if (p) idx = atoi(p + 4);
+        extract_event_name(line, name, sizeof(name));
+        char msg[96];
+        if (name[0]) snprintf(msg, sizeof(msg), "#%d saved to SD: %s", idx, name);
+        else         snprintf(msg, sizeof(msg), "#%d saved to SD", idx);
+        set_status_msg(st, msg, subghz_host_color_green());
+        return;
+    }
+    if (strstr(line, "[SUBGHZ_SAVE_ERR] ")) {
+        int idx = 0;
+        char reason[32] = {0};
+        const char *p = strstr(line, "idx=");
+        if (p) idx = atoi(p + 4);
+        p = strstr(line, "reason=");
+        if (p) {
+            p += 7;
+            const char *end = strchr(p, ' ');
+            size_t len = end ? (size_t)(end - p) : strlen(p);
+            if (len >= sizeof(reason)) len = sizeof(reason) - 1;
+            memcpy(reason, p, len);
+            reason[len] = '\0';
+        }
+        char msg[96];
+        snprintf(msg, sizeof(msg), "Save #%d failed: %s", idx, reason[0] ? reason : "error");
+        set_status_msg(st, msg, subghz_host_color_red());
+        return;
+    }
+    if (strstr(line, "[SUBGHZ_TX] ")) {
+        int idx = 0;
+        const char *p = strstr(line, "idx=");
+        if (p) idx = atoi(p + 4);
+        char msg[64];
+        if (idx > 0) snprintf(msg, sizeof(msg), "Transmitted #%d", idx);
+        else         snprintf(msg, sizeof(msg), "Transmitted");
+        set_status_msg(st, msg, subghz_host_color_green());
+        return;
+    }
+}
+
 static void process_subghz_line(subghz_tab_state_t *st, const char *line)
 {
+    handle_event_line(st, line);
+
     if (!st->listen_running) return;
 
     int rssi_unused = 0;
@@ -394,6 +505,10 @@ static void process_subghz_line(subghz_tab_state_t *st, const char *line)
     append_signal_history(st, &sig);
 }
 
+/* Set to false in listen_cleanup() to terminate the reader task without
+ * stopping the firmware capture (st->listen_running covers that). */
+static volatile bool s_listen_page_alive = false;
+
 static void subghz_listen_task_fn(void *arg)
 {
     subghz_tab_state_t *st = (subghz_tab_state_t *)arg;
@@ -405,7 +520,7 @@ static void subghz_listen_task_fn(void *arg)
     static char line_buf[LINE_BUF_LEN];
     int line_pos = 0;
 
-    while (st->listen_running) {
+    while (s_listen_page_alive) {
         int len = subghz_host_uart_read_bytes(tab_id, rx_buf, sizeof(rx_buf) - 1, pdMS_TO_TICKS(100));
         if (len > 0) {
             rx_buf[len] = '\0';
@@ -454,6 +569,7 @@ static void ui_tick_cb(lv_timer_t *t)
     }
     if (history_dirty || st->psram_exhausted)
         refresh_signal_list_view(st);
+    apply_pending_status(st);
 }
 
 static void on_signal_list_scroll(lv_event_t *e)
@@ -655,42 +771,46 @@ static void stop_listening(subghz_tab_state_t *st)
     if (!st->listen_running) return;
     st->listen_running = false;
     subghz_host_uart_send("subghz_stop");
-
-    /* Wait for monitor task to exit (max ~500 ms) */
-    for (int i = 0; i < 25 && st->listen_task; i++) {
-        vTaskDelay(pdMS_TO_TICKS(20));
-    }
-
+    /* Keep monitor task installed so Save/TX responses still update the
+     * status label; listen_cleanup() tears it down on screen exit. */
     st->activity_pending = false;
     update_start_stop_btn(st);
     if (st->btn_raw) lv_obj_clear_state(st->btn_raw, LV_STATE_DISABLED);
     ESP_LOGI(TAG, "SubGHz listen stopped");
 }
 
-static void on_start_stop(lv_event_t *e)
+static void start_listening(subghz_tab_state_t *st)
 {
-    subghz_tab_state_t *st = (subghz_tab_state_t *)lv_event_get_user_data(e);
-    if (!st) return;
-
-    if (st->listen_running) { stop_listening(st); return; }
+    if (st->listen_running) return;
 
     reset_capture_session(st);
     st->listen_running = true;
-    st->listen_task_tab_id = subghz_host_current_tab();
 
     update_start_stop_btn(st);
     if (st->btn_raw) lv_obj_add_state(st->btn_raw, LV_STATE_DISABLED);
 
-    char cmd[32];
+    char cmd[48];
     snprintf(cmd, sizeof(cmd), "subghz_freq %.2f", st->freq_mhz);
     subghz_host_uart_send(cmd);
 
-    if (st->raw_mode) subghz_host_uart_send("subghz_rx raw");
-    else              subghz_host_uart_send("subghz_rx");
+    subghz_rf_settings_t cfg;
+    subghz_rf_settings_load(&cfg);
+    if (st->raw_mode)
+        snprintf(cmd, sizeof(cmd), "subghz_rx raw rssi=%d", (int)cfg.listen_rssi_dbm);
+    else
+        snprintf(cmd, sizeof(cmd), "subghz_rx rssi=%d", (int)cfg.listen_rssi_dbm);
+    subghz_host_uart_send(cmd);
 
-    xTaskCreate(subghz_listen_task_fn, "sg_listen", 4096, st, 5, &st->listen_task);
+    ESP_LOGI(TAG, "SubGHz listen started (%.2f MHz, raw=%d, rssi=%d)",
+             st->freq_mhz, (int)st->raw_mode, (int)cfg.listen_rssi_dbm);
+}
 
-    ESP_LOGI(TAG, "SubGHz listen started (%.2f MHz, raw=%d)", st->freq_mhz, st->raw_mode);
+static void on_start_stop(lv_event_t *e)
+{
+    subghz_tab_state_t *st = (subghz_tab_state_t *)lv_event_get_user_data(e);
+    if (!st) return;
+    if (st->listen_running) stop_listening(st);
+    else                    start_listening(st);
 }
 
 static void update_mode_switch_labels(subghz_tab_state_t *st)
@@ -724,12 +844,24 @@ void subghz_listen_cleanup(subghz_tab_state_t *st)
 {
     if (!st) return;
     stop_listening(st);
+
+    /* Tell reader task to exit and wait for it (best effort, ~500 ms) */
+    s_listen_page_alive = false;
+    for (int i = 0; i < 25 && st->listen_task; i++) vTaskDelay(pdMS_TO_TICKS(20));
+
     if (st->ui_timer) { lv_timer_delete(st->ui_timer); st->ui_timer = NULL; }
+    if (st->listen_status_clear_timer) {
+        lv_timer_delete(st->listen_status_clear_timer);
+        st->listen_status_clear_timer = NULL;
+    }
+    st->listen_status_pending = false;
     if (st->canvas_buf) { heap_caps_free(st->canvas_buf); st->canvas_buf = NULL; }
     st->canvas = NULL;
     if (st->row_pool) { free(st->row_pool); st->row_pool = NULL; }
     clear_signal_history(st);
 
+    close_action_popup(st);
+    close_leave_popup(st);
     if (st->listen_freq_popup) { lv_obj_delete(st->listen_freq_popup); st->listen_freq_popup = NULL; }
     if (st->listen_page) { lv_obj_delete(st->listen_page); st->listen_page = NULL; }
 
@@ -743,13 +875,294 @@ void subghz_listen_cleanup(subghz_tab_state_t *st)
     for (int i = 0; i < 5; i++) st->rollers[i] = NULL;
 }
 
+static void perform_back(subghz_tab_state_t *st)
+{
+    subghz_listen_cleanup(st);
+    show_subghz_page();
+}
+
 static void on_back(lv_event_t *e)
 {
     (void)e;
     subghz_tab_state_t *st = subghz_host_state();
     if (!st) return;
+
+    /* Confirm leaving if there are unsaved captures. */
+    size_t total = signal_count_snapshot(st);
+    if (total > 0 && !st->listen_leave_popup) {
+        show_leave_popup(st, total);
+        return;
+    }
+    perform_back(st);
+}
+
+static void on_settings(lv_event_t *e)
+{
+    (void)e;
+    subghz_tab_state_t *st = subghz_host_state();
+    if (!st) return;
     subghz_listen_cleanup(st);
-    show_subghz_page();
+    show_subghz_listen_settings_page();
+}
+
+/* ---- Status messaging (cross-task) ----------------------------- */
+
+static void set_status_msg(subghz_tab_state_t *st, const char *msg, lv_color_t color)
+{
+    if (!st || !msg) return;
+    snprintf(st->listen_status_text, sizeof(st->listen_status_text), "%s", msg);
+    /* Pack RGB into an int for thread-safe handoff to the UI tick. */
+    st->listen_status_color_argb = ((int)color.red   << 16) |
+                                   ((int)color.green << 8)  |
+                                    (int)color.blue;
+    st->listen_status_pending = true;
+}
+
+static void status_clear_timer_cb(lv_timer_t *t)
+{
+    subghz_tab_state_t *st = (subghz_tab_state_t *)lv_timer_get_user_data(t);
+    if (st) {
+        st->listen_status_clear_timer = NULL;
+        update_signal_count_label(st, signal_count_snapshot(st));
+    }
+}
+
+static void apply_pending_status(subghz_tab_state_t *st)
+{
+    if (!st || !st->listen_status_pending || !st->count_lbl) return;
+    uint32_t packed = (uint32_t)st->listen_status_color_argb;
+    lv_color_t color = lv_color_make((uint8_t)((packed >> 16) & 0xFF),
+                                     (uint8_t)((packed >> 8)  & 0xFF),
+                                     (uint8_t)( packed        & 0xFF));
+    lv_label_set_text(st->count_lbl, st->listen_status_text);
+    lv_obj_set_style_text_color(st->count_lbl, color, 0);
+    st->listen_status_pending = false;
+    if (st->listen_status_clear_timer) {
+        lv_timer_delete(st->listen_status_clear_timer);
+        st->listen_status_clear_timer = NULL;
+    }
+    st->listen_status_clear_timer = lv_timer_create(status_clear_timer_cb, 3000, st);
+    lv_timer_set_repeat_count(st->listen_status_clear_timer, 1);
+}
+
+/* ---- Action popup (row tap -> Save / Transmit / Cancel) -------- */
+
+static void close_action_popup(subghz_tab_state_t *st)
+{
+    if (st && st->listen_action_popup) {
+        lv_obj_delete(st->listen_action_popup);
+        st->listen_action_popup = NULL;
+    }
+}
+
+static void on_action_save(lv_event_t *e)
+{
+    subghz_tab_state_t *st = subghz_host_state();
+    if (!st) return;
+    int idx = st->listen_pending_action_idx;
+    close_action_popup(st);
+    if (idx <= 0) return;
+    char cmd[32];
+    snprintf(cmd, sizeof(cmd), "subghz_save %d", idx);
+    subghz_host_uart_send(cmd);
+    char msg[64];
+    snprintf(msg, sizeof(msg), "Saving #%d to SD...", idx);
+    set_status_msg(st, msg, subghz_host_color_blue());
+    (void)e;
+}
+
+static void on_action_transmit(lv_event_t *e)
+{
+    subghz_tab_state_t *st = subghz_host_state();
+    if (!st) return;
+    int idx = st->listen_pending_action_idx;
+    close_action_popup(st);
+    if (idx <= 0) return;
+    char cmd[32];
+    snprintf(cmd, sizeof(cmd), "subghz_tx %d mem", idx);
+    subghz_host_uart_send(cmd);
+    char msg[64];
+    snprintf(msg, sizeof(msg), "Transmitting #%d...", idx);
+    set_status_msg(st, msg, subghz_host_color_blue());
+    (void)e;
+}
+
+static void on_action_cancel(lv_event_t *e)
+{
+    subghz_tab_state_t *st = subghz_host_state();
+    if (st) close_action_popup(st);
+    (void)e;
+}
+
+static void show_action_popup(subghz_tab_state_t *st, int idx)
+{
+    if (!st || idx <= 0) return;
+    close_action_popup(st);
+
+    subghz_signal_t sig;
+    bool found = find_signal_by_idx(st, idx, &sig);
+    st->listen_pending_action_idx = idx;
+
+    lv_obj_t *overlay = lv_obj_create(lv_scr_act());
+    lv_obj_remove_style_all(overlay);
+    lv_obj_set_size(overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(overlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(overlay, LV_OPA_50, 0);
+    lv_obj_clear_flag(overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(overlay, LV_OBJ_FLAG_CLICKABLE);
+    st->listen_action_popup = overlay;
+
+    lv_obj_t *popup = lv_obj_create(overlay);
+    lv_obj_set_size(popup, 540, 280);
+    lv_obj_center(popup);
+    subghz_style_popup_card(popup, 12, subghz_host_color_cyan());
+    lv_obj_set_flex_flow(popup, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(popup, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_all(popup, 16, 0);
+    lv_obj_set_style_pad_gap(popup, 12, 0);
+    lv_obj_clear_flag(popup, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(popup);
+    lv_label_set_text_fmt(title, "Signal #%d (%s)", idx,
+                          found && sig.type[0] ? sig.type : "--");
+    lv_obj_set_style_text_color(title, subghz_host_ui_text(), 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_22, 0);
+
+    lv_obj_t *name_lbl = lv_label_create(popup);
+    lv_obj_set_width(name_lbl, lv_pct(100));
+    lv_label_set_long_mode(name_lbl, LV_LABEL_LONG_DOT);
+    lv_label_set_text_fmt(name_lbl, "name: %s",
+                          (found && sig.name[0]) ? sig.name : "(unset)");
+    lv_obj_set_style_text_color(name_lbl, subghz_host_ui_muted(), 0);
+    lv_obj_set_style_text_font(name_lbl, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_align(name_lbl, LV_TEXT_ALIGN_CENTER, 0);
+
+    lv_obj_t *brow = lv_obj_create(popup);
+    lv_obj_set_size(brow, lv_pct(100), 60);
+    lv_obj_set_flex_flow(brow, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(brow, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_bg_opa(brow, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(brow, 0, 0);
+    lv_obj_set_style_pad_all(brow, 0, 0);
+    lv_obj_clear_flag(brow, LV_OBJ_FLAG_SCROLLABLE);
+
+    struct {
+        const char    *label;
+        lv_color_t     bg;
+        lv_event_cb_t  cb;
+    } btns[] = {
+        { "Save to SD", subghz_host_color_green(),  on_action_save     },
+        { "Transmit",   subghz_host_color_orange(), on_action_transmit },
+        { "Cancel",     subghz_host_ui_muted(),     on_action_cancel   },
+    };
+    for (int i = 0; i < 3; i++) {
+        lv_obj_t *b = lv_btn_create(brow);
+        lv_obj_set_size(b, 160, 50);
+        lv_obj_set_style_bg_color(b, btns[i].bg, 0);
+        lv_obj_set_style_radius(b, 8, 0);
+        lv_obj_add_event_cb(b, btns[i].cb, LV_EVENT_CLICKED, NULL);
+        lv_obj_t *l = lv_label_create(b);
+        lv_label_set_text(l, btns[i].label);
+        lv_obj_set_style_text_color(l, lv_color_white(), 0);
+        lv_obj_set_style_text_font(l, &lv_font_montserrat_18, 0);
+        lv_obj_center(l);
+    }
+}
+
+/* ---- Leave popup (unsaved captures warning) -------------------- */
+
+static void close_leave_popup(subghz_tab_state_t *st)
+{
+    if (st && st->listen_leave_popup) {
+        lv_obj_delete(st->listen_leave_popup);
+        st->listen_leave_popup = NULL;
+    }
+}
+
+static void on_leave_confirm(lv_event_t *e)
+{
+    subghz_tab_state_t *st = subghz_host_state();
+    if (!st) return;
+    close_leave_popup(st);
+    perform_back(st);
+    (void)e;
+}
+
+static void on_leave_cancel(lv_event_t *e)
+{
+    subghz_tab_state_t *st = subghz_host_state();
+    if (st) close_leave_popup(st);
+    (void)e;
+}
+
+static void show_leave_popup(subghz_tab_state_t *st, size_t count)
+{
+    close_leave_popup(st);
+
+    lv_obj_t *overlay = lv_obj_create(lv_scr_act());
+    lv_obj_remove_style_all(overlay);
+    lv_obj_set_size(overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(overlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(overlay, LV_OPA_50, 0);
+    lv_obj_clear_flag(overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(overlay, LV_OBJ_FLAG_CLICKABLE);
+    st->listen_leave_popup = overlay;
+
+    lv_obj_t *popup = lv_obj_create(overlay);
+    lv_obj_set_size(popup, 560, 260);
+    lv_obj_center(popup);
+    subghz_style_popup_card(popup, 12, subghz_host_color_red());
+    lv_obj_set_flex_flow(popup, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(popup, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_all(popup, 18, 0);
+    lv_obj_set_style_pad_gap(popup, 12, 0);
+    lv_obj_clear_flag(popup, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(popup);
+    lv_label_set_text(title, "Leave Listen?");
+    lv_obj_set_style_text_color(title, subghz_host_ui_text(), 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_22, 0);
+
+    lv_obj_t *body = lv_label_create(popup);
+    lv_obj_set_width(body, lv_pct(100));
+    lv_label_set_long_mode(body, LV_LABEL_LONG_WRAP);
+    lv_label_set_text_fmt(body,
+        "%lu unsaved capture%s will be cleared from this view. "
+        "Save them to SD first?",
+        (unsigned long)count, count == 1 ? "" : "s");
+    lv_obj_set_style_text_color(body, subghz_host_ui_muted(), 0);
+    lv_obj_set_style_text_font(body, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_align(body, LV_TEXT_ALIGN_CENTER, 0);
+
+    lv_obj_t *brow = lv_obj_create(popup);
+    lv_obj_set_size(brow, lv_pct(100), 60);
+    lv_obj_set_flex_flow(brow, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(brow, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_bg_opa(brow, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(brow, 0, 0);
+    lv_obj_clear_flag(brow, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *leave_btn = lv_btn_create(brow);
+    lv_obj_set_size(leave_btn, 200, 50);
+    lv_obj_set_style_bg_color(leave_btn, subghz_host_color_red(), 0);
+    lv_obj_set_style_radius(leave_btn, 8, 0);
+    lv_obj_add_event_cb(leave_btn, on_leave_confirm, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *ll = lv_label_create(leave_btn);
+    lv_label_set_text(ll, "Leave");
+    lv_obj_set_style_text_color(ll, lv_color_white(), 0);
+    lv_obj_set_style_text_font(ll, &lv_font_montserrat_18, 0);
+    lv_obj_center(ll);
+
+    lv_obj_t *stay_btn = lv_btn_create(brow);
+    lv_obj_set_size(stay_btn, 200, 50);
+    lv_obj_set_style_bg_color(stay_btn, subghz_host_ui_muted(), 0);
+    lv_obj_set_style_radius(stay_btn, 8, 0);
+    lv_obj_add_event_cb(stay_btn, on_leave_cancel, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *sl2 = lv_label_create(stay_btn);
+    lv_label_set_text(sl2, "Stay");
+    lv_obj_set_style_text_color(sl2, lv_color_white(), 0);
+    lv_obj_set_style_text_font(sl2, &lv_font_montserrat_18, 0);
+    lv_obj_center(sl2);
 }
 
 /* ---- Public entry ------------------------------------------------ */
@@ -762,11 +1175,8 @@ void show_subghz_listen_page(void)
 
     subghz_host_hide_all_pages();
 
-    /* If page exists, show it */
-    if (st->listen_page) {
-        lv_obj_clear_flag(st->listen_page, LV_OBJ_FLAG_HIDDEN);
-        return;
-    }
+    /* Always rebuild — we own the per-tab reader task. */
+    if (st->listen_page) { lv_obj_delete(st->listen_page); st->listen_page = NULL; }
 
     /* Ensure freq default */
     if (st->freq_mhz < 1.0f) st->freq_mhz = 433.92f;
@@ -781,6 +1191,7 @@ void show_subghz_listen_page(void)
     st->history_dirty = true;
     st->activity_pending = false;
     st->psram_exhausted = false;
+    st->listen_status_pending = false;
 
     /* Allocate row pool */
     if (!st->row_pool) {
@@ -797,11 +1208,11 @@ void show_subghz_listen_page(void)
     lv_obj_set_style_pad_row(st->listen_page, 8, 0);
     lv_obj_clear_flag(st->listen_page, LV_OBJ_FLAG_SCROLLABLE);
 
-    /* Header with back + title + freq button */
+    /* Header with back + title + freq button + settings gear */
     lv_obj_t *header = subghz_create_header(st->listen_page, "Listen",
                                             subghz_host_color_cyan(), on_back);
 
-    /* Spacer + freq button on right */
+    /* Spacer + freq button + settings gear on right */
     lv_obj_t *spacer = lv_obj_create(header);
     lv_obj_set_flex_grow(spacer, 1);
     lv_obj_set_style_bg_opa(spacer, LV_OPA_TRANSP, 0);
@@ -815,6 +1226,9 @@ void show_subghz_listen_page(void)
     lv_obj_set_style_radius(freq_btn, 8, 0);
     lv_obj_set_style_pad_hor(freq_btn, 16, 0);
     lv_obj_add_event_cb(freq_btn, on_freq_tap, LV_EVENT_CLICKED, st);
+    lv_obj_set_style_margin_right(freq_btn, 8, 0);
+
+    subghz_add_header_action(header, LV_SYMBOL_SETTINGS, on_settings, NULL);
 
     st->listen_freq_lbl = lv_label_create(freq_btn);
     update_freq_label(st);
@@ -949,5 +1363,26 @@ void show_subghz_listen_page(void)
     if (!st->ui_timer)
         st->ui_timer = lv_timer_create(ui_tick_cb, WATERFALL_TICK_MS, st);
 
+    /* Spawn background reader task for the page lifetime */
+    st->listen_task_tab_id = subghz_host_current_tab();
+    s_listen_page_alive = true;
+    if (!st->listen_task)
+        xTaskCreate(subghz_listen_task_fn, "sg_listen", 4096, st, 5, &st->listen_task);
+
+    if (st->listen_pending_autostart) {
+        st->listen_pending_autostart = false;
+        start_listening(st);
+    }
+
     ESP_LOGI(TAG, "SubGHz Listen page ready");
+}
+
+void show_subghz_listen_page_at(float mhz, bool autostart)
+{
+    subghz_tab_state_t *st = subghz_host_state();
+    if (st) {
+        if (mhz >= 1.0f && mhz <= 1000.0f) st->freq_mhz = mhz;
+        st->listen_pending_autostart = autostart;
+    }
+    show_subghz_listen_page();
 }

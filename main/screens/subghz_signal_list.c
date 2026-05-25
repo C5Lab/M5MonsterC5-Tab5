@@ -22,11 +22,11 @@ static void fill_signal(subghz_stored_sig_t *dst, const subghz_signal_info_t *sr
     snprintf(dst->type,   sizeof(dst->type),   "%s", src->type[0]   ? src->type   : "--");
     snprintf(dst->serial, sizeof(dst->serial), "%s", src->serial[0] ? src->serial : "--");
     snprintf(dst->mf,     sizeof(dst->mf),     "%s", src->mf[0]     ? src->mf     : "--");
+    snprintf(dst->name,   sizeof(dst->name),   "%s", src->name);
 }
 
-/* Re-running subghz_import re-adds every .sub file, so the firmware-side list
- * grows each time. Hide byte-for-byte duplicates from the UI (storage on JanOS
- * is left intact until the user taps Clear All). */
+/* Optional UI-side de-duplication: hide byte-for-byte duplicates when the
+ * caller passes dedup=true (e.g. mem list from a long capture session). */
 static bool is_duplicate_of_existing(const subghz_stored_sig_t *sigs, int count,
                                      const subghz_signal_info_t *p)
 {
@@ -48,11 +48,23 @@ static bool is_duplicate_of_existing(const subghz_stored_sig_t *sigs, int count,
     return false;
 }
 
-void subghz_collect_signal_list(subghz_tab_state_t *st, int timeout_ms, bool dedup)
+void subghz_collect_signal_list(subghz_tab_state_t *st, const char *source,
+                                int timeout_ms, bool dedup)
 {
     if (!st) return;
+    if (!source || (strcmp(source, "mem") != 0 && strcmp(source, "sd") != 0)) {
+        ESP_LOGE(TAG, "Invalid source '%s' (must be mem|sd)", source ? source : "(null)");
+        return;
+    }
 
     int tab_id = subghz_host_current_tab();
+
+    /* Issue command and reset count */
+    subghz_host_uart_flush_input(tab_id);
+    char cmd[32];
+    snprintf(cmd, sizeof(cmd), "subghz_list %s", source);
+    subghz_host_uart_send(cmd);
+
     st->sigs_count = 0;
 
     static char rx_buf[UART_BUF_LEN];
@@ -85,10 +97,18 @@ void subghz_collect_signal_list(subghz_tab_state_t *st, int timeout_ms, bool ded
                     ESP_LOGI(TAG, "RX< %s", line_buf);
 
                     if (strstr(line_buf, SUBGHZ_LIST_END_MARKER) != NULL) {
+                        /* Match end marker only if source matches what we asked for */
+                        const char *src_field = strstr(line_buf, "source=");
+                        if (src_field && strncmp(src_field + 7, source, strlen(source)) != 0) {
+                            ESP_LOGW(TAG, "END marker source mismatch (want=%s got=%s), ignoring",
+                                     source, src_field + 7);
+                            line_pos = 0;
+                            continue;
+                        }
                         const char *cnt = strstr(line_buf, "count=");
                         if (cnt) fw_count = atoi(cnt + 6);
-                        ESP_LOGI(TAG, "END marker received after %d lines (firmware count=%d)",
-                                 lines_seen, fw_count);
+                        ESP_LOGI(TAG, "END marker received after %d lines (firmware count=%d, source=%s)",
+                                 lines_seen, fw_count, source);
                         done = true;
                     } else {
                         subghz_signal_info_t parsed;
@@ -142,45 +162,6 @@ void subghz_collect_signal_list(subghz_tab_state_t *st, int timeout_ms, bool ded
     ESP_LOGI(TAG, "Collected %d signals (dedup=%d, lines_seen=%d, bytes_seen=%d, firmware count=%d, ended_via=%s)",
              st->sigs_count, dedup, lines_seen, bytes_seen, fw_count,
              done ? "marker" : "timeout");
-}
-
-int subghz_wait_for_marker(int tab_id, const char *marker,
-                           const char *count_prefix, int timeout_ms)
-{
-    static char rx_buf[UART_BUF_LEN];
-    static char line_buf[LINE_BUF_LEN];
-    int line_pos = 0;
-    int counted = 0;
-
-    TickType_t start = xTaskGetTickCount();
-    TickType_t timeout = pdMS_TO_TICKS(timeout_ms);
-    bool done = false;
-
-    while (!done && (xTaskGetTickCount() - start) < timeout) {
-        int len = subghz_host_uart_read_bytes(tab_id, rx_buf, sizeof(rx_buf) - 1, pdMS_TO_TICKS(100));
-        if (len <= 0) continue;
-
-        rx_buf[len] = '\0';
-        for (int i = 0; i < len; i++) {
-            char c = rx_buf[i];
-            if (c == '\n' || c == '\r') {
-                if (line_pos > 0) {
-                    line_buf[line_pos] = '\0';
-                    if (strstr(line_buf, marker) != NULL) {
-                        done = true;
-                    } else if (count_prefix && strstr(line_buf, count_prefix) != NULL) {
-                        counted++;
-                    }
-                    line_pos = 0;
-                    if (done) break;
-                }
-            } else if (line_pos < (int)sizeof(line_buf) - 1) {
-                line_buf[line_pos++] = c;
-            }
-        }
-    }
-
-    return counted;
 }
 
 void subghz_signal_list_free(subghz_tab_state_t *st)
