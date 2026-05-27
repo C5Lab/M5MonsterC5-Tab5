@@ -61,6 +61,10 @@ typedef struct subghz_tab_state {
     lv_obj_t   *empty_lbl;
     lv_obj_t   *count_lbl;
     lv_obj_t   *listen_freq_lbl;
+    volatile int  listen_rssi_dbm;      /* last [SUBGHZ_RSSI], default -100 */
+    volatile bool listen_rssi_dirty;
+    lv_obj_t   *listen_rssi_arc;
+    lv_obj_t   *listen_rssi_lbl;
     lv_obj_t   *btn_start_stop;
     lv_obj_t   *btn_raw;
     lv_obj_t   *listen_freq_popup;

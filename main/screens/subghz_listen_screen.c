@@ -20,6 +20,7 @@ static void close_leave_popup(subghz_tab_state_t *st);
 static void perform_back(subghz_tab_state_t *st);
 static void set_status_msg(subghz_tab_state_t *st, const char *msg, lv_color_t color);
 static void apply_pending_status(subghz_tab_state_t *st);
+static void update_listen_rssi_gauge(subghz_tab_state_t *st);
 
 /* ---- Layout (Tab5: large) ----- */
 #define WATERFALL_W       800
@@ -38,7 +39,11 @@ static void apply_pending_status(subghz_tab_state_t *st);
 #define WF_GRID_COLOR  0x152540
 
 #define UART_BUF_LEN 256
-#define LINE_BUF_LEN 256
+#define LINE_BUF_LEN 512
+
+#define LISTEN_RSSI_MIN_DBM  (-120)
+#define LISTEN_RSSI_MAX_DBM  (-40)
+#define LISTEN_RSSI_ARC_MAX  80
 
 /* Private types (forward-declared in subghz_host.h) */
 typedef struct subghz_signal {
@@ -412,6 +417,79 @@ static void refresh_signal_list_view(subghz_tab_state_t *st)
     }
 }
 
+/* ---- RSSI gauge + decode log helpers ----------------------------- */
+
+static lv_color_t listen_rssi_color(int rssi_dbm)
+{
+    if (rssi_dbm > -50) return subghz_host_color_green();
+    if (rssi_dbm > -70) return subghz_host_color_orange();
+    return subghz_host_color_red();
+}
+
+static int listen_rssi_to_arc(int rssi_dbm)
+{
+    int span = LISTEN_RSSI_MAX_DBM - LISTEN_RSSI_MIN_DBM;
+    int val = (rssi_dbm - LISTEN_RSSI_MIN_DBM) * LISTEN_RSSI_ARC_MAX / span;
+    if (val < 0) val = 0;
+    if (val > LISTEN_RSSI_ARC_MAX) val = LISTEN_RSSI_ARC_MAX;
+    return val;
+}
+
+static void update_listen_rssi_gauge(subghz_tab_state_t *st)
+{
+    if (!st) return;
+
+    if (!st->listen_running) {
+        if (st->listen_rssi_arc) {
+            lv_arc_set_value(st->listen_rssi_arc, 0);
+            lv_obj_set_style_arc_color(st->listen_rssi_arc, subghz_host_ui_muted(),
+                                       LV_PART_INDICATOR);
+        }
+        if (st->listen_rssi_lbl) {
+            lv_label_set_text(st->listen_rssi_lbl, "--");
+            lv_obj_set_style_text_color(st->listen_rssi_lbl, subghz_host_ui_muted(), 0);
+        }
+        return;
+    }
+
+    int rssi = st->listen_rssi_dbm;
+    lv_color_t col = listen_rssi_color(rssi);
+
+    if (st->listen_rssi_arc) {
+        lv_arc_set_value(st->listen_rssi_arc, listen_rssi_to_arc(rssi));
+        lv_obj_set_style_arc_color(st->listen_rssi_arc, col, LV_PART_INDICATOR);
+    }
+    if (st->listen_rssi_lbl) {
+        lv_label_set_text_fmt(st->listen_rssi_lbl, "%d", rssi);
+        lv_obj_set_style_text_color(st->listen_rssi_lbl, col, 0);
+    }
+}
+
+static bool listen_line_should_log(const char *line)
+{
+    if (!line) return false;
+
+    const char *tag = subghz_normalize_line(line);
+    if (tag) {
+        if (strncmp(tag, "[SUBGHZ_RSSI]", 13) == 0) return true;
+        if (strncmp(tag, "[KL_DEC]", 8) == 0) return true;
+        if (strncmp(tag, "[REPLAY_SEG]", 12) == 0) return true;
+        if (strncmp(tag, "[REPLAY]", 8) == 0) return true;
+        if (strncmp(tag, "[KAT_RX]", 8) == 0) return true;
+        if (strncmp(tag, "[SUBGHZ_RX]", 11) == 0 &&
+            (tag[11] == ' ' || tag[11] == '\0'))
+            return true;
+    }
+
+    if (strstr(line, "SubGHz: key saved")) return true;
+    return false;
+}
+
+static void listen_log_line(const char *line)
+{
+    if (line && line[0]) ESP_LOGI(TAG, "%s", line);
+}
+
 /* ---- UART monitor task ------------------------------------------- */
 
 /* Lift name= value out of an event line into a stack buffer. */
@@ -482,8 +560,15 @@ static void process_subghz_line(subghz_tab_state_t *st, const char *line)
 
     if (!st->listen_running) return;
 
-    int rssi_unused = 0;
-    if (subghz_parse_rssi_line(line, &rssi_unused)) return;
+    if (listen_line_should_log(line))
+        listen_log_line(line);
+
+    int rssi = 0;
+    if (subghz_parse_rssi_line(line, &rssi)) {
+        st->listen_rssi_dbm = rssi;
+        st->listen_rssi_dirty = true;
+        return;
+    }
 
     subghz_signal_info_t parsed;
     if (!subghz_parse_signal_line(line, &parsed)) return;
@@ -552,6 +637,11 @@ static void ui_tick_cb(lv_timer_t *t)
 {
     subghz_tab_state_t *st = (subghz_tab_state_t *)lv_timer_get_user_data(t);
     if (!st) return;
+
+    if (st->listen_rssi_dirty) {
+        st->listen_rssi_dirty = false;
+        update_listen_rssi_gauge(st);
+    }
 
     bool activity = st->activity_pending;
     st->activity_pending = false;
@@ -756,6 +846,8 @@ static void reset_capture_session(subghz_tab_state_t *st)
     st->activity_pending = false;
     st->history_dirty = true;
     st->psram_exhausted = false;
+    st->listen_rssi_dbm = -100;
+    st->listen_rssi_dirty = true;
     clear_signal_history(st);
 
     if (st->sig_list) lv_obj_scroll_to_y(st->sig_list, 0, LV_ANIM_OFF);
@@ -774,6 +866,7 @@ static void stop_listening(subghz_tab_state_t *st)
     /* Keep monitor task installed so Save/TX responses still update the
      * status label; listen_cleanup() tears it down on screen exit. */
     st->activity_pending = false;
+    st->listen_rssi_dirty = true;
     update_start_stop_btn(st);
     if (st->btn_raw) lv_obj_clear_state(st->btn_raw, LV_STATE_DISABLED);
     ESP_LOGI(TAG, "SubGHz listen stopped");
@@ -870,6 +963,8 @@ void subghz_listen_cleanup(subghz_tab_state_t *st)
     st->empty_lbl = NULL;
     st->count_lbl = NULL;
     st->listen_freq_lbl = NULL;
+    st->listen_rssi_arc = NULL;
+    st->listen_rssi_lbl = NULL;
     st->btn_start_stop = NULL;
     st->btn_raw = NULL;
     for (int i = 0; i < 5; i++) st->rollers[i] = NULL;
@@ -1192,6 +1287,10 @@ void show_subghz_listen_page(void)
     st->activity_pending = false;
     st->psram_exhausted = false;
     st->listen_status_pending = false;
+    st->listen_rssi_dbm = -100;
+    st->listen_rssi_dirty = true;
+    st->listen_rssi_arc = NULL;
+    st->listen_rssi_lbl = NULL;
 
     /* Allocate row pool */
     if (!st->row_pool) {
@@ -1218,6 +1317,34 @@ void show_subghz_listen_page(void)
     lv_obj_set_style_bg_opa(spacer, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(spacer, 0, 0);
     lv_obj_set_height(spacer, 1);
+
+    lv_obj_t *rssi_box = lv_obj_create(header);
+    lv_obj_set_size(rssi_box, 56, 48);
+    lv_obj_set_style_bg_opa(rssi_box, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(rssi_box, 0, 0);
+    lv_obj_set_style_pad_all(rssi_box, 0, 0);
+    lv_obj_set_style_margin_right(rssi_box, 8, 0);
+    lv_obj_clear_flag(rssi_box, LV_OBJ_FLAG_SCROLLABLE);
+
+    st->listen_rssi_arc = lv_arc_create(rssi_box);
+    lv_obj_set_size(st->listen_rssi_arc, 48, 48);
+    lv_obj_align(st->listen_rssi_arc, LV_ALIGN_TOP_MID, 0, 0);
+    lv_arc_set_rotation(st->listen_rssi_arc, 135);
+    lv_arc_set_bg_angles(st->listen_rssi_arc, 0, 270);
+    lv_arc_set_range(st->listen_rssi_arc, 0, LISTEN_RSSI_ARC_MAX);
+    lv_arc_set_value(st->listen_rssi_arc, 0);
+    lv_obj_remove_style(st->listen_rssi_arc, NULL, LV_PART_KNOB);
+    lv_obj_clear_flag(st->listen_rssi_arc, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_style_arc_width(st->listen_rssi_arc, 5, LV_PART_MAIN);
+    lv_obj_set_style_arc_color(st->listen_rssi_arc, subghz_host_ui_panel(), LV_PART_MAIN);
+    lv_obj_set_style_arc_width(st->listen_rssi_arc, 5, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(st->listen_rssi_arc, subghz_host_ui_muted(), LV_PART_INDICATOR);
+
+    st->listen_rssi_lbl = lv_label_create(rssi_box);
+    lv_obj_align(st->listen_rssi_lbl, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_text_font(st->listen_rssi_lbl, &lv_font_montserrat_12, 0);
+    lv_label_set_text(st->listen_rssi_lbl, "--");
+    lv_obj_set_style_text_color(st->listen_rssi_lbl, subghz_host_ui_muted(), 0);
 
     lv_obj_t *freq_btn = lv_btn_create(header);
     lv_obj_set_size(freq_btn, LV_SIZE_CONTENT, 48);
@@ -1268,7 +1395,7 @@ void show_subghz_listen_page(void)
     lv_obj_clear_flag(mode_box, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *dec_lbl = lv_label_create(mode_box);
-    lv_label_set_text(dec_lbl, "Decimal");
+    lv_label_set_text(dec_lbl, "Decode");
     lv_obj_set_style_text_font(dec_lbl, &lv_font_montserrat_18, 0);
     lv_obj_set_style_text_color(dec_lbl,
         st->raw_mode ? subghz_host_ui_muted() : subghz_host_color_cyan(), 0);
@@ -1359,6 +1486,7 @@ void show_subghz_listen_page(void)
     }
 
     refresh_signal_list_view(st);
+    update_listen_rssi_gauge(st);
 
     if (!st->ui_timer)
         st->ui_timer = lv_timer_create(ui_tick_cb, WATERFALL_TICK_MS, st);
