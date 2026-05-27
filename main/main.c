@@ -658,6 +658,11 @@ typedef struct {
     volatile bool bt_locator_tracking;
     TaskHandle_t bt_locator_task;
 
+    // AP Radar (WiFi locator)
+    lv_obj_t *ap_radar_page;
+    volatile bool ap_radar_running;
+    TaskHandle_t ap_radar_task;
+
     // =====================================================================
     // KARMA - Page and data
     // =====================================================================
@@ -758,6 +763,7 @@ typedef struct {
     // here so we don't need to expose its layout to other parts of main.c)
     // =====================================================================
     struct subghz_tab_state *subghz;  // owned, allocated in init_tab_context
+    lv_obj_t *subghz_tile;            // Sub-GHz tile in home grid (may be NULL)
 
     // Transport type for this tab context
     uint8_t transport_kind;  // 0=Grove, 1=USB, 2=MBus, 3=INTERNAL
@@ -1226,6 +1232,7 @@ static void hide_all_pages(tab_context_t *ctx) {
     if (ctx->bt_airtag_page) lv_obj_add_flag(ctx->bt_airtag_page, LV_OBJ_FLAG_HIDDEN);
     if (ctx->bt_scan_page) lv_obj_add_flag(ctx->bt_scan_page, LV_OBJ_FLAG_HIDDEN);
     if (ctx->bt_locator_page) lv_obj_add_flag(ctx->bt_locator_page, LV_OBJ_FLAG_HIDDEN);
+    if (ctx->ap_radar_page) lv_obj_add_flag(ctx->ap_radar_page, LV_OBJ_FLAG_HIDDEN);
     if (ctx->arp_poison_page) lv_obj_add_flag(ctx->arp_poison_page, LV_OBJ_FLAG_HIDDEN);
     if (ctx->nmap_page) lv_obj_add_flag(ctx->nmap_page, LV_OBJ_FLAG_HIDDEN);
     if (ctx->wardrive_page) lv_obj_add_flag(ctx->wardrive_page, LV_OBJ_FLAG_HIDDEN);
@@ -1704,6 +1711,23 @@ static lv_obj_t *bt_locator_rssi_label = NULL;
 static volatile bool bt_locator_tracking = false;
 static TaskHandle_t bt_locator_task_handle = NULL;
 
+// AP Radar (WiFi AP locator)
+#define AP_RADAR_RSSI_CENTER  (-40)
+#define AP_RADAR_RSSI_EDGE    (-90)
+
+static lv_obj_t *ap_radar_page = NULL;
+static lv_obj_t *ap_radar_panel = NULL;
+static lv_obj_t *ap_radar_rssi_label = NULL;
+static volatile bool ap_radar_running = false;
+static TaskHandle_t ap_radar_task_handle = NULL;
+static lv_timer_t *ap_radar_sweep_timer = NULL;
+static int ap_radar_sweep_angle = 0;
+static float ap_radar_blip_dist_frac = 1.0f;
+static int ap_radar_last_rssi = -100;
+static char ap_radar_target_ssid[33] = {0};
+static char ap_radar_target_bssid[18] = {0};
+static int ap_radar_target_channel = 0;
+
 // BT device storage (global legacy - type defined earlier)
 static bt_device_t bt_devices[BT_MAX_DEVICES];
 static int bt_device_count = 0;
@@ -2054,6 +2078,10 @@ static void bt_scan_device_click_cb(lv_event_t *e);
 static void show_bt_locator_page(int device_idx);
 static void bt_locator_tracking_back_btn_event_cb(lv_event_t *e);
 static void bt_locator_tracking_task(void *arg);
+static void show_ap_radar_page(int network_idx);
+static void ap_radar_back_btn_event_cb(lv_event_t *e);
+static void ap_radar_stop_btn_event_cb(lv_event_t *e);
+static void ap_radar_monitor_task(void *arg);
 
 //==================================================================================
 // INA226 Power Monitor Driver
@@ -5309,7 +5337,7 @@ static lv_obj_t *create_small_tile(lv_obj_t *parent, const char *icon, const cha
 
 static void create_attack_action_bar(lv_obj_t *parent, lv_event_cb_t callback, lv_event_cb_t karma_callback)
 {
-    bool three_cols = enable_red_team && (karma_callback != NULL);
+    bool three_cols = enable_red_team;
     lv_coord_t bar_h = three_cols ? 240 : 162;
 
     lv_obj_t *attack_bar = lv_obj_create(parent);
@@ -5375,31 +5403,16 @@ static void create_attack_action_bar(lv_obj_t *parent, lv_event_cb_t callback, l
             lv_obj_t *b6 = create_small_tile(attack_row2, LV_SYMBOL_EYE_OPEN,  "RogueAP",      COLOR_MATERIAL_CYAN,   callback,       "Rogue AP");
             lv_obj_t *b7 = create_small_tile(attack_row3, LV_SYMBOL_COPY,      "MITM",         COLOR_MATERIAL_TEAL,   callback,       "MITM");
             lv_obj_t *b8 = create_small_tile(attack_row3, LV_SYMBOL_LIST,      "Nmap",         COLOR_MATERIAL_GREEN,  callback,       "Nmap");
-            lv_obj_t *b9 = create_small_tile(attack_row3, LV_SYMBOL_WIFI,      "Karma",        COLOR_MATERIAL_AMBER,  karma_callback, "Karma");
+            lv_obj_t *b9;
+            if (karma_callback != NULL) {
+                b9 = create_small_tile(attack_row3, LV_SYMBOL_WIFI, "Karma", COLOR_MATERIAL_AMBER, karma_callback, "Karma");
+            } else {
+                b9 = create_small_tile(attack_row3, LV_SYMBOL_GPS, "Radar", COLOR_MATERIAL_BLUE, callback, "Radar");
+            }
 
             lv_obj_set_size(b1, bw, 72); lv_obj_set_size(b2, bw, 72); lv_obj_set_size(b3, bw_last, 72);
             lv_obj_set_size(b4, bw, 72); lv_obj_set_size(b5, bw, 72); lv_obj_set_size(b6, bw_last, 72);
             lv_obj_set_size(b7, bw, 72); lv_obj_set_size(b8, bw, 72); lv_obj_set_size(b9, bw_last, 72);
-        } else {
-            // 2x4 layout
-            const lv_coord_t gap_total = 24;
-            lv_coord_t btn_w = (row_inner_w - gap_total) / 4;
-            if (btn_w < 60) btn_w = 60;
-            lv_coord_t btn_last_w = btn_w + (row_inner_w - gap_total - btn_w * 4);
-
-            lv_obj_t *btn1 = create_small_tile(attack_row1, LV_SYMBOL_CHARGE,   "Deauth",       COLOR_MATERIAL_RED,    callback, "Deauth");
-            lv_obj_t *btn2 = create_small_tile(attack_row1, LV_SYMBOL_WARNING,  "Evil Twin",    COLOR_MATERIAL_ORANGE, callback, "Evil Twin");
-            lv_obj_t *btn3 = create_small_tile(attack_row1, LV_SYMBOL_POWER,    "SAE Overflow", COLOR_MATERIAL_PINK,   callback, "SAE Overflow");
-            lv_obj_t *btn4 = create_small_tile(attack_row1, LV_SYMBOL_DOWNLOAD, "Handshake",    COLOR_MATERIAL_AMBER,  callback, "Handshaker");
-            lv_obj_t *btn5 = create_small_tile(attack_row2, LV_SYMBOL_SHUFFLE,  "ARP",          COLOR_MATERIAL_PURPLE, callback, "ARP Poison");
-            lv_obj_t *btn6 = create_small_tile(attack_row2, LV_SYMBOL_WIFI,     "RogueAP",      COLOR_MATERIAL_CYAN,   callback, "Rogue AP");
-            lv_obj_t *btn7 = create_small_tile(attack_row2, LV_SYMBOL_EYE_OPEN, "MITM",         COLOR_MATERIAL_TEAL,   callback, "MITM");
-            lv_obj_t *btn8 = create_small_tile(attack_row2, LV_SYMBOL_LIST,     "Nmap",         COLOR_MATERIAL_GREEN,  callback, "Nmap");
-
-            lv_obj_set_size(btn1, btn_w, 72); lv_obj_set_size(btn2, btn_w, 72);
-            lv_obj_set_size(btn3, btn_w, 72); lv_obj_set_size(btn4, btn_last_w, 72);
-            lv_obj_set_size(btn5, btn_w, 72); lv_obj_set_size(btn6, btn_w, 72);
-            lv_obj_set_size(btn7, btn_w, 72); lv_obj_set_size(btn8, btn_last_w, 72);
         }
     } else {
         // Non-red-team: ARP + Nmap (+ Karma if requested)
@@ -7007,6 +7020,31 @@ static void handle_selected_attack(const char *attack_name)
         }
 
         show_rogue_ap_page();
+        return;
+    }
+
+    if (strcmp(attack_name, "Radar") == 0) {
+        if (v.sel_count != 1) {
+            ESP_LOGW(TAG, "Radar requires exactly 1 network, selected: %d", v.sel_count);
+            if (ctx->scan_status_label) {
+                bsp_display_lock(0);
+                lv_label_set_text(ctx->scan_status_label, "Select exactly 1 network for Radar");
+                lv_obj_set_style_text_color(ctx->scan_status_label, COLOR_MATERIAL_RED, 0);
+                bsp_display_unlock();
+            }
+            return;
+        }
+
+        int idx = v.sel_indices[0];
+        if (idx < 0 || idx >= v.net_count) return;
+
+        char cmd[32];
+        snprintf(cmd, sizeof(cmd), "select_networks %d", v.nets[idx].index);
+        uart_send_command_for_tab(cmd);
+        vTaskDelay(pdMS_TO_TICKS(100));
+        uart_send_command_for_tab("start_ap_locator");
+        show_ap_radar_page(idx);
+        return;
     }
 }
 
@@ -11900,12 +11938,41 @@ static lv_obj_t *create_home_storage_card(lv_obj_t *parent, lv_coord_t card_h, b
     return card;
 }
 
+static void update_subghz_tile_visibility(tab_context_t *ctx)
+{
+    if (!ctx) return;
+    if (!ctx->subghz_tile) return;
+
+    if (!lv_obj_is_valid(ctx->subghz_tile)) {
+        ctx->subghz_tile = NULL;
+        return;
+    }
+
+    // If the tile exists, ensure it matches the current capability flag.
+    if (ctx->has_subghz) {
+        lv_obj_clear_flag(ctx->subghz_tile, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(ctx->subghz_tile, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
 // Create tiles for UART tabs inside given container
 static void create_uart_tiles_in_container(lv_obj_t *container, tab_context_t *ctx, lv_obj_t **tiles_ptr)
 {
     if (*tiles_ptr) {
-        lv_obj_clear_flag(*tiles_ptr, LV_OBJ_FLAG_HIDDEN);
-        return;
+        // If Sub-GHz became available after the tiles UI was created, rebuild the
+        // tile grid so we can add the missing tile.
+        if (ctx && ctx->has_subghz &&
+            (!ctx->subghz_tile || !lv_obj_is_valid(ctx->subghz_tile))) {
+            ctx->subghz_tile = NULL;
+            lv_obj_del(*tiles_ptr);
+            *tiles_ptr = NULL;
+            // fall through to rebuild
+        } else {
+            update_subghz_tile_visibility(ctx);
+            lv_obj_clear_flag(*tiles_ptr, LV_OBJ_FLAG_HIDDEN);
+            return;
+        }
     }
 
     bool large = lv_disp_get_ver_res(NULL) >= 1000;
@@ -11950,17 +12017,11 @@ static void create_uart_tiles_in_container(lv_obj_t *container, tab_context_t *c
     create_tile(tile_grid, LV_SYMBOL_LOOP, "Network\nObserver", COLOR_MATERIAL_TEAL, main_tile_event_cb, "Network Observer");
     create_tile(tile_grid, LV_SYMBOL_WIFI, "Karma", COLOR_MATERIAL_ORANGE, main_tile_event_cb, "Karma");
     create_tile(tile_grid, LV_SYMBOL_GPS, "Wardrive", COLOR_MATERIAL_TEAL, main_tile_event_cb, "Wardrive");
-    {
-        lv_obj_t *subghz_tile = create_tile(tile_grid, LV_SYMBOL_BARS, "Sub-GHz",
-                                            COLOR_MATERIAL_PINK, main_tile_event_cb, "Sub-GHz");
-        if (!ctx || !ctx->has_subghz) {
-            // No JanOS RF firmware on this UART - keep the tile visible but disabled.
-            lv_obj_remove_event_cb(subghz_tile, main_tile_event_cb);
-            lv_obj_clear_flag(subghz_tile, LV_OBJ_FLAG_CLICKABLE);
-            lv_obj_set_style_bg_opa(subghz_tile, LV_OPA_30, 0);
-            lv_obj_set_style_text_opa(subghz_tile, LV_OPA_50, LV_PART_MAIN | LV_STATE_DEFAULT);
-            lv_obj_add_state(subghz_tile, LV_STATE_DISABLED);
-        }
+    if (ctx && ctx->has_subghz) {
+        ctx->subghz_tile = create_tile(tile_grid, LV_SYMBOL_BARS, "Sub-GHz",
+                                       COLOR_MATERIAL_PINK, main_tile_event_cb, "Sub-GHz");
+    } else if (ctx) {
+        ctx->subghz_tile = NULL;
     }
 
     if (dashboard_enabled) {
@@ -12184,6 +12245,7 @@ static void show_uart1_tiles(void)
     if (ctx->subghz) subghz_hide_all_pages(ctx->subghz);
 
     create_uart_tiles_in_container(container, ctx, &ctx->tiles);
+    update_subghz_tile_visibility(ctx);
     ctx->current_visible_page = ctx->tiles;
     trigger_home_meta_refresh(ctx, true);
     update_home_dashboard_labels(ctx, battery_percent_from_voltage(current_battery_voltage));
@@ -12210,6 +12272,7 @@ static void show_mbus_tiles(void)
     if (ctx->subghz) subghz_hide_all_pages(ctx->subghz);
 
     create_uart_tiles_in_container(mbus_container, ctx, &ctx->tiles);
+    update_subghz_tile_visibility(ctx);
     ctx->current_visible_page = ctx->tiles;
     trigger_home_meta_refresh(ctx, true);
     update_home_dashboard_labels(ctx, battery_percent_from_voltage(current_battery_voltage));
@@ -26493,6 +26556,384 @@ static void show_bt_scan_page(void)
 //==================================================================================
 // BT Locator Tracking Page
 //==================================================================================
+
+// ============================================================================
+// AP Radar (WiFi AP locator)
+// ============================================================================
+
+static float ap_radar_rssi_to_dist_frac(int rssi_dbm)
+{
+    if (rssi_dbm >= AP_RADAR_RSSI_CENTER) return 0.0f;
+    if (rssi_dbm <= AP_RADAR_RSSI_EDGE) return 1.0f;
+    return (float)(AP_RADAR_RSSI_CENTER - rssi_dbm)
+         / (float)(AP_RADAR_RSSI_CENTER - AP_RADAR_RSSI_EDGE);
+}
+
+static lv_color_t ap_radar_rssi_color(int rssi_dbm)
+{
+    if (rssi_dbm > -50) return COLOR_MATERIAL_GREEN;
+    if (rssi_dbm > -70) return COLOR_MATERIAL_AMBER;
+    return COLOR_MATERIAL_RED;
+}
+
+static bool parse_ap_locator_line(const char *line, int *out_rssi)
+{
+    if (!line || !out_rssi) return false;
+    if (strstr(line, "[AP Locator]") == NULL) return false;
+
+    const char *rssi_ptr = strstr(line, "RSSI:");
+    if (!rssi_ptr) return false;
+
+    *out_rssi = atoi(rssi_ptr + 5);
+    return true;
+}
+
+static void ap_radar_stop_locator(void)
+{
+    if (ap_radar_running) {
+        uart_send_command_for_tab("stop");
+        ap_radar_running = false;
+
+        tab_context_t *ctx = get_current_ctx();
+        if (ctx) {
+            ctx->ap_radar_running = false;
+        }
+
+        if (ap_radar_task_handle != NULL) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            ap_radar_task_handle = NULL;
+        }
+    }
+}
+
+static void ap_radar_sweep_timer_cb(lv_timer_t *timer)
+{
+    (void)timer;
+    ap_radar_sweep_angle = (ap_radar_sweep_angle + 12) % 360;
+    if (ap_radar_panel) {
+        lv_obj_invalidate(ap_radar_panel);
+    }
+}
+
+static void ap_radar_panel_draw_cb(lv_event_t *e)
+{
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code != LV_EVENT_DRAW_MAIN) return;
+
+    lv_obj_t *obj = lv_event_get_target_obj(e);
+    lv_layer_t *layer = lv_event_get_layer(e);
+
+    lv_area_t coords;
+    lv_obj_get_coords(obj, &coords);
+    int32_t w = lv_area_get_width(&coords);
+    int32_t h = lv_area_get_height(&coords);
+    int32_t cx = coords.x1 + w / 2;
+    int32_t cy = coords.y1 + h / 2;
+    int32_t max_r = (w < h ? w : h) / 2 - 12;
+    if (max_r < 20) max_r = 20;
+
+    lv_color_t grid_col = lv_color_hex(0x1E4D3A);
+    lv_color_t axis_col = lv_color_hex(0x2E6B52);
+    lv_color_t sweep_col = lv_color_hex(0x33FF99);
+
+    for (int ring = 1; ring <= 4; ring++) {
+        int32_t r = max_r * ring / 4;
+        lv_draw_arc_dsc_t arc_dsc;
+        lv_draw_arc_dsc_init(&arc_dsc);
+        arc_dsc.base.layer = layer;
+        arc_dsc.color = grid_col;
+        arc_dsc.width = 1;
+        arc_dsc.center.x = cx;
+        arc_dsc.center.y = cy;
+        arc_dsc.radius = r;
+        arc_dsc.start_angle = 0;
+        arc_dsc.end_angle = 360;
+        arc_dsc.opa = LV_OPA_60;
+        lv_draw_arc(layer, &arc_dsc);
+    }
+
+    lv_draw_line_dsc_t line_dsc;
+    lv_draw_line_dsc_init(&line_dsc);
+    line_dsc.base.layer = layer;
+    line_dsc.color = axis_col;
+    line_dsc.width = 1;
+    line_dsc.opa = LV_OPA_50;
+
+    line_dsc.p1.x = cx - max_r;
+    line_dsc.p1.y = cy;
+    line_dsc.p2.x = cx + max_r;
+    line_dsc.p2.y = cy;
+    lv_draw_line(layer, &line_dsc);
+
+    line_dsc.p1.x = cx;
+    line_dsc.p1.y = cy - max_r;
+    line_dsc.p2.x = cx;
+    line_dsc.p2.y = cy + max_r;
+    lv_draw_line(layer, &line_dsc);
+
+    int16_t sweep = (int16_t)ap_radar_sweep_angle;
+    int32_t sx = cx + (max_r * lv_trigo_cos(sweep)) / 32767;
+    int32_t sy = cy + (max_r * lv_trigo_sin(sweep)) / 32767;
+
+    line_dsc.color = sweep_col;
+    line_dsc.width = 2;
+    line_dsc.opa = LV_OPA_70;
+    line_dsc.p1.x = cx;
+    line_dsc.p1.y = cy;
+    line_dsc.p2.x = sx;
+    line_dsc.p2.y = sy;
+    lv_draw_line(layer, &line_dsc);
+
+    int32_t blip_r_px = (int32_t)(ap_radar_blip_dist_frac * max_r);
+    int32_t bx = cx;
+    int32_t by = cy - blip_r_px;
+
+    lv_area_t blip_area;
+    blip_area.x1 = bx - 8;
+    blip_area.y1 = by - 8;
+    blip_area.x2 = bx + 7;
+    blip_area.y2 = by + 7;
+
+    lv_draw_rect_dsc_t rect_dsc;
+    lv_draw_rect_dsc_init(&rect_dsc);
+    rect_dsc.base.layer = layer;
+    rect_dsc.bg_color = ap_radar_rssi_color(ap_radar_last_rssi);
+    rect_dsc.bg_opa = LV_OPA_COVER;
+    rect_dsc.radius = LV_RADIUS_CIRCLE;
+    rect_dsc.border_width = 0;
+    lv_draw_rect(layer, &rect_dsc, &blip_area);
+}
+
+static void ap_radar_monitor_task(void *arg)
+{
+    tab_context_t *ctx = (tab_context_t *)arg;
+    tab_id_t task_tab = tab_id_for_ctx(ctx);
+    uart_port_t uart_port = (task_tab == TAB_MBUS && uart2_initialized) ? UART2_NUM : UART_NUM;
+    const char *uart_name = tab_transport_name(task_tab);
+
+    ESP_LOGI(TAG, "[%s][AP_RADAR] Monitor task started for tab %d", uart_name, task_tab);
+
+    static char rx_buffer[256];
+    static char line_buffer[192];
+    int line_pos = 0;
+
+    while (ctx && ctx->ap_radar_running) {
+        int len = transport_read_bytes(uart_port, rx_buffer, sizeof(rx_buffer) - 1, pdMS_TO_TICKS(100));
+
+        if (len > 0) {
+            rx_buffer[len] = '\0';
+
+            for (int i = 0; i < len; i++) {
+                char c = rx_buffer[i];
+
+                if (c == '\n' || c == '\r') {
+                    if (line_pos > 0) {
+                        line_buffer[line_pos] = '\0';
+
+                        int rssi = 0;
+                        if (parse_ap_locator_line(line_buffer, &rssi)) {
+                            ap_radar_last_rssi = rssi;
+                            ap_radar_blip_dist_frac = ap_radar_rssi_to_dist_frac(rssi);
+
+                            bsp_display_lock(0);
+                            if (ap_radar_rssi_label) {
+                                lv_label_set_text_fmt(ap_radar_rssi_label, "%d dBm", rssi);
+                                lv_obj_set_style_text_color(ap_radar_rssi_label,
+                                                            ap_radar_rssi_color(rssi), 0);
+                            }
+                            if (ap_radar_panel) {
+                                lv_obj_invalidate(ap_radar_panel);
+                            }
+                            bsp_display_unlock();
+                        }
+
+                        line_pos = 0;
+                    }
+                } else if (line_pos < (int)sizeof(line_buffer) - 1) {
+                    line_buffer[line_pos++] = c;
+                }
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+
+    ESP_LOGI(TAG, "[AP_RADAR] Monitor task ended");
+    ap_radar_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+static void ap_radar_return_to_scan(void)
+{
+    ap_radar_stop_locator();
+
+    if (ap_radar_sweep_timer) {
+        lv_timer_del(ap_radar_sweep_timer);
+        ap_radar_sweep_timer = NULL;
+    }
+
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx) return;
+
+    if (ctx->ap_radar_page) {
+        lv_obj_add_flag(ctx->ap_radar_page, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    if (ctx->scan_page) {
+        lv_obj_clear_flag(ctx->scan_page, LV_OBJ_FLAG_HIDDEN);
+        ctx->current_visible_page = ctx->scan_page;
+    }
+}
+
+static void ap_radar_back_btn_event_cb(lv_event_t *e)
+{
+    (void)e;
+    ap_radar_return_to_scan();
+}
+
+static void ap_radar_stop_btn_event_cb(lv_event_t *e)
+{
+    (void)e;
+    ap_radar_return_to_scan();
+}
+
+static void show_ap_radar_page(int network_idx)
+{
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx) return;
+
+    if (network_idx < 0 || network_idx >= ctx->network_count) return;
+
+    wifi_network_t *net = &ctx->networks[network_idx];
+
+    strncpy(ap_radar_target_ssid, net->ssid, sizeof(ap_radar_target_ssid) - 1);
+    ap_radar_target_ssid[sizeof(ap_radar_target_ssid) - 1] = '\0';
+    strncpy(ap_radar_target_bssid, net->bssid, sizeof(ap_radar_target_bssid) - 1);
+    ap_radar_target_bssid[sizeof(ap_radar_target_bssid) - 1] = '\0';
+    ap_radar_target_channel = net->channel;
+
+    ap_radar_blip_dist_frac = ap_radar_rssi_to_dist_frac(net->rssi);
+    ap_radar_last_rssi = net->rssi;
+    ap_radar_sweep_angle = 0;
+
+    lv_obj_t *container = get_current_tab_container();
+    if (!container) {
+        ESP_LOGE(TAG, "Container not initialized for AP Radar");
+        return;
+    }
+
+    ap_radar_stop_locator();
+    if (ap_radar_sweep_timer) {
+        lv_timer_del(ap_radar_sweep_timer);
+        ap_radar_sweep_timer = NULL;
+    }
+
+    hide_all_pages(ctx);
+
+    if (ctx->ap_radar_page) {
+        lv_obj_del(ctx->ap_radar_page);
+        ctx->ap_radar_page = NULL;
+        ap_radar_page = NULL;
+        ap_radar_panel = NULL;
+        ap_radar_rssi_label = NULL;
+    }
+
+    if (ctx->scan_page) {
+        lv_obj_add_flag(ctx->scan_page, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    ctx->ap_radar_page = lv_obj_create(container);
+    ap_radar_page = ctx->ap_radar_page;
+    lv_obj_set_size(ap_radar_page, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(ap_radar_page, ui_bg_color(), 0);
+    lv_obj_set_style_border_width(ap_radar_page, 0, 0);
+    lv_obj_set_style_pad_all(ap_radar_page, 10, 0);
+    lv_obj_set_flex_flow(ap_radar_page, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(ap_radar_page, 8, 0);
+
+    lv_obj_t *header = lv_obj_create(ap_radar_page);
+    lv_obj_set_size(header, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(header, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(header, 0, 0);
+    lv_obj_set_style_pad_all(header, 0, 0);
+    lv_obj_set_flex_flow(header, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(header, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(header, 12, 0);
+    lv_obj_clear_flag(header, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *back_btn = lv_btn_create(header);
+    lv_obj_set_size(back_btn, 72, 60);
+    style_back_nav_button(back_btn);
+    lv_obj_add_event_cb(back_btn, ap_radar_back_btn_event_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *back_icon = lv_label_create(back_btn);
+    lv_label_set_text(back_icon, LV_SYMBOL_LEFT);
+    lv_obj_set_style_text_color(back_icon, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_center(back_icon);
+
+    lv_obj_t *title_col = lv_obj_create(header);
+    lv_obj_set_size(title_col, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(title_col, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(title_col, 0, 0);
+    lv_obj_set_style_pad_all(title_col, 0, 0);
+    lv_obj_set_flex_flow(title_col, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(title_col, 2, 0);
+    lv_obj_clear_flag(title_col, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(title_col);
+    lv_label_set_text(title, LV_SYMBOL_GPS "  AP Radar");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_BLUE, 0);
+
+    lv_obj_t *subtitle = lv_label_create(title_col);
+    const char *ssid_display = strlen(ap_radar_target_ssid) > 0 ? ap_radar_target_ssid : "(Hidden)";
+    lv_label_set_text_fmt(subtitle, "%s  |  %s  |  Ch %d",
+                          ssid_display, ap_radar_target_bssid, ap_radar_target_channel);
+    lv_obj_set_style_text_font(subtitle, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(subtitle, ui_muted_color(), 0);
+
+    ap_radar_panel = lv_obj_create(ap_radar_page);
+    lv_obj_set_width(ap_radar_panel, lv_pct(100));
+    lv_obj_set_flex_grow(ap_radar_panel, 1);
+    lv_obj_set_style_min_height(ap_radar_panel, 360, 0);
+    lv_obj_set_style_bg_color(ap_radar_panel, lv_color_hex(0x0A1A12), 0);
+    lv_obj_set_style_border_color(ap_radar_panel, COLOR_MATERIAL_GREEN, 0);
+    lv_obj_set_style_border_width(ap_radar_panel, 1, 0);
+    lv_obj_set_style_border_opa(ap_radar_panel, LV_OPA_40, 0);
+    lv_obj_set_style_radius(ap_radar_panel, 12, 0);
+    lv_obj_clear_flag(ap_radar_panel, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(ap_radar_panel, ap_radar_panel_draw_cb, LV_EVENT_DRAW_MAIN, NULL);
+
+    ap_radar_rssi_label = lv_label_create(ap_radar_page);
+    lv_label_set_text_fmt(ap_radar_rssi_label, "%d dBm", ap_radar_last_rssi);
+    lv_obj_set_style_text_font(ap_radar_rssi_label, &lv_font_montserrat_28, 0);
+    lv_obj_set_style_text_color(ap_radar_rssi_label, ap_radar_rssi_color(ap_radar_last_rssi), 0);
+    lv_obj_set_style_text_align(ap_radar_rssi_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(ap_radar_rssi_label, lv_pct(100));
+
+    lv_obj_t *stop_btn = lv_btn_create(ap_radar_page);
+    lv_obj_set_size(stop_btn, lv_pct(100), 56);
+    lv_obj_set_style_bg_color(stop_btn, COLOR_MATERIAL_RED, 0);
+    lv_obj_set_style_bg_color(stop_btn, lv_color_darken(COLOR_MATERIAL_RED, LV_OPA_20), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(stop_btn, 10, 0);
+    lv_obj_add_event_cb(stop_btn, ap_radar_stop_btn_event_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *stop_lbl = lv_label_create(stop_btn);
+    lv_label_set_text(stop_lbl, LV_SYMBOL_STOP "  STOP");
+    lv_obj_set_style_text_font(stop_lbl, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_color(stop_lbl, lv_color_white(), 0);
+    lv_obj_center(stop_lbl);
+
+    ap_radar_sweep_timer = lv_timer_create(ap_radar_sweep_timer_cb, 50, NULL);
+
+    ap_radar_running = true;
+    ctx->ap_radar_running = true;
+
+    xTaskCreate(ap_radar_monitor_task, "ap_radar", 4096, (void *)ctx, 5, &ap_radar_task_handle);
+
+    ctx->current_visible_page = ctx->ap_radar_page;
+    ESP_LOGI(TAG, "AP Radar page shown for %s", ap_radar_target_ssid);
+}
 
 // Back to BT scan from locator tracking - hide page and show BT scan
 static void bt_locator_tracking_back_btn_event_cb(lv_event_t *e)
