@@ -663,6 +663,10 @@ typedef struct {
     volatile bool ap_radar_running;
     TaskHandle_t ap_radar_task;
 
+    // BT nRF24 Jammer
+    lv_obj_t *bt_jammer_page;
+    volatile bool bt_jamming;
+
     // =====================================================================
     // KARMA - Page and data
     // =====================================================================
@@ -1233,6 +1237,7 @@ static void hide_all_pages(tab_context_t *ctx) {
     if (ctx->bt_scan_page) lv_obj_add_flag(ctx->bt_scan_page, LV_OBJ_FLAG_HIDDEN);
     if (ctx->bt_locator_page) lv_obj_add_flag(ctx->bt_locator_page, LV_OBJ_FLAG_HIDDEN);
     if (ctx->ap_radar_page) lv_obj_add_flag(ctx->ap_radar_page, LV_OBJ_FLAG_HIDDEN);
+    if (ctx->bt_jammer_page) lv_obj_add_flag(ctx->bt_jammer_page, LV_OBJ_FLAG_HIDDEN);
     if (ctx->arp_poison_page) lv_obj_add_flag(ctx->arp_poison_page, LV_OBJ_FLAG_HIDDEN);
     if (ctx->nmap_page) lv_obj_add_flag(ctx->nmap_page, LV_OBJ_FLAG_HIDDEN);
     if (ctx->wardrive_page) lv_obj_add_flag(ctx->wardrive_page, LV_OBJ_FLAG_HIDDEN);
@@ -1728,6 +1733,16 @@ static char ap_radar_target_ssid[33] = {0};
 static char ap_radar_target_bssid[18] = {0};
 static int ap_radar_target_channel = 0;
 
+// BT nRF24 Jammer
+static const char *k_jam_bands[5] = { "ble", "bt", "wifi", "drone", "all" };
+static int bt_jammer_band = 0; // default: ble
+static lv_obj_t *bt_jammer_page = NULL;
+static lv_obj_t *bt_jammer_band_btns[5] = {NULL};
+static lv_obj_t *bt_jammer_big_btn = NULL;
+static lv_obj_t *bt_jammer_big_btn_lbl = NULL;
+static lv_obj_t *bt_jammer_status_lbl = NULL;
+static TaskHandle_t bt_jammer_task_handle = NULL;
+
 // BT device storage (global legacy - type defined earlier)
 static bt_device_t bt_devices[BT_MAX_DEVICES];
 static int bt_device_count = 0;
@@ -2071,6 +2086,11 @@ static void bt_menu_back_btn_event_cb(lv_event_t *e);
 static void show_airtag_scan_page(void);
 static void airtag_scan_back_btn_event_cb(lv_event_t *e);
 static void airtag_scan_task(void *arg);
+static void show_jammer_page(void);
+static void jammer_back_btn_event_cb(lv_event_t *e);
+static void jammer_band_event_cb(lv_event_t *e);
+static void jammer_big_btn_event_cb(lv_event_t *e);
+static void bt_jammer_task(void *arg);
 static void show_bt_scan_page(void);
 static void bt_scan_back_btn_event_cb(lv_event_t *e);
 static void bt_scan_rescan_cb(lv_event_t *e);
@@ -25906,6 +25926,8 @@ static void bt_menu_tile_event_cb(lv_event_t *e)
         show_airtag_scan_page();
     } else if (strcmp(tile_name, "BT Scan & Locate") == 0) {
         show_bt_scan_page();
+    } else if (strcmp(tile_name, "Jammer") == 0) {
+        show_jammer_page();
     }
 }
 
@@ -25988,6 +26010,9 @@ static void show_bluetooth_menu_page(void)
     create_tile(tiles, LV_SYMBOL_BLUETOOTH, "BT Scan\n& Locate",
                 ui_tab_icon_color(),
                 bt_menu_tile_event_cb, "BT Scan & Locate");
+    create_tile(tiles, LV_SYMBOL_WARNING, "Jammer",
+                COLOR_MATERIAL_RED,
+                bt_menu_tile_event_cb, "Jammer");
 
     // Set current visible page
     ctx->current_visible_page = ctx->bt_menu_page;
@@ -26211,6 +26236,330 @@ static void show_airtag_scan_page(void)
 
     // Set current visible page
     ctx->current_visible_page = ctx->bt_airtag_page;
+}
+
+//==================================================================================
+// BT nRF24 Jammer Page
+//==================================================================================
+
+// Apply selected/unselected styling to a band button
+static void jammer_style_band_btn(lv_obj_t *btn, bool selected)
+{
+    if (!btn) return;
+    if (selected) {
+        lv_obj_set_style_bg_color(btn, COLOR_MATERIAL_RED, 0);
+        lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
+    } else {
+        lv_obj_set_style_bg_color(btn, ui_card_color(), 0);
+        lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
+    }
+}
+
+// Set band buttons enabled/disabled (locked while jamming)
+static void jammer_set_bands_enabled(bool enabled)
+{
+    for (int i = 0; i < 5; i++) {
+        if (!bt_jammer_band_btns[i]) continue;
+        if (enabled) {
+            lv_obj_clear_state(bt_jammer_band_btns[i], LV_STATE_DISABLED);
+        } else {
+            lv_obj_add_state(bt_jammer_band_btns[i], LV_STATE_DISABLED);
+        }
+    }
+}
+
+// Reader task - parses nRF24 status markers from the active tab's transport
+static void bt_jammer_task(void *arg)
+{
+    tab_context_t *ctx = (tab_context_t *)arg;
+
+    tab_id_t task_tab = tab_id_for_ctx(ctx);
+    uart_port_t uart_port = (task_tab == TAB_MBUS && uart2_initialized) ? UART2_NUM : UART_NUM;
+    const char *uart_name = tab_transport_name(task_tab);
+
+    ESP_LOGI(TAG, "[%s] Jammer reader task started for tab %d", uart_name, task_tab);
+
+    static char rx_buffer[256];
+    static char line_buffer[128];
+    int line_pos = 0;
+
+    while (ctx && ctx->bt_jamming) {
+        int len = transport_read_bytes(uart_port, rx_buffer, sizeof(rx_buffer) - 1, pdMS_TO_TICKS(100));
+
+        if (len > 0) {
+            rx_buffer[len] = '\0';
+
+            for (int i = 0; i < len; i++) {
+                char c = rx_buffer[i];
+
+                if (c == '\n' || c == '\r') {
+                    if (line_pos > 0) {
+                        line_buffer[line_pos] = '\0';
+
+                        if (strstr(line_buffer, "[NRF24] not detected")) {
+                            ESP_LOGW(TAG, "Jammer: nRF24 not detected");
+                            bsp_display_lock(0);
+                            if (bt_jammer_status_lbl) {
+                                lv_label_set_text(bt_jammer_status_lbl, "Module not detected!");
+                                lv_obj_set_style_text_color(bt_jammer_status_lbl, COLOR_MATERIAL_RED, 0);
+                            }
+                            bsp_display_unlock();
+                        } else if (strstr(line_buffer, "[NRF24] failed to start")) {
+                            ESP_LOGW(TAG, "Jammer: failed to start");
+                            bsp_display_lock(0);
+                            if (bt_jammer_status_lbl) {
+                                lv_label_set_text(bt_jammer_status_lbl, "Failed to start");
+                                lv_obj_set_style_text_color(bt_jammer_status_lbl, COLOR_MATERIAL_RED, 0);
+                            }
+                            bsp_display_unlock();
+                        } else if (strstr(line_buffer, "nRF24 jammer started")) {
+                            ESP_LOGI(TAG, "Jammer: started");
+                            bsp_display_lock(0);
+                            if (bt_jammer_status_lbl) {
+                                lv_label_set_text_fmt(bt_jammer_status_lbl, "Jamming %s...",
+                                                      k_jam_bands[bt_jammer_band]);
+                                lv_obj_set_style_text_color(bt_jammer_status_lbl, COLOR_MATERIAL_RED, 0);
+                            }
+                            bsp_display_unlock();
+                        }
+
+                        line_pos = 0;
+                    }
+                } else if (line_pos < (int)sizeof(line_buffer) - 1) {
+                    line_buffer[line_pos++] = c;
+                }
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+
+    ESP_LOGI(TAG, "Jammer reader task ended");
+    bt_jammer_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+// Band selector tap handler (ignored while jamming)
+static void jammer_band_event_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = get_current_ctx();
+    if (ctx && ctx->bt_jamming) return;
+
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (idx < 0 || idx >= 5) return;
+
+    bt_jammer_band = idx;
+    for (int i = 0; i < 5; i++) {
+        jammer_style_band_btn(bt_jammer_band_btns[i], i == idx);
+    }
+}
+
+// Stop jamming and reset UI to idle (does not navigate)
+static void jammer_stop(tab_context_t *ctx)
+{
+    if (!ctx || !ctx->bt_jamming) return;
+
+    ctx->bt_jamming = false;
+    uart_send_command_for_tab("stop");
+
+    if (bt_jammer_task_handle != NULL) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        bt_jammer_task_handle = NULL;
+    }
+
+    jammer_set_bands_enabled(true);
+    if (bt_jammer_big_btn) {
+        lv_obj_set_style_bg_color(bt_jammer_big_btn, COLOR_MATERIAL_RED, 0);
+    }
+    if (bt_jammer_big_btn_lbl) {
+        lv_label_set_text(bt_jammer_big_btn_lbl, LV_SYMBOL_PLAY "  Start Jammer");
+    }
+    if (bt_jammer_status_lbl) {
+        lv_label_set_text(bt_jammer_status_lbl, "Idle");
+        lv_obj_set_style_text_color(bt_jammer_status_lbl, ui_muted_color(), 0);
+    }
+}
+
+// Big start/stop button handler
+static void jammer_big_btn_event_cb(lv_event_t *e)
+{
+    (void)e;
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx) return;
+
+    if (ctx->bt_jamming) {
+        jammer_stop(ctx);
+        return;
+    }
+
+    ctx->bt_jamming = true;
+
+    char cmd[32];
+    snprintf(cmd, sizeof(cmd), "start_jammer24 %s", k_jam_bands[bt_jammer_band]);
+    uart_send_command_for_tab("init_nrf24");
+    uart_send_command_for_tab(cmd);
+
+    jammer_set_bands_enabled(false);
+    if (bt_jammer_big_btn) {
+        lv_obj_set_style_bg_color(bt_jammer_big_btn, lv_color_hex(0x8B0000), 0);
+    }
+    if (bt_jammer_big_btn_lbl) {
+        lv_label_set_text(bt_jammer_big_btn_lbl, LV_SYMBOL_STOP "  Stop Jammer");
+    }
+    if (bt_jammer_status_lbl) {
+        lv_label_set_text_fmt(bt_jammer_status_lbl, "Starting %s...", k_jam_bands[bt_jammer_band]);
+        lv_obj_set_style_text_color(bt_jammer_status_lbl, COLOR_MATERIAL_AMBER, 0);
+    }
+
+    xTaskCreate(bt_jammer_task, "bt_jammer", 4096, (void*)ctx, 5, &bt_jammer_task_handle);
+}
+
+// Back to BT menu - always stops jamming first
+static void jammer_back_btn_event_cb(lv_event_t *e)
+{
+    (void)e;
+    tab_context_t *ctx = get_current_ctx();
+
+    if (ctx && ctx->bt_jamming) {
+        jammer_stop(ctx);
+    } else {
+        // Defensive: ensure firmware radio is idle even if UI thinks it's idle
+        uart_send_command_for_tab("stop");
+    }
+
+    if (ctx && ctx->bt_jammer_page) {
+        lv_obj_add_flag(ctx->bt_jammer_page, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    if (ctx && ctx->bt_menu_page) {
+        lv_obj_clear_flag(ctx->bt_menu_page, LV_OBJ_FLAG_HIDDEN);
+        ctx->current_visible_page = ctx->bt_menu_page;
+    }
+}
+
+// Show nRF24 Jammer page (inside current tab's container)
+static void show_jammer_page(void)
+{
+    tab_context_t *ctx = get_current_ctx();
+    lv_obj_t *container = get_current_tab_container();
+
+    if (!container) {
+        ESP_LOGE(TAG, "Container not initialized for tab %d", current_tab);
+        return;
+    }
+
+    // Hide all other pages
+    hide_all_pages(ctx);
+
+    // If page already exists, just show it
+    if (ctx->bt_jammer_page) {
+        lv_obj_clear_flag(ctx->bt_jammer_page, LV_OBJ_FLAG_HIDDEN);
+        ctx->current_visible_page = ctx->bt_jammer_page;
+        bt_jammer_page = ctx->bt_jammer_page;
+        ESP_LOGI(TAG, "Showing existing Jammer page for tab %d", current_tab);
+        return;
+    }
+
+    ESP_LOGI(TAG, "Creating new Jammer page for tab %d", current_tab);
+
+    ctx->bt_jamming = false;
+
+    // Create page container inside tab container
+    ctx->bt_jammer_page = lv_obj_create(container);
+    bt_jammer_page = ctx->bt_jammer_page;
+    lv_obj_set_size(bt_jammer_page, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(bt_jammer_page, ui_bg_color(), 0);
+    lv_obj_set_style_border_width(bt_jammer_page, 0, 0);
+    lv_obj_set_style_pad_all(bt_jammer_page, 10, 0);
+    lv_obj_set_flex_flow(bt_jammer_page, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(bt_jammer_page, 10, 0);
+
+    // Header
+    lv_obj_t *header = lv_obj_create(bt_jammer_page);
+    lv_obj_set_size(header, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(header, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(header, 0, 0);
+    lv_obj_set_style_pad_all(header, 0, 0);
+    lv_obj_set_flex_flow(header, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(header, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(header, 12, 0);
+    lv_obj_clear_flag(header, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *back_btn = lv_btn_create(header);
+    lv_obj_set_size(back_btn, 72, 60);
+    style_back_nav_button(back_btn);
+    lv_obj_add_event_cb(back_btn, jammer_back_btn_event_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *back_icon = lv_label_create(back_btn);
+    lv_label_set_text(back_icon, LV_SYMBOL_LEFT);
+    lv_obj_set_style_text_color(back_icon, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_center(back_icon);
+
+    lv_obj_t *title = lv_label_create(header);
+    lv_label_set_text(title, "Jammer");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, dark_mode_enabled ? COLOR_LAB5_MAGENTA : ui_tab_icon_color(), 0);
+
+    // Content container - centered column
+    lv_obj_t *content = lv_obj_create(bt_jammer_page);
+    lv_obj_set_size(content, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_flex_grow(content, 1);
+    lv_obj_set_style_bg_opa(content, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(content, 0, 0);
+    lv_obj_set_style_pad_all(content, 20, 0);
+    lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(content, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(content, 24, 0);
+    lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLLABLE);
+
+    // Band selector row
+    lv_obj_t *band_row = lv_obj_create(content);
+    lv_obj_set_size(band_row, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(band_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(band_row, 0, 0);
+    lv_obj_set_style_pad_all(band_row, 0, 0);
+    lv_obj_set_flex_flow(band_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(band_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(band_row, 12, 0);
+    lv_obj_clear_flag(band_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    for (int i = 0; i < 5; i++) {
+        lv_obj_t *btn = lv_btn_create(band_row);
+        lv_obj_set_size(btn, 110, 56);
+        lv_obj_set_style_radius(btn, 10, 0);
+        jammer_style_band_btn(btn, i == bt_jammer_band);
+        lv_obj_add_event_cb(btn, jammer_band_event_cb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
+
+        lv_obj_t *lbl = lv_label_create(btn);
+        lv_label_set_text(lbl, k_jam_bands[i]);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_18, 0);
+        lv_obj_set_style_text_color(lbl, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_center(lbl);
+
+        bt_jammer_band_btns[i] = btn;
+    }
+
+    // Big start/stop button
+    bt_jammer_big_btn = lv_btn_create(content);
+    lv_obj_set_size(bt_jammer_big_btn, 320, 80);
+    lv_obj_set_style_radius(bt_jammer_big_btn, 16, 0);
+    lv_obj_set_style_bg_color(bt_jammer_big_btn, COLOR_MATERIAL_RED, 0);
+    lv_obj_add_event_cb(bt_jammer_big_btn, jammer_big_btn_event_cb, LV_EVENT_CLICKED, NULL);
+
+    bt_jammer_big_btn_lbl = lv_label_create(bt_jammer_big_btn);
+    lv_label_set_text(bt_jammer_big_btn_lbl, LV_SYMBOL_PLAY "  Start Jammer");
+    lv_obj_set_style_text_font(bt_jammer_big_btn_lbl, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_color(bt_jammer_big_btn_lbl, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_center(bt_jammer_big_btn_lbl);
+
+    // Status label
+    bt_jammer_status_lbl = lv_label_create(content);
+    lv_label_set_text(bt_jammer_status_lbl, "Idle");
+    lv_obj_set_style_text_font(bt_jammer_status_lbl, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(bt_jammer_status_lbl, ui_muted_color(), 0);
+
+    // Set current visible page
+    ctx->current_visible_page = ctx->bt_jammer_page;
 }
 
 //==================================================================================
