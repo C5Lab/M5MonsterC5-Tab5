@@ -29,6 +29,7 @@ typedef struct {
     char learn[24];
     int te;
     int edges;
+    char name[64];
     bool is_raw;
     bool is_duplicate;
 } subghz_signal_info_t;
