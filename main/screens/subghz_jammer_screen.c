@@ -1,6 +1,8 @@
 #include "subghz_host.h"
 #include "subghz_internal.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -8,7 +10,82 @@ static const char *TAG = "subghz_jam";
 
 static const char *s_digit_opts = "0\n1\n2\n3\n4\n5\n6\n7\n8\n9";
 
+#define JAM_UART_BUF_LEN 256
+#define JAM_LINE_BUF_LEN 256
+
 static void on_back(lv_event_t *e);
+static void stop_jamming(subghz_tab_state_t *st);
+
+/* Lives for the page lifetime; cleared on exit so the reader task quits
+ * without stopping the firmware op (st->jamming covers that). */
+static volatile bool s_jammer_page_alive = false;
+
+static void subghz_jammer_reader_task(void *arg)
+{
+    subghz_tab_state_t *st = (subghz_tab_state_t *)arg;
+    int tab_id = st->jammer_task_tab_id;
+    static char rx_buf[JAM_UART_BUF_LEN];
+    static char line_buf[JAM_LINE_BUF_LEN];
+    int line_pos = 0;
+
+    ESP_LOGI(TAG, "Jammer reader task started for tab %d", tab_id);
+    while (s_jammer_page_alive) {
+        int len = subghz_host_uart_read_bytes(tab_id, rx_buf, sizeof(rx_buf) - 1,
+                                              pdMS_TO_TICKS(100));
+        if (len <= 0) { vTaskDelay(pdMS_TO_TICKS(20)); continue; }
+        rx_buf[len] = '\0';
+        for (int i = 0; i < len; i++) {
+            char c = rx_buf[i];
+            if (c == '\n' || c == '\r') {
+                if (line_pos > 0) {
+                    line_buf[line_pos] = '\0';
+                    subghz_note_radio_line(st, line_buf);
+                    if (strstr(line_buf, "CC1101 NOT DETECTED") ||
+                        strstr(line_buf, "SubGHz jammer start failed:")) {
+                        st->jammer_radio_fail_pending = true;
+                    } else if (strstr(line_buf, "SubGHz jammer ACTIVE")) {
+                        st->jammer_active_pending = true;
+                    }
+                    line_pos = 0;
+                }
+            } else if (line_pos < (int)sizeof(line_buf) - 1) {
+                line_buf[line_pos++] = c;
+            }
+        }
+    }
+    ESP_LOGI(TAG, "Jammer reader task ended");
+    st->jammer_task = NULL;
+    vTaskDelete(NULL);
+}
+
+static void jammer_ui_tick_cb(lv_timer_t *t)
+{
+    subghz_tab_state_t *st = (subghz_tab_state_t *)lv_timer_get_user_data(t);
+    if (!st) return;
+
+    if (st->radio_status_dirty) {
+        st->radio_status_dirty = false;
+        subghz_refresh_radio_badge(st);
+    }
+
+    if (st->jammer_radio_fail_pending) {
+        st->jammer_radio_fail_pending = false;
+        st->jammer_active_pending = false;
+        stop_jamming(st);
+        if (st->jammer_status_lbl) {
+            lv_label_set_text(st->jammer_status_lbl, "CC1101 not detected");
+            lv_obj_set_style_text_color(st->jammer_status_lbl, subghz_host_color_red(), 0);
+        }
+    } else if (st->jammer_active_pending) {
+        st->jammer_active_pending = false;
+        if (st->jamming && st->jammer_status_lbl) {
+            lv_label_set_text_fmt(st->jammer_status_lbl, "Jamming %d.%02d MHz...",
+                                  (int)st->freq_mhz,
+                                  ((int)(st->freq_mhz * 100.0f + 0.5f)) % 100);
+            lv_obj_set_style_text_color(st->jammer_status_lbl, subghz_host_color_red(), 0);
+        }
+    }
+}
 
 static void close_freq_popup(subghz_tab_state_t *st)
 {
@@ -158,6 +235,7 @@ static void stop_jamming(subghz_tab_state_t *st)
 {
     if (!st->jamming) return;
     st->jamming = false;
+    st->jammer_active_pending = false;
     subghz_host_uart_send("subghz_stop");
 
     if (st->jammer_status_lbl) {
@@ -181,16 +259,18 @@ static void on_big_btn(lv_event_t *e)
     if (st->jamming) { stop_jamming(st); return; }
 
     st->jamming = true;
+    st->jammer_radio_fail_pending = false;
+    st->jammer_active_pending = false;
     char cmd[32];
     snprintf(cmd, sizeof(cmd), "subghz_freq %.2f", st->freq_mhz);
     subghz_host_uart_send(cmd);
     subghz_host_uart_send("subghz_jam");
 
     if (st->jammer_status_lbl) {
-        lv_label_set_text_fmt(st->jammer_status_lbl, "Jamming %d.%02d MHz...",
+        lv_label_set_text_fmt(st->jammer_status_lbl, "Starting %d.%02d MHz...",
                               (int)st->freq_mhz,
                               ((int)(st->freq_mhz * 100.0f + 0.5f)) % 100);
-        lv_obj_set_style_text_color(st->jammer_status_lbl, subghz_host_color_red(), 0);
+        lv_obj_set_style_text_color(st->jammer_status_lbl, subghz_host_color_amber(), 0);
     }
     if (st->jammer_big_btn)
         lv_obj_set_style_bg_color(st->jammer_big_btn, lv_color_hex(0x8B0000), 0);
@@ -200,18 +280,31 @@ static void on_big_btn(lv_event_t *e)
     ESP_LOGI(TAG, "Jammer started on %.2f MHz", st->freq_mhz);
 }
 
-static void on_back(lv_event_t *e)
+static void jammer_teardown(subghz_tab_state_t *st)
 {
-    (void)e;
-    subghz_tab_state_t *st = subghz_host_state();
-    if (!st) return;
     stop_jamming(st);
+
+    /* Stop reader task and wait briefly for it to exit. */
+    s_jammer_page_alive = false;
+    for (int i = 0; i < 25 && st->jammer_task; i++) vTaskDelay(pdMS_TO_TICKS(20));
+
+    if (st->jammer_ui_timer) { lv_timer_delete(st->jammer_ui_timer); st->jammer_ui_timer = NULL; }
     if (st->jammer_freq_popup) { lv_obj_delete(st->jammer_freq_popup); st->jammer_freq_popup = NULL; }
     if (st->jammer_page) { lv_obj_delete(st->jammer_page); st->jammer_page = NULL; }
     st->jammer_status_lbl = NULL;
     st->jammer_freq_lbl = NULL;
     st->jammer_big_btn = NULL;
     st->jammer_big_btn_lbl = NULL;
+    st->jammer_radio_fail_pending = false;
+    st->jammer_active_pending = false;
+}
+
+static void on_back(lv_event_t *e)
+{
+    (void)e;
+    subghz_tab_state_t *st = subghz_host_state();
+    if (!st) return;
+    jammer_teardown(st);
     show_subghz_page();
 }
 
@@ -222,12 +315,14 @@ void show_subghz_jammer_page(void)
     if (!st || !container) return;
 
     subghz_host_hide_all_pages();
-    if (st->jammer_page) {
-        lv_obj_clear_flag(st->jammer_page, LV_OBJ_FLAG_HIDDEN);
-        return;
-    }
+    /* Always rebuild so the reader task + UI timer have a clean lifecycle. */
+    if (st->jammer_page) { lv_obj_delete(st->jammer_page); st->jammer_page = NULL; }
 
     if (st->freq_mhz < 1.0f) st->freq_mhz = 433.92f;
+
+    st->jamming = false;
+    st->jammer_radio_fail_pending = false;
+    st->jammer_active_pending = false;
 
     st->jammer_page = lv_obj_create(container);
     lv_obj_set_size(st->jammer_page, lv_pct(100), lv_pct(100));
@@ -239,7 +334,14 @@ void show_subghz_jammer_page(void)
     lv_obj_set_style_pad_row(st->jammer_page, 24, 0);
     lv_obj_clear_flag(st->jammer_page, LV_OBJ_FLAG_SCROLLABLE);
 
-    subghz_create_header(st->jammer_page, "Jammer", subghz_host_color_red(), on_back);
+    lv_obj_t *header = subghz_create_header(st->jammer_page, "Jammer",
+                                            subghz_host_color_red(), on_back);
+    lv_obj_t *hspacer = lv_obj_create(header);
+    lv_obj_remove_style_all(hspacer);
+    lv_obj_set_flex_grow(hspacer, 1);
+    lv_obj_set_height(hspacer, 1);
+    lv_obj_clear_flag(hspacer, LV_OBJ_FLAG_CLICKABLE);
+    subghz_add_radio_badge(header, st);
 
     /* Frequency label (tappable) */
     st->jammer_freq_lbl = lv_label_create(st->jammer_page);
@@ -267,6 +369,14 @@ void show_subghz_jammer_page(void)
     lv_obj_set_style_text_font(st->jammer_status_lbl, &lv_font_montserrat_22, 0);
     lv_obj_set_style_text_color(st->jammer_status_lbl, subghz_host_ui_muted(), 0);
     lv_label_set_text(st->jammer_status_lbl, "Idle");
+
+    /* Background reader (catches CC1101 missing / jam active) + UI timer. */
+    st->jammer_task_tab_id = subghz_host_current_tab();
+    s_jammer_page_alive = true;
+    if (!st->jammer_task)
+        xTaskCreate(subghz_jammer_reader_task, "sg_jam", 4096, st, 5, &st->jammer_task);
+    if (!st->jammer_ui_timer)
+        st->jammer_ui_timer = lv_timer_create(jammer_ui_tick_cb, 150, st);
 
     ESP_LOGI(TAG, "SubGHz Jammer page ready");
 }

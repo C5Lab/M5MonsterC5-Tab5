@@ -21,6 +21,7 @@ static void perform_back(subghz_tab_state_t *st);
 static void set_status_msg(subghz_tab_state_t *st, const char *msg, lv_color_t color);
 static void apply_pending_status(subghz_tab_state_t *st);
 static void update_listen_rssi_gauge(subghz_tab_state_t *st);
+static void stop_listening(subghz_tab_state_t *st);
 
 /* ---- Layout (Tab5: large) ----- */
 #define WATERFALL_W       800
@@ -44,6 +45,13 @@ static void update_listen_rssi_gauge(subghz_tab_state_t *st);
 #define LISTEN_RSSI_MIN_DBM  (-120)
 #define LISTEN_RSSI_MAX_DBM  (-40)
 #define LISTEN_RSSI_ARC_MAX  80
+
+/* Peak-hold: pin the gauge at a caught signal's level for a while, then
+ * ease it back down so a burst stays visible instead of flashing for one
+ * frame. Tuned for the 120 ms ui tick (WATERFALL_TICK_MS). */
+#define LISTEN_RSSI_HOLD_TICKS  12   /* ~1.5 s hold */
+#define LISTEN_RSSI_DECAY_DBM   3    /* dB eased off per tick after hold */
+#define LISTEN_RSSI_CAPTURE_DBM (-45) /* floor forced when a signal decodes */
 
 /* Private types (forward-declared in subghz_host.h) */
 typedef struct subghz_signal {
@@ -435,6 +443,37 @@ static int listen_rssi_to_arc(int rssi_dbm)
     return val;
 }
 
+/* Raise the held peak (and reset the hold window) when a stronger value
+ * arrives. Called from the reader task on RSSI / signal capture. */
+static void listen_bump_peak(subghz_tab_state_t *st, int value)
+{
+    if (!st) return;
+    if (value > st->listen_rssi_peak_dbm) {
+        st->listen_rssi_peak_dbm = value;
+    }
+    st->listen_rssi_hold_ticks = LISTEN_RSSI_HOLD_TICKS;
+    st->listen_rssi_dirty = true;
+}
+
+/* Advance the peak-hold envelope one ui tick: hold while ticks remain,
+ * then decay toward the latest raw RSSI. */
+static void listen_advance_peak(subghz_tab_state_t *st)
+{
+    if (!st) return;
+    if (st->listen_rssi_hold_ticks > 0) {
+        st->listen_rssi_hold_ticks--;
+        return;
+    }
+    int raw = st->listen_rssi_dbm;
+    if (st->listen_rssi_peak_dbm > raw) {
+        st->listen_rssi_peak_dbm -= LISTEN_RSSI_DECAY_DBM;
+        if (st->listen_rssi_peak_dbm < raw)
+            st->listen_rssi_peak_dbm = raw;
+    } else {
+        st->listen_rssi_peak_dbm = raw;
+    }
+}
+
 static void update_listen_rssi_gauge(subghz_tab_state_t *st)
 {
     if (!st) return;
@@ -452,7 +491,7 @@ static void update_listen_rssi_gauge(subghz_tab_state_t *st)
         return;
     }
 
-    int rssi = st->listen_rssi_dbm;
+    int rssi = st->listen_rssi_peak_dbm;
     lv_color_t col = listen_rssi_color(rssi);
 
     if (st->listen_rssi_arc) {
@@ -558,6 +597,19 @@ static void process_subghz_line(subghz_tab_state_t *st, const char *line)
 {
     handle_event_line(st, line);
 
+    subghz_note_radio_line(st, line);
+
+    /* Radio missing / failed to start: surface it and ask the UI tick to
+     * drop back to idle (LVGL must be touched on the UI thread). */
+    if (strstr(line, "CC1101 NOT DETECTED") ||
+        strstr(line, "SubGHz receive start failed:")) {
+        if (st->listen_running) {
+            st->listen_radio_fail_pending = true;
+            set_status_msg(st, "CC1101 not detected", subghz_host_color_red());
+        }
+        return;
+    }
+
     if (!st->listen_running) return;
 
     if (listen_line_should_log(line))
@@ -566,7 +618,7 @@ static void process_subghz_line(subghz_tab_state_t *st, const char *line)
     int rssi = 0;
     if (subghz_parse_rssi_line(line, &rssi)) {
         st->listen_rssi_dbm = rssi;
-        st->listen_rssi_dirty = true;
+        listen_bump_peak(st, rssi);
         return;
     }
 
@@ -577,8 +629,12 @@ static void process_subghz_line(subghz_tab_state_t *st, const char *line)
 
     if (parsed.kind == SUBGHZ_SIGNAL_KIND_RX ||
         parsed.kind == SUBGHZ_SIGNAL_KIND_RX_DUP ||
-        parsed.kind == SUBGHZ_SIGNAL_KIND_RAW)
+        parsed.kind == SUBGHZ_SIGNAL_KIND_RAW) {
         st->activity_pending = true;
+        /* An actual decode means a real signal was caught: pin the gauge
+         * high and reset the hold window so it stays lit a moment. */
+        listen_bump_peak(st, LISTEN_RSSI_CAPTURE_DBM);
+    }
 
     if (!st->raw_mode && parsed.kind == SUBGHZ_SIGNAL_KIND_RAW) return;
     if (st->raw_mode && parsed.kind == SUBGHZ_SIGNAL_KIND_RX_DUP) return;
@@ -638,7 +694,23 @@ static void ui_tick_cb(lv_timer_t *t)
     subghz_tab_state_t *st = (subghz_tab_state_t *)lv_timer_get_user_data(t);
     if (!st) return;
 
-    if (st->listen_rssi_dirty) {
+    if (st->radio_status_dirty) {
+        st->radio_status_dirty = false;
+        subghz_refresh_radio_badge(st);
+    }
+
+    if (st->listen_radio_fail_pending) {
+        st->listen_radio_fail_pending = false;
+        if (st->listen_running) stop_listening(st);
+    }
+
+    if (st->listen_running) {
+        /* Run the peak-hold envelope every tick so the gauge eases down
+         * smoothly regardless of how often RSSI lines arrive. */
+        listen_advance_peak(st);
+        st->listen_rssi_dirty = false;
+        update_listen_rssi_gauge(st);
+    } else if (st->listen_rssi_dirty) {
         st->listen_rssi_dirty = false;
         update_listen_rssi_gauge(st);
     }
@@ -847,7 +919,10 @@ static void reset_capture_session(subghz_tab_state_t *st)
     st->history_dirty = true;
     st->psram_exhausted = false;
     st->listen_rssi_dbm = -100;
+    st->listen_rssi_peak_dbm = -100;
+    st->listen_rssi_hold_ticks = 0;
     st->listen_rssi_dirty = true;
+    st->listen_radio_fail_pending = false;
     clear_signal_history(st);
 
     if (st->sig_list) lv_obj_scroll_to_y(st->sig_list, 0, LV_ANIM_OFF);
@@ -1288,6 +1363,8 @@ void show_subghz_listen_page(void)
     st->psram_exhausted = false;
     st->listen_status_pending = false;
     st->listen_rssi_dbm = -100;
+    st->listen_rssi_peak_dbm = -100;
+    st->listen_rssi_hold_ticks = 0;
     st->listen_rssi_dirty = true;
     st->listen_rssi_arc = NULL;
     st->listen_rssi_lbl = NULL;
@@ -1356,6 +1433,7 @@ void show_subghz_listen_page(void)
     lv_obj_set_style_margin_right(freq_btn, 8, 0);
 
     subghz_add_header_action(header, LV_SYMBOL_SETTINGS, on_settings, NULL);
+    subghz_add_radio_badge(header, st);
 
     st->listen_freq_lbl = lv_label_create(freq_btn);
     update_freq_label(st);

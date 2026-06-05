@@ -130,6 +130,7 @@ static void scanner_reader_task(void *arg)
             if (c == '\n' || c == '\r') {
                 if (line_pos > 0) {
                     line_buf[line_pos] = '\0';
+                    subghz_note_radio_line(st, line_buf);
                     process_line(st, line_buf);
                     line_pos = 0;
                 }
@@ -183,6 +184,10 @@ static void ui_tick_cb(lv_timer_t *t)
 {
     subghz_tab_state_t *st = (subghz_tab_state_t *)lv_timer_get_user_data(t);
     if (!st) return;
+    if (st->radio_status_dirty) {
+        st->radio_status_dirty = false;
+        subghz_refresh_radio_badge(st);
+    }
     bool pulse = st->scanner_pulse;
     bool dirty = st->scanner_dirty;
     if (!pulse && !dirty) return;
@@ -344,6 +349,7 @@ void show_subghz_scanner_page(void)
     lv_obj_set_style_margin_right(st->scanner_pulse_dot, 8, 0);
 
     subghz_add_header_action(header, LV_SYMBOL_SETTINGS, on_settings, NULL);
+    subghz_add_radio_badge(header, st);
 
     lv_obj_t *grid = lv_obj_create(st->scanner_page);
     lv_obj_set_size(grid, lv_pct(100), lv_pct(100));

@@ -47,8 +47,8 @@
 #include "esp_http_server.h"
 #include "lwip/sockets.h"
 
-#define JANOS_TAB_VERSION "1.3.7"
-#define JANOS_VERSION_REQUIRED "1.6.4"
+#define JANOS_TAB_VERSION "1.4.0"
+#define JANOS_VERSION_REQUIRED "1.6.5"
 #include "lwip/netdb.h"
 #include <dirent.h>
 #include <sys/stat.h>
@@ -1742,6 +1742,10 @@ static lv_obj_t *bt_jammer_big_btn = NULL;
 static lv_obj_t *bt_jammer_big_btn_lbl = NULL;
 static lv_obj_t *bt_jammer_status_lbl = NULL;
 static TaskHandle_t bt_jammer_task_handle = NULL;
+// nRF24 presence: 0=unknown 1=present 2=absent
+static int bt_nrf24_present = 0;
+static TaskHandle_t bt_jammer_probe_handle = NULL;
+static volatile bool bt_jammer_probe_active = false;
 
 // BT device storage (global legacy - type defined earlier)
 static bt_device_t bt_devices[BT_MAX_DEVICES];
@@ -2091,6 +2095,8 @@ static void jammer_back_btn_event_cb(lv_event_t *e);
 static void jammer_band_event_cb(lv_event_t *e);
 static void jammer_big_btn_event_cb(lv_event_t *e);
 static void bt_jammer_task(void *arg);
+static void bt_jammer_probe_task(void *arg);
+static void jammer_stop(tab_context_t *ctx);
 static void show_bt_scan_page(void);
 static void bt_scan_back_btn_event_cb(lv_event_t *e);
 static void bt_scan_rescan_cb(lv_event_t *e);
@@ -26268,6 +26274,66 @@ static void jammer_set_bands_enabled(bool enabled)
     }
 }
 
+// One-shot probe run on page open: init the nRF24 and report whether the
+// module is present, without starting a jam.
+static void bt_jammer_probe_task(void *arg)
+{
+    tab_context_t *ctx = (tab_context_t *)arg;
+    tab_id_t task_tab = tab_id_for_ctx(ctx);
+    uart_port_t uart_port = (task_tab == TAB_MBUS && uart2_initialized) ? UART2_NUM : UART_NUM;
+
+    ESP_LOGI(TAG, "Jammer probe: detecting nRF24 on tab %d", task_tab);
+    uart_send_command_for_tab("init_nrf24");
+
+    static char rx_buffer[256];
+    static char line_buffer[128];
+    int line_pos = 0;
+    int verdict = 0; // 1=present 2=absent
+
+    for (int iter = 0; iter < 10 && verdict == 0 && bt_jammer_probe_active; iter++) {
+        int len = transport_read_bytes(uart_port, rx_buffer, sizeof(rx_buffer) - 1,
+                                       pdMS_TO_TICKS(100));
+        if (len <= 0) continue;
+        rx_buffer[len] = '\0';
+        for (int i = 0; i < len && verdict == 0; i++) {
+            char c = rx_buffer[i];
+            if (c == '\n' || c == '\r') {
+                if (line_pos > 0) {
+                    line_buffer[line_pos] = '\0';
+                    if (strstr(line_buffer, "[NRF24] not detected")) verdict = 2;
+                    else if (strstr(line_buffer, "[NRF24] detected"))  verdict = 1;
+                    line_pos = 0;
+                }
+            } else if (line_pos < (int)sizeof(line_buffer) - 1) {
+                line_buffer[line_pos++] = c;
+            }
+        }
+    }
+
+    if (verdict != 0) bt_nrf24_present = verdict;
+
+    // Update the status label only if the probe still owns the page (user
+    // hasn't pressed Start / left in the meantime).
+    if (bt_jammer_probe_active) {
+        bsp_display_lock(0);
+        if (bt_jammer_status_lbl && ctx && !ctx->bt_jamming) {
+            if (verdict == 1) {
+                lv_label_set_text(bt_jammer_status_lbl, "nRF24: OK");
+                lv_obj_set_style_text_color(bt_jammer_status_lbl, COLOR_MATERIAL_GREEN, 0);
+            } else if (verdict == 2) {
+                lv_label_set_text(bt_jammer_status_lbl, "nRF24: not detected");
+                lv_obj_set_style_text_color(bt_jammer_status_lbl, COLOR_MATERIAL_RED, 0);
+            }
+        }
+        bsp_display_unlock();
+    }
+
+    ESP_LOGI(TAG, "Jammer probe done: verdict=%d", verdict);
+    bt_jammer_probe_active = false;
+    bt_jammer_probe_handle = NULL;
+    vTaskDelete(NULL);
+}
+
 // Reader task - parses nRF24 status markers from the active tab's transport
 static void bt_jammer_task(void *arg)
 {
@@ -26298,22 +26364,36 @@ static void bt_jammer_task(void *arg)
 
                         if (strstr(line_buffer, "[NRF24] not detected")) {
                             ESP_LOGW(TAG, "Jammer: nRF24 not detected");
+                            bt_nrf24_present = 2;
+                            ctx->bt_jamming = false; /* drop out of the loop */
                             bsp_display_lock(0);
                             if (bt_jammer_status_lbl) {
-                                lv_label_set_text(bt_jammer_status_lbl, "Module not detected!");
+                                lv_label_set_text(bt_jammer_status_lbl, "nRF24 not detected!");
                                 lv_obj_set_style_text_color(bt_jammer_status_lbl, COLOR_MATERIAL_RED, 0);
                             }
+                            jammer_set_bands_enabled(true);
+                            if (bt_jammer_big_btn)
+                                lv_obj_set_style_bg_color(bt_jammer_big_btn, COLOR_MATERIAL_RED, 0);
+                            if (bt_jammer_big_btn_lbl)
+                                lv_label_set_text(bt_jammer_big_btn_lbl, LV_SYMBOL_PLAY "  Start Jammer");
                             bsp_display_unlock();
                         } else if (strstr(line_buffer, "[NRF24] failed to start")) {
                             ESP_LOGW(TAG, "Jammer: failed to start");
+                            ctx->bt_jamming = false; /* drop out of the loop */
                             bsp_display_lock(0);
                             if (bt_jammer_status_lbl) {
                                 lv_label_set_text(bt_jammer_status_lbl, "Failed to start");
                                 lv_obj_set_style_text_color(bt_jammer_status_lbl, COLOR_MATERIAL_RED, 0);
                             }
+                            jammer_set_bands_enabled(true);
+                            if (bt_jammer_big_btn)
+                                lv_obj_set_style_bg_color(bt_jammer_big_btn, COLOR_MATERIAL_RED, 0);
+                            if (bt_jammer_big_btn_lbl)
+                                lv_label_set_text(bt_jammer_big_btn_lbl, LV_SYMBOL_PLAY "  Start Jammer");
                             bsp_display_unlock();
                         } else if (strstr(line_buffer, "nRF24 jammer started")) {
                             ESP_LOGI(TAG, "Jammer: started");
+                            bt_nrf24_present = 1;
                             bsp_display_lock(0);
                             if (bt_jammer_status_lbl) {
                                 lv_label_set_text_fmt(bt_jammer_status_lbl, "Jamming %s...",
@@ -26321,6 +26401,8 @@ static void bt_jammer_task(void *arg)
                                 lv_obj_set_style_text_color(bt_jammer_status_lbl, COLOR_MATERIAL_RED, 0);
                             }
                             bsp_display_unlock();
+                        } else if (strstr(line_buffer, "[NRF24] detected")) {
+                            bt_nrf24_present = 1;
                         }
 
                         line_pos = 0;
@@ -26392,7 +26474,18 @@ static void jammer_big_btn_event_cb(lv_event_t *e)
         return;
     }
 
+    // Stop any in-flight detection probe so it doesn't consume the jam
+    // command responses (both read the same UART).
+    if (bt_jammer_probe_active) {
+        bt_jammer_probe_active = false;
+        for (int i = 0; i < 25 && bt_jammer_probe_handle; i++) vTaskDelay(pdMS_TO_TICKS(20));
+    }
+
     ctx->bt_jamming = true;
+
+    // Start the reader BEFORE sending commands so the detected / not-detected
+    // / started responses are never missed (firmware replies within ms).
+    xTaskCreate(bt_jammer_task, "bt_jammer", 4096, (void*)ctx, 5, &bt_jammer_task_handle);
 
     char cmd[32];
     snprintf(cmd, sizeof(cmd), "start_jammer24 %s", k_jam_bands[bt_jammer_band]);
@@ -26410,8 +26503,6 @@ static void jammer_big_btn_event_cb(lv_event_t *e)
         lv_label_set_text_fmt(bt_jammer_status_lbl, "Starting %s...", k_jam_bands[bt_jammer_band]);
         lv_obj_set_style_text_color(bt_jammer_status_lbl, COLOR_MATERIAL_AMBER, 0);
     }
-
-    xTaskCreate(bt_jammer_task, "bt_jammer", 4096, (void*)ctx, 5, &bt_jammer_task_handle);
 }
 
 // Back to BT menu - always stops jamming first
@@ -26419,6 +26510,12 @@ static void jammer_back_btn_event_cb(lv_event_t *e)
 {
     (void)e;
     tab_context_t *ctx = get_current_ctx();
+
+    // Stop any in-flight nRF24 detection probe.
+    if (bt_jammer_probe_active) {
+        bt_jammer_probe_active = false;
+        for (int i = 0; i < 25 && bt_jammer_probe_handle; i++) vTaskDelay(pdMS_TO_TICKS(20));
+    }
 
     if (ctx && ctx->bt_jamming) {
         jammer_stop(ctx);
@@ -26434,6 +26531,23 @@ static void jammer_back_btn_event_cb(lv_event_t *e)
     if (ctx && ctx->bt_menu_page) {
         lv_obj_clear_flag(ctx->bt_menu_page, LV_OBJ_FLAG_HIDDEN);
         ctx->current_visible_page = ctx->bt_menu_page;
+    }
+}
+
+// Kick a one-shot nRF24 detection probe (no-op while jamming / probing).
+static void jammer_start_probe(tab_context_t *ctx)
+{
+    if (!ctx || ctx->bt_jamming) return;
+    if (bt_jammer_probe_active) return;
+    if (bt_jammer_status_lbl) {
+        lv_label_set_text(bt_jammer_status_lbl, "Detecting nRF24...");
+        lv_obj_set_style_text_color(bt_jammer_status_lbl, COLOR_MATERIAL_AMBER, 0);
+    }
+    bt_jammer_probe_active = true;
+    if (xTaskCreate(bt_jammer_probe_task, "bt_jam_probe", 4096, (void *)ctx, 5,
+                    &bt_jammer_probe_handle) != pdPASS) {
+        bt_jammer_probe_active = false;
+        ESP_LOGW(TAG, "Failed to start nRF24 probe task");
     }
 }
 
@@ -26456,6 +26570,7 @@ static void show_jammer_page(void)
         lv_obj_clear_flag(ctx->bt_jammer_page, LV_OBJ_FLAG_HIDDEN);
         ctx->current_visible_page = ctx->bt_jammer_page;
         bt_jammer_page = ctx->bt_jammer_page;
+        if (!ctx->bt_jamming) jammer_start_probe(ctx);
         ESP_LOGI(TAG, "Showing existing Jammer page for tab %d", current_tab);
         return;
     }
@@ -26557,6 +26672,9 @@ static void show_jammer_page(void)
     lv_label_set_text(bt_jammer_status_lbl, "Idle");
     lv_obj_set_style_text_font(bt_jammer_status_lbl, &lv_font_montserrat_20, 0);
     lv_obj_set_style_text_color(bt_jammer_status_lbl, ui_muted_color(), 0);
+
+    // Detect the nRF24 module up front so the user knows if it's attached.
+    jammer_start_probe(ctx);
 
     // Set current visible page
     ctx->current_visible_page = ctx->bt_jammer_page;

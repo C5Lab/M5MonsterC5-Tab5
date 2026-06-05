@@ -40,6 +40,13 @@ typedef struct subghz_tab_state {
     float freq_mhz;            /* default 433.92 */
     bool  raw_mode;            /* Listen RAW vs decoded */
 
+    /* Shared CC1101 radio presence (0=unknown 1=present 2=absent) */
+    volatile int  cc1101_present;
+    volatile bool radio_status_dirty;
+    volatile bool radio_probe_running;
+    volatile bool radio_probe_cancel;  /* set on navigation so the probe bails */
+    lv_obj_t     *radio_badge_lbl;   /* per-page header chip (rebuilt each open) */
+
     /* Listen state */
     volatile bool listen_running;
     TaskHandle_t  listen_task;
@@ -63,6 +70,8 @@ typedef struct subghz_tab_state {
     lv_obj_t   *listen_freq_lbl;
     volatile int  listen_rssi_dbm;      /* last [SUBGHZ_RSSI], default -100 */
     volatile bool listen_rssi_dirty;
+    int           listen_rssi_peak_dbm; /* peak-hold display value */
+    int           listen_rssi_hold_ticks; /* remaining ticks to hold the peak */
     lv_obj_t   *listen_rssi_arc;
     lv_obj_t   *listen_rssi_lbl;
     lv_obj_t   *btn_start_stop;
@@ -81,6 +90,9 @@ typedef struct subghz_tab_state {
     lv_timer_t *listen_status_clear_timer;
     /* Pre-config used by show_subghz_listen_page_at() */
     bool        listen_pending_autostart;
+    /* Set by reader task when the radio is missing/failed; the UI tick
+     * stops listening (LVGL touch must run on the UI thread). */
+    volatile bool listen_radio_fail_pending;
 
     /* Transmit / Manage shared list */
     subghz_stored_sig_t *sigs;
@@ -118,6 +130,11 @@ typedef struct subghz_tab_state {
     lv_obj_t  *jammer_big_btn;
     lv_obj_t  *jammer_big_btn_lbl;
     lv_obj_t  *jammer_freq_popup;
+    TaskHandle_t  jammer_task;
+    int           jammer_task_tab_id;
+    lv_timer_t   *jammer_ui_timer;
+    volatile bool jammer_radio_fail_pending;   /* CC1101 missing/failed */
+    volatile bool jammer_active_pending;        /* jam confirmed active */
 
     /* Tesla */
     lv_obj_t  *tesla_status_lbl;

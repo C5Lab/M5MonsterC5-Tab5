@@ -303,6 +303,7 @@ static void hunter_reader_task(void *arg)
             if (c == '\n' || c == '\r') {
                 if (line_pos > 0) {
                     line_buf[line_pos] = '\0';
+                    subghz_note_radio_line(st, line_buf);
                     process_event_line(st, line_buf);
                     line_pos = 0;
                 }
@@ -443,6 +444,10 @@ static void ui_tick_cb(lv_timer_t *t)
 {
     subghz_tab_state_t *st = (subghz_tab_state_t *)lv_timer_get_user_data(t);
     if (!st) return;
+    if (st->radio_status_dirty) {
+        st->radio_status_dirty = false;
+        subghz_refresh_radio_badge(st);
+    }
     static int s_last_count = -1;
     int n = history_count(st);
     if (n != s_last_count) {
@@ -738,6 +743,7 @@ static void build_page_and_start(bool resume)
     lv_obj_set_style_border_width(spacer, 0, 0);
     lv_obj_set_height(spacer, 1);
     subghz_add_header_action(header, LV_SYMBOL_SETTINGS, on_settings, NULL);
+    subghz_add_radio_badge(header, st);
 
     /* Spinner + status row */
     lv_obj_t *row = lv_obj_create(st->hunter_page);

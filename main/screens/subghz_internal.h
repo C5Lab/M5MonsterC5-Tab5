@@ -19,6 +19,28 @@ lv_obj_t *subghz_add_header_action(lv_obj_t *header, const char *symbol,
 /* Style a popup as a card with a coloured border + shadow.  */
 void subghz_style_popup_card(lv_obj_t *popup, lv_coord_t radius, lv_color_t accent);
 
+/* ---- CC1101 radio presence (shared across all SubGHz radio tools) ----
+ * cc1101_present in subghz_tab_state_t: 0=unknown 1=present 2=absent. */
+
+/* Update the cached presence from one firmware output line. Safe to call
+ * from any reader task on every received line. Returns true if the cached
+ * value changed (sets radio_status_dirty). */
+bool subghz_note_radio_line(subghz_tab_state_t *st, const char *line);
+
+/* Add a small right-aligned "Radio: OK/NONE/?" chip to a header built by
+ * subghz_create_header. Stores it in st->radio_badge_lbl and styles it
+ * from the current cached presence. */
+void subghz_add_radio_badge(lv_obj_t *header, subghz_tab_state_t *st);
+
+/* Re-style st->radio_badge_lbl from the cached presence (call from a page
+ * UI timer when radio_status_dirty). */
+void subghz_refresh_radio_badge(subghz_tab_state_t *st);
+
+/* Kick a one-shot background probe (subghz_rx -> subghz_stop) that learns
+ * CC1101 presence. No-op if presence is already known or a probe / radio
+ * op is already running. */
+void subghz_host_probe_cc1101_async(void);
+
 /* Common back handler used by Listen/Transmit/Manage/Jammer/Tesla -> back to menu. */
 void subghz_on_back_to_menu(lv_event_t *e);
 

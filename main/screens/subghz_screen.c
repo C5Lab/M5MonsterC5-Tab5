@@ -1,6 +1,8 @@
 #include "subghz_host.h"
 #include "subghz_internal.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -133,6 +135,137 @@ void subghz_style_popup_card(lv_obj_t *popup, lv_coord_t radius, lv_color_t acce
     lv_obj_set_style_shadow_opa(popup, LV_OPA_30, 0);
 }
 
+/* ---------- CC1101 radio presence (shared) -------------------------- */
+
+bool subghz_note_radio_line(subghz_tab_state_t *st, const char *line)
+{
+    if (!st || !line) return false;
+
+    int next = st->cc1101_present;
+
+    if (strstr(line, "CC1101 NOT DETECTED") ||
+        strstr(line, "start failed:")) {
+        next = 2; /* absent */
+    } else if (strstr(line, "CC1101 initialized") ||
+               strstr(line, "[SUBGHZ_")) {
+        next = 1; /* present */
+    }
+
+    if (next != st->cc1101_present) {
+        st->cc1101_present = next;
+        st->radio_status_dirty = true;
+        return true;
+    }
+    return false;
+}
+
+static void radio_badge_style(lv_obj_t *lbl, int present)
+{
+    if (!lbl) return;
+    switch (present) {
+        case 1:
+            lv_label_set_text(lbl, "Radio: OK");
+            lv_obj_set_style_text_color(lbl, subghz_host_color_green(), 0);
+            break;
+        case 2:
+            lv_label_set_text(lbl, "Radio: NONE");
+            lv_obj_set_style_text_color(lbl, subghz_host_color_red(), 0);
+            break;
+        default:
+            lv_label_set_text(lbl, "Radio: ?");
+            lv_obj_set_style_text_color(lbl, subghz_host_ui_muted(), 0);
+            break;
+    }
+}
+
+/* Append the badge as the last header child. Most radio pages already have
+ * a grow spacer that right-aligns trailing header content; pages that don't
+ * should add their own before calling this. */
+void subghz_add_radio_badge(lv_obj_t *header, subghz_tab_state_t *st)
+{
+    if (!header || !st) return;
+
+    lv_obj_t *lbl = lv_label_create(header);
+    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_margin_left(lbl, 8, 0);
+    radio_badge_style(lbl, st->cc1101_present);
+    st->radio_badge_lbl = lbl;
+}
+
+void subghz_refresh_radio_badge(subghz_tab_state_t *st)
+{
+    if (!st || !st->radio_badge_lbl) return;
+    radio_badge_style(st->radio_badge_lbl, st->cc1101_present);
+}
+
+/* One-shot probe: briefly start RX (high RSSI gate so nothing is captured)
+ * to force subghz_init() on the firmware, learn the chip presence from the
+ * init output, then stop. */
+static void radio_probe_task(void *arg)
+{
+    subghz_tab_state_t *st = (subghz_tab_state_t *)arg;
+    int tab_id = subghz_host_current_tab();
+
+    subghz_host_uart_flush_input(tab_id);
+    subghz_host_uart_send_for_tab(tab_id, "subghz_rx rssi=-40");
+
+    char rx_buf[256];
+    char line_buf[256];
+    int  line_pos = 0;
+    bool resolved = false;
+    bool cancelled = false;
+
+    /* Up to ~600 ms of reads while waiting for the init verdict. */
+    for (int i = 0; i < 6 && !resolved; i++) {
+        if (st->radio_probe_cancel) { cancelled = true; break; }
+        int len = subghz_host_uart_read_bytes(tab_id, rx_buf, sizeof(rx_buf) - 1,
+                                              pdMS_TO_TICKS(100));
+        if (len <= 0) continue;
+        rx_buf[len] = '\0';
+        for (int j = 0; j < len; j++) {
+            char c = rx_buf[j];
+            if (c == '\n' || c == '\r') {
+                if (line_pos > 0) {
+                    line_buf[line_pos] = '\0';
+                    subghz_note_radio_line(st, line_buf);
+                    if (st->cc1101_present != 0) resolved = true;
+                    line_pos = 0;
+                }
+            } else if (line_pos < (int)sizeof(line_buf) - 1) {
+                line_buf[line_pos++] = c;
+            }
+        }
+    }
+
+    /* Only release the radio if we still own it. If a tool page took over,
+     * its own op manages (and will reconfigure) the radio. */
+    if (!cancelled && !st->radio_probe_cancel)
+        subghz_host_uart_send_for_tab(tab_id, "subghz_stop");
+
+    st->radio_probe_running = false;
+    ESP_LOGI(TAG, "CC1101 probe done: present=%d cancelled=%d",
+             st->cc1101_present, (int)cancelled);
+    vTaskDelete(NULL);
+}
+
+void subghz_host_probe_cc1101_async(void)
+{
+    subghz_tab_state_t *st = subghz_host_state();
+    if (!st) return;
+    if (st->cc1101_present != 0) return;   /* already known */
+    if (st->radio_probe_running) return;   /* probe in flight */
+    if (st->listen_running || st->jamming || st->hunter_running ||
+        st->scanner_running || st->weather_running)
+        return;                             /* radio busy with a real op */
+
+    st->radio_probe_cancel = false;
+    st->radio_probe_running = true;
+    if (xTaskCreate(radio_probe_task, "sg_probe", 4096, st, 5, NULL) != pdPASS) {
+        st->radio_probe_running = false;
+        ESP_LOGW(TAG, "Failed to start CC1101 probe task");
+    }
+}
+
 /* ---------- Event callbacks ----------------------------------------- */
 
 void subghz_on_back_to_menu(lv_event_t *e)
@@ -161,6 +294,13 @@ static void on_settings(lv_event_t *e) { (void)e; ESP_LOGI(TAG, "Settings");   s
 void subghz_hide_all_pages(subghz_tab_state_t *st)
 {
     if (!st) return;
+    /* The header badge belongs to whichever page is being hidden; clear the
+     * shared pointer so a stale (possibly deleted) badge is never restyled.
+     * Each page re-adds its badge on (re)build. */
+    st->radio_badge_lbl = NULL;
+    /* Navigating away: tell any in-flight CC1101 probe to bail so it never
+     * fights a tool's reader/op for the UART. */
+    st->radio_probe_cancel = true;
     if (st->page) lv_obj_add_flag(st->page, LV_OBJ_FLAG_HIDDEN);
     if (st->listen_page) lv_obj_add_flag(st->listen_page, LV_OBJ_FLAG_HIDDEN);
     if (st->manage_page) lv_obj_add_flag(st->manage_page, LV_OBJ_FLAG_HIDDEN);
@@ -189,6 +329,7 @@ void show_subghz_page(void)
 
     if (st->page) {
         lv_obj_clear_flag(st->page, LV_OBJ_FLAG_HIDDEN);
+        subghz_host_probe_cc1101_async();
         ESP_LOGI(TAG, "Showing existing SubGHz menu page");
         return;
     }
@@ -225,4 +366,8 @@ void show_subghz_page(void)
     subghz_create_tile(tiles, LV_SYMBOL_WARNING,  "Jammer",     subghz_host_color_red(),    on_jammer);
     subghz_create_tile(tiles, LV_SYMBOL_POWER,    "Tesla",      subghz_host_color_purple(), on_tesla);
     subghz_create_tile(tiles, LV_SYMBOL_SETTINGS, "Settings",   subghz_host_ui_muted(),     on_settings);
+
+    /* Learn CC1101 presence in the background so each tool's header badge
+     * is already resolved before the user opens it. */
+    subghz_host_probe_cc1101_async();
 }
