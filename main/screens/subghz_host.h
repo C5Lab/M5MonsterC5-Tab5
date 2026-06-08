@@ -122,6 +122,15 @@ typedef struct subghz_tab_state {
     /* Re-list trigger from background task after mutations */
     volatile bool manage_relist_pending;
     lv_timer_t   *manage_ui_timer;
+    /* Repeated transmit: "how many times?" roller popup + event-driven loop */
+    lv_obj_t     *manage_tx_count_popup;
+    lv_obj_t     *manage_tx_rollers[3];
+    volatile bool manage_tx_active;
+    volatile bool manage_tx_waiting;
+    int           manage_tx_total;
+    int           manage_tx_done;
+    int           manage_tx_idx;
+    uint32_t      manage_tx_deadline_ms;
 
     /* Jammer */
     bool       jamming;

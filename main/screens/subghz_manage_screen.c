@@ -49,6 +49,10 @@ static void show_action_popup(subghz_tab_state_t *st, int idx);
 static void close_action_popup(subghz_tab_state_t *st);
 static void show_delete_confirm(subghz_tab_state_t *st, int idx, const char *name);
 static void close_delete_popup(subghz_tab_state_t *st);
+static void show_tx_count_popup(subghz_tab_state_t *st, int idx);
+static void close_tx_count_popup(subghz_tab_state_t *st);
+static void on_tx_count_confirm(lv_event_t *e);
+static void on_tx_count_cancel(lv_event_t *e);
 static void ui_tick_cb(lv_timer_t *t);
 static void process_event_line(subghz_tab_state_t *st, const char *line);
 
@@ -159,6 +163,20 @@ static void process_event_line(subghz_tab_state_t *st, const char *line)
         int idx = 0;
         const char *p = strstr(line, "idx=");
         if (p) idx = atoi(p + 4);
+        if (st->manage_tx_active && st->manage_tx_waiting) {
+            /* Ack for a repeat send: count it and let ui_tick fire the next. */
+            st->manage_tx_done++;
+            st->manage_tx_waiting = false;
+            if (st->manage_tx_done >= st->manage_tx_total) {
+                st->manage_tx_active = false;
+                char msg[64];
+                snprintf(msg, sizeof(msg), "Transmitted #%d x%d",
+                         st->manage_tx_idx, st->manage_tx_done);
+                set_status_msg(st, msg, subghz_host_color_green());
+            }
+            /* While more remain, ui_tick keeps the "Transmitting X/Y" status. */
+            return;
+        }
         char msg[64];
         if (idx > 0) snprintf(msg, sizeof(msg), "Transmitted #%d", idx);
         else         snprintf(msg, sizeof(msg), "Transmitted");
@@ -272,6 +290,9 @@ static void build_one_row(subghz_tab_state_t *st, int i)
     lv_obj_set_style_bg_opa(col, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(col, 0, 0);
     lv_obj_clear_flag(col, LV_OBJ_FLAG_SCROLLABLE);
+    /* Let taps on the name/info column bubble up to the row so the whole
+     * row opens the action popup, not just the badge/chevron/gaps. */
+    lv_obj_add_flag(col, LV_OBJ_FLAG_EVENT_BUBBLE);
 
     lv_obj_t *name_lbl = lv_label_create(col);
     lv_obj_set_width(name_lbl, lv_pct(100));
@@ -545,12 +566,8 @@ static void on_action_transmit(lv_event_t *e)
     int idx = st->manage_pending_action_idx;
     close_action_popup(st);
     if (idx <= 0) return;
-    char cmd[32];
-    snprintf(cmd, sizeof(cmd), "subghz_tx %d sd", idx);
-    subghz_host_uart_send(cmd);
-    char msg[64];
-    snprintf(msg, sizeof(msg), "Transmitting #%d...", idx);
-    set_status_msg(st, msg, subghz_host_color_blue());
+    /* Ask how many times to replay the signal. */
+    show_tx_count_popup(st, idx);
     (void)e;
 }
 
@@ -559,6 +576,150 @@ static void on_action_cancel(lv_event_t *e)
     subghz_tab_state_t *st = subghz_host_state();
     if (st) close_action_popup(st);
     (void)e;
+}
+
+/* ------------------------------------------------------------------- */
+/* Repeated transmit: "how many times?" roller popup + event-driven loop */
+/* ------------------------------------------------------------------- */
+
+static const char *s_tx_digit_opts = "0\n1\n2\n3\n4\n5\n6\n7\n8\n9";
+
+static void close_tx_count_popup(subghz_tab_state_t *st)
+{
+    if (st && st->manage_tx_count_popup) {
+        lv_obj_delete(st->manage_tx_count_popup);
+        st->manage_tx_count_popup = NULL;
+    }
+    if (st) {
+        for (int i = 0; i < 3; i++) st->manage_tx_rollers[i] = NULL;
+    }
+}
+
+static void on_tx_count_cancel(lv_event_t *e)
+{
+    subghz_tab_state_t *st = subghz_host_state();
+    if (st) close_tx_count_popup(st);
+    (void)e;
+}
+
+static void on_tx_count_confirm(lv_event_t *e)
+{
+    subghz_tab_state_t *st = subghz_host_state();
+    if (!st) return;
+    int idx = st->manage_pending_action_idx;
+    if (idx <= 0) { close_tx_count_popup(st); return; }
+
+    int h = st->manage_tx_rollers[0] ? (int)lv_roller_get_selected(st->manage_tx_rollers[0]) : 0;
+    int t = st->manage_tx_rollers[1] ? (int)lv_roller_get_selected(st->manage_tx_rollers[1]) : 0;
+    int o = st->manage_tx_rollers[2] ? (int)lv_roller_get_selected(st->manage_tx_rollers[2]) : 0;
+    int count = h * 100 + t * 10 + o;
+    if (count < 1) count = 1;
+
+    close_tx_count_popup(st);
+
+    /* Start the repeat. ui_tick_cb issues the actual sends so all UART
+     * writes stay on the LVGL thread, matching the rest of this screen. */
+    st->manage_tx_idx     = idx;
+    st->manage_tx_total   = count;
+    st->manage_tx_done    = 0;
+    st->manage_tx_waiting = false;
+    st->manage_tx_active  = true;
+    (void)e;
+}
+
+static void style_tx_roller(lv_obj_t *r)
+{
+    lv_obj_set_width(r, 70);
+    lv_obj_set_style_bg_color(r, subghz_host_ui_card(), 0);
+    lv_obj_set_style_bg_opa(r, LV_OPA_COVER, 0);
+    lv_obj_set_style_text_color(r, subghz_host_ui_text(), 0);
+    lv_obj_set_style_text_font(r, &lv_font_montserrat_28, 0);
+    lv_obj_set_style_text_color(r, subghz_host_color_cyan(), LV_PART_SELECTED);
+    lv_obj_set_style_bg_color(r, subghz_host_ui_bg(), LV_PART_SELECTED);
+    lv_obj_set_style_border_width(r, 0, 0);
+    lv_obj_set_style_radius(r, 8, 0);
+}
+
+static void show_tx_count_popup(subghz_tab_state_t *st, int idx)
+{
+    if (!st || idx <= 0) return;
+    close_tx_count_popup(st);
+
+    st->manage_pending_action_idx = idx;
+
+    lv_obj_t *overlay = lv_obj_create(lv_scr_act());
+    lv_obj_remove_style_all(overlay);
+    lv_obj_set_size(overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(overlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(overlay, LV_OPA_50, 0);
+    lv_obj_clear_flag(overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(overlay, LV_OBJ_FLAG_CLICKABLE);
+    st->manage_tx_count_popup = overlay;
+
+    lv_obj_t *popup = lv_obj_create(overlay);
+    lv_obj_set_size(popup, 540, 360);
+    lv_obj_center(popup);
+    subghz_style_popup_card(popup, 12, subghz_host_color_orange());
+    lv_obj_set_flex_flow(popup, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(popup, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_all(popup, 18, 0);
+    lv_obj_set_style_pad_gap(popup, 16, 0);
+    lv_obj_clear_flag(popup, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(popup);
+    lv_label_set_text_fmt(title, "Transmit #%d - how many times?", idx);
+    lv_obj_set_style_text_color(title, subghz_host_ui_text(), 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_22, 0);
+
+    lv_obj_t *roller_row = lv_obj_create(popup);
+    lv_obj_set_size(roller_row, lv_pct(100), 150);
+    lv_obj_set_flex_flow(roller_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(roller_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_all(roller_row, 0, 0);
+    lv_obj_set_style_pad_gap(roller_row, 8, 0);
+    lv_obj_set_style_bg_opa(roller_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(roller_row, 0, 0);
+    lv_obj_clear_flag(roller_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    for (int i = 0; i < 3; i++) {
+        st->manage_tx_rollers[i] = lv_roller_create(roller_row);
+        lv_roller_set_options(st->manage_tx_rollers[i], s_tx_digit_opts,
+                              LV_ROLLER_MODE_INFINITE);
+        lv_roller_set_visible_row_count(st->manage_tx_rollers[i], 3);
+        style_tx_roller(st->manage_tx_rollers[i]);
+    }
+    /* default to 1 (ones digit) */
+    lv_roller_set_selected(st->manage_tx_rollers[2], 1, LV_ANIM_OFF);
+
+    lv_obj_t *brow = lv_obj_create(popup);
+    lv_obj_set_size(brow, lv_pct(100), 56);
+    lv_obj_set_flex_flow(brow, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(brow, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_bg_opa(brow, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(brow, 0, 0);
+    lv_obj_clear_flag(brow, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *tx = lv_btn_create(brow);
+    lv_obj_set_size(tx, 220, 50);
+    lv_obj_set_style_bg_color(tx, subghz_host_color_orange(), 0);
+    lv_obj_set_style_radius(tx, 8, 0);
+    lv_obj_add_event_cb(tx, on_tx_count_confirm, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *txl = lv_label_create(tx);
+    lv_label_set_text(txl, "Transmit");
+    lv_obj_set_style_text_color(txl, lv_color_white(), 0);
+    lv_obj_set_style_text_font(txl, &lv_font_montserrat_18, 0);
+    lv_obj_center(txl);
+
+    lv_obj_t *cn = lv_btn_create(brow);
+    lv_obj_set_size(cn, 220, 50);
+    lv_obj_set_style_bg_color(cn, subghz_host_ui_muted(), 0);
+    lv_obj_set_style_radius(cn, 8, 0);
+    lv_obj_add_event_cb(cn, on_tx_count_cancel, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *cnl = lv_label_create(cn);
+    lv_label_set_text(cnl, "Cancel");
+    lv_obj_set_style_text_color(cnl, lv_color_white(), 0);
+    lv_obj_set_style_text_font(cnl, &lv_font_montserrat_18, 0);
+    lv_obj_center(cnl);
 }
 
 static void show_action_popup(subghz_tab_state_t *st, int idx)
@@ -666,6 +827,27 @@ static void ui_tick_cb(lv_timer_t *t)
     subghz_tab_state_t *st = (subghz_tab_state_t *)lv_timer_get_user_data(t);
     if (!st) return;
     apply_pending_status(st);
+
+    /* Drive the repeated-transmit loop. Sends happen here (LVGL thread); the
+     * reader task only flips manage_tx_waiting when a [SUBGHZ_TX] ack lands. */
+    if (st->manage_tx_active) {
+        if (st->manage_tx_waiting) {
+            /* Watchdog: if no ack within 4 s, stop waiting so the loop can
+             * advance instead of hanging on a dropped [SUBGHZ_TX]. */
+            if ((int32_t)(lv_tick_get() - st->manage_tx_deadline_ms) >= 0)
+                st->manage_tx_waiting = false;
+        } else if (st->manage_tx_done < st->manage_tx_total) {
+            char cmd[32];
+            snprintf(cmd, sizeof(cmd), "subghz_tx %d sd", st->manage_tx_idx);
+            subghz_host_uart_send(cmd);
+            st->manage_tx_waiting     = true;
+            st->manage_tx_deadline_ms = lv_tick_get() + 4000;
+            char msg[64];
+            snprintf(msg, sizeof(msg), "Transmitting %d/%d (#%d)...",
+                     st->manage_tx_done + 1, st->manage_tx_total, st->manage_tx_idx);
+            set_status_msg(st, msg, subghz_host_color_orange());
+        }
+    }
 }
 
 /* ------------------------------------------------------------------- */
@@ -687,8 +869,12 @@ void subghz_manage_cleanup(subghz_tab_state_t *st)
         lv_timer_delete(st->manage_ui_timer);
         st->manage_ui_timer = NULL;
     }
+    /* Stop any in-flight repeated transmit and tear down its popup. */
+    st->manage_tx_active  = false;
+    st->manage_tx_waiting = false;
     close_action_popup(st);
     close_delete_popup(st);
+    close_tx_count_popup(st);
     subghz_signal_list_free(st);
     if (st->manage_page) { lv_obj_delete(st->manage_page); st->manage_page = NULL; }
     st->sig_list_obj = NULL;
