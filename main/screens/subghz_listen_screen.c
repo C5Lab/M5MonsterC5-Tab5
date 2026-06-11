@@ -17,6 +17,8 @@ static void show_action_popup(subghz_tab_state_t *st, int idx);
 static void close_action_popup(subghz_tab_state_t *st);
 static void show_leave_popup(subghz_tab_state_t *st, size_t count);
 static void close_leave_popup(subghz_tab_state_t *st);
+static void show_tx_warn_popup(subghz_tab_state_t *st);
+static void close_tx_warn_popup(subghz_tab_state_t *st);
 static void perform_back(subghz_tab_state_t *st);
 static void set_status_msg(subghz_tab_state_t *st, const char *msg, lv_color_t color);
 static void apply_pending_status(subghz_tab_state_t *st);
@@ -1030,6 +1032,7 @@ void subghz_listen_cleanup(subghz_tab_state_t *st)
 
     close_action_popup(st);
     close_leave_popup(st);
+    close_tx_warn_popup(st);
     if (st->listen_freq_popup) { lv_obj_delete(st->listen_freq_popup); st->listen_freq_popup = NULL; }
     if (st->listen_page) { lv_obj_delete(st->listen_page); st->listen_page = NULL; }
 
@@ -1148,6 +1151,10 @@ static void on_action_transmit(lv_event_t *e)
     int idx = st->listen_pending_action_idx;
     close_action_popup(st);
     if (idx <= 0) return;
+    if (st->listen_running) {
+        show_tx_warn_popup(st);
+        return;
+    }
     char cmd[32];
     snprintf(cmd, sizeof(cmd), "subghz_tx %d mem", idx);
     subghz_host_uart_send(cmd);
@@ -1333,6 +1340,73 @@ static void show_leave_popup(subghz_tab_state_t *st, size_t count)
     lv_obj_set_style_text_color(sl2, lv_color_white(), 0);
     lv_obj_set_style_text_font(sl2, &lv_font_montserrat_18, 0);
     lv_obj_center(sl2);
+}
+
+/* ---- TX-while-listening warning popup -------------------------- */
+
+static void close_tx_warn_popup(subghz_tab_state_t *st)
+{
+    if (st && st->listen_tx_warn_popup) {
+        lv_obj_delete(st->listen_tx_warn_popup);
+        st->listen_tx_warn_popup = NULL;
+    }
+}
+
+static void on_tx_warn_ok(lv_event_t *e)
+{
+    subghz_tab_state_t *st = subghz_host_state();
+    if (st) close_tx_warn_popup(st);
+    (void)e;
+}
+
+static void show_tx_warn_popup(subghz_tab_state_t *st)
+{
+    if (!st) return;
+    close_tx_warn_popup(st);
+
+    lv_obj_t *overlay = lv_obj_create(lv_scr_act());
+    lv_obj_remove_style_all(overlay);
+    lv_obj_set_size(overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(overlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(overlay, LV_OPA_50, 0);
+    lv_obj_clear_flag(overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(overlay, LV_OBJ_FLAG_CLICKABLE);
+    st->listen_tx_warn_popup = overlay;
+
+    lv_obj_t *popup = lv_obj_create(overlay);
+    lv_obj_set_size(popup, 560, 260);
+    lv_obj_center(popup);
+    subghz_style_popup_card(popup, 12, subghz_host_color_orange());
+    lv_obj_set_flex_flow(popup, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(popup, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_all(popup, 18, 0);
+    lv_obj_set_style_pad_gap(popup, 12, 0);
+    lv_obj_clear_flag(popup, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(popup);
+    lv_label_set_text(title, "Stop Listening First");
+    lv_obj_set_style_text_color(title, subghz_host_ui_text(), 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_22, 0);
+
+    lv_obj_t *body = lv_label_create(popup);
+    lv_obj_set_width(body, lv_pct(100));
+    lv_label_set_long_mode(body, LV_LABEL_LONG_WRAP);
+    lv_label_set_text(body,
+        "Pause listening before transmitting a signal, then try again.");
+    lv_obj_set_style_text_color(body, subghz_host_ui_muted(), 0);
+    lv_obj_set_style_text_font(body, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_align(body, LV_TEXT_ALIGN_CENTER, 0);
+
+    lv_obj_t *ok_btn = lv_btn_create(popup);
+    lv_obj_set_size(ok_btn, 200, 50);
+    lv_obj_set_style_bg_color(ok_btn, subghz_host_color_orange(), 0);
+    lv_obj_set_style_radius(ok_btn, 8, 0);
+    lv_obj_add_event_cb(ok_btn, on_tx_warn_ok, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *ol = lv_label_create(ok_btn);
+    lv_label_set_text(ol, "OK");
+    lv_obj_set_style_text_color(ol, lv_color_white(), 0);
+    lv_obj_set_style_text_font(ol, &lv_font_montserrat_18, 0);
+    lv_obj_center(ol);
 }
 
 /* ---- Public entry ------------------------------------------------ */

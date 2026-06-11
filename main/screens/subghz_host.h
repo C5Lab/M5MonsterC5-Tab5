@@ -79,6 +79,7 @@ typedef struct subghz_tab_state {
     lv_obj_t   *listen_freq_popup;
     lv_obj_t   *listen_action_popup;
     lv_obj_t   *listen_leave_popup;
+    lv_obj_t   *listen_tx_warn_popup;
     int         listen_pending_action_idx;
     lv_obj_t   *rollers[5];
     signal_row_view_t *row_pool;  /* heap-allocated array, see listen.c */
