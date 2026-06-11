@@ -22,6 +22,7 @@
 #include "sdmmc_cmd.h"
 #include "esp_lcd_st7703.h"
 #include "esp_lcd_st7123.h"
+#include "esp_lcd_st7121.h"
 #include "esp_lcd_ili9881c.h"
 #include "bsp/m5stack_tab5.h"
 #include "bsp/display.h"
@@ -1384,6 +1385,28 @@ static const st7123_lcd_init_cmd_t st7123_vendor_specific_init_default[] = {
     {0x35, (uint8_t[]){0x00}, 1, 100},
 };
 
+// Read the ST712x touch controller firmware version (register 0x0000 @ I2C 0x55).
+// Returns the version (>=0) or -1 on error. Used to tell the panels apart, since ST7121
+// and ST7123 share the same touch address and panel ID but report different FW versions:
+// 1 = ST7121, 3 = ST7123 (per M5GFX PR #202).
+static int bsp_read_st712x_touch_fw_version(void)
+{
+    i2c_master_dev_handle_t dev = NULL;
+    i2c_device_config_t dev_cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address  = 0x55,
+        .scl_speed_hz    = 100000,
+    };
+    if (i2c_master_bus_add_device(i2c_handle, &dev_cfg, &dev) != ESP_OK) {
+        return -1;
+    }
+    uint8_t reg[2]  = {0x00, 0x00};  // FW version register = 0x0000
+    uint8_t version = 0;
+    esp_err_t ret   = i2c_master_transmit_receive(dev, reg, sizeof(reg), &version, 1, I2C_MASTER_TIMEOUT_MS);
+    i2c_master_bus_rm_device(dev);
+    return (ret == ESP_OK) ? (int)version : -1;
+}
+
 // 适配st7123 tab5 屏幕
 esp_err_t bsp_display_new_with_handles_to_st7123(const bsp_display_config_t* config, bsp_lcd_handles_t* ret_handles)
 {
@@ -1395,16 +1418,24 @@ esp_err_t bsp_display_new_with_handles_to_st7123(const bsp_display_config_t* con
     ESP_RETURN_ON_ERROR(bsp_display_brightness_init(), TAG, "Brightness init failed");
     ESP_RETURN_ON_ERROR(bsp_enable_dsi_phy_power(), TAG, "DSI PHY power failed");
 
+    /* Tell ST7123 and ST7121 apart: both answer on I2C 0x55 and report the same panel ID
+     * (0xF4 = 71 23), so only the touch controller firmware version distinguishes them
+     * (register 0x0000): 1 = ST7121 (Tab5 HW from 2026-04-28), 3 = ST7123. See M5GFX PR #202. */
+    bsp_i2c_init();
+    int touch_fw_version = bsp_read_st712x_touch_fw_version();
+    bool is_st7121       = (touch_fw_version == 1);
+    ESP_LOGI(TAG, "ST712x touch FW version: %d -> panel %s", touch_fw_version, is_st7121 ? "ST7121" : "ST7123");
+
     /* create MIPI DSI bus first, it will initialize the DSI PHY as well */
     esp_lcd_dsi_bus_config_t bus_config = {
         .bus_id             = 0,
-        .num_data_lanes     = 2,  // ST7123 uses 2 data lanes
+        .num_data_lanes     = 2,
         .phy_clk_src        = MIPI_DSI_PHY_CLK_SRC_DEFAULT,
-        .lane_bit_rate_mbps = 965,  // ST7123 lane bitrate
+        .lane_bit_rate_mbps = 965,  // ST7123 and ST7121 share the same lane bitrate (M5Tab5-UserDemo)
     };
     ESP_RETURN_ON_ERROR(esp_lcd_new_dsi_bus(&bus_config, &mipi_dsi_bus), TAG, "New DSI bus init failed");
 
-    ESP_LOGI(TAG, "Install MIPI DSI LCD control panel for ST7123");
+    ESP_LOGI(TAG, "Install MIPI DSI LCD control panel for %s", is_st7121 ? "ST7121" : "ST7123");
     // we use DBI interface to send LCD commands and parameters
     esp_lcd_dbi_io_config_t dbi_config = {
         .virtual_channel = 0,
@@ -1413,11 +1444,11 @@ esp_err_t bsp_display_new_with_handles_to_st7123(const bsp_display_config_t* con
     };
     ESP_GOTO_ON_ERROR(esp_lcd_new_panel_io_dbi(mipi_dsi_bus, &dbi_config, &io), err, TAG, "New panel IO failed");
 
-    ESP_LOGI(TAG, "Install LCD driver of ST7123");
+    ESP_LOGI(TAG, "Install LCD driver of %s", is_st7121 ? "ST7121" : "ST7123");
     esp_lcd_dpi_panel_config_t dpi_config = {
         .virtual_channel    = 0,
         .dpi_clk_src        = MIPI_DSI_DPI_CLK_SRC_DEFAULT,
-        .dpi_clock_freq_mhz = 70,  // ST7123 DPI clock frequency
+        .dpi_clock_freq_mhz = 70,  // shared by ST7123 and ST7121 (M5GFX PR #202)
         .pixel_format       = LCD_COLOR_PIXEL_FORMAT_RGB565,
         .num_fbs            = 1,
         .video_timing =
@@ -1436,10 +1467,20 @@ esp_err_t bsp_display_new_with_handles_to_st7123(const bsp_display_config_t* con
                 .use_dma2d = true,
             },
     };
+    if (is_st7121) {
+        // ST7121 needs different vsync porches (M5GFX PR #202)
+        dpi_config.video_timing.vsync_pulse_width = 20;
+        dpi_config.video_timing.vsync_back_porch  = 24;
+        dpi_config.video_timing.vsync_front_porch = 200;
+    }
 
+    // For ST7121, pass init_cmds = NULL so the dedicated esp_lcd_st7121 driver uses its own
+    // built-in init sequence (matches M5Tab5-UserDemo). ST7123 keeps its explicit table here.
     st7123_vendor_config_t vendor_config = {
-        .init_cmds      = st7123_vendor_specific_init_default,
-        .init_cmds_size = sizeof(st7123_vendor_specific_init_default) / sizeof(st7123_vendor_specific_init_default[0]),
+        .init_cmds      = is_st7121 ? NULL : st7123_vendor_specific_init_default,
+        .init_cmds_size = is_st7121
+                              ? 0
+                              : (sizeof(st7123_vendor_specific_init_default) / sizeof(st7123_vendor_specific_init_default[0])),
         .mipi_config =
             {
                 .dsi_bus    = mipi_dsi_bus,
@@ -1456,9 +1497,14 @@ esp_err_t bsp_display_new_with_handles_to_st7123(const bsp_display_config_t* con
         .vendor_config  = &vendor_config,
     };
 
-    // 使用实际的 ST7123 驱动函数
-    ESP_GOTO_ON_ERROR(esp_lcd_new_panel_st7123(io, &lcd_dev_config, &disp_panel), err, TAG,
-                      "New LCD panel ST7123 failed");
+    // Select the matching driver: dedicated ST7121 panel for the new HW, ST7123 otherwise.
+    if (is_st7121) {
+        ESP_GOTO_ON_ERROR(esp_lcd_new_panel_st7121(io, &lcd_dev_config, &disp_panel), err, TAG,
+                          "New LCD panel ST7121 failed");
+    } else {
+        ESP_GOTO_ON_ERROR(esp_lcd_new_panel_st7123(io, &lcd_dev_config, &disp_panel), err, TAG,
+                          "New LCD panel ST7123 failed");
+    }
 
     ESP_GOTO_ON_ERROR(esp_lcd_panel_reset(disp_panel), err, TAG, "LCD panel reset failed");
     ESP_GOTO_ON_ERROR(esp_lcd_panel_init(disp_panel), err, TAG, "LCD panel init failed");
@@ -1473,7 +1519,7 @@ esp_err_t bsp_display_new_with_handles_to_st7123(const bsp_display_config_t* con
     /* Store IO handle globally for DCS brightness control */
     s_lcd_panel_io = io;
 
-    ESP_LOGI(TAG, "ST7123 Display initialized with resolution %dx%d", 720, 1280);
+    ESP_LOGI(TAG, "%s Display initialized with resolution %dx%d", is_st7121 ? "ST7121" : "ST7123", 720, 1280);
 
     return ret;
 
