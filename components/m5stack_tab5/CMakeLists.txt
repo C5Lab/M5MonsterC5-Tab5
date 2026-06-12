@@ -1,6 +1,6 @@
 
 idf_component_register(
-    SRCS "m5stack_tab5.c" "esp_lcd_st7123.c"
+    SRCS "esp_lcd_st7121.c" "m5stack_tab5.c" "esp_lcd_st7123.c"
     INCLUDE_DIRS "include"
     INCLUDE_DIRS "include/bsp"
     PRIV_INCLUDE_DIRS "priv_include"
