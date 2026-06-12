@@ -47,7 +47,7 @@
 #include "esp_http_server.h"
 #include "lwip/sockets.h"
 
-#define JANOS_TAB_VERSION "1.4.0"
+#define JANOS_TAB_VERSION "1.4.1"
 #define JANOS_VERSION_REQUIRED "1.6.5"
 #include "lwip/netdb.h"
 #include <dirent.h>
@@ -25747,6 +25747,10 @@ static void deauth_detector_back_btn_event_cb(lv_event_t *e)
             vTaskDelay(pdMS_TO_TICKS(100));
             deauth_detector_task_handle = NULL;
         }
+
+        // Sync button states after force-stop via Back
+        if (deauth_start_btn) lv_obj_clear_state(deauth_start_btn, LV_STATE_DISABLED);
+        if (deauth_stop_btn)  lv_obj_add_state(deauth_stop_btn, LV_STATE_DISABLED);
     }
 
     tab_context_t *ctx = get_current_ctx();
@@ -25782,6 +25786,16 @@ static void show_deauth_detector_page(void)
         lv_obj_clear_flag(ctx->deauth_detector_page, LV_OBJ_FLAG_HIDDEN);
         ctx->current_visible_page = ctx->deauth_detector_page;
         deauth_detector_page = ctx->deauth_detector_page;
+        // Sync button states with actual running state
+        if (deauth_start_btn && deauth_stop_btn) {
+            if (deauth_detector_running) {
+                lv_obj_add_state(deauth_start_btn, LV_STATE_DISABLED);
+                lv_obj_clear_state(deauth_stop_btn, LV_STATE_DISABLED);
+            } else {
+                lv_obj_clear_state(deauth_start_btn, LV_STATE_DISABLED);
+                lv_obj_add_state(deauth_stop_btn, LV_STATE_DISABLED);
+            }
+        }
         ESP_LOGI(TAG, "Showing existing deauth detector page for tab %d", current_tab);
         return;
     }
@@ -30384,6 +30398,7 @@ static void invalidate_red_team_dependent_pages(void)
         if (ctx->tiles) {
             lv_obj_del(ctx->tiles);
             ctx->tiles = NULL;
+            reset_home_dashboard_bindings(ctx);
         }
     }
 
