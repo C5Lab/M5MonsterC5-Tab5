@@ -352,6 +352,8 @@ typedef struct {
     int best_rssi;
     int avg_rssi;
     int lqi;
+    int sample_count;
+    int last_channel;
     int age_ms;
 } iot_recon_node_t;
 
@@ -718,6 +720,8 @@ typedef struct {
     iot_recon_edge_t *iot_edges;
     int iot_edge_count;
     char iot_expanded_pan[16];
+    char iot_tracked_pan[16];
+    char iot_tracked_addr[24];
     bool iot_scroll_expanded_once;
 
     // =====================================================================
@@ -2222,6 +2226,7 @@ static void iot_recon_clear_cb(lv_event_t *e);
 static bool iot_recon_send_command(tab_context_t *ctx, const char *cmd);
 static void iot_recon_monitor_task(void *arg);
 static void iot_recon_pan_click_cb(lv_event_t *e);
+static void iot_recon_node_click_cb(lv_event_t *e);
 static void wardrive_wigle_send_btn_cb(lv_event_t *e);
 static void wardrive_wigle_stop_btn_cb(lv_event_t *e);
 static void wardrive_wigle_file_checkbox_cb(lv_event_t *e);
@@ -22327,7 +22332,10 @@ static int iot_recon_get_int(const char *line, const char *key, int fallback)
 {
     char value[24];
     if (!iot_recon_get_value(line, key, value, sizeof(value))) return fallback;
-    return atoi(value);
+    char *end = NULL;
+    long parsed = strtol(value, &end, 0);
+    if (end == value || *end != '\0') return fallback;
+    return (int)parsed;
 }
 
 static uint32_t iot_recon_get_u32(const char *line, const char *key, uint32_t fallback)
@@ -22487,6 +22495,36 @@ static int iot_recon_count_edges_for_pan(const tab_context_t *ctx, const char *p
     return count;
 }
 
+static bool iot_recon_is_tracked_node(const tab_context_t *ctx, const iot_recon_node_t *node)
+{
+    return ctx && node &&
+           ctx->iot_tracked_pan[0] &&
+           strcmp(ctx->iot_tracked_pan, node->pan_id) == 0 &&
+           strcmp(ctx->iot_tracked_addr, node->addr) == 0;
+}
+
+static const iot_recon_node_t *iot_recon_find_tracked_node(const tab_context_t *ctx, const char *pan_id)
+{
+    if (!ctx || !pan_id || !ctx->iot_nodes || !ctx->iot_tracked_pan[0]) return NULL;
+    if (strcmp(ctx->iot_tracked_pan, pan_id) != 0) return NULL;
+
+    for (int i = 0; i < ctx->iot_node_count; i++) {
+        const iot_recon_node_t *node = &ctx->iot_nodes[i];
+        if (strcmp(node->pan_id, pan_id) == 0 && strcmp(node->addr, ctx->iot_tracked_addr) == 0) {
+            return node;
+        }
+    }
+    return NULL;
+}
+
+static const char *iot_recon_track_trend_label(const iot_recon_node_t *node)
+{
+    if (!node || node->sample_count < 2) return "warming up";
+    if (node->rssi >= node->avg_rssi + 4) return "closer";
+    if (node->rssi <= node->avg_rssi - 4) return "farther";
+    return "steady";
+}
+
 static void iot_recon_line_points_delete_cb(lv_event_t *e)
 {
     if (lv_event_get_code(e) == LV_EVENT_DELETE) {
@@ -22626,7 +22664,7 @@ static void iot_recon_add_inferred_line(lv_obj_t *topo, int x1, int y1, int x2, 
     iot_recon_add_topology_line(topo, x1, y1, x2, y2, r1, r2, ui_muted_color(), LV_OPA_30, true);
 }
 
-static void iot_recon_add_topology_dot(lv_obj_t *topo, const iot_recon_node_t *node, int index)
+static void iot_recon_add_topology_dot(tab_context_t *ctx, lv_obj_t *topo, const iot_recon_node_t *node, int index)
 {
     if (!topo || !node) return;
 
@@ -22635,6 +22673,7 @@ static void iot_recon_add_topology_dot(lv_obj_t *topo, const iot_recon_node_t *n
     iot_recon_topology_node_center(node, index, &cx, &cy);
     lv_color_t color = iot_recon_role_color(node->role);
     bool is_coord = strcmp(node->role, "coordinator") == 0;
+    bool tracked = iot_recon_is_tracked_node(ctx, node);
     int size = iot_recon_node_dot_size(node);
 
     lv_obj_t *dot = lv_obj_create(topo);
@@ -22642,19 +22681,24 @@ static void iot_recon_add_topology_dot(lv_obj_t *topo, const iot_recon_node_t *n
     lv_obj_set_pos(dot, cx - size / 2, cy - size / 2);
     lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
     lv_obj_set_style_bg_color(dot, color, 0);
-    lv_obj_set_style_border_width(dot, 2, 0);
-    lv_obj_set_style_border_color(dot, lv_color_lighten(color, 35), 0);
-    lv_obj_set_style_shadow_width(dot, is_coord ? 14 : 8, 0);
+    lv_obj_set_style_border_width(dot, tracked ? 4 : 2, 0);
+    lv_obj_set_style_border_color(dot, tracked ? COLOR_MATERIAL_AMBER : lv_color_lighten(color, 35), 0);
+    lv_obj_set_style_shadow_width(dot, tracked ? 18 : (is_coord ? 14 : 8), 0);
     lv_obj_set_style_shadow_color(dot, color, 0);
     lv_obj_clear_flag(dot, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(dot, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(dot, iot_recon_node_click_cb, LV_EVENT_CLICKED, (void *)node);
 
     lv_obj_t *label = lv_label_create(topo);
     const char *addr = node->addr;
     if (strncmp(addr, "0x", 2) == 0 && strlen(addr) > 2) addr += 2;
     lv_label_set_text(label, addr);
     lv_obj_set_style_text_font(label, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(label, ui_muted_color(), 0);
-    lv_obj_set_pos(label, cx - 18, cy + size / 2 + 5);
+    lv_obj_set_style_text_color(label, tracked ? COLOR_MATERIAL_AMBER : ui_muted_color(), 0);
+    lv_obj_set_width(label, 52);
+    lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
+    int label_y = cy + size / 2 + 4 + ((index % 2) ? 12 : 0);
+    lv_obj_set_pos(label, cx - 26, iot_recon_clamp_int(label_y, 34, 128));
 }
 
 static void iot_recon_render_expanded_locked(tab_context_t *ctx, lv_obj_t *card, const iot_recon_pan_t *pan)
@@ -22674,6 +22718,59 @@ static void iot_recon_render_expanded_locked(tab_context_t *ctx, lv_obj_t *card,
     lv_label_set_text(topo_title, edge_count > 0 ? "Topology (observed links)" : "Topology (inferred layout)");
     lv_obj_set_style_text_font(topo_title, &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_color(topo_title, ui_muted_color(), 0);
+
+    const iot_recon_node_t *tracked_node = iot_recon_find_tracked_node(ctx, pan->pan_id);
+    if (tracked_node) {
+        char age[16];
+        iot_recon_format_age(tracked_node->age_ms, age, sizeof(age));
+
+        lv_obj_t *track = lv_obj_create(card);
+        lv_obj_set_width(track, lv_pct(100));
+        lv_obj_set_height(track, LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_color(track, dark_mode_enabled ? lv_color_hex(0x302A18) : lv_color_hex(0xFFF3CD), 0);
+        lv_obj_set_style_border_width(track, 1, 0);
+        lv_obj_set_style_border_color(track, COLOR_MATERIAL_AMBER, 0);
+        lv_obj_set_style_border_opa(track, LV_OPA_70, 0);
+        lv_obj_set_style_radius(track, 8, 0);
+        lv_obj_set_style_pad_all(track, 8, 0);
+        lv_obj_set_style_pad_row(track, 3, 0);
+        lv_obj_set_flex_flow(track, LV_FLEX_FLOW_COLUMN);
+        lv_obj_clear_flag(track, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *title = lv_label_create(track);
+        lv_label_set_text_fmt(title, "Locate %s  %s", tracked_node->addr,
+                              iot_recon_track_trend_label(tracked_node));
+        lv_obj_set_style_text_font(title, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(title, COLOR_MATERIAL_AMBER, 0);
+        lv_obj_set_width(title, lv_pct(100));
+        lv_label_set_long_mode(title, LV_LABEL_LONG_DOT);
+
+        lv_obj_t *detail = lv_label_create(track);
+        char track_detail[160];
+        char track_tail[48];
+        if (tracked_node->last_channel >= 11 && tracked_node->last_channel <= 26) {
+            snprintf(track_tail, sizeof(track_tail), "ch %d | n %d | %s",
+                     tracked_node->last_channel, tracked_node->sample_count, age);
+        } else {
+            snprintf(track_tail, sizeof(track_tail), "ch na | n %d | %s",
+                     tracked_node->sample_count, age);
+        }
+        if (tracked_node->lqi >= 0) {
+            snprintf(track_detail, sizeof(track_detail),
+                     "last %d dBm | avg %d | best %d | LQI %d | %s",
+                     tracked_node->rssi, tracked_node->avg_rssi, tracked_node->best_rssi,
+                     tracked_node->lqi, track_tail);
+        } else {
+            snprintf(track_detail, sizeof(track_detail),
+                     "last %d dBm | avg %d | best %d | %s",
+                     tracked_node->rssi, tracked_node->avg_rssi, tracked_node->best_rssi, track_tail);
+        }
+        lv_label_set_text(detail, track_detail);
+        lv_obj_set_style_text_font(detail, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(detail, ui_text_color(), 0);
+        lv_obj_set_width(detail, lv_pct(100));
+        lv_label_set_long_mode(detail, LV_LABEL_LONG_DOT);
+    }
 
     lv_obj_t *topo = lv_obj_create(card);
     lv_obj_set_width(topo, lv_pct(100));
@@ -22734,7 +22831,7 @@ static void iot_recon_render_expanded_locked(tab_context_t *ctx, lv_obj_t *card,
     plotted = 0;
     for (int i = 0; i < ctx->iot_node_count; i++) {
         if (strcmp(ctx->iot_nodes[i].pan_id, pan->pan_id) != 0) continue;
-        iot_recon_add_topology_dot(topo, &ctx->iot_nodes[i], plotted++);
+        iot_recon_add_topology_dot(ctx, topo, &ctx->iot_nodes[i], plotted++);
     }
 
     if (plotted == 0) {
@@ -22768,6 +22865,13 @@ static void iot_recon_render_expanded_locked(tab_context_t *ctx, lv_obj_t *card,
         lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
         lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
         lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(row, iot_recon_node_click_cb, LV_EVENT_CLICKED, (void *)node);
+        if (iot_recon_is_tracked_node(ctx, node)) {
+            lv_obj_set_style_border_width(row, 1, 0);
+            lv_obj_set_style_border_color(row, COLOR_MATERIAL_AMBER, 0);
+            lv_obj_set_style_border_opa(row, LV_OPA_70, 0);
+        }
 
         lv_obj_t *dot = lv_obj_create(row);
         lv_obj_set_size(dot, 14, 14);
@@ -22790,9 +22894,17 @@ static void iot_recon_render_expanded_locked(tab_context_t *ctx, lv_obj_t *card,
 
         lv_obj_t *detail = lv_label_create(row);
         char extra[128] = {0};
+        if (node->last_channel >= 11 && node->last_channel <= 26) {
+            size_t used = strlen(extra);
+            if (used < sizeof(extra)) snprintf(extra + used, sizeof(extra) - used, "  ch %d", node->last_channel);
+        }
         if (node->lqi >= 0) {
             size_t used = strlen(extra);
             if (used < sizeof(extra)) snprintf(extra + used, sizeof(extra) - used, "  LQI %d", node->lqi);
+        }
+        if (node->sample_count > 0) {
+            size_t used = strlen(extra);
+            if (used < sizeof(extra)) snprintf(extra + used, sizeof(extra) - used, "  n %d", node->sample_count);
         }
         if (node->vendor[0] && strcmp(node->vendor, "na") != 0) {
             size_t used = strlen(extra);
@@ -22943,6 +23055,8 @@ static bool iot_recon_store_node_locked(tab_context_t *ctx, const char *line)
     node->best_rssi = iot_recon_get_int(line, "best_rssi", node->rssi);
     node->avg_rssi = iot_recon_get_int(line, "avg_rssi", node->rssi);
     node->lqi = iot_recon_get_int(line, "lqi", -1);
+    node->sample_count = iot_recon_get_int(line, "sample_count", 0);
+    node->last_channel = iot_recon_get_int(line, "last_channel", 0);
     node->age_ms = iot_recon_get_int(line, "age_ms", -1);
 
     char addr_type[16] = {0};
@@ -23231,6 +23345,24 @@ static void iot_recon_pan_click_cb(lv_event_t *e)
     iot_recon_render_pan_list_locked(ctx);
 }
 
+static void iot_recon_node_click_cb(lv_event_t *e)
+{
+    iot_recon_node_t *node = (iot_recon_node_t *)lv_event_get_user_data(e);
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx || !node) return;
+
+    lv_event_stop_bubbling(e);
+    snprintf(ctx->iot_expanded_pan, sizeof(ctx->iot_expanded_pan), "%s", node->pan_id);
+    snprintf(ctx->iot_tracked_pan, sizeof(ctx->iot_tracked_pan), "%s", node->pan_id);
+    snprintf(ctx->iot_tracked_addr, sizeof(ctx->iot_tracked_addr), "%s", node->addr);
+    ctx->iot_scroll_expanded_once = false;
+
+    ESP_LOGI(TAG, "[IoT] Locate node selected pan=%s addr=%s rssi=%d avg=%d best=%d lqi=%d samples=%d ch=%d",
+             node->pan_id, node->addr, node->rssi, node->avg_rssi, node->best_rssi,
+             node->lqi, node->sample_count, node->last_channel);
+    iot_recon_render_pan_list_locked(ctx);
+}
+
 static bool iot_recon_send_command(tab_context_t *ctx, const char *cmd)
 {
     if (!ctx || !cmd || cmd[0] == '\0') {
@@ -23288,6 +23420,8 @@ static void iot_recon_start_cb(lv_event_t *e)
     ctx->iot_node_count = 0;
     ctx->iot_edge_count = 0;
     ctx->iot_expanded_pan[0] = '\0';
+    ctx->iot_tracked_pan[0] = '\0';
+    ctx->iot_tracked_addr[0] = '\0';
     ctx->iot_scroll_expanded_once = false;
 
     if (ctx->iot_status_label) {
@@ -23355,6 +23489,8 @@ static void iot_recon_clear_cb(lv_event_t *e)
     ctx->iot_node_count = 0;
     ctx->iot_edge_count = 0;
     ctx->iot_expanded_pan[0] = '\0';
+    ctx->iot_tracked_pan[0] = '\0';
+    ctx->iot_tracked_addr[0] = '\0';
     ctx->iot_scroll_expanded_once = false;
 
     if (ctx->iot_channel_label) lv_label_set_text(ctx->iot_channel_label, "--");

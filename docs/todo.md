@@ -185,13 +185,14 @@ Format maszynowy:
 
 Rozszerzony kontrakt obsługiwany przez Tab5, do dołożenia po stronie JanOS:
 ```
-[ZIG] node pan=0x1A62 addr_type=short short=0x13D7 ext=na role=unknown packets=2 last_rssi=-66 best_rssi=-61 avg_rssi=-64 lqi=172 vendor=na device_hint=na battery=na last_seen_ms=... age_ms=...
+[ZIG] node pan=0x1A62 addr_type=short short=0x13D7 ext=na role=unknown packets=2 last_rssi=-66 best_rssi=-61 avg_rssi=-64 lqi=172 sample_count=2 last_channel=11 vendor=na device_hint=na battery=na last_seen_ms=... age_ms=...
 [ZIG] edge pan=0x1A62 from=0x0000 to=0x13D7 kind=observed packets=5 rssi=-66 age_ms=...
 ```
 
 Zasady pól:
 - `last_rssi`, `best_rssi`, `avg_rssi` to sygnał, nie dystans w metrach.
 - `lqi` pokazać tylko jeśli driver realnie raportuje Link Quality Indicator.
+- `sample_count` i `last_channel` pomagają ocenić wiarygodność RSSI i pokazać kanał ostatniej obserwacji.
 - `vendor` tylko z EUI-64/OUI albo znanego fingerprintu; dla short-only node zostaje `na`.
 - `battery` tylko jeśli realnie złapane z payloadu/clusterów; nie zgadywać.
 - `edge kind=observed` rysować przerywaną linią, `kind=confirmed/parent` może być linią mocniejszą.
@@ -289,8 +290,8 @@ Klucze cache:
   - [x] Linie są przycinane do promienia node'ów, żeby nie wchodziły pod kulki.
   - [x] Rozwinięta sieć zostaje w miejscu kliknięcia; UI robi tylko jednorazowy focus/scroll do widoku, bez zmiany kolejności listy.
   - [x] Polling zachowuje pozycję scrolla, żeby lista nie skakała przy odświeżaniu wyników.
-  - [ ] Klik node'a pokazuje mały panel szczegółów: PAN, addr type, short/ext, role, pkts, RSSI, last seen.
-  - [ ] Tryb `Track node`: po kliknięciu node'a przypiąć go i odświeżać duży wskaźnik `last/best/avg RSSI`, trend oraz czas od ostatniego pakietu.
+  - [x] Klik node'a/kulki przypina panel `Locate`: PAN, addr, last/best/avg RSSI, LQI, sample count, channel, age i trend.
+  - [x] Tryb `Track node` MVP: po kliknięciu node'a przypiąć go i odświeżać wskaźnik `last/best/avg RSSI`, trend oraz czas od ostatniego pakietu na podstawie pasywnego pollingu.
 - [x] Topologia MVP: nie rysować twardych krawędzi; tylko punkty/role. Krawędzie dopiero gdy firmware dostarczy relacje albo oznaczyć je jawnie jako inferred.
 
 ### E. Testy ręczne / akceptacja
@@ -306,9 +307,10 @@ Klucze cache:
 Tab5 jest już przygotowany na rozszerzony kontrakt `[ZIG]`, ale JanOS musi zacząć emitować dodatkowe pola. Zasada: jeśli wartość nie jest realnie znana, wysyłać `na` albo nie wysyłać pola. Nie zgadywać baterii, vendora ani prawdziwych relacji mesh.
 
 ### A. Rozszerzyć `zig_recon_nodes all`
-- [ ] Dodać `best_rssi=<int>`: najlepszy RSSI widziany dla node'a.
-- [ ] Dodać `avg_rssi=<int>`: uśredniony RSSI, np. prosty EMA albo średnia z okna.
-- [ ] Dodać `lqi=<0..255|na>` jeśli ESP-IDF/radio callback dostarcza LQI.
+- [x] Dodać `best_rssi=<int>`: najlepszy RSSI widziany dla node'a.
+- [x] Dodać `avg_rssi=<int>`: uśredniony RSSI, np. prosty EMA albo średnia z okna.
+- [x] Dodać `lqi=<0..255|na>` jeśli ESP-IDF/radio callback dostarcza LQI.
+- [x] Dodać `sample_count=<n>` i `last_channel=<11..26|na>` dla wiarygodności i namierzania.
 - [ ] Dodać `vendor=<name|na>` jeśli node ma EUI-64 i OUI/vendor DB pozwala rozpoznać producenta.
 - [ ] Dodać `device_hint=<hint|na>` dla ostrożnych heurystyk, np. `coordinator`, `router`, `end_device`, `bulb?`, `sensor?`; tylko jeśli mamy podstawę w ramkach.
 - [ ] Dodać `battery=<value|na>` tylko jeśli realnie złapane z payloadu/clusterów; w pasywnym skanie najczęściej będzie `na`.
@@ -316,7 +318,7 @@ Tab5 jest już przygotowany na rozszerzony kontrakt `[ZIG]`, ale JanOS musi zacz
 
 Docelowy przykład:
 ```
-[ZIG] node pan=0x1A62 addr_type=short short=0x13D7 ext=na role=unknown packets=2 last_rssi=-66 best_rssi=-61 avg_rssi=-64 lqi=172 vendor=IKEA device_hint=bulb? battery=na last_seen_ms=123456 age_ms=4000
+[ZIG] node pan=0x1A62 addr_type=short short=0x13D7 ext=na role=unknown packets=2 last_rssi=-66 best_rssi=-61 avg_rssi=-64 lqi=172 sample_count=2 last_channel=11 vendor=IKEA device_hint=bulb? battery=na last_seen_ms=123456 age_ms=4000
 ```
 
 ### B. Dodać opcjonalne `[ZIG] edge`
@@ -339,13 +341,15 @@ Docelowy przykład:
 
 ### D. Vendor/fingerprint
 - [ ] Jeśli uda się zebrać `ext=0x...`, sprawdzać OUI/vendor prefix w istniejącej bazie vendorów albo osobnej małej tabeli IEEE OUI.
-- [ ] W Tab5 pokazywać vendor w wierszu node'a tylko gdy nie jest `na`.
+- [x] W Tab5 pokazywać vendor w wierszu node'a tylko gdy nie jest `na`.
+- [x] W Tab5 pokazywać `device_hint` i `battery` w wierszu node'a tylko gdy nie są `na`.
+- [x] W Tab5 pokazywać `last_channel`, `LQI`, `avg/best RSSI` i `sample_count` w kompaktowej linii szczegółów node'a.
 - [ ] Dodać później opcjonalny szczegół node'a po kliknięciu: `PAN`, `short`, `ext`, `vendor`, `role`, `RSSI avg/best/last`, `LQI`, `last seen`.
 
 ### E. Co Tab5 ma jeszcze pokazać po rozszerzeniu JanOS
-- [ ] Node detail popup po kliknięciu node'a: pełny short/ext, vendor, role, pkts, best/avg/last RSSI, LQI, age.
+- [x] Node detail/locate panel po kliknięciu node'a: adres, role, pkts, best/avg/last RSSI, LQI, age, sample count i kanał.
 - [ ] Ikonki/jasne etykiety sygnału: `Strong`, `Mid`, `Weak` plus RSSI.
-- [ ] Tracking node'a po RSSI: ekran/panel `Tracking 0x13D7`, duży aktualny RSSI, `best`, `avg`, trend `closer/farther`, `last seen`. To nie jest dystans w metrach, tylko pomoc do chodzenia z urządzeniem i szukania maksimum sygnału.
+- [x] Tracking node'a po RSSI: panel `Locate 0x13D7`, aktualny RSSI, `best`, `avg`, trend `closer/farther/steady`, `last seen`, LQI, sample count i kanał. To nie jest dystans w metrach, tylko pomoc do chodzenia z urządzeniem i szukania maksimum sygnału.
 - [ ] Opcjonalny mini wykres ostatnich próbek RSSI/LQI dla przypiętego node'a, jeśli JanOS zacznie emitować sekwencję/okno próbek.
 - [ ] Badge `Observed links` gdy przychodzą `[ZIG] edge`; bez edge zostaje `inferred layout`.
 - [ ] Filtr widoku: `All`, `Zigbee`, `Thread`, `802.15.4`, opcjonalnie `Show broadcast`.
@@ -353,10 +357,10 @@ Docelowy przykład:
 - [ ] Dodać mały help tekst: `Lines are inferred unless marked observed/confirmed`.
 
 ### F. JanOS backlog — dane potrzebne do namierzania node'a
-- [ ] W `zig_recon_nodes all` utrzymywać `best_rssi`, `avg_rssi` i `last_rssi` per node, nie tylko ostatnią ramkę.
-- [ ] Dodać opcjonalny `sample_count=<n>` albo `seen_packets=<n>` dla oceny wiarygodności RSSI.
-- [ ] Dodać `last_channel=<11..26>` per node, jeśli node był widziany na konkretnym kanale.
-- [ ] Dodać `lqi=<0..255|na>` per node, jeśli radio/driver faktycznie to zwraca.
+- [x] W `zig_recon_nodes all` utrzymywać `best_rssi`, `avg_rssi` i `last_rssi` per node, nie tylko ostatnią ramkę.
+- [x] Dodać opcjonalny `sample_count=<n>` albo `seen_packets=<n>` dla oceny wiarygodności RSSI.
+- [x] Dodać `last_channel=<11..26>` per node, jeśli node był widziany na konkretnym kanale.
+- [x] Dodać `lqi=<0..255|na>` per node, jeśli radio/driver faktycznie to zwraca.
 - [ ] Rozważyć komendę `zig_recon_track <pan> <short|ext>`: JanOS może wtedy szybciej odświeżać konkretny PAN/kanał albo emitować krótszy status tylko dla jednego node'a.
 - [ ] Rozważyć preset `start_zig_recon <channel> <dwell>` z UI po wybraniu PAN, żeby po znalezieniu sieci zatrzymać hopping na jej kanale i uzyskać stabilniejszy RSSI do lokalizacji.
 
