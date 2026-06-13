@@ -47,7 +47,7 @@
 #include "esp_http_server.h"
 #include "lwip/sockets.h"
 
-#define JANOS_TAB_VERSION "1.4.1"
+#define JANOS_TAB_VERSION "1.4.2"
 #define JANOS_VERSION_REQUIRED "1.6.5"
 #include "lwip/netdb.h"
 #include <dirent.h>
@@ -713,6 +713,7 @@ typedef struct {
     char arp_our_ip[20];
     bool arp_wifi_connected;
     bool arp_auto_mode;
+    bool arp_return_to_evil_twin_passwords;
     arp_host_t *arp_hosts;  // PSRAM
     int arp_host_count;
 
@@ -8327,6 +8328,7 @@ static void arp_poison_back_cb(lv_event_t *e)
 
     tab_context_t *ctx = get_current_ctx();
     bool return_to_observer = ctx && ctx->observer_attack_return_to_observer;
+    bool return_to_evil_twin_passwords = ctx && ctx->arp_return_to_evil_twin_passwords;
 
     // Reset state
     arp_wifi_connected = false;
@@ -8340,6 +8342,9 @@ static void arp_poison_back_cb(lv_event_t *e)
     if (arp_poison_page) {
         lv_obj_del(arp_poison_page);
         arp_poison_page = NULL;
+        if (ctx) {
+            ctx->arp_poison_page = NULL;
+        }
         arp_password_input = NULL;
         arp_keyboard = NULL;
         arp_connect_btn = NULL;
@@ -8350,11 +8355,22 @@ static void arp_poison_back_cb(lv_event_t *e)
 
     if (ctx) {
         ctx->observer_attack_return_to_observer = false;
+        ctx->arp_return_to_evil_twin_passwords = false;
         clear_observer_attack_override(ctx);
     }
 
     if (return_to_observer) {
         show_observer_page();
+        return;
+    }
+
+    if (return_to_evil_twin_passwords) {
+        if (ctx && ctx->evil_twin_passwords_page) {
+            lv_obj_clear_flag(ctx->evil_twin_passwords_page, LV_OBJ_FLAG_HIDDEN);
+            ctx->current_visible_page = ctx->evil_twin_passwords_page;
+        } else {
+            show_evil_twin_passwords_page();
+        }
         return;
     }
 
@@ -10097,7 +10113,21 @@ static void show_arp_poison_page(void)
     lv_obj_t *container = get_current_tab_container();
     if (!container) return;
 
+    if (ctx && ctx->arp_poison_page) {
+        lv_obj_del(ctx->arp_poison_page);
+        if (arp_poison_page == ctx->arp_poison_page) {
+            arp_poison_page = NULL;
+        }
+        ctx->arp_poison_page = NULL;
+    } else if (arp_poison_page) {
+        lv_obj_del(arp_poison_page);
+        arp_poison_page = NULL;
+    }
+
     arp_poison_page = lv_obj_create(container);
+    if (ctx) {
+        ctx->arp_poison_page = arp_poison_page;
+    }
     lv_obj_set_size(arp_poison_page, lv_pct(100), lv_pct(100));
     lv_obj_align(arp_poison_page, LV_ALIGN_TOP_MID, 0, 0);
     lv_obj_set_style_bg_color(arp_poison_page, lv_color_hex(0x1A1A1A), 0);
@@ -21994,6 +22024,7 @@ static void evil_twin_connect_popup_yes_cb(lv_event_t *e)
     (void)e;
 
     ESP_LOGI(TAG, "Evil Twin: Connecting to %s with known password", arp_target_ssid);
+    tab_context_t *ctx = get_current_ctx();
 
     // Close popup
     if (evil_twin_connect_popup_overlay) {
@@ -22002,10 +22033,8 @@ static void evil_twin_connect_popup_yes_cb(lv_event_t *e)
         evil_twin_connect_popup_obj = NULL;
     }
 
-    // Close Evil Twin passwords page
-    if (compromised_data_page) {
-        lv_obj_del(compromised_data_page);
-        compromised_data_page = NULL;
+    if (ctx) {
+        ctx->arp_return_to_evil_twin_passwords = true;
     }
 
     // Set auto mode flag
