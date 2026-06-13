@@ -643,6 +643,9 @@ typedef struct {
     lv_obj_t *wardrive_blacklist_status_label;
     lv_obj_t *wardrive_blacklist_input;
     lv_obj_t *wardrive_blacklist_keyboard;
+    lv_obj_t *wardrive_blacklist_scan_overlay;
+    lv_obj_t *wardrive_blacklist_scan_list;
+    lv_obj_t *wardrive_blacklist_scan_status;
     // Anti-surveillance page
     lv_obj_t *antisurv_page;
     lv_obj_t *antisurv_start_btn;
@@ -2139,6 +2142,9 @@ static void wardrive_blacklist_close_cb(lv_event_t *e);
 static void wardrive_blacklist_refresh(tab_context_t *ctx);
 static void wardrive_blacklist_remove_cb(lv_event_t *e);
 static void wardrive_blacklist_row_del_cb(lv_event_t *e);
+static void wardrive_blacklist_scan_btn_cb(lv_event_t *e);
+static void wardrive_blacklist_scan_close_cb(lv_event_t *e);
+static bool parse_bt_device_line(const char *line, bt_device_t *dev);
 static void show_antisurv_page(void);
 static void antisurv_start_cb(lv_event_t *e);
 static void antisurv_stop_cb(lv_event_t *e);
@@ -20772,6 +20778,7 @@ static void wardrive_setup_close_cb(lv_event_t *e)
     tab_context_t *ctx = e ? (tab_context_t *)lv_event_get_user_data(e) : get_current_ctx();
     if (!ctx) ctx = get_current_ctx();
     if (ctx->wardrive_setup_applying) return;  // don't tear down while the worker task runs
+    wardrive_blacklist_close_cb(NULL);
     if (ctx->wardrive_setup_overlay) {
         lv_obj_del(ctx->wardrive_setup_overlay);
         ctx->wardrive_setup_overlay = NULL;
@@ -21204,6 +21211,217 @@ static void wardrive_blacklist_clear_cb(lv_event_t *e)
     wardrive_blacklist_refresh(ctx);
 }
 
+typedef struct {
+    tab_context_t *ctx;
+    char mac[18];
+} wardrive_bl_scan_pick_t;
+
+static void wardrive_blacklist_scan_pick_del_cb(lv_event_t *e)
+{
+    wardrive_bl_scan_pick_t *pick = (wardrive_bl_scan_pick_t *)lv_event_get_user_data(e);
+    if (pick) free(pick);
+}
+
+static void wardrive_blacklist_scan_close_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = e ? (tab_context_t *)lv_event_get_user_data(e) : get_current_ctx();
+    if (!ctx) ctx = get_current_ctx();
+    if (ctx && ctx->wardrive_blacklist_scan_overlay) {
+        lv_obj_del(ctx->wardrive_blacklist_scan_overlay);
+        ctx->wardrive_blacklist_scan_overlay = NULL;
+        ctx->wardrive_blacklist_scan_list = NULL;
+        ctx->wardrive_blacklist_scan_status = NULL;
+    }
+}
+
+static void wardrive_blacklist_scan_finish_async(void *param)
+{
+    tab_context_t *ctx = (tab_context_t *)param;
+    if (!ctx) return;
+    if (ctx->wardrive_blacklist_scan_overlay) {
+        lv_obj_del(ctx->wardrive_blacklist_scan_overlay);
+        ctx->wardrive_blacklist_scan_overlay = NULL;
+        ctx->wardrive_blacklist_scan_list = NULL;
+        ctx->wardrive_blacklist_scan_status = NULL;
+    }
+    wardrive_blacklist_refresh(ctx);
+}
+
+static void wardrive_blacklist_scan_pick_cb(lv_event_t *e)
+{
+    wardrive_bl_scan_pick_t *pick = (wardrive_bl_scan_pick_t *)lv_event_get_user_data(e);
+    if (!pick || !pick->ctx || !pick->mac[0]) return;
+
+    char cmd[64];
+    snprintf(cmd, sizeof(cmd), "wardrive_blacklist add %s", pick->mac);
+    wardrive_send_set_command(pick->ctx, cmd, NULL, NULL, 0);
+    if (pick->ctx->wardrive_blacklist_input) {
+        lv_textarea_set_text(pick->ctx->wardrive_blacklist_input, pick->mac);
+    }
+    lv_async_call(wardrive_blacklist_scan_finish_async, pick->ctx);
+}
+
+static void wardrive_blacklist_scan_btn_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx) ctx = get_current_ctx();
+    if (!ctx || !ctx->wardrive_blacklist_overlay) return;
+
+    if (ctx->wardrive_blacklist_scan_overlay) {
+        lv_obj_del(ctx->wardrive_blacklist_scan_overlay);
+        ctx->wardrive_blacklist_scan_overlay = NULL;
+    }
+
+    ctx->wardrive_blacklist_scan_overlay = lv_obj_create(ctx->wardrive_blacklist_overlay);
+    lv_obj_remove_style_all(ctx->wardrive_blacklist_scan_overlay);
+    lv_obj_set_size(ctx->wardrive_blacklist_scan_overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(ctx->wardrive_blacklist_scan_overlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(ctx->wardrive_blacklist_scan_overlay, LV_OPA_80, 0);
+    lv_obj_clear_flag(ctx->wardrive_blacklist_scan_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(ctx->wardrive_blacklist_scan_overlay, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_move_foreground(ctx->wardrive_blacklist_scan_overlay);
+
+    lv_obj_t *popup = lv_obj_create(ctx->wardrive_blacklist_scan_overlay);
+    lv_obj_set_size(popup, 620, 560);
+    lv_obj_center(popup);
+    lv_obj_set_style_bg_color(popup, lv_color_hex(0x1A1A2A), 0);
+    lv_obj_set_style_border_color(popup, COLOR_MATERIAL_CYAN, 0);
+    lv_obj_set_style_border_width(popup, 3, 0);
+    lv_obj_set_style_radius(popup, 16, 0);
+    lv_obj_set_style_pad_all(popup, 18, 0);
+    lv_obj_set_flex_flow(popup, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(popup, 10, 0);
+    lv_obj_clear_flag(popup, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *header = lv_obj_create(popup);
+    lv_obj_set_size(header, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(header, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(header, 0, 0);
+    lv_obj_set_style_pad_all(header, 0, 0);
+    lv_obj_set_flex_flow(header, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(header, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(header, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(header);
+    lv_label_set_text(title, LV_SYMBOL_BLUETOOTH " Pick BT device");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_CYAN, 0);
+
+    lv_obj_t *close_btn = lv_btn_create(header);
+    lv_obj_set_size(close_btn, 92, 42);
+    lv_obj_set_style_bg_color(close_btn, lv_color_hex(0x444444), 0);
+    lv_obj_set_style_radius(close_btn, 8, 0);
+    lv_obj_add_event_cb(close_btn, wardrive_blacklist_scan_close_cb, LV_EVENT_CLICKED, ctx);
+    lv_obj_t *close_lbl = lv_label_create(close_btn);
+    lv_label_set_text(close_lbl, LV_SYMBOL_CLOSE " Close");
+    lv_obj_center(close_lbl);
+
+    ctx->wardrive_blacklist_scan_status = lv_label_create(popup);
+    lv_label_set_text(ctx->wardrive_blacklist_scan_status, "Scanning for BT devices...");
+    lv_obj_set_style_text_font(ctx->wardrive_blacklist_scan_status, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(ctx->wardrive_blacklist_scan_status, COLOR_MATERIAL_AMBER, 0);
+
+    lv_obj_t *spinner = lv_spinner_create(popup);
+    lv_obj_set_size(spinner, 42, 42);
+    lv_spinner_set_anim_params(spinner, 1000, 200);
+    lv_obj_center(spinner);
+    lv_refr_now(NULL);
+
+    uart_port_t uart_port = uart_port_for_tab(current_tab);
+    uart_flush_input(uart_port);
+    uart_send_command_for_tab("scan_bt");
+
+    static char rx_buffer[8192];
+    int total_len = 0;
+    bool summary_found = false;
+    int elapsed_ms = 0;
+    while (!summary_found && elapsed_ms < 15000 && total_len < (int)sizeof(rx_buffer) - 256) {
+        int len = transport_read_bytes(uart_port, rx_buffer + total_len,
+                                       sizeof(rx_buffer) - total_len - 1,
+                                       pdMS_TO_TICKS(200));
+        if (len > 0) {
+            total_len += len;
+            rx_buffer[total_len] = '\0';
+            if (strstr(rx_buffer, "Summary:") != NULL) summary_found = true;
+        }
+        elapsed_ms += 200;
+    }
+    rx_buffer[total_len] = '\0';
+    lv_obj_del(spinner);
+
+    ctx->wardrive_blacklist_scan_list = lv_obj_create(popup);
+    lv_obj_set_size(ctx->wardrive_blacklist_scan_list, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_flex_grow(ctx->wardrive_blacklist_scan_list, 1);
+    lv_obj_set_style_bg_color(ctx->wardrive_blacklist_scan_list, lv_color_hex(0x121220), 0);
+    lv_obj_set_style_border_width(ctx->wardrive_blacklist_scan_list, 0, 0);
+    lv_obj_set_style_radius(ctx->wardrive_blacklist_scan_list, 8, 0);
+    lv_obj_set_style_pad_all(ctx->wardrive_blacklist_scan_list, 6, 0);
+    lv_obj_set_flex_flow(ctx->wardrive_blacklist_scan_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(ctx->wardrive_blacklist_scan_list, 6, 0);
+
+    int count = 0;
+    char *line = strtok(rx_buffer, "\n\r");
+    while (line != NULL && count < BT_MAX_DEVICES) {
+        if (strstr(line, "RSSI:") != NULL && strchr(line, ':') != NULL) {
+            bt_device_t dev;
+            if (parse_bt_device_line(line, &dev)) {
+                lv_obj_t *row = lv_obj_create(ctx->wardrive_blacklist_scan_list);
+                lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
+                lv_obj_set_style_bg_color(row, lv_color_hex(0x242438), 0);
+                lv_obj_set_style_bg_color(row, lv_color_hex(0x30304A), LV_STATE_PRESSED);
+                lv_obj_set_style_border_width(row, 1, 0);
+                lv_obj_set_style_border_color(row, COLOR_MATERIAL_CYAN, 0);
+                lv_obj_set_style_border_opa(row, LV_OPA_40, 0);
+                lv_obj_set_style_radius(row, 6, 0);
+                lv_obj_set_style_pad_all(row, 10, 0);
+                lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+                lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+                lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+                lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+
+                wardrive_bl_scan_pick_t *pick = malloc(sizeof(*pick));
+                if (pick) {
+                    pick->ctx = ctx;
+                    snprintf(pick->mac, sizeof(pick->mac), "%.17s", dev.mac);
+                    lv_obj_add_event_cb(row, wardrive_blacklist_scan_pick_cb, LV_EVENT_CLICKED, pick);
+                    lv_obj_add_event_cb(row, wardrive_blacklist_scan_pick_del_cb, LV_EVENT_DELETE, pick);
+                }
+
+                lv_obj_t *name_lbl = lv_label_create(row);
+                lv_label_set_text(name_lbl, dev.name[0] ? dev.name : dev.mac);
+                lv_obj_set_flex_grow(name_lbl, 1);
+                lv_label_set_long_mode(name_lbl, LV_LABEL_LONG_DOT);
+                lv_obj_set_style_text_font(name_lbl, &lv_font_montserrat_14, 0);
+                lv_obj_set_style_text_color(name_lbl, lv_color_hex(0xFFFFFF), 0);
+
+                if (dev.name[0]) {
+                    lv_obj_t *mac_lbl = lv_label_create(row);
+                    lv_label_set_text(mac_lbl, dev.mac);
+                    lv_obj_set_width(mac_lbl, 155);
+                    lv_obj_set_style_text_font(mac_lbl, &lv_font_montserrat_12, 0);
+                    lv_obj_set_style_text_color(mac_lbl, lv_color_hex(0xAAAAAA), 0);
+                }
+
+                lv_obj_t *rssi_lbl = lv_label_create(row);
+                lv_label_set_text_fmt(rssi_lbl, "%d dBm", dev.rssi);
+                lv_obj_set_width(rssi_lbl, 70);
+                lv_obj_set_style_text_font(rssi_lbl, &lv_font_montserrat_14, 0);
+                lv_obj_set_style_text_color(rssi_lbl,
+                    dev.rssi > -50 ? COLOR_MATERIAL_GREEN :
+                    dev.rssi > -70 ? COLOR_MATERIAL_AMBER : COLOR_MATERIAL_RED, 0);
+                count++;
+            }
+        }
+        line = strtok(NULL, "\n\r");
+    }
+
+    lv_label_set_text_fmt(ctx->wardrive_blacklist_scan_status,
+                          count > 0 ? "Tap device to add (%d found)" : "No BT devices found",
+                          count);
+    lv_obj_set_style_text_color(ctx->wardrive_blacklist_scan_status,
+                                count > 0 ? COLOR_MATERIAL_TEAL : COLOR_MATERIAL_RED, 0);
+}
+
 static void wardrive_blacklist_ta_focus_cb(lv_event_t *e)
 {
     tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
@@ -21222,6 +21440,7 @@ static void wardrive_blacklist_close_cb(lv_event_t *e)
 {
     tab_context_t *ctx = e ? (tab_context_t *)lv_event_get_user_data(e) : get_current_ctx();
     if (!ctx) ctx = get_current_ctx();
+    wardrive_blacklist_scan_close_cb(NULL);
     if (ctx->wardrive_blacklist_overlay) {
         lv_obj_del(ctx->wardrive_blacklist_overlay);
         ctx->wardrive_blacklist_overlay = NULL;
@@ -21229,6 +21448,9 @@ static void wardrive_blacklist_close_cb(lv_event_t *e)
         ctx->wardrive_blacklist_status_label = NULL;
         ctx->wardrive_blacklist_input = NULL;
         ctx->wardrive_blacklist_keyboard = NULL;
+        ctx->wardrive_blacklist_scan_overlay = NULL;
+        ctx->wardrive_blacklist_scan_list = NULL;
+        ctx->wardrive_blacklist_scan_status = NULL;
     }
 }
 
@@ -21243,13 +21465,15 @@ static void wardrive_blacklist_btn_cb(lv_event_t *e)
         ctx->wardrive_blacklist_overlay = NULL;
     }
 
-    ctx->wardrive_blacklist_overlay = lv_obj_create(ctx->wardrive_page);
+    lv_obj_t *overlay_parent = ctx->wardrive_setup_overlay ? ctx->wardrive_setup_overlay : ctx->wardrive_page;
+    ctx->wardrive_blacklist_overlay = lv_obj_create(overlay_parent);
     lv_obj_remove_style_all(ctx->wardrive_blacklist_overlay);
     lv_obj_set_size(ctx->wardrive_blacklist_overlay, lv_pct(100), lv_pct(100));
     lv_obj_set_style_bg_color(ctx->wardrive_blacklist_overlay, lv_color_hex(0x000000), 0);
     lv_obj_set_style_bg_opa(ctx->wardrive_blacklist_overlay, LV_OPA_80, 0);
     lv_obj_clear_flag(ctx->wardrive_blacklist_overlay, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(ctx->wardrive_blacklist_overlay, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_move_foreground(ctx->wardrive_blacklist_overlay);
 
     lv_obj_t *popup = lv_obj_create(ctx->wardrive_blacklist_overlay);
     lv_obj_set_size(popup, 560, 540);
@@ -21290,6 +21514,15 @@ static void wardrive_blacklist_btn_cb(lv_event_t *e)
     lv_obj_add_event_cb(ctx->wardrive_blacklist_input, wardrive_blacklist_ta_focus_cb, LV_EVENT_FOCUSED, ctx);
     lv_obj_add_event_cb(ctx->wardrive_blacklist_input, wardrive_blacklist_ta_focus_cb, LV_EVENT_DEFOCUSED, ctx);
     lv_obj_add_event_cb(ctx->wardrive_blacklist_input, wardrive_blacklist_ta_focus_cb, LV_EVENT_READY, ctx);
+
+    lv_obj_t *scan_btn = lv_btn_create(add_row);
+    lv_obj_set_size(scan_btn, 110, 44);
+    lv_obj_set_style_bg_color(scan_btn, COLOR_MATERIAL_CYAN, 0);
+    lv_obj_set_style_radius(scan_btn, 8, 0);
+    lv_obj_add_event_cb(scan_btn, wardrive_blacklist_scan_btn_cb, LV_EVENT_CLICKED, ctx);
+    lv_obj_t *scan_lbl = lv_label_create(scan_btn);
+    lv_label_set_text(scan_lbl, LV_SYMBOL_BLUETOOTH " Scan");
+    lv_obj_center(scan_lbl);
 
     lv_obj_t *add_btn = lv_btn_create(add_row);
     lv_obj_set_size(add_btn, 100, 44);
