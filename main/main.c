@@ -47,7 +47,7 @@
 #include "esp_http_server.h"
 #include "lwip/sockets.h"
 
-#define JANOS_TAB_VERSION "1.4.1"
+#define JANOS_TAB_VERSION "1.4.2"
 #define JANOS_VERSION_REQUIRED "1.6.5"
 #include "lwip/netdb.h"
 #include <dirent.h>
@@ -253,6 +253,38 @@ typedef struct {
     char lon[14];
     char kind[8];
 } wardrive_network_t;
+
+// ---- Wardrive 2.0 configuration (mirrors janOS get_wardrive_config / set_* commands) ----
+#define WARDRIVE_BAND_WIFI24   0x01
+#define WARDRIVE_BAND_WIFI5    0x02
+#define WARDRIVE_BAND_BLE      0x04
+#define WARDRIVE_CUSTOM_CH_MAX 96
+
+typedef enum {
+    WARDRIVE_CH_POPULAR = 0,
+    WARDRIVE_CH_ALL = 1,
+    WARDRIVE_CH_CUSTOM = 2,
+} wardrive_channel_mode_t;
+
+typedef enum {
+    WARDRIVE_ANTISURV_LOW = 0,
+    WARDRIVE_ANTISURV_MED = 1,
+    WARDRIVE_ANTISURV_HIGH = 2,
+} wardrive_antisurv_sens_t;
+
+typedef struct {
+    uint8_t bands;                       // bitmask of WARDRIVE_BAND_*
+    wardrive_channel_mode_t channel_mode;
+    char custom_channels[WARDRIVE_CUSTOM_CH_MAX]; // colon-separated, e.g. "1:6:11:36"
+    int wifi_rssi_delta;                 // 0-50, 0 = log once
+    int ble_rssi_delta;                  // 0-50
+    int startup_cooldown;                // 0-600 s
+    int mem_cap;                         // 1000-200000
+    wardrive_antisurv_sens_t antisurv_sensitivity;
+    bool loaded;                         // true once populated from get_wardrive_config
+} wardrive_config_t;
+
+#define WARDRIVE_BLACKLIST_MAX 64
 
 #define WARDRIVE_WIGLE_MAX_FILES 256
 #define WARDRIVE_WIGLE_PAGE_SIZE  20
@@ -533,6 +565,8 @@ typedef struct {
     int wardrive_wifi_count;
     int wardrive_bt_count;
     int wardrive_sat_count;
+    int wardrive_relogs;
+    int wardrive_best_ch;
     double wardrive_distance_m;
     int wardrive_net_head;
     bool wardrive_trace_enabled;
@@ -575,6 +609,52 @@ typedef struct {
     lv_obj_t *wardrive_wigle_prev_btn;
     lv_obj_t *wardrive_wigle_next_btn;
     TaskHandle_t wardrive_wigle_task;
+
+    // ---- Wardrive 2.0 config + setup overlay ----
+    wardrive_config_t wardrive_config;
+    lv_obj_t *wardrive_setup_btn;
+    lv_obj_t *wardrive_setup_overlay;
+    lv_obj_t *wardrive_setup_popup;
+    lv_obj_t *wardrive_setup_trace_sw;
+    lv_obj_t *wardrive_setup_band_24_cb;
+    lv_obj_t *wardrive_setup_band_5_cb;
+    lv_obj_t *wardrive_setup_band_ble_cb;
+    lv_obj_t *wardrive_setup_channel_dd;
+    lv_obj_t *wardrive_setup_custom_ta;
+    lv_obj_t *wardrive_setup_wifi_delta_slider;
+    lv_obj_t *wardrive_setup_wifi_delta_val;
+    lv_obj_t *wardrive_setup_ble_delta_slider;
+    lv_obj_t *wardrive_setup_ble_delta_val;
+    lv_obj_t *wardrive_setup_cooldown_slider;
+    lv_obj_t *wardrive_setup_cooldown_val;
+    lv_obj_t *wardrive_setup_memcap_dd;
+    lv_obj_t *wardrive_setup_antisurv_dd;
+    lv_obj_t *wardrive_setup_status_label;
+    lv_obj_t *wardrive_setup_keyboard;
+    lv_obj_t *wardrive_setup_spinner;
+    lv_obj_t *wardrive_setup_load_btn;
+    lv_obj_t *wardrive_setup_apply_btn;
+    lv_obj_t *wardrive_setup_close_btn;
+    volatile bool wardrive_setup_applying;
+    TaskHandle_t wardrive_setup_task;
+    // Blacklist editor (sub-overlay of setup)
+    lv_obj_t *wardrive_blacklist_overlay;
+    lv_obj_t *wardrive_blacklist_list;
+    lv_obj_t *wardrive_blacklist_status_label;
+    lv_obj_t *wardrive_blacklist_input;
+    lv_obj_t *wardrive_blacklist_keyboard;
+    // Anti-surveillance page
+    lv_obj_t *antisurv_page;
+    lv_obj_t *antisurv_start_btn;
+    lv_obj_t *antisurv_stop_btn;
+    lv_obj_t *antisurv_sens_btn;
+    lv_obj_t *antisurv_status_label;
+    lv_obj_t *antisurv_count_label;
+    lv_obj_t *antisurv_list;
+    volatile bool antisurv_monitoring;
+    TaskHandle_t antisurv_task;
+    int antisurv_follower_count;
+    int antisurv_device_count;
 
     // =====================================================================
     // COMPROMISED DATA - Page and sub-pages
@@ -1241,6 +1321,7 @@ static void hide_all_pages(tab_context_t *ctx) {
     if (ctx->arp_poison_page) lv_obj_add_flag(ctx->arp_poison_page, LV_OBJ_FLAG_HIDDEN);
     if (ctx->nmap_page) lv_obj_add_flag(ctx->nmap_page, LV_OBJ_FLAG_HIDDEN);
     if (ctx->wardrive_page) lv_obj_add_flag(ctx->wardrive_page, LV_OBJ_FLAG_HIDDEN);
+    if (ctx->antisurv_page) lv_obj_add_flag(ctx->antisurv_page, LV_OBJ_FLAG_HIDDEN);
     /* SubGHz pages (menu + sub-pages) */
     if (ctx->subghz) subghz_hide_all_pages(ctx->subghz);
 }
@@ -2027,7 +2108,6 @@ static void wardrive_monitor_task(void *arg);
 static void update_wardrive_table(tab_context_t *ctx);
 static void update_wardrive_count_label(tab_context_t *ctx);
 static void update_wardrive_trace_button(tab_context_t *ctx);
-static void wardrive_trace_btn_cb(lv_event_t *e);
 static void close_wardrive_gps_overlay(tab_context_t *ctx);
 static void wardrive_gps_type_btn_cb(lv_event_t *e);
 static void wardrive_gps_type_close_cb(lv_event_t *e);
@@ -2044,6 +2124,27 @@ static void wardrive_wigle_close_cb(lv_event_t *e);
 static void wardrive_wigle_upload_task(void *arg);
 static void wardrive_wdgwars_upload_task(void *arg);
 static void show_wardrive_upload_popup(tab_context_t *ctx, wardrive_upload_provider_t provider);
+// ---- Wardrive 2.0 setup + anti-surveillance ----
+static void wardrive_config_set_defaults(wardrive_config_t *cfg);
+static bool wardrive_send_set_command(tab_context_t *ctx, const char *cmd,
+                                      const char *ack_substr, char *resp_out, size_t resp_sz);
+static bool wardrive_load_config(tab_context_t *ctx);
+static void wardrive_setup_btn_cb(lv_event_t *e);
+static void wardrive_setup_close_cb(lv_event_t *e);
+static void wardrive_setup_apply_cb(lv_event_t *e);
+static void wardrive_setup_load_cb(lv_event_t *e);
+static void wardrive_setup_sync_controls(tab_context_t *ctx);
+static void wardrive_blacklist_btn_cb(lv_event_t *e);
+static void wardrive_blacklist_close_cb(lv_event_t *e);
+static void wardrive_blacklist_refresh(tab_context_t *ctx);
+static void wardrive_blacklist_remove_cb(lv_event_t *e);
+static void wardrive_blacklist_row_del_cb(lv_event_t *e);
+static void show_antisurv_page(void);
+static void antisurv_start_cb(lv_event_t *e);
+static void antisurv_stop_cb(lv_event_t *e);
+static void antisurv_back_cb(lv_event_t *e);
+static void antisurv_sens_btn_cb(lv_event_t *e);
+static void antisurv_monitor_task(void *arg);
 static void wardrive_wigle_send_btn_cb(lv_event_t *e);
 static void wardrive_wigle_stop_btn_cb(lv_event_t *e);
 static void wardrive_wigle_file_checkbox_cb(lv_event_t *e);
@@ -6500,6 +6601,8 @@ static void main_tile_event_cb(lv_event_t *e)
             return;
         }
         show_wardrive_page();
+    } else if (strcmp(tile_name, "Anti-Surv") == 0) {
+        show_antisurv_page();
     } else if (strcmp(tile_name, "Sub-GHz") == 0) {
         show_subghz_page();
     } else {
@@ -12043,6 +12146,7 @@ static void create_uart_tiles_in_container(lv_obj_t *container, tab_context_t *c
     create_tile(tile_grid, LV_SYMBOL_LOOP, "Network\nObserver", COLOR_MATERIAL_TEAL, main_tile_event_cb, "Network Observer");
     create_tile(tile_grid, LV_SYMBOL_WIFI, "Karma", COLOR_MATERIAL_ORANGE, main_tile_event_cb, "Karma");
     create_tile(tile_grid, LV_SYMBOL_GPS, "Wardrive", COLOR_MATERIAL_TEAL, main_tile_event_cb, "Wardrive");
+    create_tile(tile_grid, LV_SYMBOL_EYE_OPEN, "Anti-Surv", COLOR_MATERIAL_PINK, main_tile_event_cb, "Anti-Surv");
     if (ctx && ctx->has_subghz) {
         ctx->subghz_tile = create_tile(tile_grid, LV_SYMBOL_BARS, "Sub-GHz",
                                        COLOR_MATERIAL_PINK, main_tile_event_cb, "Sub-GHz");
@@ -16668,12 +16772,23 @@ static void show_wardrive_gps_overlay(tab_context_t *ctx)
 static void update_wardrive_count_label(tab_context_t *ctx)
 {
     if (!ctx || !ctx->wardrive_net_count_label) return;
-    lv_label_set_text_fmt(ctx->wardrive_net_count_label,
-                          "WiFi: %d  BT: %d  SAT: %d  %.2f km",
-                          ctx->wardrive_wifi_count,
-                          ctx->wardrive_bt_count,
-                          ctx->wardrive_sat_count,
-                          ctx->wardrive_distance_m / 1000.0);
+    if (ctx->wardrive_relogs > 0 || ctx->wardrive_best_ch > 0) {
+        lv_label_set_text_fmt(ctx->wardrive_net_count_label,
+                              "WiFi: %d  BT: %d  relog: %d  ch: %d  SAT: %d  %.2f km",
+                              ctx->wardrive_wifi_count,
+                              ctx->wardrive_bt_count,
+                              ctx->wardrive_relogs,
+                              ctx->wardrive_best_ch,
+                              ctx->wardrive_sat_count,
+                              ctx->wardrive_distance_m / 1000.0);
+    } else {
+        lv_label_set_text_fmt(ctx->wardrive_net_count_label,
+                              "WiFi: %d  BT: %d  SAT: %d  %.2f km",
+                              ctx->wardrive_wifi_count,
+                              ctx->wardrive_bt_count,
+                              ctx->wardrive_sat_count,
+                              ctx->wardrive_distance_m / 1000.0);
+    }
 }
 
 static void update_wardrive_trace_button(tab_context_t *ctx)
@@ -16688,22 +16803,6 @@ static void update_wardrive_trace_button(tab_context_t *ctx)
     lv_obj_t *label = lv_obj_get_child(ctx->wardrive_trace_btn, 0);
     if (label) {
         lv_label_set_text(label, ctx->wardrive_trace_enabled ? LV_SYMBOL_GPS " Trace On" : LV_SYMBOL_GPS " Trace");
-    }
-}
-
-static void wardrive_trace_btn_cb(lv_event_t *e)
-{
-    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
-    if (!ctx) ctx = get_current_ctx();
-    if (!ctx || ctx->wardrive_monitoring) return;
-
-    ctx->wardrive_trace_enabled = !ctx->wardrive_trace_enabled;
-
-    update_wardrive_trace_button(ctx);
-    if (ctx->wardrive_status_label) {
-        lv_label_set_text(ctx->wardrive_status_label,
-                          ctx->wardrive_trace_enabled ? "Wardrive Trace mode enabled" : "Wardrive Trace mode disabled");
-        lv_obj_set_style_text_color(ctx->wardrive_status_label, COLOR_MATERIAL_AMBER, 0);
     }
 }
 
@@ -19828,6 +19927,7 @@ static void wardrive_stop_cb(lv_event_t *e)
     if (ctx->wardrive_trace_btn) lv_obj_clear_state(ctx->wardrive_trace_btn, LV_STATE_DISABLED);
     if (ctx->wardrive_gps_type_btn) lv_obj_clear_state(ctx->wardrive_gps_type_btn, LV_STATE_DISABLED);
     if (ctx->wardrive_upload_btn) lv_obj_clear_state(ctx->wardrive_upload_btn, LV_STATE_DISABLED);
+    if (ctx->wardrive_setup_btn) lv_obj_clear_state(ctx->wardrive_setup_btn, LV_STATE_DISABLED);
 
     // Update status
     if (ctx->wardrive_status_label) {
@@ -19940,6 +20040,25 @@ static void wardrive_monitor_task(void *arg)
                                 ctx->wardrive_distance_m = atof(dist_ptr);
                             }
 
+                            // Wardrive 2.0: re-log counter
+                            char *relog_ptr = strstr(line_buffer, "relogs");
+                            if (relog_ptr) {
+                                // value precedes the word: "..., 12 relogs, ..."
+                                char *p = relog_ptr;
+                                while (p > line_buffer && (*(p - 1) == ' ')) p--;
+                                char *num_end = p;
+                                while (p > line_buffer && isdigit((unsigned char)*(p - 1))) p--;
+                                if (p < num_end) ctx->wardrive_relogs = atoi(p);
+                            }
+
+                            // Wardrive 2.0: D-UCB best channel
+                            char *bestch_ptr = strstr(line_buffer, "best ch:");
+                            if (bestch_ptr) {
+                                bestch_ptr += 8;
+                                while (*bestch_ptr == ' ') bestch_ptr++;
+                                ctx->wardrive_best_ch = atoi(bestch_ptr);
+                            }
+
                             bsp_display_lock(0);
                             update_wardrive_count_label(ctx);
                             bsp_display_unlock();
@@ -20002,6 +20121,7 @@ static void wardrive_monitor_task(void *arg)
                             if (ctx->wardrive_trace_btn) lv_obj_clear_state(ctx->wardrive_trace_btn, LV_STATE_DISABLED);
                             if (ctx->wardrive_gps_type_btn) lv_obj_clear_state(ctx->wardrive_gps_type_btn, LV_STATE_DISABLED);
                             if (ctx->wardrive_upload_btn) lv_obj_clear_state(ctx->wardrive_upload_btn, LV_STATE_DISABLED);
+                            if (ctx->wardrive_setup_btn) lv_obj_clear_state(ctx->wardrive_setup_btn, LV_STATE_DISABLED);
                             bsp_display_unlock();
                         }
 
@@ -20050,6 +20170,7 @@ static void wardrive_monitor_task(void *arg)
                             if (ctx->wardrive_trace_btn) lv_obj_clear_state(ctx->wardrive_trace_btn, LV_STATE_DISABLED);
                             if (ctx->wardrive_gps_type_btn) lv_obj_clear_state(ctx->wardrive_gps_type_btn, LV_STATE_DISABLED);
                             if (ctx->wardrive_upload_btn) lv_obj_clear_state(ctx->wardrive_upload_btn, LV_STATE_DISABLED);
+                            if (ctx->wardrive_setup_btn) lv_obj_clear_state(ctx->wardrive_setup_btn, LV_STATE_DISABLED);
                             if (ctx->wardrive_status_label) {
                                 lv_label_set_text(ctx->wardrive_status_label, "Wardrive stopped");
                                 lv_obj_set_style_text_color(ctx->wardrive_status_label, lv_color_hex(0x888888), 0);
@@ -20097,12 +20218,19 @@ static void wardrive_start_cb(lv_event_t *e)
     tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
     if (!ctx) ctx = get_current_ctx();
     if (ctx->wardrive_monitoring) return;  // Already running
+    if (ctx->antisurv_monitoring) {
+        if (ctx->wardrive_status_label) {
+            lv_label_set_text(ctx->wardrive_status_label, "Stop Anti-Surveillance first (shares the radio)");
+            lv_obj_set_style_text_color(ctx->wardrive_status_label, COLOR_MATERIAL_RED, 0);
+        }
+        return;
+    }
 
     // Stop any pending WiGLE upload popup/task when a new capture starts
     close_wardrive_wigle_popup_ctx(ctx);
 
-    ESP_LOGI(TAG, "Wardrive start - sending %s command",
-             ctx->wardrive_trace_enabled ? "start_wardrive_promisc_trace" : "start_wardrive_promisc");
+    const char *start_cmd = ctx->wardrive_trace_enabled ? "start_wardrive_promisc_trace" : "start_wardrive_promisc";
+    ESP_LOGI(TAG, "Wardrive start - sending %s command", start_cmd);
 
     // Clear any previous network selection and send start command
     tab_id_t active_tab = tab_id_for_ctx(ctx);
@@ -20115,9 +20243,9 @@ static void wardrive_start_cb(lv_event_t *e)
 
     // Send start command
     if (active_tab == TAB_MBUS) {
-        uart2_send_command(ctx->wardrive_trace_enabled ? "start_wardrive_promisc_trace" : "start_wardrive_promisc");
+        uart2_send_command(start_cmd);
     } else {
-        uart_send_command(ctx->wardrive_trace_enabled ? "start_wardrive_promisc_trace" : "start_wardrive_promisc");
+        uart_send_command(start_cmd);
     }
 
     // Reset ring buffer
@@ -20125,6 +20253,8 @@ static void wardrive_start_cb(lv_event_t *e)
     ctx->wardrive_wifi_count = 0;
     ctx->wardrive_bt_count = 0;
     ctx->wardrive_sat_count = 0;
+    ctx->wardrive_relogs = 0;
+    ctx->wardrive_best_ch = 0;
     ctx->wardrive_distance_m = 0.0;
     ctx->wardrive_net_head = 0;
     ctx->wardrive_gps_fix = false;
@@ -20139,6 +20269,7 @@ static void wardrive_start_cb(lv_event_t *e)
     if (ctx->wardrive_trace_btn) lv_obj_add_state(ctx->wardrive_trace_btn, LV_STATE_DISABLED);
     if (ctx->wardrive_gps_type_btn) lv_obj_add_state(ctx->wardrive_gps_type_btn, LV_STATE_DISABLED);
     if (ctx->wardrive_upload_btn) lv_obj_add_state(ctx->wardrive_upload_btn, LV_STATE_DISABLED);
+    if (ctx->wardrive_setup_btn) lv_obj_add_state(ctx->wardrive_setup_btn, LV_STATE_DISABLED);
 
     // Update status
     if (ctx->wardrive_status_label) {
@@ -20182,6 +20313,8 @@ static void wardrive_back_cb(lv_event_t *e)
     // Dismiss GPS overlay
     close_wardrive_gps_overlay(ctx);
     close_wardrive_wigle_popup_ctx(ctx);
+    wardrive_setup_close_cb(NULL);
+    wardrive_blacklist_close_cb(NULL);
 
     // Hide wardrive page
     if (ctx->wardrive_page) {
@@ -20193,6 +20326,1026 @@ static void wardrive_back_cb(lv_event_t *e)
         lv_obj_clear_flag(ctx->tiles, LV_OBJ_FLAG_HIDDEN);
         ctx->current_visible_page = ctx->tiles;
     }
+}
+
+//==================================================================================
+// Wardrive 2.0 — configuration helpers + Setup overlay
+//==================================================================================
+
+static void wardrive_config_set_defaults(wardrive_config_t *cfg)
+{
+    if (!cfg) return;
+    cfg->bands = WARDRIVE_BAND_WIFI24 | WARDRIVE_BAND_WIFI5 | WARDRIVE_BAND_BLE;
+    cfg->channel_mode = WARDRIVE_CH_ALL;
+    cfg->custom_channels[0] = '\0';
+    cfg->wifi_rssi_delta = 5;
+    cfg->ble_rssi_delta = 15;
+    cfg->startup_cooldown = 0;
+    cfg->mem_cap = 40000;
+    cfg->antisurv_sensitivity = WARDRIVE_ANTISURV_MED;
+    cfg->loaded = false;
+}
+
+// Send a command and poll the transport for an ACK line. Returns true if a line
+// containing ack_substr (or any non-empty line when ack_substr is NULL) arrived.
+// Mirrors the polling pattern of wardrive_send_gps_set_command.
+static bool wardrive_send_set_command(tab_context_t *ctx, const char *cmd,
+                                      const char *ack_substr, char *resp_out, size_t resp_sz)
+{
+    if (!ctx || !cmd) return false;
+    if (resp_out && resp_sz) resp_out[0] = '\0';
+
+    tab_id_t active_tab = tab_id_for_ctx(ctx);
+    uart_port_t uart_port = (active_tab == TAB_MBUS) ? UART2_NUM : UART_NUM;
+
+    if (active_tab == TAB_MBUS) {
+        uart2_send_command(cmd);
+    } else {
+        uart_send_command(cmd);
+    }
+
+    char rx_buffer[768] = {0};
+    char parse_buffer[768];
+    char found[256] = "";
+    int total_len = 0;
+
+    for (int attempt = 0; attempt < 15 && found[0] == '\0'; attempt++) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        if (total_len >= (int)sizeof(rx_buffer) - 1) break;
+
+        int len = transport_read_bytes_tab(active_tab, uart_port,
+                                           rx_buffer + total_len,
+                                           sizeof(rx_buffer) - 1 - total_len,
+                                           pdMS_TO_TICKS(50));
+        if (len <= 0) continue;
+        total_len += len;
+        rx_buffer[total_len] = '\0';
+
+        snprintf(parse_buffer, sizeof(parse_buffer), "%s", rx_buffer);
+        char *saveptr = NULL;
+        char *line = strtok_r(parse_buffer, "\r\n", &saveptr);
+        while (line) {
+            while (*line == ' ') line++;
+            if (line[0] != '\0' && (!ack_substr || strstr(line, ack_substr) != NULL)) {
+                snprintf(found, sizeof(found), "%.255s", line);
+                break;
+            }
+            line = strtok_r(NULL, "\r\n", &saveptr);
+        }
+    }
+
+    if (resp_out && resp_sz && found[0] != '\0') {
+        snprintf(resp_out, resp_sz, "%.*s", (int)resp_sz - 1, found);
+    }
+    return found[0] != '\0';
+}
+
+// Query get_wardrive_config and populate ctx->wardrive_config from [WDCFG] lines.
+static bool wardrive_load_config(tab_context_t *ctx)
+{
+    if (!ctx) return false;
+
+    tab_id_t active_tab = tab_id_for_ctx(ctx);
+    uart_port_t uart_port = (active_tab == TAB_MBUS) ? UART2_NUM : UART_NUM;
+
+    if (active_tab == TAB_MBUS) {
+        uart2_send_command("get_wardrive_config");
+    } else {
+        uart_send_command("get_wardrive_config");
+    }
+
+    wardrive_config_t cfg;
+    wardrive_config_set_defaults(&cfg);
+
+    char rx_buffer[1024] = {0};
+    char parse_buffer[1024];
+    int total_len = 0;
+    bool got_end = false;
+
+    for (int attempt = 0; attempt < 25 && !got_end; attempt++) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        if (total_len >= (int)sizeof(rx_buffer) - 1) break;
+
+        int len = transport_read_bytes_tab(active_tab, uart_port,
+                                           rx_buffer + total_len,
+                                           sizeof(rx_buffer) - 1 - total_len,
+                                           pdMS_TO_TICKS(50));
+        if (len <= 0) continue;
+        total_len += len;
+        rx_buffer[total_len] = '\0';
+        if (strstr(rx_buffer, "[WDCFG] END") != NULL) got_end = true;
+    }
+
+    if (total_len <= 0) return false;
+
+    snprintf(parse_buffer, sizeof(parse_buffer), "%s", rx_buffer);
+    char *saveptr = NULL;
+    char *line = strtok_r(parse_buffer, "\r\n", &saveptr);
+    bool any = false;
+    while (line) {
+        const char *p = strstr(line, "[WDCFG]");
+        if (p) {
+            p += strlen("[WDCFG]");
+            while (*p == ' ') p++;
+            if (strncmp(p, "bands=", 6) == 0) {
+                cfg.bands = 0;
+                if (strstr(p, "wifi24")) cfg.bands |= WARDRIVE_BAND_WIFI24;
+                if (strstr(p, "wifi5"))  cfg.bands |= WARDRIVE_BAND_WIFI5;
+                if (strstr(p, "ble"))    cfg.bands |= WARDRIVE_BAND_BLE;
+                any = true;
+            } else if (strncmp(p, "channels=", 9) == 0) {
+                const char *v = p + 9;
+                if (strncmp(v, "popular", 7) == 0) cfg.channel_mode = WARDRIVE_CH_POPULAR;
+                else if (strncmp(v, "custom", 6) == 0) cfg.channel_mode = WARDRIVE_CH_CUSTOM;
+                else cfg.channel_mode = WARDRIVE_CH_ALL;
+            } else if (strncmp(p, "custom=", 7) == 0) {
+                snprintf(cfg.custom_channels, sizeof(cfg.custom_channels), "%.*s",
+                         (int)sizeof(cfg.custom_channels) - 1, p + 7);
+            } else if (strncmp(p, "wifi_rssi_delta=", 16) == 0) {
+                cfg.wifi_rssi_delta = atoi(p + 16);
+            } else if (strncmp(p, "ble_rssi_delta=", 15) == 0) {
+                cfg.ble_rssi_delta = atoi(p + 15);
+            } else if (strncmp(p, "startup_cooldown=", 17) == 0) {
+                cfg.startup_cooldown = atoi(p + 17);
+            } else if (strncmp(p, "mem_cap=", 8) == 0) {
+                cfg.mem_cap = atoi(p + 8);
+            } else if (strncmp(p, "antisurv_sensitivity=", 21) == 0) {
+                const char *v = p + 21;
+                if (strncmp(v, "low", 3) == 0) cfg.antisurv_sensitivity = WARDRIVE_ANTISURV_LOW;
+                else if (strncmp(v, "high", 4) == 0) cfg.antisurv_sensitivity = WARDRIVE_ANTISURV_HIGH;
+                else cfg.antisurv_sensitivity = WARDRIVE_ANTISURV_MED;
+            }
+        }
+        line = strtok_r(NULL, "\r\n", &saveptr);
+    }
+
+    if (any) {
+        cfg.loaded = true;
+        ctx->wardrive_config = cfg;
+    }
+    return any;
+}
+
+static const char *wardrive_memcap_options = "10000\n20000\n40000\n80000\n120000\n200000";
+static const int wardrive_memcap_values[] = {10000, 20000, 40000, 80000, 120000, 200000};
+
+static int wardrive_memcap_to_index(int memcap)
+{
+    int best = 2; // default 40000
+    int best_diff = 1 << 30;
+    for (int i = 0; i < (int)(sizeof(wardrive_memcap_values) / sizeof(int)); i++) {
+        int diff = abs(memcap - wardrive_memcap_values[i]);
+        if (diff < best_diff) { best_diff = diff; best = i; }
+    }
+    return best;
+}
+
+// Push ctx->wardrive_config values into the setup overlay controls.
+static void wardrive_setup_sync_controls(tab_context_t *ctx)
+{
+    if (!ctx || !ctx->wardrive_setup_popup) return;
+    wardrive_config_t *cfg = &ctx->wardrive_config;
+
+    if (ctx->wardrive_setup_trace_sw) {
+        if (ctx->wardrive_trace_enabled) lv_obj_add_state(ctx->wardrive_setup_trace_sw, LV_STATE_CHECKED);
+        else lv_obj_clear_state(ctx->wardrive_setup_trace_sw, LV_STATE_CHECKED);
+    }
+    if (ctx->wardrive_setup_band_24_cb) {
+        if (cfg->bands & WARDRIVE_BAND_WIFI24) lv_obj_add_state(ctx->wardrive_setup_band_24_cb, LV_STATE_CHECKED);
+        else lv_obj_clear_state(ctx->wardrive_setup_band_24_cb, LV_STATE_CHECKED);
+    }
+    if (ctx->wardrive_setup_band_5_cb) {
+        if (cfg->bands & WARDRIVE_BAND_WIFI5) lv_obj_add_state(ctx->wardrive_setup_band_5_cb, LV_STATE_CHECKED);
+        else lv_obj_clear_state(ctx->wardrive_setup_band_5_cb, LV_STATE_CHECKED);
+    }
+    if (ctx->wardrive_setup_band_ble_cb) {
+        if (cfg->bands & WARDRIVE_BAND_BLE) lv_obj_add_state(ctx->wardrive_setup_band_ble_cb, LV_STATE_CHECKED);
+        else lv_obj_clear_state(ctx->wardrive_setup_band_ble_cb, LV_STATE_CHECKED);
+    }
+    if (ctx->wardrive_setup_channel_dd) {
+        lv_dropdown_set_selected(ctx->wardrive_setup_channel_dd, (uint16_t)cfg->channel_mode);
+    }
+    if (ctx->wardrive_setup_custom_ta) {
+        lv_textarea_set_text(ctx->wardrive_setup_custom_ta, cfg->custom_channels);
+        if (cfg->channel_mode == WARDRIVE_CH_CUSTOM) lv_obj_clear_flag(ctx->wardrive_setup_custom_ta, LV_OBJ_FLAG_HIDDEN);
+        else lv_obj_add_flag(ctx->wardrive_setup_custom_ta, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (ctx->wardrive_setup_wifi_delta_slider) {
+        lv_slider_set_value(ctx->wardrive_setup_wifi_delta_slider, cfg->wifi_rssi_delta, LV_ANIM_OFF);
+        if (ctx->wardrive_setup_wifi_delta_val)
+            lv_label_set_text_fmt(ctx->wardrive_setup_wifi_delta_val, "%d dBm%s", cfg->wifi_rssi_delta,
+                                  cfg->wifi_rssi_delta == 0 ? " (once)" : "");
+    }
+    if (ctx->wardrive_setup_ble_delta_slider) {
+        lv_slider_set_value(ctx->wardrive_setup_ble_delta_slider, cfg->ble_rssi_delta, LV_ANIM_OFF);
+        if (ctx->wardrive_setup_ble_delta_val)
+            lv_label_set_text_fmt(ctx->wardrive_setup_ble_delta_val, "%d dBm%s", cfg->ble_rssi_delta,
+                                  cfg->ble_rssi_delta == 0 ? " (once)" : "");
+    }
+    if (ctx->wardrive_setup_cooldown_slider) {
+        lv_slider_set_value(ctx->wardrive_setup_cooldown_slider, cfg->startup_cooldown, LV_ANIM_OFF);
+        if (ctx->wardrive_setup_cooldown_val)
+            lv_label_set_text_fmt(ctx->wardrive_setup_cooldown_val, "%d s", cfg->startup_cooldown);
+    }
+    if (ctx->wardrive_setup_memcap_dd) {
+        lv_dropdown_set_selected(ctx->wardrive_setup_memcap_dd, (uint16_t)wardrive_memcap_to_index(cfg->mem_cap));
+    }
+    if (ctx->wardrive_setup_antisurv_dd) {
+        lv_dropdown_set_selected(ctx->wardrive_setup_antisurv_dd, (uint16_t)cfg->antisurv_sensitivity);
+    }
+}
+
+static void wardrive_setup_do_load(tab_context_t *ctx)
+{
+    if (!ctx) return;
+    if (ctx->wardrive_setup_status_label) {
+        lv_label_set_text(ctx->wardrive_setup_status_label, "Reading device config...");
+        lv_obj_set_style_text_color(ctx->wardrive_setup_status_label, COLOR_MATERIAL_AMBER, 0);
+        lv_refr_now(NULL);
+    }
+    bool ok = wardrive_load_config(ctx);
+    wardrive_setup_sync_controls(ctx);
+    if (ctx->wardrive_setup_status_label) {
+        lv_label_set_text(ctx->wardrive_setup_status_label, ok ? "Loaded current config from device" : "No response — showing local values");
+        lv_obj_set_style_text_color(ctx->wardrive_setup_status_label, ok ? COLOR_MATERIAL_GREEN : COLOR_MATERIAL_RED, 0);
+    }
+}
+
+static void wardrive_setup_load_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx) ctx = get_current_ctx();
+    wardrive_setup_do_load(ctx);
+}
+
+// Slider value-label updaters
+static void wardrive_wifi_delta_slider_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx || !ctx->wardrive_setup_wifi_delta_val) return;
+    int v = lv_slider_get_value(ctx->wardrive_setup_wifi_delta_slider);
+    lv_label_set_text_fmt(ctx->wardrive_setup_wifi_delta_val, "%d dBm%s", v, v == 0 ? " (once)" : "");
+}
+
+static void wardrive_ble_delta_slider_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx || !ctx->wardrive_setup_ble_delta_val) return;
+    int v = lv_slider_get_value(ctx->wardrive_setup_ble_delta_slider);
+    lv_label_set_text_fmt(ctx->wardrive_setup_ble_delta_val, "%d dBm%s", v, v == 0 ? " (once)" : "");
+}
+
+static void wardrive_cooldown_slider_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx || !ctx->wardrive_setup_cooldown_val) return;
+    int v = lv_slider_get_value(ctx->wardrive_setup_cooldown_slider);
+    lv_label_set_text_fmt(ctx->wardrive_setup_cooldown_val, "%d s", v);
+}
+
+static void wardrive_setup_trace_sw_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx || !ctx->wardrive_setup_trace_sw) return;
+    ctx->wardrive_trace_enabled = lv_obj_has_state(ctx->wardrive_setup_trace_sw, LV_STATE_CHECKED);
+}
+
+static void wardrive_channel_dd_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx || !ctx->wardrive_setup_channel_dd || !ctx->wardrive_setup_custom_ta) return;
+    uint16_t sel = lv_dropdown_get_selected(ctx->wardrive_setup_channel_dd);
+    if (sel == WARDRIVE_CH_CUSTOM) lv_obj_clear_flag(ctx->wardrive_setup_custom_ta, LV_OBJ_FLAG_HIDDEN);
+    else lv_obj_add_flag(ctx->wardrive_setup_custom_ta, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void wardrive_setup_ta_focus_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    lv_obj_t *ta = lv_event_get_target(e);
+    lv_event_code_t code = lv_event_get_code(e);
+    if (!ctx || !ctx->wardrive_setup_keyboard) return;
+    if (code == LV_EVENT_FOCUSED) {
+        lv_keyboard_set_textarea(ctx->wardrive_setup_keyboard, ta);
+        lv_obj_clear_flag(ctx->wardrive_setup_keyboard, LV_OBJ_FLAG_HIDDEN);
+    } else if (code == LV_EVENT_DEFOCUSED || code == LV_EVENT_READY) {
+        lv_obj_add_flag(ctx->wardrive_setup_keyboard, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+// Per-step status update from the apply worker task (guarded; overlay may close)
+static void wardrive_apply_set_status(tab_context_t *ctx, const char *text, lv_color_t color)
+{
+    bsp_display_lock(0);
+    if (ctx->wardrive_setup_status_label && ctx->wardrive_setup_overlay) {
+        lv_label_set_text(ctx->wardrive_setup_status_label, text);
+        lv_obj_set_style_text_color(ctx->wardrive_setup_status_label, color, 0);
+    }
+    bsp_display_unlock();
+}
+
+// Worker task: sends the 7 set_* commands, waiting for each ACK, so the spinner
+// can animate (the LVGL thread stays free). Reads ctx->wardrive_config snapshot.
+static void wardrive_apply_task(void *arg)
+{
+    tab_context_t *ctx = (tab_context_t *)arg;
+    wardrive_config_t *cfg = &ctx->wardrive_config;
+    char cmd[160];
+    char step[64];
+    int ok = 0, total = 0;
+
+    // bands
+    {
+        char list[40] = "";
+        if (cfg->bands & WARDRIVE_BAND_WIFI24) strcat(list, "wifi24,");
+        if (cfg->bands & WARDRIVE_BAND_WIFI5)  strcat(list, "wifi5,");
+        if (cfg->bands & WARDRIVE_BAND_BLE)    strcat(list, "ble,");
+        size_t l = strlen(list);
+        if (l && list[l - 1] == ',') list[l - 1] = '\0';
+        snprintf(cmd, sizeof(cmd), "set_wardrive_bands %s", list);
+        wardrive_apply_set_status(ctx, "Applying 1/7: bands", COLOR_MATERIAL_AMBER);
+        total++; if (wardrive_send_set_command(ctx, cmd, "Wardrive bands", NULL, 0)) ok++;
+    }
+    // channels
+    {
+        const char *mode = cfg->channel_mode == WARDRIVE_CH_POPULAR ? "popular" :
+                           cfg->channel_mode == WARDRIVE_CH_CUSTOM ? "custom" : "all";
+        if (cfg->channel_mode == WARDRIVE_CH_CUSTOM && cfg->custom_channels[0])
+            snprintf(cmd, sizeof(cmd), "set_wardrive_channels custom %s", cfg->custom_channels);
+        else
+            snprintf(cmd, sizeof(cmd), "set_wardrive_channels %s", mode);
+        wardrive_apply_set_status(ctx, "Applying 2/7: channels", COLOR_MATERIAL_AMBER);
+        total++; if (wardrive_send_set_command(ctx, cmd, "Wardrive channels", NULL, 0)) ok++;
+    }
+    // rssi delta wifi/ble
+    snprintf(cmd, sizeof(cmd), "set_wardrive_rssi_delta wifi %d", cfg->wifi_rssi_delta);
+    wardrive_apply_set_status(ctx, "Applying 3/7: WiFi RSSI delta", COLOR_MATERIAL_AMBER);
+    total++; if (wardrive_send_set_command(ctx, cmd, "Wardrive RSSI", NULL, 0)) ok++;
+    snprintf(cmd, sizeof(cmd), "set_wardrive_rssi_delta ble %d", cfg->ble_rssi_delta);
+    wardrive_apply_set_status(ctx, "Applying 4/7: BLE RSSI delta", COLOR_MATERIAL_AMBER);
+    total++; if (wardrive_send_set_command(ctx, cmd, "Wardrive RSSI", NULL, 0)) ok++;
+    // memcap
+    snprintf(cmd, sizeof(cmd), "set_wardrive_memcap %d", cfg->mem_cap);
+    wardrive_apply_set_status(ctx, "Applying 5/7: memory cap", COLOR_MATERIAL_AMBER);
+    total++; if (wardrive_send_set_command(ctx, cmd, "Wardrive memory", NULL, 0)) ok++;
+    // cooldown
+    snprintf(cmd, sizeof(cmd), "set_wardrive_cooldown %d", cfg->startup_cooldown);
+    wardrive_apply_set_status(ctx, "Applying 6/7: startup cooldown", COLOR_MATERIAL_AMBER);
+    total++; if (wardrive_send_set_command(ctx, cmd, "Wardrive startup", NULL, 0)) ok++;
+    // antisurv sensitivity
+    {
+        const char *s = cfg->antisurv_sensitivity == WARDRIVE_ANTISURV_LOW ? "low" :
+                        cfg->antisurv_sensitivity == WARDRIVE_ANTISURV_HIGH ? "high" : "med";
+        snprintf(cmd, sizeof(cmd), "set_antisurv_sensitivity %s", s);
+        wardrive_apply_set_status(ctx, "Applying 7/7: anti-surv sensitivity", COLOR_MATERIAL_AMBER);
+        total++; if (wardrive_send_set_command(ctx, cmd, "Anti-surveillance", NULL, 0)) ok++;
+    }
+
+    cfg->loaded = true;
+    snprintf(step, sizeof(step), "Applied %d/%d settings (saved to NVS)", ok, total);
+
+    // Finalize UI: hide spinner, re-enable buttons, set status
+    bsp_display_lock(0);
+    if (ctx->wardrive_setup_overlay) {
+        if (ctx->wardrive_setup_spinner) lv_obj_add_flag(ctx->wardrive_setup_spinner, LV_OBJ_FLAG_HIDDEN);
+        if (ctx->wardrive_setup_load_btn) lv_obj_clear_state(ctx->wardrive_setup_load_btn, LV_STATE_DISABLED);
+        if (ctx->wardrive_setup_apply_btn) lv_obj_clear_state(ctx->wardrive_setup_apply_btn, LV_STATE_DISABLED);
+        if (ctx->wardrive_setup_close_btn) lv_obj_clear_state(ctx->wardrive_setup_close_btn, LV_STATE_DISABLED);
+        if (ctx->wardrive_setup_status_label) {
+            lv_label_set_text(ctx->wardrive_setup_status_label, step);
+            lv_obj_set_style_text_color(ctx->wardrive_setup_status_label,
+                                        ok == total ? COLOR_MATERIAL_GREEN : COLOR_MATERIAL_AMBER, 0);
+        }
+    }
+    bsp_display_unlock();
+
+    ctx->wardrive_setup_applying = false;
+    ctx->wardrive_setup_task = NULL;
+    vTaskDelete(NULL);
+}
+
+static void wardrive_setup_apply_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx) ctx = get_current_ctx();
+    if (!ctx->wardrive_setup_popup || ctx->wardrive_setup_applying) return;
+
+    wardrive_config_t *cfg = &ctx->wardrive_config;
+
+    // ---- gather from controls (LVGL thread) ----
+    uint8_t bands = 0;
+    if (lv_obj_has_state(ctx->wardrive_setup_band_24_cb, LV_STATE_CHECKED)) bands |= WARDRIVE_BAND_WIFI24;
+    if (lv_obj_has_state(ctx->wardrive_setup_band_5_cb, LV_STATE_CHECKED))  bands |= WARDRIVE_BAND_WIFI5;
+    if (lv_obj_has_state(ctx->wardrive_setup_band_ble_cb, LV_STATE_CHECKED)) bands |= WARDRIVE_BAND_BLE;
+    if (bands == 0) {
+        if (ctx->wardrive_setup_status_label) {
+            lv_label_set_text(ctx->wardrive_setup_status_label, "Select at least one band");
+            lv_obj_set_style_text_color(ctx->wardrive_setup_status_label, COLOR_MATERIAL_RED, 0);
+        }
+        return;
+    }
+    cfg->bands = bands;
+    cfg->channel_mode = (wardrive_channel_mode_t)lv_dropdown_get_selected(ctx->wardrive_setup_channel_dd);
+    snprintf(cfg->custom_channels, sizeof(cfg->custom_channels), "%s",
+             lv_textarea_get_text(ctx->wardrive_setup_custom_ta));
+    cfg->wifi_rssi_delta = lv_slider_get_value(ctx->wardrive_setup_wifi_delta_slider);
+    cfg->ble_rssi_delta = lv_slider_get_value(ctx->wardrive_setup_ble_delta_slider);
+    cfg->startup_cooldown = lv_slider_get_value(ctx->wardrive_setup_cooldown_slider);
+    cfg->mem_cap = wardrive_memcap_values[lv_dropdown_get_selected(ctx->wardrive_setup_memcap_dd)];
+    cfg->antisurv_sensitivity = (wardrive_antisurv_sens_t)lv_dropdown_get_selected(ctx->wardrive_setup_antisurv_dd);
+
+    // Lock the overlay, show spinner, run the sends on a worker task
+    ctx->wardrive_setup_applying = true;
+    if (ctx->wardrive_setup_spinner) lv_obj_clear_flag(ctx->wardrive_setup_spinner, LV_OBJ_FLAG_HIDDEN);
+    if (ctx->wardrive_setup_load_btn) lv_obj_add_state(ctx->wardrive_setup_load_btn, LV_STATE_DISABLED);
+    if (ctx->wardrive_setup_apply_btn) lv_obj_add_state(ctx->wardrive_setup_apply_btn, LV_STATE_DISABLED);
+    if (ctx->wardrive_setup_close_btn) lv_obj_add_state(ctx->wardrive_setup_close_btn, LV_STATE_DISABLED);
+    if (ctx->wardrive_setup_status_label) {
+        lv_label_set_text(ctx->wardrive_setup_status_label, "Applying...");
+        lv_obj_set_style_text_color(ctx->wardrive_setup_status_label, COLOR_MATERIAL_AMBER, 0);
+    }
+    xTaskCreate(wardrive_apply_task, "wd_apply", 8192, (void*)ctx, 5, &ctx->wardrive_setup_task);
+}
+
+static void wardrive_setup_close_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = e ? (tab_context_t *)lv_event_get_user_data(e) : get_current_ctx();
+    if (!ctx) ctx = get_current_ctx();
+    if (ctx->wardrive_setup_applying) return;  // don't tear down while the worker task runs
+    if (ctx->wardrive_setup_overlay) {
+        lv_obj_del(ctx->wardrive_setup_overlay);
+        ctx->wardrive_setup_overlay = NULL;
+        ctx->wardrive_setup_popup = NULL;
+        ctx->wardrive_setup_trace_sw = NULL;
+        ctx->wardrive_setup_band_24_cb = NULL;
+        ctx->wardrive_setup_band_5_cb = NULL;
+        ctx->wardrive_setup_band_ble_cb = NULL;
+        ctx->wardrive_setup_channel_dd = NULL;
+        ctx->wardrive_setup_custom_ta = NULL;
+        ctx->wardrive_setup_wifi_delta_slider = NULL;
+        ctx->wardrive_setup_wifi_delta_val = NULL;
+        ctx->wardrive_setup_ble_delta_slider = NULL;
+        ctx->wardrive_setup_ble_delta_val = NULL;
+        ctx->wardrive_setup_cooldown_slider = NULL;
+        ctx->wardrive_setup_cooldown_val = NULL;
+        ctx->wardrive_setup_memcap_dd = NULL;
+        ctx->wardrive_setup_antisurv_dd = NULL;
+        ctx->wardrive_setup_status_label = NULL;
+        ctx->wardrive_setup_keyboard = NULL;
+        ctx->wardrive_setup_spinner = NULL;
+        ctx->wardrive_setup_load_btn = NULL;
+        ctx->wardrive_setup_apply_btn = NULL;
+        ctx->wardrive_setup_close_btn = NULL;
+    }
+}
+
+// Small helper: section header label inside the setup popup
+static lv_obj_t *wardrive_setup_make_label(lv_obj_t *parent, const char *text, lv_color_t color)
+{
+    lv_obj_t *lbl = lv_label_create(parent);
+    lv_label_set_text(lbl, text);
+    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(lbl, color, 0);
+    return lbl;
+}
+
+static void wardrive_setup_btn_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx) ctx = get_current_ctx();
+    if (!ctx->wardrive_page || ctx->wardrive_monitoring) return;
+
+    if (ctx->wardrive_setup_overlay) {
+        lv_obj_del(ctx->wardrive_setup_overlay);
+        ctx->wardrive_setup_overlay = NULL;
+    }
+    if (!ctx->wardrive_config.loaded) {
+        wardrive_config_set_defaults(&ctx->wardrive_config);
+    }
+
+    // Overlay
+    ctx->wardrive_setup_overlay = lv_obj_create(ctx->wardrive_page);
+    lv_obj_remove_style_all(ctx->wardrive_setup_overlay);
+    lv_obj_set_size(ctx->wardrive_setup_overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(ctx->wardrive_setup_overlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(ctx->wardrive_setup_overlay, LV_OPA_70, 0);
+    lv_obj_clear_flag(ctx->wardrive_setup_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(ctx->wardrive_setup_overlay, LV_OBJ_FLAG_CLICKABLE);
+
+    // Popup (scrollable column)
+    lv_obj_t *popup = lv_obj_create(ctx->wardrive_setup_overlay);
+    ctx->wardrive_setup_popup = popup;
+    lv_obj_set_size(popup, 600, 620);
+    lv_obj_center(popup);
+    lv_obj_set_style_bg_color(popup, lv_color_hex(0x1A1A2A), 0);
+    lv_obj_set_style_border_color(popup, COLOR_MATERIAL_TEAL, 0);
+    lv_obj_set_style_border_width(popup, 3, 0);
+    lv_obj_set_style_radius(popup, 16, 0);
+    lv_obj_set_style_pad_all(popup, 18, 0);
+    lv_obj_set_flex_flow(popup, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(popup, 8, 0);
+
+    // Title
+    lv_obj_t *title = lv_label_create(popup);
+    lv_label_set_text(title, LV_SYMBOL_SETTINGS " Wardrive Setup");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_TEAL, 0);
+
+    // ---- Trace (KML track) toggle ----
+    lv_obj_t *trace_row = lv_obj_create(popup);
+    lv_obj_set_size(trace_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(trace_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(trace_row, 0, 0);
+    lv_obj_set_style_pad_all(trace_row, 0, 0);
+    lv_obj_set_flex_flow(trace_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(trace_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(trace_row, LV_OBJ_FLAG_SCROLLABLE);
+    wardrive_setup_make_label(trace_row, "Trace (KML track)", COLOR_MATERIAL_CYAN);
+    ctx->wardrive_setup_trace_sw = lv_switch_create(trace_row);
+    lv_obj_add_event_cb(ctx->wardrive_setup_trace_sw, wardrive_setup_trace_sw_cb, LV_EVENT_VALUE_CHANGED, ctx);
+
+    // ---- Bands ----
+    wardrive_setup_make_label(popup, "Bands", COLOR_MATERIAL_CYAN);
+    lv_obj_t *band_row = lv_obj_create(popup);
+    lv_obj_set_size(band_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(band_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(band_row, 0, 0);
+    lv_obj_set_style_pad_all(band_row, 0, 0);
+    lv_obj_set_flex_flow(band_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_column(band_row, 24, 0);
+    lv_obj_clear_flag(band_row, LV_OBJ_FLAG_SCROLLABLE);
+    ctx->wardrive_setup_band_24_cb = lv_checkbox_create(band_row);
+    lv_checkbox_set_text(ctx->wardrive_setup_band_24_cb, "2.4 GHz");
+    lv_obj_set_style_text_color(ctx->wardrive_setup_band_24_cb, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_font(ctx->wardrive_setup_band_24_cb, &lv_font_montserrat_14, 0);
+    ctx->wardrive_setup_band_5_cb = lv_checkbox_create(band_row);
+    lv_checkbox_set_text(ctx->wardrive_setup_band_5_cb, "5 GHz");
+    lv_obj_set_style_text_color(ctx->wardrive_setup_band_5_cb, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_font(ctx->wardrive_setup_band_5_cb, &lv_font_montserrat_14, 0);
+    ctx->wardrive_setup_band_ble_cb = lv_checkbox_create(band_row);
+    lv_checkbox_set_text(ctx->wardrive_setup_band_ble_cb, "BLE");
+    lv_obj_set_style_text_color(ctx->wardrive_setup_band_ble_cb, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_font(ctx->wardrive_setup_band_ble_cb, &lv_font_montserrat_14, 0);
+
+    // ---- Channels ----
+    wardrive_setup_make_label(popup, "Channels", COLOR_MATERIAL_CYAN);
+    ctx->wardrive_setup_channel_dd = lv_dropdown_create(popup);
+    lv_dropdown_set_options(ctx->wardrive_setup_channel_dd, "popular\nall\ncustom");
+    lv_obj_set_width(ctx->wardrive_setup_channel_dd, lv_pct(100));
+    lv_obj_add_event_cb(ctx->wardrive_setup_channel_dd, wardrive_channel_dd_cb, LV_EVENT_VALUE_CHANGED, ctx);
+    ctx->wardrive_setup_custom_ta = lv_textarea_create(popup);
+    lv_textarea_set_one_line(ctx->wardrive_setup_custom_ta, true);
+    lv_textarea_set_placeholder_text(ctx->wardrive_setup_custom_ta, "1:6:11:36:149");
+    lv_obj_set_width(ctx->wardrive_setup_custom_ta, lv_pct(100));
+    lv_obj_add_flag(ctx->wardrive_setup_custom_ta, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(ctx->wardrive_setup_custom_ta, wardrive_setup_ta_focus_cb, LV_EVENT_FOCUSED, ctx);
+    lv_obj_add_event_cb(ctx->wardrive_setup_custom_ta, wardrive_setup_ta_focus_cb, LV_EVENT_DEFOCUSED, ctx);
+    lv_obj_add_event_cb(ctx->wardrive_setup_custom_ta, wardrive_setup_ta_focus_cb, LV_EVENT_READY, ctx);
+
+    // ---- WiFi RSSI delta ----
+    lv_obj_t *wifi_hdr = lv_obj_create(popup);
+    lv_obj_set_size(wifi_hdr, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(wifi_hdr, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(wifi_hdr, 0, 0);
+    lv_obj_set_style_pad_all(wifi_hdr, 0, 0);
+    lv_obj_set_flex_flow(wifi_hdr, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(wifi_hdr, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(wifi_hdr, LV_OBJ_FLAG_SCROLLABLE);
+    wardrive_setup_make_label(wifi_hdr, "WiFi RSSI re-log delta", COLOR_MATERIAL_CYAN);
+    ctx->wardrive_setup_wifi_delta_val = wardrive_setup_make_label(wifi_hdr, "5 dBm", COLOR_MATERIAL_TEAL);
+    ctx->wardrive_setup_wifi_delta_slider = lv_slider_create(popup);
+    lv_slider_set_range(ctx->wardrive_setup_wifi_delta_slider, 0, 50);
+    lv_obj_set_width(ctx->wardrive_setup_wifi_delta_slider, lv_pct(100));
+    lv_obj_add_event_cb(ctx->wardrive_setup_wifi_delta_slider, wardrive_wifi_delta_slider_cb, LV_EVENT_VALUE_CHANGED, ctx);
+
+    // ---- BLE RSSI delta ----
+    lv_obj_t *ble_hdr = lv_obj_create(popup);
+    lv_obj_set_size(ble_hdr, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(ble_hdr, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(ble_hdr, 0, 0);
+    lv_obj_set_style_pad_all(ble_hdr, 0, 0);
+    lv_obj_set_flex_flow(ble_hdr, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(ble_hdr, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(ble_hdr, LV_OBJ_FLAG_SCROLLABLE);
+    wardrive_setup_make_label(ble_hdr, "BLE RSSI re-log delta", COLOR_MATERIAL_CYAN);
+    ctx->wardrive_setup_ble_delta_val = wardrive_setup_make_label(ble_hdr, "15 dBm", COLOR_MATERIAL_TEAL);
+    ctx->wardrive_setup_ble_delta_slider = lv_slider_create(popup);
+    lv_slider_set_range(ctx->wardrive_setup_ble_delta_slider, 0, 50);
+    lv_obj_set_width(ctx->wardrive_setup_ble_delta_slider, lv_pct(100));
+    lv_obj_add_event_cb(ctx->wardrive_setup_ble_delta_slider, wardrive_ble_delta_slider_cb, LV_EVENT_VALUE_CHANGED, ctx);
+
+    // ---- Startup cooldown ----
+    lv_obj_t *cd_hdr = lv_obj_create(popup);
+    lv_obj_set_size(cd_hdr, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(cd_hdr, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(cd_hdr, 0, 0);
+    lv_obj_set_style_pad_all(cd_hdr, 0, 0);
+    lv_obj_set_flex_flow(cd_hdr, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(cd_hdr, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(cd_hdr, LV_OBJ_FLAG_SCROLLABLE);
+    wardrive_setup_make_label(cd_hdr, "Startup cooldown", COLOR_MATERIAL_CYAN);
+    ctx->wardrive_setup_cooldown_val = wardrive_setup_make_label(cd_hdr, "0 s", COLOR_MATERIAL_TEAL);
+    ctx->wardrive_setup_cooldown_slider = lv_slider_create(popup);
+    lv_slider_set_range(ctx->wardrive_setup_cooldown_slider, 0, 600);
+    lv_obj_set_width(ctx->wardrive_setup_cooldown_slider, lv_pct(100));
+    lv_obj_add_event_cb(ctx->wardrive_setup_cooldown_slider, wardrive_cooldown_slider_cb, LV_EVENT_VALUE_CHANGED, ctx);
+
+    // ---- Memcap + Anti-surv (row) ----
+    lv_obj_t *dd_row = lv_obj_create(popup);
+    lv_obj_set_size(dd_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(dd_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(dd_row, 0, 0);
+    lv_obj_set_style_pad_all(dd_row, 0, 0);
+    lv_obj_set_flex_flow(dd_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_column(dd_row, 16, 0);
+    lv_obj_clear_flag(dd_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *memcap_col = lv_obj_create(dd_row);
+    lv_obj_set_size(memcap_col, lv_pct(48), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(memcap_col, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(memcap_col, 0, 0);
+    lv_obj_set_style_pad_all(memcap_col, 0, 0);
+    lv_obj_set_flex_flow(memcap_col, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(memcap_col, 4, 0);
+    lv_obj_clear_flag(memcap_col, LV_OBJ_FLAG_SCROLLABLE);
+    wardrive_setup_make_label(memcap_col, "Memory cap", COLOR_MATERIAL_CYAN);
+    ctx->wardrive_setup_memcap_dd = lv_dropdown_create(memcap_col);
+    lv_dropdown_set_options(ctx->wardrive_setup_memcap_dd, wardrive_memcap_options);
+    lv_obj_set_width(ctx->wardrive_setup_memcap_dd, lv_pct(100));
+
+    lv_obj_t *antisurv_col = lv_obj_create(dd_row);
+    lv_obj_set_size(antisurv_col, lv_pct(48), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(antisurv_col, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(antisurv_col, 0, 0);
+    lv_obj_set_style_pad_all(antisurv_col, 0, 0);
+    lv_obj_set_flex_flow(antisurv_col, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(antisurv_col, 4, 0);
+    lv_obj_clear_flag(antisurv_col, LV_OBJ_FLAG_SCROLLABLE);
+    wardrive_setup_make_label(antisurv_col, "Anti-surv sensitivity", COLOR_MATERIAL_CYAN);
+    ctx->wardrive_setup_antisurv_dd = lv_dropdown_create(antisurv_col);
+    lv_dropdown_set_options(ctx->wardrive_setup_antisurv_dd, "low\nmed\nhigh");
+    lv_obj_set_width(ctx->wardrive_setup_antisurv_dd, lv_pct(100));
+
+    // ---- Blacklist button ----
+    lv_obj_t *bl_btn = lv_btn_create(popup);
+    lv_obj_set_size(bl_btn, lv_pct(100), 44);
+    lv_obj_set_style_bg_color(bl_btn, lv_color_hex(0x455A64), 0);
+    lv_obj_set_style_radius(bl_btn, 8, 0);
+    lv_obj_add_event_cb(bl_btn, wardrive_blacklist_btn_cb, LV_EVENT_CLICKED, ctx);
+    lv_obj_t *bl_lbl = lv_label_create(bl_btn);
+    lv_label_set_text(bl_lbl, LV_SYMBOL_LIST " MAC Blacklist...");
+    lv_obj_center(bl_lbl);
+
+    // ---- Status label ----
+    ctx->wardrive_setup_status_label = lv_label_create(popup);
+    lv_label_set_text(ctx->wardrive_setup_status_label, "Tip: configure once, then Start");
+    lv_obj_set_style_text_font(ctx->wardrive_setup_status_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(ctx->wardrive_setup_status_label, lv_color_hex(0x888888), 0);
+    lv_obj_set_width(ctx->wardrive_setup_status_label, lv_pct(100));
+    lv_label_set_long_mode(ctx->wardrive_setup_status_label, LV_LABEL_LONG_WRAP);
+
+    // ---- Action buttons row ----
+    lv_obj_t *act_row = lv_obj_create(popup);
+    lv_obj_set_size(act_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(act_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(act_row, 0, 0);
+    lv_obj_set_style_pad_all(act_row, 0, 0);
+    lv_obj_set_flex_flow(act_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(act_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(act_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    ctx->wardrive_setup_load_btn = lv_btn_create(act_row);
+    lv_obj_set_size(ctx->wardrive_setup_load_btn, 150, 48);
+    lv_obj_set_style_bg_color(ctx->wardrive_setup_load_btn, COLOR_MATERIAL_BLUE, 0);
+    lv_obj_set_style_bg_color(ctx->wardrive_setup_load_btn, lv_color_hex(0x555555), LV_STATE_DISABLED);
+    lv_obj_set_style_radius(ctx->wardrive_setup_load_btn, 8, 0);
+    lv_obj_add_event_cb(ctx->wardrive_setup_load_btn, wardrive_setup_load_cb, LV_EVENT_CLICKED, ctx);
+    lv_obj_t *load_lbl = lv_label_create(ctx->wardrive_setup_load_btn);
+    lv_label_set_text(load_lbl, LV_SYMBOL_REFRESH " Load");
+    lv_obj_center(load_lbl);
+
+    ctx->wardrive_setup_apply_btn = lv_btn_create(act_row);
+    lv_obj_set_size(ctx->wardrive_setup_apply_btn, 150, 48);
+    lv_obj_set_style_bg_color(ctx->wardrive_setup_apply_btn, COLOR_MATERIAL_GREEN, 0);
+    lv_obj_set_style_bg_color(ctx->wardrive_setup_apply_btn, lv_color_hex(0x555555), LV_STATE_DISABLED);
+    lv_obj_set_style_radius(ctx->wardrive_setup_apply_btn, 8, 0);
+    lv_obj_add_event_cb(ctx->wardrive_setup_apply_btn, wardrive_setup_apply_cb, LV_EVENT_CLICKED, ctx);
+    lv_obj_t *apply_lbl = lv_label_create(ctx->wardrive_setup_apply_btn);
+    lv_label_set_text(apply_lbl, LV_SYMBOL_OK " Apply");
+    lv_obj_center(apply_lbl);
+
+    ctx->wardrive_setup_close_btn = lv_btn_create(act_row);
+    lv_obj_set_size(ctx->wardrive_setup_close_btn, 150, 48);
+    lv_obj_set_style_bg_color(ctx->wardrive_setup_close_btn, lv_color_hex(0x444444), 0);
+    lv_obj_set_style_bg_color(ctx->wardrive_setup_close_btn, lv_color_hex(0x555555), LV_STATE_DISABLED);
+    lv_obj_set_style_radius(ctx->wardrive_setup_close_btn, 8, 0);
+    lv_obj_add_event_cb(ctx->wardrive_setup_close_btn, wardrive_setup_close_cb, LV_EVENT_CLICKED, ctx);
+    lv_obj_t *close_lbl = lv_label_create(ctx->wardrive_setup_close_btn);
+    lv_label_set_text(close_lbl, LV_SYMBOL_CLOSE " Close");
+    lv_obj_center(close_lbl);
+
+    // Spinner shown while Apply is running (hidden otherwise)
+    ctx->wardrive_setup_spinner = lv_spinner_create(popup);
+    lv_obj_set_size(ctx->wardrive_setup_spinner, 36, 36);
+    lv_spinner_set_anim_params(ctx->wardrive_setup_spinner, 1000, 200);
+    lv_obj_add_flag(ctx->wardrive_setup_spinner, LV_OBJ_FLAG_HIDDEN);
+
+    // Keyboard (hidden, for custom channels textarea)
+    ctx->wardrive_setup_keyboard = lv_keyboard_create(ctx->wardrive_setup_overlay);
+    lv_obj_set_size(ctx->wardrive_setup_keyboard, lv_pct(100), lv_pct(40));
+    lv_obj_align(ctx->wardrive_setup_keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_add_flag(ctx->wardrive_setup_keyboard, LV_OBJ_FLAG_HIDDEN);
+
+    // Populate controls from current config, then refresh from device
+    wardrive_setup_sync_controls(ctx);
+    wardrive_setup_do_load(ctx);
+}
+
+//==================================================================================
+// Wardrive 2.0 — MAC blacklist editor (sub-overlay)
+//==================================================================================
+
+static void wardrive_blacklist_refresh(tab_context_t *ctx)
+{
+    if (!ctx || !ctx->wardrive_blacklist_list) return;
+    lv_obj_clean(ctx->wardrive_blacklist_list);
+
+    tab_id_t active_tab = tab_id_for_ctx(ctx);
+    uart_port_t uart_port = (active_tab == TAB_MBUS) ? UART2_NUM : UART_NUM;
+    if (active_tab == TAB_MBUS) uart2_send_command("wardrive_blacklist list");
+    else uart_send_command("wardrive_blacklist list");
+
+    char rx_buffer[1024] = {0};
+    char parse_buffer[1024];
+    int total_len = 0;
+    bool got_end = false;
+    for (int attempt = 0; attempt < 20 && !got_end; attempt++) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        if (total_len >= (int)sizeof(rx_buffer) - 1) break;
+        int len = transport_read_bytes_tab(active_tab, uart_port,
+                                           rx_buffer + total_len,
+                                           sizeof(rx_buffer) - 1 - total_len, pdMS_TO_TICKS(50));
+        if (len <= 0) continue;
+        total_len += len;
+        rx_buffer[total_len] = '\0';
+        if (strstr(rx_buffer, "Blacklist END") != NULL) got_end = true;
+    }
+
+    int count = 0;
+    snprintf(parse_buffer, sizeof(parse_buffer), "%s", rx_buffer);
+    char *saveptr = NULL;
+    char *line = strtok_r(parse_buffer, "\r\n", &saveptr);
+    while (line) {
+        while (*line == ' ') line++;
+        // A MAC line looks like AA:BB:CC:DD:EE:FF
+        if (strlen(line) >= 17 && line[2] == ':' && line[5] == ':') {
+            lv_obj_t *row = lv_obj_create(ctx->wardrive_blacklist_list);
+            lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
+            lv_obj_set_style_bg_color(row, lv_color_hex(0x2A2A3A), 0);
+            lv_obj_set_style_border_width(row, 0, 0);
+            lv_obj_set_style_radius(row, 6, 0);
+            lv_obj_set_style_pad_all(row, 6, 0);
+            lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+            lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+            lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+            char mac[18] = {0};
+            snprintf(mac, sizeof(mac), "%.17s", line);
+            lv_obj_t *mac_lbl = lv_label_create(row);
+            lv_label_set_text(mac_lbl, mac);
+            lv_obj_set_style_text_font(mac_lbl, &lv_font_montserrat_14, 0);
+            lv_obj_set_style_text_color(mac_lbl, lv_color_hex(0xDDDDDD), 0);
+
+            lv_obj_t *del_btn = lv_btn_create(row);
+            lv_obj_set_size(del_btn, 80, 36);
+            lv_obj_set_style_bg_color(del_btn, COLOR_MATERIAL_RED, 0);
+            lv_obj_set_style_radius(del_btn, 6, 0);
+            char *mac_copy = strdup(mac);
+            lv_obj_add_event_cb(del_btn, wardrive_blacklist_remove_cb, LV_EVENT_CLICKED, mac_copy);
+            lv_obj_add_event_cb(del_btn, wardrive_blacklist_row_del_cb, LV_EVENT_DELETE, mac_copy);
+            lv_obj_t *del_lbl = lv_label_create(del_btn);
+            lv_label_set_text(del_lbl, LV_SYMBOL_TRASH);
+            lv_obj_center(del_lbl);
+            count++;
+        }
+        line = strtok_r(NULL, "\r\n", &saveptr);
+    }
+
+    if (ctx->wardrive_blacklist_status_label) {
+        lv_label_set_text_fmt(ctx->wardrive_blacklist_status_label, "%d/%d entries", count, WARDRIVE_BLACKLIST_MAX);
+        lv_obj_set_style_text_color(ctx->wardrive_blacklist_status_label, COLOR_MATERIAL_TEAL, 0);
+    }
+}
+
+static void wardrive_blacklist_row_del_cb(lv_event_t *e)
+{
+    char *mac = (char *)lv_event_get_user_data(e);
+    if (mac) free(mac);
+}
+
+typedef struct {
+    tab_context_t *ctx;
+    char mac[20];
+} wardrive_bl_remove_t;
+
+// Runs outside event dispatch so deleting the clicked row is safe.
+static void wardrive_blacklist_remove_async(void *param)
+{
+    wardrive_bl_remove_t *r = (wardrive_bl_remove_t *)param;
+    if (!r) return;
+    if (r->ctx && r->mac[0]) {
+        char cmd[64];
+        snprintf(cmd, sizeof(cmd), "wardrive_blacklist remove %s", r->mac);
+        wardrive_send_set_command(r->ctx, cmd, NULL, NULL, 0);
+        if (r->ctx->wardrive_blacklist_overlay) {
+            wardrive_blacklist_refresh(r->ctx);
+        }
+    }
+    free(r);
+}
+
+static void wardrive_blacklist_remove_cb(lv_event_t *e)
+{
+    char *mac = (char *)lv_event_get_user_data(e);
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx || !mac) return;
+    wardrive_bl_remove_t *r = (wardrive_bl_remove_t *)malloc(sizeof(*r));
+    if (!r) return;
+    r->ctx = ctx;
+    snprintf(r->mac, sizeof(r->mac), "%.19s", mac);
+    lv_async_call(wardrive_blacklist_remove_async, r);
+}
+
+static void wardrive_blacklist_add_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx) ctx = get_current_ctx();
+    if (!ctx->wardrive_blacklist_input) return;
+    const char *mac = lv_textarea_get_text(ctx->wardrive_blacklist_input);
+    if (!mac || strlen(mac) < 17) {
+        if (ctx->wardrive_blacklist_status_label) {
+            lv_label_set_text(ctx->wardrive_blacklist_status_label, "Enter a full MAC (AA:BB:CC:DD:EE:FF)");
+            lv_obj_set_style_text_color(ctx->wardrive_blacklist_status_label, COLOR_MATERIAL_RED, 0);
+        }
+        return;
+    }
+    char cmd[64];
+    snprintf(cmd, sizeof(cmd), "wardrive_blacklist add %.17s", mac);
+    wardrive_send_set_command(ctx, cmd, NULL, NULL, 0);
+    lv_textarea_set_text(ctx->wardrive_blacklist_input, "");
+    wardrive_blacklist_refresh(ctx);
+}
+
+static void wardrive_blacklist_clear_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx) ctx = get_current_ctx();
+    wardrive_send_set_command(ctx, "wardrive_blacklist clear", NULL, NULL, 0);
+    wardrive_blacklist_refresh(ctx);
+}
+
+static void wardrive_blacklist_ta_focus_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    lv_obj_t *ta = lv_event_get_target(e);
+    lv_event_code_t code = lv_event_get_code(e);
+    if (!ctx || !ctx->wardrive_blacklist_keyboard) return;
+    if (code == LV_EVENT_FOCUSED) {
+        lv_keyboard_set_textarea(ctx->wardrive_blacklist_keyboard, ta);
+        lv_obj_clear_flag(ctx->wardrive_blacklist_keyboard, LV_OBJ_FLAG_HIDDEN);
+    } else if (code == LV_EVENT_DEFOCUSED || code == LV_EVENT_READY) {
+        lv_obj_add_flag(ctx->wardrive_blacklist_keyboard, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void wardrive_blacklist_close_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = e ? (tab_context_t *)lv_event_get_user_data(e) : get_current_ctx();
+    if (!ctx) ctx = get_current_ctx();
+    if (ctx->wardrive_blacklist_overlay) {
+        lv_obj_del(ctx->wardrive_blacklist_overlay);
+        ctx->wardrive_blacklist_overlay = NULL;
+        ctx->wardrive_blacklist_list = NULL;
+        ctx->wardrive_blacklist_status_label = NULL;
+        ctx->wardrive_blacklist_input = NULL;
+        ctx->wardrive_blacklist_keyboard = NULL;
+    }
+}
+
+static void wardrive_blacklist_btn_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx) ctx = get_current_ctx();
+    if (!ctx->wardrive_page) return;
+
+    if (ctx->wardrive_blacklist_overlay) {
+        lv_obj_del(ctx->wardrive_blacklist_overlay);
+        ctx->wardrive_blacklist_overlay = NULL;
+    }
+
+    ctx->wardrive_blacklist_overlay = lv_obj_create(ctx->wardrive_page);
+    lv_obj_remove_style_all(ctx->wardrive_blacklist_overlay);
+    lv_obj_set_size(ctx->wardrive_blacklist_overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(ctx->wardrive_blacklist_overlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(ctx->wardrive_blacklist_overlay, LV_OPA_80, 0);
+    lv_obj_clear_flag(ctx->wardrive_blacklist_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(ctx->wardrive_blacklist_overlay, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t *popup = lv_obj_create(ctx->wardrive_blacklist_overlay);
+    lv_obj_set_size(popup, 560, 540);
+    lv_obj_center(popup);
+    lv_obj_set_style_bg_color(popup, lv_color_hex(0x1A1A2A), 0);
+    lv_obj_set_style_border_color(popup, COLOR_MATERIAL_TEAL, 0);
+    lv_obj_set_style_border_width(popup, 3, 0);
+    lv_obj_set_style_radius(popup, 16, 0);
+    lv_obj_set_style_pad_all(popup, 18, 0);
+    lv_obj_set_flex_flow(popup, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(popup, 10, 0);
+    lv_obj_clear_flag(popup, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(popup);
+    lv_label_set_text(title, LV_SYMBOL_LIST " MAC Blacklist");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_TEAL, 0);
+
+    ctx->wardrive_blacklist_status_label = lv_label_create(popup);
+    lv_label_set_text(ctx->wardrive_blacklist_status_label, "Loading...");
+    lv_obj_set_style_text_font(ctx->wardrive_blacklist_status_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(ctx->wardrive_blacklist_status_label, lv_color_hex(0x888888), 0);
+
+    // Add row: textarea + Add button
+    lv_obj_t *add_row = lv_obj_create(popup);
+    lv_obj_set_size(add_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(add_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(add_row, 0, 0);
+    lv_obj_set_style_pad_all(add_row, 0, 0);
+    lv_obj_set_flex_flow(add_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_column(add_row, 8, 0);
+    lv_obj_clear_flag(add_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    ctx->wardrive_blacklist_input = lv_textarea_create(add_row);
+    lv_textarea_set_one_line(ctx->wardrive_blacklist_input, true);
+    lv_textarea_set_placeholder_text(ctx->wardrive_blacklist_input, "AA:BB:CC:DD:EE:FF");
+    lv_obj_set_flex_grow(ctx->wardrive_blacklist_input, 1);
+    lv_obj_add_event_cb(ctx->wardrive_blacklist_input, wardrive_blacklist_ta_focus_cb, LV_EVENT_FOCUSED, ctx);
+    lv_obj_add_event_cb(ctx->wardrive_blacklist_input, wardrive_blacklist_ta_focus_cb, LV_EVENT_DEFOCUSED, ctx);
+    lv_obj_add_event_cb(ctx->wardrive_blacklist_input, wardrive_blacklist_ta_focus_cb, LV_EVENT_READY, ctx);
+
+    lv_obj_t *add_btn = lv_btn_create(add_row);
+    lv_obj_set_size(add_btn, 100, 44);
+    lv_obj_set_style_bg_color(add_btn, COLOR_MATERIAL_GREEN, 0);
+    lv_obj_set_style_radius(add_btn, 8, 0);
+    lv_obj_add_event_cb(add_btn, wardrive_blacklist_add_cb, LV_EVENT_CLICKED, ctx);
+    lv_obj_t *add_lbl = lv_label_create(add_btn);
+    lv_label_set_text(add_lbl, LV_SYMBOL_PLUS " Add");
+    lv_obj_center(add_lbl);
+
+    // Scrollable list
+    ctx->wardrive_blacklist_list = lv_obj_create(popup);
+    lv_obj_set_size(ctx->wardrive_blacklist_list, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_flex_grow(ctx->wardrive_blacklist_list, 1);
+    lv_obj_set_style_bg_color(ctx->wardrive_blacklist_list, lv_color_hex(0x121220), 0);
+    lv_obj_set_style_border_width(ctx->wardrive_blacklist_list, 0, 0);
+    lv_obj_set_style_radius(ctx->wardrive_blacklist_list, 8, 0);
+    lv_obj_set_style_pad_all(ctx->wardrive_blacklist_list, 6, 0);
+    lv_obj_set_flex_flow(ctx->wardrive_blacklist_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(ctx->wardrive_blacklist_list, 6, 0);
+
+    // Bottom buttons
+    lv_obj_t *btn_row = lv_obj_create(popup);
+    lv_obj_set_size(btn_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(btn_row, 0, 0);
+    lv_obj_set_style_pad_all(btn_row, 0, 0);
+    lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *clear_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(clear_btn, 200, 48);
+    lv_obj_set_style_bg_color(clear_btn, COLOR_MATERIAL_RED, 0);
+    lv_obj_set_style_radius(clear_btn, 8, 0);
+    lv_obj_add_event_cb(clear_btn, wardrive_blacklist_clear_cb, LV_EVENT_CLICKED, ctx);
+    lv_obj_t *clear_lbl = lv_label_create(clear_btn);
+    lv_label_set_text(clear_lbl, LV_SYMBOL_TRASH " Clear all");
+    lv_obj_center(clear_lbl);
+
+    lv_obj_t *close_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(close_btn, 200, 48);
+    lv_obj_set_style_bg_color(close_btn, lv_color_hex(0x444444), 0);
+    lv_obj_set_style_radius(close_btn, 8, 0);
+    lv_obj_add_event_cb(close_btn, wardrive_blacklist_close_cb, LV_EVENT_CLICKED, ctx);
+    lv_obj_t *close_lbl = lv_label_create(close_btn);
+    lv_label_set_text(close_lbl, LV_SYMBOL_CLOSE " Close");
+    lv_obj_center(close_lbl);
+
+    // Keyboard (hidden)
+    ctx->wardrive_blacklist_keyboard = lv_keyboard_create(ctx->wardrive_blacklist_overlay);
+    lv_obj_set_size(ctx->wardrive_blacklist_keyboard, lv_pct(100), lv_pct(40));
+    lv_obj_align(ctx->wardrive_blacklist_keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_add_flag(ctx->wardrive_blacklist_keyboard, LV_OBJ_FLAG_HIDDEN);
+
+    wardrive_blacklist_refresh(ctx);
 }
 
 // Show wardrive full page
@@ -20300,17 +21453,8 @@ static void show_wardrive_page(void)
     lv_obj_set_style_text_font(stop_label, &lv_font_montserrat_14, 0);
     lv_obj_center(stop_label);
 
-    ctx->wardrive_trace_btn = lv_btn_create(btn_cont);
-    lv_obj_set_size(ctx->wardrive_trace_btn, 104, 40);
-    lv_obj_set_style_radius(ctx->wardrive_trace_btn, 8, 0);
-    lv_obj_set_style_bg_color(ctx->wardrive_trace_btn, lv_color_hex(0x455A64), 0);
-    lv_obj_set_style_bg_color(ctx->wardrive_trace_btn, lv_color_hex(0x555555), LV_STATE_DISABLED);
-    lv_obj_add_event_cb(ctx->wardrive_trace_btn, wardrive_trace_btn_cb, LV_EVENT_CLICKED, ctx);
-
-    lv_obj_t *trace_label = lv_label_create(ctx->wardrive_trace_btn);
-    lv_label_set_text(trace_label, LV_SYMBOL_GPS " Trace");
-    lv_obj_set_style_text_font(trace_label, &lv_font_montserrat_14, 0);
-    lv_obj_center(trace_label);
+    // Trace toggle moved into the Setup overlay to keep the header compact.
+    ctx->wardrive_trace_btn = NULL;
 
     // GPS Type button (initially enabled - disabled when running)
     ctx->wardrive_gps_type_btn = lv_btn_create(btn_cont);
@@ -20338,6 +21482,18 @@ static void show_wardrive_page(void)
     lv_obj_set_style_text_font(upload_label, &lv_font_montserrat_14, 0);
     lv_obj_center(upload_label);
 
+    // Setup button (config overlay) — disabled while running
+    ctx->wardrive_setup_btn = lv_btn_create(btn_cont);
+    lv_obj_set_size(ctx->wardrive_setup_btn, 96, 40);
+    lv_obj_set_style_bg_color(ctx->wardrive_setup_btn, lv_color_hex(0x37474F), 0);
+    lv_obj_set_style_bg_color(ctx->wardrive_setup_btn, lv_color_hex(0x555555), LV_STATE_DISABLED);
+    lv_obj_set_style_radius(ctx->wardrive_setup_btn, 8, 0);
+    lv_obj_add_event_cb(ctx->wardrive_setup_btn, wardrive_setup_btn_cb, LV_EVENT_CLICKED, ctx);
+    lv_obj_t *setup_label = lv_label_create(ctx->wardrive_setup_btn);
+    lv_label_set_text(setup_label, LV_SYMBOL_SETTINGS " Setup");
+    lv_obj_set_style_text_font(setup_label, &lv_font_montserrat_14, 0);
+    lv_obj_center(setup_label);
+
     // ---- Status row: status label (left) + net count label (right) ----
     lv_obj_t *status_row = lv_obj_create(ctx->wardrive_page);
     lv_obj_set_size(status_row, lv_pct(100), LV_SIZE_CONTENT);
@@ -20362,6 +21518,9 @@ static void show_wardrive_page(void)
     ctx->wardrive_trace_enabled = true;
     ctx->wardrive_sat_count = 0;
     ctx->wardrive_distance_m = 0.0;
+    if (!ctx->wardrive_config.loaded && ctx->wardrive_config.bands == 0) {
+        wardrive_config_set_defaults(&ctx->wardrive_config);
+    }
     update_wardrive_trace_button(ctx);
 
     // ---- Scrollable table container ----
@@ -20376,6 +21535,401 @@ static void show_wardrive_page(void)
     lv_obj_set_style_pad_row(ctx->wardrive_table, 6, 0);
 
     ctx->current_visible_page = ctx->wardrive_page;
+}
+
+//==================================================================================
+// Anti-Surveillance (BLE follower detection) — separate tile + view
+//==================================================================================
+
+static const char *antisurv_sens_name(wardrive_antisurv_sens_t s)
+{
+    switch (s) {
+        case WARDRIVE_ANTISURV_LOW:  return "low";
+        case WARDRIVE_ANTISURV_HIGH: return "high";
+        default:                     return "med";
+    }
+}
+
+static void update_antisurv_sens_button(tab_context_t *ctx)
+{
+    if (!ctx || !ctx->antisurv_sens_btn) return;
+    lv_obj_t *label = lv_obj_get_child(ctx->antisurv_sens_btn, 0);
+    if (label) {
+        lv_label_set_text_fmt(label, LV_SYMBOL_EYE_OPEN " %s",
+                              antisurv_sens_name(ctx->wardrive_config.antisurv_sensitivity));
+    }
+}
+
+static void antisurv_monitor_task(void *arg)
+{
+    tab_context_t *ctx = (tab_context_t *)arg;
+    if (!ctx) { vTaskDelete(NULL); return; }
+
+    tab_id_t active_tab = tab_id_for_ctx(ctx);
+    uart_port_t uart_port = (active_tab == TAB_MBUS) ? UART2_NUM : UART_NUM;
+
+    char rx_buffer[512];
+    char line_buffer[512];
+    int line_pos = 0;
+
+    while (ctx->antisurv_monitoring) {
+        int len = transport_read_bytes_tab(active_tab, uart_port, rx_buffer, sizeof(rx_buffer) - 1, pdMS_TO_TICKS(100));
+        if (len <= 0) continue;
+        rx_buffer[len] = '\0';
+
+        for (int i = 0; i < len; i++) {
+            char c = rx_buffer[i];
+            if (c == '\n' || c == '\r') {
+                if (line_pos > 0) {
+                    line_buffer[line_pos] = '\0';
+
+                    if (strstr(line_buffer, "[FOLLOWER]") != NULL) {
+                        ctx->antisurv_follower_count++;
+
+                        // Pull out MAC and name for a compact row
+                        char mac[20] = "?";
+                        char detail[120] = "";
+                        const char *m = strstr(line_buffer, "MAC=");
+                        if (m) { sscanf(m + 4, "%19s", mac); }
+                        snprintf(detail, sizeof(detail), "%.119s", line_buffer);
+
+                        bsp_display_lock(0);
+                        if (ctx->antisurv_list) {
+                            // Cap list size
+                            while (lv_obj_get_child_cnt(ctx->antisurv_list) > 60) {
+                                lv_obj_del(lv_obj_get_child(ctx->antisurv_list, 0));
+                            }
+                            lv_obj_t *row = lv_obj_create(ctx->antisurv_list);
+                            lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
+                            lv_obj_set_style_bg_color(row, lv_color_hex(0x3A1020), 0);
+                            lv_obj_set_style_border_color(row, COLOR_MATERIAL_RED, 0);
+                            lv_obj_set_style_border_width(row, 1, 0);
+                            lv_obj_set_style_radius(row, 6, 0);
+                            lv_obj_set_style_pad_all(row, 6, 0);
+                            lv_obj_set_flex_flow(row, LV_FLEX_FLOW_COLUMN);
+                            lv_obj_set_style_pad_row(row, 2, 0);
+                            lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+                            lv_obj_t *mac_lbl = lv_label_create(row);
+                            lv_label_set_text_fmt(mac_lbl, "! FOLLOWER ! %s", mac);
+                            lv_obj_set_style_text_font(mac_lbl, &lv_font_montserrat_14, 0);
+                            lv_obj_set_style_text_color(mac_lbl, COLOR_MATERIAL_RED, 0);
+
+                            lv_obj_t *det_lbl = lv_label_create(row);
+                            lv_label_set_text(det_lbl, detail);
+                            lv_obj_set_style_text_font(det_lbl, &lv_font_montserrat_12, 0);
+                            lv_obj_set_style_text_color(det_lbl, lv_color_hex(0xDDDDDD), 0);
+                            lv_obj_set_width(det_lbl, lv_pct(100));
+                            lv_label_set_long_mode(det_lbl, LV_LABEL_LONG_WRAP);
+
+                            lv_obj_scroll_to_view(row, LV_ANIM_OFF);
+                        }
+                        if (ctx->antisurv_count_label) {
+                            lv_label_set_text_fmt(ctx->antisurv_count_label, "Followers: %d", ctx->antisurv_follower_count);
+                            lv_obj_set_style_text_color(ctx->antisurv_count_label, COLOR_MATERIAL_RED, 0);
+                        }
+                        if (ctx->antisurv_status_label) {
+                            lv_label_set_text(ctx->antisurv_status_label, "! FOLLOWER DETECTED !");
+                            lv_obj_set_style_text_color(ctx->antisurv_status_label, COLOR_MATERIAL_RED, 0);
+                        }
+                        bsp_display_unlock();
+                    } else if (strstr(line_buffer, "Anti-surveillance") != NULL ||
+                               strstr(line_buffer, "antisurveillance") != NULL) {
+                        bsp_display_lock(0);
+                        if (ctx->antisurv_status_label) {
+                            lv_label_set_text(ctx->antisurv_status_label, "Scanning for followers...");
+                            lv_obj_set_style_text_color(ctx->antisurv_status_label, COLOR_MATERIAL_GREEN, 0);
+                        }
+                        bsp_display_unlock();
+                    }
+                    line_pos = 0;
+                }
+            } else if (line_pos < (int)sizeof(line_buffer) - 1) {
+                line_buffer[line_pos++] = c;
+            }
+        }
+    }
+
+    ctx->antisurv_task = NULL;
+    vTaskDelete(NULL);
+}
+
+static void antisurv_start_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx) ctx = get_current_ctx();
+    if (ctx->antisurv_monitoring) return;
+    if (ctx->wardrive_monitoring) {
+        if (ctx->antisurv_status_label) {
+            lv_label_set_text(ctx->antisurv_status_label, "Stop Wardrive first (shares the radio)");
+            lv_obj_set_style_text_color(ctx->antisurv_status_label, COLOR_MATERIAL_RED, 0);
+        }
+        return;
+    }
+
+    tab_id_t active_tab = tab_id_for_ctx(ctx);
+    if (active_tab == TAB_MBUS) uart2_send_command("start_antisurveillance");
+    else uart_send_command("start_antisurveillance");
+
+    ctx->antisurv_follower_count = 0;
+    ctx->antisurv_device_count = 0;
+
+    if (ctx->antisurv_list) lv_obj_clean(ctx->antisurv_list);
+    if (ctx->antisurv_start_btn) lv_obj_add_state(ctx->antisurv_start_btn, LV_STATE_DISABLED);
+    if (ctx->antisurv_stop_btn) lv_obj_clear_state(ctx->antisurv_stop_btn, LV_STATE_DISABLED);
+    if (ctx->antisurv_sens_btn) lv_obj_add_state(ctx->antisurv_sens_btn, LV_STATE_DISABLED);
+    if (ctx->antisurv_status_label) {
+        lv_label_set_text(ctx->antisurv_status_label, "Starting (needs GPS fix + movement)...");
+        lv_obj_set_style_text_color(ctx->antisurv_status_label, COLOR_MATERIAL_AMBER, 0);
+    }
+    if (ctx->antisurv_count_label) {
+        lv_label_set_text(ctx->antisurv_count_label, "Followers: 0");
+        lv_obj_set_style_text_color(ctx->antisurv_count_label, COLOR_MATERIAL_TEAL, 0);
+    }
+
+    ctx->antisurv_monitoring = true;
+    xTaskCreate(antisurv_monitor_task, "antisurv", 8192, (void*)ctx, 5, &ctx->antisurv_task);
+}
+
+static void antisurv_stop_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx) ctx = get_current_ctx();
+    if (!ctx->antisurv_monitoring) return;
+
+    tab_id_t active_tab = tab_id_for_ctx(ctx);
+    uart_port_t uart_port = (active_tab == TAB_MBUS) ? UART2_NUM : UART_NUM;
+    if (active_tab == TAB_MBUS) uart2_send_command("stop");
+    else uart_send_command("stop");
+
+    // Stop the reader task first so it doesn't consume the summary line.
+    ctx->antisurv_monitoring = false;
+    if (ctx->antisurv_task != NULL) {
+        vTaskDelay(pdMS_TO_TICKS(200));
+        ctx->antisurv_task = NULL;
+    }
+
+    // Read the stop summary: "Anti-surveillance stopped. Devices seen: D, followers flagged: F"
+    int devices_seen = -1, followers = -1;
+    {
+        char rx_buffer[768] = {0};
+        int total_len = 0;
+        for (int attempt = 0; attempt < 12 && devices_seen < 0; attempt++) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            if (total_len >= (int)sizeof(rx_buffer) - 1) break;
+            int len = transport_read_bytes_tab(active_tab, uart_port,
+                                               rx_buffer + total_len,
+                                               sizeof(rx_buffer) - 1 - total_len, pdMS_TO_TICKS(50));
+            if (len <= 0) continue;
+            total_len += len;
+            rx_buffer[total_len] = '\0';
+            char *p = strstr(rx_buffer, "Devices seen:");
+            if (p) {
+                sscanf(p, "Devices seen: %d, followers flagged: %d", &devices_seen, &followers);
+            }
+        }
+        if (devices_seen >= 0) ctx->antisurv_device_count = devices_seen;
+        if (followers >= 0) ctx->antisurv_follower_count = followers;
+    }
+
+    if (ctx->antisurv_start_btn) lv_obj_clear_state(ctx->antisurv_start_btn, LV_STATE_DISABLED);
+    if (ctx->antisurv_stop_btn) lv_obj_add_state(ctx->antisurv_stop_btn, LV_STATE_DISABLED);
+    if (ctx->antisurv_sens_btn) lv_obj_clear_state(ctx->antisurv_sens_btn, LV_STATE_DISABLED);
+    if (ctx->antisurv_count_label) {
+        if (ctx->antisurv_device_count > 0) {
+            lv_label_set_text_fmt(ctx->antisurv_count_label, "Devices: %d  Followers: %d",
+                                  ctx->antisurv_device_count, ctx->antisurv_follower_count);
+        } else {
+            lv_label_set_text_fmt(ctx->antisurv_count_label, "Followers: %d", ctx->antisurv_follower_count);
+        }
+        lv_obj_set_style_text_color(ctx->antisurv_count_label,
+                                    ctx->antisurv_follower_count > 0 ? COLOR_MATERIAL_RED : COLOR_MATERIAL_TEAL, 0);
+    }
+    if (ctx->antisurv_status_label) {
+        lv_label_set_text(ctx->antisurv_status_label, "Stopped");
+        lv_obj_set_style_text_color(ctx->antisurv_status_label, lv_color_hex(0x888888), 0);
+    }
+}
+
+static void antisurv_sens_btn_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx) ctx = get_current_ctx();
+    if (ctx->antisurv_monitoring) return;
+
+    // Cycle low -> med -> high -> low
+    ctx->wardrive_config.antisurv_sensitivity =
+        (wardrive_antisurv_sens_t)((ctx->wardrive_config.antisurv_sensitivity + 1) % 3);
+    update_antisurv_sens_button(ctx);
+
+    char cmd[48];
+    snprintf(cmd, sizeof(cmd), "set_antisurv_sensitivity %s",
+             antisurv_sens_name(ctx->wardrive_config.antisurv_sensitivity));
+    wardrive_send_set_command(ctx, cmd, "Anti-surveillance", NULL, 0);
+}
+
+static void antisurv_back_cb(lv_event_t *e)
+{
+    (void)e;
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx) return;
+
+    if (ctx->antisurv_monitoring) {
+        tab_id_t active_tab = tab_id_for_ctx(ctx);
+        if (active_tab == TAB_MBUS) uart2_send_command("stop");
+        else uart_send_command("stop");
+        ctx->antisurv_monitoring = false;
+        if (ctx->antisurv_task != NULL) {
+            vTaskDelay(pdMS_TO_TICKS(150));
+            ctx->antisurv_task = NULL;
+        }
+    }
+
+    if (ctx->antisurv_page) lv_obj_add_flag(ctx->antisurv_page, LV_OBJ_FLAG_HIDDEN);
+    if (ctx->tiles) {
+        lv_obj_clear_flag(ctx->tiles, LV_OBJ_FLAG_HIDDEN);
+        ctx->current_visible_page = ctx->tiles;
+    }
+}
+
+static void show_antisurv_page(void)
+{
+    tab_context_t *ctx = get_current_ctx();
+    lv_obj_t *container = get_current_tab_container();
+    if (!container) return;
+
+    hide_all_pages(ctx);
+
+    if (ctx->antisurv_page) {
+        lv_obj_clear_flag(ctx->antisurv_page, LV_OBJ_FLAG_HIDDEN);
+        ctx->current_visible_page = ctx->antisurv_page;
+        return;
+    }
+
+    if (!ctx->wardrive_config.loaded && ctx->wardrive_config.bands == 0) {
+        wardrive_config_set_defaults(&ctx->wardrive_config);
+    }
+
+    ctx->antisurv_page = lv_obj_create(container);
+    lv_obj_set_size(ctx->antisurv_page, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(ctx->antisurv_page, lv_color_hex(0x1A0A12), 0);
+    lv_obj_set_style_border_width(ctx->antisurv_page, 0, 0);
+    lv_obj_set_style_pad_all(ctx->antisurv_page, 10, 0);
+    lv_obj_set_flex_flow(ctx->antisurv_page, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(ctx->antisurv_page, 8, 0);
+
+    // Header
+    lv_obj_t *header = lv_obj_create(ctx->antisurv_page);
+    lv_obj_set_size(header, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(header, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(header, 0, 0);
+    lv_obj_set_style_pad_all(header, 0, 0);
+    lv_obj_set_flex_flow(header, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(header, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(header, 10, 0);
+    lv_obj_clear_flag(header, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *left_cont = lv_obj_create(header);
+    lv_obj_set_size(left_cont, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(left_cont, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(left_cont, 0, 0);
+    lv_obj_set_style_pad_all(left_cont, 0, 0);
+    lv_obj_set_flex_flow(left_cont, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(left_cont, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(left_cont, 10, 0);
+    lv_obj_clear_flag(left_cont, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *back_btn = lv_btn_create(left_cont);
+    lv_obj_set_size(back_btn, 72, 60);
+    lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x333333), 0);
+    lv_obj_set_style_radius(back_btn, 8, 0);
+    lv_obj_add_event_cb(back_btn, antisurv_back_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *back_icon = lv_label_create(back_btn);
+    lv_label_set_text(back_icon, LV_SYMBOL_LEFT);
+    lv_obj_set_style_text_color(back_icon, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_center(back_icon);
+
+    lv_obj_t *title = lv_label_create(left_cont);
+    lv_label_set_text(title, LV_SYMBOL_EYE_OPEN " Anti-Surveillance");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_PINK, 0);
+
+    lv_obj_t *btn_cont = lv_obj_create(header);
+    lv_obj_set_size(btn_cont, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(btn_cont, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(btn_cont, 0, 0);
+    lv_obj_set_style_pad_all(btn_cont, 0, 0);
+    lv_obj_set_flex_flow(btn_cont, LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_column(btn_cont, 10, 0);
+    lv_obj_clear_flag(btn_cont, LV_OBJ_FLAG_SCROLLABLE);
+
+    ctx->antisurv_start_btn = lv_btn_create(btn_cont);
+    lv_obj_set_size(ctx->antisurv_start_btn, 90, 40);
+    lv_obj_set_style_bg_color(ctx->antisurv_start_btn, COLOR_MATERIAL_GREEN, 0);
+    lv_obj_set_style_bg_color(ctx->antisurv_start_btn, lv_color_hex(0x555555), LV_STATE_DISABLED);
+    lv_obj_set_style_radius(ctx->antisurv_start_btn, 8, 0);
+    lv_obj_add_event_cb(ctx->antisurv_start_btn, antisurv_start_cb, LV_EVENT_CLICKED, ctx);
+    lv_obj_t *start_label = lv_label_create(ctx->antisurv_start_btn);
+    lv_label_set_text(start_label, LV_SYMBOL_PLAY " Start");
+    lv_obj_set_style_text_font(start_label, &lv_font_montserrat_14, 0);
+    lv_obj_center(start_label);
+
+    ctx->antisurv_stop_btn = lv_btn_create(btn_cont);
+    lv_obj_set_size(ctx->antisurv_stop_btn, 90, 40);
+    lv_obj_set_style_bg_color(ctx->antisurv_stop_btn, COLOR_MATERIAL_RED, 0);
+    lv_obj_set_style_bg_color(ctx->antisurv_stop_btn, lv_color_hex(0x555555), LV_STATE_DISABLED);
+    lv_obj_set_style_radius(ctx->antisurv_stop_btn, 8, 0);
+    lv_obj_add_event_cb(ctx->antisurv_stop_btn, antisurv_stop_cb, LV_EVENT_CLICKED, ctx);
+    lv_obj_add_state(ctx->antisurv_stop_btn, LV_STATE_DISABLED);
+    lv_obj_t *stop_label = lv_label_create(ctx->antisurv_stop_btn);
+    lv_label_set_text(stop_label, LV_SYMBOL_STOP " Stop");
+    lv_obj_set_style_text_font(stop_label, &lv_font_montserrat_14, 0);
+    lv_obj_center(stop_label);
+
+    ctx->antisurv_sens_btn = lv_btn_create(btn_cont);
+    lv_obj_set_size(ctx->antisurv_sens_btn, 110, 40);
+    lv_obj_set_style_bg_color(ctx->antisurv_sens_btn, COLOR_MATERIAL_PURPLE, 0);
+    lv_obj_set_style_bg_color(ctx->antisurv_sens_btn, lv_color_hex(0x555555), LV_STATE_DISABLED);
+    lv_obj_set_style_radius(ctx->antisurv_sens_btn, 8, 0);
+    lv_obj_add_event_cb(ctx->antisurv_sens_btn, antisurv_sens_btn_cb, LV_EVENT_CLICKED, ctx);
+    lv_obj_t *sens_label = lv_label_create(ctx->antisurv_sens_btn);
+    lv_label_set_text(sens_label, LV_SYMBOL_EYE_OPEN " med");
+    lv_obj_set_style_text_font(sens_label, &lv_font_montserrat_14, 0);
+    lv_obj_center(sens_label);
+    update_antisurv_sens_button(ctx);
+
+    // Status row
+    lv_obj_t *status_row = lv_obj_create(ctx->antisurv_page);
+    lv_obj_set_size(status_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(status_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(status_row, 0, 0);
+    lv_obj_set_style_pad_all(status_row, 0, 0);
+    lv_obj_set_flex_flow(status_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(status_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(status_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    ctx->antisurv_status_label = lv_label_create(status_row);
+    lv_label_set_text(ctx->antisurv_status_label, "Detects a BLE device that moves with you");
+    lv_obj_set_style_text_font(ctx->antisurv_status_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(ctx->antisurv_status_label, lv_color_hex(0x888888), 0);
+
+    ctx->antisurv_count_label = lv_label_create(status_row);
+    lv_label_set_text(ctx->antisurv_count_label, "Followers: 0");
+    lv_obj_set_style_text_font(ctx->antisurv_count_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(ctx->antisurv_count_label, COLOR_MATERIAL_TEAL, 0);
+
+    // Alerts list
+    ctx->antisurv_list = lv_obj_create(ctx->antisurv_page);
+    lv_obj_set_size(ctx->antisurv_list, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_flex_grow(ctx->antisurv_list, 1);
+    lv_obj_set_style_bg_color(ctx->antisurv_list, lv_color_hex(0x252525), 0);
+    lv_obj_set_style_border_width(ctx->antisurv_list, 0, 0);
+    lv_obj_set_style_radius(ctx->antisurv_list, 8, 0);
+    lv_obj_set_style_pad_all(ctx->antisurv_list, 8, 0);
+    lv_obj_set_flex_flow(ctx->antisurv_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(ctx->antisurv_list, 6, 0);
+
+    ctx->current_visible_page = ctx->antisurv_page;
 }
 
 //==================================================================================
