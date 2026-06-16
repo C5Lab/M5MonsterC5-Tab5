@@ -34867,31 +34867,63 @@ static bool check_sd_card_for_tab(tab_id_t tab)
     ESP_LOGI(TAG, "[%s] Checking SD card presence...", tab_name);
 
     const char *cmd = "sd_status\r\n";
-    transport_write_bytes_tab(tab, uart_port, cmd, strlen(cmd));
+    static const int max_attempts = 6;
+    static const int retry_delay_ms = 500;
+    static const int64_t timeout_us = 1000000; // 1s per attempt
+    bool usb_locked = false;
 
-    static char rx_buffer[64];
-    int total_len = 0;
-    uint32_t start_time = xTaskGetTickCount();
-    uint32_t timeout_ticks = pdMS_TO_TICKS(500);
+    if (tab == TAB_USB) {
+        usb_rx_exclusive = true;
+        usb_locked = true;
+    }
 
-    while ((xTaskGetTickCount() - start_time) < timeout_ticks && total_len < (int)sizeof(rx_buffer) - 1) {
-        int len = transport_read_bytes_tab(tab, uart_port, rx_buffer + total_len,
-                                           sizeof(rx_buffer) - 1 - total_len, pdMS_TO_TICKS(50));
-        if (len > 0) {
+    for (int attempt = 1; attempt <= max_attempts; attempt++) {
+        char rx_buffer[128];
+        int total_len = 0;
+        int64_t start_time = esp_timer_get_time();
+
+        rx_buffer[0] = '\0';
+
+        if (tab == TAB_USB) {
+            usb_flush_input(50);
+        } else {
+            uart_flush_input(uart_port);
+        }
+
+        transport_write_bytes_tab(tab, uart_port, cmd, strlen(cmd));
+
+        while ((esp_timer_get_time() - start_time) < timeout_us &&
+               total_len < (int)sizeof(rx_buffer) - 1) {
+            int len = transport_read_bytes_tab(tab, uart_port, rx_buffer + total_len,
+                                               sizeof(rx_buffer) - 1 - total_len,
+                                               pdMS_TO_TICKS(50));
+            if (len <= 0) {
+                continue;
+            }
+
             total_len += len;
             rx_buffer[total_len] = '\0';
+
             if (strstr(rx_buffer, "SD_OK") != NULL) {
-                ESP_LOGI(TAG, "[%s] SD card present", tab_name);
+                if (usb_locked) usb_rx_exclusive = false;
+                ESP_LOGI(TAG, "[%s] SD card present (attempt %d/%d)",
+                         tab_name, attempt, max_attempts);
                 return true;
             }
             if (strstr(rx_buffer, "SD_NONE") != NULL) {
-                ESP_LOGI(TAG, "[%s] SD card not present", tab_name);
-                return false;
+                ESP_LOGW(TAG, "[%s] SD card not ready/not present (attempt %d/%d)",
+                         tab_name, attempt, max_attempts);
+                break;
             }
+        }
+
+        if (attempt < max_attempts) {
+            vTaskDelay(pdMS_TO_TICKS(retry_delay_ms));
         }
     }
 
-    ESP_LOGW(TAG, "[%s] sd_status timeout, response: '%s'", tab_name, rx_buffer);
+    if (usb_locked) usb_rx_exclusive = false;
+    ESP_LOGW(TAG, "[%s] SD card not present after retries", tab_name);
     return false;
 }
 
