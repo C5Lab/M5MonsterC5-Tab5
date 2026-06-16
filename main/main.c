@@ -1013,6 +1013,7 @@ typedef struct {
     // JanOS firmware version (detected via 'version' command or boot banner snoop)
     char janos_version[16];
     bool janos_version_mismatch;
+    bool janos_board_ready;
 
     // JanOS RF (Sub-GHz) firmware version - "" when not detected.
     // Captured from "JanOS RF version: X.Y.Z" line printed by JanOS at boot.
@@ -2303,6 +2304,7 @@ static bool wardrive_send_set_command(tab_context_t *ctx, const char *cmd,
                                       const char *ack_substr, char *resp_out, size_t resp_sz);
 static bool wardrive_load_config(tab_context_t *ctx);
 static bool wardrive_load_gps_module(tab_context_t *ctx);
+static void wardrive_update_external_gps_mode(tab_context_t *ctx);
 static void wardrive_setup_btn_cb(lv_event_t *e);
 static void wardrive_setup_close_cb(lv_event_t *e);
 static void wardrive_setup_apply_cb(lv_event_t *e);
@@ -3763,6 +3765,8 @@ static void usb_log_cdc_state(const char *where)
              esp_err_to_name(rx_err));
 }
 
+static void schedule_board_redetect(void);
+
 static void board_redetect_cb(void *user_data)
 {
     (void)user_data;
@@ -3772,18 +3776,32 @@ static void board_redetect_cb(void *user_data)
     bool prev_grove = grove_detected;
     bool prev_usb = usb_detected;
     bool prev_uart2 = mbus_detected;
+    bool prev_grove_sd = grove_ctx.sd_card_present;
+    bool prev_usb_sd = usb_ctx.sd_card_present;
+    bool prev_mbus_sd = mbus_ctx.sd_card_present;
+    bool prev_internal_sd = internal_sd_present;
 
     detect_boards();
+
+    // One SD probe only, and only after the board answered ping.
+    check_all_sd_cards();
 
     // Re-probe Sub-GHz availability so the home tile reflects the new state.
     check_all_subghz_status();
 
     bool changed = (prev_grove != grove_detected) ||
                    (prev_usb != usb_detected) ||
-                   (prev_uart2 != mbus_detected);
+                   (prev_uart2 != mbus_detected) ||
+                   (prev_grove_sd != grove_ctx.sd_card_present) ||
+                   (prev_usb_sd != usb_ctx.sd_card_present) ||
+                   (prev_mbus_sd != mbus_ctx.sd_card_present) ||
+                   (prev_internal_sd != internal_sd_present);
 
-    ESP_LOGI(TAG, "Redetect: changed=%d, uart1=%d, mbus=%d, popup_open=%d",
-             changed, uart1_detected, mbus_detected, board_detection_popup_open);
+    ESP_LOGI(TAG, "Redetect: changed=%d, uart1=%d, mbus=%d, sd: G=%d U=%d M=%d I=%d, popup_open=%d",
+             changed, uart1_detected, mbus_detected,
+             grove_ctx.sd_card_present, usb_ctx.sd_card_present,
+             mbus_ctx.sd_card_present, internal_sd_present,
+             board_detection_popup_open);
 
     if (changed && (uart1_detected || mbus_detected) && !board_detection_popup_open) {
         ESP_LOGI(TAG, "Redetect: calling reload_gui_for_detection + show_main_tiles");
@@ -21458,6 +21476,14 @@ static void wardrive_reply_tab_gps_read(tab_id_t active_tab, uart_port_t uart_po
     }
 }
 
+static void wardrive_update_external_gps_mode(tab_context_t *ctx)
+{
+    if (!ctx) {
+        return;
+    }
+    ctx->wardrive_use_external_gps = (ctx->wardrive_setup_gps_index == 2);
+}
+
 static void wardrive_push_external_gps_update(tab_id_t active_tab,
                                               uart_port_t uart_port,
                                               bool *push_initialized,
@@ -21509,6 +21535,10 @@ static void wardrive_push_external_gps_update(tab_id_t active_tab,
     transport_write_bytes_tab(active_tab, uart_port, "\r\n", 2);
     if (written <= 0) {
         ESP_LOGW(TAG, "Wardrive: failed to push set_gps_position");
+    } else if (has_fix) {
+        ESP_LOGI(TAG, "Wardrive: pushed external GPS %.7f %.7f", lat, lon);
+    } else {
+        ESP_LOGW(TAG, "Wardrive: pushed external GPS clear (no Tab5 fix)");
     }
 
     if (has_fix) {
@@ -21989,14 +22019,14 @@ static bool wardrive_send_set_command(tab_context_t *ctx, const char *cmd,
     char found[256] = "";
     int total_len = 0;
 
-    for (int attempt = 0; attempt < 15 && found[0] == '\0'; attempt++) {
-        vTaskDelay(pdMS_TO_TICKS(100));
+    for (int attempt = 0; attempt < 4 && found[0] == '\0'; attempt++) {
+        vTaskDelay(pdMS_TO_TICKS(25));
         if (total_len >= (int)sizeof(rx_buffer) - 1) break;
 
         int len = transport_read_bytes_tab(active_tab, uart_port,
                                            rx_buffer + total_len,
                                            sizeof(rx_buffer) - 1 - total_len,
-                                           pdMS_TO_TICKS(50));
+                                           pdMS_TO_TICKS(25));
         if (len <= 0) continue;
         total_len += len;
         rx_buffer[total_len] = '\0';
@@ -22041,6 +22071,7 @@ static bool wardrive_load_gps_module(tab_context_t *ctx)
         return false;
     }
     ctx->wardrive_setup_gps_dirty = false;
+    wardrive_update_external_gps_mode(ctx);
     return true;
 }
 
@@ -22335,7 +22366,12 @@ static void wardrive_apply_task(void *arg)
                  wardrive_setup_gps_cmd_for_index(ctx->wardrive_setup_gps_index));
         snprintf(step, sizeof(step), "Applying %d/%d: GPS module", total + 1, expected_total);
         wardrive_apply_set_status(ctx, step, COLOR_MATERIAL_AMBER);
-        total++; if (wardrive_send_set_command(ctx, cmd, "GPS module", NULL, 0)) ok++;
+        total++;
+        bool gps_cmd_ok = wardrive_send_set_command(ctx, cmd, "GPS module", NULL, 0);
+        if (gps_cmd_ok) {
+            ok++;
+            wardrive_update_external_gps_mode(ctx);
+        }
     }
 
     // bands
@@ -34691,6 +34727,12 @@ static void janos_consume_line(tab_context_t *ctx, const char *line, const char 
             ESP_LOGI(TAG, "[%s] Detected JanOS version: %s (boot snoop)",
                      uart_name ? uart_name : "?", ctx->janos_version);
         }
+        return;
+    }
+    if (strstr(line, "BOARD READY") != NULL) {
+        ctx->janos_board_ready = true;
+        ESP_LOGI(TAG, "[%s] JanOS board ready (boot snoop)",
+                 uart_name ? uart_name : "?");
     }
 }
 
@@ -34816,10 +34858,13 @@ static void detect_boards(void)
     // not touched here.
     grove_ctx.janos_version[0] = '\0';
     grove_ctx.janos_rf_version[0] = '\0';
+    grove_ctx.janos_board_ready = false;
     usb_ctx.janos_version[0] = '\0';
     usb_ctx.janos_rf_version[0] = '\0';
+    usb_ctx.janos_board_ready = false;
     mbus_ctx.janos_version[0] = '\0';
     mbus_ctx.janos_rf_version[0] = '\0';
+    mbus_ctx.janos_board_ready = false;
 
     // Detect each device independently using ping/pong (also snoops JanOS boot banner)
     grove_detected = ping_uart_direct(UART_NUM, "Grove", &grove_ctx);
@@ -34867,9 +34912,7 @@ static bool check_sd_card_for_tab(tab_id_t tab)
     ESP_LOGI(TAG, "[%s] Checking SD card presence...", tab_name);
 
     const char *cmd = "sd_status\r\n";
-    static const int max_attempts = 6;
-    static const int retry_delay_ms = 500;
-    static const int64_t timeout_us = 1000000; // 1s per attempt
+    static const int64_t timeout_us = 300000; // one 300 ms probe
     bool usb_locked = false;
 
     if (tab == TAB_USB) {
@@ -34877,53 +34920,46 @@ static bool check_sd_card_for_tab(tab_id_t tab)
         usb_locked = true;
     }
 
-    for (int attempt = 1; attempt <= max_attempts; attempt++) {
-        char rx_buffer[128];
-        int total_len = 0;
-        int64_t start_time = esp_timer_get_time();
+    char rx_buffer[128];
+    int total_len = 0;
+    int64_t start_time = esp_timer_get_time();
 
-        rx_buffer[0] = '\0';
+    rx_buffer[0] = '\0';
 
-        if (tab == TAB_USB) {
-            usb_flush_input(50);
-        } else {
-            uart_flush_input(uart_port);
+    if (tab == TAB_USB) {
+        usb_flush_input(50);
+    } else {
+        uart_flush_input(uart_port);
+    }
+
+    transport_write_bytes_tab(tab, uart_port, cmd, strlen(cmd));
+
+    while ((esp_timer_get_time() - start_time) < timeout_us &&
+           total_len < (int)sizeof(rx_buffer) - 1) {
+        int len = transport_read_bytes_tab(tab, uart_port, rx_buffer + total_len,
+                                           sizeof(rx_buffer) - 1 - total_len,
+                                           pdMS_TO_TICKS(50));
+        if (len <= 0) {
+            continue;
         }
 
-        transport_write_bytes_tab(tab, uart_port, cmd, strlen(cmd));
+        total_len += len;
+        rx_buffer[total_len] = '\0';
 
-        while ((esp_timer_get_time() - start_time) < timeout_us &&
-               total_len < (int)sizeof(rx_buffer) - 1) {
-            int len = transport_read_bytes_tab(tab, uart_port, rx_buffer + total_len,
-                                               sizeof(rx_buffer) - 1 - total_len,
-                                               pdMS_TO_TICKS(50));
-            if (len <= 0) {
-                continue;
-            }
-
-            total_len += len;
-            rx_buffer[total_len] = '\0';
-
-            if (strstr(rx_buffer, "SD_OK") != NULL) {
-                if (usb_locked) usb_rx_exclusive = false;
-                ESP_LOGI(TAG, "[%s] SD card present (attempt %d/%d)",
-                         tab_name, attempt, max_attempts);
-                return true;
-            }
-            if (strstr(rx_buffer, "SD_NONE") != NULL) {
-                ESP_LOGW(TAG, "[%s] SD card not ready/not present (attempt %d/%d)",
-                         tab_name, attempt, max_attempts);
-                break;
-            }
+        if (strstr(rx_buffer, "SD_OK") != NULL) {
+            if (usb_locked) usb_rx_exclusive = false;
+            ESP_LOGI(TAG, "[%s] SD card present", tab_name);
+            return true;
         }
-
-        if (attempt < max_attempts) {
-            vTaskDelay(pdMS_TO_TICKS(retry_delay_ms));
+        if (strstr(rx_buffer, "SD_NONE") != NULL) {
+            if (usb_locked) usb_rx_exclusive = false;
+            ESP_LOGW(TAG, "[%s] SD card not ready/not present", tab_name);
+            return false;
         }
     }
 
     if (usb_locked) usb_rx_exclusive = false;
-    ESP_LOGW(TAG, "[%s] SD card not present after retries", tab_name);
+    ESP_LOGW(TAG, "[%s] SD status unknown after one probe, response: '%s'", tab_name, rx_buffer);
     return false;
 }
 
