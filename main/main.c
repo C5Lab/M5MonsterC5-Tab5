@@ -47,11 +47,13 @@
 #include "esp_http_server.h"
 #include "lwip/sockets.h"
 
-#define JANOS_TAB_VERSION "1.4.1"
-#define JANOS_VERSION_REQUIRED "1.6.5"
+#define JANOS_TAB_VERSION "1.4.2"
+#define JANOS_VERSION_REQUIRED "1.6.6"
 #include "lwip/netdb.h"
 #include <dirent.h>
 #include <sys/stat.h>
+#include <time.h>
+#include <sys/time.h>
 
 static const char *TAG = "wifi_scanner";
 extern const lv_image_dsc_t intro_splash_img;
@@ -254,6 +256,38 @@ typedef struct {
     char kind[8];
 } wardrive_network_t;
 
+// ---- Wardrive 2.0 configuration (mirrors janOS get_wardrive_config / set_* commands) ----
+#define WARDRIVE_BAND_WIFI24   0x01
+#define WARDRIVE_BAND_WIFI5    0x02
+#define WARDRIVE_BAND_BLE      0x04
+#define WARDRIVE_CUSTOM_CH_MAX 96
+
+typedef enum {
+    WARDRIVE_CH_POPULAR = 0,
+    WARDRIVE_CH_ALL = 1,
+    WARDRIVE_CH_CUSTOM = 2,
+} wardrive_channel_mode_t;
+
+typedef enum {
+    WARDRIVE_ANTISURV_LOW = 0,
+    WARDRIVE_ANTISURV_MED = 1,
+    WARDRIVE_ANTISURV_HIGH = 2,
+} wardrive_antisurv_sens_t;
+
+typedef struct {
+    uint8_t bands;                       // bitmask of WARDRIVE_BAND_*
+    wardrive_channel_mode_t channel_mode;
+    char custom_channels[WARDRIVE_CUSTOM_CH_MAX]; // colon-separated, e.g. "1:6:11:36"
+    int wifi_rssi_delta;                 // 0-50, 0 = log once
+    int ble_rssi_delta;                  // 0-50
+    int startup_cooldown;                // 0-600 s
+    int mem_cap;                         // 1000-200000
+    wardrive_antisurv_sens_t antisurv_sensitivity;
+    bool loaded;                         // true once populated from get_wardrive_config
+} wardrive_config_t;
+
+#define WARDRIVE_BLACKLIST_MAX 64
+
 #define WARDRIVE_WIGLE_MAX_FILES 256
 #define WARDRIVE_WIGLE_PAGE_SIZE  20
 #define WARDRIVE_WIGLE_PATH_MAX  160
@@ -261,15 +295,73 @@ typedef struct {
 typedef struct {
     char path[WARDRIVE_WIGLE_PATH_MAX];
     char name[96];
+    char hash[17];
+    char wigle_status[16];
+    char wdgwars_status[16];
+    long size_bytes;
+    int wifi_rows;
+    int ble_rows;
+    int bt_rows;
+    int bad_rows;
     bool selected;
     lv_obj_t *checkbox;
 } wardrive_wigle_file_t;
+
+typedef struct {
+    int files;
+    long bytes;
+    int rows;
+    int devices;
+    int wifi;
+    int ble;
+    int bt;
+    int bad;
+    int wigle_ok;
+    int wigle_pending;
+    int wigle_failed;
+    int wigle_rate_limited;
+    int wdgwars_ok;
+    int wdgwars_pending;
+    int wdgwars_failed;
+    int wdgwars_rate_limited;
+    bool valid;
+} wardrive_file_summary_t;
+
+#define WARDRIVE_UPLOAD_STATE_MAX 256
+
+typedef struct {
+    char service[12];
+    char filename[96];
+    char hash[17];
+    char status[16];
+    long size_bytes;
+    int wifi_rows;
+    int ble_rows;
+    int bt_rows;
+    int bad_rows;
+} wardrive_upload_state_entry_t;
 
 typedef enum {
     WARDRIVE_UPLOAD_PROVIDER_NONE = 0,
     WARDRIVE_UPLOAD_PROVIDER_WIGLE = 1,
     WARDRIVE_UPLOAD_PROVIDER_WDGWARS = 2,
 } wardrive_upload_provider_t;
+
+// How an upload run picks its files:
+//  SELECTED — upload the files the user ticked (per-file `<cmd> <name>` loop).
+//  PENDING  — single `<cmd>` (no args): firmware uploads only files not yet done.
+//  ALL      — single `<cmd> all`: firmware re-uploads every local file.
+typedef enum {
+    WARDRIVE_UPLOAD_MODE_SELECTED = 0,
+    WARDRIVE_UPLOAD_MODE_PENDING = 1,
+    WARDRIVE_UPLOAD_MODE_ALL = 2,
+} wardrive_upload_mode_t;
+
+typedef enum {
+    WIFI_CONNECT_AUTH_OPEN = 0,
+    WIFI_CONNECT_AUTH_PASSWORD = 1,
+    WIFI_CONNECT_AUTH_SAVED = 2,
+} wifi_connect_auth_mode_t;
 
 typedef enum {
     COMPROMISED_FILE_KIND_HANDSHAKE = 0,
@@ -288,11 +380,52 @@ typedef enum {
 #define KARMA2_MAX_HTML_FILES 20
 #define BEACON_SPAM_MAX_SSIDS 128
 #define BEACON_SPAM_SSID_MAX_LEN 96
+#define IOT_RECON_MAX_PANS 32
+#define IOT_RECON_MAX_NODES 128
+#define IOT_RECON_MAX_EDGES 128
 
 typedef struct {
     int index;
     char ssid[BEACON_SPAM_SSID_MAX_LEN + 1];
 } beacon_spam_ssid_t;
+
+typedef struct {
+    char pan_id[16];
+    char proto[32];
+    char confidence[24];
+    char channels[48];
+    int nodes;
+    int packets;
+    int rssi;
+    int age_ms;
+} iot_recon_pan_t;
+
+typedef struct {
+    char pan_id[16];
+    char addr[24];
+    char role[24];
+    char vendor[32];
+    char device_hint[32];
+    char battery[16];
+    int packets;
+    int rssi;
+    int best_rssi;
+    int avg_rssi;
+    int lqi;
+    int sample_count;
+    int last_channel;
+    int age_ms;
+} iot_recon_node_t;
+
+typedef struct {
+    char pan_id[16];
+    char from[24];
+    char to[24];
+    char kind[24];
+    int packets;
+    int rssi;
+    int age_ms;
+} iot_recon_edge_t;
 
 // ============================================================================
 // COMPLETE TAB CONTEXT - All UI, data, and state for one tab (Grove/USB/MBus/INTERNAL)
@@ -413,6 +546,7 @@ typedef struct {
     lv_obj_t *mitm_stop_btn;
     lv_obj_t *mitm_pass_row;
     lv_obj_t *mitm_btn_row;
+    bool mitm_use_saved_password;
 
     // Handshaker popup (per-network)
     lv_obj_t *handshaker_popup_overlay;
@@ -533,21 +667,29 @@ typedef struct {
     int wardrive_wifi_count;
     int wardrive_bt_count;
     int wardrive_sat_count;
+    int wardrive_relogs;
+    int wardrive_best_ch;
     double wardrive_distance_m;
     int wardrive_net_head;
     bool wardrive_trace_enabled;
-    lv_obj_t *wardrive_gps_type_btn;
-    lv_obj_t *wardrive_gps_type_overlay;
-    lv_obj_t *wardrive_gps_type_response_label;
     lv_obj_t *wardrive_upload_btn;
     lv_obj_t *wardrive_upload_menu_overlay;
     lv_obj_t *wardrive_upload_menu_popup;
+    // Background loader for the Wardrive Upload menu (so the ~40s file listing /
+    // hashing runs off the UI thread with a live spinner instead of freezing).
+    volatile bool wardrive_upload_menu_loading;
+    bool wardrive_upload_menu_loaded;
+    TaskHandle_t wardrive_upload_menu_task;
     wardrive_upload_provider_t wardrive_upload_provider;
+    wardrive_upload_mode_t wardrive_upload_mode;
     lv_obj_t *wardrive_wigle_popup_overlay;
     lv_obj_t *wardrive_wigle_popup;
     lv_obj_t *wardrive_wigle_status_label;
     lv_obj_t *wardrive_wigle_list;
     lv_obj_t *wardrive_wigle_send_btn;
+    lv_obj_t *wardrive_wigle_sync_btn;   // "Sync pending" batch button
+    lv_obj_t *wardrive_wigle_all_btn;    // "Force all" batch button
+    lv_obj_t *wardrive_wigle_batch_row;  // row holding the two batch buttons
     lv_obj_t *wardrive_wigle_stop_btn;
     lv_obj_t *wardrive_wigle_spinner;
     lv_obj_t *wardrive_wigle_close_btn;
@@ -568,6 +710,10 @@ typedef struct {
     char wardrive_wigle_selected_ssid[33];
     char wardrive_wigle_selected_password[65];
     wardrive_wigle_file_t *wardrive_wigle_files; // PSRAM alloc, NULL when popup closed
+    wardrive_file_summary_t wardrive_file_summary;
+    wardrive_upload_state_entry_t *wardrive_upload_state_entries; // PSRAM alloc
+    int wardrive_upload_state_count;
+    bool wardrive_upload_state_loaded;
     int wardrive_wigle_file_count;
     int wardrive_wigle_selected_count;
     int wardrive_wigle_page;             // current page index (0-based)
@@ -575,6 +721,81 @@ typedef struct {
     lv_obj_t *wardrive_wigle_prev_btn;
     lv_obj_t *wardrive_wigle_next_btn;
     TaskHandle_t wardrive_wigle_task;
+
+    // ---- Wardrive 2.0 config + setup overlay ----
+    wardrive_config_t wardrive_config;
+    lv_obj_t *wardrive_setup_btn;
+    lv_obj_t *wardrive_setup_overlay;
+    lv_obj_t *wardrive_setup_popup;
+    lv_obj_t *wardrive_setup_trace_sw;
+    lv_obj_t *wardrive_setup_band_24_cb;
+    lv_obj_t *wardrive_setup_band_5_cb;
+    lv_obj_t *wardrive_setup_band_ble_cb;
+    lv_obj_t *wardrive_setup_gps_dd;
+    lv_obj_t *wardrive_setup_channel_dd;
+    lv_obj_t *wardrive_setup_custom_ta;
+    lv_obj_t *wardrive_setup_wifi_delta_slider;
+    lv_obj_t *wardrive_setup_wifi_delta_val;
+    lv_obj_t *wardrive_setup_ble_delta_slider;
+    lv_obj_t *wardrive_setup_ble_delta_val;
+    lv_obj_t *wardrive_setup_cooldown_slider;
+    lv_obj_t *wardrive_setup_cooldown_val;
+    lv_obj_t *wardrive_setup_memcap_dd;
+    lv_obj_t *wardrive_setup_antisurv_dd;
+    lv_obj_t *wardrive_setup_status_label;
+    lv_obj_t *wardrive_setup_keyboard;
+    lv_obj_t *wardrive_setup_load_btn;
+    lv_obj_t *wardrive_setup_apply_btn;
+    lv_obj_t *wardrive_setup_close_btn;
+    volatile bool wardrive_setup_applying;
+    bool wardrive_setup_gps_dirty;
+    uint8_t wardrive_setup_gps_index;
+    TaskHandle_t wardrive_setup_task;
+    // Blacklist editor (sub-overlay of setup)
+    lv_obj_t *wardrive_blacklist_overlay;
+    lv_obj_t *wardrive_blacklist_list;
+    lv_obj_t *wardrive_blacklist_status_label;
+    lv_obj_t *wardrive_blacklist_input;
+    lv_obj_t *wardrive_blacklist_keyboard;
+    lv_obj_t *wardrive_blacklist_scan_overlay;
+    lv_obj_t *wardrive_blacklist_scan_list;
+    lv_obj_t *wardrive_blacklist_scan_status;
+    // Anti-surveillance page
+    lv_obj_t *antisurv_page;
+    lv_obj_t *antisurv_start_btn;
+    lv_obj_t *antisurv_stop_btn;
+    lv_obj_t *antisurv_sens_btn;
+    lv_obj_t *antisurv_status_label;
+    lv_obj_t *antisurv_count_label;
+    lv_obj_t *antisurv_list;
+    volatile bool antisurv_monitoring;
+    TaskHandle_t antisurv_task;
+    int antisurv_follower_count;
+    int antisurv_device_count;
+
+    // IoT / 802.15.4 Recon page
+    lv_obj_t *iot_page;
+    lv_obj_t *iot_status_label;
+    lv_obj_t *iot_channel_label;
+    lv_obj_t *iot_packets_label;
+    lv_obj_t *iot_networks_label;
+    lv_obj_t *iot_dropped_label;
+    lv_obj_t *iot_pan_list;
+    lv_obj_t *iot_start_btn;
+    lv_obj_t *iot_stop_btn;
+    lv_obj_t *iot_clear_btn;
+    volatile bool iot_recon_monitoring;
+    TaskHandle_t iot_recon_task;
+    iot_recon_pan_t *iot_pans;
+    int iot_pan_count;
+    iot_recon_node_t *iot_nodes;
+    int iot_node_count;
+    iot_recon_edge_t *iot_edges;
+    int iot_edge_count;
+    char iot_expanded_pan[16];
+    char iot_tracked_pan[16];
+    char iot_tracked_addr[24];
+    bool iot_scroll_expanded_once;
 
     // =====================================================================
     // COMPROMISED DATA - Page and sub-pages
@@ -590,11 +811,24 @@ typedef struct {
     lv_obj_t *compromised_cleanup_status_label;
     lv_obj_t *compromised_cleanup_log_container;
     lv_obj_t *compromised_cleanup_log_label;
+    lv_obj_t *compromised_cleanup_move_btn;
+    lv_obj_t *compromised_cleanup_close_btn;
     volatile bool compromised_cleanup_running;
     TaskHandle_t compromised_cleanup_task;
     compromised_file_kind_t compromised_cleanup_kind;
     compromised_cleanup_action_t compromised_cleanup_action;
+    bool wardrive_cleanup_dry_run_ready;
+    char wardrive_cleanup_service[12];
+    char wardrive_cleanup_status[16];
     char compromised_cleanup_log_buffer[1536];
+
+    // Background loader for the compromised/wardrive file listing (so the listing,
+    // which can hash several MB of wardrive logs, runs off the UI thread with a
+    // live spinner instead of freezing the GUI).
+    volatile bool compromised_files_loading;   // guard: a load task is in flight
+    bool compromised_files_loaded;             // data ready in ctx, render from cache
+    compromised_file_kind_t compromised_files_load_kind;
+    TaskHandle_t compromised_files_load_task;
 
     // WPA-SEC upload popup
     lv_obj_t *wpasec_popup_overlay;
@@ -713,6 +947,7 @@ typedef struct {
     char arp_our_ip[20];
     bool arp_wifi_connected;
     bool arp_auto_mode;
+    bool arp_return_to_evil_twin_passwords;
     arp_host_t *arp_hosts;  // PSRAM
     int arp_host_count;
 
@@ -778,6 +1013,7 @@ typedef struct {
     // JanOS firmware version (detected via 'version' command or boot banner snoop)
     char janos_version[16];
     bool janos_version_mismatch;
+    bool janos_board_ready;
 
     // JanOS RF (Sub-GHz) firmware version - "" when not detected.
     // Captured from "JanOS RF version: X.Y.Z" line printed by JanOS at boot.
@@ -792,6 +1028,18 @@ typedef struct {
     int path_count;
     char paths[WARDRIVE_WIGLE_MAX_FILES][WARDRIVE_WIGLE_PATH_MAX];
 } compromised_cleanup_task_args_t;
+
+typedef struct {
+    tab_context_t *ctx;
+    char service[12];
+    char status[16];
+    bool move;
+} wardrive_cleanup_task_args_t;
+
+typedef struct {
+    tab_context_t *ctx;
+    char file[96];
+} wardrive_fix_task_args_t;
 
 typedef enum {
     TAB_GROVE = 0,
@@ -1241,6 +1489,8 @@ static void hide_all_pages(tab_context_t *ctx) {
     if (ctx->arp_poison_page) lv_obj_add_flag(ctx->arp_poison_page, LV_OBJ_FLAG_HIDDEN);
     if (ctx->nmap_page) lv_obj_add_flag(ctx->nmap_page, LV_OBJ_FLAG_HIDDEN);
     if (ctx->wardrive_page) lv_obj_add_flag(ctx->wardrive_page, LV_OBJ_FLAG_HIDDEN);
+    if (ctx->antisurv_page) lv_obj_add_flag(ctx->antisurv_page, LV_OBJ_FLAG_HIDDEN);
+    if (ctx->iot_page) lv_obj_add_flag(ctx->iot_page, LV_OBJ_FLAG_HIDDEN);
     /* SubGHz pages (menu + sub-pages) */
     if (ctx->subghz) subghz_hide_all_pages(ctx->subghz);
 }
@@ -1411,6 +1661,7 @@ static bool ina226_initialized = false;
 // Battery status bar
 static lv_obj_t *status_bar = NULL;
 static lv_obj_t *battery_voltage_label = NULL;
+static lv_obj_t *status_clock_label = NULL;   // RTC clock on the status bar
 static lv_obj_t *charging_status_label = NULL;
 static lv_coord_t charging_status_slot_width = 0;
 static lv_timer_t *battery_update_timer = NULL;
@@ -1440,10 +1691,20 @@ static bool screen_dimmed = false;
 static lv_timer_t *screen_timeout_timer = NULL;
 static lv_obj_t *sleep_overlay = NULL;  // Invisible overlay to capture wake touch
 
+// Screen lock: full-screen "slide to unlock" overlay to prevent accidental taps.
+static bool screen_lock_enabled = true;     // Feature on/off (persisted in NVS)
+static bool screen_auto_lock_enabled = false; // Auto-engage lock when screen dims (NVS)
+static lv_obj_t *lock_overlay = NULL;       // Active lock layer (NULL when unlocked)
+static lv_obj_t *lock_status_btn = NULL;    // Lock trigger button in the status bar
+static void lock_screen_activate(void);     // Defined below; used by the dim timer
+
 // Screen settings (loaded from NVS)
 // screen_timeout_setting: 0=10s, 1=30s, 2=1min, 3=5min, 4=StaysOn
 static uint8_t screen_timeout_setting = 1;  // Default: 30s (index 1)
 static uint8_t screen_brightness_setting = 80;  // Default: 80%
+static bool clock_24h = true;   // status-bar clock format (24h vs 12h)
+static bool clock_dst = false;  // daylight saving applied to the RTC (+1h)
+static bool clock_show = true;  // show the clock on the top status bar
 
 // LVGL UI elements - observer page
 static lv_obj_t *observer_start_btn = NULL;
@@ -1784,6 +2045,7 @@ static void show_scan_page(void);
 static void show_observer_page(void);
 static void show_esp_modem_page(void);
 static void show_settings_page(void);
+static void show_time_popup(void);
 static void main_tile_event_cb(lv_event_t *e);
 static void back_btn_event_cb(lv_event_t *e);
 static void network_checkbox_event_cb(lv_event_t *e);
@@ -1993,6 +2255,8 @@ static void show_internal_tiles(void);
 static void update_tab_styles(void);
 static uart_port_t get_current_uart(void);
 static void uart_send_command_for_tab(const char *cmd);
+static bool build_wifi_connect_command(char *out, size_t out_sz, const char *ssid,
+                                       const char *password, wifi_connect_auth_mode_t mode);
 static void show_blackout_confirm_popup(void);
 static void blackout_confirm_yes_cb(lv_event_t *e);
 static void blackout_confirm_no_cb(lv_event_t *e);
@@ -2027,16 +2291,13 @@ static void wardrive_monitor_task(void *arg);
 static void update_wardrive_table(tab_context_t *ctx);
 static void update_wardrive_count_label(tab_context_t *ctx);
 static void update_wardrive_trace_button(tab_context_t *ctx);
-static void wardrive_trace_btn_cb(lv_event_t *e);
 static void close_wardrive_gps_overlay(tab_context_t *ctx);
-static void wardrive_gps_type_btn_cb(lv_event_t *e);
-static void wardrive_gps_type_close_cb(lv_event_t *e);
-static void wardrive_gps_set_m5_cb(lv_event_t *e);
-static void wardrive_gps_set_atgm_cb(lv_event_t *e);
-static void wardrive_gps_set_external_cb(lv_event_t *e);
 static void wardrive_upload_btn_cb(lv_event_t *e);
 static void close_wardrive_upload_menu(tab_context_t *ctx);
+static void hide_wardrive_upload_menu_keep_cache(tab_context_t *ctx);
 static void wardrive_upload_menu_close_cb(lv_event_t *e);
+static void wardrive_upload_menu_load_task(void *arg);
+static void wardrive_upload_menu_load_async_render(void *user_data);
 static void wardrive_upload_wigle_btn_cb(lv_event_t *e);
 static void wardrive_upload_wdgwars_btn_cb(lv_event_t *e);
 static void show_wardrive_upload_menu(tab_context_t *ctx);
@@ -2044,7 +2305,46 @@ static void wardrive_wigle_close_cb(lv_event_t *e);
 static void wardrive_wigle_upload_task(void *arg);
 static void wardrive_wdgwars_upload_task(void *arg);
 static void show_wardrive_upload_popup(tab_context_t *ctx, wardrive_upload_provider_t provider);
+// ---- Wardrive 2.0 setup + anti-surveillance ----
+static void wardrive_config_set_defaults(wardrive_config_t *cfg);
+static bool wardrive_send_set_command(tab_context_t *ctx, const char *cmd,
+                                      const char *ack_substr, char *resp_out, size_t resp_sz);
+static bool wardrive_load_config(tab_context_t *ctx);
+static bool wardrive_load_gps_module(tab_context_t *ctx);
+static void wardrive_update_external_gps_mode(tab_context_t *ctx);
+static void wardrive_setup_btn_cb(lv_event_t *e);
+static void wardrive_setup_close_cb(lv_event_t *e);
+static void wardrive_setup_apply_cb(lv_event_t *e);
+static void wardrive_setup_load_cb(lv_event_t *e);
+static void wardrive_setup_sync_controls(tab_context_t *ctx);
+static void wardrive_setup_gps_dd_cb(lv_event_t *e);
+static void wardrive_blacklist_btn_cb(lv_event_t *e);
+static void wardrive_blacklist_close_cb(lv_event_t *e);
+static void wardrive_blacklist_refresh(tab_context_t *ctx);
+static void wardrive_blacklist_remove_cb(lv_event_t *e);
+static void wardrive_blacklist_row_del_cb(lv_event_t *e);
+static void wardrive_blacklist_scan_btn_cb(lv_event_t *e);
+static void wardrive_blacklist_scan_close_cb(lv_event_t *e);
+static bool parse_bt_device_line(const char *line, bt_device_t *dev);
+static void show_antisurv_page(void);
+static void antisurv_start_cb(lv_event_t *e);
+static void antisurv_stop_cb(lv_event_t *e);
+static void antisurv_back_cb(lv_event_t *e);
+static void antisurv_sens_btn_cb(lv_event_t *e);
+static void antisurv_monitor_task(void *arg);
+static void show_zig_recon_page(void);
+static void iot_recon_back_cb(lv_event_t *e);
+static void iot_recon_start_cb(lv_event_t *e);
+static void iot_recon_stop_cb(lv_event_t *e);
+static void iot_recon_clear_cb(lv_event_t *e);
+static bool iot_recon_send_command(tab_context_t *ctx, const char *cmd);
+static void iot_recon_monitor_task(void *arg);
+static void iot_recon_pan_click_cb(lv_event_t *e);
+static void iot_recon_node_click_cb(lv_event_t *e);
 static void wardrive_wigle_send_btn_cb(lv_event_t *e);
+static void wardrive_wigle_sync_pending_btn_cb(lv_event_t *e);
+static void wardrive_wigle_force_all_btn_cb(lv_event_t *e);
+static void wardrive_wigle_start_upload(tab_context_t *ctx, wardrive_upload_mode_t mode);
 static void wardrive_wigle_stop_btn_cb(lv_event_t *e);
 static void wardrive_wigle_file_checkbox_cb(lv_event_t *e);
 static void wardrive_wigle_network_row_click_cb(lv_event_t *e);
@@ -2053,8 +2353,20 @@ static void wardrive_wigle_keyboard_cb(lv_event_t *e);
 static void wardrive_wigle_connect_btn_cb(lv_event_t *e);
 static void wardrive_wigle_rescan_btn_cb(lv_event_t *e);
 static void wardrive_wigle_show_password_toggle_cb(lv_event_t *e);
+static void wardrive_upload_state_reset(tab_context_t *ctx);
 static bool wardrive_wigle_store_file(tab_context_t *ctx, const char *dir, const char *token);
 static void wardrive_wigle_load_file_list(tab_context_t *ctx, tab_id_t active_tab, uart_port_t uart_port);
+static int wardrive_load_upload_state_from_command(tab_context_t *ctx, tab_id_t active_tab,
+                                                   uart_port_t uart_port, int timeout_ms);
+static void wardrive_format_file_detail(const wardrive_wigle_file_t *file, char *out, size_t out_sz);
+static void wardrive_format_file_detail_rich(const wardrive_wigle_file_t *file, char *out, size_t out_sz);
+static void wardrive_file_card_palette(const wardrive_wigle_file_t *file, lv_color_t *bg,
+                                       lv_color_t *border, lv_color_t *title);
+static void wardrive_status_card_palette(const char *status, int bad_rows, lv_color_t *bg,
+                                         lv_color_t *border, lv_color_t *title);
+static void wardrive_format_upload_state_entry(const wardrive_upload_state_entry_t *entry,
+                                               char *out, size_t out_sz);
+static void wardrive_format_summary_text(const wardrive_file_summary_t *summary, char *out, size_t out_sz);
 static void usb_gps_process_bytes(const uint8_t *data, size_t len);
 static bool usb_gps_get_fix(double *lat_out, double *lon_out, uint32_t wait_ms);
 static void usb_flush_input(uint32_t max_ms);
@@ -2071,6 +2383,15 @@ static void show_wardrive_files_page(void);
 static void compromised_file_delete_cb(lv_event_t *e);
 static void compromised_file_clean_cb(lv_event_t *e);
 static void close_compromised_cleanup_popup(tab_context_t *ctx);
+static void compromised_files_load_task(void *arg);
+static void compromised_files_load_async_render(void *user_data);
+static void wardrive_cleanup_move_confirm_cb(lv_event_t *e);
+static void wardrive_cleanup_close_cb(lv_event_t *e);
+static void wardrive_cleanup_dry_run_cb(lv_event_t *e);
+static void wardrive_cleanup_task(void *arg);
+static void wardrive_fix_file_cb(lv_event_t *e);
+static void *compromised_make_user_data(compromised_file_kind_t kind, int index);
+static void wardrive_fix_task(void *arg);
 static void show_compromised_cleanup_popup(tab_context_t *ctx, compromised_file_kind_t kind,
                                            compromised_cleanup_action_t action);
 static bool compromised_start_cleanup_operation(tab_context_t *ctx,
@@ -2241,6 +2562,169 @@ static bool ina226_read_current(float *current_a)
              (uint16_t)raw_current, raw_current, *current_a);
 
     return true;
+}
+
+//==================================================================================
+// RX8130CE Real-Time Clock (I2C 0x32, shared bsp bus: P4 G32=SCL, G31=SDA)
+//==================================================================================
+
+#define RX8130_I2C_ADDR     0x32
+#define RX8130_REG_SEC      0x10   // 0x10..0x16: Sec,Min,Hour,Week,Day,Month,Year (BCD)
+#define RX8130_REG_FLAG     0x1D   // bit1 = VLF (voltage-low / data loss)
+#define RX8130_REG_CTRL0    0x1E   // bit6 = STOP (must be 0 to run)
+#define RX8130_FLAG_VLF     0x02
+
+static i2c_master_dev_handle_t rx8130_dev_handle = NULL;
+static bool rx8130_present = false;
+
+static inline uint8_t rx8130_bcd2bin(uint8_t v) { return (uint8_t)((v >> 4) * 10 + (v & 0x0F)); }
+static inline uint8_t rx8130_bin2bcd(uint8_t v) { return (uint8_t)(((v / 10) << 4) | (v % 10)); }
+
+static esp_err_t rx8130_read_reg(uint8_t reg, uint8_t *buf, size_t len)
+{
+    if (!rx8130_dev_handle) return ESP_ERR_INVALID_STATE;
+    return i2c_master_transmit_receive(rx8130_dev_handle, &reg, 1, buf, len, 100);
+}
+
+static esp_err_t rx8130_write_reg(uint8_t reg, const uint8_t *buf, size_t len)
+{
+    if (!rx8130_dev_handle) return ESP_ERR_INVALID_STATE;
+    uint8_t tmp[8];
+    if (len + 1 > sizeof(tmp)) return ESP_ERR_INVALID_SIZE;
+    tmp[0] = reg;
+    memcpy(&tmp[1], buf, len);
+    return i2c_master_transmit(rx8130_dev_handle, tmp, len + 1, 100);
+}
+
+static esp_err_t rx8130_init(void)
+{
+    if (rx8130_dev_handle) {
+        return ESP_OK;
+    }
+
+    i2c_master_bus_handle_t i2c_bus = bsp_i2c_get_handle();
+    if (i2c_bus == NULL) {
+        ESP_LOGE(TAG, "RX8130: I2C bus not initialized");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    esp_err_t ret = i2c_master_probe(i2c_bus, RX8130_I2C_ADDR, 100);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "RX8130CE not found at 0x%02X", RX8130_I2C_ADDR);
+        return ret;
+    }
+
+    i2c_device_config_t dev_cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = RX8130_I2C_ADDR,
+        .scl_speed_hz = 100000,
+    };
+    ret = i2c_master_bus_add_device(i2c_bus, &dev_cfg, &rx8130_dev_handle);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "RX8130: failed to add device: %s", esp_err_to_name(ret));
+        rx8130_dev_handle = NULL;
+        return ret;
+    }
+
+    // Make sure the oscillator is running (clear STOP bit in Control 0).
+    uint8_t ctrl0 = 0;
+    if (rx8130_read_reg(RX8130_REG_CTRL0, &ctrl0, 1) == ESP_OK && (ctrl0 & 0x40)) {
+        ctrl0 &= (uint8_t)~0x40;
+        rx8130_write_reg(RX8130_REG_CTRL0, &ctrl0, 1);
+    }
+
+    rx8130_present = true;
+    ESP_LOGI(TAG, "RX8130CE RTC initialized at 0x%02X", RX8130_I2C_ADDR);
+    return ESP_OK;
+}
+
+// Reads the RTC into tm_out (normalized via mktime). power_lost (optional) is set
+// true when the VLF flag indicates the clock lost power and time is invalid.
+static esp_err_t rx8130_read_time(struct tm *tm_out, bool *power_lost)
+{
+    if (!tm_out) return ESP_ERR_INVALID_ARG;
+    if (!rx8130_dev_handle) return ESP_ERR_INVALID_STATE;
+
+    if (power_lost) {
+        uint8_t flag = 0;
+        if (rx8130_read_reg(RX8130_REG_FLAG, &flag, 1) == ESP_OK) {
+            *power_lost = (flag & RX8130_FLAG_VLF) != 0;
+        } else {
+            *power_lost = false;
+        }
+    }
+
+    uint8_t b[7];
+    esp_err_t ret = rx8130_read_reg(RX8130_REG_SEC, b, sizeof(b));
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    memset(tm_out, 0, sizeof(*tm_out));
+    tm_out->tm_sec  = rx8130_bcd2bin(b[0] & 0x7F);
+    tm_out->tm_min  = rx8130_bcd2bin(b[1] & 0x7F);
+    tm_out->tm_hour = rx8130_bcd2bin(b[2] & 0x3F);
+    tm_out->tm_mday = rx8130_bcd2bin(b[4] & 0x3F);
+    tm_out->tm_mon  = rx8130_bcd2bin(b[5] & 0x1F) - 1;   // 0-based
+    tm_out->tm_year = rx8130_bcd2bin(b[6]) + 100;        // years since 1900 (20xx)
+    tm_out->tm_isdst = -1;
+    mktime(tm_out);  // normalize + fill tm_wday/tm_yday
+    return ESP_OK;
+}
+
+static esp_err_t rx8130_set_time(const struct tm *tm_in)
+{
+    if (!tm_in) return ESP_ERR_INVALID_ARG;
+    if (!rx8130_dev_handle) return ESP_ERR_INVALID_STATE;
+
+    struct tm t = *tm_in;
+    t.tm_isdst = -1;
+    mktime(&t);  // normalize and compute weekday
+
+    uint8_t b[7];
+    b[0] = rx8130_bin2bcd((uint8_t)t.tm_sec);
+    b[1] = rx8130_bin2bcd((uint8_t)t.tm_min);
+    b[2] = rx8130_bin2bcd((uint8_t)t.tm_hour);
+    b[3] = (uint8_t)(1 << (t.tm_wday & 0x07));        // week = single set bit
+    b[4] = rx8130_bin2bcd((uint8_t)t.tm_mday);
+    b[5] = rx8130_bin2bcd((uint8_t)(t.tm_mon + 1));
+    b[6] = rx8130_bin2bcd((uint8_t)((t.tm_year + 1900) % 100));
+
+    esp_err_t ret = rx8130_write_reg(RX8130_REG_SEC, b, sizeof(b));
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "RX8130: set_time write failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    // Clock now holds a valid time: clear the VLF / data-loss flag.
+    uint8_t flag = 0;
+    if (rx8130_read_reg(RX8130_REG_FLAG, &flag, 1) == ESP_OK && (flag & RX8130_FLAG_VLF)) {
+        flag &= (uint8_t)~RX8130_FLAG_VLF;
+        rx8130_write_reg(RX8130_REG_FLAG, &flag, 1);
+    }
+    return ESP_OK;
+}
+
+// Push the current ESP system clock (UTC seconds) from the RTC.
+static void rx8130_sync_system_from_rtc(void)
+{
+    struct tm t;
+    bool power_lost = false;
+    if (rx8130_read_time(&t, &power_lost) != ESP_OK) {
+        return;
+    }
+    if (power_lost) {
+        ESP_LOGW(TAG, "RX8130: VLF set - RTC lost power, not syncing system clock");
+        return;
+    }
+    time_t epoch = mktime(&t);
+    if (epoch <= 0) {
+        return;
+    }
+    struct timeval tv = { .tv_sec = epoch, .tv_usec = 0 };
+    settimeofday(&tv, NULL);
+    ESP_LOGI(TAG, "System clock set from RTC: %04d-%02d-%02d %02d:%02d:%02d",
+             t.tm_year + 1900, t.tm_mon + 1, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec);
 }
 
 //==================================================================================
@@ -2862,6 +3346,38 @@ static void home_quote_start(void)
     }
 }
 
+// Refresh the status-bar clock from the system clock (seeded from the RTC).
+static void update_status_clock(void)
+{
+    if (!status_clock_label) {
+        return;
+    }
+    if (!clock_show) {
+        lv_obj_add_flag(status_clock_label, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+    lv_obj_clear_flag(status_clock_label, LV_OBJ_FLAG_HIDDEN);
+    time_t now = time(NULL);
+    struct tm t;
+    localtime_r(&now, &t);
+
+    // Skip showing a clock until the time looks real (year >= 2024).
+    if (t.tm_year + 1900 < 2024) {
+        lv_label_set_text(status_clock_label, "--:--");
+        return;
+    }
+
+    char buf[16];
+    if (clock_24h) {
+        snprintf(buf, sizeof(buf), "%02d:%02d", t.tm_hour, t.tm_min);
+    } else {
+        int h12 = t.tm_hour % 12;
+        if (h12 == 0) h12 = 12;
+        snprintf(buf, sizeof(buf), "%d:%02d %s", h12, t.tm_min, (t.tm_hour < 12) ? "AM" : "PM");
+    }
+    lv_label_set_text(status_clock_label, buf);
+}
+
 static void update_battery_status(void)
 {
     current_battery_voltage = ina226_read_bus_voltage();
@@ -2891,6 +3407,8 @@ static void battery_status_timer_cb(lv_timer_t *timer)
              (unsigned)(dma_free / 1024), (unsigned)(dma_min / 1024));
 
     int battery_pct = battery_percent_from_voltage(current_battery_voltage);
+
+    update_status_clock();
 
     // Update top bar labels
     if (battery_voltage_label) {
@@ -3000,6 +3518,12 @@ static void screen_timeout_timer_cb(lv_timer_t *timer)
         bsp_display_brightness_set(0);  // Turn off backlight
         screen_dimmed = true;
 
+        // Auto-lock: engage the lock now (before the wake overlay) so it stays in
+        // place underneath and the user must slide to unlock after waking.
+        if (screen_auto_lock_enabled) {
+            lock_screen_activate();
+        }
+
         // Create invisible overlay to capture wake touch
         sleep_overlay = lv_obj_create(lv_layer_top());
         lv_obj_remove_style_all(sleep_overlay);
@@ -3022,6 +3546,73 @@ static void touch_activity_cb(lv_event_t *e)
     if (!screen_dimmed) {
         last_activity_time = lv_tick_get();
     }
+}
+
+// Slider drag callback: unlock once dragged (almost) all the way across.
+static void lock_slider_value_cb(lv_event_t *e)
+{
+    lv_obj_t *slider = lv_event_get_target(e);
+    if (lv_slider_get_value(slider) >= 95) {
+        if (lock_overlay) {
+            lv_obj_del(lock_overlay);
+            lock_overlay = NULL;
+        }
+        last_activity_time = lv_tick_get();
+        ESP_LOGI(TAG, "Screen unlocked");
+    }
+}
+
+// Slider release callback: snap back to the start if not dragged far enough.
+static void lock_slider_release_cb(lv_event_t *e)
+{
+    lv_obj_t *slider = lv_event_get_target(e);
+    if (lv_slider_get_value(slider) < 95) {
+        lv_slider_set_value(slider, 0, LV_ANIM_ON);
+    }
+}
+
+// Engage the lock: a full-screen overlay that swallows all touches except the
+// "slide to unlock" slider. Lives on lv_layer_top() so it covers every tab.
+static void lock_screen_activate(void)
+{
+    if (lock_overlay) return;
+
+    lock_overlay = lv_obj_create(lv_layer_top());
+    lv_obj_remove_style_all(lock_overlay);
+    lv_obj_set_size(lock_overlay, LV_PCT(100), LV_PCT(100));
+    lv_obj_set_style_bg_color(lock_overlay, ui_bg_color(), 0);
+    lv_obj_set_style_bg_opa(lock_overlay, LV_OPA_80, 0);
+    lv_obj_add_flag(lock_overlay, LV_OBJ_FLAG_CLICKABLE);  // Swallow taps to the UI below
+    lv_obj_clear_flag(lock_overlay, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *hint = lv_label_create(lock_overlay);
+    lv_label_set_text(hint, LV_SYMBOL_RIGHT "  Slide to unlock");
+    lv_obj_set_style_text_font(hint, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_color(hint, COLOR_LAB5_MAGENTA, 0);
+    lv_obj_align(hint, LV_ALIGN_CENTER, 0, -60);
+
+    lv_obj_t *slider = lv_slider_create(lock_overlay);
+    lv_slider_set_range(slider, 0, 100);
+    lv_slider_set_value(slider, 0, LV_ANIM_OFF);
+    lv_obj_set_size(slider, LV_PCT(70), 56);
+    lv_obj_align(slider, LV_ALIGN_CENTER, 0, 20);
+    lv_obj_set_style_bg_color(slider, ui_card_color(), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(slider, COLOR_LAB5_MAGENTA, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(slider, COLOR_LAB5_MAGENTA, LV_PART_KNOB);
+    lv_obj_set_style_pad_all(slider, 6, LV_PART_KNOB);
+    lv_obj_set_style_radius(slider, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+    lv_obj_add_event_cb(slider, lock_slider_value_cb, LV_EVENT_VALUE_CHANGED, NULL);
+    lv_obj_add_event_cb(slider, lock_slider_release_cb, LV_EVENT_RELEASED, NULL);
+    lv_obj_add_event_cb(slider, lock_slider_release_cb, LV_EVENT_PRESS_LOST, NULL);
+
+    ESP_LOGI(TAG, "Screen locked");
+}
+
+// Status-bar lock button callback.
+static void lock_status_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    lock_screen_activate();
 }
 
 static bool usb_transport_ready = false;
@@ -3254,6 +3845,8 @@ static void usb_log_cdc_state(const char *where)
              esp_err_to_name(rx_err));
 }
 
+static void schedule_board_redetect(void);
+
 static void board_redetect_cb(void *user_data)
 {
     (void)user_data;
@@ -3263,18 +3856,32 @@ static void board_redetect_cb(void *user_data)
     bool prev_grove = grove_detected;
     bool prev_usb = usb_detected;
     bool prev_uart2 = mbus_detected;
+    bool prev_grove_sd = grove_ctx.sd_card_present;
+    bool prev_usb_sd = usb_ctx.sd_card_present;
+    bool prev_mbus_sd = mbus_ctx.sd_card_present;
+    bool prev_internal_sd = internal_sd_present;
 
     detect_boards();
+
+    // One SD probe only, and only after the board answered ping.
+    check_all_sd_cards();
 
     // Re-probe Sub-GHz availability so the home tile reflects the new state.
     check_all_subghz_status();
 
     bool changed = (prev_grove != grove_detected) ||
                    (prev_usb != usb_detected) ||
-                   (prev_uart2 != mbus_detected);
+                   (prev_uart2 != mbus_detected) ||
+                   (prev_grove_sd != grove_ctx.sd_card_present) ||
+                   (prev_usb_sd != usb_ctx.sd_card_present) ||
+                   (prev_mbus_sd != mbus_ctx.sd_card_present) ||
+                   (prev_internal_sd != internal_sd_present);
 
-    ESP_LOGI(TAG, "Redetect: changed=%d, uart1=%d, mbus=%d, popup_open=%d",
-             changed, uart1_detected, mbus_detected, board_detection_popup_open);
+    ESP_LOGI(TAG, "Redetect: changed=%d, uart1=%d, mbus=%d, sd: G=%d U=%d M=%d I=%d, popup_open=%d",
+             changed, uart1_detected, mbus_detected,
+             grove_ctx.sd_card_present, usb_ctx.sd_card_present,
+             mbus_ctx.sd_card_present, internal_sd_present,
+             board_detection_popup_open);
 
     if (changed && (uart1_detected || mbus_detected) && !board_detection_popup_open) {
         ESP_LOGI(TAG, "Redetect: calling reload_gui_for_detection + show_main_tiles");
@@ -5656,6 +6263,7 @@ static void create_status_bar(void)
         lv_obj_del(status_bar);
         status_bar = NULL;
         battery_voltage_label = NULL;
+        status_clock_label = NULL;
         charging_status_label = NULL;
         charging_status_slot_width = 0;
         portal_icon = NULL;
@@ -5678,8 +6286,7 @@ static void create_status_bar(void)
 
     // Big logo hitbox for reliable screenshot trigger on touch.
     lv_obj_t *logo_btn = lv_btn_create(status_bar);
-    lv_obj_set_size(logo_btn, 0, UI_STATUS_BAR_HEIGHT - (tall_layout ? 8 : 6));
-    lv_obj_set_flex_grow(logo_btn, 1);
+    lv_obj_set_size(logo_btn, LV_SIZE_CONTENT, UI_STATUS_BAR_HEIGHT - (tall_layout ? 8 : 6));
     lv_obj_set_style_bg_opa(logo_btn, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(logo_btn, 0, 0);
     lv_obj_set_style_shadow_width(logo_btn, 0, 0);
@@ -5691,8 +6298,7 @@ static void create_status_bar(void)
     lv_label_set_text(app_title, "#FF2FA3 LAB5# | control the chaos");
     lv_obj_set_style_text_font(app_title, tall_layout ? &lv_font_montserrat_24 : &lv_font_montserrat_18, 0);
     lv_obj_set_style_text_color(app_title, ui_text_color(), 0);
-    lv_obj_set_width(app_title, lv_pct(100));
-    lv_label_set_long_mode(app_title, LV_LABEL_LONG_DOT);
+    lv_obj_set_width(app_title, LV_SIZE_CONTENT);
     lv_obj_align(app_title, LV_ALIGN_LEFT_MID, 0, 0);
 
 #if SCREENSHOT_ENABLED
@@ -5703,6 +6309,19 @@ static void create_status_bar(void)
     lv_obj_add_event_cb(app_title, screenshot_click_cb, LV_EVENT_CLICKED, NULL);
     screenshot_title_label = app_title;  // Store for visual feedback
 #endif
+
+    // RTC clock, placed right after the title.
+    status_clock_label = lv_label_create(status_bar);
+    lv_label_set_text(status_clock_label, "--:--");
+    lv_obj_set_style_text_font(status_clock_label, tall_layout ? &lv_font_montserrat_22 : &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_color(status_clock_label, COLOR_LAB5_MAGENTA, 0);
+    lv_obj_set_style_text_letter_space(status_clock_label, 0, 0);
+
+    // Flexible spacer pushes the battery/settings strip to the right edge.
+    lv_obj_t *bar_spacer = lv_obj_create(status_bar);
+    lv_obj_remove_style_all(bar_spacer);
+    lv_obj_set_height(bar_spacer, 1);
+    lv_obj_set_flex_grow(bar_spacer, 1);
 
     // Right status strip
     lv_obj_t *right_status = lv_obj_create(status_bar);
@@ -5758,6 +6377,24 @@ static void create_status_bar(void)
     lv_obj_set_style_text_color(charging_status_label, COLOR_NEON_GREEN, 0);
     lv_obj_set_width(charging_status_label, 0);
     lv_obj_set_style_text_align(charging_status_label, LV_TEXT_ALIGN_CENTER, 0);
+
+    // Screen lock button (slide-to-unlock). Hidden unless the feature is enabled.
+    lock_status_btn = lv_btn_create(right_status);
+    lv_obj_remove_style_all(lock_status_btn);
+    lv_obj_set_size(lock_status_btn, tall_layout ? 52 : 46, tall_layout ? 52 : 46);
+    lv_obj_set_style_bg_opa(lock_status_btn, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_pad_all(lock_status_btn, 0, 0);
+    lv_obj_add_flag(lock_status_btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(lock_status_btn, lock_status_btn_cb, LV_EVENT_CLICKED, NULL);
+    if (!screen_lock_enabled) {
+        lv_obj_add_flag(lock_status_btn, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    lv_obj_t *lock_icon = lv_label_create(lock_status_btn);
+    lv_label_set_text(lock_icon, LV_SYMBOL_EYE_CLOSE);
+    lv_obj_set_style_text_font(lock_icon, tall_layout ? &lv_font_montserrat_22 : &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_color(lock_icon, dark_mode_enabled ? lv_color_hex(0xA5AFBA) : lv_color_hex(0x4E5F72), 0);
+    lv_obj_center(lock_icon);
 
     // Settings button (larger hitbox for touch).
     lv_obj_t *settings_btn = lv_btn_create(right_status);
@@ -6500,6 +7137,10 @@ static void main_tile_event_cb(lv_event_t *e)
             return;
         }
         show_wardrive_page();
+    } else if (strcmp(tile_name, "Anti-Surv") == 0) {
+        show_antisurv_page();
+    } else if (strcmp(tile_name, "IoT") == 0) {
+        show_zig_recon_page();
     } else if (strcmp(tile_name, "Sub-GHz") == 0) {
         show_subghz_page();
     } else {
@@ -7344,6 +7985,7 @@ static void mitm_popup_close_cb(lv_event_t *e)
         ctx->mitm_stop_btn = NULL;
         ctx->mitm_pass_row = NULL;
         ctx->mitm_btn_row = NULL;
+        ctx->mitm_use_saved_password = false;
         ctx->observer_attack_return_to_observer = false;
         clear_observer_attack_override(ctx);
     }
@@ -7361,8 +8003,10 @@ static void mitm_keyboard_cb(lv_event_t *e)
 
 static void mitm_password_input_cb(lv_event_t *e)
 {
-    (void)e;
     tab_context_t *ctx = get_current_ctx();
+    if (ctx && lv_event_get_code(e) == LV_EVENT_VALUE_CHANGED) {
+        ctx->mitm_use_saved_password = false;
+    }
     if (ctx && ctx->mitm_keyboard) {
         lv_obj_clear_flag(ctx->mitm_keyboard, LV_OBJ_FLAG_HIDDEN);
         lv_keyboard_set_textarea(ctx->mitm_keyboard, ctx->mitm_password_input);
@@ -7410,19 +8054,13 @@ static void mitm_connect_and_start_cb(lv_event_t *e)
     bsp_display_unlock();
     vTaskDelay(pdMS_TO_TICKS(50));
 
-    char escaped_ssid[67];
-    char escaped_password[131];
-    beacon_spam_escape_quoted_arg(ssid, escaped_ssid, sizeof(escaped_ssid));
-    beacon_spam_escape_quoted_arg(password, escaped_password, sizeof(escaped_password));
-
     char cmd[256];
-    int cmd_len = 0;
-    if (is_open || password == NULL || strlen(password) == 0) {
-        cmd_len = snprintf(cmd, sizeof(cmd), "wifi_connect \"%s\"", escaped_ssid);
-    } else {
-        cmd_len = snprintf(cmd, sizeof(cmd), "wifi_connect \"%s\" \"%s\"", escaped_ssid, escaped_password);
-    }
-    if (cmd_len < 0 || cmd_len >= (int)sizeof(cmd)) {
+    wifi_connect_auth_mode_t auth_mode =
+        (is_open || password == NULL || strlen(password) == 0)
+            ? WIFI_CONNECT_AUTH_OPEN
+            : (ctx->mitm_use_saved_password ? WIFI_CONNECT_AUTH_SAVED
+                                             : WIFI_CONNECT_AUTH_PASSWORD);
+    if (!build_wifi_connect_command(cmd, sizeof(cmd), ssid, password, auth_mode)) {
         ESP_LOGW(TAG, "MITM: wifi_connect command too long, aborting");
         bsp_display_lock(0);
         if (ctx->mitm_status_label) {
@@ -7561,7 +8199,7 @@ static void show_mitm_popup(void)
     wifi_network_t *net = &v.nets[idx];
     const char *ssid_display = strlen(net->ssid) > 0 ? net->ssid : "(Hidden)";
 
-    // Check Evil Twin DB for known password
+    // Check Evil Twin DB for a saved password.
     char mitm_found_password[65] = {0};
     bool mitm_password_known = false;
     {
@@ -7615,7 +8253,7 @@ static void show_mitm_popup(void)
             if (strcmp(evil_twin_entries[i].ssid, net->ssid) == 0) {
                 strncpy(mitm_found_password, evil_twin_entries[i].password, sizeof(mitm_found_password) - 1);
                 mitm_password_known = true;
-                ESP_LOGI(TAG, "MITM: Found password for %s in Evil Twin database", net->ssid);
+                ESP_LOGI(TAG, "MITM: Found saved password for %s in Evil Twin database", net->ssid);
                 break;
             }
         }
@@ -7683,14 +8321,18 @@ static void show_mitm_popup(void)
     lv_obj_set_style_border_width(ctx->mitm_password_input, 1, 0);
     lv_obj_set_style_text_color(ctx->mitm_password_input, lv_color_hex(0xFFFFFF), 0);
     lv_obj_add_event_cb(ctx->mitm_password_input, mitm_password_input_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(ctx->mitm_password_input, mitm_password_input_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
     if (mitm_password_known) {
         lv_textarea_set_text(ctx->mitm_password_input, mitm_found_password);
+        ctx->mitm_use_saved_password = true;
+    } else {
+        ctx->mitm_use_saved_password = false;
     }
 
     ctx->mitm_status_label = lv_label_create(ctx->mitm_popup);
     lv_label_set_text(ctx->mitm_status_label,
-        mitm_password_known ? "Known password found! Press Connect & Start."
+        mitm_password_known ? "Saved password found. Press Connect & Start."
                             : "Enter WiFi password to connect and start PCAP capture.");
     lv_obj_set_style_text_font(ctx->mitm_status_label, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(ctx->mitm_status_label,
@@ -8327,6 +8969,7 @@ static void arp_poison_back_cb(lv_event_t *e)
 
     tab_context_t *ctx = get_current_ctx();
     bool return_to_observer = ctx && ctx->observer_attack_return_to_observer;
+    bool return_to_evil_twin_passwords = ctx && ctx->arp_return_to_evil_twin_passwords;
 
     // Reset state
     arp_wifi_connected = false;
@@ -8340,6 +8983,9 @@ static void arp_poison_back_cb(lv_event_t *e)
     if (arp_poison_page) {
         lv_obj_del(arp_poison_page);
         arp_poison_page = NULL;
+        if (ctx) {
+            ctx->arp_poison_page = NULL;
+        }
         arp_password_input = NULL;
         arp_keyboard = NULL;
         arp_connect_btn = NULL;
@@ -8350,11 +8996,22 @@ static void arp_poison_back_cb(lv_event_t *e)
 
     if (ctx) {
         ctx->observer_attack_return_to_observer = false;
+        ctx->arp_return_to_evil_twin_passwords = false;
         clear_observer_attack_override(ctx);
     }
 
     if (return_to_observer) {
         show_observer_page();
+        return;
+    }
+
+    if (return_to_evil_twin_passwords) {
+        if (ctx && ctx->evil_twin_passwords_page) {
+            lv_obj_clear_flag(ctx->evil_twin_passwords_page, LV_OBJ_FLAG_HIDDEN);
+            ctx->current_visible_page = ctx->evil_twin_passwords_page;
+        } else {
+            show_evil_twin_passwords_page();
+        }
         return;
     }
 
@@ -8390,10 +9047,10 @@ static void arp_connect_cb(lv_event_t *e)
     bool is_open = (strstr(arp_target_security, "OPEN") != NULL || arp_target_security[0] == '\0');
     const char *password = NULL;
 
-    // Check if we have a known password (from Evil Twin database)
+    // Check if we have a saved password (from Evil Twin database).
     if (strlen(arp_target_password) > 0) {
         password = arp_target_password;
-        ESP_LOGI(TAG, "ARP Poison: Using known password from Evil Twin database");
+        ESP_LOGI(TAG, "ARP Poison: using saved password from Evil Twin database");
     } else if (arp_password_input) {
         password = lv_textarea_get_text(arp_password_input);
     }
@@ -8421,19 +9078,14 @@ static void arp_connect_cb(lv_event_t *e)
     bsp_display_unlock();
     vTaskDelay(pdMS_TO_TICKS(50));
 
-    char escaped_ssid[67];
-    char escaped_password[131];
-    beacon_spam_escape_quoted_arg(arp_target_ssid, escaped_ssid, sizeof(escaped_ssid));
-    beacon_spam_escape_quoted_arg(password, escaped_password, sizeof(escaped_password));
-
     char cmd[256];
-    int cmd_len = 0;
-    if (is_open || password == NULL || strlen(password) == 0) {
-        cmd_len = snprintf(cmd, sizeof(cmd), "wifi_connect \"%s\"", escaped_ssid);
-    } else {
-        cmd_len = snprintf(cmd, sizeof(cmd), "wifi_connect \"%s\" \"%s\"", escaped_ssid, escaped_password);
+    wifi_connect_auth_mode_t auth_mode = WIFI_CONNECT_AUTH_OPEN;
+    if (!is_open && strlen(arp_target_password) > 0) {
+        auth_mode = WIFI_CONNECT_AUTH_SAVED;
+    } else if (!is_open && password != NULL && strlen(password) > 0) {
+        auth_mode = WIFI_CONNECT_AUTH_PASSWORD;
     }
-    if (cmd_len < 0 || cmd_len >= (int)sizeof(cmd)) {
+    if (!build_wifi_connect_command(cmd, sizeof(cmd), arp_target_ssid, password, auth_mode)) {
         ESP_LOGW(TAG, "ARP Poison: wifi_connect command too long, aborting");
         bsp_display_lock(0);
         if (arp_status_label) {
@@ -8779,13 +9431,14 @@ static void arp_auto_connect_timer_cb(lv_timer_t *timer)
     vTaskDelay(pdMS_TO_TICKS(50));
 
     // Send wifi_connect command to current tab's UART
-    char escaped_ssid[67];
-    char escaped_password[131];
-    beacon_spam_escape_quoted_arg(arp_target_ssid, escaped_ssid, sizeof(escaped_ssid));
-    beacon_spam_escape_quoted_arg(arp_target_password, escaped_password, sizeof(escaped_password));
-
     char cmd[256];
-    snprintf(cmd, sizeof(cmd), "wifi_connect \"%s\" \"%s\"", escaped_ssid, escaped_password);
+    if (!build_wifi_connect_command(cmd, sizeof(cmd), arp_target_ssid, NULL, WIFI_CONNECT_AUTH_SAVED)) {
+        if (arp_status_label) {
+            lv_label_set_text(arp_status_label, "SSID too long");
+            lv_obj_set_style_text_color(arp_status_label, COLOR_MATERIAL_RED, 0);
+        }
+        return;
+    }
     uart_send_command_for_tab(cmd);
     uart_port_t uart_port = get_current_uart();
 
@@ -8970,16 +9623,21 @@ static void nmap_connect_cb(lv_event_t *e)
     bsp_display_unlock();
     vTaskDelay(pdMS_TO_TICKS(50));
 
-    char escaped_ssid[67];
-    char escaped_pass[131];
-    beacon_spam_escape_quoted_arg(nmap_target_ssid, escaped_ssid, sizeof(escaped_ssid));
-
     char cmd[256];
-    if (is_open || password == NULL || strlen(password) == 0) {
-        snprintf(cmd, sizeof(cmd), "wifi_connect \"%s\"", escaped_ssid);
-    } else {
-        beacon_spam_escape_quoted_arg(password, escaped_pass, sizeof(escaped_pass));
-        snprintf(cmd, sizeof(cmd), "wifi_connect \"%s\" \"%s\"", escaped_ssid, escaped_pass);
+    wifi_connect_auth_mode_t auth_mode = WIFI_CONNECT_AUTH_OPEN;
+    if (!is_open && strlen(nmap_target_password) > 0) {
+        auth_mode = WIFI_CONNECT_AUTH_SAVED;
+    } else if (!is_open && password != NULL && strlen(password) > 0) {
+        auth_mode = WIFI_CONNECT_AUTH_PASSWORD;
+    }
+    if (!build_wifi_connect_command(cmd, sizeof(cmd), nmap_target_ssid, password, auth_mode)) {
+        bsp_display_lock(0);
+        if (nmap_status_label) {
+            lv_label_set_text(nmap_status_label, "SSID/password too long");
+            lv_obj_set_style_text_color(nmap_status_label, COLOR_MATERIAL_RED, 0);
+        }
+        bsp_display_unlock();
+        return;
     }
     uart_send_command_for_tab(cmd);
 
@@ -9871,7 +10529,7 @@ static void show_nmap_page(void)
             if (strcmp(evil_twin_entries[i].ssid, nmap_target_ssid) == 0) {
                 snprintf(nmap_target_password, sizeof(nmap_target_password), "%s", evil_twin_entries[i].password);
                 password_known = true;
-                ESP_LOGI(TAG, "Nmap: Found password for %s in Evil Twin database", nmap_target_ssid);
+                ESP_LOGI(TAG, "Nmap: found saved password for %s in Evil Twin database", nmap_target_ssid);
                 break;
             }
         }
@@ -9931,12 +10589,12 @@ static void show_nmap_page(void)
         lv_obj_set_flex_flow(pass_section, LV_FLEX_FLOW_COLUMN);
 
         lv_obj_t *pass_title = lv_label_create(pass_section);
-        lv_label_set_text(pass_title, "Known Password:");
+        lv_label_set_text(pass_title, "Saved password available");
         lv_obj_set_style_text_font(pass_title, &lv_font_montserrat_14, 0);
         lv_obj_set_style_text_color(pass_title, lv_color_hex(0xFFFFFF), 0);
 
         lv_obj_t *pass_value = lv_label_create(pass_section);
-        lv_label_set_text_fmt(pass_value, "%s", nmap_target_password);
+        lv_label_set_text(pass_value, "Firmware will use --saved");
         lv_obj_set_style_text_font(pass_value, &lv_font_montserrat_16, 0);
         lv_obj_set_style_text_color(pass_value, COLOR_MATERIAL_GREEN, 0);
 
@@ -10097,7 +10755,21 @@ static void show_arp_poison_page(void)
     lv_obj_t *container = get_current_tab_container();
     if (!container) return;
 
+    if (ctx && ctx->arp_poison_page) {
+        lv_obj_del(ctx->arp_poison_page);
+        if (arp_poison_page == ctx->arp_poison_page) {
+            arp_poison_page = NULL;
+        }
+        ctx->arp_poison_page = NULL;
+    } else if (arp_poison_page) {
+        lv_obj_del(arp_poison_page);
+        arp_poison_page = NULL;
+    }
+
     arp_poison_page = lv_obj_create(container);
+    if (ctx) {
+        ctx->arp_poison_page = arp_poison_page;
+    }
     lv_obj_set_size(arp_poison_page, lv_pct(100), lv_pct(100));
     lv_obj_align(arp_poison_page, LV_ALIGN_TOP_MID, 0, 0);
     lv_obj_set_style_bg_color(arp_poison_page, lv_color_hex(0x1A1A1A), 0);
@@ -10207,7 +10879,7 @@ static void show_arp_poison_page(void)
                 strncpy(arp_target_password, evil_twin_entries[i].password, sizeof(arp_target_password) - 1);
                 arp_target_password[sizeof(arp_target_password) - 1] = '\0';
                 password_known = true;
-                ESP_LOGI(TAG, "ARP: Found password for %s in Evil Twin database", arp_target_ssid);
+                ESP_LOGI(TAG, "ARP: found saved password for %s in Evil Twin database", arp_target_ssid);
                 break;
             }
         }
@@ -10267,16 +10939,16 @@ static void show_arp_poison_page(void)
             lv_obj_set_style_text_font(list_hosts_label, &lv_font_montserrat_16, 0);
             lv_obj_center(list_hosts_label);
         } else if (password_known) {
-            // Show known password as label
+            // Saved password exists on the module; let firmware resolve it via --saved.
             lv_obj_set_flex_flow(pass_section, LV_FLEX_FLOW_COLUMN);
 
             lv_obj_t *pass_title = lv_label_create(pass_section);
-            lv_label_set_text(pass_title, "Known Password:");
+            lv_label_set_text(pass_title, "Saved password available");
             lv_obj_set_style_text_font(pass_title, &lv_font_montserrat_14, 0);
             lv_obj_set_style_text_color(pass_title, lv_color_hex(0xFFFFFF), 0);
 
             lv_obj_t *pass_value = lv_label_create(pass_section);
-            lv_label_set_text_fmt(pass_value, "%s", arp_target_password);
+            lv_label_set_text(pass_value, "Firmware will use --saved");
             lv_obj_set_style_text_font(pass_value, &lv_font_montserrat_16, 0);
             lv_obj_set_style_text_color(pass_value, COLOR_MATERIAL_GREEN, 0);
 
@@ -12043,6 +12715,8 @@ static void create_uart_tiles_in_container(lv_obj_t *container, tab_context_t *c
     create_tile(tile_grid, LV_SYMBOL_LOOP, "Network\nObserver", COLOR_MATERIAL_TEAL, main_tile_event_cb, "Network Observer");
     create_tile(tile_grid, LV_SYMBOL_WIFI, "Karma", COLOR_MATERIAL_ORANGE, main_tile_event_cb, "Karma");
     create_tile(tile_grid, LV_SYMBOL_GPS, "Wardrive", COLOR_MATERIAL_TEAL, main_tile_event_cb, "Wardrive");
+    create_tile(tile_grid, LV_SYMBOL_EYE_OPEN, "Anti-Surv", COLOR_MATERIAL_PINK, main_tile_event_cb, "Anti-Surv");
+    create_tile(tile_grid, LV_SYMBOL_BARS, "Mesh\nRecon", COLOR_MATERIAL_PURPLE, main_tile_event_cb, "IoT");
     if (ctx && ctx->has_subghz) {
         ctx->subghz_tile = create_tile(tile_grid, LV_SYMBOL_BARS, "Sub-GHz",
                                        COLOR_MATERIAL_PINK, main_tile_event_cb, "Sub-GHz");
@@ -16668,12 +17342,23 @@ static void show_wardrive_gps_overlay(tab_context_t *ctx)
 static void update_wardrive_count_label(tab_context_t *ctx)
 {
     if (!ctx || !ctx->wardrive_net_count_label) return;
-    lv_label_set_text_fmt(ctx->wardrive_net_count_label,
-                          "WiFi: %d  BT: %d  SAT: %d  %.2f km",
-                          ctx->wardrive_wifi_count,
-                          ctx->wardrive_bt_count,
-                          ctx->wardrive_sat_count,
-                          ctx->wardrive_distance_m / 1000.0);
+    if (ctx->wardrive_relogs > 0 || ctx->wardrive_best_ch > 0) {
+        lv_label_set_text_fmt(ctx->wardrive_net_count_label,
+                              "WiFi: %d  BT: %d  relog: %d  ch: %d  SAT: %d  %.2f km",
+                              ctx->wardrive_wifi_count,
+                              ctx->wardrive_bt_count,
+                              ctx->wardrive_relogs,
+                              ctx->wardrive_best_ch,
+                              ctx->wardrive_sat_count,
+                              ctx->wardrive_distance_m / 1000.0);
+    } else {
+        lv_label_set_text_fmt(ctx->wardrive_net_count_label,
+                              "WiFi: %d  BT: %d  SAT: %d  %.2f km",
+                              ctx->wardrive_wifi_count,
+                              ctx->wardrive_bt_count,
+                              ctx->wardrive_sat_count,
+                              ctx->wardrive_distance_m / 1000.0);
+    }
 }
 
 static void update_wardrive_trace_button(tab_context_t *ctx)
@@ -16688,22 +17373,6 @@ static void update_wardrive_trace_button(tab_context_t *ctx)
     lv_obj_t *label = lv_obj_get_child(ctx->wardrive_trace_btn, 0);
     if (label) {
         lv_label_set_text(label, ctx->wardrive_trace_enabled ? LV_SYMBOL_GPS " Trace On" : LV_SYMBOL_GPS " Trace");
-    }
-}
-
-static void wardrive_trace_btn_cb(lv_event_t *e)
-{
-    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
-    if (!ctx) ctx = get_current_ctx();
-    if (!ctx || ctx->wardrive_monitoring) return;
-
-    ctx->wardrive_trace_enabled = !ctx->wardrive_trace_enabled;
-
-    update_wardrive_trace_button(ctx);
-    if (ctx->wardrive_status_label) {
-        lv_label_set_text(ctx->wardrive_status_label,
-                          ctx->wardrive_trace_enabled ? "Wardrive Trace mode enabled" : "Wardrive Trace mode disabled");
-        lv_obj_set_style_text_color(ctx->wardrive_status_label, COLOR_MATERIAL_AMBER, 0);
     }
 }
 
@@ -16875,300 +17544,6 @@ static bool parse_wardrive_network_line(tab_context_t *ctx, const char *line)
     return true;
 }
 
-// Close GPS type popup
-static void wardrive_gps_type_close_cb(lv_event_t *e)
-{
-    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
-    if (!ctx) ctx = get_current_ctx();
-
-    if (ctx->wardrive_gps_type_overlay) {
-        lv_obj_del(ctx->wardrive_gps_type_overlay);
-        ctx->wardrive_gps_type_overlay = NULL;
-        ctx->wardrive_gps_type_response_label = NULL;
-    }
-}
-
-static const char *wardrive_gps_mode_from_cmd(const char *cmd)
-{
-    if (!cmd) {
-        return "Unknown";
-    }
-    if (strstr(cmd, "external") != NULL || strstr(cmd, "usb") != NULL) {
-        return "External";
-    }
-    if (strstr(cmd, "atgm") != NULL) {
-        return "ATGM";
-    }
-    if (strstr(cmd, "m5") != NULL) {
-        return "M5";
-    }
-    return "Unknown";
-}
-
-static bool wardrive_is_relevant_gps_response_line(const char *line, const char *cmd)
-{
-    if (!line || !cmd) {
-        return false;
-    }
-
-    while (isspace((unsigned char)*line)) {
-        line++;
-    }
-
-    if (*line == '\0' || strcmp(line, ">") == 0) {
-        return false;
-    }
-    if (strstr(line, "gps_set") != NULL) {
-        return false;
-    }
-
-    // Ignore unrelated runtime/status lines that can be in UART buffer.
-    if (strcmp(line, "stop") == 0 ||
-        strstr(line, "Flushed ") != NULL ||
-        strstr(line, "Wardrive") != NULL ||
-        strstr(line, "wardrive") != NULL ||
-        strstr(line, "GPS fix") != NULL ||
-        strstr(line, "start_wardrive") != NULL) {
-        return false;
-    }
-
-    bool mode_token = false;
-    if (strstr(cmd, "m5") != NULL) {
-        mode_token = (strstr(line, "m5") != NULL || strstr(line, "M5") != NULL);
-    } else if (strstr(cmd, "atgm") != NULL) {
-        mode_token = (strstr(line, "atgm") != NULL || strstr(line, "ATGM") != NULL);
-    } else if (strstr(cmd, "external") != NULL || strstr(cmd, "usb") != NULL) {
-        mode_token = (strstr(line, "external") != NULL || strstr(line, "External") != NULL ||
-                      strstr(line, "usb") != NULL || strstr(line, "USB") != NULL);
-    }
-    if (mode_token) {
-        return true;
-    }
-
-    bool gps_keyword = (strstr(line, "gps") != NULL || strstr(line, "GPS") != NULL ||
-                        strstr(line, "module") != NULL || strstr(line, "Module") != NULL);
-    bool state_keyword = (strstr(line, "set") != NULL || strstr(line, "Set") != NULL ||
-                          strstr(line, "selected") != NULL || strstr(line, "Selected") != NULL ||
-                          strstr(line, "unknown") != NULL || strstr(line, "Unknown") != NULL);
-    return gps_keyword && state_keyword;
-}
-
-static void wardrive_send_gps_set_command(tab_context_t *ctx, const char *cmd)
-{
-    if (!ctx || !cmd) {
-        return;
-    }
-
-    if (strstr(cmd, "gps_set external") != NULL || strstr(cmd, "gps_set usb") != NULL) {
-        ctx->wardrive_use_external_gps = true;
-    } else if (strstr(cmd, "gps_set") != NULL) {
-        ctx->wardrive_use_external_gps = false;
-    }
-
-    const char *mode_name = wardrive_gps_mode_from_cmd(cmd);
-    char default_response[64];
-    snprintf(default_response, sizeof(default_response), "GPS set: %s", mode_name);
-
-    if (ctx->wardrive_gps_type_response_label) {
-        char pending_text[64];
-        snprintf(pending_text, sizeof(pending_text), "Setting GPS: %s...", mode_name);
-        lv_label_set_text(ctx->wardrive_gps_type_response_label, pending_text);
-        lv_obj_set_style_text_color(ctx->wardrive_gps_type_response_label, COLOR_MATERIAL_AMBER, 0);
-    }
-    lv_refr_now(NULL);
-
-    tab_id_t active_tab = tab_id_for_ctx(ctx);
-    uart_port_t uart_port = (active_tab == TAB_MBUS) ? UART2_NUM : UART_NUM;
-    if (active_tab == TAB_MBUS) {
-        uart2_send_command(cmd);
-    } else {
-        uart_send_command(cmd);
-    }
-
-    char rx_buffer[512] = {0};
-    char parse_buffer[512];
-    char response[256] = "";
-    int total_len = 0;
-
-    for (int attempt = 0; attempt < 15 && response[0] == '\0'; attempt++) {
-        vTaskDelay(pdMS_TO_TICKS(100));
-        if (total_len >= (int)sizeof(rx_buffer) - 1) {
-            break;
-        }
-
-        int len = transport_read_bytes_tab(active_tab,
-                                           uart_port,
-                                           rx_buffer + total_len,
-                                           sizeof(rx_buffer) - 1 - total_len,
-                                           pdMS_TO_TICKS(50));
-        if (len <= 0) {
-            continue;
-        }
-
-        total_len += len;
-        rx_buffer[total_len] = '\0';
-
-        snprintf(parse_buffer, sizeof(parse_buffer), "%s", rx_buffer);
-        char *saveptr = NULL;
-        char *line = strtok_r(parse_buffer, "\r\n", &saveptr);
-        while (line) {
-            if (wardrive_is_relevant_gps_response_line(line, cmd)) {
-                snprintf(response, sizeof(response), "%.255s", line);
-                break;
-            }
-            line = strtok_r(NULL, "\r\n", &saveptr);
-        }
-    }
-
-    if (ctx->wardrive_gps_type_response_label) {
-        if (response[0] != '\0') {
-            lv_label_set_text(ctx->wardrive_gps_type_response_label, response);
-            lv_obj_set_style_text_color(ctx->wardrive_gps_type_response_label, COLOR_MATERIAL_GREEN, 0);
-        } else {
-            lv_label_set_text(ctx->wardrive_gps_type_response_label, default_response);
-            lv_obj_set_style_text_color(ctx->wardrive_gps_type_response_label, COLOR_MATERIAL_GREEN, 0);
-        }
-    }
-}
-
-// GPS set M5 callback
-static void wardrive_gps_set_m5_cb(lv_event_t *e)
-{
-    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
-    if (!ctx) ctx = get_current_ctx();
-    wardrive_send_gps_set_command(ctx, "gps_set m5");
-}
-
-// GPS set ATGM callback
-static void wardrive_gps_set_atgm_cb(lv_event_t *e)
-{
-    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
-    if (!ctx) ctx = get_current_ctx();
-    wardrive_send_gps_set_command(ctx, "gps_set atgm");
-}
-
-// GPS set External callback
-static void wardrive_gps_set_external_cb(lv_event_t *e)
-{
-    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
-    if (!ctx) ctx = get_current_ctx();
-    wardrive_send_gps_set_command(ctx, "gps_set external");
-}
-
-// GPS type button callback - show popup
-static void wardrive_gps_type_btn_cb(lv_event_t *e)
-{
-    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
-    if (!ctx) ctx = get_current_ctx();
-    if (!ctx->wardrive_page) return;
-
-    // Close existing overlay if any
-    if (ctx->wardrive_gps_type_overlay) {
-        lv_obj_del(ctx->wardrive_gps_type_overlay);
-        ctx->wardrive_gps_type_overlay = NULL;
-    }
-
-    // Create overlay
-    ctx->wardrive_gps_type_overlay = lv_obj_create(ctx->wardrive_page);
-    lv_obj_remove_style_all(ctx->wardrive_gps_type_overlay);
-    lv_obj_set_size(ctx->wardrive_gps_type_overlay, lv_pct(100), lv_pct(100));
-    lv_obj_set_style_bg_color(ctx->wardrive_gps_type_overlay, lv_color_hex(0x000000), 0);
-    lv_obj_set_style_bg_opa(ctx->wardrive_gps_type_overlay, LV_OPA_70, 0);
-    lv_obj_clear_flag(ctx->wardrive_gps_type_overlay, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(ctx->wardrive_gps_type_overlay, LV_OBJ_FLAG_CLICKABLE);
-
-    // Create popup
-    lv_obj_t *popup = lv_obj_create(ctx->wardrive_gps_type_overlay);
-    lv_obj_set_size(popup, 450, 280);
-    lv_obj_center(popup);
-    lv_obj_set_style_bg_color(popup, lv_color_hex(0x1A1A2A), 0);
-    lv_obj_set_style_border_color(popup, COLOR_MATERIAL_TEAL, 0);
-    lv_obj_set_style_border_width(popup, 3, 0);
-    lv_obj_set_style_radius(popup, 16, 0);
-    lv_obj_set_style_shadow_width(popup, 30, 0);
-    lv_obj_set_style_shadow_color(popup, lv_color_hex(0x000000), 0);
-    lv_obj_set_style_shadow_opa(popup, LV_OPA_50, 0);
-    lv_obj_set_style_pad_all(popup, 20, 0);
-    lv_obj_set_flex_flow(popup, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(popup, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_row(popup, 12, 0);
-    lv_obj_clear_flag(popup, LV_OBJ_FLAG_SCROLLABLE);
-
-    // Title
-    lv_obj_t *title = lv_label_create(popup);
-    lv_label_set_text(title, "GPS Type");
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
-    lv_obj_set_style_text_color(title, COLOR_MATERIAL_TEAL, 0);
-
-    // Buttons row
-    lv_obj_t *btn_row = lv_obj_create(popup);
-    lv_obj_set_size(btn_row, lv_pct(100), LV_SIZE_CONTENT);
-    lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(btn_row, 0, 0);
-    lv_obj_set_style_pad_all(btn_row, 0, 0);
-    lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_column(btn_row, 12, 0);
-    lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
-
-    // Set M5 button
-    lv_obj_t *m5_btn = lv_btn_create(btn_row);
-    lv_obj_set_size(m5_btn, 120, 50);
-    lv_obj_set_style_bg_color(m5_btn, COLOR_MATERIAL_TEAL, 0);
-    lv_obj_set_style_radius(m5_btn, 8, 0);
-    lv_obj_add_event_cb(m5_btn, wardrive_gps_set_m5_cb, LV_EVENT_CLICKED, ctx);
-
-    lv_obj_t *m5_label = lv_label_create(m5_btn);
-    lv_label_set_text(m5_label, "Set M5");
-    lv_obj_set_style_text_font(m5_label, &lv_font_montserrat_16, 0);
-    lv_obj_center(m5_label);
-
-    // Set ATGM button
-    lv_obj_t *atgm_btn = lv_btn_create(btn_row);
-    lv_obj_set_size(atgm_btn, 120, 50);
-    lv_obj_set_style_bg_color(atgm_btn, COLOR_MATERIAL_TEAL, 0);
-    lv_obj_set_style_radius(atgm_btn, 8, 0);
-    lv_obj_add_event_cb(atgm_btn, wardrive_gps_set_atgm_cb, LV_EVENT_CLICKED, ctx);
-
-    lv_obj_t *atgm_label = lv_label_create(atgm_btn);
-    lv_label_set_text(atgm_label, "Set ATGM");
-    lv_obj_set_style_text_font(atgm_label, &lv_font_montserrat_16, 0);
-    lv_obj_center(atgm_label);
-
-    // Set External button
-    lv_obj_t *usb_btn = lv_btn_create(btn_row);
-    lv_obj_set_size(usb_btn, 120, 50);
-    lv_obj_set_style_bg_color(usb_btn, COLOR_MATERIAL_TEAL, 0);
-    lv_obj_set_style_radius(usb_btn, 8, 0);
-    lv_obj_add_event_cb(usb_btn, wardrive_gps_set_external_cb, LV_EVENT_CLICKED, ctx);
-
-    lv_obj_t *usb_label = lv_label_create(usb_btn);
-    lv_label_set_text(usb_label, "Set External");
-    lv_obj_set_style_text_font(usb_label, &lv_font_montserrat_16, 0);
-    lv_obj_center(usb_label);
-
-    // Response label
-    ctx->wardrive_gps_type_response_label = lv_label_create(popup);
-    lv_label_set_text(ctx->wardrive_gps_type_response_label, "");
-    lv_obj_set_style_text_font(ctx->wardrive_gps_type_response_label, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(ctx->wardrive_gps_type_response_label, lv_color_hex(0x888888), 0);
-    lv_obj_set_style_text_align(ctx->wardrive_gps_type_response_label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_width(ctx->wardrive_gps_type_response_label, lv_pct(95));
-    lv_label_set_long_mode(ctx->wardrive_gps_type_response_label, LV_LABEL_LONG_WRAP);
-
-    // Close button
-    lv_obj_t *close_btn = lv_btn_create(popup);
-    lv_obj_set_size(close_btn, 120, 45);
-    lv_obj_set_style_bg_color(close_btn, lv_color_hex(0x444444), 0);
-    lv_obj_set_style_radius(close_btn, 8, 0);
-    lv_obj_add_event_cb(close_btn, wardrive_gps_type_close_cb, LV_EVENT_CLICKED, ctx);
-
-    lv_obj_t *close_label = lv_label_create(close_btn);
-    lv_label_set_text(close_label, "Close");
-    lv_obj_set_style_text_font(close_label, &lv_font_montserrat_16, 0);
-    lv_obj_center(close_label);
-}
-
 static bool wardrive_tab_has_sd_card(tab_id_t tab)
 {
     if (tab_is_internal(tab)) {
@@ -17201,9 +17576,11 @@ static void close_wardrive_upload_menu(tab_context_t *ctx)
         ctx->wardrive_upload_menu_overlay = NULL;
         ctx->wardrive_upload_menu_popup = NULL;
     }
+    // A manual close means: next open should re-fetch the listing.
+    ctx->wardrive_upload_menu_loaded = false;
 }
 
-static void close_wardrive_wigle_popup_ctx(tab_context_t *ctx)
+static void close_wardrive_wigle_provider_popup(tab_context_t *ctx)
 {
     if (!ctx) {
         return;
@@ -17216,6 +17593,7 @@ static void close_wardrive_wigle_popup_ctx(tab_context_t *ctx)
     ctx->wardrive_wigle_selected_ssid[0] = '\0';
     ctx->wardrive_wigle_selected_password[0] = '\0';
     ctx->wardrive_upload_provider = WARDRIVE_UPLOAD_PROVIDER_NONE;
+    ctx->wardrive_upload_mode = WARDRIVE_UPLOAD_MODE_SELECTED;
 
     if (ctx->wardrive_wigle_popup_overlay) {
         lv_obj_del(ctx->wardrive_wigle_popup_overlay);
@@ -17224,6 +17602,9 @@ static void close_wardrive_wigle_popup_ctx(tab_context_t *ctx)
         ctx->wardrive_wigle_status_label = NULL;
         ctx->wardrive_wigle_list = NULL;
         ctx->wardrive_wigle_send_btn = NULL;
+        ctx->wardrive_wigle_sync_btn = NULL;
+        ctx->wardrive_wigle_all_btn = NULL;
+        ctx->wardrive_wigle_batch_row = NULL;
         ctx->wardrive_wigle_keyboard = NULL;
         ctx->wardrive_wigle_ssid_input = NULL;
         ctx->wardrive_wigle_password_input = NULL;
@@ -17241,10 +17622,24 @@ static void close_wardrive_wigle_popup_ctx(tab_context_t *ctx)
         ctx->wardrive_wigle_next_btn = NULL;
     }
 
+    if (ctx->wardrive_upload_btn && !ctx->wardrive_monitoring) {
+        lv_obj_clear_state(ctx->wardrive_upload_btn, LV_STATE_DISABLED);
+    }
+}
+
+static void close_wardrive_wigle_popup_ctx(tab_context_t *ctx)
+{
+    if (!ctx) {
+        return;
+    }
+
+    close_wardrive_wigle_provider_popup(ctx);
+
     if (ctx->wardrive_wigle_files) {
         free(ctx->wardrive_wigle_files);
         ctx->wardrive_wigle_files = NULL;
     }
+    wardrive_upload_state_reset(ctx);
     ctx->wardrive_wigle_file_count = 0;
     ctx->wardrive_wigle_selected_count = 0;
     ctx->wardrive_wigle_page = 0;
@@ -17258,7 +17653,14 @@ static void wardrive_wigle_close_cb(lv_event_t *e)
 {
     tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
     if (!ctx) ctx = get_current_ctx();
-    close_wardrive_wigle_popup_ctx(ctx);
+    bool refresh_after_upload = (ctx && ctx->wardrive_wigle_upload_done);
+    close_wardrive_wigle_provider_popup(ctx);
+    if (ctx && ctx->wardrive_page && !ctx->wardrive_upload_menu_overlay) {
+        ctx->wardrive_upload_menu_loaded =
+            !refresh_after_upload &&
+            (ctx->wardrive_wigle_files != NULL && ctx->wardrive_wigle_file_count > 0);
+        show_wardrive_upload_menu(ctx);
+    }
 }
 
 static void wardrive_upload_menu_close_cb(lv_event_t *e)
@@ -17268,6 +17670,18 @@ static void wardrive_upload_menu_close_cb(lv_event_t *e)
         ctx = get_current_ctx();
     }
     close_wardrive_upload_menu(ctx);
+}
+
+static void hide_wardrive_upload_menu_keep_cache(tab_context_t *ctx)
+{
+    if (!ctx) {
+        return;
+    }
+    if (ctx->wardrive_upload_menu_overlay) {
+        lv_obj_del(ctx->wardrive_upload_menu_overlay);
+        ctx->wardrive_upload_menu_overlay = NULL;
+        ctx->wardrive_upload_menu_popup = NULL;
+    }
 }
 
 static void wardrive_upload_wigle_btn_cb(lv_event_t *e)
@@ -17280,7 +17694,7 @@ static void wardrive_upload_wigle_btn_cb(lv_event_t *e)
         return;
     }
 
-    close_wardrive_upload_menu(ctx);
+    hide_wardrive_upload_menu_keep_cache(ctx);
     show_wardrive_upload_popup(ctx, WARDRIVE_UPLOAD_PROVIDER_WIGLE);
 }
 
@@ -17294,8 +17708,54 @@ static void wardrive_upload_wdgwars_btn_cb(lv_event_t *e)
         return;
     }
 
-    close_wardrive_upload_menu(ctx);
+    hide_wardrive_upload_menu_keep_cache(ctx);
     show_wardrive_upload_popup(ctx, WARDRIVE_UPLOAD_PROVIDER_WDGWARS);
+}
+
+// Background task: fetch the wardrive file listing over UART (off the UI thread so
+// the menu spinner keeps animating), then ask the LVGL thread to rebuild the menu.
+static void wardrive_upload_menu_load_task(void *arg)
+{
+    tab_context_t *ctx = (tab_context_t *)arg;
+    if (!ctx) {
+        vTaskDelete(NULL);
+        return;
+    }
+
+    tab_id_t tab = tab_id_for_ctx(ctx);
+    uart_port_t uart_port = uart_port_for_tab(tab);
+    wardrive_wigle_load_file_list(ctx, tab, uart_port);
+    wardrive_load_upload_state_from_command(ctx, tab, uart_port, 10000);
+
+    ctx->wardrive_upload_menu_loaded = true;
+    ctx->wardrive_upload_menu_loading = false;
+    ctx->wardrive_upload_menu_task = NULL;
+    lv_async_call(wardrive_upload_menu_load_async_render, ctx);
+    vTaskDelete(NULL);
+}
+
+// Runs on the LVGL thread once the background loader finished: rebuild the still-open
+// menu so it renders the file list from the now-populated ctx cache.
+static void wardrive_upload_menu_load_async_render(void *user_data)
+{
+    tab_context_t *ctx = (tab_context_t *)user_data;
+    if (!ctx) {
+        return;
+    }
+
+    bool same_tab = (tab_id_for_ctx(ctx) == current_tab);
+    if (!ctx->wardrive_upload_menu_overlay || !same_tab) {
+        // Menu was closed (or tab switched) while loading; drop the staged data.
+        ctx->wardrive_upload_menu_loaded = false;
+        return;
+    }
+
+    // Tear down the spinner popup directly (NOT via close_wardrive_upload_menu,
+    // which would clear wardrive_upload_menu_loaded) and reopen rendering the cache.
+    lv_obj_del(ctx->wardrive_upload_menu_overlay);
+    ctx->wardrive_upload_menu_overlay = NULL;
+    ctx->wardrive_upload_menu_popup = NULL;
+    show_wardrive_upload_menu(ctx);
 }
 
 static void show_wardrive_upload_menu(tab_context_t *ctx)
@@ -17315,53 +17775,411 @@ static void show_wardrive_upload_menu(tab_context_t *ctx)
     lv_obj_move_foreground(ctx->wardrive_upload_menu_overlay);
 
     ctx->wardrive_upload_menu_popup = lv_obj_create(ctx->wardrive_upload_menu_overlay);
-    lv_obj_set_size(ctx->wardrive_upload_menu_popup, 380, LV_SIZE_CONTENT);
+    lv_obj_set_size(ctx->wardrive_upload_menu_popup, lv_pct(85), lv_pct(85));
     lv_obj_center(ctx->wardrive_upload_menu_popup);
-    style_popup_card(ctx->wardrive_upload_menu_popup, 14, COLOR_MATERIAL_PURPLE);
+    lv_obj_set_style_bg_color(ctx->wardrive_upload_menu_popup, lv_color_hex(0x1A1A2A), 0);
+    lv_obj_set_style_border_color(ctx->wardrive_upload_menu_popup, COLOR_MATERIAL_TEAL, 0);
+    lv_obj_set_style_border_width(ctx->wardrive_upload_menu_popup, 2, 0);
+    lv_obj_set_style_radius(ctx->wardrive_upload_menu_popup, 16, 0);
+    lv_obj_set_style_shadow_width(ctx->wardrive_upload_menu_popup, 30, 0);
+    lv_obj_set_style_shadow_color(ctx->wardrive_upload_menu_popup, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_shadow_opa(ctx->wardrive_upload_menu_popup, LV_OPA_60, 0);
     lv_obj_set_style_pad_all(ctx->wardrive_upload_menu_popup, 20, 0);
     lv_obj_set_style_pad_row(ctx->wardrive_upload_menu_popup, 12, 0);
     lv_obj_set_flex_flow(ctx->wardrive_upload_menu_popup, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(ctx->wardrive_upload_menu_popup, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_flex_align(ctx->wardrive_upload_menu_popup, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_clear_flag(ctx->wardrive_upload_menu_popup, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *title = lv_label_create(ctx->wardrive_upload_menu_popup);
     lv_label_set_text(title, LV_SYMBOL_UPLOAD " Wardrive Upload");
     lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
-    lv_obj_set_style_text_color(title, COLOR_MATERIAL_PURPLE, 0);
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_TEAL, 0);
 
     lv_obj_t *subtitle = lv_label_create(ctx->wardrive_upload_menu_popup);
-    lv_label_set_text(subtitle, "Choose upload target");
+    lv_label_set_recolor(subtitle, true);
+    lv_label_set_text(subtitle, "Loading wardrive status...");
     lv_obj_set_style_text_font(subtitle, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(subtitle, lv_color_hex(0xCCCCCC), 0);
+    lv_obj_set_width(subtitle, lv_pct(95));
+    lv_obj_set_style_text_align(subtitle, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(subtitle, LV_LABEL_LONG_WRAP);
 
-    lv_obj_t *wigle_btn = lv_btn_create(ctx->wardrive_upload_menu_popup);
-    lv_obj_set_size(wigle_btn, lv_pct(100), 52);
+    // Window is split top/bottom: "To Upload" (files still on the card) over
+    // "Uploaded" (history of past upload attempts). Each half scrolls on its own.
+    lv_obj_t *upload_hdr = lv_label_create(ctx->wardrive_upload_menu_popup);
+    lv_label_set_text(upload_hdr, LV_SYMBOL_UPLOAD " To Upload");
+    lv_obj_set_style_text_font(upload_hdr, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(upload_hdr, COLOR_MATERIAL_TEAL, 0);
+    lv_obj_set_width(upload_hdr, lv_pct(100));
+    lv_obj_set_style_text_align(upload_hdr, LV_TEXT_ALIGN_CENTER, 0);
+
+    lv_obj_t *file_list = lv_obj_create(ctx->wardrive_upload_menu_popup);
+    lv_obj_set_size(file_list, lv_pct(100), 0);
+    lv_obj_set_flex_grow(file_list, 1);
+    lv_obj_set_style_bg_color(file_list, lv_color_hex(0x111122), 0);
+    lv_obj_set_style_border_width(file_list, 0, 0);
+    lv_obj_set_style_radius(file_list, 8, 0);
+    lv_obj_set_style_pad_all(file_list, 8, 0);
+    lv_obj_set_style_pad_row(file_list, 6, 0);
+    lv_obj_set_flex_flow(file_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_scroll_dir(file_list, LV_DIR_VER);
+
+    lv_obj_t *uploaded_hdr = lv_label_create(ctx->wardrive_upload_menu_popup);
+    lv_label_set_text(uploaded_hdr, LV_SYMBOL_OK " Uploaded");
+    lv_obj_set_style_text_font(uploaded_hdr, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(uploaded_hdr, COLOR_MATERIAL_PURPLE, 0);
+    lv_obj_set_width(uploaded_hdr, lv_pct(100));
+    lv_obj_set_style_text_align(uploaded_hdr, LV_TEXT_ALIGN_CENTER, 0);
+
+    lv_obj_t *state_list = lv_obj_create(ctx->wardrive_upload_menu_popup);
+    lv_obj_set_size(state_list, lv_pct(100), 0);
+    lv_obj_set_flex_grow(state_list, 1);
+    lv_obj_set_style_bg_color(state_list, lv_color_hex(0x111122), 0);
+    lv_obj_set_style_border_width(state_list, 0, 0);
+    lv_obj_set_style_radius(state_list, 8, 0);
+    lv_obj_set_style_pad_all(state_list, 8, 0);
+    lv_obj_set_style_pad_row(state_list, 6, 0);
+    lv_obj_set_flex_flow(state_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_scroll_dir(state_list, LV_DIR_VER);
+
+    bool has_sd = wardrive_tab_has_sd_card(tab_id_for_ctx(ctx));
+
+    if (!has_sd) {
+        lv_label_set_text(subtitle, "No SD card detected on this tab.");
+    } else if (!ctx->wardrive_upload_menu_loaded) {
+        // Listing the files hashes several MB and takes ~40s. Do it on a background
+        // task with a live spinner; wardrive_upload_menu_load_task() rebuilds this
+        // menu (with wardrive_upload_menu_loaded == true) once the module is done.
+        lv_label_set_text(subtitle, "Reading wardrive files from module...");
+
+        // Hide the empty To Upload / Uploaded sections while loading so the spinner
+        // doesn't sit on top of the "Uploaded" header.
+        lv_obj_add_flag(upload_hdr, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(file_list, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(uploaded_hdr, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(state_list, LV_OBJ_FLAG_HIDDEN);
+
+        lv_obj_t *spin_box = lv_obj_create(ctx->wardrive_upload_menu_popup);
+        lv_obj_remove_style_all(spin_box);
+        lv_obj_set_size(spin_box, lv_pct(100), lv_pct(100));
+        lv_obj_add_flag(spin_box, LV_OBJ_FLAG_IGNORE_LAYOUT);
+        lv_obj_clear_flag(spin_box, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_align(spin_box, LV_ALIGN_CENTER, 0, 0);
+
+        lv_obj_t *spinner = lv_spinner_create(spin_box);
+        lv_obj_set_size(spinner, 80, 80);
+        lv_spinner_set_anim_params(spinner, 1000, 200);
+        lv_obj_set_style_arc_color(spinner, COLOR_MATERIAL_TEAL, LV_PART_INDICATOR);
+        lv_obj_center(spinner);
+        lv_obj_move_foreground(spin_box);
+
+        if (!ctx->wardrive_upload_menu_loading) {
+            ctx->wardrive_upload_menu_loading = true;
+            if (xTaskCreate(wardrive_upload_menu_load_task, "wd_menu_ld", 8192, ctx, 5,
+                            &ctx->wardrive_upload_menu_task) != pdTRUE) {
+                ctx->wardrive_upload_menu_loading = false;
+                ctx->wardrive_upload_menu_task = NULL;
+                lv_label_set_text(subtitle, "Failed to start file loader task.");
+            }
+        }
+    } else {
+        // Data already fetched by the background task — render from cache.
+        ctx->wardrive_upload_menu_loaded = false;
+
+        char summary[320];
+        wardrive_format_summary_text(&ctx->wardrive_file_summary, summary, sizeof(summary));
+        if (summary[0] != '\0') {
+            lv_label_set_text(subtitle, summary);
+        } else if (ctx->wardrive_wigle_file_count > 0) {
+            lv_label_set_text_fmt(subtitle, "Found %d wardrive file(s).",
+                                  ctx->wardrive_wigle_file_count);
+        } else {
+            lv_label_set_text(subtitle, "No Wardrive LOG/TXT/CSV files found.");
+        }
+
+        // A working-dir file still belongs in "To Upload" until it is uploaded to
+        // BOTH services. Once wigle+wdgwars are both done it moves to the journal
+        // (Uploaded section) and is dropped from this list.
+        int attention_files = 0;
+        int bad_files = 0;
+        for (int i = 0; i < ctx->wardrive_wigle_file_count; i++) {
+            wardrive_wigle_file_t *file = &ctx->wardrive_wigle_files[i];
+            if (file->name[0] == '\0') {
+                continue;
+            }
+            bool both_done = (strcmp(file->wigle_status, "done") == 0 &&
+                              strcmp(file->wdgwars_status, "done") == 0);
+            if (!both_done) {
+                attention_files++;
+                if (file->bad_rows > 0) {
+                    bad_files++;
+                }
+            }
+        }
+
+        lv_obj_t *files_title = lv_label_create(file_list);
+        if (attention_files > 0) {
+            lv_label_set_text_fmt(files_title, "%d file(s) to upload", attention_files);
+        } else if (ctx->wardrive_wigle_file_count > 0) {
+            lv_label_set_text(files_title, "All files uploaded");
+        } else {
+            lv_label_set_text(files_title, "No files to upload");
+        }
+        lv_obj_set_style_text_font(files_title, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(files_title, COLOR_MATERIAL_TEAL, 0);
+        lv_obj_set_width(files_title, lv_pct(100));
+        lv_obj_set_style_text_align(files_title, LV_TEXT_ALIGN_CENTER, 0);
+
+        if (bad_files > 0) {
+            lv_obj_t *bad_note = lv_label_create(file_list);
+            lv_label_set_text_fmt(bad_note,
+                                  "%d file(s) contain bad rows - tap Fix to repair before upload",
+                                  bad_files);
+            lv_obj_set_style_text_font(bad_note, &lv_font_montserrat_12, 0);
+            lv_obj_set_style_text_color(bad_note, COLOR_MATERIAL_AMBER, 0);
+            lv_obj_set_width(bad_note, lv_pct(100));
+            lv_obj_set_style_text_align(bad_note, LV_TEXT_ALIGN_CENTER, 0);
+            lv_label_set_long_mode(bad_note, LV_LABEL_LONG_WRAP);
+        }
+
+        if (attention_files == 0 && ctx->wardrive_wigle_file_count > 0) {
+            lv_obj_t *none_lbl = lv_label_create(file_list);
+            lv_label_set_text(none_lbl, "Nothing to send - see Uploaded below.");
+            lv_obj_set_style_text_font(none_lbl, &lv_font_montserrat_14, 0);
+            lv_obj_set_style_text_color(none_lbl, lv_color_hex(0xAAAAAA), 0);
+            lv_obj_set_width(none_lbl, lv_pct(100));
+            lv_obj_set_style_text_align(none_lbl, LV_TEXT_ALIGN_CENTER, 0);
+        }
+
+        // Newest first (files auto-increment wN.log, so the last entry is the most
+        // recent). Keep this screen compact; the full list lives in Wardrive Files
+        // and the provider popup. Files already done on both services are skipped -
+        // they live in the Uploaded journal below.
+        const int preview_cap = 6;
+        int total_files = ctx->wardrive_wigle_file_count;
+        int shown = 0;
+        for (int disp = 0; disp < total_files && shown < preview_cap; disp++) {
+            int i = total_files - 1 - disp; // reverse order
+            wardrive_wigle_file_t *file = &ctx->wardrive_wigle_files[i];
+            if (file->name[0] == '\0') {
+                continue;
+            }
+            if (strcmp(file->wigle_status, "done") == 0 &&
+                strcmp(file->wdgwars_status, "done") == 0) {
+                continue; // fully uploaded -> shown in the Uploaded section
+            }
+
+            lv_color_t card_bg, card_border, card_title;
+            wardrive_file_card_palette(file, &card_bg, &card_border, &card_title);
+
+            lv_obj_t *row = lv_obj_create(file_list);
+            lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
+            lv_obj_set_style_bg_color(row, card_bg, 0);
+            lv_obj_set_style_border_width(row, 1, 0);
+            lv_obj_set_style_border_color(row, card_border, 0);
+            lv_obj_set_style_radius(row, 6, 0);
+            lv_obj_set_style_pad_all(row, 8, 0);
+            lv_obj_set_style_pad_row(row, 4, 0);
+            lv_obj_set_flex_flow(row, LV_FLEX_FLOW_COLUMN);
+            lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+            lv_obj_t *name_lbl = lv_label_create(row);
+            lv_label_set_text(name_lbl, file->name);
+            lv_obj_set_style_text_font(name_lbl, &lv_font_montserrat_16, 0);
+            lv_obj_set_style_text_color(name_lbl, card_title, 0);
+            lv_obj_set_width(name_lbl, lv_pct(100));
+            lv_label_set_long_mode(name_lbl, LV_LABEL_LONG_DOT);
+
+            char detail[224];
+            wardrive_format_file_detail_rich(file, detail, sizeof(detail));
+            if (detail[0] != '\0') {
+                lv_obj_t *detail_lbl = lv_label_create(row);
+                lv_label_set_recolor(detail_lbl, true);
+                lv_label_set_text(detail_lbl, detail);
+                lv_obj_set_style_text_font(detail_lbl, &lv_font_montserrat_14, 0);
+                lv_obj_set_style_text_color(detail_lbl, lv_color_hex(0xCCCCCC), 0);
+                lv_obj_set_width(detail_lbl, lv_pct(100));
+                lv_label_set_long_mode(detail_lbl, LV_LABEL_LONG_WRAP);
+            }
+
+            // Bad rows can't be uploaded as-is; offer an inline repair that runs
+            // wardrive_fix on the module (original file is left untouched).
+            if (file->bad_rows > 0 && has_sd) {
+                lv_obj_t *fix_btn = lv_btn_create(row);
+                lv_obj_set_size(fix_btn, 120, 38);
+                lv_obj_set_style_bg_color(fix_btn, COLOR_MATERIAL_TEAL, 0);
+                lv_obj_set_style_bg_color(fix_btn, lv_color_hex(0x00796B), LV_STATE_PRESSED);
+                lv_obj_set_style_bg_color(fix_btn, lv_color_hex(0x555555), LV_STATE_DISABLED);
+                lv_obj_set_style_radius(fix_btn, 8, 0);
+                lv_obj_set_style_shadow_width(fix_btn, 0, 0);
+                lv_obj_add_event_cb(fix_btn, wardrive_fix_file_cb, LV_EVENT_CLICKED,
+                                    compromised_make_user_data(COMPROMISED_FILE_KIND_WARDRIVE, i));
+
+                lv_obj_t *fix_lbl = lv_label_create(fix_btn);
+                lv_label_set_text(fix_lbl, LV_SYMBOL_REFRESH " Fix");
+                lv_obj_set_style_text_font(fix_lbl, &lv_font_montserrat_14, 0);
+                lv_obj_set_style_text_color(fix_lbl, lv_color_hex(0xFFFFFF), 0);
+                lv_obj_center(fix_lbl);
+            }
+            shown++;
+        }
+
+        if (attention_files > shown) {
+            lv_obj_t *more_lbl = lv_label_create(file_list);
+            lv_label_set_text_fmt(more_lbl, "%d more file(s) to upload hidden here - open Wardrive Files for the full list",
+                                  attention_files - shown);
+            lv_obj_set_style_text_font(more_lbl, &lv_font_montserrat_12, 0);
+            lv_obj_set_style_text_color(more_lbl, lv_color_hex(0xAAAAAA), 0);
+            lv_obj_set_width(more_lbl, lv_pct(100));
+            lv_obj_set_style_text_align(more_lbl, LV_TEXT_ALIGN_CENTER, 0);
+        }
+
+        if (ctx->wardrive_upload_state_loaded) {
+            lv_obj_t *state_title = lv_label_create(state_list);
+            lv_label_set_text_fmt(state_title, "Upload status: %d entr%s",
+                                  ctx->wardrive_upload_state_count,
+                                  ctx->wardrive_upload_state_count == 1 ? "y" : "ies");
+            lv_obj_set_style_text_font(state_title, &lv_font_montserrat_14, 0);
+            lv_obj_set_style_text_color(state_title, COLOR_MATERIAL_PURPLE, 0);
+            lv_obj_set_width(state_title, lv_pct(100));
+            lv_obj_set_style_text_align(state_title, LV_TEXT_ALIGN_CENTER, 0);
+
+            int state_shown = 0;
+            const int state_preview_cap = 6;
+            for (int disp = 0; disp < ctx->wardrive_upload_state_count &&
+                               state_shown < state_preview_cap; disp++) {
+                int i = ctx->wardrive_upload_state_count - 1 - disp;
+                wardrive_upload_state_entry_t *entry = &ctx->wardrive_upload_state_entries[i];
+                if (entry->filename[0] == '\0') {
+                    continue;
+                }
+
+                lv_color_t card_bg, card_border, card_title;
+                wardrive_status_card_palette(entry->status, entry->bad_rows,
+                                             &card_bg, &card_border, &card_title);
+
+                lv_obj_t *row = lv_obj_create(state_list);
+                lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
+                lv_obj_set_style_bg_color(row, card_bg, 0);
+                lv_obj_set_style_border_width(row, 1, 0);
+                lv_obj_set_style_border_color(row, card_border, 0);
+                lv_obj_set_style_radius(row, 6, 0);
+                lv_obj_set_style_pad_all(row, 8, 0);
+                lv_obj_set_style_pad_row(row, 4, 0);
+                lv_obj_set_flex_flow(row, LV_FLEX_FLOW_COLUMN);
+                lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+                lv_obj_t *name_lbl = lv_label_create(row);
+                lv_label_set_text(name_lbl, entry->filename);
+                lv_obj_set_style_text_font(name_lbl, &lv_font_montserrat_16, 0);
+                lv_obj_set_style_text_color(name_lbl, card_title, 0);
+                lv_obj_set_width(name_lbl, lv_pct(100));
+                lv_label_set_long_mode(name_lbl, LV_LABEL_LONG_DOT);
+
+                char detail[192];
+                wardrive_format_upload_state_entry(entry, detail, sizeof(detail));
+                lv_obj_t *detail_lbl = lv_label_create(row);
+                lv_label_set_recolor(detail_lbl, true);
+                lv_label_set_text(detail_lbl, detail);
+                lv_obj_set_style_text_font(detail_lbl, &lv_font_montserrat_14, 0);
+                lv_obj_set_style_text_color(detail_lbl, lv_color_hex(0xCCCCCC), 0);
+                lv_obj_set_width(detail_lbl, lv_pct(100));
+                lv_label_set_long_mode(detail_lbl, LV_LABEL_LONG_WRAP);
+                state_shown++;
+            }
+
+            if (ctx->wardrive_upload_state_count > state_shown) {
+                lv_obj_t *more_state = lv_label_create(state_list);
+                lv_label_set_text_fmt(more_state,
+                                      "%d older status entr%s hidden - open Wardrive Files for the full history",
+                                      ctx->wardrive_upload_state_count - state_shown,
+                                      (ctx->wardrive_upload_state_count - state_shown) == 1 ? "y" : "ies");
+                lv_obj_set_style_text_font(more_state, &lv_font_montserrat_12, 0);
+                lv_obj_set_style_text_color(more_state, lv_color_hex(0xAAAAAA), 0);
+                lv_obj_set_width(more_state, lv_pct(100));
+                lv_obj_set_style_text_align(more_state, LV_TEXT_ALIGN_CENTER, 0);
+                lv_label_set_long_mode(more_state, LV_LABEL_LONG_WRAP);
+            }
+        } else {
+            lv_obj_t *no_state = lv_label_create(state_list);
+            lv_label_set_text(no_state, "No upload history yet.");
+            lv_obj_set_style_text_font(no_state, &lv_font_montserrat_14, 0);
+            lv_obj_set_style_text_color(no_state, lv_color_hex(0xAAAAAA), 0);
+            lv_obj_set_width(no_state, lv_pct(100));
+            lv_obj_set_style_text_align(no_state, LV_TEXT_ALIGN_CENTER, 0);
+        }
+    }
+
+    bool actions_enabled = has_sd && !ctx->wardrive_upload_menu_loading &&
+                           ctx->wardrive_wigle_file_count > 0;
+
+    lv_obj_t *button_row = lv_obj_create(ctx->wardrive_upload_menu_popup);
+    lv_obj_set_size(button_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(button_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(button_row, 0, 0);
+    lv_obj_set_style_pad_all(button_row, 0, 0);
+    lv_obj_set_style_pad_column(button_row, 10, 0);
+    lv_obj_set_flex_flow(button_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(button_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(button_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *wigle_btn = lv_btn_create(button_row);
+    lv_obj_set_height(wigle_btn, 48);
+    lv_obj_set_flex_grow(wigle_btn, 3);
     lv_obj_set_style_bg_color(wigle_btn, COLOR_MATERIAL_TEAL, 0);
     lv_obj_set_style_bg_color(wigle_btn, lv_color_hex(0x00897B), LV_STATE_PRESSED);
     lv_obj_set_style_radius(wigle_btn, 10, 0);
     lv_obj_add_event_cb(wigle_btn, wardrive_upload_wigle_btn_cb, LV_EVENT_CLICKED, ctx);
+    if (!actions_enabled) {
+        lv_obj_add_state(wigle_btn, LV_STATE_DISABLED);
+        lv_obj_set_style_bg_color(wigle_btn, lv_color_hex(0x555555), LV_STATE_DISABLED);
+    }
 
     lv_obj_t *wigle_lbl = lv_label_create(wigle_btn);
     lv_label_set_text(wigle_lbl, "WiGLE");
-    lv_obj_set_style_text_font(wigle_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(wigle_lbl, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(wigle_lbl, lv_color_hex(0xFFFFFF), 0);
     lv_obj_center(wigle_lbl);
 
-    lv_obj_t *wdgwars_btn = lv_btn_create(ctx->wardrive_upload_menu_popup);
-    lv_obj_set_size(wdgwars_btn, lv_pct(100), 52);
+    lv_obj_t *wdgwars_btn = lv_btn_create(button_row);
+    lv_obj_set_height(wdgwars_btn, 48);
+    lv_obj_set_flex_grow(wdgwars_btn, 3);
     lv_obj_set_style_bg_color(wdgwars_btn, lv_color_hex(0x455A64), 0);
     lv_obj_set_style_bg_color(wdgwars_btn, lv_color_hex(0x37474F), LV_STATE_PRESSED);
     lv_obj_set_style_radius(wdgwars_btn, 10, 0);
     lv_obj_add_event_cb(wdgwars_btn, wardrive_upload_wdgwars_btn_cb, LV_EVENT_CLICKED, ctx);
+    if (!actions_enabled) {
+        lv_obj_add_state(wdgwars_btn, LV_STATE_DISABLED);
+        lv_obj_set_style_bg_color(wdgwars_btn, lv_color_hex(0x555555), LV_STATE_DISABLED);
+    }
 
     lv_obj_t *wdgwars_lbl = lv_label_create(wdgwars_btn);
     lv_label_set_text(wdgwars_lbl, "WDGWars");
-    lv_obj_set_style_text_font(wdgwars_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(wdgwars_lbl, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(wdgwars_lbl, lv_color_hex(0xFFFFFF), 0);
     lv_obj_center(wdgwars_lbl);
 
-    lv_obj_t *close_btn = lv_btn_create(ctx->wardrive_upload_menu_popup);
-    lv_obj_set_size(close_btn, 120, 42);
+    lv_obj_t *archive_btn = lv_btn_create(button_row);
+    lv_obj_set_height(archive_btn, 48);
+    lv_obj_set_flex_grow(archive_btn, 3);
+    lv_obj_set_style_bg_color(archive_btn, COLOR_MATERIAL_AMBER, 0);
+    lv_obj_set_style_bg_color(archive_btn, lv_color_hex(0xFFA000), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(archive_btn, 10, 0);
+    lv_obj_add_event_cb(archive_btn, wardrive_cleanup_dry_run_cb, LV_EVENT_CLICKED, ctx);
+    if (!actions_enabled) {
+        lv_obj_add_state(archive_btn, LV_STATE_DISABLED);
+        lv_obj_set_style_bg_color(archive_btn, lv_color_hex(0x555555), LV_STATE_DISABLED);
+    }
+
+    lv_obj_t *archive_lbl = lv_label_create(archive_btn);
+    lv_label_set_text(archive_lbl, LV_SYMBOL_TRASH " Archive done");
+    lv_obj_set_style_text_font(archive_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(archive_lbl, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_center(archive_lbl);
+
+    lv_obj_t *close_btn = lv_btn_create(button_row);
+    lv_obj_set_height(close_btn, 48);
+    lv_obj_set_flex_grow(close_btn, 2);
     lv_obj_set_style_bg_color(close_btn, lv_color_hex(0x444444), 0);
     lv_obj_set_style_bg_color(close_btn, lv_color_hex(0x555555), LV_STATE_PRESSED);
     lv_obj_set_style_radius(close_btn, 8, 0);
@@ -17383,6 +18201,9 @@ static void wardrive_wigle_update_send_btn(tab_context_t *ctx)
     if (ctx->wardrive_wigle_upload_done) {
         // Upload finished successfully: hide Send, hide Stop, hide spinner, green Close
         lv_obj_add_flag(ctx->wardrive_wigle_send_btn, LV_OBJ_FLAG_HIDDEN);
+        if (ctx->wardrive_wigle_batch_row) {
+            lv_obj_add_flag(ctx->wardrive_wigle_batch_row, LV_OBJ_FLAG_HIDDEN);
+        }
         if (ctx->wardrive_wigle_stop_btn) {
             lv_obj_add_flag(ctx->wardrive_wigle_stop_btn, LV_OBJ_FLAG_HIDDEN);
         }
@@ -17399,6 +18220,9 @@ static void wardrive_wigle_update_send_btn(tab_context_t *ctx)
     if (ctx->wardrive_wigle_task_running) {
         // Task in progress: hide Send, show Stop, show spinner
         lv_obj_add_flag(ctx->wardrive_wigle_send_btn, LV_OBJ_FLAG_HIDDEN);
+        if (ctx->wardrive_wigle_batch_row) {
+            lv_obj_add_flag(ctx->wardrive_wigle_batch_row, LV_OBJ_FLAG_HIDDEN);
+        }
         if (ctx->wardrive_wigle_stop_btn) {
             lv_obj_clear_flag(ctx->wardrive_wigle_stop_btn, LV_OBJ_FLAG_HIDDEN);
         }
@@ -17410,6 +18234,9 @@ static void wardrive_wigle_update_send_btn(tab_context_t *ctx)
 
     // Idle: show Send (enabled/disabled), hide Stop, hide spinner
     lv_obj_clear_flag(ctx->wardrive_wigle_send_btn, LV_OBJ_FLAG_HIDDEN);
+    if (ctx->wardrive_wigle_batch_row) {
+        lv_obj_clear_flag(ctx->wardrive_wigle_batch_row, LV_OBJ_FLAG_HIDDEN);
+    }
     if (ctx->wardrive_wigle_stop_btn) {
         lv_obj_add_flag(ctx->wardrive_wigle_stop_btn, LV_OBJ_FLAG_HIDDEN);
     }
@@ -17420,6 +18247,13 @@ static void wardrive_wigle_update_send_btn(tab_context_t *ctx)
         lv_obj_add_state(ctx->wardrive_wigle_send_btn, LV_STATE_DISABLED);
     } else {
         lv_obj_clear_state(ctx->wardrive_wigle_send_btn, LV_STATE_DISABLED);
+    }
+    if (ctx->wardrive_wigle_file_count <= 0) {
+        if (ctx->wardrive_wigle_sync_btn) lv_obj_add_state(ctx->wardrive_wigle_sync_btn, LV_STATE_DISABLED);
+        if (ctx->wardrive_wigle_all_btn) lv_obj_add_state(ctx->wardrive_wigle_all_btn, LV_STATE_DISABLED);
+    } else {
+        if (ctx->wardrive_wigle_sync_btn) lv_obj_clear_state(ctx->wardrive_wigle_sync_btn, LV_STATE_DISABLED);
+        if (ctx->wardrive_wigle_all_btn) lv_obj_clear_state(ctx->wardrive_wigle_all_btn, LV_STATE_DISABLED);
     }
 }
 
@@ -17501,6 +18335,108 @@ static bool wardrive_wigle_extract_csv_token(const char *line, char *out, size_t
     return strlen(out) > 0;
 }
 
+static bool wardrive_marker_get_value(const char *line, const char *key, char *out, size_t out_sz)
+{
+    if (!line || !key || !out || out_sz == 0) {
+        return false;
+    }
+    out[0] = '\0';
+
+    size_t key_len = strlen(key);
+    const char *p = line;
+    while ((p = strstr(p, key)) != NULL) {
+        bool key_boundary = (p == line) || isspace((unsigned char)p[-1]);
+        if (key_boundary && p[key_len] == '=') {
+            const char *value = p + key_len + 1;
+            size_t len = 0;
+            while (value[len] && !isspace((unsigned char)value[len])) {
+                len++;
+            }
+            if (len >= out_sz) {
+                len = out_sz - 1;
+            }
+            memcpy(out, value, len);
+            out[len] = '\0';
+            return len > 0;
+        }
+        p += key_len;
+    }
+
+    return false;
+}
+
+static long wardrive_marker_get_long(const char *line, const char *key, long fallback)
+{
+    char value[24];
+    if (!wardrive_marker_get_value(line, key, value, sizeof(value))) {
+        return fallback;
+    }
+    return strtol(value, NULL, 10);
+}
+
+static int wardrive_marker_get_int(const char *line, const char *key, int fallback)
+{
+    return (int)wardrive_marker_get_long(line, key, fallback);
+}
+
+static void wardrive_upload_state_reset(tab_context_t *ctx)
+{
+    if (!ctx) {
+        return;
+    }
+    if (ctx->wardrive_upload_state_entries) {
+        free(ctx->wardrive_upload_state_entries);
+        ctx->wardrive_upload_state_entries = NULL;
+    }
+    ctx->wardrive_upload_state_count = 0;
+    ctx->wardrive_upload_state_loaded = false;
+}
+
+static bool wardrive_upload_state_alloc(tab_context_t *ctx)
+{
+    if (!ctx) {
+        return false;
+    }
+    wardrive_upload_state_reset(ctx);
+    ctx->wardrive_upload_state_entries = heap_caps_calloc(WARDRIVE_UPLOAD_STATE_MAX,
+                                                          sizeof(wardrive_upload_state_entry_t),
+                                                          MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!ctx->wardrive_upload_state_entries) {
+        ctx->wardrive_upload_state_entries = calloc(WARDRIVE_UPLOAD_STATE_MAX,
+                                                    sizeof(wardrive_upload_state_entry_t));
+    }
+    return ctx->wardrive_upload_state_entries != NULL;
+}
+
+static bool wardrive_parse_upload_state_line(tab_context_t *ctx, const char *line)
+{
+    if (!ctx || !line || !ctx->wardrive_upload_state_entries ||
+        ctx->wardrive_upload_state_count >= WARDRIVE_UPLOAD_STATE_MAX ||
+        strstr(line, "[UPLOAD_STATE] service=") == NULL) {
+        return false;
+    }
+
+    wardrive_upload_state_entry_t *entry =
+        &ctx->wardrive_upload_state_entries[ctx->wardrive_upload_state_count];
+    memset(entry, 0, sizeof(*entry));
+
+    if (!wardrive_marker_get_value(line, "service", entry->service, sizeof(entry->service)) ||
+        !wardrive_marker_get_value(line, "filename", entry->filename, sizeof(entry->filename))) {
+        memset(entry, 0, sizeof(*entry));
+        return false;
+    }
+
+    wardrive_marker_get_value(line, "hash", entry->hash, sizeof(entry->hash));
+    wardrive_marker_get_value(line, "status", entry->status, sizeof(entry->status));
+    entry->size_bytes = wardrive_marker_get_long(line, "size", 0);
+    entry->wifi_rows = wardrive_marker_get_int(line, "wifi", 0);
+    entry->ble_rows = wardrive_marker_get_int(line, "ble", 0);
+    entry->bt_rows = wardrive_marker_get_int(line, "bt", 0);
+    entry->bad_rows = wardrive_marker_get_int(line, "bad", 0);
+    ctx->wardrive_upload_state_count++;
+    return true;
+}
+
 static bool wardrive_wigle_store_file(tab_context_t *ctx, const char *dir, const char *token)
 {
     if (!ctx || !dir || !token || !ctx->wardrive_wigle_files ||
@@ -17533,10 +18469,505 @@ static bool wardrive_wigle_store_file(tab_context_t *ctx, const char *dir, const
     size_t name_len = strnlen(name, sizeof(f->name) - 1);
     memcpy(f->name, name, name_len);
     f->name[name_len] = '\0';
+    f->hash[0] = '\0';
+    snprintf(f->wigle_status, sizeof(f->wigle_status), "unknown");
+    snprintf(f->wdgwars_status, sizeof(f->wdgwars_status), "unknown");
+    f->size_bytes = 0;
+    f->wifi_rows = 0;
+    f->ble_rows = 0;
+    f->bt_rows = 0;
+    f->bad_rows = 0;
     f->selected = false;
     f->checkbox = NULL;
     return true;
 }
+
+static bool wardrive_parse_file_marker_line(tab_context_t *ctx, const char *line)
+{
+    if (!ctx || !line || !ctx->wardrive_wigle_files ||
+        ctx->wardrive_wigle_file_count >= WARDRIVE_WIGLE_MAX_FILES ||
+        strstr(line, "[WARD_FILE] filename=") == NULL) {
+        return false;
+    }
+
+    char filename[96];
+    if (!wardrive_marker_get_value(line, "filename", filename, sizeof(filename))) {
+        return false;
+    }
+
+    int old_count = ctx->wardrive_wigle_file_count;
+    if (!wardrive_wigle_store_file(ctx, "/sdcard/lab/wardrives", filename)) {
+        return false;
+    }
+
+    wardrive_wigle_file_t *f = &ctx->wardrive_wigle_files[old_count];
+    wardrive_marker_get_value(line, "hash", f->hash, sizeof(f->hash));
+    wardrive_marker_get_value(line, "wigle", f->wigle_status, sizeof(f->wigle_status));
+    wardrive_marker_get_value(line, "wdgwars", f->wdgwars_status, sizeof(f->wdgwars_status));
+    f->size_bytes = wardrive_marker_get_long(line, "size", 0);
+    f->wifi_rows = wardrive_marker_get_int(line, "wifi", 0);
+    f->ble_rows = wardrive_marker_get_int(line, "ble", 0);
+    f->bt_rows = wardrive_marker_get_int(line, "bt", 0);
+    f->bad_rows = wardrive_marker_get_int(line, "bad", 0);
+    return true;
+}
+
+static bool wardrive_parse_file_summary_line(tab_context_t *ctx, const char *line)
+{
+    if (!ctx || !line || strstr(line, "[WARD_FILE] SUMMARY") == NULL) {
+        return false;
+    }
+
+    wardrive_file_summary_t *s = &ctx->wardrive_file_summary;
+    memset(s, 0, sizeof(*s));
+    s->files = wardrive_marker_get_int(line, "files", 0);
+    s->bytes = wardrive_marker_get_long(line, "bytes", 0);
+    s->rows = wardrive_marker_get_int(line, "rows", 0);
+    s->devices = wardrive_marker_get_int(line, "devices", 0);
+    s->wifi = wardrive_marker_get_int(line, "wifi", 0);
+    s->ble = wardrive_marker_get_int(line, "ble", 0);
+    s->bt = wardrive_marker_get_int(line, "bt", 0);
+    s->bad = wardrive_marker_get_int(line, "bad", 0);
+    s->wigle_ok = wardrive_marker_get_int(line, "wigle_ok", 0);
+    s->wigle_pending = wardrive_marker_get_int(line, "wigle_pending", 0);
+    s->wigle_failed = wardrive_marker_get_int(line, "wigle_failed", 0);
+    s->wigle_rate_limited = wardrive_marker_get_int(line, "wigle_rate_limited", 0);
+    s->wdgwars_ok = wardrive_marker_get_int(line, "wdgwars_ok", 0);
+    s->wdgwars_pending = wardrive_marker_get_int(line, "wdgwars_pending", 0);
+    s->wdgwars_failed = wardrive_marker_get_int(line, "wdgwars_failed", 0);
+    s->wdgwars_rate_limited = wardrive_marker_get_int(line, "wdgwars_rate_limited", 0);
+    s->valid = true;
+    return true;
+}
+
+static int wardrive_load_files_from_command(tab_context_t *ctx, tab_id_t active_tab,
+                                            uart_port_t uart_port, int timeout_ms)
+{
+    if (!ctx || !ctx->wardrive_wigle_files || tab_is_internal(active_tab)) {
+        return 0;
+    }
+
+    ctx->wardrive_file_summary.valid = false;
+
+    if (active_tab == TAB_USB && usb_cdc_handle) {
+        usbh_cdc_flush_rx_buffer(usb_cdc_handle);
+    } else {
+        uart_flush(uart_port);
+    }
+
+    transport_write_bytes_tab(active_tab, uart_port, "wardrive_files", strlen("wardrive_files"));
+    transport_write_bytes_tab(active_tab, uart_port, "\r\n", 2);
+
+    // Big PSRAM buffer: a full wardrive_files listing (24+ files with interleaved
+    // preflight/sanitize lines) easily exceeds 16KB. Keep it in PSRAM so a large
+    // buffer never eats scarce internal RAM; fall back only to a small internal
+    // buffer (which may truncate the listing) if PSRAM is unavailable.
+    size_t rx_size = 65536;
+    char *rx_buffer = heap_caps_malloc(rx_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!rx_buffer) {
+        ESP_LOGW(TAG, "wardrive_files: PSRAM rx buffer alloc failed, using small internal buffer");
+        rx_size = 8192;
+        rx_buffer = malloc(rx_size);
+    }
+    if (!rx_buffer) {
+        return 0;
+    }
+    rx_buffer[0] = '\0';
+
+    int rx_len = 0;
+    int elapsed_ms = 0;
+    int empty_reads = 0;
+    bool saw_end_marker = false;
+    const int poll_ms = 250;
+    while (elapsed_ms < timeout_ms && rx_len < (int)rx_size - 1) {
+        int len = transport_read_bytes_tab(active_tab, uart_port,
+                                           rx_buffer + rx_len,
+                                           rx_size - 1 - rx_len,
+                                           pdMS_TO_TICKS(poll_ms));
+        if (len > 0) {
+            rx_len += len;
+            rx_buffer[rx_len] = '\0';
+            empty_reads = 0;
+            if (strstr(rx_buffer, "[WARD_FILE] END") != NULL) {
+                saw_end_marker = true;
+                break;
+            }
+            if (strstr(rx_buffer, "Unrecognized command") != NULL) {
+                break;
+            }
+        } else {
+            empty_reads++;
+            if (empty_reads >= 6 && strstr(rx_buffer, "[WARD_FILE] BEGIN") == NULL) {
+                break;
+            }
+        }
+        elapsed_ms += poll_ms;
+    }
+    if (rx_len <= 0) {
+        free(rx_buffer);
+        return 0;
+    }
+    rx_buffer[(rx_len < (int)rx_size) ? rx_len : (int)rx_size - 1] = '\0';
+
+    ESP_LOGI(TAG, "[%s] wardrive_files response (%d bytes, end=%d): %s",
+             tab_transport_name(active_tab), rx_len, saw_end_marker ? 1 : 0, rx_buffer);
+
+    bool saw_begin = false;
+    bool saw_end = false;
+    int added = 0;
+    char *line = strtok(rx_buffer, "\n\r");
+    while (line && ctx->wardrive_wigle_file_count < WARDRIVE_WIGLE_MAX_FILES) {
+        while (isspace((unsigned char)*line)) {
+            line++;
+        }
+        if (strcmp(line, "[WARD_FILE] BEGIN") == 0) {
+            saw_begin = true;
+        } else if (strcmp(line, "[WARD_FILE] END") == 0) {
+            saw_end = true;
+        } else if (wardrive_parse_file_summary_line(ctx, line)) {
+            /* summary parsed */
+        } else if (wardrive_parse_file_marker_line(ctx, line)) {
+            added++;
+        }
+        line = strtok(NULL, "\n\r");
+    }
+
+    free(rx_buffer);
+    return (saw_begin || saw_end || added > 0 || ctx->wardrive_file_summary.valid) ? added : 0;
+}
+
+static int wardrive_load_upload_state_from_command(tab_context_t *ctx, tab_id_t active_tab,
+                                                   uart_port_t uart_port, int timeout_ms)
+{
+    if (!ctx || tab_is_internal(active_tab)) {
+        return 0;
+    }
+    if (!wardrive_upload_state_alloc(ctx)) {
+        ESP_LOGW(TAG, "upload_state: failed to allocate state cache");
+        return 0;
+    }
+
+    if (active_tab == TAB_USB && usb_cdc_handle) {
+        usbh_cdc_flush_rx_buffer(usb_cdc_handle);
+    } else {
+        uart_flush(uart_port);
+    }
+
+    transport_write_bytes_tab(active_tab, uart_port, "upload_state", strlen("upload_state"));
+    transport_write_bytes_tab(active_tab, uart_port, "\r\n", 2);
+
+    size_t rx_size = 32768;
+    char *rx_buffer = heap_caps_malloc(rx_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!rx_buffer) {
+        rx_size = 8192;
+        rx_buffer = malloc(rx_size);
+    }
+    if (!rx_buffer) {
+        return 0;
+    }
+    rx_buffer[0] = '\0';
+
+    int rx_len = 0;
+    int elapsed_ms = 0;
+    int empty_reads = 0;
+    bool saw_end_marker = false;
+    const int poll_ms = 250;
+    while (elapsed_ms < timeout_ms && rx_len < (int)rx_size - 1) {
+        int len = transport_read_bytes_tab(active_tab, uart_port,
+                                           rx_buffer + rx_len,
+                                           rx_size - 1 - rx_len,
+                                           pdMS_TO_TICKS(poll_ms));
+        if (len > 0) {
+            rx_len += len;
+            rx_buffer[rx_len] = '\0';
+            empty_reads = 0;
+            if (strstr(rx_buffer, "[UPLOAD_STATE] END") != NULL) {
+                saw_end_marker = true;
+                break;
+            }
+            if (strstr(rx_buffer, "Unrecognized command") != NULL) {
+                break;
+            }
+        } else {
+            empty_reads++;
+            if (empty_reads >= 6 && strstr(rx_buffer, "[UPLOAD_STATE] BEGIN") == NULL) {
+                break;
+            }
+        }
+        elapsed_ms += poll_ms;
+    }
+
+    if (rx_len <= 0) {
+        free(rx_buffer);
+        return 0;
+    }
+    rx_buffer[(rx_len < (int)rx_size) ? rx_len : (int)rx_size - 1] = '\0';
+    ESP_LOGI(TAG, "[%s] upload_state response (%d bytes, end=%d): %s",
+             tab_transport_name(active_tab), rx_len, saw_end_marker ? 1 : 0, rx_buffer);
+
+    bool saw_begin = false;
+    bool saw_end = false;
+    char *line = strtok(rx_buffer, "\n\r");
+    while (line && ctx->wardrive_upload_state_count < WARDRIVE_UPLOAD_STATE_MAX) {
+        while (isspace((unsigned char)*line)) {
+            line++;
+        }
+        if (strcmp(line, "[UPLOAD_STATE] BEGIN") == 0) {
+            saw_begin = true;
+        } else if (strcmp(line, "[UPLOAD_STATE] END") == 0) {
+            saw_end = true;
+        } else {
+            wardrive_parse_upload_state_line(ctx, line);
+        }
+        line = strtok(NULL, "\n\r");
+    }
+
+    ctx->wardrive_upload_state_loaded = (saw_begin || saw_end ||
+                                         ctx->wardrive_upload_state_count > 0);
+    free(rx_buffer);
+    return ctx->wardrive_upload_state_count;
+}
+
+// Shared color convention for wardrive file stats / upload status (LVGL recolor
+// hex, no leading '#'). Reused across the upload menu, the selection popup and the
+// Files page so done/failed/rate_limited and WiFi/BLE/BT always read the same.
+#define WARD_HEX_WIFI    "00bcd4"   // cyan
+#define WARD_HEX_BLE     "e91e63"   // pink
+#define WARD_HEX_BT      "ffc107"   // amber
+#define WARD_HEX_BAD     "f44336"   // red
+#define WARD_HEX_DONE    "4caf50"   // green
+#define WARD_HEX_FAILED  "f44336"   // red
+#define WARD_HEX_RATE    "ff9800"   // orange
+#define WARD_HEX_PENDING "2196f3"   // blue
+#define WARD_HEX_MUTED   "90a4ae"   // blue-grey
+
+static const char *wardrive_status_hex(const char *status)
+{
+    if (!status || status[0] == '\0') return WARD_HEX_MUTED;
+    if (strcmp(status, "done") == 0)         return WARD_HEX_DONE;
+    if (strcmp(status, "ok") == 0)           return WARD_HEX_DONE;
+    if (strcmp(status, "failed") == 0)       return WARD_HEX_FAILED;
+    if (strcmp(status, "rate_limited") == 0) return WARD_HEX_RATE;
+    if (strcmp(status, "pending") == 0)      return WARD_HEX_PENDING;
+    return WARD_HEX_MUTED; // unknown
+}
+
+static bool wardrive_status_equals(const char *status, const char *expected)
+{
+    return status && expected && strcmp(status, expected) == 0;
+}
+
+static bool wardrive_file_all_done(const wardrive_wigle_file_t *file)
+{
+    return file &&
+           wardrive_status_equals(file->wigle_status, "done") &&
+           wardrive_status_equals(file->wdgwars_status, "done");
+}
+
+static void wardrive_file_card_palette(const wardrive_wigle_file_t *file, lv_color_t *bg,
+                                       lv_color_t *border, lv_color_t *title)
+{
+    lv_color_t bg_color = lv_color_hex(0x1A1A2A);
+    lv_color_t border_color = lv_color_hex(0x303044);
+    lv_color_t title_color = COLOR_MATERIAL_TEAL;
+
+    if (file) {
+        bool failed = wardrive_status_equals(file->wigle_status, "failed") ||
+                      wardrive_status_equals(file->wdgwars_status, "failed");
+        bool rate_limited = wardrive_status_equals(file->wigle_status, "rate_limited") ||
+                            wardrive_status_equals(file->wdgwars_status, "rate_limited");
+        bool pending = wardrive_status_equals(file->wigle_status, "pending") ||
+                       wardrive_status_equals(file->wdgwars_status, "pending");
+
+        if (failed) {
+            bg_color = lv_color_hex(0x3A1018);
+            border_color = COLOR_MATERIAL_RED;
+            title_color = COLOR_MATERIAL_RED;
+        } else if (rate_limited) {
+            bg_color = lv_color_hex(0x33200A);
+            border_color = COLOR_MATERIAL_ORANGE;
+            title_color = COLOR_MATERIAL_ORANGE;
+        } else if (pending) {
+            bg_color = lv_color_hex(0x102A3A);
+            border_color = COLOR_MATERIAL_BLUE;
+            title_color = COLOR_MATERIAL_BLUE;
+        } else if (file->bad_rows > 0) {
+            bg_color = lv_color_hex(0x342A10);
+            border_color = COLOR_MATERIAL_AMBER;
+            title_color = COLOR_MATERIAL_AMBER;
+        } else if (wardrive_file_all_done(file)) {
+            bg_color = lv_color_hex(0x123020);
+            border_color = COLOR_MATERIAL_GREEN;
+            title_color = COLOR_MATERIAL_GREEN;
+        }
+    }
+
+    if (bg) *bg = bg_color;
+    if (border) *border = border_color;
+    if (title) *title = title_color;
+}
+
+static void wardrive_status_card_palette(const char *status, int bad_rows, lv_color_t *bg,
+                                         lv_color_t *border, lv_color_t *title)
+{
+    lv_color_t bg_color = lv_color_hex(0x1A1A2A);
+    lv_color_t border_color = lv_color_hex(0x303044);
+    lv_color_t title_color = COLOR_MATERIAL_TEAL;
+
+    if (wardrive_status_equals(status, "failed")) {
+        bg_color = lv_color_hex(0x3A1018);
+        border_color = COLOR_MATERIAL_RED;
+        title_color = COLOR_MATERIAL_RED;
+    } else if (wardrive_status_equals(status, "rate_limited")) {
+        bg_color = lv_color_hex(0x33200A);
+        border_color = COLOR_MATERIAL_ORANGE;
+        title_color = COLOR_MATERIAL_ORANGE;
+    } else if (wardrive_status_equals(status, "pending")) {
+        bg_color = lv_color_hex(0x102A3A);
+        border_color = COLOR_MATERIAL_BLUE;
+        title_color = COLOR_MATERIAL_BLUE;
+    } else if (bad_rows > 0) {
+        bg_color = lv_color_hex(0x342A10);
+        border_color = COLOR_MATERIAL_AMBER;
+        title_color = COLOR_MATERIAL_AMBER;
+    } else if (wardrive_status_equals(status, "done") || wardrive_status_equals(status, "ok")) {
+        bg_color = lv_color_hex(0x123020);
+        border_color = COLOR_MATERIAL_GREEN;
+        title_color = COLOR_MATERIAL_GREEN;
+    }
+
+    if (bg) *bg = bg_color;
+    if (border) *border = border_color;
+    if (title) *title = title_color;
+}
+
+static void wardrive_human_size(long bytes, char *out, size_t out_sz)
+{
+    if (bytes >= 1024 * 1024) {
+        snprintf(out, out_sz, "%.1f MB", bytes / 1048576.0);
+    } else if (bytes >= 1024) {
+        snprintf(out, out_sz, "%.0f KB", bytes / 1024.0);
+    } else {
+        snprintf(out, out_sz, "%ld B", bytes);
+    }
+}
+
+// Rich, multi-colored detail for a file card (requires lv_label_set_recolor(true)).
+// Line 1: size + WiFi/BLE/BT (+bad if any). Line 2: per-service upload status.
+static void wardrive_format_file_detail_rich(const wardrive_wigle_file_t *file,
+                                             char *out, size_t out_sz)
+{
+    if (!file || !out || out_sz == 0) {
+        return;
+    }
+    out[0] = '\0';
+
+    char size_str[24];
+    wardrive_human_size(file->size_bytes, size_str, sizeof(size_str));
+
+    char bad_seg[40] = "";
+    if (file->bad_rows > 0) {
+        snprintf(bad_seg, sizeof(bad_seg), "  #" WARD_HEX_BAD " bad:%d fix#", file->bad_rows);
+    }
+
+    const char *wigle = file->wigle_status[0] ? file->wigle_status : "unknown";
+    const char *wdg   = file->wdgwars_status[0] ? file->wdgwars_status : "unknown";
+
+    snprintf(out, out_sz,
+             "#" WARD_HEX_MUTED " %s#   #" WARD_HEX_WIFI " WiFi:%d#  "
+             "#" WARD_HEX_BLE " BLE:%d#  #" WARD_HEX_BT " BT:%d#%s\n"
+             "WiGLE #%s %s#    WDG #%s %s#",
+             size_str, file->wifi_rows, file->ble_rows, file->bt_rows, bad_seg,
+             wardrive_status_hex(wigle), wigle,
+             wardrive_status_hex(wdg), wdg);
+}
+
+static void wardrive_format_file_detail(const wardrive_wigle_file_t *file, char *out, size_t out_sz)
+{
+    if (!file || !out || out_sz == 0) {
+        return;
+    }
+    out[0] = '\0';
+
+    bool has_counts = file->wifi_rows > 0 || file->ble_rows > 0 ||
+                      file->bt_rows > 0 || file->bad_rows > 0 ||
+                      file->size_bytes > 0;
+    bool has_status = file->wigle_status[0] != '\0' &&
+                      strcmp(file->wigle_status, "unknown") != 0;
+
+    if (has_counts && has_status) {
+        snprintf(out, out_sz,
+                 "%ld B | wifi:%d ble:%d bt:%d bad:%d | WiGLE:%s WDG:%s",
+                 file->size_bytes, file->wifi_rows, file->ble_rows,
+                 file->bt_rows, file->bad_rows,
+                 file->wigle_status, file->wdgwars_status);
+    } else if (has_counts) {
+        snprintf(out, out_sz,
+                 "%ld B | wifi:%d ble:%d bt:%d bad:%d",
+                 file->size_bytes, file->wifi_rows, file->ble_rows,
+                 file->bt_rows, file->bad_rows);
+    }
+}
+
+static void wardrive_format_upload_state_entry(const wardrive_upload_state_entry_t *entry,
+                                               char *out, size_t out_sz)
+{
+    if (!entry || !out || out_sz == 0) {
+        return;
+    }
+    out[0] = '\0';
+    if (entry->service[0] == '\0' || entry->filename[0] == '\0') {
+        return;
+    }
+
+    const char *svc = (strcmp(entry->service, "wdgwars") == 0) ? "WDG" : "WiGLE";
+    char size_str[24];
+    wardrive_human_size(entry->size_bytes, size_str, sizeof(size_str));
+    snprintf(out, out_sz,
+             "%s #%s %s#  %s | "
+             "#%s WiFi:%d#  #%s BLE:%d#  #%s BT:%d#  #%s bad:%d#",
+             svc,
+             wardrive_status_hex(entry->status),
+             entry->status[0] ? entry->status : "unknown",
+             size_str,
+             WARD_HEX_WIFI, entry->wifi_rows,
+             WARD_HEX_BLE, entry->ble_rows,
+             WARD_HEX_BT, entry->bt_rows,
+             entry->bad_rows > 0 ? WARD_HEX_BAD : WARD_HEX_MUTED, entry->bad_rows);
+}
+
+static void wardrive_format_summary_text(const wardrive_file_summary_t *summary,
+                                         char *out, size_t out_sz)
+{
+    if (!summary || !out || out_sz == 0) {
+        return;
+    }
+    out[0] = '\0';
+    if (!summary->valid) {
+        return;
+    }
+
+    // Recolored, aligned summary (requires lv_label_set_recolor(true) on the label).
+    // Line 1: totals. Lines 2-3: per-service status with the shared color legend.
+    char bad_seg[48] = "";
+    if (summary->bad > 0) {
+        snprintf(bad_seg, sizeof(bad_seg), "  #" WARD_HEX_BAD " %d bad#", summary->bad);
+    }
+
+    snprintf(out, out_sz,
+             "#ffffff %d files#   #" WARD_HEX_WIFI " %d WiFi#  "
+             "#" WARD_HEX_BLE " %d BLE#  #" WARD_HEX_BT " %d BT#%s\n"
+             "WiGLE  #" WARD_HEX_DONE " %d ok#  #" WARD_HEX_PENDING " %d pend#  "
+             "#" WARD_HEX_FAILED " %d fail#  #" WARD_HEX_RATE " %d rate#\n"
+             "WDG    #" WARD_HEX_DONE " %d ok#  #" WARD_HEX_PENDING " %d pend#  "
+             "#" WARD_HEX_FAILED " %d fail#  #" WARD_HEX_RATE " %d rate#",
+             summary->files, summary->wifi, summary->ble, summary->bt, bad_seg,
+             summary->wigle_ok, summary->wigle_pending,
+             summary->wigle_failed, summary->wigle_rate_limited,
+             summary->wdgwars_ok, summary->wdgwars_pending,
+             summary->wdgwars_failed, summary->wdgwars_rate_limited);
+}
+
 
 static int wardrive_wigle_load_files_from_dir(tab_context_t *ctx, tab_id_t active_tab, uart_port_t uart_port,
                                               const char *dir, bool require_marker)
@@ -17624,6 +19055,8 @@ static void wardrive_wigle_load_file_list(tab_context_t *ctx, tab_id_t active_ta
     ctx->wardrive_wigle_file_count = 0;
     ctx->wardrive_wigle_selected_count = 0;
     ctx->wardrive_wigle_page = 0;
+    memset(&ctx->wardrive_file_summary, 0, sizeof(ctx->wardrive_file_summary));
+    wardrive_upload_state_reset(ctx);
 
     if (ctx->wardrive_wigle_files) {
         free(ctx->wardrive_wigle_files);
@@ -17638,6 +19071,13 @@ static void wardrive_wigle_load_file_list(tab_context_t *ctx, tab_id_t active_ta
     }
     if (!ctx->wardrive_wigle_files) {
         ESP_LOGE(TAG, "[%s] WiGLE: file list alloc failed", tab_transport_name(active_tab));
+        return;
+    }
+
+    int marker_files = wardrive_load_files_from_command(ctx, active_tab, uart_port, 120000);
+    if (marker_files > 0 || ctx->wardrive_file_summary.valid) {
+        ESP_LOGI(TAG, "[%s] Wardrive files loaded from wardrive_files: %d",
+                 tab_transport_name(active_tab), marker_files);
         return;
     }
 
@@ -17692,22 +19132,20 @@ static void wardrive_wigle_file_checkbox_cb(lv_event_t *e)
     }
 }
 
-static void wardrive_wigle_send_btn_cb(lv_event_t *e)
+static void wardrive_wigle_start_upload(tab_context_t *ctx, wardrive_upload_mode_t mode)
 {
-    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
-    if (!ctx) {
-        ctx = get_current_ctx();
-    }
     if (!ctx || ctx->wardrive_wigle_task_running) {
         return;
     }
 
-    ESP_LOGI(TAG, "[%s] Wardrive %s Send clicked, selected files: %d",
+    ESP_LOGI(TAG, "[%s] Wardrive %s upload start, mode=%d, selected=%d",
              tab_transport_name(tab_id_for_ctx(ctx)),
              wardrive_upload_provider_label(ctx->wardrive_upload_provider),
-             ctx->wardrive_wigle_selected_count);
+             (int)mode, ctx->wardrive_wigle_selected_count);
 
-    if (ctx->wardrive_wigle_selected_count <= 0) {
+    // Only the per-file "Send" mode needs a selection; batch modes act on the
+    // firmware-side manifest, so they run even with nothing ticked.
+    if (mode == WARDRIVE_UPLOAD_MODE_SELECTED && ctx->wardrive_wigle_selected_count <= 0) {
         if (ctx->wardrive_wigle_status_label) {
             lv_label_set_text(ctx->wardrive_wigle_status_label, "Select at least one file.");
         }
@@ -17715,6 +19153,7 @@ static void wardrive_wigle_send_btn_cb(lv_event_t *e)
         return;
     }
 
+    ctx->wardrive_upload_mode = mode;
     ctx->wardrive_wigle_connect_ready = false;
     ctx->wardrive_wigle_selected_ssid[0] = '\0';
     ctx->wardrive_wigle_selected_password[0] = '\0';
@@ -17726,9 +19165,13 @@ static void wardrive_wigle_send_btn_cb(lv_event_t *e)
     if (ctx->wardrive_wigle_page_label) lv_obj_add_flag(ctx->wardrive_wigle_page_label, LV_OBJ_FLAG_HIDDEN);
 
     if (ctx->wardrive_wigle_status_label) {
+        const char *mode_txt = (mode == WARDRIVE_UPLOAD_MODE_PENDING) ? " (pending)"
+                             : (mode == WARDRIVE_UPLOAD_MODE_ALL)     ? " (all)"
+                                                                      : "";
         lv_label_set_text_fmt(ctx->wardrive_wigle_status_label,
-                              "Preparing %s upload...",
-                              wardrive_upload_provider_label(ctx->wardrive_upload_provider));
+                              "Preparing %s upload%s...",
+                              wardrive_upload_provider_label(ctx->wardrive_upload_provider),
+                              mode_txt);
     }
 
     TaskFunction_t upload_task = wardrive_wigle_upload_task;
@@ -17748,6 +19191,33 @@ static void wardrive_wigle_send_btn_cb(lv_event_t *e)
         }
         wardrive_wigle_update_send_btn(ctx);
     }
+}
+
+static void wardrive_wigle_send_btn_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx) {
+        ctx = get_current_ctx();
+    }
+    wardrive_wigle_start_upload(ctx, WARDRIVE_UPLOAD_MODE_SELECTED);
+}
+
+static void wardrive_wigle_sync_pending_btn_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx) {
+        ctx = get_current_ctx();
+    }
+    wardrive_wigle_start_upload(ctx, WARDRIVE_UPLOAD_MODE_PENDING);
+}
+
+static void wardrive_wigle_force_all_btn_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx) {
+        ctx = get_current_ctx();
+    }
+    wardrive_wigle_start_upload(ctx, WARDRIVE_UPLOAD_MODE_ALL);
 }
 
 static void wardrive_wigle_stop_btn_cb(lv_event_t *e)
@@ -18289,6 +19759,7 @@ static bool wardrive_wigle_ensure_wifi_connected(tab_context_t *ctx, tab_id_t ac
              tab_transport_name(active_tab), ctx->wardrive_wigle_selected_ssid);
 
     bool manual_credentials = (strcmp(ctx->wardrive_wigle_selected_ssid, WARDRIVE_WIGLE_OTHER_SSID) == 0);
+    bool use_saved_password = false;
     ESP_LOGI(TAG, "[%s] WiGLE: manual credentials mode = %d",
              tab_transport_name(active_tab), manual_credentials ? 1 : 0);
 
@@ -18305,7 +19776,7 @@ static bool wardrive_wigle_ensure_wifi_connected(tab_context_t *ctx, tab_id_t ac
             lv_label_set_text(ctx->wardrive_wigle_status_label, "Manual network selected\nEnter SSID and WiFi password:");
         } else {
             lv_label_set_text_fmt(ctx->wardrive_wigle_status_label,
-                                  "Selected: %s\nChecking known passwords...",
+                                  "Selected: %s\nChecking saved passwords...",
                                   ctx->wardrive_wigle_selected_ssid);
         }
     }
@@ -18404,6 +19875,7 @@ static bool wardrive_wigle_ensure_wifi_connected(tab_context_t *ctx, tab_id_t ac
                 strncpy(ctx->wardrive_wigle_selected_password, et_entries[i].password,
                         sizeof(ctx->wardrive_wigle_selected_password) - 1);
                 ctx->wardrive_wigle_selected_password[sizeof(ctx->wardrive_wigle_selected_password) - 1] = '\0';
+                use_saved_password = true;
                 break;
             }
         }
@@ -18418,7 +19890,7 @@ static bool wardrive_wigle_ensure_wifi_connected(tab_context_t *ctx, tab_id_t ac
         bsp_display_lock(0);
         if (ctx->wardrive_wigle_status_label) {
             lv_label_set_text_fmt(ctx->wardrive_wigle_status_label,
-                                  "No known password for %s\nEnter WiFi password:",
+                                  "No saved password for %s\nEnter WiFi password:",
                                   ctx->wardrive_wigle_selected_ssid);
         }
         wardrive_wigle_create_credentials_prompt(ctx, false);
@@ -18460,14 +19932,27 @@ static bool wardrive_wigle_ensure_wifi_connected(tab_context_t *ctx, tab_id_t ac
     }
     bsp_display_unlock();
 
-    char escaped_ssid[67];
-    char escaped_password[131];
-    beacon_spam_escape_quoted_arg(ctx->wardrive_wigle_selected_ssid, escaped_ssid, sizeof(escaped_ssid));
-    beacon_spam_escape_quoted_arg(ctx->wardrive_wigle_selected_password, escaped_password, sizeof(escaped_password));
-
     char wifi_cmd[256];
-    snprintf(wifi_cmd, sizeof(wifi_cmd), "wifi_connect \"%s\" \"%s\"",
-             escaped_ssid, escaped_password);
+    if (!build_wifi_connect_command(wifi_cmd, sizeof(wifi_cmd),
+                                    ctx->wardrive_wigle_selected_ssid,
+                                    ctx->wardrive_wigle_selected_password,
+                                    use_saved_password ? WIFI_CONNECT_AUTH_SAVED
+                                                       : WIFI_CONNECT_AUTH_PASSWORD)) {
+        bsp_display_lock(0);
+        if (ctx->wardrive_wigle_status_label) {
+            lv_label_set_text(ctx->wardrive_wigle_status_label, "SSID/password too long.");
+        }
+        if (ctx->wardrive_wigle_spinner) {
+            lv_obj_add_flag(ctx->wardrive_wigle_spinner, LV_OBJ_FLAG_HIDDEN);
+        }
+        bsp_display_unlock();
+        heap_caps_free(scan_rx_buf);
+        heap_caps_free(line_buf);
+        heap_caps_free(et_entries);
+        heap_caps_free(et_buf);
+        heap_caps_free(wifi_rx_buf);
+        return false;
+    }
 
     wifi_success = false;
     bool do_wifi_retry = false;
@@ -18594,6 +20079,7 @@ static bool wardrive_wigle_ensure_wifi_connected(tab_context_t *ctx, tab_id_t ac
                         strncpy(ctx->wardrive_wigle_selected_password, new_pass,
                                 sizeof(ctx->wardrive_wigle_selected_password) - 1);
                         ctx->wardrive_wigle_selected_password[sizeof(ctx->wardrive_wigle_selected_password) - 1] = '\0';
+                        use_saved_password = false;
                     }
                 }
                 // Remove credentials UI before retrying
@@ -18617,10 +20103,19 @@ static bool wardrive_wigle_ensure_wifi_connected(tab_context_t *ctx, tab_id_t ac
                                           ctx->wardrive_wigle_selected_ssid);
                 }
                 // Rebuild wifi_cmd with potentially new password
-                beacon_spam_escape_quoted_arg(ctx->wardrive_wigle_selected_ssid, escaped_ssid, sizeof(escaped_ssid));
-                beacon_spam_escape_quoted_arg(ctx->wardrive_wigle_selected_password, escaped_password, sizeof(escaped_password));
-                snprintf(wifi_cmd, sizeof(wifi_cmd), "wifi_connect \"%s\" \"%s\"",
-                         escaped_ssid, escaped_password);
+                if (!build_wifi_connect_command(wifi_cmd, sizeof(wifi_cmd),
+                                                ctx->wardrive_wigle_selected_ssid,
+                                                ctx->wardrive_wigle_selected_password,
+                                                use_saved_password ? WIFI_CONNECT_AUTH_SAVED
+                                                                   : WIFI_CONNECT_AUTH_PASSWORD)) {
+                    if (ctx->wardrive_wigle_status_label) {
+                        lv_label_set_text(ctx->wardrive_wigle_status_label, "SSID/password too long.");
+                    }
+                    if (ctx->wardrive_wigle_spinner) {
+                        lv_obj_add_flag(ctx->wardrive_wigle_spinner, LV_OBJ_FLAG_HIDDEN);
+                    }
+                    ctx->wardrive_wigle_task_running = false;
+                }
             } else if (ctx->wardrive_wigle_rescan_requested) {
                 if (ctx->wardrive_wigle_credentials_col) {
                     lv_obj_del(ctx->wardrive_wigle_credentials_col);
@@ -18687,17 +20182,35 @@ static bool wardrive_wigle_ensure_wifi_connected(tab_context_t *ctx, tab_id_t ac
     return true;
 }
 
-static bool wardrive_parse_wigle_summary(const char *rx_text, int *uploaded, int *failed, int *skipped)
+static bool wardrive_parse_wigle_summary(const char *rx_text, int *uploaded, int *failed,
+                                         int *skipped, int *rate_limited)
 {
     if (!rx_text || !uploaded || !failed || !skipped) {
         return false;
+    }
+    if (rate_limited) {
+        *rate_limited = 0;
     }
 
     int up = 0;
     int fail = 0;
     int skip = 0;
+    int rate = 0;
 
-    const char *p = strstr(rx_text, "up=");
+    // New Wardrive 2.0 format with the rate-limited counter. Must be matched before
+    // the 3-field "Done:" variant below, otherwise that sscanf would consume the
+    // first three numbers of this line and silently drop 'rate_limited'.
+    const char *p = strstr(rx_text, "Done:");
+    if (p && sscanf(p, "Done: %d uploaded, %d skipped, %d failed, %d rate_limited",
+                    &up, &skip, &fail, &rate) == 4) {
+        *uploaded = up;
+        *failed = fail;
+        *skipped = skip;
+        if (rate_limited) *rate_limited = rate;
+        return true;
+    }
+
+    p = strstr(rx_text, "up=");
     if (p && sscanf(p, "up=%d fail=%d skip=%d", &up, &fail, &skip) == 3) {
         *uploaded = up;
         *failed = fail;
@@ -18730,6 +20243,129 @@ static bool wardrive_parse_wigle_summary(const char *rx_text, int *uploaded, int
     }
 
     return false;
+}
+
+typedef struct {
+    int uploaded;
+    int failed;
+    int skipped;
+    int rate_limited;
+    bool any_response;
+    bool unsupported_cmd;
+    bool creds_missing;
+    bool auth_failed;
+    bool wifi_lost;
+    bool rate_limited_stop;
+} wardrive_batch_result_t;
+
+// Runs a single batch upload command (e.g. "wigle_upload" or "wdgwars_upload all")
+// and parses the streamed result. Used by the "Sync pending" / "Force all" buttons,
+// which delegate file selection to the firmware-side upload manifest.
+static void wardrive_run_batch_command(tab_context_t *ctx, tab_id_t active_tab,
+                                       uart_port_t uart_port, const char *cmd,
+                                       const char *creds_marker, wardrive_batch_result_t *res)
+{
+    if (!res) {
+        return;
+    }
+    memset(res, 0, sizeof(*res));
+    if (!ctx || !cmd) {
+        return;
+    }
+
+    if (active_tab == TAB_USB && usb_cdc_handle) {
+        usbh_cdc_flush_rx_buffer(usb_cdc_handle);
+    } else {
+        uart_flush(uart_port);
+    }
+
+    transport_write_bytes_tab(active_tab, uart_port, cmd, strlen(cmd));
+    transport_write_bytes_tab(active_tab, uart_port, "\r\n", 2);
+    ESP_LOGI(TAG, "[%s] Wardrive batch: sent %s", tab_transport_name(active_tab), cmd);
+
+    // The batch streams every file's preflight + result, so use a generous PSRAM
+    // buffer and a long timeout (a full re-upload of many large files takes minutes).
+    size_t rx_size = 16384;
+    char *rx = heap_caps_malloc(rx_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!rx) {
+        rx_size = 4096;
+        rx = malloc(rx_size);
+    }
+    if (!rx) {
+        res->failed = 1;
+        return;
+    }
+    rx[0] = '\0';
+
+    int total_len = 0;
+    int elapsed_ms = 0;
+    int last_ui_ms = 0;
+    int empty_reads = 0;
+    const int timeout_ms = 900000; // 15 min cap for a whole batch
+
+    while (ctx->wardrive_wigle_task_running &&
+           elapsed_ms < timeout_ms &&
+           total_len < (int)rx_size - 1 &&
+           empty_reads < 2400) {
+        int len = transport_read_bytes_tab(active_tab, uart_port,
+                                           rx + total_len, rx_size - 1 - total_len,
+                                           pdMS_TO_TICKS(500));
+        if (len > 0) {
+            total_len += len;
+            empty_reads = 0;
+            rx[total_len] = '\0';
+            if (strstr(rx, "Done:") != NULL ||
+                (creds_marker && strstr(rx, creds_marker) != NULL) ||
+                strstr(rx, "AUTH FAILED") != NULL ||
+                strstr(rx, "RATE LIMITED") != NULL ||
+                strstr(rx, "WIFI NOT CONNECTED") != NULL ||
+                strstr(rx, "Unrecognized command") != NULL) {
+                break;
+            }
+        } else {
+            empty_reads++;
+        }
+        elapsed_ms += 500;
+
+        if (elapsed_ms - last_ui_ms >= 2000) {
+            last_ui_ms = elapsed_ms;
+            bsp_display_lock(0);
+            if (ctx->wardrive_wigle_status_label) {
+                lv_label_set_text_fmt(ctx->wardrive_wigle_status_label,
+                                      "Uploading batch...\n%ds elapsed", elapsed_ms / 1000);
+            }
+            bsp_display_unlock();
+        }
+    }
+
+    rx[total_len] = '\0';
+    res->any_response = (total_len > 0);
+    ESP_LOGI(TAG, "Wardrive batch response (%s): %s", cmd, rx);
+
+    if (strstr(rx, "Unrecognized command") != NULL) {
+        res->unsupported_cmd = true;
+    } else if (creds_marker && strstr(rx, creds_marker) != NULL) {
+        res->creds_missing = true;
+    } else if (strstr(rx, "AUTH FAILED") != NULL) {
+        res->auth_failed = true;
+    } else if (strstr(rx, "WIFI NOT CONNECTED") != NULL) {
+        res->wifi_lost = true;
+    } else {
+        int up = 0, fail = 0, skip = 0, rate = 0;
+        if (wardrive_parse_wigle_summary(rx, &up, &fail, &skip, &rate)) {
+            res->uploaded = up;
+            res->failed = fail;
+            res->skipped = skip;
+            res->rate_limited = rate;
+        } else if (strstr(rx, "RATE LIMITED") != NULL) {
+            res->rate_limited = 1;
+        }
+        if (res->rate_limited > 0) {
+            res->rate_limited_stop = true;
+        }
+    }
+
+    free(rx);
 }
 
 static void wardrive_wigle_upload_task(void *arg)
@@ -18803,7 +20439,8 @@ static void wardrive_wigle_upload_task(void *arg)
         goto done;
     }
 
-    if (ctx->wardrive_wigle_selected_count <= 0) {
+    if (ctx->wardrive_upload_mode == WARDRIVE_UPLOAD_MODE_SELECTED &&
+        ctx->wardrive_wigle_selected_count <= 0) {
         bsp_display_lock(0);
         if (ctx->wardrive_wigle_status_label) {
             lv_label_set_text(ctx->wardrive_wigle_status_label, "Select at least one file.");
@@ -18848,12 +20485,39 @@ static void wardrive_wigle_upload_task(void *arg)
     int total_uploaded = 0;
     int total_failed = 0;
     int total_skipped = 0;
+    int total_rate_limited = 0;
     bool any_response = false;
     bool unsupported_cmd = false;
     bool creds_missing = false;
+    bool auth_failed = false;
     bool wifi_lost = false;
+    bool rate_limited_stop = false;
 
-    for (int i = 0; i < ctx->wardrive_wigle_file_count && ctx->wardrive_wigle_task_running; i++) {
+    // Batch modes (Sync pending / Force all) delegate file picking to the firmware
+    // manifest via a single command; the per-file loop below is then skipped.
+    if (ctx->wardrive_upload_mode != WARDRIVE_UPLOAD_MODE_SELECTED) {
+        bool is_wdg = (ctx->wardrive_upload_provider == WARDRIVE_UPLOAD_PROVIDER_WDGWARS);
+        const char *base = is_wdg ? "wdgwars_upload" : "wigle_upload";
+        const char *creds = is_wdg ? "NO WDGWARS CREDENTIALS" : "NO WIGLE CREDENTIALS";
+        char cmd[40];
+        snprintf(cmd, sizeof(cmd), "%s%s", base,
+                 ctx->wardrive_upload_mode == WARDRIVE_UPLOAD_MODE_ALL ? " all" : "");
+        wardrive_batch_result_t br;
+        wardrive_run_batch_command(ctx, active_tab, uart_port, cmd, creds, &br);
+        total_uploaded = br.uploaded;
+        total_failed = br.failed;
+        total_skipped = br.skipped;
+        total_rate_limited = br.rate_limited;
+        any_response = br.any_response;
+        unsupported_cmd = br.unsupported_cmd;
+        creds_missing = br.creds_missing;
+        auth_failed = br.auth_failed;
+        wifi_lost = br.wifi_lost;
+        rate_limited_stop = br.rate_limited_stop;
+    }
+
+    for (int i = 0; i < ctx->wardrive_wigle_file_count && ctx->wardrive_wigle_task_running &&
+                    ctx->wardrive_upload_mode == WARDRIVE_UPLOAD_MODE_SELECTED; i++) {
         wardrive_wigle_file_t *file = &ctx->wardrive_wigle_files[i];
         if (!file->selected || file->name[0] == '\0') {
             continue;
@@ -18913,6 +20577,8 @@ static void wardrive_wigle_upload_task(void *arg)
 
                 if (strstr(rx_buf, "Done:") != NULL ||
                     strstr(rx_buf, "NO WIGLE CREDENTIALS") != NULL ||
+                    strstr(rx_buf, "AUTH FAILED") != NULL ||
+                    strstr(rx_buf, "RATE LIMITED") != NULL ||
                     strstr(rx_buf, "WIFI NOT CONNECTED") != NULL ||
                     strstr(rx_buf, "Unrecognized command") != NULL) {
                     break;
@@ -18956,6 +20622,10 @@ static void wardrive_wigle_upload_task(void *arg)
             creds_missing = true;
             break;
         }
+        if (strstr(rx_buf, "AUTH FAILED") != NULL) {
+            auth_failed = true;
+            break;
+        }
         if (strstr(rx_buf, "WIFI NOT CONNECTED") != NULL) {
             wifi_lost = true;
             break;
@@ -18964,10 +20634,14 @@ static void wardrive_wigle_upload_task(void *arg)
         int uploaded = 0;
         int failed = 0;
         int skipped = 0;
-        if (wardrive_parse_wigle_summary(rx_buf, &uploaded, &failed, &skipped)) {
+        int rate = 0;
+        if (wardrive_parse_wigle_summary(rx_buf, &uploaded, &failed, &skipped, &rate)) {
             total_uploaded += uploaded;
             total_failed += failed;
             total_skipped += skipped;
+            total_rate_limited += rate;
+        } else if (strstr(rx_buf, "RATE LIMITED") != NULL) {
+            total_rate_limited++;
         } else if (strstr(rx_buf, "-> OK") != NULL) {
             total_uploaded++;
         } else if (strstr(rx_buf, "-> skipped") != NULL || strstr(rx_buf, "duplicate") != NULL) {
@@ -18987,6 +20661,13 @@ static void wardrive_wigle_upload_task(void *arg)
             }
             bsp_display_unlock();
         }
+
+        // Server opened its rate-limit circuit breaker. Stop the batch immediately
+        // and do NOT keep hammering it with the remaining files.
+        if (total_rate_limited > 0) {
+            rate_limited_stop = true;
+            break;
+        }
     }
 
     if (!ctx->wardrive_wigle_task_running) {
@@ -19004,13 +20685,23 @@ static void wardrive_wigle_upload_task(void *arg)
         } else if (creds_missing) {
             lv_label_set_text(ctx->wardrive_wigle_status_label,
                               "WiGLE credentials missing.\nAdd key and try again.");
+        } else if (auth_failed) {
+            lv_label_set_text(ctx->wardrive_wigle_status_label,
+                              "WiGLE authentication failed.\nCheck API key and try again.");
         } else if (wifi_lost) {
             lv_label_set_text(ctx->wardrive_wigle_status_label,
                               "WiFi disconnected during upload.\nReconnect and try again.");
+        } else if (rate_limited_stop) {
+            // Controlled pause, not a fatal error — stop and tell the user to wait.
+            lv_label_set_text_fmt(ctx->wardrive_wigle_status_label,
+                                  "#ff9800 Rate limited - paused.#\n"
+                                  "Uploaded: %d  Skipped: %d  Failed: %d\n"
+                                  "Wait a few minutes before retrying.",
+                                  total_uploaded, total_skipped, total_failed);
         } else if ((total_uploaded + total_skipped + total_failed) > 0) {
             ctx->wardrive_wigle_upload_done = true;
             lv_label_set_text_fmt(ctx->wardrive_wigle_status_label,
-                                  "WiGLE sync finished.\nUploaded: %d\nSkipped: %d\nFailed: %d",
+                                  "WiGLE sync finished.\nUploaded: %d  Skipped: %d  Failed: %d",
                                   total_uploaded, total_skipped, total_failed);
         } else if (any_response) {
             ctx->wardrive_wigle_upload_done = true;
@@ -19101,7 +20792,8 @@ static void wardrive_wdgwars_upload_task(void *arg)
         goto done;
     }
 
-    if (ctx->wardrive_wigle_selected_count <= 0) {
+    if (ctx->wardrive_upload_mode == WARDRIVE_UPLOAD_MODE_SELECTED &&
+        ctx->wardrive_wigle_selected_count <= 0) {
         bsp_display_lock(0);
         if (ctx->wardrive_wigle_status_label) {
             lv_label_set_text(ctx->wardrive_wigle_status_label, "Select at least one file.");
@@ -19146,13 +20838,39 @@ static void wardrive_wdgwars_upload_task(void *arg)
     int total_uploaded = 0;
     int total_failed = 0;
     int total_skipped = 0;
+    int total_rate_limited = 0;
     bool any_response = false;
     bool unsupported_cmd = false;
     bool creds_missing = false;
     bool auth_failed = false;
     bool wifi_lost = false;
+    bool rate_limited_stop = false;
 
-    for (int i = 0; i < ctx->wardrive_wigle_file_count && ctx->wardrive_wigle_task_running; i++) {
+    // Batch modes (Sync pending / Force all) delegate file picking to the firmware
+    // manifest via a single command; the per-file loop below is then skipped.
+    if (ctx->wardrive_upload_mode != WARDRIVE_UPLOAD_MODE_SELECTED) {
+        bool is_wdg = (ctx->wardrive_upload_provider == WARDRIVE_UPLOAD_PROVIDER_WDGWARS);
+        const char *base = is_wdg ? "wdgwars_upload" : "wigle_upload";
+        const char *creds = is_wdg ? "NO WDGWARS CREDENTIALS" : "NO WIGLE CREDENTIALS";
+        char cmd[40];
+        snprintf(cmd, sizeof(cmd), "%s%s", base,
+                 ctx->wardrive_upload_mode == WARDRIVE_UPLOAD_MODE_ALL ? " all" : "");
+        wardrive_batch_result_t br;
+        wardrive_run_batch_command(ctx, active_tab, uart_port, cmd, creds, &br);
+        total_uploaded = br.uploaded;
+        total_failed = br.failed;
+        total_skipped = br.skipped;
+        total_rate_limited = br.rate_limited;
+        any_response = br.any_response;
+        unsupported_cmd = br.unsupported_cmd;
+        creds_missing = br.creds_missing;
+        auth_failed = br.auth_failed;
+        wifi_lost = br.wifi_lost;
+        rate_limited_stop = br.rate_limited_stop;
+    }
+
+    for (int i = 0; i < ctx->wardrive_wigle_file_count && ctx->wardrive_wigle_task_running &&
+                    ctx->wardrive_upload_mode == WARDRIVE_UPLOAD_MODE_SELECTED; i++) {
         wardrive_wigle_file_t *file = &ctx->wardrive_wigle_files[i];
         if (!file->selected || file->name[0] == '\0') {
             continue;
@@ -19213,6 +20931,7 @@ static void wardrive_wdgwars_upload_task(void *arg)
                 if (strstr(rx_buf, "Done:") != NULL ||
                     strstr(rx_buf, "NO WDGWARS CREDENTIALS") != NULL ||
                     strstr(rx_buf, "WDGWARS AUTH FAILED") != NULL ||
+                    strstr(rx_buf, "RATE LIMITED") != NULL ||
                     strstr(rx_buf, "WIFI NOT CONNECTED") != NULL ||
                     strstr(rx_buf, "Unrecognized command") != NULL) {
                     break;
@@ -19267,10 +20986,14 @@ static void wardrive_wdgwars_upload_task(void *arg)
         int uploaded = 0;
         int failed = 0;
         int skipped = 0;
-        if (wardrive_parse_wigle_summary(rx_buf, &uploaded, &failed, &skipped)) {
+        int rate = 0;
+        if (wardrive_parse_wigle_summary(rx_buf, &uploaded, &failed, &skipped, &rate)) {
             total_uploaded += uploaded;
             total_failed += failed;
             total_skipped += skipped;
+            total_rate_limited += rate;
+        } else if (strstr(rx_buf, "RATE LIMITED") != NULL) {
+            total_rate_limited++;
         } else if (strstr(rx_buf, "-> OK") != NULL) {
             total_uploaded++;
         } else if (strstr(rx_buf, "-> skipped") != NULL || strstr(rx_buf, "duplicate") != NULL) {
@@ -19288,6 +21011,13 @@ static void wardrive_wdgwars_upload_task(void *arg)
                                  processed_selected * 100 / total_selected, LV_ANIM_ON);
             }
             bsp_display_unlock();
+        }
+
+        // WDGWars opens a circuit breaker on HTTP 429. Stop the batch and back off
+        // instead of retrying the remaining files (avoids Cloudflare spam).
+        if (total_rate_limited > 0) {
+            rate_limited_stop = true;
+            break;
         }
     }
 
@@ -19312,10 +21042,17 @@ static void wardrive_wdgwars_upload_task(void *arg)
         } else if (wifi_lost) {
             lv_label_set_text(ctx->wardrive_wigle_status_label,
                               "WiFi disconnected during upload.\nReconnect and try again.");
+        } else if (rate_limited_stop) {
+            // HTTP 429 circuit breaker — controlled pause, not a fatal error.
+            lv_label_set_text_fmt(ctx->wardrive_wigle_status_label,
+                                  "#ff9800 Rate limited - paused.#\n"
+                                  "Uploaded: %d  Skipped: %d  Failed: %d\n"
+                                  "Wait a few minutes before retrying.",
+                                  total_uploaded, total_skipped, total_failed);
         } else if ((total_uploaded + total_skipped + total_failed) > 0) {
             ctx->wardrive_wigle_upload_done = true;
             lv_label_set_text_fmt(ctx->wardrive_wigle_status_label,
-                                  "WDGWars sync finished.\nUploaded: %d\nSkipped: %d\nFailed: %d",
+                                  "WDGWars sync finished.\nUploaded: %d  Skipped: %d  Failed: %d",
                                   total_uploaded, total_skipped, total_failed);
         } else if (any_response) {
             ctx->wardrive_wigle_upload_done = true;
@@ -19356,17 +21093,59 @@ static void wardrive_wigle_render_page(tab_context_t *ctx)
     int end   = start + WARDRIVE_WIGLE_PAGE_SIZE;
     if (end > total) end = total;
 
-    for (int i = start; i < end; i++) {
+    for (int k = start; k < end; k++) {
+        int i = total - 1 - k; // newest first
         wardrive_wigle_file_t *f = &ctx->wardrive_wigle_files[i];
+        lv_color_t card_bg, card_border, card_title;
+        wardrive_file_card_palette(f, &card_bg, &card_border, &card_title);
 
-        lv_obj_t *cb = lv_checkbox_create(ctx->wardrive_wigle_list);
-        lv_checkbox_set_text(cb, f->name);
-        lv_obj_set_style_text_font(cb, &lv_font_montserrat_14, 0);
-        lv_obj_set_style_text_color(cb, lv_color_hex(0xE0E0E0), 0);
-        lv_obj_set_width(cb, lv_pct(100));
-        lv_obj_set_style_min_height(cb, 44, 0);
-        lv_obj_set_style_pad_top(cb, 8, 0);
-        lv_obj_set_style_pad_bottom(cb, 8, 0);
+        lv_obj_t *row = lv_obj_create(ctx->wardrive_wigle_list);
+        lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_color(row, card_bg, 0);
+        lv_obj_set_style_border_width(row, 1, 0);
+        lv_obj_set_style_border_color(row, card_border, 0);
+        lv_obj_set_style_radius(row, 6, 0);
+        lv_obj_set_style_pad_all(row, 8, 0);
+        lv_obj_set_style_pad_column(row, 10, 0);
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *cb = lv_checkbox_create(row);
+        lv_checkbox_set_text(cb, "");
+        lv_obj_set_size(cb, 44, 44);
+        lv_obj_set_ext_click_area(cb, 12);
+        lv_obj_set_style_bg_color(cb, lv_color_hex(0x3D3D3D), LV_PART_INDICATOR);
+        lv_obj_set_style_bg_color(cb, COLOR_MATERIAL_GREEN, LV_PART_INDICATOR | LV_STATE_CHECKED);
+        lv_obj_set_style_border_color(cb, lv_color_hex(0x888888), LV_PART_INDICATOR);
+        lv_obj_set_style_border_width(cb, 2, LV_PART_INDICATOR);
+        lv_obj_set_style_radius(cb, 4, LV_PART_INDICATOR);
+
+        lv_obj_t *text_col = lv_obj_create(row);
+        lv_obj_remove_style_all(text_col);
+        lv_obj_set_flex_grow(text_col, 1);
+        lv_obj_set_height(text_col, LV_SIZE_CONTENT);
+        lv_obj_set_flex_flow(text_col, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_style_pad_row(text_col, 4, 0);
+
+        lv_obj_t *name_lbl = lv_label_create(text_col);
+        lv_label_set_text(name_lbl, f->name);
+        lv_obj_set_style_text_font(name_lbl, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(name_lbl, card_title, 0);
+        lv_obj_set_width(name_lbl, lv_pct(100));
+        lv_label_set_long_mode(name_lbl, LV_LABEL_LONG_DOT);
+
+        char detail[224];
+        wardrive_format_file_detail_rich(f, detail, sizeof(detail));
+        if (detail[0] != '\0') {
+            lv_obj_t *detail_lbl = lv_label_create(text_col);
+            lv_label_set_recolor(detail_lbl, true);
+            lv_label_set_text(detail_lbl, detail);
+            lv_obj_set_style_text_font(detail_lbl, &lv_font_montserrat_14, 0);
+            lv_obj_set_style_text_color(detail_lbl, lv_color_hex(0xCCCCCC), 0);
+            lv_obj_set_width(detail_lbl, lv_pct(100));
+            lv_label_set_long_mode(detail_lbl, LV_LABEL_LONG_WRAP);
+        }
         if (f->selected) {
             lv_obj_add_state(cb, LV_STATE_CHECKED);
         }
@@ -19492,6 +21271,7 @@ static void show_wardrive_upload_popup(tab_context_t *ctx, wardrive_upload_provi
     lv_obj_set_style_text_color(title, COLOR_MATERIAL_TEAL, 0);
 
     ctx->wardrive_wigle_status_label = lv_label_create(ctx->wardrive_wigle_popup);
+    lv_label_set_recolor(ctx->wardrive_wigle_status_label, true);
     lv_label_set_text(ctx->wardrive_wigle_status_label, "Loading Wardrive files...");
     lv_obj_set_width(ctx->wardrive_wigle_status_label, lv_pct(90));
     lv_obj_set_style_text_font(ctx->wardrive_wigle_status_label, &lv_font_montserrat_18, 0);
@@ -19562,6 +21342,45 @@ static void show_wardrive_upload_popup(tab_context_t *ctx, wardrive_upload_provi
     lv_obj_set_style_text_color(next_lbl, lv_color_hex(0xFFFFFF), 0);
     lv_obj_center(next_lbl);
     lv_obj_add_flag(ctx->wardrive_wigle_next_btn, LV_OBJ_FLAG_HIDDEN);
+
+    ctx->wardrive_wigle_batch_row = lv_obj_create(ctx->wardrive_wigle_popup);
+    lv_obj_t *batch_row = ctx->wardrive_wigle_batch_row;
+    lv_obj_set_size(batch_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(batch_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(batch_row, 0, 0);
+    lv_obj_set_style_pad_all(batch_row, 0, 0);
+    lv_obj_set_style_pad_column(batch_row, 12, 0);
+    lv_obj_set_flex_flow(batch_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(batch_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(batch_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    ctx->wardrive_wigle_sync_btn = lv_btn_create(batch_row);
+    lv_obj_set_size(ctx->wardrive_wigle_sync_btn, 170, 42);
+    lv_obj_set_style_bg_color(ctx->wardrive_wigle_sync_btn, COLOR_MATERIAL_TEAL, 0);
+    lv_obj_set_style_bg_color(ctx->wardrive_wigle_sync_btn, lv_color_hex(0x555555), LV_STATE_DISABLED);
+    lv_obj_set_style_bg_color(ctx->wardrive_wigle_sync_btn, lv_color_hex(0x00897B), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(ctx->wardrive_wigle_sync_btn, 8, 0);
+    lv_obj_add_event_cb(ctx->wardrive_wigle_sync_btn, wardrive_wigle_sync_pending_btn_cb, LV_EVENT_CLICKED, ctx);
+
+    lv_obj_t *sync_lbl = lv_label_create(ctx->wardrive_wigle_sync_btn);
+    lv_label_set_text(sync_lbl, "Sync pending");
+    lv_obj_set_style_text_font(sync_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(sync_lbl, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_center(sync_lbl);
+
+    ctx->wardrive_wigle_all_btn = lv_btn_create(batch_row);
+    lv_obj_set_size(ctx->wardrive_wigle_all_btn, 150, 42);
+    lv_obj_set_style_bg_color(ctx->wardrive_wigle_all_btn, COLOR_MATERIAL_AMBER, 0);
+    lv_obj_set_style_bg_color(ctx->wardrive_wigle_all_btn, lv_color_hex(0x555555), LV_STATE_DISABLED);
+    lv_obj_set_style_bg_color(ctx->wardrive_wigle_all_btn, lv_color_hex(0xFFA000), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(ctx->wardrive_wigle_all_btn, 8, 0);
+    lv_obj_add_event_cb(ctx->wardrive_wigle_all_btn, wardrive_wigle_force_all_btn_cb, LV_EVENT_CLICKED, ctx);
+
+    lv_obj_t *all_lbl = lv_label_create(ctx->wardrive_wigle_all_btn);
+    lv_label_set_text(all_lbl, "Force all");
+    lv_obj_set_style_text_font(all_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(all_lbl, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_center(all_lbl);
 
     ctx->wardrive_wigle_btn_row = lv_obj_create(ctx->wardrive_wigle_popup);
     lv_obj_t *btn_row = ctx->wardrive_wigle_btn_row;
@@ -19636,6 +21455,7 @@ static void show_wardrive_upload_popup(tab_context_t *ctx, wardrive_upload_provi
     ctx->wardrive_wigle_task_running = false;
     ctx->wardrive_wigle_connect_ready = false;
     ctx->wardrive_wigle_upload_done = false;
+    ctx->wardrive_upload_mode = WARDRIVE_UPLOAD_MODE_SELECTED;
     ctx->wardrive_wigle_task = NULL;
     ctx->wardrive_wigle_selected_ssid[0] = '\0';
     ctx->wardrive_wigle_selected_password[0] = '\0';
@@ -19652,15 +21472,25 @@ static void show_wardrive_upload_popup(tab_context_t *ctx, wardrive_upload_provi
         return;
     }
 
-    if (ctx->wardrive_wigle_spinner) {
-        lv_obj_clear_flag(ctx->wardrive_wigle_spinner, LV_OBJ_FLAG_HIDDEN);
-    }
-    lv_refr_now(NULL);
+    bool have_cached_files = (ctx->wardrive_wigle_files != NULL &&
+                              ctx->wardrive_wigle_file_count > 0);
+    if (!have_cached_files) {
+        if (ctx->wardrive_wigle_spinner) {
+            lv_obj_clear_flag(ctx->wardrive_wigle_spinner, LV_OBJ_FLAG_HIDDEN);
+        }
+        lv_refr_now(NULL);
 
-    wardrive_wigle_load_file_list(ctx, tab_id_for_ctx(ctx), uart_port_for_tab(tab_id_for_ctx(ctx)));
+        wardrive_wigle_load_file_list(ctx, tab_id_for_ctx(ctx), uart_port_for_tab(tab_id_for_ctx(ctx)));
 
-    if (ctx->wardrive_wigle_spinner) {
-        lv_obj_add_flag(ctx->wardrive_wigle_spinner, LV_OBJ_FLAG_HIDDEN);
+        if (ctx->wardrive_wigle_spinner) {
+            lv_obj_add_flag(ctx->wardrive_wigle_spinner, LV_OBJ_FLAG_HIDDEN);
+        }
+    } else {
+        for (int i = 0; i < ctx->wardrive_wigle_file_count; i++) {
+            ctx->wardrive_wigle_files[i].selected = false;
+            ctx->wardrive_wigle_files[i].checkbox = NULL;
+        }
+        ctx->wardrive_wigle_selected_count = 0;
     }
 
     if (ctx->wardrive_wigle_file_count <= 0) {
@@ -19675,10 +21505,19 @@ static void show_wardrive_upload_popup(tab_context_t *ctx, wardrive_upload_provi
     wardrive_wigle_render_page(ctx);
 
     if (ctx->wardrive_wigle_status_label) {
-        lv_label_set_text_fmt(ctx->wardrive_wigle_status_label,
-                              "Found %d file(s). Select files and tap Send to %s.",
-                              ctx->wardrive_wigle_file_count,
-                              wardrive_upload_provider_label(provider));
+        char summary[320];
+        wardrive_format_summary_text(&ctx->wardrive_file_summary, summary, sizeof(summary));
+        if (summary[0] != '\0') {
+            lv_label_set_text_fmt(ctx->wardrive_wigle_status_label,
+                                  "%s\nUse Sync pending / Force all, or select files and tap Send to %s.",
+                                  summary,
+                                  wardrive_upload_provider_label(provider));
+        } else {
+            lv_label_set_text_fmt(ctx->wardrive_wigle_status_label,
+                                  "Found %d file(s). Use batch buttons, or select files and tap Send to %s.",
+                                  ctx->wardrive_wigle_file_count,
+                                  wardrive_upload_provider_label(provider));
+        }
     }
     wardrive_wigle_update_send_btn(ctx);
 }
@@ -19735,6 +21574,14 @@ static void wardrive_reply_tab_gps_read(tab_id_t active_tab, uart_port_t uart_po
     }
 }
 
+static void wardrive_update_external_gps_mode(tab_context_t *ctx)
+{
+    if (!ctx) {
+        return;
+    }
+    ctx->wardrive_use_external_gps = (ctx->wardrive_setup_gps_index == 2);
+}
+
 static void wardrive_push_external_gps_update(tab_id_t active_tab,
                                               uart_port_t uart_port,
                                               bool *push_initialized,
@@ -19786,6 +21633,10 @@ static void wardrive_push_external_gps_update(tab_id_t active_tab,
     transport_write_bytes_tab(active_tab, uart_port, "\r\n", 2);
     if (written <= 0) {
         ESP_LOGW(TAG, "Wardrive: failed to push set_gps_position");
+    } else if (has_fix) {
+        ESP_LOGI(TAG, "Wardrive: pushed external GPS %.7f %.7f", lat, lon);
+    } else {
+        ESP_LOGW(TAG, "Wardrive: pushed external GPS clear (no Tab5 fix)");
     }
 
     if (has_fix) {
@@ -19826,8 +21677,8 @@ static void wardrive_stop_cb(lv_event_t *e)
     if (ctx->wardrive_start_btn) lv_obj_clear_state(ctx->wardrive_start_btn, LV_STATE_DISABLED);
     if (ctx->wardrive_stop_btn) lv_obj_add_state(ctx->wardrive_stop_btn, LV_STATE_DISABLED);
     if (ctx->wardrive_trace_btn) lv_obj_clear_state(ctx->wardrive_trace_btn, LV_STATE_DISABLED);
-    if (ctx->wardrive_gps_type_btn) lv_obj_clear_state(ctx->wardrive_gps_type_btn, LV_STATE_DISABLED);
     if (ctx->wardrive_upload_btn) lv_obj_clear_state(ctx->wardrive_upload_btn, LV_STATE_DISABLED);
+    if (ctx->wardrive_setup_btn) lv_obj_clear_state(ctx->wardrive_setup_btn, LV_STATE_DISABLED);
 
     // Update status
     if (ctx->wardrive_status_label) {
@@ -19940,6 +21791,25 @@ static void wardrive_monitor_task(void *arg)
                                 ctx->wardrive_distance_m = atof(dist_ptr);
                             }
 
+                            // Wardrive 2.0: re-log counter
+                            char *relog_ptr = strstr(line_buffer, "relogs");
+                            if (relog_ptr) {
+                                // value precedes the word: "..., 12 relogs, ..."
+                                char *p = relog_ptr;
+                                while (p > line_buffer && (*(p - 1) == ' ')) p--;
+                                char *num_end = p;
+                                while (p > line_buffer && isdigit((unsigned char)*(p - 1))) p--;
+                                if (p < num_end) ctx->wardrive_relogs = atoi(p);
+                            }
+
+                            // Wardrive 2.0: D-UCB best channel
+                            char *bestch_ptr = strstr(line_buffer, "best ch:");
+                            if (bestch_ptr) {
+                                bestch_ptr += 8;
+                                while (*bestch_ptr == ' ') bestch_ptr++;
+                                ctx->wardrive_best_ch = atoi(bestch_ptr);
+                            }
+
                             bsp_display_lock(0);
                             update_wardrive_count_label(ctx);
                             bsp_display_unlock();
@@ -20000,8 +21870,8 @@ static void wardrive_monitor_task(void *arg)
                             if (ctx->wardrive_start_btn) lv_obj_clear_state(ctx->wardrive_start_btn, LV_STATE_DISABLED);
                             if (ctx->wardrive_stop_btn) lv_obj_add_state(ctx->wardrive_stop_btn, LV_STATE_DISABLED);
                             if (ctx->wardrive_trace_btn) lv_obj_clear_state(ctx->wardrive_trace_btn, LV_STATE_DISABLED);
-                            if (ctx->wardrive_gps_type_btn) lv_obj_clear_state(ctx->wardrive_gps_type_btn, LV_STATE_DISABLED);
                             if (ctx->wardrive_upload_btn) lv_obj_clear_state(ctx->wardrive_upload_btn, LV_STATE_DISABLED);
+                            if (ctx->wardrive_setup_btn) lv_obj_clear_state(ctx->wardrive_setup_btn, LV_STATE_DISABLED);
                             bsp_display_unlock();
                         }
 
@@ -20048,8 +21918,8 @@ static void wardrive_monitor_task(void *arg)
                             if (ctx->wardrive_start_btn) lv_obj_clear_state(ctx->wardrive_start_btn, LV_STATE_DISABLED);
                             if (ctx->wardrive_stop_btn) lv_obj_add_state(ctx->wardrive_stop_btn, LV_STATE_DISABLED);
                             if (ctx->wardrive_trace_btn) lv_obj_clear_state(ctx->wardrive_trace_btn, LV_STATE_DISABLED);
-                            if (ctx->wardrive_gps_type_btn) lv_obj_clear_state(ctx->wardrive_gps_type_btn, LV_STATE_DISABLED);
                             if (ctx->wardrive_upload_btn) lv_obj_clear_state(ctx->wardrive_upload_btn, LV_STATE_DISABLED);
+                            if (ctx->wardrive_setup_btn) lv_obj_clear_state(ctx->wardrive_setup_btn, LV_STATE_DISABLED);
                             if (ctx->wardrive_status_label) {
                                 lv_label_set_text(ctx->wardrive_status_label, "Wardrive stopped");
                                 lv_obj_set_style_text_color(ctx->wardrive_status_label, lv_color_hex(0x888888), 0);
@@ -20097,12 +21967,19 @@ static void wardrive_start_cb(lv_event_t *e)
     tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
     if (!ctx) ctx = get_current_ctx();
     if (ctx->wardrive_monitoring) return;  // Already running
+    if (ctx->antisurv_monitoring) {
+        if (ctx->wardrive_status_label) {
+            lv_label_set_text(ctx->wardrive_status_label, "Stop Anti-Surveillance first (shares the radio)");
+            lv_obj_set_style_text_color(ctx->wardrive_status_label, COLOR_MATERIAL_RED, 0);
+        }
+        return;
+    }
 
     // Stop any pending WiGLE upload popup/task when a new capture starts
     close_wardrive_wigle_popup_ctx(ctx);
 
-    ESP_LOGI(TAG, "Wardrive start - sending %s command",
-             ctx->wardrive_trace_enabled ? "start_wardrive_promisc_trace" : "start_wardrive_promisc");
+    const char *start_cmd = ctx->wardrive_trace_enabled ? "start_wardrive_promisc_trace" : "start_wardrive_promisc";
+    ESP_LOGI(TAG, "Wardrive start - sending %s command", start_cmd);
 
     // Clear any previous network selection and send start command
     tab_id_t active_tab = tab_id_for_ctx(ctx);
@@ -20115,9 +21992,9 @@ static void wardrive_start_cb(lv_event_t *e)
 
     // Send start command
     if (active_tab == TAB_MBUS) {
-        uart2_send_command(ctx->wardrive_trace_enabled ? "start_wardrive_promisc_trace" : "start_wardrive_promisc");
+        uart2_send_command(start_cmd);
     } else {
-        uart_send_command(ctx->wardrive_trace_enabled ? "start_wardrive_promisc_trace" : "start_wardrive_promisc");
+        uart_send_command(start_cmd);
     }
 
     // Reset ring buffer
@@ -20125,6 +22002,8 @@ static void wardrive_start_cb(lv_event_t *e)
     ctx->wardrive_wifi_count = 0;
     ctx->wardrive_bt_count = 0;
     ctx->wardrive_sat_count = 0;
+    ctx->wardrive_relogs = 0;
+    ctx->wardrive_best_ch = 0;
     ctx->wardrive_distance_m = 0.0;
     ctx->wardrive_net_head = 0;
     ctx->wardrive_gps_fix = false;
@@ -20137,8 +22016,8 @@ static void wardrive_start_cb(lv_event_t *e)
     if (ctx->wardrive_start_btn) lv_obj_add_state(ctx->wardrive_start_btn, LV_STATE_DISABLED);
     if (ctx->wardrive_stop_btn) lv_obj_clear_state(ctx->wardrive_stop_btn, LV_STATE_DISABLED);
     if (ctx->wardrive_trace_btn) lv_obj_add_state(ctx->wardrive_trace_btn, LV_STATE_DISABLED);
-    if (ctx->wardrive_gps_type_btn) lv_obj_add_state(ctx->wardrive_gps_type_btn, LV_STATE_DISABLED);
     if (ctx->wardrive_upload_btn) lv_obj_add_state(ctx->wardrive_upload_btn, LV_STATE_DISABLED);
+    if (ctx->wardrive_setup_btn) lv_obj_add_state(ctx->wardrive_setup_btn, LV_STATE_DISABLED);
 
     // Update status
     if (ctx->wardrive_status_label) {
@@ -20182,6 +22061,8 @@ static void wardrive_back_cb(lv_event_t *e)
     // Dismiss GPS overlay
     close_wardrive_gps_overlay(ctx);
     close_wardrive_wigle_popup_ctx(ctx);
+    wardrive_setup_close_cb(NULL);
+    wardrive_blacklist_close_cb(NULL);
 
     // Hide wardrive page
     if (ctx->wardrive_page) {
@@ -20193,6 +22074,1344 @@ static void wardrive_back_cb(lv_event_t *e)
         lv_obj_clear_flag(ctx->tiles, LV_OBJ_FLAG_HIDDEN);
         ctx->current_visible_page = ctx->tiles;
     }
+}
+
+//==================================================================================
+// Wardrive 2.0 — configuration helpers + Setup overlay
+//==================================================================================
+
+static void wardrive_config_set_defaults(wardrive_config_t *cfg)
+{
+    if (!cfg) return;
+    cfg->bands = WARDRIVE_BAND_WIFI24 | WARDRIVE_BAND_WIFI5 | WARDRIVE_BAND_BLE;
+    cfg->channel_mode = WARDRIVE_CH_ALL;
+    cfg->custom_channels[0] = '\0';
+    cfg->wifi_rssi_delta = 5;
+    cfg->ble_rssi_delta = 15;
+    cfg->startup_cooldown = 0;
+    cfg->mem_cap = 40000;
+    cfg->antisurv_sensitivity = WARDRIVE_ANTISURV_MED;
+    cfg->loaded = false;
+}
+
+// Send a command and poll the transport for an ACK line. Returns true if a line
+// containing ack_substr (or any non-empty line when ack_substr is NULL) arrived.
+// Used by setup Apply/Load commands where the firmware answers with a short line.
+static bool wardrive_send_set_command(tab_context_t *ctx, const char *cmd,
+                                      const char *ack_substr, char *resp_out, size_t resp_sz)
+{
+    if (!ctx || !cmd) return false;
+    if (resp_out && resp_sz) resp_out[0] = '\0';
+
+    tab_id_t active_tab = tab_id_for_ctx(ctx);
+    uart_port_t uart_port = (active_tab == TAB_MBUS) ? UART2_NUM : UART_NUM;
+
+    if (active_tab == TAB_MBUS) {
+        uart2_send_command(cmd);
+    } else {
+        uart_send_command(cmd);
+    }
+
+    char rx_buffer[768] = {0};
+    char parse_buffer[768];
+    char found[256] = "";
+    int total_len = 0;
+
+    for (int attempt = 0; attempt < 4 && found[0] == '\0'; attempt++) {
+        vTaskDelay(pdMS_TO_TICKS(25));
+        if (total_len >= (int)sizeof(rx_buffer) - 1) break;
+
+        int len = transport_read_bytes_tab(active_tab, uart_port,
+                                           rx_buffer + total_len,
+                                           sizeof(rx_buffer) - 1 - total_len,
+                                           pdMS_TO_TICKS(25));
+        if (len <= 0) continue;
+        total_len += len;
+        rx_buffer[total_len] = '\0';
+
+        snprintf(parse_buffer, sizeof(parse_buffer), "%s", rx_buffer);
+        char *saveptr = NULL;
+        char *line = strtok_r(parse_buffer, "\r\n", &saveptr);
+        while (line) {
+            while (*line == ' ') line++;
+            if (line[0] != '\0' && (!ack_substr || strstr(line, ack_substr) != NULL)) {
+                snprintf(found, sizeof(found), "%.255s", line);
+                break;
+            }
+            line = strtok_r(NULL, "\r\n", &saveptr);
+        }
+    }
+
+    if (resp_out && resp_sz && found[0] != '\0') {
+        snprintf(resp_out, resp_sz, "%.*s", (int)resp_sz - 1, found);
+    }
+    return found[0] != '\0';
+}
+
+static bool wardrive_load_gps_module(tab_context_t *ctx)
+{
+    char resp[256];
+    if (!wardrive_send_set_command(ctx, "gps_set", "Current GPS module", resp, sizeof(resp))) {
+        return false;
+    }
+
+    if (strstr(resp, "M5Stack") != NULL || strstr(resp, "M5STACK") != NULL) {
+        ctx->wardrive_setup_gps_index = 0;
+    } else if (strstr(resp, "ATGM") != NULL || strstr(resp, "atgm") != NULL) {
+        ctx->wardrive_setup_gps_index = 1;
+    } else if (strstr(resp, "ExternalCap") != NULL || strstr(resp, "external_cap") != NULL ||
+               strstr(resp, "cap") != NULL) {
+        ctx->wardrive_setup_gps_index = 3;
+    } else if (strstr(resp, "External") != NULL || strstr(resp, "external") != NULL ||
+               strstr(resp, "tab5") != NULL) {
+        ctx->wardrive_setup_gps_index = 2;
+    } else {
+        return false;
+    }
+    ctx->wardrive_setup_gps_dirty = false;
+    wardrive_update_external_gps_mode(ctx);
+    return true;
+}
+
+// Query get_wardrive_config and populate ctx->wardrive_config from [WDCFG] lines.
+static bool wardrive_load_config(tab_context_t *ctx)
+{
+    if (!ctx) return false;
+
+    tab_id_t active_tab = tab_id_for_ctx(ctx);
+    uart_port_t uart_port = (active_tab == TAB_MBUS) ? UART2_NUM : UART_NUM;
+
+    if (active_tab == TAB_MBUS) {
+        uart2_send_command("get_wardrive_config");
+    } else {
+        uart_send_command("get_wardrive_config");
+    }
+
+    wardrive_config_t cfg;
+    wardrive_config_set_defaults(&cfg);
+
+    char rx_buffer[1024] = {0};
+    char parse_buffer[1024];
+    int total_len = 0;
+    bool got_end = false;
+
+    for (int attempt = 0; attempt < 25 && !got_end; attempt++) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        if (total_len >= (int)sizeof(rx_buffer) - 1) break;
+
+        int len = transport_read_bytes_tab(active_tab, uart_port,
+                                           rx_buffer + total_len,
+                                           sizeof(rx_buffer) - 1 - total_len,
+                                           pdMS_TO_TICKS(50));
+        if (len <= 0) continue;
+        total_len += len;
+        rx_buffer[total_len] = '\0';
+        if (strstr(rx_buffer, "[WDCFG] END") != NULL) got_end = true;
+    }
+
+    if (total_len <= 0) return false;
+
+    snprintf(parse_buffer, sizeof(parse_buffer), "%s", rx_buffer);
+    char *saveptr = NULL;
+    char *line = strtok_r(parse_buffer, "\r\n", &saveptr);
+    bool any = false;
+    while (line) {
+        const char *p = strstr(line, "[WDCFG]");
+        if (p) {
+            p += strlen("[WDCFG]");
+            while (*p == ' ') p++;
+            if (strncmp(p, "bands=", 6) == 0) {
+                cfg.bands = 0;
+                if (strstr(p, "wifi24")) cfg.bands |= WARDRIVE_BAND_WIFI24;
+                if (strstr(p, "wifi5"))  cfg.bands |= WARDRIVE_BAND_WIFI5;
+                if (strstr(p, "ble"))    cfg.bands |= WARDRIVE_BAND_BLE;
+                any = true;
+            } else if (strncmp(p, "channels=", 9) == 0) {
+                const char *v = p + 9;
+                if (strncmp(v, "popular", 7) == 0) cfg.channel_mode = WARDRIVE_CH_POPULAR;
+                else if (strncmp(v, "custom", 6) == 0) cfg.channel_mode = WARDRIVE_CH_CUSTOM;
+                else cfg.channel_mode = WARDRIVE_CH_ALL;
+            } else if (strncmp(p, "custom=", 7) == 0) {
+                snprintf(cfg.custom_channels, sizeof(cfg.custom_channels), "%.*s",
+                         (int)sizeof(cfg.custom_channels) - 1, p + 7);
+            } else if (strncmp(p, "wifi_rssi_delta=", 16) == 0) {
+                cfg.wifi_rssi_delta = atoi(p + 16);
+            } else if (strncmp(p, "ble_rssi_delta=", 15) == 0) {
+                cfg.ble_rssi_delta = atoi(p + 15);
+            } else if (strncmp(p, "startup_cooldown=", 17) == 0) {
+                cfg.startup_cooldown = atoi(p + 17);
+            } else if (strncmp(p, "mem_cap=", 8) == 0) {
+                cfg.mem_cap = atoi(p + 8);
+            } else if (strncmp(p, "antisurv_sensitivity=", 21) == 0) {
+                const char *v = p + 21;
+                if (strncmp(v, "low", 3) == 0) cfg.antisurv_sensitivity = WARDRIVE_ANTISURV_LOW;
+                else if (strncmp(v, "high", 4) == 0) cfg.antisurv_sensitivity = WARDRIVE_ANTISURV_HIGH;
+                else cfg.antisurv_sensitivity = WARDRIVE_ANTISURV_MED;
+            }
+        }
+        line = strtok_r(NULL, "\r\n", &saveptr);
+    }
+
+    if (any) {
+        cfg.loaded = true;
+        ctx->wardrive_config = cfg;
+    }
+    return any;
+}
+
+static const char *wardrive_memcap_options = "10000\n20000\n40000\n80000\n120000\n200000";
+static const int wardrive_memcap_values[] = {10000, 20000, 40000, 80000, 120000, 200000};
+
+static int wardrive_memcap_to_index(int memcap)
+{
+    int best = 2; // default 40000
+    int best_diff = 1 << 30;
+    for (int i = 0; i < (int)(sizeof(wardrive_memcap_values) / sizeof(int)); i++) {
+        int diff = abs(memcap - wardrive_memcap_values[i]);
+        if (diff < best_diff) { best_diff = diff; best = i; }
+    }
+    return best;
+}
+
+// Push ctx->wardrive_config values into the setup overlay controls.
+static void wardrive_setup_sync_controls(tab_context_t *ctx)
+{
+    if (!ctx || !ctx->wardrive_setup_popup) return;
+    wardrive_config_t *cfg = &ctx->wardrive_config;
+
+    if (ctx->wardrive_setup_trace_sw) {
+        if (ctx->wardrive_trace_enabled) lv_obj_add_state(ctx->wardrive_setup_trace_sw, LV_STATE_CHECKED);
+        else lv_obj_clear_state(ctx->wardrive_setup_trace_sw, LV_STATE_CHECKED);
+    }
+    if (ctx->wardrive_setup_gps_dd) {
+        lv_dropdown_set_selected(ctx->wardrive_setup_gps_dd, ctx->wardrive_setup_gps_index);
+        ctx->wardrive_setup_gps_dirty = false;
+    }
+    if (ctx->wardrive_setup_band_24_cb) {
+        if (cfg->bands & WARDRIVE_BAND_WIFI24) lv_obj_add_state(ctx->wardrive_setup_band_24_cb, LV_STATE_CHECKED);
+        else lv_obj_clear_state(ctx->wardrive_setup_band_24_cb, LV_STATE_CHECKED);
+    }
+    if (ctx->wardrive_setup_band_5_cb) {
+        if (cfg->bands & WARDRIVE_BAND_WIFI5) lv_obj_add_state(ctx->wardrive_setup_band_5_cb, LV_STATE_CHECKED);
+        else lv_obj_clear_state(ctx->wardrive_setup_band_5_cb, LV_STATE_CHECKED);
+    }
+    if (ctx->wardrive_setup_band_ble_cb) {
+        if (cfg->bands & WARDRIVE_BAND_BLE) lv_obj_add_state(ctx->wardrive_setup_band_ble_cb, LV_STATE_CHECKED);
+        else lv_obj_clear_state(ctx->wardrive_setup_band_ble_cb, LV_STATE_CHECKED);
+    }
+    if (ctx->wardrive_setup_channel_dd) {
+        lv_dropdown_set_selected(ctx->wardrive_setup_channel_dd, (uint16_t)cfg->channel_mode);
+    }
+    if (ctx->wardrive_setup_custom_ta) {
+        lv_textarea_set_text(ctx->wardrive_setup_custom_ta, cfg->custom_channels);
+        if (cfg->channel_mode == WARDRIVE_CH_CUSTOM) lv_obj_clear_flag(ctx->wardrive_setup_custom_ta, LV_OBJ_FLAG_HIDDEN);
+        else lv_obj_add_flag(ctx->wardrive_setup_custom_ta, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (ctx->wardrive_setup_wifi_delta_slider) {
+        lv_slider_set_value(ctx->wardrive_setup_wifi_delta_slider, cfg->wifi_rssi_delta, LV_ANIM_OFF);
+        if (ctx->wardrive_setup_wifi_delta_val)
+            lv_label_set_text_fmt(ctx->wardrive_setup_wifi_delta_val, "%d dBm%s", cfg->wifi_rssi_delta,
+                                  cfg->wifi_rssi_delta == 0 ? " (once)" : "");
+    }
+    if (ctx->wardrive_setup_ble_delta_slider) {
+        lv_slider_set_value(ctx->wardrive_setup_ble_delta_slider, cfg->ble_rssi_delta, LV_ANIM_OFF);
+        if (ctx->wardrive_setup_ble_delta_val)
+            lv_label_set_text_fmt(ctx->wardrive_setup_ble_delta_val, "%d dBm%s", cfg->ble_rssi_delta,
+                                  cfg->ble_rssi_delta == 0 ? " (once)" : "");
+    }
+    if (ctx->wardrive_setup_cooldown_slider) {
+        lv_slider_set_value(ctx->wardrive_setup_cooldown_slider, cfg->startup_cooldown, LV_ANIM_OFF);
+        if (ctx->wardrive_setup_cooldown_val)
+            lv_label_set_text_fmt(ctx->wardrive_setup_cooldown_val, "%d s", cfg->startup_cooldown);
+    }
+    if (ctx->wardrive_setup_memcap_dd) {
+        lv_dropdown_set_selected(ctx->wardrive_setup_memcap_dd, (uint16_t)wardrive_memcap_to_index(cfg->mem_cap));
+    }
+    if (ctx->wardrive_setup_antisurv_dd) {
+        lv_dropdown_set_selected(ctx->wardrive_setup_antisurv_dd, (uint16_t)cfg->antisurv_sensitivity);
+    }
+}
+
+static void wardrive_setup_do_load(tab_context_t *ctx)
+{
+    if (!ctx) return;
+    if (ctx->wardrive_setup_status_label) {
+        lv_label_set_text(ctx->wardrive_setup_status_label, "Reading device config...");
+        lv_obj_set_style_text_color(ctx->wardrive_setup_status_label, COLOR_MATERIAL_AMBER, 0);
+        lv_refr_now(NULL);
+    }
+    bool ok = wardrive_load_config(ctx);
+    bool gps_ok = wardrive_load_gps_module(ctx);
+    wardrive_setup_sync_controls(ctx);
+    if (ctx->wardrive_setup_status_label) {
+        if (ok && gps_ok) {
+            lv_label_set_text(ctx->wardrive_setup_status_label, "Loaded current config and GPS module from device");
+        } else if (ok) {
+            lv_label_set_text(ctx->wardrive_setup_status_label, "Loaded config; GPS module not reported");
+        } else {
+            lv_label_set_text(ctx->wardrive_setup_status_label, "No response - showing local values");
+        }
+        lv_obj_set_style_text_color(ctx->wardrive_setup_status_label,
+                                    ok ? COLOR_MATERIAL_GREEN : COLOR_MATERIAL_RED, 0);
+    }
+}
+
+static void wardrive_setup_load_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx) ctx = get_current_ctx();
+    wardrive_setup_do_load(ctx);
+}
+
+// Slider value-label updaters
+static void wardrive_wifi_delta_slider_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx || !ctx->wardrive_setup_wifi_delta_val) return;
+    int v = lv_slider_get_value(ctx->wardrive_setup_wifi_delta_slider);
+    lv_label_set_text_fmt(ctx->wardrive_setup_wifi_delta_val, "%d dBm%s", v, v == 0 ? " (once)" : "");
+}
+
+static void wardrive_ble_delta_slider_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx || !ctx->wardrive_setup_ble_delta_val) return;
+    int v = lv_slider_get_value(ctx->wardrive_setup_ble_delta_slider);
+    lv_label_set_text_fmt(ctx->wardrive_setup_ble_delta_val, "%d dBm%s", v, v == 0 ? " (once)" : "");
+}
+
+static void wardrive_cooldown_slider_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx || !ctx->wardrive_setup_cooldown_val) return;
+    int v = lv_slider_get_value(ctx->wardrive_setup_cooldown_slider);
+    lv_label_set_text_fmt(ctx->wardrive_setup_cooldown_val, "%d s", v);
+}
+
+static void wardrive_setup_trace_sw_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx || !ctx->wardrive_setup_trace_sw) return;
+    ctx->wardrive_trace_enabled = lv_obj_has_state(ctx->wardrive_setup_trace_sw, LV_STATE_CHECKED);
+}
+
+static const char *wardrive_setup_gps_cmd_for_index(uint8_t index)
+{
+    switch (index) {
+        case 0: return "m5";
+        case 1: return "atgm";
+        case 3: return "cap";
+        default: return "external";
+    }
+}
+
+static void wardrive_setup_gps_dd_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx || !ctx->wardrive_setup_gps_dd) return;
+    ctx->wardrive_setup_gps_index = (uint8_t)lv_dropdown_get_selected(ctx->wardrive_setup_gps_dd);
+    ctx->wardrive_setup_gps_dirty = true;
+}
+
+static void wardrive_channel_dd_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx || !ctx->wardrive_setup_channel_dd || !ctx->wardrive_setup_custom_ta) return;
+    uint16_t sel = lv_dropdown_get_selected(ctx->wardrive_setup_channel_dd);
+    if (sel == WARDRIVE_CH_CUSTOM) lv_obj_clear_flag(ctx->wardrive_setup_custom_ta, LV_OBJ_FLAG_HIDDEN);
+    else lv_obj_add_flag(ctx->wardrive_setup_custom_ta, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void wardrive_setup_ta_focus_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    lv_obj_t *ta = lv_event_get_target(e);
+    lv_event_code_t code = lv_event_get_code(e);
+    if (!ctx || !ctx->wardrive_setup_keyboard) return;
+    if (code == LV_EVENT_FOCUSED) {
+        lv_keyboard_set_textarea(ctx->wardrive_setup_keyboard, ta);
+        lv_obj_clear_flag(ctx->wardrive_setup_keyboard, LV_OBJ_FLAG_HIDDEN);
+    } else if (code == LV_EVENT_DEFOCUSED || code == LV_EVENT_READY) {
+        lv_obj_add_flag(ctx->wardrive_setup_keyboard, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+// Per-step status update from the apply worker task (guarded; overlay may close)
+static void wardrive_apply_set_status(tab_context_t *ctx, const char *text, lv_color_t color)
+{
+    bsp_display_lock(0);
+    if (ctx->wardrive_setup_status_label && ctx->wardrive_setup_overlay) {
+        lv_label_set_text(ctx->wardrive_setup_status_label, text);
+        lv_obj_set_style_text_color(ctx->wardrive_setup_status_label, color, 0);
+    }
+    bsp_display_unlock();
+}
+
+// Worker task: sends the set_* commands, waiting for each ACK while the LVGL
+// thread stays free. Reads ctx->wardrive_config snapshot.
+static void wardrive_apply_task(void *arg)
+{
+    tab_context_t *ctx = (tab_context_t *)arg;
+    wardrive_config_t *cfg = &ctx->wardrive_config;
+    char cmd[160];
+    char step[64];
+    int ok = 0, total = 0;
+    const bool apply_gps = ctx->wardrive_setup_gps_dirty;
+    const int expected_total = apply_gps ? 8 : 7;
+
+    if (apply_gps) {
+        snprintf(cmd, sizeof(cmd), "gps_set %s",
+                 wardrive_setup_gps_cmd_for_index(ctx->wardrive_setup_gps_index));
+        snprintf(step, sizeof(step), "Applying %d/%d: GPS module", total + 1, expected_total);
+        wardrive_apply_set_status(ctx, step, COLOR_MATERIAL_AMBER);
+        total++;
+        bool gps_cmd_ok = wardrive_send_set_command(ctx, cmd, "GPS module", NULL, 0);
+        if (gps_cmd_ok) {
+            ok++;
+            wardrive_update_external_gps_mode(ctx);
+        }
+    }
+
+    // bands
+    {
+        char list[40] = "";
+        if (cfg->bands & WARDRIVE_BAND_WIFI24) strcat(list, "wifi24,");
+        if (cfg->bands & WARDRIVE_BAND_WIFI5)  strcat(list, "wifi5,");
+        if (cfg->bands & WARDRIVE_BAND_BLE)    strcat(list, "ble,");
+        size_t l = strlen(list);
+        if (l && list[l - 1] == ',') list[l - 1] = '\0';
+        snprintf(cmd, sizeof(cmd), "set_wardrive_bands %s", list);
+        snprintf(step, sizeof(step), "Applying %d/%d: bands", total + 1, expected_total);
+        wardrive_apply_set_status(ctx, step, COLOR_MATERIAL_AMBER);
+        total++; if (wardrive_send_set_command(ctx, cmd, "Wardrive bands", NULL, 0)) ok++;
+    }
+    // channels
+    {
+        const char *mode = cfg->channel_mode == WARDRIVE_CH_POPULAR ? "popular" :
+                           cfg->channel_mode == WARDRIVE_CH_CUSTOM ? "custom" : "all";
+        if (cfg->channel_mode == WARDRIVE_CH_CUSTOM && cfg->custom_channels[0])
+            snprintf(cmd, sizeof(cmd), "set_wardrive_channels custom %s", cfg->custom_channels);
+        else
+            snprintf(cmd, sizeof(cmd), "set_wardrive_channels %s", mode);
+        snprintf(step, sizeof(step), "Applying %d/%d: channels", total + 1, expected_total);
+        wardrive_apply_set_status(ctx, step, COLOR_MATERIAL_AMBER);
+        total++; if (wardrive_send_set_command(ctx, cmd, "Wardrive channels", NULL, 0)) ok++;
+    }
+    // rssi delta wifi/ble
+    snprintf(cmd, sizeof(cmd), "set_wardrive_rssi_delta wifi %d", cfg->wifi_rssi_delta);
+    snprintf(step, sizeof(step), "Applying %d/%d: WiFi RSSI delta", total + 1, expected_total);
+    wardrive_apply_set_status(ctx, step, COLOR_MATERIAL_AMBER);
+    total++; if (wardrive_send_set_command(ctx, cmd, "Wardrive RSSI", NULL, 0)) ok++;
+    snprintf(cmd, sizeof(cmd), "set_wardrive_rssi_delta ble %d", cfg->ble_rssi_delta);
+    snprintf(step, sizeof(step), "Applying %d/%d: BLE RSSI delta", total + 1, expected_total);
+    wardrive_apply_set_status(ctx, step, COLOR_MATERIAL_AMBER);
+    total++; if (wardrive_send_set_command(ctx, cmd, "Wardrive RSSI", NULL, 0)) ok++;
+    // memcap
+    snprintf(cmd, sizeof(cmd), "set_wardrive_memcap %d", cfg->mem_cap);
+    snprintf(step, sizeof(step), "Applying %d/%d: memory cap", total + 1, expected_total);
+    wardrive_apply_set_status(ctx, step, COLOR_MATERIAL_AMBER);
+    total++; if (wardrive_send_set_command(ctx, cmd, "Wardrive memory", NULL, 0)) ok++;
+    // cooldown
+    snprintf(cmd, sizeof(cmd), "set_wardrive_cooldown %d", cfg->startup_cooldown);
+    snprintf(step, sizeof(step), "Applying %d/%d: startup cooldown", total + 1, expected_total);
+    wardrive_apply_set_status(ctx, step, COLOR_MATERIAL_AMBER);
+    total++; if (wardrive_send_set_command(ctx, cmd, "Wardrive startup", NULL, 0)) ok++;
+    // antisurv sensitivity
+    {
+        const char *s = cfg->antisurv_sensitivity == WARDRIVE_ANTISURV_LOW ? "low" :
+                        cfg->antisurv_sensitivity == WARDRIVE_ANTISURV_HIGH ? "high" : "med";
+        snprintf(cmd, sizeof(cmd), "set_antisurv_sensitivity %s", s);
+        snprintf(step, sizeof(step), "Applying %d/%d: anti-surv sensitivity", total + 1, expected_total);
+        wardrive_apply_set_status(ctx, step, COLOR_MATERIAL_AMBER);
+        total++; if (wardrive_send_set_command(ctx, cmd, "Anti-surveillance", NULL, 0)) ok++;
+    }
+
+    cfg->loaded = true;
+    ctx->wardrive_setup_gps_dirty = false;
+    snprintf(step, sizeof(step), "Applied %d/%d settings (saved to NVS)", ok, total);
+
+    // Finalize UI: re-enable buttons and set status.
+    bsp_display_lock(0);
+    if (ctx->wardrive_setup_overlay) {
+        if (ctx->wardrive_setup_load_btn) lv_obj_clear_state(ctx->wardrive_setup_load_btn, LV_STATE_DISABLED);
+        if (ctx->wardrive_setup_apply_btn) lv_obj_clear_state(ctx->wardrive_setup_apply_btn, LV_STATE_DISABLED);
+        if (ctx->wardrive_setup_close_btn) lv_obj_clear_state(ctx->wardrive_setup_close_btn, LV_STATE_DISABLED);
+        if (ctx->wardrive_setup_status_label) {
+            lv_label_set_text(ctx->wardrive_setup_status_label, step);
+            lv_obj_set_style_text_color(ctx->wardrive_setup_status_label,
+                                        ok == total ? COLOR_MATERIAL_GREEN : COLOR_MATERIAL_AMBER, 0);
+        }
+    }
+    bsp_display_unlock();
+
+    ctx->wardrive_setup_applying = false;
+    ctx->wardrive_setup_task = NULL;
+    vTaskDelete(NULL);
+}
+
+static void wardrive_setup_apply_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx) ctx = get_current_ctx();
+    if (!ctx->wardrive_setup_popup || ctx->wardrive_setup_applying) return;
+
+    wardrive_config_t *cfg = &ctx->wardrive_config;
+
+    // ---- gather from controls (LVGL thread) ----
+    uint8_t bands = 0;
+    if (lv_obj_has_state(ctx->wardrive_setup_band_24_cb, LV_STATE_CHECKED)) bands |= WARDRIVE_BAND_WIFI24;
+    if (lv_obj_has_state(ctx->wardrive_setup_band_5_cb, LV_STATE_CHECKED))  bands |= WARDRIVE_BAND_WIFI5;
+    if (lv_obj_has_state(ctx->wardrive_setup_band_ble_cb, LV_STATE_CHECKED)) bands |= WARDRIVE_BAND_BLE;
+    if (bands == 0) {
+        if (ctx->wardrive_setup_status_label) {
+            lv_label_set_text(ctx->wardrive_setup_status_label, "Select at least one band");
+            lv_obj_set_style_text_color(ctx->wardrive_setup_status_label, COLOR_MATERIAL_RED, 0);
+        }
+        return;
+    }
+    cfg->bands = bands;
+    cfg->channel_mode = (wardrive_channel_mode_t)lv_dropdown_get_selected(ctx->wardrive_setup_channel_dd);
+    snprintf(cfg->custom_channels, sizeof(cfg->custom_channels), "%s",
+             lv_textarea_get_text(ctx->wardrive_setup_custom_ta));
+    cfg->wifi_rssi_delta = lv_slider_get_value(ctx->wardrive_setup_wifi_delta_slider);
+    cfg->ble_rssi_delta = lv_slider_get_value(ctx->wardrive_setup_ble_delta_slider);
+    cfg->startup_cooldown = lv_slider_get_value(ctx->wardrive_setup_cooldown_slider);
+    cfg->mem_cap = wardrive_memcap_values[lv_dropdown_get_selected(ctx->wardrive_setup_memcap_dd)];
+    cfg->antisurv_sensitivity = (wardrive_antisurv_sens_t)lv_dropdown_get_selected(ctx->wardrive_setup_antisurv_dd);
+    if (ctx->wardrive_setup_gps_dd && ctx->wardrive_setup_gps_dirty) {
+        ctx->wardrive_setup_gps_index = (uint8_t)lv_dropdown_get_selected(ctx->wardrive_setup_gps_dd);
+    }
+
+    // Lock the overlay and run the sends on a worker task.
+    ctx->wardrive_setup_applying = true;
+    if (ctx->wardrive_setup_load_btn) lv_obj_add_state(ctx->wardrive_setup_load_btn, LV_STATE_DISABLED);
+    if (ctx->wardrive_setup_apply_btn) lv_obj_add_state(ctx->wardrive_setup_apply_btn, LV_STATE_DISABLED);
+    if (ctx->wardrive_setup_close_btn) lv_obj_add_state(ctx->wardrive_setup_close_btn, LV_STATE_DISABLED);
+    if (ctx->wardrive_setup_status_label) {
+        lv_label_set_text(ctx->wardrive_setup_status_label, "Applying...");
+        lv_obj_set_style_text_color(ctx->wardrive_setup_status_label, COLOR_MATERIAL_AMBER, 0);
+    }
+    xTaskCreate(wardrive_apply_task, "wd_apply", 8192, (void*)ctx, 5, &ctx->wardrive_setup_task);
+}
+
+static void wardrive_setup_close_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = e ? (tab_context_t *)lv_event_get_user_data(e) : get_current_ctx();
+    if (!ctx) ctx = get_current_ctx();
+    if (ctx->wardrive_setup_applying) return;  // don't tear down while the worker task runs
+    wardrive_blacklist_close_cb(NULL);
+    if (ctx->wardrive_setup_overlay) {
+        lv_obj_del(ctx->wardrive_setup_overlay);
+        ctx->wardrive_setup_overlay = NULL;
+        ctx->wardrive_setup_popup = NULL;
+        ctx->wardrive_setup_trace_sw = NULL;
+        ctx->wardrive_setup_band_24_cb = NULL;
+        ctx->wardrive_setup_band_5_cb = NULL;
+        ctx->wardrive_setup_band_ble_cb = NULL;
+        ctx->wardrive_setup_gps_dd = NULL;
+        ctx->wardrive_setup_channel_dd = NULL;
+        ctx->wardrive_setup_custom_ta = NULL;
+        ctx->wardrive_setup_wifi_delta_slider = NULL;
+        ctx->wardrive_setup_wifi_delta_val = NULL;
+        ctx->wardrive_setup_ble_delta_slider = NULL;
+        ctx->wardrive_setup_ble_delta_val = NULL;
+        ctx->wardrive_setup_cooldown_slider = NULL;
+        ctx->wardrive_setup_cooldown_val = NULL;
+        ctx->wardrive_setup_memcap_dd = NULL;
+        ctx->wardrive_setup_antisurv_dd = NULL;
+        ctx->wardrive_setup_status_label = NULL;
+        ctx->wardrive_setup_keyboard = NULL;
+        ctx->wardrive_setup_load_btn = NULL;
+        ctx->wardrive_setup_apply_btn = NULL;
+        ctx->wardrive_setup_close_btn = NULL;
+        ctx->wardrive_setup_gps_dirty = false;
+    }
+}
+
+// Small helper: section header label inside the setup popup
+static lv_obj_t *wardrive_setup_make_label(lv_obj_t *parent, const char *text, lv_color_t color)
+{
+    lv_obj_t *lbl = lv_label_create(parent);
+    lv_label_set_text(lbl, text);
+    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(lbl, color, 0);
+    return lbl;
+}
+
+static void wardrive_setup_btn_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx) ctx = get_current_ctx();
+    if (!ctx->wardrive_page || ctx->wardrive_monitoring) return;
+
+    if (ctx->wardrive_setup_overlay) {
+        lv_obj_del(ctx->wardrive_setup_overlay);
+        ctx->wardrive_setup_overlay = NULL;
+    }
+    if (!ctx->wardrive_config.loaded) {
+        wardrive_config_set_defaults(&ctx->wardrive_config);
+    }
+
+    // Overlay
+    ctx->wardrive_setup_overlay = lv_obj_create(ctx->wardrive_page);
+    lv_obj_remove_style_all(ctx->wardrive_setup_overlay);
+    lv_obj_set_size(ctx->wardrive_setup_overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(ctx->wardrive_setup_overlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(ctx->wardrive_setup_overlay, LV_OPA_70, 0);
+    lv_obj_clear_flag(ctx->wardrive_setup_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(ctx->wardrive_setup_overlay, LV_OBJ_FLAG_CLICKABLE);
+
+    // Popup (scrollable column)
+    lv_obj_t *popup = lv_obj_create(ctx->wardrive_setup_overlay);
+    ctx->wardrive_setup_popup = popup;
+    lv_obj_set_size(popup, 600, 620);
+    lv_obj_center(popup);
+    lv_obj_set_style_bg_color(popup, lv_color_hex(0x1A1A2A), 0);
+    lv_obj_set_style_border_color(popup, COLOR_MATERIAL_TEAL, 0);
+    lv_obj_set_style_border_width(popup, 3, 0);
+    lv_obj_set_style_radius(popup, 16, 0);
+    lv_obj_set_style_pad_all(popup, 18, 0);
+    lv_obj_set_flex_flow(popup, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(popup, 8, 0);
+
+    // Title
+    lv_obj_t *title = lv_label_create(popup);
+    lv_label_set_text(title, LV_SYMBOL_SETTINGS " Wardrive Setup");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_TEAL, 0);
+
+    // ---- Trace (KML track) toggle ----
+    lv_obj_t *trace_row = lv_obj_create(popup);
+    lv_obj_set_size(trace_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(trace_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(trace_row, 0, 0);
+    lv_obj_set_style_pad_all(trace_row, 0, 0);
+    lv_obj_set_flex_flow(trace_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(trace_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(trace_row, LV_OBJ_FLAG_SCROLLABLE);
+    wardrive_setup_make_label(trace_row, "Trace (KML track)", COLOR_MATERIAL_CYAN);
+    ctx->wardrive_setup_trace_sw = lv_switch_create(trace_row);
+    lv_obj_add_event_cb(ctx->wardrive_setup_trace_sw, wardrive_setup_trace_sw_cb, LV_EVENT_VALUE_CHANGED, ctx);
+
+    // ---- GPS module ----
+    lv_obj_t *gps_row = lv_obj_create(popup);
+    lv_obj_set_size(gps_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(gps_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(gps_row, 0, 0);
+    lv_obj_set_style_pad_all(gps_row, 0, 0);
+    lv_obj_set_flex_flow(gps_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(gps_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(gps_row, 16, 0);
+    lv_obj_clear_flag(gps_row, LV_OBJ_FLAG_SCROLLABLE);
+    wardrive_setup_make_label(gps_row, "GPS module", COLOR_MATERIAL_CYAN);
+    ctx->wardrive_setup_gps_dd = lv_dropdown_create(gps_row);
+    lv_dropdown_set_options(ctx->wardrive_setup_gps_dd, "m5\natgm\nexternal/tab5\ncap");
+    lv_dropdown_set_selected(ctx->wardrive_setup_gps_dd, ctx->wardrive_setup_gps_index);
+    lv_obj_set_width(ctx->wardrive_setup_gps_dd, 220);
+    lv_obj_add_event_cb(ctx->wardrive_setup_gps_dd, wardrive_setup_gps_dd_cb, LV_EVENT_VALUE_CHANGED, ctx);
+
+    // ---- Bands ----
+    wardrive_setup_make_label(popup, "Bands", COLOR_MATERIAL_CYAN);
+    lv_obj_t *band_row = lv_obj_create(popup);
+    lv_obj_set_size(band_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(band_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(band_row, 0, 0);
+    lv_obj_set_style_pad_all(band_row, 0, 0);
+    lv_obj_set_flex_flow(band_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_column(band_row, 24, 0);
+    lv_obj_clear_flag(band_row, LV_OBJ_FLAG_SCROLLABLE);
+    ctx->wardrive_setup_band_24_cb = lv_checkbox_create(band_row);
+    lv_checkbox_set_text(ctx->wardrive_setup_band_24_cb, "2.4 GHz");
+    lv_obj_set_style_text_color(ctx->wardrive_setup_band_24_cb, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_font(ctx->wardrive_setup_band_24_cb, &lv_font_montserrat_14, 0);
+    ctx->wardrive_setup_band_5_cb = lv_checkbox_create(band_row);
+    lv_checkbox_set_text(ctx->wardrive_setup_band_5_cb, "5 GHz");
+    lv_obj_set_style_text_color(ctx->wardrive_setup_band_5_cb, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_font(ctx->wardrive_setup_band_5_cb, &lv_font_montserrat_14, 0);
+    ctx->wardrive_setup_band_ble_cb = lv_checkbox_create(band_row);
+    lv_checkbox_set_text(ctx->wardrive_setup_band_ble_cb, "BLE");
+    lv_obj_set_style_text_color(ctx->wardrive_setup_band_ble_cb, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_font(ctx->wardrive_setup_band_ble_cb, &lv_font_montserrat_14, 0);
+
+    // ---- Channels ----
+    wardrive_setup_make_label(popup, "Channels", COLOR_MATERIAL_CYAN);
+    ctx->wardrive_setup_channel_dd = lv_dropdown_create(popup);
+    lv_dropdown_set_options(ctx->wardrive_setup_channel_dd, "popular\nall\ncustom");
+    lv_obj_set_width(ctx->wardrive_setup_channel_dd, lv_pct(100));
+    lv_obj_add_event_cb(ctx->wardrive_setup_channel_dd, wardrive_channel_dd_cb, LV_EVENT_VALUE_CHANGED, ctx);
+    ctx->wardrive_setup_custom_ta = lv_textarea_create(popup);
+    lv_textarea_set_one_line(ctx->wardrive_setup_custom_ta, true);
+    lv_textarea_set_placeholder_text(ctx->wardrive_setup_custom_ta, "1:6:11:36:149");
+    lv_obj_set_width(ctx->wardrive_setup_custom_ta, lv_pct(100));
+    lv_obj_add_flag(ctx->wardrive_setup_custom_ta, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(ctx->wardrive_setup_custom_ta, wardrive_setup_ta_focus_cb, LV_EVENT_FOCUSED, ctx);
+    lv_obj_add_event_cb(ctx->wardrive_setup_custom_ta, wardrive_setup_ta_focus_cb, LV_EVENT_DEFOCUSED, ctx);
+    lv_obj_add_event_cb(ctx->wardrive_setup_custom_ta, wardrive_setup_ta_focus_cb, LV_EVENT_READY, ctx);
+
+    // ---- WiFi RSSI delta ----
+    lv_obj_t *wifi_hdr = lv_obj_create(popup);
+    lv_obj_set_size(wifi_hdr, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(wifi_hdr, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(wifi_hdr, 0, 0);
+    lv_obj_set_style_pad_all(wifi_hdr, 0, 0);
+    lv_obj_set_flex_flow(wifi_hdr, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(wifi_hdr, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(wifi_hdr, LV_OBJ_FLAG_SCROLLABLE);
+    wardrive_setup_make_label(wifi_hdr, "WiFi RSSI re-log delta", COLOR_MATERIAL_CYAN);
+    ctx->wardrive_setup_wifi_delta_val = wardrive_setup_make_label(wifi_hdr, "5 dBm", COLOR_MATERIAL_TEAL);
+    ctx->wardrive_setup_wifi_delta_slider = lv_slider_create(popup);
+    lv_slider_set_range(ctx->wardrive_setup_wifi_delta_slider, 0, 50);
+    lv_obj_set_width(ctx->wardrive_setup_wifi_delta_slider, lv_pct(100));
+    lv_obj_add_event_cb(ctx->wardrive_setup_wifi_delta_slider, wardrive_wifi_delta_slider_cb, LV_EVENT_VALUE_CHANGED, ctx);
+
+    // ---- BLE RSSI delta ----
+    lv_obj_t *ble_hdr = lv_obj_create(popup);
+    lv_obj_set_size(ble_hdr, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(ble_hdr, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(ble_hdr, 0, 0);
+    lv_obj_set_style_pad_all(ble_hdr, 0, 0);
+    lv_obj_set_flex_flow(ble_hdr, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(ble_hdr, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(ble_hdr, LV_OBJ_FLAG_SCROLLABLE);
+    wardrive_setup_make_label(ble_hdr, "BLE RSSI re-log delta", COLOR_MATERIAL_CYAN);
+    ctx->wardrive_setup_ble_delta_val = wardrive_setup_make_label(ble_hdr, "15 dBm", COLOR_MATERIAL_TEAL);
+    ctx->wardrive_setup_ble_delta_slider = lv_slider_create(popup);
+    lv_slider_set_range(ctx->wardrive_setup_ble_delta_slider, 0, 50);
+    lv_obj_set_width(ctx->wardrive_setup_ble_delta_slider, lv_pct(100));
+    lv_obj_add_event_cb(ctx->wardrive_setup_ble_delta_slider, wardrive_ble_delta_slider_cb, LV_EVENT_VALUE_CHANGED, ctx);
+
+    // ---- Startup cooldown ----
+    lv_obj_t *cd_hdr = lv_obj_create(popup);
+    lv_obj_set_size(cd_hdr, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(cd_hdr, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(cd_hdr, 0, 0);
+    lv_obj_set_style_pad_all(cd_hdr, 0, 0);
+    lv_obj_set_flex_flow(cd_hdr, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(cd_hdr, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(cd_hdr, LV_OBJ_FLAG_SCROLLABLE);
+    wardrive_setup_make_label(cd_hdr, "Startup cooldown", COLOR_MATERIAL_CYAN);
+    ctx->wardrive_setup_cooldown_val = wardrive_setup_make_label(cd_hdr, "0 s", COLOR_MATERIAL_TEAL);
+    ctx->wardrive_setup_cooldown_slider = lv_slider_create(popup);
+    lv_slider_set_range(ctx->wardrive_setup_cooldown_slider, 0, 600);
+    lv_obj_set_width(ctx->wardrive_setup_cooldown_slider, lv_pct(100));
+    lv_obj_add_event_cb(ctx->wardrive_setup_cooldown_slider, wardrive_cooldown_slider_cb, LV_EVENT_VALUE_CHANGED, ctx);
+
+    // ---- Memcap + Anti-surv (row) ----
+    lv_obj_t *dd_row = lv_obj_create(popup);
+    lv_obj_set_size(dd_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(dd_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(dd_row, 0, 0);
+    lv_obj_set_style_pad_all(dd_row, 0, 0);
+    lv_obj_set_flex_flow(dd_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_column(dd_row, 16, 0);
+    lv_obj_clear_flag(dd_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *memcap_col = lv_obj_create(dd_row);
+    lv_obj_set_size(memcap_col, lv_pct(48), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(memcap_col, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(memcap_col, 0, 0);
+    lv_obj_set_style_pad_all(memcap_col, 0, 0);
+    lv_obj_set_flex_flow(memcap_col, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(memcap_col, 4, 0);
+    lv_obj_clear_flag(memcap_col, LV_OBJ_FLAG_SCROLLABLE);
+    wardrive_setup_make_label(memcap_col, "Memory cap", COLOR_MATERIAL_CYAN);
+    ctx->wardrive_setup_memcap_dd = lv_dropdown_create(memcap_col);
+    lv_dropdown_set_options(ctx->wardrive_setup_memcap_dd, wardrive_memcap_options);
+    lv_obj_set_width(ctx->wardrive_setup_memcap_dd, lv_pct(100));
+
+    lv_obj_t *antisurv_col = lv_obj_create(dd_row);
+    lv_obj_set_size(antisurv_col, lv_pct(48), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(antisurv_col, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(antisurv_col, 0, 0);
+    lv_obj_set_style_pad_all(antisurv_col, 0, 0);
+    lv_obj_set_flex_flow(antisurv_col, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(antisurv_col, 4, 0);
+    lv_obj_clear_flag(antisurv_col, LV_OBJ_FLAG_SCROLLABLE);
+    wardrive_setup_make_label(antisurv_col, "Anti-surv sensitivity", COLOR_MATERIAL_CYAN);
+    ctx->wardrive_setup_antisurv_dd = lv_dropdown_create(antisurv_col);
+    lv_dropdown_set_options(ctx->wardrive_setup_antisurv_dd, "low\nmed\nhigh");
+    lv_obj_set_width(ctx->wardrive_setup_antisurv_dd, lv_pct(100));
+
+    // ---- Blacklist button ----
+    lv_obj_t *bl_btn = lv_btn_create(popup);
+    lv_obj_set_size(bl_btn, lv_pct(100), 44);
+    lv_obj_set_style_bg_color(bl_btn, lv_color_hex(0x455A64), 0);
+    lv_obj_set_style_radius(bl_btn, 8, 0);
+    lv_obj_add_event_cb(bl_btn, wardrive_blacklist_btn_cb, LV_EVENT_CLICKED, ctx);
+    lv_obj_t *bl_lbl = lv_label_create(bl_btn);
+    lv_label_set_text(bl_lbl, LV_SYMBOL_LIST " MAC Blacklist...");
+    lv_obj_center(bl_lbl);
+
+    // ---- Status label ----
+    ctx->wardrive_setup_status_label = lv_label_create(popup);
+    lv_label_set_text(ctx->wardrive_setup_status_label, "Tip: configure once, then Start");
+    lv_obj_set_style_text_font(ctx->wardrive_setup_status_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(ctx->wardrive_setup_status_label, lv_color_hex(0x888888), 0);
+    lv_obj_set_width(ctx->wardrive_setup_status_label, lv_pct(100));
+    lv_label_set_long_mode(ctx->wardrive_setup_status_label, LV_LABEL_LONG_WRAP);
+
+    // ---- Action buttons row ----
+    lv_obj_t *act_row = lv_obj_create(popup);
+    lv_obj_set_size(act_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(act_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(act_row, 0, 0);
+    lv_obj_set_style_pad_all(act_row, 0, 0);
+    lv_obj_set_flex_flow(act_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(act_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(act_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    ctx->wardrive_setup_load_btn = lv_btn_create(act_row);
+    lv_obj_set_size(ctx->wardrive_setup_load_btn, 150, 48);
+    lv_obj_set_style_bg_color(ctx->wardrive_setup_load_btn, COLOR_MATERIAL_BLUE, 0);
+    lv_obj_set_style_bg_color(ctx->wardrive_setup_load_btn, lv_color_hex(0x555555), LV_STATE_DISABLED);
+    lv_obj_set_style_radius(ctx->wardrive_setup_load_btn, 8, 0);
+    lv_obj_add_event_cb(ctx->wardrive_setup_load_btn, wardrive_setup_load_cb, LV_EVENT_CLICKED, ctx);
+    lv_obj_t *load_lbl = lv_label_create(ctx->wardrive_setup_load_btn);
+    lv_label_set_text(load_lbl, LV_SYMBOL_REFRESH " Load");
+    lv_obj_center(load_lbl);
+
+    ctx->wardrive_setup_apply_btn = lv_btn_create(act_row);
+    lv_obj_set_size(ctx->wardrive_setup_apply_btn, 150, 48);
+    lv_obj_set_style_bg_color(ctx->wardrive_setup_apply_btn, COLOR_MATERIAL_GREEN, 0);
+    lv_obj_set_style_bg_color(ctx->wardrive_setup_apply_btn, lv_color_hex(0x555555), LV_STATE_DISABLED);
+    lv_obj_set_style_radius(ctx->wardrive_setup_apply_btn, 8, 0);
+    lv_obj_add_event_cb(ctx->wardrive_setup_apply_btn, wardrive_setup_apply_cb, LV_EVENT_CLICKED, ctx);
+    lv_obj_t *apply_lbl = lv_label_create(ctx->wardrive_setup_apply_btn);
+    lv_label_set_text(apply_lbl, LV_SYMBOL_OK " Apply");
+    lv_obj_center(apply_lbl);
+
+    ctx->wardrive_setup_close_btn = lv_btn_create(act_row);
+    lv_obj_set_size(ctx->wardrive_setup_close_btn, 150, 48);
+    lv_obj_set_style_bg_color(ctx->wardrive_setup_close_btn, lv_color_hex(0x444444), 0);
+    lv_obj_set_style_bg_color(ctx->wardrive_setup_close_btn, lv_color_hex(0x555555), LV_STATE_DISABLED);
+    lv_obj_set_style_radius(ctx->wardrive_setup_close_btn, 8, 0);
+    lv_obj_add_event_cb(ctx->wardrive_setup_close_btn, wardrive_setup_close_cb, LV_EVENT_CLICKED, ctx);
+    lv_obj_t *close_lbl = lv_label_create(ctx->wardrive_setup_close_btn);
+    lv_label_set_text(close_lbl, LV_SYMBOL_CLOSE " Close");
+    lv_obj_center(close_lbl);
+
+    // Keyboard (hidden, for custom channels textarea)
+    ctx->wardrive_setup_keyboard = lv_keyboard_create(ctx->wardrive_setup_overlay);
+    lv_obj_set_size(ctx->wardrive_setup_keyboard, lv_pct(100), lv_pct(40));
+    lv_obj_align(ctx->wardrive_setup_keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_add_flag(ctx->wardrive_setup_keyboard, LV_OBJ_FLAG_HIDDEN);
+
+    // Populate controls from current config, then refresh from device
+    wardrive_setup_sync_controls(ctx);
+    wardrive_setup_do_load(ctx);
+}
+
+//==================================================================================
+// Wardrive 2.0 — MAC blacklist editor (sub-overlay)
+//==================================================================================
+
+static void wardrive_blacklist_refresh(tab_context_t *ctx)
+{
+    if (!ctx || !ctx->wardrive_blacklist_list) return;
+    lv_obj_clean(ctx->wardrive_blacklist_list);
+
+    tab_id_t active_tab = tab_id_for_ctx(ctx);
+    uart_port_t uart_port = (active_tab == TAB_MBUS) ? UART2_NUM : UART_NUM;
+    if (active_tab == TAB_MBUS) uart2_send_command("wardrive_blacklist list");
+    else uart_send_command("wardrive_blacklist list");
+
+    char rx_buffer[1024] = {0};
+    char parse_buffer[1024];
+    int total_len = 0;
+    bool got_end = false;
+    for (int attempt = 0; attempt < 20 && !got_end; attempt++) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        if (total_len >= (int)sizeof(rx_buffer) - 1) break;
+        int len = transport_read_bytes_tab(active_tab, uart_port,
+                                           rx_buffer + total_len,
+                                           sizeof(rx_buffer) - 1 - total_len, pdMS_TO_TICKS(50));
+        if (len <= 0) continue;
+        total_len += len;
+        rx_buffer[total_len] = '\0';
+        if (strstr(rx_buffer, "Blacklist END") != NULL) got_end = true;
+    }
+
+    int count = 0;
+    snprintf(parse_buffer, sizeof(parse_buffer), "%s", rx_buffer);
+    char *saveptr = NULL;
+    char *line = strtok_r(parse_buffer, "\r\n", &saveptr);
+    while (line) {
+        while (*line == ' ') line++;
+        // A MAC line looks like AA:BB:CC:DD:EE:FF
+        if (strlen(line) >= 17 && line[2] == ':' && line[5] == ':') {
+            lv_obj_t *row = lv_obj_create(ctx->wardrive_blacklist_list);
+            lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
+            lv_obj_set_style_bg_color(row, lv_color_hex(0x2A2A3A), 0);
+            lv_obj_set_style_border_width(row, 0, 0);
+            lv_obj_set_style_radius(row, 6, 0);
+            lv_obj_set_style_pad_all(row, 6, 0);
+            lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+            lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+            lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+            char mac[18] = {0};
+            snprintf(mac, sizeof(mac), "%.17s", line);
+            lv_obj_t *mac_lbl = lv_label_create(row);
+            lv_label_set_text(mac_lbl, mac);
+            lv_obj_set_style_text_font(mac_lbl, &lv_font_montserrat_14, 0);
+            lv_obj_set_style_text_color(mac_lbl, lv_color_hex(0xDDDDDD), 0);
+
+            lv_obj_t *del_btn = lv_btn_create(row);
+            lv_obj_set_size(del_btn, 80, 36);
+            lv_obj_set_style_bg_color(del_btn, COLOR_MATERIAL_RED, 0);
+            lv_obj_set_style_radius(del_btn, 6, 0);
+            char *mac_copy = strdup(mac);
+            lv_obj_add_event_cb(del_btn, wardrive_blacklist_remove_cb, LV_EVENT_CLICKED, mac_copy);
+            lv_obj_add_event_cb(del_btn, wardrive_blacklist_row_del_cb, LV_EVENT_DELETE, mac_copy);
+            lv_obj_t *del_lbl = lv_label_create(del_btn);
+            lv_label_set_text(del_lbl, LV_SYMBOL_TRASH);
+            lv_obj_center(del_lbl);
+            count++;
+        }
+        line = strtok_r(NULL, "\r\n", &saveptr);
+    }
+
+    if (ctx->wardrive_blacklist_status_label) {
+        lv_label_set_text_fmt(ctx->wardrive_blacklist_status_label, "%d/%d entries", count, WARDRIVE_BLACKLIST_MAX);
+        lv_obj_set_style_text_color(ctx->wardrive_blacklist_status_label, COLOR_MATERIAL_TEAL, 0);
+    }
+}
+
+static void wardrive_blacklist_row_del_cb(lv_event_t *e)
+{
+    char *mac = (char *)lv_event_get_user_data(e);
+    if (mac) free(mac);
+}
+
+typedef struct {
+    tab_context_t *ctx;
+    char mac[20];
+} wardrive_bl_remove_t;
+
+// Runs outside event dispatch so deleting the clicked row is safe.
+static void wardrive_blacklist_remove_async(void *param)
+{
+    wardrive_bl_remove_t *r = (wardrive_bl_remove_t *)param;
+    if (!r) return;
+    if (r->ctx && r->mac[0]) {
+        char cmd[64];
+        snprintf(cmd, sizeof(cmd), "wardrive_blacklist remove %s", r->mac);
+        wardrive_send_set_command(r->ctx, cmd, NULL, NULL, 0);
+        if (r->ctx->wardrive_blacklist_overlay) {
+            wardrive_blacklist_refresh(r->ctx);
+        }
+    }
+    free(r);
+}
+
+static void wardrive_blacklist_remove_cb(lv_event_t *e)
+{
+    char *mac = (char *)lv_event_get_user_data(e);
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx || !mac) return;
+    wardrive_bl_remove_t *r = (wardrive_bl_remove_t *)malloc(sizeof(*r));
+    if (!r) return;
+    r->ctx = ctx;
+    snprintf(r->mac, sizeof(r->mac), "%.19s", mac);
+    lv_async_call(wardrive_blacklist_remove_async, r);
+}
+
+static void wardrive_blacklist_add_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx) ctx = get_current_ctx();
+    if (!ctx->wardrive_blacklist_input) return;
+    const char *mac = lv_textarea_get_text(ctx->wardrive_blacklist_input);
+    if (!mac || strlen(mac) < 17) {
+        if (ctx->wardrive_blacklist_status_label) {
+            lv_label_set_text(ctx->wardrive_blacklist_status_label, "Enter a full MAC (AA:BB:CC:DD:EE:FF)");
+            lv_obj_set_style_text_color(ctx->wardrive_blacklist_status_label, COLOR_MATERIAL_RED, 0);
+        }
+        return;
+    }
+    char cmd[64];
+    snprintf(cmd, sizeof(cmd), "wardrive_blacklist add %.17s", mac);
+    wardrive_send_set_command(ctx, cmd, NULL, NULL, 0);
+    lv_textarea_set_text(ctx->wardrive_blacklist_input, "");
+    wardrive_blacklist_refresh(ctx);
+}
+
+static void wardrive_blacklist_clear_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx) ctx = get_current_ctx();
+    wardrive_send_set_command(ctx, "wardrive_blacklist clear", NULL, NULL, 0);
+    wardrive_blacklist_refresh(ctx);
+}
+
+typedef struct {
+    tab_context_t *ctx;
+    char mac[18];
+} wardrive_bl_scan_pick_t;
+
+static void wardrive_blacklist_scan_pick_del_cb(lv_event_t *e)
+{
+    wardrive_bl_scan_pick_t *pick = (wardrive_bl_scan_pick_t *)lv_event_get_user_data(e);
+    if (pick) free(pick);
+}
+
+static void wardrive_blacklist_scan_close_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = e ? (tab_context_t *)lv_event_get_user_data(e) : get_current_ctx();
+    if (!ctx) ctx = get_current_ctx();
+    if (ctx && ctx->wardrive_blacklist_scan_overlay) {
+        lv_obj_del(ctx->wardrive_blacklist_scan_overlay);
+        ctx->wardrive_blacklist_scan_overlay = NULL;
+        ctx->wardrive_blacklist_scan_list = NULL;
+        ctx->wardrive_blacklist_scan_status = NULL;
+    }
+}
+
+static void wardrive_blacklist_scan_finish_async(void *param)
+{
+    tab_context_t *ctx = (tab_context_t *)param;
+    if (!ctx) return;
+    if (ctx->wardrive_blacklist_scan_overlay) {
+        lv_obj_del(ctx->wardrive_blacklist_scan_overlay);
+        ctx->wardrive_blacklist_scan_overlay = NULL;
+        ctx->wardrive_blacklist_scan_list = NULL;
+        ctx->wardrive_blacklist_scan_status = NULL;
+    }
+    wardrive_blacklist_refresh(ctx);
+}
+
+static void wardrive_blacklist_scan_pick_cb(lv_event_t *e)
+{
+    wardrive_bl_scan_pick_t *pick = (wardrive_bl_scan_pick_t *)lv_event_get_user_data(e);
+    if (!pick || !pick->ctx || !pick->mac[0]) return;
+
+    char cmd[64];
+    snprintf(cmd, sizeof(cmd), "wardrive_blacklist add %s", pick->mac);
+    wardrive_send_set_command(pick->ctx, cmd, NULL, NULL, 0);
+    if (pick->ctx->wardrive_blacklist_input) {
+        lv_textarea_set_text(pick->ctx->wardrive_blacklist_input, pick->mac);
+    }
+    lv_async_call(wardrive_blacklist_scan_finish_async, pick->ctx);
+}
+
+static void wardrive_blacklist_scan_btn_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx) ctx = get_current_ctx();
+    if (!ctx || !ctx->wardrive_blacklist_overlay) return;
+
+    if (ctx->wardrive_blacklist_scan_overlay) {
+        lv_obj_del(ctx->wardrive_blacklist_scan_overlay);
+        ctx->wardrive_blacklist_scan_overlay = NULL;
+    }
+
+    ctx->wardrive_blacklist_scan_overlay = lv_obj_create(ctx->wardrive_blacklist_overlay);
+    lv_obj_remove_style_all(ctx->wardrive_blacklist_scan_overlay);
+    lv_obj_set_size(ctx->wardrive_blacklist_scan_overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(ctx->wardrive_blacklist_scan_overlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(ctx->wardrive_blacklist_scan_overlay, LV_OPA_80, 0);
+    lv_obj_clear_flag(ctx->wardrive_blacklist_scan_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(ctx->wardrive_blacklist_scan_overlay, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_move_foreground(ctx->wardrive_blacklist_scan_overlay);
+
+    lv_obj_t *popup = lv_obj_create(ctx->wardrive_blacklist_scan_overlay);
+    lv_obj_set_size(popup, 620, 560);
+    lv_obj_center(popup);
+    lv_obj_set_style_bg_color(popup, lv_color_hex(0x1A1A2A), 0);
+    lv_obj_set_style_border_color(popup, COLOR_MATERIAL_CYAN, 0);
+    lv_obj_set_style_border_width(popup, 3, 0);
+    lv_obj_set_style_radius(popup, 16, 0);
+    lv_obj_set_style_pad_all(popup, 18, 0);
+    lv_obj_set_flex_flow(popup, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(popup, 10, 0);
+    lv_obj_clear_flag(popup, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *header = lv_obj_create(popup);
+    lv_obj_set_size(header, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(header, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(header, 0, 0);
+    lv_obj_set_style_pad_all(header, 0, 0);
+    lv_obj_set_flex_flow(header, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(header, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(header, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(header);
+    lv_label_set_text(title, LV_SYMBOL_BLUETOOTH " Pick BT device");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_CYAN, 0);
+
+    lv_obj_t *close_btn = lv_btn_create(header);
+    lv_obj_set_size(close_btn, 92, 42);
+    lv_obj_set_style_bg_color(close_btn, lv_color_hex(0x444444), 0);
+    lv_obj_set_style_radius(close_btn, 8, 0);
+    lv_obj_add_event_cb(close_btn, wardrive_blacklist_scan_close_cb, LV_EVENT_CLICKED, ctx);
+    lv_obj_t *close_lbl = lv_label_create(close_btn);
+    lv_label_set_text(close_lbl, LV_SYMBOL_CLOSE " Close");
+    lv_obj_center(close_lbl);
+
+    ctx->wardrive_blacklist_scan_status = lv_label_create(popup);
+    lv_label_set_text(ctx->wardrive_blacklist_scan_status, "Scanning for BT devices...");
+    lv_obj_set_style_text_font(ctx->wardrive_blacklist_scan_status, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(ctx->wardrive_blacklist_scan_status, COLOR_MATERIAL_AMBER, 0);
+
+    lv_obj_t *spinner = lv_spinner_create(popup);
+    lv_obj_set_size(spinner, 42, 42);
+    lv_spinner_set_anim_params(spinner, 1000, 200);
+    lv_obj_center(spinner);
+    lv_refr_now(NULL);
+
+    uart_port_t uart_port = uart_port_for_tab(current_tab);
+    uart_flush_input(uart_port);
+    uart_send_command_for_tab("scan_bt");
+
+    static char rx_buffer[8192];
+    int total_len = 0;
+    bool summary_found = false;
+    int elapsed_ms = 0;
+    while (!summary_found && elapsed_ms < 15000 && total_len < (int)sizeof(rx_buffer) - 256) {
+        int len = transport_read_bytes(uart_port, rx_buffer + total_len,
+                                       sizeof(rx_buffer) - total_len - 1,
+                                       pdMS_TO_TICKS(200));
+        if (len > 0) {
+            total_len += len;
+            rx_buffer[total_len] = '\0';
+            if (strstr(rx_buffer, "Summary:") != NULL) summary_found = true;
+        }
+        elapsed_ms += 200;
+    }
+    rx_buffer[total_len] = '\0';
+    lv_obj_del(spinner);
+
+    ctx->wardrive_blacklist_scan_list = lv_obj_create(popup);
+    lv_obj_set_size(ctx->wardrive_blacklist_scan_list, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_flex_grow(ctx->wardrive_blacklist_scan_list, 1);
+    lv_obj_set_style_bg_color(ctx->wardrive_blacklist_scan_list, lv_color_hex(0x121220), 0);
+    lv_obj_set_style_border_width(ctx->wardrive_blacklist_scan_list, 0, 0);
+    lv_obj_set_style_radius(ctx->wardrive_blacklist_scan_list, 8, 0);
+    lv_obj_set_style_pad_all(ctx->wardrive_blacklist_scan_list, 6, 0);
+    lv_obj_set_flex_flow(ctx->wardrive_blacklist_scan_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(ctx->wardrive_blacklist_scan_list, 6, 0);
+
+    int count = 0;
+    char *line = strtok(rx_buffer, "\n\r");
+    while (line != NULL && count < BT_MAX_DEVICES) {
+        if (strstr(line, "RSSI:") != NULL && strchr(line, ':') != NULL) {
+            bt_device_t dev;
+            if (parse_bt_device_line(line, &dev)) {
+                lv_obj_t *row = lv_obj_create(ctx->wardrive_blacklist_scan_list);
+                lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
+                lv_obj_set_style_bg_color(row, lv_color_hex(0x242438), 0);
+                lv_obj_set_style_bg_color(row, lv_color_hex(0x30304A), LV_STATE_PRESSED);
+                lv_obj_set_style_border_width(row, 1, 0);
+                lv_obj_set_style_border_color(row, COLOR_MATERIAL_CYAN, 0);
+                lv_obj_set_style_border_opa(row, LV_OPA_40, 0);
+                lv_obj_set_style_radius(row, 6, 0);
+                lv_obj_set_style_pad_all(row, 10, 0);
+                lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+                lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+                lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+                lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+
+                wardrive_bl_scan_pick_t *pick = malloc(sizeof(*pick));
+                if (pick) {
+                    pick->ctx = ctx;
+                    snprintf(pick->mac, sizeof(pick->mac), "%.17s", dev.mac);
+                    lv_obj_add_event_cb(row, wardrive_blacklist_scan_pick_cb, LV_EVENT_CLICKED, pick);
+                    lv_obj_add_event_cb(row, wardrive_blacklist_scan_pick_del_cb, LV_EVENT_DELETE, pick);
+                }
+
+                lv_obj_t *name_lbl = lv_label_create(row);
+                lv_label_set_text(name_lbl, dev.name[0] ? dev.name : dev.mac);
+                lv_obj_set_flex_grow(name_lbl, 1);
+                lv_label_set_long_mode(name_lbl, LV_LABEL_LONG_DOT);
+                lv_obj_set_style_text_font(name_lbl, &lv_font_montserrat_14, 0);
+                lv_obj_set_style_text_color(name_lbl, lv_color_hex(0xFFFFFF), 0);
+
+                if (dev.name[0]) {
+                    lv_obj_t *mac_lbl = lv_label_create(row);
+                    lv_label_set_text(mac_lbl, dev.mac);
+                    lv_obj_set_width(mac_lbl, 155);
+                    lv_obj_set_style_text_font(mac_lbl, &lv_font_montserrat_12, 0);
+                    lv_obj_set_style_text_color(mac_lbl, lv_color_hex(0xAAAAAA), 0);
+                }
+
+                lv_obj_t *rssi_lbl = lv_label_create(row);
+                lv_label_set_text_fmt(rssi_lbl, "%d dBm", dev.rssi);
+                lv_obj_set_width(rssi_lbl, 70);
+                lv_obj_set_style_text_font(rssi_lbl, &lv_font_montserrat_14, 0);
+                lv_obj_set_style_text_color(rssi_lbl,
+                    dev.rssi > -50 ? COLOR_MATERIAL_GREEN :
+                    dev.rssi > -70 ? COLOR_MATERIAL_AMBER : COLOR_MATERIAL_RED, 0);
+                count++;
+            }
+        }
+        line = strtok(NULL, "\n\r");
+    }
+
+    lv_label_set_text_fmt(ctx->wardrive_blacklist_scan_status,
+                          count > 0 ? "Tap device to add (%d found)" : "No BT devices found",
+                          count);
+    lv_obj_set_style_text_color(ctx->wardrive_blacklist_scan_status,
+                                count > 0 ? COLOR_MATERIAL_TEAL : COLOR_MATERIAL_RED, 0);
+}
+
+static void wardrive_blacklist_ta_focus_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    lv_obj_t *ta = lv_event_get_target(e);
+    lv_event_code_t code = lv_event_get_code(e);
+    if (!ctx || !ctx->wardrive_blacklist_keyboard) return;
+    if (code == LV_EVENT_FOCUSED) {
+        lv_keyboard_set_textarea(ctx->wardrive_blacklist_keyboard, ta);
+        lv_obj_clear_flag(ctx->wardrive_blacklist_keyboard, LV_OBJ_FLAG_HIDDEN);
+    } else if (code == LV_EVENT_DEFOCUSED || code == LV_EVENT_READY) {
+        lv_obj_add_flag(ctx->wardrive_blacklist_keyboard, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void wardrive_blacklist_close_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = e ? (tab_context_t *)lv_event_get_user_data(e) : get_current_ctx();
+    if (!ctx) ctx = get_current_ctx();
+    wardrive_blacklist_scan_close_cb(NULL);
+    if (ctx->wardrive_blacklist_overlay) {
+        lv_obj_del(ctx->wardrive_blacklist_overlay);
+        ctx->wardrive_blacklist_overlay = NULL;
+        ctx->wardrive_blacklist_list = NULL;
+        ctx->wardrive_blacklist_status_label = NULL;
+        ctx->wardrive_blacklist_input = NULL;
+        ctx->wardrive_blacklist_keyboard = NULL;
+        ctx->wardrive_blacklist_scan_overlay = NULL;
+        ctx->wardrive_blacklist_scan_list = NULL;
+        ctx->wardrive_blacklist_scan_status = NULL;
+    }
+}
+
+static void wardrive_blacklist_btn_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx) ctx = get_current_ctx();
+    if (!ctx->wardrive_page) return;
+
+    if (ctx->wardrive_blacklist_overlay) {
+        lv_obj_del(ctx->wardrive_blacklist_overlay);
+        ctx->wardrive_blacklist_overlay = NULL;
+    }
+
+    lv_obj_t *overlay_parent = ctx->wardrive_setup_overlay ? ctx->wardrive_setup_overlay : ctx->wardrive_page;
+    ctx->wardrive_blacklist_overlay = lv_obj_create(overlay_parent);
+    lv_obj_remove_style_all(ctx->wardrive_blacklist_overlay);
+    lv_obj_set_size(ctx->wardrive_blacklist_overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(ctx->wardrive_blacklist_overlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(ctx->wardrive_blacklist_overlay, LV_OPA_80, 0);
+    lv_obj_clear_flag(ctx->wardrive_blacklist_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(ctx->wardrive_blacklist_overlay, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_move_foreground(ctx->wardrive_blacklist_overlay);
+
+    lv_obj_t *popup = lv_obj_create(ctx->wardrive_blacklist_overlay);
+    lv_obj_set_size(popup, 560, 540);
+    lv_obj_center(popup);
+    lv_obj_set_style_bg_color(popup, lv_color_hex(0x1A1A2A), 0);
+    lv_obj_set_style_border_color(popup, COLOR_MATERIAL_TEAL, 0);
+    lv_obj_set_style_border_width(popup, 3, 0);
+    lv_obj_set_style_radius(popup, 16, 0);
+    lv_obj_set_style_pad_all(popup, 18, 0);
+    lv_obj_set_flex_flow(popup, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(popup, 10, 0);
+    lv_obj_clear_flag(popup, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(popup);
+    lv_label_set_text(title, LV_SYMBOL_LIST " MAC Blacklist");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_TEAL, 0);
+
+    ctx->wardrive_blacklist_status_label = lv_label_create(popup);
+    lv_label_set_text(ctx->wardrive_blacklist_status_label, "Loading...");
+    lv_obj_set_style_text_font(ctx->wardrive_blacklist_status_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(ctx->wardrive_blacklist_status_label, lv_color_hex(0x888888), 0);
+
+    // Add row: textarea + Add button
+    lv_obj_t *add_row = lv_obj_create(popup);
+    lv_obj_set_size(add_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(add_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(add_row, 0, 0);
+    lv_obj_set_style_pad_all(add_row, 0, 0);
+    lv_obj_set_flex_flow(add_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_column(add_row, 8, 0);
+    lv_obj_clear_flag(add_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    ctx->wardrive_blacklist_input = lv_textarea_create(add_row);
+    lv_textarea_set_one_line(ctx->wardrive_blacklist_input, true);
+    lv_textarea_set_placeholder_text(ctx->wardrive_blacklist_input, "AA:BB:CC:DD:EE:FF");
+    lv_obj_set_flex_grow(ctx->wardrive_blacklist_input, 1);
+    lv_obj_add_event_cb(ctx->wardrive_blacklist_input, wardrive_blacklist_ta_focus_cb, LV_EVENT_FOCUSED, ctx);
+    lv_obj_add_event_cb(ctx->wardrive_blacklist_input, wardrive_blacklist_ta_focus_cb, LV_EVENT_DEFOCUSED, ctx);
+    lv_obj_add_event_cb(ctx->wardrive_blacklist_input, wardrive_blacklist_ta_focus_cb, LV_EVENT_READY, ctx);
+
+    lv_obj_t *scan_btn = lv_btn_create(add_row);
+    lv_obj_set_size(scan_btn, 110, 44);
+    lv_obj_set_style_bg_color(scan_btn, COLOR_MATERIAL_CYAN, 0);
+    lv_obj_set_style_radius(scan_btn, 8, 0);
+    lv_obj_add_event_cb(scan_btn, wardrive_blacklist_scan_btn_cb, LV_EVENT_CLICKED, ctx);
+    lv_obj_t *scan_lbl = lv_label_create(scan_btn);
+    lv_label_set_text(scan_lbl, LV_SYMBOL_BLUETOOTH " Scan");
+    lv_obj_center(scan_lbl);
+
+    lv_obj_t *add_btn = lv_btn_create(add_row);
+    lv_obj_set_size(add_btn, 100, 44);
+    lv_obj_set_style_bg_color(add_btn, COLOR_MATERIAL_GREEN, 0);
+    lv_obj_set_style_radius(add_btn, 8, 0);
+    lv_obj_add_event_cb(add_btn, wardrive_blacklist_add_cb, LV_EVENT_CLICKED, ctx);
+    lv_obj_t *add_lbl = lv_label_create(add_btn);
+    lv_label_set_text(add_lbl, LV_SYMBOL_PLUS " Add");
+    lv_obj_center(add_lbl);
+
+    // Scrollable list
+    ctx->wardrive_blacklist_list = lv_obj_create(popup);
+    lv_obj_set_size(ctx->wardrive_blacklist_list, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_flex_grow(ctx->wardrive_blacklist_list, 1);
+    lv_obj_set_style_bg_color(ctx->wardrive_blacklist_list, lv_color_hex(0x121220), 0);
+    lv_obj_set_style_border_width(ctx->wardrive_blacklist_list, 0, 0);
+    lv_obj_set_style_radius(ctx->wardrive_blacklist_list, 8, 0);
+    lv_obj_set_style_pad_all(ctx->wardrive_blacklist_list, 6, 0);
+    lv_obj_set_flex_flow(ctx->wardrive_blacklist_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(ctx->wardrive_blacklist_list, 6, 0);
+
+    // Bottom buttons
+    lv_obj_t *btn_row = lv_obj_create(popup);
+    lv_obj_set_size(btn_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(btn_row, 0, 0);
+    lv_obj_set_style_pad_all(btn_row, 0, 0);
+    lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *clear_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(clear_btn, 200, 48);
+    lv_obj_set_style_bg_color(clear_btn, COLOR_MATERIAL_RED, 0);
+    lv_obj_set_style_radius(clear_btn, 8, 0);
+    lv_obj_add_event_cb(clear_btn, wardrive_blacklist_clear_cb, LV_EVENT_CLICKED, ctx);
+    lv_obj_t *clear_lbl = lv_label_create(clear_btn);
+    lv_label_set_text(clear_lbl, LV_SYMBOL_TRASH " Clear all");
+    lv_obj_center(clear_lbl);
+
+    lv_obj_t *close_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(close_btn, 200, 48);
+    lv_obj_set_style_bg_color(close_btn, lv_color_hex(0x444444), 0);
+    lv_obj_set_style_radius(close_btn, 8, 0);
+    lv_obj_add_event_cb(close_btn, wardrive_blacklist_close_cb, LV_EVENT_CLICKED, ctx);
+    lv_obj_t *close_lbl = lv_label_create(close_btn);
+    lv_label_set_text(close_lbl, LV_SYMBOL_CLOSE " Close");
+    lv_obj_center(close_lbl);
+
+    // Keyboard (hidden)
+    ctx->wardrive_blacklist_keyboard = lv_keyboard_create(ctx->wardrive_blacklist_overlay);
+    lv_obj_set_size(ctx->wardrive_blacklist_keyboard, lv_pct(100), lv_pct(40));
+    lv_obj_align(ctx->wardrive_blacklist_keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_add_flag(ctx->wardrive_blacklist_keyboard, LV_OBJ_FLAG_HIDDEN);
+
+    wardrive_blacklist_refresh(ctx);
 }
 
 // Show wardrive full page
@@ -20263,7 +23482,7 @@ static void show_wardrive_page(void)
     lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
     lv_obj_set_style_text_color(title, COLOR_MATERIAL_TEAL, 0);
 
-    // Right side: Start + Stop + Trace + GPS + Upload buttons
+    // Right side: Start + Stop + Upload + Setup buttons
     lv_obj_t *btn_cont = lv_obj_create(header);
     lv_obj_set_size(btn_cont, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
     lv_obj_set_style_bg_opa(btn_cont, LV_OPA_TRANSP, 0);
@@ -20300,30 +23519,10 @@ static void show_wardrive_page(void)
     lv_obj_set_style_text_font(stop_label, &lv_font_montserrat_14, 0);
     lv_obj_center(stop_label);
 
-    ctx->wardrive_trace_btn = lv_btn_create(btn_cont);
-    lv_obj_set_size(ctx->wardrive_trace_btn, 104, 40);
-    lv_obj_set_style_radius(ctx->wardrive_trace_btn, 8, 0);
-    lv_obj_set_style_bg_color(ctx->wardrive_trace_btn, lv_color_hex(0x455A64), 0);
-    lv_obj_set_style_bg_color(ctx->wardrive_trace_btn, lv_color_hex(0x555555), LV_STATE_DISABLED);
-    lv_obj_add_event_cb(ctx->wardrive_trace_btn, wardrive_trace_btn_cb, LV_EVENT_CLICKED, ctx);
+    // Trace toggle moved into the Setup overlay to keep the header compact.
+    ctx->wardrive_trace_btn = NULL;
 
-    lv_obj_t *trace_label = lv_label_create(ctx->wardrive_trace_btn);
-    lv_label_set_text(trace_label, LV_SYMBOL_GPS " Trace");
-    lv_obj_set_style_text_font(trace_label, &lv_font_montserrat_14, 0);
-    lv_obj_center(trace_label);
-
-    // GPS Type button (initially enabled - disabled when running)
-    ctx->wardrive_gps_type_btn = lv_btn_create(btn_cont);
-    lv_obj_set_size(ctx->wardrive_gps_type_btn, 92, 40);
-    lv_obj_set_style_bg_color(ctx->wardrive_gps_type_btn, COLOR_MATERIAL_TEAL, 0);
-    lv_obj_set_style_bg_color(ctx->wardrive_gps_type_btn, lv_color_hex(0x555555), LV_STATE_DISABLED);
-    lv_obj_set_style_radius(ctx->wardrive_gps_type_btn, 8, 0);
-    lv_obj_add_event_cb(ctx->wardrive_gps_type_btn, wardrive_gps_type_btn_cb, LV_EVENT_CLICKED, ctx);
-
-    lv_obj_t *gps_type_label = lv_label_create(ctx->wardrive_gps_type_btn);
-    lv_label_set_text(gps_type_label, LV_SYMBOL_GPS " GPS");
-    lv_obj_set_style_text_font(gps_type_label, &lv_font_montserrat_14, 0);
-    lv_obj_center(gps_type_label);
+    // GPS module selection moved into Wardrive Setup.
 
     // Upload button (enabled only when wardrive is not running)
     ctx->wardrive_upload_btn = lv_btn_create(btn_cont);
@@ -20337,6 +23536,18 @@ static void show_wardrive_page(void)
     lv_label_set_text(upload_label, LV_SYMBOL_UPLOAD " Upload");
     lv_obj_set_style_text_font(upload_label, &lv_font_montserrat_14, 0);
     lv_obj_center(upload_label);
+
+    // Setup button (config overlay) — disabled while running
+    ctx->wardrive_setup_btn = lv_btn_create(btn_cont);
+    lv_obj_set_size(ctx->wardrive_setup_btn, 96, 40);
+    lv_obj_set_style_bg_color(ctx->wardrive_setup_btn, lv_color_hex(0x37474F), 0);
+    lv_obj_set_style_bg_color(ctx->wardrive_setup_btn, lv_color_hex(0x555555), LV_STATE_DISABLED);
+    lv_obj_set_style_radius(ctx->wardrive_setup_btn, 8, 0);
+    lv_obj_add_event_cb(ctx->wardrive_setup_btn, wardrive_setup_btn_cb, LV_EVENT_CLICKED, ctx);
+    lv_obj_t *setup_label = lv_label_create(ctx->wardrive_setup_btn);
+    lv_label_set_text(setup_label, LV_SYMBOL_SETTINGS " Setup");
+    lv_obj_set_style_text_font(setup_label, &lv_font_montserrat_14, 0);
+    lv_obj_center(setup_label);
 
     // ---- Status row: status label (left) + net count label (right) ----
     lv_obj_t *status_row = lv_obj_create(ctx->wardrive_page);
@@ -20362,6 +23573,9 @@ static void show_wardrive_page(void)
     ctx->wardrive_trace_enabled = true;
     ctx->wardrive_sat_count = 0;
     ctx->wardrive_distance_m = 0.0;
+    if (!ctx->wardrive_config.loaded && ctx->wardrive_config.bands == 0) {
+        wardrive_config_set_defaults(&ctx->wardrive_config);
+    }
     update_wardrive_trace_button(ctx);
 
     // ---- Scrollable table container ----
@@ -20376,6 +23590,1800 @@ static void show_wardrive_page(void)
     lv_obj_set_style_pad_row(ctx->wardrive_table, 6, 0);
 
     ctx->current_visible_page = ctx->wardrive_page;
+}
+
+//==================================================================================
+// Anti-Surveillance (BLE follower detection) — separate tile + view
+//==================================================================================
+
+static const char *antisurv_sens_name(wardrive_antisurv_sens_t s)
+{
+    switch (s) {
+        case WARDRIVE_ANTISURV_LOW:  return "low";
+        case WARDRIVE_ANTISURV_HIGH: return "high";
+        default:                     return "med";
+    }
+}
+
+static void update_antisurv_sens_button(tab_context_t *ctx)
+{
+    if (!ctx || !ctx->antisurv_sens_btn) return;
+    lv_obj_t *label = lv_obj_get_child(ctx->antisurv_sens_btn, 0);
+    if (label) {
+        lv_label_set_text_fmt(label, LV_SYMBOL_EYE_OPEN " %s",
+                              antisurv_sens_name(ctx->wardrive_config.antisurv_sensitivity));
+    }
+}
+
+static void antisurv_monitor_task(void *arg)
+{
+    tab_context_t *ctx = (tab_context_t *)arg;
+    if (!ctx) { vTaskDelete(NULL); return; }
+
+    tab_id_t active_tab = tab_id_for_ctx(ctx);
+    uart_port_t uart_port = (active_tab == TAB_MBUS) ? UART2_NUM : UART_NUM;
+
+    char rx_buffer[512];
+    char line_buffer[512];
+    int line_pos = 0;
+
+    while (ctx->antisurv_monitoring) {
+        int len = transport_read_bytes_tab(active_tab, uart_port, rx_buffer, sizeof(rx_buffer) - 1, pdMS_TO_TICKS(100));
+        if (len <= 0) continue;
+        rx_buffer[len] = '\0';
+
+        for (int i = 0; i < len; i++) {
+            char c = rx_buffer[i];
+            if (c == '\n' || c == '\r') {
+                if (line_pos > 0) {
+                    line_buffer[line_pos] = '\0';
+
+                    if (strstr(line_buffer, "[FOLLOWER]") != NULL) {
+                        ctx->antisurv_follower_count++;
+
+                        // Pull out MAC and name for a compact row
+                        char mac[20] = "?";
+                        char detail[120] = "";
+                        const char *m = strstr(line_buffer, "MAC=");
+                        if (m) { sscanf(m + 4, "%19s", mac); }
+                        snprintf(detail, sizeof(detail), "%.119s", line_buffer);
+
+                        bsp_display_lock(0);
+                        if (ctx->antisurv_list) {
+                            // Cap list size
+                            while (lv_obj_get_child_cnt(ctx->antisurv_list) > 60) {
+                                lv_obj_del(lv_obj_get_child(ctx->antisurv_list, 0));
+                            }
+                            lv_obj_t *row = lv_obj_create(ctx->antisurv_list);
+                            lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
+                            lv_obj_set_style_bg_color(row, lv_color_hex(0x3A1020), 0);
+                            lv_obj_set_style_border_color(row, COLOR_MATERIAL_RED, 0);
+                            lv_obj_set_style_border_width(row, 1, 0);
+                            lv_obj_set_style_radius(row, 6, 0);
+                            lv_obj_set_style_pad_all(row, 6, 0);
+                            lv_obj_set_flex_flow(row, LV_FLEX_FLOW_COLUMN);
+                            lv_obj_set_style_pad_row(row, 2, 0);
+                            lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+                            lv_obj_t *mac_lbl = lv_label_create(row);
+                            lv_label_set_text_fmt(mac_lbl, "! FOLLOWER ! %s", mac);
+                            lv_obj_set_style_text_font(mac_lbl, &lv_font_montserrat_14, 0);
+                            lv_obj_set_style_text_color(mac_lbl, COLOR_MATERIAL_RED, 0);
+
+                            lv_obj_t *det_lbl = lv_label_create(row);
+                            lv_label_set_text(det_lbl, detail);
+                            lv_obj_set_style_text_font(det_lbl, &lv_font_montserrat_12, 0);
+                            lv_obj_set_style_text_color(det_lbl, lv_color_hex(0xDDDDDD), 0);
+                            lv_obj_set_width(det_lbl, lv_pct(100));
+                            lv_label_set_long_mode(det_lbl, LV_LABEL_LONG_WRAP);
+
+                            lv_obj_scroll_to_view(row, LV_ANIM_OFF);
+                        }
+                        if (ctx->antisurv_count_label) {
+                            lv_label_set_text_fmt(ctx->antisurv_count_label, "Followers: %d", ctx->antisurv_follower_count);
+                            lv_obj_set_style_text_color(ctx->antisurv_count_label, COLOR_MATERIAL_RED, 0);
+                        }
+                        if (ctx->antisurv_status_label) {
+                            lv_label_set_text(ctx->antisurv_status_label, "! FOLLOWER DETECTED !");
+                            lv_obj_set_style_text_color(ctx->antisurv_status_label, COLOR_MATERIAL_RED, 0);
+                        }
+                        bsp_display_unlock();
+                    } else if (strstr(line_buffer, "Anti-surveillance") != NULL ||
+                               strstr(line_buffer, "antisurveillance") != NULL) {
+                        bsp_display_lock(0);
+                        if (ctx->antisurv_status_label) {
+                            lv_label_set_text(ctx->antisurv_status_label, "Scanning for followers...");
+                            lv_obj_set_style_text_color(ctx->antisurv_status_label, COLOR_MATERIAL_GREEN, 0);
+                        }
+                        bsp_display_unlock();
+                    }
+                    line_pos = 0;
+                }
+            } else if (line_pos < (int)sizeof(line_buffer) - 1) {
+                line_buffer[line_pos++] = c;
+            }
+        }
+    }
+
+    ctx->antisurv_task = NULL;
+    vTaskDelete(NULL);
+}
+
+static void antisurv_start_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx) ctx = get_current_ctx();
+    if (ctx->antisurv_monitoring) return;
+    if (ctx->wardrive_monitoring) {
+        if (ctx->antisurv_status_label) {
+            lv_label_set_text(ctx->antisurv_status_label, "Stop Wardrive first (shares the radio)");
+            lv_obj_set_style_text_color(ctx->antisurv_status_label, COLOR_MATERIAL_RED, 0);
+        }
+        return;
+    }
+
+    tab_id_t active_tab = tab_id_for_ctx(ctx);
+    if (active_tab == TAB_MBUS) uart2_send_command("start_antisurveillance");
+    else uart_send_command("start_antisurveillance");
+
+    ctx->antisurv_follower_count = 0;
+    ctx->antisurv_device_count = 0;
+
+    if (ctx->antisurv_list) lv_obj_clean(ctx->antisurv_list);
+    if (ctx->antisurv_start_btn) lv_obj_add_state(ctx->antisurv_start_btn, LV_STATE_DISABLED);
+    if (ctx->antisurv_stop_btn) lv_obj_clear_state(ctx->antisurv_stop_btn, LV_STATE_DISABLED);
+    if (ctx->antisurv_sens_btn) lv_obj_add_state(ctx->antisurv_sens_btn, LV_STATE_DISABLED);
+    if (ctx->antisurv_status_label) {
+        lv_label_set_text(ctx->antisurv_status_label, "Starting (needs GPS fix + movement)...");
+        lv_obj_set_style_text_color(ctx->antisurv_status_label, COLOR_MATERIAL_AMBER, 0);
+    }
+    if (ctx->antisurv_count_label) {
+        lv_label_set_text(ctx->antisurv_count_label, "Followers: 0");
+        lv_obj_set_style_text_color(ctx->antisurv_count_label, COLOR_MATERIAL_TEAL, 0);
+    }
+
+    ctx->antisurv_monitoring = true;
+    xTaskCreate(antisurv_monitor_task, "antisurv", 8192, (void*)ctx, 5, &ctx->antisurv_task);
+}
+
+static void antisurv_stop_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx) ctx = get_current_ctx();
+    if (!ctx->antisurv_monitoring) return;
+
+    tab_id_t active_tab = tab_id_for_ctx(ctx);
+    uart_port_t uart_port = (active_tab == TAB_MBUS) ? UART2_NUM : UART_NUM;
+    if (active_tab == TAB_MBUS) uart2_send_command("stop");
+    else uart_send_command("stop");
+
+    // Stop the reader task first so it doesn't consume the summary line.
+    ctx->antisurv_monitoring = false;
+    if (ctx->antisurv_task != NULL) {
+        vTaskDelay(pdMS_TO_TICKS(200));
+        ctx->antisurv_task = NULL;
+    }
+
+    // Read the stop summary: "Anti-surveillance stopped. Devices seen: D, followers flagged: F"
+    int devices_seen = -1, followers = -1;
+    {
+        char rx_buffer[768] = {0};
+        int total_len = 0;
+        for (int attempt = 0; attempt < 12 && devices_seen < 0; attempt++) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            if (total_len >= (int)sizeof(rx_buffer) - 1) break;
+            int len = transport_read_bytes_tab(active_tab, uart_port,
+                                               rx_buffer + total_len,
+                                               sizeof(rx_buffer) - 1 - total_len, pdMS_TO_TICKS(50));
+            if (len <= 0) continue;
+            total_len += len;
+            rx_buffer[total_len] = '\0';
+            char *p = strstr(rx_buffer, "Devices seen:");
+            if (p) {
+                sscanf(p, "Devices seen: %d, followers flagged: %d", &devices_seen, &followers);
+            }
+        }
+        if (devices_seen >= 0) ctx->antisurv_device_count = devices_seen;
+        if (followers >= 0) ctx->antisurv_follower_count = followers;
+    }
+
+    if (ctx->antisurv_start_btn) lv_obj_clear_state(ctx->antisurv_start_btn, LV_STATE_DISABLED);
+    if (ctx->antisurv_stop_btn) lv_obj_add_state(ctx->antisurv_stop_btn, LV_STATE_DISABLED);
+    if (ctx->antisurv_sens_btn) lv_obj_clear_state(ctx->antisurv_sens_btn, LV_STATE_DISABLED);
+    if (ctx->antisurv_count_label) {
+        if (ctx->antisurv_device_count > 0) {
+            lv_label_set_text_fmt(ctx->antisurv_count_label, "Devices: %d  Followers: %d",
+                                  ctx->antisurv_device_count, ctx->antisurv_follower_count);
+        } else {
+            lv_label_set_text_fmt(ctx->antisurv_count_label, "Followers: %d", ctx->antisurv_follower_count);
+        }
+        lv_obj_set_style_text_color(ctx->antisurv_count_label,
+                                    ctx->antisurv_follower_count > 0 ? COLOR_MATERIAL_RED : COLOR_MATERIAL_TEAL, 0);
+    }
+    if (ctx->antisurv_status_label) {
+        lv_label_set_text(ctx->antisurv_status_label, "Stopped");
+        lv_obj_set_style_text_color(ctx->antisurv_status_label, lv_color_hex(0x888888), 0);
+    }
+}
+
+static void antisurv_sens_btn_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx) ctx = get_current_ctx();
+    if (ctx->antisurv_monitoring) return;
+
+    // Cycle low -> med -> high -> low
+    ctx->wardrive_config.antisurv_sensitivity =
+        (wardrive_antisurv_sens_t)((ctx->wardrive_config.antisurv_sensitivity + 1) % 3);
+    update_antisurv_sens_button(ctx);
+
+    char cmd[48];
+    snprintf(cmd, sizeof(cmd), "set_antisurv_sensitivity %s",
+             antisurv_sens_name(ctx->wardrive_config.antisurv_sensitivity));
+    wardrive_send_set_command(ctx, cmd, "Anti-surveillance", NULL, 0);
+}
+
+static void antisurv_back_cb(lv_event_t *e)
+{
+    (void)e;
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx) return;
+
+    if (ctx->antisurv_monitoring) {
+        tab_id_t active_tab = tab_id_for_ctx(ctx);
+        if (active_tab == TAB_MBUS) uart2_send_command("stop");
+        else uart_send_command("stop");
+        ctx->antisurv_monitoring = false;
+        if (ctx->antisurv_task != NULL) {
+            vTaskDelay(pdMS_TO_TICKS(150));
+            ctx->antisurv_task = NULL;
+        }
+    }
+
+    if (ctx->antisurv_page) lv_obj_add_flag(ctx->antisurv_page, LV_OBJ_FLAG_HIDDEN);
+    if (ctx->tiles) {
+        lv_obj_clear_flag(ctx->tiles, LV_OBJ_FLAG_HIDDEN);
+        ctx->current_visible_page = ctx->tiles;
+    }
+}
+
+static void show_antisurv_page(void)
+{
+    tab_context_t *ctx = get_current_ctx();
+    lv_obj_t *container = get_current_tab_container();
+    if (!container) return;
+
+    hide_all_pages(ctx);
+
+    if (ctx->antisurv_page) {
+        lv_obj_clear_flag(ctx->antisurv_page, LV_OBJ_FLAG_HIDDEN);
+        ctx->current_visible_page = ctx->antisurv_page;
+        return;
+    }
+
+    if (!ctx->wardrive_config.loaded && ctx->wardrive_config.bands == 0) {
+        wardrive_config_set_defaults(&ctx->wardrive_config);
+    }
+
+    ctx->antisurv_page = lv_obj_create(container);
+    lv_obj_set_size(ctx->antisurv_page, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(ctx->antisurv_page, lv_color_hex(0x1A0A12), 0);
+    lv_obj_set_style_border_width(ctx->antisurv_page, 0, 0);
+    lv_obj_set_style_pad_all(ctx->antisurv_page, 10, 0);
+    lv_obj_set_flex_flow(ctx->antisurv_page, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(ctx->antisurv_page, 8, 0);
+
+    // Header
+    lv_obj_t *header = lv_obj_create(ctx->antisurv_page);
+    lv_obj_set_size(header, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(header, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(header, 0, 0);
+    lv_obj_set_style_pad_all(header, 0, 0);
+    lv_obj_set_flex_flow(header, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(header, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(header, 10, 0);
+    lv_obj_clear_flag(header, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *left_cont = lv_obj_create(header);
+    lv_obj_set_size(left_cont, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(left_cont, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(left_cont, 0, 0);
+    lv_obj_set_style_pad_all(left_cont, 0, 0);
+    lv_obj_set_flex_flow(left_cont, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(left_cont, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(left_cont, 10, 0);
+    lv_obj_clear_flag(left_cont, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *back_btn = lv_btn_create(left_cont);
+    lv_obj_set_size(back_btn, 72, 60);
+    lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x333333), 0);
+    lv_obj_set_style_radius(back_btn, 8, 0);
+    lv_obj_add_event_cb(back_btn, antisurv_back_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *back_icon = lv_label_create(back_btn);
+    lv_label_set_text(back_icon, LV_SYMBOL_LEFT);
+    lv_obj_set_style_text_color(back_icon, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_center(back_icon);
+
+    lv_obj_t *title = lv_label_create(left_cont);
+    lv_label_set_text(title, LV_SYMBOL_EYE_OPEN " Anti-Surveillance");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_PINK, 0);
+
+    lv_obj_t *btn_cont = lv_obj_create(header);
+    lv_obj_set_size(btn_cont, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(btn_cont, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(btn_cont, 0, 0);
+    lv_obj_set_style_pad_all(btn_cont, 0, 0);
+    lv_obj_set_flex_flow(btn_cont, LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_column(btn_cont, 10, 0);
+    lv_obj_clear_flag(btn_cont, LV_OBJ_FLAG_SCROLLABLE);
+
+    ctx->antisurv_start_btn = lv_btn_create(btn_cont);
+    lv_obj_set_size(ctx->antisurv_start_btn, 90, 40);
+    lv_obj_set_style_bg_color(ctx->antisurv_start_btn, COLOR_MATERIAL_GREEN, 0);
+    lv_obj_set_style_bg_color(ctx->antisurv_start_btn, lv_color_hex(0x555555), LV_STATE_DISABLED);
+    lv_obj_set_style_radius(ctx->antisurv_start_btn, 8, 0);
+    lv_obj_add_event_cb(ctx->antisurv_start_btn, antisurv_start_cb, LV_EVENT_CLICKED, ctx);
+    lv_obj_t *start_label = lv_label_create(ctx->antisurv_start_btn);
+    lv_label_set_text(start_label, LV_SYMBOL_PLAY " Start");
+    lv_obj_set_style_text_font(start_label, &lv_font_montserrat_14, 0);
+    lv_obj_center(start_label);
+
+    ctx->antisurv_stop_btn = lv_btn_create(btn_cont);
+    lv_obj_set_size(ctx->antisurv_stop_btn, 90, 40);
+    lv_obj_set_style_bg_color(ctx->antisurv_stop_btn, COLOR_MATERIAL_RED, 0);
+    lv_obj_set_style_bg_color(ctx->antisurv_stop_btn, lv_color_hex(0x555555), LV_STATE_DISABLED);
+    lv_obj_set_style_radius(ctx->antisurv_stop_btn, 8, 0);
+    lv_obj_add_event_cb(ctx->antisurv_stop_btn, antisurv_stop_cb, LV_EVENT_CLICKED, ctx);
+    lv_obj_add_state(ctx->antisurv_stop_btn, LV_STATE_DISABLED);
+    lv_obj_t *stop_label = lv_label_create(ctx->antisurv_stop_btn);
+    lv_label_set_text(stop_label, LV_SYMBOL_STOP " Stop");
+    lv_obj_set_style_text_font(stop_label, &lv_font_montserrat_14, 0);
+    lv_obj_center(stop_label);
+
+    ctx->antisurv_sens_btn = lv_btn_create(btn_cont);
+    lv_obj_set_size(ctx->antisurv_sens_btn, 110, 40);
+    lv_obj_set_style_bg_color(ctx->antisurv_sens_btn, COLOR_MATERIAL_PURPLE, 0);
+    lv_obj_set_style_bg_color(ctx->antisurv_sens_btn, lv_color_hex(0x555555), LV_STATE_DISABLED);
+    lv_obj_set_style_radius(ctx->antisurv_sens_btn, 8, 0);
+    lv_obj_add_event_cb(ctx->antisurv_sens_btn, antisurv_sens_btn_cb, LV_EVENT_CLICKED, ctx);
+    lv_obj_t *sens_label = lv_label_create(ctx->antisurv_sens_btn);
+    lv_label_set_text(sens_label, LV_SYMBOL_EYE_OPEN " med");
+    lv_obj_set_style_text_font(sens_label, &lv_font_montserrat_14, 0);
+    lv_obj_center(sens_label);
+    update_antisurv_sens_button(ctx);
+
+    // Status row
+    lv_obj_t *status_row = lv_obj_create(ctx->antisurv_page);
+    lv_obj_set_size(status_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(status_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(status_row, 0, 0);
+    lv_obj_set_style_pad_all(status_row, 0, 0);
+    lv_obj_set_flex_flow(status_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(status_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(status_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    ctx->antisurv_status_label = lv_label_create(status_row);
+    lv_label_set_text(ctx->antisurv_status_label, "Detects a BLE device that moves with you");
+    lv_obj_set_style_text_font(ctx->antisurv_status_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(ctx->antisurv_status_label, lv_color_hex(0x888888), 0);
+
+    ctx->antisurv_count_label = lv_label_create(status_row);
+    lv_label_set_text(ctx->antisurv_count_label, "Followers: 0");
+    lv_obj_set_style_text_font(ctx->antisurv_count_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(ctx->antisurv_count_label, COLOR_MATERIAL_TEAL, 0);
+
+    // Alerts list
+    ctx->antisurv_list = lv_obj_create(ctx->antisurv_page);
+    lv_obj_set_size(ctx->antisurv_list, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_flex_grow(ctx->antisurv_list, 1);
+    lv_obj_set_style_bg_color(ctx->antisurv_list, lv_color_hex(0x252525), 0);
+    lv_obj_set_style_border_width(ctx->antisurv_list, 0, 0);
+    lv_obj_set_style_radius(ctx->antisurv_list, 8, 0);
+    lv_obj_set_style_pad_all(ctx->antisurv_list, 8, 0);
+    lv_obj_set_flex_flow(ctx->antisurv_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(ctx->antisurv_list, 6, 0);
+
+    ctx->current_visible_page = ctx->antisurv_page;
+}
+
+static lv_obj_t *iot_recon_create_metric(lv_obj_t *parent, const char *title, const char *value,
+                                         lv_color_t accent, lv_obj_t **value_out)
+{
+    lv_obj_t *card = lv_obj_create(parent);
+    lv_obj_set_flex_grow(card, 1);
+    lv_obj_set_height(card, 86);
+    lv_obj_set_style_bg_color(card, ui_panel_color(), 0);
+    lv_obj_set_style_border_width(card, 1, 0);
+    lv_obj_set_style_border_color(card, ui_border_color(), 0);
+    lv_obj_set_style_border_opa(card, dark_mode_enabled ? LV_OPA_40 : LV_OPA_70, 0);
+    lv_obj_set_style_radius(card, 10, 0);
+    lv_obj_set_style_shadow_width(card, 0, 0);
+    lv_obj_set_style_pad_all(card, 10, 0);
+    lv_obj_set_style_pad_row(card, 4, 0);
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(card, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title_lbl = lv_label_create(card);
+    lv_label_set_text(title_lbl, title);
+    lv_obj_set_style_text_font(title_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(title_lbl, accent, 0);
+
+    lv_obj_t *value_lbl = lv_label_create(card);
+    lv_label_set_text(value_lbl, value);
+    lv_obj_set_style_text_font(value_lbl, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(value_lbl, ui_text_color(), 0);
+    lv_obj_set_width(value_lbl, lv_pct(100));
+    lv_obj_set_style_text_align(value_lbl, LV_TEXT_ALIGN_CENTER, 0);
+
+    if (value_out) {
+        *value_out = value_lbl;
+    }
+    return card;
+}
+
+static bool iot_recon_get_value(const char *line, const char *key, char *out, size_t out_len)
+{
+    if (!line || !key || !out || out_len == 0) return false;
+
+    char pattern[32];
+    snprintf(pattern, sizeof(pattern), "%s=", key);
+    const char *p = strstr(line, pattern);
+    if (!p) return false;
+
+    p += strlen(pattern);
+    size_t i = 0;
+    while (p[i] && p[i] != ' ' && p[i] != '\r' && p[i] != '\n' && i < out_len - 1) {
+        out[i] = p[i];
+        i++;
+    }
+    out[i] = '\0';
+    return i > 0;
+}
+
+static int iot_recon_get_int(const char *line, const char *key, int fallback)
+{
+    char value[24];
+    if (!iot_recon_get_value(line, key, value, sizeof(value))) return fallback;
+    char *end = NULL;
+    long parsed = strtol(value, &end, 0);
+    if (end == value || *end != '\0') return fallback;
+    return (int)parsed;
+}
+
+static uint32_t iot_recon_get_u32(const char *line, const char *key, uint32_t fallback)
+{
+    char value[24];
+    if (!iot_recon_get_value(line, key, value, sizeof(value))) return fallback;
+    return (uint32_t)strtoul(value, NULL, 0);
+}
+
+static void iot_recon_format_age(int age_ms, char *out, size_t out_len)
+{
+    if (!out || out_len == 0) return;
+    if (age_ms < 0) {
+        snprintf(out, out_len, "--");
+        return;
+    }
+
+    int sec = age_ms / 1000;
+    if (sec < 60) {
+        snprintf(out, out_len, "%ds", sec);
+    } else if (sec < 3600) {
+        snprintf(out, out_len, "%dm", sec / 60);
+    } else {
+        snprintf(out, out_len, "%dh", sec / 3600);
+    }
+}
+
+static void iot_recon_format_channels(uint32_t mask, char *out, size_t out_len)
+{
+    if (!out || out_len == 0) return;
+    out[0] = '\0';
+
+    for (int ch = 11; ch <= 26; ch++) {
+        if ((mask & (1UL << ch)) == 0) continue;
+
+        size_t used = strlen(out);
+        if (used >= out_len - 1) break;
+        snprintf(out + used, out_len - used, "%s%d", used > 0 ? "," : "", ch);
+    }
+
+    if (out[0] == '\0') {
+        snprintf(out, out_len, "--");
+    }
+}
+
+static const char *iot_recon_proto_label(const char *proto)
+{
+    if (!proto || proto[0] == '\0') return "802.15.4";
+    if (strcmp(proto, "zigbee") == 0) return "Zigbee";
+    if (strcmp(proto, "thread") == 0) return "Thread";
+    if (strcmp(proto, "matter_thread") == 0) return "Matter/Thread?";
+    if (strcmp(proto, "ieee802154") == 0) return "802.15.4";
+    return proto;
+}
+
+static lv_color_t iot_recon_proto_color(const char *proto)
+{
+    if (!proto) return ui_muted_color();
+    if (strcmp(proto, "zigbee") == 0) return COLOR_MATERIAL_GREEN;
+    if (strcmp(proto, "thread") == 0) return COLOR_MATERIAL_CYAN;
+    if (strcmp(proto, "matter_thread") == 0) return COLOR_MATERIAL_PURPLE;
+    return ui_muted_color();
+}
+
+static void iot_recon_show_empty_locked(tab_context_t *ctx)
+{
+    if (!ctx || !ctx->iot_pan_list) return;
+
+    lv_obj_clean(ctx->iot_pan_list);
+    lv_obj_t *empty = lv_label_create(ctx->iot_pan_list);
+    lv_label_set_text(empty, "No Mesh networks yet");
+    lv_obj_set_style_text_font(empty, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(empty, ui_muted_color(), 0);
+}
+
+static bool iot_recon_ensure_cache(tab_context_t *ctx)
+{
+    if (!ctx) return false;
+
+    if (!ctx->iot_pans) {
+        ctx->iot_pans = heap_caps_calloc(IOT_RECON_MAX_PANS, sizeof(iot_recon_pan_t),
+                                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!ctx->iot_pans) {
+            ctx->iot_pans = heap_caps_calloc(IOT_RECON_MAX_PANS, sizeof(iot_recon_pan_t),
+                                             MALLOC_CAP_8BIT);
+        }
+    }
+
+    if (!ctx->iot_nodes) {
+        ctx->iot_nodes = heap_caps_calloc(IOT_RECON_MAX_NODES, sizeof(iot_recon_node_t),
+                                          MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!ctx->iot_nodes) {
+            ctx->iot_nodes = heap_caps_calloc(IOT_RECON_MAX_NODES, sizeof(iot_recon_node_t),
+                                              MALLOC_CAP_8BIT);
+        }
+    }
+
+    if (!ctx->iot_edges) {
+        ctx->iot_edges = heap_caps_calloc(IOT_RECON_MAX_EDGES, sizeof(iot_recon_edge_t),
+                                          MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!ctx->iot_edges) {
+            ctx->iot_edges = heap_caps_calloc(IOT_RECON_MAX_EDGES, sizeof(iot_recon_edge_t),
+                                              MALLOC_CAP_8BIT);
+        }
+    }
+
+    if (!ctx->iot_pans || !ctx->iot_nodes || !ctx->iot_edges) {
+        ESP_LOGE(TAG, "[IoT] Failed to allocate recon cache (pans=%p nodes=%p edges=%p)",
+                 (void *)ctx->iot_pans, (void *)ctx->iot_nodes, (void *)ctx->iot_edges);
+        return false;
+    }
+
+    return true;
+}
+
+static lv_color_t iot_recon_role_color(const char *role)
+{
+    if (!role) return ui_muted_color();
+    if (strcmp(role, "coordinator") == 0) return COLOR_MATERIAL_ORANGE;
+    if (strcmp(role, "router") == 0) return COLOR_MATERIAL_BLUE;
+    return COLOR_MATERIAL_GREEN;
+}
+
+static const char *iot_recon_role_label(const char *role)
+{
+    if (!role || role[0] == '\0') return "Unknown";
+    if (strcmp(role, "coordinator") == 0) return "Coordinator";
+    if (strcmp(role, "router") == 0) return "Router";
+    if (strcmp(role, "unknown") == 0) return "Unknown";
+    return role;
+}
+
+static const char *iot_recon_signal_label(int rssi)
+{
+    if (rssi >= -65) return "Strong";
+    if (rssi >= -82) return "Mid";
+    return "Weak";
+}
+
+static int iot_recon_count_nodes_for_pan(const tab_context_t *ctx, const char *pan_id)
+{
+    if (!ctx || !pan_id || !ctx->iot_nodes) return 0;
+    int count = 0;
+    for (int i = 0; i < ctx->iot_node_count; i++) {
+        if (strcmp(ctx->iot_nodes[i].pan_id, pan_id) == 0) count++;
+    }
+    return count;
+}
+
+static int iot_recon_count_edges_for_pan(const tab_context_t *ctx, const char *pan_id)
+{
+    if (!ctx || !pan_id || !ctx->iot_edges) return 0;
+    int count = 0;
+    for (int i = 0; i < ctx->iot_edge_count; i++) {
+        if (strcmp(ctx->iot_edges[i].pan_id, pan_id) == 0) count++;
+    }
+    return count;
+}
+
+static bool iot_recon_is_tracked_node(const tab_context_t *ctx, const iot_recon_node_t *node)
+{
+    return ctx && node &&
+           ctx->iot_tracked_pan[0] &&
+           strcmp(ctx->iot_tracked_pan, node->pan_id) == 0 &&
+           strcmp(ctx->iot_tracked_addr, node->addr) == 0;
+}
+
+static const iot_recon_node_t *iot_recon_find_tracked_node(const tab_context_t *ctx, const char *pan_id)
+{
+    if (!ctx || !pan_id || !ctx->iot_nodes || !ctx->iot_tracked_pan[0]) return NULL;
+    if (strcmp(ctx->iot_tracked_pan, pan_id) != 0) return NULL;
+
+    for (int i = 0; i < ctx->iot_node_count; i++) {
+        const iot_recon_node_t *node = &ctx->iot_nodes[i];
+        if (strcmp(node->pan_id, pan_id) == 0 && strcmp(node->addr, ctx->iot_tracked_addr) == 0) {
+            return node;
+        }
+    }
+    return NULL;
+}
+
+static const char *iot_recon_track_trend_label(const iot_recon_node_t *node)
+{
+    if (!node || node->sample_count < 2) return "warming up";
+    if (node->rssi >= node->avg_rssi + 4) return "closer";
+    if (node->rssi <= node->avg_rssi - 4) return "farther";
+    return "steady";
+}
+
+static void iot_recon_line_points_delete_cb(lv_event_t *e)
+{
+    if (lv_event_get_code(e) == LV_EVENT_DELETE) {
+        void *points = lv_event_get_user_data(e);
+        if (points) lv_free(points);
+    }
+}
+
+static uint32_t iot_recon_hash_text(const char *text)
+{
+    uint32_t hash = 2166136261u;
+    if (!text) return hash;
+    while (*text) {
+        hash ^= (uint8_t)*text++;
+        hash *= 16777619u;
+    }
+    return hash;
+}
+
+static int iot_recon_clamp_int(int value, int min_value, int max_value)
+{
+    if (value < min_value) return min_value;
+    if (value > max_value) return max_value;
+    return value;
+}
+
+static int iot_recon_node_dot_size(const iot_recon_node_t *node)
+{
+    if (!node) return 24;
+    return strcmp(node->role, "coordinator") == 0 ? 34 : 24;
+}
+
+static void iot_recon_topology_node_center(const iot_recon_node_t *node, int index, int *cx, int *cy)
+{
+    if (!cx || !cy) return;
+    if (!node) {
+        *cx = 80;
+        *cy = 78;
+        return;
+    }
+
+    if (strcmp(node->role, "coordinator") == 0 || strcmp(node->addr, "0x0000") == 0) {
+        *cx = 86;
+        *cy = 78;
+        return;
+    }
+
+    uint32_t hash = iot_recon_hash_text(node->addr);
+    int angle_deg = -62 + (int)(hash % 125);
+    const double pi = 3.14159265358979323846;
+    double angle = ((double)angle_deg * pi) / 180.0;
+    int weak = iot_recon_clamp_int((-node->rssi) - 58, 0, 55);
+    int radius = 145 + weak * 7 + (index % 3) * 22;
+
+    int x = 86 + (int)((double)radius * cos(angle));
+    int y = 88 + (int)((double)radius * sin(angle));
+    *cx = iot_recon_clamp_int(x, 135, 690);
+    *cy = iot_recon_clamp_int(y, 26, 98);
+}
+
+static void iot_recon_trim_line_to_nodes(int *x1, int *y1, int *x2, int *y2, int r1, int r2)
+{
+    if (!x1 || !y1 || !x2 || !y2) return;
+
+    double dx = (double)(*x2 - *x1);
+    double dy = (double)(*y2 - *y1);
+    double len = sqrt(dx * dx + dy * dy);
+    if (len < 1.0) return;
+
+    double ux = dx / len;
+    double uy = dy / len;
+    *x1 += (int)(ux * (double)(r1 + 2));
+    *y1 += (int)(uy * (double)(r1 + 2));
+    *x2 -= (int)(ux * (double)(r2 + 2));
+    *y2 -= (int)(uy * (double)(r2 + 2));
+}
+
+static bool iot_recon_find_node_center(const tab_context_t *ctx, const char *pan_id, const char *addr,
+                                       int *cx, int *cy)
+{
+    if (!ctx || !pan_id || !addr || !ctx->iot_nodes) return false;
+
+    int plotted = 0;
+    for (int i = 0; i < ctx->iot_node_count; i++) {
+        const iot_recon_node_t *node = &ctx->iot_nodes[i];
+        if (strcmp(node->pan_id, pan_id) != 0) continue;
+        if (strcmp(node->addr, addr) == 0) {
+            iot_recon_topology_node_center(node, plotted, cx, cy);
+            return true;
+        }
+        plotted++;
+    }
+    return false;
+}
+
+static int iot_recon_find_node_radius(const tab_context_t *ctx, const char *pan_id, const char *addr)
+{
+    if (!ctx || !pan_id || !addr || !ctx->iot_nodes) return 12;
+
+    for (int i = 0; i < ctx->iot_node_count; i++) {
+        const iot_recon_node_t *node = &ctx->iot_nodes[i];
+        if (strcmp(node->pan_id, pan_id) != 0) continue;
+        if (strcmp(node->addr, addr) == 0) {
+            return iot_recon_node_dot_size(node) / 2;
+        }
+    }
+    return 12;
+}
+
+static void iot_recon_add_topology_line(lv_obj_t *topo, int x1, int y1, int x2, int y2,
+                                        int r1, int r2, lv_color_t color, lv_opa_t opa, bool dashed)
+{
+    if (!topo) return;
+    iot_recon_trim_line_to_nodes(&x1, &y1, &x2, &y2, r1, r2);
+
+    lv_point_precise_t *points = lv_malloc(sizeof(lv_point_precise_t) * 2);
+    if (!points) return;
+    points[0].x = x1;
+    points[0].y = y1;
+    points[1].x = x2;
+    points[1].y = y2;
+
+    lv_obj_t *line = lv_line_create(topo);
+    lv_line_set_points_mutable(line, points, 2);
+    lv_obj_add_event_cb(line, iot_recon_line_points_delete_cb, LV_EVENT_DELETE, points);
+    lv_obj_set_style_line_color(line, color, 0);
+    lv_obj_set_style_line_opa(line, opa, 0);
+    lv_obj_set_style_line_width(line, 2, 0);
+    if (dashed) {
+        lv_obj_set_style_line_dash_width(line, 6, 0);
+        lv_obj_set_style_line_dash_gap(line, 7, 0);
+    }
+}
+
+static void iot_recon_add_inferred_line(lv_obj_t *topo, int x1, int y1, int x2, int y2, int r1, int r2)
+{
+    iot_recon_add_topology_line(topo, x1, y1, x2, y2, r1, r2, ui_muted_color(), LV_OPA_30, true);
+}
+
+static void iot_recon_add_topology_dot(tab_context_t *ctx, lv_obj_t *topo, const iot_recon_node_t *node, int index)
+{
+    if (!topo || !node) return;
+
+    int cx = 0;
+    int cy = 0;
+    iot_recon_topology_node_center(node, index, &cx, &cy);
+    lv_color_t color = iot_recon_role_color(node->role);
+    bool is_coord = strcmp(node->role, "coordinator") == 0;
+    bool tracked = iot_recon_is_tracked_node(ctx, node);
+    int size = iot_recon_node_dot_size(node);
+
+    lv_obj_t *dot = lv_obj_create(topo);
+    lv_obj_set_size(dot, size, size);
+    lv_obj_set_pos(dot, cx - size / 2, cy - size / 2);
+    lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(dot, color, 0);
+    lv_obj_set_style_border_width(dot, tracked ? 4 : 2, 0);
+    lv_obj_set_style_border_color(dot, tracked ? COLOR_MATERIAL_AMBER : lv_color_lighten(color, 35), 0);
+    lv_obj_set_style_shadow_width(dot, tracked ? 18 : (is_coord ? 14 : 8), 0);
+    lv_obj_set_style_shadow_color(dot, color, 0);
+    lv_obj_clear_flag(dot, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(dot, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(dot, iot_recon_node_click_cb, LV_EVENT_CLICKED, (void *)node);
+
+    lv_obj_t *label = lv_label_create(topo);
+    const char *addr = node->addr;
+    if (strncmp(addr, "0x", 2) == 0 && strlen(addr) > 2) addr += 2;
+    lv_label_set_text(label, addr);
+    lv_obj_set_style_text_font(label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(label, tracked ? COLOR_MATERIAL_AMBER : ui_muted_color(), 0);
+    lv_obj_set_width(label, 52);
+    lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
+    int label_y = cy + size / 2 + 4 + ((index % 2) ? 12 : 0);
+    lv_obj_set_pos(label, cx - 26, iot_recon_clamp_int(label_y, 34, 128));
+}
+
+static void iot_recon_render_expanded_locked(tab_context_t *ctx, lv_obj_t *card, const iot_recon_pan_t *pan)
+{
+    if (!ctx || !card || !pan) return;
+    if (!iot_recon_ensure_cache(ctx)) return;
+
+    lv_obj_t *sep = lv_obj_create(card);
+    lv_obj_set_width(sep, lv_pct(100));
+    lv_obj_set_height(sep, 1);
+    lv_obj_set_style_bg_color(sep, ui_border_color(), 0);
+    lv_obj_set_style_border_width(sep, 0, 0);
+    lv_obj_set_style_pad_all(sep, 0, 0);
+
+    lv_obj_t *topo_title = lv_label_create(card);
+    int edge_count = iot_recon_count_edges_for_pan(ctx, pan->pan_id);
+    lv_label_set_text(topo_title, edge_count > 0 ? "Topology (observed links)" : "Topology (inferred layout)");
+    lv_obj_set_style_text_font(topo_title, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(topo_title, ui_muted_color(), 0);
+
+    const iot_recon_node_t *tracked_node = iot_recon_find_tracked_node(ctx, pan->pan_id);
+    if (tracked_node) {
+        char age[16];
+        iot_recon_format_age(tracked_node->age_ms, age, sizeof(age));
+
+        lv_obj_t *track = lv_obj_create(card);
+        lv_obj_set_width(track, lv_pct(100));
+        lv_obj_set_height(track, LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_color(track, dark_mode_enabled ? lv_color_hex(0x302A18) : lv_color_hex(0xFFF3CD), 0);
+        lv_obj_set_style_border_width(track, 1, 0);
+        lv_obj_set_style_border_color(track, COLOR_MATERIAL_AMBER, 0);
+        lv_obj_set_style_border_opa(track, LV_OPA_70, 0);
+        lv_obj_set_style_radius(track, 8, 0);
+        lv_obj_set_style_pad_all(track, 8, 0);
+        lv_obj_set_style_pad_row(track, 3, 0);
+        lv_obj_set_flex_flow(track, LV_FLEX_FLOW_COLUMN);
+        lv_obj_clear_flag(track, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *title = lv_label_create(track);
+        lv_label_set_text_fmt(title, "Locate %s  %s", tracked_node->addr,
+                              iot_recon_track_trend_label(tracked_node));
+        lv_obj_set_style_text_font(title, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(title, COLOR_MATERIAL_AMBER, 0);
+        lv_obj_set_width(title, lv_pct(100));
+        lv_label_set_long_mode(title, LV_LABEL_LONG_DOT);
+
+        lv_obj_t *detail = lv_label_create(track);
+        char track_detail[160];
+        char track_tail[48];
+        if (tracked_node->last_channel >= 11 && tracked_node->last_channel <= 26) {
+            snprintf(track_tail, sizeof(track_tail), "ch %d | n %d | %s",
+                     tracked_node->last_channel, tracked_node->sample_count, age);
+        } else {
+            snprintf(track_tail, sizeof(track_tail), "ch na | n %d | %s",
+                     tracked_node->sample_count, age);
+        }
+        if (tracked_node->lqi >= 0) {
+            snprintf(track_detail, sizeof(track_detail),
+                     "last %d dBm | avg %d | best %d | LQI %d | %s",
+                     tracked_node->rssi, tracked_node->avg_rssi, tracked_node->best_rssi,
+                     tracked_node->lqi, track_tail);
+        } else {
+            snprintf(track_detail, sizeof(track_detail),
+                     "last %d dBm | avg %d | best %d | %s",
+                     tracked_node->rssi, tracked_node->avg_rssi, tracked_node->best_rssi, track_tail);
+        }
+        lv_label_set_text(detail, track_detail);
+        lv_obj_set_style_text_font(detail, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(detail, ui_text_color(), 0);
+        lv_obj_set_width(detail, lv_pct(100));
+        lv_label_set_long_mode(detail, LV_LABEL_LONG_DOT);
+    }
+
+    lv_obj_t *topo = lv_obj_create(card);
+    lv_obj_set_width(topo, lv_pct(100));
+    int pan_node_count = iot_recon_count_nodes_for_pan(ctx, pan->pan_id);
+    int topo_h = pan_node_count >= 5 ? 150 : 172;
+    int node_row_h = pan_node_count >= 5 ? 38 : 44;
+    lv_obj_set_height(topo, topo_h);
+    lv_obj_set_style_bg_color(topo, dark_mode_enabled ? lv_color_hex(0x202020) : lv_color_hex(0xE9EDF2), 0);
+    lv_obj_set_style_border_width(topo, 0, 0);
+    lv_obj_set_style_radius(topo, 8, 0);
+    lv_obj_clear_flag(topo, LV_OBJ_FLAG_SCROLLABLE);
+
+    const iot_recon_node_t *coordinator = NULL;
+    for (int i = 0; i < ctx->iot_node_count; i++) {
+        if (strcmp(ctx->iot_nodes[i].pan_id, pan->pan_id) != 0) continue;
+        if (strcmp(ctx->iot_nodes[i].role, "coordinator") == 0 || strcmp(ctx->iot_nodes[i].addr, "0x0000") == 0) {
+            coordinator = &ctx->iot_nodes[i];
+            break;
+        }
+    }
+
+    int plotted = 0;
+    if (edge_count > 0) {
+        for (int i = 0; i < ctx->iot_edge_count; i++) {
+            const iot_recon_edge_t *edge = &ctx->iot_edges[i];
+            if (strcmp(edge->pan_id, pan->pan_id) != 0) continue;
+
+            int x1 = 0, y1 = 0, x2 = 0, y2 = 0;
+            if (!iot_recon_find_node_center(ctx, pan->pan_id, edge->from, &x1, &y1)) continue;
+            if (!iot_recon_find_node_center(ctx, pan->pan_id, edge->to, &x2, &y2)) continue;
+
+            bool confirmed = strcmp(edge->kind, "confirmed") == 0 || strcmp(edge->kind, "parent") == 0;
+            int r1 = iot_recon_find_node_radius(ctx, pan->pan_id, edge->from);
+            int r2 = iot_recon_find_node_radius(ctx, pan->pan_id, edge->to);
+            iot_recon_add_topology_line(topo, x1, y1, x2, y2,
+                                        r1, r2,
+                                        confirmed ? COLOR_MATERIAL_CYAN : ui_muted_color(),
+                                        confirmed ? LV_OPA_70 : LV_OPA_40,
+                                        !confirmed);
+        }
+    } else if (coordinator) {
+        int hub_x = 0;
+        int hub_y = 0;
+        iot_recon_topology_node_center(coordinator, 0, &hub_x, &hub_y);
+        for (int i = 0; i < ctx->iot_node_count; i++) {
+            if (strcmp(ctx->iot_nodes[i].pan_id, pan->pan_id) != 0) continue;
+            if (&ctx->iot_nodes[i] == coordinator) continue;
+            int node_x = 0;
+            int node_y = 0;
+            iot_recon_topology_node_center(&ctx->iot_nodes[i], plotted + 1, &node_x, &node_y);
+            iot_recon_add_inferred_line(topo, hub_x, hub_y, node_x, node_y,
+                                        iot_recon_node_dot_size(coordinator) / 2,
+                                        iot_recon_node_dot_size(&ctx->iot_nodes[i]) / 2);
+            plotted++;
+        }
+    }
+
+    plotted = 0;
+    for (int i = 0; i < ctx->iot_node_count; i++) {
+        if (strcmp(ctx->iot_nodes[i].pan_id, pan->pan_id) != 0) continue;
+        iot_recon_add_topology_dot(ctx, topo, &ctx->iot_nodes[i], plotted++);
+    }
+
+    if (plotted == 0) {
+        lv_obj_t *empty = lv_label_create(topo);
+        lv_label_set_text(empty, "Waiting for node data...");
+        lv_obj_set_style_text_font(empty, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(empty, ui_muted_color(), 0);
+        lv_obj_center(empty);
+    }
+
+    lv_obj_t *nodes_title = lv_label_create(card);
+    lv_label_set_text(nodes_title, "Nodes");
+    lv_obj_set_style_text_font(nodes_title, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(nodes_title, ui_muted_color(), 0);
+
+    for (int i = 0; i < ctx->iot_node_count; i++) {
+        const iot_recon_node_t *node = &ctx->iot_nodes[i];
+        if (strcmp(node->pan_id, pan->pan_id) != 0) continue;
+
+        char age[16];
+        iot_recon_format_age(node->age_ms, age, sizeof(age));
+
+        lv_obj_t *row = lv_obj_create(card);
+        lv_obj_set_width(row, lv_pct(100));
+        lv_obj_set_height(row, node_row_h);
+        lv_obj_set_style_bg_color(row, dark_mode_enabled ? lv_color_hex(0x333333) : lv_color_hex(0xFFFFFF), 0);
+        lv_obj_set_style_border_width(row, 0, 0);
+        lv_obj_set_style_radius(row, 8, 0);
+        lv_obj_set_style_pad_hor(row, 10, 0);
+        lv_obj_set_style_pad_column(row, 8, 0);
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(row, iot_recon_node_click_cb, LV_EVENT_CLICKED, (void *)node);
+        if (iot_recon_is_tracked_node(ctx, node)) {
+            lv_obj_set_style_border_width(row, 1, 0);
+            lv_obj_set_style_border_color(row, COLOR_MATERIAL_AMBER, 0);
+            lv_obj_set_style_border_opa(row, LV_OPA_70, 0);
+        }
+
+        lv_obj_t *dot = lv_obj_create(row);
+        lv_obj_set_size(dot, 14, 14);
+        lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_bg_color(dot, iot_recon_role_color(node->role), 0);
+        lv_obj_set_style_border_width(dot, 0, 0);
+        lv_obj_clear_flag(dot, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *addr = lv_label_create(row);
+        lv_label_set_text(addr, node->addr);
+        lv_obj_set_width(addr, 140);
+        lv_obj_set_style_text_font(addr, pan_node_count >= 5 ? &lv_font_montserrat_14 : &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(addr, ui_text_color(), 0);
+
+        lv_obj_t *role = lv_label_create(row);
+        lv_label_set_text(role, iot_recon_role_label(node->role));
+        lv_obj_set_width(role, 130);
+        lv_obj_set_style_text_font(role, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(role, iot_recon_role_color(node->role), 0);
+
+        lv_obj_t *detail = lv_label_create(row);
+        char extra[128] = {0};
+        if (node->last_channel >= 11 && node->last_channel <= 26) {
+            size_t used = strlen(extra);
+            if (used < sizeof(extra)) snprintf(extra + used, sizeof(extra) - used, "  ch %d", node->last_channel);
+        }
+        if (node->lqi >= 0) {
+            size_t used = strlen(extra);
+            if (used < sizeof(extra)) snprintf(extra + used, sizeof(extra) - used, "  LQI %d", node->lqi);
+        }
+        if (node->sample_count > 0) {
+            size_t used = strlen(extra);
+            if (used < sizeof(extra)) snprintf(extra + used, sizeof(extra) - used, "  n %d", node->sample_count);
+        }
+        if (node->vendor[0] && strcmp(node->vendor, "na") != 0) {
+            size_t used = strlen(extra);
+            if (used < sizeof(extra)) snprintf(extra + used, sizeof(extra) - used, "  %s", node->vendor);
+        }
+        if (node->device_hint[0] && strcmp(node->device_hint, "na") != 0) {
+            size_t used = strlen(extra);
+            if (used < sizeof(extra)) snprintf(extra + used, sizeof(extra) - used, "  %s", node->device_hint);
+        }
+        if (node->battery[0] && strcmp(node->battery, "na") != 0) {
+            size_t used = strlen(extra);
+            if (used < sizeof(extra)) snprintf(extra + used, sizeof(extra) - used, "  Bat %s", node->battery);
+        }
+        lv_label_set_text_fmt(detail, "%d pkts  %d dBm %s  %s%s",
+                              node->packets, node->rssi, iot_recon_signal_label(node->rssi), age, extra);
+        lv_obj_set_style_text_font(detail, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(detail, ui_muted_color(), 0);
+        lv_obj_set_width(detail, lv_pct(45));
+        lv_label_set_long_mode(detail, LV_LABEL_LONG_DOT);
+    }
+}
+
+static void iot_recon_render_pan_list_locked(tab_context_t *ctx)
+{
+    if (!ctx || !ctx->iot_pan_list) return;
+    if (!iot_recon_ensure_cache(ctx)) {
+        iot_recon_show_empty_locked(ctx);
+        return;
+    }
+
+    int32_t old_scroll_y = lv_obj_get_scroll_y(ctx->iot_pan_list);
+    lv_obj_clean(ctx->iot_pan_list);
+    if (ctx->iot_pan_count == 0) {
+        iot_recon_show_empty_locked(ctx);
+        return;
+    }
+
+    lv_obj_t *expanded_card = NULL;
+    for (int i = 0; i < ctx->iot_pan_count; i++) {
+        iot_recon_pan_t *pan = &ctx->iot_pans[i];
+        bool expanded = strcmp(ctx->iot_expanded_pan, pan->pan_id) == 0;
+
+        int node_count = iot_recon_count_nodes_for_pan(ctx, pan->pan_id);
+
+        char age[16];
+        iot_recon_format_age(pan->age_ms, age, sizeof(age));
+
+        lv_obj_t *card = lv_obj_create(ctx->iot_pan_list);
+        lv_obj_set_width(card, lv_pct(100));
+        lv_obj_set_height(card, LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_color(card, dark_mode_enabled ? lv_color_hex(0x2A2A2A) : lv_color_hex(0xF2F4F7), 0);
+        lv_obj_set_style_border_width(card, 1, 0);
+        lv_obj_set_style_border_color(card, expanded ? iot_recon_proto_color(pan->proto) : ui_border_color(), 0);
+        lv_obj_set_style_border_opa(card, expanded ? LV_OPA_80 : (dark_mode_enabled ? LV_OPA_40 : LV_OPA_70), 0);
+        lv_obj_set_style_radius(card, 8, 0);
+        lv_obj_set_style_pad_all(card, 10, 0);
+        lv_obj_set_style_pad_row(card, 8, 0);
+        lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+        lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(card, iot_recon_pan_click_cb, LV_EVENT_CLICKED, pan);
+
+        lv_obj_t *top = lv_obj_create(card);
+        lv_obj_set_width(top, lv_pct(100));
+        lv_obj_set_height(top, LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_opa(top, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(top, 0, 0);
+        lv_obj_set_style_pad_all(top, 0, 0);
+        lv_obj_set_flex_flow(top, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(top, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_clear_flag(top, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *title = lv_label_create(top);
+        lv_label_set_text_fmt(title, "PAN: %s", pan->pan_id);
+        lv_obj_set_style_text_font(title, &lv_font_montserrat_18, 0);
+        lv_obj_set_style_text_color(title, ui_text_color(), 0);
+
+        lv_obj_t *badge = lv_label_create(top);
+        lv_label_set_text(badge, iot_recon_proto_label(pan->proto));
+        lv_obj_set_style_text_font(badge, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(badge, iot_recon_proto_color(pan->proto), 0);
+
+        lv_obj_t *details = lv_label_create(card);
+        int display_nodes = node_count > 0 ? node_count : pan->nodes;
+        lv_label_set_text_fmt(details, "%d %s | %d pkts | ch %s | %d dBm | %s",
+                              display_nodes, display_nodes == 1 ? "node" : "nodes",
+                              pan->packets, pan->channels, pan->rssi, age);
+        lv_obj_set_style_text_font(details, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(details, ui_muted_color(), 0);
+        lv_obj_set_width(details, lv_pct(100));
+        lv_label_set_long_mode(details, LV_LABEL_LONG_WRAP);
+
+        if (expanded) {
+            iot_recon_render_expanded_locked(ctx, card, pan);
+            expanded_card = card;
+        }
+    }
+
+    if (ctx->iot_scroll_expanded_once && expanded_card) {
+        lv_obj_scroll_to_view(expanded_card, LV_ANIM_ON);
+        ctx->iot_scroll_expanded_once = false;
+    } else {
+        lv_obj_scroll_to_y(ctx->iot_pan_list, old_scroll_y, LV_ANIM_OFF);
+    }
+}
+
+static bool iot_recon_store_pan_locked(tab_context_t *ctx, const char *line)
+{
+    if (!ctx || !line) return false;
+    if (!iot_recon_ensure_cache(ctx)) return false;
+
+    char kind[24] = {0};
+    iot_recon_get_value(line, "kind", kind, sizeof(kind));
+    if (strcmp(kind, "broadcast") == 0) {
+        ESP_LOGD(TAG, "[IoT] UI hiding broadcast PAN: %s", line);
+        return false;
+    }
+
+    if (ctx->iot_pan_count >= IOT_RECON_MAX_PANS) return false;
+
+    iot_recon_pan_t *pan = &ctx->iot_pans[ctx->iot_pan_count++];
+    memset(pan, 0, sizeof(*pan));
+    iot_recon_get_value(line, "id", pan->pan_id, sizeof(pan->pan_id));
+    iot_recon_get_value(line, "proto", pan->proto, sizeof(pan->proto));
+    iot_recon_get_value(line, "confidence", pan->confidence, sizeof(pan->confidence));
+    pan->nodes = iot_recon_get_int(line, "nodes", 0);
+    pan->packets = iot_recon_get_int(line, "packets", 0);
+    pan->rssi = iot_recon_get_int(line, "best_rssi", iot_recon_get_int(line, "last_rssi", 0));
+    pan->age_ms = iot_recon_get_int(line, "age_ms", -1);
+    iot_recon_format_channels(iot_recon_get_u32(line, "channels", 0), pan->channels, sizeof(pan->channels));
+    return true;
+}
+
+static bool iot_recon_store_node_locked(tab_context_t *ctx, const char *line)
+{
+    if (!ctx || !line || ctx->iot_node_count >= IOT_RECON_MAX_NODES) return false;
+    if (!iot_recon_ensure_cache(ctx)) return false;
+
+    iot_recon_node_t *node = &ctx->iot_nodes[ctx->iot_node_count++];
+    memset(node, 0, sizeof(*node));
+    iot_recon_get_value(line, "pan", node->pan_id, sizeof(node->pan_id));
+    iot_recon_get_value(line, "role", node->role, sizeof(node->role));
+    iot_recon_get_value(line, "vendor", node->vendor, sizeof(node->vendor));
+    iot_recon_get_value(line, "device_hint", node->device_hint, sizeof(node->device_hint));
+    iot_recon_get_value(line, "battery", node->battery, sizeof(node->battery));
+    node->packets = iot_recon_get_int(line, "packets", 0);
+    node->rssi = iot_recon_get_int(line, "last_rssi", 0);
+    node->best_rssi = iot_recon_get_int(line, "best_rssi", node->rssi);
+    node->avg_rssi = iot_recon_get_int(line, "avg_rssi", node->rssi);
+    node->lqi = iot_recon_get_int(line, "lqi", -1);
+    node->sample_count = iot_recon_get_int(line, "sample_count", 0);
+    node->last_channel = iot_recon_get_int(line, "last_channel", 0);
+    node->age_ms = iot_recon_get_int(line, "age_ms", -1);
+
+    char addr_type[16] = {0};
+    char short_addr[24] = {0};
+    char ext_addr[32] = {0};
+    iot_recon_get_value(line, "addr_type", addr_type, sizeof(addr_type));
+    iot_recon_get_value(line, "short", short_addr, sizeof(short_addr));
+    iot_recon_get_value(line, "ext", ext_addr, sizeof(ext_addr));
+
+    if (strcmp(addr_type, "ext") == 0 || strcmp(short_addr, "na") == 0) {
+        if (strncmp(ext_addr, "0x", 2) == 0 && strlen(ext_addr) > 6) {
+            snprintf(node->addr, sizeof(node->addr), "EXT ...%s", ext_addr + strlen(ext_addr) - 4);
+        } else {
+            snprintf(node->addr, sizeof(node->addr), "EXT");
+        }
+    } else {
+        snprintf(node->addr, sizeof(node->addr), "%s", short_addr[0] ? short_addr : "0x????");
+    }
+    return node->pan_id[0] != '\0';
+}
+
+static bool iot_recon_store_edge_locked(tab_context_t *ctx, const char *line)
+{
+    if (!ctx || !line || ctx->iot_edge_count >= IOT_RECON_MAX_EDGES) return false;
+    if (!iot_recon_ensure_cache(ctx)) return false;
+
+    iot_recon_edge_t *edge = &ctx->iot_edges[ctx->iot_edge_count++];
+    memset(edge, 0, sizeof(*edge));
+    iot_recon_get_value(line, "pan", edge->pan_id, sizeof(edge->pan_id));
+    iot_recon_get_value(line, "from", edge->from, sizeof(edge->from));
+    iot_recon_get_value(line, "to", edge->to, sizeof(edge->to));
+    iot_recon_get_value(line, "kind", edge->kind, sizeof(edge->kind));
+    edge->packets = iot_recon_get_int(line, "packets", 0);
+    edge->rssi = iot_recon_get_int(line, "last_rssi", iot_recon_get_int(line, "rssi", 0));
+    edge->age_ms = iot_recon_get_int(line, "age_ms", -1);
+    return edge->pan_id[0] && edge->from[0] && edge->to[0];
+}
+
+static void iot_recon_process_line_locked(tab_context_t *ctx, const char *line,
+                                          int *rendered_pan_count, int *hidden_pan_count)
+{
+    if (!ctx || !line || strncmp(line, "[ZIG]", 5) != 0) return;
+
+    ESP_LOGI(TAG, "[IoT] RX %s", line);
+
+    if (strstr(line, "[ZIG] status ") == line) {
+        int active = iot_recon_get_int(line, "active", 0);
+        int channel = iot_recon_get_int(line, "channel", 0);
+        int packets = iot_recon_get_int(line, "packets", 0);
+        int pans = iot_recon_get_int(line, "pans", 0);
+        int dropped = iot_recon_get_int(line, "dropped", 0);
+
+        if (ctx->iot_channel_label) {
+            if (channel > 0) lv_label_set_text_fmt(ctx->iot_channel_label, "%d", channel);
+            else lv_label_set_text(ctx->iot_channel_label, "--");
+        }
+        if (ctx->iot_packets_label) lv_label_set_text_fmt(ctx->iot_packets_label, "%d", packets);
+        if (ctx->iot_networks_label) lv_label_set_text_fmt(ctx->iot_networks_label, "%d", pans);
+        if (ctx->iot_dropped_label) lv_label_set_text_fmt(ctx->iot_dropped_label, "%d", dropped);
+        if (ctx->iot_status_label) {
+        lv_label_set_text(ctx->iot_status_label, active ? "Mesh recon running - polling JanOS" : "Mesh recon idle");
+            lv_obj_set_style_text_color(ctx->iot_status_label, active ? COLOR_MATERIAL_GREEN : ui_muted_color(), 0);
+        }
+    } else if (strstr(line, "[ZIG] pan ") == line) {
+        bool rendered = iot_recon_store_pan_locked(ctx, line);
+        if (rendered) {
+            if (rendered_pan_count) (*rendered_pan_count)++;
+        } else if (hidden_pan_count) {
+            (*hidden_pan_count)++;
+        }
+    } else if (strstr(line, "[ZIG] node ") == line) {
+        iot_recon_store_node_locked(ctx, line);
+    } else if (strstr(line, "[ZIG] edge ") == line) {
+        iot_recon_store_edge_locked(ctx, line);
+    }
+}
+
+static void iot_recon_process_response(tab_context_t *ctx, const char *cmd, const char *response)
+{
+    if (!ctx || !cmd || !response) return;
+
+    bool is_list = strstr(cmd, "zig_recon_list") != NULL;
+    bool is_nodes = strstr(cmd, "zig_recon_nodes") != NULL;
+    int rendered_pan_count = 0;
+    int hidden_pan_count = 0;
+
+    if (!bsp_display_lock(0)) {
+        ESP_LOGW(TAG, "[IoT] Could not lock display for response: %s", cmd);
+        return;
+    }
+
+    if (is_list) {
+        ctx->iot_pan_count = 0;
+    }
+    if (is_nodes) {
+        ctx->iot_node_count = 0;
+        ctx->iot_edge_count = 0;
+    }
+
+    char line[320];
+    size_t line_pos = 0;
+    for (size_t i = 0; ; i++) {
+        char c = response[i];
+        if (c == '\r' || c == '\n' || c == '\0') {
+            if (line_pos > 0) {
+                line[line_pos] = '\0';
+                iot_recon_process_line_locked(ctx, line, &rendered_pan_count, &hidden_pan_count);
+                line_pos = 0;
+            }
+            if (c == '\0') break;
+            continue;
+        }
+        if (line_pos < sizeof(line) - 1) {
+            line[line_pos++] = c;
+        }
+    }
+
+    if (is_list) {
+        if (rendered_pan_count == 0) {
+            iot_recon_show_empty_locked(ctx);
+        } else {
+            iot_recon_render_pan_list_locked(ctx);
+        }
+        if (ctx->iot_networks_label) {
+            lv_label_set_text_fmt(ctx->iot_networks_label, "%d", rendered_pan_count);
+        }
+        if (hidden_pan_count > 0) {
+            ESP_LOGI(TAG, "[IoT] UI rendered %d PAN(s), hidden %d broadcast/debug PAN(s)",
+                     rendered_pan_count, hidden_pan_count);
+        }
+    } else if (is_nodes && ctx->iot_pan_count > 0) {
+        iot_recon_render_pan_list_locked(ctx);
+    }
+
+    bsp_display_unlock();
+}
+
+static int iot_recon_send_command_collect(tab_context_t *ctx, const char *cmd, char *out,
+                                          size_t out_size, uint32_t timeout_ms)
+{
+    if (!ctx || !cmd || !out || out_size < 2) return 0;
+
+    tab_id_t tab = tab_id_for_ctx(ctx);
+    if (tab_is_internal(tab)) return 0;
+
+    uart_port_t uart_port = uart_port_for_tab(tab);
+    bool usb_lock_set = false;
+
+    if (tab == TAB_USB) {
+        usb_rx_exclusive = true;
+        usb_lock_set = true;
+        usb_flush_input(80);
+    } else {
+        uart_flush_input(uart_port);
+    }
+
+    if (!iot_recon_send_command(ctx, cmd)) {
+        if (usb_lock_set) usb_rx_exclusive = false;
+        return 0;
+    }
+
+    int total = 0;
+    uint32_t start = lv_tick_get();
+    while (lv_tick_elaps(start) < timeout_ms && total < (int)out_size - 1) {
+        int len = transport_read_bytes_tab(tab, uart_port, out + total, out_size - 1 - total,
+                                           pdMS_TO_TICKS(100));
+        if (len > 0) {
+            total += len;
+            out[total] = '\0';
+            if (strstr(out, "[ZIG] END")) {
+                break;
+            }
+        }
+    }
+
+    out[total] = '\0';
+    if (usb_lock_set) usb_rx_exclusive = false;
+
+    if (total <= 0) {
+        ESP_LOGW(TAG, "[IoT][%s] RX timeout/no data for: %s", tab_transport_name(tab), cmd);
+    } else if (!strstr(out, "[ZIG] END")) {
+        ESP_LOGW(TAG, "[IoT][%s] RX partial for %s (%d bytes)", tab_transport_name(tab), cmd, total);
+    } else {
+        ESP_LOGI(TAG, "[IoT][%s] RX complete for %s (%d bytes)", tab_transport_name(tab), cmd, total);
+    }
+
+    return total;
+}
+
+static void iot_recon_monitor_task(void *arg)
+{
+    tab_context_t *ctx = (tab_context_t *)arg;
+    if (!ctx) {
+        vTaskDelete(NULL);
+        return;
+    }
+
+    tab_id_t tab = tab_id_for_ctx(ctx);
+    const char *tab_name = tab_transport_name(tab);
+    char *rx_buffer = heap_caps_malloc(8192, MALLOC_CAP_8BIT);
+    if (!rx_buffer) {
+        ESP_LOGE(TAG, "[IoT][%s] Failed to allocate RX buffer", tab_name);
+        ctx->iot_recon_monitoring = false;
+        ctx->iot_recon_task = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    ESP_LOGI(TAG, "[IoT][%s] Recon polling task started", tab_name);
+    vTaskDelay(pdMS_TO_TICKS(700));
+
+    int loop_count = 0;
+    while (ctx->iot_recon_monitoring) {
+        int rx_len = iot_recon_send_command_collect(ctx, "zig_recon_status", rx_buffer, 8192, 1200);
+        if (rx_len > 0) {
+            iot_recon_process_response(ctx, "zig_recon_status", rx_buffer);
+        }
+
+        if (!ctx->iot_recon_monitoring) break;
+
+        if ((loop_count % 2) == 0) {
+            rx_len = iot_recon_send_command_collect(ctx, "zig_recon_list all", rx_buffer, 8192, 1800);
+            if (rx_len > 0) {
+                iot_recon_process_response(ctx, "zig_recon_list all", rx_buffer);
+            }
+
+            if (!ctx->iot_recon_monitoring) break;
+
+            rx_len = iot_recon_send_command_collect(ctx, "zig_recon_nodes all", rx_buffer, 8192, 1800);
+            if (rx_len > 0) {
+                iot_recon_process_response(ctx, "zig_recon_nodes all", rx_buffer);
+            }
+        }
+
+        loop_count++;
+        for (int i = 0; i < 10 && ctx->iot_recon_monitoring; i++) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+    }
+
+    free(rx_buffer);
+    ESP_LOGI(TAG, "[IoT][%s] Recon polling task ended", tab_name);
+    ctx->iot_recon_task = NULL;
+    vTaskDelete(NULL);
+}
+
+static void iot_recon_back_cb(lv_event_t *e)
+{
+    (void)e;
+    tab_context_t *ctx = get_current_ctx();
+    ESP_LOGI(TAG, "[IoT] Back clicked on tab %d", current_tab);
+    if (!ctx) return;
+
+    if (ctx->iot_recon_monitoring) {
+        ctx->iot_recon_monitoring = false;
+        iot_recon_send_command(ctx, "stop");
+    }
+
+    if (ctx->iot_page) {
+        lv_obj_add_flag(ctx->iot_page, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (ctx->tiles) {
+        lv_obj_clear_flag(ctx->tiles, LV_OBJ_FLAG_HIDDEN);
+        ctx->current_visible_page = ctx->tiles;
+    }
+}
+
+static void iot_recon_pan_click_cb(lv_event_t *e)
+{
+    iot_recon_pan_t *pan = (iot_recon_pan_t *)lv_event_get_user_data(e);
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx || !pan) return;
+    if (!iot_recon_ensure_cache(ctx)) return;
+
+    if (strcmp(ctx->iot_expanded_pan, pan->pan_id) == 0) {
+        ctx->iot_expanded_pan[0] = '\0';
+        ctx->iot_scroll_expanded_once = false;
+        ESP_LOGI(TAG, "[IoT] Collapsed PAN %s", pan->pan_id);
+    } else {
+        snprintf(ctx->iot_expanded_pan, sizeof(ctx->iot_expanded_pan), "%s", pan->pan_id);
+        ctx->iot_scroll_expanded_once = true;
+        ESP_LOGI(TAG, "[IoT] Expanded PAN %s (%d node(s) cached)",
+                 pan->pan_id, iot_recon_count_nodes_for_pan(ctx, pan->pan_id));
+    }
+
+    iot_recon_render_pan_list_locked(ctx);
+}
+
+static void iot_recon_node_click_cb(lv_event_t *e)
+{
+    iot_recon_node_t *node = (iot_recon_node_t *)lv_event_get_user_data(e);
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx || !node) return;
+
+    lv_event_stop_bubbling(e);
+    snprintf(ctx->iot_expanded_pan, sizeof(ctx->iot_expanded_pan), "%s", node->pan_id);
+    snprintf(ctx->iot_tracked_pan, sizeof(ctx->iot_tracked_pan), "%s", node->pan_id);
+    snprintf(ctx->iot_tracked_addr, sizeof(ctx->iot_tracked_addr), "%s", node->addr);
+    ctx->iot_scroll_expanded_once = false;
+
+    ESP_LOGI(TAG, "[IoT] Locate node selected pan=%s addr=%s rssi=%d avg=%d best=%d lqi=%d samples=%d ch=%d",
+             node->pan_id, node->addr, node->rssi, node->avg_rssi, node->best_rssi,
+             node->lqi, node->sample_count, node->last_channel);
+    iot_recon_render_pan_list_locked(ctx);
+}
+
+static bool iot_recon_send_command(tab_context_t *ctx, const char *cmd)
+{
+    if (!ctx || !cmd || cmd[0] == '\0') {
+        ESP_LOGW(TAG, "[IoT] TX blocked: empty command or missing context");
+        return false;
+    }
+
+    tab_id_t tab = tab_id_for_ctx(ctx);
+    if (tab_is_internal(tab)) {
+        ESP_LOGW(TAG, "[IoT][%s] TX blocked: internal tab has no JanOS target",
+                 tab_transport_name(tab));
+        return false;
+    }
+
+    uart_port_t uart_port = uart_port_for_tab(tab);
+    size_t cmd_len = strlen(cmd);
+
+    ESP_LOGI(TAG, "[IoT][%s] TX: %s", tab_transport_name(tab), cmd);
+    int cmd_written = transport_write_bytes_tab(tab, uart_port, cmd, cmd_len);
+    int crlf_written = transport_write_bytes_tab(tab, uart_port, "\r\n", 2);
+    ESP_LOGI(TAG, "[IoT][%s] TX done: cmd_bytes=%d/%u crlf_bytes=%d/2",
+             tab_transport_name(tab), cmd_written, (unsigned)cmd_len, crlf_written);
+
+    return cmd_written == (int)cmd_len && crlf_written == 2;
+}
+
+static void iot_recon_start_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx) ctx = get_current_ctx();
+    if (!ctx) return;
+    if (!iot_recon_ensure_cache(ctx)) {
+        if (ctx->iot_status_label) {
+            lv_label_set_text(ctx->iot_status_label, "No memory for Mesh Recon cache");
+            lv_obj_set_style_text_color(ctx->iot_status_label, COLOR_MATERIAL_RED, 0);
+        }
+        return;
+    }
+    if (ctx->iot_recon_monitoring) {
+        ESP_LOGW(TAG, "[IoT] Start ignored - recon already running");
+        return;
+    }
+
+    ESP_LOGI(TAG, "[IoT] Start clicked on tab %d", tab_id_for_ctx(ctx));
+    if (!iot_recon_send_command(ctx, "start_zig_recon all 250")) {
+        if (ctx->iot_status_label) {
+            lv_label_set_text(ctx->iot_status_label, "Transport unavailable - command not sent");
+            lv_obj_set_style_text_color(ctx->iot_status_label, COLOR_MATERIAL_RED, 0);
+        }
+        return;
+    }
+
+    ctx->iot_recon_monitoring = true;
+    ctx->iot_pan_count = 0;
+    ctx->iot_node_count = 0;
+    ctx->iot_edge_count = 0;
+    ctx->iot_expanded_pan[0] = '\0';
+    ctx->iot_tracked_pan[0] = '\0';
+    ctx->iot_tracked_addr[0] = '\0';
+    ctx->iot_scroll_expanded_once = false;
+
+    if (ctx->iot_status_label) {
+        lv_label_set_text(ctx->iot_status_label, "Starting Mesh Recon - polling JanOS");
+        lv_obj_set_style_text_color(ctx->iot_status_label, COLOR_MATERIAL_AMBER, 0);
+    }
+    if (ctx->iot_pan_list) {
+        iot_recon_show_empty_locked(ctx);
+    }
+    if (ctx->iot_start_btn) lv_obj_add_state(ctx->iot_start_btn, LV_STATE_DISABLED);
+    if (ctx->iot_stop_btn) lv_obj_clear_state(ctx->iot_stop_btn, LV_STATE_DISABLED);
+
+    if (ctx->iot_recon_task == NULL) {
+        if (xTaskCreate(iot_recon_monitor_task, "iot_recon", 8192, (void *)ctx, 5,
+                        &ctx->iot_recon_task) != pdTRUE) {
+            ESP_LOGE(TAG, "[IoT] Failed to create recon polling task");
+            ctx->iot_recon_monitoring = false;
+            ctx->iot_recon_task = NULL;
+            if (ctx->iot_status_label) {
+                lv_label_set_text(ctx->iot_status_label, "Failed to start polling task");
+                lv_obj_set_style_text_color(ctx->iot_status_label, COLOR_MATERIAL_RED, 0);
+            }
+            if (ctx->iot_start_btn) lv_obj_clear_state(ctx->iot_start_btn, LV_STATE_DISABLED);
+            if (ctx->iot_stop_btn) lv_obj_add_state(ctx->iot_stop_btn, LV_STATE_DISABLED);
+        }
+    } else {
+        ESP_LOGW(TAG, "[IoT] Recon polling task already running");
+    }
+}
+
+static void iot_recon_stop_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx) ctx = get_current_ctx();
+    if (!ctx) return;
+
+    ESP_LOGI(TAG, "[IoT] Stop clicked on tab %d", tab_id_for_ctx(ctx));
+    ctx->iot_recon_monitoring = false;
+
+    if (!iot_recon_send_command(ctx, "stop")) {
+        if (ctx->iot_status_label) {
+            lv_label_set_text(ctx->iot_status_label, "Transport unavailable - stop not sent");
+            lv_obj_set_style_text_color(ctx->iot_status_label, COLOR_MATERIAL_RED, 0);
+        }
+        return;
+    }
+
+    if (ctx->iot_status_label) {
+        lv_label_set_text(ctx->iot_status_label, "Mesh recon stopped - results stay visible");
+        lv_obj_set_style_text_color(ctx->iot_status_label, ui_muted_color(), 0);
+    }
+    if (ctx->iot_start_btn) lv_obj_clear_state(ctx->iot_start_btn, LV_STATE_DISABLED);
+    if (ctx->iot_stop_btn) lv_obj_add_state(ctx->iot_stop_btn, LV_STATE_DISABLED);
+}
+
+static void iot_recon_clear_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx) ctx = get_current_ctx();
+    if (!ctx) return;
+
+    ESP_LOGI(TAG, "[IoT] Clear clicked on tab %d", tab_id_for_ctx(ctx));
+    bool clear_sent = iot_recon_send_command(ctx, "zig_recon_clear");
+    ctx->iot_pan_count = 0;
+    ctx->iot_node_count = 0;
+    ctx->iot_edge_count = 0;
+    ctx->iot_expanded_pan[0] = '\0';
+    ctx->iot_tracked_pan[0] = '\0';
+    ctx->iot_tracked_addr[0] = '\0';
+    ctx->iot_scroll_expanded_once = false;
+
+    if (ctx->iot_channel_label) lv_label_set_text(ctx->iot_channel_label, "--");
+    if (ctx->iot_packets_label) lv_label_set_text(ctx->iot_packets_label, "0");
+    if (ctx->iot_networks_label) lv_label_set_text(ctx->iot_networks_label, "0");
+    if (ctx->iot_dropped_label) lv_label_set_text(ctx->iot_dropped_label, "0");
+    if (ctx->iot_status_label) {
+        if (clear_sent) {
+            lv_label_set_text(ctx->iot_status_label, "Cleared local state and JanOS cache");
+            lv_obj_set_style_text_color(ctx->iot_status_label, COLOR_MATERIAL_TEAL, 0);
+        } else {
+            lv_label_set_text(ctx->iot_status_label, "Cleared local state - JanOS clear not sent");
+            lv_obj_set_style_text_color(ctx->iot_status_label, COLOR_MATERIAL_AMBER, 0);
+        }
+    }
+    if (ctx->iot_pan_list) {
+        iot_recon_show_empty_locked(ctx);
+    }
+}
+
+static void show_zig_recon_page(void)
+{
+    tab_context_t *ctx = get_current_ctx();
+    lv_obj_t *container = get_current_tab_container();
+    if (!ctx || !container) return;
+
+    ESP_LOGI(TAG, "[IoT] Opening IoT page on tab %d (%s)", current_tab, tab_transport_name(current_tab));
+    if (!iot_recon_ensure_cache(ctx)) {
+        ESP_LOGE(TAG, "[IoT] Opening page without cache; controls will report memory error");
+    }
+    hide_all_pages(ctx);
+
+    if (ctx->iot_page) {
+        lv_obj_clear_flag(ctx->iot_page, LV_OBJ_FLAG_HIDDEN);
+        ctx->current_visible_page = ctx->iot_page;
+        ESP_LOGI(TAG, "[IoT] Reusing existing IoT page");
+        return;
+    }
+
+    ESP_LOGI(TAG, "[IoT] Creating IoT page skeleton");
+    ctx->iot_page = lv_obj_create(container);
+    lv_obj_set_size(ctx->iot_page, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(ctx->iot_page, ui_bg_color(), 0);
+    lv_obj_set_style_border_width(ctx->iot_page, 0, 0);
+    lv_obj_set_style_pad_all(ctx->iot_page, 10, 0);
+    lv_obj_set_style_pad_row(ctx->iot_page, 10, 0);
+    lv_obj_set_flex_flow(ctx->iot_page, LV_FLEX_FLOW_COLUMN);
+
+    lv_obj_t *header = lv_obj_create(ctx->iot_page);
+    lv_obj_set_size(header, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(header, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(header, 0, 0);
+    lv_obj_set_style_pad_all(header, 0, 0);
+    lv_obj_set_style_pad_column(header, 10, 0);
+    lv_obj_set_flex_flow(header, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(header, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(header, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *left_cont = lv_obj_create(header);
+    lv_obj_set_size(left_cont, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(left_cont, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(left_cont, 0, 0);
+    lv_obj_set_style_pad_all(left_cont, 0, 0);
+    lv_obj_set_style_pad_column(left_cont, 10, 0);
+    lv_obj_set_flex_flow(left_cont, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(left_cont, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(left_cont, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *back_btn = lv_btn_create(left_cont);
+    lv_obj_set_size(back_btn, 72, 60);
+    style_back_nav_button(back_btn);
+    lv_obj_add_event_cb(back_btn, iot_recon_back_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *back_icon = lv_label_create(back_btn);
+    lv_label_set_text(back_icon, LV_SYMBOL_LEFT);
+    lv_obj_set_style_text_color(back_icon, lv_color_white(), 0);
+    lv_obj_center(back_icon);
+
+    lv_obj_t *title_col = lv_obj_create(left_cont);
+    lv_obj_set_size(title_col, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(title_col, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(title_col, 0, 0);
+    lv_obj_set_style_pad_all(title_col, 0, 0);
+    lv_obj_set_style_pad_row(title_col, 2, 0);
+    lv_obj_set_flex_flow(title_col, LV_FLEX_FLOW_COLUMN);
+    lv_obj_clear_flag(title_col, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(title_col);
+    lv_label_set_text(title, LV_SYMBOL_BARS " Mesh Recon");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_22, 0);
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_PURPLE, 0);
+
+    lv_obj_t *subtitle = lv_label_create(title_col);
+    lv_label_set_text(subtitle, "802.15.4 / Zigbee / Thread");
+    lv_obj_set_style_text_font(subtitle, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(subtitle, ui_muted_color(), 0);
+
+    lv_obj_t *btn_cont = lv_obj_create(header);
+    lv_obj_set_size(btn_cont, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(btn_cont, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(btn_cont, 0, 0);
+    lv_obj_set_style_pad_all(btn_cont, 0, 0);
+    lv_obj_set_style_pad_column(btn_cont, 8, 0);
+    lv_obj_set_flex_flow(btn_cont, LV_FLEX_FLOW_ROW);
+    lv_obj_clear_flag(btn_cont, LV_OBJ_FLAG_SCROLLABLE);
+
+    ctx->iot_start_btn = lv_btn_create(btn_cont);
+    lv_obj_set_size(ctx->iot_start_btn, 88, 42);
+    lv_obj_set_style_bg_color(ctx->iot_start_btn, COLOR_MATERIAL_GREEN, 0);
+    lv_obj_set_style_bg_color(ctx->iot_start_btn, lv_color_hex(0x555555), LV_STATE_DISABLED);
+    lv_obj_set_style_radius(ctx->iot_start_btn, 8, 0);
+    lv_obj_add_event_cb(ctx->iot_start_btn, iot_recon_start_cb, LV_EVENT_CLICKED, ctx);
+    lv_obj_t *start_lbl = lv_label_create(ctx->iot_start_btn);
+    lv_label_set_text(start_lbl, LV_SYMBOL_PLAY " Start");
+    lv_obj_set_style_text_font(start_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_center(start_lbl);
+
+    ctx->iot_stop_btn = lv_btn_create(btn_cont);
+    lv_obj_set_size(ctx->iot_stop_btn, 84, 42);
+    lv_obj_set_style_bg_color(ctx->iot_stop_btn, COLOR_MATERIAL_RED, 0);
+    lv_obj_set_style_bg_color(ctx->iot_stop_btn, lv_color_hex(0x555555), LV_STATE_DISABLED);
+    lv_obj_set_style_radius(ctx->iot_stop_btn, 8, 0);
+    lv_obj_add_event_cb(ctx->iot_stop_btn, iot_recon_stop_cb, LV_EVENT_CLICKED, ctx);
+    lv_obj_add_state(ctx->iot_stop_btn, LV_STATE_DISABLED);
+    lv_obj_t *stop_lbl = lv_label_create(ctx->iot_stop_btn);
+    lv_label_set_text(stop_lbl, LV_SYMBOL_STOP " Stop");
+    lv_obj_set_style_text_font(stop_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_center(stop_lbl);
+
+    ctx->iot_clear_btn = lv_btn_create(btn_cont);
+    lv_obj_set_size(ctx->iot_clear_btn, 82, 42);
+    lv_obj_set_style_bg_color(ctx->iot_clear_btn, COLOR_MATERIAL_AMBER, 0);
+    lv_obj_set_style_radius(ctx->iot_clear_btn, 8, 0);
+    lv_obj_add_event_cb(ctx->iot_clear_btn, iot_recon_clear_cb, LV_EVENT_CLICKED, ctx);
+    lv_obj_t *clear_lbl = lv_label_create(ctx->iot_clear_btn);
+    lv_label_set_text(clear_lbl, "Clear");
+    lv_obj_set_style_text_font(clear_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_center(clear_lbl);
+
+    ctx->iot_status_label = lv_label_create(ctx->iot_page);
+    lv_label_set_text(ctx->iot_status_label, "Skeleton ready - parser/polling comes next");
+    lv_obj_set_style_text_font(ctx->iot_status_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(ctx->iot_status_label, ui_muted_color(), 0);
+    lv_obj_set_width(ctx->iot_status_label, lv_pct(100));
+    lv_label_set_long_mode(ctx->iot_status_label, LV_LABEL_LONG_WRAP);
+
+    lv_obj_t *metrics = lv_obj_create(ctx->iot_page);
+    lv_obj_set_size(metrics, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(metrics, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(metrics, 0, 0);
+    lv_obj_set_style_pad_all(metrics, 0, 0);
+    lv_obj_set_style_pad_column(metrics, 8, 0);
+    lv_obj_set_flex_flow(metrics, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(metrics, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_clear_flag(metrics, LV_OBJ_FLAG_SCROLLABLE);
+
+    iot_recon_create_metric(metrics, "Channel", "--", COLOR_MATERIAL_CYAN, &ctx->iot_channel_label);
+    iot_recon_create_metric(metrics, "Packets", "0", COLOR_MATERIAL_AMBER, &ctx->iot_packets_label);
+    iot_recon_create_metric(metrics, "Networks", "0", COLOR_MATERIAL_GREEN, &ctx->iot_networks_label);
+    iot_recon_create_metric(metrics, "Dropped", "0", COLOR_MATERIAL_RED, &ctx->iot_dropped_label);
+
+    ctx->iot_pan_list = lv_obj_create(ctx->iot_page);
+    lv_obj_set_size(ctx->iot_pan_list, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_flex_grow(ctx->iot_pan_list, 1);
+    lv_obj_set_style_bg_color(ctx->iot_pan_list, ui_panel_color(), 0);
+    lv_obj_set_style_border_width(ctx->iot_pan_list, 1, 0);
+    lv_obj_set_style_border_color(ctx->iot_pan_list, ui_border_color(), 0);
+    lv_obj_set_style_border_opa(ctx->iot_pan_list, dark_mode_enabled ? LV_OPA_40 : LV_OPA_70, 0);
+    lv_obj_set_style_radius(ctx->iot_pan_list, 10, 0);
+    lv_obj_set_style_pad_all(ctx->iot_pan_list, 12, 0);
+    lv_obj_set_style_pad_row(ctx->iot_pan_list, 8, 0);
+    lv_obj_set_flex_flow(ctx->iot_pan_list, LV_FLEX_FLOW_COLUMN);
+
+    lv_obj_t *empty = lv_label_create(ctx->iot_pan_list);
+    lv_label_set_text(empty, "No Mesh networks yet");
+    lv_obj_set_style_text_font(empty, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(empty, ui_muted_color(), 0);
+
+    ctx->current_visible_page = ctx->iot_page;
+    ESP_LOGI(TAG, "[IoT] IoT page skeleton created");
 }
 
 //==================================================================================
@@ -20444,6 +25452,8 @@ static void compromised_listing_reset_files(tab_context_t *ctx)
     }
     ctx->wardrive_wigle_file_count = 0;
     ctx->wardrive_wigle_selected_count = 0;
+    memset(&ctx->wardrive_file_summary, 0, sizeof(ctx->wardrive_file_summary));
+    wardrive_upload_state_reset(ctx);
 }
 
 static void compromised_transport_lock_begin(tab_id_t tab, uart_port_t uart_port, bool *usb_lock_set)
@@ -20616,6 +25626,12 @@ static int compromised_load_wardrive_files(tab_context_t *ctx, tab_id_t active_t
 
     bool usb_lock_set = false;
     compromised_transport_lock_begin(active_tab, uart_port, &usb_lock_set);
+
+    int marker_files = wardrive_load_files_from_command(ctx, active_tab, uart_port, 120000);
+    if (marker_files > 0 || ctx->wardrive_file_summary.valid) {
+        compromised_transport_lock_end(usb_lock_set);
+        return ctx->wardrive_wigle_file_count;
+    }
 
     char rx_buffer[4096];
     for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]) &&
@@ -20919,8 +25935,11 @@ static void close_compromised_cleanup_popup(tab_context_t *ctx)
         ctx->compromised_cleanup_status_label = NULL;
         ctx->compromised_cleanup_log_container = NULL;
         ctx->compromised_cleanup_log_label = NULL;
+        ctx->compromised_cleanup_move_btn = NULL;
+        ctx->compromised_cleanup_close_btn = NULL;
     }
     ctx->compromised_cleanup_log_buffer[0] = '\0';
+    ctx->wardrive_cleanup_dry_run_ready = false;
 }
 
 static void show_compromised_cleanup_popup(tab_context_t *ctx, compromised_file_kind_t kind,
@@ -20995,6 +26014,38 @@ static void show_compromised_cleanup_popup(tab_context_t *ctx, compromised_file_
     lv_label_set_long_mode(ctx->compromised_cleanup_log_label, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_font(ctx->compromised_cleanup_log_label, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(ctx->compromised_cleanup_log_label, ui_muted_color(), 0);
+
+    lv_obj_t *btn_row = lv_obj_create(ctx->compromised_cleanup_popup);
+    lv_obj_remove_style_all(btn_row);
+    lv_obj_set_size(btn_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(btn_row, 12, 0);
+
+    ctx->compromised_cleanup_move_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(ctx->compromised_cleanup_move_btn, 160, 42);
+    lv_obj_set_style_bg_color(ctx->compromised_cleanup_move_btn, COLOR_MATERIAL_AMBER, 0);
+    lv_obj_set_style_bg_color(ctx->compromised_cleanup_move_btn, lv_color_hex(0xFFA000), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(ctx->compromised_cleanup_move_btn, 8, 0);
+    lv_obj_add_event_cb(ctx->compromised_cleanup_move_btn, wardrive_cleanup_move_confirm_cb, LV_EVENT_CLICKED, ctx);
+    lv_obj_add_flag(ctx->compromised_cleanup_move_btn, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_t *move_lbl = lv_label_create(ctx->compromised_cleanup_move_btn);
+    lv_label_set_text(move_lbl, "Move matched");
+    lv_obj_set_style_text_font(move_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(move_lbl, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_center(move_lbl);
+
+    ctx->compromised_cleanup_close_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(ctx->compromised_cleanup_close_btn, 120, 42);
+    lv_obj_set_style_bg_color(ctx->compromised_cleanup_close_btn, lv_color_hex(0x444444), 0);
+    lv_obj_set_style_bg_color(ctx->compromised_cleanup_close_btn, lv_color_hex(0x555555), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(ctx->compromised_cleanup_close_btn, 8, 0);
+    lv_obj_add_event_cb(ctx->compromised_cleanup_close_btn, wardrive_cleanup_close_cb, LV_EVENT_CLICKED, ctx);
+    lv_obj_t *close_lbl = lv_label_create(ctx->compromised_cleanup_close_btn);
+    lv_label_set_text(close_lbl, "Close");
+    lv_obj_set_style_text_font(close_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(close_lbl, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_center(close_lbl);
 }
 
 static bool compromised_start_cleanup_operation(tab_context_t *ctx,
@@ -21070,6 +26121,471 @@ static void compromised_cleanup_async_refresh(void *user_data)
             trigger_home_meta_refresh(ctx, true);
         }
     }
+}
+
+// Runs on the LVGL thread (via lv_async_call) after the background loader finished.
+// Rebuilds the file page so it renders from the now-populated ctx cache.
+static void compromised_files_load_async_render(void *user_data)
+{
+    tab_context_t *ctx = (tab_context_t *)user_data;
+    if (!ctx) {
+        return;
+    }
+
+    compromised_file_kind_t kind = ctx->compromised_files_load_kind;
+    lv_obj_t **page_slot = compromised_page_slot_for_kind(ctx, kind);
+    bool same_tab = (tab_id_for_ctx(ctx) == current_tab);
+    bool page_visible = (same_tab && page_slot && *page_slot &&
+                         ctx->current_visible_page == *page_slot);
+
+    if (!page_visible) {
+        // User navigated away while loading; drop the staged flag so the next open
+        // performs a fresh load instead of rendering stale cache.
+        ctx->compromised_files_loaded = false;
+        return;
+    }
+
+    if (kind == COMPROMISED_FILE_KIND_HANDSHAKE) {
+        show_handshakes_page();
+    } else if (kind == COMPROMISED_FILE_KIND_WARDRIVE) {
+        show_wardrive_files_page();
+    } else {
+        ctx->compromised_files_loaded = false;
+    }
+}
+
+// Background task: fetch the file listing over UART (off the UI thread so the page
+// spinner keeps animating), then ask the LVGL thread to rebuild the page.
+static void compromised_files_load_task(void *arg)
+{
+    tab_context_t *ctx = (tab_context_t *)arg;
+    if (!ctx) {
+        vTaskDelete(NULL);
+        return;
+    }
+
+    tab_id_t active_tab = tab_id_for_ctx(ctx);
+    uart_port_t uart_port = uart_port_for_tab(active_tab);
+    compromised_file_kind_t kind = ctx->compromised_files_load_kind;
+
+    if (kind == COMPROMISED_FILE_KIND_HANDSHAKE) {
+        ctx->home_handshake_count = compromised_load_handshake_files(ctx, active_tab, uart_port);
+    } else {
+        (void)compromised_load_wardrive_files(ctx, active_tab, uart_port);
+        if (kind == COMPROMISED_FILE_KIND_WARDRIVE) {
+            // Also pull the upload journal so files already uploaded and moved out
+            // of the working dir still show up as "uploaded" history on the page.
+            wardrive_load_upload_state_from_command(ctx, active_tab, uart_port, 10000);
+        }
+    }
+
+    ctx->compromised_files_loaded = true;
+    ctx->compromised_files_loading = false;
+    ctx->compromised_files_load_task = NULL;
+    lv_async_call(compromised_files_load_async_render, ctx);
+    vTaskDelete(NULL);
+}
+
+static void wardrive_cleanup_close_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx) {
+        ctx = get_current_ctx();
+    }
+    if (!ctx || ctx->compromised_cleanup_running) {
+        return;
+    }
+    close_compromised_cleanup_popup(ctx);
+}
+
+static bool wardrive_cleanup_start(tab_context_t *ctx, const char *service,
+                                   const char *status, bool move)
+{
+    if (!ctx || ctx->compromised_cleanup_running || !service || !status) {
+        return false;
+    }
+
+    wardrive_cleanup_task_args_t *args = calloc(1, sizeof(*args));
+    if (!args) {
+        return false;
+    }
+    args->ctx = ctx;
+    args->move = move;
+    snprintf(args->service, sizeof(args->service), "%s", service);
+    snprintf(args->status, sizeof(args->status), "%s", status);
+
+    ctx->compromised_cleanup_running = true;
+    ctx->compromised_cleanup_kind = COMPROMISED_FILE_KIND_WARDRIVE;
+    ctx->compromised_cleanup_action = COMPROMISED_CLEANUP_ACTION_CLEAN;
+    snprintf(ctx->wardrive_cleanup_service, sizeof(ctx->wardrive_cleanup_service), "%s", service);
+    snprintf(ctx->wardrive_cleanup_status, sizeof(ctx->wardrive_cleanup_status), "%s", status);
+    ctx->wardrive_cleanup_dry_run_ready = false;
+    ctx->compromised_cleanup_log_buffer[0] = '\0';
+
+    if (!ctx->compromised_cleanup_overlay) {
+        show_compromised_cleanup_popup(ctx, COMPROMISED_FILE_KIND_WARDRIVE,
+                                       COMPROMISED_CLEANUP_ACTION_CLEAN);
+    }
+    if (ctx->compromised_cleanup_status_label) {
+        lv_label_set_text_fmt(ctx->compromised_cleanup_status_label,
+                              move ? "Moving matched wardrive files..." :
+                                     "Dry-run: finding wardrive files to move...");
+    }
+    if (ctx->compromised_cleanup_spinner) {
+        lv_obj_clear_flag(ctx->compromised_cleanup_spinner, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (ctx->compromised_cleanup_log_label) {
+        lv_label_set_text(ctx->compromised_cleanup_log_label,
+                          move ? "Starting wardrive_cleanup move..." :
+                                 "Starting wardrive_cleanup dry-run...");
+    }
+    if (ctx->compromised_cleanup_move_btn) {
+        lv_obj_add_flag(ctx->compromised_cleanup_move_btn, LV_OBJ_FLAG_HIDDEN);
+    }
+    lv_refr_now(NULL);
+
+    if (xTaskCreate(wardrive_cleanup_task, "wd_clean", 8192, args, 5,
+                    &ctx->compromised_cleanup_task) != pdTRUE) {
+        ctx->compromised_cleanup_running = false;
+        ctx->compromised_cleanup_task = NULL;
+        free(args);
+        return false;
+    }
+    return true;
+}
+
+static void wardrive_cleanup_move_confirm_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx) {
+        ctx = get_current_ctx();
+    }
+    if (!ctx || !ctx->wardrive_cleanup_dry_run_ready) {
+        return;
+    }
+    wardrive_cleanup_start(ctx,
+                           ctx->wardrive_cleanup_service[0] ? ctx->wardrive_cleanup_service : "all",
+                           ctx->wardrive_cleanup_status[0] ? ctx->wardrive_cleanup_status : "done",
+                           true);
+}
+
+static void wardrive_cleanup_dry_run_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx) {
+        ctx = get_current_ctx();
+    }
+    wardrive_cleanup_start(ctx, "all", "done", false);
+}
+
+static void wardrive_cleanup_task(void *arg)
+{
+    wardrive_cleanup_task_args_t *args = (wardrive_cleanup_task_args_t *)arg;
+    if (!args || !args->ctx) {
+        free(args);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    tab_context_t *ctx = args->ctx;
+    tab_id_t tab = tab_id_for_ctx(ctx);
+    uart_port_t uart_port = uart_port_for_tab(tab);
+
+    // On the actual move, append a session stamp (from the RTC-seeded system
+    // clock) so the module archives into a unique subfolder
+    // (.../<service>/<status>/YYYY-MM-DD_HHMMSS). A per-run stamp avoids name
+    // collisions even when wN.log restarts at w1 the same day. Dry-run sends
+    // no destination.
+    char cmd[96];
+    if (args->move) {
+        time_t now = time(NULL);
+        struct tm t;
+        localtime_r(&now, &t);
+        if (t.tm_year + 1900 >= 2024) {
+            char sessbuf[24];
+            snprintf(sessbuf, sizeof(sessbuf), "%04d-%02d-%02d_%02d%02d%02d",
+                     (t.tm_year + 1900) % 10000, (t.tm_mon + 1) % 100, t.tm_mday % 100,
+                     t.tm_hour % 100, t.tm_min % 100, t.tm_sec % 100);
+            snprintf(cmd, sizeof(cmd), "wardrive_cleanup %s %s move %s",
+                     args->service, args->status, sessbuf);
+        } else {
+            // No valid clock yet - fall back to the plain move (legacy destination).
+            snprintf(cmd, sizeof(cmd), "wardrive_cleanup %s %s move",
+                     args->service, args->status);
+        }
+    } else {
+        snprintf(cmd, sizeof(cmd), "wardrive_cleanup %s %s",
+                 args->service, args->status);
+    }
+
+    bool usb_lock_set = false;
+    compromised_transport_lock_begin(tab, uart_port, &usb_lock_set);
+    transport_write_bytes_tab(tab, uart_port, cmd, strlen(cmd));
+    transport_write_bytes_tab(tab, uart_port, "\r\n", 2);
+    ESP_LOGI(TAG, "[%s] sent %s", tab_transport_name(tab), cmd);
+
+    char *rx = heap_caps_malloc(16384, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    size_t rx_size = 16384;
+    if (!rx) {
+        rx_size = 4096;
+        rx = malloc(rx_size);
+    }
+    if (!rx) {
+        compromised_transport_lock_end(usb_lock_set);
+        bsp_display_lock(0);
+        if (ctx->compromised_cleanup_spinner) {
+            lv_obj_add_flag(ctx->compromised_cleanup_spinner, LV_OBJ_FLAG_HIDDEN);
+        }
+        if (ctx->compromised_cleanup_status_label) {
+            lv_label_set_text(ctx->compromised_cleanup_status_label,
+                              "Cleanup failed: not enough memory for response buffer.");
+        }
+        bsp_display_unlock();
+        ctx->compromised_cleanup_running = false;
+        ctx->compromised_cleanup_task = NULL;
+        free(args);
+        vTaskDelete(NULL);
+        return;
+    }
+    rx[0] = '\0';
+
+    int total_len = 0;
+    int elapsed_ms = 0;
+    int empty_reads = 0;
+    const int poll_ms = 250;
+    while (elapsed_ms < 120000 && total_len < (int)rx_size - 1) {
+        int len = transport_read_bytes_tab(tab, uart_port, rx + total_len,
+                                           rx_size - 1 - total_len,
+                                           pdMS_TO_TICKS(poll_ms));
+        if (len > 0) {
+            total_len += len;
+            rx[total_len] = '\0';
+            empty_reads = 0;
+            if (strstr(rx, "[WARD_CLEANUP] END") != NULL ||
+                strstr(rx, "Usage: wardrive_cleanup") != NULL ||
+                strstr(rx, "Unrecognized command") != NULL) {
+                break;
+            }
+        } else {
+            empty_reads++;
+            if (empty_reads >= 8 && strstr(rx, "[WARD_CLEANUP] BEGIN") == NULL) {
+                break;
+            }
+        }
+        elapsed_ms += poll_ms;
+    }
+    compromised_transport_lock_end(usb_lock_set);
+
+    int scanned = 0, matched = 0, moved = 0, failed = 0, dry_run = args->move ? 0 : 1;
+    int shown = 0;
+    char *line = strtok(rx, "\n\r");
+    while (line) {
+        while (isspace((unsigned char)*line)) line++;
+        if (strstr(line, "[WARD_CLEANUP] filename=") != NULL) {
+            char filename[96] = {0};
+            char action[24] = {0};
+            wardrive_marker_get_value(line, "filename", filename, sizeof(filename));
+            wardrive_marker_get_value(line, "action", action, sizeof(action));
+            char log_line[160];
+            snprintf(log_line, sizeof(log_line), "%s %s",
+                     action[0] ? action : "matched", filename[0] ? filename : "(file)");
+            bsp_display_lock(0);
+            compromised_cleanup_append_log(ctx, log_line);
+            bsp_display_unlock();
+            shown++;
+        } else if (strstr(line, "[WARD_CLEANUP] SUMMARY") != NULL) {
+            scanned = wardrive_marker_get_int(line, "scanned", 0);
+            matched = wardrive_marker_get_int(line, "matched", 0);
+            moved = wardrive_marker_get_int(line, "moved", 0);
+            failed = wardrive_marker_get_int(line, "failed", 0);
+            dry_run = wardrive_marker_get_int(line, "dry_run", dry_run);
+        }
+        line = strtok(NULL, "\n\r");
+    }
+    if (shown == 0 && rx[0] != '\0') {
+        bsp_display_lock(0);
+        compromised_cleanup_append_log(ctx, rx);
+        bsp_display_unlock();
+    }
+
+    free(rx);
+
+    bsp_display_lock(0);
+    if (ctx->compromised_cleanup_spinner) {
+        lv_obj_add_flag(ctx->compromised_cleanup_spinner, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (ctx->compromised_cleanup_status_label) {
+        if (dry_run) {
+            if (matched > 0) {
+                lv_label_set_text_fmt(ctx->compromised_cleanup_status_label,
+                                      "Dry-run complete. Scanned: %d, matched: %d. Tap Move matched to archive.",
+                                      scanned, matched);
+            } else {
+                lv_label_set_text_fmt(ctx->compromised_cleanup_status_label,
+                                      "Dry-run complete. Scanned: %d, nothing to move, failed: %d",
+                                      scanned, failed);
+            }
+        } else {
+            lv_label_set_text_fmt(ctx->compromised_cleanup_status_label,
+                                  "Move complete. Matched: %d, moved: %d, failed: %d",
+                                  matched, moved, failed);
+            ctx->compromised_files_loaded = false;
+        }
+    }
+    if (dry_run && matched > 0 && ctx->compromised_cleanup_move_btn) {
+        ctx->wardrive_cleanup_dry_run_ready = true;
+        lv_obj_clear_flag(ctx->compromised_cleanup_move_btn, LV_OBJ_FLAG_HIDDEN);
+    }
+    bsp_display_unlock();
+
+    ctx->compromised_cleanup_running = false;
+    ctx->compromised_cleanup_task = NULL;
+    free(args);
+    vTaskDelete(NULL);
+}
+
+static void wardrive_fix_task(void *arg)
+{
+    wardrive_fix_task_args_t *args = (wardrive_fix_task_args_t *)arg;
+    if (!args || !args->ctx) {
+        free(args);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    tab_context_t *ctx = args->ctx;
+    tab_id_t tab = tab_id_for_ctx(ctx);
+    uart_port_t uart_port = uart_port_for_tab(tab);
+
+    char cmd[128];
+    snprintf(cmd, sizeof(cmd), "wardrive_fix %s", args->file);
+
+    bool usb_lock_set = false;
+    compromised_transport_lock_begin(tab, uart_port, &usb_lock_set);
+    transport_write_bytes_tab(tab, uart_port, cmd, strlen(cmd));
+    transport_write_bytes_tab(tab, uart_port, "\r\n", 2);
+    ESP_LOGI(TAG, "[%s] sent %s", tab_transport_name(tab), cmd);
+
+    char *rx = heap_caps_malloc(8192, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    size_t rx_size = 8192;
+    if (!rx) {
+        rx_size = 4096;
+        rx = malloc(rx_size);
+    }
+    if (!rx) {
+        compromised_transport_lock_end(usb_lock_set);
+        bsp_display_lock(0);
+        if (ctx->compromised_cleanup_spinner) {
+            lv_obj_add_flag(ctx->compromised_cleanup_spinner, LV_OBJ_FLAG_HIDDEN);
+        }
+        if (ctx->compromised_cleanup_status_label) {
+            lv_label_set_text(ctx->compromised_cleanup_status_label,
+                              "Fix failed: not enough memory for response buffer.");
+        }
+        bsp_display_unlock();
+        ctx->compromised_cleanup_running = false;
+        ctx->compromised_cleanup_task = NULL;
+        free(args);
+        vTaskDelete(NULL);
+        return;
+    }
+    rx[0] = '\0';
+
+    int total_len = 0;
+    int elapsed_ms = 0;
+    int empty_reads = 0;
+    const int poll_ms = 250;
+    while (elapsed_ms < 120000 && total_len < (int)rx_size - 1) {
+        int len = transport_read_bytes_tab(tab, uart_port, rx + total_len,
+                                           rx_size - 1 - total_len,
+                                           pdMS_TO_TICKS(poll_ms));
+        if (len > 0) {
+            total_len += len;
+            rx[total_len] = '\0';
+            empty_reads = 0;
+            if (strstr(rx, "[WARD_FIX] END") != NULL ||
+                strstr(rx, "Usage: wardrive_fix") != NULL ||
+                strstr(rx, "Unrecognized command") != NULL) {
+                break;
+            }
+        } else {
+            empty_reads++;
+            if (empty_reads >= 8 && strstr(rx, "[WARD_FIX] BEGIN") == NULL) {
+                break;
+            }
+        }
+        elapsed_ms += poll_ms;
+    }
+    compromised_transport_lock_end(usb_lock_set);
+
+    char filename[96] = {0};
+    char output[96] = {0};
+    char status[16] = {0};
+    long size_bytes = 0;
+    int kept = 0, dropped = 0, wifi = 0, ble = 0, bt = 0, bad = 0;
+    bool parsed = false;
+
+    char *line = strtok(rx, "\n\r");
+    while (line) {
+        while (isspace((unsigned char)*line)) line++;
+        if (strstr(line, "[WARD_FIX] filename=") != NULL) {
+            wardrive_marker_get_value(line, "filename", filename, sizeof(filename));
+            wardrive_marker_get_value(line, "output", output, sizeof(output));
+            wardrive_marker_get_value(line, "status", status, sizeof(status));
+            size_bytes = wardrive_marker_get_long(line, "size", 0);
+            kept = wardrive_marker_get_int(line, "kept", 0);
+            dropped = wardrive_marker_get_int(line, "dropped", 0);
+            wifi = wardrive_marker_get_int(line, "wifi", 0);
+            ble = wardrive_marker_get_int(line, "ble", 0);
+            bt = wardrive_marker_get_int(line, "bt", 0);
+            bad = wardrive_marker_get_int(line, "bad", 0);
+            parsed = true;
+            break;
+        }
+        line = strtok(NULL, "\n\r");
+    }
+
+    char log_line[320];
+    if (parsed) {
+        char size_str[24];
+        wardrive_human_size(size_bytes, size_str, sizeof(size_str));
+        snprintf(log_line, sizeof(log_line),
+                 "input: %s\noutput: %s\nsize: %s\nkept=%d dropped=%d\nwifi=%d ble=%d bt=%d bad=%d",
+                 filename[0] ? filename : args->file,
+                 output[0] ? output : "(unknown)",
+                 size_str, kept, dropped, wifi, ble, bt, bad);
+    } else {
+        snprintf(log_line, sizeof(log_line), "%s", rx[0] ? rx : "No wardrive_fix response.");
+    }
+
+    free(rx);
+
+    bsp_display_lock(0);
+    if (ctx->compromised_cleanup_spinner) {
+        lv_obj_add_flag(ctx->compromised_cleanup_spinner, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (ctx->compromised_cleanup_status_label) {
+        if (parsed && strcmp(status, "ok") == 0) {
+            lv_label_set_text(ctx->compromised_cleanup_status_label,
+                              "Fix complete. Original file was not changed.");
+        } else if (parsed) {
+            lv_label_set_text_fmt(ctx->compromised_cleanup_status_label,
+                                  "Fix finished with status: %s", status[0] ? status : "unknown");
+        } else {
+            lv_label_set_text(ctx->compromised_cleanup_status_label,
+                              "Fix failed or returned an unexpected response.");
+        }
+    }
+    if (ctx->compromised_cleanup_log_label) {
+        lv_label_set_text(ctx->compromised_cleanup_log_label, log_line);
+    }
+    ctx->compromised_files_loaded = false;
+    bsp_display_unlock();
+
+    ctx->compromised_cleanup_running = false;
+    ctx->compromised_cleanup_task = NULL;
+    free(args);
+    vTaskDelete(NULL);
 }
 
 static void compromised_cleanup_task(void *arg)
@@ -21372,6 +26888,8 @@ static void show_compromised_file_page(compromised_file_kind_t kind)
     lv_obj_set_flex_grow(spacer, 1);
     lv_obj_set_height(spacer, 1);
 
+    lv_obj_t *clean_btn = NULL;
+
     if (kind == COMPROMISED_FILE_KIND_HANDSHAKE) {
         lv_obj_t *wpasec_btn = lv_btn_create(header);
         lv_obj_set_size(wpasec_btn, 190, 50);
@@ -21388,19 +26906,22 @@ static void show_compromised_file_page(compromised_file_kind_t kind)
         lv_obj_center(wpasec_lbl);
     }
 
-    lv_obj_t *clean_btn = lv_btn_create(header);
-    lv_obj_set_size(clean_btn, 120, 50);
-    style_danger_button(clean_btn);
-    lv_obj_add_event_cb(clean_btn, compromised_file_clean_cb, LV_EVENT_CLICKED,
-                        compromised_make_user_data(kind, 0));
+    if (kind != COMPROMISED_FILE_KIND_WARDRIVE) {
+        clean_btn = lv_btn_create(header);
+        lv_obj_set_size(clean_btn, 120, 50);
+        style_danger_button(clean_btn);
+        lv_obj_add_event_cb(clean_btn, compromised_file_clean_cb, LV_EVENT_CLICKED,
+                            compromised_make_user_data(kind, 0));
 
-    lv_obj_t *clean_lbl = lv_label_create(clean_btn);
-    lv_label_set_text(clean_lbl, LV_SYMBOL_TRASH " Clean");
-    lv_obj_set_style_text_font(clean_lbl, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(clean_lbl, lv_color_hex(0xFFFFFF), 0);
-    lv_obj_center(clean_lbl);
+        lv_obj_t *clean_lbl = lv_label_create(clean_btn);
+        lv_label_set_text(clean_lbl, LV_SYMBOL_TRASH " Clean");
+        lv_obj_set_style_text_font(clean_lbl, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(clean_lbl, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_center(clean_lbl);
+    }
 
     lv_obj_t *status_label = lv_label_create(*page_slot);
+    lv_label_set_recolor(status_label, true);
     lv_label_set_text(status_label, "Loading...");
     lv_obj_set_style_text_font(status_label, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(status_label, ui_muted_color(), 0);
@@ -21415,55 +26936,126 @@ static void show_compromised_file_page(compromised_file_kind_t kind)
 
     if (!current_tab_has_sd_card()) {
         lv_label_set_text(status_label, "No SD card detected on this tab.");
-        lv_obj_add_state(clean_btn, LV_STATE_DISABLED);
+        if (clean_btn) lv_obj_add_state(clean_btn, LV_STATE_DISABLED);
         return;
     }
 
     if (tab_is_internal(current_tab)) {
         lv_label_set_text(status_label, "Manage files from a JanOS transport tab.");
-        lv_obj_add_state(clean_btn, LV_STATE_DISABLED);
+        if (clean_btn) lv_obj_add_state(clean_btn, LV_STATE_DISABLED);
         return;
     }
 
-    int entry_count = 0;
-    tab_id_t active_tab = current_tab;
-    uart_port_t uart_port = uart_port_for_tab(active_tab);
-    if (kind == COMPROMISED_FILE_KIND_HANDSHAKE) {
-        entry_count = compromised_load_handshake_files(ctx, active_tab, uart_port);
-        ctx->home_handshake_count = entry_count;
-        update_home_dashboard_labels(ctx, battery_percent_from_voltage(current_battery_voltage));
-    } else {
-        entry_count = compromised_load_wardrive_files(ctx, active_tab, uart_port);
+    // The listing is fetched over UART and can hash several MB of wardrive logs,
+    // which takes many seconds. Do it on a background task with a live spinner so
+    // the GUI stays responsive; compromised_files_load_task() rebuilds this page
+    // (with compromised_files_loaded == true) once the module sends its END marker.
+    if (!ctx->compromised_files_loaded) {
+        lv_label_set_text(status_label, "Reading file list from module...");
+        if (clean_btn) lv_obj_add_state(clean_btn, LV_STATE_DISABLED);
+
+        // Centered overlay on top of the page (IGNORE_LAYOUT so flex can't squeeze
+        // it to zero height, move_foreground so it never hides behind the list).
+        lv_obj_t *loading_box = lv_obj_create(*page_slot);
+        lv_obj_remove_style_all(loading_box);
+        lv_obj_set_size(loading_box, lv_pct(100), lv_pct(100));
+        lv_obj_add_flag(loading_box, LV_OBJ_FLAG_IGNORE_LAYOUT);
+        lv_obj_clear_flag(loading_box, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_align(loading_box, LV_ALIGN_CENTER, 0, 0);
+
+        lv_obj_t *spinner = lv_spinner_create(loading_box);
+        lv_obj_set_size(spinner, 80, 80);
+        lv_spinner_set_anim_params(spinner, 1000, 200);
+        lv_obj_set_style_arc_color(spinner, accent, LV_PART_INDICATOR);
+        lv_obj_center(spinner);
+
+        lv_obj_t *loading_lbl = lv_label_create(loading_box);
+        lv_label_set_text_fmt(loading_lbl, "Loading %s files...",
+                              compromised_tile_name_for_kind(kind));
+        lv_obj_set_style_text_font(loading_lbl, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(loading_lbl, ui_muted_color(), 0);
+        lv_obj_align(loading_lbl, LV_ALIGN_CENTER, 0, 70);
+
+        lv_obj_move_foreground(loading_box);
+
+        if (!ctx->compromised_files_loading) {
+            ctx->compromised_files_loading = true;
+            ctx->compromised_files_load_kind = kind;
+            if (xTaskCreate(compromised_files_load_task, "cf_load", 8192, ctx, 5,
+                            &ctx->compromised_files_load_task) != pdTRUE) {
+                ctx->compromised_files_loading = false;
+                ctx->compromised_files_load_task = NULL;
+                lv_label_set_text(status_label, "Failed to start file loader task.");
+            }
+        }
+        return;
     }
 
-    if (entry_count <= 0) {
-        lv_label_set_text(status_label, compromised_empty_text_for_kind(kind));
-        lv_obj_add_state(clean_btn, LV_STATE_DISABLED);
+    // Data is already in ctx (filled by the background task) — render from cache,
+    // never re-issue the UART listing here.
+    ctx->compromised_files_loaded = false;
+    int entry_count = ctx->wardrive_wigle_file_count;
+    if (kind == COMPROMISED_FILE_KIND_HANDSHAKE) {
+        ctx->home_handshake_count = entry_count;
+        update_home_dashboard_labels(ctx, battery_percent_from_voltage(current_battery_voltage));
+    }
 
+    // Wardrive keeps an upload journal that survives after files are uploaded and
+    // moved to the archive, so an empty working dir is not necessarily an empty page.
+    bool have_upload_state = (kind == COMPROMISED_FILE_KIND_WARDRIVE &&
+                              ctx->wardrive_upload_state_loaded &&
+                              ctx->wardrive_upload_state_count > 0);
+
+    if (entry_count <= 0) {
+        if (clean_btn) lv_obj_add_state(clean_btn, LV_STATE_DISABLED);
+
+        if (!have_upload_state) {
+            lv_label_set_text(status_label, compromised_empty_text_for_kind(kind));
+            lv_obj_t *empty = lv_label_create(list_container);
+            lv_label_set_text(empty, compromised_empty_text_for_kind(kind));
+            lv_obj_set_style_text_font(empty, &lv_font_montserrat_16, 0);
+            lv_obj_set_style_text_color(empty, ui_muted_color(), 0);
+            lv_obj_set_style_text_align(empty, LV_TEXT_ALIGN_CENTER, 0);
+            lv_obj_set_width(empty, lv_pct(100));
+            return;
+        }
+
+        // No files waiting, but we have history below — say so and fall through.
+        lv_label_set_text(status_label, "No files waiting - already uploaded/archived.");
         lv_obj_t *empty = lv_label_create(list_container);
-        lv_label_set_text(empty, compromised_empty_text_for_kind(kind));
-        lv_obj_set_style_text_font(empty, &lv_font_montserrat_16, 0);
+        lv_label_set_text(empty, "No wardrive files in the working folder.");
+        lv_obj_set_style_text_font(empty, &lv_font_montserrat_14, 0);
         lv_obj_set_style_text_color(empty, ui_muted_color(), 0);
         lv_obj_set_style_text_align(empty, LV_TEXT_ALIGN_CENTER, 0);
         lv_obj_set_width(empty, lv_pct(100));
-        return;
+    } else if (kind == COMPROMISED_FILE_KIND_WARDRIVE && ctx->wardrive_file_summary.valid) {
+        char summary[320];
+        wardrive_format_summary_text(&ctx->wardrive_file_summary, summary, sizeof(summary));
+        lv_label_set_text(status_label, summary);
+    } else {
+        lv_label_set_text_fmt(status_label, "Found %d %s file(s)",
+                              entry_count, compromised_tile_name_for_kind(kind));
     }
 
-    lv_label_set_text_fmt(status_label, "Found %d %s file(s)",
-                          entry_count, compromised_tile_name_for_kind(kind));
-
-    for (int i = 0; i < entry_count && i < WARDRIVE_WIGLE_MAX_FILES; i++) {
+    // Newest first (wN.log auto-increments, so the last entry is the most recent).
+    int max_entries = (entry_count < WARDRIVE_WIGLE_MAX_FILES) ? entry_count
+                                                               : WARDRIVE_WIGLE_MAX_FILES;
+    for (int disp = 0; disp < max_entries; disp++) {
+        int i = max_entries - 1 - disp; // real array index, kept for delete callback
         wardrive_wigle_file_t *file = &ctx->wardrive_wigle_files[i];
         if (file->name[0] == '\0') {
             continue;
         }
 
+        lv_color_t card_bg, card_border, card_title;
+        wardrive_file_card_palette(file, &card_bg, &card_border, &card_title);
+
         lv_obj_t *row = lv_obj_create(list_container);
         lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
-        lv_obj_set_style_bg_color(row, ui_card_color(), 0);
+        lv_obj_set_style_bg_color(row, card_bg, 0);
         lv_obj_set_style_border_width(row, 1, 0);
-        lv_obj_set_style_border_color(row, ui_border_color(), 0);
-        lv_obj_set_style_border_opa(row, dark_mode_enabled ? LV_OPA_40 : LV_OPA_70, 0);
+        lv_obj_set_style_border_color(row, card_border, 0);
+        lv_obj_set_style_border_opa(row, LV_OPA_80, 0);
         lv_obj_set_style_radius(row, 8, 0);
         lv_obj_set_style_pad_all(row, 10, 0);
         lv_obj_set_style_pad_column(row, 10, 0);
@@ -21482,7 +27074,7 @@ static void show_compromised_file_page(compromised_file_kind_t kind)
         lv_obj_t *name_lbl = lv_label_create(info);
         lv_label_set_text(name_lbl, file->name);
         lv_obj_set_style_text_font(name_lbl, &lv_font_montserrat_16, 0);
-        lv_obj_set_style_text_color(name_lbl, accent, 0);
+        lv_obj_set_style_text_color(name_lbl, card_title, 0);
         lv_obj_set_width(name_lbl, lv_pct(100));
         lv_label_set_long_mode(name_lbl, LV_LABEL_LONG_WRAP);
 
@@ -21493,7 +27085,57 @@ static void show_compromised_file_page(compromised_file_kind_t kind)
         lv_obj_set_width(path_lbl, lv_pct(100));
         lv_label_set_long_mode(path_lbl, LV_LABEL_LONG_WRAP);
 
-        lv_obj_t *delete_btn = lv_btn_create(row);
+        if (kind == COMPROMISED_FILE_KIND_WARDRIVE) {
+            char detail[224];
+            wardrive_format_file_detail_rich(file, detail, sizeof(detail));
+            if (detail[0] != '\0') {
+                lv_obj_t *detail_lbl = lv_label_create(info);
+                lv_label_set_recolor(detail_lbl, true);
+                lv_label_set_text(detail_lbl, detail);
+                lv_obj_set_style_text_font(detail_lbl, &lv_font_montserrat_14, 0);
+                lv_obj_set_style_text_color(detail_lbl, ui_muted_color(), 0);
+                lv_obj_set_width(detail_lbl, lv_pct(100));
+                lv_label_set_long_mode(detail_lbl, LV_LABEL_LONG_WRAP);
+            }
+        } else {
+            char detail[192];
+            wardrive_format_file_detail(file, detail, sizeof(detail));
+            if (detail[0] != '\0') {
+                lv_obj_t *detail_lbl = lv_label_create(info);
+                lv_label_set_text(detail_lbl, detail);
+                lv_obj_set_style_text_font(detail_lbl, &lv_font_montserrat_12, 0);
+                lv_obj_set_style_text_color(detail_lbl, ui_muted_color(), 0);
+                lv_obj_set_width(detail_lbl, lv_pct(100));
+                lv_label_set_long_mode(detail_lbl, LV_LABEL_LONG_WRAP);
+            }
+        }
+
+        lv_obj_t *actions = lv_obj_create(row);
+        lv_obj_remove_style_all(actions);
+        lv_obj_set_size(actions, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+        lv_obj_set_flex_flow(actions, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(actions, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_column(actions, 8, 0);
+        lv_obj_clear_flag(actions, LV_OBJ_FLAG_SCROLLABLE);
+
+        if (kind == COMPROMISED_FILE_KIND_WARDRIVE) {
+            lv_obj_t *fix_btn = lv_btn_create(actions);
+            lv_obj_set_size(fix_btn, 86, 44);
+            lv_obj_set_style_bg_color(fix_btn, COLOR_MATERIAL_TEAL, 0);
+            lv_obj_set_style_bg_color(fix_btn, lv_color_hex(0x00796B), LV_STATE_PRESSED);
+            lv_obj_set_style_radius(fix_btn, 8, 0);
+            lv_obj_set_style_shadow_width(fix_btn, 0, 0);
+            lv_obj_add_event_cb(fix_btn, wardrive_fix_file_cb, LV_EVENT_CLICKED,
+                                compromised_make_user_data(kind, i));
+
+            lv_obj_t *fix_lbl = lv_label_create(fix_btn);
+            lv_label_set_text(fix_lbl, "Fix");
+            lv_obj_set_style_text_font(fix_lbl, &lv_font_montserrat_14, 0);
+            lv_obj_set_style_text_color(fix_lbl, lv_color_hex(0xFFFFFF), 0);
+            lv_obj_center(fix_lbl);
+        }
+
+        lv_obj_t *delete_btn = lv_btn_create(actions);
         lv_obj_set_size(delete_btn, 110, 44);
         style_danger_button(delete_btn);
         lv_obj_add_event_cb(delete_btn, compromised_file_delete_cb, LV_EVENT_CLICKED,
@@ -21504,6 +27146,63 @@ static void show_compromised_file_page(compromised_file_kind_t kind)
         lv_obj_set_style_text_font(delete_lbl, &lv_font_montserrat_14, 0);
         lv_obj_set_style_text_color(delete_lbl, lv_color_hex(0xFFFFFF), 0);
         lv_obj_center(delete_lbl);
+    }
+
+    // Wardrive only: append the upload journal (upload_state). Files that were
+    // already uploaded get moved to the "uploaded" archive folder, so they are
+    // gone from the working-dir listing above - this is the only record left.
+    if (kind == COMPROMISED_FILE_KIND_WARDRIVE && ctx->wardrive_upload_state_loaded &&
+        ctx->wardrive_upload_state_count > 0) {
+        lv_obj_t *state_title = lv_label_create(list_container);
+        lv_label_set_text_fmt(state_title,
+                              LV_SYMBOL_OK " Upload status - %d entr%s (uploaded / archived)",
+                              ctx->wardrive_upload_state_count,
+                              ctx->wardrive_upload_state_count == 1 ? "y" : "ies");
+        lv_obj_set_style_text_font(state_title, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(state_title, COLOR_MATERIAL_PURPLE, 0);
+        lv_obj_set_width(state_title, lv_pct(100));
+        lv_obj_set_style_text_align(state_title, LV_TEXT_ALIGN_CENTER, 0);
+
+        for (int disp = 0; disp < ctx->wardrive_upload_state_count; disp++) {
+            int i = ctx->wardrive_upload_state_count - 1 - disp; // newest first
+            wardrive_upload_state_entry_t *entry = &ctx->wardrive_upload_state_entries[i];
+            if (entry->filename[0] == '\0') {
+                continue;
+            }
+
+            lv_color_t card_bg, card_border, card_title;
+            wardrive_status_card_palette(entry->status, entry->bad_rows,
+                                         &card_bg, &card_border, &card_title);
+
+            lv_obj_t *row = lv_obj_create(list_container);
+            lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
+            lv_obj_set_style_bg_color(row, card_bg, 0);
+            lv_obj_set_style_border_width(row, 1, 0);
+            lv_obj_set_style_border_color(row, card_border, 0);
+            lv_obj_set_style_border_opa(row, LV_OPA_80, 0);
+            lv_obj_set_style_radius(row, 8, 0);
+            lv_obj_set_style_pad_all(row, 10, 0);
+            lv_obj_set_style_pad_row(row, 4, 0);
+            lv_obj_set_flex_flow(row, LV_FLEX_FLOW_COLUMN);
+            lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+            lv_obj_t *name_lbl = lv_label_create(row);
+            lv_label_set_text(name_lbl, entry->filename);
+            lv_obj_set_style_text_font(name_lbl, &lv_font_montserrat_16, 0);
+            lv_obj_set_style_text_color(name_lbl, card_title, 0);
+            lv_obj_set_width(name_lbl, lv_pct(100));
+            lv_label_set_long_mode(name_lbl, LV_LABEL_LONG_DOT);
+
+            char detail[192];
+            wardrive_format_upload_state_entry(entry, detail, sizeof(detail));
+            lv_obj_t *detail_lbl = lv_label_create(row);
+            lv_label_set_recolor(detail_lbl, true);
+            lv_label_set_text(detail_lbl, detail);
+            lv_obj_set_style_text_font(detail_lbl, &lv_font_montserrat_14, 0);
+            lv_obj_set_style_text_color(detail_lbl, ui_muted_color(), 0);
+            lv_obj_set_width(detail_lbl, lv_pct(100));
+            lv_label_set_long_mode(detail_lbl, LV_LABEL_LONG_WRAP);
+        }
     }
 }
 
@@ -21539,6 +27238,61 @@ static void compromised_file_delete_cb(lv_event_t *e)
 
     if (!compromised_start_cleanup_operation(ctx, task_args)) {
         free(task_args);
+    }
+}
+
+static void wardrive_fix_file_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx || ctx->compromised_cleanup_running) {
+        return;
+    }
+
+    int index = compromised_index_from_user_data(lv_event_get_user_data(e));
+    if (index < 0 || index >= ctx->wardrive_wigle_file_count) {
+        return;
+    }
+
+    const char *file = ctx->wardrive_wigle_files[index].name;
+    if (!file || file[0] == '\0') {
+        return;
+    }
+
+    wardrive_fix_task_args_t *args = calloc(1, sizeof(*args));
+    if (!args) {
+        ESP_LOGW(TAG, "Failed to allocate wardrive fix task args");
+        return;
+    }
+
+    args->ctx = ctx;
+    snprintf(args->file, sizeof(args->file), "%s", file);
+
+    ctx->compromised_cleanup_running = true;
+    ctx->compromised_cleanup_kind = COMPROMISED_FILE_KIND_WARDRIVE;
+    ctx->compromised_cleanup_action = COMPROMISED_CLEANUP_ACTION_CLEAN;
+    ctx->compromised_cleanup_log_buffer[0] = '\0';
+
+    show_compromised_cleanup_popup(ctx, COMPROMISED_FILE_KIND_WARDRIVE,
+                                   COMPROMISED_CLEANUP_ACTION_CLEAN);
+    if (ctx->compromised_cleanup_status_label) {
+        lv_label_set_text(ctx->compromised_cleanup_status_label,
+                          "Fixing wardrive file...");
+    }
+    if (ctx->compromised_cleanup_log_label) {
+        lv_label_set_text(ctx->compromised_cleanup_log_label,
+                          "Running wardrive_fix. Original file stays unchanged.");
+    }
+    if (ctx->compromised_cleanup_move_btn) {
+        lv_obj_add_flag(ctx->compromised_cleanup_move_btn, LV_OBJ_FLAG_HIDDEN);
+    }
+    lv_refr_now(NULL);
+
+    if (xTaskCreate(wardrive_fix_task, "wd_fix", 8192, args, 5,
+                    &ctx->compromised_cleanup_task) != pdTRUE) {
+        ctx->compromised_cleanup_running = false;
+        ctx->compromised_cleanup_task = NULL;
+        close_compromised_cleanup_popup(ctx);
+        free(args);
     }
 }
 
@@ -21994,6 +27748,7 @@ static void evil_twin_connect_popup_yes_cb(lv_event_t *e)
     (void)e;
 
     ESP_LOGI(TAG, "Evil Twin: Connecting to %s with known password", arp_target_ssid);
+    tab_context_t *ctx = get_current_ctx();
 
     // Close popup
     if (evil_twin_connect_popup_overlay) {
@@ -22002,10 +27757,8 @@ static void evil_twin_connect_popup_yes_cb(lv_event_t *e)
         evil_twin_connect_popup_obj = NULL;
     }
 
-    // Close Evil Twin passwords page
-    if (compromised_data_page) {
-        lv_obj_del(compromised_data_page);
-        compromised_data_page = NULL;
+    if (ctx) {
+        ctx->arp_return_to_evil_twin_passwords = true;
     }
 
     // Set auto mode flag
@@ -25111,7 +30864,7 @@ static void wpasec_upload_task(void *arg)
             if (manual_credentials) {
                 lv_label_set_text(ctx->wpasec_status_label, "Manual network selected\nEnter SSID and WiFi password:");
             } else {
-                lv_label_set_text_fmt(ctx->wpasec_status_label, "Selected: %s\nChecking known passwords...", ctx->wpasec_selected_ssid);
+                lv_label_set_text_fmt(ctx->wpasec_status_label, "Selected: %s\nChecking saved passwords...", ctx->wpasec_selected_ssid);
             }
         }
         if (ctx->wpasec_network_list) {
@@ -25203,18 +30956,18 @@ static void wpasec_upload_task(void *arg)
                     strncpy(ctx->wpasec_selected_password, et_entries[i].password, sizeof(ctx->wpasec_selected_password) - 1);
                     ctx->wpasec_selected_password[sizeof(ctx->wpasec_selected_password) - 1] = '\0';
                     ctx->wpasec_password_known = true;
-                    ESP_LOGI(TAG, "wpasec: found known password for %s", ctx->wpasec_selected_ssid);
+                    ESP_LOGI(TAG, "wpasec: found saved password for %s", ctx->wpasec_selected_ssid);
                     break;
                 }
             }
 
             if (ctx->wpasec_password_known) {
-                // Password known - show it and proceed to connect
+                // Saved password exists on the module; let firmware resolve it via --saved.
                 bsp_display_lock(0);
                 if (ctx->wpasec_status_label) {
                     lv_label_set_text_fmt(ctx->wpasec_status_label,
-                        "Known password for %s:\n%s\n\nConnecting...",
-                        ctx->wpasec_selected_ssid, ctx->wpasec_selected_password);
+                        "Saved password for %s found.\nConnecting with --saved...",
+                        ctx->wpasec_selected_ssid);
                 }
                 bsp_display_unlock();
             } else {
@@ -25224,7 +30977,7 @@ static void wpasec_upload_task(void *arg)
                 bsp_display_lock(0);
                 if (ctx->wpasec_status_label) {
                     lv_label_set_text_fmt(ctx->wpasec_status_label,
-                        "No known password for %s\nEnter WiFi password:", ctx->wpasec_selected_ssid);
+                        "No saved password for %s\nEnter WiFi password:", ctx->wpasec_selected_ssid);
                 }
                 if (ctx->wpasec_popup) {
                     wpasec_create_credentials_prompt(ctx, false);
@@ -25262,14 +31015,19 @@ static void wpasec_upload_task(void *arg)
         }
         bsp_display_unlock();
 
-        char escaped_ssid[67];
-        char escaped_password[131];
-        beacon_spam_escape_quoted_arg(ctx->wpasec_selected_ssid, escaped_ssid, sizeof(escaped_ssid));
-        beacon_spam_escape_quoted_arg(ctx->wpasec_selected_password, escaped_password, sizeof(escaped_password));
-
         char wifi_cmd[256];
-        snprintf(wifi_cmd, sizeof(wifi_cmd), "wifi_connect \"%s\" \"%s\"",
-                 escaped_ssid, escaped_password);
+        if (!build_wifi_connect_command(wifi_cmd, sizeof(wifi_cmd),
+                                        ctx->wpasec_selected_ssid,
+                                        ctx->wpasec_selected_password,
+                                        ctx->wpasec_password_known ? WIFI_CONNECT_AUTH_SAVED
+                                                                   : WIFI_CONNECT_AUTH_PASSWORD)) {
+            bsp_display_lock(0);
+            if (ctx->wpasec_status_label) {
+                lv_label_set_text(ctx->wpasec_status_label, "SSID/password too long.");
+            }
+            bsp_display_unlock();
+            goto done;
+        }
 
         uart_flush_input(uart_port);
         uart_send_command_for_tab(wifi_cmd);
@@ -26012,16 +31770,16 @@ static void show_bluetooth_menu_page(void)
     lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
     lv_obj_set_style_text_color(title, dark_mode_enabled ? COLOR_LAB5_MAGENTA : ui_tab_icon_color(), 0);
 
-    // Tiles container - vertical column, centered
+    // Tiles container - horizontal wrapping grid, like the main menu
     lv_obj_t *tiles = lv_obj_create(bt_menu_page);
     lv_obj_set_size(tiles, lv_pct(100), LV_SIZE_CONTENT);
     lv_obj_set_flex_grow(tiles, 1);
     lv_obj_set_style_bg_opa(tiles, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(tiles, 0, 0);
     lv_obj_set_style_pad_all(tiles, 10, 0);
-    lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_row(tiles, 15, 0);
+    lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_set_style_pad_gap(tiles, 15, 0);
     lv_obj_clear_flag(tiles, LV_OBJ_FLAG_SCROLLABLE);
 
     create_tile(tiles, LV_SYMBOL_GPS, "AirTag\nScan",
@@ -26030,9 +31788,13 @@ static void show_bluetooth_menu_page(void)
     create_tile(tiles, LV_SYMBOL_BLUETOOTH, "BT Scan\n& Locate",
                 ui_tab_icon_color(),
                 bt_menu_tile_event_cb, "BT Scan & Locate");
-    create_tile(tiles, LV_SYMBOL_WARNING, "Jammer",
-                COLOR_MATERIAL_RED,
-                bt_menu_tile_event_cb, "Jammer");
+    // Jammer needs the MonsterRF/Sub-GHz (nRF24) module - show only when detected,
+    // mirroring the Sub-GHz tile gating in the main menu.
+    if (ctx && ctx->has_subghz) {
+        create_tile(tiles, LV_SYMBOL_WARNING, "Jammer",
+                    COLOR_MATERIAL_RED,
+                    bt_menu_tile_event_cb, "Jammer");
+    }
 
     // Set current visible page
     ctx->current_visible_page = ctx->bt_menu_page;
@@ -26042,22 +31804,55 @@ static void show_bluetooth_menu_page(void)
 // AirTag Scan Page
 //==================================================================================
 
+// Stop the AirTag scan: clear both flags so the reader task exits, then tell
+// the board to stop. Sends "stop" if either flag indicated an active scan.
+static void airtag_scan_stop(tab_context_t *ctx)
+{
+    bool was_scanning = airtag_scanning || (ctx && ctx->airtag_scanning);
+
+    // Clear flags first so airtag_scan_task() (which checks ctx->airtag_scanning)
+    // breaks out of its loop.
+    airtag_scanning = false;
+    if (ctx) ctx->airtag_scanning = false;
+
+    if (was_scanning) {
+        uart_send_command_for_tab("stop");
+        ESP_LOGI(TAG, "AirTag scan stopped");
+    }
+
+    if (airtag_scan_task_handle != NULL) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        airtag_scan_task_handle = NULL;
+    }
+}
+
+// Start (or restart) the AirTag scan for the given tab. Resets the counters,
+// sends the scan command and spawns the reader task. No-op if already scanning.
+static void airtag_scan_start(tab_context_t *ctx)
+{
+    if (!ctx || ctx->airtag_scanning) return;
+
+    ESP_LOGI(TAG, "Starting AirTag scan");
+
+    if (airtag_count_label) lv_label_set_text(airtag_count_label, "0");
+    if (smarttag_count_label) lv_label_set_text(smarttag_count_label, "0");
+
+    uart_send_command_for_tab("scan_airtag");
+    airtag_scanning = true;
+    ctx->airtag_scanning = true;
+
+    xTaskCreate(airtag_scan_task, "airtag_scan", 4096, (void*)ctx, 5, &airtag_scan_task_handle);
+}
+
 // Back to BT menu from AirTag page - hide page and show BT menu
 static void airtag_scan_back_btn_event_cb(lv_event_t *e)
 {
     (void)e;
 
-    // Stop scanning
-    if (airtag_scanning) {
-        uart_send_command_for_tab("stop");
-        airtag_scanning = false;
-        if (airtag_scan_task_handle != NULL) {
-            vTaskDelay(pdMS_TO_TICKS(100));
-            airtag_scan_task_handle = NULL;
-        }
-    }
-
     tab_context_t *ctx = get_current_ctx();
+
+    // Stop scanning (sends "stop" and ends the reader task)
+    airtag_scan_stop(ctx);
 
     // Hide AirTag page
     if (ctx->bt_airtag_page) {
@@ -26146,12 +31941,13 @@ static void show_airtag_scan_page(void)
     // Hide all other pages
     hide_all_pages(ctx);
 
-    // If page already exists, just show it
+    // If page already exists, show it and restart scanning
     if (ctx->bt_airtag_page) {
         lv_obj_clear_flag(ctx->bt_airtag_page, LV_OBJ_FLAG_HIDDEN);
         ctx->current_visible_page = ctx->bt_airtag_page;
         bt_airtag_page = ctx->bt_airtag_page;
         ESP_LOGI(TAG, "Showing existing AirTag scan page for tab %d", current_tab);
+        airtag_scan_start(ctx);
         return;
     }
 
@@ -26243,16 +32039,7 @@ static void show_airtag_scan_page(void)
     lv_obj_set_style_text_color(smarttag_label, ui_text_color(), 0);
 
     // Start scanning
-    ESP_LOGI(TAG, "Starting AirTag scan");
-    uart_send_command_for_tab("scan_airtag");
-    airtag_scanning = true;
-
-    // Also mark in context
-    if (ctx) {
-        ctx->airtag_scanning = true;
-    }
-
-    xTaskCreate(airtag_scan_task, "airtag_scan", 4096, (void*)ctx, 5, &airtag_scan_task_handle);
+    airtag_scan_start(ctx);
 
     // Set current visible page
     ctx->current_visible_page = ctx->bt_airtag_page;
@@ -27711,6 +33498,31 @@ static void beacon_spam_escape_quoted_arg(const char *src, char *dst, size_t dst
     dst[out] = '\0';
 }
 
+static bool build_wifi_connect_command(char *out, size_t out_sz, const char *ssid,
+                                       const char *password, wifi_connect_auth_mode_t mode)
+{
+    if (!out || out_sz == 0 || !ssid || ssid[0] == '\0') {
+        return false;
+    }
+
+    char escaped_ssid[67];
+    char escaped_password[131];
+    beacon_spam_escape_quoted_arg(ssid, escaped_ssid, sizeof(escaped_ssid));
+
+    int cmd_len = 0;
+    if (mode == WIFI_CONNECT_AUTH_SAVED) {
+        cmd_len = snprintf(out, out_sz, "wifi_connect \"%s\" --saved", escaped_ssid);
+    } else if (mode == WIFI_CONNECT_AUTH_PASSWORD && password && password[0] != '\0') {
+        beacon_spam_escape_quoted_arg(password, escaped_password, sizeof(escaped_password));
+        cmd_len = snprintf(out, out_sz, "wifi_connect \"%s\" \"%s\"",
+                           escaped_ssid, escaped_password);
+    } else {
+        cmd_len = snprintf(out, out_sz, "wifi_connect \"%s\"", escaped_ssid);
+    }
+
+    return cmd_len >= 0 && cmd_len < (int)out_sz;
+}
+
 static void beacon_spam_trim_whitespace(char *text)
 {
     if (!text) return;
@@ -28710,6 +34522,11 @@ static __attribute__((unused)) lv_obj_t *settings_popup_obj = NULL;
 #define NVS_KEY_DASHBOARD       "dashboard"
 #define NVS_KEY_DARK_MODE       "dark_mode"
 #define NVS_KEY_BOOT_SOUND      "boot_sound"
+#define NVS_KEY_CLOCK_24H       "clock_24h"
+#define NVS_KEY_CLOCK_DST       "clock_dst"
+#define NVS_KEY_CLOCK_SHOW      "clock_show"
+#define NVS_KEY_SCREEN_LOCK     "scr_lock"
+#define NVS_KEY_AUTO_LOCK       "scr_autolock"
 
 // Load Red Team setting from NVS (called on startup)
 // Note: Device detection is automatic via ping/pong
@@ -28795,6 +34612,26 @@ static void load_screen_settings_from_nvs(void)
             ESP_LOGI(TAG, "No Dark Mode setting in NVS, using default: ON");
         }
 
+        uint8_t scr_lock = 1;
+        err = nvs_get_u8(nvs, NVS_KEY_SCREEN_LOCK, &scr_lock);
+        if (err == ESP_OK) {
+            screen_lock_enabled = (scr_lock != 0);
+            ESP_LOGI(TAG, "Loaded Screen Lock from NVS: %s", screen_lock_enabled ? "ON" : "OFF");
+        } else {
+            screen_lock_enabled = true;
+            ESP_LOGI(TAG, "No Screen Lock setting in NVS, using default: ON");
+        }
+
+        uint8_t auto_lock = 0;
+        err = nvs_get_u8(nvs, NVS_KEY_AUTO_LOCK, &auto_lock);
+        if (err == ESP_OK) {
+            screen_auto_lock_enabled = (auto_lock != 0);
+            ESP_LOGI(TAG, "Loaded Auto Lock from NVS: %s", screen_auto_lock_enabled ? "ON" : "OFF");
+        } else {
+            screen_auto_lock_enabled = false;
+            ESP_LOGI(TAG, "No Auto Lock setting in NVS, using default: OFF");
+        }
+
         uint8_t boot_sound = (uint8_t)BOOT_SOUND_MODE_NOKIA;
         err = nvs_get_u8(nvs, NVS_KEY_BOOT_SOUND, &boot_sound);
         if (err == ESP_OK) {
@@ -28847,6 +34684,36 @@ static void save_screen_brightness_to_nvs(uint8_t brightness)
     }
 }
 
+// Save screen lock enable setting to NVS
+static void save_screen_lock_to_nvs(bool enabled)
+{
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs);
+    if (err == ESP_OK) {
+        nvs_set_u8(nvs, NVS_KEY_SCREEN_LOCK, enabled ? 1 : 0);
+        nvs_commit(nvs);
+        nvs_close(nvs);
+        ESP_LOGI(TAG, "Saved Screen Lock to NVS: %s", enabled ? "ON" : "OFF");
+    } else {
+        ESP_LOGE(TAG, "Failed to open NVS for writing Screen Lock: %s", esp_err_to_name(err));
+    }
+}
+
+// Save auto-lock setting to NVS
+static void save_auto_lock_to_nvs(bool enabled)
+{
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs);
+    if (err == ESP_OK) {
+        nvs_set_u8(nvs, NVS_KEY_AUTO_LOCK, enabled ? 1 : 0);
+        nvs_commit(nvs);
+        nvs_close(nvs);
+        ESP_LOGI(TAG, "Saved Auto Lock to NVS: %s", enabled ? "ON" : "OFF");
+    } else {
+        ESP_LOGE(TAG, "Failed to open NVS for writing Auto Lock: %s", esp_err_to_name(err));
+    }
+}
+
 static void load_dashboard_from_nvs(void)
 {
     nvs_handle_t nvs;
@@ -28872,6 +34739,43 @@ static void save_dashboard_to_nvs(bool enabled)
         ESP_LOGI(TAG, "Saved Dashboard to NVS: %s", enabled ? "ON" : "OFF");
     } else {
         ESP_LOGE(TAG, "Failed to open NVS for writing Dashboard: %s", esp_err_to_name(err));
+    }
+}
+
+static void load_clock_settings_from_nvs(void)
+{
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs);
+    if (err != ESP_OK) return;
+
+    uint8_t v = 1;
+    if (nvs_get_u8(nvs, NVS_KEY_CLOCK_24H, &v) == ESP_OK) {
+        clock_24h = (v != 0);
+    }
+    v = 0;
+    if (nvs_get_u8(nvs, NVS_KEY_CLOCK_DST, &v) == ESP_OK) {
+        clock_dst = (v != 0);
+    }
+    v = 1;
+    if (nvs_get_u8(nvs, NVS_KEY_CLOCK_SHOW, &v) == ESP_OK) {
+        clock_show = (v != 0);
+    }
+    nvs_close(nvs);
+}
+
+static void save_clock_settings_to_nvs(void)
+{
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs);
+    if (err == ESP_OK) {
+        nvs_set_u8(nvs, NVS_KEY_CLOCK_24H, clock_24h ? 1 : 0);
+        nvs_set_u8(nvs, NVS_KEY_CLOCK_DST, clock_dst ? 1 : 0);
+        nvs_set_u8(nvs, NVS_KEY_CLOCK_SHOW, clock_show ? 1 : 0);
+        nvs_commit(nvs);
+        nvs_close(nvs);
+        ESP_LOGI(TAG, "Saved clock settings: 24h=%d dst=%d show=%d", clock_24h, clock_dst, clock_show);
+    } else {
+        ESP_LOGE(TAG, "Failed to open NVS for clock settings: %s", esp_err_to_name(err));
     }
 }
 
@@ -29002,6 +34906,12 @@ static void janos_consume_line(tab_context_t *ctx, const char *line, const char 
             ESP_LOGI(TAG, "[%s] Detected JanOS version: %s (boot snoop)",
                      uart_name ? uart_name : "?", ctx->janos_version);
         }
+        return;
+    }
+    if (strstr(line, "BOARD READY") != NULL) {
+        ctx->janos_board_ready = true;
+        ESP_LOGI(TAG, "[%s] JanOS board ready (boot snoop)",
+                 uart_name ? uart_name : "?");
     }
 }
 
@@ -29127,10 +35037,13 @@ static void detect_boards(void)
     // not touched here.
     grove_ctx.janos_version[0] = '\0';
     grove_ctx.janos_rf_version[0] = '\0';
+    grove_ctx.janos_board_ready = false;
     usb_ctx.janos_version[0] = '\0';
     usb_ctx.janos_rf_version[0] = '\0';
+    usb_ctx.janos_board_ready = false;
     mbus_ctx.janos_version[0] = '\0';
     mbus_ctx.janos_rf_version[0] = '\0';
+    mbus_ctx.janos_board_ready = false;
 
     // Detect each device independently using ping/pong (also snoops JanOS boot banner)
     grove_detected = ping_uart_direct(UART_NUM, "Grove", &grove_ctx);
@@ -29178,31 +35091,54 @@ static bool check_sd_card_for_tab(tab_id_t tab)
     ESP_LOGI(TAG, "[%s] Checking SD card presence...", tab_name);
 
     const char *cmd = "sd_status\r\n";
+    static const int64_t timeout_us = 300000; // one 300 ms probe
+    bool usb_locked = false;
+
+    if (tab == TAB_USB) {
+        usb_rx_exclusive = true;
+        usb_locked = true;
+    }
+
+    char rx_buffer[128];
+    int total_len = 0;
+    int64_t start_time = esp_timer_get_time();
+
+    rx_buffer[0] = '\0';
+
+    if (tab == TAB_USB) {
+        usb_flush_input(50);
+    } else {
+        uart_flush_input(uart_port);
+    }
+
     transport_write_bytes_tab(tab, uart_port, cmd, strlen(cmd));
 
-    static char rx_buffer[64];
-    int total_len = 0;
-    uint32_t start_time = xTaskGetTickCount();
-    uint32_t timeout_ticks = pdMS_TO_TICKS(500);
-
-    while ((xTaskGetTickCount() - start_time) < timeout_ticks && total_len < (int)sizeof(rx_buffer) - 1) {
+    while ((esp_timer_get_time() - start_time) < timeout_us &&
+           total_len < (int)sizeof(rx_buffer) - 1) {
         int len = transport_read_bytes_tab(tab, uart_port, rx_buffer + total_len,
-                                           sizeof(rx_buffer) - 1 - total_len, pdMS_TO_TICKS(50));
-        if (len > 0) {
-            total_len += len;
-            rx_buffer[total_len] = '\0';
-            if (strstr(rx_buffer, "SD_OK") != NULL) {
-                ESP_LOGI(TAG, "[%s] SD card present", tab_name);
-                return true;
-            }
-            if (strstr(rx_buffer, "SD_NONE") != NULL) {
-                ESP_LOGI(TAG, "[%s] SD card not present", tab_name);
-                return false;
-            }
+                                           sizeof(rx_buffer) - 1 - total_len,
+                                           pdMS_TO_TICKS(50));
+        if (len <= 0) {
+            continue;
+        }
+
+        total_len += len;
+        rx_buffer[total_len] = '\0';
+
+        if (strstr(rx_buffer, "SD_OK") != NULL) {
+            if (usb_locked) usb_rx_exclusive = false;
+            ESP_LOGI(TAG, "[%s] SD card present", tab_name);
+            return true;
+        }
+        if (strstr(rx_buffer, "SD_NONE") != NULL) {
+            if (usb_locked) usb_rx_exclusive = false;
+            ESP_LOGW(TAG, "[%s] SD card not ready/not present", tab_name);
+            return false;
         }
     }
 
-    ESP_LOGW(TAG, "[%s] sd_status timeout, response: '%s'", tab_name, rx_buffer);
+    if (usb_locked) usb_rx_exclusive = false;
+    ESP_LOGW(TAG, "[%s] SD status unknown after one probe, response: '%s'", tab_name, rx_buffer);
     return false;
 }
 
@@ -31029,6 +36965,286 @@ static void theme_dark_mode_switch_cb(lv_event_t *e)
     refresh_theme_visuals(true);
 }
 
+// ======================= Time / RTC (RX8130CE) picker =======================
+
+#define RTC_PICKER_YEAR_MIN 2024
+#define RTC_PICKER_YEAR_MAX 2099
+
+static lv_obj_t *time_popup_overlay = NULL;
+static lv_obj_t *time_popup_status = NULL;
+static lv_obj_t *time_year_roller = NULL;
+static lv_obj_t *time_month_roller = NULL;
+static lv_obj_t *time_day_roller = NULL;
+static lv_obj_t *time_hour_roller = NULL;
+static lv_obj_t *time_min_roller = NULL;
+
+static void time_popup_close_cb(lv_event_t *e)
+{
+    (void)e;
+    if (time_popup_overlay) {
+        lv_obj_del(time_popup_overlay);
+        time_popup_overlay = NULL;
+        time_popup_status = NULL;
+        time_year_roller = time_month_roller = time_day_roller = NULL;
+        time_hour_roller = time_min_roller = NULL;
+    }
+}
+
+static lv_obj_t *time_make_roller(lv_obj_t *parent, const char *opts)
+{
+    lv_obj_t *r = lv_roller_create(parent);
+    lv_roller_set_options(r, opts, LV_ROLLER_MODE_NORMAL);
+    lv_roller_set_visible_row_count(r, 3);
+    lv_obj_set_width(r, 86);
+    lv_obj_set_style_text_font(r, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_bg_color(r, ui_card_color(), 0);
+    lv_obj_set_style_text_color(r, ui_text_color(), 0);
+    lv_obj_set_style_border_color(r, ui_border_color(), 0);
+    lv_obj_set_style_bg_color(r, COLOR_MATERIAL_PURPLE, LV_PART_SELECTED);
+    lv_obj_set_style_text_color(r, lv_color_hex(0xFFFFFF), LV_PART_SELECTED);
+    return r;
+}
+
+static void time_popup_set_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!time_year_roller) return;
+
+    struct tm t;
+    memset(&t, 0, sizeof(t));
+    t.tm_year = (RTC_PICKER_YEAR_MIN + (int)lv_roller_get_selected(time_year_roller)) - 1900;
+    t.tm_mon  = (int)lv_roller_get_selected(time_month_roller);        // 0-based
+    t.tm_mday = (int)lv_roller_get_selected(time_day_roller) + 1;
+    t.tm_hour = (int)lv_roller_get_selected(time_hour_roller);
+    t.tm_min  = (int)lv_roller_get_selected(time_min_roller);
+    t.tm_sec  = 0;
+    t.tm_isdst = -1;
+
+    esp_err_t ret = rx8130_set_time(&t);
+    if (time_popup_status) {
+        if (ret == ESP_OK) {
+            rx8130_sync_system_from_rtc();
+            lv_label_set_text_fmt(time_popup_status,
+                                  "RTC set: %04d-%02d-%02d %02d:%02d:00",
+                                  t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
+                                  t.tm_hour, t.tm_min);
+            lv_obj_set_style_text_color(time_popup_status, COLOR_MATERIAL_GREEN, 0);
+        } else {
+            lv_label_set_text(time_popup_status, "Failed to write RTC.");
+            lv_obj_set_style_text_color(time_popup_status, COLOR_MATERIAL_RED, 0);
+        }
+    }
+}
+
+// Reads the current RTC value into the picker rollers + status label.
+static void time_popup_refresh_from_rtc(void)
+{
+    if (!time_year_roller || !rx8130_present) return;
+
+    struct tm now;
+    bool power_lost = false;
+    if (rx8130_read_time(&now, &power_lost) != ESP_OK) return;
+
+    int yi = (now.tm_year + 1900) - RTC_PICKER_YEAR_MIN;
+    if (yi < 0) yi = 0;
+    if (yi > (RTC_PICKER_YEAR_MAX - RTC_PICKER_YEAR_MIN)) yi = RTC_PICKER_YEAR_MAX - RTC_PICKER_YEAR_MIN;
+    lv_roller_set_selected(time_year_roller, (uint16_t)yi, LV_ANIM_OFF);
+    lv_roller_set_selected(time_month_roller, (uint16_t)(now.tm_mon), LV_ANIM_OFF);
+    lv_roller_set_selected(time_day_roller, (uint16_t)(now.tm_mday - 1), LV_ANIM_OFF);
+    lv_roller_set_selected(time_hour_roller, (uint16_t)(now.tm_hour), LV_ANIM_OFF);
+    lv_roller_set_selected(time_min_roller, (uint16_t)(now.tm_min), LV_ANIM_OFF);
+
+    if (time_popup_status) {
+        if (power_lost) {
+            lv_label_set_text(time_popup_status, "RTC lost power (VLF) - time invalid, please set.");
+            lv_obj_set_style_text_color(time_popup_status, COLOR_MATERIAL_AMBER, 0);
+        } else {
+            lv_label_set_text_fmt(time_popup_status, "RTC now: %04d-%02d-%02d %02d:%02d:%02d",
+                                  now.tm_year + 1900, now.tm_mon + 1, now.tm_mday,
+                                  now.tm_hour, now.tm_min, now.tm_sec);
+            lv_obj_set_style_text_color(time_popup_status, ui_muted_color(), 0);
+        }
+    }
+}
+
+static void time_24h_switch_cb(lv_event_t *e)
+{
+    bool on = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+    if (on == clock_24h) return;
+    clock_24h = on;
+    save_clock_settings_to_nvs();
+    update_status_clock();
+}
+
+static void time_show_switch_cb(lv_event_t *e)
+{
+    bool on = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+    if (on == clock_show) return;
+    clock_show = on;
+    save_clock_settings_to_nvs();
+    update_status_clock();
+}
+
+static void time_dst_switch_cb(lv_event_t *e)
+{
+    bool on = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+    if (on == clock_dst) return;
+
+    // Shift the RTC by +/-1h once, so the displayed wall-clock follows DST.
+    if (rx8130_present) {
+        struct tm t;
+        bool pl = false;
+        if (rx8130_read_time(&t, &pl) == ESP_OK) {
+            time_t epoch = mktime(&t) + (on ? 3600 : -3600);
+            struct tm shifted;
+            localtime_r(&epoch, &shifted);
+            rx8130_set_time(&shifted);
+            rx8130_sync_system_from_rtc();
+        }
+    }
+    clock_dst = on;
+    save_clock_settings_to_nvs();
+    update_status_clock();
+    time_popup_refresh_from_rtc();
+}
+
+static void time_add_switch_row(lv_obj_t *parent, const char *text, bool checked, lv_event_cb_t cb)
+{
+    lv_obj_t *row = lv_obj_create(parent);
+    lv_obj_set_size(row, lv_pct(100), 44);
+    lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(row, 0, 0);
+    lv_obj_set_style_pad_all(row, 0, 0);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *lbl = lv_label_create(row);
+    lv_label_set_text(lbl, text);
+    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(lbl, ui_text_color(), 0);
+
+    lv_obj_t *sw = lv_switch_create(row);
+    style_theme_switch(sw);
+    if (checked) lv_obj_add_state(sw, LV_STATE_CHECKED);
+    lv_obj_add_event_cb(sw, cb, LV_EVENT_VALUE_CHANGED, NULL);
+}
+
+static void show_time_popup(void)
+{
+    lv_obj_t *container = get_current_tab_container();
+    if (!container) return;
+    if (time_popup_overlay) return;
+
+    time_popup_overlay = lv_obj_create(container);
+    style_modal_overlay(time_popup_overlay, dark_mode_enabled ? LV_OPA_50 : LV_OPA_30);
+
+    lv_obj_t *card = lv_obj_create(time_popup_overlay);
+    lv_obj_set_size(card, 600, 640);
+    lv_obj_center(card);
+    style_popup_card(card, 12, ui_tab_icon_color());
+    lv_obj_set_style_pad_all(card, 18, 0);
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(card, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(card, 12, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(card);
+    lv_label_set_text(title, LV_SYMBOL_BELL " Time (RTC)");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_22, 0);
+    lv_obj_set_style_text_color(title, dark_mode_enabled ? COLOR_LAB5_MAGENTA : ui_tab_icon_color(), 0);
+
+    time_popup_status = lv_label_create(card);
+    lv_obj_set_width(time_popup_status, lv_pct(100));
+    lv_obj_set_style_text_font(time_popup_status, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(time_popup_status, ui_muted_color(), 0);
+    lv_obj_set_style_text_align(time_popup_status, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(time_popup_status, LV_LABEL_LONG_WRAP);
+
+    if (!rx8130_present) {
+        lv_label_set_text(time_popup_status, "RX8130CE RTC not detected on I2C 0x32.");
+        lv_obj_set_style_text_color(time_popup_status, COLOR_MATERIAL_RED, 0);
+    }
+
+    // Roller row: Year | Month | Day | Hour | Minute
+    lv_obj_t *rollers = lv_obj_create(card);
+    lv_obj_set_size(rollers, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(rollers, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(rollers, 0, 0);
+    lv_obj_set_style_pad_all(rollers, 0, 0);
+    lv_obj_set_style_pad_column(rollers, 6, 0);
+    lv_obj_set_flex_flow(rollers, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(rollers, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(rollers, LV_OBJ_FLAG_SCROLLABLE);
+
+    char buf[512];
+    size_t pos = 0;
+    buf[0] = '\0';
+    for (int y = RTC_PICKER_YEAR_MIN; y <= RTC_PICKER_YEAR_MAX; y++) {
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "%d%s", y, (y < RTC_PICKER_YEAR_MAX) ? "\n" : "");
+    }
+    time_year_roller = time_make_roller(rollers, buf);
+    lv_obj_set_width(time_year_roller, 104);
+
+    pos = 0; buf[0] = '\0';
+    for (int m = 1; m <= 12; m++) pos += snprintf(buf + pos, sizeof(buf) - pos, "%02d%s", m, (m < 12) ? "\n" : "");
+    time_month_roller = time_make_roller(rollers, buf);
+
+    pos = 0; buf[0] = '\0';
+    for (int d = 1; d <= 31; d++) pos += snprintf(buf + pos, sizeof(buf) - pos, "%02d%s", d, (d < 31) ? "\n" : "");
+    time_day_roller = time_make_roller(rollers, buf);
+
+    pos = 0; buf[0] = '\0';
+    for (int h = 0; h <= 23; h++) pos += snprintf(buf + pos, sizeof(buf) - pos, "%02d%s", h, (h < 23) ? "\n" : "");
+    time_hour_roller = time_make_roller(rollers, buf);
+
+    pos = 0; buf[0] = '\0';
+    for (int mi = 0; mi <= 59; mi++) pos += snprintf(buf + pos, sizeof(buf) - pos, "%02d%s", mi, (mi < 59) ? "\n" : "");
+    time_min_roller = time_make_roller(rollers, buf);
+
+    // Preselect rollers + status from the current RTC value.
+    time_popup_refresh_from_rtc();
+
+    // Format / DST / visibility toggles
+    time_add_switch_row(card, "Show clock on top bar", clock_show, time_show_switch_cb);
+    time_add_switch_row(card, "24-hour format", clock_24h, time_24h_switch_cb);
+    time_add_switch_row(card, "Summer time (DST +1h)", clock_dst, time_dst_switch_cb);
+
+    // Buttons
+    lv_obj_t *btn_row = lv_obj_create(card);
+    lv_obj_set_size(btn_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(btn_row, 0, 0);
+    lv_obj_set_style_pad_all(btn_row, 0, 0);
+    lv_obj_set_style_pad_column(btn_row, 16, 0);
+    lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *set_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(set_btn, 160, 48);
+    lv_obj_set_style_bg_color(set_btn, COLOR_MATERIAL_GREEN, 0);
+    lv_obj_set_style_bg_color(set_btn, lv_color_hex(0x555555), LV_STATE_DISABLED);
+    lv_obj_set_style_radius(set_btn, 8, 0);
+    lv_obj_add_event_cb(set_btn, time_popup_set_cb, LV_EVENT_CLICKED, NULL);
+    if (!rx8130_present) lv_obj_add_state(set_btn, LV_STATE_DISABLED);
+    lv_obj_t *set_lbl = lv_label_create(set_btn);
+    lv_label_set_text(set_lbl, LV_SYMBOL_OK " Set");
+    lv_obj_set_style_text_font(set_lbl, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_color(set_lbl, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_center(set_lbl);
+
+    lv_obj_t *close_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(close_btn, 140, 48);
+    style_neutral_button(close_btn);
+    lv_obj_add_event_cb(close_btn, time_popup_close_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *close_lbl = lv_label_create(close_btn);
+    lv_label_set_text(close_lbl, "Close");
+    lv_obj_set_style_text_font(close_lbl, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_color(close_lbl, ui_text_color(), 0);
+    lv_obj_center(close_lbl);
+}
+
 static void show_theme_popup(void)
 {
     lv_obj_t *container = get_current_tab_container();
@@ -31151,15 +37367,156 @@ static void settings_back_btn_event_cb(lv_event_t *e)
     (void)e;
     ESP_LOGI(TAG, "Settings back button clicked, returning to internal tiles");
 
-    // Hide settings page
-    if (internal_settings_page) {
-        lv_obj_add_flag(internal_settings_page, LV_OBJ_FLAG_HIDDEN);
-    }
+    // Delegate to show_internal_tiles(): it hides the settings page and, crucially,
+    // creates internal_tiles if they don't exist yet. This happens when Settings was
+    // opened straight from the top-bar gear without ever visiting the INTERNAL tab,
+    // which previously left a blank screen on back (internal_tiles was NULL).
+    show_internal_tiles();
+}
 
-    // Show internal tiles
-    if (internal_tiles) {
-        lv_obj_clear_flag(internal_tiles, LV_OBJ_FLAG_HIDDEN);
+// Screen Lock popup variables
+static lv_obj_t *screen_lock_popup_overlay = NULL;
+
+static void screen_lock_popup_close_cb(lv_event_t *e)
+{
+    (void)e;
+    if (screen_lock_popup_overlay) {
+        lv_obj_del(screen_lock_popup_overlay);
+        screen_lock_popup_overlay = NULL;
     }
+}
+
+// Toggle whether the lock button is shown in the status bar (persisted).
+static void screen_lock_switch_cb(lv_event_t *e)
+{
+    lv_obj_t *sw = lv_event_get_target(e);
+    screen_lock_enabled = lv_obj_has_state(sw, LV_STATE_CHECKED);
+    save_screen_lock_to_nvs(screen_lock_enabled);
+    if (lock_status_btn) {
+        if (screen_lock_enabled) {
+            lv_obj_clear_flag(lock_status_btn, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(lock_status_btn, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+}
+
+// Toggle auto-lock when the screen dims (persisted).
+static void auto_lock_switch_cb(lv_event_t *e)
+{
+    lv_obj_t *sw = lv_event_get_target(e);
+    screen_auto_lock_enabled = lv_obj_has_state(sw, LV_STATE_CHECKED);
+    save_auto_lock_to_nvs(screen_auto_lock_enabled);
+}
+
+// "Lock now" button: close the popup, then engage the lock overlay.
+static void screen_lock_now_cb(lv_event_t *e)
+{
+    (void)e;
+    screen_lock_popup_close_cb(NULL);
+    lock_screen_activate();
+}
+
+static void show_screen_lock_popup(void)
+{
+    lv_obj_t *container = get_current_tab_container();
+    if (!container) return;
+    if (screen_lock_popup_overlay) return;
+
+    screen_lock_popup_overlay = lv_obj_create(container);
+    style_modal_overlay(screen_lock_popup_overlay, dark_mode_enabled ? LV_OPA_50 : LV_OPA_30);
+
+    lv_obj_t *card = lv_obj_create(screen_lock_popup_overlay);
+    lv_obj_set_size(card, 430, 390);
+    lv_obj_center(card);
+    style_popup_card(card, 12, ui_tab_icon_color());
+    lv_obj_set_style_pad_all(card, 18, 0);
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(card, 14, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(card);
+    lv_label_set_text(title, "Screen Lock");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_22, 0);
+    lv_obj_set_style_text_color(title, dark_mode_enabled ? COLOR_LAB5_MAGENTA : ui_tab_icon_color(), 0);
+
+    lv_obj_t *row = lv_obj_create(card);
+    lv_obj_set_size(row, lv_pct(100), 56);
+    lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(row, 0, 0);
+    lv_obj_set_style_pad_all(row, 0, 0);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *row_label = lv_label_create(row);
+    lv_label_set_text(row_label, "Show lock button");
+    lv_obj_set_style_text_font(row_label, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_color(row_label, ui_text_color(), 0);
+
+    lv_obj_t *sw = lv_switch_create(row);
+    style_theme_switch(sw);
+    if (screen_lock_enabled) lv_obj_add_state(sw, LV_STATE_CHECKED);
+    lv_obj_add_event_cb(sw, screen_lock_switch_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    lv_obj_t *auto_row = lv_obj_create(card);
+    lv_obj_set_size(auto_row, lv_pct(100), 56);
+    lv_obj_set_style_bg_opa(auto_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(auto_row, 0, 0);
+    lv_obj_set_style_pad_all(auto_row, 0, 0);
+    lv_obj_set_flex_flow(auto_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(auto_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(auto_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *auto_label = lv_label_create(auto_row);
+    lv_label_set_text(auto_label, "Auto-lock on screen off");
+    lv_obj_set_style_text_font(auto_label, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_color(auto_label, ui_text_color(), 0);
+
+    lv_obj_t *auto_sw = lv_switch_create(auto_row);
+    style_theme_switch(auto_sw);
+    if (screen_auto_lock_enabled) lv_obj_add_state(auto_sw, LV_STATE_CHECKED);
+    lv_obj_add_event_cb(auto_sw, auto_lock_switch_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    lv_obj_t *desc = lv_label_create(card);
+    lv_label_set_text(desc,
+        "Adds a lock button to the top status bar.\n"
+        "When locked, the screen ignores all taps until\n"
+        "you slide to unlock - prevents accidental clicks.\n"
+        "Auto-lock engages the lock when the screen dims.");
+    lv_obj_set_style_text_font(desc, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(desc, ui_muted_color(), 0);
+    lv_obj_set_width(desc, lv_pct(100));
+    lv_label_set_long_mode(desc, LV_LABEL_LONG_WRAP);
+
+    lv_obj_t *btn_row = lv_obj_create(card);
+    lv_obj_set_size(btn_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(btn_row, 0, 0);
+    lv_obj_set_style_pad_all(btn_row, 0, 0);
+    lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *lock_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(lock_btn, 140, 44);
+    style_neutral_button(lock_btn);
+    lv_obj_add_event_cb(lock_btn, screen_lock_now_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *lock_btn_label = lv_label_create(lock_btn);
+    lv_label_set_text(lock_btn_label, LV_SYMBOL_EYE_CLOSE " Lock now");
+    lv_obj_set_style_text_font(lock_btn_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(lock_btn_label, ui_text_color(), 0);
+    lv_obj_center(lock_btn_label);
+
+    lv_obj_t *close_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(close_btn, 120, 44);
+    style_neutral_button(close_btn);
+    lv_obj_add_event_cb(close_btn, screen_lock_popup_close_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *close_label = lv_label_create(close_btn);
+    lv_label_set_text(close_label, "Close");
+    lv_obj_set_style_text_font(close_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(close_label, ui_text_color(), 0);
+    lv_obj_center(close_label);
 }
 
 static void settings_tile_event_cb(lv_event_t *e)
@@ -31177,6 +37534,10 @@ static void settings_tile_event_cb(lv_event_t *e)
         show_screen_brightness_popup();
     } else if (strcmp(tile_name, "Theme") == 0) {
         show_theme_popup();
+    } else if (strcmp(tile_name, "Time") == 0) {
+        show_time_popup();
+    } else if (strcmp(tile_name, "Screen Lock") == 0) {
+        show_screen_lock_popup();
     }
 }
 
@@ -31266,6 +37627,12 @@ static void show_settings_page(void)
 
     // Theme tile
     create_tile(tiles, LV_SYMBOL_SETTINGS, "Theme", COLOR_MATERIAL_TEAL, settings_tile_event_cb, "Theme");
+
+    // Time / RTC tile
+    create_tile(tiles, LV_SYMBOL_BELL, "Time", COLOR_MATERIAL_PURPLE, settings_tile_event_cb, "Time");
+
+    // Screen Lock tile
+    create_tile(tiles, LV_SYMBOL_EYE_CLOSE, "Screen\nLock", COLOR_MATERIAL_BLUE, settings_tile_event_cb, "Screen Lock");
 }
 
 void app_main(void)
@@ -31307,6 +37674,11 @@ void app_main(void)
     // Initialize IO expander
     bsp_io_expander_pi4ioe_init(bsp_i2c_get_handle());
 
+    // Initialize RX8130CE RTC and seed the system clock from it
+    if (rx8130_init() == ESP_OK) {
+        rx8130_sync_system_from_rtc();
+    }
+
     // Initialize audio codec (ES8388 speaker + ES7210 mic)
     bsp_codec_init();
 
@@ -31330,6 +37702,7 @@ void app_main(void)
     // Load screen settings from NVS (timeout and brightness)
     load_screen_settings_from_nvs();
     load_dashboard_from_nvs();
+    load_clock_settings_from_nvs();
 
     // Initialize both UARTs for board detection
     // UART1: Grove (TX=53, RX=54) - always initialized
