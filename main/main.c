@@ -31770,16 +31770,16 @@ static void show_bluetooth_menu_page(void)
     lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
     lv_obj_set_style_text_color(title, dark_mode_enabled ? COLOR_LAB5_MAGENTA : ui_tab_icon_color(), 0);
 
-    // Tiles container - vertical column, centered
+    // Tiles container - horizontal wrapping grid, like the main menu
     lv_obj_t *tiles = lv_obj_create(bt_menu_page);
     lv_obj_set_size(tiles, lv_pct(100), LV_SIZE_CONTENT);
     lv_obj_set_flex_grow(tiles, 1);
     lv_obj_set_style_bg_opa(tiles, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(tiles, 0, 0);
     lv_obj_set_style_pad_all(tiles, 10, 0);
-    lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_row(tiles, 15, 0);
+    lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_set_style_pad_gap(tiles, 15, 0);
     lv_obj_clear_flag(tiles, LV_OBJ_FLAG_SCROLLABLE);
 
     create_tile(tiles, LV_SYMBOL_GPS, "AirTag\nScan",
@@ -31788,9 +31788,13 @@ static void show_bluetooth_menu_page(void)
     create_tile(tiles, LV_SYMBOL_BLUETOOTH, "BT Scan\n& Locate",
                 ui_tab_icon_color(),
                 bt_menu_tile_event_cb, "BT Scan & Locate");
-    create_tile(tiles, LV_SYMBOL_WARNING, "Jammer",
-                COLOR_MATERIAL_RED,
-                bt_menu_tile_event_cb, "Jammer");
+    // Jammer needs the MonsterRF/Sub-GHz (nRF24) module - show only when detected,
+    // mirroring the Sub-GHz tile gating in the main menu.
+    if (ctx && ctx->has_subghz) {
+        create_tile(tiles, LV_SYMBOL_WARNING, "Jammer",
+                    COLOR_MATERIAL_RED,
+                    bt_menu_tile_event_cb, "Jammer");
+    }
 
     // Set current visible page
     ctx->current_visible_page = ctx->bt_menu_page;
@@ -31800,22 +31804,55 @@ static void show_bluetooth_menu_page(void)
 // AirTag Scan Page
 //==================================================================================
 
+// Stop the AirTag scan: clear both flags so the reader task exits, then tell
+// the board to stop. Sends "stop" if either flag indicated an active scan.
+static void airtag_scan_stop(tab_context_t *ctx)
+{
+    bool was_scanning = airtag_scanning || (ctx && ctx->airtag_scanning);
+
+    // Clear flags first so airtag_scan_task() (which checks ctx->airtag_scanning)
+    // breaks out of its loop.
+    airtag_scanning = false;
+    if (ctx) ctx->airtag_scanning = false;
+
+    if (was_scanning) {
+        uart_send_command_for_tab("stop");
+        ESP_LOGI(TAG, "AirTag scan stopped");
+    }
+
+    if (airtag_scan_task_handle != NULL) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        airtag_scan_task_handle = NULL;
+    }
+}
+
+// Start (or restart) the AirTag scan for the given tab. Resets the counters,
+// sends the scan command and spawns the reader task. No-op if already scanning.
+static void airtag_scan_start(tab_context_t *ctx)
+{
+    if (!ctx || ctx->airtag_scanning) return;
+
+    ESP_LOGI(TAG, "Starting AirTag scan");
+
+    if (airtag_count_label) lv_label_set_text(airtag_count_label, "0");
+    if (smarttag_count_label) lv_label_set_text(smarttag_count_label, "0");
+
+    uart_send_command_for_tab("scan_airtag");
+    airtag_scanning = true;
+    ctx->airtag_scanning = true;
+
+    xTaskCreate(airtag_scan_task, "airtag_scan", 4096, (void*)ctx, 5, &airtag_scan_task_handle);
+}
+
 // Back to BT menu from AirTag page - hide page and show BT menu
 static void airtag_scan_back_btn_event_cb(lv_event_t *e)
 {
     (void)e;
 
-    // Stop scanning
-    if (airtag_scanning) {
-        uart_send_command_for_tab("stop");
-        airtag_scanning = false;
-        if (airtag_scan_task_handle != NULL) {
-            vTaskDelay(pdMS_TO_TICKS(100));
-            airtag_scan_task_handle = NULL;
-        }
-    }
-
     tab_context_t *ctx = get_current_ctx();
+
+    // Stop scanning (sends "stop" and ends the reader task)
+    airtag_scan_stop(ctx);
 
     // Hide AirTag page
     if (ctx->bt_airtag_page) {
@@ -31904,12 +31941,13 @@ static void show_airtag_scan_page(void)
     // Hide all other pages
     hide_all_pages(ctx);
 
-    // If page already exists, just show it
+    // If page already exists, show it and restart scanning
     if (ctx->bt_airtag_page) {
         lv_obj_clear_flag(ctx->bt_airtag_page, LV_OBJ_FLAG_HIDDEN);
         ctx->current_visible_page = ctx->bt_airtag_page;
         bt_airtag_page = ctx->bt_airtag_page;
         ESP_LOGI(TAG, "Showing existing AirTag scan page for tab %d", current_tab);
+        airtag_scan_start(ctx);
         return;
     }
 
@@ -32001,16 +32039,7 @@ static void show_airtag_scan_page(void)
     lv_obj_set_style_text_color(smarttag_label, ui_text_color(), 0);
 
     // Start scanning
-    ESP_LOGI(TAG, "Starting AirTag scan");
-    uart_send_command_for_tab("scan_airtag");
-    airtag_scanning = true;
-
-    // Also mark in context
-    if (ctx) {
-        ctx->airtag_scanning = true;
-    }
-
-    xTaskCreate(airtag_scan_task, "airtag_scan", 4096, (void*)ctx, 5, &airtag_scan_task_handle);
+    airtag_scan_start(ctx);
 
     // Set current visible page
     ctx->current_visible_page = ctx->bt_airtag_page;
