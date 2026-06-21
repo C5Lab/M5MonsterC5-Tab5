@@ -1691,6 +1691,11 @@ static bool screen_dimmed = false;
 static lv_timer_t *screen_timeout_timer = NULL;
 static lv_obj_t *sleep_overlay = NULL;  // Invisible overlay to capture wake touch
 
+// Screen lock: full-screen "slide to unlock" overlay to prevent accidental taps.
+static bool screen_lock_enabled = true;   // Feature on/off (persisted in NVS)
+static lv_obj_t *lock_overlay = NULL;     // Active lock layer (NULL when unlocked)
+static lv_obj_t *lock_status_btn = NULL;  // Lock trigger button in the status bar
+
 // Screen settings (loaded from NVS)
 // screen_timeout_setting: 0=10s, 1=30s, 2=1min, 3=5min, 4=StaysOn
 static uint8_t screen_timeout_setting = 1;  // Default: 30s (index 1)
@@ -3533,6 +3538,73 @@ static void touch_activity_cb(lv_event_t *e)
     if (!screen_dimmed) {
         last_activity_time = lv_tick_get();
     }
+}
+
+// Slider drag callback: unlock once dragged (almost) all the way across.
+static void lock_slider_value_cb(lv_event_t *e)
+{
+    lv_obj_t *slider = lv_event_get_target(e);
+    if (lv_slider_get_value(slider) >= 95) {
+        if (lock_overlay) {
+            lv_obj_del(lock_overlay);
+            lock_overlay = NULL;
+        }
+        last_activity_time = lv_tick_get();
+        ESP_LOGI(TAG, "Screen unlocked");
+    }
+}
+
+// Slider release callback: snap back to the start if not dragged far enough.
+static void lock_slider_release_cb(lv_event_t *e)
+{
+    lv_obj_t *slider = lv_event_get_target(e);
+    if (lv_slider_get_value(slider) < 95) {
+        lv_slider_set_value(slider, 0, LV_ANIM_ON);
+    }
+}
+
+// Engage the lock: a full-screen overlay that swallows all touches except the
+// "slide to unlock" slider. Lives on lv_layer_top() so it covers every tab.
+static void lock_screen_activate(void)
+{
+    if (lock_overlay) return;
+
+    lock_overlay = lv_obj_create(lv_layer_top());
+    lv_obj_remove_style_all(lock_overlay);
+    lv_obj_set_size(lock_overlay, LV_PCT(100), LV_PCT(100));
+    lv_obj_set_style_bg_color(lock_overlay, ui_bg_color(), 0);
+    lv_obj_set_style_bg_opa(lock_overlay, LV_OPA_80, 0);
+    lv_obj_add_flag(lock_overlay, LV_OBJ_FLAG_CLICKABLE);  // Swallow taps to the UI below
+    lv_obj_clear_flag(lock_overlay, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *hint = lv_label_create(lock_overlay);
+    lv_label_set_text(hint, LV_SYMBOL_RIGHT "  Slide to unlock");
+    lv_obj_set_style_text_font(hint, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_color(hint, COLOR_LAB5_MAGENTA, 0);
+    lv_obj_align(hint, LV_ALIGN_CENTER, 0, -60);
+
+    lv_obj_t *slider = lv_slider_create(lock_overlay);
+    lv_slider_set_range(slider, 0, 100);
+    lv_slider_set_value(slider, 0, LV_ANIM_OFF);
+    lv_obj_set_size(slider, LV_PCT(70), 56);
+    lv_obj_align(slider, LV_ALIGN_CENTER, 0, 20);
+    lv_obj_set_style_bg_color(slider, ui_card_color(), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(slider, COLOR_LAB5_MAGENTA, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(slider, COLOR_LAB5_MAGENTA, LV_PART_KNOB);
+    lv_obj_set_style_pad_all(slider, 6, LV_PART_KNOB);
+    lv_obj_set_style_radius(slider, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+    lv_obj_add_event_cb(slider, lock_slider_value_cb, LV_EVENT_VALUE_CHANGED, NULL);
+    lv_obj_add_event_cb(slider, lock_slider_release_cb, LV_EVENT_RELEASED, NULL);
+    lv_obj_add_event_cb(slider, lock_slider_release_cb, LV_EVENT_PRESS_LOST, NULL);
+
+    ESP_LOGI(TAG, "Screen locked");
+}
+
+// Status-bar lock button callback.
+static void lock_status_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    lock_screen_activate();
 }
 
 static bool usb_transport_ready = false;
@@ -6297,6 +6369,24 @@ static void create_status_bar(void)
     lv_obj_set_style_text_color(charging_status_label, COLOR_NEON_GREEN, 0);
     lv_obj_set_width(charging_status_label, 0);
     lv_obj_set_style_text_align(charging_status_label, LV_TEXT_ALIGN_CENTER, 0);
+
+    // Screen lock button (slide-to-unlock). Hidden unless the feature is enabled.
+    lock_status_btn = lv_btn_create(right_status);
+    lv_obj_remove_style_all(lock_status_btn);
+    lv_obj_set_size(lock_status_btn, tall_layout ? 52 : 46, tall_layout ? 52 : 46);
+    lv_obj_set_style_bg_opa(lock_status_btn, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_pad_all(lock_status_btn, 0, 0);
+    lv_obj_add_flag(lock_status_btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(lock_status_btn, lock_status_btn_cb, LV_EVENT_CLICKED, NULL);
+    if (!screen_lock_enabled) {
+        lv_obj_add_flag(lock_status_btn, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    lv_obj_t *lock_icon = lv_label_create(lock_status_btn);
+    lv_label_set_text(lock_icon, LV_SYMBOL_EYE_CLOSE);
+    lv_obj_set_style_text_font(lock_icon, tall_layout ? &lv_font_montserrat_22 : &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_color(lock_icon, dark_mode_enabled ? lv_color_hex(0xA5AFBA) : lv_color_hex(0x4E5F72), 0);
+    lv_obj_center(lock_icon);
 
     // Settings button (larger hitbox for touch).
     lv_obj_t *settings_btn = lv_btn_create(right_status);
@@ -34398,6 +34488,7 @@ static __attribute__((unused)) lv_obj_t *settings_popup_obj = NULL;
 #define NVS_KEY_CLOCK_24H       "clock_24h"
 #define NVS_KEY_CLOCK_DST       "clock_dst"
 #define NVS_KEY_CLOCK_SHOW      "clock_show"
+#define NVS_KEY_SCREEN_LOCK     "scr_lock"
 
 // Load Red Team setting from NVS (called on startup)
 // Note: Device detection is automatic via ping/pong
@@ -34483,6 +34574,16 @@ static void load_screen_settings_from_nvs(void)
             ESP_LOGI(TAG, "No Dark Mode setting in NVS, using default: ON");
         }
 
+        uint8_t scr_lock = 1;
+        err = nvs_get_u8(nvs, NVS_KEY_SCREEN_LOCK, &scr_lock);
+        if (err == ESP_OK) {
+            screen_lock_enabled = (scr_lock != 0);
+            ESP_LOGI(TAG, "Loaded Screen Lock from NVS: %s", screen_lock_enabled ? "ON" : "OFF");
+        } else {
+            screen_lock_enabled = true;
+            ESP_LOGI(TAG, "No Screen Lock setting in NVS, using default: ON");
+        }
+
         uint8_t boot_sound = (uint8_t)BOOT_SOUND_MODE_NOKIA;
         err = nvs_get_u8(nvs, NVS_KEY_BOOT_SOUND, &boot_sound);
         if (err == ESP_OK) {
@@ -34532,6 +34633,21 @@ static void save_screen_brightness_to_nvs(uint8_t brightness)
         ESP_LOGI(TAG, "Saved Screen Brightness to NVS: %d%%", brightness);
     } else {
         ESP_LOGE(TAG, "Failed to open NVS for writing Screen Brightness: %s", esp_err_to_name(err));
+    }
+}
+
+// Save screen lock enable setting to NVS
+static void save_screen_lock_to_nvs(bool enabled)
+{
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs);
+    if (err == ESP_OK) {
+        nvs_set_u8(nvs, NVS_KEY_SCREEN_LOCK, enabled ? 1 : 0);
+        nvs_commit(nvs);
+        nvs_close(nvs);
+        ESP_LOGI(TAG, "Saved Screen Lock to NVS: %s", enabled ? "ON" : "OFF");
+    } else {
+        ESP_LOGE(TAG, "Failed to open NVS for writing Screen Lock: %s", esp_err_to_name(err));
     }
 }
 
@@ -37188,15 +37304,128 @@ static void settings_back_btn_event_cb(lv_event_t *e)
     (void)e;
     ESP_LOGI(TAG, "Settings back button clicked, returning to internal tiles");
 
-    // Hide settings page
-    if (internal_settings_page) {
-        lv_obj_add_flag(internal_settings_page, LV_OBJ_FLAG_HIDDEN);
-    }
+    // Delegate to show_internal_tiles(): it hides the settings page and, crucially,
+    // creates internal_tiles if they don't exist yet. This happens when Settings was
+    // opened straight from the top-bar gear without ever visiting the INTERNAL tab,
+    // which previously left a blank screen on back (internal_tiles was NULL).
+    show_internal_tiles();
+}
 
-    // Show internal tiles
-    if (internal_tiles) {
-        lv_obj_clear_flag(internal_tiles, LV_OBJ_FLAG_HIDDEN);
+// Screen Lock popup variables
+static lv_obj_t *screen_lock_popup_overlay = NULL;
+
+static void screen_lock_popup_close_cb(lv_event_t *e)
+{
+    (void)e;
+    if (screen_lock_popup_overlay) {
+        lv_obj_del(screen_lock_popup_overlay);
+        screen_lock_popup_overlay = NULL;
     }
+}
+
+// Toggle whether the lock button is shown in the status bar (persisted).
+static void screen_lock_switch_cb(lv_event_t *e)
+{
+    lv_obj_t *sw = lv_event_get_target(e);
+    screen_lock_enabled = lv_obj_has_state(sw, LV_STATE_CHECKED);
+    save_screen_lock_to_nvs(screen_lock_enabled);
+    if (lock_status_btn) {
+        if (screen_lock_enabled) {
+            lv_obj_clear_flag(lock_status_btn, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(lock_status_btn, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+}
+
+// "Lock now" button: close the popup, then engage the lock overlay.
+static void screen_lock_now_cb(lv_event_t *e)
+{
+    (void)e;
+    screen_lock_popup_close_cb(NULL);
+    lock_screen_activate();
+}
+
+static void show_screen_lock_popup(void)
+{
+    lv_obj_t *container = get_current_tab_container();
+    if (!container) return;
+    if (screen_lock_popup_overlay) return;
+
+    screen_lock_popup_overlay = lv_obj_create(container);
+    style_modal_overlay(screen_lock_popup_overlay, dark_mode_enabled ? LV_OPA_50 : LV_OPA_30);
+
+    lv_obj_t *card = lv_obj_create(screen_lock_popup_overlay);
+    lv_obj_set_size(card, 430, 320);
+    lv_obj_center(card);
+    style_popup_card(card, 12, ui_tab_icon_color());
+    lv_obj_set_style_pad_all(card, 18, 0);
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(card, 14, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(card);
+    lv_label_set_text(title, "Screen Lock");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_22, 0);
+    lv_obj_set_style_text_color(title, dark_mode_enabled ? COLOR_LAB5_MAGENTA : ui_tab_icon_color(), 0);
+
+    lv_obj_t *row = lv_obj_create(card);
+    lv_obj_set_size(row, lv_pct(100), 56);
+    lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(row, 0, 0);
+    lv_obj_set_style_pad_all(row, 0, 0);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *row_label = lv_label_create(row);
+    lv_label_set_text(row_label, "Show lock button");
+    lv_obj_set_style_text_font(row_label, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_color(row_label, ui_text_color(), 0);
+
+    lv_obj_t *sw = lv_switch_create(row);
+    style_theme_switch(sw);
+    if (screen_lock_enabled) lv_obj_add_state(sw, LV_STATE_CHECKED);
+    lv_obj_add_event_cb(sw, screen_lock_switch_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    lv_obj_t *desc = lv_label_create(card);
+    lv_label_set_text(desc,
+        "Adds a lock button to the top status bar.\n"
+        "When locked, the screen ignores all taps until\n"
+        "you slide to unlock - prevents accidental clicks.");
+    lv_obj_set_style_text_font(desc, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(desc, ui_muted_color(), 0);
+    lv_obj_set_width(desc, lv_pct(100));
+    lv_label_set_long_mode(desc, LV_LABEL_LONG_WRAP);
+
+    lv_obj_t *btn_row = lv_obj_create(card);
+    lv_obj_set_size(btn_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(btn_row, 0, 0);
+    lv_obj_set_style_pad_all(btn_row, 0, 0);
+    lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *lock_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(lock_btn, 140, 44);
+    style_neutral_button(lock_btn);
+    lv_obj_add_event_cb(lock_btn, screen_lock_now_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *lock_btn_label = lv_label_create(lock_btn);
+    lv_label_set_text(lock_btn_label, LV_SYMBOL_EYE_CLOSE " Lock now");
+    lv_obj_set_style_text_font(lock_btn_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(lock_btn_label, ui_text_color(), 0);
+    lv_obj_center(lock_btn_label);
+
+    lv_obj_t *close_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(close_btn, 120, 44);
+    style_neutral_button(close_btn);
+    lv_obj_add_event_cb(close_btn, screen_lock_popup_close_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *close_label = lv_label_create(close_btn);
+    lv_label_set_text(close_label, "Close");
+    lv_obj_set_style_text_font(close_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(close_label, ui_text_color(), 0);
+    lv_obj_center(close_label);
 }
 
 static void settings_tile_event_cb(lv_event_t *e)
@@ -37216,6 +37445,8 @@ static void settings_tile_event_cb(lv_event_t *e)
         show_theme_popup();
     } else if (strcmp(tile_name, "Time") == 0) {
         show_time_popup();
+    } else if (strcmp(tile_name, "Screen Lock") == 0) {
+        show_screen_lock_popup();
     }
 }
 
@@ -37308,6 +37539,9 @@ static void show_settings_page(void)
 
     // Time / RTC tile
     create_tile(tiles, LV_SYMBOL_BELL, "Time", COLOR_MATERIAL_PURPLE, settings_tile_event_cb, "Time");
+
+    // Screen Lock tile
+    create_tile(tiles, LV_SYMBOL_EYE_CLOSE, "Screen\nLock", COLOR_MATERIAL_BLUE, settings_tile_event_cb, "Screen Lock");
 }
 
 void app_main(void)
