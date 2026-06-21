@@ -1692,9 +1692,11 @@ static lv_timer_t *screen_timeout_timer = NULL;
 static lv_obj_t *sleep_overlay = NULL;  // Invisible overlay to capture wake touch
 
 // Screen lock: full-screen "slide to unlock" overlay to prevent accidental taps.
-static bool screen_lock_enabled = true;   // Feature on/off (persisted in NVS)
-static lv_obj_t *lock_overlay = NULL;     // Active lock layer (NULL when unlocked)
-static lv_obj_t *lock_status_btn = NULL;  // Lock trigger button in the status bar
+static bool screen_lock_enabled = true;     // Feature on/off (persisted in NVS)
+static bool screen_auto_lock_enabled = false; // Auto-engage lock when screen dims (NVS)
+static lv_obj_t *lock_overlay = NULL;       // Active lock layer (NULL when unlocked)
+static lv_obj_t *lock_status_btn = NULL;    // Lock trigger button in the status bar
+static void lock_screen_activate(void);     // Defined below; used by the dim timer
 
 // Screen settings (loaded from NVS)
 // screen_timeout_setting: 0=10s, 1=30s, 2=1min, 3=5min, 4=StaysOn
@@ -3515,6 +3517,12 @@ static void screen_timeout_timer_cb(lv_timer_t *timer)
     if (timeout_ms != UINT32_MAX && (now - last_activity_time) >= timeout_ms) {
         bsp_display_brightness_set(0);  // Turn off backlight
         screen_dimmed = true;
+
+        // Auto-lock: engage the lock now (before the wake overlay) so it stays in
+        // place underneath and the user must slide to unlock after waking.
+        if (screen_auto_lock_enabled) {
+            lock_screen_activate();
+        }
 
         // Create invisible overlay to capture wake touch
         sleep_overlay = lv_obj_create(lv_layer_top());
@@ -34489,6 +34497,7 @@ static __attribute__((unused)) lv_obj_t *settings_popup_obj = NULL;
 #define NVS_KEY_CLOCK_DST       "clock_dst"
 #define NVS_KEY_CLOCK_SHOW      "clock_show"
 #define NVS_KEY_SCREEN_LOCK     "scr_lock"
+#define NVS_KEY_AUTO_LOCK       "scr_autolock"
 
 // Load Red Team setting from NVS (called on startup)
 // Note: Device detection is automatic via ping/pong
@@ -34584,6 +34593,16 @@ static void load_screen_settings_from_nvs(void)
             ESP_LOGI(TAG, "No Screen Lock setting in NVS, using default: ON");
         }
 
+        uint8_t auto_lock = 0;
+        err = nvs_get_u8(nvs, NVS_KEY_AUTO_LOCK, &auto_lock);
+        if (err == ESP_OK) {
+            screen_auto_lock_enabled = (auto_lock != 0);
+            ESP_LOGI(TAG, "Loaded Auto Lock from NVS: %s", screen_auto_lock_enabled ? "ON" : "OFF");
+        } else {
+            screen_auto_lock_enabled = false;
+            ESP_LOGI(TAG, "No Auto Lock setting in NVS, using default: OFF");
+        }
+
         uint8_t boot_sound = (uint8_t)BOOT_SOUND_MODE_NOKIA;
         err = nvs_get_u8(nvs, NVS_KEY_BOOT_SOUND, &boot_sound);
         if (err == ESP_OK) {
@@ -34648,6 +34667,21 @@ static void save_screen_lock_to_nvs(bool enabled)
         ESP_LOGI(TAG, "Saved Screen Lock to NVS: %s", enabled ? "ON" : "OFF");
     } else {
         ESP_LOGE(TAG, "Failed to open NVS for writing Screen Lock: %s", esp_err_to_name(err));
+    }
+}
+
+// Save auto-lock setting to NVS
+static void save_auto_lock_to_nvs(bool enabled)
+{
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs);
+    if (err == ESP_OK) {
+        nvs_set_u8(nvs, NVS_KEY_AUTO_LOCK, enabled ? 1 : 0);
+        nvs_commit(nvs);
+        nvs_close(nvs);
+        ESP_LOGI(TAG, "Saved Auto Lock to NVS: %s", enabled ? "ON" : "OFF");
+    } else {
+        ESP_LOGE(TAG, "Failed to open NVS for writing Auto Lock: %s", esp_err_to_name(err));
     }
 }
 
@@ -37338,6 +37372,14 @@ static void screen_lock_switch_cb(lv_event_t *e)
     }
 }
 
+// Toggle auto-lock when the screen dims (persisted).
+static void auto_lock_switch_cb(lv_event_t *e)
+{
+    lv_obj_t *sw = lv_event_get_target(e);
+    screen_auto_lock_enabled = lv_obj_has_state(sw, LV_STATE_CHECKED);
+    save_auto_lock_to_nvs(screen_auto_lock_enabled);
+}
+
 // "Lock now" button: close the popup, then engage the lock overlay.
 static void screen_lock_now_cb(lv_event_t *e)
 {
@@ -37356,7 +37398,7 @@ static void show_screen_lock_popup(void)
     style_modal_overlay(screen_lock_popup_overlay, dark_mode_enabled ? LV_OPA_50 : LV_OPA_30);
 
     lv_obj_t *card = lv_obj_create(screen_lock_popup_overlay);
-    lv_obj_set_size(card, 430, 320);
+    lv_obj_set_size(card, 430, 390);
     lv_obj_center(card);
     style_popup_card(card, 12, ui_tab_icon_color());
     lv_obj_set_style_pad_all(card, 18, 0);
@@ -37388,11 +37430,31 @@ static void show_screen_lock_popup(void)
     if (screen_lock_enabled) lv_obj_add_state(sw, LV_STATE_CHECKED);
     lv_obj_add_event_cb(sw, screen_lock_switch_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
+    lv_obj_t *auto_row = lv_obj_create(card);
+    lv_obj_set_size(auto_row, lv_pct(100), 56);
+    lv_obj_set_style_bg_opa(auto_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(auto_row, 0, 0);
+    lv_obj_set_style_pad_all(auto_row, 0, 0);
+    lv_obj_set_flex_flow(auto_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(auto_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(auto_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *auto_label = lv_label_create(auto_row);
+    lv_label_set_text(auto_label, "Auto-lock on screen off");
+    lv_obj_set_style_text_font(auto_label, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_color(auto_label, ui_text_color(), 0);
+
+    lv_obj_t *auto_sw = lv_switch_create(auto_row);
+    style_theme_switch(auto_sw);
+    if (screen_auto_lock_enabled) lv_obj_add_state(auto_sw, LV_STATE_CHECKED);
+    lv_obj_add_event_cb(auto_sw, auto_lock_switch_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
     lv_obj_t *desc = lv_label_create(card);
     lv_label_set_text(desc,
         "Adds a lock button to the top status bar.\n"
         "When locked, the screen ignores all taps until\n"
-        "you slide to unlock - prevents accidental clicks.");
+        "you slide to unlock - prevents accidental clicks.\n"
+        "Auto-lock engages the lock when the screen dims.");
     lv_obj_set_style_text_font(desc, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(desc, ui_muted_color(), 0);
     lv_obj_set_width(desc, lv_pct(100));
