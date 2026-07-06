@@ -47,8 +47,8 @@
 #include "esp_http_server.h"
 #include "lwip/sockets.h"
 
-#define JANOS_TAB_VERSION "1.4.2"
-#define JANOS_VERSION_REQUIRED "1.6.6"
+#define JANOS_TAB_VERSION "1.4.3"
+#define JANOS_VERSION_REQUIRED "1.6.8"
 #include "lwip/netdb.h"
 #include <dirent.h>
 #include <sys/stat.h>
@@ -3367,13 +3367,13 @@ static void update_status_clock(void)
         return;
     }
 
-    char buf[16];
+    char buf[8];
     if (clock_24h) {
         snprintf(buf, sizeof(buf), "%02d:%02d", t.tm_hour, t.tm_min);
     } else {
         int h12 = t.tm_hour % 12;
         if (h12 == 0) h12 = 12;
-        snprintf(buf, sizeof(buf), "%d:%02d %s", h12, t.tm_min, (t.tm_hour < 12) ? "AM" : "PM");
+        snprintf(buf, sizeof(buf), "%02d:%02d", h12, t.tm_min);
     }
     lv_label_set_text(status_clock_label, buf);
 }
@@ -6313,9 +6313,12 @@ static void create_status_bar(void)
     // RTC clock, placed right after the title.
     status_clock_label = lv_label_create(status_bar);
     lv_label_set_text(status_clock_label, "--:--");
-    lv_obj_set_style_text_font(status_clock_label, tall_layout ? &lv_font_montserrat_22 : &lv_font_montserrat_18, 0);
+    lv_label_set_long_mode(status_clock_label, LV_LABEL_LONG_CLIP);
+    lv_obj_set_width(status_clock_label, tall_layout ? 66 : 58);
+    lv_obj_set_style_text_font(status_clock_label, tall_layout ? &lv_font_montserrat_18 : &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_color(status_clock_label, COLOR_LAB5_MAGENTA, 0);
     lv_obj_set_style_text_letter_space(status_clock_label, 0, 0);
+    lv_obj_set_style_text_align(status_clock_label, LV_TEXT_ALIGN_CENTER, 0);
 
     // Flexible spacer pushes the battery/settings strip to the right edge.
     lv_obj_t *bar_spacer = lv_obj_create(status_bar);
@@ -6355,7 +6358,7 @@ static void create_status_bar(void)
 
     const lv_font_t *battery_font = tall_layout ? &lv_font_montserrat_20 : &lv_font_montserrat_16;
     // Reserve extra room for the worst-case string: "8.40V 100%" plus font overhang.
-    lv_coord_t battery_value_width = tall_layout ? 176 : 148;
+    lv_coord_t battery_value_width = tall_layout ? 248 : 212;
     lv_coord_t charge_slot_width = tall_layout ? 32 : 28;
     lv_coord_t battery_chip_width = battery_value_width + charge_slot_width + (tall_layout ? 6 : 4) + ((tall_layout ? 8 : 6) * 2);
     charging_status_slot_width = charge_slot_width;
