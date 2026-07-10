@@ -72,14 +72,18 @@ flowchart TD
     Opt -->|"Pass"| KbPass["Keyboard: password<br/>(show/hide)"] --> Setup
     Opt -->|"Mode DHCP/Manual"| Mode["Toggle mode<br/>(Manual: IP/Netmask/GW/DNS)"] --> Setup
     Opt -->|"Channel main/dev"| Chan["Send: ota_channel main|dev"] --> Setup
-    Opt -->|"List updates"| SendList["Send: ota_list"] --> ListScr["OTA List screen<br/>OTA[n]: ..."]
+    Opt -->|"List updates"| ValidList{"P4 validation:<br/>SSID required,<br/>Manual: IP/NM/GW"}
     Opt -->|"Show info"| SendInfo["Send: ota_info"] --> InfoScr["OTA Info screen<br/>boot/running/next + APP[n]<br/>Activate inactive slot"]
 
     Valid -->|"OK"| SendWC["Send:<br/>wifi_connect \"SSID\" \"PASS\" ota [ip nm gw dns]<br/>or --saved ota"]
     Valid -->|"Error"| Setup
+    ValidList -->|"OK"| SendWL["Send:<br/>wifi_connect \"SSID\" \"PASS\" [ip nm gw dns]<br/>or --saved"]
+    ValidList -->|"Error"| Setup
 
     SendWC --> Status["OTA Status screen<br/>WiFi / IP / OTA"]
-    ListScr --> Setup
+    SendWL --> ListStatus["OTA List status<br/>WiFi -> Releases -> Ready"]
+    ListStatus -->|"IP received"| SendList["Send: ota_list"]
+    SendList -->|"OTA[n]"| ListStatus
     InfoScr --> Setup
 ```
 
@@ -94,7 +98,8 @@ The **Setup ("Monster OTA")** screen on Tab5 — form plus action buttons:
 5. **Channel: main / dev** — dropdown; sends `ota_channel <main|dev>`.
 6. **Download & Flash** — builds `wifi_connect ... ota` and starts the C5 self-OTA
    immediately after WiFi connects.
-7. **List** — sends `ota_list`, opens the list screen.
+7. **List** — connects WiFi with the selected SSID/password first, then sends `ota_list` after
+   the C5 reports an IP. It uses the same saved-password and manual-IP handling as update.
 8. **Info** — sends `ota_info`, opens the info screen. The inactive partition row has
    **Activate**, which sends `ota_boot <ota_0|ota_1>` and reboots the C5.
 
@@ -104,8 +109,8 @@ The connect/update behavior:
   If the selected network has a saved Evil Twin password on the C5, the UI sends
   `wifi_connect "SSID" --saved ota [...]` instead. The C5 joins the network and
   **automatically** starts OTA once it gets an IP.
-- `List` is separate and informational. It sends `ota_list` but does not gate the main update
-  flow.
+- `List` is separate and informational. It opens a status-style monitor, connects WiFi without
+  the `ota` flag, then sends `ota_list` after IP is assigned.
 
 ## OTA state diagram
 
