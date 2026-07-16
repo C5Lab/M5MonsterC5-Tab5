@@ -292,6 +292,8 @@ typedef struct {
 #define WARDRIVE_WIGLE_PAGE_SIZE  20
 #define WARDRIVE_WIGLE_PATH_MAX  160
 #define WARDRIVE_WIGLE_OTHER_SSID "__WARDRIVE_WIGLE_OTHER__"
+static const char wpasec_other_ssid_user_data[] = WPASEC_OTHER_SSID;
+static const char wardrive_wigle_other_ssid_user_data[] = WARDRIVE_WIGLE_OTHER_SSID;
 typedef struct {
     char path[WARDRIVE_WIGLE_PATH_MAX];
     char name[96];
@@ -708,6 +710,7 @@ typedef struct {
     volatile bool wardrive_wigle_rescan_requested;
     bool wardrive_wigle_upload_done;
     char wardrive_wigle_selected_ssid[33];
+    char wardrive_wigle_selected_security[24];
     char wardrive_wigle_selected_password[65];
     wardrive_wigle_file_t *wardrive_wigle_files; // PSRAM alloc, NULL when popup closed
     wardrive_file_summary_t wardrive_file_summary;
@@ -843,6 +846,7 @@ typedef struct {
     lv_obj_t *wpasec_keyboard;
     lv_obj_t *wpasec_connect_btn;
     char wpasec_selected_ssid[33];
+    char wpasec_selected_security[24];
     char wpasec_selected_password[65];
     volatile bool wpasec_password_known;
     volatile bool wpasec_connect_ready;   // set by Connect button callback
@@ -2261,6 +2265,7 @@ static uart_port_t get_current_uart(void);
 static void uart_send_command_for_tab(const char *cmd);
 static bool build_wifi_connect_command(char *out, size_t out_sz, const char *ssid,
                                        const char *password, wifi_connect_auth_mode_t mode);
+static bool wifi_network_security_is_open(const char *security);
 static void show_blackout_confirm_popup(void);
 static void blackout_confirm_yes_cb(lv_event_t *e);
 static void blackout_confirm_no_cb(lv_event_t *e);
@@ -8031,7 +8036,7 @@ static void mitm_connect_and_start_cb(lv_event_t *e)
     int idx = v.sel_indices[0];
     if (idx < 0 || idx >= v.net_count) return;
     const char *ssid = v.nets[idx].ssid;
-    bool is_open = (strstr(v.nets[idx].security, "OPEN") != NULL || v.nets[idx].security[0] == '\0');
+    bool is_open = wifi_network_security_is_open(v.nets[idx].security);
 
     const char *password = NULL;
     if (ctx->mitm_password_input) {
@@ -9051,7 +9056,7 @@ static void arp_connect_cb(lv_event_t *e)
 {
     (void)e;
 
-    bool is_open = (strstr(arp_target_security, "OPEN") != NULL || arp_target_security[0] == '\0');
+    bool is_open = wifi_network_security_is_open(arp_target_security);
     const char *password = NULL;
 
     // Check if we have a saved password (from Evil Twin database).
@@ -9598,7 +9603,7 @@ static void nmap_connect_cb(lv_event_t *e)
 {
     (void)e;
 
-    bool is_open = (strstr(nmap_target_security, "OPEN") != NULL || nmap_target_security[0] == '\0');
+    bool is_open = wifi_network_security_is_open(nmap_target_security);
     const char *password = NULL;
 
     if (strlen(nmap_target_password) > 0) {
@@ -9632,9 +9637,9 @@ static void nmap_connect_cb(lv_event_t *e)
 
     char cmd[256];
     wifi_connect_auth_mode_t auth_mode = WIFI_CONNECT_AUTH_OPEN;
-    if (!is_open && strlen(nmap_target_password) > 0) {
+    if (strlen(nmap_target_password) > 0) {
         auth_mode = WIFI_CONNECT_AUTH_SAVED;
-    } else if (!is_open && password != NULL && strlen(password) > 0) {
+    } else if (password != NULL && strlen(password) > 0) {
         auth_mode = WIFI_CONNECT_AUTH_PASSWORD;
     }
     if (!build_wifi_connect_command(cmd, sizeof(cmd), nmap_target_ssid, password, auth_mode)) {
@@ -10481,7 +10486,7 @@ static void show_nmap_page(void)
     lv_obj_set_style_text_font(target_label, &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_color(target_label, lv_color_hex(0xCCCCCC), 0);
 
-    bool is_open_network = (strstr(nmap_target_security, "OPEN") != NULL || nmap_target_security[0] == '\0');
+    bool is_open_network = wifi_network_security_is_open(nmap_target_security);
     bool password_known = false;
 
     if (!is_open_network) {
@@ -10559,6 +10564,33 @@ static void show_nmap_page(void)
         lv_label_set_text(open_label, LV_SYMBOL_WARNING "  Open Network (no password required)");
         lv_obj_set_style_text_font(open_label, &lv_font_montserrat_14, 0);
         lv_obj_set_style_text_color(open_label, COLOR_MATERIAL_AMBER, 0);
+
+        lv_obj_t *pass_left = lv_obj_create(pass_section);
+        lv_obj_set_size(pass_left, lv_pct(100), LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_opa(pass_left, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(pass_left, 0, 0);
+        lv_obj_set_style_pad_all(pass_left, 0, 0);
+        lv_obj_set_flex_flow(pass_left, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(pass_left, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_column(pass_left, 10, 0);
+        lv_obj_clear_flag(pass_left, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *pass_label = lv_label_create(pass_left);
+        lv_label_set_text(pass_label, "Password:");
+        lv_obj_set_style_text_font(pass_label, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(pass_label, lv_color_hex(0xFFFFFF), 0);
+
+        nmap_password_input = lv_textarea_create(pass_left);
+        lv_obj_set_size(nmap_password_input, 300, 40);
+        lv_textarea_set_one_line(nmap_password_input, true);
+        lv_textarea_set_placeholder_text(nmap_password_input, "Optional");
+        lv_textarea_set_password_mode(nmap_password_input, true);
+        lv_textarea_set_password_show_time(nmap_password_input, WPASEC_PASSWORD_SHOW_MS);
+        lv_obj_set_style_bg_color(nmap_password_input, lv_color_hex(0x1A1A1A), 0);
+        lv_obj_set_style_border_color(nmap_password_input, COLOR_MATERIAL_GREEN, 0);
+        lv_obj_set_style_border_width(nmap_password_input, 1, 0);
+        lv_obj_set_style_text_color(nmap_password_input, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_add_event_cb(nmap_password_input, nmap_password_input_cb, LV_EVENT_CLICKED, NULL);
 
         lv_obj_t *btn_row = lv_obj_create(pass_section);
         lv_obj_set_size(btn_row, lv_pct(100), LV_SIZE_CONTENT);
@@ -10694,7 +10726,7 @@ static void show_nmap_page(void)
     // Status label
     nmap_status_label = lv_label_create(nmap_page);
     if (is_open_network) {
-        lv_label_set_text(nmap_status_label, "Press Connect to join open network");
+        lv_label_set_text(nmap_status_label, "Press Connect to try open, or enter password");
     } else if (password_known) {
         lv_label_set_text(nmap_status_label, "Press Connect to join network");
     } else {
@@ -10721,7 +10753,7 @@ static void show_nmap_page(void)
     lv_obj_set_style_text_color(placeholder, lv_color_hex(0x888888), 0);
 
     // Keyboard (hidden, for password entry)
-    if (!is_open_network && !password_known) {
+    if (nmap_password_input && !password_known) {
         nmap_keyboard = lv_keyboard_create(nmap_page);
         lv_obj_set_size(nmap_keyboard, lv_pct(100), 200);
         lv_obj_add_flag(nmap_keyboard, LV_OBJ_FLAG_HIDDEN);
@@ -10821,7 +10853,7 @@ static void show_arp_poison_page(void)
     lv_obj_set_style_text_font(target_label, &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_color(target_label, lv_color_hex(0xCCCCCC), 0);
 
-    bool is_open_network = (strstr(arp_target_security, "OPEN") != NULL || arp_target_security[0] == '\0');
+    bool is_open_network = wifi_network_security_is_open(arp_target_security);
 
     // Check if password is known from Evil Twin database (only in manual mode, non-open)
     bool password_known = false;
@@ -17458,7 +17490,7 @@ static void update_wardrive_table(tab_context_t *ctx)
             lv_obj_set_style_text_color(sec_lbl, COLOR_MATERIAL_GREEN, 0);
         } else if (strstr(net->security, "WPA2") != NULL || strstr(net->security, "WPA_") != NULL) {
             lv_obj_set_style_text_color(sec_lbl, COLOR_MATERIAL_AMBER, 0);
-        } else if (strstr(net->security, "OPEN") != NULL || net->security[0] == '\0') {
+        } else if (wifi_network_security_is_open(net->security)) {
             lv_obj_set_style_text_color(sec_lbl, COLOR_MATERIAL_RED, 0);
         } else {
             lv_obj_set_style_text_color(sec_lbl, COLOR_MATERIAL_AMBER, 0);
@@ -17598,6 +17630,7 @@ static void close_wardrive_wigle_provider_popup(tab_context_t *ctx)
     ctx->wardrive_wigle_retry_requested = false;
     ctx->wardrive_wigle_rescan_requested = false;
     ctx->wardrive_wigle_selected_ssid[0] = '\0';
+    ctx->wardrive_wigle_selected_security[0] = '\0';
     ctx->wardrive_wigle_selected_password[0] = '\0';
     ctx->wardrive_upload_provider = WARDRIVE_UPLOAD_PROVIDER_NONE;
     ctx->wardrive_upload_mode = WARDRIVE_UPLOAD_MODE_SELECTED;
@@ -19163,6 +19196,7 @@ static void wardrive_wigle_start_upload(tab_context_t *ctx, wardrive_upload_mode
     ctx->wardrive_upload_mode = mode;
     ctx->wardrive_wigle_connect_ready = false;
     ctx->wardrive_wigle_selected_ssid[0] = '\0';
+    ctx->wardrive_wigle_selected_security[0] = '\0';
     ctx->wardrive_wigle_selected_password[0] = '\0';
     ctx->wardrive_wigle_task_running = true;
     wardrive_wigle_update_send_btn(ctx);
@@ -19246,19 +19280,47 @@ static void wardrive_wigle_stop_btn_cb(lv_event_t *e)
 static void wardrive_wigle_network_row_click_cb(lv_event_t *e)
 {
     lv_obj_t *row = lv_event_get_target(e);
-    const char *ssid = (const char *)lv_event_get_user_data(e);
+    void *user_data = lv_event_get_user_data(e);
     tab_context_t *ctx = get_current_ctx();
-    if (!ctx || !ssid) {
+    if (!ctx || !user_data) {
+        return;
+    }
+
+    const char *ssid = NULL;
+    const char *security = NULL;
+    if (user_data == (void *)wardrive_wigle_other_ssid_user_data) {
+        ssid = WARDRIVE_WIGLE_OTHER_SSID;
+    } else {
+        wifi_network_t *net = (wifi_network_t *)user_data;
+        ssid = net->ssid;
+        security = net->security;
+    }
+
+    if (!ssid) {
         return;
     }
 
     if (strlen(ssid) == 0) {
+        if (security) {
+            strncpy(ctx->wardrive_wigle_selected_security, security,
+                    sizeof(ctx->wardrive_wigle_selected_security) - 1);
+            ctx->wardrive_wigle_selected_security[sizeof(ctx->wardrive_wigle_selected_security) - 1] = '\0';
+        } else {
+            ctx->wardrive_wigle_selected_security[0] = '\0';
+        }
         show_hidden_ssid_popup(hidden_ssid_wardrive_confirm_cb);
         return;
     }
 
     strncpy(ctx->wardrive_wigle_selected_ssid, ssid, sizeof(ctx->wardrive_wigle_selected_ssid) - 1);
     ctx->wardrive_wigle_selected_ssid[sizeof(ctx->wardrive_wigle_selected_ssid) - 1] = '\0';
+    if (security) {
+        strncpy(ctx->wardrive_wigle_selected_security, security,
+                sizeof(ctx->wardrive_wigle_selected_security) - 1);
+        ctx->wardrive_wigle_selected_security[sizeof(ctx->wardrive_wigle_selected_security) - 1] = '\0';
+    } else {
+        ctx->wardrive_wigle_selected_security[0] = '\0';
+    }
     ESP_LOGI(TAG, "[%s] WiGLE selected SSID: %s",
              tab_transport_name(tab_id_for_ctx(ctx)), ctx->wardrive_wigle_selected_ssid);
 
@@ -19510,6 +19572,7 @@ static bool wardrive_wigle_ensure_wifi_connected(tab_context_t *ctx, tab_id_t ac
     do_rescan = false;
     ctx->wardrive_wigle_rescan_requested = false;
     ctx->wardrive_wigle_selected_ssid[0] = '\0';
+    ctx->wardrive_wigle_selected_security[0] = '\0';
     ctx->wardrive_wigle_selected_password[0] = '\0';
     ctx->wardrive_wigle_connect_ready = false;
 
@@ -19673,6 +19736,7 @@ static bool wardrive_wigle_ensure_wifi_connected(tab_context_t *ctx, tab_id_t ac
 
     ctx->wardrive_wigle_selected_ssid[0] = '\0';
     ctx->wardrive_wigle_connect_ready = false;
+    ctx->wardrive_wigle_selected_security[0] = '\0';
     ctx->wardrive_wigle_selected_password[0] = '\0';
 
     bsp_display_lock(0);
@@ -19724,7 +19788,7 @@ static bool wardrive_wigle_ensure_wifi_connected(tab_context_t *ctx, tab_id_t ac
             lv_obj_set_style_text_font(info_lbl, &lv_font_montserrat_12, 0);
             lv_obj_set_style_text_color(info_lbl, lv_color_hex(0x888888), 0);
 
-            lv_obj_add_event_cb(row, wardrive_wigle_network_row_click_cb, LV_EVENT_CLICKED, (void *)nets[i].ssid);
+            lv_obj_add_event_cb(row, wardrive_wigle_network_row_click_cb, LV_EVENT_CLICKED, (void *)&nets[i]);
         }
 
         lv_obj_t *other_row = lv_obj_create(ctx->wardrive_wigle_list);
@@ -19749,7 +19813,7 @@ static bool wardrive_wigle_ensure_wifi_connected(tab_context_t *ctx, tab_id_t ac
         lv_obj_set_style_text_color(other_info_lbl, lv_color_hex(0x888888), 0);
 
         lv_obj_add_event_cb(other_row, wardrive_wigle_network_row_click_cb,
-                            LV_EVENT_CLICKED, (void *)WARDRIVE_WIGLE_OTHER_SSID);
+                            LV_EVENT_CLICKED, (void *)wardrive_wigle_other_ssid_user_data);
     }
     if (ctx->wardrive_wigle_spinner) {
         lv_obj_add_flag(ctx->wardrive_wigle_spinner, LV_OBJ_FLAG_HIDDEN);
@@ -19766,9 +19830,11 @@ static bool wardrive_wigle_ensure_wifi_connected(tab_context_t *ctx, tab_id_t ac
              tab_transport_name(active_tab), ctx->wardrive_wigle_selected_ssid);
 
     bool manual_credentials = (strcmp(ctx->wardrive_wigle_selected_ssid, WARDRIVE_WIGLE_OTHER_SSID) == 0);
+    bool selected_open_network = wifi_network_security_is_open(ctx->wardrive_wigle_selected_security);
     bool use_saved_password = false;
-    ESP_LOGI(TAG, "[%s] WiGLE: manual credentials mode = %d",
-             tab_transport_name(active_tab), manual_credentials ? 1 : 0);
+    ESP_LOGI(TAG, "[%s] WiGLE: manual credentials=%d, selected_open=%d, security='%s'",
+             tab_transport_name(active_tab), manual_credentials ? 1 : 0,
+             selected_open_network ? 1 : 0, ctx->wardrive_wigle_selected_security);
 
     bsp_display_lock(0);
     if (ctx->wardrive_wigle_spinner) {
@@ -19781,6 +19847,10 @@ static bool wardrive_wigle_ensure_wifi_connected(tab_context_t *ctx, tab_id_t ac
     if (ctx->wardrive_wigle_status_label) {
         if (manual_credentials) {
             lv_label_set_text(ctx->wardrive_wigle_status_label, "Manual network selected\nEnter SSID and WiFi password:");
+        } else if (selected_open_network) {
+            lv_label_set_text_fmt(ctx->wardrive_wigle_status_label,
+                                  "Selected open network: %s\nConnecting without password...",
+                                  ctx->wardrive_wigle_selected_ssid);
         } else {
             lv_label_set_text_fmt(ctx->wardrive_wigle_status_label,
                                   "Selected: %s\nChecking saved passwords...",
@@ -19791,6 +19861,7 @@ static bool wardrive_wigle_ensure_wifi_connected(tab_context_t *ctx, tab_id_t ac
 
     if (manual_credentials) {
         ctx->wardrive_wigle_selected_ssid[0] = '\0';
+        ctx->wardrive_wigle_selected_security[0] = '\0';
         ctx->wardrive_wigle_selected_password[0] = '\0';
         ctx->wardrive_wigle_connect_ready = false;
 
@@ -19810,10 +19881,10 @@ static bool wardrive_wigle_ensure_wifi_connected(tab_context_t *ctx, tab_id_t ac
             return false;
         }
 
-        if (strlen(ctx->wardrive_wigle_selected_ssid) == 0 || strlen(ctx->wardrive_wigle_selected_password) == 0) {
+        if (strlen(ctx->wardrive_wigle_selected_ssid) == 0) {
             bsp_display_lock(0);
             if (ctx->wardrive_wigle_status_label) {
-                lv_label_set_text(ctx->wardrive_wigle_status_label, "Enter SSID and password.");
+                lv_label_set_text(ctx->wardrive_wigle_status_label, "Enter SSID.");
             }
             bsp_display_unlock();
             heap_caps_free(scan_rx_buf);
@@ -19823,7 +19894,8 @@ static bool wardrive_wigle_ensure_wifi_connected(tab_context_t *ctx, tab_id_t ac
             heap_caps_free(wifi_rx_buf);
             return false;
         }
-    } else {
+        selected_open_network = (ctx->wardrive_wigle_selected_password[0] == '\0');
+    } else if (!selected_open_network) {
         ctx->wardrive_wigle_selected_password[0] = '\0';
 
         if (active_tab == TAB_USB && usb_cdc_handle) {
@@ -19891,7 +19963,7 @@ static bool wardrive_wigle_ensure_wifi_connected(tab_context_t *ctx, tab_id_t ac
                  (int)(strlen(ctx->wardrive_wigle_selected_password) > 0));
     }
 
-    if (strlen(ctx->wardrive_wigle_selected_password) == 0) {
+    if (!selected_open_network && strlen(ctx->wardrive_wigle_selected_password) == 0) {
         ctx->wardrive_wigle_connect_ready = false;
 
         bsp_display_lock(0);
@@ -19940,11 +20012,13 @@ static bool wardrive_wigle_ensure_wifi_connected(tab_context_t *ctx, tab_id_t ac
     bsp_display_unlock();
 
     char wifi_cmd[256];
+    wifi_connect_auth_mode_t auth_mode =
+        selected_open_network ? WIFI_CONNECT_AUTH_OPEN :
+        (use_saved_password ? WIFI_CONNECT_AUTH_SAVED : WIFI_CONNECT_AUTH_PASSWORD);
     if (!build_wifi_connect_command(wifi_cmd, sizeof(wifi_cmd),
                                     ctx->wardrive_wigle_selected_ssid,
                                     ctx->wardrive_wigle_selected_password,
-                                    use_saved_password ? WIFI_CONNECT_AUTH_SAVED
-                                                       : WIFI_CONNECT_AUTH_PASSWORD)) {
+                                    auth_mode)) {
         bsp_display_lock(0);
         if (ctx->wardrive_wigle_status_label) {
             lv_label_set_text(ctx->wardrive_wigle_status_label, "SSID/password too long.");
@@ -20034,14 +20108,33 @@ static bool wardrive_wigle_ensure_wifi_connected(tab_context_t *ctx, tab_id_t ac
             }
 
             bsp_display_lock(0);
+            bool created_password_prompt = false;
+            if (!ctx->wardrive_wigle_password_input) {
+                selected_open_network = false;
+                use_saved_password = false;
+                ctx->wardrive_wigle_selected_password[0] = '\0';
+                if (ctx->wardrive_wigle_status_label) {
+                    lv_label_set_text_fmt(ctx->wardrive_wigle_status_label,
+                                          "WiFi failed: %s\nEnter WiFi password, or Rescan.",
+                                          fail_reason);
+                }
+                wardrive_wigle_create_credentials_prompt(ctx, false);
+                created_password_prompt = true;
+            }
             // Keep credentials UI visible so user can edit password and retry
             if (ctx->wardrive_wigle_connect_btn) {
                 lv_obj_clear_state(ctx->wardrive_wigle_connect_btn, LV_STATE_DISABLED);
             }
-            if (ctx->wardrive_wigle_status_label) {
-                lv_label_set_text_fmt(ctx->wardrive_wigle_status_label,
-                                      "WiFi failed: %s\nEdit password and tap Connect, or Rescan.",
-                                      fail_reason);
+            if (ctx->wardrive_wigle_status_label && !created_password_prompt) {
+                if (ctx->wardrive_wigle_password_input) {
+                    lv_label_set_text_fmt(ctx->wardrive_wigle_status_label,
+                                          "WiFi failed: %s\nEdit password and tap Connect, or Rescan.",
+                                          fail_reason);
+                } else {
+                    lv_label_set_text_fmt(ctx->wardrive_wigle_status_label,
+                                          "WiFi failed: %s\nTap Rescan.",
+                                          fail_reason);
+                }
             }
             if (ctx->wardrive_wigle_spinner) {
                 lv_obj_add_flag(ctx->wardrive_wigle_spinner, LV_OBJ_FLAG_HIDDEN);
@@ -20110,11 +20203,12 @@ static bool wardrive_wigle_ensure_wifi_connected(tab_context_t *ctx, tab_id_t ac
                                           ctx->wardrive_wigle_selected_ssid);
                 }
                 // Rebuild wifi_cmd with potentially new password
+                auth_mode = selected_open_network ? WIFI_CONNECT_AUTH_OPEN :
+                            (use_saved_password ? WIFI_CONNECT_AUTH_SAVED : WIFI_CONNECT_AUTH_PASSWORD);
                 if (!build_wifi_connect_command(wifi_cmd, sizeof(wifi_cmd),
                                                 ctx->wardrive_wigle_selected_ssid,
                                                 ctx->wardrive_wigle_selected_password,
-                                                use_saved_password ? WIFI_CONNECT_AUTH_SAVED
-                                                                   : WIFI_CONNECT_AUTH_PASSWORD)) {
+                                                auth_mode)) {
                     if (ctx->wardrive_wigle_status_label) {
                         lv_label_set_text(ctx->wardrive_wigle_status_label, "SSID/password too long.");
                     }
@@ -21465,6 +21559,7 @@ static void show_wardrive_upload_popup(tab_context_t *ctx, wardrive_upload_provi
     ctx->wardrive_upload_mode = WARDRIVE_UPLOAD_MODE_SELECTED;
     ctx->wardrive_wigle_task = NULL;
     ctx->wardrive_wigle_selected_ssid[0] = '\0';
+    ctx->wardrive_wigle_selected_security[0] = '\0';
     ctx->wardrive_wigle_selected_password[0] = '\0';
     ctx->wardrive_wigle_ssid_input = NULL;
     ctx->wardrive_wigle_password_input = NULL;
@@ -30453,6 +30548,7 @@ static void close_wpasec_popup(lv_event_t *e)
         ctx->wpasec_keyboard = NULL;
         ctx->wpasec_connect_btn = NULL;
         ctx->wpasec_selected_ssid[0] = '\0';
+        ctx->wpasec_selected_security[0] = '\0';
         ctx->wpasec_selected_password[0] = '\0';
         ctx->wpasec_password_known = false;
         ctx->wpasec_connect_ready = false;
@@ -30465,17 +30561,41 @@ static void close_wpasec_popup(lv_event_t *e)
 static void wpasec_network_row_click_cb(lv_event_t *e)
 {
     lv_obj_t *row = lv_event_get_target(e);
-    const char *ssid = (const char *)lv_event_get_user_data(e);
+    void *user_data = lv_event_get_user_data(e);
     tab_context_t *ctx = get_current_ctx();
-    if (!ctx || !ssid) return;
+    if (!ctx || !user_data) return;
+
+    const char *ssid = NULL;
+    const char *security = NULL;
+    if (user_data == (void *)wpasec_other_ssid_user_data) {
+        ssid = WPASEC_OTHER_SSID;
+    } else {
+        wifi_network_t *net = (wifi_network_t *)user_data;
+        ssid = net->ssid;
+        security = net->security;
+    }
+
+    if (!ssid) return;
 
     if (strlen(ssid) == 0) {
+        if (security) {
+            strncpy(ctx->wpasec_selected_security, security, sizeof(ctx->wpasec_selected_security) - 1);
+            ctx->wpasec_selected_security[sizeof(ctx->wpasec_selected_security) - 1] = '\0';
+        } else {
+            ctx->wpasec_selected_security[0] = '\0';
+        }
         show_hidden_ssid_popup(hidden_ssid_wpasec_confirm_cb);
         return;
     }
 
     strncpy(ctx->wpasec_selected_ssid, ssid, sizeof(ctx->wpasec_selected_ssid) - 1);
     ctx->wpasec_selected_ssid[sizeof(ctx->wpasec_selected_ssid) - 1] = '\0';
+    if (security) {
+        strncpy(ctx->wpasec_selected_security, security, sizeof(ctx->wpasec_selected_security) - 1);
+        ctx->wpasec_selected_security[sizeof(ctx->wpasec_selected_security) - 1] = '\0';
+    } else {
+        ctx->wpasec_selected_security[0] = '\0';
+    }
 
     // Highlight selected row, reset others
     if (ctx->wpasec_network_list) {
@@ -30532,6 +30652,8 @@ static void wpasec_connect_btn_cb(lv_event_t *e)
         if (text && strlen(text) > 0) {
             strncpy(ctx->wpasec_selected_password, text, sizeof(ctx->wpasec_selected_password) - 1);
             ctx->wpasec_selected_password[sizeof(ctx->wpasec_selected_password) - 1] = '\0';
+        } else {
+            ctx->wpasec_selected_password[0] = '\0';
         }
     }
 
@@ -30773,6 +30895,7 @@ static void wpasec_upload_task(void *arg)
 
         // Build network list UI
         ctx->wpasec_selected_ssid[0] = '\0';
+        ctx->wpasec_selected_security[0] = '\0';
         bsp_display_lock(0);
         if (ctx->wpasec_status_label) {
             lv_label_set_text_fmt(ctx->wpasec_status_label, "Found %d networks - select one:", wpasec_net_count);
@@ -30824,9 +30947,9 @@ static void wpasec_upload_task(void *arg)
                 lv_obj_set_style_text_font(info_lbl, &lv_font_montserrat_12, 0);
                 lv_obj_set_style_text_color(info_lbl, lv_color_hex(0x888888), 0);
 
-                // Store SSID pointer in the static array for callback
+                // Store network pointer in the static array for callback
                 lv_obj_add_event_cb(row, wpasec_network_row_click_cb, LV_EVENT_CLICKED,
-                                    (void *)wpasec_nets[i].ssid);
+                                    (void *)&wpasec_nets[i]);
             }
 
             // Manual entry option at the bottom
@@ -30851,7 +30974,7 @@ static void wpasec_upload_task(void *arg)
             lv_obj_set_style_text_font(other_info_lbl, &lv_font_montserrat_12, 0);
             lv_obj_set_style_text_color(other_info_lbl, lv_color_hex(0x888888), 0);
 
-            lv_obj_add_event_cb(other_row, wpasec_network_row_click_cb, LV_EVENT_CLICKED, (void *)WPASEC_OTHER_SSID);
+            lv_obj_add_event_cb(other_row, wpasec_network_row_click_cb, LV_EVENT_CLICKED, (void *)wpasec_other_ssid_user_data);
         }
         bsp_display_unlock();
 
@@ -30864,12 +30987,17 @@ static void wpasec_upload_task(void *arg)
         ESP_LOGI(TAG, "wpasec: user selected SSID: %s", ctx->wpasec_selected_ssid);
 
         bool manual_credentials = (strcmp(ctx->wpasec_selected_ssid, WPASEC_OTHER_SSID) == 0);
+        bool selected_open_network = wifi_network_security_is_open(ctx->wpasec_selected_security);
 
         // Remove network list to make room
         bsp_display_lock(0);
         if (ctx->wpasec_status_label) {
             if (manual_credentials) {
                 lv_label_set_text(ctx->wpasec_status_label, "Manual network selected\nEnter SSID and WiFi password:");
+            } else if (selected_open_network) {
+                lv_label_set_text_fmt(ctx->wpasec_status_label,
+                    "Selected open network: %s\nConnecting without password...",
+                    ctx->wpasec_selected_ssid);
             } else {
                 lv_label_set_text_fmt(ctx->wpasec_status_label, "Selected: %s\nChecking saved passwords...", ctx->wpasec_selected_ssid);
             }
@@ -30882,6 +31010,7 @@ static void wpasec_upload_task(void *arg)
 
         if (manual_credentials) {
             ctx->wpasec_selected_ssid[0] = '\0';
+            ctx->wpasec_selected_security[0] = '\0';
             ctx->wpasec_selected_password[0] = '\0';
             ctx->wpasec_password_known = false;
             ctx->wpasec_connect_ready = false;
@@ -30897,15 +31026,16 @@ static void wpasec_upload_task(void *arg)
             }
             if (!ctx->wpasec_task_running) goto done;
 
-            if (strlen(ctx->wpasec_selected_ssid) == 0 || strlen(ctx->wpasec_selected_password) == 0) {
+            if (strlen(ctx->wpasec_selected_ssid) == 0) {
                 bsp_display_lock(0);
                 if (ctx->wpasec_status_label) {
-                    lv_label_set_text(ctx->wpasec_status_label, "Enter SSID and password.");
+                    lv_label_set_text(ctx->wpasec_status_label, "Enter SSID.");
                 }
                 bsp_display_unlock();
                 goto done;
             }
-        } else {
+            selected_open_network = (ctx->wpasec_selected_password[0] == '\0');
+        } else if (!selected_open_network) {
             uart_flush_input(uart_port);
             uart_send_command_for_tab("show_pass evil");
             vTaskDelay(pdMS_TO_TICKS(200));
@@ -31022,48 +31152,100 @@ static void wpasec_upload_task(void *arg)
         }
         bsp_display_unlock();
 
-        char wifi_cmd[256];
-        if (!build_wifi_connect_command(wifi_cmd, sizeof(wifi_cmd),
-                                        ctx->wpasec_selected_ssid,
-                                        ctx->wpasec_selected_password,
-                                        ctx->wpasec_password_known ? WIFI_CONNECT_AUTH_SAVED
-                                                                   : WIFI_CONNECT_AUTH_PASSWORD)) {
-            bsp_display_lock(0);
-            if (ctx->wpasec_status_label) {
-                lv_label_set_text(ctx->wpasec_status_label, "SSID/password too long.");
-            }
-            bsp_display_unlock();
-            goto done;
-        }
-
-        uart_flush_input(uart_port);
-        uart_send_command_for_tab(wifi_cmd);
-        ESP_LOGI(TAG, "wpasec: sent wifi_connect for %s", ctx->wpasec_selected_ssid);
-
-        // Wait for SUCCESS/FAILED (up to 15 seconds)
-        total_len = 0;
         bool wifi_success = false;
-        int wifi_elapsed = 0;
-        int wifi_timeout = 15000;
+        bool retry_with_password = false;
+        do {
+            retry_with_password = false;
 
-        while (wifi_elapsed < wifi_timeout && total_len < (int)sizeof(rx_buf) - 256 && ctx->wpasec_task_running) {
-            int len = transport_read_bytes(uart_port, rx_buf + total_len,
-                                           sizeof(rx_buf) - total_len - 1, pdMS_TO_TICKS(200));
-            if (len > 0) {
-                total_len += len;
-                rx_buf[total_len] = '\0';
-                if (strstr(rx_buf, "SUCCESS") != NULL) {
-                    wifi_success = true;
-                    break;
+            char wifi_cmd[256];
+            wifi_connect_auth_mode_t auth_mode =
+                selected_open_network ? WIFI_CONNECT_AUTH_OPEN :
+                (ctx->wpasec_password_known ? WIFI_CONNECT_AUTH_SAVED : WIFI_CONNECT_AUTH_PASSWORD);
+            if (!build_wifi_connect_command(wifi_cmd, sizeof(wifi_cmd),
+                                            ctx->wpasec_selected_ssid,
+                                            ctx->wpasec_selected_password,
+                                            auth_mode)) {
+                bsp_display_lock(0);
+                if (ctx->wpasec_status_label) {
+                    lv_label_set_text(ctx->wpasec_status_label, "SSID/password too long.");
                 }
-                if (strstr(rx_buf, "FAILED") != NULL || strstr(rx_buf, "Error") != NULL) {
-                    break;
-                }
+                bsp_display_unlock();
+                goto done;
             }
-            wifi_elapsed += 200;
-        }
 
-        if (!ctx->wpasec_task_running) goto done;
+            uart_flush_input(uart_port);
+            uart_send_command_for_tab(wifi_cmd);
+            ESP_LOGI(TAG, "wpasec: sent wifi_connect for %s", ctx->wpasec_selected_ssid);
+
+            // Wait for SUCCESS/FAILED (up to 15 seconds)
+            total_len = 0;
+            wifi_success = false;
+            int wifi_elapsed = 0;
+            int wifi_timeout = 15000;
+
+            while (wifi_elapsed < wifi_timeout && total_len < (int)sizeof(rx_buf) - 256 && ctx->wpasec_task_running) {
+                int len = transport_read_bytes(uart_port, rx_buf + total_len,
+                                               sizeof(rx_buf) - total_len - 1, pdMS_TO_TICKS(200));
+                if (len > 0) {
+                    total_len += len;
+                    rx_buf[total_len] = '\0';
+                    if (strstr(rx_buf, "SUCCESS") != NULL) {
+                        wifi_success = true;
+                        break;
+                    }
+                    if (strstr(rx_buf, "FAILED") != NULL || strstr(rx_buf, "Error") != NULL) {
+                        break;
+                    }
+                }
+                wifi_elapsed += 200;
+            }
+
+            if (!ctx->wpasec_task_running) goto done;
+
+            if (!wifi_success && selected_open_network) {
+                selected_open_network = false;
+                ctx->wpasec_password_known = false;
+                ctx->wpasec_selected_password[0] = '\0';
+                ctx->wpasec_connect_ready = false;
+
+                bsp_display_lock(0);
+                if (ctx->wpasec_status_label) {
+                    lv_label_set_text(ctx->wpasec_status_label,
+                        "Open connect failed.\nEnter WiFi password, or Close.");
+                }
+                if (ctx->wpasec_popup) {
+                    wpasec_create_credentials_prompt(ctx, false);
+                }
+                bsp_display_unlock();
+
+                while (!ctx->wpasec_connect_ready && ctx->wpasec_task_running) {
+                    vTaskDelay(pdMS_TO_TICKS(100));
+                }
+                if (!ctx->wpasec_task_running) goto done;
+
+                if (strlen(ctx->wpasec_selected_password) == 0) {
+                    bsp_display_lock(0);
+                    if (ctx->wpasec_status_label) {
+                        lv_label_set_text(ctx->wpasec_status_label, "No password entered.");
+                    }
+                    bsp_display_unlock();
+                    goto done;
+                }
+
+                bsp_display_lock(0);
+                if (ctx->wpasec_keyboard) {
+                    lv_obj_del(ctx->wpasec_keyboard);
+                    ctx->wpasec_keyboard = NULL;
+                }
+                if (ctx->wpasec_status_label) {
+                    lv_label_set_text_fmt(ctx->wpasec_status_label,
+                                          "Retrying connection to %s...",
+                                          ctx->wpasec_selected_ssid);
+                }
+                bsp_display_unlock();
+                retry_with_password = true;
+            }
+        } while (retry_with_password && ctx->wpasec_task_running);
 
         if (wifi_success) {
             arp_wifi_connected = true;
@@ -31235,6 +31417,7 @@ static void show_wpasec_popup(void)
 
     // Reset WiFi-connect state
     ctx->wpasec_selected_ssid[0] = '\0';
+    ctx->wpasec_selected_security[0] = '\0';
     ctx->wpasec_selected_password[0] = '\0';
     ctx->wpasec_password_known = false;
     ctx->wpasec_connect_ready = false;
@@ -33528,6 +33711,28 @@ static bool build_wifi_connect_command(char *out, size_t out_sz, const char *ssi
     }
 
     return cmd_len >= 0 && cmd_len < (int)out_sz;
+}
+
+static bool wifi_network_security_is_open(const char *security)
+{
+    if (!security || security[0] == '\0') {
+        return true;
+    }
+    char upper[32];
+    size_t i = 0;
+    for (; security[i] && i < sizeof(upper) - 1; i++) {
+        upper[i] = (char)toupper((unsigned char)security[i]);
+    }
+    upper[i] = '\0';
+
+    if (strstr(upper, "OPEN") || strstr(upper, "UNKNOWN") || strstr(upper, "OWE")) {
+        return true;
+    }
+    if (strstr(upper, "WPA") || strstr(upper, "WEP") ||
+        strstr(upper, "SAE") || strstr(upper, "PSK")) {
+        return false;
+    }
+    return true;
 }
 
 static void beacon_spam_trim_whitespace(char *text)
@@ -38948,7 +39153,7 @@ static bool ota_prepare_wifi_command(char *cmd, size_t cmd_sz, bool start_ota)
         }
     }
 
-    bool use_saved = g_ota.selected_saved_password || !pass || pass[0] == '\0';
+    bool use_saved = g_ota.selected_saved_password;
     if (!ota_build_wifi_connect_cmd(cmd, cmd_sz, ssid, pass, use_saved,
                                     start_ota, manual, ip, nm, gw, dns)) {
         if (g_ota.page_status) lv_label_set_text(g_ota.page_status, "SSID/password too long");
@@ -38968,13 +39173,6 @@ static bool ota_build_wifi_connect_cmd(char *out, size_t out_sz, const char *ssi
 
     const char *ota_flag = start_ota ? " ota" : "";
     if (!manual) {
-        if (start_ota && !use_saved && (!password || password[0] == '\0')) {
-            char escaped_ssid[67];
-            beacon_spam_escape_quoted_arg(ssid, escaped_ssid, sizeof(escaped_ssid));
-            int cmd_len = snprintf(out, out_sz, "wifi_connect \"%s\" \"\"%s",
-                                   escaped_ssid, ota_flag);
-            return cmd_len >= 0 && cmd_len < (int)out_sz;
-        }
         wifi_connect_auth_mode_t mode = use_saved ? WIFI_CONNECT_AUTH_SAVED :
                                         ((password && password[0]) ? WIFI_CONNECT_AUTH_PASSWORD
                                                                   : WIFI_CONNECT_AUTH_OPEN);
@@ -39009,16 +39207,6 @@ static bool ota_build_wifi_connect_cmd(char *out, size_t out_sz, const char *ssi
                                escaped_ssid, escaped_password, ota_flag, ip, nm, gw);
         }
     } else {
-        if (start_ota) {
-            if (dns && dns[0]) {
-                cmd_len = snprintf(out, out_sz, "wifi_connect \"%s\" \"\"%s %s %s %s %s",
-                                   escaped_ssid, ota_flag, ip, nm, gw, dns);
-            } else {
-                cmd_len = snprintf(out, out_sz, "wifi_connect \"%s\" \"\"%s %s %s %s",
-                                   escaped_ssid, ota_flag, ip, nm, gw);
-            }
-            return cmd_len >= 0 && cmd_len < (int)out_sz;
-        }
         if (dns && dns[0]) {
             cmd_len = snprintf(out, out_sz, "wifi_connect \"%s\"%s %s %s %s %s",
                                escaped_ssid, ota_flag, ip, nm, gw, dns);
