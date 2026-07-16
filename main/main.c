@@ -47,7 +47,7 @@
 #include "esp_http_server.h"
 #include "lwip/sockets.h"
 
-#define JANOS_TAB_VERSION "1.5.0"
+#define JANOS_TAB_VERSION "1.5.1"
 #define JANOS_VERSION_REQUIRED "1.6.9"
 #include "lwip/netdb.h"
 #include <dirent.h>
@@ -56,7 +56,6 @@
 #include <sys/time.h>
 
 static const char *TAG = "wifi_scanner";
-extern const lv_image_dsc_t intro_splash_img;
 #if LV_USE_TINY_TTF
 extern const unsigned char lv_font_lato_regular_ttf[];
 extern const unsigned int lv_font_lato_regular_ttf_len;
@@ -1681,14 +1680,37 @@ static bool current_charging_status = false;
 // active tab. Only one overlay can be visible at a time so it stays a global.
 static lv_obj_t *scan_overlay = NULL;
 
-// Splash screen
+// Splash screen (procedural "demoscene" boot intro, no bitmap asset)
 static lv_obj_t *splash_screen = NULL;
-static lv_obj_t *splash_label = NULL;
-static lv_obj_t *splash_loading_label = NULL;
-static lv_obj_t *splash_detecting_label = NULL;
 static lv_timer_t *splash_timer = NULL;
-static int glitch_frame = 0;
 static bool splash_detection_started = false;
+
+// Procedural intro tuning + state
+#define INTRO_TICK_MS         40      // animation tick (~25 fps)
+#define INTRO_SCAN_TILE_W     4       // CRT scanline tile width  (procedurally filled)
+#define INTRO_SCAN_TILE_H     3       // CRT scanline tile height (1 dark row per tile)
+#define INTRO_DETECT_START_MS 1500    // when the (blocking) board detection kicks in
+#define INTRO_LOG_LINES       5       // boot-log slots
+
+static uint32_t splash_start_tick = 0;
+static bool     intro_finishing = false;
+static bool     intro_title_locked = false;
+static bool     intro_detection_done = false;
+static uint32_t intro_rng = 0x1a2b3c4du;
+static lv_timer_t *intro_finish_timer = NULL;
+static lv_obj_t *intro_scanlines = NULL;   // CRT scanline overlay (tiled ARGB tile)
+static lv_obj_t *intro_glitch_bar = NULL;  // occasional horizontal glitch strip
+static lv_obj_t *intro_title = NULL;       // "TAB5 Monster C5"
+static lv_obj_t *intro_title_glow = NULL;  // under-glow behind the title
+static lv_obj_t *intro_footer = NULL;      // "LAB5 - TAB5 version x.y.z"
+static lv_obj_t *intro_boot[INTRO_LOG_LINES] = { 0 };   // terminal boot-log lines
+static const char *intro_log_text[INTRO_LOG_LINES] = { 0 };
+static uint32_t intro_log_tick[INTRO_LOG_LINES] = { 0 };
+static int8_t   intro_boot_shown[INTRO_LOG_LINES];
+static int      intro_log_count = 0;
+static char     intro_link_buf[64];        // holds the concrete "MONSTER DETECTED @ ..." line
+static uint8_t  intro_scan_buf[INTRO_SCAN_TILE_W * INTRO_SCAN_TILE_H * 4];
+static lv_image_dsc_t intro_scan_dsc;
 
 // Screen timeout/dimming
 #define SCREEN_TIMEOUT_MS       30000  // 30 seconds (default, overridden by setting)
@@ -5456,68 +5478,326 @@ static void hide_evil_twin_loading_overlay(void) {
 }
 
 //==================================================================================
-// Startup Splash Screen Animation
+// Startup Splash Screen Animation  (procedural retro boot intro, rendered by LVGL)
 //==================================================================================
+//
+// The old fullscreen RGB565 bitmap (assets/intro/generated/intro_splash_img.c,
+// ~1.84 MB in flash) has been replaced by this fully procedural intro built from
+// native LVGL primitives only: a glitching terminal title ("TAB5 Monster C5"), an
+// event-driven boot log that reflects the real boot phase (init -> detect monster
+// -> result), a version footer and subtle CRT scanlines. No image assets.
+//
+// splash_timer_cb() drives the animation and, near the end, arms detection_timer
+// -> detection_complete_cb(), which runs board detection, prints the outcome in
+// the boot log, builds the real UI behind the splash and fades it away cleanly.
 
-// Splash timer callback - animates loading intro states
+// Boot-log lines are pushed as real events happen (init -> detect -> result),
+// each typed out terminal-style by intro_update_boot().
+static void intro_log_push(const char *text)
+{
+    if (intro_log_count >= INTRO_LOG_LINES) return;
+    int i = intro_log_count++;
+    intro_log_text[i]   = text;
+    intro_log_tick[i]   = lv_tick_get();
+    intro_boot_shown[i] = -1;
+    if (intro_boot[i]) lv_obj_clear_flag(intro_boot[i], LV_OBJ_FLAG_HIDDEN);
+}
+
+// Small, fast xorshift PRNG so glitch effects don't touch the system RNG.
+static uint32_t intro_rand(void)
+{
+    uint32_t x = intro_rng;
+    x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+    intro_rng = x ? x : 0x1a2b3c4du;
+    return intro_rng;
+}
+
+// --- teardown / transition helpers -------------------------------------------
+
+static void splash_teardown(void)
+{
+    if (splash_timer)       { lv_timer_del(splash_timer);       splash_timer = NULL; }
+    if (detection_timer)    { lv_timer_del(detection_timer);    detection_timer = NULL; }
+    if (intro_finish_timer) { lv_timer_del(intro_finish_timer); intro_finish_timer = NULL; }
+    if (splash_screen)      { lv_obj_del(splash_screen);        splash_screen = NULL; }
+
+    // All the elements below were children of splash_screen and are now gone.
+    intro_scanlines = NULL;
+    intro_glitch_bar = NULL;
+    intro_title = NULL;
+    intro_title_glow = NULL;
+    intro_footer = NULL;
+    for (int k = 0; k < INTRO_LOG_LINES; k++) intro_boot[k] = NULL;
+    intro_finishing = false;
+    // intro_scan_buf is static storage, nothing to free.
+}
+
+static void intro_anim_opa_cb(void *var, int32_t v)
+{
+    lv_obj_set_style_opa((lv_obj_t *)var, (lv_opa_t)v, 0);
+}
+static void intro_fade_done_cb(lv_anim_t *a)
+{
+    (void)a;
+    splash_teardown();
+}
+
+// Gentle fade of the whole splash to reveal the real UI (no screen-fill flash).
+static void intro_start_finish_anim(void)
+{
+    if (intro_finishing) return;
+    intro_finishing = true;
+    if (splash_timer)       { lv_timer_del(splash_timer);       splash_timer = NULL; }
+    if (intro_finish_timer) { lv_timer_del(intro_finish_timer); intro_finish_timer = NULL; }
+
+    if (!splash_screen) { splash_teardown(); return; }
+
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, splash_screen);
+    lv_anim_set_exec_cb(&a, intro_anim_opa_cb);
+    lv_anim_set_values(&a, LV_OPA_COVER, LV_OPA_TRANSP);
+    lv_anim_set_time(&a, 340);
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_in);
+    lv_anim_set_ready_cb(&a, intro_fade_done_cb);
+    lv_anim_start(&a);
+}
+
+// Fires after a short readable window so the result lines can type out.
+static void intro_finish_cb(lv_timer_t *timer)
+{
+    (void)timer;
+    intro_finish_timer = NULL;
+    intro_start_finish_anim();
+}
+
+// Skip on tap: force pending detection now, or fade out if detection is done.
+static void intro_skip_cb(lv_event_t *e)
+{
+    (void)e;
+    if (intro_finishing) return;
+    if (intro_detection_done) {
+        intro_start_finish_anim();
+        return;
+    }
+    if (!splash_detection_started) {
+        splash_detection_started = true;
+        intro_log_push("> DETECTING MONSTER");
+        if (detection_timer) { lv_timer_del(detection_timer); detection_timer = NULL; }
+        detection_timer = lv_timer_create(detection_complete_cb, 60, NULL);
+        lv_timer_set_repeat_count(detection_timer, 1);
+    }
+    // else: detection already in flight, let it finish on its own.
+}
+
+// --- scene builders ----------------------------------------------------------
+
+static void intro_build_title(lv_obj_t *parent, int w, int h)
+{
+    (void)w; (void)h;
+
+    intro_title_glow = lv_label_create(parent);
+    lv_obj_set_style_text_font(intro_title_glow, &lv_font_montserrat_48, 0);
+    lv_obj_set_style_text_color(intro_title_glow, lv_color_hex(0x18FF9B), 0);
+    lv_obj_set_style_text_letter_space(intro_title_glow, 3, 0);
+    lv_label_set_text_static(intro_title_glow, "TAB5 Monster C5");
+    lv_obj_align(intro_title_glow, LV_ALIGN_CENTER, 0, -138);
+    lv_obj_add_flag(intro_title_glow, LV_OBJ_FLAG_HIDDEN);
+
+    intro_title = lv_label_create(parent);
+    lv_obj_set_style_text_font(intro_title, &lv_font_montserrat_48, 0);
+    lv_obj_set_style_text_color(intro_title, lv_color_hex(0x66F5FF), 0);
+    lv_obj_set_style_text_letter_space(intro_title, 3, 0);
+    lv_label_set_text_static(intro_title, "TAB5 Monster C5");
+    lv_obj_align(intro_title, LV_ALIGN_CENTER, 0, -140);
+    lv_obj_add_flag(intro_title, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void intro_build_boot(lv_obj_t *parent, int w, int h)
+{
+    (void)w;
+    for (int k = 0; k < INTRO_LOG_LINES; k++) {
+        intro_boot[k] = lv_label_create(parent);
+        lv_obj_set_style_text_font(intro_boot[k], &lv_font_montserrat_18, 0);
+        lv_obj_set_style_text_color(intro_boot[k], lv_color_hex(0x35FF7A), 0);
+        lv_obj_set_style_text_letter_space(intro_boot[k], 1, 0);
+        lv_label_set_text_static(intro_boot[k], "");
+        lv_obj_align(intro_boot[k], LV_ALIGN_TOP_LEFT, 60, (h * 46) / 100 + k * 42);
+        lv_obj_add_flag(intro_boot[k], LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void intro_build_footer(lv_obj_t *parent, int w, int h)
+{
+    (void)w; (void)h;
+    intro_footer = lv_label_create(parent);
+    lv_obj_set_style_text_font(intro_footer, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(intro_footer, lv_color_hex(0x5FB8C8), 0);
+    lv_obj_set_style_text_letter_space(intro_footer, 2, 0);
+    lv_label_set_text_static(intro_footer, "LAB5 - TAB5 version " JANOS_TAB_VERSION);
+    lv_obj_align(intro_footer, LV_ALIGN_BOTTOM_MID, 0, -34);
+    lv_obj_set_style_text_opa(intro_footer, LV_OPA_TRANSP, 0);
+    lv_obj_add_flag(intro_footer, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void intro_build_glitch(lv_obj_t *parent, int w, int h)
+{
+    (void)h;
+    intro_glitch_bar = lv_obj_create(parent);
+    lv_obj_remove_style_all(intro_glitch_bar);
+    lv_obj_set_size(intro_glitch_bar, w, 6);
+    lv_obj_set_pos(intro_glitch_bar, 0, 0);
+    lv_obj_clear_flag(intro_glitch_bar, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_bg_color(intro_glitch_bar, lv_color_hex(0x9CFBFF), 0);
+    lv_obj_set_style_bg_opa(intro_glitch_bar, LV_OPA_TRANSP, 0);
+    lv_obj_add_flag(intro_glitch_bar, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void intro_build_scanlines(lv_obj_t *parent, int w, int h)
+{
+    // Fill a tiny ARGB8888 tile in code: one dark, semi-transparent row per tile.
+    lv_color32_t *px = (lv_color32_t *)intro_scan_buf;
+    for (int y = 0; y < INTRO_SCAN_TILE_H; y++) {
+        for (int x = 0; x < INTRO_SCAN_TILE_W; x++) {
+            lv_color32_t c;
+            c.red = 0; c.green = 0; c.blue = 0;
+            c.alpha = (y == 0) ? 95 : 0;
+            px[y * INTRO_SCAN_TILE_W + x] = c;
+        }
+    }
+    memset(&intro_scan_dsc, 0, sizeof(intro_scan_dsc));
+    intro_scan_dsc.header.magic  = LV_IMAGE_HEADER_MAGIC;
+    intro_scan_dsc.header.cf     = LV_COLOR_FORMAT_ARGB8888;
+    intro_scan_dsc.header.w      = INTRO_SCAN_TILE_W;
+    intro_scan_dsc.header.h      = INTRO_SCAN_TILE_H;
+    intro_scan_dsc.header.stride = INTRO_SCAN_TILE_W * 4;
+    intro_scan_dsc.data          = intro_scan_buf;
+    intro_scan_dsc.data_size     = sizeof(intro_scan_buf);
+
+    intro_scanlines = lv_obj_create(parent);
+    lv_obj_remove_style_all(intro_scanlines);
+    lv_obj_set_size(intro_scanlines, w, h);
+    lv_obj_set_pos(intro_scanlines, 0, 0);
+    lv_obj_clear_flag(intro_scanlines, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_bg_opa(intro_scanlines, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_bg_image_src(intro_scanlines, &intro_scan_dsc, 0);
+    lv_obj_set_style_bg_image_tiled(intro_scanlines, true, 0);
+}
+
+// --- per-frame updates -------------------------------------------------------
+
+static void intro_update_title(uint32_t el)
+{
+    if (!intro_title) return;
+    if (el < 60) return;
+
+    // The full title is set at build time; here we just reveal it (no scramble).
+    if (!intro_title_locked) {
+        intro_title_locked = true;
+        lv_obj_clear_flag(intro_title, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(intro_title_glow, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    // Quick fade-in, then a gentle ambient glow pulse behind the text.
+    int a = (int)el - 60;
+    int opa = (a > 250) ? 255 : a * 255 / 250;
+    lv_obj_set_style_text_opa(intro_title, (lv_opa_t)opa, 0);
+
+    float ph = (float)el / 1400.0f;
+    int g = 26 + (int)(40.0f * (0.5f + 0.5f * sinf(ph * 6.2831853f)));
+    lv_obj_set_style_text_opa(intro_title_glow, (lv_opa_t)(g * opa / 255), 0);
+}
+
+static void intro_update_footer(uint32_t el)
+{
+    if (!intro_footer) return;
+    if (el < 150) return;
+    lv_obj_clear_flag(intro_footer, LV_OBJ_FLAG_HIDDEN);
+    int a = (int)el - 150;
+    int opa = (a > 400) ? 200 : a * 200 / 400;  // fade in, settle muted
+    lv_obj_set_style_text_opa(intro_footer, (lv_opa_t)opa, 0);
+}
+
+// Show each pushed boot-log line as a whole, with a gentle fade-in (no typing).
+static void intro_update_boot(void)
+{
+    for (int i = 0; i < intro_log_count; i++) {
+        if (!intro_boot[i] || !intro_log_text[i]) continue;
+        if (intro_boot_shown[i] != 1) {
+            intro_boot_shown[i] = 1;
+            lv_label_set_text(intro_boot[i], intro_log_text[i]);
+            lv_obj_clear_flag(intro_boot[i], LV_OBJ_FLAG_HIDDEN);
+        }
+        int a = (int)lv_tick_elaps(intro_log_tick[i]);
+        int opa = (a > 180) ? 255 : a * 255 / 180;
+        lv_obj_set_style_text_opa(intro_boot[i], (lv_opa_t)opa, 0);
+    }
+}
+
+static void intro_update_glitch(uint32_t el)
+{
+    if (!intro_glitch_bar) return;
+    if (el > 150 && (intro_rand() % 100) < 5) {
+        int w = lv_disp_get_hor_res(NULL);
+        int h = lv_disp_get_ver_res(NULL);
+        int y = (int)(intro_rand() % (uint32_t)h);
+        int bh = 3 + (int)(intro_rand() % 8);
+        lv_obj_set_pos(intro_glitch_bar, 0, y);
+        lv_obj_set_size(intro_glitch_bar, w, bh);
+        lv_obj_set_style_bg_opa(intro_glitch_bar, (lv_opa_t)(40 + intro_rand() % 90), 0);
+        lv_obj_clear_flag(intro_glitch_bar, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(intro_glitch_bar, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+// Intro animation tick: drives the title/footer/glitch, feeds the boot log with
+// the current phase, and arms board detection near the end.
 static void splash_timer_cb(lv_timer_t *timer)
 {
     (void)timer;
+    if (intro_finishing) return;
 
-    glitch_frame++;
+    uint32_t el = lv_tick_elaps(splash_start_tick);
 
-    // Animated loading text with moving dots + blink.
-    if (splash_loading_label) {
-        static const char *loading_frames[] = {
-            "LOADING",
-            "LOADING.",
-            "LOADING..",
-            "LOADING..."
-        };
-        lv_label_set_text(splash_loading_label, loading_frames[(glitch_frame / 3) % 4]);
-        lv_obj_set_style_text_opa(splash_loading_label, (glitch_frame % 10 < 6) ? LV_OPA_100 : LV_OPA_60, 0);
-    }
+    intro_update_title(el);
+    intro_update_footer(el);
+    intro_update_boot();
+    intro_update_glitch(el);
 
-    // Show "Detecting devices..." on the same intro screen, then start detection.
-    if (glitch_frame >= 22 && splash_detecting_label) {
-        lv_obj_clear_flag(splash_detecting_label, LV_OBJ_FLAG_HIDDEN);
-    }
+    // Boot-log lines appear as the boot phases progress.
+    if (el >= 100 && intro_log_count == 0) intro_log_push("> INITIALIZING TAB5 CORE");
+    if (el >= 650 && intro_log_count == 1) intro_log_push("> LOADING SUBSYSTEMS");
 
-    if (!splash_detection_started && glitch_frame >= 28) {
+    if (!splash_detection_started && el >= INTRO_DETECT_START_MS) {
         splash_detection_started = true;
+        intro_log_push("> DETECTING MONSTER");
         if (detection_timer) {
             lv_timer_del(detection_timer);
             detection_timer = NULL;
         }
-        detection_timer = lv_timer_create(detection_complete_cb, 700, NULL);
+        detection_timer = lv_timer_create(detection_complete_cb, 400, NULL);
         lv_timer_set_repeat_count(detection_timer, 1);
     }
 }
 
-// Detection complete callback - called after waiting for devices to stabilize
+// Detection complete callback - runs detection, reports it in the boot log,
+// builds the real UI behind the splash and schedules the closing fade.
 static void detection_complete_cb(lv_timer_t *timer)
 {
     (void)timer;
     detection_timer = NULL;
 
+    if (intro_detection_done || intro_finishing) return;
+
     ESP_LOGI(TAG, "Detection timer complete, running board detection");
 
-    if (splash_timer) {
-        lv_timer_del(splash_timer);
-        splash_timer = NULL;
-    }
-
-    // Run board detection
+    // Run board detection (blocking UART probes).
     detect_boards();
-
-    // Check SD card presence on all detected devices
     check_all_sd_cards();
-
-    // Check JanOS firmware version on all detected devices
     check_all_versions();
-
-    // Probe Sub-GHz module availability per tab (sets ctx->has_subghz).
     check_all_subghz_status();
+    intro_detection_done = true;
 
     ESP_LOGI(TAG, "Detection complete: uart1=%d, mbus=%d, grove=%d, usb=%d",
              uart1_detected, mbus_detected, grove_detected, usb_detected);
@@ -5528,16 +5808,19 @@ static void detection_complete_cb(lv_timer_t *timer)
         detection_popup_overlay = NULL;
     }
 
-    // Remove splash screen after integrated intro+loading+detecting flow.
-    if (splash_screen) {
-        lv_obj_del(splash_screen);
-        splash_screen = NULL;
-        splash_label = NULL;
-        splash_loading_label = NULL;
-        splash_detecting_label = NULL;
+    // Report the result concretely (which link the Monster answered on).
+    if (!uart1_detected && !mbus_detected) {
+        intro_log_push("> MONSTER NOT FOUND");
+    } else {
+        snprintf(intro_link_buf, sizeof(intro_link_buf), "> MONSTER DETECTED @%s%s%s",
+                 mbus_detected ? " M-BUS" : "",
+                 (uart1_detected || grove_detected) ? " GROVE" : "",
+                 usb_detected ? " USB" : "");
+        intro_log_push(intro_link_buf);
     }
+    intro_log_push("> SYSTEM READY");
 
-    // Show appropriate UI based on detection results
+    // Build the real UI *behind* the still-visible splash so the fade reveals it.
     if (!uart1_detected && !mbus_detected) {
         ESP_LOGI(TAG, "No boards detected - showing popup");
         show_no_board_popup();
@@ -5546,6 +5829,12 @@ static void detection_complete_cb(lv_timer_t *timer)
         show_main_tiles();
         show_version_mismatch_popup();
     }
+    if (splash_screen) lv_obj_move_foreground(splash_screen);
+
+    // Keep the intro up briefly so the result lines type out, then fade away.
+    if (intro_finish_timer) { lv_timer_del(intro_finish_timer); intro_finish_timer = NULL; }
+    intro_finish_timer = lv_timer_create(intro_finish_cb, 900, NULL);
+    lv_timer_set_repeat_count(intro_finish_timer, 1);
 }
 
 static void play_startup_beep(void)
@@ -5709,55 +5998,43 @@ static void play_startup_beep(void)
     vTaskDelete(NULL);
 }
 
-// Show splash screen with C5Lab glitch animation
+// Show the procedural retro boot intro (all LVGL primitives, no bitmap asset).
 static void show_splash_screen(void)
 {
-    ESP_LOGI(TAG, "Showing splash screen...");
+    ESP_LOGI(TAG, "Showing procedural boot intro...");
 
-    glitch_frame = 0;
     splash_detection_started = false;
+    intro_finishing = false;
+    intro_title_locked = false;
+    intro_detection_done = false;
+    intro_log_count = 0;
+    for (int k = 0; k < INTRO_LOG_LINES; k++) { intro_boot_shown[k] = -1; intro_log_text[k] = NULL; }
+    splash_start_tick = lv_tick_get();
 
-    // Create full-screen black background
+    int w = lv_disp_get_hor_res(NULL);
+    int h = lv_disp_get_ver_res(NULL);
+
+    // Near-black full-screen backdrop; tappable to skip the intro.
     splash_screen = lv_obj_create(lv_scr_act());
     lv_obj_remove_style_all(splash_screen);
-    lv_obj_set_size(splash_screen, lv_pct(100), lv_pct(100));
-    lv_obj_set_style_bg_color(splash_screen, lv_color_hex(0x000000), 0);
+    lv_obj_set_size(splash_screen, w, h);
+    lv_obj_set_style_bg_color(splash_screen, lv_color_hex(0x02040A), 0);
     lv_obj_set_style_bg_opa(splash_screen, LV_OPA_COVER, 0);
     lv_obj_clear_flag(splash_screen, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(splash_screen, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(splash_screen, intro_skip_cb, LV_EVENT_CLICKED, NULL);
 
-    // Fullscreen intro image (LVGL RGB565 C array)
-    lv_obj_t *splash_image = lv_image_create(splash_screen);
-    lv_image_set_src(splash_image, &intro_splash_img);
-    lv_obj_align(splash_image, LV_ALIGN_CENTER, 0, 0);
+    // Build layers bottom-to-top: title -> boot log -> footer -> glitch -> CRT.
+    intro_build_title(splash_screen, w, h);
+    intro_build_boot(splash_screen, w, h);
+    intro_build_footer(splash_screen, w, h);
+    intro_build_glitch(splash_screen, w, h);
+    intro_build_scanlines(splash_screen, w, h);
 
-    // Bottom text stack: LAB5 -> LOADING... -> Detecting devices...
-    bool tall_layout = lv_disp_get_ver_res(NULL) >= 1000;
-
-    splash_label = lv_label_create(splash_screen);
-    lv_label_set_text(splash_label, "LAB5");
-    lv_obj_set_style_text_font(splash_label, tall_layout ? &lv_font_montserrat_40 : &lv_font_montserrat_32, 0);
-    lv_obj_set_style_text_color(splash_label, COLOR_LAB5_MAGENTA, 0);
-    lv_obj_set_style_text_letter_space(splash_label, 2, 0);
-    lv_obj_align(splash_label, LV_ALIGN_BOTTOM_MID, 0, tall_layout ? -150 : -95);
-
-    splash_loading_label = lv_label_create(splash_screen);
-    lv_label_set_text(splash_loading_label, "LOADING...");
-    lv_obj_set_style_text_font(splash_loading_label, tall_layout ? &lv_font_montserrat_22 : &lv_font_montserrat_18, 0);
-    lv_obj_set_style_text_color(splash_loading_label, lv_color_hex(0xD8D8D8), 0);
-    lv_obj_align(splash_loading_label, LV_ALIGN_BOTTOM_MID, 0, tall_layout ? -112 : -64);
-
-    splash_detecting_label = lv_label_create(splash_screen);
-    lv_label_set_text(splash_detecting_label, "Detecting devices...");
-    lv_obj_set_style_text_font(splash_detecting_label, tall_layout ? &lv_font_montserrat_20 : &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(splash_detecting_label, lv_color_hex(0x9FE7D8), 0);
-    lv_obj_align(splash_detecting_label, LV_ALIGN_BOTTOM_MID, 0, tall_layout ? -80 : -38);
-    lv_obj_add_flag(splash_detecting_label, LV_OBJ_FLAG_HIDDEN);
-
-    // Start intro animation timer (100ms gives readable loading/dot dynamics).
-    splash_timer = lv_timer_create(splash_timer_cb, 100, NULL);
+    splash_timer = lv_timer_create(splash_timer_cb, INTRO_TICK_MS, NULL);
 
     if (boot_sound_mode != BOOT_SOUND_MODE_OFF) {
-        // Play startup melody in background task to not block UI
+        // Play startup melody in background task to not block UI (unchanged).
         xTaskCreate(
             (TaskFunction_t)play_startup_beep,
             "melody",
@@ -40117,6 +40394,15 @@ void app_main(void)
         ESP_LOGE(TAG, "Failed to initialize display");
         return;
     }
+
+    // Paint the base screen dark and flush it *before* the backlight comes on, so
+    // the very first visible frame is already dark. Otherwise the default (light)
+    // LVGL screen flashes/fills white for a moment before the boot intro appears.
+    bsp_display_lock(0);
+    lv_obj_set_style_bg_color(lv_scr_act(), lv_color_hex(0x02040A), 0);
+    lv_obj_set_style_bg_opa(lv_scr_act(), LV_OPA_COVER, 0);
+    lv_refr_now(disp);
+    bsp_display_unlock();
 
     // Set display brightness from saved setting with gamma correction
     set_brightness_gamma(screen_brightness_setting);

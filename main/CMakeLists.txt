@@ -1,7 +1,6 @@
 idf_component_register(SRCS
                     "main.c"
                     "lv_font_lato_regular_ttf.c"
-                    "../assets/intro/generated/intro_splash_img.c"
                     "screens/psram_dynarr.c"
                     "screens/subghz_parser.c"
                     "screens/subghz_signal_list.c"
