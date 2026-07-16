@@ -47,8 +47,8 @@
 #include "esp_http_server.h"
 #include "lwip/sockets.h"
 
-#define JANOS_TAB_VERSION "1.4.3"
-#define JANOS_VERSION_REQUIRED "1.6.8"
+#define JANOS_TAB_VERSION "1.5.0"
+#define JANOS_VERSION_REQUIRED "1.6.9"
 #include "lwip/netdb.h"
 #include <dirent.h>
 #include <sys/stat.h>
@@ -292,6 +292,8 @@ typedef struct {
 #define WARDRIVE_WIGLE_PAGE_SIZE  20
 #define WARDRIVE_WIGLE_PATH_MAX  160
 #define WARDRIVE_WIGLE_OTHER_SSID "__WARDRIVE_WIGLE_OTHER__"
+static const char wpasec_other_ssid_user_data[] = WPASEC_OTHER_SSID;
+static const char wardrive_wigle_other_ssid_user_data[] = WARDRIVE_WIGLE_OTHER_SSID;
 typedef struct {
     char path[WARDRIVE_WIGLE_PATH_MAX];
     char name[96];
@@ -708,6 +710,7 @@ typedef struct {
     volatile bool wardrive_wigle_rescan_requested;
     bool wardrive_wigle_upload_done;
     char wardrive_wigle_selected_ssid[33];
+    char wardrive_wigle_selected_security[24];
     char wardrive_wigle_selected_password[65];
     wardrive_wigle_file_t *wardrive_wigle_files; // PSRAM alloc, NULL when popup closed
     wardrive_file_summary_t wardrive_file_summary;
@@ -843,6 +846,7 @@ typedef struct {
     lv_obj_t *wpasec_keyboard;
     lv_obj_t *wpasec_connect_btn;
     char wpasec_selected_ssid[33];
+    char wpasec_selected_security[24];
     char wpasec_selected_password[65];
     volatile bool wpasec_password_known;
     volatile bool wpasec_connect_ready;   // set by Connect button callback
@@ -1012,6 +1016,9 @@ typedef struct {
 
     // JanOS firmware version (detected via 'version' command or boot banner snoop)
     char janos_version[16];
+    char janos_app_project[32];
+    char janos_app_version[64];
+    char janos_app_build[80];
     bool janos_version_mismatch;
     bool janos_board_ready;
 
@@ -2238,6 +2245,7 @@ static void janos_feed_bytes(tab_context_t *ctx, const char *uart_name,
 static void janos_consume_line(tab_context_t *ctx, const char *line, const char *uart_name);
 static void janos_copy_version_token(const char *src, char *dst);
 static void show_version_mismatch_popup(void);
+static void show_ota_page(void);
 static void show_no_board_popup(void);
 static void board_detect_retry_cb(lv_timer_t *timer);
 static void board_detect_popup_close_cb(lv_event_t *e);
@@ -2257,6 +2265,7 @@ static uart_port_t get_current_uart(void);
 static void uart_send_command_for_tab(const char *cmd);
 static bool build_wifi_connect_command(char *out, size_t out_sz, const char *ssid,
                                        const char *password, wifi_connect_auth_mode_t mode);
+static bool wifi_network_security_is_open(const char *security);
 static void show_blackout_confirm_popup(void);
 static void blackout_confirm_yes_cb(lv_event_t *e);
 static void blackout_confirm_no_cb(lv_event_t *e);
@@ -8027,7 +8036,7 @@ static void mitm_connect_and_start_cb(lv_event_t *e)
     int idx = v.sel_indices[0];
     if (idx < 0 || idx >= v.net_count) return;
     const char *ssid = v.nets[idx].ssid;
-    bool is_open = (strstr(v.nets[idx].security, "OPEN") != NULL || v.nets[idx].security[0] == '\0');
+    bool is_open = wifi_network_security_is_open(v.nets[idx].security);
 
     const char *password = NULL;
     if (ctx->mitm_password_input) {
@@ -9047,7 +9056,7 @@ static void arp_connect_cb(lv_event_t *e)
 {
     (void)e;
 
-    bool is_open = (strstr(arp_target_security, "OPEN") != NULL || arp_target_security[0] == '\0');
+    bool is_open = wifi_network_security_is_open(arp_target_security);
     const char *password = NULL;
 
     // Check if we have a saved password (from Evil Twin database).
@@ -9594,7 +9603,7 @@ static void nmap_connect_cb(lv_event_t *e)
 {
     (void)e;
 
-    bool is_open = (strstr(nmap_target_security, "OPEN") != NULL || nmap_target_security[0] == '\0');
+    bool is_open = wifi_network_security_is_open(nmap_target_security);
     const char *password = NULL;
 
     if (strlen(nmap_target_password) > 0) {
@@ -9628,9 +9637,9 @@ static void nmap_connect_cb(lv_event_t *e)
 
     char cmd[256];
     wifi_connect_auth_mode_t auth_mode = WIFI_CONNECT_AUTH_OPEN;
-    if (!is_open && strlen(nmap_target_password) > 0) {
+    if (strlen(nmap_target_password) > 0) {
         auth_mode = WIFI_CONNECT_AUTH_SAVED;
-    } else if (!is_open && password != NULL && strlen(password) > 0) {
+    } else if (password != NULL && strlen(password) > 0) {
         auth_mode = WIFI_CONNECT_AUTH_PASSWORD;
     }
     if (!build_wifi_connect_command(cmd, sizeof(cmd), nmap_target_ssid, password, auth_mode)) {
@@ -10477,7 +10486,7 @@ static void show_nmap_page(void)
     lv_obj_set_style_text_font(target_label, &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_color(target_label, lv_color_hex(0xCCCCCC), 0);
 
-    bool is_open_network = (strstr(nmap_target_security, "OPEN") != NULL || nmap_target_security[0] == '\0');
+    bool is_open_network = wifi_network_security_is_open(nmap_target_security);
     bool password_known = false;
 
     if (!is_open_network) {
@@ -10555,6 +10564,33 @@ static void show_nmap_page(void)
         lv_label_set_text(open_label, LV_SYMBOL_WARNING "  Open Network (no password required)");
         lv_obj_set_style_text_font(open_label, &lv_font_montserrat_14, 0);
         lv_obj_set_style_text_color(open_label, COLOR_MATERIAL_AMBER, 0);
+
+        lv_obj_t *pass_left = lv_obj_create(pass_section);
+        lv_obj_set_size(pass_left, lv_pct(100), LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_opa(pass_left, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(pass_left, 0, 0);
+        lv_obj_set_style_pad_all(pass_left, 0, 0);
+        lv_obj_set_flex_flow(pass_left, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(pass_left, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_column(pass_left, 10, 0);
+        lv_obj_clear_flag(pass_left, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *pass_label = lv_label_create(pass_left);
+        lv_label_set_text(pass_label, "Password:");
+        lv_obj_set_style_text_font(pass_label, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(pass_label, lv_color_hex(0xFFFFFF), 0);
+
+        nmap_password_input = lv_textarea_create(pass_left);
+        lv_obj_set_size(nmap_password_input, 300, 40);
+        lv_textarea_set_one_line(nmap_password_input, true);
+        lv_textarea_set_placeholder_text(nmap_password_input, "Optional");
+        lv_textarea_set_password_mode(nmap_password_input, true);
+        lv_textarea_set_password_show_time(nmap_password_input, WPASEC_PASSWORD_SHOW_MS);
+        lv_obj_set_style_bg_color(nmap_password_input, lv_color_hex(0x1A1A1A), 0);
+        lv_obj_set_style_border_color(nmap_password_input, COLOR_MATERIAL_GREEN, 0);
+        lv_obj_set_style_border_width(nmap_password_input, 1, 0);
+        lv_obj_set_style_text_color(nmap_password_input, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_add_event_cb(nmap_password_input, nmap_password_input_cb, LV_EVENT_CLICKED, NULL);
 
         lv_obj_t *btn_row = lv_obj_create(pass_section);
         lv_obj_set_size(btn_row, lv_pct(100), LV_SIZE_CONTENT);
@@ -10690,7 +10726,7 @@ static void show_nmap_page(void)
     // Status label
     nmap_status_label = lv_label_create(nmap_page);
     if (is_open_network) {
-        lv_label_set_text(nmap_status_label, "Press Connect to join open network");
+        lv_label_set_text(nmap_status_label, "Press Connect to try open, or enter password");
     } else if (password_known) {
         lv_label_set_text(nmap_status_label, "Press Connect to join network");
     } else {
@@ -10717,7 +10753,7 @@ static void show_nmap_page(void)
     lv_obj_set_style_text_color(placeholder, lv_color_hex(0x888888), 0);
 
     // Keyboard (hidden, for password entry)
-    if (!is_open_network && !password_known) {
+    if (nmap_password_input && !password_known) {
         nmap_keyboard = lv_keyboard_create(nmap_page);
         lv_obj_set_size(nmap_keyboard, lv_pct(100), 200);
         lv_obj_add_flag(nmap_keyboard, LV_OBJ_FLAG_HIDDEN);
@@ -10817,7 +10853,7 @@ static void show_arp_poison_page(void)
     lv_obj_set_style_text_font(target_label, &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_color(target_label, lv_color_hex(0xCCCCCC), 0);
 
-    bool is_open_network = (strstr(arp_target_security, "OPEN") != NULL || arp_target_security[0] == '\0');
+    bool is_open_network = wifi_network_security_is_open(arp_target_security);
 
     // Check if password is known from Evil Twin database (only in manual mode, non-open)
     bool password_known = false;
@@ -17454,7 +17490,7 @@ static void update_wardrive_table(tab_context_t *ctx)
             lv_obj_set_style_text_color(sec_lbl, COLOR_MATERIAL_GREEN, 0);
         } else if (strstr(net->security, "WPA2") != NULL || strstr(net->security, "WPA_") != NULL) {
             lv_obj_set_style_text_color(sec_lbl, COLOR_MATERIAL_AMBER, 0);
-        } else if (strstr(net->security, "OPEN") != NULL || net->security[0] == '\0') {
+        } else if (wifi_network_security_is_open(net->security)) {
             lv_obj_set_style_text_color(sec_lbl, COLOR_MATERIAL_RED, 0);
         } else {
             lv_obj_set_style_text_color(sec_lbl, COLOR_MATERIAL_AMBER, 0);
@@ -17594,6 +17630,7 @@ static void close_wardrive_wigle_provider_popup(tab_context_t *ctx)
     ctx->wardrive_wigle_retry_requested = false;
     ctx->wardrive_wigle_rescan_requested = false;
     ctx->wardrive_wigle_selected_ssid[0] = '\0';
+    ctx->wardrive_wigle_selected_security[0] = '\0';
     ctx->wardrive_wigle_selected_password[0] = '\0';
     ctx->wardrive_upload_provider = WARDRIVE_UPLOAD_PROVIDER_NONE;
     ctx->wardrive_upload_mode = WARDRIVE_UPLOAD_MODE_SELECTED;
@@ -19159,6 +19196,7 @@ static void wardrive_wigle_start_upload(tab_context_t *ctx, wardrive_upload_mode
     ctx->wardrive_upload_mode = mode;
     ctx->wardrive_wigle_connect_ready = false;
     ctx->wardrive_wigle_selected_ssid[0] = '\0';
+    ctx->wardrive_wigle_selected_security[0] = '\0';
     ctx->wardrive_wigle_selected_password[0] = '\0';
     ctx->wardrive_wigle_task_running = true;
     wardrive_wigle_update_send_btn(ctx);
@@ -19242,19 +19280,47 @@ static void wardrive_wigle_stop_btn_cb(lv_event_t *e)
 static void wardrive_wigle_network_row_click_cb(lv_event_t *e)
 {
     lv_obj_t *row = lv_event_get_target(e);
-    const char *ssid = (const char *)lv_event_get_user_data(e);
+    void *user_data = lv_event_get_user_data(e);
     tab_context_t *ctx = get_current_ctx();
-    if (!ctx || !ssid) {
+    if (!ctx || !user_data) {
+        return;
+    }
+
+    const char *ssid = NULL;
+    const char *security = NULL;
+    if (user_data == (void *)wardrive_wigle_other_ssid_user_data) {
+        ssid = WARDRIVE_WIGLE_OTHER_SSID;
+    } else {
+        wifi_network_t *net = (wifi_network_t *)user_data;
+        ssid = net->ssid;
+        security = net->security;
+    }
+
+    if (!ssid) {
         return;
     }
 
     if (strlen(ssid) == 0) {
+        if (security) {
+            strncpy(ctx->wardrive_wigle_selected_security, security,
+                    sizeof(ctx->wardrive_wigle_selected_security) - 1);
+            ctx->wardrive_wigle_selected_security[sizeof(ctx->wardrive_wigle_selected_security) - 1] = '\0';
+        } else {
+            ctx->wardrive_wigle_selected_security[0] = '\0';
+        }
         show_hidden_ssid_popup(hidden_ssid_wardrive_confirm_cb);
         return;
     }
 
     strncpy(ctx->wardrive_wigle_selected_ssid, ssid, sizeof(ctx->wardrive_wigle_selected_ssid) - 1);
     ctx->wardrive_wigle_selected_ssid[sizeof(ctx->wardrive_wigle_selected_ssid) - 1] = '\0';
+    if (security) {
+        strncpy(ctx->wardrive_wigle_selected_security, security,
+                sizeof(ctx->wardrive_wigle_selected_security) - 1);
+        ctx->wardrive_wigle_selected_security[sizeof(ctx->wardrive_wigle_selected_security) - 1] = '\0';
+    } else {
+        ctx->wardrive_wigle_selected_security[0] = '\0';
+    }
     ESP_LOGI(TAG, "[%s] WiGLE selected SSID: %s",
              tab_transport_name(tab_id_for_ctx(ctx)), ctx->wardrive_wigle_selected_ssid);
 
@@ -19506,6 +19572,7 @@ static bool wardrive_wigle_ensure_wifi_connected(tab_context_t *ctx, tab_id_t ac
     do_rescan = false;
     ctx->wardrive_wigle_rescan_requested = false;
     ctx->wardrive_wigle_selected_ssid[0] = '\0';
+    ctx->wardrive_wigle_selected_security[0] = '\0';
     ctx->wardrive_wigle_selected_password[0] = '\0';
     ctx->wardrive_wigle_connect_ready = false;
 
@@ -19669,6 +19736,7 @@ static bool wardrive_wigle_ensure_wifi_connected(tab_context_t *ctx, tab_id_t ac
 
     ctx->wardrive_wigle_selected_ssid[0] = '\0';
     ctx->wardrive_wigle_connect_ready = false;
+    ctx->wardrive_wigle_selected_security[0] = '\0';
     ctx->wardrive_wigle_selected_password[0] = '\0';
 
     bsp_display_lock(0);
@@ -19720,7 +19788,7 @@ static bool wardrive_wigle_ensure_wifi_connected(tab_context_t *ctx, tab_id_t ac
             lv_obj_set_style_text_font(info_lbl, &lv_font_montserrat_12, 0);
             lv_obj_set_style_text_color(info_lbl, lv_color_hex(0x888888), 0);
 
-            lv_obj_add_event_cb(row, wardrive_wigle_network_row_click_cb, LV_EVENT_CLICKED, (void *)nets[i].ssid);
+            lv_obj_add_event_cb(row, wardrive_wigle_network_row_click_cb, LV_EVENT_CLICKED, (void *)&nets[i]);
         }
 
         lv_obj_t *other_row = lv_obj_create(ctx->wardrive_wigle_list);
@@ -19745,7 +19813,7 @@ static bool wardrive_wigle_ensure_wifi_connected(tab_context_t *ctx, tab_id_t ac
         lv_obj_set_style_text_color(other_info_lbl, lv_color_hex(0x888888), 0);
 
         lv_obj_add_event_cb(other_row, wardrive_wigle_network_row_click_cb,
-                            LV_EVENT_CLICKED, (void *)WARDRIVE_WIGLE_OTHER_SSID);
+                            LV_EVENT_CLICKED, (void *)wardrive_wigle_other_ssid_user_data);
     }
     if (ctx->wardrive_wigle_spinner) {
         lv_obj_add_flag(ctx->wardrive_wigle_spinner, LV_OBJ_FLAG_HIDDEN);
@@ -19762,9 +19830,11 @@ static bool wardrive_wigle_ensure_wifi_connected(tab_context_t *ctx, tab_id_t ac
              tab_transport_name(active_tab), ctx->wardrive_wigle_selected_ssid);
 
     bool manual_credentials = (strcmp(ctx->wardrive_wigle_selected_ssid, WARDRIVE_WIGLE_OTHER_SSID) == 0);
+    bool selected_open_network = wifi_network_security_is_open(ctx->wardrive_wigle_selected_security);
     bool use_saved_password = false;
-    ESP_LOGI(TAG, "[%s] WiGLE: manual credentials mode = %d",
-             tab_transport_name(active_tab), manual_credentials ? 1 : 0);
+    ESP_LOGI(TAG, "[%s] WiGLE: manual credentials=%d, selected_open=%d, security='%s'",
+             tab_transport_name(active_tab), manual_credentials ? 1 : 0,
+             selected_open_network ? 1 : 0, ctx->wardrive_wigle_selected_security);
 
     bsp_display_lock(0);
     if (ctx->wardrive_wigle_spinner) {
@@ -19777,6 +19847,10 @@ static bool wardrive_wigle_ensure_wifi_connected(tab_context_t *ctx, tab_id_t ac
     if (ctx->wardrive_wigle_status_label) {
         if (manual_credentials) {
             lv_label_set_text(ctx->wardrive_wigle_status_label, "Manual network selected\nEnter SSID and WiFi password:");
+        } else if (selected_open_network) {
+            lv_label_set_text_fmt(ctx->wardrive_wigle_status_label,
+                                  "Selected open network: %s\nConnecting without password...",
+                                  ctx->wardrive_wigle_selected_ssid);
         } else {
             lv_label_set_text_fmt(ctx->wardrive_wigle_status_label,
                                   "Selected: %s\nChecking saved passwords...",
@@ -19787,6 +19861,7 @@ static bool wardrive_wigle_ensure_wifi_connected(tab_context_t *ctx, tab_id_t ac
 
     if (manual_credentials) {
         ctx->wardrive_wigle_selected_ssid[0] = '\0';
+        ctx->wardrive_wigle_selected_security[0] = '\0';
         ctx->wardrive_wigle_selected_password[0] = '\0';
         ctx->wardrive_wigle_connect_ready = false;
 
@@ -19806,10 +19881,10 @@ static bool wardrive_wigle_ensure_wifi_connected(tab_context_t *ctx, tab_id_t ac
             return false;
         }
 
-        if (strlen(ctx->wardrive_wigle_selected_ssid) == 0 || strlen(ctx->wardrive_wigle_selected_password) == 0) {
+        if (strlen(ctx->wardrive_wigle_selected_ssid) == 0) {
             bsp_display_lock(0);
             if (ctx->wardrive_wigle_status_label) {
-                lv_label_set_text(ctx->wardrive_wigle_status_label, "Enter SSID and password.");
+                lv_label_set_text(ctx->wardrive_wigle_status_label, "Enter SSID.");
             }
             bsp_display_unlock();
             heap_caps_free(scan_rx_buf);
@@ -19819,7 +19894,8 @@ static bool wardrive_wigle_ensure_wifi_connected(tab_context_t *ctx, tab_id_t ac
             heap_caps_free(wifi_rx_buf);
             return false;
         }
-    } else {
+        selected_open_network = (ctx->wardrive_wigle_selected_password[0] == '\0');
+    } else if (!selected_open_network) {
         ctx->wardrive_wigle_selected_password[0] = '\0';
 
         if (active_tab == TAB_USB && usb_cdc_handle) {
@@ -19887,7 +19963,7 @@ static bool wardrive_wigle_ensure_wifi_connected(tab_context_t *ctx, tab_id_t ac
                  (int)(strlen(ctx->wardrive_wigle_selected_password) > 0));
     }
 
-    if (strlen(ctx->wardrive_wigle_selected_password) == 0) {
+    if (!selected_open_network && strlen(ctx->wardrive_wigle_selected_password) == 0) {
         ctx->wardrive_wigle_connect_ready = false;
 
         bsp_display_lock(0);
@@ -19936,11 +20012,13 @@ static bool wardrive_wigle_ensure_wifi_connected(tab_context_t *ctx, tab_id_t ac
     bsp_display_unlock();
 
     char wifi_cmd[256];
+    wifi_connect_auth_mode_t auth_mode =
+        selected_open_network ? WIFI_CONNECT_AUTH_OPEN :
+        (use_saved_password ? WIFI_CONNECT_AUTH_SAVED : WIFI_CONNECT_AUTH_PASSWORD);
     if (!build_wifi_connect_command(wifi_cmd, sizeof(wifi_cmd),
                                     ctx->wardrive_wigle_selected_ssid,
                                     ctx->wardrive_wigle_selected_password,
-                                    use_saved_password ? WIFI_CONNECT_AUTH_SAVED
-                                                       : WIFI_CONNECT_AUTH_PASSWORD)) {
+                                    auth_mode)) {
         bsp_display_lock(0);
         if (ctx->wardrive_wigle_status_label) {
             lv_label_set_text(ctx->wardrive_wigle_status_label, "SSID/password too long.");
@@ -20030,14 +20108,33 @@ static bool wardrive_wigle_ensure_wifi_connected(tab_context_t *ctx, tab_id_t ac
             }
 
             bsp_display_lock(0);
+            bool created_password_prompt = false;
+            if (!ctx->wardrive_wigle_password_input) {
+                selected_open_network = false;
+                use_saved_password = false;
+                ctx->wardrive_wigle_selected_password[0] = '\0';
+                if (ctx->wardrive_wigle_status_label) {
+                    lv_label_set_text_fmt(ctx->wardrive_wigle_status_label,
+                                          "WiFi failed: %s\nEnter WiFi password, or Rescan.",
+                                          fail_reason);
+                }
+                wardrive_wigle_create_credentials_prompt(ctx, false);
+                created_password_prompt = true;
+            }
             // Keep credentials UI visible so user can edit password and retry
             if (ctx->wardrive_wigle_connect_btn) {
                 lv_obj_clear_state(ctx->wardrive_wigle_connect_btn, LV_STATE_DISABLED);
             }
-            if (ctx->wardrive_wigle_status_label) {
-                lv_label_set_text_fmt(ctx->wardrive_wigle_status_label,
-                                      "WiFi failed: %s\nEdit password and tap Connect, or Rescan.",
-                                      fail_reason);
+            if (ctx->wardrive_wigle_status_label && !created_password_prompt) {
+                if (ctx->wardrive_wigle_password_input) {
+                    lv_label_set_text_fmt(ctx->wardrive_wigle_status_label,
+                                          "WiFi failed: %s\nEdit password and tap Connect, or Rescan.",
+                                          fail_reason);
+                } else {
+                    lv_label_set_text_fmt(ctx->wardrive_wigle_status_label,
+                                          "WiFi failed: %s\nTap Rescan.",
+                                          fail_reason);
+                }
             }
             if (ctx->wardrive_wigle_spinner) {
                 lv_obj_add_flag(ctx->wardrive_wigle_spinner, LV_OBJ_FLAG_HIDDEN);
@@ -20106,11 +20203,12 @@ static bool wardrive_wigle_ensure_wifi_connected(tab_context_t *ctx, tab_id_t ac
                                           ctx->wardrive_wigle_selected_ssid);
                 }
                 // Rebuild wifi_cmd with potentially new password
+                auth_mode = selected_open_network ? WIFI_CONNECT_AUTH_OPEN :
+                            (use_saved_password ? WIFI_CONNECT_AUTH_SAVED : WIFI_CONNECT_AUTH_PASSWORD);
                 if (!build_wifi_connect_command(wifi_cmd, sizeof(wifi_cmd),
                                                 ctx->wardrive_wigle_selected_ssid,
                                                 ctx->wardrive_wigle_selected_password,
-                                                use_saved_password ? WIFI_CONNECT_AUTH_SAVED
-                                                                   : WIFI_CONNECT_AUTH_PASSWORD)) {
+                                                auth_mode)) {
                     if (ctx->wardrive_wigle_status_label) {
                         lv_label_set_text(ctx->wardrive_wigle_status_label, "SSID/password too long.");
                     }
@@ -21461,6 +21559,7 @@ static void show_wardrive_upload_popup(tab_context_t *ctx, wardrive_upload_provi
     ctx->wardrive_upload_mode = WARDRIVE_UPLOAD_MODE_SELECTED;
     ctx->wardrive_wigle_task = NULL;
     ctx->wardrive_wigle_selected_ssid[0] = '\0';
+    ctx->wardrive_wigle_selected_security[0] = '\0';
     ctx->wardrive_wigle_selected_password[0] = '\0';
     ctx->wardrive_wigle_ssid_input = NULL;
     ctx->wardrive_wigle_password_input = NULL;
@@ -30449,6 +30548,7 @@ static void close_wpasec_popup(lv_event_t *e)
         ctx->wpasec_keyboard = NULL;
         ctx->wpasec_connect_btn = NULL;
         ctx->wpasec_selected_ssid[0] = '\0';
+        ctx->wpasec_selected_security[0] = '\0';
         ctx->wpasec_selected_password[0] = '\0';
         ctx->wpasec_password_known = false;
         ctx->wpasec_connect_ready = false;
@@ -30461,17 +30561,41 @@ static void close_wpasec_popup(lv_event_t *e)
 static void wpasec_network_row_click_cb(lv_event_t *e)
 {
     lv_obj_t *row = lv_event_get_target(e);
-    const char *ssid = (const char *)lv_event_get_user_data(e);
+    void *user_data = lv_event_get_user_data(e);
     tab_context_t *ctx = get_current_ctx();
-    if (!ctx || !ssid) return;
+    if (!ctx || !user_data) return;
+
+    const char *ssid = NULL;
+    const char *security = NULL;
+    if (user_data == (void *)wpasec_other_ssid_user_data) {
+        ssid = WPASEC_OTHER_SSID;
+    } else {
+        wifi_network_t *net = (wifi_network_t *)user_data;
+        ssid = net->ssid;
+        security = net->security;
+    }
+
+    if (!ssid) return;
 
     if (strlen(ssid) == 0) {
+        if (security) {
+            strncpy(ctx->wpasec_selected_security, security, sizeof(ctx->wpasec_selected_security) - 1);
+            ctx->wpasec_selected_security[sizeof(ctx->wpasec_selected_security) - 1] = '\0';
+        } else {
+            ctx->wpasec_selected_security[0] = '\0';
+        }
         show_hidden_ssid_popup(hidden_ssid_wpasec_confirm_cb);
         return;
     }
 
     strncpy(ctx->wpasec_selected_ssid, ssid, sizeof(ctx->wpasec_selected_ssid) - 1);
     ctx->wpasec_selected_ssid[sizeof(ctx->wpasec_selected_ssid) - 1] = '\0';
+    if (security) {
+        strncpy(ctx->wpasec_selected_security, security, sizeof(ctx->wpasec_selected_security) - 1);
+        ctx->wpasec_selected_security[sizeof(ctx->wpasec_selected_security) - 1] = '\0';
+    } else {
+        ctx->wpasec_selected_security[0] = '\0';
+    }
 
     // Highlight selected row, reset others
     if (ctx->wpasec_network_list) {
@@ -30528,6 +30652,8 @@ static void wpasec_connect_btn_cb(lv_event_t *e)
         if (text && strlen(text) > 0) {
             strncpy(ctx->wpasec_selected_password, text, sizeof(ctx->wpasec_selected_password) - 1);
             ctx->wpasec_selected_password[sizeof(ctx->wpasec_selected_password) - 1] = '\0';
+        } else {
+            ctx->wpasec_selected_password[0] = '\0';
         }
     }
 
@@ -30769,6 +30895,7 @@ static void wpasec_upload_task(void *arg)
 
         // Build network list UI
         ctx->wpasec_selected_ssid[0] = '\0';
+        ctx->wpasec_selected_security[0] = '\0';
         bsp_display_lock(0);
         if (ctx->wpasec_status_label) {
             lv_label_set_text_fmt(ctx->wpasec_status_label, "Found %d networks - select one:", wpasec_net_count);
@@ -30820,9 +30947,9 @@ static void wpasec_upload_task(void *arg)
                 lv_obj_set_style_text_font(info_lbl, &lv_font_montserrat_12, 0);
                 lv_obj_set_style_text_color(info_lbl, lv_color_hex(0x888888), 0);
 
-                // Store SSID pointer in the static array for callback
+                // Store network pointer in the static array for callback
                 lv_obj_add_event_cb(row, wpasec_network_row_click_cb, LV_EVENT_CLICKED,
-                                    (void *)wpasec_nets[i].ssid);
+                                    (void *)&wpasec_nets[i]);
             }
 
             // Manual entry option at the bottom
@@ -30847,7 +30974,7 @@ static void wpasec_upload_task(void *arg)
             lv_obj_set_style_text_font(other_info_lbl, &lv_font_montserrat_12, 0);
             lv_obj_set_style_text_color(other_info_lbl, lv_color_hex(0x888888), 0);
 
-            lv_obj_add_event_cb(other_row, wpasec_network_row_click_cb, LV_EVENT_CLICKED, (void *)WPASEC_OTHER_SSID);
+            lv_obj_add_event_cb(other_row, wpasec_network_row_click_cb, LV_EVENT_CLICKED, (void *)wpasec_other_ssid_user_data);
         }
         bsp_display_unlock();
 
@@ -30860,12 +30987,17 @@ static void wpasec_upload_task(void *arg)
         ESP_LOGI(TAG, "wpasec: user selected SSID: %s", ctx->wpasec_selected_ssid);
 
         bool manual_credentials = (strcmp(ctx->wpasec_selected_ssid, WPASEC_OTHER_SSID) == 0);
+        bool selected_open_network = wifi_network_security_is_open(ctx->wpasec_selected_security);
 
         // Remove network list to make room
         bsp_display_lock(0);
         if (ctx->wpasec_status_label) {
             if (manual_credentials) {
                 lv_label_set_text(ctx->wpasec_status_label, "Manual network selected\nEnter SSID and WiFi password:");
+            } else if (selected_open_network) {
+                lv_label_set_text_fmt(ctx->wpasec_status_label,
+                    "Selected open network: %s\nConnecting without password...",
+                    ctx->wpasec_selected_ssid);
             } else {
                 lv_label_set_text_fmt(ctx->wpasec_status_label, "Selected: %s\nChecking saved passwords...", ctx->wpasec_selected_ssid);
             }
@@ -30878,6 +31010,7 @@ static void wpasec_upload_task(void *arg)
 
         if (manual_credentials) {
             ctx->wpasec_selected_ssid[0] = '\0';
+            ctx->wpasec_selected_security[0] = '\0';
             ctx->wpasec_selected_password[0] = '\0';
             ctx->wpasec_password_known = false;
             ctx->wpasec_connect_ready = false;
@@ -30893,15 +31026,16 @@ static void wpasec_upload_task(void *arg)
             }
             if (!ctx->wpasec_task_running) goto done;
 
-            if (strlen(ctx->wpasec_selected_ssid) == 0 || strlen(ctx->wpasec_selected_password) == 0) {
+            if (strlen(ctx->wpasec_selected_ssid) == 0) {
                 bsp_display_lock(0);
                 if (ctx->wpasec_status_label) {
-                    lv_label_set_text(ctx->wpasec_status_label, "Enter SSID and password.");
+                    lv_label_set_text(ctx->wpasec_status_label, "Enter SSID.");
                 }
                 bsp_display_unlock();
                 goto done;
             }
-        } else {
+            selected_open_network = (ctx->wpasec_selected_password[0] == '\0');
+        } else if (!selected_open_network) {
             uart_flush_input(uart_port);
             uart_send_command_for_tab("show_pass evil");
             vTaskDelay(pdMS_TO_TICKS(200));
@@ -31018,48 +31152,100 @@ static void wpasec_upload_task(void *arg)
         }
         bsp_display_unlock();
 
-        char wifi_cmd[256];
-        if (!build_wifi_connect_command(wifi_cmd, sizeof(wifi_cmd),
-                                        ctx->wpasec_selected_ssid,
-                                        ctx->wpasec_selected_password,
-                                        ctx->wpasec_password_known ? WIFI_CONNECT_AUTH_SAVED
-                                                                   : WIFI_CONNECT_AUTH_PASSWORD)) {
-            bsp_display_lock(0);
-            if (ctx->wpasec_status_label) {
-                lv_label_set_text(ctx->wpasec_status_label, "SSID/password too long.");
-            }
-            bsp_display_unlock();
-            goto done;
-        }
-
-        uart_flush_input(uart_port);
-        uart_send_command_for_tab(wifi_cmd);
-        ESP_LOGI(TAG, "wpasec: sent wifi_connect for %s", ctx->wpasec_selected_ssid);
-
-        // Wait for SUCCESS/FAILED (up to 15 seconds)
-        total_len = 0;
         bool wifi_success = false;
-        int wifi_elapsed = 0;
-        int wifi_timeout = 15000;
+        bool retry_with_password = false;
+        do {
+            retry_with_password = false;
 
-        while (wifi_elapsed < wifi_timeout && total_len < (int)sizeof(rx_buf) - 256 && ctx->wpasec_task_running) {
-            int len = transport_read_bytes(uart_port, rx_buf + total_len,
-                                           sizeof(rx_buf) - total_len - 1, pdMS_TO_TICKS(200));
-            if (len > 0) {
-                total_len += len;
-                rx_buf[total_len] = '\0';
-                if (strstr(rx_buf, "SUCCESS") != NULL) {
-                    wifi_success = true;
-                    break;
+            char wifi_cmd[256];
+            wifi_connect_auth_mode_t auth_mode =
+                selected_open_network ? WIFI_CONNECT_AUTH_OPEN :
+                (ctx->wpasec_password_known ? WIFI_CONNECT_AUTH_SAVED : WIFI_CONNECT_AUTH_PASSWORD);
+            if (!build_wifi_connect_command(wifi_cmd, sizeof(wifi_cmd),
+                                            ctx->wpasec_selected_ssid,
+                                            ctx->wpasec_selected_password,
+                                            auth_mode)) {
+                bsp_display_lock(0);
+                if (ctx->wpasec_status_label) {
+                    lv_label_set_text(ctx->wpasec_status_label, "SSID/password too long.");
                 }
-                if (strstr(rx_buf, "FAILED") != NULL || strstr(rx_buf, "Error") != NULL) {
-                    break;
-                }
+                bsp_display_unlock();
+                goto done;
             }
-            wifi_elapsed += 200;
-        }
 
-        if (!ctx->wpasec_task_running) goto done;
+            uart_flush_input(uart_port);
+            uart_send_command_for_tab(wifi_cmd);
+            ESP_LOGI(TAG, "wpasec: sent wifi_connect for %s", ctx->wpasec_selected_ssid);
+
+            // Wait for SUCCESS/FAILED (up to 15 seconds)
+            total_len = 0;
+            wifi_success = false;
+            int wifi_elapsed = 0;
+            int wifi_timeout = 15000;
+
+            while (wifi_elapsed < wifi_timeout && total_len < (int)sizeof(rx_buf) - 256 && ctx->wpasec_task_running) {
+                int len = transport_read_bytes(uart_port, rx_buf + total_len,
+                                               sizeof(rx_buf) - total_len - 1, pdMS_TO_TICKS(200));
+                if (len > 0) {
+                    total_len += len;
+                    rx_buf[total_len] = '\0';
+                    if (strstr(rx_buf, "SUCCESS") != NULL) {
+                        wifi_success = true;
+                        break;
+                    }
+                    if (strstr(rx_buf, "FAILED") != NULL || strstr(rx_buf, "Error") != NULL) {
+                        break;
+                    }
+                }
+                wifi_elapsed += 200;
+            }
+
+            if (!ctx->wpasec_task_running) goto done;
+
+            if (!wifi_success && selected_open_network) {
+                selected_open_network = false;
+                ctx->wpasec_password_known = false;
+                ctx->wpasec_selected_password[0] = '\0';
+                ctx->wpasec_connect_ready = false;
+
+                bsp_display_lock(0);
+                if (ctx->wpasec_status_label) {
+                    lv_label_set_text(ctx->wpasec_status_label,
+                        "Open connect failed.\nEnter WiFi password, or Close.");
+                }
+                if (ctx->wpasec_popup) {
+                    wpasec_create_credentials_prompt(ctx, false);
+                }
+                bsp_display_unlock();
+
+                while (!ctx->wpasec_connect_ready && ctx->wpasec_task_running) {
+                    vTaskDelay(pdMS_TO_TICKS(100));
+                }
+                if (!ctx->wpasec_task_running) goto done;
+
+                if (strlen(ctx->wpasec_selected_password) == 0) {
+                    bsp_display_lock(0);
+                    if (ctx->wpasec_status_label) {
+                        lv_label_set_text(ctx->wpasec_status_label, "No password entered.");
+                    }
+                    bsp_display_unlock();
+                    goto done;
+                }
+
+                bsp_display_lock(0);
+                if (ctx->wpasec_keyboard) {
+                    lv_obj_del(ctx->wpasec_keyboard);
+                    ctx->wpasec_keyboard = NULL;
+                }
+                if (ctx->wpasec_status_label) {
+                    lv_label_set_text_fmt(ctx->wpasec_status_label,
+                                          "Retrying connection to %s...",
+                                          ctx->wpasec_selected_ssid);
+                }
+                bsp_display_unlock();
+                retry_with_password = true;
+            }
+        } while (retry_with_password && ctx->wpasec_task_running);
 
         if (wifi_success) {
             arp_wifi_connected = true;
@@ -31231,6 +31417,7 @@ static void show_wpasec_popup(void)
 
     // Reset WiFi-connect state
     ctx->wpasec_selected_ssid[0] = '\0';
+    ctx->wpasec_selected_security[0] = '\0';
     ctx->wpasec_selected_password[0] = '\0';
     ctx->wpasec_password_known = false;
     ctx->wpasec_connect_ready = false;
@@ -33526,6 +33713,28 @@ static bool build_wifi_connect_command(char *out, size_t out_sz, const char *ssi
     return cmd_len >= 0 && cmd_len < (int)out_sz;
 }
 
+static bool wifi_network_security_is_open(const char *security)
+{
+    if (!security || security[0] == '\0') {
+        return true;
+    }
+    char upper[32];
+    size_t i = 0;
+    for (; security[i] && i < sizeof(upper) - 1; i++) {
+        upper[i] = (char)toupper((unsigned char)security[i]);
+    }
+    upper[i] = '\0';
+
+    if (strstr(upper, "OPEN") || strstr(upper, "UNKNOWN") || strstr(upper, "OWE")) {
+        return true;
+    }
+    if (strstr(upper, "WPA") || strstr(upper, "WEP") ||
+        strstr(upper, "SAE") || strstr(upper, "PSK")) {
+        return false;
+    }
+    return true;
+}
+
 static void beacon_spam_trim_whitespace(char *text)
 {
     if (!text) return;
@@ -34882,6 +35091,14 @@ static void janos_copy_version_token(const char *src, char *dst)
     dst[i] = '\0';
 }
 
+static void janos_clear_app_identity(tab_context_t *ctx)
+{
+    if (!ctx) return;
+    ctx->janos_app_project[0] = '\0';
+    ctx->janos_app_version[0] = '\0';
+    ctx->janos_app_build[0] = '\0';
+}
+
 // Scan a single completed line for JanOS boot-banner version markers and
 // store them into ctx. Order matters: check "JanOS RF version:" first because
 // "JanOS version:" is a substring of nothing here, but we don't want to
@@ -35039,12 +35256,15 @@ static void detect_boards(void)
     // is owned by check_all_subghz_status() (run after detect_boards) and is
     // not touched here.
     grove_ctx.janos_version[0] = '\0';
+    janos_clear_app_identity(&grove_ctx);
     grove_ctx.janos_rf_version[0] = '\0';
     grove_ctx.janos_board_ready = false;
     usb_ctx.janos_version[0] = '\0';
+    janos_clear_app_identity(&usb_ctx);
     usb_ctx.janos_rf_version[0] = '\0';
     usb_ctx.janos_board_ready = false;
     mbus_ctx.janos_version[0] = '\0';
+    janos_clear_app_identity(&mbus_ctx);
     mbus_ctx.janos_rf_version[0] = '\0';
     mbus_ctx.janos_board_ready = false;
 
@@ -35402,6 +35622,7 @@ static void check_all_versions(void)
         check_version_for_tab(TAB_GROVE);
     } else {
         grove_ctx.janos_version[0] = '\0';
+        janos_clear_app_identity(&grove_ctx);
         grove_ctx.janos_version_mismatch = false;
         grove_ctx.janos_rf_version[0] = '\0';
     }
@@ -35410,6 +35631,7 @@ static void check_all_versions(void)
         check_version_for_tab(TAB_USB);
     } else {
         usb_ctx.janos_version[0] = '\0';
+        janos_clear_app_identity(&usb_ctx);
         usb_ctx.janos_version_mismatch = false;
         usb_ctx.janos_rf_version[0] = '\0';
     }
@@ -35418,11 +35640,13 @@ static void check_all_versions(void)
         check_version_for_tab(TAB_MBUS);
     } else {
         mbus_ctx.janos_version[0] = '\0';
+        janos_clear_app_identity(&mbus_ctx);
         mbus_ctx.janos_version_mismatch = false;
         mbus_ctx.janos_rf_version[0] = '\0';
     }
 
     internal_ctx.janos_version[0] = '\0';
+    janos_clear_app_identity(&internal_ctx);
     internal_ctx.janos_version_mismatch = false;
     internal_ctx.janos_rf_version[0] = '\0';
 
@@ -35436,6 +35660,25 @@ static void version_popup_close_cb(lv_event_t *e)
 {
     lv_obj_t *overlay = (lv_obj_t *)lv_event_get_user_data(e);
     if (overlay) lv_obj_del(overlay);
+}
+
+static void version_popup_ota_cb(lv_event_t *e)
+{
+    lv_obj_t *overlay = (lv_obj_t *)lv_event_get_user_data(e);
+    if (overlay) lv_obj_del(overlay);
+
+    lv_obj_t *old_container = get_current_tab_container();
+    if (old_container && old_container != internal_container) {
+        lv_obj_add_flag(old_container, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    current_tab = TAB_INTERNAL;
+    update_tab_styles();
+    if (internal_container) {
+        lv_obj_clear_flag(internal_container, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    show_ota_page();
 }
 
 static void show_version_mismatch_popup(void)
@@ -35480,7 +35723,7 @@ static void show_version_mismatch_popup(void)
     lv_obj_add_flag(overlay, LV_OBJ_FLAG_CLICKABLE);
 
     lv_obj_t *popup = lv_obj_create(overlay);
-    lv_obj_set_size(popup, 560, 300);
+    lv_obj_set_size(popup, 560, 370);
     lv_obj_center(popup);
     lv_obj_set_style_bg_color(popup, lv_color_hex(0x2D2D2D), 0);
     lv_obj_set_style_border_color(popup, lv_color_hex(0xF44336), 0);
@@ -35508,6 +35751,17 @@ static void show_version_mismatch_popup(void)
     lv_obj_set_style_text_color(message, lv_color_hex(0xCCCCCC), 0);
     lv_obj_set_style_text_align(message, LV_TEXT_ALIGN_LEFT, 0);
     lv_obj_set_width(message, 500);
+
+    lv_obj_t *ota_btn = lv_btn_create(popup);
+    lv_obj_set_size(ota_btn, 220, 48);
+    lv_obj_set_style_bg_color(ota_btn, COLOR_MATERIAL_ORANGE, 0);
+    lv_obj_set_style_radius(ota_btn, 8, 0);
+    lv_obj_add_event_cb(ota_btn, version_popup_ota_cb, LV_EVENT_CLICKED, overlay);
+
+    lv_obj_t *ota_label = lv_label_create(ota_btn);
+    lv_label_set_text(ota_label, LV_SYMBOL_DOWNLOAD " Monster OTA");
+    lv_obj_set_style_text_font(ota_label, &lv_font_montserrat_16, 0);
+    lv_obj_center(ota_label);
 
     lv_obj_t *ok_btn = lv_btn_create(popup);
     lv_obj_set_size(ok_btn, 140, 46);
@@ -37522,6 +37776,2144 @@ static void show_screen_lock_popup(void)
     lv_obj_center(close_label);
 }
 
+// ============================ Monster OTA =============================
+// Over-the-air update of the ESP32-C5 (JanOS / projectZero) firmware.
+//
+// This is a SELF-OTA: the C5 has its own WiFi and pulls the firmware from
+// GitHub via esp_https_ota, then reflashes its own OTA partition. The Tab5
+// (ESP32-P4) side is only a remote control / UI: it sends text commands over
+// the UART of the tab where the C5 was detected and streams back the C5's log
+// lines. No OTA logic runs on the P4. See docs/Monster_OTA.md for the flow.
+
+typedef enum {
+    OTA_VIEW_NONE = 0,
+    OTA_VIEW_STATUS,
+    OTA_VIEW_LIST,
+    OTA_VIEW_INFO,
+} ota_view_t;
+
+typedef struct {
+    char name[16];
+    char offset[16];
+    char size[16];
+    char subtype[8];
+    char state[8];
+    char project[32];
+    char version[64];
+    char build[80];
+    bool present;
+    bool is_boot;
+    bool is_running;
+    bool is_next;
+
+    lv_obj_t *card;
+    lv_obj_t *title_label;
+    lv_obj_t *role_label;
+    lv_obj_t *meta_label;
+    lv_obj_t *version_label;
+    lv_obj_t *build_label;
+    lv_obj_t *activate_btn;
+    lv_obj_t *activate_label;
+} ota_slot_info_t;
+
+static struct {
+    tab_id_t target_tab;      // radio tab the C5 lives on (Grove/USB/MBus)
+    char     channel[8];      // "main" / "dev"
+
+    // Setup page widgets
+    lv_obj_t *page;
+    lv_obj_t *page_status;     // small status/error line on the setup page
+    lv_obj_t *ssid_ta;
+    lv_obj_t *pass_ta;
+    lv_obj_t *mode_dd;         // 0 = DHCP, 1 = Manual
+    lv_obj_t *manual_box;      // container holding IP / Netmask / GW / DNS
+    lv_obj_t *ip_ta;
+    lv_obj_t *netmask_ta;
+    lv_obj_t *gw_ta;
+    lv_obj_t *dns_ta;
+    lv_obj_t *channel_dd;      // 0 = main, 1 = dev
+    lv_obj_t *keyboard;
+
+    // WiFi network scan picker (same mechanism as the wardrive upload flow)
+    char          sel_ssid[33];
+    volatile bool scan_selected;
+    volatile bool scan_running;
+    TaskHandle_t  scan_task;
+    lv_obj_t     *scan_overlay;
+    lv_obj_t     *scan_status;
+    lv_obj_t     *scan_list;
+    bool          selected_saved_password;
+
+    bool          install_started;
+    bool          reboot_wait_shown;
+    bool          flash_progress_seen;
+    bool          byte_progress_seen;
+    bool          terminal_status_seen;
+    bool          screen_timeout_suspended;
+    bool          list_after_connect;
+    bool          list_sent_after_connect;
+    bool          release_list_waiting;
+    bool          wifi_connected;
+    tab_id_t      wifi_connected_tab;
+    char          wifi_connected_ssid[33];
+    uint8_t       saved_screen_timeout_setting;
+
+    // Monitor overlay (Status / List / Info)
+    ota_view_t view;
+    lv_obj_t *mon_overlay;
+    lv_obj_t *mon_phase;       // Status only
+    lv_obj_t *mon_detail;      // Status only
+    lv_obj_t *mon_progress;    // Status only
+    lv_obj_t *mon_steps[4];    // Status only
+    lv_obj_t *mon_wifi;        // Status only
+    lv_obj_t *mon_ip;          // Status only
+    lv_obj_t *mon_ota;         // Status only
+    lv_obj_t *mon_release_list; // Status/List only
+    lv_obj_t *mon_log_container;
+    lv_obj_t *mon_log_label;
+    lv_obj_t *mon_close_btn;
+    lv_obj_t *mon_close_label;
+    int       mon_release_count;
+    char      log_buf[2048];
+    lv_obj_t *info_summary;
+    ota_slot_info_t info_slots[2];
+
+    volatile bool monitoring;
+    TaskHandle_t  task;
+} g_ota;
+
+// ---- forward declarations (Monster OTA block) ----
+static void show_ota_page(void);
+static void ota_monitor_task(void *arg);
+static void ota_open_monitor(ota_view_t view, const char *title);
+static void ota_close_monitor(void);
+static void ota_monitor_close_cb(lv_event_t *e);
+static void ota_ta_focus_cb(lv_event_t *e);
+static void ota_kb_ready_cb(lv_event_t *e);
+static void ota_pass_toggle_cb(lv_event_t *e);
+static void ota_mode_changed_cb(lv_event_t *e);
+static void ota_channel_changed_cb(lv_event_t *e);
+static void ota_slot_activate_cb(lv_event_t *e);
+static void ota_list_btn_cb(lv_event_t *e);
+static void ota_info_btn_cb(lv_event_t *e);
+static void ota_check_btn_cb(lv_event_t *e);
+static void ota_back_cb(lv_event_t *e);
+static void ota_scan_btn_cb(lv_event_t *e);
+static void ota_scan_close_cb(lv_event_t *e);
+static void ota_scan_close(void);
+static void ota_scan_task(void *arg);
+static void ota_credentials_changed_cb(lv_event_t *e);
+static bool ota_build_wifi_connect_cmd(char *out, size_t out_sz, const char *ssid,
+                                       const char *password, bool use_saved,
+                                       bool start_ota, bool manual,
+                                       const char *ip, const char *nm,
+                                       const char *gw, const char *dns);
+
+// Pick the tab the C5 modem is on. Priority Grove > USB > MBus.
+static tab_id_t ota_pick_target_tab(void)
+{
+    if (grove_detected) return TAB_GROVE;
+    if (usb_detected)   return TAB_USB;
+    if (mbus_detected)  return TAB_MBUS;
+    return TAB_INTERNAL;   // none detected
+}
+
+// Send a text command + CRLF to the C5's UART on the target tab.
+static void ota_send_cmd(const char *cmd)
+{
+    if (g_ota.target_tab == TAB_INTERNAL) {
+        ESP_LOGW(TAG, "[OTA] No C5 detected, dropping command: %s", cmd);
+        return;
+    }
+    uart_port_t port = uart_port_for_tab(g_ota.target_tab);
+    transport_write_bytes_tab(g_ota.target_tab, port, cmd, strlen(cmd));
+    transport_write_bytes_tab(g_ota.target_tab, port, "\r\n", 2);
+    ESP_LOGI(TAG, "[OTA->%s] %s", tab_transport_name(g_ota.target_tab), cmd);
+}
+
+static void ota_suspend_screen_timeout(void)
+{
+    if (g_ota.screen_timeout_suspended || screen_timeout_setting == 4) return;
+
+    g_ota.saved_screen_timeout_setting = screen_timeout_setting;
+    g_ota.screen_timeout_suspended = true;
+    screen_timeout_setting = 4;  // runtime-only Stays On; do not persist to NVS
+    if (screen_dimmed) wake_screen("OTA update");
+    last_activity_time = lv_tick_get();
+    ESP_LOGI(TAG, "[OTA] Screen timeout suspended (saved setting=%u)",
+             (unsigned)g_ota.saved_screen_timeout_setting);
+}
+
+static void ota_restore_screen_timeout(void)
+{
+    if (!g_ota.screen_timeout_suspended) return;
+
+    screen_timeout_setting = g_ota.saved_screen_timeout_setting;
+    g_ota.screen_timeout_suspended = false;
+    last_activity_time = lv_tick_get();
+    ESP_LOGI(TAG, "[OTA] Screen timeout restored (setting=%u)",
+             (unsigned)screen_timeout_setting);
+}
+
+// Case-insensitive substring test (no ctype dependency).
+static bool ota_ci_contains(const char *hay, const char *needle)
+{
+    if (!hay || !needle) return false;
+    size_t nl = strlen(needle);
+    if (nl == 0) return true;
+    for (const char *p = hay; *p; p++) {
+        size_t i = 0;
+        while (p[i] && needle[i]) {
+            char a = p[i];      if (a >= 'A' && a <= 'Z') a += 32;
+            char b = needle[i]; if (b >= 'A' && b <= 'Z') b += 32;
+            if (a != b) break;
+            i++;
+        }
+        if (i == nl) return true;
+    }
+    return false;
+}
+
+// Append a line to the monitor log label. Caller must hold the display lock.
+static void ota_append_log(const char *line)
+{
+    if (!g_ota.mon_log_label) return;
+    size_t cur = strlen(g_ota.log_buf);
+    size_t add = strlen(line);
+    size_t max = sizeof(g_ota.log_buf) - 2;
+    while (cur + add + 1 > max && cur > 0) {
+        char *nl = strchr(g_ota.log_buf, '\n');
+        if (nl) {
+            memmove(g_ota.log_buf, nl + 1, strlen(nl + 1) + 1);
+            cur = strlen(g_ota.log_buf);
+        } else {
+            g_ota.log_buf[0] = '\0';
+            cur = 0;
+            break;
+        }
+    }
+    if (cur > 0) strncat(g_ota.log_buf, "\n", sizeof(g_ota.log_buf) - cur - 1);
+    strncat(g_ota.log_buf, line, sizeof(g_ota.log_buf) - strlen(g_ota.log_buf) - 1);
+    lv_label_set_text(g_ota.mon_log_label, g_ota.log_buf);
+    if (g_ota.mon_log_container)
+        lv_obj_scroll_to_y(g_ota.mon_log_container, LV_COORD_MAX, LV_ANIM_OFF);
+}
+
+// Friendly one-line summary for an "OTA: ..." progress line, or NULL to show raw.
+static const char *ota_status_pretty(const char *line)
+{
+    if (ota_ci_contains(line, "asset size"))       return LV_SYMBOL_DOWNLOAD " Update found on server";
+    if (ota_ci_contains(line, "asset updated_at")) return LV_SYMBOL_REFRESH " Release metadata loaded";
+    if (ota_ci_contains(line, "current="))         return LV_SYMBOL_REFRESH " Preparing selected release";
+    if (ota_ci_contains(line, "image project"))    return LV_SYMBOL_SD_CARD " Verifying firmware image";
+    if (ota_ci_contains(line, "progress"))         return LV_SYMBOL_DOWNLOAD " Downloading firmware...";
+    if (ota_ci_contains(line, "download complete")) return LV_SYMBOL_OK " Download complete";
+    if (ota_ci_contains(line, "download stalled")) return LV_SYMBOL_WARNING " Download stalled";
+    if (ota_ci_contains(line, "no update"))        return LV_SYMBOL_OK " Already up to date";
+    if (ota_ci_contains(line, "updating to"))      return LV_SYMBOL_DOWNLOAD " Downloading & flashing...";
+    if (ota_ci_contains(line, "target partition")) return LV_SYMBOL_SD_CARD " Writing new firmware...";
+    if (ota_ci_contains(line, "update applied"))   return LV_SYMBOL_OK " Applied - rebooting the C5...";
+    if (ota_ci_contains(line, "marked valid"))     return LV_SYMBOL_OK " New firmware verified & active";
+    if (ota_ci_contains(line, "update failed") ||
+        ota_ci_contains(line, "aborting"))         return LV_SYMBOL_WARNING " Update failed";
+    return NULL;
+}
+
+static void ota_status_set_step(int active_step, int progress_pct)
+{
+    const char *update_labels[4] = {"WiFi", "Release", "Download", "Flash"};
+    const char *list_labels[4] = {"WiFi", "Releases", "Ready", ""};
+    const char **labels = g_ota.list_after_connect ? list_labels : update_labels;
+    for (int i = 0; i < 4; i++) {
+        if (!g_ota.mon_steps[i]) continue;
+        const char *mark = (i < active_step) ? LV_SYMBOL_OK : (i == active_step ? LV_SYMBOL_RIGHT : " ");
+        lv_label_set_text_fmt(g_ota.mon_steps[i], "%s %s", mark, labels[i]);
+        lv_obj_set_style_text_color(g_ota.mon_steps[i],
+                                    (i < active_step) ? COLOR_MATERIAL_GREEN :
+                                    (i == active_step) ? COLOR_MATERIAL_ORANGE :
+                                                         ui_muted_color(),
+                                    0);
+    }
+    if (g_ota.mon_progress) lv_bar_set_value(g_ota.mon_progress, progress_pct, LV_ANIM_OFF);
+}
+
+static void ota_status_set_phase(const char *phase, const char *detail,
+                                 lv_color_t color, int active_step, int progress_pct)
+{
+    if (g_ota.mon_phase) {
+        lv_label_set_text(g_ota.mon_phase, phase ? phase : "");
+        lv_obj_set_style_text_color(g_ota.mon_phase, color, 0);
+    }
+    if (g_ota.mon_detail) {
+        lv_label_set_text(g_ota.mon_detail, detail ? detail : "");
+        lv_obj_set_style_text_color(g_ota.mon_detail, ui_text_color(), 0);
+    }
+    ota_status_set_step(active_step, progress_pct);
+}
+
+static void ota_monitor_set_close_state(bool enabled, lv_color_t color, const char *label)
+{
+    if (!g_ota.mon_close_btn) return;
+
+    if (enabled) lv_obj_clear_state(g_ota.mon_close_btn, LV_STATE_DISABLED);
+    else         lv_obj_add_state(g_ota.mon_close_btn, LV_STATE_DISABLED);
+
+    lv_obj_set_style_bg_color(g_ota.mon_close_btn, color, 0);
+    lv_obj_set_style_bg_color(g_ota.mon_close_btn,
+                              enabled ? lv_color_darken(color, 20) : lv_color_hex(0x333333),
+                              LV_STATE_PRESSED);
+    lv_obj_set_style_bg_color(g_ota.mon_close_btn, lv_color_hex(0x333333), LV_STATE_DISABLED);
+    if (g_ota.mon_close_label) {
+        lv_label_set_text(g_ota.mon_close_label, label ? label : "Close");
+        lv_obj_center(g_ota.mon_close_label);
+    }
+}
+
+static void ota_monitor_lock_close_for_update(void)
+{
+    g_ota.terminal_status_seen = false;
+    ota_monitor_set_close_state(false, lv_color_hex(0x333333), "Updating...");
+}
+
+static void ota_monitor_lock_close_for_list(void)
+{
+    ota_monitor_set_close_state(false, lv_color_hex(0x333333), "Loading...");
+}
+
+static void ota_monitor_finish_close_ok(void)
+{
+    g_ota.terminal_status_seen = true;
+    ota_monitor_set_close_state(true, COLOR_MATERIAL_GREEN, "Done - Close");
+}
+
+static void ota_monitor_finish_close_error(void)
+{
+    g_ota.terminal_status_seen = true;
+    ota_monitor_set_close_state(true, COLOR_MATERIAL_RED, "Close");
+}
+
+static void ota_note_wifi_connected(void)
+{
+    const char *ssid = g_ota.ssid_ta ? lv_textarea_get_text(g_ota.ssid_ta) : "";
+    if (!ssid || ssid[0] == '\0') return;
+    g_ota.wifi_connected = true;
+    g_ota.wifi_connected_tab = g_ota.target_tab;
+    strncpy(g_ota.wifi_connected_ssid, ssid, sizeof(g_ota.wifi_connected_ssid) - 1);
+    g_ota.wifi_connected_ssid[sizeof(g_ota.wifi_connected_ssid) - 1] = '\0';
+}
+
+static void ota_note_wifi_disconnected(void)
+{
+    g_ota.wifi_connected = false;
+    g_ota.wifi_connected_ssid[0] = '\0';
+}
+
+static bool ota_can_reuse_wifi_for_update(void)
+{
+    const char *ssid = g_ota.ssid_ta ? lv_textarea_get_text(g_ota.ssid_ta) : "";
+    return g_ota.wifi_connected &&
+           g_ota.wifi_connected_tab == g_ota.target_tab &&
+           ssid && strcmp(g_ota.wifi_connected_ssid, ssid) == 0;
+}
+
+static void ota_release_list_finish(bool ok)
+{
+    if (!g_ota.release_list_waiting) return;
+    g_ota.release_list_waiting = false;
+    ota_restore_screen_timeout();
+    ota_monitor_set_close_state(true, ok ? COLOR_MATERIAL_GREEN : COLOR_MATERIAL_RED,
+                                ok ? "Done - Close" : "Close");
+}
+
+static void ota_release_list_prepare(void)
+{
+    if (!g_ota.mon_release_list) return;
+    lv_obj_clean(g_ota.mon_release_list);
+    lv_obj_clear_flag(g_ota.mon_release_list, LV_OBJ_FLAG_HIDDEN);
+    if (g_ota.mon_log_container) lv_obj_add_flag(g_ota.mon_log_container, LV_OBJ_FLAG_HIDDEN);
+    g_ota.mon_release_count = 0;
+    g_ota.release_list_waiting = true;
+
+    lv_obj_t *waiting = lv_label_create(g_ota.mon_release_list);
+    lv_label_set_text(waiting, LV_SYMBOL_REFRESH " Waiting for release list...");
+    lv_obj_set_style_text_font(waiting, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(waiting, ui_muted_color(), 0);
+}
+
+static void ota_release_list_add_line(const char *line)
+{
+    if (!g_ota.mon_release_list || !line) return;
+
+    int idx = -1;
+    char tag[32] = "";
+    char channel[16] = "";
+    char date[16] = "";
+    char title[128] = "";
+    int parsed = sscanf(line, "OTA[%d]: %31s (%15[^)]) %15s %127[^\r\n]",
+                        &idx, tag, channel, date, title);
+    if (parsed < 4) {
+        snprintf(tag, sizeof(tag), "Release");
+        snprintf(channel, sizeof(channel), "unknown");
+        snprintf(date, sizeof(date), "?");
+        snprintf(title, sizeof(title), "%.*s", (int)sizeof(title) - 1, line);
+    } else if (parsed < 5) {
+        title[0] = '\0';
+    }
+
+    if (g_ota.mon_release_count == 0) lv_obj_clean(g_ota.mon_release_list);
+
+    lv_obj_t *row = lv_obj_create(g_ota.mon_release_list);
+    lv_obj_set_size(row, lv_pct(100), 58);
+    lv_obj_set_style_bg_color(row, ui_bg_color(), 0);
+    lv_obj_set_style_border_width(row, 1, 0);
+    lv_obj_set_style_border_color(row, idx == 0 ? COLOR_MATERIAL_GREEN : ui_border_color(), 0);
+    lv_obj_set_style_radius(row, 8, 0);
+    lv_obj_set_style_pad_all(row, 8, 0);
+    lv_obj_set_style_pad_column(row, 10, 0);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *badge = lv_label_create(row);
+    lv_label_set_text_fmt(badge, idx == 0 ? LV_SYMBOL_OK " latest" : "#%d", idx);
+    lv_obj_set_style_text_font(badge, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(badge, idx == 0 ? COLOR_MATERIAL_GREEN : ui_muted_color(), 0);
+    lv_obj_set_width(badge, 88);
+    lv_label_set_long_mode(badge, LV_LABEL_LONG_DOT);
+
+    lv_obj_t *text_col = lv_obj_create(row);
+    lv_obj_remove_style_all(text_col);
+    lv_obj_set_flex_grow(text_col, 1);
+    lv_obj_set_height(text_col, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(text_col, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(text_col, 3, 0);
+
+    lv_obj_t *version = lv_label_create(text_col);
+    lv_label_set_text(version, tag[0] ? tag : "?");
+    lv_obj_set_style_text_font(version, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_color(version, idx == 0 ? COLOR_MATERIAL_GREEN : ui_text_color(), 0);
+    lv_obj_set_width(version, lv_pct(100));
+    lv_label_set_long_mode(version, LV_LABEL_LONG_DOT);
+
+    lv_obj_t *meta = lv_label_create(text_col);
+    if (title[0]) {
+        lv_label_set_text_fmt(meta, "%s | %s | %s", channel, date, title);
+    } else {
+        lv_label_set_text_fmt(meta, "%s | %s", channel, date);
+    }
+    lv_obj_set_style_text_font(meta, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(meta, ui_muted_color(), 0);
+    lv_obj_set_width(meta, lv_pct(100));
+    lv_label_set_long_mode(meta, LV_LABEL_LONG_DOT);
+
+    g_ota.mon_release_count++;
+}
+
+static int ota_status_parse_download_pct(const char *line)
+{
+    if (!line) return -1;
+    const char *p = strstr(line, "progress ");
+    if (!p) return -1;
+    p += strlen("progress ");
+
+    int pct = -1;
+    if (sscanf(p, "%d%%", &pct) != 1) return -1;
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+    return pct;
+}
+
+static int ota_status_overall_from_download_pct(int download_pct)
+{
+    const int download_start = 50;
+    const int download_end = 88;
+    return download_start + ((download_end - download_start) * download_pct) / 100;
+}
+
+static void ota_status_from_ota_line(const char *line)
+{
+    if (!line) return;
+    if (ota_ci_contains(line, "asset size")) {
+        g_ota.flash_progress_seen = true;
+        ota_status_set_phase(LV_SYMBOL_DOWNLOAD " Package found",
+                             "JanOS found the firmware asset. Download/flash has started.",
+                             COLOR_MATERIAL_ORANGE, 2, 46);
+    } else if (ota_ci_contains(line, "asset updated_at")) {
+        g_ota.flash_progress_seen = true;
+        ota_status_set_phase(LV_SYMBOL_REFRESH " Release metadata",
+                             "Server release metadata received.",
+                             ui_text_color(), 2, 47);
+    } else if (ota_ci_contains(line, "current=")) {
+        g_ota.flash_progress_seen = true;
+        ota_status_set_phase(LV_SYMBOL_REFRESH " Selecting target",
+                             line, ui_text_color(), 2, 48);
+    } else if (ota_ci_contains(line, "updating to")) {
+        g_ota.flash_progress_seen = true;
+        ota_status_set_phase(LV_SYMBOL_DOWNLOAD " Downloading & flashing",
+                             line, COLOR_MATERIAL_ORANGE, 2, 49);
+    } else if (ota_ci_contains(line, "target partition")) {
+        g_ota.flash_progress_seen = true;
+        ota_status_set_phase(LV_SYMBOL_SD_CARD " Writing inactive partition",
+                             line, COLOR_MATERIAL_ORANGE, 2, 50);
+    } else if (ota_ci_contains(line, "image project")) {
+        g_ota.flash_progress_seen = true;
+        ota_status_set_phase(LV_SYMBOL_DOWNLOAD " Firmware image accepted",
+                             "Download is starting. Progress is based on received bytes.",
+                             ui_text_color(), 2, 50);
+    } else if (ota_ci_contains(line, "progress")) {
+        g_ota.flash_progress_seen = true;
+        g_ota.byte_progress_seen = true;
+        int download_pct = ota_status_parse_download_pct(line);
+        int overall_pct = download_pct >= 0 ? ota_status_overall_from_download_pct(download_pct) : 50;
+        ota_status_set_phase(LV_SYMBOL_DOWNLOAD " Downloading firmware",
+                             line, COLOR_MATERIAL_ORANGE, 2, overall_pct);
+    } else if (ota_ci_contains(line, "download complete")) {
+        g_ota.flash_progress_seen = true;
+        g_ota.byte_progress_seen = true;
+        ota_status_set_phase(LV_SYMBOL_SD_CARD " Finalizing OTA",
+                             "Firmware download finished. JanOS is validating and switching boot slot.",
+                             COLOR_MATERIAL_ORANGE, 3, 92);
+    } else if (ota_ci_contains(line, "download stalled")) {
+        g_ota.byte_progress_seen = true;
+        ota_status_set_phase(LV_SYMBOL_WARNING " Download stalled",
+                             line, COLOR_MATERIAL_RED, 2, 50);
+        if (g_ota.install_started) ota_monitor_finish_close_error();
+        ota_restore_screen_timeout();
+    } else if (ota_ci_contains(line, "not connected") ||
+               ota_ci_contains(line, "wifi not ready") ||
+               ota_ci_contains(line, "config not set") ||
+               ota_ci_contains(line, "check already in progress") ||
+               ota_ci_contains(line, "out of memory") ||
+               ota_ci_contains(line, "failed to start check task") ||
+               ota_ci_contains(line, "failed to fetch release info") ||
+               ota_ci_contains(line, "begin failed") ||
+               ota_ci_contains(line, "image desc failed") ||
+               ota_ci_contains(line, "unexpected project") ||
+               ota_ci_contains(line, "perform failed") ||
+               ota_ci_contains(line, "incomplete image") ||
+               ota_ci_contains(line, "finish failed") ||
+               ota_ci_contains(line, "update failed")) {
+        ota_status_set_phase(LV_SYMBOL_WARNING " OTA stopped",
+                             line, COLOR_MATERIAL_RED, 2, 50);
+        if (ota_ci_contains(line, "not connected") || ota_ci_contains(line, "wifi not ready")) {
+            ota_note_wifi_disconnected();
+        }
+        if (g_ota.release_list_waiting) ota_release_list_finish(false);
+        if (g_ota.install_started) ota_monitor_finish_close_error();
+        ota_restore_screen_timeout();
+    } else if (ota_ci_contains(line, "no update") || ota_ci_contains(line, "up to date")) {
+        ota_status_set_phase(LV_SYMBOL_OK " Already up to date",
+                             "No newer release is available for this channel.",
+                             COLOR_MATERIAL_GREEN, 3, 100);
+        if (g_ota.release_list_waiting) ota_release_list_finish(true);
+        if (g_ota.install_started) ota_monitor_finish_close_ok();
+        ota_restore_screen_timeout();
+    } else if (ota_ci_contains(line, "update applied") ||
+               ota_ci_contains(line, "marked valid") ||
+               ota_ci_contains(line, "restart") ||
+               ota_ci_contains(line, "reboot")) {
+        ota_status_set_phase(LV_SYMBOL_OK " Update applied",
+                             "Firmware was written. The C5 should reboot into the new slot.",
+                             COLOR_MATERIAL_GREEN, 4, 100);
+        if (g_ota.install_started) ota_monitor_finish_close_ok();
+        ota_restore_screen_timeout();
+    } else if (ota_ci_contains(line, "error") || ota_ci_contains(line, "fail") ||
+               ota_ci_contains(line, "abort")) {
+        ota_status_set_phase(LV_SYMBOL_WARNING " OTA failed",
+                             line, COLOR_MATERIAL_RED, 2, 50);
+        if (g_ota.release_list_waiting) ota_release_list_finish(false);
+        if (g_ota.install_started) ota_monitor_finish_close_error();
+        ota_restore_screen_timeout();
+    }
+}
+
+static void ota_status_show_reboot_wait(void)
+{
+    if (g_ota.reboot_wait_shown) return;
+    g_ota.reboot_wait_shown = true;
+    if (g_ota.byte_progress_seen) {
+        ota_status_set_phase(LV_SYMBOL_REFRESH " C5 is busy / rebooting",
+                             "No UART output after byte progress. Wait for JanOS to come back, then open Info to confirm the active partition.",
+                             COLOR_MATERIAL_GREEN, 3, 96);
+        if (g_ota.install_started) ota_monitor_finish_close_ok();
+    } else {
+        ota_status_set_phase(LV_SYMBOL_REFRESH " Waiting for old JanOS",
+                             "This JanOS does not report byte progress. OTA may still be downloading/flashing; wait for reboot or a final OTA line.",
+                             COLOR_MATERIAL_ORANGE, 2, 88);
+    }
+    if (g_ota.mon_ota) {
+        lv_label_set_text(g_ota.mon_ota,
+                          g_ota.byte_progress_seen
+                              ? LV_SYMBOL_REFRESH " Waiting for JanOS after flash/reboot..."
+                              : LV_SYMBOL_REFRESH " Old JanOS: no detailed progress, keep waiting...");
+        lv_obj_set_style_text_color(g_ota.mon_ota,
+                                    g_ota.byte_progress_seen ? COLOR_MATERIAL_GREEN
+                                                             : COLOR_MATERIAL_ORANGE,
+                                    0);
+    }
+}
+
+// Reformat an "ota_info" line into a friendlier one; copies raw line if unknown.
+static void ota_info_pretty(const char *line, char *out, size_t out_sz)
+{
+    if (!strncmp(line, "OTA running:", 12)) {
+        char part[16] = "?"; sscanf(line + 12, " %15s", part);
+        snprintf(out, out_sz, LV_SYMBOL_PLAY "  Running now: %s (active)", part);
+    } else if (!strncmp(line, "OTA boot:", 9)) {
+        char part[16] = "?"; sscanf(line + 9, " %15s", part);
+        snprintf(out, out_sz, LV_SYMBOL_POWER "  Boots from: %s", part);
+    } else if (!strncmp(line, "OTA next:", 9)) {
+        char part[16] = "?"; sscanf(line + 9, " %15s", part);
+        snprintf(out, out_sz, LV_SYMBOL_REFRESH "  Next update -> %s", part);
+    } else if (!strncmp(line, "APP[", 4)) {
+        char slot[16] = "?";
+        const char *colon = strchr(line, ':');
+        if (colon) sscanf(colon + 1, " %15s", slot);
+        char ver[48] = "?";
+        const char *vp = strstr(line, "ver=");
+        if (vp) { vp += 4; int i = 0; while (vp[i] && vp[i] != ' ' && i < 47) { ver[i] = vp[i]; i++; } ver[i] = '\0'; }
+        char state[8] = "";
+        const char *sp = strstr(line, "state=");
+        if (sp) { sp += 6; int i = 0; while (sp[i] && sp[i] != ' ' && i < 7) { state[i] = sp[i]; i++; } state[i] = '\0'; }
+        if (strcmp(state, "-1") == 0 && strcmp(ver, "1") == 0) {
+            snprintf(ver, sizeof(ver), "old image");
+        }
+        char project[32] = "";
+        const char *pp = strstr(line, "project=");
+        if (pp) { pp += 8; int i = 0; while (pp[i] && pp[i] != ' ' && i < 31) { project[i] = pp[i]; i++; } project[i] = '\0'; }
+        const char *bp = strstr(line, "build=");
+        if (bp && project[0]) snprintf(out, out_sz, "   Slot %s:  %s %s  (%.40s)", slot, project, ver, bp + 6);
+        else if (bp)          snprintf(out, out_sz, "   Slot %s:  %s  (%.40s)", slot, ver, bp + 6);
+        else if (project[0])  snprintf(out, out_sz, "   Slot %s:  %s %s", slot, project, ver);
+        else                  snprintf(out, out_sz, "   Slot %s:  %s", slot, ver);
+    } else {
+        snprintf(out, out_sz, "%.*s", (int)out_sz - 1, line);
+    }
+}
+
+static int ota_slot_index_from_name(const char *name)
+{
+    if (!name) return -1;
+    if (strcmp(name, "ota_0") == 0) return 0;
+    if (strcmp(name, "ota_1") == 0) return 1;
+    return -1;
+}
+
+static void ota_info_copy_token(const char *line, const char *key, char *out, size_t out_sz)
+{
+    if (!out || out_sz == 0) return;
+    out[0] = '\0';
+    const char *p = strstr(line, key);
+    if (!p) return;
+    p += strlen(key);
+    size_t i = 0;
+    while (p[i] && p[i] != ' ' && i + 1 < out_sz) {
+        out[i] = p[i];
+        i++;
+    }
+    out[i] = '\0';
+}
+
+static void ota_info_copy_tail(const char *line, const char *key, char *out, size_t out_sz)
+{
+    if (!out || out_sz == 0) return;
+    out[0] = '\0';
+    const char *p = strstr(line, key);
+    if (!p) return;
+    p += strlen(key);
+    while (*p == ' ') p++;
+    snprintf(out, out_sz, "%.*s", (int)out_sz - 1, p);
+}
+
+static void ota_info_extract_semver(const char *src, char *out, size_t out_sz)
+{
+    if (!out || out_sz == 0) return;
+    out[0] = '\0';
+    if (!src) return;
+    while (*src == ' ' || *src == '\t') src++;
+    if (*src == 'v' || *src == 'V') src++;
+
+    size_t i = 0;
+    while (src[i] && i + 1 < out_sz) {
+        char c = src[i];
+        if (!((c >= '0' && c <= '9') || c == '.')) break;
+        out[i] = c;
+        i++;
+    }
+    out[i] = '\0';
+}
+
+static void ota_info_sync_running_context(const ota_slot_info_t *slot)
+{
+    if (!slot || !slot->is_running) return;
+    tab_context_t *tctx = get_ctx_for_tab(g_ota.target_tab);
+    if (!tctx) return;
+
+    if (slot->project[0]) {
+        strncpy(tctx->janos_app_project, slot->project, sizeof(tctx->janos_app_project) - 1);
+        tctx->janos_app_project[sizeof(tctx->janos_app_project) - 1] = '\0';
+    }
+    if (slot->version[0]) {
+        strncpy(tctx->janos_app_version, slot->version, sizeof(tctx->janos_app_version) - 1);
+        tctx->janos_app_version[sizeof(tctx->janos_app_version) - 1] = '\0';
+
+        char short_ver[sizeof(tctx->janos_version)];
+        ota_info_extract_semver(slot->version, short_ver, sizeof(short_ver));
+        if (short_ver[0]) {
+            strncpy(tctx->janos_version, short_ver, sizeof(tctx->janos_version) - 1);
+            tctx->janos_version[sizeof(tctx->janos_version) - 1] = '\0';
+            tctx->janos_version_mismatch = (strcmp(tctx->janos_version, JANOS_VERSION_REQUIRED) != 0);
+        }
+    }
+    if (slot->build[0]) {
+        strncpy(tctx->janos_app_build, slot->build, sizeof(tctx->janos_app_build) - 1);
+        tctx->janos_app_build[sizeof(tctx->janos_app_build) - 1] = '\0';
+    }
+}
+
+static void ota_info_reset_slots(void)
+{
+    memset(g_ota.info_slots, 0, sizeof(g_ota.info_slots));
+    strcpy(g_ota.info_slots[0].name, "ota_0");
+    strcpy(g_ota.info_slots[1].name, "ota_1");
+}
+
+static const char *ota_info_state_name(const char *state)
+{
+    if (!state || state[0] == '\0') return "unknown";
+    if (strcmp(state, "0") == 0) return "new";
+    if (strcmp(state, "1") == 0) return "pending verify";
+    if (strcmp(state, "2") == 0) return "valid";
+    if (strcmp(state, "3") == 0) return "invalid";
+    if (strcmp(state, "4") == 0) return "aborted";
+    return state;
+}
+
+static bool ota_info_is_old_placeholder_image(const ota_slot_info_t *slot)
+{
+    return slot && !slot->is_running && strcmp(slot->state, "-1") == 0 &&
+           strcmp(slot->version, "1") == 0;
+}
+
+static bool ota_info_has_running_slot(void)
+{
+    return g_ota.info_slots[0].is_running || g_ota.info_slots[1].is_running;
+}
+
+static void ota_info_update_ui(void)
+{
+    if (g_ota.view != OTA_VIEW_INFO) return;
+
+    char summary[160];
+    const char *boot = "?";
+    const char *running = "?";
+    const char *next = "?";
+    for (int i = 0; i < 2; i++) {
+        if (g_ota.info_slots[i].is_boot) boot = g_ota.info_slots[i].name;
+        if (g_ota.info_slots[i].is_running) {
+            running = g_ota.info_slots[i].name;
+        }
+        if (g_ota.info_slots[i].is_next) next = g_ota.info_slots[i].name;
+    }
+    snprintf(summary, sizeof(summary), "Boot: %s    Running: %s    Next OTA write: %s",
+             boot, running, next);
+    if (g_ota.info_summary) lv_label_set_text(g_ota.info_summary, summary);
+
+    bool have_running = ota_info_has_running_slot();
+    for (int i = 0; i < 2; i++) {
+        ota_slot_info_t *s = &g_ota.info_slots[i];
+        char title[48];
+        snprintf(title, sizeof(title), "Partition %d / %s", i + 1, s->name);
+        if (s->title_label) lv_label_set_text(s->title_label, title);
+
+        char roles[96] = "";
+        if (s->is_running) strncat(roles, LV_SYMBOL_PLAY " active", sizeof(roles) - strlen(roles) - 1);
+        if (s->is_boot) {
+            if (roles[0]) strncat(roles, "  ", sizeof(roles) - strlen(roles) - 1);
+            strncat(roles, LV_SYMBOL_POWER " boot", sizeof(roles) - strlen(roles) - 1);
+        }
+        if (s->is_next) {
+            if (roles[0]) strncat(roles, "  ", sizeof(roles) - strlen(roles) - 1);
+            strncat(roles, LV_SYMBOL_REFRESH " next", sizeof(roles) - strlen(roles) - 1);
+        }
+        if (roles[0] == '\0') snprintf(roles, sizeof(roles), "inactive");
+        if (s->role_label) {
+            lv_label_set_text(s->role_label, roles);
+            lv_obj_set_style_text_color(s->role_label,
+                                        s->is_running ? COLOR_MATERIAL_GREEN : ui_muted_color(), 0);
+        }
+
+        char meta[64];
+        snprintf(meta, sizeof(meta), "State: %s", ota_info_state_name(s->state));
+        if (s->meta_label) lv_label_set_text(s->meta_label, meta);
+
+        char ver[96];
+        snprintf(ver, sizeof(ver), "Version: %s",
+                 ota_info_is_old_placeholder_image(s) ? "old image" :
+                 (s->version[0] ? s->version : "?"));
+        if (s->version_label) {
+            lv_obj_clear_flag(s->version_label, LV_OBJ_FLAG_HIDDEN);
+            lv_label_set_text(s->version_label, ver);
+        }
+        if (s->build_label) lv_obj_add_flag(s->build_label, LV_OBJ_FLAG_HIDDEN);
+
+        if (s->card) {
+            lv_obj_set_style_border_color(s->card,
+                                          s->is_running ? COLOR_MATERIAL_GREEN : ui_border_color(), 0);
+        }
+        if (s->activate_btn) {
+            bool can_activate = s->present && have_running && !s->is_running;
+            if (can_activate) lv_obj_clear_flag(s->activate_btn, LV_OBJ_FLAG_HIDDEN);
+            else              lv_obj_add_flag(s->activate_btn, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+}
+
+static void ota_info_parse_line(const char *line)
+{
+    char part[16] = "";
+
+    if (!strncmp(line, "OTA boot:", 9)) {
+        sscanf(line + 9, " %15s", part);
+        for (int i = 0; i < 2; i++) g_ota.info_slots[i].is_boot = false;
+        int idx = ota_slot_index_from_name(part);
+        if (idx >= 0) g_ota.info_slots[idx].is_boot = true;
+    } else if (!strncmp(line, "OTA running:", 12)) {
+        sscanf(line + 12, " %15s", part);
+        for (int i = 0; i < 2; i++) g_ota.info_slots[i].is_running = false;
+        int idx = ota_slot_index_from_name(part);
+        if (idx >= 0) {
+            g_ota.info_slots[idx].is_running = true;
+            ota_info_sync_running_context(&g_ota.info_slots[idx]);
+        }
+    } else if (!strncmp(line, "OTA next:", 9)) {
+        sscanf(line + 9, " %15s", part);
+        for (int i = 0; i < 2; i++) g_ota.info_slots[i].is_next = false;
+        int idx = ota_slot_index_from_name(part);
+        if (idx >= 0) g_ota.info_slots[idx].is_next = true;
+    } else if (!strncmp(line, "APP[", 4)) {
+        const char *colon = strchr(line, ':');
+        if (colon) sscanf(colon + 1, " %15s", part);
+        int idx = ota_slot_index_from_name(part);
+        if (idx >= 0) {
+            ota_slot_info_t *s = &g_ota.info_slots[idx];
+            s->present = true;
+            ota_info_copy_token(line, "offset=", s->offset, sizeof(s->offset));
+            ota_info_copy_token(line, "size=", s->size, sizeof(s->size));
+            ota_info_copy_token(line, "subtype=", s->subtype, sizeof(s->subtype));
+            ota_info_copy_token(line, "state=", s->state, sizeof(s->state));
+            ota_info_copy_token(line, "project=", s->project, sizeof(s->project));
+            ota_info_copy_token(line, "ver=", s->version, sizeof(s->version));
+            ota_info_copy_tail(line, "build=", s->build, sizeof(s->build));
+            ota_info_sync_running_context(s);
+        }
+    }
+
+    ota_info_update_ui();
+}
+
+// Parse one line from the C5 and update the open monitor overlay.
+// Caller must hold the display lock.
+static void ota_handle_line(const char *line)
+{
+    if (line[0] == '\0') return;
+
+    if (g_ota.view == OTA_VIEW_STATUS) {
+        // WiFi status: "Wi-Fi: connected...", "Connecting to AP...", "SUCCESS: Connected...".
+        if (!strncmp(line, "Wi-Fi:", 6) || !strncmp(line, "WiFi:", 5) ||
+            !strncmp(line, "Connecting to AP", 16) || !strncmp(line, "SUCCESS: Connected", 18)) {
+            if (g_ota.mon_wifi) {
+                lv_label_set_text(g_ota.mon_wifi, line);
+                if (!strncmp(line, "SUCCESS", 7))
+                    lv_obj_set_style_text_color(g_ota.mon_wifi, COLOR_MATERIAL_GREEN, 0);
+            }
+            if (!strncmp(line, "SUCCESS: Connected", 18) || !strncmp(line, "Wi-Fi: connected", 16)) {
+                ota_status_set_phase(LV_SYMBOL_WIFI " WiFi connected",
+                                     "Waiting for IP address from the C5.",
+                                     COLOR_MATERIAL_GREEN, 0, 20);
+            } else {
+                ota_status_set_phase(LV_SYMBOL_WIFI " Connecting WiFi",
+                                     line, ui_text_color(), 0, 10);
+            }
+        // IP: "DHCP IP: <addr>, Netmask: ..., GW: ..." -> we now have connectivity.
+        } else if (!strncmp(line, "DHCP IP:", 8) || !strncmp(line, "IP:", 3) ||
+                   !strncmp(line, "Static IP:", 10)) {
+            ota_note_wifi_connected();
+            if (g_ota.mon_ip) {
+                lv_label_set_text(g_ota.mon_ip, line);
+                lv_obj_set_style_text_color(g_ota.mon_ip, COLOR_MATERIAL_GREEN, 0);
+            }
+            if (g_ota.list_after_connect && !g_ota.list_sent_after_connect) {
+                g_ota.list_sent_after_connect = true;
+                ota_status_set_phase(LV_SYMBOL_WIFI " Online",
+                                     "Connected. Reading available JanOS releases...",
+                                     COLOR_MATERIAL_GREEN, 1, 45);
+                if (g_ota.mon_ota) {
+                    lv_label_set_text(g_ota.mon_ota, LV_SYMBOL_REFRESH " Fetching OTA list...");
+                    lv_obj_set_style_text_color(g_ota.mon_ota, ui_text_color(), 0);
+                }
+                ota_send_cmd("ota_list");
+            } else {
+                ota_status_set_phase(LV_SYMBOL_WIFI " Online",
+                                     "Connected. JanOS will run the OTA update flow.",
+                                     COLOR_MATERIAL_GREEN, 1, 35);
+            }
+        } else if (!strncmp(line, "FAILED", 6) || !strncmp(line, "Wi-Fi failed", 12)) {
+            if (g_ota.mon_wifi) {
+                lv_label_set_text(g_ota.mon_wifi, line);
+                lv_obj_set_style_text_color(g_ota.mon_wifi, COLOR_MATERIAL_RED, 0);
+            }
+            ota_status_set_phase(LV_SYMBOL_WARNING " WiFi failed", line,
+                                 COLOR_MATERIAL_RED, 0, 0);
+            ota_note_wifi_disconnected();
+            if (g_ota.release_list_waiting) ota_release_list_finish(false);
+            if (g_ota.install_started) {
+                ota_monitor_finish_close_error();
+                ota_restore_screen_timeout();
+            }
+        } else if (!strncmp(line, "OTA:", 4)) {
+            ota_status_from_ota_line(line);
+            if (g_ota.mon_ota) {
+                const char *pretty = ota_status_pretty(line);
+                lv_label_set_text(g_ota.mon_ota, pretty ? pretty : line);
+                lv_color_t c = ui_text_color();
+                if (ota_ci_contains(line, "success") || ota_ci_contains(line, "up to date") ||
+                    ota_ci_contains(line, "no update") || ota_ci_contains(line, "applied") ||
+                    ota_ci_contains(line, "marked valid") || ota_ci_contains(line, "restart")) {
+                    c = COLOR_MATERIAL_GREEN;
+                } else if (ota_ci_contains(line, "error") || ota_ci_contains(line, "fail") ||
+                           ota_ci_contains(line, "abort")) {
+                    c = COLOR_MATERIAL_RED;
+                }
+                lv_obj_set_style_text_color(g_ota.mon_ota, c, 0);
+            }
+        } else if (!strncmp(line, "OTA[", 4)) {
+            if (g_ota.list_after_connect) {
+                ota_release_list_add_line(line);
+                ota_release_list_finish(true);
+                ota_status_set_phase(LV_SYMBOL_LIST " Available releases",
+                                     "Latest JanOS releases received from the C5.",
+                                     COLOR_MATERIAL_GREEN, 2, 100);
+                if (g_ota.mon_ota) {
+                    lv_label_set_text_fmt(g_ota.mon_ota, "%d release%s available",
+                                          g_ota.mon_release_count,
+                                          g_ota.mon_release_count == 1 ? "" : "s");
+                    lv_obj_set_style_text_color(g_ota.mon_ota, COLOR_MATERIAL_GREEN, 0);
+                }
+            }
+        }
+
+        ota_append_log(line);
+    } else if (g_ota.view == OTA_VIEW_LIST) {
+        // Release entries ("OTA[n]:") plus any "OTA: not connected/..." notice.
+        if (!strncmp(line, "OTA", 3)) ota_append_log(line);
+    } else if (g_ota.view == OTA_VIEW_INFO) {
+        if (!strncmp(line, "OTA boot", 8)    || !strncmp(line, "OTA running", 11) ||
+            !strncmp(line, "OTA next", 8)    || !strncmp(line, "OTA channel", 11) ||
+            !strncmp(line, "APP[", 4)) {
+            ota_info_parse_line(line);
+            char pretty[256];
+            ota_info_pretty(line, pretty, sizeof(pretty));
+            ota_append_log(pretty);
+        }
+    }
+}
+
+// Reads the C5 UART line-by-line while g_ota.monitoring is set and routes each
+// line to the open monitor overlay. Mirrors handshaker_monitor_task.
+static void ota_monitor_task(void *arg)
+{
+    (void)arg;
+    tab_id_t tab = g_ota.target_tab;
+    uart_port_t port = uart_port_for_tab(tab);
+    static char rx[512];
+    static char line[512];
+    int line_pos = 0;
+    TickType_t last_rx_tick = xTaskGetTickCount();
+
+    ESP_LOGI(TAG, "[OTA] monitor task started (tab %s)", tab_transport_name(tab));
+
+    while (g_ota.monitoring) {
+        int len = transport_read_bytes_tab(tab, port, rx, sizeof(rx) - 1, pdMS_TO_TICKS(100));
+        if (len <= 0) {
+            if (g_ota.view == OTA_VIEW_STATUS && g_ota.release_list_waiting &&
+                g_ota.list_sent_after_connect &&
+                (xTaskGetTickCount() - last_rx_tick) > pdMS_TO_TICKS(70000)) {
+                if (bsp_display_lock(50)) {
+                    ota_status_set_phase(LV_SYMBOL_WARNING " Release list timeout",
+                                         "No release data received from JanOS. Check WiFi and try again.",
+                                         COLOR_MATERIAL_RED, 1, 45);
+                    ota_release_list_finish(false);
+                    bsp_display_unlock();
+                }
+            }
+            if (g_ota.view == OTA_VIEW_STATUS && g_ota.install_started &&
+                g_ota.flash_progress_seen && !g_ota.terminal_status_seen &&
+                !g_ota.reboot_wait_shown &&
+                (xTaskGetTickCount() - last_rx_tick) > pdMS_TO_TICKS(12000)) {
+                if (bsp_display_lock(50)) {
+                    ota_status_show_reboot_wait();
+                    bsp_display_unlock();
+                }
+            }
+            continue;
+        }
+        last_rx_tick = xTaskGetTickCount();
+        rx[len] = '\0';
+        for (int i = 0; i < len; i++) {
+            char c = rx[i];
+            if (c == '\n' || c == '\r') {
+                if (line_pos > 0) {
+                    line[line_pos] = '\0';
+                    ESP_LOGI(TAG, "[OTA<-%s] %s", tab_transport_name(tab), line);
+                    if (bsp_display_lock(50)) {
+                        ota_handle_line(line);
+                        bsp_display_unlock();
+                    }
+                    line_pos = 0;
+                }
+            } else if (line_pos < (int)sizeof(line) - 1) {
+                line[line_pos++] = c;
+            }
+        }
+    }
+
+    ESP_LOGI(TAG, "[OTA] monitor task ended");
+    g_ota.task = NULL;
+    vTaskDelete(NULL);
+}
+
+static void ota_close_monitor(void)
+{
+    ota_restore_screen_timeout();
+    if (g_ota.monitoring) {
+        g_ota.monitoring = false;
+        vTaskDelay(pdMS_TO_TICKS(150));   // let the task observe the flag and exit
+    }
+    g_ota.task = NULL;
+    if (g_ota.mon_overlay) {
+        lv_obj_del(g_ota.mon_overlay);
+        g_ota.mon_overlay = NULL;
+    }
+    g_ota.mon_wifi = NULL;
+    g_ota.mon_ip = NULL;
+    g_ota.mon_ota = NULL;
+    g_ota.mon_phase = NULL;
+    g_ota.mon_detail = NULL;
+    g_ota.mon_progress = NULL;
+    for (int i = 0; i < 4; i++) g_ota.mon_steps[i] = NULL;
+    g_ota.mon_release_list = NULL;
+    g_ota.mon_log_container = NULL;
+    g_ota.mon_log_label = NULL;
+    g_ota.mon_close_btn = NULL;
+    g_ota.mon_close_label = NULL;
+    g_ota.mon_release_count = 0;
+    g_ota.info_summary = NULL;
+    for (int i = 0; i < 2; i++) {
+        g_ota.info_slots[i].card = NULL;
+        g_ota.info_slots[i].title_label = NULL;
+        g_ota.info_slots[i].role_label = NULL;
+        g_ota.info_slots[i].meta_label = NULL;
+        g_ota.info_slots[i].version_label = NULL;
+        g_ota.info_slots[i].build_label = NULL;
+        g_ota.info_slots[i].activate_btn = NULL;
+        g_ota.info_slots[i].activate_label = NULL;
+    }
+    g_ota.install_started = false;
+    g_ota.reboot_wait_shown = false;
+    g_ota.flash_progress_seen = false;
+    g_ota.byte_progress_seen = false;
+    g_ota.terminal_status_seen = false;
+    g_ota.screen_timeout_suspended = false;
+    g_ota.list_after_connect = false;
+    g_ota.list_sent_after_connect = false;
+    g_ota.release_list_waiting = false;
+    g_ota.mon_release_count = 0;
+    g_ota.view = OTA_VIEW_NONE;
+}
+
+static void ota_monitor_close_cb(lv_event_t *e)
+{
+    (void)e;
+    if (g_ota.mon_close_btn && lv_obj_has_state(g_ota.mon_close_btn, LV_STATE_DISABLED)) {
+        return;
+    }
+    ota_close_monitor();
+}
+
+static void ota_create_info_slot_card(lv_obj_t *parent, int idx)
+{
+    ota_slot_info_t *s = &g_ota.info_slots[idx];
+    s->card = lv_obj_create(parent);
+    lv_obj_set_size(s->card, 0, 230);
+    lv_obj_set_flex_grow(s->card, 1);
+    lv_obj_set_style_bg_color(s->card, ui_bg_color(), 0);
+    lv_obj_set_style_border_width(s->card, 2, 0);
+    lv_obj_set_style_border_color(s->card, ui_border_color(), 0);
+    lv_obj_set_style_radius(s->card, 8, 0);
+    lv_obj_set_style_pad_all(s->card, 10, 0);
+    lv_obj_set_style_pad_row(s->card, 6, 0);
+    lv_obj_set_flex_flow(s->card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_clear_flag(s->card, LV_OBJ_FLAG_SCROLLABLE);
+
+    s->title_label = lv_label_create(s->card);
+    lv_obj_set_style_text_font(s->title_label, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_color(s->title_label, ui_text_color(), 0);
+    lv_obj_set_width(s->title_label, lv_pct(100));
+    lv_label_set_long_mode(s->title_label, LV_LABEL_LONG_DOT);
+
+    s->role_label = lv_label_create(s->card);
+    lv_obj_set_style_text_font(s->role_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(s->role_label, ui_muted_color(), 0);
+    lv_obj_set_width(s->role_label, lv_pct(100));
+    lv_label_set_long_mode(s->role_label, LV_LABEL_LONG_DOT);
+
+    s->meta_label = lv_label_create(s->card);
+    lv_obj_set_style_text_font(s->meta_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(s->meta_label, ui_muted_color(), 0);
+    lv_obj_set_width(s->meta_label, lv_pct(100));
+    lv_label_set_long_mode(s->meta_label, LV_LABEL_LONG_WRAP);
+
+    s->version_label = lv_label_create(s->card);
+    lv_obj_set_style_text_font(s->version_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(s->version_label, ui_text_color(), 0);
+    lv_obj_set_width(s->version_label, lv_pct(100));
+    lv_label_set_long_mode(s->version_label, LV_LABEL_LONG_WRAP);
+
+    s->build_label = lv_label_create(s->card);
+    lv_obj_set_style_text_font(s->build_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s->build_label, ui_muted_color(), 0);
+    lv_obj_set_width(s->build_label, lv_pct(100));
+    lv_label_set_long_mode(s->build_label, LV_LABEL_LONG_DOT);
+
+    lv_obj_t *spacer = lv_obj_create(s->card);
+    lv_obj_remove_style_all(spacer);
+    lv_obj_set_flex_grow(spacer, 1);
+
+    s->activate_btn = lv_btn_create(s->card);
+    lv_obj_set_size(s->activate_btn, lv_pct(100), 42);
+    lv_obj_set_style_bg_color(s->activate_btn, COLOR_MATERIAL_GREEN, 0);
+    lv_obj_set_style_radius(s->activate_btn, 8, 0);
+    lv_obj_add_event_cb(s->activate_btn, ota_slot_activate_cb, LV_EVENT_CLICKED,
+                        (void *)(idx == 0 ? "ota_0" : "ota_1"));
+    lv_obj_add_flag(s->activate_btn, LV_OBJ_FLAG_HIDDEN);
+
+    s->activate_label = lv_label_create(s->activate_btn);
+    lv_label_set_text(s->activate_label, "Activate");
+    lv_obj_set_style_text_font(s->activate_label, &lv_font_montserrat_16, 0);
+    lv_obj_center(s->activate_label);
+}
+
+// Open the Status / List / Info overlay and start streaming the C5 UART.
+static void ota_open_monitor(ota_view_t view, const char *title)
+{
+    if (!internal_container) return;
+    ota_close_monitor();   // ensure only one overlay/task at a time
+
+    g_ota.log_buf[0] = '\0';
+    g_ota.view = view;
+    g_ota.install_started = false;
+    g_ota.reboot_wait_shown = false;
+    g_ota.flash_progress_seen = false;
+    g_ota.byte_progress_seen = false;
+    g_ota.terminal_status_seen = false;
+    g_ota.screen_timeout_suspended = false;
+    g_ota.list_after_connect = false;
+    g_ota.list_sent_after_connect = false;
+    g_ota.release_list_waiting = false;
+    if (view == OTA_VIEW_INFO) ota_info_reset_slots();
+
+    g_ota.mon_overlay = lv_obj_create(internal_container);
+    lv_obj_remove_style_all(g_ota.mon_overlay);
+    lv_obj_set_size(g_ota.mon_overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(g_ota.mon_overlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(g_ota.mon_overlay, LV_OPA_50, 0);
+    lv_obj_clear_flag(g_ota.mon_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(g_ota.mon_overlay, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t *box = lv_obj_create(g_ota.mon_overlay);
+    lv_obj_set_size(box, view == OTA_VIEW_INFO ? 640 : 640,
+                    view == OTA_VIEW_INFO ? 560 : 620);
+    lv_obj_center(box);
+    lv_obj_set_style_bg_color(box, ui_card_color(), 0);
+    lv_obj_set_style_border_color(box, COLOR_MATERIAL_ORANGE, 0);
+    lv_obj_set_style_border_width(box, 2, 0);
+    lv_obj_set_style_radius(box, 16, 0);
+    lv_obj_set_style_pad_all(box, view == OTA_VIEW_INFO ? 12 : 16, 0);
+    lv_obj_set_flex_flow(box, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(box, 10, 0);
+    lv_obj_clear_flag(box, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *ttl = lv_label_create(box);
+    lv_label_set_text(ttl, title);
+    lv_obj_set_style_text_font(ttl, &lv_font_montserrat_22, 0);
+    lv_obj_set_style_text_color(ttl, COLOR_MATERIAL_ORANGE, 0);
+
+    if (view == OTA_VIEW_INFO) {
+        g_ota.info_summary = lv_label_create(box);
+        lv_label_set_text(g_ota.info_summary, "Reading partition info from C5...");
+        lv_obj_set_style_text_font(g_ota.info_summary, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(g_ota.info_summary, ui_text_color(), 0);
+        lv_obj_set_width(g_ota.info_summary, lv_pct(100));
+        lv_label_set_long_mode(g_ota.info_summary, LV_LABEL_LONG_WRAP);
+
+        lv_obj_t *slots = lv_obj_create(box);
+        lv_obj_set_size(slots, lv_pct(100), LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_opa(slots, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(slots, 0, 0);
+        lv_obj_set_style_pad_all(slots, 0, 0);
+        lv_obj_set_style_pad_column(slots, 8, 0);
+        lv_obj_set_flex_flow(slots, LV_FLEX_FLOW_ROW);
+        lv_obj_clear_flag(slots, LV_OBJ_FLAG_SCROLLABLE);
+
+        ota_create_info_slot_card(slots, 0);
+        ota_create_info_slot_card(slots, 1);
+        ota_info_update_ui();
+    } else if (view == OTA_VIEW_STATUS) {
+        lv_obj_t *status_card = lv_obj_create(box);
+        lv_obj_set_size(status_card, lv_pct(100), 166);
+        lv_obj_set_style_bg_color(status_card, ui_bg_color(), 0);
+        lv_obj_set_style_border_width(status_card, 1, 0);
+        lv_obj_set_style_border_color(status_card, ui_border_color(), 0);
+        lv_obj_set_style_radius(status_card, 8, 0);
+        lv_obj_set_style_pad_all(status_card, 12, 0);
+        lv_obj_set_style_pad_row(status_card, 6, 0);
+        lv_obj_set_flex_flow(status_card, LV_FLEX_FLOW_COLUMN);
+        lv_obj_clear_flag(status_card, LV_OBJ_FLAG_SCROLLABLE);
+
+        g_ota.mon_phase = lv_label_create(status_card);
+        lv_label_set_text(g_ota.mon_phase, LV_SYMBOL_WIFI " Connecting WiFi");
+        lv_obj_set_style_text_font(g_ota.mon_phase, &lv_font_montserrat_22, 0);
+        lv_obj_set_style_text_color(g_ota.mon_phase, COLOR_MATERIAL_ORANGE, 0);
+        lv_obj_set_width(g_ota.mon_phase, lv_pct(100));
+        lv_label_set_long_mode(g_ota.mon_phase, LV_LABEL_LONG_DOT);
+
+        g_ota.mon_detail = lv_label_create(status_card);
+        lv_label_set_text(g_ota.mon_detail, "Waiting for JanOS network status...");
+        lv_obj_set_style_text_font(g_ota.mon_detail, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(g_ota.mon_detail, ui_text_color(), 0);
+        lv_obj_set_width(g_ota.mon_detail, lv_pct(100));
+        lv_label_set_long_mode(g_ota.mon_detail, LV_LABEL_LONG_WRAP);
+
+        g_ota.mon_progress = lv_bar_create(status_card);
+        lv_obj_set_size(g_ota.mon_progress, lv_pct(100), 8);
+        lv_bar_set_range(g_ota.mon_progress, 0, 100);
+        lv_bar_set_value(g_ota.mon_progress, 0, LV_ANIM_OFF);
+
+        lv_obj_t *steps = lv_obj_create(status_card);
+        lv_obj_set_size(steps, lv_pct(100), LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_opa(steps, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(steps, 0, 0);
+        lv_obj_set_style_pad_all(steps, 0, 0);
+        lv_obj_set_style_pad_column(steps, 10, 0);
+        lv_obj_set_flex_flow(steps, LV_FLEX_FLOW_ROW);
+        lv_obj_clear_flag(steps, LV_OBJ_FLAG_SCROLLABLE);
+
+        for (int i = 0; i < 4; i++) {
+            g_ota.mon_steps[i] = lv_label_create(steps);
+            lv_obj_set_flex_grow(g_ota.mon_steps[i], 1);
+            lv_obj_set_style_text_font(g_ota.mon_steps[i], &lv_font_montserrat_14, 0);
+            lv_obj_set_style_text_color(g_ota.mon_steps[i], ui_muted_color(), 0);
+            lv_label_set_long_mode(g_ota.mon_steps[i], LV_LABEL_LONG_DOT);
+        }
+        ota_status_set_step(0, 0);
+
+        g_ota.mon_wifi = lv_label_create(box);
+        lv_label_set_text(g_ota.mon_wifi, "WiFi: connecting...");
+        lv_obj_set_style_text_font(g_ota.mon_wifi, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(g_ota.mon_wifi, ui_text_color(), 0);
+
+        g_ota.mon_ip = lv_label_create(box);
+        lv_label_set_text(g_ota.mon_ip, "IP: ...");
+        lv_obj_set_style_text_font(g_ota.mon_ip, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(g_ota.mon_ip, ui_text_color(), 0);
+
+        g_ota.mon_ota = lv_label_create(box);
+        lv_label_set_text(g_ota.mon_ota, "OTA: waiting for the C5...");
+        lv_obj_set_style_text_font(g_ota.mon_ota, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(g_ota.mon_ota, ui_muted_color(), 0);
+        lv_obj_set_width(g_ota.mon_ota, lv_pct(100));
+        lv_label_set_long_mode(g_ota.mon_ota, LV_LABEL_LONG_WRAP);
+
+        g_ota.mon_release_list = lv_obj_create(box);
+        lv_obj_set_size(g_ota.mon_release_list, lv_pct(100), 220);
+        lv_obj_set_style_bg_color(g_ota.mon_release_list, ui_card_color(), 0);
+        lv_obj_set_style_border_width(g_ota.mon_release_list, 1, 0);
+        lv_obj_set_style_border_color(g_ota.mon_release_list, ui_border_color(), 0);
+        lv_obj_set_style_radius(g_ota.mon_release_list, 8, 0);
+        lv_obj_set_style_pad_all(g_ota.mon_release_list, 8, 0);
+        lv_obj_set_style_pad_row(g_ota.mon_release_list, 8, 0);
+        lv_obj_set_flex_flow(g_ota.mon_release_list, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_scroll_dir(g_ota.mon_release_list, LV_DIR_VER);
+        lv_obj_set_scrollbar_mode(g_ota.mon_release_list, LV_SCROLLBAR_MODE_AUTO);
+        lv_obj_add_flag(g_ota.mon_release_list, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    g_ota.mon_log_container = lv_obj_create(box);
+    lv_obj_set_width(g_ota.mon_log_container, lv_pct(100));
+    lv_obj_set_flex_grow(g_ota.mon_log_container, 1);
+    lv_obj_set_style_bg_color(g_ota.mon_log_container, ui_bg_color(), 0);
+    lv_obj_set_style_border_width(g_ota.mon_log_container, 1, 0);
+    lv_obj_set_style_border_color(g_ota.mon_log_container, ui_border_color(), 0);
+    lv_obj_set_style_radius(g_ota.mon_log_container, 8, 0);
+    lv_obj_set_style_pad_all(g_ota.mon_log_container, 8, 0);
+    lv_obj_set_scroll_dir(g_ota.mon_log_container, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(g_ota.mon_log_container, LV_SCROLLBAR_MODE_AUTO);
+
+    g_ota.mon_log_label = lv_label_create(g_ota.mon_log_container);
+    lv_label_set_text(g_ota.mon_log_label, "");
+    lv_obj_set_width(g_ota.mon_log_label, lv_pct(100));
+    lv_label_set_long_mode(g_ota.mon_log_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(g_ota.mon_log_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(g_ota.mon_log_label, ui_muted_color(), 0);
+
+    g_ota.mon_close_btn = lv_btn_create(box);
+    lv_obj_set_size(g_ota.mon_close_btn, lv_pct(100), 46);
+    lv_obj_set_style_radius(g_ota.mon_close_btn, 8, 0);
+    lv_obj_add_event_cb(g_ota.mon_close_btn, ota_monitor_close_cb, LV_EVENT_CLICKED, NULL);
+    g_ota.mon_close_label = lv_label_create(g_ota.mon_close_btn);
+    lv_obj_set_style_text_font(g_ota.mon_close_label, &lv_font_montserrat_18, 0);
+    ota_monitor_set_close_state(true, COLOR_MATERIAL_ORANGE, "Close");
+
+    // Pause any background scan on the target tab, flush stale bytes, then stream.
+    tab_context_t *tctx = get_ctx_for_tab(g_ota.target_tab);
+    if (tctx && tctx->observer_running) pause_observer_for_attack(tctx);
+    if (g_ota.target_tab == TAB_USB) {
+        usb_flush_input(100);
+    } else if (g_ota.target_tab != TAB_INTERNAL) {
+        uart_flush_input(uart_port_for_tab(g_ota.target_tab));
+    }
+
+    g_ota.monitoring = true;
+    xTaskCreate(ota_monitor_task, "ota_monitor", 4096, NULL, 5, &g_ota.task);
+}
+
+// ---- keyboard + input handling ----
+
+static void ota_kb_ready_cb(lv_event_t *e)
+{
+    lv_event_code_t code = lv_event_get_code(e);
+    if ((code == LV_EVENT_READY || code == LV_EVENT_CANCEL) && g_ota.keyboard) {
+        lv_obj_add_flag(g_ota.keyboard, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void ota_ta_focus_cb(lv_event_t *e)
+{
+    lv_obj_t *ta = lv_event_get_target(e);
+    if (g_ota.keyboard) {
+        lv_keyboard_set_textarea(g_ota.keyboard, ta);
+        lv_obj_clear_flag(g_ota.keyboard, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void ota_pass_toggle_cb(lv_event_t *e)
+{
+    lv_obj_t *btn = lv_event_get_target(e);
+    if (!g_ota.pass_ta) return;
+    bool now = !lv_textarea_get_password_mode(g_ota.pass_ta);
+    lv_textarea_set_password_mode(g_ota.pass_ta, now);
+    lv_obj_t *lbl = lv_obj_get_child(btn, 0);
+    if (lbl) lv_label_set_text(lbl, now ? LV_SYMBOL_EYE_CLOSE : LV_SYMBOL_EYE_OPEN);
+}
+
+static void ota_credentials_changed_cb(lv_event_t *e)
+{
+    (void)e;
+    g_ota.selected_saved_password = false;
+    if (g_ota.pass_ta) {
+        lv_textarea_set_placeholder_text(g_ota.pass_ta, "password");
+    }
+}
+
+static bool ota_prepare_wifi_command(char *cmd, size_t cmd_sz, bool start_ota)
+{
+    const char *ssid = g_ota.ssid_ta ? lv_textarea_get_text(g_ota.ssid_ta) : "";
+    const char *pass = g_ota.pass_ta ? lv_textarea_get_text(g_ota.pass_ta) : "";
+    if (g_ota.target_tab == TAB_INTERNAL) {
+        if (g_ota.page_status) lv_label_set_text(g_ota.page_status, "No C5 detected - connect the module");
+        return false;
+    }
+    if (!ssid || strlen(ssid) == 0) {
+        if (g_ota.page_status) lv_label_set_text(g_ota.page_status, "SSID required (tap Scan or type it)");
+        return false;
+    }
+
+    bool manual = g_ota.mode_dd && (lv_dropdown_get_selected(g_ota.mode_dd) == 1);
+    const char *ip = "", *nm = "", *gw = "", *dns = "";
+    if (manual) {
+        ip  = lv_textarea_get_text(g_ota.ip_ta);
+        nm  = lv_textarea_get_text(g_ota.netmask_ta);
+        gw  = lv_textarea_get_text(g_ota.gw_ta);
+        dns = g_ota.dns_ta ? lv_textarea_get_text(g_ota.dns_ta) : "";
+        if (strlen(ip) == 0 || strlen(nm) == 0 || strlen(gw) == 0) {
+            if (g_ota.page_status)
+                lv_label_set_text(g_ota.page_status, "IP / Netmask / GW required in Manual mode");
+            return false;
+        }
+    }
+
+    bool use_saved = g_ota.selected_saved_password;
+    if (!ota_build_wifi_connect_cmd(cmd, cmd_sz, ssid, pass, use_saved,
+                                    start_ota, manual, ip, nm, gw, dns)) {
+        if (g_ota.page_status) lv_label_set_text(g_ota.page_status, "SSID/password too long");
+        return false;
+    }
+
+    return true;
+}
+
+static bool ota_build_wifi_connect_cmd(char *out, size_t out_sz, const char *ssid,
+                                       const char *password, bool use_saved,
+                                       bool start_ota, bool manual,
+                                       const char *ip, const char *nm,
+                                       const char *gw, const char *dns)
+{
+    if (!out || out_sz == 0 || !ssid || ssid[0] == '\0') return false;
+
+    const char *ota_flag = start_ota ? " ota" : "";
+    if (!manual) {
+        wifi_connect_auth_mode_t mode = use_saved ? WIFI_CONNECT_AUTH_SAVED :
+                                        ((password && password[0]) ? WIFI_CONNECT_AUTH_PASSWORD
+                                                                  : WIFI_CONNECT_AUTH_OPEN);
+        if (!build_wifi_connect_command(out, out_sz, ssid, password, mode)) return false;
+        if (start_ota) {
+            size_t len = strlen(out);
+            int add = snprintf(out + len, out_sz - len, "%s", ota_flag);
+            if (add < 0 || len + (size_t)add >= out_sz) return false;
+        }
+        return true;
+    }
+
+    char escaped_ssid[67];
+    char escaped_password[131];
+    beacon_spam_escape_quoted_arg(ssid, escaped_ssid, sizeof(escaped_ssid));
+    int cmd_len = 0;
+    if (use_saved) {
+        if (dns && dns[0]) {
+            cmd_len = snprintf(out, out_sz, "wifi_connect \"%s\" --saved%s %s %s %s %s",
+                               escaped_ssid, ota_flag, ip, nm, gw, dns);
+        } else {
+            cmd_len = snprintf(out, out_sz, "wifi_connect \"%s\" --saved%s %s %s %s",
+                               escaped_ssid, ota_flag, ip, nm, gw);
+        }
+    } else if (password && password[0]) {
+        beacon_spam_escape_quoted_arg(password, escaped_password, sizeof(escaped_password));
+        if (dns && dns[0]) {
+            cmd_len = snprintf(out, out_sz, "wifi_connect \"%s\" \"%s\"%s %s %s %s %s",
+                               escaped_ssid, escaped_password, ota_flag, ip, nm, gw, dns);
+        } else {
+            cmd_len = snprintf(out, out_sz, "wifi_connect \"%s\" \"%s\"%s %s %s %s",
+                               escaped_ssid, escaped_password, ota_flag, ip, nm, gw);
+        }
+    } else {
+        if (dns && dns[0]) {
+            cmd_len = snprintf(out, out_sz, "wifi_connect \"%s\"%s %s %s %s %s",
+                               escaped_ssid, ota_flag, ip, nm, gw, dns);
+        } else {
+            cmd_len = snprintf(out, out_sz, "wifi_connect \"%s\"%s %s %s %s",
+                               escaped_ssid, ota_flag, ip, nm, gw);
+        }
+    }
+    return cmd_len >= 0 && cmd_len < (int)out_sz;
+}
+
+static void ota_mode_changed_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!g_ota.mode_dd || !g_ota.manual_box) return;
+    bool manual = (lv_dropdown_get_selected(g_ota.mode_dd) == 1);
+    if (manual) lv_obj_clear_flag(g_ota.manual_box, LV_OBJ_FLAG_HIDDEN);
+    else        lv_obj_add_flag(g_ota.manual_box, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void ota_channel_changed_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!g_ota.channel_dd) return;
+    const char *ch = (lv_dropdown_get_selected(g_ota.channel_dd) == 1) ? "dev" : "main";
+    strncpy(g_ota.channel, ch, sizeof(g_ota.channel) - 1);
+    g_ota.channel[sizeof(g_ota.channel) - 1] = '\0';
+    char cmd[32];
+    snprintf(cmd, sizeof(cmd), "ota_channel %s", ch);
+    ota_send_cmd(cmd);
+    if (g_ota.page_status) {
+        char m[48];
+        snprintf(m, sizeof(m), "Channel set to: %s", ch);
+        lv_label_set_text(g_ota.page_status, m);
+    }
+}
+
+static void ota_slot_activate_cb(lv_event_t *e)
+{
+    const char *slot = (const char *)lv_event_get_user_data(e);
+    if (!slot || g_ota.target_tab == TAB_INTERNAL) return;
+
+    char cmd[32];
+    snprintf(cmd, sizeof(cmd), "ota_boot %s", slot);
+    ota_send_cmd(cmd);
+
+    if (g_ota.info_summary) {
+        lv_label_set_text_fmt(g_ota.info_summary,
+                              "Sent ota_boot %s. C5 will reboot into that partition.",
+                              slot);
+        lv_obj_set_style_text_color(g_ota.info_summary, COLOR_MATERIAL_AMBER, 0);
+    }
+
+    lv_obj_t *btn = lv_event_get_target(e);
+    if (btn) lv_obj_add_state(btn, LV_STATE_DISABLED);
+    int idx = ota_slot_index_from_name(slot);
+    if (idx >= 0 && g_ota.info_slots[idx].activate_label) {
+        lv_label_set_text(g_ota.info_slots[idx].activate_label, "Rebooting...");
+    }
+}
+
+static void ota_list_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    char cmd[256];
+    if (!ota_prepare_wifi_command(cmd, sizeof(cmd), false)) {
+        return;
+    }
+
+    ota_open_monitor(OTA_VIEW_STATUS, "Monster OTA - Available Updates");
+    g_ota.list_after_connect = true;
+    g_ota.list_sent_after_connect = false;
+    ota_release_list_prepare();
+    ota_suspend_screen_timeout();
+    ota_monitor_lock_close_for_list();
+    ota_status_set_phase(LV_SYMBOL_WIFI " Connect & list",
+                         "JanOS will connect to WiFi first, then read available releases.",
+                         COLOR_MATERIAL_ORANGE, 0, 10);
+    ota_send_cmd(cmd);
+}
+
+static void ota_info_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    if (g_ota.target_tab == TAB_INTERNAL) {
+        if (g_ota.page_status) lv_label_set_text(g_ota.page_status, "No C5 detected");
+        return;
+    }
+    ota_open_monitor(OTA_VIEW_INFO, "OTA - Partition Info");
+    ota_send_cmd("ota_info");
+}
+
+static void ota_check_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    char cmd[256];
+    bool start_ota = true;
+    if (!ota_prepare_wifi_command(cmd, sizeof(cmd), start_ota)) {
+        return;
+    }
+    bool reuse_wifi = ota_can_reuse_wifi_for_update();
+    if (reuse_wifi) {
+        snprintf(cmd, sizeof(cmd), "ota_check");
+    }
+
+    ota_open_monitor(OTA_VIEW_STATUS, "Monster OTA - Updating");
+    g_ota.install_started = start_ota;
+    if (start_ota) {
+        ota_suspend_screen_timeout();
+        ota_monitor_lock_close_for_update();
+        if (reuse_wifi) {
+            ota_status_set_phase(LV_SYMBOL_DOWNLOAD " Reusing WiFi",
+                                 "C5 is already online. Starting JanOS OTA check.",
+                                 COLOR_MATERIAL_GREEN, 1, 35);
+        } else {
+            ota_status_set_phase(LV_SYMBOL_DOWNLOAD " Connect & update",
+                                 "JanOS will start download and flash after WiFi connects.",
+                                 COLOR_MATERIAL_ORANGE, 0, 10);
+        }
+    }
+    ota_send_cmd(cmd);
+}
+
+// ---- setup page ----
+
+static lv_obj_t *ota_make_label(lv_obj_t *parent, const char *text)
+{
+    lv_obj_t *l = lv_label_create(parent);
+    lv_label_set_text(l, text);
+    lv_obj_set_style_text_font(l, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(l, ui_muted_color(), 0);
+    return l;
+}
+
+static lv_obj_t *ota_make_textarea(lv_obj_t *parent, const char *placeholder, int maxlen, bool password)
+{
+    lv_obj_t *ta = lv_textarea_create(parent);
+    lv_obj_set_width(ta, lv_pct(100));
+    lv_textarea_set_one_line(ta, true);
+    if (maxlen > 0) lv_textarea_set_max_length(ta, maxlen);
+    lv_textarea_set_placeholder_text(ta, placeholder);
+    lv_textarea_set_password_mode(ta, password);
+    lv_obj_set_style_bg_color(ta, ui_bg_color(), 0);
+    lv_obj_set_style_border_color(ta, ui_border_color(), 0);
+    lv_obj_set_style_border_width(ta, 1, 0);
+    lv_obj_set_style_text_color(ta, ui_text_color(), 0);
+    lv_obj_add_event_cb(ta, ota_ta_focus_cb, LV_EVENT_FOCUSED, NULL);
+    lv_obj_add_event_cb(ta, ota_ta_focus_cb, LV_EVENT_CLICKED, NULL);
+    return ta;
+}
+
+// ---- WiFi network scan picker (same mechanism as the wardrive upload) ----
+
+static void ota_scan_row_click_cb(lv_event_t *e)
+{
+    const char *ssid = (const char *)lv_event_get_user_data(e);
+    if (!ssid) return;
+    strncpy(g_ota.sel_ssid, ssid, sizeof(g_ota.sel_ssid) - 1);
+    g_ota.sel_ssid[sizeof(g_ota.sel_ssid) - 1] = '\0';
+    g_ota.scan_selected = true;
+}
+
+static void ota_scan_close(void)
+{
+    if (g_ota.scan_running) {
+        g_ota.scan_running = false;
+        vTaskDelay(pdMS_TO_TICKS(200));   // let the scan task observe the flag and exit
+    }
+    g_ota.scan_task = NULL;
+    if (g_ota.scan_overlay) {
+        lv_obj_del(g_ota.scan_overlay);
+        g_ota.scan_overlay = NULL;
+    }
+    g_ota.scan_status = NULL;
+    g_ota.scan_list = NULL;
+}
+
+static void ota_scan_close_cb(lv_event_t *e)
+{
+    (void)e;
+    ota_scan_close();
+}
+
+// Scans WiFi via the C5 ("scan_networks"), lets the user pick a network, then
+// fills the SSID/password fields on the setup page (saved password if known).
+static void ota_scan_task(void *arg)
+{
+    (void)arg;
+    tab_id_t tab = g_ota.target_tab;
+    uart_port_t port = uart_port_for_tab(tab);
+
+    char *rxbuf   = heap_caps_malloc(UART_BUF_SIZE, MALLOC_CAP_SPIRAM);
+    char *linebuf = heap_caps_malloc(512, MALLOC_CAP_SPIRAM);
+    char *etbuf   = heap_caps_malloc(512, MALLOC_CAP_SPIRAM);
+    evil_twin_entry_t *et = heap_caps_calloc(EVIL_TWIN_MAX_ENTRIES, sizeof(evil_twin_entry_t), MALLOC_CAP_SPIRAM);
+    static wifi_network_t nets[MAX_NETWORKS];
+    int net_count = 0, line_pos = 0, empty = 0;
+    bool scan_complete = false, background = false, found = false;
+    TickType_t start = xTaskGetTickCount();
+    TickType_t tmo = pdMS_TO_TICKS(UART_RX_TIMEOUT);
+
+    if (!rxbuf || !linebuf || !etbuf || !et) {
+        ESP_LOGE(TAG, "[OTA] scan: allocation failed");
+        goto done;
+    }
+    memset(nets, 0, sizeof(nets));
+
+    if (tab == TAB_USB && usb_cdc_handle) usbh_cdc_flush_rx_buffer(usb_cdc_handle);
+    else uart_flush(port);
+    transport_write_bytes_tab(tab, port, "scan_networks\r\n", 15);
+    ESP_LOGI(TAG, "[OTA] scan: sent scan_networks");
+
+    while (!scan_complete && (xTaskGetTickCount() - start) < tmo && g_ota.scan_running) {
+        int len = transport_read_bytes_tab(tab, port, rxbuf, UART_BUF_SIZE - 1, pdMS_TO_TICKS(100));
+        if (len <= 0) { if (++empty >= 8) { background = true; break; } continue; }
+        empty = 0; rxbuf[len] = '\0';
+        for (int i = 0; i < len; i++) {
+            char c = rxbuf[i];
+            if (c == '\n' || c == '\r') {
+                if (line_pos > 0) {
+                    linebuf[line_pos] = '\0';
+                    if (strstr(linebuf, "Scan results printed")) { scan_complete = true; break; }
+                    if (strstr(linebuf, "Background scan started") || strstr(linebuf, "Scan already in progress")) background = true;
+                    if (linebuf[0] == '"' && net_count < MAX_NETWORKS) {
+                        wifi_network_t n;
+                        if (parse_network_line(linebuf, &n)) nets[net_count++] = n;
+                    }
+                    line_pos = 0;
+                }
+            } else if (line_pos < 511) linebuf[line_pos++] = c;
+        }
+    }
+
+    while (!scan_complete && background && (xTaskGetTickCount() - start) < tmo && g_ota.scan_running) {
+        vTaskDelay(pdMS_TO_TICKS(600));
+        if (tab == TAB_USB && usb_cdc_handle) usbh_cdc_flush_rx_buffer(usb_cdc_handle);
+        else uart_flush(port);
+        transport_write_bytes_tab(tab, port, "show_scan_results\r\n", 19);
+        int pempty = 0; line_pos = 0;
+        while (!scan_complete && pempty < 5 && (xTaskGetTickCount() - start) < tmo && g_ota.scan_running) {
+            int len = transport_read_bytes_tab(tab, port, rxbuf, UART_BUF_SIZE - 1, pdMS_TO_TICKS(250));
+            if (len <= 0) { pempty++; continue; }
+            pempty = 0; rxbuf[len] = '\0';
+            for (int i = 0; i < len; i++) {
+                char c = rxbuf[i];
+                if (c == '\n' || c == '\r') {
+                    if (line_pos > 0) {
+                        linebuf[line_pos] = '\0';
+                        if (strstr(linebuf, "Scan results printed")) { scan_complete = true; break; }
+                        if (strstr(linebuf, "Scan still in progress")) { line_pos = 0; continue; }
+                        if (linebuf[0] == '"' && net_count < MAX_NETWORKS) {
+                            wifi_network_t n;
+                            if (parse_network_line(linebuf, &n)) {
+                                bool dup = false;
+                                for (int k = 0; k < net_count; k++) if (!strcmp(nets[k].bssid, n.bssid)) { dup = true; break; }
+                                if (!dup) nets[net_count++] = n;
+                            }
+                        }
+                        line_pos = 0;
+                    }
+                } else if (line_pos < 511) linebuf[line_pos++] = c;
+            }
+        }
+    }
+
+    if (!g_ota.scan_running) goto done;
+
+    // Populate the picker list.
+    if (bsp_display_lock(50)) {
+        if (g_ota.scan_status) {
+            if (net_count > 0) lv_label_set_text_fmt(g_ota.scan_status, "Found %d networks - tap one:", net_count);
+            else               lv_label_set_text(g_ota.scan_status, "No networks found. Close and retry.");
+        }
+        if (g_ota.scan_list) {
+            for (int i = 0; i < net_count; i++) {
+                lv_obj_t *row = lv_obj_create(g_ota.scan_list);
+                lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
+                lv_obj_set_style_pad_all(row, 8, 0);
+                lv_obj_set_style_bg_color(row, ui_card_color(), 0);
+                lv_obj_set_style_bg_color(row, ui_card_pressed_color(), LV_STATE_PRESSED);
+                lv_obj_set_style_border_width(row, 0, 0);
+                lv_obj_set_style_radius(row, 8, 0);
+                lv_obj_set_flex_flow(row, LV_FLEX_FLOW_COLUMN);
+                lv_obj_set_style_pad_row(row, 2, 0);
+                lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+                lv_obj_t *s = lv_label_create(row);
+                lv_label_set_text(s, strlen(nets[i].ssid) > 0 ? nets[i].ssid : "(Hidden)");
+                lv_obj_set_style_text_font(s, &lv_font_montserrat_16, 0);
+                lv_obj_set_style_text_color(s, ui_text_color(), 0);
+                lv_obj_t *info = lv_label_create(row);
+                lv_label_set_text_fmt(info, "%s | %s | %s | %d dBm",
+                                      nets[i].bssid, nets[i].band, nets[i].security, nets[i].rssi);
+                lv_obj_set_style_text_font(info, &lv_font_montserrat_12, 0);
+                lv_obj_set_style_text_color(info, ui_muted_color(), 0);
+                lv_obj_add_event_cb(row, ota_scan_row_click_cb, LV_EVENT_CLICKED, (void *)nets[i].ssid);
+            }
+        }
+        bsp_display_unlock();
+    }
+
+    // Wait for the user to pick a row (or cancel).
+    while (!g_ota.scan_selected && g_ota.scan_running) vTaskDelay(pdMS_TO_TICKS(100));
+    if (!g_ota.scan_running) goto done;
+
+    // Look up a saved password for the chosen SSID in the eviltwin DB.
+    if (tab == TAB_USB && usb_cdc_handle) usbh_cdc_flush_rx_buffer(usb_cdc_handle);
+    else uart_flush(port);
+    transport_write_bytes_tab(tab, port, "show_pass evil\r\n", 16);
+    vTaskDelay(pdMS_TO_TICKS(200));
+    {
+        int etc = 0, retries = 10, eempty = 0;
+        while (retries-- > 0 && etc < EVIL_TWIN_MAX_ENTRIES && g_ota.scan_running) {
+            int len = transport_read_bytes_tab(tab, port, etbuf, 511, pdMS_TO_TICKS(100));
+            if (len > 0) {
+                etbuf[len] = '\0'; eempty = 0;
+                char *ln = strtok(etbuf, "\n\r");
+                while (ln && etc < EVIL_TWIN_MAX_ENTRIES) {
+                    if (strlen(ln) > 3 && ln[0] == '"') {
+                        char *ss = ln + 1; char *se = strchr(ss, '"');
+                        if (se && se[1] == ',' && se[2] == ' ' && se[3] == '"') {
+                            *se = '\0'; char *ps = se + 4; char *pe = strchr(ps, '"');
+                            if (pe) {
+                                *pe = '\0';
+                                strncpy(et[etc].ssid, ss, 32); et[etc].ssid[32] = '\0';
+                                strncpy(et[etc].password, ps, 64); et[etc].password[64] = '\0';
+                                etc++;
+                            }
+                        }
+                    }
+                    ln = strtok(NULL, "\n\r");
+                }
+            } else if (++eempty >= 3) break;
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+        for (int i = 0; i < etc; i++) {
+            if (strcmp(et[i].ssid, g_ota.sel_ssid) == 0) {
+                found = true;
+                break;
+            }
+        }
+    }
+
+    // Fill the page fields and close the picker.
+    if (bsp_display_lock(50)) {
+        if (g_ota.ssid_ta) lv_textarea_set_text(g_ota.ssid_ta, g_ota.sel_ssid);
+        if (g_ota.pass_ta) {
+            lv_textarea_set_text(g_ota.pass_ta, "");
+            lv_textarea_set_placeholder_text(g_ota.pass_ta,
+                                             found ? "saved password on C5" : "password");
+        }
+        g_ota.selected_saved_password = found;
+        if (g_ota.page_status)
+            lv_label_set_text_fmt(g_ota.page_status,
+                                  found ? "Selected %s (saved password will be used)"
+                                        : "Selected %s - enter WiFi password",
+                                  g_ota.sel_ssid);
+        if (g_ota.scan_overlay) { lv_obj_del(g_ota.scan_overlay); g_ota.scan_overlay = NULL; }
+        g_ota.scan_status = NULL;
+        g_ota.scan_list = NULL;
+        bsp_display_unlock();
+    }
+
+done:
+    if (rxbuf)   heap_caps_free(rxbuf);
+    if (linebuf) heap_caps_free(linebuf);
+    if (etbuf)   heap_caps_free(etbuf);
+    if (et)      heap_caps_free(et);
+    g_ota.scan_running = false;
+    g_ota.scan_task = NULL;
+    vTaskDelete(NULL);
+}
+
+static void ota_scan_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!internal_container) return;
+    if (g_ota.target_tab == TAB_INTERNAL) {
+        if (g_ota.page_status) lv_label_set_text(g_ota.page_status, "No C5 detected");
+        return;
+    }
+    if (g_ota.scan_running) return;
+
+    tab_context_t *tctx = get_ctx_for_tab(g_ota.target_tab);
+    if (tctx && tctx->observer_running) pause_observer_for_attack(tctx);
+
+    g_ota.sel_ssid[0] = '\0';
+    g_ota.scan_selected = false;
+    g_ota.selected_saved_password = false;
+
+    g_ota.scan_overlay = lv_obj_create(internal_container);
+    lv_obj_remove_style_all(g_ota.scan_overlay);
+    lv_obj_set_size(g_ota.scan_overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(g_ota.scan_overlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(g_ota.scan_overlay, LV_OPA_50, 0);
+    lv_obj_clear_flag(g_ota.scan_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(g_ota.scan_overlay, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t *box = lv_obj_create(g_ota.scan_overlay);
+    lv_obj_set_size(box, 600, 520);
+    lv_obj_center(box);
+    lv_obj_set_style_bg_color(box, ui_card_color(), 0);
+    lv_obj_set_style_border_color(box, COLOR_MATERIAL_ORANGE, 0);
+    lv_obj_set_style_border_width(box, 2, 0);
+    lv_obj_set_style_radius(box, 16, 0);
+    lv_obj_set_style_pad_all(box, 16, 0);
+    lv_obj_set_flex_flow(box, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(box, 10, 0);
+    lv_obj_clear_flag(box, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *ttl = lv_label_create(box);
+    lv_label_set_text(ttl, LV_SYMBOL_WIFI " Select WiFi network");
+    lv_obj_set_style_text_font(ttl, &lv_font_montserrat_22, 0);
+    lv_obj_set_style_text_color(ttl, COLOR_MATERIAL_ORANGE, 0);
+
+    g_ota.scan_status = lv_label_create(box);
+    lv_label_set_text(g_ota.scan_status, "Scanning WiFi networks...");
+    lv_obj_set_style_text_font(g_ota.scan_status, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(g_ota.scan_status, ui_muted_color(), 0);
+    lv_obj_set_width(g_ota.scan_status, lv_pct(100));
+    lv_label_set_long_mode(g_ota.scan_status, LV_LABEL_LONG_WRAP);
+
+    g_ota.scan_list = lv_obj_create(box);
+    lv_obj_set_width(g_ota.scan_list, lv_pct(100));
+    lv_obj_set_flex_grow(g_ota.scan_list, 1);
+    lv_obj_set_style_bg_color(g_ota.scan_list, ui_bg_color(), 0);
+    lv_obj_set_style_border_width(g_ota.scan_list, 0, 0);
+    lv_obj_set_style_radius(g_ota.scan_list, 8, 0);
+    lv_obj_set_style_pad_all(g_ota.scan_list, 6, 0);
+    lv_obj_set_flex_flow(g_ota.scan_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(g_ota.scan_list, 4, 0);
+    lv_obj_set_scroll_dir(g_ota.scan_list, LV_DIR_VER);
+
+    lv_obj_t *close_btn = lv_btn_create(box);
+    lv_obj_set_size(close_btn, lv_pct(100), 46);
+    lv_obj_set_style_bg_color(close_btn, lv_color_hex(0x555555), 0);
+    lv_obj_set_style_radius(close_btn, 8, 0);
+    lv_obj_add_event_cb(close_btn, ota_scan_close_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *cl = lv_label_create(close_btn);
+    lv_label_set_text(cl, "Cancel");
+    lv_obj_set_style_text_font(cl, &lv_font_montserrat_18, 0);
+    lv_obj_center(cl);
+
+    g_ota.scan_running = true;
+    xTaskCreate(ota_scan_task, "ota_scan", 8192, NULL, 5, &g_ota.scan_task);
+}
+
+static void ota_back_cb(lv_event_t *e)
+{
+    (void)e;
+    ota_close_monitor();
+    ota_scan_close();
+    g_ota.keyboard = NULL;   // child of page, deleted below
+    if (g_ota.page) {
+        lv_obj_del(g_ota.page);
+        g_ota.page = NULL;
+    }
+    g_ota.page_status = NULL;
+    g_ota.ssid_ta = NULL;
+    g_ota.pass_ta = NULL;
+    g_ota.mode_dd = NULL;
+    g_ota.manual_box = NULL;
+    g_ota.ip_ta = NULL;
+    g_ota.netmask_ta = NULL;
+    g_ota.gw_ta = NULL;
+    g_ota.dns_ta = NULL;
+    g_ota.channel_dd = NULL;
+    if (internal_settings_page) lv_obj_clear_flag(internal_settings_page, LV_OBJ_FLAG_HIDDEN);
+    else show_settings_page();
+}
+
+static void show_ota_page(void)
+{
+    if (!internal_container) {
+        ESP_LOGE(TAG, "Internal container not initialized!");
+        return;
+    }
+    if (g_ota.page) return;   // already open
+
+    g_ota.target_tab = ota_pick_target_tab();
+    if (g_ota.channel[0] == '\0') strcpy(g_ota.channel, "main");
+    g_ota.selected_saved_password = false;
+
+    if (internal_settings_page) lv_obj_add_flag(internal_settings_page, LV_OBJ_FLAG_HIDDEN);
+
+    g_ota.page = lv_obj_create(internal_container);
+    lv_obj_set_size(g_ota.page, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(g_ota.page, ui_bg_color(), 0);
+    lv_obj_set_style_border_width(g_ota.page, 0, 0);
+    lv_obj_set_style_pad_all(g_ota.page, 12, 0);
+    lv_obj_set_flex_flow(g_ota.page, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(g_ota.page, 10, 0);
+    lv_obj_clear_flag(g_ota.page, LV_OBJ_FLAG_SCROLLABLE);
+
+    // Header: back + title
+    lv_obj_t *header = lv_obj_create(g_ota.page);
+    lv_obj_set_size(header, lv_pct(100), 50);
+    lv_obj_set_style_bg_opa(header, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(header, 0, 0);
+    lv_obj_clear_flag(header, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *back_btn = lv_btn_create(header);
+    lv_obj_set_size(back_btn, 90, 40);
+    lv_obj_align(back_btn, LV_ALIGN_LEFT_MID, 0, 0);
+    lv_obj_set_style_bg_color(back_btn, dark_mode_enabled ? lv_color_hex(0x34122B) : lv_color_hex(0xD4DFEA), 0);
+    lv_obj_set_style_border_width(back_btn, 1, 0);
+    lv_obj_set_style_border_color(back_btn, dark_mode_enabled ? COLOR_LAB5_MAGENTA : ui_border_color(), 0);
+    lv_obj_add_event_cb(back_btn, ota_back_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *back_lbl = lv_label_create(back_btn);
+    lv_label_set_text(back_lbl, LV_SYMBOL_LEFT " Back");
+    lv_obj_set_style_text_color(back_lbl, ui_text_color(), 0);
+    lv_obj_center(back_lbl);
+
+    lv_obj_t *title = lv_label_create(header);
+    lv_label_set_text(title, LV_SYMBOL_DOWNLOAD " Monster OTA");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_color(title, dark_mode_enabled ? COLOR_LAB5_MAGENTA : ui_text_color(), 0);
+    lv_obj_align(title, LV_ALIGN_CENTER, 0, 0);
+
+    // Scrollable form
+    lv_obj_t *form = lv_obj_create(g_ota.page);
+    lv_obj_set_width(form, lv_pct(100));
+    lv_obj_set_flex_grow(form, 1);
+    lv_obj_set_style_bg_opa(form, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(form, 0, 0);
+    lv_obj_set_style_pad_all(form, 4, 0);
+    lv_obj_set_flex_flow(form, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(form, 8, 0);
+    lv_obj_set_scroll_dir(form, LV_DIR_VER);
+
+    // Target C5 info / version badge
+    tab_context_t *tctx = get_ctx_for_tab(g_ota.target_tab);
+    lv_obj_t *tgt = lv_label_create(form);
+    if (g_ota.target_tab == TAB_INTERNAL) {
+        lv_label_set_text(tgt, LV_SYMBOL_WARNING " No C5 module detected - connect it and reopen");
+        lv_obj_set_style_text_color(tgt, COLOR_MATERIAL_RED, 0);
+    } else {
+        const char *ver = (tctx && tctx->janos_version[0]) ? tctx->janos_version : "unknown";
+        bool mism = tctx && tctx->janos_version_mismatch;
+        if (tctx && tctx->janos_app_version[0]) {
+            lv_label_set_text_fmt(tgt, "C5: %s   %s %s%s\nBuild: %s",
+                                  tab_transport_name(g_ota.target_tab),
+                                  tctx->janos_app_project[0] ? tctx->janos_app_project : "JanOS",
+                                  tctx->janos_app_version,
+                                  mism ? "   (update available)" : "   (up to date)",
+                                  tctx->janos_app_build[0] ? tctx->janos_app_build : "?");
+        } else {
+            lv_label_set_text_fmt(tgt, "C5: %s   JanOS %s%s",
+                                  tab_transport_name(g_ota.target_tab), ver,
+                                  mism ? "   (update available)" : "   (up to date)");
+        }
+        lv_obj_set_style_text_color(tgt, mism ? COLOR_MATERIAL_AMBER : COLOR_MATERIAL_GREEN, 0);
+    }
+    lv_obj_set_style_text_font(tgt, &lv_font_montserrat_16, 0);
+    lv_obj_set_width(tgt, lv_pct(100));
+    lv_label_set_long_mode(tgt, LV_LABEL_LONG_WRAP);
+
+    // WiFi network: scan-and-pick (same as the wardrive upload) or type it in.
+    ota_make_label(form, "WiFi Network");
+    lv_obj_t *ssid_row = lv_obj_create(form);
+    lv_obj_set_width(ssid_row, lv_pct(100));
+    lv_obj_set_height(ssid_row, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(ssid_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(ssid_row, 0, 0);
+    lv_obj_set_style_pad_all(ssid_row, 0, 0);
+    lv_obj_set_flex_flow(ssid_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(ssid_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(ssid_row, 8, 0);
+    lv_obj_clear_flag(ssid_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    g_ota.ssid_ta = ota_make_textarea(ssid_row, "tap Scan or type SSID", 32, false);
+    lv_obj_set_flex_grow(g_ota.ssid_ta, 1);
+    lv_obj_add_event_cb(g_ota.ssid_ta, ota_credentials_changed_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    lv_obj_t *scan_btn = lv_btn_create(ssid_row);
+    lv_obj_set_size(scan_btn, 110, 44);
+    lv_obj_set_style_bg_color(scan_btn, COLOR_MATERIAL_BLUE, 0);
+    lv_obj_set_style_radius(scan_btn, 8, 0);
+    lv_obj_add_event_cb(scan_btn, ota_scan_btn_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *scan_lbl = lv_label_create(scan_btn);
+    lv_label_set_text(scan_lbl, LV_SYMBOL_WIFI " Scan");
+    lv_obj_set_style_text_font(scan_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_center(scan_lbl);
+
+    // Password + show/hide
+    ota_make_label(form, "WiFi Password");
+    lv_obj_t *pass_row = lv_obj_create(form);
+    lv_obj_set_width(pass_row, lv_pct(100));
+    lv_obj_set_height(pass_row, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(pass_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(pass_row, 0, 0);
+    lv_obj_set_style_pad_all(pass_row, 0, 0);
+    lv_obj_set_flex_flow(pass_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(pass_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(pass_row, 8, 0);
+    lv_obj_clear_flag(pass_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    g_ota.pass_ta = ota_make_textarea(pass_row, "password", 64, true);
+    lv_obj_set_flex_grow(g_ota.pass_ta, 1);
+    lv_obj_add_event_cb(g_ota.pass_ta, ota_credentials_changed_cb, LV_EVENT_VALUE_CHANGED, NULL);
+    lv_obj_t *eye_btn = lv_btn_create(pass_row);
+    lv_obj_set_size(eye_btn, 52, 44);
+    lv_obj_set_style_bg_color(eye_btn, ui_card_color(), 0);
+    lv_obj_set_style_border_width(eye_btn, 1, 0);
+    lv_obj_set_style_border_color(eye_btn, ui_border_color(), 0);
+    lv_obj_add_event_cb(eye_btn, ota_pass_toggle_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *eye_lbl = lv_label_create(eye_btn);
+    lv_label_set_text(eye_lbl, LV_SYMBOL_EYE_CLOSE);
+    lv_obj_set_style_text_color(eye_lbl, ui_text_color(), 0);
+    lv_obj_center(eye_lbl);
+
+    // IP mode
+    ota_make_label(form, "IP Mode");
+    g_ota.mode_dd = lv_dropdown_create(form);
+    lv_dropdown_set_options(g_ota.mode_dd, "DHCP\nManual");
+    lv_obj_set_width(g_ota.mode_dd, lv_pct(100));
+    lv_obj_add_event_cb(g_ota.mode_dd, ota_mode_changed_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    // Manual IP box (hidden unless Manual is selected)
+    g_ota.manual_box = lv_obj_create(form);
+    lv_obj_set_width(g_ota.manual_box, lv_pct(100));
+    lv_obj_set_height(g_ota.manual_box, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(g_ota.manual_box, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(g_ota.manual_box, 0, 0);
+    lv_obj_set_style_pad_all(g_ota.manual_box, 0, 0);
+    lv_obj_set_flex_flow(g_ota.manual_box, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(g_ota.manual_box, 6, 0);
+    lv_obj_clear_flag(g_ota.manual_box, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(g_ota.manual_box, LV_OBJ_FLAG_HIDDEN);
+
+    ota_make_label(g_ota.manual_box, "IP address");
+    g_ota.ip_ta = ota_make_textarea(g_ota.manual_box, "192.168.1.50", 15, false);
+    ota_make_label(g_ota.manual_box, "Netmask");
+    g_ota.netmask_ta = ota_make_textarea(g_ota.manual_box, "255.255.255.0", 15, false);
+    ota_make_label(g_ota.manual_box, "Gateway");
+    g_ota.gw_ta = ota_make_textarea(g_ota.manual_box, "192.168.1.1", 15, false);
+    ota_make_label(g_ota.manual_box, "DNS (optional)");
+    g_ota.dns_ta = ota_make_textarea(g_ota.manual_box, "8.8.8.8", 15, false);
+
+    // Update channel
+    ota_make_label(form, "Update Channel");
+    g_ota.channel_dd = lv_dropdown_create(form);
+    lv_dropdown_set_options(g_ota.channel_dd, "main\ndev");
+    lv_obj_set_width(g_ota.channel_dd, lv_pct(100));
+    lv_dropdown_set_selected(g_ota.channel_dd, strcmp(g_ota.channel, "dev") == 0 ? 1 : 0);
+    lv_obj_add_event_cb(g_ota.channel_dd, ota_channel_changed_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    // Action row (fixed, below the form)
+    lv_obj_t *actions = lv_obj_create(g_ota.page);
+    lv_obj_set_size(actions, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(actions, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(actions, 0, 0);
+    lv_obj_set_style_pad_all(actions, 0, 0);
+    lv_obj_set_flex_flow(actions, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(actions, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(actions, 8, 0);
+    lv_obj_clear_flag(actions, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *check_btn = lv_btn_create(actions);
+    lv_obj_set_height(check_btn, 52);
+    lv_obj_set_flex_grow(check_btn, 1);
+    lv_obj_set_style_bg_color(check_btn, COLOR_MATERIAL_GREEN, 0);
+    lv_obj_set_style_radius(check_btn, 8, 0);
+    lv_obj_add_event_cb(check_btn, ota_check_btn_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *check_lbl = lv_label_create(check_btn);
+    lv_label_set_text(check_lbl, LV_SYMBOL_DOWNLOAD " Download & Flash");
+    lv_obj_set_style_text_font(check_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_center(check_lbl);
+
+    lv_obj_t *list_btn = lv_btn_create(actions);
+    lv_obj_set_size(list_btn, 90, 52);
+    lv_obj_set_style_bg_color(list_btn, COLOR_MATERIAL_BLUE, 0);
+    lv_obj_set_style_radius(list_btn, 8, 0);
+    lv_obj_add_event_cb(list_btn, ota_list_btn_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *list_lbl = lv_label_create(list_btn);
+    lv_label_set_text(list_lbl, "List");
+    lv_obj_set_style_text_font(list_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_center(list_lbl);
+
+    lv_obj_t *info_btn = lv_btn_create(actions);
+    lv_obj_set_size(info_btn, 90, 52);
+    lv_obj_set_style_bg_color(info_btn, COLOR_MATERIAL_CYAN, 0);
+    lv_obj_set_style_radius(info_btn, 8, 0);
+    lv_obj_add_event_cb(info_btn, ota_info_btn_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *info_lbl = lv_label_create(info_btn);
+    lv_label_set_text(info_lbl, "Info");
+    lv_obj_set_style_text_font(info_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_center(info_lbl);
+
+    // Page status line
+    g_ota.page_status = lv_label_create(g_ota.page);
+    lv_label_set_text(g_ota.page_status, "");
+    lv_obj_set_style_text_font(g_ota.page_status, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(g_ota.page_status, COLOR_MATERIAL_AMBER, 0);
+    lv_obj_set_width(g_ota.page_status, lv_pct(100));
+    lv_label_set_long_mode(g_ota.page_status, LV_LABEL_LONG_WRAP);
+
+    // On-screen keyboard (floating, hidden until a field is focused)
+    g_ota.keyboard = lv_keyboard_create(g_ota.page);
+    lv_obj_set_size(g_ota.keyboard, lv_pct(100), 260);
+    lv_obj_align(g_ota.keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_add_flag(g_ota.keyboard, LV_OBJ_FLAG_IGNORE_LAYOUT);
+    style_on_screen_keyboard(g_ota.keyboard);
+    lv_obj_add_flag(g_ota.keyboard, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(g_ota.keyboard, ota_kb_ready_cb, LV_EVENT_READY, NULL);
+    lv_obj_add_event_cb(g_ota.keyboard, ota_kb_ready_cb, LV_EVENT_CANCEL, NULL);
+}
+
 static void settings_tile_event_cb(lv_event_t *e)
 {
     const char *tile_name = (const char *)lv_event_get_user_data(e);
@@ -37541,6 +39933,8 @@ static void settings_tile_event_cb(lv_event_t *e)
         show_time_popup();
     } else if (strcmp(tile_name, "Screen Lock") == 0) {
         show_screen_lock_popup();
+    } else if (strcmp(tile_name, "Monster OTA") == 0) {
+        show_ota_page();
     }
 }
 
@@ -37636,6 +40030,9 @@ static void show_settings_page(void)
 
     // Screen Lock tile
     create_tile(tiles, LV_SYMBOL_EYE_CLOSE, "Screen\nLock", COLOR_MATERIAL_BLUE, settings_tile_event_cb, "Screen Lock");
+
+    // Monster OTA tile (ESP32-C5 firmware update)
+    create_tile(tiles, LV_SYMBOL_DOWNLOAD, "Monster\nOTA", COLOR_MATERIAL_ORANGE, settings_tile_event_cb, "Monster OTA");
 }
 
 void app_main(void)
