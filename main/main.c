@@ -48,7 +48,7 @@
 #include "lwip/sockets.h"
 
 #define JANOS_TAB_VERSION "1.5.0"
-#define JANOS_VERSION_REQUIRED "1.6.9"
+#define JANOS_VERSION_REQUIRED "1.7.0"
 #include "lwip/netdb.h"
 #include <dirent.h>
 #include <sys/stat.h>
