@@ -47,8 +47,10 @@
 #include "esp_http_server.h"
 #include "lwip/sockets.h"
 
-#define JANOS_TAB_VERSION "1.5.0"
+
+#define JANOS_TAB_VERSION "1.5.2"
 #define JANOS_VERSION_REQUIRED "1.7.0"
+
 #include "lwip/netdb.h"
 #include <dirent.h>
 #include <sys/stat.h>
@@ -56,7 +58,6 @@
 #include <sys/time.h>
 
 static const char *TAG = "wifi_scanner";
-extern const lv_image_dsc_t intro_splash_img;
 #if LV_USE_TINY_TTF
 extern const unsigned char lv_font_lato_regular_ttf[];
 extern const unsigned int lv_font_lato_regular_ttf_len;
@@ -292,6 +293,8 @@ typedef struct {
 #define WARDRIVE_WIGLE_PAGE_SIZE  20
 #define WARDRIVE_WIGLE_PATH_MAX  160
 #define WARDRIVE_WIGLE_OTHER_SSID "__WARDRIVE_WIGLE_OTHER__"
+static const char wpasec_other_ssid_user_data[] = WPASEC_OTHER_SSID;
+static const char wardrive_wigle_other_ssid_user_data[] = WARDRIVE_WIGLE_OTHER_SSID;
 typedef struct {
     char path[WARDRIVE_WIGLE_PATH_MAX];
     char name[96];
@@ -708,6 +711,7 @@ typedef struct {
     volatile bool wardrive_wigle_rescan_requested;
     bool wardrive_wigle_upload_done;
     char wardrive_wigle_selected_ssid[33];
+    char wardrive_wigle_selected_security[24];
     char wardrive_wigle_selected_password[65];
     wardrive_wigle_file_t *wardrive_wigle_files; // PSRAM alloc, NULL when popup closed
     wardrive_file_summary_t wardrive_file_summary;
@@ -843,6 +847,7 @@ typedef struct {
     lv_obj_t *wpasec_keyboard;
     lv_obj_t *wpasec_connect_btn;
     char wpasec_selected_ssid[33];
+    char wpasec_selected_security[24];
     char wpasec_selected_password[65];
     volatile bool wpasec_password_known;
     volatile bool wpasec_connect_ready;   // set by Connect button callback
@@ -1677,14 +1682,37 @@ static bool current_charging_status = false;
 // active tab. Only one overlay can be visible at a time so it stays a global.
 static lv_obj_t *scan_overlay = NULL;
 
-// Splash screen
+// Splash screen (procedural "demoscene" boot intro, no bitmap asset)
 static lv_obj_t *splash_screen = NULL;
-static lv_obj_t *splash_label = NULL;
-static lv_obj_t *splash_loading_label = NULL;
-static lv_obj_t *splash_detecting_label = NULL;
 static lv_timer_t *splash_timer = NULL;
-static int glitch_frame = 0;
 static bool splash_detection_started = false;
+
+// Procedural intro tuning + state
+#define INTRO_TICK_MS         40      // animation tick (~25 fps)
+#define INTRO_SCAN_TILE_W     4       // CRT scanline tile width  (procedurally filled)
+#define INTRO_SCAN_TILE_H     3       // CRT scanline tile height (1 dark row per tile)
+#define INTRO_DETECT_START_MS 1500    // when the (blocking) board detection kicks in
+#define INTRO_LOG_LINES       5       // boot-log slots
+
+static uint32_t splash_start_tick = 0;
+static bool     intro_finishing = false;
+static bool     intro_title_locked = false;
+static bool     intro_detection_done = false;
+static uint32_t intro_rng = 0x1a2b3c4du;
+static lv_timer_t *intro_finish_timer = NULL;
+static lv_obj_t *intro_scanlines = NULL;   // CRT scanline overlay (tiled ARGB tile)
+static lv_obj_t *intro_glitch_bar = NULL;  // occasional horizontal glitch strip
+static lv_obj_t *intro_title = NULL;       // "TAB5 Monster C5"
+static lv_obj_t *intro_title_glow = NULL;  // under-glow behind the title
+static lv_obj_t *intro_footer = NULL;      // "LAB5 - TAB5 version x.y.z"
+static lv_obj_t *intro_boot[INTRO_LOG_LINES] = { 0 };   // terminal boot-log lines
+static const char *intro_log_text[INTRO_LOG_LINES] = { 0 };
+static uint32_t intro_log_tick[INTRO_LOG_LINES] = { 0 };
+static int8_t   intro_boot_shown[INTRO_LOG_LINES];
+static int      intro_log_count = 0;
+static char     intro_link_buf[64];        // holds the concrete "MONSTER DETECTED @ ..." line
+static uint8_t  intro_scan_buf[INTRO_SCAN_TILE_W * INTRO_SCAN_TILE_H * 4];
+static lv_image_dsc_t intro_scan_dsc;
 
 // Screen timeout/dimming
 #define SCREEN_TIMEOUT_MS       30000  // 30 seconds (default, overridden by setting)
@@ -2261,6 +2289,7 @@ static uart_port_t get_current_uart(void);
 static void uart_send_command_for_tab(const char *cmd);
 static bool build_wifi_connect_command(char *out, size_t out_sz, const char *ssid,
                                        const char *password, wifi_connect_auth_mode_t mode);
+static bool wifi_network_security_is_open(const char *security);
 static void show_blackout_confirm_popup(void);
 static void blackout_confirm_yes_cb(lv_event_t *e);
 static void blackout_confirm_no_cb(lv_event_t *e);
@@ -5451,68 +5480,326 @@ static void hide_evil_twin_loading_overlay(void) {
 }
 
 //==================================================================================
-// Startup Splash Screen Animation
+// Startup Splash Screen Animation  (procedural retro boot intro, rendered by LVGL)
 //==================================================================================
+//
+// The old fullscreen RGB565 bitmap (assets/intro/generated/intro_splash_img.c,
+// ~1.84 MB in flash) has been replaced by this fully procedural intro built from
+// native LVGL primitives only: a glitching terminal title ("TAB5 Monster C5"), an
+// event-driven boot log that reflects the real boot phase (init -> detect monster
+// -> result), a version footer and subtle CRT scanlines. No image assets.
+//
+// splash_timer_cb() drives the animation and, near the end, arms detection_timer
+// -> detection_complete_cb(), which runs board detection, prints the outcome in
+// the boot log, builds the real UI behind the splash and fades it away cleanly.
 
-// Splash timer callback - animates loading intro states
+// Boot-log lines are pushed as real events happen (init -> detect -> result),
+// each typed out terminal-style by intro_update_boot().
+static void intro_log_push(const char *text)
+{
+    if (intro_log_count >= INTRO_LOG_LINES) return;
+    int i = intro_log_count++;
+    intro_log_text[i]   = text;
+    intro_log_tick[i]   = lv_tick_get();
+    intro_boot_shown[i] = -1;
+    if (intro_boot[i]) lv_obj_clear_flag(intro_boot[i], LV_OBJ_FLAG_HIDDEN);
+}
+
+// Small, fast xorshift PRNG so glitch effects don't touch the system RNG.
+static uint32_t intro_rand(void)
+{
+    uint32_t x = intro_rng;
+    x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+    intro_rng = x ? x : 0x1a2b3c4du;
+    return intro_rng;
+}
+
+// --- teardown / transition helpers -------------------------------------------
+
+static void splash_teardown(void)
+{
+    if (splash_timer)       { lv_timer_del(splash_timer);       splash_timer = NULL; }
+    if (detection_timer)    { lv_timer_del(detection_timer);    detection_timer = NULL; }
+    if (intro_finish_timer) { lv_timer_del(intro_finish_timer); intro_finish_timer = NULL; }
+    if (splash_screen)      { lv_obj_del(splash_screen);        splash_screen = NULL; }
+
+    // All the elements below were children of splash_screen and are now gone.
+    intro_scanlines = NULL;
+    intro_glitch_bar = NULL;
+    intro_title = NULL;
+    intro_title_glow = NULL;
+    intro_footer = NULL;
+    for (int k = 0; k < INTRO_LOG_LINES; k++) intro_boot[k] = NULL;
+    intro_finishing = false;
+    // intro_scan_buf is static storage, nothing to free.
+}
+
+static void intro_anim_opa_cb(void *var, int32_t v)
+{
+    lv_obj_set_style_opa((lv_obj_t *)var, (lv_opa_t)v, 0);
+}
+static void intro_fade_done_cb(lv_anim_t *a)
+{
+    (void)a;
+    splash_teardown();
+}
+
+// Gentle fade of the whole splash to reveal the real UI (no screen-fill flash).
+static void intro_start_finish_anim(void)
+{
+    if (intro_finishing) return;
+    intro_finishing = true;
+    if (splash_timer)       { lv_timer_del(splash_timer);       splash_timer = NULL; }
+    if (intro_finish_timer) { lv_timer_del(intro_finish_timer); intro_finish_timer = NULL; }
+
+    if (!splash_screen) { splash_teardown(); return; }
+
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, splash_screen);
+    lv_anim_set_exec_cb(&a, intro_anim_opa_cb);
+    lv_anim_set_values(&a, LV_OPA_COVER, LV_OPA_TRANSP);
+    lv_anim_set_time(&a, 340);
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_in);
+    lv_anim_set_ready_cb(&a, intro_fade_done_cb);
+    lv_anim_start(&a);
+}
+
+// Fires after a short readable window so the result lines can type out.
+static void intro_finish_cb(lv_timer_t *timer)
+{
+    (void)timer;
+    intro_finish_timer = NULL;
+    intro_start_finish_anim();
+}
+
+// Skip on tap: force pending detection now, or fade out if detection is done.
+static void intro_skip_cb(lv_event_t *e)
+{
+    (void)e;
+    if (intro_finishing) return;
+    if (intro_detection_done) {
+        intro_start_finish_anim();
+        return;
+    }
+    if (!splash_detection_started) {
+        splash_detection_started = true;
+        intro_log_push("> DETECTING MONSTER");
+        if (detection_timer) { lv_timer_del(detection_timer); detection_timer = NULL; }
+        detection_timer = lv_timer_create(detection_complete_cb, 60, NULL);
+        lv_timer_set_repeat_count(detection_timer, 1);
+    }
+    // else: detection already in flight, let it finish on its own.
+}
+
+// --- scene builders ----------------------------------------------------------
+
+static void intro_build_title(lv_obj_t *parent, int w, int h)
+{
+    (void)w; (void)h;
+
+    intro_title_glow = lv_label_create(parent);
+    lv_obj_set_style_text_font(intro_title_glow, &lv_font_montserrat_48, 0);
+    lv_obj_set_style_text_color(intro_title_glow, lv_color_hex(0x18FF9B), 0);
+    lv_obj_set_style_text_letter_space(intro_title_glow, 3, 0);
+    lv_label_set_text_static(intro_title_glow, "TAB5 Monster C5");
+    lv_obj_align(intro_title_glow, LV_ALIGN_CENTER, 0, -138);
+    lv_obj_add_flag(intro_title_glow, LV_OBJ_FLAG_HIDDEN);
+
+    intro_title = lv_label_create(parent);
+    lv_obj_set_style_text_font(intro_title, &lv_font_montserrat_48, 0);
+    lv_obj_set_style_text_color(intro_title, lv_color_hex(0x66F5FF), 0);
+    lv_obj_set_style_text_letter_space(intro_title, 3, 0);
+    lv_label_set_text_static(intro_title, "TAB5 Monster C5");
+    lv_obj_align(intro_title, LV_ALIGN_CENTER, 0, -140);
+    lv_obj_add_flag(intro_title, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void intro_build_boot(lv_obj_t *parent, int w, int h)
+{
+    (void)w;
+    for (int k = 0; k < INTRO_LOG_LINES; k++) {
+        intro_boot[k] = lv_label_create(parent);
+        lv_obj_set_style_text_font(intro_boot[k], &lv_font_montserrat_18, 0);
+        lv_obj_set_style_text_color(intro_boot[k], lv_color_hex(0x35FF7A), 0);
+        lv_obj_set_style_text_letter_space(intro_boot[k], 1, 0);
+        lv_label_set_text_static(intro_boot[k], "");
+        lv_obj_align(intro_boot[k], LV_ALIGN_TOP_LEFT, 60, (h * 46) / 100 + k * 42);
+        lv_obj_add_flag(intro_boot[k], LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void intro_build_footer(lv_obj_t *parent, int w, int h)
+{
+    (void)w; (void)h;
+    intro_footer = lv_label_create(parent);
+    lv_obj_set_style_text_font(intro_footer, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(intro_footer, lv_color_hex(0x5FB8C8), 0);
+    lv_obj_set_style_text_letter_space(intro_footer, 2, 0);
+    lv_label_set_text_static(intro_footer, "LAB5 - TAB5 version " JANOS_TAB_VERSION);
+    lv_obj_align(intro_footer, LV_ALIGN_BOTTOM_MID, 0, -34);
+    lv_obj_set_style_text_opa(intro_footer, LV_OPA_TRANSP, 0);
+    lv_obj_add_flag(intro_footer, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void intro_build_glitch(lv_obj_t *parent, int w, int h)
+{
+    (void)h;
+    intro_glitch_bar = lv_obj_create(parent);
+    lv_obj_remove_style_all(intro_glitch_bar);
+    lv_obj_set_size(intro_glitch_bar, w, 6);
+    lv_obj_set_pos(intro_glitch_bar, 0, 0);
+    lv_obj_clear_flag(intro_glitch_bar, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_bg_color(intro_glitch_bar, lv_color_hex(0x9CFBFF), 0);
+    lv_obj_set_style_bg_opa(intro_glitch_bar, LV_OPA_TRANSP, 0);
+    lv_obj_add_flag(intro_glitch_bar, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void intro_build_scanlines(lv_obj_t *parent, int w, int h)
+{
+    // Fill a tiny ARGB8888 tile in code: one dark, semi-transparent row per tile.
+    lv_color32_t *px = (lv_color32_t *)intro_scan_buf;
+    for (int y = 0; y < INTRO_SCAN_TILE_H; y++) {
+        for (int x = 0; x < INTRO_SCAN_TILE_W; x++) {
+            lv_color32_t c;
+            c.red = 0; c.green = 0; c.blue = 0;
+            c.alpha = (y == 0) ? 95 : 0;
+            px[y * INTRO_SCAN_TILE_W + x] = c;
+        }
+    }
+    memset(&intro_scan_dsc, 0, sizeof(intro_scan_dsc));
+    intro_scan_dsc.header.magic  = LV_IMAGE_HEADER_MAGIC;
+    intro_scan_dsc.header.cf     = LV_COLOR_FORMAT_ARGB8888;
+    intro_scan_dsc.header.w      = INTRO_SCAN_TILE_W;
+    intro_scan_dsc.header.h      = INTRO_SCAN_TILE_H;
+    intro_scan_dsc.header.stride = INTRO_SCAN_TILE_W * 4;
+    intro_scan_dsc.data          = intro_scan_buf;
+    intro_scan_dsc.data_size     = sizeof(intro_scan_buf);
+
+    intro_scanlines = lv_obj_create(parent);
+    lv_obj_remove_style_all(intro_scanlines);
+    lv_obj_set_size(intro_scanlines, w, h);
+    lv_obj_set_pos(intro_scanlines, 0, 0);
+    lv_obj_clear_flag(intro_scanlines, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_bg_opa(intro_scanlines, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_bg_image_src(intro_scanlines, &intro_scan_dsc, 0);
+    lv_obj_set_style_bg_image_tiled(intro_scanlines, true, 0);
+}
+
+// --- per-frame updates -------------------------------------------------------
+
+static void intro_update_title(uint32_t el)
+{
+    if (!intro_title) return;
+    if (el < 60) return;
+
+    // The full title is set at build time; here we just reveal it (no scramble).
+    if (!intro_title_locked) {
+        intro_title_locked = true;
+        lv_obj_clear_flag(intro_title, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(intro_title_glow, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    // Quick fade-in, then a gentle ambient glow pulse behind the text.
+    int a = (int)el - 60;
+    int opa = (a > 250) ? 255 : a * 255 / 250;
+    lv_obj_set_style_text_opa(intro_title, (lv_opa_t)opa, 0);
+
+    float ph = (float)el / 1400.0f;
+    int g = 26 + (int)(40.0f * (0.5f + 0.5f * sinf(ph * 6.2831853f)));
+    lv_obj_set_style_text_opa(intro_title_glow, (lv_opa_t)(g * opa / 255), 0);
+}
+
+static void intro_update_footer(uint32_t el)
+{
+    if (!intro_footer) return;
+    if (el < 150) return;
+    lv_obj_clear_flag(intro_footer, LV_OBJ_FLAG_HIDDEN);
+    int a = (int)el - 150;
+    int opa = (a > 400) ? 200 : a * 200 / 400;  // fade in, settle muted
+    lv_obj_set_style_text_opa(intro_footer, (lv_opa_t)opa, 0);
+}
+
+// Show each pushed boot-log line as a whole, with a gentle fade-in (no typing).
+static void intro_update_boot(void)
+{
+    for (int i = 0; i < intro_log_count; i++) {
+        if (!intro_boot[i] || !intro_log_text[i]) continue;
+        if (intro_boot_shown[i] != 1) {
+            intro_boot_shown[i] = 1;
+            lv_label_set_text(intro_boot[i], intro_log_text[i]);
+            lv_obj_clear_flag(intro_boot[i], LV_OBJ_FLAG_HIDDEN);
+        }
+        int a = (int)lv_tick_elaps(intro_log_tick[i]);
+        int opa = (a > 180) ? 255 : a * 255 / 180;
+        lv_obj_set_style_text_opa(intro_boot[i], (lv_opa_t)opa, 0);
+    }
+}
+
+static void intro_update_glitch(uint32_t el)
+{
+    if (!intro_glitch_bar) return;
+    if (el > 150 && (intro_rand() % 100) < 5) {
+        int w = lv_disp_get_hor_res(NULL);
+        int h = lv_disp_get_ver_res(NULL);
+        int y = (int)(intro_rand() % (uint32_t)h);
+        int bh = 3 + (int)(intro_rand() % 8);
+        lv_obj_set_pos(intro_glitch_bar, 0, y);
+        lv_obj_set_size(intro_glitch_bar, w, bh);
+        lv_obj_set_style_bg_opa(intro_glitch_bar, (lv_opa_t)(40 + intro_rand() % 90), 0);
+        lv_obj_clear_flag(intro_glitch_bar, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(intro_glitch_bar, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+// Intro animation tick: drives the title/footer/glitch, feeds the boot log with
+// the current phase, and arms board detection near the end.
 static void splash_timer_cb(lv_timer_t *timer)
 {
     (void)timer;
+    if (intro_finishing) return;
 
-    glitch_frame++;
+    uint32_t el = lv_tick_elaps(splash_start_tick);
 
-    // Animated loading text with moving dots + blink.
-    if (splash_loading_label) {
-        static const char *loading_frames[] = {
-            "LOADING",
-            "LOADING.",
-            "LOADING..",
-            "LOADING..."
-        };
-        lv_label_set_text(splash_loading_label, loading_frames[(glitch_frame / 3) % 4]);
-        lv_obj_set_style_text_opa(splash_loading_label, (glitch_frame % 10 < 6) ? LV_OPA_100 : LV_OPA_60, 0);
-    }
+    intro_update_title(el);
+    intro_update_footer(el);
+    intro_update_boot();
+    intro_update_glitch(el);
 
-    // Show "Detecting devices..." on the same intro screen, then start detection.
-    if (glitch_frame >= 22 && splash_detecting_label) {
-        lv_obj_clear_flag(splash_detecting_label, LV_OBJ_FLAG_HIDDEN);
-    }
+    // Boot-log lines appear as the boot phases progress.
+    if (el >= 100 && intro_log_count == 0) intro_log_push("> INITIALIZING TAB5 CORE");
+    if (el >= 650 && intro_log_count == 1) intro_log_push("> LOADING SUBSYSTEMS");
 
-    if (!splash_detection_started && glitch_frame >= 28) {
+    if (!splash_detection_started && el >= INTRO_DETECT_START_MS) {
         splash_detection_started = true;
+        intro_log_push("> DETECTING MONSTER");
         if (detection_timer) {
             lv_timer_del(detection_timer);
             detection_timer = NULL;
         }
-        detection_timer = lv_timer_create(detection_complete_cb, 700, NULL);
+        detection_timer = lv_timer_create(detection_complete_cb, 400, NULL);
         lv_timer_set_repeat_count(detection_timer, 1);
     }
 }
 
-// Detection complete callback - called after waiting for devices to stabilize
+// Detection complete callback - runs detection, reports it in the boot log,
+// builds the real UI behind the splash and schedules the closing fade.
 static void detection_complete_cb(lv_timer_t *timer)
 {
     (void)timer;
     detection_timer = NULL;
 
+    if (intro_detection_done || intro_finishing) return;
+
     ESP_LOGI(TAG, "Detection timer complete, running board detection");
 
-    if (splash_timer) {
-        lv_timer_del(splash_timer);
-        splash_timer = NULL;
-    }
-
-    // Run board detection
+    // Run board detection (blocking UART probes).
     detect_boards();
-
-    // Check SD card presence on all detected devices
     check_all_sd_cards();
-
-    // Check JanOS firmware version on all detected devices
     check_all_versions();
-
-    // Probe Sub-GHz module availability per tab (sets ctx->has_subghz).
     check_all_subghz_status();
+    intro_detection_done = true;
 
     ESP_LOGI(TAG, "Detection complete: uart1=%d, mbus=%d, grove=%d, usb=%d",
              uart1_detected, mbus_detected, grove_detected, usb_detected);
@@ -5523,16 +5810,19 @@ static void detection_complete_cb(lv_timer_t *timer)
         detection_popup_overlay = NULL;
     }
 
-    // Remove splash screen after integrated intro+loading+detecting flow.
-    if (splash_screen) {
-        lv_obj_del(splash_screen);
-        splash_screen = NULL;
-        splash_label = NULL;
-        splash_loading_label = NULL;
-        splash_detecting_label = NULL;
+    // Report the result concretely (which link the Monster answered on).
+    if (!uart1_detected && !mbus_detected) {
+        intro_log_push("> MONSTER NOT FOUND");
+    } else {
+        snprintf(intro_link_buf, sizeof(intro_link_buf), "> MONSTER DETECTED @%s%s%s",
+                 mbus_detected ? " M-BUS" : "",
+                 (uart1_detected || grove_detected) ? " GROVE" : "",
+                 usb_detected ? " USB" : "");
+        intro_log_push(intro_link_buf);
     }
+    intro_log_push("> SYSTEM READY");
 
-    // Show appropriate UI based on detection results
+    // Build the real UI *behind* the still-visible splash so the fade reveals it.
     if (!uart1_detected && !mbus_detected) {
         ESP_LOGI(TAG, "No boards detected - showing popup");
         show_no_board_popup();
@@ -5541,6 +5831,12 @@ static void detection_complete_cb(lv_timer_t *timer)
         show_main_tiles();
         show_version_mismatch_popup();
     }
+    if (splash_screen) lv_obj_move_foreground(splash_screen);
+
+    // Keep the intro up briefly so the result lines type out, then fade away.
+    if (intro_finish_timer) { lv_timer_del(intro_finish_timer); intro_finish_timer = NULL; }
+    intro_finish_timer = lv_timer_create(intro_finish_cb, 900, NULL);
+    lv_timer_set_repeat_count(intro_finish_timer, 1);
 }
 
 static void play_startup_beep(void)
@@ -5704,55 +6000,43 @@ static void play_startup_beep(void)
     vTaskDelete(NULL);
 }
 
-// Show splash screen with C5Lab glitch animation
+// Show the procedural retro boot intro (all LVGL primitives, no bitmap asset).
 static void show_splash_screen(void)
 {
-    ESP_LOGI(TAG, "Showing splash screen...");
+    ESP_LOGI(TAG, "Showing procedural boot intro...");
 
-    glitch_frame = 0;
     splash_detection_started = false;
+    intro_finishing = false;
+    intro_title_locked = false;
+    intro_detection_done = false;
+    intro_log_count = 0;
+    for (int k = 0; k < INTRO_LOG_LINES; k++) { intro_boot_shown[k] = -1; intro_log_text[k] = NULL; }
+    splash_start_tick = lv_tick_get();
 
-    // Create full-screen black background
+    int w = lv_disp_get_hor_res(NULL);
+    int h = lv_disp_get_ver_res(NULL);
+
+    // Near-black full-screen backdrop; tappable to skip the intro.
     splash_screen = lv_obj_create(lv_scr_act());
     lv_obj_remove_style_all(splash_screen);
-    lv_obj_set_size(splash_screen, lv_pct(100), lv_pct(100));
-    lv_obj_set_style_bg_color(splash_screen, lv_color_hex(0x000000), 0);
+    lv_obj_set_size(splash_screen, w, h);
+    lv_obj_set_style_bg_color(splash_screen, lv_color_hex(0x02040A), 0);
     lv_obj_set_style_bg_opa(splash_screen, LV_OPA_COVER, 0);
     lv_obj_clear_flag(splash_screen, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(splash_screen, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(splash_screen, intro_skip_cb, LV_EVENT_CLICKED, NULL);
 
-    // Fullscreen intro image (LVGL RGB565 C array)
-    lv_obj_t *splash_image = lv_image_create(splash_screen);
-    lv_image_set_src(splash_image, &intro_splash_img);
-    lv_obj_align(splash_image, LV_ALIGN_CENTER, 0, 0);
+    // Build layers bottom-to-top: title -> boot log -> footer -> glitch -> CRT.
+    intro_build_title(splash_screen, w, h);
+    intro_build_boot(splash_screen, w, h);
+    intro_build_footer(splash_screen, w, h);
+    intro_build_glitch(splash_screen, w, h);
+    intro_build_scanlines(splash_screen, w, h);
 
-    // Bottom text stack: LAB5 -> LOADING... -> Detecting devices...
-    bool tall_layout = lv_disp_get_ver_res(NULL) >= 1000;
-
-    splash_label = lv_label_create(splash_screen);
-    lv_label_set_text(splash_label, "LAB5");
-    lv_obj_set_style_text_font(splash_label, tall_layout ? &lv_font_montserrat_40 : &lv_font_montserrat_32, 0);
-    lv_obj_set_style_text_color(splash_label, COLOR_LAB5_MAGENTA, 0);
-    lv_obj_set_style_text_letter_space(splash_label, 2, 0);
-    lv_obj_align(splash_label, LV_ALIGN_BOTTOM_MID, 0, tall_layout ? -150 : -95);
-
-    splash_loading_label = lv_label_create(splash_screen);
-    lv_label_set_text(splash_loading_label, "LOADING...");
-    lv_obj_set_style_text_font(splash_loading_label, tall_layout ? &lv_font_montserrat_22 : &lv_font_montserrat_18, 0);
-    lv_obj_set_style_text_color(splash_loading_label, lv_color_hex(0xD8D8D8), 0);
-    lv_obj_align(splash_loading_label, LV_ALIGN_BOTTOM_MID, 0, tall_layout ? -112 : -64);
-
-    splash_detecting_label = lv_label_create(splash_screen);
-    lv_label_set_text(splash_detecting_label, "Detecting devices...");
-    lv_obj_set_style_text_font(splash_detecting_label, tall_layout ? &lv_font_montserrat_20 : &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(splash_detecting_label, lv_color_hex(0x9FE7D8), 0);
-    lv_obj_align(splash_detecting_label, LV_ALIGN_BOTTOM_MID, 0, tall_layout ? -80 : -38);
-    lv_obj_add_flag(splash_detecting_label, LV_OBJ_FLAG_HIDDEN);
-
-    // Start intro animation timer (100ms gives readable loading/dot dynamics).
-    splash_timer = lv_timer_create(splash_timer_cb, 100, NULL);
+    splash_timer = lv_timer_create(splash_timer_cb, INTRO_TICK_MS, NULL);
 
     if (boot_sound_mode != BOOT_SOUND_MODE_OFF) {
-        // Play startup melody in background task to not block UI
+        // Play startup melody in background task to not block UI (unchanged).
         xTaskCreate(
             (TaskFunction_t)play_startup_beep,
             "melody",
@@ -8031,7 +8315,7 @@ static void mitm_connect_and_start_cb(lv_event_t *e)
     int idx = v.sel_indices[0];
     if (idx < 0 || idx >= v.net_count) return;
     const char *ssid = v.nets[idx].ssid;
-    bool is_open = (strstr(v.nets[idx].security, "OPEN") != NULL || v.nets[idx].security[0] == '\0');
+    bool is_open = wifi_network_security_is_open(v.nets[idx].security);
 
     const char *password = NULL;
     if (ctx->mitm_password_input) {
@@ -9051,7 +9335,7 @@ static void arp_connect_cb(lv_event_t *e)
 {
     (void)e;
 
-    bool is_open = (strstr(arp_target_security, "OPEN") != NULL || arp_target_security[0] == '\0');
+    bool is_open = wifi_network_security_is_open(arp_target_security);
     const char *password = NULL;
 
     // Check if we have a saved password (from Evil Twin database).
@@ -9598,7 +9882,7 @@ static void nmap_connect_cb(lv_event_t *e)
 {
     (void)e;
 
-    bool is_open = (strstr(nmap_target_security, "OPEN") != NULL || nmap_target_security[0] == '\0');
+    bool is_open = wifi_network_security_is_open(nmap_target_security);
     const char *password = NULL;
 
     if (strlen(nmap_target_password) > 0) {
@@ -9632,9 +9916,9 @@ static void nmap_connect_cb(lv_event_t *e)
 
     char cmd[256];
     wifi_connect_auth_mode_t auth_mode = WIFI_CONNECT_AUTH_OPEN;
-    if (!is_open && strlen(nmap_target_password) > 0) {
+    if (strlen(nmap_target_password) > 0) {
         auth_mode = WIFI_CONNECT_AUTH_SAVED;
-    } else if (!is_open && password != NULL && strlen(password) > 0) {
+    } else if (password != NULL && strlen(password) > 0) {
         auth_mode = WIFI_CONNECT_AUTH_PASSWORD;
     }
     if (!build_wifi_connect_command(cmd, sizeof(cmd), nmap_target_ssid, password, auth_mode)) {
@@ -10481,7 +10765,7 @@ static void show_nmap_page(void)
     lv_obj_set_style_text_font(target_label, &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_color(target_label, lv_color_hex(0xCCCCCC), 0);
 
-    bool is_open_network = (strstr(nmap_target_security, "OPEN") != NULL || nmap_target_security[0] == '\0');
+    bool is_open_network = wifi_network_security_is_open(nmap_target_security);
     bool password_known = false;
 
     if (!is_open_network) {
@@ -10559,6 +10843,33 @@ static void show_nmap_page(void)
         lv_label_set_text(open_label, LV_SYMBOL_WARNING "  Open Network (no password required)");
         lv_obj_set_style_text_font(open_label, &lv_font_montserrat_14, 0);
         lv_obj_set_style_text_color(open_label, COLOR_MATERIAL_AMBER, 0);
+
+        lv_obj_t *pass_left = lv_obj_create(pass_section);
+        lv_obj_set_size(pass_left, lv_pct(100), LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_opa(pass_left, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(pass_left, 0, 0);
+        lv_obj_set_style_pad_all(pass_left, 0, 0);
+        lv_obj_set_flex_flow(pass_left, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(pass_left, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_column(pass_left, 10, 0);
+        lv_obj_clear_flag(pass_left, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *pass_label = lv_label_create(pass_left);
+        lv_label_set_text(pass_label, "Password:");
+        lv_obj_set_style_text_font(pass_label, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(pass_label, lv_color_hex(0xFFFFFF), 0);
+
+        nmap_password_input = lv_textarea_create(pass_left);
+        lv_obj_set_size(nmap_password_input, 300, 40);
+        lv_textarea_set_one_line(nmap_password_input, true);
+        lv_textarea_set_placeholder_text(nmap_password_input, "Optional");
+        lv_textarea_set_password_mode(nmap_password_input, true);
+        lv_textarea_set_password_show_time(nmap_password_input, WPASEC_PASSWORD_SHOW_MS);
+        lv_obj_set_style_bg_color(nmap_password_input, lv_color_hex(0x1A1A1A), 0);
+        lv_obj_set_style_border_color(nmap_password_input, COLOR_MATERIAL_GREEN, 0);
+        lv_obj_set_style_border_width(nmap_password_input, 1, 0);
+        lv_obj_set_style_text_color(nmap_password_input, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_add_event_cb(nmap_password_input, nmap_password_input_cb, LV_EVENT_CLICKED, NULL);
 
         lv_obj_t *btn_row = lv_obj_create(pass_section);
         lv_obj_set_size(btn_row, lv_pct(100), LV_SIZE_CONTENT);
@@ -10694,7 +11005,7 @@ static void show_nmap_page(void)
     // Status label
     nmap_status_label = lv_label_create(nmap_page);
     if (is_open_network) {
-        lv_label_set_text(nmap_status_label, "Press Connect to join open network");
+        lv_label_set_text(nmap_status_label, "Press Connect to try open, or enter password");
     } else if (password_known) {
         lv_label_set_text(nmap_status_label, "Press Connect to join network");
     } else {
@@ -10721,7 +11032,7 @@ static void show_nmap_page(void)
     lv_obj_set_style_text_color(placeholder, lv_color_hex(0x888888), 0);
 
     // Keyboard (hidden, for password entry)
-    if (!is_open_network && !password_known) {
+    if (nmap_password_input && !password_known) {
         nmap_keyboard = lv_keyboard_create(nmap_page);
         lv_obj_set_size(nmap_keyboard, lv_pct(100), 200);
         lv_obj_add_flag(nmap_keyboard, LV_OBJ_FLAG_HIDDEN);
@@ -10821,7 +11132,7 @@ static void show_arp_poison_page(void)
     lv_obj_set_style_text_font(target_label, &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_color(target_label, lv_color_hex(0xCCCCCC), 0);
 
-    bool is_open_network = (strstr(arp_target_security, "OPEN") != NULL || arp_target_security[0] == '\0');
+    bool is_open_network = wifi_network_security_is_open(arp_target_security);
 
     // Check if password is known from Evil Twin database (only in manual mode, non-open)
     bool password_known = false;
@@ -17458,7 +17769,7 @@ static void update_wardrive_table(tab_context_t *ctx)
             lv_obj_set_style_text_color(sec_lbl, COLOR_MATERIAL_GREEN, 0);
         } else if (strstr(net->security, "WPA2") != NULL || strstr(net->security, "WPA_") != NULL) {
             lv_obj_set_style_text_color(sec_lbl, COLOR_MATERIAL_AMBER, 0);
-        } else if (strstr(net->security, "OPEN") != NULL || net->security[0] == '\0') {
+        } else if (wifi_network_security_is_open(net->security)) {
             lv_obj_set_style_text_color(sec_lbl, COLOR_MATERIAL_RED, 0);
         } else {
             lv_obj_set_style_text_color(sec_lbl, COLOR_MATERIAL_AMBER, 0);
@@ -17598,6 +17909,7 @@ static void close_wardrive_wigle_provider_popup(tab_context_t *ctx)
     ctx->wardrive_wigle_retry_requested = false;
     ctx->wardrive_wigle_rescan_requested = false;
     ctx->wardrive_wigle_selected_ssid[0] = '\0';
+    ctx->wardrive_wigle_selected_security[0] = '\0';
     ctx->wardrive_wigle_selected_password[0] = '\0';
     ctx->wardrive_upload_provider = WARDRIVE_UPLOAD_PROVIDER_NONE;
     ctx->wardrive_upload_mode = WARDRIVE_UPLOAD_MODE_SELECTED;
@@ -19163,6 +19475,7 @@ static void wardrive_wigle_start_upload(tab_context_t *ctx, wardrive_upload_mode
     ctx->wardrive_upload_mode = mode;
     ctx->wardrive_wigle_connect_ready = false;
     ctx->wardrive_wigle_selected_ssid[0] = '\0';
+    ctx->wardrive_wigle_selected_security[0] = '\0';
     ctx->wardrive_wigle_selected_password[0] = '\0';
     ctx->wardrive_wigle_task_running = true;
     wardrive_wigle_update_send_btn(ctx);
@@ -19246,19 +19559,47 @@ static void wardrive_wigle_stop_btn_cb(lv_event_t *e)
 static void wardrive_wigle_network_row_click_cb(lv_event_t *e)
 {
     lv_obj_t *row = lv_event_get_target(e);
-    const char *ssid = (const char *)lv_event_get_user_data(e);
+    void *user_data = lv_event_get_user_data(e);
     tab_context_t *ctx = get_current_ctx();
-    if (!ctx || !ssid) {
+    if (!ctx || !user_data) {
+        return;
+    }
+
+    const char *ssid = NULL;
+    const char *security = NULL;
+    if (user_data == (void *)wardrive_wigle_other_ssid_user_data) {
+        ssid = WARDRIVE_WIGLE_OTHER_SSID;
+    } else {
+        wifi_network_t *net = (wifi_network_t *)user_data;
+        ssid = net->ssid;
+        security = net->security;
+    }
+
+    if (!ssid) {
         return;
     }
 
     if (strlen(ssid) == 0) {
+        if (security) {
+            strncpy(ctx->wardrive_wigle_selected_security, security,
+                    sizeof(ctx->wardrive_wigle_selected_security) - 1);
+            ctx->wardrive_wigle_selected_security[sizeof(ctx->wardrive_wigle_selected_security) - 1] = '\0';
+        } else {
+            ctx->wardrive_wigle_selected_security[0] = '\0';
+        }
         show_hidden_ssid_popup(hidden_ssid_wardrive_confirm_cb);
         return;
     }
 
     strncpy(ctx->wardrive_wigle_selected_ssid, ssid, sizeof(ctx->wardrive_wigle_selected_ssid) - 1);
     ctx->wardrive_wigle_selected_ssid[sizeof(ctx->wardrive_wigle_selected_ssid) - 1] = '\0';
+    if (security) {
+        strncpy(ctx->wardrive_wigle_selected_security, security,
+                sizeof(ctx->wardrive_wigle_selected_security) - 1);
+        ctx->wardrive_wigle_selected_security[sizeof(ctx->wardrive_wigle_selected_security) - 1] = '\0';
+    } else {
+        ctx->wardrive_wigle_selected_security[0] = '\0';
+    }
     ESP_LOGI(TAG, "[%s] WiGLE selected SSID: %s",
              tab_transport_name(tab_id_for_ctx(ctx)), ctx->wardrive_wigle_selected_ssid);
 
@@ -19510,6 +19851,7 @@ static bool wardrive_wigle_ensure_wifi_connected(tab_context_t *ctx, tab_id_t ac
     do_rescan = false;
     ctx->wardrive_wigle_rescan_requested = false;
     ctx->wardrive_wigle_selected_ssid[0] = '\0';
+    ctx->wardrive_wigle_selected_security[0] = '\0';
     ctx->wardrive_wigle_selected_password[0] = '\0';
     ctx->wardrive_wigle_connect_ready = false;
 
@@ -19673,6 +20015,7 @@ static bool wardrive_wigle_ensure_wifi_connected(tab_context_t *ctx, tab_id_t ac
 
     ctx->wardrive_wigle_selected_ssid[0] = '\0';
     ctx->wardrive_wigle_connect_ready = false;
+    ctx->wardrive_wigle_selected_security[0] = '\0';
     ctx->wardrive_wigle_selected_password[0] = '\0';
 
     bsp_display_lock(0);
@@ -19724,7 +20067,7 @@ static bool wardrive_wigle_ensure_wifi_connected(tab_context_t *ctx, tab_id_t ac
             lv_obj_set_style_text_font(info_lbl, &lv_font_montserrat_12, 0);
             lv_obj_set_style_text_color(info_lbl, lv_color_hex(0x888888), 0);
 
-            lv_obj_add_event_cb(row, wardrive_wigle_network_row_click_cb, LV_EVENT_CLICKED, (void *)nets[i].ssid);
+            lv_obj_add_event_cb(row, wardrive_wigle_network_row_click_cb, LV_EVENT_CLICKED, (void *)&nets[i]);
         }
 
         lv_obj_t *other_row = lv_obj_create(ctx->wardrive_wigle_list);
@@ -19749,7 +20092,7 @@ static bool wardrive_wigle_ensure_wifi_connected(tab_context_t *ctx, tab_id_t ac
         lv_obj_set_style_text_color(other_info_lbl, lv_color_hex(0x888888), 0);
 
         lv_obj_add_event_cb(other_row, wardrive_wigle_network_row_click_cb,
-                            LV_EVENT_CLICKED, (void *)WARDRIVE_WIGLE_OTHER_SSID);
+                            LV_EVENT_CLICKED, (void *)wardrive_wigle_other_ssid_user_data);
     }
     if (ctx->wardrive_wigle_spinner) {
         lv_obj_add_flag(ctx->wardrive_wigle_spinner, LV_OBJ_FLAG_HIDDEN);
@@ -19766,9 +20109,11 @@ static bool wardrive_wigle_ensure_wifi_connected(tab_context_t *ctx, tab_id_t ac
              tab_transport_name(active_tab), ctx->wardrive_wigle_selected_ssid);
 
     bool manual_credentials = (strcmp(ctx->wardrive_wigle_selected_ssid, WARDRIVE_WIGLE_OTHER_SSID) == 0);
+    bool selected_open_network = wifi_network_security_is_open(ctx->wardrive_wigle_selected_security);
     bool use_saved_password = false;
-    ESP_LOGI(TAG, "[%s] WiGLE: manual credentials mode = %d",
-             tab_transport_name(active_tab), manual_credentials ? 1 : 0);
+    ESP_LOGI(TAG, "[%s] WiGLE: manual credentials=%d, selected_open=%d, security='%s'",
+             tab_transport_name(active_tab), manual_credentials ? 1 : 0,
+             selected_open_network ? 1 : 0, ctx->wardrive_wigle_selected_security);
 
     bsp_display_lock(0);
     if (ctx->wardrive_wigle_spinner) {
@@ -19781,6 +20126,10 @@ static bool wardrive_wigle_ensure_wifi_connected(tab_context_t *ctx, tab_id_t ac
     if (ctx->wardrive_wigle_status_label) {
         if (manual_credentials) {
             lv_label_set_text(ctx->wardrive_wigle_status_label, "Manual network selected\nEnter SSID and WiFi password:");
+        } else if (selected_open_network) {
+            lv_label_set_text_fmt(ctx->wardrive_wigle_status_label,
+                                  "Selected open network: %s\nConnecting without password...",
+                                  ctx->wardrive_wigle_selected_ssid);
         } else {
             lv_label_set_text_fmt(ctx->wardrive_wigle_status_label,
                                   "Selected: %s\nChecking saved passwords...",
@@ -19791,6 +20140,7 @@ static bool wardrive_wigle_ensure_wifi_connected(tab_context_t *ctx, tab_id_t ac
 
     if (manual_credentials) {
         ctx->wardrive_wigle_selected_ssid[0] = '\0';
+        ctx->wardrive_wigle_selected_security[0] = '\0';
         ctx->wardrive_wigle_selected_password[0] = '\0';
         ctx->wardrive_wigle_connect_ready = false;
 
@@ -19810,10 +20160,10 @@ static bool wardrive_wigle_ensure_wifi_connected(tab_context_t *ctx, tab_id_t ac
             return false;
         }
 
-        if (strlen(ctx->wardrive_wigle_selected_ssid) == 0 || strlen(ctx->wardrive_wigle_selected_password) == 0) {
+        if (strlen(ctx->wardrive_wigle_selected_ssid) == 0) {
             bsp_display_lock(0);
             if (ctx->wardrive_wigle_status_label) {
-                lv_label_set_text(ctx->wardrive_wigle_status_label, "Enter SSID and password.");
+                lv_label_set_text(ctx->wardrive_wigle_status_label, "Enter SSID.");
             }
             bsp_display_unlock();
             heap_caps_free(scan_rx_buf);
@@ -19823,7 +20173,8 @@ static bool wardrive_wigle_ensure_wifi_connected(tab_context_t *ctx, tab_id_t ac
             heap_caps_free(wifi_rx_buf);
             return false;
         }
-    } else {
+        selected_open_network = (ctx->wardrive_wigle_selected_password[0] == '\0');
+    } else if (!selected_open_network) {
         ctx->wardrive_wigle_selected_password[0] = '\0';
 
         if (active_tab == TAB_USB && usb_cdc_handle) {
@@ -19891,7 +20242,7 @@ static bool wardrive_wigle_ensure_wifi_connected(tab_context_t *ctx, tab_id_t ac
                  (int)(strlen(ctx->wardrive_wigle_selected_password) > 0));
     }
 
-    if (strlen(ctx->wardrive_wigle_selected_password) == 0) {
+    if (!selected_open_network && strlen(ctx->wardrive_wigle_selected_password) == 0) {
         ctx->wardrive_wigle_connect_ready = false;
 
         bsp_display_lock(0);
@@ -19940,11 +20291,13 @@ static bool wardrive_wigle_ensure_wifi_connected(tab_context_t *ctx, tab_id_t ac
     bsp_display_unlock();
 
     char wifi_cmd[256];
+    wifi_connect_auth_mode_t auth_mode =
+        selected_open_network ? WIFI_CONNECT_AUTH_OPEN :
+        (use_saved_password ? WIFI_CONNECT_AUTH_SAVED : WIFI_CONNECT_AUTH_PASSWORD);
     if (!build_wifi_connect_command(wifi_cmd, sizeof(wifi_cmd),
                                     ctx->wardrive_wigle_selected_ssid,
                                     ctx->wardrive_wigle_selected_password,
-                                    use_saved_password ? WIFI_CONNECT_AUTH_SAVED
-                                                       : WIFI_CONNECT_AUTH_PASSWORD)) {
+                                    auth_mode)) {
         bsp_display_lock(0);
         if (ctx->wardrive_wigle_status_label) {
             lv_label_set_text(ctx->wardrive_wigle_status_label, "SSID/password too long.");
@@ -20034,14 +20387,33 @@ static bool wardrive_wigle_ensure_wifi_connected(tab_context_t *ctx, tab_id_t ac
             }
 
             bsp_display_lock(0);
+            bool created_password_prompt = false;
+            if (!ctx->wardrive_wigle_password_input) {
+                selected_open_network = false;
+                use_saved_password = false;
+                ctx->wardrive_wigle_selected_password[0] = '\0';
+                if (ctx->wardrive_wigle_status_label) {
+                    lv_label_set_text_fmt(ctx->wardrive_wigle_status_label,
+                                          "WiFi failed: %s\nEnter WiFi password, or Rescan.",
+                                          fail_reason);
+                }
+                wardrive_wigle_create_credentials_prompt(ctx, false);
+                created_password_prompt = true;
+            }
             // Keep credentials UI visible so user can edit password and retry
             if (ctx->wardrive_wigle_connect_btn) {
                 lv_obj_clear_state(ctx->wardrive_wigle_connect_btn, LV_STATE_DISABLED);
             }
-            if (ctx->wardrive_wigle_status_label) {
-                lv_label_set_text_fmt(ctx->wardrive_wigle_status_label,
-                                      "WiFi failed: %s\nEdit password and tap Connect, or Rescan.",
-                                      fail_reason);
+            if (ctx->wardrive_wigle_status_label && !created_password_prompt) {
+                if (ctx->wardrive_wigle_password_input) {
+                    lv_label_set_text_fmt(ctx->wardrive_wigle_status_label,
+                                          "WiFi failed: %s\nEdit password and tap Connect, or Rescan.",
+                                          fail_reason);
+                } else {
+                    lv_label_set_text_fmt(ctx->wardrive_wigle_status_label,
+                                          "WiFi failed: %s\nTap Rescan.",
+                                          fail_reason);
+                }
             }
             if (ctx->wardrive_wigle_spinner) {
                 lv_obj_add_flag(ctx->wardrive_wigle_spinner, LV_OBJ_FLAG_HIDDEN);
@@ -20110,11 +20482,12 @@ static bool wardrive_wigle_ensure_wifi_connected(tab_context_t *ctx, tab_id_t ac
                                           ctx->wardrive_wigle_selected_ssid);
                 }
                 // Rebuild wifi_cmd with potentially new password
+                auth_mode = selected_open_network ? WIFI_CONNECT_AUTH_OPEN :
+                            (use_saved_password ? WIFI_CONNECT_AUTH_SAVED : WIFI_CONNECT_AUTH_PASSWORD);
                 if (!build_wifi_connect_command(wifi_cmd, sizeof(wifi_cmd),
                                                 ctx->wardrive_wigle_selected_ssid,
                                                 ctx->wardrive_wigle_selected_password,
-                                                use_saved_password ? WIFI_CONNECT_AUTH_SAVED
-                                                                   : WIFI_CONNECT_AUTH_PASSWORD)) {
+                                                auth_mode)) {
                     if (ctx->wardrive_wigle_status_label) {
                         lv_label_set_text(ctx->wardrive_wigle_status_label, "SSID/password too long.");
                     }
@@ -21465,6 +21838,7 @@ static void show_wardrive_upload_popup(tab_context_t *ctx, wardrive_upload_provi
     ctx->wardrive_upload_mode = WARDRIVE_UPLOAD_MODE_SELECTED;
     ctx->wardrive_wigle_task = NULL;
     ctx->wardrive_wigle_selected_ssid[0] = '\0';
+    ctx->wardrive_wigle_selected_security[0] = '\0';
     ctx->wardrive_wigle_selected_password[0] = '\0';
     ctx->wardrive_wigle_ssid_input = NULL;
     ctx->wardrive_wigle_password_input = NULL;
@@ -30453,6 +30827,7 @@ static void close_wpasec_popup(lv_event_t *e)
         ctx->wpasec_keyboard = NULL;
         ctx->wpasec_connect_btn = NULL;
         ctx->wpasec_selected_ssid[0] = '\0';
+        ctx->wpasec_selected_security[0] = '\0';
         ctx->wpasec_selected_password[0] = '\0';
         ctx->wpasec_password_known = false;
         ctx->wpasec_connect_ready = false;
@@ -30465,17 +30840,41 @@ static void close_wpasec_popup(lv_event_t *e)
 static void wpasec_network_row_click_cb(lv_event_t *e)
 {
     lv_obj_t *row = lv_event_get_target(e);
-    const char *ssid = (const char *)lv_event_get_user_data(e);
+    void *user_data = lv_event_get_user_data(e);
     tab_context_t *ctx = get_current_ctx();
-    if (!ctx || !ssid) return;
+    if (!ctx || !user_data) return;
+
+    const char *ssid = NULL;
+    const char *security = NULL;
+    if (user_data == (void *)wpasec_other_ssid_user_data) {
+        ssid = WPASEC_OTHER_SSID;
+    } else {
+        wifi_network_t *net = (wifi_network_t *)user_data;
+        ssid = net->ssid;
+        security = net->security;
+    }
+
+    if (!ssid) return;
 
     if (strlen(ssid) == 0) {
+        if (security) {
+            strncpy(ctx->wpasec_selected_security, security, sizeof(ctx->wpasec_selected_security) - 1);
+            ctx->wpasec_selected_security[sizeof(ctx->wpasec_selected_security) - 1] = '\0';
+        } else {
+            ctx->wpasec_selected_security[0] = '\0';
+        }
         show_hidden_ssid_popup(hidden_ssid_wpasec_confirm_cb);
         return;
     }
 
     strncpy(ctx->wpasec_selected_ssid, ssid, sizeof(ctx->wpasec_selected_ssid) - 1);
     ctx->wpasec_selected_ssid[sizeof(ctx->wpasec_selected_ssid) - 1] = '\0';
+    if (security) {
+        strncpy(ctx->wpasec_selected_security, security, sizeof(ctx->wpasec_selected_security) - 1);
+        ctx->wpasec_selected_security[sizeof(ctx->wpasec_selected_security) - 1] = '\0';
+    } else {
+        ctx->wpasec_selected_security[0] = '\0';
+    }
 
     // Highlight selected row, reset others
     if (ctx->wpasec_network_list) {
@@ -30532,6 +30931,8 @@ static void wpasec_connect_btn_cb(lv_event_t *e)
         if (text && strlen(text) > 0) {
             strncpy(ctx->wpasec_selected_password, text, sizeof(ctx->wpasec_selected_password) - 1);
             ctx->wpasec_selected_password[sizeof(ctx->wpasec_selected_password) - 1] = '\0';
+        } else {
+            ctx->wpasec_selected_password[0] = '\0';
         }
     }
 
@@ -30773,6 +31174,7 @@ static void wpasec_upload_task(void *arg)
 
         // Build network list UI
         ctx->wpasec_selected_ssid[0] = '\0';
+        ctx->wpasec_selected_security[0] = '\0';
         bsp_display_lock(0);
         if (ctx->wpasec_status_label) {
             lv_label_set_text_fmt(ctx->wpasec_status_label, "Found %d networks - select one:", wpasec_net_count);
@@ -30824,9 +31226,9 @@ static void wpasec_upload_task(void *arg)
                 lv_obj_set_style_text_font(info_lbl, &lv_font_montserrat_12, 0);
                 lv_obj_set_style_text_color(info_lbl, lv_color_hex(0x888888), 0);
 
-                // Store SSID pointer in the static array for callback
+                // Store network pointer in the static array for callback
                 lv_obj_add_event_cb(row, wpasec_network_row_click_cb, LV_EVENT_CLICKED,
-                                    (void *)wpasec_nets[i].ssid);
+                                    (void *)&wpasec_nets[i]);
             }
 
             // Manual entry option at the bottom
@@ -30851,7 +31253,7 @@ static void wpasec_upload_task(void *arg)
             lv_obj_set_style_text_font(other_info_lbl, &lv_font_montserrat_12, 0);
             lv_obj_set_style_text_color(other_info_lbl, lv_color_hex(0x888888), 0);
 
-            lv_obj_add_event_cb(other_row, wpasec_network_row_click_cb, LV_EVENT_CLICKED, (void *)WPASEC_OTHER_SSID);
+            lv_obj_add_event_cb(other_row, wpasec_network_row_click_cb, LV_EVENT_CLICKED, (void *)wpasec_other_ssid_user_data);
         }
         bsp_display_unlock();
 
@@ -30864,12 +31266,17 @@ static void wpasec_upload_task(void *arg)
         ESP_LOGI(TAG, "wpasec: user selected SSID: %s", ctx->wpasec_selected_ssid);
 
         bool manual_credentials = (strcmp(ctx->wpasec_selected_ssid, WPASEC_OTHER_SSID) == 0);
+        bool selected_open_network = wifi_network_security_is_open(ctx->wpasec_selected_security);
 
         // Remove network list to make room
         bsp_display_lock(0);
         if (ctx->wpasec_status_label) {
             if (manual_credentials) {
                 lv_label_set_text(ctx->wpasec_status_label, "Manual network selected\nEnter SSID and WiFi password:");
+            } else if (selected_open_network) {
+                lv_label_set_text_fmt(ctx->wpasec_status_label,
+                    "Selected open network: %s\nConnecting without password...",
+                    ctx->wpasec_selected_ssid);
             } else {
                 lv_label_set_text_fmt(ctx->wpasec_status_label, "Selected: %s\nChecking saved passwords...", ctx->wpasec_selected_ssid);
             }
@@ -30882,6 +31289,7 @@ static void wpasec_upload_task(void *arg)
 
         if (manual_credentials) {
             ctx->wpasec_selected_ssid[0] = '\0';
+            ctx->wpasec_selected_security[0] = '\0';
             ctx->wpasec_selected_password[0] = '\0';
             ctx->wpasec_password_known = false;
             ctx->wpasec_connect_ready = false;
@@ -30897,15 +31305,16 @@ static void wpasec_upload_task(void *arg)
             }
             if (!ctx->wpasec_task_running) goto done;
 
-            if (strlen(ctx->wpasec_selected_ssid) == 0 || strlen(ctx->wpasec_selected_password) == 0) {
+            if (strlen(ctx->wpasec_selected_ssid) == 0) {
                 bsp_display_lock(0);
                 if (ctx->wpasec_status_label) {
-                    lv_label_set_text(ctx->wpasec_status_label, "Enter SSID and password.");
+                    lv_label_set_text(ctx->wpasec_status_label, "Enter SSID.");
                 }
                 bsp_display_unlock();
                 goto done;
             }
-        } else {
+            selected_open_network = (ctx->wpasec_selected_password[0] == '\0');
+        } else if (!selected_open_network) {
             uart_flush_input(uart_port);
             uart_send_command_for_tab("show_pass evil");
             vTaskDelay(pdMS_TO_TICKS(200));
@@ -31022,48 +31431,100 @@ static void wpasec_upload_task(void *arg)
         }
         bsp_display_unlock();
 
-        char wifi_cmd[256];
-        if (!build_wifi_connect_command(wifi_cmd, sizeof(wifi_cmd),
-                                        ctx->wpasec_selected_ssid,
-                                        ctx->wpasec_selected_password,
-                                        ctx->wpasec_password_known ? WIFI_CONNECT_AUTH_SAVED
-                                                                   : WIFI_CONNECT_AUTH_PASSWORD)) {
-            bsp_display_lock(0);
-            if (ctx->wpasec_status_label) {
-                lv_label_set_text(ctx->wpasec_status_label, "SSID/password too long.");
-            }
-            bsp_display_unlock();
-            goto done;
-        }
-
-        uart_flush_input(uart_port);
-        uart_send_command_for_tab(wifi_cmd);
-        ESP_LOGI(TAG, "wpasec: sent wifi_connect for %s", ctx->wpasec_selected_ssid);
-
-        // Wait for SUCCESS/FAILED (up to 15 seconds)
-        total_len = 0;
         bool wifi_success = false;
-        int wifi_elapsed = 0;
-        int wifi_timeout = 15000;
+        bool retry_with_password = false;
+        do {
+            retry_with_password = false;
 
-        while (wifi_elapsed < wifi_timeout && total_len < (int)sizeof(rx_buf) - 256 && ctx->wpasec_task_running) {
-            int len = transport_read_bytes(uart_port, rx_buf + total_len,
-                                           sizeof(rx_buf) - total_len - 1, pdMS_TO_TICKS(200));
-            if (len > 0) {
-                total_len += len;
-                rx_buf[total_len] = '\0';
-                if (strstr(rx_buf, "SUCCESS") != NULL) {
-                    wifi_success = true;
-                    break;
+            char wifi_cmd[256];
+            wifi_connect_auth_mode_t auth_mode =
+                selected_open_network ? WIFI_CONNECT_AUTH_OPEN :
+                (ctx->wpasec_password_known ? WIFI_CONNECT_AUTH_SAVED : WIFI_CONNECT_AUTH_PASSWORD);
+            if (!build_wifi_connect_command(wifi_cmd, sizeof(wifi_cmd),
+                                            ctx->wpasec_selected_ssid,
+                                            ctx->wpasec_selected_password,
+                                            auth_mode)) {
+                bsp_display_lock(0);
+                if (ctx->wpasec_status_label) {
+                    lv_label_set_text(ctx->wpasec_status_label, "SSID/password too long.");
                 }
-                if (strstr(rx_buf, "FAILED") != NULL || strstr(rx_buf, "Error") != NULL) {
-                    break;
-                }
+                bsp_display_unlock();
+                goto done;
             }
-            wifi_elapsed += 200;
-        }
 
-        if (!ctx->wpasec_task_running) goto done;
+            uart_flush_input(uart_port);
+            uart_send_command_for_tab(wifi_cmd);
+            ESP_LOGI(TAG, "wpasec: sent wifi_connect for %s", ctx->wpasec_selected_ssid);
+
+            // Wait for SUCCESS/FAILED (up to 15 seconds)
+            total_len = 0;
+            wifi_success = false;
+            int wifi_elapsed = 0;
+            int wifi_timeout = 15000;
+
+            while (wifi_elapsed < wifi_timeout && total_len < (int)sizeof(rx_buf) - 256 && ctx->wpasec_task_running) {
+                int len = transport_read_bytes(uart_port, rx_buf + total_len,
+                                               sizeof(rx_buf) - total_len - 1, pdMS_TO_TICKS(200));
+                if (len > 0) {
+                    total_len += len;
+                    rx_buf[total_len] = '\0';
+                    if (strstr(rx_buf, "SUCCESS") != NULL) {
+                        wifi_success = true;
+                        break;
+                    }
+                    if (strstr(rx_buf, "FAILED") != NULL || strstr(rx_buf, "Error") != NULL) {
+                        break;
+                    }
+                }
+                wifi_elapsed += 200;
+            }
+
+            if (!ctx->wpasec_task_running) goto done;
+
+            if (!wifi_success && selected_open_network) {
+                selected_open_network = false;
+                ctx->wpasec_password_known = false;
+                ctx->wpasec_selected_password[0] = '\0';
+                ctx->wpasec_connect_ready = false;
+
+                bsp_display_lock(0);
+                if (ctx->wpasec_status_label) {
+                    lv_label_set_text(ctx->wpasec_status_label,
+                        "Open connect failed.\nEnter WiFi password, or Close.");
+                }
+                if (ctx->wpasec_popup) {
+                    wpasec_create_credentials_prompt(ctx, false);
+                }
+                bsp_display_unlock();
+
+                while (!ctx->wpasec_connect_ready && ctx->wpasec_task_running) {
+                    vTaskDelay(pdMS_TO_TICKS(100));
+                }
+                if (!ctx->wpasec_task_running) goto done;
+
+                if (strlen(ctx->wpasec_selected_password) == 0) {
+                    bsp_display_lock(0);
+                    if (ctx->wpasec_status_label) {
+                        lv_label_set_text(ctx->wpasec_status_label, "No password entered.");
+                    }
+                    bsp_display_unlock();
+                    goto done;
+                }
+
+                bsp_display_lock(0);
+                if (ctx->wpasec_keyboard) {
+                    lv_obj_del(ctx->wpasec_keyboard);
+                    ctx->wpasec_keyboard = NULL;
+                }
+                if (ctx->wpasec_status_label) {
+                    lv_label_set_text_fmt(ctx->wpasec_status_label,
+                                          "Retrying connection to %s...",
+                                          ctx->wpasec_selected_ssid);
+                }
+                bsp_display_unlock();
+                retry_with_password = true;
+            }
+        } while (retry_with_password && ctx->wpasec_task_running);
 
         if (wifi_success) {
             arp_wifi_connected = true;
@@ -31235,6 +31696,7 @@ static void show_wpasec_popup(void)
 
     // Reset WiFi-connect state
     ctx->wpasec_selected_ssid[0] = '\0';
+    ctx->wpasec_selected_security[0] = '\0';
     ctx->wpasec_selected_password[0] = '\0';
     ctx->wpasec_password_known = false;
     ctx->wpasec_connect_ready = false;
@@ -33528,6 +33990,28 @@ static bool build_wifi_connect_command(char *out, size_t out_sz, const char *ssi
     }
 
     return cmd_len >= 0 && cmd_len < (int)out_sz;
+}
+
+static bool wifi_network_security_is_open(const char *security)
+{
+    if (!security || security[0] == '\0') {
+        return true;
+    }
+    char upper[32];
+    size_t i = 0;
+    for (; security[i] && i < sizeof(upper) - 1; i++) {
+        upper[i] = (char)toupper((unsigned char)security[i]);
+    }
+    upper[i] = '\0';
+
+    if (strstr(upper, "OPEN") || strstr(upper, "UNKNOWN") || strstr(upper, "OWE")) {
+        return true;
+    }
+    if (strstr(upper, "WPA") || strstr(upper, "WEP") ||
+        strstr(upper, "SAE") || strstr(upper, "PSK")) {
+        return false;
+    }
+    return true;
 }
 
 static void beacon_spam_trim_whitespace(char *text)
@@ -38948,7 +39432,7 @@ static bool ota_prepare_wifi_command(char *cmd, size_t cmd_sz, bool start_ota)
         }
     }
 
-    bool use_saved = g_ota.selected_saved_password || !pass || pass[0] == '\0';
+    bool use_saved = g_ota.selected_saved_password;
     if (!ota_build_wifi_connect_cmd(cmd, cmd_sz, ssid, pass, use_saved,
                                     start_ota, manual, ip, nm, gw, dns)) {
         if (g_ota.page_status) lv_label_set_text(g_ota.page_status, "SSID/password too long");
@@ -38968,13 +39452,6 @@ static bool ota_build_wifi_connect_cmd(char *out, size_t out_sz, const char *ssi
 
     const char *ota_flag = start_ota ? " ota" : "";
     if (!manual) {
-        if (start_ota && !use_saved && (!password || password[0] == '\0')) {
-            char escaped_ssid[67];
-            beacon_spam_escape_quoted_arg(ssid, escaped_ssid, sizeof(escaped_ssid));
-            int cmd_len = snprintf(out, out_sz, "wifi_connect \"%s\" \"\"%s",
-                                   escaped_ssid, ota_flag);
-            return cmd_len >= 0 && cmd_len < (int)out_sz;
-        }
         wifi_connect_auth_mode_t mode = use_saved ? WIFI_CONNECT_AUTH_SAVED :
                                         ((password && password[0]) ? WIFI_CONNECT_AUTH_PASSWORD
                                                                   : WIFI_CONNECT_AUTH_OPEN);
@@ -39009,16 +39486,6 @@ static bool ota_build_wifi_connect_cmd(char *out, size_t out_sz, const char *ssi
                                escaped_ssid, escaped_password, ota_flag, ip, nm, gw);
         }
     } else {
-        if (start_ota) {
-            if (dns && dns[0]) {
-                cmd_len = snprintf(out, out_sz, "wifi_connect \"%s\" \"\"%s %s %s %s %s",
-                                   escaped_ssid, ota_flag, ip, nm, gw, dns);
-            } else {
-                cmd_len = snprintf(out, out_sz, "wifi_connect \"%s\" \"\"%s %s %s %s",
-                                   escaped_ssid, ota_flag, ip, nm, gw);
-            }
-            return cmd_len >= 0 && cmd_len < (int)out_sz;
-        }
         if (dns && dns[0]) {
             cmd_len = snprintf(out, out_sz, "wifi_connect \"%s\"%s %s %s %s %s",
                                escaped_ssid, ota_flag, ip, nm, gw, dns);
@@ -39929,6 +40396,15 @@ void app_main(void)
         ESP_LOGE(TAG, "Failed to initialize display");
         return;
     }
+
+    // Paint the base screen dark and flush it *before* the backlight comes on, so
+    // the very first visible frame is already dark. Otherwise the default (light)
+    // LVGL screen flashes/fills white for a moment before the boot intro appears.
+    bsp_display_lock(0);
+    lv_obj_set_style_bg_color(lv_scr_act(), lv_color_hex(0x02040A), 0);
+    lv_obj_set_style_bg_opa(lv_scr_act(), LV_OPA_COVER, 0);
+    lv_refr_now(disp);
+    bsp_display_unlock();
 
     // Set display brightness from saved setting with gamma correction
     set_brightness_gamma(screen_brightness_setting);
