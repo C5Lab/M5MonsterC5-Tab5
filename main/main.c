@@ -257,6 +257,19 @@ typedef struct {
     char kind[8];
 } wardrive_network_t;
 
+// Stop wardrive gracefully at/below this battery %, so JanOS can finalize the KML
+// (append </Folder></Document></kml> + rename .inprogress.kml -> _track.kml) and close
+// the log before a hard power-off would leave an unopenable, truncated file.
+#define WARDRIVE_LOW_BATT_PCT 8
+
+// Home networks (auto-upload trigger set), cached from JanOS `home_list` at scan start.
+#define WARDRIVE_HOME_MAX 16
+typedef struct {
+    char ssid[33];
+    char bssid[18];  // optional; matches hidden networks (empty SSID) by MAC
+    bool prompted;   // auto-upload already offered for this entry this session
+} wardrive_home_entry_t;
+
 // ---- Wardrive 2.0 configuration (mirrors janOS get_wardrive_config / set_* commands) ----
 #define WARDRIVE_BAND_WIFI24   0x01
 #define WARDRIVE_BAND_WIFI5    0x02
@@ -457,6 +470,7 @@ typedef struct {
     lv_obj_t *home_files_white_label;
     lv_obj_t *home_files_wigle_label;
     lv_obj_t *home_files_wdgwars_label;
+    lv_obj_t *home_files_home_label;
     lv_obj_t *home_files_spinner;
     lv_obj_t *home_files_row;
     lv_obj_t *home_quote_label;
@@ -466,6 +480,7 @@ typedef struct {
     bool home_wigle_present;
     bool home_wdgwars_present;
     bool home_white_present;
+    bool home_homenet_present;
     bool home_sd_stats_valid;
     uint64_t home_sd_total_bytes;
     uint64_t home_sd_free_bytes;
@@ -755,6 +770,37 @@ typedef struct {
     bool wardrive_setup_gps_dirty;
     uint8_t wardrive_setup_gps_index;
     TaskHandle_t wardrive_setup_task;
+    // ---- Auto-upload (home networks) ----
+    // Setup-overlay controls (live in the GPS/auto-upload section)
+    lv_obj_t *wardrive_setup_autoup_sw;
+    lv_obj_t *wardrive_setup_autoup_wigle_cb;
+    lv_obj_t *wardrive_setup_autoup_wdgwars_cb;
+    lv_obj_t *wardrive_setup_autoup_archive_cb;
+    lv_obj_t *wardrive_setup_autoup_poweroff_cb;
+    lv_obj_t *wardrive_setup_home_btn;
+    // Home-networks management sub-overlay
+    lv_obj_t *home_mgmt_overlay;
+    lv_obj_t *home_mgmt_list;
+    lv_obj_t *home_mgmt_status_label;
+    lv_obj_t *home_mgmt_ssid_input;
+    lv_obj_t *home_mgmt_pass_input;
+    lv_obj_t *home_mgmt_bssid_input;
+    lv_obj_t *home_mgmt_keyboard;
+    volatile bool home_mgmt_busy;
+    TaskHandle_t home_mgmt_scan_task;
+    // Runtime detection state (populated at scan start via `home_list`)
+    wardrive_home_entry_t wardrive_home[WARDRIVE_HOME_MAX];
+    int wardrive_home_count;
+    // Auto-upload run state + confirm/result overlay
+    volatile bool wardrive_autoupload_busy;
+    volatile bool wardrive_autoupload_requested;
+    bool wardrive_autoupload_ready;   // an armed provider actually has an API key
+    char wardrive_autoupload_ssid[33];
+    TaskHandle_t wardrive_autoupload_task_handle;
+    lv_obj_t *wardrive_autoup_overlay;
+    lv_obj_t *wardrive_autoup_status_label;
+    lv_obj_t *wardrive_autoup_btn_row;
+    lv_obj_t *wardrive_home_confirm_overlay;
     // Blacklist editor (sub-overlay of setup)
     lv_obj_t *wardrive_blacklist_overlay;
     lv_obj_t *wardrive_blacklist_list;
@@ -1779,6 +1825,13 @@ static char arp_target_security[24] = {0};
 static char arp_our_ip[20] = {0};
 static bool arp_wifi_connected = false;
 
+// Wardrive auto-upload (home networks) config, persisted in NVS (namespace "settings").
+static bool g_wd_autoupload_enabled  = false;  // master toggle
+static bool g_wd_autoupload_wigle    = true;   // upload wardrive logs to WiGLE
+static bool g_wd_autoupload_wdgwars  = false;  // upload wardrive logs to WDGWars
+static bool g_wd_autoupload_archive  = false;  // auto-archive uploaded files on success
+static bool g_wd_autoupload_poweroff = false;  // power off the Tab5 after a successful auto-upload
+
 // Nmap page (legacy globals)
 static lv_obj_t *nmap_page = NULL;
 static lv_obj_t *nmap_password_input = NULL;
@@ -2338,6 +2391,18 @@ static void wardrive_wigle_close_cb(lv_event_t *e);
 static void wardrive_wigle_upload_task(void *arg);
 static void wardrive_wdgwars_upload_task(void *arg);
 static void show_wardrive_upload_popup(tab_context_t *ctx, wardrive_upload_provider_t provider);
+// ---- Wardrive auto-upload (home networks) ----
+static int  wardrive_home_fetch(tab_context_t *ctx, char entries[][33], char bssids[][18], int max_entries);
+static void wardrive_load_home_networks(tab_context_t *ctx);
+static void wardrive_begin_scan(tab_context_t *ctx);
+static void wardrive_autoupload_task(void *arg);
+static void show_wardrive_home_confirm(tab_context_t *ctx, const char *ssid);
+static void close_wardrive_home_confirm(tab_context_t *ctx);
+static void close_wardrive_autoup_overlay(tab_context_t *ctx);
+static void show_home_mgmt_overlay(tab_context_t *ctx);
+static void close_home_mgmt_overlay(tab_context_t *ctx);
+static void load_wd_autoupload_from_nvs(void);
+static void save_wd_autoupload_to_nvs(void);
 // ---- Wardrive 2.0 setup + anti-surveillance ----
 static void wardrive_config_set_defaults(wardrive_config_t *cfg);
 static bool wardrive_send_set_command(tab_context_t *ctx, const char *cmd,
@@ -2860,7 +2925,7 @@ static int home_collect_uart_response(tab_id_t tab, uart_port_t uart_port, char 
     return total;
 }
 
-static void home_parse_remote_list_dir(const char *buf, int *pcap_count, bool *wpasec_ok, bool *vendors_ok, bool *wigle_ok, bool *wdgwars_ok, bool *white_ok)
+static void home_parse_remote_list_dir(const char *buf, int *pcap_count, bool *wpasec_ok, bool *vendors_ok, bool *wigle_ok, bool *wdgwars_ok, bool *white_ok, bool *home_ok)
 {
     if (!buf) return;
 
@@ -2888,6 +2953,9 @@ static void home_parse_remote_list_dir(const char *buf, int *pcap_count, bool *w
                 }
                 if (white_ok && strstr(line, "white.txt")) {
                     *white_ok = true;
+                }
+                if (home_ok && strstr(line, "home.txt")) {
+                    *home_ok = true;
                 }
                 line_pos = 0;
             }
@@ -2924,6 +2992,7 @@ static void home_read_local_meta(tab_context_t *ctx)
     ctx->home_wigle_present   = file_exists("/sdcard/lab/wigle.txt");
     ctx->home_wdgwars_present = file_exists("/sdcard/lab/wdgwars.txt");
     ctx->home_white_present   = file_exists("/sdcard/lab/white.txt");
+    ctx->home_homenet_present = file_exists("/sdcard/lab/home.txt");
 
     uint64_t total = 0;
     uint64_t free = 0;
@@ -2951,6 +3020,7 @@ static void home_read_remote_meta(tab_context_t *ctx)
     bool wigle_ok = false;
     bool wdgwars_ok = false;
     bool white_ok = false;
+    bool home_ok = false;
     bool usb_lock_set = false;
 
     if (tab == TAB_INTERNAL) {
@@ -2975,7 +3045,7 @@ static void home_read_remote_meta(tab_context_t *ctx)
         transport_write_bytes_tab(tab, uart_port, cmd, strlen(cmd));
         transport_write_bytes_tab(tab, uart_port, "\r\n", 2);
         if (home_collect_uart_response(tab, uart_port, rx_buf, sizeof(rx_buf), 1600) > 0) {
-            home_parse_remote_list_dir(rx_buf, &pcap_count, NULL, NULL, NULL, NULL, NULL);
+            home_parse_remote_list_dir(rx_buf, &pcap_count, NULL, NULL, NULL, NULL, NULL, NULL);
             if (home_list_dir_success(rx_buf)) break;
         }
     }
@@ -2995,7 +3065,7 @@ static void home_read_remote_meta(tab_context_t *ctx)
         transport_write_bytes_tab(tab, uart_port, cmd, strlen(cmd));
         transport_write_bytes_tab(tab, uart_port, "\r\n", 2);
         if (home_collect_uart_response(tab, uart_port, rx_buf, sizeof(rx_buf), 1400) > 0) {
-            home_parse_remote_list_dir(rx_buf, NULL, &wpasec_ok, &vendors_ok, &wigle_ok, &wdgwars_ok, &white_ok);
+            home_parse_remote_list_dir(rx_buf, NULL, &wpasec_ok, &vendors_ok, &wigle_ok, &wdgwars_ok, &white_ok, &home_ok);
             if (home_list_dir_success(rx_buf)) break;
         }
     }
@@ -3010,7 +3080,7 @@ static void home_read_remote_meta(tab_context_t *ctx)
             transport_write_bytes_tab(tab, uart_port, cmd, strlen(cmd));
             transport_write_bytes_tab(tab, uart_port, "\r\n", 2);
             if (home_collect_uart_response(tab, uart_port, rx_buf, sizeof(rx_buf), 1200) > 0) {
-                home_parse_remote_list_dir(rx_buf, NULL, NULL, &vendors_ok, NULL, NULL, NULL);
+                home_parse_remote_list_dir(rx_buf, NULL, NULL, &vendors_ok, NULL, NULL, NULL, NULL);
                 if (vendors_ok) break;
             }
         }
@@ -3026,6 +3096,7 @@ static void home_read_remote_meta(tab_context_t *ctx)
     ctx->home_wigle_present   = wigle_ok;
     ctx->home_wdgwars_present = wdgwars_ok;
     ctx->home_white_present   = white_ok;
+    ctx->home_homenet_present = home_ok;
 
     // Storage ring tracks Tab5 SD free space (always local mount on this UI device).
     uint64_t total = 0;
@@ -3261,6 +3332,10 @@ static void update_home_dashboard_labels(tab_context_t *ctx, int battery_pct)
                 lv_label_set_text(ctx->home_files_wdgwars_label, "wdgwars: " LV_SYMBOL_CLOSE);
                 lv_obj_set_style_text_color(ctx->home_files_wdgwars_label, COLOR_MATERIAL_RED, 0);
             }
+            if (ctx->home_files_home_label) {
+                lv_label_set_text(ctx->home_files_home_label, "home: " LV_SYMBOL_CLOSE);
+                lv_obj_set_style_text_color(ctx->home_files_home_label, COLOR_MATERIAL_RED, 0);
+            }
         } else {
             lv_label_set_text(ctx->home_files_label,
                               ctx->home_wpasec_present ? "wpa-sec: " LV_SYMBOL_OK : "wpa-sec: " LV_SYMBOL_CLOSE);
@@ -3289,6 +3364,12 @@ static void update_home_dashboard_labels(tab_context_t *ctx, int battery_pct)
                                   ctx->home_wdgwars_present ? "wdgwars: " LV_SYMBOL_OK : "wdgwars: " LV_SYMBOL_CLOSE);
                 lv_obj_set_style_text_color(ctx->home_files_wdgwars_label,
                                             ctx->home_wdgwars_present ? COLOR_MATERIAL_GREEN : COLOR_MATERIAL_RED, 0);
+            }
+            if (ctx->home_files_home_label) {
+                lv_label_set_text(ctx->home_files_home_label,
+                                  ctx->home_homenet_present ? "home: " LV_SYMBOL_OK : "home: " LV_SYMBOL_CLOSE);
+                lv_obj_set_style_text_color(ctx->home_files_home_label,
+                                            ctx->home_homenet_present ? COLOR_MATERIAL_GREEN : COLOR_MATERIAL_RED, 0);
             }
         }
     } else if (ctx->home_files_detail_label) {
@@ -12873,6 +12954,7 @@ static void reset_home_dashboard_bindings(tab_context_t *ctx)
     ctx->home_files_white_label = NULL;
     ctx->home_files_wigle_label = NULL;
     ctx->home_files_wdgwars_label = NULL;
+    ctx->home_files_home_label = NULL;
     ctx->home_files_spinner = NULL;
     ctx->home_files_row = NULL;
     ctx->home_quote_label = NULL;
@@ -13192,6 +13274,11 @@ static void create_uart_tiles_in_container(lv_obj_t *container, tab_context_t *c
             lv_label_set_text(ctx->home_files_wdgwars_label, "wdgwars: --");
             lv_obj_set_style_text_font(ctx->home_files_wdgwars_label, small_font, 0);
             lv_obj_set_style_text_color(ctx->home_files_wdgwars_label, ui_muted_color(), 0);
+
+            ctx->home_files_home_label = lv_label_create(col_right);
+            lv_label_set_text(ctx->home_files_home_label, "home: --");
+            lv_obj_set_style_text_font(ctx->home_files_home_label, small_font, 0);
+            lv_obj_set_style_text_color(ctx->home_files_home_label, ui_muted_color(), 0);
 
             ctx->home_files_row = files_row;
             // Initially show spinner, hide columns until first refresh completes
@@ -20683,6 +20770,13 @@ static void wardrive_run_batch_command(tab_context_t *ctx, tab_id_t active_tab,
     int empty_reads = 0;
     const int timeout_ms = 900000; // 15 min cap for a whole batch
 
+    // Live per-file progress parsed from the stream JanOS already prints:
+    //   "Uploading N Wardrive file(s)..."  and  "[i/N] filename (bytes) -> RESULT".
+    int batch_total = 0;
+    int batch_cur = 0;
+    int batch_logged = 0;
+    char batch_file[80] = "";
+
     while (ctx->wardrive_wigle_task_running &&
            elapsed_ms < timeout_ms &&
            total_len < (int)rx_size - 1 &&
@@ -20694,6 +20788,33 @@ static void wardrive_run_batch_command(tab_context_t *ctx, tab_id_t active_tab,
             total_len += len;
             empty_reads = 0;
             rx[total_len] = '\0';
+
+            if (batch_total == 0) {
+                const char *up = strstr(rx, "Uploading ");
+                int n = 0;
+                if (up && sscanf(up, "Uploading %d Wardrive", &n) == 1) batch_total = n;
+            }
+            // Latest "[i/N] filename" marker in the buffer -> current file.
+            const char *p = rx, *last = NULL;
+            while ((p = strchr(p, '[')) != NULL) {
+                int a = 0, b = 0;
+                if (sscanf(p, "[%d/%d]", &a, &b) == 2) last = p;
+                p++;
+            }
+            if (last) {
+                int a = 0, b = 0;
+                char fn[80] = "";
+                if (sscanf(last, "[%d/%d] %79s", &a, &b, fn) >= 2) {
+                    batch_cur = a;
+                    if (b > 0) batch_total = b;
+                    snprintf(batch_file, sizeof(batch_file), "%s", fn);
+                    if (a > batch_logged) {
+                        batch_logged = a;
+                        ESP_LOGI(TAG, "Wardrive batch: [%d/%d] %s", a, batch_total, fn);
+                    }
+                }
+            }
+
             if (strstr(rx, "Done:") != NULL ||
                 (creds_marker && strstr(rx, creds_marker) != NULL) ||
                 strstr(rx, "AUTH FAILED") != NULL ||
@@ -20709,10 +20830,23 @@ static void wardrive_run_batch_command(tab_context_t *ctx, tab_id_t active_tab,
 
         if (elapsed_ms - last_ui_ms >= 2000) {
             last_ui_ms = elapsed_ms;
+            int secs = elapsed_ms / 1000;
             bsp_display_lock(0);
             if (ctx->wardrive_wigle_status_label) {
-                lv_label_set_text_fmt(ctx->wardrive_wigle_status_label,
-                                      "Uploading batch...\n%ds elapsed", elapsed_ms / 1000);
+                if (batch_cur > 0 && batch_total > 0) {
+                    int eta = (batch_cur < batch_total) ? (secs * (batch_total - batch_cur)) / batch_cur : 0;
+                    lv_label_set_text_fmt(ctx->wardrive_wigle_status_label,
+                                          "File %d/%d: %s\n%ds elapsed, ~%ds left",
+                                          batch_cur, batch_total, batch_file, secs, eta);
+                } else {
+                    lv_label_set_text_fmt(ctx->wardrive_wigle_status_label,
+                                          "Uploading batch...\n%ds elapsed", secs);
+                }
+            }
+            if (batch_total > 0 && ctx->wardrive_wigle_progress_bar) {
+                lv_obj_clear_flag(ctx->wardrive_wigle_progress_bar, LV_OBJ_FLAG_HIDDEN);
+                lv_bar_set_value(ctx->wardrive_wigle_progress_bar,
+                                 (batch_cur * 100) / batch_total, LV_ANIM_OFF);
             }
             bsp_display_unlock();
         }
@@ -22070,6 +22204,1225 @@ static void wardrive_stop_cb(lv_event_t *e)
 }
 
 // Wardrive monitor task - reads UART for GPS fix, network CSV lines, log messages
+//==================================================================================
+// Wardrive auto-upload (home networks)
+//==================================================================================
+// When wardrive is running and a network from JanOS `home.txt` (the "home networks"
+// list) comes into range, offer a one-tap confirm to stop scanning, connect using the
+// saved password, upload the pending wardrive logs (WiGLE / WDGWars) and handshakes
+// (wpa-sec), optionally auto-archive on success, then resume or return to idle.
+
+// Block-local forward declarations (mutually-referential UI callbacks / helpers).
+static void home_mgmt_refresh(tab_context_t *ctx);
+static void home_mgmt_delete_cb(lv_event_t *e);
+static void home_mgmt_add_cb(lv_event_t *e);
+static void home_mgmt_close_cb(lv_event_t *e);
+static void wardrive_autoup_build_overlay(tab_context_t *ctx);
+static void wardrive_autoup_show_result(tab_context_t *ctx, bool success, const char *msg);
+static void wardrive_autoup_retry_cb(lv_event_t *e);
+static void wardrive_autoup_resume_cb(lv_event_t *e);
+static void wardrive_autoup_close_cb(lv_event_t *e);
+static void wardrive_home_confirm_yes_cb(lv_event_t *e);
+static void wardrive_home_confirm_no_cb(lv_event_t *e);
+
+// Query JanOS `home_list` and parse the `N "SSID"` lines into `entries`.
+// Returns the number of SSIDs parsed (0 if none / no response).
+static int wardrive_home_fetch(tab_context_t *ctx, char entries[][33], char bssids[][18], int max_entries)
+{
+    if (!ctx || !entries || !bssids || max_entries <= 0) return 0;
+    tab_id_t active_tab = tab_id_for_ctx(ctx);
+    uart_port_t uart_port = uart_port_for_tab(active_tab);
+
+    if (active_tab == TAB_USB && usb_cdc_handle) usbh_cdc_flush_rx_buffer(usb_cdc_handle);
+    else uart_flush(uart_port);
+    transport_write_bytes_tab(active_tab, uart_port, "home_list\r\n", 11);
+
+    char rx[1024];
+    char parse[1024];
+    int total = 0;
+    bool got_end = false;
+    for (int attempt = 0; attempt < 25 && !got_end; attempt++) {
+        if (total >= (int)sizeof(rx) - 1) break;
+        int len = transport_read_bytes_tab(active_tab, uart_port, rx + total,
+                                           sizeof(rx) - 1 - total, pdMS_TO_TICKS(80));
+        if (len <= 0) continue;
+        total += len;
+        rx[total] = '\0';
+        if (strstr(rx, "Home networks printed") != NULL) got_end = true;
+    }
+    if (total <= 0) return 0;
+
+    // Each entry line is: N "SSID" "BSSID"  (BSSID may be empty). Parse the two quoted
+    // fields explicitly (last-quote tricks break when a second field is present).
+    int count = 0;
+    snprintf(parse, sizeof(parse), "%s", rx);
+    char *saveptr = NULL;
+    char *line = strtok_r(parse, "\r\n", &saveptr);
+    while (line && count < max_entries) {
+        char *q1 = strchr(line, '"');
+        char *q2 = q1 ? strchr(q1 + 1, '"') : NULL;
+        if (q1 && q2 && q2 > q1 + 1) {
+            size_t n = (size_t)(q2 - (q1 + 1));
+            if (n > 32) n = 32;
+            memcpy(entries[count], q1 + 1, n);
+            entries[count][n] = '\0';
+
+            bssids[count][0] = '\0';
+            char *q3 = strchr(q2 + 1, '"');
+            char *q4 = q3 ? strchr(q3 + 1, '"') : NULL;
+            if (q3 && q4 && q4 > q3 + 1) {
+                size_t m = (size_t)(q4 - (q3 + 1));
+                if (m > 17) m = 17;
+                memcpy(bssids[count], q3 + 1, m);
+                bssids[count][m] = '\0';
+            }
+            count++;
+        }
+        line = strtok_r(NULL, "\r\n", &saveptr);
+    }
+    return count;
+}
+
+// Populate ctx->wardrive_home[] (auto-upload trigger set) from home_list; reset guards.
+static void wardrive_load_home_networks(tab_context_t *ctx)
+{
+    if (!ctx) return;
+    char list[WARDRIVE_HOME_MAX][33];
+    char blist[WARDRIVE_HOME_MAX][18];
+    int n = wardrive_home_fetch(ctx, list, blist, WARDRIVE_HOME_MAX);
+    ctx->wardrive_home_count = 0;
+    for (int i = 0; i < n && i < WARDRIVE_HOME_MAX; i++) {
+        snprintf(ctx->wardrive_home[i].ssid, sizeof(ctx->wardrive_home[i].ssid), "%.32s", list[i]);
+        snprintf(ctx->wardrive_home[i].bssid, sizeof(ctx->wardrive_home[i].bssid), "%.17s", blist[i]);
+        ctx->wardrive_home[i].prompted = false;
+        ctx->wardrive_home_count++;
+    }
+    ESP_LOGI(TAG, "Wardrive auto-upload: cached %d home network(s)", ctx->wardrive_home_count);
+}
+
+// Send a short command to JanOS and collect its reply (for home_add / home_remove).
+static bool wardrive_home_send_and_wait(tab_context_t *ctx, const char *cmd,
+                                        char *resp, size_t resp_sz)
+{
+    if (!ctx || !cmd) return false;
+    tab_id_t active_tab = tab_id_for_ctx(ctx);
+    uart_port_t uart_port = uart_port_for_tab(active_tab);
+    if (active_tab == TAB_USB && usb_cdc_handle) usbh_cdc_flush_rx_buffer(usb_cdc_handle);
+    else uart_flush(uart_port);
+    transport_write_bytes_tab(active_tab, uart_port, cmd, strlen(cmd));
+    transport_write_bytes_tab(active_tab, uart_port, "\r\n", 2);
+
+    char rx[512];
+    int total = 0;
+    int empty = 0;
+    while (empty < 6 && total < (int)sizeof(rx) - 1) {
+        int len = transport_read_bytes_tab(active_tab, uart_port, rx + total,
+                                           sizeof(rx) - 1 - total, pdMS_TO_TICKS(100));
+        if (len > 0) { total += len; rx[total] = '\0'; empty = 0; }
+        else empty++;
+    }
+    rx[total] = '\0';
+    if (resp && resp_sz) snprintf(resp, resp_sz, "%.*s", (int)resp_sz - 1, rx);
+    return total > 0;
+}
+
+// ---- Home networks management sub-overlay (opened from wardrive setup) ----
+
+static void home_mgmt_refresh(tab_context_t *ctx)
+{
+    if (!ctx || !ctx->home_mgmt_list) return;
+    lv_obj_clean(ctx->home_mgmt_list);
+
+    char list[WARDRIVE_HOME_MAX][33];
+    char blist[WARDRIVE_HOME_MAX][18];
+    int n = wardrive_home_fetch(ctx, list, blist, WARDRIVE_HOME_MAX);
+    ctx->wardrive_home_count = 0;
+    for (int i = 0; i < n && i < WARDRIVE_HOME_MAX; i++) {
+        snprintf(ctx->wardrive_home[i].ssid, sizeof(ctx->wardrive_home[i].ssid), "%.32s", list[i]);
+        snprintf(ctx->wardrive_home[i].bssid, sizeof(ctx->wardrive_home[i].bssid), "%.17s", blist[i]);
+        ctx->wardrive_home[i].prompted = false;
+        ctx->wardrive_home_count++;
+    }
+
+    if (ctx->wardrive_home_count == 0) {
+        lv_obj_t *empty = lv_label_create(ctx->home_mgmt_list);
+        lv_label_set_text(empty, "No home networks yet.");
+        lv_obj_set_style_text_color(empty, lv_color_hex(0x888888), 0);
+        return;
+    }
+
+    for (int i = 0; i < ctx->wardrive_home_count; i++) {
+        lv_obj_t *row = lv_obj_create(ctx->home_mgmt_list);
+        lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
+        lv_obj_set_style_pad_all(row, 8, 0);
+        lv_obj_set_style_bg_color(row, lv_color_hex(0x2D2D2D), 0);
+        lv_obj_set_style_border_width(row, 0, 0);
+        lv_obj_set_style_radius(row, 8, 0);
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *lbl = lv_label_create(row);
+        if (ctx->wardrive_home[i].bssid[0] != '\0')
+            lv_label_set_text_fmt(lbl, "%s  [%s]", ctx->wardrive_home[i].ssid, ctx->wardrive_home[i].bssid);
+        else
+            lv_label_set_text(lbl, ctx->wardrive_home[i].ssid);
+        lv_obj_set_style_text_color(lbl, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, 0);
+        lv_obj_set_flex_grow(lbl, 1);
+
+        lv_obj_t *del = lv_btn_create(row);
+        lv_obj_set_size(del, 46, 40);
+        lv_obj_set_style_bg_color(del, COLOR_MATERIAL_RED, 0);
+        lv_obj_set_style_radius(del, 8, 0);
+        lv_obj_add_event_cb(del, home_mgmt_delete_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+        lv_obj_t *dl = lv_label_create(del);
+        lv_label_set_text(dl, LV_SYMBOL_TRASH);
+        lv_obj_center(dl);
+    }
+}
+
+static void home_mgmt_delete_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx || ctx->home_mgmt_busy) return;
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (idx < 0 || idx >= ctx->wardrive_home_count) return;
+
+    char ssid[33];
+    snprintf(ssid, sizeof(ssid), "%s", ctx->wardrive_home[idx].ssid);
+    char esc[67];
+    beacon_spam_escape_quoted_arg(ssid, esc, sizeof(esc));
+    char cmd[128];
+    snprintf(cmd, sizeof(cmd), "home_remove \"%s\"", esc);
+
+    ctx->home_mgmt_busy = true;
+    if (ctx->home_mgmt_status_label) lv_label_set_text_fmt(ctx->home_mgmt_status_label, "Removing %s...", ssid);
+    lv_refr_now(NULL);
+    wardrive_home_send_and_wait(ctx, cmd, NULL, 0);
+    home_mgmt_refresh(ctx);
+    if (ctx->home_mgmt_status_label) lv_label_set_text_fmt(ctx->home_mgmt_status_label, "Removed %s", ssid);
+    ctx->home_mgmt_busy = false;
+}
+
+static void home_mgmt_add_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx) ctx = get_current_ctx();
+    if (!ctx || ctx->home_mgmt_busy) return;
+
+    const char *ssid = ctx->home_mgmt_ssid_input ? lv_textarea_get_text(ctx->home_mgmt_ssid_input) : "";
+    const char *pass = ctx->home_mgmt_pass_input ? lv_textarea_get_text(ctx->home_mgmt_pass_input) : "";
+    const char *bssid = ctx->home_mgmt_bssid_input ? lv_textarea_get_text(ctx->home_mgmt_bssid_input) : "";
+    if (!ssid || ssid[0] == '\0') {
+        if (ctx->home_mgmt_status_label) lv_label_set_text(ctx->home_mgmt_status_label, "Enter an SSID first.");
+        return;
+    }
+
+    char esc_ssid[67], esc_pass[131], esc_bssid[40];
+    beacon_spam_escape_quoted_arg(ssid, esc_ssid, sizeof(esc_ssid));
+    beacon_spam_escape_quoted_arg(pass ? pass : "", esc_pass, sizeof(esc_pass));
+    char cmd[320];
+    if (bssid && bssid[0] != '\0') {
+        beacon_spam_escape_quoted_arg(bssid, esc_bssid, sizeof(esc_bssid));
+        snprintf(cmd, sizeof(cmd), "home_add \"%s\" \"%s\" \"%s\"", esc_ssid, esc_pass, esc_bssid);
+    } else {
+        snprintf(cmd, sizeof(cmd), "home_add \"%s\" \"%s\"", esc_ssid, esc_pass);
+    }
+
+    ctx->home_mgmt_busy = true;
+    if (ctx->home_mgmt_status_label) lv_label_set_text_fmt(ctx->home_mgmt_status_label, "Saving %s...", ssid);
+    lv_refr_now(NULL);
+
+    char resp[512];
+    wardrive_home_send_and_wait(ctx, cmd, resp, sizeof(resp));
+    home_mgmt_refresh(ctx);
+    if (ctx->home_mgmt_status_label) {
+        if (strstr(resp, "Unrecognized command") != NULL)
+            lv_label_set_text(ctx->home_mgmt_status_label, "JanOS firmware too old (no home_add).");
+        else if (strstr(resp, "length") != NULL || strstr(resp, "too long") != NULL)
+            lv_label_set_text(ctx->home_mgmt_status_label, "SSID 1-32 chars, password max 64.");
+        else if (strstr(resp, "full") != NULL)
+            lv_label_set_text(ctx->home_mgmt_status_label, "Home list is full.");
+        else
+            lv_label_set_text_fmt(ctx->home_mgmt_status_label, "Saved %s", ssid);
+    }
+    if (ctx->home_mgmt_ssid_input) lv_textarea_set_text(ctx->home_mgmt_ssid_input, "");
+    if (ctx->home_mgmt_pass_input) lv_textarea_set_text(ctx->home_mgmt_pass_input, "");
+    if (ctx->home_mgmt_bssid_input) lv_textarea_set_text(ctx->home_mgmt_bssid_input, "");
+    ctx->home_mgmt_busy = false;
+}
+
+static void home_mgmt_ta_focus_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    lv_obj_t *ta = lv_event_get_target(e);
+    lv_event_code_t code = lv_event_get_code(e);
+    if (!ctx || !ctx->home_mgmt_keyboard) return;
+    if (code == LV_EVENT_FOCUSED) {
+        lv_keyboard_set_textarea(ctx->home_mgmt_keyboard, ta);
+        lv_obj_clear_flag(ctx->home_mgmt_keyboard, LV_OBJ_FLAG_HIDDEN);
+    } else if (code == LV_EVENT_DEFOCUSED || code == LV_EVENT_READY) {
+        lv_obj_add_flag(ctx->home_mgmt_keyboard, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void close_home_mgmt_overlay(tab_context_t *ctx)
+{
+    if (!ctx) ctx = get_current_ctx();
+    if (!ctx || !ctx->home_mgmt_overlay || ctx->home_mgmt_busy) return;
+    lv_obj_del(ctx->home_mgmt_overlay);
+    ctx->home_mgmt_overlay = NULL;
+    ctx->home_mgmt_list = NULL;
+    ctx->home_mgmt_status_label = NULL;
+    ctx->home_mgmt_ssid_input = NULL;
+    ctx->home_mgmt_pass_input = NULL;
+    ctx->home_mgmt_bssid_input = NULL;
+    ctx->home_mgmt_keyboard = NULL;
+}
+
+static void home_mgmt_close_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx) ctx = get_current_ctx();
+    close_home_mgmt_overlay(ctx);
+}
+
+// Scan networks stay in static storage so a row's user_data pointer survives the task.
+static wifi_network_t home_mgmt_scan_nets[MAX_NETWORKS];
+static int home_mgmt_scan_count;
+
+// Tap a scanned network -> fill the SSID + BSSID inputs. For a hidden AP the SSID is
+// empty, so the BSSID is filled and the user types the real name.
+static void home_mgmt_scan_pick_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = get_current_ctx();
+    wifi_network_t *net = (wifi_network_t *)lv_event_get_user_data(e);
+    if (!ctx || !net) return;
+    if (ctx->home_mgmt_ssid_input) lv_textarea_set_text(ctx->home_mgmt_ssid_input, net->ssid);
+    if (ctx->home_mgmt_bssid_input) lv_textarea_set_text(ctx->home_mgmt_bssid_input, net->bssid);
+    if (ctx->home_mgmt_status_label) {
+        if (net->ssid[0] == '\0')
+            lv_label_set_text(ctx->home_mgmt_status_label, "Hidden: type the real SSID + password, then Add.");
+        else
+            lv_label_set_text(ctx->home_mgmt_status_label, "Enter the password, then Add.");
+    }
+    home_mgmt_refresh(ctx);   // restore the saved-home list under the inputs
+}
+
+// Background WiFi scan for the home-networks picker (runs off the LVGL thread).
+static void home_mgmt_scan_task(void *arg)
+{
+    tab_context_t *ctx = (tab_context_t *)arg;
+    if (!ctx) { vTaskDelete(NULL); return; }
+    tab_id_t tab = tab_id_for_ctx(ctx);
+    uart_port_t port = uart_port_for_tab(tab);
+
+    home_mgmt_scan_count = 0;
+    memset(home_mgmt_scan_nets, 0, sizeof(home_mgmt_scan_nets));
+
+    char *rxb = heap_caps_malloc(UART_BUF_SIZE, MALLOC_CAP_SPIRAM);
+    char *lb  = heap_caps_malloc(512, MALLOC_CAP_SPIRAM);
+    if (!rxb || !lb) {
+        if (rxb) heap_caps_free(rxb);
+        if (lb) heap_caps_free(lb);
+        ctx->home_mgmt_busy = false;
+        ctx->home_mgmt_scan_task = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    if (tab == TAB_USB && usb_cdc_handle) usbh_cdc_flush_rx_buffer(usb_cdc_handle);
+    else uart_flush(port);
+    transport_write_bytes_tab(tab, port, "scan_networks\r\n", 15);
+
+    int line_pos = 0;
+    bool done = false, bg = false;
+    int empty = 0;
+    TickType_t t0 = xTaskGetTickCount();
+    TickType_t tmo = pdMS_TO_TICKS(UART_RX_TIMEOUT);
+
+    while (!done && (xTaskGetTickCount() - t0) < tmo) {
+        int len = transport_read_bytes_tab(tab, port, rxb, UART_BUF_SIZE - 1, pdMS_TO_TICKS(100));
+        if (len <= 0) { if (++empty >= 8) { bg = true; break; } continue; }
+        empty = 0;
+        rxb[len] = '\0';
+        for (int i = 0; i < len; i++) {
+            char c = rxb[i];
+            if (c == '\n' || c == '\r') {
+                if (line_pos > 0) {
+                    lb[line_pos] = '\0';
+                    if (strstr(lb, "Scan results printed")) { done = true; break; }
+                    if (lb[0] == '"' && home_mgmt_scan_count < MAX_NETWORKS) {
+                        wifi_network_t net;
+                        if (parse_network_line(lb, &net)) home_mgmt_scan_nets[home_mgmt_scan_count++] = net;
+                    }
+                    line_pos = 0;
+                }
+            } else if (line_pos < 511) lb[line_pos++] = c;
+        }
+    }
+
+    // Fallback: some builds run the scan in the background and answer show_scan_results.
+    while (!done && bg && (xTaskGetTickCount() - t0) < tmo) {
+        vTaskDelay(pdMS_TO_TICKS(600));
+        if (tab == TAB_USB && usb_cdc_handle) usbh_cdc_flush_rx_buffer(usb_cdc_handle);
+        else uart_flush(port);
+        transport_write_bytes_tab(tab, port, "show_scan_results\r\n", 19);
+        int pe = 0; line_pos = 0;
+        while (!done && pe < 5 && (xTaskGetTickCount() - t0) < tmo) {
+            int len = transport_read_bytes_tab(tab, port, rxb, UART_BUF_SIZE - 1, pdMS_TO_TICKS(250));
+            if (len <= 0) { pe++; continue; }
+            pe = 0; rxb[len] = '\0';
+            for (int i = 0; i < len; i++) {
+                char c = rxb[i];
+                if (c == '\n' || c == '\r') {
+                    if (line_pos > 0) {
+                        lb[line_pos] = '\0';
+                        if (strstr(lb, "Scan results printed")) { done = true; break; }
+                        if (strstr(lb, "Scan still in progress")) { line_pos = 0; continue; }
+                        if (lb[0] == '"' && home_mgmt_scan_count < MAX_NETWORKS) {
+                            wifi_network_t net;
+                            if (parse_network_line(lb, &net)) {
+                                bool dup = false;
+                                for (int n = 0; n < home_mgmt_scan_count; n++)
+                                    if (strcmp(home_mgmt_scan_nets[n].bssid, net.bssid) == 0) { dup = true; break; }
+                                if (!dup) home_mgmt_scan_nets[home_mgmt_scan_count++] = net;
+                            }
+                        }
+                        line_pos = 0;
+                    }
+                } else if (line_pos < 511) lb[line_pos++] = c;
+            }
+        }
+    }
+
+    heap_caps_free(rxb);
+    heap_caps_free(lb);
+
+    // Render the picker into the list (LVGL thread ownership via the lock).
+    bsp_display_lock(0);
+    if (ctx->home_mgmt_overlay && ctx->home_mgmt_list) {
+        lv_obj_clean(ctx->home_mgmt_list);
+        if (home_mgmt_scan_count == 0) {
+            lv_obj_t *lbl = lv_label_create(ctx->home_mgmt_list);
+            lv_label_set_text(lbl, "No networks found. Tap Scan to retry.");
+            lv_obj_set_style_text_color(lbl, lv_color_hex(0x888888), 0);
+        } else {
+            for (int i = 0; i < home_mgmt_scan_count; i++) {
+                lv_obj_t *row = lv_obj_create(ctx->home_mgmt_list);
+                lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
+                lv_obj_set_style_pad_all(row, 6, 0);
+                lv_obj_set_style_bg_color(row, lv_color_hex(0x263238), 0);
+                lv_obj_set_style_bg_color(row, lv_color_hex(0x37474F), LV_STATE_PRESSED);
+                lv_obj_set_style_border_width(row, 0, 0);
+                lv_obj_set_style_radius(row, 6, 0);
+                lv_obj_set_flex_flow(row, LV_FLEX_FLOW_COLUMN);
+                lv_obj_set_style_pad_row(row, 2, 0);
+                lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+
+                lv_obj_t *s = lv_label_create(row);
+                lv_label_set_text(s, home_mgmt_scan_nets[i].ssid[0] ? home_mgmt_scan_nets[i].ssid : "(hidden)");
+                lv_obj_set_style_text_color(s, lv_color_hex(0xFFFFFF), 0);
+                lv_obj_set_style_text_font(s, &lv_font_montserrat_16, 0);
+
+                lv_obj_t *d = lv_label_create(row);
+                lv_label_set_text_fmt(d, "%s | %s | %d dBm", home_mgmt_scan_nets[i].bssid,
+                                      home_mgmt_scan_nets[i].band, home_mgmt_scan_nets[i].rssi);
+                lv_obj_set_style_text_color(d, lv_color_hex(0x888888), 0);
+                lv_obj_set_style_text_font(d, &lv_font_montserrat_12, 0);
+
+                lv_obj_add_event_cb(row, home_mgmt_scan_pick_cb, LV_EVENT_CLICKED,
+                                    (void *)&home_mgmt_scan_nets[i]);
+            }
+        }
+        if (ctx->home_mgmt_status_label) {
+            lv_label_set_text(ctx->home_mgmt_status_label,
+                              home_mgmt_scan_count > 0 ? "Tap a network to fill SSID/BSSID."
+                                                       : "No networks found.");
+        }
+    }
+    bsp_display_unlock();
+
+    ctx->home_mgmt_busy = false;
+    ctx->home_mgmt_scan_task = NULL;
+    vTaskDelete(NULL);
+}
+
+static void home_mgmt_scan_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx) ctx = get_current_ctx();
+    if (!ctx || ctx->home_mgmt_busy) return;
+    ctx->home_mgmt_busy = true;
+    if (ctx->home_mgmt_list) lv_obj_clean(ctx->home_mgmt_list);
+    if (ctx->home_mgmt_status_label) lv_label_set_text(ctx->home_mgmt_status_label, "Scanning WiFi...");
+    lv_refr_now(NULL);
+    if (xTaskCreate(home_mgmt_scan_task, "hm_scan", 6144, (void *)ctx, 4, &ctx->home_mgmt_scan_task) != pdTRUE) {
+        ctx->home_mgmt_busy = false;
+        ctx->home_mgmt_scan_task = NULL;
+        if (ctx->home_mgmt_status_label) lv_label_set_text(ctx->home_mgmt_status_label, "Scan failed to start.");
+    }
+}
+
+static void show_home_mgmt_overlay(tab_context_t *ctx)
+{
+    ESP_LOGI(TAG, "show_home_mgmt_overlay: ctx=%p page=%p existing_overlay=%p",
+             ctx, ctx ? ctx->wardrive_page : NULL, ctx ? ctx->home_mgmt_overlay : NULL);
+    if (!ctx || !ctx->wardrive_page || ctx->home_mgmt_overlay) return;
+
+    // Parent to the top layer so it renders ABOVE the still-open Wardrive Setup overlay
+    // (a sibling on wardrive_page could end up behind it).
+    ctx->home_mgmt_overlay = lv_obj_create(lv_layer_top());
+    lv_obj_remove_style_all(ctx->home_mgmt_overlay);
+    lv_obj_set_size(ctx->home_mgmt_overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(ctx->home_mgmt_overlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(ctx->home_mgmt_overlay, LV_OPA_70, 0);
+    lv_obj_clear_flag(ctx->home_mgmt_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(ctx->home_mgmt_overlay, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t *popup = lv_obj_create(ctx->home_mgmt_overlay);
+    lv_obj_set_size(popup, 600, 560);
+    lv_obj_center(popup);
+    lv_obj_set_style_bg_color(popup, lv_color_hex(0x1A1A2A), 0);
+    lv_obj_set_style_border_color(popup, COLOR_MATERIAL_TEAL, 0);
+    lv_obj_set_style_border_width(popup, 3, 0);
+    lv_obj_set_style_radius(popup, 16, 0);
+    lv_obj_set_style_pad_all(popup, 18, 0);
+    lv_obj_set_flex_flow(popup, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(popup, 10, 0);
+    // Only the inner list scrolls; keep the popup itself fixed (no stray right scrollbar).
+    lv_obj_clear_flag(popup, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(popup);
+    lv_label_set_text(title, LV_SYMBOL_HOME " Home networks");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_TEAL, 0);
+
+    lv_obj_t *hint = lv_label_create(popup);
+    lv_label_set_text(hint, "Recognised while wardriving -> offers auto-upload.");
+    lv_obj_set_style_text_font(hint, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(hint, lv_color_hex(0x888888), 0);
+
+    // Scrollable list of current entries
+    ctx->home_mgmt_list = lv_obj_create(popup);
+    lv_obj_set_width(ctx->home_mgmt_list, lv_pct(100));
+    lv_obj_set_flex_grow(ctx->home_mgmt_list, 1);
+    lv_obj_set_style_bg_color(ctx->home_mgmt_list, lv_color_hex(0x111122), 0);
+    lv_obj_set_style_border_width(ctx->home_mgmt_list, 0, 0);
+    lv_obj_set_style_radius(ctx->home_mgmt_list, 8, 0);
+    lv_obj_set_style_pad_all(ctx->home_mgmt_list, 6, 0);
+    lv_obj_set_flex_flow(ctx->home_mgmt_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(ctx->home_mgmt_list, 4, 0);
+
+    // SSID + password inputs
+    ctx->home_mgmt_ssid_input = lv_textarea_create(popup);
+    lv_textarea_set_one_line(ctx->home_mgmt_ssid_input, true);
+    lv_textarea_set_placeholder_text(ctx->home_mgmt_ssid_input, "SSID (spaces allowed)");
+    lv_obj_set_width(ctx->home_mgmt_ssid_input, lv_pct(100));
+    lv_obj_add_event_cb(ctx->home_mgmt_ssid_input, home_mgmt_ta_focus_cb, LV_EVENT_FOCUSED, ctx);
+    lv_obj_add_event_cb(ctx->home_mgmt_ssid_input, home_mgmt_ta_focus_cb, LV_EVENT_DEFOCUSED, ctx);
+    lv_obj_add_event_cb(ctx->home_mgmt_ssid_input, home_mgmt_ta_focus_cb, LV_EVENT_READY, ctx);
+
+    ctx->home_mgmt_pass_input = lv_textarea_create(popup);
+    lv_textarea_set_one_line(ctx->home_mgmt_pass_input, true);
+    lv_textarea_set_placeholder_text(ctx->home_mgmt_pass_input, "Password");
+    lv_obj_set_width(ctx->home_mgmt_pass_input, lv_pct(100));
+    lv_obj_add_event_cb(ctx->home_mgmt_pass_input, home_mgmt_ta_focus_cb, LV_EVENT_FOCUSED, ctx);
+    lv_obj_add_event_cb(ctx->home_mgmt_pass_input, home_mgmt_ta_focus_cb, LV_EVENT_DEFOCUSED, ctx);
+    lv_obj_add_event_cb(ctx->home_mgmt_pass_input, home_mgmt_ta_focus_cb, LV_EVENT_READY, ctx);
+
+    ctx->home_mgmt_bssid_input = lv_textarea_create(popup);
+    lv_textarea_set_one_line(ctx->home_mgmt_bssid_input, true);
+    lv_textarea_set_placeholder_text(ctx->home_mgmt_bssid_input, "BSSID (optional, for hidden SSID) AA:BB:CC:DD:EE:FF");
+    lv_obj_set_width(ctx->home_mgmt_bssid_input, lv_pct(100));
+    lv_obj_add_event_cb(ctx->home_mgmt_bssid_input, home_mgmt_ta_focus_cb, LV_EVENT_FOCUSED, ctx);
+    lv_obj_add_event_cb(ctx->home_mgmt_bssid_input, home_mgmt_ta_focus_cb, LV_EVENT_DEFOCUSED, ctx);
+    lv_obj_add_event_cb(ctx->home_mgmt_bssid_input, home_mgmt_ta_focus_cb, LV_EVENT_READY, ctx);
+
+    ctx->home_mgmt_status_label = lv_label_create(popup);
+    lv_label_set_text(ctx->home_mgmt_status_label, "");
+    lv_obj_set_style_text_font(ctx->home_mgmt_status_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(ctx->home_mgmt_status_label, COLOR_MATERIAL_CYAN, 0);
+    lv_obj_set_width(ctx->home_mgmt_status_label, lv_pct(100));
+    lv_label_set_long_mode(ctx->home_mgmt_status_label, LV_LABEL_LONG_WRAP);
+
+    // Action buttons
+    lv_obj_t *act_row = lv_obj_create(popup);
+    lv_obj_set_size(act_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(act_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(act_row, 0, 0);
+    lv_obj_set_style_pad_all(act_row, 0, 0);
+    lv_obj_set_flex_flow(act_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(act_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(act_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *scan_btn = lv_btn_create(act_row);
+    lv_obj_set_size(scan_btn, 178, 48);
+    lv_obj_set_style_bg_color(scan_btn, COLOR_MATERIAL_BLUE, 0);
+    lv_obj_set_style_radius(scan_btn, 8, 0);
+    lv_obj_add_event_cb(scan_btn, home_mgmt_scan_cb, LV_EVENT_CLICKED, ctx);
+    lv_obj_t *scan_lbl = lv_label_create(scan_btn);
+    lv_label_set_text(scan_lbl, LV_SYMBOL_WIFI " Scan");
+    lv_obj_center(scan_lbl);
+
+    lv_obj_t *add_btn = lv_btn_create(act_row);
+    lv_obj_set_size(add_btn, 178, 48);
+    lv_obj_set_style_bg_color(add_btn, COLOR_MATERIAL_GREEN, 0);
+    lv_obj_set_style_radius(add_btn, 8, 0);
+    lv_obj_add_event_cb(add_btn, home_mgmt_add_cb, LV_EVENT_CLICKED, ctx);
+    lv_obj_t *add_lbl = lv_label_create(add_btn);
+    lv_label_set_text(add_lbl, LV_SYMBOL_PLUS " Add");
+    lv_obj_center(add_lbl);
+
+    lv_obj_t *close_btn = lv_btn_create(act_row);
+    lv_obj_set_size(close_btn, 178, 48);
+    lv_obj_set_style_bg_color(close_btn, lv_color_hex(0x444444), 0);
+    lv_obj_set_style_radius(close_btn, 8, 0);
+    lv_obj_add_event_cb(close_btn, home_mgmt_close_cb, LV_EVENT_CLICKED, ctx);
+    lv_obj_t *close_lbl = lv_label_create(close_btn);
+    lv_label_set_text(close_lbl, LV_SYMBOL_CLOSE " Close");
+    lv_obj_center(close_lbl);
+
+    // Hidden keyboard for the inputs — same look/behaviour as the WiGLE keyboard.
+    ctx->home_mgmt_keyboard = lv_keyboard_create(ctx->home_mgmt_overlay);
+    lv_obj_set_size(ctx->home_mgmt_keyboard, lv_pct(100), 240);
+    lv_obj_add_flag(ctx->home_mgmt_keyboard, LV_OBJ_FLAG_FLOATING);
+    lv_obj_align(ctx->home_mgmt_keyboard, LV_ALIGN_BOTTOM_MID, 0, -8);
+    style_on_screen_keyboard(ctx->home_mgmt_keyboard);
+    lv_obj_add_flag(ctx->home_mgmt_keyboard, LV_OBJ_FLAG_HIDDEN);
+
+    // Paint the overlay now, before the (blocking, ~2 s) home_list fetch on this thread,
+    // so it appears instantly instead of only after the UART round-trip completes.
+    lv_refr_now(NULL);
+    ESP_LOGI(TAG, "home_mgmt overlay created; fetching home_list...");
+    home_mgmt_refresh(ctx);
+    ESP_LOGI(TAG, "home_mgmt refresh done: %d entr(y/ies)", ctx->wardrive_home_count);
+}
+
+// ---- Auto-upload progress / result overlay ----
+
+static void close_wardrive_autoup_overlay(tab_context_t *ctx)
+{
+    if (!ctx) return;
+    if (ctx->wardrive_autoup_overlay) {
+        // The upload worker may be borrowing this label for batch progress; drop the
+        // borrow first so it never writes to a freed object.
+        if (ctx->wardrive_wigle_status_label == ctx->wardrive_autoup_status_label) {
+            ctx->wardrive_wigle_status_label = NULL;
+        }
+        lv_obj_del(ctx->wardrive_autoup_overlay);
+        ctx->wardrive_autoup_overlay = NULL;
+        ctx->wardrive_autoup_status_label = NULL;
+        ctx->wardrive_autoup_btn_row = NULL;
+    }
+}
+
+static void wardrive_autoup_build_overlay(tab_context_t *ctx)
+{
+    if (!ctx || !ctx->wardrive_page || ctx->wardrive_autoup_overlay) return;
+
+    ctx->wardrive_autoup_overlay = lv_obj_create(ctx->wardrive_page);
+    lv_obj_remove_style_all(ctx->wardrive_autoup_overlay);
+    lv_obj_set_size(ctx->wardrive_autoup_overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(ctx->wardrive_autoup_overlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(ctx->wardrive_autoup_overlay, LV_OPA_70, 0);
+    lv_obj_clear_flag(ctx->wardrive_autoup_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(ctx->wardrive_autoup_overlay, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t *box = lv_obj_create(ctx->wardrive_autoup_overlay);
+    lv_obj_set_size(box, 560, LV_SIZE_CONTENT);
+    lv_obj_align(box, LV_ALIGN_CENTER, 0, -200);   // match the "home detected" prompt height
+    lv_obj_set_style_bg_color(box, lv_color_hex(0x1A1A2A), 0);
+    lv_obj_set_style_border_color(box, COLOR_MATERIAL_TEAL, 0);
+    lv_obj_set_style_border_width(box, 3, 0);
+    lv_obj_set_style_radius(box, 16, 0);
+    lv_obj_set_style_pad_all(box, 20, 0);
+    lv_obj_set_flex_flow(box, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(box, 14, 0);
+    lv_obj_clear_flag(box, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(box);
+    lv_label_set_text(title, LV_SYMBOL_UPLOAD " Auto-upload");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_TEAL, 0);
+
+    ctx->wardrive_autoup_status_label = lv_label_create(box);
+    lv_label_set_text(ctx->wardrive_autoup_status_label, "Starting...");
+    lv_obj_set_style_text_color(ctx->wardrive_autoup_status_label, COLOR_MATERIAL_AMBER, 0);
+    lv_label_set_long_mode(ctx->wardrive_autoup_status_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(ctx->wardrive_autoup_status_label, lv_pct(100));
+
+    ctx->wardrive_autoup_btn_row = lv_obj_create(box);
+    lv_obj_set_size(ctx->wardrive_autoup_btn_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(ctx->wardrive_autoup_btn_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(ctx->wardrive_autoup_btn_row, 0, 0);
+    lv_obj_set_style_pad_all(ctx->wardrive_autoup_btn_row, 0, 0);
+    lv_obj_set_flex_flow(ctx->wardrive_autoup_btn_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(ctx->wardrive_autoup_btn_row, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(ctx->wardrive_autoup_btn_row, LV_OBJ_FLAG_SCROLLABLE);
+}
+
+static void wardrive_autoup_set_status(tab_context_t *ctx, const char *text, lv_color_t color)
+{
+    bsp_display_lock(0);
+    if (ctx->wardrive_autoup_status_label && ctx->wardrive_autoup_overlay) {
+        lv_label_set_text(ctx->wardrive_autoup_status_label, text);
+        lv_obj_set_style_text_color(ctx->wardrive_autoup_status_label, color, 0);
+    }
+    bsp_display_unlock();
+}
+
+static lv_obj_t *wardrive_autoup_make_btn(lv_obj_t *row, const char *text, lv_color_t color,
+                                          lv_event_cb_t cb, void *user_data)
+{
+    lv_obj_t *btn = lv_btn_create(row);
+    lv_obj_set_size(btn, 160, 50);
+    lv_obj_set_style_bg_color(btn, color, 0);
+    lv_obj_set_style_radius(btn, 8, 0);
+    lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, user_data);
+    lv_obj_t *lbl = lv_label_create(btn);
+    lv_label_set_text(lbl, text);
+    lv_obj_center(lbl);
+    return btn;
+}
+
+static void wardrive_autoup_show_result(tab_context_t *ctx, bool success, const char *msg)
+{
+    bsp_display_lock(0);
+    if (ctx->wardrive_autoup_overlay) {
+        if (ctx->wardrive_autoup_status_label) {
+            lv_label_set_text(ctx->wardrive_autoup_status_label, msg);
+            lv_obj_set_style_text_color(ctx->wardrive_autoup_status_label,
+                                        success ? COLOR_MATERIAL_GREEN : COLOR_MATERIAL_RED, 0);
+        }
+        if (ctx->wardrive_autoup_btn_row) {
+            lv_obj_clean(ctx->wardrive_autoup_btn_row);
+            if (!success) {
+                wardrive_autoup_make_btn(ctx->wardrive_autoup_btn_row, LV_SYMBOL_REFRESH " Retry",
+                                         COLOR_MATERIAL_BLUE, wardrive_autoup_retry_cb, ctx);
+            }
+            wardrive_autoup_make_btn(ctx->wardrive_autoup_btn_row, LV_SYMBOL_GPS " Resume",
+                                     COLOR_MATERIAL_GREEN, wardrive_autoup_resume_cb, ctx);
+            wardrive_autoup_make_btn(ctx->wardrive_autoup_btn_row, LV_SYMBOL_CLOSE " Close",
+                                     lv_color_hex(0x444444), wardrive_autoup_close_cb, ctx);
+        }
+    }
+    bsp_display_unlock();
+}
+
+static void wardrive_autoup_close_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx) ctx = get_current_ctx();
+    close_wardrive_autoup_overlay(ctx);
+    bsp_display_lock(0);
+    if (ctx->wardrive_start_btn) lv_obj_clear_state(ctx->wardrive_start_btn, LV_STATE_DISABLED);
+    if (ctx->wardrive_stop_btn) lv_obj_add_state(ctx->wardrive_stop_btn, LV_STATE_DISABLED);
+    if (ctx->wardrive_trace_btn) lv_obj_clear_state(ctx->wardrive_trace_btn, LV_STATE_DISABLED);
+    if (ctx->wardrive_upload_btn) lv_obj_clear_state(ctx->wardrive_upload_btn, LV_STATE_DISABLED);
+    if (ctx->wardrive_setup_btn) lv_obj_clear_state(ctx->wardrive_setup_btn, LV_STATE_DISABLED);
+    if (ctx->wardrive_status_label) {
+        lv_label_set_text(ctx->wardrive_status_label, "Idle");
+        lv_obj_set_style_text_color(ctx->wardrive_status_label, lv_color_hex(0x888888), 0);
+    }
+    bsp_display_unlock();
+}
+
+static void wardrive_autoup_resume_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx) ctx = get_current_ctx();
+    close_wardrive_autoup_overlay(ctx);
+    wardrive_begin_scan(ctx);
+}
+
+static void wardrive_autoup_retry_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx) ctx = get_current_ctx();
+    if (ctx->wardrive_autoupload_busy) return;
+    close_wardrive_autoup_overlay(ctx);
+    xTaskCreate(wardrive_autoupload_task, "wd_autoup", 8192, (void *)ctx, 5,
+                &ctx->wardrive_autoupload_task_handle);
+}
+
+// True when a "<svc>_key read" reply indicates a usable key.
+static bool wardrive_autoup_key_ok(tab_id_t tab, uart_port_t port, const char *cmd)
+{
+    if (tab == TAB_USB && usb_cdc_handle) usbh_cdc_flush_rx_buffer(usb_cdc_handle);
+    else uart_flush(port);
+    transport_write_bytes_tab(tab, port, cmd, strlen(cmd));
+    transport_write_bytes_tab(tab, port, "\r\n", 2);
+    char rx[1024]; int total = 0; int empty = 0;
+    while (empty < 5 && total < (int)sizeof(rx) - 1) {
+        int len = transport_read_bytes_tab(tab, port, rx + total, sizeof(rx) - 1 - total, pdMS_TO_TICKS(300));
+        if (len > 0) { total += len; rx[total] = '\0'; empty = 0; } else empty++;
+    }
+    rx[total] = '\0';
+    if (strstr(rx, "Unrecognized command") != NULL) return false;
+    if (strstr(rx, "not set") != NULL || strstr(rx, "NOT SET") != NULL ||
+        strstr(rx, "NO WIGLE CREDENTIALS") != NULL || strstr(rx, "NO WDGWARS CREDENTIALS") != NULL ||
+        strstr(rx, "missing") != NULL || strstr(rx, "MISSING") != NULL) return false;
+    return true;
+}
+
+// The auto-upload worker: stop -> connect(saved) -> upload pending -> archive -> result.
+// Launched by the wardrive monitor task after the user confirms the home-network prompt,
+// or relaunched by the Retry button. Owns the transport for its whole run.
+static void wardrive_autoupload_task(void *arg)
+{
+    tab_context_t *ctx = (tab_context_t *)arg;
+    if (!ctx) { vTaskDelete(NULL); return; }
+
+    tab_id_t active_tab = tab_id_for_ctx(ctx);
+    uart_port_t uart_port = uart_port_for_tab(active_tab);
+    char ssid[33];
+    snprintf(ssid, sizeof(ssid), "%.32s", ctx->wardrive_autoupload_ssid);
+
+    // Declared before the first `goto finish` so the jump never skips an initializer.
+    bool any_ok = false, hard_err = false;
+    char summary[256]; summary[0] = '\0';
+
+    ctx->wardrive_autoupload_busy = true;
+    ctx->wardrive_wigle_task_running = true;   // enables wardrive_run_batch_command
+    ESP_LOGI(TAG, "auto-upload task: START ssid='%s' (wigle=%d wdgwars=%d archive=%d)",
+             ssid, g_wd_autoupload_wigle, g_wd_autoupload_wdgwars, g_wd_autoupload_archive);
+
+    bsp_display_lock(0);
+    wardrive_autoup_build_overlay(ctx);
+    bsp_display_unlock();
+
+    // 1) Stop promiscuous wardrive and drain any buffered output.
+    wardrive_autoup_set_status(ctx, "Stopping wardrive...", COLOR_MATERIAL_AMBER);
+    ESP_LOGI(TAG, "auto-upload: stopping wardrive + draining");
+    if (active_tab == TAB_USB && usb_cdc_handle) usbh_cdc_flush_rx_buffer(usb_cdc_handle);
+    else uart_flush(uart_port);
+    transport_write_bytes_tab(active_tab, uart_port, "stop\r\n", 6);
+    {
+        char drain[256];
+        for (int i = 0; i < 20; i++) {
+            transport_read_bytes_tab(active_tab, uart_port, drain, sizeof(drain) - 1, pdMS_TO_TICKS(100));
+        }
+    }
+
+    // 2) Connect using the saved home-network password.
+    {
+        char msg[96];
+        snprintf(msg, sizeof(msg), "Connecting to %s...", ssid);
+        wardrive_autoup_set_status(ctx, msg, COLOR_MATERIAL_AMBER);
+    }
+    bool connected = false;
+    char wifi_cmd[256];
+    if (build_wifi_connect_command(wifi_cmd, sizeof(wifi_cmd), ssid, NULL, WIFI_CONNECT_AUTH_SAVED)) {
+        if (active_tab == TAB_USB && usb_cdc_handle) usbh_cdc_flush_rx_buffer(usb_cdc_handle);
+        else uart_flush(uart_port);
+        transport_write_bytes_tab(active_tab, uart_port, wifi_cmd, strlen(wifi_cmd));
+        transport_write_bytes_tab(active_tab, uart_port, "\r\n", 2);
+        char rx[2048]; int total = 0; int elapsed = 0;
+        while (elapsed < 15000 && total < (int)sizeof(rx) - 1) {
+            int len = transport_read_bytes_tab(active_tab, uart_port, rx + total,
+                                               sizeof(rx) - 1 - total, pdMS_TO_TICKS(200));
+            if (len > 0) {
+                total += len; rx[total] = '\0';
+                if (strstr(rx, "SUCCESS") != NULL) { connected = true; break; }
+                if (strstr(rx, "FAILED") != NULL || strstr(rx, "Error") != NULL) break;
+            }
+            elapsed += 200;
+        }
+    }
+
+    if (!connected) {
+        arp_wifi_connected = false; ctx->arp_wifi_connected = false;
+        ESP_LOGW(TAG, "auto-upload: connect to '%s' FAILED", ssid);
+        char msg[96];
+        snprintf(msg, sizeof(msg), "Could not connect to %s.\nCheck the saved password.", ssid);
+        wardrive_autoup_show_result(ctx, false, msg);
+        goto finish;
+    }
+    arp_wifi_connected = true; ctx->arp_wifi_connected = true;
+    ESP_LOGI(TAG, "auto-upload: connected to '%s'", ssid);
+
+    // 3) Upload only PENDING files to the enabled providers, plus wpa-sec handshakes.
+    ctx->wardrive_upload_mode = WARDRIVE_UPLOAD_MODE_PENDING;
+
+    // Borrow the WiGLE status label so wardrive_run_batch_command's live progress shows.
+    ctx->wardrive_wigle_status_label = ctx->wardrive_autoup_status_label;
+
+    if (g_wd_autoupload_wigle) {
+        wardrive_autoup_set_status(ctx, "WiGLE: checking key...", COLOR_MATERIAL_AMBER);
+        if (!wardrive_autoup_key_ok(active_tab, uart_port, "wigle_key read")) {
+            char tmp[48]; snprintf(tmp, sizeof(tmp), "%sWiGLE: no key", summary[0] ? "\n" : "");
+            strncat(summary, tmp, sizeof(summary) - strlen(summary) - 1);
+        } else {
+            wardrive_autoup_set_status(ctx, "WiGLE: uploading pending...", COLOR_MATERIAL_AMBER);
+            ctx->wardrive_upload_provider = WARDRIVE_UPLOAD_PROVIDER_WIGLE;
+            wardrive_batch_result_t br;
+            wardrive_run_batch_command(ctx, active_tab, uart_port, "wigle_upload", "NO WIGLE CREDENTIALS", &br);
+            if (br.uploaded + br.skipped > 0 || br.any_response) any_ok = true;
+            if (br.auth_failed || br.creds_missing || br.unsupported_cmd) hard_err = true;
+            char tmp[96]; snprintf(tmp, sizeof(tmp), "%sWiGLE: up %d skip %d fail %d",
+                                   summary[0] ? "\n" : "", br.uploaded, br.skipped, br.failed);
+            strncat(summary, tmp, sizeof(summary) - strlen(summary) - 1);
+        }
+    }
+
+    if (g_wd_autoupload_wdgwars) {
+        wardrive_autoup_set_status(ctx, "WDGWars: checking key...", COLOR_MATERIAL_AMBER);
+        if (!wardrive_autoup_key_ok(active_tab, uart_port, "wdgwars_key read")) {
+            char tmp[48]; snprintf(tmp, sizeof(tmp), "%sWDGWars: no key", summary[0] ? "\n" : "");
+            strncat(summary, tmp, sizeof(summary) - strlen(summary) - 1);
+        } else {
+            wardrive_autoup_set_status(ctx, "WDGWars: uploading pending...", COLOR_MATERIAL_AMBER);
+            ctx->wardrive_upload_provider = WARDRIVE_UPLOAD_PROVIDER_WDGWARS;
+            wardrive_batch_result_t br;
+            wardrive_run_batch_command(ctx, active_tab, uart_port, "wdgwars_upload", "NO WDGWARS CREDENTIALS", &br);
+            if (br.uploaded + br.skipped > 0 || br.any_response) any_ok = true;
+            if (br.auth_failed || br.creds_missing || br.unsupported_cmd) hard_err = true;
+            char tmp[96]; snprintf(tmp, sizeof(tmp), "%sWDGWars: up %d skip %d fail %d",
+                                   summary[0] ? "\n" : "", br.uploaded, br.skipped, br.failed);
+            strncat(summary, tmp, sizeof(summary) - strlen(summary) - 1);
+        }
+    }
+
+    // wpa-sec handshakes — decoupled from wardrive: run ONLY if handshakes exist.
+    int hs_count = 0;
+    {
+        if (active_tab == TAB_USB && usb_cdc_handle) usbh_cdc_flush_rx_buffer(usb_cdc_handle);
+        else uart_flush(uart_port);
+        const char *hs_cmd = "list_dir /sdcard/lab/handshakes\r\n";
+        transport_write_bytes_tab(active_tab, uart_port, hs_cmd, strlen(hs_cmd));
+        char hrx[2048]; int ht = 0; int he = 0;
+        while (he < 8 && ht < (int)sizeof(hrx) - 1) {
+            int len = transport_read_bytes_tab(active_tab, uart_port, hrx + ht, sizeof(hrx) - 1 - ht, pdMS_TO_TICKS(120));
+            if (len > 0) {
+                ht += len; hrx[ht] = '\0'; he = 0;
+                if (strstr(hrx, ".pcap") != NULL) { hs_count = 1; break; }
+                if (strstr(hrx, "file(s)") != NULL || strstr(hrx, "not accessible") != NULL) break;
+            } else {
+                he++;
+            }
+        }
+    }
+
+    if (hs_count == 0) {
+        ESP_LOGI(TAG, "auto-upload: no handshakes found -> skipping wpa-sec");
+    } else {
+        wardrive_autoup_set_status(ctx, "wpa-sec: uploading handshakes...", COLOR_MATERIAL_AMBER);
+        if (active_tab == TAB_USB && usb_cdc_handle) usbh_cdc_flush_rx_buffer(usb_cdc_handle);
+        else uart_flush(uart_port);
+        transport_write_bytes_tab(active_tab, uart_port, "wpasec_key read\r\n", 17);
+        char rx[1024]; int total = 0; int empty = 0;
+        while (empty < 5 && total < (int)sizeof(rx) - 1) {
+            int len = transport_read_bytes_tab(active_tab, uart_port, rx + total, sizeof(rx) - 1 - total, pdMS_TO_TICKS(300));
+            if (len > 0) { total += len; rx[total] = '\0'; empty = 0; } else empty++;
+        }
+        rx[total] = '\0';
+        if (strstr(rx, "not set") == NULL && strstr(rx, "Unrecognized command") == NULL) {
+            if (active_tab == TAB_USB && usb_cdc_handle) usbh_cdc_flush_rx_buffer(usb_cdc_handle);
+            else uart_flush(uart_port);
+            transport_write_bytes_tab(active_tab, uart_port, "wpasec_upload\r\n", 15);
+            char urx[4096]; int ut = 0; int el = 0;
+            while (el < 120000 && ut < (int)sizeof(urx) - 1) {
+                int len = transport_read_bytes_tab(active_tab, uart_port, urx + ut, sizeof(urx) - 1 - ut, pdMS_TO_TICKS(500));
+                if (len > 0) {
+                    ut += len; urx[ut] = '\0';
+                    if (strstr(urx, "Done") != NULL || strstr(urx, "fail") != NULL ||
+                        strstr(urx, "Error") != NULL || strstr(urx, "error") != NULL) break;
+                }
+                el += 500;
+            }
+            urx[ut] = '\0';
+            char *dp = strstr(urx, "Done");
+            int wu = 0, wd = 0, wf = 0;
+            if (dp && sscanf(dp, "Done: %d uploaded, %d duplicate, %d failed", &wu, &wd, &wf) == 3) {
+                any_ok = true;
+                char tmp[64]; snprintf(tmp, sizeof(tmp), "%swpa-sec: up %d dup %d fail %d",
+                                       summary[0] ? "\n" : "", wu, wd, wf);
+                strncat(summary, tmp, sizeof(summary) - strlen(summary) - 1);
+            } else if (dp) {
+                any_ok = true;
+                char tmp[32]; snprintf(tmp, sizeof(tmp), "%swpa-sec: done", summary[0] ? "\n" : "");
+                strncat(summary, tmp, sizeof(summary) - strlen(summary) - 1);
+            }
+        }
+    }
+
+    ctx->wardrive_wigle_status_label = NULL;   // stop borrowing the label
+
+    // 4) Auto-archive uploaded (done) files on success.
+    bool overall_ok = any_ok && !hard_err;
+    if (g_wd_autoupload_archive && overall_ok) {
+        wardrive_autoup_set_status(ctx, "Archiving uploaded files...", COLOR_MATERIAL_AMBER);
+        char cmd[96];
+        time_t now = time(NULL);
+        struct tm t;
+        localtime_r(&now, &t);
+        if (t.tm_year + 1900 >= 2024) {
+            char sessbuf[24];
+            snprintf(sessbuf, sizeof(sessbuf), "%04d-%02d-%02d_%02d%02d%02d",
+                     (t.tm_year + 1900) % 10000, (t.tm_mon + 1) % 100, t.tm_mday % 100,
+                     t.tm_hour % 100, t.tm_min % 100, t.tm_sec % 100);
+            snprintf(cmd, sizeof(cmd), "wardrive_cleanup all done move %s", sessbuf);
+        } else {
+            snprintf(cmd, sizeof(cmd), "wardrive_cleanup all done move");
+        }
+        if (active_tab == TAB_USB && usb_cdc_handle) usbh_cdc_flush_rx_buffer(usb_cdc_handle);
+        else uart_flush(uart_port);
+        transport_write_bytes_tab(active_tab, uart_port, cmd, strlen(cmd));
+        transport_write_bytes_tab(active_tab, uart_port, "\r\n", 2);
+        char arx[2048]; int at = 0; int ael = 0;
+        while (ael < 60000 && at < (int)sizeof(arx) - 1) {
+            int len = transport_read_bytes_tab(active_tab, uart_port, arx + at, sizeof(arx) - 1 - at, pdMS_TO_TICKS(250));
+            if (len > 0) {
+                at += len; arx[at] = '\0';
+                if (strstr(arx, "[WARD_CLEANUP] END") != NULL ||
+                    strstr(arx, "Unrecognized command") != NULL) break;
+            }
+            ael += 250;
+        }
+    }
+
+    // 5) Final result.
+    ESP_LOGI(TAG, "auto-upload: DONE ok=%d | %s", overall_ok, summary[0] ? summary : "(nothing pending)");
+    if (overall_ok && g_wd_autoupload_poweroff) {
+        char msg[300];
+        snprintf(msg, sizeof(msg), "Upload complete.\n%s\nPowering off in 4s...",
+                 summary[0] ? summary : "Nothing pending.");
+        wardrive_autoup_set_status(ctx, msg, COLOR_MATERIAL_GREEN);
+        ESP_LOGW(TAG, "auto-upload: success -> powering off Tab5");
+        vTaskDelay(pdMS_TO_TICKS(4000));
+        bsp_generate_poweroff_signal();
+        vTaskDelay(pdMS_TO_TICKS(3000));   // give the PMIC time to cut power
+    } else if (overall_ok) {
+        char msg[300];
+        snprintf(msg, sizeof(msg), "Upload complete.\n%s%s",
+                 summary[0] ? summary : "Nothing pending.",
+                 g_wd_autoupload_archive ? "\nArchived done files." : "");
+        wardrive_autoup_show_result(ctx, true, msg);
+    } else {
+        char msg[300];
+        snprintf(msg, sizeof(msg), "Upload failed.\n%s\nFiles kept - you can Retry.",
+                 summary[0] ? summary : "No usable credentials / no response.");
+        wardrive_autoup_show_result(ctx, false, msg);
+    }
+
+finish:
+    ctx->wardrive_wigle_status_label = NULL;
+    ctx->wardrive_wigle_task_running = false;
+    ctx->wardrive_autoupload_busy = false;
+    ctx->wardrive_autoupload_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+// ---- Home-network detected confirm prompt (shown from the monitor task) ----
+
+static void close_wardrive_home_confirm(tab_context_t *ctx)
+{
+    if (!ctx) return;
+    if (ctx->wardrive_home_confirm_overlay) {
+        lv_obj_del(ctx->wardrive_home_confirm_overlay);
+        ctx->wardrive_home_confirm_overlay = NULL;
+    }
+}
+
+static void wardrive_home_confirm_yes_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx) ctx = get_current_ctx();
+    ESP_LOGI(TAG, "auto-upload: user confirmed for '%s' - stopping wardrive",
+             ctx ? ctx->wardrive_autoupload_ssid : "?");
+    close_wardrive_home_confirm(ctx);
+    // Ask the monitor task to stop and hand off to the auto-upload worker.
+    ctx->wardrive_autoupload_requested = true;
+    ctx->wardrive_monitoring = false;
+}
+
+static void wardrive_home_confirm_no_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx) ctx = get_current_ctx();
+    ESP_LOGI(TAG, "auto-upload: user declined - continuing wardrive");
+    close_wardrive_home_confirm(ctx);   // SSID already marked prompted; keep scanning
+}
+
+static void show_wardrive_home_confirm(tab_context_t *ctx, const char *ssid)
+{
+    if (!ctx || !ctx->wardrive_page || ctx->wardrive_home_confirm_overlay) return;
+    snprintf(ctx->wardrive_autoupload_ssid, sizeof(ctx->wardrive_autoupload_ssid), "%s", ssid ? ssid : "");
+
+    lv_obj_t *ov = lv_obj_create(ctx->wardrive_page);
+    ctx->wardrive_home_confirm_overlay = ov;
+    lv_obj_remove_style_all(ov);
+    lv_obj_set_size(ov, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(ov, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(ov, LV_OPA_70, 0);
+    lv_obj_clear_flag(ov, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(ov, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t *box = lv_obj_create(ov);
+    lv_obj_set_size(box, 540, LV_SIZE_CONTENT);
+    lv_obj_align(box, LV_ALIGN_CENTER, 0, -200);   // 200 px above center
+    lv_obj_set_style_bg_color(box, lv_color_hex(0x1A1A2A), 0);
+    lv_obj_set_style_border_color(box, COLOR_MATERIAL_AMBER, 0);
+    lv_obj_set_style_border_width(box, 3, 0);
+    lv_obj_set_style_radius(box, 16, 0);
+    lv_obj_set_style_pad_all(box, 20, 0);
+    lv_obj_set_flex_flow(box, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(box, 14, 0);
+    lv_obj_clear_flag(box, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(box);
+    lv_label_set_text(title, LV_SYMBOL_HOME " Home network detected");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_AMBER, 0);
+
+    lv_obj_t *msg = lv_label_create(box);
+    lv_label_set_text_fmt(msg, "'%s' is in range.\nStop wardrive and auto-upload now?", ssid ? ssid : "");
+    lv_obj_set_style_text_color(msg, lv_color_hex(0xDDDDDD), 0);
+    lv_label_set_long_mode(msg, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(msg, lv_pct(100));
+
+    lv_obj_t *row = lv_obj_create(box);
+    lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(row, 0, 0);
+    lv_obj_set_style_pad_all(row, 0, 0);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *yes = lv_btn_create(row);
+    lv_obj_set_size(yes, 210, 54);
+    lv_obj_set_style_bg_color(yes, COLOR_MATERIAL_GREEN, 0);
+    lv_obj_set_style_radius(yes, 8, 0);
+    lv_obj_add_event_cb(yes, wardrive_home_confirm_yes_cb, LV_EVENT_CLICKED, ctx);
+    lv_obj_t *yl = lv_label_create(yes);
+    lv_label_set_text(yl, LV_SYMBOL_OK " Yes, upload");
+    lv_obj_center(yl);
+
+    lv_obj_t *no = lv_btn_create(row);
+    lv_obj_set_size(no, 210, 54);
+    lv_obj_set_style_bg_color(no, lv_color_hex(0x444444), 0);
+    lv_obj_set_style_radius(no, 8, 0);
+    lv_obj_add_event_cb(no, wardrive_home_confirm_no_cb, LV_EVENT_CLICKED, ctx);
+    lv_obj_t *nl = lv_label_create(no);
+    lv_label_set_text(nl, LV_SYMBOL_CLOSE " No");
+    lv_obj_center(nl);
+}
+
+// Check a freshly-parsed wardrive network against the cached home list; if it matches
+// an un-prompted home SSID, mark it prompted and raise the confirm dialog (once).
+static void wardrive_autoupload_check(tab_context_t *ctx, const wardrive_network_t *net)
+{
+    if (!ctx || !net) return;
+    if (!g_wd_autoupload_enabled || !ctx->wardrive_autoupload_ready) return;
+    if (ctx->wardrive_autoupload_busy || ctx->wardrive_autoupload_requested) return;
+    if (ctx->wardrive_home_confirm_overlay) return;
+    if (strcmp(net->kind, "WIFI") != 0) return;
+
+    for (int i = 0; i < ctx->wardrive_home_count; i++) {
+        if (ctx->wardrive_home[i].prompted) continue;
+        bool ssid_match = (net->ssid[0] != '\0' &&
+                           strcmp(ctx->wardrive_home[i].ssid, net->ssid) == 0);
+        bool bssid_match = (ctx->wardrive_home[i].bssid[0] != '\0' && net->bssid[0] != '\0' &&
+                            strcasecmp(ctx->wardrive_home[i].bssid, net->bssid) == 0);
+        if (ssid_match || bssid_match) {
+            ctx->wardrive_home[i].prompted = true;   // one prompt per entry per session
+            ESP_LOGI(TAG, "auto-upload: home network matched '%s' (bssid=%s) via %s -> prompting",
+                     ctx->wardrive_home[i].ssid, net->bssid[0] ? net->bssid : "-",
+                     ssid_match ? "SSID" : "BSSID");
+            // Connect using the stored (real) SSID even when matched by BSSID (hidden net).
+            bsp_display_lock(0);
+            show_wardrive_home_confirm(ctx, ctx->wardrive_home[i].ssid);
+            bsp_display_unlock();
+            break;
+        }
+    }
+}
+
+// Core of "start wardrive", shared by the Start button and the auto-upload Resume button.
+static void wardrive_begin_scan(tab_context_t *ctx)
+{
+    if (!ctx || ctx->wardrive_monitoring) return;
+
+    close_wardrive_wigle_popup_ctx(ctx);
+
+    // Auto-upload: cache the home-network trigger set once, before promisc takes the radio.
+    ctx->wardrive_home_count = 0;
+    ctx->wardrive_autoupload_requested = false;
+    ctx->wardrive_autoupload_ready = false;
+    arp_wifi_connected = false;
+    ctx->arp_wifi_connected = false;
+    if (g_wd_autoupload_enabled) {
+        wardrive_load_home_networks(ctx);
+        // Precheck: is an API key present for an armed provider? If not, don't arm the
+        // trigger - no point stopping the scan and connecting only to upload nothing.
+        tab_id_t au_tab = tab_id_for_ctx(ctx);
+        uart_port_t au_port = uart_port_for_tab(au_tab);
+        bool have_key = false;
+        if (g_wd_autoupload_wigle && wardrive_autoup_key_ok(au_tab, au_port, "wigle_key read"))
+            have_key = true;
+        if (!have_key && g_wd_autoupload_wdgwars && wardrive_autoup_key_ok(au_tab, au_port, "wdgwars_key read"))
+            have_key = true;
+        ctx->wardrive_autoupload_ready = have_key;
+        if (have_key) {
+            ESP_LOGI(TAG, "auto-upload: armed (home nets=%d, API key present)", ctx->wardrive_home_count);
+        } else {
+            ESP_LOGW(TAG, "auto-upload: no API key in /lab/wigle.txt or wdgwars.txt - trigger disabled this session");
+        }
+    }
+
+    const char *start_cmd = ctx->wardrive_trace_enabled ? "start_wardrive_promisc_trace" : "start_wardrive_promisc";
+    ESP_LOGI(TAG, "Wardrive start - sending %s command", start_cmd);
+
+    tab_id_t active_tab = tab_id_for_ctx(ctx);
+    if (active_tab == TAB_MBUS) {
+        uart2_send_command("unselect_networks");
+    } else {
+        uart_send_command("unselect_networks");
+    }
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    if (active_tab == TAB_MBUS) {
+        uart2_send_command(start_cmd);
+    } else {
+        uart_send_command(start_cmd);
+    }
+
+    ctx->wardrive_net_count = 0;
+    ctx->wardrive_wifi_count = 0;
+    ctx->wardrive_bt_count = 0;
+    ctx->wardrive_sat_count = 0;
+    ctx->wardrive_relogs = 0;
+    ctx->wardrive_best_ch = 0;
+    ctx->wardrive_distance_m = 0.0;
+    ctx->wardrive_net_head = 0;
+    ctx->wardrive_gps_fix = false;
+
+    bsp_display_lock(0);
+    if (ctx->wardrive_table) lv_obj_clean(ctx->wardrive_table);
+
+    if (ctx->wardrive_start_btn) lv_obj_add_state(ctx->wardrive_start_btn, LV_STATE_DISABLED);
+    if (ctx->wardrive_stop_btn) lv_obj_clear_state(ctx->wardrive_stop_btn, LV_STATE_DISABLED);
+    if (ctx->wardrive_trace_btn) lv_obj_add_state(ctx->wardrive_trace_btn, LV_STATE_DISABLED);
+    if (ctx->wardrive_upload_btn) lv_obj_add_state(ctx->wardrive_upload_btn, LV_STATE_DISABLED);
+    if (ctx->wardrive_setup_btn) lv_obj_add_state(ctx->wardrive_setup_btn, LV_STATE_DISABLED);
+
+    if (ctx->wardrive_status_label) {
+        lv_label_set_text(ctx->wardrive_status_label,
+                          ctx->wardrive_trace_enabled ? "Starting wardrive trace..." : "Starting wardrive...");
+        lv_obj_set_style_text_color(ctx->wardrive_status_label, COLOR_MATERIAL_AMBER, 0);
+    }
+    update_wardrive_count_label(ctx);
+
+    show_wardrive_gps_overlay(ctx);
+    bsp_display_unlock();
+
+    ctx->wardrive_monitoring = true;
+    xTaskCreate(wardrive_monitor_task, "wd_monitor", 8192, (void*)ctx, 5, &ctx->wardrive_task);
+}
+
 static void wardrive_monitor_task(void *arg)
 {
     tab_context_t *ctx = (tab_context_t *)arg;
@@ -22095,6 +23448,9 @@ static void wardrive_monitor_task(void *arg)
     double gps_push_last_lon = 0.0;
     uint32_t gps_push_last_sent_tick = 0;
     uint32_t gps_push_last_probe_tick = 0;
+    uint32_t last_batt_check_tick = 0;
+    int low_batt_hits = 0;
+    bool low_batt_stop_sent = false;
 
     while (ctx->wardrive_monitoring) {
         if (ctx->wardrive_use_external_gps) {
@@ -22106,6 +23462,35 @@ static void wardrive_monitor_task(void *arg)
                                               &gps_push_last_lon,
                                               &gps_push_last_sent_tick,
                                               &gps_push_last_probe_tick);
+        }
+
+        // Low-battery guard: stop the wardrive cleanly so JanOS can finalize the KML
+        // (append </Folder></Document></kml> + rename) and close the log before a hard
+        // power-off truncates them. Checked every ~10 s; needs 2 sustained low reads.
+        uint32_t now_batt_tick = xTaskGetTickCount();
+        if (!low_batt_stop_sent &&
+            (now_batt_tick - last_batt_check_tick) >= pdMS_TO_TICKS(10000)) {
+            last_batt_check_tick = now_batt_tick;
+            int batt_pct = battery_percent_from_voltage(current_battery_voltage);
+            if (batt_pct >= 0 && batt_pct <= WARDRIVE_LOW_BATT_PCT) {
+                if (++low_batt_hits >= 2) {
+                    low_batt_stop_sent = true;
+                    ESP_LOGW(TAG, "Wardrive: battery %d%% <= %d%% - graceful stop",
+                             batt_pct, WARDRIVE_LOW_BATT_PCT);
+                    if (active_tab == TAB_MBUS) uart2_send_command("stop");
+                    else uart_send_command("stop");
+                    bsp_display_lock(0);
+                    close_wardrive_home_confirm(ctx);
+                    if (ctx->wardrive_status_label) {
+                        lv_label_set_text_fmt(ctx->wardrive_status_label,
+                            "Low battery (%d%%) - stopping & saving...", batt_pct);
+                        lv_obj_set_style_text_color(ctx->wardrive_status_label, COLOR_MATERIAL_RED, 0);
+                    }
+                    bsp_display_unlock();
+                }
+            } else {
+                low_batt_hits = 0;
+            }
         }
 
         int len = transport_read_bytes_tab(active_tab, uart_port, rx_buffer, sizeof(rx_buffer) - 1, pdMS_TO_TICKS(100));
@@ -22312,6 +23697,10 @@ static void wardrive_monitor_task(void *arg)
                         // Try to parse as CSV network line
                         if (parse_wardrive_network_line(ctx, line_buffer)) {
                             batch_has_new_networks = true;
+                            // Auto-upload: check the just-parsed network against the home list.
+                            int last_idx = (ctx->wardrive_net_head - 1 + WARDRIVE_MAX_NETWORKS)
+                                           % WARDRIVE_MAX_NETWORKS;
+                            wardrive_autoupload_check(ctx, &ctx->wardrive_networks[last_idx]);
                         }
 
                         line_pos = 0;
@@ -22338,6 +23727,18 @@ static void wardrive_monitor_task(void *arg)
     }
 
     ESP_LOGI(TAG, "Wardrive monitor task ended");
+
+    // Auto-upload handoff: the user confirmed a home network, so launch the upload
+    // worker (which now owns the transport) instead of returning to idle.
+    if (ctx->wardrive_autoupload_requested) {
+        ctx->wardrive_autoupload_requested = false;
+        ctx->wardrive_task = NULL;
+        xTaskCreate(wardrive_autoupload_task, "wd_autoup", 8192, (void*)ctx, 5,
+                    &ctx->wardrive_autoupload_task_handle);
+        vTaskDelete(NULL);
+        return;
+    }
+
     ctx->wardrive_task = NULL;
     vTaskDelete(NULL);
 }
@@ -22356,65 +23757,7 @@ static void wardrive_start_cb(lv_event_t *e)
         return;
     }
 
-    // Stop any pending WiGLE upload popup/task when a new capture starts
-    close_wardrive_wigle_popup_ctx(ctx);
-
-    const char *start_cmd = ctx->wardrive_trace_enabled ? "start_wardrive_promisc_trace" : "start_wardrive_promisc";
-    ESP_LOGI(TAG, "Wardrive start - sending %s command", start_cmd);
-
-    // Clear any previous network selection and send start command
-    tab_id_t active_tab = tab_id_for_ctx(ctx);
-    if (active_tab == TAB_MBUS) {
-        uart2_send_command("unselect_networks");
-    } else {
-        uart_send_command("unselect_networks");
-    }
-    vTaskDelay(pdMS_TO_TICKS(100));
-
-    // Send start command
-    if (active_tab == TAB_MBUS) {
-        uart2_send_command(start_cmd);
-    } else {
-        uart_send_command(start_cmd);
-    }
-
-    // Reset ring buffer
-    ctx->wardrive_net_count = 0;
-    ctx->wardrive_wifi_count = 0;
-    ctx->wardrive_bt_count = 0;
-    ctx->wardrive_sat_count = 0;
-    ctx->wardrive_relogs = 0;
-    ctx->wardrive_best_ch = 0;
-    ctx->wardrive_distance_m = 0.0;
-    ctx->wardrive_net_head = 0;
-    ctx->wardrive_gps_fix = false;
-
-    // Clear table
-    bsp_display_lock(0);
-    if (ctx->wardrive_table) lv_obj_clean(ctx->wardrive_table);
-
-    // Toggle buttons
-    if (ctx->wardrive_start_btn) lv_obj_add_state(ctx->wardrive_start_btn, LV_STATE_DISABLED);
-    if (ctx->wardrive_stop_btn) lv_obj_clear_state(ctx->wardrive_stop_btn, LV_STATE_DISABLED);
-    if (ctx->wardrive_trace_btn) lv_obj_add_state(ctx->wardrive_trace_btn, LV_STATE_DISABLED);
-    if (ctx->wardrive_upload_btn) lv_obj_add_state(ctx->wardrive_upload_btn, LV_STATE_DISABLED);
-    if (ctx->wardrive_setup_btn) lv_obj_add_state(ctx->wardrive_setup_btn, LV_STATE_DISABLED);
-
-    // Update status
-    if (ctx->wardrive_status_label) {
-        lv_label_set_text(ctx->wardrive_status_label,
-                          ctx->wardrive_trace_enabled ? "Starting wardrive trace..." : "Starting wardrive...");
-        lv_obj_set_style_text_color(ctx->wardrive_status_label, COLOR_MATERIAL_AMBER, 0);
-    }
-    update_wardrive_count_label(ctx);
-
-    // Show GPS fix overlay
-    show_wardrive_gps_overlay(ctx);
-    bsp_display_unlock();
-
-    // Start monitor task
-    ctx->wardrive_monitoring = true;
-    xTaskCreate(wardrive_monitor_task, "wd_monitor", 8192, (void*)ctx, 5, &ctx->wardrive_task);
+    wardrive_begin_scan(ctx);
 }
 
 // Wardrive back button - stop if running, return to tiles
@@ -22442,6 +23785,9 @@ static void wardrive_back_cb(lv_event_t *e)
     // Dismiss GPS overlay
     close_wardrive_gps_overlay(ctx);
     close_wardrive_wigle_popup_ctx(ctx);
+    close_wardrive_home_confirm(ctx);
+    close_wardrive_autoup_overlay(ctx);
+    close_home_mgmt_overlay(ctx);
     wardrive_setup_close_cb(NULL);
     wardrive_blacklist_close_cb(NULL);
 
@@ -22664,6 +24010,26 @@ static void wardrive_setup_sync_controls(tab_context_t *ctx)
         if (ctx->wardrive_trace_enabled) lv_obj_add_state(ctx->wardrive_setup_trace_sw, LV_STATE_CHECKED);
         else lv_obj_clear_state(ctx->wardrive_setup_trace_sw, LV_STATE_CHECKED);
     }
+    if (ctx->wardrive_setup_autoup_sw) {
+        if (g_wd_autoupload_enabled) lv_obj_add_state(ctx->wardrive_setup_autoup_sw, LV_STATE_CHECKED);
+        else lv_obj_clear_state(ctx->wardrive_setup_autoup_sw, LV_STATE_CHECKED);
+    }
+    if (ctx->wardrive_setup_autoup_wigle_cb) {
+        if (g_wd_autoupload_wigle) lv_obj_add_state(ctx->wardrive_setup_autoup_wigle_cb, LV_STATE_CHECKED);
+        else lv_obj_clear_state(ctx->wardrive_setup_autoup_wigle_cb, LV_STATE_CHECKED);
+    }
+    if (ctx->wardrive_setup_autoup_wdgwars_cb) {
+        if (g_wd_autoupload_wdgwars) lv_obj_add_state(ctx->wardrive_setup_autoup_wdgwars_cb, LV_STATE_CHECKED);
+        else lv_obj_clear_state(ctx->wardrive_setup_autoup_wdgwars_cb, LV_STATE_CHECKED);
+    }
+    if (ctx->wardrive_setup_autoup_archive_cb) {
+        if (g_wd_autoupload_archive) lv_obj_add_state(ctx->wardrive_setup_autoup_archive_cb, LV_STATE_CHECKED);
+        else lv_obj_clear_state(ctx->wardrive_setup_autoup_archive_cb, LV_STATE_CHECKED);
+    }
+    if (ctx->wardrive_setup_autoup_poweroff_cb) {
+        if (g_wd_autoupload_poweroff) lv_obj_add_state(ctx->wardrive_setup_autoup_poweroff_cb, LV_STATE_CHECKED);
+        else lv_obj_clear_state(ctx->wardrive_setup_autoup_poweroff_cb, LV_STATE_CHECKED);
+    }
     if (ctx->wardrive_setup_gps_dd) {
         lv_dropdown_set_selected(ctx->wardrive_setup_gps_dd, ctx->wardrive_setup_gps_index);
         ctx->wardrive_setup_gps_dirty = false;
@@ -22774,6 +24140,56 @@ static void wardrive_setup_trace_sw_cb(lv_event_t *e)
     tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
     if (!ctx || !ctx->wardrive_setup_trace_sw) return;
     ctx->wardrive_trace_enabled = lv_obj_has_state(ctx->wardrive_setup_trace_sw, LV_STATE_CHECKED);
+}
+
+// Auto-upload (home networks) — setup control callbacks (Tab5-side prefs -> NVS).
+static void wardrive_autoup_sw_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx || !ctx->wardrive_setup_autoup_sw) return;
+    g_wd_autoupload_enabled = lv_obj_has_state(ctx->wardrive_setup_autoup_sw, LV_STATE_CHECKED);
+    save_wd_autoupload_to_nvs();
+}
+
+static void wardrive_autoup_wigle_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx || !ctx->wardrive_setup_autoup_wigle_cb) return;
+    g_wd_autoupload_wigle = lv_obj_has_state(ctx->wardrive_setup_autoup_wigle_cb, LV_STATE_CHECKED);
+    save_wd_autoupload_to_nvs();
+}
+
+static void wardrive_autoup_wdgwars_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx || !ctx->wardrive_setup_autoup_wdgwars_cb) return;
+    g_wd_autoupload_wdgwars = lv_obj_has_state(ctx->wardrive_setup_autoup_wdgwars_cb, LV_STATE_CHECKED);
+    save_wd_autoupload_to_nvs();
+}
+
+static void wardrive_autoup_archive_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx || !ctx->wardrive_setup_autoup_archive_cb) return;
+    g_wd_autoupload_archive = lv_obj_has_state(ctx->wardrive_setup_autoup_archive_cb, LV_STATE_CHECKED);
+    save_wd_autoupload_to_nvs();
+}
+
+static void wardrive_autoup_poweroff_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx || !ctx->wardrive_setup_autoup_poweroff_cb) return;
+    g_wd_autoupload_poweroff = lv_obj_has_state(ctx->wardrive_setup_autoup_poweroff_cb, LV_STATE_CHECKED);
+    save_wd_autoupload_to_nvs();
+}
+
+static void wardrive_home_btn_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx) ctx = get_current_ctx();
+    ESP_LOGI(TAG, "Home networks button clicked (ctx=%p page=%p)",
+             ctx, ctx ? ctx->wardrive_page : NULL);
+    show_home_mgmt_overlay(ctx);
 }
 
 static const char *wardrive_setup_gps_cmd_for_index(uint8_t index)
@@ -22986,6 +24402,12 @@ static void wardrive_setup_close_cb(lv_event_t *e)
         ctx->wardrive_setup_overlay = NULL;
         ctx->wardrive_setup_popup = NULL;
         ctx->wardrive_setup_trace_sw = NULL;
+        ctx->wardrive_setup_autoup_sw = NULL;
+        ctx->wardrive_setup_autoup_wigle_cb = NULL;
+        ctx->wardrive_setup_autoup_wdgwars_cb = NULL;
+        ctx->wardrive_setup_autoup_archive_cb = NULL;
+        ctx->wardrive_setup_autoup_poweroff_cb = NULL;
+        ctx->wardrive_setup_home_btn = NULL;
         ctx->wardrive_setup_band_24_cb = NULL;
         ctx->wardrive_setup_band_5_cb = NULL;
         ctx->wardrive_setup_band_ble_cb = NULL;
@@ -23090,6 +24512,59 @@ static void wardrive_setup_btn_cb(lv_event_t *e)
     lv_dropdown_set_selected(ctx->wardrive_setup_gps_dd, ctx->wardrive_setup_gps_index);
     lv_obj_set_width(ctx->wardrive_setup_gps_dd, 220);
     lv_obj_add_event_cb(ctx->wardrive_setup_gps_dd, wardrive_setup_gps_dd_cb, LV_EVENT_VALUE_CHANGED, ctx);
+
+    // ---- Auto-upload (home networks) ----
+    wardrive_setup_make_label(popup, "Auto-upload (home networks)", COLOR_MATERIAL_AMBER);
+
+    lv_obj_t *au_row = lv_obj_create(popup);
+    lv_obj_set_size(au_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(au_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(au_row, 0, 0);
+    lv_obj_set_style_pad_all(au_row, 0, 0);
+    lv_obj_set_flex_flow(au_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(au_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(au_row, LV_OBJ_FLAG_SCROLLABLE);
+    wardrive_setup_make_label(au_row, "Auto upload on home network", COLOR_MATERIAL_CYAN);
+    ctx->wardrive_setup_autoup_sw = lv_switch_create(au_row);
+    lv_obj_add_event_cb(ctx->wardrive_setup_autoup_sw, wardrive_autoup_sw_cb, LV_EVENT_VALUE_CHANGED, ctx);
+
+    lv_obj_t *au_prov_row = lv_obj_create(popup);
+    lv_obj_set_size(au_prov_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(au_prov_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(au_prov_row, 0, 0);
+    lv_obj_set_style_pad_all(au_prov_row, 0, 0);
+    lv_obj_set_flex_flow(au_prov_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_column(au_prov_row, 24, 0);
+    lv_obj_clear_flag(au_prov_row, LV_OBJ_FLAG_SCROLLABLE);
+    ctx->wardrive_setup_autoup_wigle_cb = lv_checkbox_create(au_prov_row);
+    lv_checkbox_set_text(ctx->wardrive_setup_autoup_wigle_cb, "WiGLE");
+    lv_obj_set_style_text_color(ctx->wardrive_setup_autoup_wigle_cb, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_font(ctx->wardrive_setup_autoup_wigle_cb, &lv_font_montserrat_14, 0);
+    lv_obj_add_event_cb(ctx->wardrive_setup_autoup_wigle_cb, wardrive_autoup_wigle_cb, LV_EVENT_VALUE_CHANGED, ctx);
+    ctx->wardrive_setup_autoup_wdgwars_cb = lv_checkbox_create(au_prov_row);
+    lv_checkbox_set_text(ctx->wardrive_setup_autoup_wdgwars_cb, "WDGWars");
+    lv_obj_set_style_text_color(ctx->wardrive_setup_autoup_wdgwars_cb, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_font(ctx->wardrive_setup_autoup_wdgwars_cb, &lv_font_montserrat_14, 0);
+    lv_obj_add_event_cb(ctx->wardrive_setup_autoup_wdgwars_cb, wardrive_autoup_wdgwars_cb, LV_EVENT_VALUE_CHANGED, ctx);
+    ctx->wardrive_setup_autoup_archive_cb = lv_checkbox_create(au_prov_row);
+    lv_checkbox_set_text(ctx->wardrive_setup_autoup_archive_cb, "Archive");
+    lv_obj_set_style_text_color(ctx->wardrive_setup_autoup_archive_cb, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_font(ctx->wardrive_setup_autoup_archive_cb, &lv_font_montserrat_14, 0);
+    lv_obj_add_event_cb(ctx->wardrive_setup_autoup_archive_cb, wardrive_autoup_archive_cb, LV_EVENT_VALUE_CHANGED, ctx);
+    ctx->wardrive_setup_autoup_poweroff_cb = lv_checkbox_create(au_prov_row);
+    lv_checkbox_set_text(ctx->wardrive_setup_autoup_poweroff_cb, "Power off");
+    lv_obj_set_style_text_color(ctx->wardrive_setup_autoup_poweroff_cb, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_font(ctx->wardrive_setup_autoup_poweroff_cb, &lv_font_montserrat_14, 0);
+    lv_obj_add_event_cb(ctx->wardrive_setup_autoup_poweroff_cb, wardrive_autoup_poweroff_cb, LV_EVENT_VALUE_CHANGED, ctx);
+
+    ctx->wardrive_setup_home_btn = lv_btn_create(popup);
+    lv_obj_set_size(ctx->wardrive_setup_home_btn, lv_pct(100), 44);
+    lv_obj_set_style_bg_color(ctx->wardrive_setup_home_btn, lv_color_hex(0x455A64), 0);
+    lv_obj_set_style_radius(ctx->wardrive_setup_home_btn, 8, 0);
+    lv_obj_add_event_cb(ctx->wardrive_setup_home_btn, wardrive_home_btn_cb, LV_EVENT_CLICKED, ctx);
+    lv_obj_t *home_btn_lbl = lv_label_create(ctx->wardrive_setup_home_btn);
+    lv_label_set_text(home_btn_lbl, LV_SYMBOL_HOME " Home networks...");
+    lv_obj_center(home_btn_lbl);
 
     // ---- Bands ----
     wardrive_setup_make_label(popup, "Bands", COLOR_MATERIAL_CYAN);
@@ -35018,6 +36493,11 @@ static __attribute__((unused)) lv_obj_t *settings_popup_obj = NULL;
 #define NVS_KEY_CLOCK_SHOW      "clock_show"
 #define NVS_KEY_SCREEN_LOCK     "scr_lock"
 #define NVS_KEY_AUTO_LOCK       "scr_autolock"
+#define NVS_KEY_WD_AUTOUP_EN    "wd_au_en"
+#define NVS_KEY_WD_AUTOUP_WIGLE "wd_au_wg"
+#define NVS_KEY_WD_AUTOUP_WDG   "wd_au_wdg"
+#define NVS_KEY_WD_AUTOUP_ARCH  "wd_au_arch"
+#define NVS_KEY_WD_AUTOUP_POFF  "wd_au_poff"
 
 // Load Red Team setting from NVS (called on startup)
 // Note: Device detection is automatic via ping/pong
@@ -35055,6 +36535,41 @@ static void save_red_team_to_nvs(bool enabled)
     } else {
         ESP_LOGE(TAG, "Failed to open NVS for writing Red Team: %s", esp_err_to_name(err));
     }
+}
+
+// Load wardrive auto-upload (home networks) config from NVS (called on startup)
+static void load_wd_autoupload_from_nvs(void)
+{
+    nvs_handle_t nvs;
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs) != ESP_OK) {
+        return;
+    }
+    uint8_t v;
+    if (nvs_get_u8(nvs, NVS_KEY_WD_AUTOUP_EN, &v) == ESP_OK)    g_wd_autoupload_enabled = (v != 0);
+    if (nvs_get_u8(nvs, NVS_KEY_WD_AUTOUP_WIGLE, &v) == ESP_OK) g_wd_autoupload_wigle   = (v != 0);
+    if (nvs_get_u8(nvs, NVS_KEY_WD_AUTOUP_WDG, &v) == ESP_OK)   g_wd_autoupload_wdgwars = (v != 0);
+    if (nvs_get_u8(nvs, NVS_KEY_WD_AUTOUP_ARCH, &v) == ESP_OK)  g_wd_autoupload_archive = (v != 0);
+    if (nvs_get_u8(nvs, NVS_KEY_WD_AUTOUP_POFF, &v) == ESP_OK)  g_wd_autoupload_poweroff = (v != 0);
+    nvs_close(nvs);
+    ESP_LOGI(TAG, "Loaded auto-upload cfg: en=%d wigle=%d wdg=%d arch=%d poff=%d",
+             g_wd_autoupload_enabled, g_wd_autoupload_wigle,
+             g_wd_autoupload_wdgwars, g_wd_autoupload_archive, g_wd_autoupload_poweroff);
+}
+
+// Save wardrive auto-upload (home networks) config to NVS
+static void save_wd_autoupload_to_nvs(void)
+{
+    nvs_handle_t nvs;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs) != ESP_OK) {
+        return;
+    }
+    nvs_set_u8(nvs, NVS_KEY_WD_AUTOUP_EN,    g_wd_autoupload_enabled ? 1 : 0);
+    nvs_set_u8(nvs, NVS_KEY_WD_AUTOUP_WIGLE, g_wd_autoupload_wigle ? 1 : 0);
+    nvs_set_u8(nvs, NVS_KEY_WD_AUTOUP_WDG,   g_wd_autoupload_wdgwars ? 1 : 0);
+    nvs_set_u8(nvs, NVS_KEY_WD_AUTOUP_ARCH,  g_wd_autoupload_archive ? 1 : 0);
+    nvs_set_u8(nvs, NVS_KEY_WD_AUTOUP_POFF,  g_wd_autoupload_poweroff ? 1 : 0);
+    nvs_commit(nvs);
+    nvs_close(nvs);
 }
 
 // Load screen settings from NVS (called on startup)
@@ -40382,6 +41897,7 @@ void app_main(void)
     load_screen_settings_from_nvs();
     load_dashboard_from_nvs();
     load_clock_settings_from_nvs();
+    load_wd_autoupload_from_nvs();
 
     // Initialize both UARTs for board detection
     // UART1: Grove (TX=53, RX=54) - always initialized
