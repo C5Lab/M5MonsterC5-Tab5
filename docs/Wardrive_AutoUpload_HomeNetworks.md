@@ -61,7 +61,7 @@ network in a **quoted CSV** format — the same convention as `eviltwin.txt`:
 | **WiGLE**      | Upload pending wardrive logs to WiGLE.                          |
 | **WDGWars**    | Upload pending wardrive logs to WDGWars.                        |
 | **Archive**    | After a successful upload, archive the uploaded ("done") files. |
-| **Power off**  | Power off the Tab5 after a successful upload (skipped on failure). |
+| **Power off**  | Power off the Tab5 after a successful upload (skipped on failure; a 15 s countdown lets you cancel). |
 
 Settings persist in NVS on the Tab5 (namespace `settings`, keys `wd_au_*`).
 **wpa‑sec** handshakes are uploaded **only if handshakes are actually present**
@@ -165,9 +165,11 @@ appears and you tap **Yes**:
    `wardrive_cleanup all done move <timestamp>`.
 5. Show the result with **Resume** (restart the wardrive) / **Close** buttons.
    On failure the files are kept and a **Retry** button is offered.
-6. If **Power off** is enabled and the upload succeeded, the Tab5 shows a short
-   countdown and powers off (`bsp_generate_poweroff_signal`). Skipped on failure so
-   you can Retry.
+6. If **Power off** is enabled and the upload succeeded, the Tab5 counts down from
+   **15 s** and then powers off (`bsp_generate_poweroff_signal`). A **Stay on**
+   button cancels the countdown — you land on the normal result screen
+   (*Resume* / *Close*) and the device stays up. Power off is skipped entirely on
+   failure, so a failed run always leaves you with **Retry**.
 
 Requirements for a real upload: a WiGLE/WDGWars key on the C5
 (`/lab/wigle.txt`, `/lab/wdgwars.txt`) and at least one **pending** file.
@@ -187,9 +189,11 @@ flowchart TD
     AR -->|"no"| RS["Result: OK"]
     AR -->|"yes"| MV["wardrive_cleanup all done move"] --> RS
     RS --> PO{"Power off enabled?"}
-    PO -->|"yes"| OFF["Tab5 powers off"]
-    PO -->|"no"| E["Buttons: Resume / Close"]
-    RF --> E
+    PO -->|"yes"| CD["15 s countdown - Stay on cancels"]
+    CD -->|"timeout"| OFF["Tab5 powers off"]
+    CD -->|"cancelled"| E["Buttons: Resume / Close"]
+    PO -->|"no"| E
+    RF --> E2["Buttons: Retry / Resume / Close"]
 ```
 
 ---

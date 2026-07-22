@@ -262,6 +262,9 @@ typedef struct {
 // the log before a hard power-off would leave an unopenable, truncated file.
 #define WARDRIVE_LOW_BATT_PCT 8
 
+// Grace period before the post-auto-upload power-off, so the user can cancel it.
+#define WARDRIVE_AUTOUP_POFF_SECS 15
+
 // Home networks (auto-upload trigger set), cached from JanOS `home_list` at scan start.
 #define WARDRIVE_HOME_MAX 16
 typedef struct {
@@ -795,6 +798,7 @@ typedef struct {
     volatile bool wardrive_autoupload_busy;
     volatile bool wardrive_autoupload_requested;
     bool wardrive_autoupload_ready;   // an armed provider actually has an API key
+    volatile bool wardrive_autoup_poff_cancel;   // user aborted the power-off countdown
     char wardrive_autoupload_ssid[33];
     TaskHandle_t wardrive_autoupload_task_handle;
     lv_obj_t *wardrive_autoup_overlay;
@@ -17700,15 +17704,22 @@ static void show_wardrive_gps_overlay(tab_context_t *ctx)
     ctx->wardrive_gps_overlay = lv_obj_create(ctx->wardrive_page);
     lv_obj_remove_style_all(ctx->wardrive_gps_overlay);
     lv_obj_set_size(ctx->wardrive_gps_overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_pos(ctx->wardrive_gps_overlay, 0, 0);
     lv_obj_set_style_bg_color(ctx->wardrive_gps_overlay, lv_color_hex(0x000000), 0);
     lv_obj_set_style_bg_opa(ctx->wardrive_gps_overlay, LV_OPA_70, 0);
+    // Keep the prompt fixed instead of letting the Wardrive flex layout place
+    // it below the network table or scroll the page to reach it.
+    lv_obj_add_flag(ctx->wardrive_gps_overlay, LV_OBJ_FLAG_FLOATING);
     lv_obj_clear_flag(ctx->wardrive_gps_overlay, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(ctx->wardrive_gps_overlay, LV_OBJ_FLAG_CLICKABLE);
+    // Let the active Stop button remain tappable while a GPS fix is pending.
+    lv_obj_clear_flag(ctx->wardrive_gps_overlay, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_move_foreground(ctx->wardrive_gps_overlay);
 
-    // Small centered popup card
+    // Place the prompt in the upper part of the portrait display, below the
+    // Wardrive header, so it does not obscure the empty/table area.
     ctx->wardrive_gps_popup = lv_obj_create(ctx->wardrive_gps_overlay);
     lv_obj_set_size(ctx->wardrive_gps_popup, 420, 220);
-    lv_obj_center(ctx->wardrive_gps_popup);
+    lv_obj_align(ctx->wardrive_gps_popup, LV_ALIGN_TOP_MID, 0, 120);
     lv_obj_set_style_bg_color(ctx->wardrive_gps_popup, lv_color_hex(0x1A1A2A), 0);
     lv_obj_set_style_border_color(ctx->wardrive_gps_popup, COLOR_MATERIAL_TEAL, 0);
     lv_obj_set_style_border_width(ctx->wardrive_gps_popup, 3, 0);
@@ -22947,6 +22958,16 @@ static void wardrive_autoup_retry_cb(lv_event_t *e)
                 &ctx->wardrive_autoupload_task_handle);
 }
 
+// Abort the post-upload power-off countdown; the worker then falls back to the
+// normal result screen (Resume / Close) instead of cutting power.
+static void wardrive_autoup_poff_cancel_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx) ctx = get_current_ctx();
+    ctx->wardrive_autoup_poff_cancel = true;
+    ESP_LOGW(TAG, "auto-upload: power-off cancelled by user");
+}
+
 // True when a "<svc>_key read" reply indicates a usable key.
 static bool wardrive_autoup_key_ok(tab_id_t tab, uart_port_t port, const char *cmd)
 {
@@ -23186,14 +23207,40 @@ static void wardrive_autoupload_task(void *arg)
     // 5) Final result.
     ESP_LOGI(TAG, "auto-upload: DONE ok=%d | %s", overall_ok, summary[0] ? summary : "(nothing pending)");
     if (overall_ok && g_wd_autoupload_poweroff) {
-        char msg[300];
-        snprintf(msg, sizeof(msg), "Upload complete.\n%s\nPowering off in 4s...",
-                 summary[0] ? summary : "Nothing pending.");
-        wardrive_autoup_set_status(ctx, msg, COLOR_MATERIAL_GREEN);
-        ESP_LOGW(TAG, "auto-upload: success -> powering off Tab5");
-        vTaskDelay(pdMS_TO_TICKS(4000));
-        bsp_generate_poweroff_signal();
-        vTaskDelay(pdMS_TO_TICKS(3000));   // give the PMIC time to cut power
+        // Cancellable countdown: one "Stay on" button, ticking once a second. The
+        // vTaskDelay yields to LVGL, so the tap is picked up between ticks.
+        ctx->wardrive_autoup_poff_cancel = false;
+        bsp_display_lock(0);
+        if (ctx->wardrive_autoup_btn_row) {
+            lv_obj_clean(ctx->wardrive_autoup_btn_row);
+            lv_obj_t *stay = wardrive_autoup_make_btn(ctx->wardrive_autoup_btn_row,
+                                                      LV_SYMBOL_CLOSE " Stay on",
+                                                      COLOR_MATERIAL_RED,
+                                                      wardrive_autoup_poff_cancel_cb, ctx);
+            lv_obj_set_width(stay, 240);
+        }
+        bsp_display_unlock();
+
+        for (int s = WARDRIVE_AUTOUP_POFF_SECS; s > 0 && !ctx->wardrive_autoup_poff_cancel; s--) {
+            char msg[320];
+            snprintf(msg, sizeof(msg), "Upload complete.\n%s\nPowering off in %ds - tap Stay on to cancel.",
+                     summary[0] ? summary : "Nothing pending.", s);
+            wardrive_autoup_set_status(ctx, msg, COLOR_MATERIAL_GREEN);
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        }
+
+        if (!ctx->wardrive_autoup_poff_cancel) {
+            ESP_LOGW(TAG, "auto-upload: success -> powering off Tab5");
+            bsp_generate_poweroff_signal();
+            vTaskDelay(pdMS_TO_TICKS(3000));   // give the PMIC time to cut power
+        } else {
+            // Cancelled -> behave like a plain successful run (Resume / Close).
+            char msg[300];
+            snprintf(msg, sizeof(msg), "Upload complete.\n%s%s\nPower off cancelled.",
+                     summary[0] ? summary : "Nothing pending.",
+                     g_wd_autoupload_archive ? "\nArchived done files." : "");
+            wardrive_autoup_show_result(ctx, true, msg);
+        }
     } else if (overall_ok) {
         char msg[300];
         snprintf(msg, sizeof(msg), "Upload complete.\n%s%s",
@@ -24459,23 +24506,29 @@ static void wardrive_setup_btn_cb(lv_event_t *e)
     ctx->wardrive_setup_overlay = lv_obj_create(ctx->wardrive_page);
     lv_obj_remove_style_all(ctx->wardrive_setup_overlay);
     lv_obj_set_size(ctx->wardrive_setup_overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_pos(ctx->wardrive_setup_overlay, 0, 0);
     lv_obj_set_style_bg_color(ctx->wardrive_setup_overlay, lv_color_hex(0x000000), 0);
     lv_obj_set_style_bg_opa(ctx->wardrive_setup_overlay, LV_OPA_70, 0);
+    // This is a modal layer, not another item in Wardrive's flex column.
+    // Floating keeps it fixed over the page instead of placing it below the
+    // table and allowing the whole Wardrive page to scroll underneath it.
+    lv_obj_add_flag(ctx->wardrive_setup_overlay, LV_OBJ_FLAG_FLOATING);
     lv_obj_clear_flag(ctx->wardrive_setup_overlay, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(ctx->wardrive_setup_overlay, LV_OBJ_FLAG_CLICKABLE);
 
-    // Popup (scrollable column)
+    // Taller single-column setup panel: keeps the original narrow layout while
+    // using nearly the complete height of the Tab5 display.
     lv_obj_t *popup = lv_obj_create(ctx->wardrive_setup_overlay);
     ctx->wardrive_setup_popup = popup;
-    lv_obj_set_size(popup, 600, 620);
-    lv_obj_center(popup);
+    lv_obj_set_size(popup, 600, 700);
+    lv_obj_align(popup, LV_ALIGN_CENTER, 0, -50);
     lv_obj_set_style_bg_color(popup, lv_color_hex(0x1A1A2A), 0);
     lv_obj_set_style_border_color(popup, COLOR_MATERIAL_TEAL, 0);
     lv_obj_set_style_border_width(popup, 3, 0);
     lv_obj_set_style_radius(popup, 16, 0);
-    lv_obj_set_style_pad_all(popup, 18, 0);
+    lv_obj_set_style_pad_all(popup, 12, 0);
     lv_obj_set_flex_flow(popup, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_pad_row(popup, 8, 0);
+    lv_obj_set_style_pad_row(popup, 2, 0);
 
     // Title
     lv_obj_t *title = lv_label_create(popup);
@@ -25296,6 +25349,7 @@ static void show_wardrive_page(void)
     lv_obj_set_style_pad_all(ctx->wardrive_page, 10, 0);
     lv_obj_set_flex_flow(ctx->wardrive_page, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_row(ctx->wardrive_page, 8, 0);
+    lv_obj_clear_flag(ctx->wardrive_page, LV_OBJ_FLAG_SCROLLABLE);
 
     // ---- Header row ----
     lv_obj_t *header = lv_obj_create(ctx->wardrive_page);
@@ -25352,7 +25406,8 @@ static void show_wardrive_page(void)
     ctx->wardrive_start_btn = lv_btn_create(btn_cont);
     lv_obj_set_size(ctx->wardrive_start_btn, 86, 40);
     lv_obj_set_style_bg_color(ctx->wardrive_start_btn, COLOR_MATERIAL_GREEN, 0);
-    lv_obj_set_style_bg_color(ctx->wardrive_start_btn, lv_color_hex(0x555555), LV_STATE_DISABLED);
+    lv_obj_set_style_bg_color(ctx->wardrive_start_btn, lv_color_hex(0x424242), LV_STATE_DISABLED);
+    lv_obj_set_style_text_color(ctx->wardrive_start_btn, lv_color_hex(0x9E9E9E), LV_STATE_DISABLED);
     lv_obj_set_style_radius(ctx->wardrive_start_btn, 8, 0);
     lv_obj_add_event_cb(ctx->wardrive_start_btn, wardrive_start_cb, LV_EVENT_CLICKED, ctx);
 
@@ -25384,7 +25439,8 @@ static void show_wardrive_page(void)
     ctx->wardrive_upload_btn = lv_btn_create(btn_cont);
     lv_obj_set_size(ctx->wardrive_upload_btn, 110, 40);
     lv_obj_set_style_bg_color(ctx->wardrive_upload_btn, COLOR_MATERIAL_PURPLE, 0);
-    lv_obj_set_style_bg_color(ctx->wardrive_upload_btn, lv_color_hex(0x555555), LV_STATE_DISABLED);
+    lv_obj_set_style_bg_color(ctx->wardrive_upload_btn, lv_color_hex(0x424242), LV_STATE_DISABLED);
+    lv_obj_set_style_text_color(ctx->wardrive_upload_btn, lv_color_hex(0x9E9E9E), LV_STATE_DISABLED);
     lv_obj_set_style_radius(ctx->wardrive_upload_btn, 8, 0);
     lv_obj_add_event_cb(ctx->wardrive_upload_btn, wardrive_upload_btn_cb, LV_EVENT_CLICKED, ctx);
 
@@ -25397,7 +25453,8 @@ static void show_wardrive_page(void)
     ctx->wardrive_setup_btn = lv_btn_create(btn_cont);
     lv_obj_set_size(ctx->wardrive_setup_btn, 96, 40);
     lv_obj_set_style_bg_color(ctx->wardrive_setup_btn, lv_color_hex(0x37474F), 0);
-    lv_obj_set_style_bg_color(ctx->wardrive_setup_btn, lv_color_hex(0x555555), LV_STATE_DISABLED);
+    lv_obj_set_style_bg_color(ctx->wardrive_setup_btn, lv_color_hex(0x424242), LV_STATE_DISABLED);
+    lv_obj_set_style_text_color(ctx->wardrive_setup_btn, lv_color_hex(0x9E9E9E), LV_STATE_DISABLED);
     lv_obj_set_style_radius(ctx->wardrive_setup_btn, 8, 0);
     lv_obj_add_event_cb(ctx->wardrive_setup_btn, wardrive_setup_btn_cb, LV_EVENT_CLICKED, ctx);
     lv_obj_t *setup_label = lv_label_create(ctx->wardrive_setup_btn);
