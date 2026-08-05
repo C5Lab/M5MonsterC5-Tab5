@@ -6,6 +6,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 #include <stdlib.h>
 #include <ctype.h>
 #include <errno.h>
@@ -48,7 +49,7 @@
 #include "lwip/sockets.h"
 
 
-#define JANOS_TAB_VERSION "1.5.2"
+#define JANOS_TAB_VERSION "1.5.1"
 #define JANOS_VERSION_REQUIRED "1.7.0"
 
 #include "lwip/netdb.h"
@@ -1088,6 +1089,23 @@ typedef struct {
     // SD card presence (detected via sd_status command)
     bool sd_card_present;  // true if SD card detected on this UART/device
 
+    // JanOS SD Card Admin portal (external ESP32-C5, controlled over UART).
+    lv_obj_t *sd_admin_page;
+    lv_obj_t *sd_admin_password_input;
+    lv_obj_t *sd_admin_keyboard;
+    lv_obj_t *sd_admin_qr_section;
+    lv_obj_t *sd_admin_qr;
+    lv_obj_t *sd_admin_status_label;
+    lv_obj_t *sd_admin_command_label;
+    lv_obj_t *sd_admin_start_btn;
+    lv_obj_t *sd_admin_quick_start_btn;
+    lv_obj_t *sd_admin_stop_btn;
+    lv_obj_t *sd_admin_leave_overlay;
+    volatile uint8_t sd_admin_state;  // 0=stopped, 1=starting, 2=running, 3=stopping
+    TaskHandle_t sd_admin_task;
+    char sd_admin_status[128];
+    char sd_admin_active_password[64];
+
     // JanOS firmware version (detected via 'version' command or boot banner snoop)
     char janos_version[16];
     char janos_app_project[32];
@@ -1449,6 +1467,8 @@ static lv_obj_t *portal_icon = NULL;            // Portal icon in status bar
 // Tab-based UI state
 static tab_id_t current_tab = TAB_INTERNAL;     // Active tab id
 static uint8_t portal_started_by_uart = 0;      // 0=none/Internal, 1=Grove/USB, 2=MBus
+// UART selected for the SD Admin page, which lives in INTERNAL > Settings.
+static tab_id_t sd_admin_target_tab = TAB_INTERNAL;
 static lv_obj_t *tab_bar = NULL;                // Tab bar container
 static lv_obj_t *grove_tab_btn = NULL;          // Grove tab button
 static lv_obj_t *usb_tab_btn = NULL;            // USB tab button
@@ -1572,6 +1592,7 @@ static void hide_all_pages(tab_context_t *ctx) {
     if (ctx->wardrive_page) lv_obj_add_flag(ctx->wardrive_page, LV_OBJ_FLAG_HIDDEN);
     if (ctx->antisurv_page) lv_obj_add_flag(ctx->antisurv_page, LV_OBJ_FLAG_HIDDEN);
     if (ctx->iot_page) lv_obj_add_flag(ctx->iot_page, LV_OBJ_FLAG_HIDDEN);
+    if (ctx->sd_admin_page) lv_obj_add_flag(ctx->sd_admin_page, LV_OBJ_FLAG_HIDDEN);
     /* SubGHz pages (menu + sub-pages) */
     if (ctx->subghz) subghz_hide_all_pages(ctx->subghz);
 }
@@ -2179,6 +2200,14 @@ static void trigger_home_meta_refresh(tab_context_t *ctx, bool force);
 static void home_meta_refresh_task(void *arg);
 static void rebuild_all_home_tiles(void);
 static void show_global_attacks_page(void);
+static void show_sd_admin_page(void);
+static void sd_admin_start_cb(lv_event_t *e);
+static void sd_admin_quick_start_cb(lv_event_t *e);
+static void sd_admin_stop_cb(lv_event_t *e);
+static void sd_admin_back_cb(lv_event_t *e);
+static void sd_admin_password_focus_cb(lv_event_t *e);
+static void sd_admin_show_password_toggle_cb(lv_event_t *e);
+static void sd_admin_password_insert_cb(lv_event_t *e);
 static void global_attack_tile_event_cb(lv_event_t *e);
 static void show_beacon_spam_page(void);
 static void beacon_spam_back_btn_event_cb(lv_event_t *e);
@@ -6842,6 +6871,9 @@ static void switch_to_internal_settings_page(void)
     if (!internal_container) return;
 
     if (current_tab != TAB_INTERNAL) {
+        // SD Admin is configured in Internal Settings but controls the JanOS
+        // device on the UART tab the user was just using.
+        sd_admin_target_tab = current_tab;
         tab_context_t *old_ctx = get_current_ctx();
         save_globals_to_tab_context(old_ctx);
 
@@ -42288,6 +42320,8 @@ static void settings_tile_event_cb(lv_event_t *e)
         show_screen_lock_popup();
     } else if (strcmp(tile_name, "Monster OTA") == 0) {
         show_ota_page();
+    } else if (strcmp(tile_name, "Monster SD Admin") == 0) {
+        show_sd_admin_page();
     }
 }
 
@@ -42386,6 +42420,587 @@ static void show_settings_page(void)
 
     // Monster OTA tile (ESP32-C5 firmware update)
     create_tile(tiles, LV_SYMBOL_DOWNLOAD, "Monster\nOTA", COLOR_MATERIAL_ORANGE, settings_tile_event_cb, "Monster OTA");
+
+    // JanOS SD card file manager (controlled over the selected external UART).
+    create_tile(tiles, LV_SYMBOL_SAVE, "Monster SD\nAdmin", COLOR_MATERIAL_GREEN, settings_tile_event_cb, "Monster SD Admin");
+}
+
+#define SD_ADMIN_STOPPED   0
+#define SD_ADMIN_STARTING  1
+#define SD_ADMIN_RUNNING   2
+#define SD_ADMIN_STOPPING  3
+#define SD_ADMIN_TIMEOUT_MS 10000
+#define SD_ADMIN_NVS_NAMESPACE "sd_admin"
+#define SD_ADMIN_NVS_PASSWORD_KEY "wpa2_pass"
+
+static bool sd_admin_load_saved_password(char *password, size_t password_size)
+{
+    if (!password || password_size == 0) return false;
+    password[0] = '\0';
+    nvs_handle_t nvs;
+    if (nvs_open(SD_ADMIN_NVS_NAMESPACE, NVS_READONLY, &nvs) != ESP_OK) return false;
+    size_t stored_size = password_size;
+    esp_err_t err = nvs_get_str(nvs, SD_ADMIN_NVS_PASSWORD_KEY, password, &stored_size);
+    nvs_close(nvs);
+    return err == ESP_OK;
+}
+
+static bool sd_admin_save_password(const char *password)
+{
+    if (!password || !password[0]) return false;
+    nvs_handle_t nvs;
+    if (nvs_open(SD_ADMIN_NVS_NAMESPACE, NVS_READWRITE, &nvs) != ESP_OK) return false;
+    esp_err_t err = nvs_set_str(nvs, SD_ADMIN_NVS_PASSWORD_KEY, password);
+    if (err == ESP_OK) err = nvs_commit(nvs);
+    nvs_close(nvs);
+    return err == ESP_OK;
+}
+
+static bool sd_admin_contains_ci(const char *line, const char *needle)
+{
+    if (!line || !needle || !needle[0]) return false;
+    size_t needle_len = strlen(needle);
+    for (const char *p = line; *p; ++p) {
+        if (strncasecmp(p, needle, needle_len) == 0) return true;
+    }
+    return false;
+}
+
+static const char *sd_admin_state_name(uint8_t state)
+{
+    switch (state) {
+        case SD_ADMIN_STARTING: return "Starting";
+        case SD_ADMIN_RUNNING: return "Running";
+        case SD_ADMIN_STOPPING: return "Stopping";
+        default: return "Stopped";
+    }
+}
+
+static tab_id_t sd_admin_resolve_target_tab(void)
+{
+    if (!tab_is_internal(sd_admin_target_tab)) return sd_admin_target_tab;
+    if (grove_detected) return TAB_GROVE;
+    if (usb_detected) return TAB_USB;
+    if (mbus_detected) return TAB_MBUS;
+    return TAB_INTERNAL;
+}
+
+static void sd_admin_return_to_settings(tab_context_t *ctx)
+{
+    if (ctx && ctx->sd_admin_page) lv_obj_add_flag(ctx->sd_admin_page, LV_OBJ_FLAG_HIDDEN);
+    if (internal_settings_page) lv_obj_clear_flag(internal_settings_page, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void sd_admin_set_status(tab_context_t *ctx, uint8_t state, const char *message)
+{
+    if (!ctx) return;
+    ctx->sd_admin_state = state;
+    snprintf(ctx->sd_admin_status, sizeof(ctx->sd_admin_status), "%s", message ? message : "");
+}
+
+static void sd_admin_hide_qr(tab_context_t *ctx)
+{
+    if (ctx && ctx->sd_admin_qr_section && lv_obj_is_valid(ctx->sd_admin_qr_section)) {
+        lv_obj_add_flag(ctx->sd_admin_qr_section, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void sd_admin_show_qr(tab_context_t *ctx)
+{
+    if (!ctx || !ctx->sd_admin_qr || !lv_obj_is_valid(ctx->sd_admin_qr) ||
+        !ctx->sd_admin_active_password[0]) return;
+
+    char wifi_qr[128];
+    snprintf(wifi_qr, sizeof(wifi_qr), "WIFI:T:WPA;S:JanOS-Admin;P:%s;;",
+             ctx->sd_admin_active_password);
+    lv_qrcode_set_data(ctx->sd_admin_qr, wifi_qr);
+    memset(wifi_qr, 0, sizeof(wifi_qr));
+    if (ctx->sd_admin_qr_section && lv_obj_is_valid(ctx->sd_admin_qr_section)) {
+        lv_obj_clear_flag(ctx->sd_admin_qr_section, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+/* Must be called while the LVGL display is locked or from an LVGL event. */
+static void sd_admin_refresh_ui(tab_context_t *ctx)
+{
+    if (!ctx) return;
+    if (ctx->sd_admin_status_label && lv_obj_is_valid(ctx->sd_admin_status_label)) {
+        lv_label_set_text_fmt(ctx->sd_admin_status_label, "%s\n%s",
+                              sd_admin_state_name(ctx->sd_admin_state), ctx->sd_admin_status);
+        lv_obj_set_style_text_color(ctx->sd_admin_status_label,
+            ctx->sd_admin_state == SD_ADMIN_RUNNING ? COLOR_MATERIAL_GREEN :
+            (ctx->sd_admin_state == SD_ADMIN_STOPPED ? ui_muted_color() : COLOR_MATERIAL_AMBER), 0);
+    }
+    if (ctx->sd_admin_start_btn && lv_obj_is_valid(ctx->sd_admin_start_btn)) {
+        if (ctx->sd_admin_state == SD_ADMIN_STOPPED) lv_obj_clear_state(ctx->sd_admin_start_btn, LV_STATE_DISABLED);
+        else lv_obj_add_state(ctx->sd_admin_start_btn, LV_STATE_DISABLED);
+    }
+    if (ctx->sd_admin_quick_start_btn && lv_obj_is_valid(ctx->sd_admin_quick_start_btn)) {
+        if (ctx->sd_admin_state == SD_ADMIN_STOPPED) lv_obj_clear_state(ctx->sd_admin_quick_start_btn, LV_STATE_DISABLED);
+        else lv_obj_add_state(ctx->sd_admin_quick_start_btn, LV_STATE_DISABLED);
+    }
+    if (ctx->sd_admin_stop_btn && lv_obj_is_valid(ctx->sd_admin_stop_btn)) {
+        if (ctx->sd_admin_state == SD_ADMIN_RUNNING) lv_obj_clear_state(ctx->sd_admin_stop_btn, LV_STATE_DISABLED);
+        else lv_obj_add_state(ctx->sd_admin_stop_btn, LV_STATE_DISABLED);
+    }
+}
+
+static void sd_admin_consume_line(tab_context_t *ctx, const char *line)
+{
+    if (!ctx || !line) return;
+    uint8_t state = ctx->sd_admin_state;
+    if (sd_admin_contains_ci(line, "Admin portal started. Connect to 'JanOS-Admin'")) {
+        sd_admin_set_status(ctx, SD_ADMIN_RUNNING,
+                            "Connect to Wi-Fi JanOS-Admin, then open http://172.0.0.1");
+        sd_admin_show_qr(ctx);
+    } else if (sd_admin_contains_ci(line, "Failed to initialize SD card")) {
+        sd_admin_set_status(ctx, SD_ADMIN_STOPPED,
+                            "SD card unavailable. Insert it and try again.");
+    } else if (sd_admin_contains_ci(line, "Portal already running")) {
+        sd_admin_set_status(ctx, SD_ADMIN_RUNNING,
+                            "The portal is already running. Connect to Wi-Fi JanOS-Admin.");
+    } else if (sd_admin_contains_ci(line, "password") &&
+               (sd_admin_contains_ci(line, "length") || sd_admin_contains_ci(line, "8-63"))) {
+        sd_admin_set_status(ctx, SD_ADMIN_STOPPED, "The WPA2 password must be 8-63 characters long.");
+    } else if (state == SD_ADMIN_STARTING &&
+               (sd_admin_contains_ci(line, "failed to start") ||
+                sd_admin_contains_ci(line, "error") ||
+                (sd_admin_contains_ci(line, "AP") &&
+                 (sd_admin_contains_ci(line, "unable") || sd_admin_contains_ci(line, "could not"))) ||
+                (sd_admin_contains_ci(line, "HTTP") &&
+                 (sd_admin_contains_ci(line, "unable") || sd_admin_contains_ci(line, "could not"))))) {
+        sd_admin_set_status(ctx, SD_ADMIN_STOPPED, "JanOS could not start the AP or HTTP portal.");
+    } else if (state == SD_ADMIN_STOPPING &&
+               (sd_admin_contains_ci(line, "admin portal stopped") ||
+                sd_admin_contains_ci(line, "portal stopped") ||
+                sd_admin_contains_ci(line, "stopped"))) {
+        sd_admin_set_status(ctx, SD_ADMIN_STOPPED, "Portal stopped.");
+        sd_admin_hide_qr(ctx);
+    }
+}
+
+static void sd_admin_monitor_task(void *arg)
+{
+    tab_context_t *ctx = (tab_context_t *)arg;
+    if (!ctx) { vTaskDelete(NULL); return; }
+    tab_id_t task_tab = sd_admin_resolve_target_tab();
+    if (tab_is_internal(task_tab)) {
+        if (bsp_display_lock(50)) {
+            sd_admin_set_status(ctx, SD_ADMIN_STOPPED, "No JanOS UART device is connected.");
+            sd_admin_refresh_ui(ctx);
+            bsp_display_unlock();
+        }
+        ctx->sd_admin_task = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+    uart_port_t uart_port = uart_port_for_tab(task_tab);
+    uint8_t rx[128];
+    char line[256];
+    int line_pos = 0;
+    TickType_t started_at = xTaskGetTickCount();
+    bool done = false;
+
+    while (!done && (xTaskGetTickCount() - started_at) < pdMS_TO_TICKS(SD_ADMIN_TIMEOUT_MS)) {
+        int len = transport_read_bytes_tab(task_tab, uart_port, rx, sizeof(rx), pdMS_TO_TICKS(100));
+        for (int i = 0; i < len; i++) {
+            char c = (char)rx[i];
+            if (c == '\r' || c == '\n') {
+                if (line_pos == 0) continue;
+                line[line_pos] = '\0';
+                if (bsp_display_lock(50)) {
+                    sd_admin_consume_line(ctx, line);
+                    sd_admin_refresh_ui(ctx);
+                    bsp_display_unlock();
+                }
+                if (ctx->sd_admin_state == SD_ADMIN_RUNNING || ctx->sd_admin_state == SD_ADMIN_STOPPED) done = true;
+                line_pos = 0;
+            } else if (line_pos < (int)sizeof(line) - 1) {
+                line[line_pos++] = c;
+            }
+        }
+    }
+
+    if (!done && bsp_display_lock(50)) {
+        if (ctx->sd_admin_state == SD_ADMIN_STOPPING) {
+            sd_admin_set_status(ctx, SD_ADMIN_STOPPED, "Stop confirmation timed out; the state was reset.");
+            sd_admin_hide_qr(ctx);
+        } else if (ctx->sd_admin_state == SD_ADMIN_STARTING) {
+            sd_admin_set_status(ctx, SD_ADMIN_STOPPED, "Start confirmation timed out; the portal was not confirmed.");
+        }
+        sd_admin_refresh_ui(ctx);
+        bsp_display_unlock();
+    }
+    ctx->sd_admin_task = NULL;
+    vTaskDelete(NULL);
+}
+
+static void sd_admin_begin_monitor(tab_context_t *ctx)
+{
+    if (!ctx || ctx->sd_admin_task) return;
+    if (xTaskCreate(sd_admin_monitor_task, "sd_admin_uart", 4096, ctx, 9, &ctx->sd_admin_task) != pdPASS) {
+        ctx->sd_admin_task = NULL;
+        sd_admin_set_status(ctx, SD_ADMIN_STOPPED, "Could not start the UART response task.");
+        sd_admin_refresh_ui(ctx);
+    }
+}
+
+static void sd_admin_show_last_command(tab_context_t *ctx, const char *command)
+{
+    if (!ctx || !command || !ctx->sd_admin_command_label ||
+        !lv_obj_is_valid(ctx->sd_admin_command_label)) return;
+    lv_label_set_text_fmt(ctx->sd_admin_command_label, "Last command: %s", command);
+    lv_obj_clear_flag(ctx->sd_admin_command_label, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void sd_admin_keyboard_cb(lv_event_t *e)
+{
+    if (lv_event_get_code(e) == LV_EVENT_READY || lv_event_get_code(e) == LV_EVENT_CANCEL) {
+        lv_obj_add_flag(lv_event_get_target(e), LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void sd_admin_password_focus_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = &internal_ctx;
+    if (!ctx || !ctx->sd_admin_keyboard) return;
+    lv_keyboard_set_textarea(ctx->sd_admin_keyboard, ctx->sd_admin_password_input);
+    lv_obj_clear_flag(ctx->sd_admin_keyboard, LV_OBJ_FLAG_HIDDEN);
+    (void)e;
+}
+
+static void sd_admin_show_password_toggle_cb(lv_event_t *e)
+{
+    lv_obj_t *checkbox = lv_event_get_target(e);
+    lv_obj_t *password_input = (lv_obj_t *)lv_event_get_user_data(e);
+    if (!password_input) return;
+    lv_textarea_set_password_mode(password_input,
+                                  !lv_obj_has_state(checkbox, LV_STATE_CHECKED));
+}
+
+static void sd_admin_password_insert_cb(lv_event_t *e)
+{
+    const char *inserted = (const char *)lv_event_get_param(e);
+    if (inserted && strchr(inserted, ' ')) {
+        lv_textarea_set_insert_replace(lv_event_get_target(e), "");
+    }
+}
+
+static void sd_admin_start_with_password(tab_context_t *ctx, const char *password, bool save_to_nvs)
+{
+    if (!ctx || ctx->sd_admin_state != SD_ADMIN_STOPPED || !password) return;
+    size_t password_len = strlen(password);
+    if (password_len < 8 || password_len > 63 || strchr(password, ' ') ||
+        strchr(password, '\r') || strchr(password, '\n')) {
+        sd_admin_set_status(ctx, SD_ADMIN_STOPPED, "Enter a WPA2 password with 8-63 characters and no spaces.");
+        sd_admin_refresh_ui(ctx);
+        return;
+    }
+    tab_id_t tab = sd_admin_resolve_target_tab();
+    if (tab_is_internal(tab)) {
+        sd_admin_set_status(ctx, SD_ADMIN_STOPPED, "No JanOS UART device is connected.");
+        sd_admin_refresh_ui(ctx);
+        return;
+    }
+    uart_port_t uart_port = uart_port_for_tab(tab);
+    if (save_to_nvs && !sd_admin_save_password(password)) {
+        sd_admin_set_status(ctx, SD_ADMIN_STOPPED, "Could not save the WPA2 password locally.");
+        sd_admin_refresh_ui(ctx);
+        return;
+    }
+    char command[96];
+    snprintf(command, sizeof(command), "start_admin_portal %s", password);
+    transport_write_bytes_tab(tab, uart_port, command, strlen(command));
+    transport_write_bytes_tab(tab, uart_port, "\r\n", 2);
+    sd_admin_show_last_command(ctx, command);
+    snprintf(ctx->sd_admin_active_password, sizeof(ctx->sd_admin_active_password), "%s", password);
+    memset(command, 0, sizeof(command));
+    sd_admin_hide_qr(ctx);
+    if (ctx->sd_admin_keyboard) lv_obj_add_flag(ctx->sd_admin_keyboard, LV_OBJ_FLAG_HIDDEN);
+    sd_admin_set_status(ctx, SD_ADMIN_STARTING, "Starting portal; waiting for JanOS confirmation...");
+    sd_admin_refresh_ui(ctx);
+    sd_admin_begin_monitor(ctx);
+}
+
+static void sd_admin_start_cb(lv_event_t *e)
+{
+    (void)e;
+    tab_context_t *ctx = &internal_ctx;
+    const char *password = ctx && ctx->sd_admin_password_input ?
+                           lv_textarea_get_text(ctx->sd_admin_password_input) : NULL;
+    sd_admin_start_with_password(ctx, password, true);
+}
+
+static void sd_admin_quick_start_cb(lv_event_t *e)
+{
+    (void)e;
+    sd_admin_start_with_password(&internal_ctx, "12345678", false);
+}
+
+static void sd_admin_stop_cb(lv_event_t *e)
+{
+    (void)e;
+    tab_context_t *ctx = &internal_ctx;
+    if (!ctx || ctx->sd_admin_state != SD_ADMIN_RUNNING) return;
+    tab_id_t tab = sd_admin_resolve_target_tab();
+    uart_port_t uart_port = uart_port_for_tab(tab);
+    transport_write_bytes_tab(tab, uart_port, "stop\r\n", 6);
+    sd_admin_set_status(ctx, SD_ADMIN_STOPPING, "Stopping portal; waiting for JanOS confirmation...");
+    sd_admin_refresh_ui(ctx);
+    sd_admin_begin_monitor(ctx);
+}
+
+static void sd_admin_leave_keep_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx) return;
+    if (ctx->sd_admin_leave_overlay) {
+        lv_obj_del(ctx->sd_admin_leave_overlay);
+        ctx->sd_admin_leave_overlay = NULL;
+    }
+    sd_admin_return_to_settings(ctx);
+}
+
+static void sd_admin_leave_stop_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx) return;
+    if (ctx->sd_admin_leave_overlay) {
+        lv_obj_del(ctx->sd_admin_leave_overlay);
+        ctx->sd_admin_leave_overlay = NULL;
+    }
+    /* Keep the page visible so STOPPING is visible until UART confirms it. */
+    sd_admin_stop_cb(NULL);
+}
+
+static void sd_admin_back_cb(lv_event_t *e)
+{
+    (void)e;
+    tab_context_t *ctx = &internal_ctx;
+    if (!ctx) return;
+    if (ctx->sd_admin_state != SD_ADMIN_RUNNING) {
+        sd_admin_return_to_settings(ctx);
+        return;
+    }
+    if (ctx->sd_admin_leave_overlay) return;
+    lv_obj_t *container = internal_container;
+    ctx->sd_admin_leave_overlay = lv_obj_create(container);
+    lv_obj_remove_style_all(ctx->sd_admin_leave_overlay);
+    lv_obj_set_size(ctx->sd_admin_leave_overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(ctx->sd_admin_leave_overlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(ctx->sd_admin_leave_overlay, LV_OPA_50, 0);
+    lv_obj_clear_flag(ctx->sd_admin_leave_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *dialog = lv_obj_create(ctx->sd_admin_leave_overlay);
+    lv_obj_set_size(dialog, 520, 260);
+    lv_obj_center(dialog);
+    style_surface_panel(dialog, 14);
+    lv_obj_set_flex_flow(dialog, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(dialog, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_all(dialog, 22, 0);
+    lv_obj_t *title = lv_label_create(dialog);
+    lv_label_set_text(title, "Admin portal is running");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_t *text = lv_label_create(dialog);
+    lv_label_set_text(text, "Keep it active or stop it before going back?");
+    lv_obj_set_style_text_color(text, ui_muted_color(), 0);
+    lv_obj_t *row = lv_obj_create(dialog);
+    lv_obj_set_size(row, lv_pct(100), 56);
+    lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(row, 0, 0);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(row, 16, 0);
+    lv_obj_t *keep = lv_btn_create(row);
+    lv_obj_set_size(keep, 210, 48);
+    lv_obj_set_style_bg_color(keep, COLOR_MATERIAL_GREEN, 0);
+    lv_obj_add_event_cb(keep, sd_admin_leave_keep_cb, LV_EVENT_CLICKED, ctx);
+    lv_obj_t *keep_label = lv_label_create(keep);
+    lv_label_set_text(keep_label, "Keep running");
+    lv_obj_center(keep_label);
+    lv_obj_t *stop = lv_btn_create(row);
+    lv_obj_set_size(stop, 150, 48);
+    style_danger_button(stop);
+    lv_obj_add_event_cb(stop, sd_admin_leave_stop_cb, LV_EVENT_CLICKED, ctx);
+    lv_obj_t *stop_label = lv_label_create(stop);
+    lv_label_set_text(stop_label, "Stop portal");
+    lv_obj_center(stop_label);
+}
+
+static void show_sd_admin_page(void)
+{
+    tab_context_t *ctx = &internal_ctx;
+    lv_obj_t *container = internal_container;
+    if (!ctx || !container) return;
+    if (internal_settings_page) lv_obj_add_flag(internal_settings_page, LV_OBJ_FLAG_HIDDEN);
+    hide_all_pages(ctx);
+    if (ctx->sd_admin_page) {
+        lv_obj_clear_flag(ctx->sd_admin_page, LV_OBJ_FLAG_HIDDEN);
+        ctx->current_visible_page = ctx->sd_admin_page;
+        sd_admin_refresh_ui(ctx);
+        return;
+    }
+
+    ctx->sd_admin_page = lv_obj_create(container);
+    lv_obj_set_size(ctx->sd_admin_page, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(ctx->sd_admin_page, ui_bg_color(), 0);
+    lv_obj_set_style_border_width(ctx->sd_admin_page, 0, 0);
+    lv_obj_set_style_pad_all(ctx->sd_admin_page, 18, 0);
+    lv_obj_set_flex_flow(ctx->sd_admin_page, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(ctx->sd_admin_page, 14, 0);
+
+    lv_obj_t *header = lv_obj_create(ctx->sd_admin_page);
+    lv_obj_set_size(header, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(header, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(header, 0, 0);
+    lv_obj_set_style_pad_all(header, 0, 0);
+    lv_obj_set_flex_flow(header, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(header, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(header, 14, 0);
+    lv_obj_t *back = lv_btn_create(header);
+    lv_obj_set_size(back, 72, 60);
+    style_back_nav_button(back);
+    lv_obj_add_event_cb(back, sd_admin_back_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *back_label = lv_label_create(back);
+    lv_label_set_text(back_label, LV_SYMBOL_LEFT);
+    lv_obj_center(back_label);
+    lv_obj_t *title = lv_label_create(header);
+    lv_label_set_text(title, "SD Card Admin / File Manager");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_GREEN, 0);
+
+    lv_obj_t *info = lv_obj_create(ctx->sd_admin_page);
+    lv_obj_set_size(info, lv_pct(100), LV_SIZE_CONTENT);
+    style_surface_panel(info, 10);
+    lv_obj_set_style_pad_all(info, 14, 0);
+    lv_obj_t *info_text = lv_label_create(info);
+    lv_label_set_text(info_text,
+        "Secure SD file manager. Only devices connected to JanOS-Admin can access /sdcard/lab.\n"
+        "1. Enter a WPA2 password and tap Start, or use Quick Start.\n"
+        "2. When status shows Running, scan the QR code or join Wi-Fi: JanOS-Admin\n"
+        "3. Open: http://172.0.0.1");
+    lv_label_set_long_mode(info_text, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(info_text, lv_pct(100));
+    lv_obj_set_style_text_font(info_text, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(info_text, ui_text_color(), 0);
+
+    lv_obj_t *form = lv_obj_create(ctx->sd_admin_page);
+    lv_obj_set_size(form, lv_pct(100), LV_SIZE_CONTENT);
+    style_surface_panel(form, 10);
+    lv_obj_set_style_pad_all(form, 14, 0);
+    lv_obj_set_flex_flow(form, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(form, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_set_style_pad_row(form, 8, 0);
+    ctx->sd_admin_password_input = lv_textarea_create(form);
+    lv_obj_set_size(ctx->sd_admin_password_input, 520, 48);
+    lv_textarea_set_one_line(ctx->sd_admin_password_input, true);
+    lv_textarea_set_max_length(ctx->sd_admin_password_input, 63);
+    lv_textarea_set_password_mode(ctx->sd_admin_password_input, true);
+    lv_textarea_set_password_show_time(ctx->sd_admin_password_input, WPASEC_PASSWORD_SHOW_MS);
+    lv_textarea_set_placeholder_text(ctx->sd_admin_password_input, "Enter WPA2 password");
+    lv_obj_add_event_cb(ctx->sd_admin_password_input, sd_admin_password_focus_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(ctx->sd_admin_password_input, sd_admin_password_focus_cb, LV_EVENT_FOCUSED, NULL);
+    lv_obj_add_event_cb(ctx->sd_admin_password_input, sd_admin_password_insert_cb, LV_EVENT_INSERT, NULL);
+    char saved_password[64];
+    if (sd_admin_load_saved_password(saved_password, sizeof(saved_password))) {
+        lv_textarea_set_text(ctx->sd_admin_password_input, saved_password);
+    }
+    memset(saved_password, 0, sizeof(saved_password));
+    lv_obj_t *show_password_checkbox = lv_checkbox_create(form);
+    lv_checkbox_set_text(show_password_checkbox, "Show password");
+    lv_obj_set_style_text_font(show_password_checkbox, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(show_password_checkbox, ui_text_color(), 0);
+    lv_obj_add_event_cb(show_password_checkbox, sd_admin_show_password_toggle_cb,
+                        LV_EVENT_VALUE_CHANGED, ctx->sd_admin_password_input);
+
+    lv_obj_t *actions = lv_obj_create(ctx->sd_admin_page);
+    lv_obj_set_size(actions, lv_pct(100), 56);
+    lv_obj_set_style_bg_opa(actions, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(actions, 0, 0);
+    lv_obj_set_style_pad_all(actions, 0, 0);
+    lv_obj_set_flex_flow(actions, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(actions, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(actions, 14, 0);
+    ctx->sd_admin_start_btn = lv_btn_create(actions);
+    lv_obj_set_size(ctx->sd_admin_start_btn, 220, 52);
+    lv_obj_set_style_bg_color(ctx->sd_admin_start_btn, COLOR_MATERIAL_GREEN, 0);
+    lv_obj_add_event_cb(ctx->sd_admin_start_btn, sd_admin_start_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *start_label = lv_label_create(ctx->sd_admin_start_btn);
+    lv_label_set_text(start_label, "Start Admin Portal");
+    lv_obj_center(start_label);
+    ctx->sd_admin_quick_start_btn = lv_btn_create(actions);
+    lv_obj_set_size(ctx->sd_admin_quick_start_btn, 150, 52);
+    lv_obj_set_style_bg_color(ctx->sd_admin_quick_start_btn, COLOR_MATERIAL_TEAL, 0);
+    lv_obj_set_style_bg_color(ctx->sd_admin_quick_start_btn, lv_color_hex(0x00796B), LV_STATE_PRESSED);
+    lv_obj_add_event_cb(ctx->sd_admin_quick_start_btn, sd_admin_quick_start_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *quick_start_label = lv_label_create(ctx->sd_admin_quick_start_btn);
+    lv_label_set_text(quick_start_label, "Quick Start");
+    lv_obj_center(quick_start_label);
+    ctx->sd_admin_stop_btn = lv_btn_create(actions);
+    lv_obj_set_size(ctx->sd_admin_stop_btn, 160, 52);
+    style_danger_button(ctx->sd_admin_stop_btn);
+    lv_obj_add_event_cb(ctx->sd_admin_stop_btn, sd_admin_stop_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *stop_label = lv_label_create(ctx->sd_admin_stop_btn);
+    lv_label_set_text(stop_label, "Stop Portal");
+    lv_obj_center(stop_label);
+    lv_obj_t *quick_start_info = lv_label_create(ctx->sd_admin_page);
+    lv_label_set_text(quick_start_info, "Quick Start password: 12345678");
+    lv_obj_set_style_text_font(quick_start_info, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(quick_start_info, COLOR_MATERIAL_TEAL, 0);
+
+    lv_obj_t *status_panel = lv_obj_create(ctx->sd_admin_page);
+    lv_obj_set_size(status_panel, lv_pct(100), LV_SIZE_CONTENT);
+    style_surface_panel(status_panel, 10);
+    lv_obj_set_style_pad_all(status_panel, 12, 0);
+    lv_obj_set_flex_flow(status_panel, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(status_panel, 4, 0);
+    ctx->sd_admin_status_label = lv_label_create(status_panel);
+    lv_label_set_long_mode(ctx->sd_admin_status_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(ctx->sd_admin_status_label, lv_pct(100));
+    lv_obj_set_style_text_font(ctx->sd_admin_status_label, &lv_font_montserrat_16, 0);
+    ctx->sd_admin_command_label = lv_label_create(status_panel);
+    lv_label_set_long_mode(ctx->sd_admin_command_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(ctx->sd_admin_command_label, lv_pct(100));
+    lv_obj_set_style_text_font(ctx->sd_admin_command_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(ctx->sd_admin_command_label, ui_muted_color(), 0);
+    lv_obj_add_flag(ctx->sd_admin_command_label, LV_OBJ_FLAG_HIDDEN);
+    if (!ctx->sd_admin_status[0]) sd_admin_set_status(ctx, SD_ADMIN_STOPPED,
+                                                       "Enter a WPA2 password or use Quick Start.");
+
+    ctx->sd_admin_qr_section = lv_obj_create(ctx->sd_admin_page);
+    lv_obj_set_size(ctx->sd_admin_qr_section, lv_pct(100), 264);
+    style_surface_panel(ctx->sd_admin_qr_section, 12);
+    lv_obj_set_style_pad_all(ctx->sd_admin_qr_section, 10, 0);
+    lv_obj_clear_flag(ctx->sd_admin_qr_section, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *qr_heading = lv_label_create(ctx->sd_admin_qr_section);
+    lv_label_set_text(qr_heading, "Phone connection");
+    lv_obj_set_style_text_font(qr_heading, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(qr_heading, COLOR_MATERIAL_GREEN, 0);
+    lv_obj_align(qr_heading, LV_ALIGN_TOP_MID, 0, 0);
+    lv_obj_t *qr_label = lv_label_create(ctx->sd_admin_qr_section);
+    lv_label_set_text(qr_label, "Scan QR to join JanOS-Admin");
+    lv_obj_set_style_text_font(qr_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(qr_label, ui_muted_color(), 0);
+    lv_obj_align(qr_label, LV_ALIGN_TOP_MID, 0, 24);
+    ctx->sd_admin_qr = lv_qrcode_create(ctx->sd_admin_qr_section);
+    lv_qrcode_set_size(ctx->sd_admin_qr, 190);
+    lv_qrcode_set_dark_color(ctx->sd_admin_qr, lv_color_black());
+    lv_qrcode_set_light_color(ctx->sd_admin_qr, lv_color_white());
+    lv_qrcode_set_quiet_zone(ctx->sd_admin_qr, true);
+    lv_obj_set_style_border_color(ctx->sd_admin_qr, lv_color_white(), 0);
+    lv_obj_set_style_border_width(ctx->sd_admin_qr, 5, 0);
+    lv_obj_align(ctx->sd_admin_qr, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_add_flag(ctx->sd_admin_qr_section, LV_OBJ_FLAG_HIDDEN);
+
+    ctx->sd_admin_keyboard = lv_keyboard_create(ctx->sd_admin_page);
+    lv_obj_set_size(ctx->sd_admin_keyboard, lv_pct(100), 240);
+    lv_obj_add_flag(ctx->sd_admin_keyboard, LV_OBJ_FLAG_FLOATING);
+    lv_obj_align(ctx->sd_admin_keyboard, LV_ALIGN_BOTTOM_MID, 0, -8);
+    style_on_screen_keyboard(ctx->sd_admin_keyboard);
+    lv_keyboard_set_textarea(ctx->sd_admin_keyboard, ctx->sd_admin_password_input);
+    lv_obj_add_event_cb(ctx->sd_admin_keyboard, sd_admin_keyboard_cb, LV_EVENT_ALL, NULL);
+    lv_obj_add_flag(ctx->sd_admin_keyboard, LV_OBJ_FLAG_HIDDEN);
+    ctx->current_visible_page = ctx->sd_admin_page;
+    sd_admin_refresh_ui(ctx);
 }
 
 void app_main(void)
