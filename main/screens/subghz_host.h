@@ -72,6 +72,10 @@ typedef struct subghz_tab_state {
     volatile bool listen_rssi_dirty;
     int           listen_rssi_peak_dbm; /* peak-hold display value */
     int           listen_rssi_hold_ticks; /* remaining ticks to hold the peak */
+    int           wf_capture_hold;      /* remaining ticks to hold red waterfall marker */
+    unsigned      wf_col_counter;       /* pushed-column count, drives the scrolling time grid */
+    int           wf_noise_floor;       /* slow RSSI baseline (EMA) for energy detection */
+    int           wf_energy_hold;       /* remaining ticks to hold the RSSI energy marker */
     lv_obj_t   *listen_rssi_arc;
     lv_obj_t   *listen_rssi_lbl;
     lv_obj_t   *btn_start_stop;

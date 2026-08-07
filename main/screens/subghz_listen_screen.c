@@ -28,7 +28,7 @@ static void stop_listening(subghz_tab_state_t *st);
 /* ---- Layout (Tab5: large) ----- */
 #define WATERFALL_W       800
 #define WATERFALL_H       70
-#define WATERFALL_TICK_MS 120
+#define WATERFALL_TICK_MS 60
 #define SIGNAL_CHUNK_CAPACITY 64
 #define SIGNAL_ROW_HEIGHT     34
 #define SIGNAL_ROW_POOL_SIZE  16
@@ -41,6 +41,25 @@ static void stop_listening(subghz_tab_state_t *st);
 #define WF_BG_COLOR    0x0A1628
 #define WF_GRID_COLOR  0x152540
 
+/* RSSI -> waterfall colour range, narrowed to the real operating band so
+ * noise (~-87) stays blue and a signal (~-66..-55) turns orange/red at once. */
+#define WF_RSSI_MIN_DBM       (-95)
+#define WF_RSSI_MAX_DBM       (-55)
+#define WF_CAPTURE_HOLD_TICKS 10     /* hold the red decode marker N ticks (wide, unmissable band) */
+/* Push several columns per tick so the sweep scrolls faster and each ~1 Hz
+ * RSSI sample paints a visibly thicker band. */
+#define WF_COLS_PER_TICK      2
+/* Immediate energy marker: flag a spike the instant RSSI rises clearly above
+ * the adaptive noise floor (or past an absolute strong level), so a caught
+ * signal is unmistakable without waiting for a firmware decode line. */
+#define WF_ENERGY_MARGIN_DB   14
+#define WF_ENERGY_ABS_DBM     (-60)
+#define WF_ENERGY_HOLD_TICKS  6
+/* Faint vertical time grid, scrolled with the waterfall, so the sweep is
+ * visibly moving from the moment listening starts even when the RSSI (and
+ * therefore the column colour) barely changes. */
+#define WF_TIMEGRID_COLS      24     /* one gridline every N columns (~3 s) */
+
 #define UART_BUF_LEN 256
 #define LINE_BUF_LEN 512
 
@@ -50,9 +69,9 @@ static void stop_listening(subghz_tab_state_t *st);
 
 /* Peak-hold: pin the gauge at a caught signal's level for a while, then
  * ease it back down so a burst stays visible instead of flashing for one
- * frame. Tuned for the 120 ms ui tick (WATERFALL_TICK_MS). */
-#define LISTEN_RSSI_HOLD_TICKS  12   /* ~1.5 s hold */
-#define LISTEN_RSSI_DECAY_DBM   3    /* dB eased off per tick after hold */
+ * frame. Tuned for the 60 ms ui tick (WATERFALL_TICK_MS). */
+#define LISTEN_RSSI_HOLD_TICKS  24   /* ~1.4 s hold */
+#define LISTEN_RSSI_DECAY_DBM   2    /* dB eased off per tick after hold */
 #define LISTEN_RSSI_CAPTURE_DBM (-45) /* floor forced when a signal decodes */
 
 /* Private types (forward-declared in subghz_host.h) */
@@ -259,40 +278,99 @@ static inline uint16_t wf_color(uint32_t hex)
     return lv_color_to_u16(lv_color_hex(hex));
 }
 
+/* Map an RSSI dBm value to an RGB triple across a dark-blue -> blue -> cyan
+ * -> green -> yellow -> red gradient (same stops as Mate's Listen waterfall).
+ * Values outside [WF_RSSI_MIN_DBM, WF_RSSI_MAX_DBM] are clamped. */
+static void wf_rssi_rgb(int rssi, int *pr, int *pg, int *pb)
+{
+    static const uint8_t stops[6][3] = {
+        {  10,  22,  40 },
+        {   0,  80, 160 },
+        {   0, 200, 200 },
+        { 120, 220,  60 },
+        { 255, 220,  40 },
+        { 255,  80,  40 },
+    };
+
+    float t = (float)(rssi - WF_RSSI_MIN_DBM) /
+              (float)(WF_RSSI_MAX_DBM - WF_RSSI_MIN_DBM);
+    if (t < 0.0f) t = 0.0f;
+    if (t > 1.0f) t = 1.0f;
+
+    float seg = t * (6 - 1);
+    int   i   = (int)seg;
+    if (i > 6 - 2) i = 6 - 2;
+    float f = seg - (float)i;
+
+    *pr = (int)(stops[i][0] + (stops[i + 1][0] - stops[i][0]) * f + 0.5f);
+    *pg = (int)(stops[i][1] + (stops[i + 1][1] - stops[i][1]) * f + 0.5f);
+    *pb = (int)(stops[i][2] + (stops[i + 1][2] - stops[i][2]) * f + 0.5f);
+}
+
+
+
 static void waterfall_fill_bg(uint16_t *buf)
 {
     uint16_t bg   = wf_color(WF_BG_COLOR);
     uint16_t grid = wf_color(WF_GRID_COLOR);
     for (int y = 0; y < WATERFALL_H; y++) {
-        uint16_t c = (y % 10 == 0) ? grid : bg;
-        for (int x = 0; x < WATERFALL_W; x++)
-            buf[y * WATERFALL_W + x] = c;
+        uint16_t row = (y % 10 == 0) ? grid : bg;
+        for (int x = 0; x < WATERFALL_W; x++) {
+            /* Vertical time grid, aligned to the left edge so it stays in
+             * phase with the columns pushed in at the left by
+             * waterfall_push_column() (sweep flows left -> right). */
+            bool vline = ((x % WF_TIMEGRID_COLS) == 0);
+            buf[y * WATERFALL_W + x] = vline ? grid : row;
+        }
     }
 }
 
-static void waterfall_push_activity(subghz_tab_state_t *st, bool active)
+/* Push one waterfall column. Normal columns are coloured by the current RSSI
+ * so the display keeps scrolling with a live colour gradient even when no
+ * signal is present. Priority overrides: a decoded/captured signal draws a
+ * bright red bar with a white cap; an RSSI energy spike draws a bright red
+ * bar (no cap) so a caught signal is unmistakable at RF onset. The caller is
+ * responsible for invalidating the canvas after pushing all columns. */
+static void waterfall_push_column(subghz_tab_state_t *st, int rssi, bool capture, bool energy)
 {
     if (!st->canvas || !st->canvas_buf) return;
     uint16_t *buf = (uint16_t *)st->canvas_buf;
 
-    /* Shift left one column */
-    for (int y = 0; y < WATERFALL_H; y++) {
-        for (int x = 0; x < WATERFALL_W - 1; x++)
-            buf[y * WATERFALL_W + x] = buf[y * WATERFALL_W + x + 1];
+    /* Shift right one column so the sweep flows left -> right: newest data is
+     * drawn at the left edge and older data moves to the right. */
+    for (int y = 0; y < WATERFALL_H; y++)
+        memmove(&buf[y * WATERFALL_W + 1], &buf[y * WATERFALL_W],
+                (size_t)(WATERFALL_W - 1) * sizeof(uint16_t));
+
+    int col = 0;
+
+    if (capture) {
+        uint16_t bar = wf_color(0xFF2323);
+        uint16_t cap = wf_color(0xFFFFFF);
+        for (int y = 0; y < WATERFALL_H; y++)
+            buf[y * WATERFALL_W + col] = (y < 3) ? cap : bar;
+    } else if (energy) {
+        uint16_t bar = wf_color(0xFF4040);
+        for (int y = 0; y < WATERFALL_H; y++)
+            buf[y * WATERFALL_W + col] = bar;
+    } else {
+        int r, g, b;
+        wf_rssi_rgb(rssi, &r, &g, &b);
+        /* Every WF_TIMEGRID_COLS columns brighten the column into a faint
+         * gridline. Scrolling these makes the sweep visibly move even when
+         * the RSSI (and thus colour) is nearly constant. */
+        if ((st->wf_col_counter % WF_TIMEGRID_COLS) == 0) {
+            r += 30; g += 34; b += 46;
+            if (r > 255) r = 255;
+            if (g > 255) g = 255;
+            if (b > 255) b = 255;
+        }
+        uint16_t c = wf_color(((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b);
+        for (int y = 0; y < WATERFALL_H; y++)
+            buf[y * WATERFALL_W + col] = c;
     }
 
-    uint16_t bg   = wf_color(WF_BG_COLOR);
-    uint16_t grid = wf_color(WF_GRID_COLOR);
-    uint16_t bar  = wf_color(0xFF3030);
-
-    for (int y = 0; y < WATERFALL_H; y++) {
-        if (active)
-            buf[y * WATERFALL_W + WATERFALL_W - 1] = bar;
-        else
-            buf[y * WATERFALL_W + WATERFALL_W - 1] = (y % 10 == 0) ? grid : bg;
-    }
-
-    lv_obj_invalidate(st->canvas);
+    st->wf_col_counter++;
 }
 
 /* ---- Signal list (lazy virtual rendering) ------------------------- */
@@ -621,6 +699,13 @@ static void process_subghz_line(subghz_tab_state_t *st, const char *line)
     if (subghz_parse_rssi_line(line, &rssi)) {
         st->listen_rssi_dbm = rssi;
         listen_bump_peak(st, rssi);
+        /* Flag an energy spike the instant a sample rises clearly above the
+         * adaptive baseline (or past an absolute strong level), then ease the
+         * baseline toward the new sample with a slow EMA (alpha 1/8). */
+        int base = st->wf_noise_floor;
+        bool hot = (rssi - base >= WF_ENERGY_MARGIN_DB) || (rssi >= WF_ENERGY_ABS_DBM);
+        st->wf_noise_floor += (rssi - base) / 8;
+        if (hot) st->wf_energy_hold = WF_ENERGY_HOLD_TICKS;
         return;
     }
 
@@ -633,6 +718,10 @@ static void process_subghz_line(subghz_tab_state_t *st, const char *line)
         parsed.kind == SUBGHZ_SIGNAL_KIND_RX_DUP ||
         parsed.kind == SUBGHZ_SIGNAL_KIND_RAW) {
         st->activity_pending = true;
+        /* A decode is a certain catch: also arm the energy marker so a red
+         * bar shows immediately, without waiting for the next ~1 Hz RSSI
+         * sample to happen to be strong. */
+        st->wf_energy_hold = WF_ENERGY_HOLD_TICKS;
         /* An actual decode means a real signal was caught: pin the gauge
          * high and reset the hold window so it stays lit a moment. */
         listen_bump_peak(st, LISTEN_RSSI_CAPTURE_DBM);
@@ -722,8 +811,18 @@ static void ui_tick_cb(lv_timer_t *t)
     bool history_dirty = st->history_dirty;
     st->history_dirty = false;
 
-    if (st->listen_running)
-        waterfall_push_activity(st, activity);
+    if (activity)
+        st->wf_capture_hold = WF_CAPTURE_HOLD_TICKS;
+
+    if (st->listen_running) {
+        bool capture = st->wf_capture_hold > 0;
+        bool energy  = st->wf_energy_hold  > 0;
+        if (capture) st->wf_capture_hold--;
+        if (energy)  st->wf_energy_hold--;
+        for (int i = 0; i < WF_COLS_PER_TICK; i++)
+            waterfall_push_column(st, st->listen_rssi_dbm, capture, energy);
+        if (st->canvas) lv_obj_invalidate(st->canvas);
+    }
 
     if (history_dirty && st->follow_latest && st->sig_list) {
         size_t total = signal_count_snapshot(st);
@@ -923,9 +1022,20 @@ static void reset_capture_session(subghz_tab_state_t *st)
     st->listen_rssi_dbm = -100;
     st->listen_rssi_peak_dbm = -100;
     st->listen_rssi_hold_ticks = 0;
+    st->wf_capture_hold = 0;
+    st->wf_col_counter = 0;
+    st->wf_noise_floor = -90;
+    st->wf_energy_hold = 0;
     st->listen_rssi_dirty = true;
     st->listen_radio_fail_pending = false;
     clear_signal_history(st);
+
+    /* Start each session from a clean, gridded canvas so the scrolling sweep
+     * is immediately visible instead of pushing against stale content. */
+    if (st->canvas_buf) {
+        waterfall_fill_bg((uint16_t *)st->canvas_buf);
+        if (st->canvas) lv_obj_invalidate(st->canvas);
+    }
 
     if (st->sig_list) lv_obj_scroll_to_y(st->sig_list, 0, LV_ANIM_OFF);
     if (st->canvas_buf) {
@@ -1439,6 +1549,10 @@ void show_subghz_listen_page(void)
     st->listen_rssi_dbm = -100;
     st->listen_rssi_peak_dbm = -100;
     st->listen_rssi_hold_ticks = 0;
+    st->wf_capture_hold = 0;
+    st->wf_col_counter = 0;
+    st->wf_noise_floor = -90;
+    st->wf_energy_hold = 0;
     st->listen_rssi_dirty = true;
     st->listen_rssi_arc = NULL;
     st->listen_rssi_lbl = NULL;
