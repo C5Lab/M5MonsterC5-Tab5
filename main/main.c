@@ -1150,6 +1150,13 @@ typedef struct {
 #define PCAP_VIEWER_PACKET_PAGE_SIZE    20
 #define PCAP_VIEWER_MAX_INDEXED_PACKETS 4096
 #define PCAP_VIEWER_HEX_BYTES           256
+#define PCAP_VIEWER_ROW_HEIGHT           40
+#define PCAP_VIEWER_ENDPOINT_HEIGHT      32
+#define PCAP_VIEWER_COL_NO_TIME         150
+#define PCAP_VIEWER_COL_PROTOCOL        100
+#define PCAP_VIEWER_COL_SOURCE          230
+#define PCAP_VIEWER_COL_DESTINATION     230
+#define PCAP_VIEWER_COL_LENGTH           80
 
 typedef struct {
     char path[PCAP_VIEWER_PATH_MAX];
@@ -34688,6 +34695,52 @@ static void pcap_viewer_format_endpoint(const char *address, uint16_t port,
     }
 }
 
+static void pcap_viewer_format_table_endpoint(const char *address, uint16_t port,
+                                              char *output, size_t output_size)
+{
+    if (!output || output_size == 0) {
+        return;
+    }
+    if (!address || !address[0]) {
+        snprintf(output, output_size, "-");
+        return;
+    }
+
+    size_t address_length = strlen(address);
+    unsigned total_colons = 0;
+    for (const char *cursor = address; *cursor; cursor++) {
+        if (*cursor == ':') {
+            total_colons++;
+        }
+    }
+    if (address_length < 32U || total_colons != 7U) {
+        pcap_viewer_format_endpoint(address, port, output, output_size);
+        return;
+    }
+
+    const char *split = NULL;
+    unsigned colon_count = 0;
+    for (const char *cursor = address; *cursor; cursor++) {
+        if (*cursor == ':' && ++colon_count == 4U) {
+            split = cursor + 1;
+            break;
+        }
+    }
+    if (!split) {
+        pcap_viewer_format_endpoint(address, port, output, output_size);
+        return;
+    }
+
+    int first_line_length = (int)(split - address);
+    if (port > 0) {
+        snprintf(output, output_size, "%.*s\n%s:%u",
+                 first_line_length, address, split, port);
+    } else {
+        snprintf(output, output_size, "%.*s\n%s",
+                 first_line_length, address, split);
+    }
+}
+
 static void pcap_viewer_packet_detail_close_cb(lv_event_t *e)
 {
     pcap_viewer_state_t *state = (pcap_viewer_state_t *)lv_event_get_user_data(e);
@@ -34860,18 +34913,28 @@ static bool pcap_viewer_packet_is_visible(const pcap_viewer_state_t *state,
                                              state->packet_filter);
 }
 
-static uint32_t pcap_viewer_filtered_packet_count(const pcap_viewer_state_t *state)
+static uint32_t pcap_viewer_filter_packet_count(const pcap_viewer_state_t *state,
+                                                pcap_packet_filter_t filter)
 {
     if (!state) {
         return 0;
     }
+    if (filter == PCAP_FILTER_ALL) {
+        return state->scan_summary.indexed_packets;
+    }
     uint32_t count = 0;
     for (uint32_t i = 0; i < state->scan_summary.indexed_packets; i++) {
-        if (pcap_viewer_packet_is_visible(state, i)) {
+        if (state->packet_flags &&
+            pcap_reader_packet_matches_filter(state->packet_flags[i], filter)) {
             count++;
         }
     }
     return count;
+}
+
+static uint32_t pcap_viewer_filtered_packet_count(const pcap_viewer_state_t *state)
+{
+    return state ? pcap_viewer_filter_packet_count(state, state->packet_filter) : 0;
 }
 
 static void pcap_viewer_update_filter_styles(pcap_viewer_state_t *state)
@@ -34980,21 +35043,30 @@ static void pcap_viewer_render_packet_page(pcap_viewer_state_t *state)
         double packet_time = (double)packet->timestamp_seconds +
                              ((double)packet->timestamp_fraction / fraction_scale);
         char source[96], destination[96];
-        pcap_viewer_format_endpoint(details.source, details.source_port,
-                                    source, sizeof(source));
-        pcap_viewer_format_endpoint(details.destination, details.destination_port,
-                                    destination, sizeof(destination));
+        pcap_viewer_format_table_endpoint(details.source, details.source_port,
+                                          source, sizeof(source));
+        pcap_viewer_format_table_endpoint(details.destination, details.destination_port,
+                                          destination, sizeof(destination));
 
         lv_obj_t *row = lv_obj_create(state->packet_list);
-        lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
-        lv_obj_set_style_bg_color(row, ui_card_color(), 0);
+        lv_obj_remove_style_all(row);
+        lv_obj_set_size(row, lv_pct(100), PCAP_VIEWER_ROW_HEIGHT);
+        lv_color_t row_color = (i & 1U)
+                                   ? lv_color_mix(ui_card_color(), ui_bg_color(), LV_OPA_70)
+                                   : ui_card_color();
+        lv_obj_set_style_bg_color(row, row_color, 0);
+        lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
         lv_obj_set_style_bg_color(row, ui_card_pressed_color(), LV_STATE_PRESSED);
         lv_obj_set_style_border_width(row, 1, 0);
         lv_obj_set_style_border_color(row,
                                       details.malformed ? COLOR_MATERIAL_RED : ui_border_color(), 0);
-        lv_obj_set_style_radius(row, 7, 0);
-        lv_obj_set_style_pad_all(row, 8, 0);
-        lv_obj_set_style_pad_column(row, 10, 0);
+        lv_obj_set_style_border_side(row, LV_BORDER_SIDE_BOTTOM, 0);
+        lv_obj_set_style_radius(row, 0, 0);
+        lv_obj_set_style_pad_left(row, 6, 0);
+        lv_obj_set_style_pad_right(row, 6, 0);
+        lv_obj_set_style_pad_top(row, 0, 0);
+        lv_obj_set_style_pad_bottom(row, 0, 0);
+        lv_obj_set_style_pad_column(row, 8, 0);
         lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
         lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START,
                               LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
@@ -35004,35 +35076,52 @@ static void pcap_viewer_render_packet_page(pcap_viewer_state_t *state)
                             (void *)(uintptr_t)(i + 1U));
 
         lv_obj_t *number = lv_label_create(row);
-        lv_label_set_text_fmt(number, "#%lu\n+%.6fs",
+        lv_label_set_text_fmt(number, "%lu   +%.4fs",
                               (unsigned long)(i + 1), packet_time - first_time);
-        lv_obj_set_width(number, 125);
+        lv_obj_set_width(number, PCAP_VIEWER_COL_NO_TIME);
+        lv_label_set_long_mode(number, LV_LABEL_LONG_DOT);
         lv_obj_set_style_text_font(number, &lv_font_montserrat_12, 0);
         lv_obj_set_style_text_color(number, ui_muted_color(), 0);
 
         lv_obj_t *protocol = lv_label_create(row);
         lv_label_set_text(protocol, details.protocol[0] ? details.protocol : "Unknown");
-        lv_obj_set_width(protocol, 110);
-        lv_obj_set_style_text_font(protocol, &lv_font_montserrat_14, 0);
+        lv_obj_set_width(protocol, PCAP_VIEWER_COL_PROTOCOL);
+        lv_label_set_long_mode(protocol, LV_LABEL_LONG_DOT);
+        lv_obj_set_style_text_font(protocol, &lv_font_montserrat_12, 0);
         lv_obj_set_style_text_color(protocol,
                                     details.malformed ? COLOR_MATERIAL_RED : COLOR_NEON_GREEN, 0);
 
-        lv_obj_t *flow = lv_label_create(row);
-        lv_label_set_text_fmt(flow, "%s  ->  %s", source, destination);
-        lv_obj_set_width(flow, 430);
-        lv_label_set_long_mode(flow, LV_LABEL_LONG_DOT);
-        lv_obj_set_style_text_font(flow, &lv_font_montserrat_12, 0);
-        lv_obj_set_style_text_color(flow, ui_text_color(), 0);
+        lv_obj_t *source_label = lv_label_create(row);
+        lv_label_set_text(source_label, source);
+        lv_obj_set_width(source_label, PCAP_VIEWER_COL_SOURCE);
+        lv_obj_set_height(source_label, PCAP_VIEWER_ENDPOINT_HEIGHT);
+        lv_label_set_long_mode(source_label, LV_LABEL_LONG_CLIP);
+        lv_obj_set_style_text_font(source_label, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(source_label, ui_text_color(), 0);
+
+        lv_obj_t *destination_label = lv_label_create(row);
+        lv_label_set_text(destination_label, destination);
+        lv_obj_set_width(destination_label, PCAP_VIEWER_COL_DESTINATION);
+        lv_obj_set_height(destination_label, PCAP_VIEWER_ENDPOINT_HEIGHT);
+        lv_label_set_long_mode(destination_label, LV_LABEL_LONG_CLIP);
+        lv_obj_set_style_text_font(destination_label, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(destination_label, ui_text_color(), 0);
 
         lv_obj_t *info = lv_label_create(row);
-        lv_label_set_text_fmt(info, "%s  [%lu/%lu B]",
-                              details.info[0] ? details.info : "-",
-                              (unsigned long)packet->captured_length,
-                              (unsigned long)packet->original_length);
+        lv_label_set_text(info, details.info[0] ? details.info : "-");
         lv_obj_set_flex_grow(info, 1);
+        lv_obj_set_width(info, 0);
         lv_label_set_long_mode(info, LV_LABEL_LONG_DOT);
         lv_obj_set_style_text_font(info, &lv_font_montserrat_12, 0);
         lv_obj_set_style_text_color(info, ui_muted_color(), 0);
+
+        lv_obj_t *length_label = lv_label_create(row);
+        lv_label_set_text_fmt(length_label, "%lu",
+                              (unsigned long)packet->captured_length);
+        lv_obj_set_width(length_label, PCAP_VIEWER_COL_LENGTH);
+        lv_obj_set_style_text_align(length_label, LV_TEXT_ALIGN_RIGHT, 0);
+        lv_obj_set_style_text_font(length_label, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(length_label, ui_muted_color(), 0);
     }
 }
 
@@ -35351,7 +35440,7 @@ static void pcap_viewer_render_capture_page(pcap_viewer_state_t *state)
     lv_obj_center(dns_label);
 
     lv_obj_t *filter_bar = lv_obj_create(page);
-    lv_obj_set_size(filter_bar, lv_pct(100), 50);
+    lv_obj_set_size(filter_bar, lv_pct(100), 62);
     lv_obj_set_style_bg_color(filter_bar, lv_color_hex(0x050A14), 0);
     lv_obj_set_style_border_width(filter_bar, 1, 0);
     lv_obj_set_style_border_color(filter_bar, ui_border_color(), 0);
@@ -35363,9 +35452,15 @@ static void pcap_viewer_render_capture_page(pcap_viewer_state_t *state)
                           LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_scroll_dir(filter_bar, LV_DIR_HOR);
     lv_obj_set_scrollbar_mode(filter_bar, LV_SCROLLBAR_MODE_AUTO);
+    lv_obj_set_style_width(filter_bar, 4, LV_PART_SCROLLBAR);
+    lv_obj_set_style_bg_color(filter_bar, COLOR_NEON_CYAN, LV_PART_SCROLLBAR);
+    lv_obj_set_style_bg_opa(filter_bar, LV_OPA_70, LV_PART_SCROLLBAR);
+    lv_obj_set_style_radius(filter_bar, LV_RADIUS_CIRCLE, LV_PART_SCROLLBAR);
 
     for (int filter = 0; filter < PCAP_FILTER_COUNT; filter++) {
         const char *filter_name = pcap_reader_filter_name((pcap_packet_filter_t)filter);
+        uint32_t filter_count = pcap_viewer_filter_packet_count(
+            state, (pcap_packet_filter_t)filter);
         int button_width = 88;
         if (filter == PCAP_FILTER_WIFI_MGMT) button_width = 150;
         else if (filter == PCAP_FILTER_MALFORMED) button_width = 132;
@@ -35379,7 +35474,9 @@ static void pcap_viewer_render_capture_page(pcap_viewer_state_t *state)
         lv_obj_add_event_cb(button, pcap_viewer_filter_cb, LV_EVENT_CLICKED,
                             (void *)(uintptr_t)(filter + 1U));
         lv_obj_t *label = lv_label_create(button);
-        lv_label_set_text(label, filter_name);
+        lv_label_set_text_fmt(label, "%s\n%lu", filter_name,
+                              (unsigned long)filter_count);
+        lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
         lv_obj_set_style_text_font(label, &lv_font_montserrat_12, 0);
         lv_obj_set_style_text_color(label, lv_color_white(), 0);
         lv_obj_center(label);
@@ -35421,12 +35518,67 @@ static void pcap_viewer_render_capture_page(pcap_viewer_state_t *state)
     lv_label_set_text(next_label, "Next " LV_SYMBOL_RIGHT);
     lv_obj_center(next_label);
 
+    lv_obj_t *table_header = lv_obj_create(page);
+    lv_obj_remove_style_all(table_header);
+    lv_obj_set_size(table_header, lv_pct(100), 30);
+    lv_obj_set_style_bg_color(table_header,
+                              lv_color_mix(COLOR_NEON_CYAN, ui_bg_color(), LV_OPA_20), 0);
+    lv_obj_set_style_bg_opa(table_header, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(table_header, 1, 0);
+    lv_obj_set_style_border_color(table_header, COLOR_NEON_CYAN, 0);
+    lv_obj_set_style_border_side(table_header, LV_BORDER_SIDE_BOTTOM, 0);
+    lv_obj_set_style_pad_left(table_header, 6, 0);
+    lv_obj_set_style_pad_right(table_header, 6, 0);
+    lv_obj_set_style_pad_column(table_header, 8, 0);
+    lv_obj_set_flex_flow(table_header, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(table_header, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(table_header, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *number_header = lv_label_create(table_header);
+    lv_label_set_text(number_header, "NO. / RELATIVE TIME");
+    lv_obj_set_width(number_header, PCAP_VIEWER_COL_NO_TIME);
+    lv_obj_set_style_text_font(number_header, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_color(number_header, COLOR_NEON_CYAN, 0);
+
+    lv_obj_t *protocol_header = lv_label_create(table_header);
+    lv_label_set_text(protocol_header, "PROTOCOL");
+    lv_obj_set_width(protocol_header, PCAP_VIEWER_COL_PROTOCOL);
+    lv_obj_set_style_text_font(protocol_header, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_color(protocol_header, COLOR_NEON_CYAN, 0);
+
+    lv_obj_t *source_header = lv_label_create(table_header);
+    lv_label_set_text(source_header, "SOURCE");
+    lv_obj_set_width(source_header, PCAP_VIEWER_COL_SOURCE);
+    lv_obj_set_style_text_font(source_header, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_color(source_header, COLOR_NEON_CYAN, 0);
+
+    lv_obj_t *destination_header = lv_label_create(table_header);
+    lv_label_set_text(destination_header, "DESTINATION");
+    lv_obj_set_width(destination_header, PCAP_VIEWER_COL_DESTINATION);
+    lv_obj_set_style_text_font(destination_header, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_color(destination_header, COLOR_NEON_CYAN, 0);
+
+    lv_obj_t *info_header = lv_label_create(table_header);
+    lv_label_set_text(info_header, "INFO");
+    lv_obj_set_width(info_header, 0);
+    lv_obj_set_flex_grow(info_header, 1);
+    lv_obj_set_style_text_font(info_header, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_color(info_header, COLOR_NEON_CYAN, 0);
+
+    lv_obj_t *length_header = lv_label_create(table_header);
+    lv_label_set_text(length_header, "LEN");
+    lv_obj_set_width(length_header, PCAP_VIEWER_COL_LENGTH);
+    lv_obj_set_style_text_align(length_header, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_set_style_text_font(length_header, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_color(length_header, COLOR_NEON_CYAN, 0);
+
     state->packet_list = lv_obj_create(page);
     lv_obj_set_size(state->packet_list, lv_pct(100), LV_SIZE_CONTENT);
     lv_obj_set_flex_grow(state->packet_list, 1);
     style_surface_panel(state->packet_list, 8);
-    lv_obj_set_style_pad_all(state->packet_list, 8, 0);
-    lv_obj_set_style_pad_row(state->packet_list, 6, 0);
+    lv_obj_set_style_pad_all(state->packet_list, 2, 0);
+    lv_obj_set_style_pad_row(state->packet_list, 0, 0);
     lv_obj_set_flex_flow(state->packet_list, LV_FLEX_FLOW_COLUMN);
     state->packet_page = 0;
     pcap_viewer_render_packet_page(state);
