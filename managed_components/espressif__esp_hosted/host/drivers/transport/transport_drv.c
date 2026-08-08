@@ -25,6 +25,10 @@
 #include "port_esp_hosted_host_log.h"
 #include "esp_hosted_power_save.h"
 
+#if H_TRANSPORT_IN_USE == H_TRANSPORT_SDIO
+#include "sdio_drv.h"
+#endif
+
 #include "esp_hosted_cli.h"
 #include "rpc_wrap.h"
 
@@ -44,6 +48,8 @@ void *bus_handle = NULL;
 
 
 static volatile uint8_t transport_state = TRANSPORT_INACTIVE;
+static bool sta_tx_oom_logged;
+static bool ap_tx_oom_logged;
 
 static void process_event(uint8_t *evt_buf, uint16_t len);
 static int process_init_event(uint8_t *evt_buf, uint16_t len);
@@ -247,9 +253,26 @@ static void transport_serial_free_cb(void *buf)
 	mempool_free(chan_arr[ESP_SERIAL_IF]->memp, buf);
 }
 
+static esp_err_t transport_drv_tx_no_mem(bool *logged, const char *interface_name,
+		size_t len)
+{
+	if (!*logged) {
+		ESP_LOGW(TAG, "%s TX buffer allocation failed; deferring packet (len=%u) instead of rebooting",
+				interface_name, (unsigned)len);
+		*logged = true;
+	}
+	errno = -ENOBUFS;
+#if defined(ESP_ERR_ESP_NETIF_TX_FAILED)
+	return ESP_ERR_ESP_NETIF_TX_FAILED;
+#else
+	return ESP_ERR_ESP_NETIF_NO_MEM;
+#endif
+}
+
 static esp_err_t transport_drv_sta_tx(void *h, void *buffer, size_t len)
 {
 	void * copy_buff = NULL;
+	void (*copy_free_func)(void *buf) = transport_sta_free_cb;
 
 	if (!buffer || !len)
 		return ESP_OK;
@@ -269,29 +292,65 @@ static esp_err_t transport_drv_sta_tx(void *h, void *buffer, size_t len)
 
 	assert(h && h==chan_arr[ESP_STA_IF]->api_chan);
 
-	/*  Prepare transport buffer directly consumable */
+	/* SDIO has a single serialized DMA writer. Keep the queued network copy in
+	 * general heap/PSRAM and let sdio_write_task use its shared DMA buffer only
+	 * while the packet is physically written. */
+#if H_TRANSPORT_IN_USE == H_TRANSPORT_SDIO
+	copy_buff = g_h.funcs->_h_malloc(len);
+	copy_free_func = g_h.funcs->_h_free;
+#else
 	copy_buff = mempool_alloc(((struct mempool*)chan_arr[ESP_STA_IF]->memp), MAX_TRANSPORT_BUFFER_SIZE, true);
-	assert(copy_buff);
+#endif
+	if (!copy_buff) {
+		return transport_drv_tx_no_mem(&sta_tx_oom_logged, "STA", len);
+	}
+	if (sta_tx_oom_logged) {
+		ESP_LOGI(TAG, "STA TX buffer allocation recovered");
+		sta_tx_oom_logged = false;
+	}
+#if H_TRANSPORT_IN_USE == H_TRANSPORT_SDIO
+	g_h.funcs->_h_memcpy(copy_buff, buffer, len);
+	return esp_hosted_tx(ESP_STA_IF, 0, copy_buff, len, H_BUFF_NO_ZEROCOPY,
+			copy_buff, copy_free_func, 0);
+#else
 	g_h.funcs->_h_memcpy(copy_buff+H_ESP_PAYLOAD_HEADER_OFFSET, buffer, len);
-
-	return esp_hosted_tx(ESP_STA_IF, 0, copy_buff, len, H_BUFF_ZEROCOPY, copy_buff, transport_sta_free_cb, 0);
+	return esp_hosted_tx(ESP_STA_IF, 0, copy_buff, len, H_BUFF_ZEROCOPY,
+			copy_buff, copy_free_func, 0);
+#endif
 }
 
 static esp_err_t transport_drv_ap_tx(void *h, void *buffer, size_t len)
 {
 	void * copy_buff = NULL;
+	void (*copy_free_func)(void *buf) = transport_ap_free_cb;
 
 	if (!buffer || !len)
 		return ESP_OK;
 
 	assert(h && h==chan_arr[ESP_AP_IF]->api_chan);
 
-	/*  Prepare transport buffer directly consumable */
+#if H_TRANSPORT_IN_USE == H_TRANSPORT_SDIO
+	copy_buff = g_h.funcs->_h_malloc(len);
+	copy_free_func = g_h.funcs->_h_free;
+#else
 	copy_buff = mempool_alloc(((struct mempool*)chan_arr[ESP_AP_IF]->memp), MAX_TRANSPORT_BUFFER_SIZE, true);
-	assert(copy_buff);
+#endif
+	if (!copy_buff) {
+		return transport_drv_tx_no_mem(&ap_tx_oom_logged, "AP", len);
+	}
+	if (ap_tx_oom_logged) {
+		ESP_LOGI(TAG, "AP TX buffer allocation recovered");
+		ap_tx_oom_logged = false;
+	}
+#if H_TRANSPORT_IN_USE == H_TRANSPORT_SDIO
+	g_h.funcs->_h_memcpy(copy_buff, buffer, len);
+	return esp_hosted_tx(ESP_AP_IF, 0, copy_buff, len, H_BUFF_NO_ZEROCOPY,
+			copy_buff, copy_free_func, 0);
+#else
 	g_h.funcs->_h_memcpy(copy_buff+H_ESP_PAYLOAD_HEADER_OFFSET, buffer, len);
-
-	return esp_hosted_tx(ESP_AP_IF, 0, copy_buff, len, H_BUFF_ZEROCOPY, copy_buff, transport_ap_free_cb, 0);
+	return esp_hosted_tx(ESP_AP_IF, 0, copy_buff, len, H_BUFF_ZEROCOPY,
+			copy_buff, copy_free_func, 0);
+#endif
 }
 
 esp_err_t transport_drv_serial_tx(void *h, void *buffer, size_t len)
@@ -357,6 +416,13 @@ transport_channel_t *transport_drv_add_channel(void *api_chan,
 	channel->memp = mempool_create(MAX_TRANSPORT_BUFFER_SIZE);
 #ifdef H_USE_MEMPOOL
 	assert(channel->memp);
+#endif
+#if H_TRANSPORT_IN_USE == H_TRANSPORT_SDIO
+	if (if_type == ESP_STA_IF) {
+		/* Reserve the shared writer buffer at the earliest safe point, before
+		 * setup_transport creates SDIO queues, tasks and driver objects. */
+		sdio_reserve_dma_buffers();
+	}
 #endif
 
 	ESP_LOGD(TAG, "Add ESP-Hosted channel IF[%u]: S[%u] Tx[%p] Rx[%p]",
@@ -593,8 +659,13 @@ esp_err_t send_slave_config(uint8_t host_cap, uint8_t firmware_chip_id,
 	uint16_t len = 0;
 	uint8_t *sendbuf = NULL;
 
-	sendbuf = g_h.funcs->_h_malloc_align(MEMPOOL_ALIGNED(256), MEMPOOL_ALIGNMENT_BYTES);
-	assert(sendbuf);
+	/* This is a source payload for H_BUFF_NO_ZEROCOPY. The SDIO writer copies
+	 * it into its shared DMA block, so this staging buffer can use general heap. */
+	sendbuf = g_h.funcs->_h_malloc(MEMPOOL_ALIGNED(256));
+	if (!sendbuf) {
+		ESP_LOGE(TAG, "Could not allocate slave-config staging buffer");
+		return ESP_ERR_NO_MEM;
+	}
 
 	/* Populate event data */
 	//event = (struct esp_priv_event *) (sendbuf + sizeof(struct esp_payload_header)); //ZeroCopy

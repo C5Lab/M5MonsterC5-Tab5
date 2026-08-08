@@ -12,9 +12,11 @@
 #include <errno.h>
 #include <math.h>
 #include <stdint.h>
+#include <stdarg.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/idf_additions.h"
+#include "freertos/event_groups.h"
 #include "freertos/timers.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
@@ -42,19 +44,37 @@
 #include "esp_wifi.h"
 #include "esp_netif.h"
 #include "esp_event.h"
+#include "esp_system.h"
 #include "esp_vfs_fat.h"
+#include "janos_file_transfer.h"
+#include "pcap_reader.h"
+#include "pcap_summary.h"
 
 // Captive portal includes
 #include "esp_http_server.h"
 #include "lwip/sockets.h"
 
+#if defined(CONFIG_SPIRAM_XIP_FROM_PSRAM) && CONFIG_SPIRAM_XIP_FROM_PSRAM && \
+    defined(CONFIG_FREERTOS_TLSP_DELETION_CALLBACKS) && CONFIG_FREERTOS_TLSP_DELETION_CALLBACKS
+/*
+ * ESP-IDF 5.4.1 keeps this cleanup entry point private, but it is the same
+ * routine used by pthread-created tasks before they delete themselves.  With
+ * PSRAM XIP enabled on dual-core ESP32-P4, the generic FreeRTOS delete hook
+ * rejects its 0x480... callback address before it can run.  Calling it while
+ * the task is still alive releases the LwIP per-thread semaphore and clears
+ * the callback slot, so vTaskDelete() no longer reaches that faulty check.
+ */
+extern void pthread_internal_local_storage_destructor_callback(TaskHandle_t handle);
+#endif
 
-#define JANOS_TAB_VERSION "1.5.2"
+
+#define JANOS_TAB_VERSION "1.5.3"
 #define JANOS_VERSION_REQUIRED "1.7.1"
 
 #include "lwip/netdb.h"
 #include <dirent.h>
 #include <sys/stat.h>
+#include <unistd.h>
 #include <time.h>
 #include <sys/time.h>
 
@@ -389,6 +409,7 @@ typedef enum {
     COMPROMISED_FILE_KIND_WARDRIVE = 1,
     COMPROMISED_FILE_KIND_EVIL_TWIN = 2,
     COMPROMISED_FILE_KIND_PORTAL = 3,
+    COMPROMISED_FILE_KIND_PCAP_CAPTURE = 4,
 } compromised_file_kind_t;
 
 typedef enum {
@@ -883,6 +904,9 @@ typedef struct {
     lv_obj_t *portal_data_page;
     lv_obj_t *handshakes_page;
     lv_obj_t *wardrive_files_page;
+    lv_obj_t *pcap_captures_page;
+    lv_obj_t *pcap_viewer_page;
+    struct pcap_viewer_state *pcap_viewer;
     lv_obj_t *compromised_cleanup_overlay;
     lv_obj_t *compromised_cleanup_popup;
     lv_obj_t *compromised_cleanup_spinner;
@@ -1120,6 +1144,48 @@ typedef struct {
     bool has_subghz;
 } tab_context_t;
 
+#define PCAP_VIEWER_ROOT                "/sdcard/lab/pcaps"
+#define PCAP_VIEWER_MAX_FILES           128
+#define PCAP_VIEWER_PATH_MAX            288
+#define PCAP_VIEWER_PACKET_PAGE_SIZE    20
+#define PCAP_VIEWER_MAX_INDEXED_PACKETS 4096
+#define PCAP_VIEWER_HEX_BYTES           256
+
+typedef struct {
+    char path[PCAP_VIEWER_PATH_MAX];
+    char name[96];
+    uint64_t size_bytes;
+} pcap_viewer_file_t;
+
+typedef struct pcap_viewer_state {
+    tab_context_t *ctx;
+    pcap_viewer_file_t files[PCAP_VIEWER_MAX_FILES];
+    int file_count;
+    pcap_reader_t *reader;
+    pcap_capture_info_t capture_info;
+    pcap_packet_index_t *packet_index;
+    uint32_t *packet_flags;
+    pcap_summary_t *summary;
+    pcap_scan_summary_t scan_summary;
+    pcap_reader_status_t load_status;
+    pcap_reader_status_t summary_status;
+    volatile bool loading;
+    volatile bool cancel_requested;
+    TaskHandle_t task;
+    int packet_page;
+    char selected_path[PCAP_VIEWER_PATH_MAX];
+    char selected_name[96];
+    char notice[192];
+    pcap_packet_filter_t packet_filter;
+    lv_obj_t *status_label;
+    lv_obj_t *packet_list;
+    lv_obj_t *page_label;
+    lv_obj_t *prev_btn;
+    lv_obj_t *next_btn;
+    lv_obj_t *filter_buttons[PCAP_FILTER_COUNT];
+    lv_obj_t *detail_overlay;
+} pcap_viewer_state_t;
+
 typedef struct {
     tab_context_t *ctx;
     compromised_file_kind_t kind;
@@ -1139,6 +1205,48 @@ typedef struct {
     tab_context_t *ctx;
     char file[96];
 } wardrive_fix_task_args_t;
+
+typedef struct {
+    tab_context_t *ctx;
+    int tab;
+    char remote_path[WARDRIVE_WIGLE_PATH_MAX];
+    char file_name[96];
+} compromised_transfer_task_args_t;
+
+typedef struct {
+    char remote_path[WARDRIVE_WIGLE_PATH_MAX];
+    char file_name[96];
+} compromised_sync_item_t;
+
+typedef struct {
+    tab_context_t *ctx;
+    int tab;
+    compromised_file_kind_t kind;
+    int item_count;
+    compromised_sync_item_t items[];
+} compromised_sync_task_args_t;
+
+typedef struct {
+    int current;
+    int total;
+    const char *file_name;
+} compromised_sync_progress_ctx_t;
+
+typedef struct {
+    volatile bool active;
+    volatile bool cancel_requested;
+    bool sync_mode;
+    TaskHandle_t task;
+    lv_obj_t *overlay;
+    lv_obj_t *popup;
+    lv_obj_t *status_label;
+    lv_obj_t *detail_label;
+    lv_obj_t *progress_bar;
+    lv_obj_t *action_btn;
+    lv_obj_t *action_label;
+} compromised_transfer_ui_t;
+
+static compromised_transfer_ui_t compromised_transfer_ui;
 
 typedef enum {
     TAB_GROVE = 0,
@@ -1580,6 +1688,8 @@ static void hide_all_pages(tab_context_t *ctx) {
     if (ctx->portal_data_page) lv_obj_add_flag(ctx->portal_data_page, LV_OBJ_FLAG_HIDDEN);
     if (ctx->handshakes_page) lv_obj_add_flag(ctx->handshakes_page, LV_OBJ_FLAG_HIDDEN);
     if (ctx->wardrive_files_page) lv_obj_add_flag(ctx->wardrive_files_page, LV_OBJ_FLAG_HIDDEN);
+    if (ctx->pcap_captures_page) lv_obj_add_flag(ctx->pcap_captures_page, LV_OBJ_FLAG_HIDDEN);
+    if (ctx->pcap_viewer_page) lv_obj_add_flag(ctx->pcap_viewer_page, LV_OBJ_FLAG_HIDDEN);
     if (ctx->deauth_detector_page) lv_obj_add_flag(ctx->deauth_detector_page, LV_OBJ_FLAG_HIDDEN);
     if (ctx->bt_menu_page) lv_obj_add_flag(ctx->bt_menu_page, LV_OBJ_FLAG_HIDDEN);
     if (ctx->bt_airtag_page) lv_obj_add_flag(ctx->bt_airtag_page, LV_OBJ_FLAG_HIDDEN);
@@ -2538,6 +2648,13 @@ static void show_evil_twin_passwords_page(void);
 static void show_portal_data_page(void);
 static void show_handshakes_page(void);
 static void show_wardrive_files_page(void);
+static void show_pcap_captures_page(void);
+static void show_pcap_viewer_page(void);
+static void pcap_viewer_render_capture_page(pcap_viewer_state_t *state);
+static void pcap_viewer_render_packet_page(pcap_viewer_state_t *state);
+static void pcap_viewer_file_open_cb(lv_event_t *e);
+static void compromised_file_copy_cb(lv_event_t *e);
+static void compromised_files_sync_cb(lv_event_t *e);
 static void compromised_file_delete_cb(lv_event_t *e);
 static void compromised_file_clean_cb(lv_event_t *e);
 static void close_compromised_cleanup_popup(tab_context_t *ctx);
@@ -8466,7 +8583,8 @@ static void mitm_connect_and_start_cb(lv_event_t *e)
         password = lv_textarea_get_text(ctx->mitm_password_input);
     }
 
-    if (!is_open && (password == NULL || strlen(password) == 0)) {
+    if (!is_open && !ctx->mitm_use_saved_password &&
+        (password == NULL || strlen(password) == 0)) {
         if (ctx->mitm_status_label) {
             lv_label_set_text(ctx->mitm_status_label, "Enter password first");
             lv_obj_set_style_text_color(ctx->mitm_status_label, COLOR_MATERIAL_RED, 0);
@@ -8490,11 +8608,10 @@ static void mitm_connect_and_start_cb(lv_event_t *e)
     vTaskDelay(pdMS_TO_TICKS(50));
 
     char cmd[256];
-    wifi_connect_auth_mode_t auth_mode =
-        (is_open || password == NULL || strlen(password) == 0)
-            ? WIFI_CONNECT_AUTH_OPEN
-            : (ctx->mitm_use_saved_password ? WIFI_CONNECT_AUTH_SAVED
-                                             : WIFI_CONNECT_AUTH_PASSWORD);
+    wifi_connect_auth_mode_t auth_mode = is_open
+        ? WIFI_CONNECT_AUTH_OPEN
+        : (ctx->mitm_use_saved_password ? WIFI_CONNECT_AUTH_SAVED
+                                        : WIFI_CONNECT_AUTH_PASSWORD);
     if (!build_wifi_connect_command(cmd, sizeof(cmd), ssid, password, auth_mode)) {
         ESP_LOGW(TAG, "MITM: wifi_connect command too long, aborting");
         bsp_display_lock(0);
@@ -8504,9 +8621,15 @@ static void mitm_connect_and_start_cb(lv_event_t *e)
         }
         return;
     }
+    tab_id_t mitm_tab = current_tab;
+    uart_port_t uart_port = uart_port_for_tab(mitm_tab);
+    if (mitm_tab == TAB_USB && usb_cdc_handle) {
+        usbh_cdc_flush_rx_buffer(usb_cdc_handle);
+    } else {
+        uart_flush(uart_port);
+    }
     uart_send_command_for_tab(cmd);
 
-    uart_port_t uart_port = get_current_uart();
     static char rx_buffer[2048];
     int total_len = 0;
     bool success = false;
@@ -8514,8 +8637,9 @@ static void mitm_connect_and_start_cb(lv_event_t *e)
     int elapsed_ms = 0;
 
     while (elapsed_ms < timeout_ms && total_len < (int)sizeof(rx_buffer) - 256) {
-        int len = transport_read_bytes(uart_port, rx_buffer + total_len,
-                                       sizeof(rx_buffer) - total_len - 1, pdMS_TO_TICKS(200));
+        int len = transport_read_bytes_tab(mitm_tab, uart_port, rx_buffer + total_len,
+                                           sizeof(rx_buffer) - total_len - 1,
+                                           pdMS_TO_TICKS(200));
         if (len > 0) {
             total_len += len;
             rx_buffer[total_len] = '\0';
@@ -8542,7 +8666,7 @@ static void mitm_connect_and_start_cb(lv_event_t *e)
 
         char pcap_filename[256] = {0};
         {
-            uart_port_t pcap_port = get_current_uart();
+            uart_port_t pcap_port = uart_port_for_tab(mitm_tab);
             char pcap_rx[512];
             char pcap_line[256];
             int pcap_line_pos = 0;
@@ -8550,7 +8674,9 @@ static void mitm_connect_and_start_cb(lv_event_t *e)
             int pcap_empty = 0;
 
             while (pcap_retries-- > 0) {
-                int plen = transport_read_bytes(pcap_port, pcap_rx, sizeof(pcap_rx) - 1, pdMS_TO_TICKS(100));
+                int plen = transport_read_bytes_tab(mitm_tab, pcap_port, pcap_rx,
+                                                    sizeof(pcap_rx) - 1,
+                                                    pdMS_TO_TICKS(100));
                 if (plen > 0) {
                     pcap_rx[plen] = '\0';
                     pcap_empty = 0;
@@ -8612,9 +8738,21 @@ static void mitm_connect_and_start_cb(lv_event_t *e)
         }
     } else {
         ESP_LOGW(TAG, "MITM: Connection failed to %s", ssid);
+        bool saved_password_failed = ctx->mitm_use_saved_password;
+        ctx->mitm_use_saved_password = false;
+        if (ctx->mitm_password_input) {
+            lv_textarea_set_placeholder_text(ctx->mitm_password_input,
+                                             "Enter password manually");
+        }
         if (ctx->mitm_status_label) {
-            lv_label_set_text_fmt(ctx->mitm_status_label,
-                "Connection failed to %s\nCheck password and try again.", ssid);
+            if (saved_password_failed) {
+                lv_label_set_text_fmt(ctx->mitm_status_label,
+                    "Saved password was not accepted for %s.\n"
+                    "Enter or correct the password and try again.", ssid);
+            } else {
+                lv_label_set_text_fmt(ctx->mitm_status_label,
+                    "Connection failed to %s\nCheck password and try again.", ssid);
+            }
             lv_obj_set_style_text_color(ctx->mitm_status_label, COLOR_MATERIAL_RED, 0);
         }
     }
@@ -8633,6 +8771,7 @@ static void show_mitm_popup(void)
 
     wifi_network_t *net = &v.nets[idx];
     const char *ssid_display = strlen(net->ssid) > 0 ? net->ssid : "(Hidden)";
+    bool is_open = wifi_network_security_is_open(net->security);
 
     // Check Evil Twin DB for a saved password.
     char mitm_found_password[65] = {0};
@@ -8641,16 +8780,24 @@ static void show_mitm_popup(void)
         evil_twin_entry_count = 0;
         memset(evil_twin_entries, 0, sizeof(evil_twin_entries));
 
-        uart_port_t uart_port = get_current_uart();
-        uart_flush(uart_port);
-        uart_send_command_for_tab("show_pass evil");
+        tab_id_t active_tab = current_tab;
+        uart_port_t uart_port = uart_port_for_tab(active_tab);
+        if (active_tab == TAB_USB && usb_cdc_handle) {
+            usbh_cdc_flush_rx_buffer(usb_cdc_handle);
+        } else {
+            uart_flush(uart_port);
+        }
+        transport_write_bytes_tab(active_tab, uart_port, "show_pass evil\r\n", 16);
+        vTaskDelay(pdMS_TO_TICKS(200));
 
         char rx_buffer[512];
-        int retries = 10;
+        int retries = 16;
         int empty_reads = 0;
 
         while (retries-- > 0 && evil_twin_entry_count < 50) {
-            int len = transport_read_bytes(uart_port, rx_buffer, sizeof(rx_buffer) - 1, pdMS_TO_TICKS(100));
+            int len = transport_read_bytes_tab(active_tab, uart_port, rx_buffer,
+                                               sizeof(rx_buffer) - 1,
+                                               pdMS_TO_TICKS(100));
             if (len > 0) {
                 rx_buffer[len] = '\0';
                 empty_reads = 0;
@@ -8677,7 +8824,7 @@ static void show_mitm_popup(void)
                 }
             } else {
                 empty_reads++;
-                if (empty_reads >= 3) break;
+                if (empty_reads >= 6) break;
             }
             vTaskDelay(pdMS_TO_TICKS(50));
         }
@@ -8751,6 +8898,7 @@ static void show_mitm_popup(void)
     lv_obj_set_size(ctx->mitm_password_input, 320, 40);
     lv_textarea_set_one_line(ctx->mitm_password_input, true);
     lv_textarea_set_placeholder_text(ctx->mitm_password_input, "WiFi password");
+    lv_textarea_set_password_mode(ctx->mitm_password_input, true);
     lv_obj_set_style_bg_color(ctx->mitm_password_input, lv_color_hex(0x1A1A1A), 0);
     lv_obj_set_style_border_color(ctx->mitm_password_input, COLOR_MATERIAL_TEAL, 0);
     lv_obj_set_style_border_width(ctx->mitm_password_input, 1, 0);
@@ -8760,18 +8908,32 @@ static void show_mitm_popup(void)
 
     if (mitm_password_known) {
         lv_textarea_set_text(ctx->mitm_password_input, mitm_found_password);
-        ctx->mitm_use_saved_password = true;
+    } else if (!is_open) {
+        lv_textarea_set_placeholder_text(ctx->mitm_password_input,
+                                         "Saved password on JanOS");
     } else {
-        ctx->mitm_use_saved_password = false;
+        lv_obj_add_flag(ctx->mitm_pass_row, LV_OBJ_FLAG_HIDDEN);
     }
+    // For every secured network, let JanOS resolve --saved against eviltwin.txt,
+    // portals.txt and home.txt. If it fails, the callback switches to manual input.
+    ctx->mitm_use_saved_password = !is_open;
 
     ctx->mitm_status_label = lv_label_create(ctx->mitm_popup);
-    lv_label_set_text(ctx->mitm_status_label,
-        mitm_password_known ? "Saved password found. Press Connect & Start."
-                            : "Enter WiFi password to connect and start PCAP capture.");
+    if (mitm_password_known) {
+        lv_label_set_text(ctx->mitm_status_label,
+                          "Known password found. Press Connect & Start.");
+    } else if (!is_open) {
+        lv_label_set_text(ctx->mitm_status_label,
+                          "JanOS saved passwords will be tried automatically.\n"
+                          "If none matches, manual input will be enabled.");
+    } else {
+        lv_label_set_text(ctx->mitm_status_label,
+                          "Open network. Press Connect & Start.");
+    }
     lv_obj_set_style_text_font(ctx->mitm_status_label, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(ctx->mitm_status_label,
-        mitm_password_known ? COLOR_MATERIAL_GREEN : lv_color_hex(0xCCCCCC), 0);
+        (mitm_password_known || !is_open) ? COLOR_MATERIAL_GREEN
+                                         : lv_color_hex(0xCCCCCC), 0);
     lv_obj_set_style_text_align(ctx->mitm_status_label, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_width(ctx->mitm_status_label, lv_pct(100));
 
@@ -27878,6 +28040,10 @@ static void compromised_data_tile_event_cb(lv_event_t *e)
         show_handshakes_page();
     } else if (strcmp(tile_name, "Wardrive Files") == 0) {
         show_wardrive_files_page();
+    } else if (strcmp(tile_name, "PCAP Captures") == 0) {
+        show_pcap_captures_page();
+    } else if (strcmp(tile_name, "PCAP Viewer") == 0) {
+        show_pcap_viewer_page();
     }
 }
 
@@ -28033,6 +28199,63 @@ static int compromised_load_handshake_files(tab_context_t *ctx, tab_id_t active_
         }
 
         ESP_LOGI(TAG, "[%s] Handshake list response from %s: %s",
+                 tab_transport_name(active_tab), dirs[i], rx_buffer);
+
+        char *line = strtok(rx_buffer, "\n\r");
+        while (line && ctx->wardrive_wigle_file_count < WARDRIVE_WIGLE_MAX_FILES) {
+            char token[WARDRIVE_WIGLE_PATH_MAX] = {0};
+            if (compromised_extract_file_token(line, token, sizeof(token), exts, 1)) {
+                wardrive_wigle_store_file(ctx, dirs[i], token);
+            }
+            line = strtok(NULL, "\n\r");
+        }
+
+        if (ctx->wardrive_wigle_file_count > 0) {
+            break;
+        }
+    }
+
+    compromised_transport_lock_end(usb_lock_set);
+    return ctx->wardrive_wigle_file_count;
+}
+
+static int compromised_load_pcap_capture_files(tab_context_t *ctx, tab_id_t active_tab,
+                                               uart_port_t uart_port)
+{
+    if (!ctx || tab_is_internal(active_tab)) {
+        return 0;
+    }
+
+    static const char *dirs[] = {
+        "/sdcard/lab/pcaps",
+        "/lab/pcaps",
+        "/sdcard/pcaps",
+        "/pcaps"
+    };
+    static const char *exts[] = { ".pcap" };
+
+    compromised_listing_reset_files(ctx);
+
+    bool usb_lock_set = false;
+    compromised_transport_lock_begin(active_tab, uart_port, &usb_lock_set);
+
+    char rx_buffer[4096];
+    for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]) &&
+                       ctx->wardrive_wigle_file_count < WARDRIVE_WIGLE_MAX_FILES; i++) {
+        compromised_transport_flush(active_tab, uart_port);
+
+        char cmd[128];
+        snprintf(cmd, sizeof(cmd), "list_dir %s", dirs[i]);
+        transport_write_bytes_tab(active_tab, uart_port, cmd, strlen(cmd));
+        transport_write_bytes_tab(active_tab, uart_port, "\r\n", 2);
+
+        int rx_len = home_collect_uart_response(active_tab, uart_port, rx_buffer,
+                                                sizeof(rx_buffer), 1600);
+        if (rx_len <= 0) {
+            continue;
+        }
+
+        ESP_LOGI(TAG, "[%s] PCAP capture list response from %s: %s",
                  tab_transport_name(active_tab), dirs[i], rx_buffer);
 
         char *line = strtok(rx_buffer, "\n\r");
@@ -28219,6 +28442,8 @@ static const char *compromised_title_for_kind(compromised_file_kind_t kind)
             return "Evil Twin Passwords";
         case COMPROMISED_FILE_KIND_PORTAL:
             return "Portal Data";
+        case COMPROMISED_FILE_KIND_PCAP_CAPTURE:
+            return "PCAP Captures";
         default:
             return "Compromised Files";
     }
@@ -28235,6 +28460,8 @@ static const char *compromised_empty_text_for_kind(compromised_file_kind_t kind)
             return "No Evil Twin file found on this tab.";
         case COMPROMISED_FILE_KIND_PORTAL:
             return "No portal data file found on this tab.";
+        case COMPROMISED_FILE_KIND_PCAP_CAPTURE:
+            return "No PCAP captures found on this tab.";
         default:
             return "No compromised files found on this tab.";
     }
@@ -28251,6 +28478,8 @@ static const char *compromised_tile_name_for_kind(compromised_file_kind_t kind)
             return "evil twin";
         case COMPROMISED_FILE_KIND_PORTAL:
             return "portal";
+        case COMPROMISED_FILE_KIND_PCAP_CAPTURE:
+            return "PCAP capture";
         default:
             return "compromised";
     }
@@ -28267,6 +28496,8 @@ static lv_color_t compromised_accent_for_kind(compromised_file_kind_t kind)
             return COLOR_MATERIAL_AMBER;
         case COMPROMISED_FILE_KIND_PORTAL:
             return COLOR_LAB5_MAGENTA;
+        case COMPROMISED_FILE_KIND_PCAP_CAPTURE:
+            return COLOR_MATERIAL_GREEN;
         default:
             return ui_tab_icon_color();
     }
@@ -28286,6 +28517,8 @@ static lv_obj_t **compromised_page_slot_for_kind(tab_context_t *ctx, compromised
             return &ctx->evil_twin_passwords_page;
         case COMPROMISED_FILE_KIND_PORTAL:
             return &ctx->portal_data_page;
+        case COMPROMISED_FILE_KIND_PCAP_CAPTURE:
+            return &ctx->pcap_captures_page;
         default:
             return NULL;
     }
@@ -28304,6 +28537,8 @@ static const char *compromised_cleanup_title_for_action(compromised_file_kind_t 
                 return "Deleting Evil Twin File";
             case COMPROMISED_FILE_KIND_PORTAL:
                 return "Deleting Portal File";
+            case COMPROMISED_FILE_KIND_PCAP_CAPTURE:
+                return "Deleting PCAP Capture";
             default:
                 return "Deleting File";
         }
@@ -28317,6 +28552,8 @@ static const char *compromised_cleanup_title_for_action(compromised_file_kind_t 
             return "Cleaning Evil Twin Data";
         case COMPROMISED_FILE_KIND_PORTAL:
             return "Cleaning Portal Data";
+        case COMPROMISED_FILE_KIND_PCAP_CAPTURE:
+            return "Cleaning PCAP Captures";
         default:
             return "Cleaning Files";
     }
@@ -28556,6 +28793,8 @@ static void compromised_cleanup_async_refresh(void *user_data)
             show_evil_twin_passwords_page();
         } else if (kind == COMPROMISED_FILE_KIND_PORTAL) {
             show_portal_data_page();
+        } else if (kind == COMPROMISED_FILE_KIND_PCAP_CAPTURE) {
+            show_pcap_captures_page();
         }
     } else if (page_slot && *page_slot) {
         lv_obj_del(*page_slot);
@@ -28596,6 +28835,8 @@ static void compromised_files_load_async_render(void *user_data)
         show_handshakes_page();
     } else if (kind == COMPROMISED_FILE_KIND_WARDRIVE) {
         show_wardrive_files_page();
+    } else if (kind == COMPROMISED_FILE_KIND_PCAP_CAPTURE) {
+        show_pcap_captures_page();
     } else {
         ctx->compromised_files_loaded = false;
     }
@@ -28617,6 +28858,8 @@ static void compromised_files_load_task(void *arg)
 
     if (kind == COMPROMISED_FILE_KIND_HANDSHAKE) {
         ctx->home_handshake_count = compromised_load_handshake_files(ctx, active_tab, uart_port);
+    } else if (kind == COMPROMISED_FILE_KIND_PCAP_CAPTURE) {
+        (void)compromised_load_pcap_capture_files(ctx, active_tab, uart_port);
     } else {
         (void)compromised_load_wardrive_files(ctx, active_tab, uart_port);
         if (kind == COMPROMISED_FILE_KIND_WARDRIVE) {
@@ -29353,6 +29596,48 @@ static void show_compromised_file_page(compromised_file_kind_t kind)
         lv_obj_center(wpasec_lbl);
     }
 
+    // Both handshake and general PCAP pages expose the newest file in the header.
+    // Per-file copy remains available on every row.
+    bool is_copyable_pcap = (kind == COMPROMISED_FILE_KIND_HANDSHAKE ||
+                             kind == COMPROMISED_FILE_KIND_PCAP_CAPTURE);
+    if (is_copyable_pcap && ctx->compromised_files_loaded &&
+        ctx->wardrive_wigle_file_count > 0) {
+        int latest_index = ctx->wardrive_wigle_file_count - 1;
+        lv_obj_t *copy_latest_btn = lv_btn_create(header);
+        lv_obj_set_size(copy_latest_btn, 180, 50);
+        lv_obj_set_style_bg_color(copy_latest_btn, lv_color_hex(0x087EA4), 0);
+        lv_obj_set_style_bg_color(copy_latest_btn, lv_color_hex(0x05617F),
+                                  LV_STATE_PRESSED);
+        lv_obj_set_style_border_width(copy_latest_btn, 2, 0);
+        lv_obj_set_style_border_color(copy_latest_btn, COLOR_MATERIAL_CYAN, 0);
+        lv_obj_set_style_radius(copy_latest_btn, 8, 0);
+        lv_obj_add_event_cb(copy_latest_btn, compromised_file_copy_cb,
+                            LV_EVENT_CLICKED,
+                            compromised_make_user_data(kind, latest_index));
+
+        lv_obj_t *copy_latest_lbl = lv_label_create(copy_latest_btn);
+        lv_label_set_text(copy_latest_lbl, "Copy latest");
+        lv_obj_set_style_text_font(copy_latest_lbl, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(copy_latest_lbl, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_center(copy_latest_lbl);
+
+        lv_obj_t *sync_btn = lv_btn_create(header);
+        lv_obj_set_size(sync_btn, 155, 50);
+        lv_obj_set_style_bg_color(sync_btn, lv_color_hex(0x008F76), 0);
+        lv_obj_set_style_bg_color(sync_btn, lv_color_hex(0x006B58), LV_STATE_PRESSED);
+        lv_obj_set_style_border_width(sync_btn, 2, 0);
+        lv_obj_set_style_border_color(sync_btn, COLOR_NEON_GREEN, 0);
+        lv_obj_set_style_radius(sync_btn, 8, 0);
+        lv_obj_add_event_cb(sync_btn, compromised_files_sync_cb, LV_EVENT_CLICKED,
+                            compromised_make_user_data(kind, 0));
+
+        lv_obj_t *sync_lbl = lv_label_create(sync_btn);
+        lv_label_set_text(sync_lbl, LV_SYMBOL_REFRESH " Sync new");
+        lv_obj_set_style_text_font(sync_lbl, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(sync_lbl, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_center(sync_lbl);
+    }
+
     if (kind != COMPROMISED_FILE_KIND_WARDRIVE) {
         clean_btn = lv_btn_create(header);
         lv_obj_set_size(clean_btn, 120, 50);
@@ -29507,7 +29792,8 @@ static void show_compromised_file_page(compromised_file_kind_t kind)
         lv_obj_set_style_pad_all(row, 10, 0);
         lv_obj_set_style_pad_column(row, 10, 0);
         lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
-        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN,
+                              LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
         lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
 
         lv_obj_t *info = lv_obj_create(row);
@@ -29559,10 +29845,16 @@ static void show_compromised_file_page(compromised_file_kind_t kind)
 
         lv_obj_t *actions = lv_obj_create(row);
         lv_obj_remove_style_all(actions);
-        lv_obj_set_size(actions, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+        if (is_copyable_pcap) {
+            // Explicit dimensions avoid LVGL resolving a percentage inside a
+            // content-sized flex parent to zero and hiding the copy action.
+            lv_obj_set_size(actions, 392, 62);
+        } else {
+            lv_obj_set_size(actions, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+        }
         lv_obj_set_flex_flow(actions, LV_FLEX_FLOW_ROW);
         lv_obj_set_flex_align(actions, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-        lv_obj_set_style_pad_column(actions, 8, 0);
+        lv_obj_set_style_pad_column(actions, 12, 0);
         lv_obj_clear_flag(actions, LV_OBJ_FLAG_SCROLLABLE);
 
         if (kind == COMPROMISED_FILE_KIND_WARDRIVE) {
@@ -29582,14 +29874,49 @@ static void show_compromised_file_page(compromised_file_kind_t kind)
             lv_obj_center(fix_lbl);
         }
 
+        if (is_copyable_pcap) {
+            lv_obj_t *copy_btn = lv_btn_create(actions);
+            lv_obj_set_size(copy_btn, 250, 62);
+            lv_obj_set_style_bg_color(copy_btn, lv_color_hex(0x087EA4), 0);
+            lv_obj_set_style_bg_color(copy_btn, lv_color_hex(0x05617F), LV_STATE_PRESSED);
+            lv_obj_set_style_border_width(copy_btn, 2, 0);
+            lv_obj_set_style_border_color(copy_btn, COLOR_MATERIAL_CYAN, 0);
+            lv_obj_set_style_border_opa(copy_btn, LV_OPA_100, 0);
+            lv_obj_set_style_radius(copy_btn, 10, 0);
+            lv_obj_set_style_shadow_width(copy_btn, 8, 0);
+            lv_obj_set_style_shadow_color(copy_btn, COLOR_MATERIAL_CYAN, 0);
+            lv_obj_set_style_shadow_opa(copy_btn, LV_OPA_30, 0);
+            lv_obj_set_flex_flow(copy_btn, LV_FLEX_FLOW_COLUMN);
+            lv_obj_set_flex_align(copy_btn, LV_FLEX_ALIGN_CENTER,
+                                  LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+            lv_obj_set_style_pad_row(copy_btn, 1, 0);
+            lv_obj_add_event_cb(copy_btn, compromised_file_copy_cb, LV_EVENT_CLICKED,
+                                compromised_make_user_data(kind, i));
+
+            lv_obj_t *copy_title = lv_label_create(copy_btn);
+            lv_label_set_text(copy_title, "COPY TO TAB5");
+            lv_obj_set_style_text_font(copy_title, &lv_font_montserrat_16, 0);
+            lv_obj_set_style_text_color(copy_title, lv_color_hex(0xFFFFFF), 0);
+
+            lv_obj_t *copy_hint = lv_label_create(copy_btn);
+            lv_label_set_text(copy_hint, "Monster SD  >  Tab5 SD");
+            lv_obj_set_style_text_font(copy_hint, &lv_font_montserrat_12, 0);
+            lv_obj_set_style_text_color(copy_hint, lv_color_hex(0xD7F7FF), 0);
+        }
+
         lv_obj_t *delete_btn = lv_btn_create(actions);
-        lv_obj_set_size(delete_btn, 110, 44);
+        lv_obj_set_size(delete_btn,
+                        is_copyable_pcap ? 130 : 110,
+                        is_copyable_pcap ? 62 : 44);
         style_danger_button(delete_btn);
         lv_obj_add_event_cb(delete_btn, compromised_file_delete_cb, LV_EVENT_CLICKED,
                             compromised_make_user_data(kind, i));
 
         lv_obj_t *delete_lbl = lv_label_create(delete_btn);
-        lv_label_set_text(delete_lbl, LV_SYMBOL_TRASH " Delete");
+        lv_label_set_text(delete_lbl,
+                          is_copyable_pcap
+                              ? "DELETE FILE"
+                              : LV_SYMBOL_TRASH " Delete");
         lv_obj_set_style_text_font(delete_lbl, &lv_font_montserrat_14, 0);
         lv_obj_set_style_text_color(delete_lbl, lv_color_hex(0xFFFFFF), 0);
         lv_obj_center(delete_lbl);
@@ -29780,7 +30107,7 @@ static void compromised_file_clean_cb(lv_event_t *e)
     }
 }
 
-// Show Compromised Data page with 4 tiles (inside current tab's container)
+// Show Compromised Data page with file-category tiles inside the current tab.
 static void show_compromised_data_page(void)
 {
     tab_context_t *ctx = get_current_ctx();
@@ -29856,10 +30183,13 @@ static void show_compromised_data_page(void)
     lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
     lv_obj_clear_flag(tiles, LV_OBJ_FLAG_SCROLLABLE);
 
-    // Create 4 tiles (same flow as main menu)
+    // Same responsive row-wrap flow as the main menu. Six category tiles wrap
+    // into additional rows when the available width is smaller.
     create_tile(tiles, LV_SYMBOL_LIST, "Evil Twin\nPasswords", COLOR_MATERIAL_AMBER, compromised_data_tile_event_cb, "Evil Twin Passwords");
     create_tile(tiles, LV_SYMBOL_FILE, "Portal\nData", COLOR_MATERIAL_TEAL, compromised_data_tile_event_cb, "Portal Data");
     create_tile(tiles, LV_SYMBOL_DOWNLOAD, "Handshakes", COLOR_MATERIAL_PURPLE, compromised_data_tile_event_cb, "Handshakes");
+    create_tile(tiles, LV_SYMBOL_SAVE, "PCAP\nCaptures", COLOR_MATERIAL_GREEN, compromised_data_tile_event_cb, "PCAP Captures");
+    create_tile(tiles, LV_SYMBOL_EYE_OPEN, "PCAP\nViewer", lv_color_hex(0x087EA4), compromised_data_tile_event_cb, "PCAP Viewer");
     create_tile(tiles, LV_SYMBOL_GPS, "Wardrive\nFiles", COLOR_MATERIAL_CYAN, compromised_data_tile_event_cb, "Wardrive Files");
 
     // Set current visible page
@@ -33790,6 +34120,1316 @@ static void show_handshakes_page(void)
 static void show_wardrive_files_page(void)
 {
     show_compromised_file_page(COMPROMISED_FILE_KIND_WARDRIVE);
+}
+
+static void show_pcap_captures_page(void)
+{
+    show_compromised_file_page(COMPROMISED_FILE_KIND_PCAP_CAPTURE);
+}
+
+//==================================================================================
+// Local PCAP Viewer (Tab5 SD)
+//==================================================================================
+
+static pcap_viewer_state_t *pcap_viewer_get_state(tab_context_t *ctx, bool create)
+{
+    if (!ctx) {
+        return NULL;
+    }
+    if (!ctx->pcap_viewer && create) {
+        ctx->pcap_viewer = heap_caps_calloc(1, sizeof(pcap_viewer_state_t),
+                                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!ctx->pcap_viewer) {
+            ctx->pcap_viewer = calloc(1, sizeof(pcap_viewer_state_t));
+        }
+        if (ctx->pcap_viewer) {
+            ctx->pcap_viewer->ctx = ctx;
+        }
+    }
+    return ctx->pcap_viewer;
+}
+
+static void pcap_viewer_close_detail(pcap_viewer_state_t *state)
+{
+    if (!state) {
+        return;
+    }
+    if (state->detail_overlay && lv_obj_is_valid(state->detail_overlay)) {
+        lv_obj_del(state->detail_overlay);
+    }
+    state->detail_overlay = NULL;
+}
+
+static void pcap_viewer_release_capture(pcap_viewer_state_t *state)
+{
+    if (!state || state->loading) {
+        return;
+    }
+    pcap_viewer_close_detail(state);
+    if (state->reader) {
+        pcap_reader_close(state->reader);
+        state->reader = NULL;
+    }
+    if (state->packet_index) {
+        heap_caps_free(state->packet_index);
+        state->packet_index = NULL;
+    }
+    if (state->packet_flags) {
+        heap_caps_free(state->packet_flags);
+        state->packet_flags = NULL;
+    }
+    if (state->summary) {
+        heap_caps_free(state->summary);
+        state->summary = NULL;
+    }
+    memset(&state->capture_info, 0, sizeof(state->capture_info));
+    memset(&state->scan_summary, 0, sizeof(state->scan_summary));
+    state->packet_page = 0;
+    state->packet_filter = PCAP_FILTER_ALL;
+    state->selected_path[0] = '\0';
+    state->selected_name[0] = '\0';
+}
+
+static bool pcap_viewer_supported_extension(const char *name)
+{
+    return name && (str_ends_with_ext(name, ".pcap") || str_ends_with_ext(name, ".pcapng"));
+}
+
+static void pcap_viewer_scan_directory(pcap_viewer_state_t *state, const char *directory,
+                                       int depth)
+{
+    if (!state || !directory || depth > 4 ||
+        state->file_count >= PCAP_VIEWER_MAX_FILES) {
+        return;
+    }
+    DIR *dir = opendir(directory);
+    if (!dir) {
+        return;
+    }
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL && state->file_count < PCAP_VIEWER_MAX_FILES) {
+        if (entry->d_name[0] == '.') {
+            continue;
+        }
+        char path[PCAP_VIEWER_PATH_MAX];
+        int written = snprintf(path, sizeof(path), "%s/%s", directory, entry->d_name);
+        if (written <= 0 || (size_t)written >= sizeof(path)) {
+            continue;
+        }
+        struct stat item_stat;
+        if (stat(path, &item_stat) != 0) {
+            continue;
+        }
+        if (S_ISDIR(item_stat.st_mode)) {
+            pcap_viewer_scan_directory(state, path, depth + 1);
+            continue;
+        }
+        if (!S_ISREG(item_stat.st_mode) || !pcap_viewer_supported_extension(entry->d_name)) {
+            continue;
+        }
+        pcap_viewer_file_t *file = &state->files[state->file_count++];
+        snprintf(file->path, sizeof(file->path), "%s", path);
+        size_t name_length = strnlen(entry->d_name, sizeof(file->name) - 1U);
+        memcpy(file->name, entry->d_name, name_length);
+        file->name[name_length] = '\0';
+        file->size_bytes = item_stat.st_size > 0 ? (uint64_t)item_stat.st_size : 0;
+    }
+    closedir(dir);
+}
+
+static int pcap_viewer_file_compare(const void *left, const void *right)
+{
+    const pcap_viewer_file_t *a = (const pcap_viewer_file_t *)left;
+    const pcap_viewer_file_t *b = (const pcap_viewer_file_t *)right;
+    return strcasecmp(a->path, b->path);
+}
+
+static void pcap_viewer_format_size(uint64_t bytes, char *output, size_t output_size)
+{
+    if (!output || output_size == 0) {
+        return;
+    }
+    if (bytes >= 1024ULL * 1024ULL) {
+        snprintf(output, output_size, "%.2f MB", (double)bytes / (1024.0 * 1024.0));
+    } else if (bytes >= 1024ULL) {
+        snprintf(output, output_size, "%.1f KB", (double)bytes / 1024.0);
+    } else {
+        snprintf(output, output_size, "%llu B", (unsigned long long)bytes);
+    }
+}
+
+static lv_obj_t *pcap_viewer_create_page(pcap_viewer_state_t *state, lv_obj_t *parent)
+{
+    if (!state || !state->ctx || !parent) {
+        return NULL;
+    }
+    if (state->ctx->pcap_viewer_page && lv_obj_is_valid(state->ctx->pcap_viewer_page)) {
+        lv_obj_del(state->ctx->pcap_viewer_page);
+    }
+    state->status_label = NULL;
+    state->packet_list = NULL;
+    state->page_label = NULL;
+    state->prev_btn = NULL;
+    state->next_btn = NULL;
+    memset(state->filter_buttons, 0, sizeof(state->filter_buttons));
+    state->ctx->pcap_viewer_page = lv_obj_create(parent);
+    lv_obj_t *page = state->ctx->pcap_viewer_page;
+    lv_obj_set_size(page, lv_pct(100), lv_pct(100));
+    lv_obj_align(page, LV_ALIGN_TOP_MID, 0, 0);
+    lv_obj_set_style_bg_color(page, ui_bg_color(), 0);
+    lv_obj_set_style_border_width(page, 0, 0);
+    lv_obj_set_style_pad_all(page, 10, 0);
+    lv_obj_set_style_pad_row(page, 8, 0);
+    lv_obj_set_flex_flow(page, LV_FLEX_FLOW_COLUMN);
+    state->ctx->current_visible_page = page;
+    return page;
+}
+
+static void pcap_viewer_back_cb(lv_event_t *e)
+{
+    pcap_viewer_state_t *state = (pcap_viewer_state_t *)lv_event_get_user_data(e);
+    if (!state) {
+        return;
+    }
+    if (state->loading) {
+        state->cancel_requested = true;
+        if (state->status_label && lv_obj_is_valid(state->status_label)) {
+            lv_label_set_text(state->status_label, "Cancelling PCAP analysis...");
+        }
+        return;
+    }
+    if (state->selected_path[0]) {
+        pcap_viewer_release_capture(state);
+        show_pcap_viewer_page();
+    } else {
+        show_compromised_data_page();
+    }
+}
+
+static lv_obj_t *pcap_viewer_add_header(pcap_viewer_state_t *state, lv_obj_t *page,
+                                        const char *title_text)
+{
+    lv_obj_t *header = lv_obj_create(page);
+    lv_obj_set_size(header, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(header, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(header, 0, 0);
+    lv_obj_set_style_pad_all(header, 0, 0);
+    lv_obj_set_style_pad_column(header, 12, 0);
+    lv_obj_set_flex_flow(header, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(header, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    lv_obj_t *back_btn = lv_btn_create(header);
+    lv_obj_set_size(back_btn, 72, 60);
+    style_back_nav_button(back_btn);
+    lv_obj_add_event_cb(back_btn, pcap_viewer_back_cb, LV_EVENT_CLICKED, state);
+    lv_obj_t *back_icon = lv_label_create(back_btn);
+    lv_label_set_text(back_icon, LV_SYMBOL_LEFT);
+    lv_obj_set_style_text_color(back_icon, lv_color_white(), 0);
+    lv_obj_center(back_icon);
+
+    lv_obj_t *title = lv_label_create(header);
+    lv_label_set_text(title, title_text ? title_text : "PCAP Viewer");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, COLOR_NEON_CYAN, 0);
+    lv_obj_set_flex_grow(title, 1);
+    lv_label_set_long_mode(title, LV_LABEL_LONG_DOT);
+
+    lv_obj_t *badge = lv_label_create(header);
+    lv_label_set_text(badge, LV_SYMBOL_SD_CARD " TAB5 SD");
+    lv_obj_set_style_text_font(badge, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(badge, COLOR_NEON_GREEN, 0);
+    return header;
+}
+
+static void pcap_viewer_render_file_list(pcap_viewer_state_t *state)
+{
+    if (!state || !state->ctx) {
+        return;
+    }
+    lv_obj_t *parent = NULL;
+    if (state->ctx->pcap_viewer_page && lv_obj_is_valid(state->ctx->pcap_viewer_page)) {
+        parent = lv_obj_get_parent(state->ctx->pcap_viewer_page);
+    } else if (tab_id_for_ctx(state->ctx) == current_tab) {
+        parent = get_current_tab_container();
+    }
+    if (!parent) {
+        return;
+    }
+    hide_all_pages(state->ctx);
+    lv_obj_t *page = pcap_viewer_create_page(state, parent);
+    if (!page) {
+        return;
+    }
+    pcap_viewer_add_header(state, page, "PCAP Viewer - local library");
+
+    state->status_label = lv_label_create(page);
+    lv_obj_set_width(state->status_label, lv_pct(100));
+    lv_label_set_long_mode(state->status_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(state->status_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(state->status_label,
+                                state->notice[0] ? COLOR_MATERIAL_AMBER : ui_muted_color(), 0);
+    if (state->notice[0]) {
+        lv_label_set_text(state->status_label, state->notice);
+    } else {
+        lv_label_set_text_fmt(state->status_label,
+                              "Found %d local capture(s) under %s",
+                              state->file_count, PCAP_VIEWER_ROOT);
+    }
+
+    lv_obj_t *list = lv_obj_create(page);
+    lv_obj_set_size(list, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_flex_grow(list, 1);
+    style_surface_panel(list, 8);
+    lv_obj_set_style_pad_all(list, 10, 0);
+    lv_obj_set_style_pad_row(list, 8, 0);
+    lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
+
+    if (state->file_count == 0) {
+        lv_obj_t *empty = lv_label_create(list);
+        lv_label_set_text(empty,
+                          "No local PCAP files yet.\nUse COPY TO TAB5 or Sync new first.");
+        lv_obj_set_width(empty, lv_pct(100));
+        lv_obj_set_style_text_align(empty, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_font(empty, &lv_font_montserrat_18, 0);
+        lv_obj_set_style_text_color(empty, ui_muted_color(), 0);
+        return;
+    }
+
+    for (int i = 0; i < state->file_count; i++) {
+        pcap_viewer_file_t *file = &state->files[i];
+        lv_obj_t *row = lv_obj_create(list);
+        lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_color(row, ui_card_color(), 0);
+        lv_obj_set_style_border_width(row, 1, 0);
+        lv_obj_set_style_border_color(row, ui_border_color(), 0);
+        lv_obj_set_style_radius(row, 8, 0);
+        lv_obj_set_style_pad_all(row, 10, 0);
+        lv_obj_set_style_pad_column(row, 10, 0);
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN,
+                              LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *info = lv_obj_create(row);
+        lv_obj_remove_style_all(info);
+        lv_obj_set_height(info, LV_SIZE_CONTENT);
+        lv_obj_set_flex_grow(info, 1);
+        lv_obj_set_flex_flow(info, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_style_pad_row(info, 3, 0);
+        lv_obj_clear_flag(info, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *name = lv_label_create(info);
+        lv_label_set_text(name, file->name);
+        lv_obj_set_width(name, lv_pct(100));
+        lv_label_set_long_mode(name, LV_LABEL_LONG_DOT);
+        lv_obj_set_style_text_font(name, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(name, COLOR_NEON_CYAN, 0);
+
+        char size_text[32];
+        pcap_viewer_format_size(file->size_bytes, size_text, sizeof(size_text));
+        lv_obj_t *path = lv_label_create(info);
+        lv_label_set_text_fmt(path, "%s  |  %s", file->path, size_text);
+        lv_obj_set_width(path, lv_pct(100));
+        lv_label_set_long_mode(path, LV_LABEL_LONG_DOT);
+        lv_obj_set_style_text_font(path, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(path, ui_muted_color(), 0);
+
+        lv_obj_t *open_btn = lv_btn_create(row);
+        lv_obj_set_size(open_btn, 150, 52);
+        lv_obj_set_style_bg_color(open_btn, lv_color_hex(0x087EA4), 0);
+        lv_obj_set_style_bg_color(open_btn, lv_color_hex(0x05617F), LV_STATE_PRESSED);
+        lv_obj_set_style_border_width(open_btn, 2, 0);
+        lv_obj_set_style_border_color(open_btn, COLOR_NEON_CYAN, 0);
+        lv_obj_set_style_radius(open_btn, 8, 0);
+        lv_obj_add_event_cb(open_btn, pcap_viewer_file_open_cb, LV_EVENT_CLICKED, file);
+        lv_obj_t *open_label = lv_label_create(open_btn);
+        lv_label_set_text(open_label, LV_SYMBOL_EYE_OPEN " OPEN");
+        lv_obj_set_style_text_font(open_label, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(open_label, lv_color_white(), 0);
+        lv_obj_center(open_label);
+    }
+}
+
+static void show_pcap_viewer_page(void)
+{
+    tab_context_t *ctx = get_current_ctx();
+    pcap_viewer_state_t *state = pcap_viewer_get_state(ctx, true);
+    if (!state || state->loading) {
+        return;
+    }
+    pcap_viewer_release_capture(state);
+    state->file_count = 0;
+    pcap_viewer_scan_directory(state, PCAP_VIEWER_ROOT, 0);
+    if (state->file_count > 1) {
+        qsort(state->files, (size_t)state->file_count,
+              sizeof(state->files[0]), pcap_viewer_file_compare);
+    }
+    ESP_LOGI(TAG, "[PCAP Viewer] Local library scan: root=%s files=%d",
+             PCAP_VIEWER_ROOT, state->file_count);
+    pcap_viewer_render_file_list(state);
+    state->notice[0] = '\0';
+}
+
+static void pcap_viewer_progress_cb(uint64_t offset, uint64_t file_size,
+                                    uint64_t packet_count, void *user_ctx)
+{
+    pcap_viewer_state_t *state = (pcap_viewer_state_t *)user_ctx;
+    if (!state || !state->status_label || !bsp_display_lock(50)) {
+        return;
+    }
+    if (state->status_label && lv_obj_is_valid(state->status_label)) {
+        int percent = file_size > 0 ? (int)((offset * 100U) / file_size) : 0;
+        if (percent > 100) percent = 100;
+        lv_label_set_text_fmt(state->status_label,
+                              "Indexing packets... %d%%\n%llu packet(s)",
+                              percent, (unsigned long long)packet_count);
+    }
+    bsp_display_unlock();
+}
+
+static void pcap_viewer_summary_progress_cb(size_t processed_packets,
+                                            size_t total_packets, void *user_ctx)
+{
+    pcap_viewer_state_t *state = (pcap_viewer_state_t *)user_ctx;
+    if (!state || !state->status_label || !bsp_display_lock(50)) {
+        return;
+    }
+    if (state->status_label && lv_obj_is_valid(state->status_label)) {
+        int percent = total_packets > 0
+                          ? (int)((processed_packets * 100U) / total_packets) : 100;
+        if (percent > 100) percent = 100;
+        lv_label_set_text_fmt(state->status_label,
+                              "Building Zeek-style summary... %d%%\n%u/%u indexed packets",
+                              percent, (unsigned)processed_packets,
+                              (unsigned)total_packets);
+    }
+    bsp_display_unlock();
+}
+
+static void pcap_viewer_render_load_result_async(void *user_data)
+{
+    pcap_viewer_state_t *state = (pcap_viewer_state_t *)user_data;
+    if (!state || !state->ctx) {
+        return;
+    }
+    state->loading = false;
+    bool usable = (state->load_status == PCAP_READER_OK ||
+                   state->load_status == PCAP_READER_LIMIT_REACHED ||
+                   state->load_status == PCAP_READER_TRUNCATED);
+    ESP_LOGI(TAG,
+             "[PCAP Viewer] Analysis finished: scan=%s summary=%s packets=%llu indexed=%lu malformed=%lu dns=%llu",
+             pcap_reader_status_name(state->load_status),
+             pcap_reader_status_name(state->summary_status),
+             (unsigned long long)state->scan_summary.packet_count,
+             (unsigned long)state->scan_summary.indexed_packets,
+             (unsigned long)state->scan_summary.malformed_records,
+             state->summary ? (unsigned long long)state->summary->dns_packets : 0ULL);
+    if (usable) {
+        pcap_viewer_render_capture_page(state);
+        return;
+    }
+
+    if (state->load_status == PCAP_READER_UNSUPPORTED_FORMAT) {
+        snprintf(state->notice, sizeof(state->notice),
+                 "%s: PCAPNG is not supported yet. Use classic PCAP 2.4.",
+                 state->selected_name[0] ? state->selected_name : "PCAP");
+    } else {
+        snprintf(state->notice, sizeof(state->notice), "%s: %s",
+                 state->selected_name[0] ? state->selected_name : "PCAP",
+                 pcap_reader_status_name(state->load_status));
+    }
+    pcap_viewer_release_capture(state);
+    state->file_count = 0;
+    pcap_viewer_scan_directory(state, PCAP_VIEWER_ROOT, 0);
+    if (state->file_count > 1) {
+        qsort(state->files, (size_t)state->file_count,
+              sizeof(state->files[0]), pcap_viewer_file_compare);
+    }
+    pcap_viewer_render_file_list(state);
+    state->notice[0] = '\0';
+}
+
+static void pcap_viewer_load_task(void *arg)
+{
+    pcap_viewer_state_t *state = (pcap_viewer_state_t *)arg;
+    if (!state) {
+        vTaskDelete(NULL);
+        return;
+    }
+    ESP_LOGI(TAG, "[PCAP Viewer] Opening %s", state->selected_path);
+    state->load_status = pcap_reader_open(state->selected_path, &state->reader,
+                                          &state->capture_info);
+    if (state->load_status == PCAP_READER_OK) {
+        state->load_status = pcap_reader_scan(state->reader, state->packet_index,
+                                              PCAP_VIEWER_MAX_INDEXED_PACKETS,
+                                              &state->scan_summary,
+                                              &state->cancel_requested,
+                                              pcap_viewer_progress_cb, state);
+    }
+    if ((state->load_status == PCAP_READER_OK ||
+         state->load_status == PCAP_READER_LIMIT_REACHED ||
+         state->load_status == PCAP_READER_TRUNCATED) &&
+        state->summary && state->packet_flags) {
+        pcap_reader_status_t scan_status = state->load_status;
+        state->summary_status =
+            pcap_summary_build(state->reader, state->packet_index,
+                               state->scan_summary.indexed_packets,
+                               state->summary, state->packet_flags,
+                               PCAP_VIEWER_MAX_INDEXED_PACKETS,
+                               &state->cancel_requested,
+                               pcap_viewer_summary_progress_cb, state);
+        if (state->summary_status == PCAP_READER_OK) {
+            state->load_status = scan_status;
+        } else {
+            state->load_status = state->summary_status;
+        }
+    }
+    state->task = NULL;
+    lv_async_call(pcap_viewer_render_load_result_async, state);
+    vTaskDelete(NULL);
+}
+
+static void pcap_viewer_render_loading_page(pcap_viewer_state_t *state)
+{
+    if (!state || !state->ctx) {
+        return;
+    }
+    lv_obj_t *parent = get_current_tab_container();
+    if (!parent) {
+        return;
+    }
+    hide_all_pages(state->ctx);
+    lv_obj_t *page = pcap_viewer_create_page(state, parent);
+    if (!page) {
+        return;
+    }
+    pcap_viewer_add_header(state, page, state->selected_name);
+
+    lv_obj_t *box = lv_obj_create(page);
+    lv_obj_set_size(box, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_flex_grow(box, 1);
+    style_surface_panel(box, 12);
+    lv_obj_set_flex_flow(box, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(box, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(box, 24, 0);
+
+    lv_obj_t *spinner = lv_spinner_create(box);
+    lv_obj_set_size(spinner, 96, 96);
+    lv_spinner_set_anim_params(spinner, 1000, 200);
+    lv_obj_set_style_arc_color(spinner, COLOR_NEON_CYAN, LV_PART_INDICATOR);
+
+    state->status_label = lv_label_create(box);
+    lv_label_set_text(state->status_label,
+                      "Opening PCAP, building PSRAM index and summary...");
+    lv_obj_set_width(state->status_label, lv_pct(90));
+    lv_obj_set_style_text_align(state->status_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(state->status_label, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_color(state->status_label, ui_text_color(), 0);
+}
+
+static void pcap_viewer_file_open_cb(lv_event_t *e)
+{
+    pcap_viewer_file_t *file = (pcap_viewer_file_t *)lv_event_get_user_data(e);
+    tab_context_t *ctx = get_current_ctx();
+    pcap_viewer_state_t *state = pcap_viewer_get_state(ctx, false);
+    if (!state || !file || state->loading || state->task) {
+        return;
+    }
+    pcap_viewer_release_capture(state);
+    state->packet_index = heap_caps_calloc(PCAP_VIEWER_MAX_INDEXED_PACKETS,
+                                           sizeof(pcap_packet_index_t),
+                                           MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    state->packet_flags = heap_caps_calloc(PCAP_VIEWER_MAX_INDEXED_PACKETS,
+                                           sizeof(uint32_t),
+                                           MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    state->summary = heap_caps_calloc(1, sizeof(pcap_summary_t),
+                                      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!state->packet_index || !state->packet_flags || !state->summary) {
+        snprintf(state->notice, sizeof(state->notice),
+                 "Not enough PSRAM for the packet index and summary.");
+        pcap_viewer_release_capture(state);
+        pcap_viewer_render_file_list(state);
+        state->notice[0] = '\0';
+        return;
+    }
+
+    snprintf(state->selected_path, sizeof(state->selected_path), "%s", file->path);
+    snprintf(state->selected_name, sizeof(state->selected_name), "%s", file->name);
+    state->cancel_requested = false;
+    state->loading = true;
+    state->load_status = PCAP_READER_OK;
+    state->summary_status = PCAP_READER_OK;
+    state->packet_filter = PCAP_FILTER_ALL;
+    pcap_viewer_render_loading_page(state);
+    if (xTaskCreate(pcap_viewer_load_task, "pcap_index", 8192, state, 5,
+                    &state->task) != pdTRUE) {
+        state->loading = false;
+        state->task = NULL;
+        snprintf(state->notice, sizeof(state->notice), "Could not start PCAP index task.");
+        pcap_viewer_release_capture(state);
+        show_pcap_viewer_page();
+    }
+}
+
+static void pcap_viewer_format_endpoint(const char *address, uint16_t port,
+                                        char *output, size_t output_size)
+{
+    if (!output || output_size == 0) {
+        return;
+    }
+    if (!address || !address[0]) {
+        snprintf(output, output_size, "-");
+    } else if (port > 0) {
+        snprintf(output, output_size, "%s:%u", address, port);
+    } else {
+        snprintf(output, output_size, "%s", address);
+    }
+}
+
+static void pcap_viewer_packet_detail_close_cb(lv_event_t *e)
+{
+    pcap_viewer_state_t *state = (pcap_viewer_state_t *)lv_event_get_user_data(e);
+    pcap_viewer_close_detail(state);
+}
+
+static void pcap_viewer_append_text(char *output, size_t output_size, size_t *position,
+                                    const char *format, ...)
+{
+    if (!output || !position || *position >= output_size) {
+        return;
+    }
+    va_list args;
+    va_start(args, format);
+    int written = vsnprintf(output + *position, output_size - *position, format, args);
+    va_end(args);
+    if (written < 0) {
+        return;
+    }
+    size_t added = (size_t)written;
+    if (added >= output_size - *position) {
+        *position = output_size - 1;
+    } else {
+        *position += added;
+    }
+}
+
+static void pcap_viewer_packet_detail_cb(lv_event_t *e)
+{
+    uintptr_t encoded = (uintptr_t)lv_event_get_user_data(e);
+    if (encoded == 0) {
+        return;
+    }
+    uint32_t packet_index = (uint32_t)(encoded - 1U);
+    tab_context_t *ctx = get_current_ctx();
+    pcap_viewer_state_t *state = pcap_viewer_get_state(ctx, false);
+    if (!state || !state->reader || !state->packet_index ||
+        packet_index >= state->scan_summary.indexed_packets) {
+        return;
+    }
+    pcap_viewer_close_detail(state);
+
+    pcap_packet_index_t *packet = &state->packet_index[packet_index];
+    pcap_packet_details_t details;
+    pcap_reader_status_t detail_status =
+        pcap_reader_describe_packet(state->reader, packet, &details);
+    uint8_t bytes[PCAP_VIEWER_HEX_BYTES];
+    size_t bytes_read = 0;
+    pcap_reader_status_t read_status =
+        pcap_reader_read_packet(state->reader, packet, bytes, sizeof(bytes), &bytes_read);
+    if ((detail_status != PCAP_READER_OK && detail_status != PCAP_READER_LIMIT_REACHED) ||
+        (read_status != PCAP_READER_OK && read_status != PCAP_READER_LIMIT_REACHED)) {
+        return;
+    }
+
+    char *text_buffer = heap_caps_malloc(4096, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!text_buffer) {
+        return;
+    }
+    text_buffer[0] = '\0';
+    size_t position = 0;
+    char source[96], destination[96];
+    pcap_viewer_format_endpoint(details.source, details.source_port,
+                                source, sizeof(source));
+    pcap_viewer_format_endpoint(details.destination, details.destination_port,
+                                destination, sizeof(destination));
+    uint32_t fraction_width = state->capture_info.timestamp_resolution ==
+                                  PCAP_TIMESTAMP_NANOSECONDS ? 9U : 6U;
+    pcap_viewer_append_text(text_buffer, 4096, &position,
+                            "Packet #%lu\nTimestamp: %lu.%0*lu (%s)\n"
+                            "Captured: %lu B | Original: %lu B\n"
+                            "Protocol: %s\nSource: %s\nDestination: %s\nInfo: %s%s%s\n\n"
+                            "HEX / ASCII (first %u bytes)\n",
+                            (unsigned long)(packet_index + 1),
+                            (unsigned long)packet->timestamp_seconds,
+                            (int)fraction_width, (unsigned long)packet->timestamp_fraction,
+                            state->capture_info.timestamp_resolution == PCAP_TIMESTAMP_NANOSECONDS
+                                ? "nanoseconds" : "microseconds",
+                            (unsigned long)packet->captured_length,
+                            (unsigned long)packet->original_length,
+                            details.protocol[0] ? details.protocol : "Unknown",
+                            source, destination,
+                            details.info[0] ? details.info : "-",
+                            details.malformed ? " | MALFORMED" : "",
+                            details.payload_truncated ? " | SNAPSHOT TRUNCATED" : "",
+                            (unsigned)bytes_read);
+
+    for (size_t offset = 0; offset < bytes_read; offset += 16) {
+        pcap_viewer_append_text(text_buffer, 4096, &position, "%04X  ", (unsigned)offset);
+        for (size_t column = 0; column < 16; column++) {
+            if (offset + column < bytes_read) {
+                pcap_viewer_append_text(text_buffer, 4096, &position,
+                                        "%02X ", bytes[offset + column]);
+            } else {
+                pcap_viewer_append_text(text_buffer, 4096, &position, "   ");
+            }
+        }
+        pcap_viewer_append_text(text_buffer, 4096, &position, " ");
+        for (size_t column = 0; column < 16 && offset + column < bytes_read; column++) {
+            uint8_t c = bytes[offset + column];
+            pcap_viewer_append_text(text_buffer, 4096, &position, "%c",
+                                    c >= 32 && c <= 126 ? c : '.');
+        }
+        pcap_viewer_append_text(text_buffer, 4096, &position, "\n");
+    }
+
+    state->detail_overlay = lv_obj_create(lv_scr_act());
+    lv_obj_remove_style_all(state->detail_overlay);
+    lv_obj_set_size(state->detail_overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(state->detail_overlay, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(state->detail_overlay, LV_OPA_70, 0);
+    lv_obj_add_flag(state->detail_overlay, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(state->detail_overlay, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *popup = lv_obj_create(state->detail_overlay);
+    lv_obj_set_size(popup, lv_pct(88), lv_pct(88));
+    lv_obj_center(popup);
+    style_surface_panel(popup, 14);
+    lv_obj_set_style_border_width(popup, 2, 0);
+    lv_obj_set_style_border_color(popup, COLOR_NEON_CYAN, 0);
+    lv_obj_set_style_pad_all(popup, 14, 0);
+    lv_obj_set_style_pad_row(popup, 10, 0);
+    lv_obj_set_flex_flow(popup, LV_FLEX_FLOW_COLUMN);
+
+    lv_obj_t *title = lv_label_create(popup);
+    lv_label_set_text_fmt(title, LV_SYMBOL_EYE_OPEN " Packet #%lu details",
+                          (unsigned long)(packet_index + 1));
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, COLOR_NEON_CYAN, 0);
+
+    lv_obj_t *scroll = lv_obj_create(popup);
+    lv_obj_set_size(scroll, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_flex_grow(scroll, 1);
+    lv_obj_set_style_bg_color(scroll, lv_color_hex(0x050A14), 0);
+    lv_obj_set_style_border_width(scroll, 1, 0);
+    lv_obj_set_style_border_color(scroll, ui_border_color(), 0);
+    lv_obj_set_style_pad_all(scroll, 12, 0);
+
+    lv_obj_t *detail_label = lv_label_create(scroll);
+    lv_label_set_text(detail_label, text_buffer);
+    lv_obj_set_width(detail_label, lv_pct(100));
+    lv_label_set_long_mode(detail_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(detail_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(detail_label, ui_text_color(), 0);
+    heap_caps_free(text_buffer);
+
+    lv_obj_t *close_btn = lv_btn_create(popup);
+    lv_obj_set_size(close_btn, 160, 46);
+    lv_obj_set_style_bg_color(close_btn, COLOR_MATERIAL_BLUE, 0);
+    lv_obj_set_style_radius(close_btn, 8, 0);
+    lv_obj_add_event_cb(close_btn, pcap_viewer_packet_detail_close_cb,
+                        LV_EVENT_CLICKED, state);
+    lv_obj_t *close_label = lv_label_create(close_btn);
+    lv_label_set_text(close_label, "Close");
+    lv_obj_set_style_text_color(close_label, lv_color_white(), 0);
+    lv_obj_center(close_label);
+}
+
+static bool pcap_viewer_packet_is_visible(const pcap_viewer_state_t *state,
+                                          uint32_t packet_index)
+{
+    if (!state || packet_index >= state->scan_summary.indexed_packets) {
+        return false;
+    }
+    if (state->packet_filter == PCAP_FILTER_ALL) {
+        return true;
+    }
+    return state->packet_flags &&
+           pcap_reader_packet_matches_filter(state->packet_flags[packet_index],
+                                             state->packet_filter);
+}
+
+static uint32_t pcap_viewer_filtered_packet_count(const pcap_viewer_state_t *state)
+{
+    if (!state) {
+        return 0;
+    }
+    uint32_t count = 0;
+    for (uint32_t i = 0; i < state->scan_summary.indexed_packets; i++) {
+        if (pcap_viewer_packet_is_visible(state, i)) {
+            count++;
+        }
+    }
+    return count;
+}
+
+static void pcap_viewer_update_filter_styles(pcap_viewer_state_t *state)
+{
+    if (!state) {
+        return;
+    }
+    for (int filter = 0; filter < PCAP_FILTER_COUNT; filter++) {
+        lv_obj_t *button = state->filter_buttons[filter];
+        if (!button || !lv_obj_is_valid(button)) {
+            continue;
+        }
+        bool active = state->packet_filter == (pcap_packet_filter_t)filter;
+        lv_obj_set_style_bg_color(button,
+                                  active ? lv_color_hex(0x087EA4) : ui_card_color(), 0);
+        lv_obj_set_style_border_color(button,
+                                      active ? COLOR_NEON_CYAN : ui_border_color(), 0);
+    }
+}
+
+static void pcap_viewer_filter_cb(lv_event_t *e)
+{
+    uintptr_t encoded = (uintptr_t)lv_event_get_user_data(e);
+    if (encoded == 0 || encoded > PCAP_FILTER_COUNT) {
+        return;
+    }
+    tab_context_t *ctx = get_current_ctx();
+    pcap_viewer_state_t *state = pcap_viewer_get_state(ctx, false);
+    if (!state || state->loading) {
+        return;
+    }
+    state->packet_filter = (pcap_packet_filter_t)(encoded - 1U);
+    state->packet_page = 0;
+    ESP_LOGI(TAG, "[PCAP Viewer] Filter %s selected: %lu indexed match(es)",
+             pcap_reader_filter_name(state->packet_filter),
+             (unsigned long)pcap_viewer_filtered_packet_count(state));
+    pcap_viewer_update_filter_styles(state);
+    pcap_viewer_render_packet_page(state);
+}
+
+static void pcap_viewer_render_packet_page(pcap_viewer_state_t *state)
+{
+    if (!state || !state->packet_list || !lv_obj_is_valid(state->packet_list) ||
+        !state->reader || !state->packet_index) {
+        return;
+    }
+    lv_obj_clean(state->packet_list);
+    uint32_t indexed = state->scan_summary.indexed_packets;
+    uint32_t filtered = pcap_viewer_filtered_packet_count(state);
+    int total_pages = filtered == 0 ? 1 :
+        (int)((filtered + PCAP_VIEWER_PACKET_PAGE_SIZE - 1) /
+              PCAP_VIEWER_PACKET_PAGE_SIZE);
+    if (state->packet_page < 0) state->packet_page = 0;
+    if (state->packet_page >= total_pages) state->packet_page = total_pages - 1;
+    uint32_t start_match = (uint32_t)state->packet_page * PCAP_VIEWER_PACKET_PAGE_SIZE;
+    uint32_t end_match = start_match + PCAP_VIEWER_PACKET_PAGE_SIZE;
+    if (end_match > filtered) end_match = filtered;
+
+    if (state->page_label && lv_obj_is_valid(state->page_label)) {
+        lv_label_set_text_fmt(state->page_label, "Page %d/%d | %lu indexed match | %llu total",
+                              state->packet_page + 1, total_pages,
+                              (unsigned long)filtered,
+                              (unsigned long long)state->scan_summary.packet_count);
+    }
+    if (state->prev_btn) {
+        if (state->packet_page <= 0) lv_obj_add_state(state->prev_btn, LV_STATE_DISABLED);
+        else lv_obj_clear_state(state->prev_btn, LV_STATE_DISABLED);
+    }
+    if (state->next_btn) {
+        if (state->packet_page + 1 >= total_pages) lv_obj_add_state(state->next_btn, LV_STATE_DISABLED);
+        else lv_obj_clear_state(state->next_btn, LV_STATE_DISABLED);
+    }
+
+    if (filtered == 0) {
+        lv_obj_t *empty = lv_label_create(state->packet_list);
+        lv_label_set_text_fmt(empty, "%s: no matching indexed packets.",
+                              pcap_reader_filter_name(state->packet_filter));
+        lv_obj_set_width(empty, lv_pct(100));
+        lv_obj_set_style_text_align(empty, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_color(empty, ui_muted_color(), 0);
+        return;
+    }
+
+    double fraction_scale = state->capture_info.timestamp_resolution ==
+                                PCAP_TIMESTAMP_NANOSECONDS ? 1000000000.0 : 1000000.0;
+    double first_time = (double)state->scan_summary.first_timestamp_seconds +
+                        ((double)state->scan_summary.first_timestamp_fraction / fraction_scale);
+    uint32_t match_index = 0;
+    for (uint32_t i = 0; i < indexed && match_index < end_match; i++) {
+        if (!pcap_viewer_packet_is_visible(state, i)) {
+            continue;
+        }
+        if (match_index++ < start_match) {
+            continue;
+        }
+        pcap_packet_index_t *packet = &state->packet_index[i];
+        pcap_packet_details_t details;
+        pcap_reader_status_t status =
+            pcap_reader_describe_packet(state->reader, packet, &details);
+        if (status != PCAP_READER_OK && status != PCAP_READER_LIMIT_REACHED) {
+            memset(&details, 0, sizeof(details));
+            snprintf(details.protocol, sizeof(details.protocol), "Read error");
+            snprintf(details.info, sizeof(details.info), "%s",
+                     pcap_reader_status_name(status));
+        }
+        double packet_time = (double)packet->timestamp_seconds +
+                             ((double)packet->timestamp_fraction / fraction_scale);
+        char source[96], destination[96];
+        pcap_viewer_format_endpoint(details.source, details.source_port,
+                                    source, sizeof(source));
+        pcap_viewer_format_endpoint(details.destination, details.destination_port,
+                                    destination, sizeof(destination));
+
+        lv_obj_t *row = lv_obj_create(state->packet_list);
+        lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_color(row, ui_card_color(), 0);
+        lv_obj_set_style_bg_color(row, ui_card_pressed_color(), LV_STATE_PRESSED);
+        lv_obj_set_style_border_width(row, 1, 0);
+        lv_obj_set_style_border_color(row,
+                                      details.malformed ? COLOR_MATERIAL_RED : ui_border_color(), 0);
+        lv_obj_set_style_radius(row, 7, 0);
+        lv_obj_set_style_pad_all(row, 8, 0);
+        lv_obj_set_style_pad_column(row, 10, 0);
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START,
+                              LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_event_cb(row, pcap_viewer_packet_detail_cb, LV_EVENT_CLICKED,
+                            (void *)(uintptr_t)(i + 1U));
+
+        lv_obj_t *number = lv_label_create(row);
+        lv_label_set_text_fmt(number, "#%lu\n+%.6fs",
+                              (unsigned long)(i + 1), packet_time - first_time);
+        lv_obj_set_width(number, 125);
+        lv_obj_set_style_text_font(number, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(number, ui_muted_color(), 0);
+
+        lv_obj_t *protocol = lv_label_create(row);
+        lv_label_set_text(protocol, details.protocol[0] ? details.protocol : "Unknown");
+        lv_obj_set_width(protocol, 110);
+        lv_obj_set_style_text_font(protocol, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(protocol,
+                                    details.malformed ? COLOR_MATERIAL_RED : COLOR_NEON_GREEN, 0);
+
+        lv_obj_t *flow = lv_label_create(row);
+        lv_label_set_text_fmt(flow, "%s  ->  %s", source, destination);
+        lv_obj_set_width(flow, 430);
+        lv_label_set_long_mode(flow, LV_LABEL_LONG_DOT);
+        lv_obj_set_style_text_font(flow, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(flow, ui_text_color(), 0);
+
+        lv_obj_t *info = lv_label_create(row);
+        lv_label_set_text_fmt(info, "%s  [%lu/%lu B]",
+                              details.info[0] ? details.info : "-",
+                              (unsigned long)packet->captured_length,
+                              (unsigned long)packet->original_length);
+        lv_obj_set_flex_grow(info, 1);
+        lv_label_set_long_mode(info, LV_LABEL_LONG_DOT);
+        lv_obj_set_style_text_font(info, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(info, ui_muted_color(), 0);
+    }
+}
+
+static void pcap_viewer_page_change_cb(lv_event_t *e)
+{
+    pcap_viewer_state_t *state = (pcap_viewer_state_t *)lv_event_get_user_data(e);
+    if (!state) {
+        return;
+    }
+    lv_obj_t *target = lv_event_get_target(e);
+    if (target == state->prev_btn) {
+        state->packet_page--;
+    } else if (target == state->next_btn) {
+        state->packet_page++;
+    }
+    pcap_viewer_render_packet_page(state);
+}
+
+static void pcap_viewer_show_summary_popup(pcap_viewer_state_t *state,
+                                           const char *title_text,
+                                           const char *body_text)
+{
+    if (!state || !title_text || !body_text) {
+        return;
+    }
+    pcap_viewer_close_detail(state);
+    state->detail_overlay = lv_obj_create(lv_scr_act());
+    lv_obj_remove_style_all(state->detail_overlay);
+    lv_obj_set_size(state->detail_overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(state->detail_overlay, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(state->detail_overlay, LV_OPA_70, 0);
+    lv_obj_add_flag(state->detail_overlay, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(state->detail_overlay, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *popup = lv_obj_create(state->detail_overlay);
+    lv_obj_set_size(popup, lv_pct(86), lv_pct(88));
+    lv_obj_center(popup);
+    style_surface_panel(popup, 14);
+    lv_obj_set_style_border_width(popup, 2, 0);
+    lv_obj_set_style_border_color(popup, COLOR_NEON_CYAN, 0);
+    lv_obj_set_style_pad_all(popup, 14, 0);
+    lv_obj_set_style_pad_row(popup, 10, 0);
+    lv_obj_set_flex_flow(popup, LV_FLEX_FLOW_COLUMN);
+
+    lv_obj_t *title = lv_label_create(popup);
+    lv_label_set_text(title, title_text);
+    lv_obj_set_width(title, lv_pct(100));
+    lv_label_set_long_mode(title, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, COLOR_NEON_CYAN, 0);
+
+    lv_obj_t *scroll = lv_obj_create(popup);
+    lv_obj_set_size(scroll, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_flex_grow(scroll, 1);
+    lv_obj_set_style_bg_color(scroll, lv_color_hex(0x050A14), 0);
+    lv_obj_set_style_border_width(scroll, 1, 0);
+    lv_obj_set_style_border_color(scroll, ui_border_color(), 0);
+    lv_obj_set_style_pad_all(scroll, 12, 0);
+
+    lv_obj_t *body = lv_label_create(scroll);
+    lv_label_set_text(body, body_text);
+    lv_obj_set_width(body, lv_pct(100));
+    lv_label_set_long_mode(body, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(body, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(body, ui_text_color(), 0);
+
+    lv_obj_t *close_btn = lv_btn_create(popup);
+    lv_obj_set_size(close_btn, 160, 46);
+    lv_obj_set_style_bg_color(close_btn, COLOR_MATERIAL_BLUE, 0);
+    lv_obj_set_style_radius(close_btn, 8, 0);
+    lv_obj_add_event_cb(close_btn, pcap_viewer_packet_detail_close_cb,
+                        LV_EVENT_CLICKED, state);
+    lv_obj_t *close_label = lv_label_create(close_btn);
+    lv_label_set_text(close_label, "Close");
+    lv_obj_set_style_text_color(close_label, lv_color_white(), 0);
+    lv_obj_center(close_label);
+}
+
+static void pcap_viewer_append_top_text(char *buffer, size_t buffer_size,
+                                        size_t *position, const char *heading,
+                                        const pcap_summary_text_counter_t *entries,
+                                        uint16_t count, uint16_t limit,
+                                        bool approximate)
+{
+    pcap_viewer_append_text(buffer, buffer_size, position, "\n%s%s\n",
+                            heading, approximate ? " (approximate)" : "");
+    uint16_t shown = count < limit ? count : limit;
+    if (shown == 0) {
+        pcap_viewer_append_text(buffer, buffer_size, position, "  none\n");
+        return;
+    }
+    for (uint16_t i = 0; i < shown; i++) {
+        pcap_viewer_append_text(buffer, buffer_size, position,
+                                "  %u. %s - %llu\n", (unsigned)(i + 1),
+                                entries[i].label,
+                                (unsigned long long)entries[i].count);
+    }
+}
+
+static void pcap_viewer_summary_cb(lv_event_t *e)
+{
+    uintptr_t summary_kind = (uintptr_t)lv_event_get_user_data(e);
+    tab_context_t *ctx = get_current_ctx();
+    pcap_viewer_state_t *state = pcap_viewer_get_state(ctx, false);
+    if (!state || !state->summary || state->summary_status != PCAP_READER_OK) {
+        return;
+    }
+
+    char *text_buffer = heap_caps_malloc(8192, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!text_buffer) {
+        return;
+    }
+    text_buffer[0] = '\0';
+    size_t position = 0;
+    const pcap_summary_t *summary = state->summary;
+    bool sampled = summary->analyzed_packets < state->scan_summary.packet_count;
+
+    if (summary_kind == 2U) {
+        pcap_viewer_append_text(text_buffer, 8192, &position,
+                                "Scope: %llu indexed packet(s)%s\n"
+                                "DNS packets: %llu | queries: %llu | responses: %llu\n"
+                                "RCODE: NOERROR %llu | NXDOMAIN %llu | SERVFAIL %llu | other %llu\n"
+                                "Observed unique domains: %llu%s\n"
+                                "Long names (>=50 chars): %llu | >=5 labels: %llu\n",
+                                (unsigned long long)summary->analyzed_packets,
+                                sampled ? " (capture sample)" : "",
+                                (unsigned long long)summary->dns_packets,
+                                (unsigned long long)summary->dns_queries,
+                                (unsigned long long)summary->dns_responses,
+                                (unsigned long long)summary->dns_noerror,
+                                (unsigned long long)summary->dns_nxdomain,
+                                (unsigned long long)summary->dns_servfail,
+                                (unsigned long long)summary->dns_other_rcode,
+                                (unsigned long long)summary->dns_unique_domains_observed,
+                                summary->dns_domain_table_approximate ? " (approximate)" : "",
+                                (unsigned long long)summary->dns_long_names,
+                                (unsigned long long)summary->dns_many_label_names);
+        if (summary->dns_packets == 0) {
+            pcap_viewer_append_text(text_buffer, 8192, &position,
+                                    "\nNo decoded DNS was found. Encrypted 802.11 payloads "
+                                    "and handshake-only PCAPs do not expose DNS.\n");
+        }
+        pcap_viewer_append_top_text(text_buffer, 8192, &position, "Query types",
+                                    summary->dns_types, summary->dns_type_count, 10,
+                                    summary->dns_type_table_approximate);
+        pcap_viewer_append_top_text(text_buffer, 8192, &position, "Top domains",
+                                    summary->dns_domains, summary->dns_domain_count, 12,
+                                    summary->dns_domain_table_approximate);
+        pcap_viewer_append_top_text(text_buffer, 8192, &position, "Top answers",
+                                    summary->dns_answers, summary->dns_answer_count, 10,
+                                    summary->dns_answer_table_approximate);
+        pcap_viewer_append_top_text(text_buffer, 8192, &position, "DNS clients",
+                                    summary->dns_clients, summary->dns_client_count, 8,
+                                    summary->dns_client_table_approximate);
+        pcap_viewer_append_top_text(text_buffer, 8192, &position, "DNS servers",
+                                    summary->dns_servers, summary->dns_server_count, 8,
+                                    summary->dns_server_table_approximate);
+        pcap_viewer_append_text(text_buffer, 8192, &position,
+                                "\nLong-name counters are indicators, not a security verdict.\n");
+        pcap_viewer_show_summary_popup(state, LV_SYMBOL_LIST " DNS Summary", text_buffer);
+    } else {
+        double fraction_scale = state->capture_info.timestamp_resolution ==
+                                    PCAP_TIMESTAMP_NANOSECONDS ? 1000000000.0 : 1000000.0;
+        double duration = 0;
+        if (state->scan_summary.packet_count > 0) {
+            duration = (double)state->scan_summary.last_timestamp_seconds -
+                       (double)state->scan_summary.first_timestamp_seconds +
+                       ((double)state->scan_summary.last_timestamp_fraction -
+                        (double)state->scan_summary.first_timestamp_fraction) /
+                           fraction_scale;
+            if (duration < 0) duration = 0;
+        }
+        double packet_rate = duration > 0
+                                 ? (double)state->scan_summary.packet_count / duration : 0;
+        double bit_rate = duration > 0
+                              ? ((double)state->scan_summary.captured_bytes * 8.0) / duration : 0;
+        pcap_viewer_append_text(text_buffer, 8192, &position,
+                                "Capture: %llu packet(s), %llu captured bytes, %.3f s\n"
+                                "Rate: %.2f packets/s | %.2f kbit/s\n"
+                                "Analyzed: %llu indexed packet(s)%s\n"
+                                "TCP %llu | UDP %llu | ARP %llu | DNS %llu | HTTP %llu | TLS %llu\n"
+                                "EAPOL %llu | malformed %llu | snapshot truncated %llu | decode >512 B %llu\n"
+                                "802.11 management %llu | beacon %llu | probe req %llu | probe resp %llu | deauth %llu\n",
+                                (unsigned long long)state->scan_summary.packet_count,
+                                (unsigned long long)state->scan_summary.captured_bytes,
+                                duration, packet_rate, bit_rate / 1000.0,
+                                (unsigned long long)summary->analyzed_packets,
+                                sampled ? " (capture sample)" : "",
+                                (unsigned long long)summary->tcp_packets,
+                                (unsigned long long)summary->udp_packets,
+                                (unsigned long long)summary->arp_packets,
+                                (unsigned long long)summary->dns_packets,
+                                (unsigned long long)summary->http_packets,
+                                (unsigned long long)summary->tls_packets,
+                                (unsigned long long)summary->eapol_packets,
+                                (unsigned long long)summary->malformed_packets,
+                                (unsigned long long)summary->truncated_packets,
+                                (unsigned long long)summary->decode_limited_packets,
+                                (unsigned long long)summary->wifi_management_packets,
+                                (unsigned long long)summary->wifi_beacons,
+                                (unsigned long long)summary->wifi_probe_requests,
+                                (unsigned long long)summary->wifi_probe_responses,
+                                (unsigned long long)summary->wifi_deauthentications);
+        pcap_viewer_append_top_text(text_buffer, 8192, &position, "Protocols",
+                                    summary->protocols, summary->protocol_count, 10,
+                                    summary->protocol_table_approximate);
+        pcap_viewer_append_top_text(text_buffer, 8192, &position, "Top endpoints",
+                                    summary->endpoints, summary->endpoint_count, 12,
+                                    summary->endpoint_table_approximate);
+        pcap_viewer_append_text(text_buffer, 8192, &position, "\nTop ports%s\n",
+                                summary->port_table_approximate ? " (approximate)" : "");
+        uint16_t ports_shown = summary->port_count < 12 ? summary->port_count : 12;
+        if (ports_shown == 0) {
+            pcap_viewer_append_text(text_buffer, 8192, &position, "  none\n");
+        }
+        for (uint16_t i = 0; i < ports_shown; i++) {
+            pcap_viewer_append_text(text_buffer, 8192, &position,
+                                    "  %u. %s/%u - %llu\n", (unsigned)(i + 1),
+                                    summary->ports[i].ip_protocol == 6 ? "TCP" : "UDP",
+                                    summary->ports[i].port,
+                                    (unsigned long long)summary->ports[i].count);
+        }
+        pcap_viewer_show_summary_popup(state, LV_SYMBOL_EYE_OPEN " PCAP Overview", text_buffer);
+    }
+    heap_caps_free(text_buffer);
+}
+
+static void pcap_viewer_render_capture_page(pcap_viewer_state_t *state)
+{
+    if (!state || !state->ctx || !state->ctx->pcap_viewer_page ||
+        !lv_obj_is_valid(state->ctx->pcap_viewer_page)) {
+        return;
+    }
+    lv_obj_t *parent = lv_obj_get_parent(state->ctx->pcap_viewer_page);
+    lv_obj_t *page = pcap_viewer_create_page(state, parent);
+    if (!page) {
+        return;
+    }
+    pcap_viewer_add_header(state, page, state->selected_name);
+
+    lv_obj_t *summary = lv_obj_create(page);
+    lv_obj_set_size(summary, lv_pct(100), LV_SIZE_CONTENT);
+    style_surface_panel(summary, 8);
+    lv_obj_set_style_pad_all(summary, 10, 0);
+    lv_obj_set_style_pad_column(summary, 18, 0);
+    lv_obj_set_flex_flow(summary, LV_FLEX_FLOW_ROW);
+    lv_obj_clear_flag(summary, LV_OBJ_FLAG_SCROLLABLE);
+
+    double fraction_scale = state->capture_info.timestamp_resolution ==
+                                PCAP_TIMESTAMP_NANOSECONDS ? 1000000000.0 : 1000000.0;
+    double duration = 0;
+    if (state->scan_summary.packet_count > 0) {
+        duration = (double)state->scan_summary.last_timestamp_seconds -
+                   (double)state->scan_summary.first_timestamp_seconds +
+                   ((double)state->scan_summary.last_timestamp_fraction -
+                    (double)state->scan_summary.first_timestamp_fraction) / fraction_scale;
+        if (duration < 0) duration = 0;
+    }
+    char file_size_text[32];
+    pcap_viewer_format_size(state->capture_info.file_size,
+                            file_size_text, sizeof(file_size_text));
+    lv_obj_t *summary_label = lv_label_create(summary);
+    lv_label_set_text_fmt(summary_label,
+                          "#52B6FF %s#  |  PCAP %u.%u %s-endian %s\n"
+                          "#5EDCA3 %llu packets#  |  indexed %lu  |  %.3f s  |  %s  |  snaplen %lu%s%s",
+                          pcap_reader_link_type_name(state->capture_info.link_type),
+                          state->capture_info.version_major, state->capture_info.version_minor,
+                          state->capture_info.big_endian ? "big" : "little",
+                          state->capture_info.timestamp_resolution == PCAP_TIMESTAMP_NANOSECONDS
+                              ? "ns" : "us",
+                          (unsigned long long)state->scan_summary.packet_count,
+                          (unsigned long)state->scan_summary.indexed_packets,
+                          duration, file_size_text,
+                          (unsigned long)state->capture_info.snaplen,
+                          state->scan_summary.index_limited ? "  |  INDEX LIMITED" : "",
+                          state->scan_summary.truncated_tail ? "  |  TRUNCATED TAIL" : "");
+    lv_label_set_recolor(summary_label, true);
+    lv_obj_set_width(summary_label, lv_pct(100));
+    lv_label_set_long_mode(summary_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(summary_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(summary_label, ui_text_color(), 0);
+
+    lv_obj_t *analysis_actions = lv_obj_create(page);
+    lv_obj_set_size(analysis_actions, lv_pct(100), 46);
+    lv_obj_set_style_bg_opa(analysis_actions, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(analysis_actions, 0, 0);
+    lv_obj_set_style_pad_all(analysis_actions, 0, 0);
+    lv_obj_set_style_pad_column(analysis_actions, 10, 0);
+    lv_obj_set_flex_flow(analysis_actions, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(analysis_actions, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(analysis_actions, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *overview_btn = lv_btn_create(analysis_actions);
+    lv_obj_set_size(overview_btn, 190, 42);
+    lv_obj_set_style_bg_color(overview_btn, lv_color_hex(0x087EA4), 0);
+    lv_obj_set_style_radius(overview_btn, 8, 0);
+    lv_obj_add_event_cb(overview_btn, pcap_viewer_summary_cb,
+                        LV_EVENT_CLICKED, (void *)(uintptr_t)1U);
+    lv_obj_t *overview_label = lv_label_create(overview_btn);
+    lv_label_set_text(overview_label, LV_SYMBOL_EYE_OPEN " OVERVIEW");
+    lv_obj_set_style_text_color(overview_label, lv_color_white(), 0);
+    lv_obj_center(overview_label);
+
+    lv_obj_t *dns_btn = lv_btn_create(analysis_actions);
+    lv_obj_set_size(dns_btn, 190, 42);
+    lv_obj_set_style_bg_color(dns_btn, COLOR_MATERIAL_PURPLE, 0);
+    lv_obj_set_style_radius(dns_btn, 8, 0);
+    lv_obj_add_event_cb(dns_btn, pcap_viewer_summary_cb,
+                        LV_EVENT_CLICKED, (void *)(uintptr_t)2U);
+    lv_obj_t *dns_label = lv_label_create(dns_btn);
+    lv_label_set_text_fmt(dns_label, LV_SYMBOL_LIST " DNS SUMMARY (%llu)",
+                          state->summary
+                              ? (unsigned long long)state->summary->dns_packets : 0ULL);
+    lv_obj_set_style_text_color(dns_label, lv_color_white(), 0);
+    lv_obj_center(dns_label);
+
+    lv_obj_t *filter_bar = lv_obj_create(page);
+    lv_obj_set_size(filter_bar, lv_pct(100), 50);
+    lv_obj_set_style_bg_color(filter_bar, lv_color_hex(0x050A14), 0);
+    lv_obj_set_style_border_width(filter_bar, 1, 0);
+    lv_obj_set_style_border_color(filter_bar, ui_border_color(), 0);
+    lv_obj_set_style_radius(filter_bar, 8, 0);
+    lv_obj_set_style_pad_all(filter_bar, 4, 0);
+    lv_obj_set_style_pad_column(filter_bar, 6, 0);
+    lv_obj_set_flex_flow(filter_bar, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(filter_bar, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_scroll_dir(filter_bar, LV_DIR_HOR);
+    lv_obj_set_scrollbar_mode(filter_bar, LV_SCROLLBAR_MODE_AUTO);
+
+    for (int filter = 0; filter < PCAP_FILTER_COUNT; filter++) {
+        const char *filter_name = pcap_reader_filter_name((pcap_packet_filter_t)filter);
+        int button_width = 88;
+        if (filter == PCAP_FILTER_WIFI_MGMT) button_width = 150;
+        else if (filter == PCAP_FILTER_MALFORMED) button_width = 132;
+        else if (filter == PCAP_FILTER_EAPOL) button_width = 100;
+        lv_obj_t *button = lv_btn_create(filter_bar);
+        state->filter_buttons[filter] = button;
+        lv_obj_set_size(button, button_width, 38);
+        lv_obj_set_style_border_width(button, 1, 0);
+        lv_obj_set_style_radius(button, 7, 0);
+        lv_obj_set_style_pad_all(button, 4, 0);
+        lv_obj_add_event_cb(button, pcap_viewer_filter_cb, LV_EVENT_CLICKED,
+                            (void *)(uintptr_t)(filter + 1U));
+        lv_obj_t *label = lv_label_create(button);
+        lv_label_set_text(label, filter_name);
+        lv_obj_set_style_text_font(label, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(label, lv_color_white(), 0);
+        lv_obj_center(label);
+    }
+    pcap_viewer_update_filter_styles(state);
+
+    lv_obj_t *pager = lv_obj_create(page);
+    lv_obj_set_size(pager, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(pager, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(pager, 0, 0);
+    lv_obj_set_style_pad_all(pager, 0, 0);
+    lv_obj_set_style_pad_column(pager, 10, 0);
+    lv_obj_set_flex_flow(pager, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(pager, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    state->prev_btn = lv_btn_create(pager);
+    lv_obj_set_size(state->prev_btn, 110, 42);
+    style_back_nav_button(state->prev_btn);
+    lv_obj_add_event_cb(state->prev_btn, pcap_viewer_page_change_cb,
+                        LV_EVENT_CLICKED, state);
+    lv_obj_t *prev_label = lv_label_create(state->prev_btn);
+    lv_label_set_text(prev_label, LV_SYMBOL_LEFT " Prev");
+    lv_obj_center(prev_label);
+
+    state->page_label = lv_label_create(pager);
+    lv_obj_set_width(state->page_label, 430);
+    lv_obj_set_style_text_align(state->page_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(state->page_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(state->page_label, ui_muted_color(), 0);
+
+    state->next_btn = lv_btn_create(pager);
+    lv_obj_set_size(state->next_btn, 110, 42);
+    lv_obj_set_style_bg_color(state->next_btn, lv_color_hex(0x087EA4), 0);
+    lv_obj_set_style_radius(state->next_btn, 8, 0);
+    lv_obj_add_event_cb(state->next_btn, pcap_viewer_page_change_cb,
+                        LV_EVENT_CLICKED, state);
+    lv_obj_t *next_label = lv_label_create(state->next_btn);
+    lv_label_set_text(next_label, "Next " LV_SYMBOL_RIGHT);
+    lv_obj_center(next_label);
+
+    state->packet_list = lv_obj_create(page);
+    lv_obj_set_size(state->packet_list, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_flex_grow(state->packet_list, 1);
+    style_surface_panel(state->packet_list, 8);
+    lv_obj_set_style_pad_all(state->packet_list, 8, 0);
+    lv_obj_set_style_pad_row(state->packet_list, 6, 0);
+    lv_obj_set_flex_flow(state->packet_list, LV_FLEX_FLOW_COLUMN);
+    state->packet_page = 0;
+    pcap_viewer_render_packet_page(state);
 }
 
 //==================================================================================
@@ -40618,6 +42258,11 @@ static int ota_status_overall_from_download_pct(int download_pct)
 static void ota_status_from_ota_line(const char *line)
 {
     if (!line) return;
+    // Any new OTA line means the C5 is still alive. Allow the silence watchdog to
+    // show a fresh waiting message after the next quiet period, but never treat
+    // that silence itself as a successful installation.
+    if (!g_ota.terminal_status_seen) g_ota.reboot_wait_shown = false;
+
     if (ota_ci_contains(line, "asset size")) {
         g_ota.flash_progress_seen = true;
         ota_status_set_phase(LV_SYMBOL_DOWNLOAD " Package found",
@@ -40693,15 +42338,23 @@ static void ota_status_from_ota_line(const char *line)
         if (g_ota.release_list_waiting) ota_release_list_finish(true);
         if (g_ota.install_started) ota_monitor_finish_close_ok();
         ota_restore_screen_timeout();
-    } else if (ota_ci_contains(line, "update applied") ||
-               ota_ci_contains(line, "marked valid") ||
-               ota_ci_contains(line, "restart") ||
-               ota_ci_contains(line, "reboot")) {
+    } else if (ota_ci_contains(line, "update applied") &&
+               (ota_ci_contains(line, "restarting") ||
+                ota_ci_contains(line, "rebooting"))) {
         ota_status_set_phase(LV_SYMBOL_OK " Update applied",
                              "Firmware was written. The C5 should reboot into the new slot.",
                              COLOR_MATERIAL_GREEN, 4, 100);
         if (g_ota.install_started) ota_monitor_finish_close_ok();
         ota_restore_screen_timeout();
+    } else if (ota_ci_contains(line, "marked valid")) {
+        ota_status_set_phase(LV_SYMBOL_OK " Firmware verified",
+                             "JanOS marked the running firmware as valid.",
+                             COLOR_MATERIAL_GREEN, 4, 100);
+    } else if (ota_ci_contains(line, "restart") ||
+               ota_ci_contains(line, "reboot")) {
+        ota_status_set_phase(LV_SYMBOL_REFRESH " Waiting for apply confirmation",
+                             "JanOS announced a restart. Waiting for the explicit update-applied marker.",
+                             COLOR_MATERIAL_ORANGE, 3, 96);
     } else if (ota_ci_contains(line, "error") || ota_ci_contains(line, "fail") ||
                ota_ci_contains(line, "abort")) {
         ota_status_set_phase(LV_SYMBOL_WARNING " OTA failed",
@@ -40717,10 +42370,9 @@ static void ota_status_show_reboot_wait(void)
     if (g_ota.reboot_wait_shown) return;
     g_ota.reboot_wait_shown = true;
     if (g_ota.byte_progress_seen) {
-        ota_status_set_phase(LV_SYMBOL_REFRESH " C5 is busy / rebooting",
-                             "No UART output after byte progress. Wait for JanOS to come back, then open Info to confirm the active partition.",
-                             COLOR_MATERIAL_GREEN, 3, 96);
-        if (g_ota.install_started) ota_monitor_finish_close_ok();
+        ota_status_set_phase(LV_SYMBOL_REFRESH " C5 is still finalizing",
+                             "No UART output after byte progress. Waiting for: OTA: update applied, restarting",
+                             COLOR_MATERIAL_ORANGE, 3, 96);
     } else {
         ota_status_set_phase(LV_SYMBOL_REFRESH " Waiting for old JanOS",
                              "This JanOS does not report byte progress. OTA may still be downloading/flashing; wait for reboot or a final OTA line.",
@@ -40732,8 +42384,7 @@ static void ota_status_show_reboot_wait(void)
                               ? LV_SYMBOL_REFRESH " Waiting for JanOS after flash/reboot..."
                               : LV_SYMBOL_REFRESH " Old JanOS: no detailed progress, keep waiting...");
         lv_obj_set_style_text_color(g_ota.mon_ota,
-                                    g_ota.byte_progress_seen ? COLOR_MATERIAL_GREEN
-                                                             : COLOR_MATERIAL_ORANGE,
+                                    COLOR_MATERIAL_ORANGE,
                                     0);
     }
 }
@@ -43001,6 +44652,1141 @@ static void show_sd_admin_page(void)
     lv_obj_add_flag(ctx->sd_admin_keyboard, LV_OBJ_FLAG_HIDDEN);
     ctx->current_visible_page = ctx->sd_admin_page;
     sd_admin_refresh_ui(ctx);
+}
+
+// ============================================================================
+// JanOS SD -> Tab5 SD transfer
+// ============================================================================
+
+#define JANOS_TRANSFER_WIFI_CONNECTED_BIT BIT0
+#define JANOS_TRANSFER_WIFI_FAILED_BIT    BIT1
+#define JANOS_TRANSFER_WIFI_TIMEOUT_MS    20000
+#define JANOS_TRANSFER_HTTP_TIMEOUT_MS    20000
+#define JANOS_TRANSFER_BASE_URL           "http://172.0.0.1"
+#define JANOS_TRANSFER_LOCAL_ROOT         "/sdcard/lab/pcaps/imported"
+
+typedef struct {
+    EventGroupHandle_t events;
+    const volatile bool *cancel_requested;
+    int retries;
+} janos_transfer_wifi_wait_t;
+
+typedef struct {
+    bool valid;
+    bool was_connected;
+    bool previous_config_valid;
+    wifi_mode_t previous_mode;
+    wifi_config_t previous_config;
+} janos_transfer_wifi_session_t;
+
+static void compromised_transfer_set_stage(const char *status, const char *detail, int percent)
+{
+    if (!bsp_display_lock(100)) {
+        return;
+    }
+    if (compromised_transfer_ui.status_label &&
+        lv_obj_is_valid(compromised_transfer_ui.status_label)) {
+        lv_label_set_text(compromised_transfer_ui.status_label, status ? status : "Working...");
+    }
+    if (compromised_transfer_ui.detail_label &&
+        lv_obj_is_valid(compromised_transfer_ui.detail_label)) {
+        lv_label_set_text(compromised_transfer_ui.detail_label, detail ? detail : "");
+    }
+    if (compromised_transfer_ui.progress_bar &&
+        lv_obj_is_valid(compromised_transfer_ui.progress_bar)) {
+        lv_bar_set_value(compromised_transfer_ui.progress_bar,
+                         percent < 0 ? 0 : (percent > 100 ? 100 : percent), LV_ANIM_ON);
+    }
+    bsp_display_unlock();
+}
+
+static void compromised_transfer_progress_cb(const janos_file_transfer_progress_t *progress,
+                                             void *user_ctx)
+{
+    (void)user_ctx;
+    if (!progress) {
+        return;
+    }
+
+    int percent = 0;
+    if (progress->bytes_total > 0) {
+        uint64_t value = (progress->bytes_received * 100U) / progress->bytes_total;
+        percent = value > 100U ? 100 : (int)value;
+    }
+
+    char detail[256];
+    if (progress->state == JANOS_FILE_TRANSFER_DOWNLOADING && progress->bytes_total > 0) {
+        snprintf(detail, sizeof(detail), "%llu / %llu bytes (%d%%)",
+                 (unsigned long long)progress->bytes_received,
+                 (unsigned long long)progress->bytes_total,
+                 percent);
+    } else if (progress->state == JANOS_FILE_TRANSFER_DONE) {
+        snprintf(detail, sizeof(detail), "%llu bytes, CRC32 %08lX",
+                 (unsigned long long)progress->bytes_received,
+                 (unsigned long)progress->crc32);
+        percent = 100;
+    } else if (progress->message) {
+        snprintf(detail, sizeof(detail), "%s", progress->message);
+    } else {
+        detail[0] = '\0';
+    }
+
+    compromised_transfer_set_stage(janos_file_transfer_state_name(progress->state),
+                                   detail, percent);
+}
+
+static void compromised_transfer_close_or_cancel_cb(lv_event_t *e)
+{
+    (void)e;
+    if (compromised_transfer_ui.active) {
+        compromised_transfer_ui.cancel_requested = true;
+        if (compromised_transfer_ui.action_btn &&
+            lv_obj_is_valid(compromised_transfer_ui.action_btn)) {
+            lv_obj_add_state(compromised_transfer_ui.action_btn, LV_STATE_DISABLED);
+        }
+        if (compromised_transfer_ui.action_label &&
+            lv_obj_is_valid(compromised_transfer_ui.action_label)) {
+            lv_label_set_text(compromised_transfer_ui.action_label, "Cancelling...");
+        }
+        return;
+    }
+
+    if (compromised_transfer_ui.overlay && lv_obj_is_valid(compromised_transfer_ui.overlay)) {
+        lv_obj_del(compromised_transfer_ui.overlay);
+    }
+    compromised_transfer_ui.overlay = NULL;
+    compromised_transfer_ui.popup = NULL;
+    compromised_transfer_ui.status_label = NULL;
+    compromised_transfer_ui.detail_label = NULL;
+    compromised_transfer_ui.progress_bar = NULL;
+    compromised_transfer_ui.action_btn = NULL;
+    compromised_transfer_ui.action_label = NULL;
+    compromised_transfer_ui.cancel_requested = false;
+    compromised_transfer_ui.sync_mode = false;
+}
+
+static void compromised_transfer_show_popup(const char *file_name)
+{
+    compromised_transfer_ui.overlay = lv_obj_create(lv_scr_act());
+    lv_obj_remove_style_all(compromised_transfer_ui.overlay);
+    lv_obj_set_size(compromised_transfer_ui.overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(compromised_transfer_ui.overlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(compromised_transfer_ui.overlay, LV_OPA_60, 0);
+    lv_obj_add_flag(compromised_transfer_ui.overlay, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(compromised_transfer_ui.overlay, LV_OBJ_FLAG_SCROLLABLE);
+
+    compromised_transfer_ui.popup = lv_obj_create(compromised_transfer_ui.overlay);
+    lv_obj_set_size(compromised_transfer_ui.popup, 680, 340);
+    lv_obj_center(compromised_transfer_ui.popup);
+    style_surface_panel(compromised_transfer_ui.popup, 16);
+    lv_obj_set_style_pad_all(compromised_transfer_ui.popup, 24, 0);
+    lv_obj_set_flex_flow(compromised_transfer_ui.popup, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(compromised_transfer_ui.popup, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(compromised_transfer_ui.popup, 16, 0);
+    lv_obj_clear_flag(compromised_transfer_ui.popup, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(compromised_transfer_ui.popup);
+    lv_label_set_text(title, compromised_transfer_ui.sync_mode
+                                ? LV_SYMBOL_REFRESH " Sync Monster SD"
+                                : LV_SYMBOL_DOWNLOAD " Copy to Tab5");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_GREEN, 0);
+
+    lv_obj_t *name = lv_label_create(compromised_transfer_ui.popup);
+    lv_label_set_text(name, file_name ? file_name : "PCAP file");
+    lv_obj_set_width(name, lv_pct(100));
+    lv_label_set_long_mode(name, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_align(name, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(name, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(name, ui_text_color(), 0);
+
+    compromised_transfer_ui.status_label = lv_label_create(compromised_transfer_ui.popup);
+    lv_label_set_text(compromised_transfer_ui.status_label, "Preparing transfer...");
+    lv_obj_set_width(compromised_transfer_ui.status_label, lv_pct(100));
+    lv_obj_set_style_text_align(compromised_transfer_ui.status_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(compromised_transfer_ui.status_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(compromised_transfer_ui.status_label, COLOR_MATERIAL_AMBER, 0);
+
+    compromised_transfer_ui.progress_bar = lv_bar_create(compromised_transfer_ui.popup);
+    lv_obj_set_size(compromised_transfer_ui.progress_bar, 580, 24);
+    lv_bar_set_range(compromised_transfer_ui.progress_bar, 0, 100);
+    lv_bar_set_value(compromised_transfer_ui.progress_bar, 0, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(compromised_transfer_ui.progress_bar, ui_card_color(), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(compromised_transfer_ui.progress_bar, COLOR_MATERIAL_GREEN,
+                              LV_PART_INDICATOR);
+
+    compromised_transfer_ui.detail_label = lv_label_create(compromised_transfer_ui.popup);
+    lv_label_set_text(compromised_transfer_ui.detail_label,
+                      "The original file will remain on the Monster.");
+    lv_obj_set_width(compromised_transfer_ui.detail_label, lv_pct(100));
+    lv_label_set_long_mode(compromised_transfer_ui.detail_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(compromised_transfer_ui.detail_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(compromised_transfer_ui.detail_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(compromised_transfer_ui.detail_label, ui_muted_color(), 0);
+
+    compromised_transfer_ui.action_btn = lv_btn_create(compromised_transfer_ui.popup);
+    lv_obj_set_size(compromised_transfer_ui.action_btn, 180, 48);
+    style_danger_button(compromised_transfer_ui.action_btn);
+    lv_obj_add_event_cb(compromised_transfer_ui.action_btn,
+                        compromised_transfer_close_or_cancel_cb, LV_EVENT_CLICKED, NULL);
+
+    compromised_transfer_ui.action_label = lv_label_create(compromised_transfer_ui.action_btn);
+    lv_label_set_text(compromised_transfer_ui.action_label, "Cancel");
+    lv_obj_set_style_text_font(compromised_transfer_ui.action_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(compromised_transfer_ui.action_label, lv_color_white(), 0);
+    lv_obj_center(compromised_transfer_ui.action_label);
+}
+
+static void compromised_transfer_finish_ui_unlocked(bool success, const char *detail)
+{
+    compromised_transfer_ui.active = false;
+    if (compromised_transfer_ui.status_label &&
+        lv_obj_is_valid(compromised_transfer_ui.status_label)) {
+        lv_label_set_text(compromised_transfer_ui.status_label,
+                          success ? (compromised_transfer_ui.sync_mode
+                                         ? "Sync complete" : "Transfer complete") :
+                          (compromised_transfer_ui.cancel_requested
+                               ? (compromised_transfer_ui.sync_mode
+                                      ? "Sync cancelled" : "Transfer cancelled")
+                               : (compromised_transfer_ui.sync_mode
+                                      ? "Sync finished with errors" : "Transfer failed")));
+        lv_obj_set_style_text_color(compromised_transfer_ui.status_label,
+                                    success ? COLOR_MATERIAL_GREEN : COLOR_MATERIAL_RED, 0);
+    }
+    if (compromised_transfer_ui.detail_label &&
+        lv_obj_is_valid(compromised_transfer_ui.detail_label)) {
+        lv_label_set_text(compromised_transfer_ui.detail_label, detail ? detail : "");
+    }
+    if (compromised_transfer_ui.progress_bar &&
+        lv_obj_is_valid(compromised_transfer_ui.progress_bar) && success) {
+        lv_bar_set_value(compromised_transfer_ui.progress_bar, 100, LV_ANIM_ON);
+    }
+    if (compromised_transfer_ui.action_btn &&
+        lv_obj_is_valid(compromised_transfer_ui.action_btn)) {
+        lv_obj_clear_state(compromised_transfer_ui.action_btn, LV_STATE_DISABLED);
+        lv_obj_set_style_bg_color(compromised_transfer_ui.action_btn,
+                                  success ? COLOR_MATERIAL_GREEN : COLOR_MATERIAL_BLUE, 0);
+    }
+    if (compromised_transfer_ui.action_label &&
+        lv_obj_is_valid(compromised_transfer_ui.action_label)) {
+        lv_label_set_text(compromised_transfer_ui.action_label, "Close");
+    }
+}
+
+static void compromised_transfer_finish_ui(bool success, const char *detail)
+{
+    if (!bsp_display_lock(250)) {
+        return;
+    }
+    compromised_transfer_finish_ui_unlocked(success, detail);
+    bsp_display_unlock();
+}
+
+static void janos_transfer_wifi_event_handler(void *arg, esp_event_base_t event_base,
+                                              int32_t event_id, void *event_data)
+{
+    janos_transfer_wifi_wait_t *wait = (janos_transfer_wifi_wait_t *)arg;
+    if (!wait || !wait->events) {
+        return;
+    }
+
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        if ((!wait->cancel_requested || !*wait->cancel_requested) && wait->retries < 4) {
+            wait->retries++;
+            esp_wifi_connect();
+        } else {
+            xEventGroupSetBits(wait->events, JANOS_TRANSFER_WIFI_FAILED_BIT);
+        }
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        const ip_event_got_ip_t *got_ip = (const ip_event_got_ip_t *)event_data;
+        if (got_ip) {
+            ESP_LOGI(TAG, "[Monster transfer] JanOS-Admin connected, IP=" IPSTR,
+                     IP2STR(&got_ip->ip_info.ip));
+        }
+        xEventGroupSetBits(wait->events, JANOS_TRANSFER_WIFI_CONNECTED_BIT);
+    }
+}
+
+static esp_err_t janos_transfer_connect_wifi(const char *password,
+                                             const volatile bool *cancel_requested,
+                                             janos_transfer_wifi_session_t *session)
+{
+    if (!password || !session) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    memset(session, 0, sizeof(*session));
+
+    bool was_initialized = esp_modem_wifi_initialized;
+    esp_err_t err = esp_modem_wifi_init();
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    session->valid = true;
+    if (esp_wifi_get_mode(&session->previous_mode) != ESP_OK) {
+        session->previous_mode = WIFI_MODE_STA;
+    }
+    session->previous_config_valid =
+        esp_wifi_get_config(WIFI_IF_STA, &session->previous_config) == ESP_OK;
+    wifi_ap_record_t previous_ap;
+    session->was_connected = was_initialized && esp_wifi_sta_get_ap_info(&previous_ap) == ESP_OK;
+
+    esp_wifi_disconnect();
+    vTaskDelay(pdMS_TO_TICKS(150));
+
+    EventGroupHandle_t events = xEventGroupCreate();
+    if (!events) {
+        return ESP_ERR_NO_MEM;
+    }
+    janos_transfer_wifi_wait_t wait = {
+        .events = events,
+        .cancel_requested = cancel_requested,
+        .retries = 0,
+    };
+    esp_event_handler_instance_t wifi_instance = NULL;
+    esp_event_handler_instance_t ip_instance = NULL;
+    err = esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
+                                              janos_transfer_wifi_event_handler, &wait,
+                                              &wifi_instance);
+    if (err == ESP_OK) {
+        err = esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
+                                                  janos_transfer_wifi_event_handler, &wait,
+                                                  &ip_instance);
+    }
+
+    wifi_config_t config = {0};
+    snprintf((char *)config.sta.ssid, sizeof(config.sta.ssid), "%s", "JanOS-Admin");
+    snprintf((char *)config.sta.password, sizeof(config.sta.password), "%s", password);
+    config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    config.sta.pmf_cfg.capable = true;
+    config.sta.pmf_cfg.required = false;
+
+    if (err == ESP_OK) {
+        err = esp_wifi_set_mode(WIFI_MODE_STA);
+    }
+    if (err == ESP_OK) {
+        err = esp_wifi_set_config(WIFI_IF_STA, &config);
+    }
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "[Monster transfer] Connecting internal C6 to Monster AP JanOS-Admin");
+        err = esp_wifi_connect();
+    }
+
+    if (err == ESP_OK) {
+        TickType_t started = xTaskGetTickCount();
+        while ((xTaskGetTickCount() - started) < pdMS_TO_TICKS(JANOS_TRANSFER_WIFI_TIMEOUT_MS)) {
+            if (cancel_requested && *cancel_requested) {
+                err = ESP_ERR_INVALID_STATE;
+                break;
+            }
+            EventBits_t bits = xEventGroupWaitBits(events,
+                                                   JANOS_TRANSFER_WIFI_CONNECTED_BIT |
+                                                       JANOS_TRANSFER_WIFI_FAILED_BIT,
+                                                   pdFALSE, pdFALSE, pdMS_TO_TICKS(250));
+            if (bits & JANOS_TRANSFER_WIFI_CONNECTED_BIT) {
+                err = ESP_OK;
+                break;
+            }
+            if (bits & JANOS_TRANSFER_WIFI_FAILED_BIT) {
+                err = ESP_FAIL;
+                break;
+            }
+        }
+        if (!(xEventGroupGetBits(events) & JANOS_TRANSFER_WIFI_CONNECTED_BIT) && err == ESP_OK) {
+            err = ESP_ERR_TIMEOUT;
+        }
+    }
+
+    if (ip_instance) {
+        esp_event_handler_instance_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, ip_instance);
+    }
+    if (wifi_instance) {
+        esp_event_handler_instance_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_instance);
+    }
+    vEventGroupDelete(events);
+    if (err != ESP_OK) {
+        esp_wifi_disconnect();
+    }
+    return err;
+}
+
+static void janos_transfer_restore_wifi(const janos_transfer_wifi_session_t *session)
+{
+    if (!session || !session->valid) {
+        return;
+    }
+    esp_wifi_disconnect();
+    vTaskDelay(pdMS_TO_TICKS(100));
+    esp_wifi_set_mode(session->previous_mode);
+    if (session->previous_config_valid) {
+        wifi_config_t previous_config = session->previous_config;
+        esp_wifi_set_config(WIFI_IF_STA, &previous_config);
+    }
+    if (session->was_connected) {
+        esp_wifi_connect();
+    }
+}
+
+static bool janos_transfer_wait_for_portal(tab_id_t tab, uart_port_t uart_port,
+                                           const char *password, char *response,
+                                           size_t response_size)
+{
+    if (!password || !response || response_size < 2) {
+        return false;
+    }
+
+    char command[96];
+    snprintf(command, sizeof(command), "start_admin_portal %s", password);
+    compromised_transport_flush(tab, uart_port);
+    ESP_LOGI(TAG, "[%s] Sending start_admin_portal <session-password> to Monster",
+             tab_transport_name(tab));
+    size_t command_len = strlen(command);
+    int command_written = transport_write_bytes_tab(tab, uart_port, command, command_len);
+    int newline_written = transport_write_bytes_tab(tab, uart_port, "\r\n", 2);
+    memset(command, 0, sizeof(command));
+    if (command_written != (int)command_len || newline_written != 2) {
+        ESP_LOGE(TAG, "[%s] Failed to send complete start_admin_portal command (%d/%u + %d/2)",
+                 tab_transport_name(tab), command_written, (unsigned)command_len,
+                 newline_written);
+        return false;
+    }
+    ESP_LOGI(TAG, "[%s] start_admin_portal command sent; waiting for Monster confirmation",
+             tab_transport_name(tab));
+
+    response[0] = '\0';
+    size_t total = 0;
+    TickType_t started = xTaskGetTickCount();
+    while ((xTaskGetTickCount() - started) < pdMS_TO_TICKS(15000) &&
+           total < response_size - 1) {
+        if (compromised_transfer_ui.cancel_requested) {
+            return false;
+        }
+        int read = transport_read_bytes_tab(tab, uart_port, response + total,
+                                            response_size - total - 1,
+                                            pdMS_TO_TICKS(100));
+        if (read <= 0) {
+            continue;
+        }
+        total += (size_t)read;
+        response[total] = '\0';
+        if (strstr(response, "Admin portal started. Connect to 'JanOS-Admin'") ||
+            strstr(response, "Portal already running")) {
+            ESP_LOGI(TAG, "[%s] Monster confirmed JanOS-Admin AP is running",
+                     tab_transport_name(tab));
+            return true;
+        }
+        if (strstr(response, "Failed to initialize SD card") ||
+            strstr(response, "Password length must be") ||
+            strstr(response, "Failed to start HTTP server") ||
+            strstr(response, "Failed to enable AP mode")) {
+            return false;
+        }
+    }
+    return false;
+}
+
+static const char *janos_transfer_source_folder(tab_id_t tab)
+{
+    switch (tab) {
+        case TAB_GROVE: return "grove";
+        case TAB_USB: return "usb";
+        case TAB_MBUS: return "mbus";
+        default: return "unknown";
+    }
+}
+
+static void janos_transfer_sanitize_filename(const char *input, char *output, size_t output_size)
+{
+    if (!output || output_size == 0) {
+        return;
+    }
+    size_t pos = 0;
+    const char *name = input ? input : "capture.pcap";
+    for (; *name && pos + 1 < output_size; name++) {
+        unsigned char c = (unsigned char)*name;
+        if (isalnum(c) || c == '.' || c == '-' || c == '_') {
+            output[pos++] = (char)c;
+        } else {
+            output[pos++] = '_';
+        }
+    }
+    output[pos] = '\0';
+    if (pos == 0) {
+        snprintf(output, output_size, "%s", "capture.pcap");
+    }
+}
+
+static bool janos_transfer_build_unique_local_path(tab_id_t tab, const char *file_name,
+                                                   char *output, size_t output_size)
+{
+    char safe_name[96];
+    janos_transfer_sanitize_filename(file_name, safe_name, sizeof(safe_name));
+
+    char base[96];
+    char extension[20] = {0};
+    snprintf(base, sizeof(base), "%s", safe_name);
+    char *dot = strrchr(base, '.');
+    if (dot && dot != base) {
+        snprintf(extension, sizeof(extension), "%s", dot);
+        *dot = '\0';
+    }
+
+    for (int suffix = 0; suffix < 1000; suffix++) {
+        int written;
+        if (suffix == 0) {
+            written = snprintf(output, output_size, "%s/%s/%s%s",
+                               JANOS_TRANSFER_LOCAL_ROOT, janos_transfer_source_folder(tab),
+                               base, extension);
+        } else {
+            written = snprintf(output, output_size, "%s/%s/%s_%d%s",
+                               JANOS_TRANSFER_LOCAL_ROOT, janos_transfer_source_folder(tab),
+                               base, suffix, extension);
+        }
+        if (written < 0 || (size_t)written >= output_size) {
+            return false;
+        }
+
+        char part_path[288];
+        snprintf(part_path, sizeof(part_path), "%s.part", output);
+        if (access(output, F_OK) != 0 && access(part_path, F_OK) != 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+#define JANOS_SYNC_STATE_FILE ".monster_sync.tsv"
+#define JANOS_SYNC_LINE_MAX   768
+
+static bool janos_sync_build_state_path(tab_id_t tab, char *output, size_t output_size)
+{
+    if (!output || output_size == 0) {
+        return false;
+    }
+    int written = snprintf(output, output_size, "%s/%s/%s",
+                           JANOS_TRANSFER_LOCAL_ROOT, janos_transfer_source_folder(tab),
+                           JANOS_SYNC_STATE_FILE);
+    return written > 0 && (size_t)written < output_size;
+}
+
+static bool janos_sync_build_canonical_local_path(tab_id_t tab, const char *file_name,
+                                                  char *output, size_t output_size)
+{
+    if (!output || output_size == 0) {
+        return false;
+    }
+    char safe_name[96];
+    janos_transfer_sanitize_filename(file_name, safe_name, sizeof(safe_name));
+    int written = snprintf(output, output_size, "%s/%s/%s",
+                           JANOS_TRANSFER_LOCAL_ROOT, janos_transfer_source_folder(tab),
+                           safe_name);
+    return written > 0 && (size_t)written < output_size;
+}
+
+static bool janos_sync_local_file_matches(const char *local_path, uint64_t remote_size)
+{
+    struct stat file_stat;
+    if (!local_path || stat(local_path, &file_stat) != 0 || !S_ISREG(file_stat.st_mode)) {
+        return false;
+    }
+    return (uint64_t)file_stat.st_size == remote_size;
+}
+
+/*
+ * The Monster file API currently exposes name/type/size, but no modification time
+ * or hash.  Exact remote path + size is therefore the strongest identity available
+ * without changing JanOS.  The downloaded CRC is retained for auditing and for a
+ * future API that can expose the remote CRC before download.
+ */
+static bool janos_sync_state_contains(tab_id_t tab, const char *remote_path,
+                                      uint64_t remote_size, char *local_path_out,
+                                      size_t local_path_out_size)
+{
+    char state_path[320];
+    if (!remote_path || !janos_sync_build_state_path(tab, state_path, sizeof(state_path))) {
+        return false;
+    }
+
+    FILE *state = fopen(state_path, "r");
+    if (!state) {
+        return false;
+    }
+
+    bool found = false;
+    char line[JANOS_SYNC_LINE_MAX];
+    while (fgets(line, sizeof(line), state)) {
+        char *save = NULL;
+        char *size_text = strtok_r(line, "\t", &save);
+        char *crc_text = strtok_r(NULL, "\t", &save);
+        char *saved_remote_path = strtok_r(NULL, "\t", &save);
+        char *saved_local_path = strtok_r(NULL, "\r\n", &save);
+        if (!size_text || !crc_text || !saved_remote_path || !saved_local_path) {
+            continue;
+        }
+
+        char *end = NULL;
+        errno = 0;
+        unsigned long long saved_size = strtoull(size_text, &end, 10);
+        if (errno != 0 || end == size_text || *end != '\0') {
+            continue;
+        }
+        (void)crc_text;
+
+        if ((uint64_t)saved_size == remote_size &&
+            strcmp(saved_remote_path, remote_path) == 0 &&
+            janos_sync_local_file_matches(saved_local_path, remote_size)) {
+            if (local_path_out && local_path_out_size > 0) {
+                snprintf(local_path_out, local_path_out_size, "%s", saved_local_path);
+            }
+            found = true;
+            break;
+        }
+    }
+    fclose(state);
+    return found;
+}
+
+static esp_err_t janos_sync_state_append(tab_id_t tab, const char *remote_path,
+                                         uint64_t remote_size, const char *local_path,
+                                         uint32_t crc32)
+{
+    if (!remote_path || !local_path || strchr(remote_path, '\t') || strchr(remote_path, '\n') ||
+        strchr(local_path, '\t') || strchr(local_path, '\n')) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    char state_path[320];
+    if (!janos_sync_build_state_path(tab, state_path, sizeof(state_path))) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    FILE *state = fopen(state_path, "a");
+    if (!state) {
+        ESP_LOGE(TAG, "Could not open sync state %s: errno=%d", state_path, errno);
+        return ESP_FAIL;
+    }
+    int written = fprintf(state, "%llu\t%08lX\t%s\t%s\n",
+                          (unsigned long long)remote_size, (unsigned long)crc32,
+                          remote_path, local_path);
+    esp_err_t err = ESP_OK;
+    if (written < 0 || fflush(state) != 0) {
+        err = ESP_FAIL;
+    } else {
+        int fd = fileno(state);
+        if (fd >= 0 && fsync(fd) != 0) {
+            err = ESP_FAIL;
+        }
+    }
+    if (fclose(state) != 0) {
+        err = ESP_FAIL;
+    }
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Could not persist sync state %s: errno=%d", state_path, errno);
+    }
+    return err;
+}
+
+static bool janos_sync_bootstrap_existing(tab_id_t tab, const char *remote_path,
+                                          const char *file_name, uint64_t remote_size)
+{
+    char canonical_path[256];
+    if (!janos_sync_build_canonical_local_path(tab, file_name,
+                                               canonical_path, sizeof(canonical_path)) ||
+        !janos_sync_local_file_matches(canonical_path, remote_size)) {
+        return false;
+    }
+
+    esp_err_t err = janos_sync_state_append(tab, remote_path, remote_size,
+                                            canonical_path, 0);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "[%s] Sync indexed existing local file %s",
+                 tab_transport_name(tab), canonical_path);
+        return true;
+    }
+    return false;
+}
+
+static void compromised_sync_progress_cb(const janos_file_transfer_progress_t *progress,
+                                         void *user_ctx)
+{
+    compromised_sync_progress_ctx_t *sync = (compromised_sync_progress_ctx_t *)user_ctx;
+    if (!progress || !sync || sync->total <= 0) {
+        return;
+    }
+
+    int file_percent = 0;
+    if (progress->bytes_total > 0) {
+        uint64_t value = (progress->bytes_received * 100U) / progress->bytes_total;
+        file_percent = value > 100U ? 100 : (int)value;
+    }
+    int overall_percent = (((sync->current - 1) * 100) + file_percent) / sync->total;
+
+    char detail[320];
+    if (progress->state == JANOS_FILE_TRANSFER_DOWNLOADING && progress->bytes_total > 0) {
+        snprintf(detail, sizeof(detail),
+                 "File %d/%d: %s\n%llu / %llu bytes (%d%%)",
+                 sync->current, sync->total,
+                 sync->file_name ? sync->file_name : "capture",
+                 (unsigned long long)progress->bytes_received,
+                 (unsigned long long)progress->bytes_total, file_percent);
+    } else if (progress->message) {
+        snprintf(detail, sizeof(detail), "File %d/%d: %s\n%s",
+                 sync->current, sync->total,
+                 sync->file_name ? sync->file_name : "capture", progress->message);
+    } else {
+        snprintf(detail, sizeof(detail), "File %d/%d: %s",
+                 sync->current, sync->total,
+                 sync->file_name ? sync->file_name : "capture");
+    }
+    compromised_transfer_set_stage("Syncing new files...", detail, overall_percent);
+}
+
+static void compromised_transfer_delete_current_task(void)
+{
+#if defined(CONFIG_SPIRAM_XIP_FROM_PSRAM) && CONFIG_SPIRAM_XIP_FROM_PSRAM && \
+    defined(CONFIG_FREERTOS_TLSP_DELETION_CALLBACKS) && CONFIG_FREERTOS_TLSP_DELETION_CALLBACKS
+    pthread_internal_local_storage_destructor_callback(NULL);
+#endif
+    compromised_transfer_ui.task = NULL;
+    vTaskDelete(NULL);
+}
+
+static void compromised_transfer_task(void *arg)
+{
+    compromised_transfer_task_args_t *args = (compromised_transfer_task_args_t *)arg;
+    if (!args || !args->ctx) {
+        free(args);
+        compromised_transfer_ui.active = false;
+        compromised_transfer_delete_current_task();
+        return;
+    }
+
+    tab_id_t tab = (tab_id_t)args->tab;
+    uart_port_t uart_port = uart_port_for_tab(tab);
+    bool usb_lock_set = false;
+    bool portal_started = false;
+    janos_transfer_wifi_session_t wifi_session = {0};
+    esp_err_t result_err = ESP_FAIL;
+    janos_file_transfer_result_t result = {0};
+    char final_detail[384] = {0};
+
+    compromised_transport_lock_begin(tab, uart_port, &usb_lock_set);
+    compromised_transfer_set_stage("Stopping Monster operations...",
+                                   "Preparing a stable file for download", 0);
+    transport_write_bytes_tab(tab, uart_port, "stop\r\n", 6);
+    char stop_response[1024];
+    (void)home_collect_uart_response(tab, uart_port, stop_response, sizeof(stop_response), 4500);
+
+    if (compromised_transfer_ui.cancel_requested) {
+        result_err = ESP_ERR_INVALID_STATE;
+        goto cleanup;
+    }
+
+    char password[24];
+    snprintf(password, sizeof(password), "T5%08lX%02lX",
+             (unsigned long)esp_random(), (unsigned long)(esp_random() & 0xFFU));
+    compromised_transfer_set_stage("Starting JanOS-Admin...",
+                                   "Waiting for the Monster file server", 0);
+    char portal_response[2048];
+    if (!janos_transfer_wait_for_portal(tab, uart_port, password,
+                                        portal_response, sizeof(portal_response))) {
+        snprintf(final_detail, sizeof(final_detail),
+                 "JanOS-Admin did not start.\n%.260s",
+                 portal_response[0] ? portal_response : "No confirmation received.");
+        result_err = ESP_FAIL;
+        memset(password, 0, sizeof(password));
+        goto cleanup;
+    }
+    portal_started = true;
+
+    compromised_transfer_set_stage("Connecting Tab5 Wi-Fi...",
+                                   "Joining JanOS-Admin with the internal C6", 0);
+    result_err = janos_transfer_connect_wifi(password,
+                                             &compromised_transfer_ui.cancel_requested,
+                                             &wifi_session);
+    memset(password, 0, sizeof(password));
+    if (result_err != ESP_OK) {
+        snprintf(final_detail, sizeof(final_detail), "Could not connect to JanOS-Admin: %s",
+                 esp_err_to_name(result_err));
+        goto cleanup;
+    }
+
+    char local_path[256];
+    if (!janos_transfer_build_unique_local_path(tab, args->file_name,
+                                                local_path, sizeof(local_path))) {
+        result_err = ESP_ERR_INVALID_SIZE;
+        snprintf(final_detail, sizeof(final_detail), "Could not create a unique local filename.");
+        goto cleanup;
+    }
+
+    janos_file_transfer_config_t config = {
+        .base_url = JANOS_TRANSFER_BASE_URL,
+        .remote_path = args->remote_path,
+        .local_path = local_path,
+        .storage_mount_point = "/sdcard",
+        .io_buffer_size = 8192,
+        .timeout_ms = JANOS_TRANSFER_HTTP_TIMEOUT_MS,
+        .cancel_requested = &compromised_transfer_ui.cancel_requested,
+        .progress_cb = compromised_transfer_progress_cb,
+        .progress_ctx = args->ctx,
+    };
+    result_err = janos_file_transfer_download(&config, &result);
+    if (result_err == ESP_OK) {
+        esp_err_t state_err = janos_sync_state_append(tab, args->remote_path,
+                                                      result.remote_size_after,
+                                                      result.final_path, result.crc32);
+        snprintf(final_detail, sizeof(final_detail),
+                 "%s\n%llu bytes | CRC32 %08lX\nOriginal kept on Monster.%s",
+                 result.final_path,
+                 (unsigned long long)result.bytes_written,
+                 (unsigned long)result.crc32,
+                 state_err == ESP_OK ? "\nAdded to the sync index."
+                                     : "\nWarning: sync index was not saved.");
+    } else if (!final_detail[0]) {
+        snprintf(final_detail, sizeof(final_detail),
+                 "%s\nPartial file, if any: %s",
+                 compromised_transfer_ui.cancel_requested ? "Cancelled by user."
+                                                         : esp_err_to_name(result_err),
+                 result.part_path[0] ? result.part_path : "not created");
+    }
+
+cleanup:
+    if (portal_started) {
+        compromised_transfer_set_stage("Closing JanOS-Admin...",
+                                       "The copied file remains on both SD cards", 100);
+        transport_write_bytes_tab(tab, uart_port, "stop\r\n", 6);
+        vTaskDelay(pdMS_TO_TICKS(350));
+    }
+    janos_transfer_restore_wifi(&wifi_session);
+    compromised_transport_lock_end(usb_lock_set);
+
+    ESP_LOGI(TAG, "[%s] Monster file transfer finished: %s",
+             tab_transport_name(tab), esp_err_to_name(result_err));
+    compromised_transfer_finish_ui(result_err == ESP_OK, final_detail);
+    free(args);
+    compromised_transfer_delete_current_task();
+}
+
+static bool compromised_transfer_preflight(tab_context_t *ctx, bool sync_mode)
+{
+    struct stat sd_stat;
+    const char *reason = NULL;
+    if (!ctx || stat("/sdcard", &sd_stat) != 0 || !S_ISDIR(sd_stat.st_mode)) {
+        reason = "Tab5 SD card is not mounted. Insert or remount the card and try again.";
+    } else if (portal_active) {
+        reason = "Stop the Tab5 captive portal before connecting to JanOS-Admin.";
+    } else if (internal_ctx.sd_admin_task || internal_ctx.sd_admin_state != SD_ADMIN_STOPPED) {
+        reason = "Stop the manual SD Admin session before starting an automatic copy.";
+    }
+
+    if (!reason) {
+        return true;
+    }
+
+    compromised_transfer_ui.cancel_requested = false;
+    compromised_transfer_ui.sync_mode = sync_mode;
+    compromised_transfer_show_popup("Operation unavailable");
+    compromised_transfer_finish_ui_unlocked(false, reason);
+    return false;
+}
+
+static void compromised_sync_task(void *arg)
+{
+    compromised_sync_task_args_t *args = (compromised_sync_task_args_t *)arg;
+    if (!args || !args->ctx || args->item_count <= 0) {
+        heap_caps_free(args);
+        compromised_transfer_ui.active = false;
+        compromised_transfer_delete_current_task();
+        return;
+    }
+
+    tab_id_t tab = (tab_id_t)args->tab;
+    uart_port_t uart_port = uart_port_for_tab(tab);
+    bool usb_lock_set = false;
+    bool portal_started = false;
+    janos_transfer_wifi_session_t wifi_session = {0};
+    esp_err_t session_err = ESP_FAIL;
+    int copied = 0;
+    int skipped = 0;
+    int failed = 0;
+    int index_warnings = 0;
+    char final_detail[512] = {0};
+
+    compromised_transport_lock_begin(tab, uart_port, &usb_lock_set);
+    compromised_transfer_set_stage("Stopping Monster operations...",
+                                   "Preparing one stable sync session", 0);
+    transport_write_bytes_tab(tab, uart_port, "stop\r\n", 6);
+    char stop_response[1024];
+    (void)home_collect_uart_response(tab, uart_port, stop_response, sizeof(stop_response), 4500);
+
+    if (compromised_transfer_ui.cancel_requested) {
+        session_err = ESP_ERR_INVALID_STATE;
+        goto cleanup;
+    }
+
+    char password[24];
+    snprintf(password, sizeof(password), "T5%08lX%02lX",
+             (unsigned long)esp_random(), (unsigned long)(esp_random() & 0xFFU));
+    compromised_transfer_set_stage("Starting JanOS-Admin...",
+                                   "One connection will serve the whole batch", 0);
+    char portal_response[2048];
+    if (!janos_transfer_wait_for_portal(tab, uart_port, password,
+                                        portal_response, sizeof(portal_response))) {
+        snprintf(final_detail, sizeof(final_detail),
+                 "JanOS-Admin did not start.\n%.360s",
+                 portal_response[0] ? portal_response : "No confirmation received.");
+        memset(password, 0, sizeof(password));
+        session_err = ESP_FAIL;
+        goto cleanup;
+    }
+    portal_started = true;
+
+    compromised_transfer_set_stage("Connecting Tab5 Wi-Fi...",
+                                   "Joining JanOS-Admin with the internal C6", 0);
+    session_err = janos_transfer_connect_wifi(password,
+                                              &compromised_transfer_ui.cancel_requested,
+                                              &wifi_session);
+    memset(password, 0, sizeof(password));
+    if (session_err != ESP_OK) {
+        snprintf(final_detail, sizeof(final_detail), "Could not connect to JanOS-Admin: %s",
+                 esp_err_to_name(session_err));
+        goto cleanup;
+    }
+
+    session_err = ESP_OK;
+    for (int i = 0; i < args->item_count; i++) {
+        if (compromised_transfer_ui.cancel_requested) {
+            session_err = ESP_ERR_INVALID_STATE;
+            break;
+        }
+
+        compromised_sync_item_t *item = &args->items[i];
+        int checked_percent = (i * 100) / args->item_count;
+        char checking[256];
+        snprintf(checking, sizeof(checking), "File %d/%d: %s",
+                 i + 1, args->item_count, item->file_name);
+        compromised_transfer_set_stage("Checking Monster file...", checking, checked_percent);
+
+        uint64_t remote_size = 0;
+        esp_err_t item_err = janos_file_transfer_query_size(JANOS_TRANSFER_BASE_URL,
+                                                            item->remote_path,
+                                                            JANOS_TRANSFER_HTTP_TIMEOUT_MS,
+                                                            &remote_size);
+        if (item_err != ESP_OK) {
+            ESP_LOGW(TAG, "[%s] Sync could not inspect %s: %s",
+                     tab_transport_name(tab), item->remote_path, esp_err_to_name(item_err));
+            failed++;
+            continue;
+        }
+
+        char indexed_local_path[256];
+        if (janos_sync_state_contains(tab, item->remote_path, remote_size,
+                                      indexed_local_path, sizeof(indexed_local_path)) ||
+            janos_sync_bootstrap_existing(tab, item->remote_path, item->file_name,
+                                          remote_size)) {
+            ESP_LOGI(TAG, "[%s] Sync skipped unchanged %s (%llu bytes)",
+                     tab_transport_name(tab), item->remote_path,
+                     (unsigned long long)remote_size);
+            skipped++;
+            continue;
+        }
+
+        char local_path[256];
+        if (!janos_transfer_build_unique_local_path(tab, item->file_name,
+                                                    local_path, sizeof(local_path))) {
+            ESP_LOGE(TAG, "[%s] Sync could not create a local path for %s",
+                     tab_transport_name(tab), item->remote_path);
+            failed++;
+            continue;
+        }
+
+        compromised_sync_progress_ctx_t progress_ctx = {
+            .current = i + 1,
+            .total = args->item_count,
+            .file_name = item->file_name,
+        };
+        janos_file_transfer_result_t result = {0};
+        janos_file_transfer_config_t config = {
+            .base_url = JANOS_TRANSFER_BASE_URL,
+            .remote_path = item->remote_path,
+            .local_path = local_path,
+            .storage_mount_point = "/sdcard",
+            .io_buffer_size = 8192,
+            .timeout_ms = JANOS_TRANSFER_HTTP_TIMEOUT_MS,
+            .cancel_requested = &compromised_transfer_ui.cancel_requested,
+            .progress_cb = compromised_sync_progress_cb,
+            .progress_ctx = &progress_ctx,
+        };
+        item_err = janos_file_transfer_download(&config, &result);
+        if (item_err != ESP_OK) {
+            ESP_LOGW(TAG, "[%s] Sync failed for %s: %s",
+                     tab_transport_name(tab), item->remote_path, esp_err_to_name(item_err));
+            failed++;
+            if (compromised_transfer_ui.cancel_requested) {
+                session_err = ESP_ERR_INVALID_STATE;
+                break;
+            }
+            continue;
+        }
+
+        esp_err_t state_err = janos_sync_state_append(tab, item->remote_path,
+                                                      result.remote_size_after,
+                                                      result.final_path, result.crc32);
+        if (state_err != ESP_OK) {
+            index_warnings++;
+        }
+        copied++;
+        ESP_LOGI(TAG, "[%s] Sync copied %s -> %s (%llu bytes, CRC32 %08lX)",
+                 tab_transport_name(tab), item->remote_path, result.final_path,
+                 (unsigned long long)result.bytes_written, (unsigned long)result.crc32);
+    }
+
+    if (!compromised_transfer_ui.cancel_requested) {
+        session_err = failed == 0 ? ESP_OK : ESP_FAIL;
+        compromised_transfer_set_stage("Finalizing sync...",
+                                       "Saving results and closing JanOS-Admin", 100);
+        snprintf(final_detail, sizeof(final_detail),
+                 "Copied: %d | Already synced: %d | Failed: %d\nSaved under %s/%s%s",
+                 copied, skipped, failed, JANOS_TRANSFER_LOCAL_ROOT,
+                 janos_transfer_source_folder(tab),
+                 index_warnings > 0
+                     ? "\nWarning: some sync-index entries could not be saved." : "");
+    }
+
+cleanup:
+    if (portal_started) {
+        compromised_transfer_set_stage("Closing JanOS-Admin...",
+                                       "Copied files remain on both SD cards", 100);
+        transport_write_bytes_tab(tab, uart_port, "stop\r\n", 6);
+        vTaskDelay(pdMS_TO_TICKS(350));
+    }
+    janos_transfer_restore_wifi(&wifi_session);
+    compromised_transport_lock_end(usb_lock_set);
+
+    if (!final_detail[0]) {
+        snprintf(final_detail, sizeof(final_detail),
+                 "%s\nCopied: %d | Already synced: %d | Failed: %d",
+                 compromised_transfer_ui.cancel_requested ? "Cancelled by user."
+                                                         : esp_err_to_name(session_err),
+                 copied, skipped, failed);
+    }
+    ESP_LOGI(TAG, "[%s] Monster SD sync finished: %s (copied=%d skipped=%d failed=%d)",
+             tab_transport_name(tab), esp_err_to_name(session_err), copied, skipped, failed);
+    compromised_transfer_finish_ui(session_err == ESP_OK, final_detail);
+    heap_caps_free(args);
+    compromised_transfer_delete_current_task();
+}
+
+static void compromised_files_sync_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx || compromised_transfer_ui.active || compromised_transfer_ui.task) {
+        return;
+    }
+
+    compromised_file_kind_t kind = compromised_kind_from_user_data(lv_event_get_user_data(e));
+    bool syncable_kind = (kind == COMPROMISED_FILE_KIND_HANDSHAKE ||
+                          kind == COMPROMISED_FILE_KIND_PCAP_CAPTURE);
+    if (!syncable_kind || ctx->wardrive_wigle_file_count <= 0 ||
+        tab_is_internal(current_tab) || !compromised_transfer_preflight(ctx, true)) {
+        return;
+    }
+
+    int item_count = ctx->wardrive_wigle_file_count;
+    if (item_count > WARDRIVE_WIGLE_MAX_FILES) {
+        item_count = WARDRIVE_WIGLE_MAX_FILES;
+    }
+    size_t args_size = sizeof(compromised_sync_task_args_t) +
+                       ((size_t)item_count * sizeof(compromised_sync_item_t));
+    compromised_sync_task_args_t *args = heap_caps_calloc(1, args_size,
+                                                          MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!args) {
+        compromised_transfer_ui.sync_mode = true;
+        compromised_transfer_show_popup("Sync new files");
+        compromised_transfer_finish_ui_unlocked(false,
+            "Not enough PSRAM to create the sync file list.");
+        return;
+    }
+
+    args->ctx = ctx;
+    args->tab = current_tab;
+    args->kind = kind;
+    for (int i = 0; i < item_count; i++) {
+        wardrive_wigle_file_t *file = &ctx->wardrive_wigle_files[i];
+        if (!file->path[0] || !file->name[0]) {
+            continue;
+        }
+        compromised_sync_item_t *item = &args->items[args->item_count++];
+        snprintf(item->remote_path, sizeof(item->remote_path), "%s", file->path);
+        snprintf(item->file_name, sizeof(item->file_name), "%s", file->name);
+    }
+    if (args->item_count == 0) {
+        heap_caps_free(args);
+        return;
+    }
+
+    compromised_transfer_ui.active = true;
+    compromised_transfer_ui.cancel_requested = false;
+    compromised_transfer_ui.sync_mode = true;
+    char popup_name[128];
+    snprintf(popup_name, sizeof(popup_name), "%s: %d file(s)",
+             compromised_title_for_kind(kind), args->item_count);
+    compromised_transfer_show_popup(popup_name);
+    if (xTaskCreate(compromised_sync_task, "janos_sync", 14336, args, 6,
+                    &compromised_transfer_ui.task) != pdPASS) {
+        compromised_transfer_ui.active = false;
+        compromised_transfer_ui.task = NULL;
+        compromised_transfer_finish_ui_unlocked(false, "Could not start the sync task.");
+        heap_caps_free(args);
+    }
+}
+
+static void compromised_file_copy_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx || compromised_transfer_ui.active || compromised_transfer_ui.task) {
+        return;
+    }
+
+    compromised_file_kind_t kind = compromised_kind_from_user_data(lv_event_get_user_data(e));
+    int index = compromised_index_from_user_data(lv_event_get_user_data(e));
+    bool copyable_kind = (kind == COMPROMISED_FILE_KIND_HANDSHAKE ||
+                          kind == COMPROMISED_FILE_KIND_PCAP_CAPTURE);
+    if (!copyable_kind || index < 0 ||
+        index >= ctx->wardrive_wigle_file_count || tab_is_internal(current_tab)) {
+        return;
+    }
+
+    if (!compromised_transfer_preflight(ctx, false)) {
+        return;
+    }
+
+    wardrive_wigle_file_t *file = &ctx->wardrive_wigle_files[index];
+    if (!file->path[0] || !file->name[0]) {
+        return;
+    }
+
+    compromised_transfer_task_args_t *args = calloc(1, sizeof(*args));
+    if (!args) {
+        return;
+    }
+    args->ctx = ctx;
+    args->tab = current_tab;
+    snprintf(args->remote_path, sizeof(args->remote_path), "%s", file->path);
+    snprintf(args->file_name, sizeof(args->file_name), "%s", file->name);
+
+    compromised_transfer_ui.active = true;
+    compromised_transfer_ui.cancel_requested = false;
+    compromised_transfer_ui.sync_mode = false;
+    compromised_transfer_show_popup(file->name);
+    if (xTaskCreate(compromised_transfer_task, "janos_copy", 12288, args, 6,
+                    &compromised_transfer_ui.task) != pdPASS) {
+        compromised_transfer_ui.active = false;
+        compromised_transfer_ui.task = NULL;
+        compromised_transfer_finish_ui_unlocked(false, "Could not start the transfer task.");
+        free(args);
+    }
 }
 
 void app_main(void)

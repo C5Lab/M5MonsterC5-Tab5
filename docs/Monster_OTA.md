@@ -213,7 +213,18 @@ The Status screen and the List/Info screens are built by parsing the start of ea
 The **OTA Status** screen shows a large phase card, step labels, WiFi/IP/OTA summary lines, and
 the raw UART log. The main update flow starts with `wifi_connect ... ota`; after WiFi connects,
 JanOS downloads and flashes on the C5 side. If UART becomes quiet after flash progress, the UI
-shows a busy/reboot wait state.
+shows a busy/finalizing wait state. Silence is not treated as success: the close button remains
+disabled until an explicit terminal line is received.
+
+For an installation, the UI state transitions are intentionally strict:
+
+- `OTA: download complete (...)` means only that all bytes arrived; the UI shows `Finalizing OTA`
+  at 92% and continues waiting;
+- a quiet UART after byte progress shows `C5 is still finalizing` at 96%; it never enables `Done`;
+- generic `restart` or `reboot` text is informational and is not a success marker;
+- only `OTA: update applied, restarting` confirms that the image was finished and the boot slot
+  was switched; this moves progress to 100% and enables `Done - Close`;
+- `no update` / `up to date` remains a valid terminal result because no flash operation is needed.
 
 The **OTA List** screen — up to 5 `OTA[n]:` lines with the latest releases.
 
@@ -228,7 +239,8 @@ on the currently inactive partition.
   modeled on the existing `handshaker_monitoring` (see also `ctx->global_handshaker_monitoring`).
 - **Restart after success.** After a successful OTA the C5 **restarts**: it disappears from the
   UART for a few seconds and comes back with the new version. The UI should treat this as a
-  `rebooting...` state and, once the module returns, re-detect the version via
+  `rebooting...` state only after the explicit `OTA: update applied, restarting` marker and,
+  once the module returns, re-detect the version via
   `check_version_for_tab(tab)`.
 - **Port selection on MBus.** When the C5 is connected over MBus, `uart_port_for_tab` returns
   `UART2_NUM` (as long as `uart2_initialized`); otherwise `UART_NUM`.

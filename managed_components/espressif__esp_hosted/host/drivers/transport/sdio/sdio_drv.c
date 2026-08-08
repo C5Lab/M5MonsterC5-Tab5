@@ -201,6 +201,13 @@ static semaphore_handle_t sem_double_buf_xfer_data;
 static void * sdio_rx_buf_thread;
 static void sdio_data_to_rx_buf_task(void const* pvParameters);
 
+/* Backport of the ESP-Hosted 2.12 OOM handling. ESP-Hosted 2.8.5 used
+ * assertions for transient SDIO RX allocation failures, which rebooted the
+ * whole P4 when internal/DMA RAM was temporarily fragmented. */
+static bool sdio_rx_oom_logged;
+static bool sdio_tx_dma_reserved;
+static bool sdio_rx_dma_reserved_logged;
+
 static int sdio_generate_slave_intr(uint8_t intr_no);
 
 static void sdio_write_task(void const* pvParameters);
@@ -209,16 +216,74 @@ static void sdio_process_rx_task(void const* pvParameters);
 
 static inline void sdio_mempool_create(void)
 {
-	MEM_DUMP("sdio_mempool_create");
-	buf_mp_g = mempool_create(MAX_SDIO_BUFFER_SIZE);
+	void *reserved = NULL;
+
+	if (!buf_mp_g) {
+		MEM_DUMP("sdio_mempool_create");
+		buf_mp_g = mempool_create(MAX_SDIO_BUFFER_SIZE);
 #ifdef H_USE_MEMPOOL
-	assert(buf_mp_g);
+		assert(buf_mp_g);
 #endif
+	}
+#ifdef H_USE_MEMPOOL
+	if (sdio_tx_dma_reserved) {
+		return;
+	}
+	reserved = mempool_alloc(buf_mp_g, MAX_SDIO_BUFFER_SIZE, MEMSET_NOT_REQUIRED);
+	if (reserved) {
+		mempool_free(buf_mp_g, reserved);
+		sdio_tx_dma_reserved = true;
+		ESP_LOGI(TAG, "Reserved 1 shared SDIO TX DMA buffer");
+	} else {
+		ESP_LOGW(TAG, "Could not reserve the shared SDIO TX DMA buffer");
+	}
+#endif
+}
+
+static void sdio_rx_stream_buffers_reserve(void)
+{
+	unsigned reserved_count = 0;
+
+	for (unsigned i = 0; i < 2; i++) {
+		if (!double_buf.buffer[i].buf) {
+			double_buf.buffer[i].buf = (uint8_t *)g_h.funcs->_h_malloc_align(
+					MAX_SDIO_BUFFER_SIZE, HOSTED_MEM_ALIGNMENT_64);
+			if (!double_buf.buffer[i].buf) {
+				ESP_LOGW(TAG, "Could not reserve SDIO RX DMA stream buffer %u", i);
+				continue;
+			}
+			double_buf.buffer[i].buf_size = MAX_SDIO_BUFFER_SIZE;
+		}
+		reserved_count++;
+	}
+
+	if (reserved_count == 2 && !sdio_rx_dma_reserved_logged) {
+		ESP_LOGI(TAG, "Reserved 2 SDIO RX DMA stream buffers");
+		sdio_rx_dma_reserved_logged = true;
+	}
+}
+
+void sdio_reserve_dma_buffers(void)
+{
+	/* Allocate all long-lived DMA blocks while internal RAM is still
+	 * contiguous. Runtime RX/TX packet queues themselves use general heap. */
+	sdio_mempool_create();
+	sdio_rx_stream_buffers_reserve();
 }
 
 static inline void sdio_mempool_destroy(void)
 {
 	mempool_destroy(buf_mp_g);
+	buf_mp_g = NULL;
+	sdio_tx_dma_reserved = false;
+	for (unsigned i = 0; i < 2; i++) {
+		if (double_buf.buffer[i].buf) {
+			g_h.funcs->_h_free_align(double_buf.buffer[i].buf);
+			double_buf.buffer[i].buf = NULL;
+		}
+		double_buf.buffer[i].buf_size = 0;
+	}
+	sdio_rx_dma_reserved_logged = false;
 }
 
 static inline void *sdio_buffer_alloc(uint need_memset)
@@ -525,9 +590,8 @@ static void sdio_write_task(void const* pvParameters)
 #endif
 
 		if (!buf_handle.payload_zcopy) {
-			sendbuf = sdio_buffer_alloc(MEMSET_REQUIRED);
-			assert(sendbuf);
 			free_func = sdio_buffer_free;
+			sendbuf = sdio_buffer_alloc(MEMSET_REQUIRED);
 		} else {
 			sendbuf = buf_handle.payload;
 			free_func = buf_handle.free_buf_handle;
@@ -721,7 +785,8 @@ static int is_valid_sdio_rx_packet(uint8_t *rxbuff_a, uint16_t *len_a, uint16_t 
 }
 
 // pushes received packet data on to rx queue
-static esp_err_t sdio_push_pkt_to_queue(uint8_t * rxbuff, uint16_t len, uint16_t offset)
+static esp_err_t sdio_push_pkt_to_queue(uint8_t * rxbuff, uint16_t len, uint16_t offset,
+		void (*free_buf_func)(void *ptr))
 {
 	uint8_t pkt_prio = PRIO_Q_OTHERS;
 	struct esp_payload_header *h= NULL;
@@ -732,7 +797,7 @@ static esp_err_t sdio_push_pkt_to_queue(uint8_t * rxbuff, uint16_t len, uint16_t
 	memset(&buf_handle, 0, sizeof(interface_buffer_handle_t));
 
 	buf_handle.priv_buffer_handle = rxbuff;
-	buf_handle.free_buf_handle    = sdio_buffer_free;
+	buf_handle.free_buf_handle    = free_buf_func;
 	buf_handle.payload_len        = len;
 	buf_handle.if_type            = h->if_type;
 	buf_handle.if_num             = h->if_num;
@@ -800,7 +865,7 @@ static esp_err_t sdio_push_data_to_queue(uint8_t * buf, uint32_t buf_len)
 		return ESP_FAIL;
 	}
 
-	if (sdio_push_pkt_to_queue(buf, len, offset)) {
+	if (sdio_push_pkt_to_queue(buf, len, offset, sdio_buffer_free)) {
 		ESP_LOGE(TAG, "Failed to push Rx packet to queue");
 		return ESP_FAIL;
 	}
@@ -822,12 +887,18 @@ static uint8_t * sdio_rx_get_buffer(uint32_t len)
 	uint8_t ** buf = &double_buf.buffer[index].buf;
 
 	if (len > double_buf.buffer[index].buf_size) {
+		/* Keep the current buffer valid if a larger allocation cannot be
+		 * satisfied. The caller will retry on the next SDIO interrupt. */
+		uint8_t *new_buf = (uint8_t *)g_h.funcs->_h_malloc_align(len, HOSTED_MEM_ALIGNMENT_64);
+		if (!new_buf) {
+			ESP_LOGW(TAG, "RX stream buffer allocation failed (len=%lu); retrying",
+					(unsigned long)len);
+			return NULL;
+		}
 		if (*buf) {
-			// free already allocated memory
 			g_h.funcs->_h_free_align(*buf);
 		}
-		*buf = (uint8_t *)g_h.funcs->_h_malloc_align(len, HOSTED_MEM_ALIGNMENT_64);
-		assert(*buf);
+		*buf = new_buf;
 		double_buf.buffer[index].buf_size = len;
 		ESP_LOGD(TAG, "buf %d size: %ld", index, double_buf.buffer[index].buf_size);
 	}
@@ -847,6 +918,7 @@ static esp_err_t sdio_push_data_to_queue(uint8_t * buf, uint32_t buf_len)
 	uint16_t len = 0;
 	uint16_t offset = 0;
 	uint32_t packet_size;
+	void (*pkt_free_func)(void *ptr) = NULL;
 
 	// break up the data stream into packets to send to the queue
 	do {
@@ -857,20 +929,38 @@ static esp_err_t sdio_push_data_to_queue(uint8_t * buf, uint32_t buf_len)
 			/* TODO: Free by caller? */
 			return ESP_FAIL;
 		}
-		/* Allocate rx buffer */
-		pkt_rxbuff = sdio_buffer_alloc(MEMSET_REQUIRED);
-		assert(pkt_rxbuff);
-
 		packet_size = len + offset;
 		if (packet_size > buf_len) {
 			ESP_LOGE(TAG, "packet size[%lu]>[%lu] too big for remaining stream data",
 					packet_size, buf_len);
 			return ESP_FAIL;
 		}
+
+		/* Allocate rx buffer */
+		/* The DMA read has already completed into the stream buffer. Queue an
+		 * exact-size CPU copy in general heap/PSRAM, leaving the single shared
+		 * DMA block exclusively for the serialized SDIO write task. */
+		pkt_rxbuff = g_h.funcs->_h_malloc(packet_size);
+		pkt_free_func = g_h.funcs->_h_free;
+		if (!pkt_rxbuff) {
+			if (!sdio_rx_oom_logged) {
+				ESP_LOGW(TAG, "SDIO RX general heap exhausted; dropping packet instead of rebooting");
+				sdio_rx_oom_logged = true;
+			}
+			buf_len -= packet_size;
+			buf += packet_size;
+			continue;
+		}
+		if (sdio_rx_oom_logged) {
+			ESP_LOGI(TAG, "SDIO RX general heap recovered");
+			sdio_rx_oom_logged = false;
+		}
+
 		memcpy(pkt_rxbuff, buf, packet_size);
 
-		if (sdio_push_pkt_to_queue(pkt_rxbuff, len, offset)) {
+		if (sdio_push_pkt_to_queue(pkt_rxbuff, len, offset, pkt_free_func)) {
 			ESP_LOGI(TAG, "Failed to push a packet to queue from stream");
+			pkt_free_func(pkt_rxbuff);
 		}
 
 		// move to the next packet in the stream
@@ -962,6 +1052,7 @@ static void sdio_read_task(void const* pvParameters)
 	uint32_t len_to_read;
 	uint8_t *pos;
 	uint32_t interrupts;
+	bool pending = false;
 
 #if DO_COMBINED_REG_READ
 	uint32_t *intr_index = NULL;
@@ -1000,17 +1091,19 @@ static void sdio_read_task(void const* pvParameters)
 	sdio_generate_slave_intr(ESP_OPEN_DATA_PATH);
 
 	for (;;) {
+		if (!pending) {
+			// wait for sdio interrupt from slave
+			/* call will block until there is an interrupt, timeout or error */
+			ESP_LOGD(TAG, "--- Wait for SDIO intr ---");
+			res = g_h.funcs->_h_sdio_wait_slave_intr(sdio_handle, HOSTED_BLOCK_MAX);
+			ESP_LOGD(TAG, "--- SDIO intr received ---");
 
-		// wait for sdio interrupt from slave
-		/* call will block until there is an interrupt, timeout or error */
-		ESP_LOGD(TAG, "--- Wait for SDIO intr ---");
-		res = g_h.funcs->_h_sdio_wait_slave_intr(sdio_handle, HOSTED_BLOCK_MAX);
-		ESP_LOGD(TAG, "--- SDIO intr received ---");
-
-		if (res != ESP_OK) {
-			ESP_LOGE(TAG, "wait_slave_intr error: %d", res);
-			continue;
+			if (res != ESP_OK) {
+				ESP_LOGE(TAG, "wait_slave_intr error: %d", res);
+				continue;
+			}
 		}
+		pending = false;
 
 		SDIO_DRV_LOCK();
 
@@ -1083,7 +1176,12 @@ static void sdio_read_task(void const* pvParameters)
 
 		/* Allocate rx buffer */
 		rxbuff = sdio_rx_get_buffer(len_from_slave);
-		assert(rxbuff);
+		if (!rxbuff) {
+			pending = true;
+			SDIO_DRV_UNLOCK();
+			g_h.funcs->_h_msleep(1);
+			continue;
+		}
 
 		data_left = len_from_slave;
 		pos = rxbuff;
@@ -1121,6 +1219,12 @@ static void sdio_read_task(void const* pvParameters)
 		//sdio_rx_byte_count += (len_from_slave-data_left);
 		sdio_rx_byte_count += len_from_slave;
 		sdio_rx_byte_count = sdio_rx_byte_count % ESP_RX_BYTE_MAX;
+
+#if H_SDIO_HOST_RX_MODE != H_SDIO_ALWAYS_HOST_RX_MAX_TRANSPORT_SIZE
+		/* Check the length register again without waiting: the slave may still
+		 * have queued bytes even after the interrupt bit was cleared. */
+		pending = true;
+#endif
 
 		if (unlikely(ret))
 			continue;
@@ -1251,6 +1355,10 @@ void *bus_init_internal(void)
 	sdio_tx_buf_count = 0;
 	sdio_rx_byte_count = 0;
 
+	/* Reserve the only required DMA packet buffer before queues, tasks and the
+	 * SDMMC driver fragment internal RAM. The write task serializes all users. */
+	sdio_reserve_dma_buffers();
+
 	struct esp_hosted_sdio_config *psdio_config;
 
 	// get queue sizes from transport config
@@ -1295,8 +1403,6 @@ void *bus_init_internal(void)
 		assert(to_slave_queue[prio_q_idx]);
 	}
 
-	sdio_mempool_create();
-
 	/* initialise SDMMC before starting read/write threads
 	 * which depend on SDMMC*/
 	sdio_handle = g_h.funcs->_h_bus_init();
@@ -1305,9 +1411,9 @@ void *bus_init_internal(void)
 		assert(sdio_handle);
 	}
 
-	// initialise double buffering structs
-	memset(&double_buf, 0, sizeof(double_buf_t));
+	// Initialise indices without discarding the pre-reserved DMA buffers.
 	double_buf.read_index = -1; // indicates we are not reading anything
+	double_buf.read_data_len = 0;
 	double_buf.write_index = 0; // we will write into the first buffer
 
 	sem_double_buf_xfer_data = g_h.funcs->_h_create_semaphore(1);
