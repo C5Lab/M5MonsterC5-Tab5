@@ -40,6 +40,12 @@ static uint16_t read_be16(const uint8_t *data)
     return ((uint16_t)data[0] << 8) | (uint16_t)data[1];
 }
 
+static uint32_t read_be32(const uint8_t *data)
+{
+    return ((uint32_t)data[0] << 24) | ((uint32_t)data[1] << 16) |
+           ((uint32_t)data[2] << 8) | (uint32_t)data[3];
+}
+
 static uint16_t read_le16(const uint8_t *data)
 {
     return (uint16_t)data[0] | ((uint16_t)data[1] << 8);
@@ -577,7 +583,7 @@ static void describe_dns(const uint8_t *data, size_t length, pcap_packet_details
 }
 
 static void describe_transport(const uint8_t *data, size_t length, uint8_t ip_protocol,
-                               pcap_packet_details_t *details)
+                               size_t packet_offset, pcap_packet_details_t *details)
 {
     if (!data || !details) {
         return;
@@ -595,6 +601,8 @@ static void describe_transport(const uint8_t *data, size_t length, uint8_t ip_pr
         }
         details->source_port = read_be16(data);
         details->destination_port = read_be16(data + 2);
+        details->tcp_sequence = read_be32(data + 4);
+        details->tcp_acknowledgment = read_be32(data + 8);
         uint8_t header_length = (uint8_t)((data[12] >> 4) * 4U);
         if (header_length < 20 || header_length > length) {
             details->malformed = true;
@@ -603,6 +611,7 @@ static void describe_transport(const uint8_t *data, size_t length, uint8_t ip_pr
         }
         payload_offset = header_length;
         uint8_t flags = data[13];
+        details->tcp_flags = flags;
         snprintf(details->info, sizeof(details->info), "TCP %u -> %u flags 0x%02X",
                  details->source_port, details->destination_port, flags);
     } else if (ip_protocol == 17) {
@@ -626,6 +635,8 @@ static void describe_transport(const uint8_t *data, size_t length, uint8_t ip_pr
                                             details->destination_port);
     const uint8_t *payload = data + payload_offset;
     size_t payload_length = length - payload_offset;
+    details->payload_offset = (uint32_t)(packet_offset + payload_offset);
+    details->payload_captured_length = (uint32_t)payload_length;
     if (looks_like_http(payload, payload_length)) {
         application = "HTTP";
     } else if (looks_like_tls(payload, payload_length)) {
@@ -670,7 +681,8 @@ static void describe_transport(const uint8_t *data, size_t length, uint8_t ip_pr
     }
 }
 
-static void describe_ipv4(const uint8_t *data, size_t length, pcap_packet_details_t *details)
+static void describe_ipv4(const uint8_t *data, size_t length, size_t packet_offset,
+                          pcap_packet_details_t *details)
 {
     details->flags |= PCAP_PACKET_FLAG_IPV4;
     if (length < 20 || (data[0] >> 4) != 4) {
@@ -688,10 +700,12 @@ static void describe_ipv4(const uint8_t *data, size_t length, pcap_packet_detail
     }
     format_ipv4(data + 12, details->source, sizeof(details->source));
     format_ipv4(data + 16, details->destination, sizeof(details->destination));
-    describe_transport(data + header_length, length - header_length, data[9], details);
+    describe_transport(data + header_length, length - header_length, data[9],
+                       packet_offset + header_length, details);
 }
 
-static void describe_ipv6(const uint8_t *data, size_t length, pcap_packet_details_t *details)
+static void describe_ipv6(const uint8_t *data, size_t length, size_t packet_offset,
+                          pcap_packet_details_t *details)
 {
     details->flags |= PCAP_PACKET_FLAG_IPV6;
     if (length < 40 || (data[0] >> 4) != 6) {
@@ -702,7 +716,7 @@ static void describe_ipv6(const uint8_t *data, size_t length, pcap_packet_detail
     }
     format_ipv6(data + 8, details->source, sizeof(details->source));
     format_ipv6(data + 24, details->destination, sizeof(details->destination));
-    describe_transport(data + 40, length - 40, data[6], details);
+    describe_transport(data + 40, length - 40, data[6], packet_offset + 40, details);
 }
 
 static void describe_ethernet(const uint8_t *data, size_t length,
@@ -717,6 +731,8 @@ static void describe_ethernet(const uint8_t *data, size_t length,
     }
     format_mac(data + 6, details->source, sizeof(details->source));
     format_mac(data, details->destination, sizeof(details->destination));
+    format_mac(data + 6, details->source_mac, sizeof(details->source_mac));
+    format_mac(data, details->destination_mac, sizeof(details->destination_mac));
     size_t offset = 14;
     uint16_t ether_type = read_be16(data + 12);
     int vlan_depth = 0;
@@ -728,9 +744,9 @@ static void describe_ethernet(const uint8_t *data, size_t length,
     }
     details->ether_type = ether_type;
     if (ether_type == 0x0800U) {
-        describe_ipv4(data + offset, length - offset, details);
+        describe_ipv4(data + offset, length - offset, offset, details);
     } else if (ether_type == 0x86DDU) {
-        describe_ipv6(data + offset, length - offset, details);
+        describe_ipv6(data + offset, length - offset, offset, details);
     } else if (ether_type == 0x0806U) {
         details->flags |= PCAP_PACKET_FLAG_ARP;
         snprintf(details->protocol, sizeof(details->protocol), "ARP");
@@ -794,8 +810,10 @@ static void describe_ieee80211(const uint8_t *data, size_t length,
     bool from_ds = (frame_control & 0x0200U) != 0;
 
     format_mac(data + 4, details->destination, sizeof(details->destination));
+    format_mac(data + 4, details->destination_mac, sizeof(details->destination_mac));
     if (length >= 16) {
         format_mac(data + 10, details->source, sizeof(details->source));
+        format_mac(data + 10, details->source_mac, sizeof(details->source_mac));
     }
     snprintf(details->protocol, sizeof(details->protocol), "802.11");
     if (type == 0) {
@@ -828,13 +846,19 @@ static void describe_ieee80211(const uint8_t *data, size_t length,
     /* Address roles in data frames depend on the ToDS/FromDS bits. */
     if (to_ds && from_ds) {
         format_mac(data + 24, details->source, sizeof(details->source));
+        format_mac(data + 24, details->source_mac, sizeof(details->source_mac));
         format_mac(data + 16, details->destination, sizeof(details->destination));
+        format_mac(data + 16, details->destination_mac, sizeof(details->destination_mac));
     } else if (to_ds) {
         format_mac(data + 10, details->source, sizeof(details->source));
+        format_mac(data + 10, details->source_mac, sizeof(details->source_mac));
         format_mac(data + 16, details->destination, sizeof(details->destination));
+        format_mac(data + 16, details->destination_mac, sizeof(details->destination_mac));
     } else if (from_ds) {
         format_mac(data + 16, details->source, sizeof(details->source));
+        format_mac(data + 16, details->source_mac, sizeof(details->source_mac));
         format_mac(data + 4, details->destination, sizeof(details->destination));
+        format_mac(data + 4, details->destination_mac, sizeof(details->destination_mac));
     }
 
     const uint8_t *payload = data + header_length;
@@ -848,9 +872,9 @@ static void describe_ieee80211(const uint8_t *data, size_t length,
             snprintf(details->protocol, sizeof(details->protocol), "EAPOL");
             snprintf(details->info, sizeof(details->info), "802.11 EAPOL key frame");
         } else if (ether_type == 0x0800U) {
-            describe_ipv4(payload + 8, payload_length - 8, details);
+            describe_ipv4(payload + 8, payload_length - 8, header_length + 8, details);
         } else if (ether_type == 0x86DDU) {
-            describe_ipv6(payload + 8, payload_length - 8, details);
+            describe_ipv6(payload + 8, payload_length - 8, header_length + 8, details);
         } else {
             snprintf(details->info, sizeof(details->info), "802.11 Data EtherType 0x%04X",
                      ether_type);

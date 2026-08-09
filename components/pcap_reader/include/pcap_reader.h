@@ -98,10 +98,16 @@ typedef struct {
     char protocol[24];
     char source[64];
     char destination[64];
+    char source_mac[18];
+    char destination_mac[18];
     char info[128];
     char dns_query[96];
     char dns_first_answer[80];
     uint32_t flags;
+    uint32_t tcp_sequence;
+    uint32_t tcp_acknowledgment;
+    uint32_t payload_offset;
+    uint32_t payload_captured_length;
     uint16_t source_port;
     uint16_t destination_port;
     uint16_t ether_type;
@@ -110,6 +116,7 @@ typedef struct {
     uint16_t dns_question_count;
     uint16_t dns_answer_count;
     uint8_t ip_protocol;
+    uint8_t tcp_flags;
     uint8_t dns_rcode;
     uint8_t wifi_frame_type;
     uint8_t wifi_frame_subtype;
