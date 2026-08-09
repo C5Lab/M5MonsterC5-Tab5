@@ -13,9 +13,9 @@ extern "C" {
 #endif
 
 #define PCAP_ANALYSIS_STORE_PATH_MAX 384U
-#define PCAP_ANALYSIS_CACHE_SCHEMA_VERSION 2U
-#define PCAP_ANALYSIS_REPORT_SCHEMA_VERSION 2U
-#define PCAP_ANALYSIS_FILTER_SCHEMA_VERSION 1U
+#define PCAP_ANALYSIS_CACHE_SCHEMA_VERSION 3U
+#define PCAP_ANALYSIS_REPORT_SCHEMA_VERSION 3U
+#define PCAP_ANALYSIS_FILTER_SCHEMA_VERSION 2U
 
 typedef enum {
     PCAP_ANALYSIS_STORE_OK = 0,
@@ -75,6 +75,8 @@ pcap_analysis_store_status_t pcap_analysis_export_report_json(
     const uint32_t *packet_flags,
     size_t packet_flag_count,
     pcap_packet_filter_t active_filter,
+    const pcap_flow_filter_t *quick_filter,
+    uint32_t selected_matches,
     bool loaded_from_cache,
     char *output_path,
     size_t output_path_size);
@@ -93,11 +95,13 @@ pcap_analysis_store_status_t pcap_analysis_export_filtered_pcap(
 
 pcap_analysis_store_status_t pcap_analysis_filter_profile_save(
     pcap_packet_filter_t active_filter,
+    const pcap_flow_filter_t *quick_filter,
     char *output_path,
     size_t output_path_size);
 
 pcap_analysis_store_status_t pcap_analysis_filter_profile_load(
     pcap_packet_filter_t *active_filter_out,
+    pcap_flow_filter_t *quick_filter_out,
     char *input_path,
     size_t input_path_size);
 

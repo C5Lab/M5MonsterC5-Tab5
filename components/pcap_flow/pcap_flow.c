@@ -55,6 +55,174 @@ static bool payload_contains(const uint8_t *payload, size_t length,
     return false;
 }
 
+static void copy_text(char *destination, size_t destination_size,
+                      const char *source, size_t source_length)
+{
+    if (!destination || destination_size == 0U) return;
+    size_t count = 0;
+    if (source) {
+        while (count + 1U < destination_size && count < source_length && source[count]) {
+            destination[count] = source[count];
+            count++;
+        }
+    }
+    destination[count] = '\0';
+}
+
+static bool address_is_internal(const char *address)
+{
+    if (!address || !address[0]) return false;
+    unsigned a = 0, b = 0, c = 0, d = 0;
+    if (sscanf(address, "%u.%u.%u.%u", &a, &b, &c, &d) == 4) {
+        (void)c;
+        (void)d;
+        return a == 10U || a == 127U || (a == 192U && b == 168U) ||
+               (a == 172U && b >= 16U && b <= 31U) ||
+               (a == 169U && b == 254U);
+    }
+    return strncasecmp(address, "fe80:", 5U) == 0 ||
+           strncasecmp(address, "fc", 2U) == 0 ||
+           strncasecmp(address, "fd", 2U) == 0 || strcmp(address, "::1") == 0;
+}
+
+static bool address_is_multicast(const char *address)
+{
+    if (!address || !address[0]) return false;
+    unsigned first = 0;
+    if (sscanf(address, "%u", &first) == 1 && strchr(address, '.')) {
+        return first >= 224U || strcmp(address, "255.255.255.255") == 0;
+    }
+    return strncasecmp(address, "ff", 2U) == 0;
+}
+
+static bool mac_is_group(const char *mac)
+{
+    if (!mac || !mac[0]) return false;
+    unsigned first = 0;
+    return sscanf(mac, "%2x", &first) == 1 && (first & 1U) != 0U;
+}
+
+static uint16_t read_payload_be16(const uint8_t *data)
+{
+    return (uint16_t)(((uint16_t)data[0] << 8) | data[1]);
+}
+
+static void extract_http_metadata(const uint8_t *payload, size_t length,
+                                  pcap_flow_entry_t *flow)
+{
+    if (!payload || !flow || length == 0U) return;
+    size_t line_length = 0;
+    while (line_length < length && line_length < 120U && payload[line_length] != '\r' &&
+           payload[line_length] != '\n') line_length++;
+    if (line_length > 0U && flow->application_detail[0] == '\0') {
+        copy_text(flow->application_detail, sizeof(flow->application_detail),
+                  (const char *)payload, line_length);
+    }
+    for (size_t i = 0; i + 6U < length; i++) {
+        if ((i == 0U || payload[i - 1U] == '\n') &&
+            strncasecmp((const char *)payload + i, "Host:", 5U) == 0) {
+            size_t start = i + 5U;
+            while (start < length && (payload[start] == ' ' || payload[start] == '\t')) start++;
+            size_t end = start;
+            while (end < length && payload[end] != '\r' && payload[end] != '\n') end++;
+            copy_text(flow->server_name, sizeof(flow->server_name),
+                      (const char *)payload + start, end - start);
+            break;
+        }
+    }
+}
+
+static void extract_tls_client_hello(const uint8_t *payload, size_t length,
+                                     pcap_flow_entry_t *flow)
+{
+    if (!payload || !flow || length < 11U || payload[0] != 0x16U ||
+        payload[5] != 0x01U) return;
+    flow->tls_version = read_payload_be16(payload + 9U);
+    size_t position = 43U;
+    if (position >= length) return;
+    size_t session_length = payload[position++];
+    if (position + session_length + 2U > length) return;
+    position += session_length;
+    size_t cipher_length = read_payload_be16(payload + position);
+    position += 2U;
+    if (position + cipher_length + 1U > length) return;
+    position += cipher_length;
+    size_t compression_length = payload[position++];
+    if (position + compression_length + 2U > length) return;
+    position += compression_length;
+    size_t extensions_length = read_payload_be16(payload + position);
+    position += 2U;
+    size_t extensions_end = position + extensions_length;
+    if (extensions_end > length) extensions_end = length;
+    char alpn[32] = {0};
+    while (position + 4U <= extensions_end) {
+        uint16_t type = read_payload_be16(payload + position);
+        size_t extension_length = read_payload_be16(payload + position + 2U);
+        position += 4U;
+        if (position + extension_length > extensions_end) break;
+        if (type == 0U && extension_length >= 5U) {
+            size_t name_position = position + 2U;
+            if (name_position + 3U <= position + extension_length &&
+                payload[name_position] == 0U) {
+                size_t name_length = read_payload_be16(payload + name_position + 1U);
+                name_position += 3U;
+                if (name_position + name_length <= position + extension_length) {
+                    copy_text(flow->server_name, sizeof(flow->server_name),
+                              (const char *)payload + name_position, name_length);
+                }
+            }
+        } else if (type == 16U && extension_length >= 3U) {
+            size_t alpn_position = position + 2U;
+            if (alpn_position < position + extension_length) {
+                size_t alpn_length = payload[alpn_position++];
+                if (alpn_position + alpn_length <= position + extension_length) {
+                    copy_text(alpn, sizeof(alpn),
+                              (const char *)payload + alpn_position, alpn_length);
+                }
+            }
+        }
+        position += extension_length;
+    }
+    if (flow->application_detail[0] == '\0') {
+        if (alpn[0]) {
+            snprintf(flow->application_detail, sizeof(flow->application_detail),
+                     "TLS 0x%04X | ALPN %s", flow->tls_version, alpn);
+        } else {
+            snprintf(flow->application_detail, sizeof(flow->application_detail),
+                     "TLS 0x%04X", flow->tls_version);
+        }
+    }
+}
+
+static void extract_bittorrent_metadata(const uint8_t *payload, size_t length,
+                                        pcap_flow_entry_t *flow)
+{
+    if (!payload || !flow || length < 48U || payload[0] != 19U ||
+        flow->application_detail[0]) return;
+    size_t position = 0;
+    int written = snprintf(flow->application_detail, sizeof(flow->application_detail),
+                           "info_hash=");
+    if (written < 0) return;
+    position = (size_t)written;
+    for (size_t i = 28U; i < 48U && position + 2U < sizeof(flow->application_detail); i++) {
+        written = snprintf(flow->application_detail + position,
+                           sizeof(flow->application_detail) - position, "%02x", payload[i]);
+        if (written != 2) break;
+        position += 2U;
+    }
+}
+
+static void update_flow_metadata(pcap_flow_entry_t *flow, pcap_application_t application,
+                                 const uint8_t *payload, size_t payload_length)
+{
+    if (!flow || !payload || payload_length == 0U) return;
+    if (application == PCAP_APP_HTTP) extract_http_metadata(payload, payload_length, flow);
+    if (application == PCAP_APP_TLS) extract_tls_client_hello(payload, payload_length, flow);
+    if (application == PCAP_APP_BITTORRENT) {
+        extract_bittorrent_metadata(payload, payload_length, flow);
+    }
+}
+
 static bool looks_like_http(const uint8_t *payload, size_t length)
 {
     static const char *markers[] = {
@@ -256,10 +424,12 @@ static uint16_t create_flow(pcap_flow_analysis_t *analysis,
     const char *responder = syn_ack ? details->source : details->destination;
     const char *originator_mac = syn_ack ? details->destination_mac : details->source_mac;
     const char *responder_mac = syn_ack ? details->source_mac : details->destination_mac;
-    snprintf(flow->originator, sizeof(flow->originator), "%s", originator);
-    snprintf(flow->responder, sizeof(flow->responder), "%s", responder);
-    snprintf(flow->originator_mac, sizeof(flow->originator_mac), "%s", originator_mac);
-    snprintf(flow->responder_mac, sizeof(flow->responder_mac), "%s", responder_mac);
+    copy_text(flow->originator, sizeof(flow->originator), originator, strlen(originator));
+    copy_text(flow->responder, sizeof(flow->responder), responder, strlen(responder));
+    copy_text(flow->originator_mac, sizeof(flow->originator_mac), originator_mac,
+              strlen(originator_mac));
+    copy_text(flow->responder_mac, sizeof(flow->responder_mac), responder_mac,
+              strlen(responder_mac));
     flow->originator_port = syn_ack ? details->destination_port : details->source_port;
     flow->responder_port = syn_ack ? details->source_port : details->destination_port;
     flow->ip_protocol = details->ip_protocol;
@@ -271,6 +441,375 @@ static uint16_t create_flow(pcap_flow_analysis_t *analysis,
     return id;
 }
 
+static int find_device(const pcap_flow_analysis_t *analysis, const char *address)
+{
+    if (!analysis || !address || !address[0]) return -1;
+    for (uint32_t i = 0; i < analysis->device_count; i++) {
+        if (strcasecmp(analysis->devices[i].address, address) == 0) return (int)i;
+    }
+    return -1;
+}
+
+static pcap_device_entry_t *observe_device(pcap_flow_analysis_t *analysis,
+                                           const char *address, const char *mac,
+                                           uint64_t time_us, bool sent,
+                                           uint32_t captured_bytes)
+{
+    if (!analysis || !address || !address[0] || address_is_multicast(address)) return NULL;
+    int index = find_device(analysis, address);
+    if (index < 0) {
+        if (analysis->device_count >= PCAP_FLOW_MAX_DEVICES) {
+            analysis->device_limited = true;
+            return NULL;
+        }
+        index = (int)analysis->device_count++;
+        pcap_device_entry_t *created = &analysis->devices[index];
+        copy_text(created->address, sizeof(created->address), address, strlen(address));
+        created->internal = address_is_internal(address);
+        created->first_time_us = time_us;
+    }
+    pcap_device_entry_t *device = &analysis->devices[index];
+    if (mac && mac[0] && !mac_is_group(mac)) {
+        copy_text(device->mac, sizeof(device->mac), mac, strlen(mac));
+    }
+    if (device->first_time_us == 0U || time_us < device->first_time_us) {
+        device->first_time_us = time_us;
+    }
+    if (time_us > device->last_time_us) device->last_time_us = time_us;
+    if (sent) {
+        device->sent_packets++;
+        device->sent_bytes += captured_bytes;
+    } else {
+        device->received_packets++;
+        device->received_bytes += captured_bytes;
+    }
+    return device;
+}
+
+static void add_device_service(pcap_flow_analysis_t *analysis, const char *address,
+                               uint16_t port, uint8_t ip_protocol, uint8_t application,
+                               uint32_t packets, uint64_t bytes)
+{
+    int index = find_device(analysis, address);
+    if (index < 0 || port == 0U) return;
+    pcap_device_entry_t *device = &analysis->devices[index];
+    for (uint16_t i = 0; i < device->service_count; i++) {
+        pcap_device_service_t *service = &device->services[i];
+        if (service->port == port && service->ip_protocol == ip_protocol) {
+            service->packets += packets;
+            service->bytes += bytes;
+            if (application > service->application) service->application = application;
+            return;
+        }
+    }
+    if (device->service_count >= PCAP_FLOW_DEVICE_SERVICES) {
+        device->service_limited = true;
+        return;
+    }
+    pcap_device_service_t *service = &device->services[device->service_count++];
+    service->port = port;
+    service->ip_protocol = ip_protocol;
+    service->application = application;
+    service->packets = packets;
+    service->bytes = bytes;
+}
+
+static pcap_security_alert_t *add_alert(pcap_flow_analysis_t *analysis,
+                                        pcap_alert_type_t type,
+                                        pcap_health_level_t severity,
+                                        pcap_app_confidence_t confidence,
+                                        const char *source, const char *target,
+                                        uint16_t service_port, uint16_t flow_id,
+                                        uint32_t first_packet, uint32_t last_packet,
+                                        uint64_t first_time_us, uint64_t last_time_us,
+                                        const char *detail)
+{
+    if (!analysis) return NULL;
+    for (uint32_t i = 0; i < analysis->alert_count; i++) {
+        pcap_security_alert_t *existing = &analysis->alerts[i];
+        if (existing->type == type && existing->service_port == service_port &&
+            strcasecmp(existing->source, source ? source : "") == 0 &&
+            strcasecmp(existing->target, target ? target : "") == 0) return existing;
+    }
+    if (analysis->alert_count >= PCAP_FLOW_MAX_ALERTS) {
+        analysis->alert_limited = true;
+        return NULL;
+    }
+    pcap_security_alert_t *alert = &analysis->alerts[analysis->alert_count++];
+    alert->type = (uint8_t)type;
+    alert->severity = (uint8_t)severity;
+    alert->confidence = (uint8_t)confidence;
+    alert->flow_id = flow_id;
+    alert->service_port = service_port;
+    alert->first_packet = first_packet;
+    alert->last_packet = last_packet;
+    alert->first_time_us = first_time_us;
+    alert->last_time_us = last_time_us;
+    copy_text(alert->source, sizeof(alert->source), source, source ? strlen(source) : 0U);
+    copy_text(alert->target, sizeof(alert->target), target, target ? strlen(target) : 0U);
+    copy_text(alert->detail, sizeof(alert->detail), detail, detail ? strlen(detail) : 0U);
+    if (severity > analysis->health_level) analysis->health_level = (uint8_t)severity;
+    return alert;
+}
+
+static void alert_evidence(pcap_security_alert_t *alert, uint32_t packet_number)
+{
+    if (!alert || alert->evidence_count >= PCAP_FLOW_ALERT_EVIDENCE) return;
+    for (uint8_t i = 0; i < alert->evidence_count; i++) {
+        if (alert->evidence_packets[i] == packet_number) return;
+    }
+    alert->evidence_packets[alert->evidence_count++] = packet_number;
+}
+
+static unsigned bit_count64(uint64_t value)
+{
+    unsigned count = 0;
+    while (value) {
+        count += (unsigned)(value & 1ULL);
+        value >>= 1U;
+    }
+    return count;
+}
+
+static uint32_t text_hash(const char *text)
+{
+    uint32_t hash = 2166136261UL;
+    if (!text) return hash;
+    while (*text) {
+        hash ^= (uint8_t)*text++;
+        hash *= 16777619UL;
+    }
+    return hash;
+}
+
+static void build_scan_alerts(pcap_flow_analysis_t *analysis)
+{
+    const uint64_t window_us = 60000000ULL;
+    for (uint16_t anchor = 0; anchor < analysis->flow_count; anchor++) {
+        const pcap_flow_entry_t *base = &analysis->flows[anchor];
+        if (base->ip_protocol != 6U && base->ip_protocol != 17U) continue;
+        uint64_t port_bits = 0U;
+        uint64_t host_bits = 0U;
+        uint32_t last_packet = base->last_packet;
+        uint64_t last_time = base->last_time_us;
+        for (uint16_t i = anchor; i < analysis->flow_count; i++) {
+            const pcap_flow_entry_t *flow = &analysis->flows[i];
+            if (flow->first_time_us < base->first_time_us ||
+                flow->first_time_us - base->first_time_us > window_us) continue;
+            if (strcasecmp(flow->originator, base->originator) != 0) continue;
+            if (strcasecmp(flow->responder, base->responder) == 0) {
+                uint64_t bit = 1ULL << (flow->responder_port & 63U);
+                port_bits |= bit;
+            }
+            if (flow->responder_port == base->responder_port &&
+                flow->ip_protocol == base->ip_protocol) {
+                uint64_t bit = 1ULL << (text_hash(flow->responder) & 63U);
+                host_bits |= bit;
+            }
+            if (flow->last_packet > last_packet) last_packet = flow->last_packet;
+            if (flow->last_time_us > last_time) last_time = flow->last_time_us;
+        }
+        uint32_t port_matches = bit_count64(port_bits);
+        uint32_t host_matches = bit_count64(host_bits);
+        if (port_matches >= 10U) {
+            char detail[160];
+            snprintf(detail, sizeof(detail),
+                     "%.47s contacted at least %lu ports on %.47s within 60 s",
+                     base->originator, (unsigned long)port_matches, base->responder);
+            pcap_security_alert_t *alert = add_alert(
+                analysis, PCAP_ALERT_PORT_SCAN, PCAP_HEALTH_SUSPICIOUS,
+                PCAP_APP_CONFIDENCE_CONFIRMED, base->originator, base->responder,
+                0U, PCAP_FLOW_ID_NONE, base->first_packet, last_packet,
+                base->first_time_us, last_time, detail);
+            for (uint16_t i = anchor; alert && i < analysis->flow_count; i++) {
+                const pcap_flow_entry_t *flow = &analysis->flows[i];
+                if (strcasecmp(flow->originator, base->originator) == 0 &&
+                    strcasecmp(flow->responder, base->responder) == 0 &&
+                    flow->first_time_us >= base->first_time_us &&
+                    flow->first_time_us - base->first_time_us <= window_us) {
+                    alert_evidence(alert, flow->first_packet);
+                }
+            }
+        }
+        if (host_matches >= 8U) {
+            char detail[160];
+            snprintf(detail, sizeof(detail),
+                     "%.47s contacted at least %lu hosts on %s/%u within 60 s",
+                     base->originator, (unsigned long)host_matches,
+                     pcap_flow_transport_name(base->ip_protocol), base->responder_port);
+            pcap_security_alert_t *alert = add_alert(
+                analysis, PCAP_ALERT_HOST_SWEEP, PCAP_HEALTH_SUSPICIOUS,
+                PCAP_APP_CONFIDENCE_CONFIRMED, base->originator, "multiple hosts",
+                base->responder_port, PCAP_FLOW_ID_NONE, base->first_packet, last_packet,
+                base->first_time_us, last_time, detail);
+            for (uint16_t i = anchor; alert && i < analysis->flow_count; i++) {
+                const pcap_flow_entry_t *flow = &analysis->flows[i];
+                if (strcasecmp(flow->originator, base->originator) == 0 &&
+                    flow->responder_port == base->responder_port &&
+                    flow->first_time_us >= base->first_time_us &&
+                    flow->first_time_us - base->first_time_us <= window_us) {
+                    alert_evidence(alert, flow->first_packet);
+                }
+            }
+        }
+    }
+}
+
+static void build_flow_alerts(pcap_flow_analysis_t *analysis)
+{
+    for (uint16_t i = 0; i < analysis->flow_count; i++) {
+        const pcap_flow_entry_t *flow = &analysis->flows[i];
+        if (flow->originator_payload_bytes >= 65536ULL &&
+            flow->originator_payload_bytes > (flow->responder_payload_bytes + 1ULL) * 10ULL &&
+            address_is_internal(flow->originator) && !address_is_internal(flow->responder)) {
+            char detail[160];
+            snprintf(detail, sizeof(detail),
+                     "%.35s sent %llu payload B and received %llu B from external %.35s",
+                     flow->originator,
+                     (unsigned long long)flow->originator_payload_bytes,
+                     (unsigned long long)flow->responder_payload_bytes, flow->responder);
+            pcap_security_alert_t *alert = add_alert(
+                analysis, PCAP_ALERT_EXFIL_CANDIDATE, PCAP_HEALTH_WATCH,
+                PCAP_APP_CONFIDENCE_LIKELY, flow->originator, flow->responder,
+                flow->responder_port, i, flow->first_packet, flow->last_packet,
+                flow->first_time_us, flow->last_time_us, detail);
+            alert_evidence(alert, flow->first_packet);
+        }
+        pcap_application_t app = (pcap_application_t)flow->app_protocol;
+        if (app == PCAP_APP_TELNET || app == PCAP_APP_FTP || app == PCAP_APP_HTTP ||
+            app == PCAP_APP_SMTP || app == PCAP_APP_POP3 || app == PCAP_APP_IMAP) {
+            char detail[160];
+            snprintf(detail, sizeof(detail), "%.23s observed between %.35s and %.35s on port %u",
+                     pcap_flow_application_name(app), flow->originator, flow->responder,
+                     flow->responder_port);
+            pcap_security_alert_t *alert = add_alert(
+                analysis, PCAP_ALERT_CLEARTEXT_SERVICE, PCAP_HEALTH_WATCH,
+                (pcap_app_confidence_t)flow->app_confidence, flow->originator,
+                flow->responder, flow->responder_port, i, flow->first_packet,
+                flow->last_packet, flow->first_time_us, flow->last_time_us, detail);
+            alert_evidence(alert, flow->first_packet);
+        }
+        if (app == PCAP_APP_TLS && flow->tls_version > 0U &&
+            flow->tls_version <= 0x0302U) {
+            char detail[160];
+            snprintf(detail, sizeof(detail),
+                     "TLS legacy version 0x%04X observed for %.47s:%u%s%.47s",
+                     flow->tls_version, flow->responder, flow->responder_port,
+                     flow->server_name[0] ? " SNI " : "",
+                     flow->server_name[0] ? flow->server_name : "");
+            pcap_security_alert_t *alert = add_alert(
+                analysis, PCAP_ALERT_WEAK_TLS, PCAP_HEALTH_WATCH,
+                PCAP_APP_CONFIDENCE_CONFIRMED, flow->originator, flow->responder,
+                flow->responder_port, i, flow->first_packet, flow->last_packet,
+                flow->first_time_us, flow->last_time_us, detail);
+            alert_evidence(alert, flow->first_packet);
+        }
+        uint32_t tcp_packets = flow->originator_packets + flow->responder_packets;
+        uint32_t retransmissions = flow->originator_retransmissions +
+                                   flow->responder_retransmissions;
+        if (flow->ip_protocol == 6U && tcp_packets >= 20U &&
+            ((retransmissions * 100U / tcp_packets) >= 10U ||
+             flow->zero_window_packets >= 3U)) {
+            char detail[160];
+            snprintf(detail, sizeof(detail),
+                     "TCP %.35s -> %.35s:%u has %lu retransmission indicators and %lu zero-window packets",
+                     flow->originator, flow->responder, flow->responder_port,
+                     (unsigned long)retransmissions,
+                     (unsigned long)flow->zero_window_packets);
+            pcap_security_alert_t *alert = add_alert(
+                analysis, PCAP_ALERT_TCP_QUALITY, PCAP_HEALTH_WATCH,
+                PCAP_APP_CONFIDENCE_LIKELY, flow->originator, flow->responder,
+                flow->responder_port, i, flow->first_packet, flow->last_packet,
+                flow->first_time_us, flow->last_time_us, detail);
+            alert_evidence(alert, flow->first_packet);
+        }
+    }
+
+    for (uint16_t anchor = 0; anchor < analysis->flow_count; anchor++) {
+        const pcap_flow_entry_t *base = &analysis->flows[anchor];
+        uint32_t count = 1U;
+        uint64_t previous = base->first_time_us;
+        uint64_t interval_sum = 0U;
+        uint64_t interval_min = UINT64_MAX;
+        uint64_t interval_max = 0U;
+        uint32_t last_packet = base->last_packet;
+        for (uint16_t i = anchor + 1U; i < analysis->flow_count; i++) {
+            const pcap_flow_entry_t *flow = &analysis->flows[i];
+            if (flow->ip_protocol != base->ip_protocol ||
+                flow->responder_port != base->responder_port ||
+                strcasecmp(flow->originator, base->originator) != 0 ||
+                strcasecmp(flow->responder, base->responder) != 0) continue;
+            uint64_t interval = flow->first_time_us - previous;
+            previous = flow->first_time_us;
+            interval_sum += interval;
+            if (interval < interval_min) interval_min = interval;
+            if (interval > interval_max) interval_max = interval;
+            last_packet = flow->last_packet;
+            count++;
+        }
+        if (count >= 5U) {
+            uint64_t mean = interval_sum / (count - 1U);
+            if (mean >= 2000000ULL && interval_max - interval_min <= mean / 3U) {
+                char detail[160];
+                snprintf(detail, sizeof(detail),
+                         "%lu regular connections from %.35s to %.35s:%u, mean interval %.1f s",
+                         (unsigned long)count, base->originator, base->responder,
+                         base->responder_port, (double)mean / 1000000.0);
+                pcap_security_alert_t *alert = add_alert(
+                    analysis, PCAP_ALERT_BEACONING, PCAP_HEALTH_WATCH,
+                    PCAP_APP_CONFIDENCE_LIKELY, base->originator, base->responder,
+                    base->responder_port, PCAP_FLOW_ID_NONE, base->first_packet, last_packet,
+                    base->first_time_us, previous, detail);
+                alert_evidence(alert, base->first_packet);
+            }
+        }
+    }
+}
+
+static void build_worm_alerts(pcap_flow_analysis_t *analysis)
+{
+    uint32_t original_count = analysis->alert_count;
+    for (uint32_t first = 0; first < original_count; first++) {
+        const pcap_security_alert_t *a = &analysis->alerts[first];
+        if (a->type != PCAP_ALERT_HOST_SWEEP) continue;
+        for (uint32_t second = 0; second < original_count; second++) {
+            const pcap_security_alert_t *b = &analysis->alerts[second];
+            if (b->type != PCAP_ALERT_HOST_SWEEP || b->first_time_us <= a->first_time_us ||
+                b->first_time_us - a->first_time_us > 120000000ULL ||
+                b->service_port != a->service_port) continue;
+            bool first_touched_second = false;
+            for (uint16_t f = 0; f < analysis->flow_count; f++) {
+                const pcap_flow_entry_t *flow = &analysis->flows[f];
+                if (strcasecmp(flow->originator, a->source) == 0 &&
+                    strcasecmp(flow->responder, b->source) == 0 &&
+                    flow->first_time_us >= a->first_time_us &&
+                    flow->first_time_us <= b->first_time_us) {
+                    first_touched_second = true;
+                    break;
+                }
+            }
+            if (!first_touched_second) continue;
+            char detail[160];
+            snprintf(detail, sizeof(detail),
+                     "%.47s swept port %u, then contacted %.47s which repeated the sweep",
+                     a->source, a->service_port, b->source);
+            pcap_security_alert_t *alert = add_alert(
+                analysis, PCAP_ALERT_WORM_LIKE_SPREAD, PCAP_HEALTH_CRITICAL,
+                PCAP_APP_CONFIDENCE_LIKELY, a->source, b->source, a->service_port,
+                PCAP_FLOW_ID_NONE, a->first_packet, b->last_packet,
+                a->first_time_us, b->last_time_us, detail);
+            if (alert) {
+                for (uint8_t e = 0; e < a->evidence_count; e++) {
+                    alert_evidence(alert, a->evidence_packets[e]);
+                }
+                for (uint8_t e = 0; e < b->evidence_count; e++) {
+                    alert_evidence(alert, b->evidence_packets[e]);
+                }
+            }
+        }
+    }
+}
+
 pcap_reader_status_t pcap_flow_analysis_build(
     pcap_reader_t *reader, const pcap_capture_info_t *capture_info,
     const pcap_packet_index_t *packet_index, size_t packet_count,
@@ -279,6 +818,7 @@ pcap_reader_status_t pcap_flow_analysis_build(
     if (!reader || !capture_info || !packet_index || !analysis ||
         packet_count > PCAP_FLOW_MAX_PACKET_MAP) return PCAP_READER_INVALID_ARG;
     memset(analysis, 0, sizeof(*analysis));
+    analysis->health_level = PCAP_HEALTH_INSUFFICIENT;
     for (size_t i = 0; i < PCAP_FLOW_MAX_PACKET_MAP; i++) {
         analysis->packet_flow_id[i] = PCAP_FLOW_ID_NONE;
         analysis->packet_direction[i] = 2U;
@@ -309,6 +849,67 @@ pcap_reader_status_t pcap_flow_analysis_build(
                                                       &confidence);
         analysis->packet_application[i] = (uint8_t)app;
         analysis->packet_confidence[i] = (uint8_t)confidence;
+        uint64_t time_us = packet_time_us(&packet_index[i],
+                                          capture_info->timestamp_resolution);
+
+        if ((details.flags & (PCAP_PACKET_FLAG_IPV4 | PCAP_PACKET_FLAG_IPV6)) != 0U) {
+            observe_device(analysis, details.source, details.source_mac, time_us, true,
+                           packet_index[i].captured_length);
+            observe_device(analysis, details.destination, details.destination_mac, time_us,
+                           false, packet_index[i].captured_length);
+            if (address_is_multicast(details.destination) ||
+                mac_is_group(details.destination_mac)) analysis->broadcast_packets++;
+        }
+        if ((details.flags & PCAP_PACKET_FLAG_ARP) != 0U && details.arp_sender_ip[0]) {
+            int existing_index = find_device(analysis, details.arp_sender_ip);
+            if (existing_index >= 0 && analysis->devices[existing_index].mac[0] &&
+                details.arp_sender_mac[0] &&
+                strcasecmp(analysis->devices[existing_index].mac,
+                           details.arp_sender_mac) != 0) {
+                char detail[160];
+                snprintf(detail, sizeof(detail), "%.63s changed MAC from %.17s to %.17s",
+                         details.arp_sender_ip, analysis->devices[existing_index].mac,
+                         details.arp_sender_mac);
+                pcap_security_alert_t *alert = add_alert(
+                    analysis, PCAP_ALERT_ARP_CONFLICT, PCAP_HEALTH_CRITICAL,
+                    PCAP_APP_CONFIDENCE_CONFIRMED, details.arp_sender_ip,
+                    details.arp_target_ip, 0U, PCAP_FLOW_ID_NONE, i, i,
+                    time_us, time_us, detail);
+                alert_evidence(alert, i);
+            }
+            observe_device(analysis, details.arp_sender_ip, details.arp_sender_mac,
+                           time_us, true, packet_index[i].captured_length);
+            if (details.arp_target_ip[0]) {
+                observe_device(analysis, details.arp_target_ip, details.arp_target_mac,
+                               time_us, false, packet_index[i].captured_length);
+            }
+            if (mac_is_group(details.destination_mac)) analysis->broadcast_packets++;
+        }
+        if (details.dns_valid) {
+            analysis->dns_packets++;
+            if (details.dns_response && details.dns_rcode != 0U) {
+                analysis->dns_error_packets++;
+            }
+            if (details.dns_response && details.dns_query[0] &&
+                details.dns_first_answer[0]) {
+                int answer_device = find_device(analysis, details.dns_first_answer);
+                if (answer_device >= 0 && analysis->devices[answer_device].hostname[0] == '\0') {
+                    copy_text(analysis->devices[answer_device].hostname,
+                              sizeof(analysis->devices[answer_device].hostname),
+                              details.dns_query, strlen(details.dns_query));
+                }
+            }
+            if (!details.dns_response && details.dns_query[0]) {
+                size_t query_length = strlen(details.dns_query);
+                unsigned labels = 1U;
+                for (size_t character = 0; character < query_length; character++) {
+                    if (details.dns_query[character] == '.') labels++;
+                }
+                if (query_length >= 50U || labels >= 5U) {
+                    analysis->dns_suspicious_names++;
+                }
+            }
+        }
 
         if (!details.malformed &&
             (details.ip_protocol == 6 || details.ip_protocol == 17) &&
@@ -316,8 +917,6 @@ pcap_reader_status_t pcap_flow_analysis_build(
             details.source_port && details.destination_port) {
             int direction = -1;
             uint16_t flow_id = find_flow(analysis, &details, &direction);
-            uint64_t time_us = packet_time_us(&packet_index[i],
-                                              capture_info->timestamp_resolution);
             if (flow_id == PCAP_FLOW_ID_NONE) {
                 flow_id = create_flow(analysis, &details, i, time_us, &direction);
             }
@@ -329,8 +928,46 @@ pcap_reader_status_t pcap_flow_analysis_build(
                     flow->app_protocol = (uint8_t)app;
                     flow->app_confidence = (uint8_t)confidence;
                 }
+                update_flow_metadata(flow, app, payload, payload_length);
                 uint64_t payload_bytes = details.payload_offset < packet_index[i].captured_length
                     ? packet_index[i].captured_length - details.payload_offset : 0;
+                if (details.ip_protocol == 6U) {
+                    if (direction == 0 && (details.tcp_flags & 0x12U) == 0x02U &&
+                        flow->syn_time_us == 0U) {
+                        flow->syn_time_us = time_us;
+                    } else if (direction == 1 && (details.tcp_flags & 0x12U) == 0x12U &&
+                               flow->syn_time_us > 0U && time_us >= flow->syn_time_us &&
+                               flow->handshake_rtt_us == 0U) {
+                        flow->handshake_rtt_us = time_us - flow->syn_time_us;
+                    }
+                    if (details.tcp_window == 0U && (details.tcp_flags & 0x04U) == 0U) {
+                        flow->zero_window_packets++;
+                    }
+                    uint32_t advance = (uint32_t)payload_bytes;
+                    if (details.tcp_flags & 0x02U) advance++;
+                    if (details.tcp_flags & 0x01U) advance++;
+                    if (advance > 0U) {
+                        uint32_t end_sequence = details.tcp_sequence + advance;
+                        uint32_t *next_sequence = direction == 0
+                            ? &flow->originator_next_sequence
+                            : &flow->responder_next_sequence;
+                        bool *sequence_seen = direction == 0
+                            ? &flow->originator_sequence_seen
+                            : &flow->responder_sequence_seen;
+                        uint32_t *retransmissions = direction == 0
+                            ? &flow->originator_retransmissions
+                            : &flow->responder_retransmissions;
+                        if (*sequence_seen && payload_bytes > 0U &&
+                            details.tcp_sequence < *next_sequence &&
+                            *next_sequence - details.tcp_sequence < 0x80000000UL) {
+                            (*retransmissions)++;
+                        }
+                        if (!*sequence_seen || end_sequence > *next_sequence) {
+                            *next_sequence = end_sequence;
+                        }
+                        *sequence_seen = true;
+                    }
+                }
                 if (direction == 0) {
                     flow->originator_packets++;
                     flow->originator_bytes += packet_index[i].captured_length;
@@ -377,6 +1014,42 @@ pcap_reader_status_t pcap_flow_analysis_build(
         } else if (flow->app_confidence == PCAP_APP_CONFIDENCE_LIKELY) {
             analysis->applications[app].likely_flows++;
         }
+        add_device_service(analysis, flow->responder, flow->responder_port,
+                           flow->ip_protocol, flow->app_protocol,
+                           flow->originator_packets + flow->responder_packets,
+                           flow->originator_bytes + flow->responder_bytes);
+    }
+
+    build_scan_alerts(analysis);
+    build_flow_alerts(analysis);
+    if ((analysis->dns_packets >= 20U &&
+         analysis->dns_error_packets * 100U / analysis->dns_packets >= 30U) ||
+        analysis->dns_suspicious_names >= 10U) {
+        char detail[160];
+        snprintf(detail, sizeof(detail),
+                 "DNS errors %lu/%lu; long or multi-label query indicators %lu",
+                 (unsigned long)analysis->dns_error_packets,
+                 (unsigned long)analysis->dns_packets,
+                 (unsigned long)analysis->dns_suspicious_names);
+        add_alert(analysis, PCAP_ALERT_DNS_ANOMALY, PCAP_HEALTH_SUSPICIOUS,
+                  PCAP_APP_CONFIDENCE_CONFIRMED, "DNS clients", "DNS servers", 53U,
+                  PCAP_FLOW_ID_NONE, 0U, analysis->analyzed_packets - 1U, 0U, 0U, detail);
+    }
+    if (analysis->analyzed_packets >= 100U &&
+        analysis->broadcast_packets * 100U / analysis->analyzed_packets >= 40U) {
+        char detail[160];
+        snprintf(detail, sizeof(detail), "%lu of %lu analyzed packets were multicast/broadcast",
+                 (unsigned long)analysis->broadcast_packets,
+                 (unsigned long)analysis->analyzed_packets);
+        add_alert(analysis, PCAP_ALERT_EXCESSIVE_BROADCAST, PCAP_HEALTH_WATCH,
+                  PCAP_APP_CONFIDENCE_CONFIRMED, "local segment", "group traffic", 0U,
+                  PCAP_FLOW_ID_NONE, 0U, analysis->analyzed_packets - 1U, 0U, 0U, detail);
+    }
+    build_worm_alerts(analysis);
+    if (analysis->analyzed_packets >= 50U) {
+        if (analysis->health_level == PCAP_HEALTH_INSUFFICIENT) {
+            analysis->health_level = PCAP_HEALTH_HEALTHY;
+        }
     }
     return PCAP_READER_OK;
 }
@@ -406,6 +1079,35 @@ const char *pcap_flow_confidence_name(pcap_app_confidence_t confidence)
 const char *pcap_flow_transport_name(uint8_t ip_protocol)
 {
     return ip_protocol == 6 ? "TCP" : (ip_protocol == 17 ? "UDP" : "IP");
+}
+
+const char *pcap_flow_health_name(pcap_health_level_t level)
+{
+    switch (level) {
+        case PCAP_HEALTH_HEALTHY: return "HEALTHY";
+        case PCAP_HEALTH_WATCH: return "WATCH";
+        case PCAP_HEALTH_SUSPICIOUS: return "SUSPICIOUS";
+        case PCAP_HEALTH_CRITICAL: return "CRITICAL";
+        default: return "INSUFFICIENT DATA";
+    }
+}
+
+const char *pcap_flow_alert_name(pcap_alert_type_t type)
+{
+    switch (type) {
+        case PCAP_ALERT_PORT_SCAN: return "PORT SCAN";
+        case PCAP_ALERT_HOST_SWEEP: return "HOST SWEEP";
+        case PCAP_ALERT_ARP_CONFLICT: return "ARP CONFLICT";
+        case PCAP_ALERT_DNS_ANOMALY: return "DNS ANOMALY";
+        case PCAP_ALERT_BEACONING: return "BEACONING";
+        case PCAP_ALERT_EXFIL_CANDIDATE: return "EXFIL CANDIDATE";
+        case PCAP_ALERT_CLEARTEXT_SERVICE: return "CLEARTEXT SERVICE";
+        case PCAP_ALERT_WORM_LIKE_SPREAD: return "WORM-LIKE SPREAD";
+        case PCAP_ALERT_EXCESSIVE_BROADCAST: return "EXCESSIVE BROADCAST";
+        case PCAP_ALERT_WEAK_TLS: return "WEAK TLS";
+        case PCAP_ALERT_TCP_QUALITY: return "TCP QUALITY";
+        default: return "UNKNOWN ALERT";
+    }
 }
 
 void pcap_flow_filter_clear(pcap_flow_filter_t *filter)
@@ -530,13 +1232,16 @@ static int segment_compare(const void *left, const void *right)
            (a->packet_number > b->packet_number ? 1 : 0);
 }
 
-pcap_reader_status_t pcap_flow_build_stream(
+pcap_reader_status_t pcap_flow_build_stream_ex(
     pcap_reader_t *reader, const pcap_packet_index_t *packet_index,
     size_t packet_count, const pcap_flow_analysis_t *analysis, uint16_t flow_id,
-    char *output, size_t output_size, pcap_flow_stream_result_t *result)
+    pcap_flow_stream_mode_t mode, char *output, size_t output_size,
+    pcap_flow_stream_result_t *result)
 {
     if (!reader || !packet_index || !analysis || flow_id >= analysis->flow_count ||
-        !output || output_size < 2U || !result) return PCAP_READER_INVALID_ARG;
+        mode > PCAP_FLOW_STREAM_HEX || !output || output_size < 2U || !result) {
+        return PCAP_READER_INVALID_ARG;
+    }
     memset(result, 0, sizeof(*result));
     output[0] = '\0';
     pcap_stream_segment_t *segments = calloc(PCAP_FLOW_STREAM_SEGMENTS, sizeof(*segments));
@@ -575,12 +1280,13 @@ pcap_reader_status_t pcap_flow_build_stream(
     const pcap_flow_entry_t *flow = &analysis->flows[flow_id];
     size_t position = 0;
     stream_append(output, output_size, &position, result,
-                  "Flow #%u | %s | %s (%s)\n"
+                  "Flow #%u | %s | %s (%s) | %s\n"
                   "%s:%u <-> %s:%u\n"
                   "%lu packet(s), %lu payload packet(s), %llu payload bytes\n\n",
                   (unsigned)flow_id + 1U, pcap_flow_transport_name(flow->ip_protocol),
                   pcap_flow_application_name((pcap_application_t)flow->app_protocol),
                   pcap_flow_confidence_name((pcap_app_confidence_t)flow->app_confidence),
+                  mode == PCAP_FLOW_STREAM_HEX ? "HEX" : "ASCII",
                   flow->originator, flow->originator_port,
                   flow->responder, flow->responder_port,
                   (unsigned long)result->matching_packets,
@@ -631,9 +1337,14 @@ pcap_reader_status_t pcap_flow_build_stream(
                           (unsigned long)available);
             for (size_t byte = 0; byte < available && !result->output_truncated; byte++) {
                 unsigned char c = raw[payload_offset + byte];
-                char shown = (c == '\r' || c == '\n' || c == '\t') ? (char)c :
-                             (isprint(c) ? (char)c : '.');
-                stream_append(output, output_size, &position, result, "%c", shown);
+                if (mode == PCAP_FLOW_STREAM_HEX) {
+                    stream_append(output, output_size, &position, result, "%02X%s", c,
+                                  ((byte + 1U) % 16U) == 0U ? "\n" : " ");
+                } else {
+                    char shown = (c == '\r' || c == '\n' || c == '\t') ? (char)c :
+                                 (isprint(c) ? (char)c : '.');
+                    stream_append(output, output_size, &position, result, "%c", shown);
+                }
             }
             if (flow->ip_protocol == 6) {
                 expected = segment->sequence + segment->payload_length;
@@ -655,4 +1366,14 @@ pcap_reader_status_t pcap_flow_build_stream(
     free(raw);
     free(segments);
     return PCAP_READER_OK;
+}
+
+pcap_reader_status_t pcap_flow_build_stream(
+    pcap_reader_t *reader, const pcap_packet_index_t *packet_index,
+    size_t packet_count, const pcap_flow_analysis_t *analysis, uint16_t flow_id,
+    char *output, size_t output_size, pcap_flow_stream_result_t *result)
+{
+    return pcap_flow_build_stream_ex(reader, packet_index, packet_count, analysis,
+                                     flow_id, PCAP_FLOW_STREAM_ASCII,
+                                     output, output_size, result);
 }

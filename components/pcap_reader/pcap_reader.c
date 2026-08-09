@@ -603,6 +603,7 @@ static void describe_transport(const uint8_t *data, size_t length, uint8_t ip_pr
         details->destination_port = read_be16(data + 2);
         details->tcp_sequence = read_be32(data + 4);
         details->tcp_acknowledgment = read_be32(data + 8);
+        details->tcp_window = read_be16(data + 14);
         uint8_t header_length = (uint8_t)((data[12] >> 4) * 4U);
         if (header_length < 20 || header_length > length) {
             details->malformed = true;
@@ -750,8 +751,28 @@ static void describe_ethernet(const uint8_t *data, size_t length,
     } else if (ether_type == 0x0806U) {
         details->flags |= PCAP_PACKET_FLAG_ARP;
         snprintf(details->protocol, sizeof(details->protocol), "ARP");
-        snprintf(details->info, sizeof(details->info), "ARP frame%s",
-                 vlan_depth > 0 ? " (VLAN)" : "");
+        if (offset + 28U <= length && read_be16(data + offset) == 1U &&
+            read_be16(data + offset + 2U) == 0x0800U &&
+            data[offset + 4U] == 6U && data[offset + 5U] == 4U) {
+            details->arp_operation = read_be16(data + offset + 6U);
+            format_mac(data + offset + 8U, details->arp_sender_mac,
+                       sizeof(details->arp_sender_mac));
+            format_ipv4(data + offset + 14U, details->arp_sender_ip,
+                        sizeof(details->arp_sender_ip));
+            format_mac(data + offset + 18U, details->arp_target_mac,
+                       sizeof(details->arp_target_mac));
+            format_ipv4(data + offset + 24U, details->arp_target_ip,
+                        sizeof(details->arp_target_ip));
+            snprintf(details->info, sizeof(details->info),
+                     "ARP %s %.15s is-at %.17s -> %.15s%s",
+                     details->arp_operation == 1U ? "request" :
+                     (details->arp_operation == 2U ? "reply" : "operation"),
+                     details->arp_sender_ip, details->arp_sender_mac,
+                     details->arp_target_ip, vlan_depth > 0 ? " (VLAN)" : "");
+        } else {
+            snprintf(details->info, sizeof(details->info), "ARP frame%s",
+                     vlan_depth > 0 ? " (VLAN)" : "");
+        }
     } else if (ether_type == 0x888EU) {
         details->flags |= PCAP_PACKET_FLAG_EAPOL;
         snprintf(details->protocol, sizeof(details->protocol), "EAPOL");

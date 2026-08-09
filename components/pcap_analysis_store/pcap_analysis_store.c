@@ -236,7 +236,9 @@ static void espc_fill_cache_info(const espc_cache_header_t *header, const char *
     info->indexed_packets = header->indexed_packets;
     info->source_size = header->source_size;
     info->source_mtime = header->source_mtime;
-    snprintf(info->cache_path, sizeof(info->cache_path), "%s", path);
+    size_t path_length = path ? strnlen(path, sizeof(info->cache_path) - 1U) : 0U;
+    if (path_length > 0U) memcpy(info->cache_path, path, path_length);
+    info->cache_path[path_length] = '\0';
 }
 
 pcap_analysis_store_status_t pcap_analysis_cache_probe(
@@ -315,7 +317,10 @@ pcap_analysis_store_status_t pcap_analysis_cache_load(
         summary_out->dns_server_count > PCAP_SUMMARY_MAX_DNS_PEERS ||
         summary_out->dns_type_count > PCAP_SUMMARY_MAX_DNS_TYPES ||
         flow_analysis_out->analyzed_packets != header.indexed_packets ||
-        flow_analysis_out->flow_count > PCAP_FLOW_MAX_FLOWS) {
+        flow_analysis_out->flow_count > PCAP_FLOW_MAX_FLOWS ||
+        flow_analysis_out->device_count > PCAP_FLOW_MAX_DEVICES ||
+        flow_analysis_out->alert_count > PCAP_FLOW_MAX_ALERTS ||
+        flow_analysis_out->health_level > PCAP_HEALTH_CRITICAL) {
         return PCAP_ANALYSIS_STORE_INVALID;
     }
     for (uint32_t i = 0; i < header.indexed_packets; i++) {
@@ -337,6 +342,22 @@ pcap_analysis_store_status_t pcap_analysis_cache_load(
         if (flow_analysis_out->flows[i].app_protocol >= PCAP_APP_COUNT ||
             flow_analysis_out->flows[i].app_confidence >
                 PCAP_APP_CONFIDENCE_CONFIRMED) {
+            return PCAP_ANALYSIS_STORE_INVALID;
+        }
+    }
+    for (uint32_t i = 0; i < flow_analysis_out->device_count; i++) {
+        if (flow_analysis_out->devices[i].service_count > PCAP_FLOW_DEVICE_SERVICES) {
+            return PCAP_ANALYSIS_STORE_INVALID;
+        }
+    }
+    for (uint32_t i = 0; i < flow_analysis_out->alert_count; i++) {
+        const pcap_security_alert_t *alert = &flow_analysis_out->alerts[i];
+        if (alert->type > PCAP_ALERT_TCP_QUALITY ||
+            alert->severity > PCAP_HEALTH_CRITICAL ||
+            alert->confidence > PCAP_APP_CONFIDENCE_CONFIRMED ||
+            alert->evidence_count > PCAP_FLOW_ALERT_EVIDENCE ||
+            (alert->flow_id != PCAP_FLOW_ID_NONE &&
+             alert->flow_id >= flow_analysis_out->flow_count)) {
             return PCAP_ANALYSIS_STORE_INVALID;
         }
     }
@@ -519,11 +540,12 @@ pcap_analysis_store_status_t pcap_analysis_export_report_json(
     const pcap_scan_summary_t *scan_summary, const pcap_summary_t *summary,
     const pcap_flow_analysis_t *flow_analysis, const uint32_t *packet_flags,
     size_t packet_flag_count,
-    pcap_packet_filter_t active_filter, bool loaded_from_cache,
+    pcap_packet_filter_t active_filter, const pcap_flow_filter_t *quick_filter,
+    uint32_t selected_matches, bool loaded_from_cache,
     char *output_path, size_t output_path_size)
 {
     if (!source_path || !capture_info || !scan_summary || !summary ||
-        !flow_analysis || !packet_flags ||
+        !flow_analysis || !packet_flags || !quick_filter ||
         active_filter < PCAP_FILTER_ALL || active_filter >= PCAP_FILTER_COUNT ||
         !output_path || output_path_size == 0 || !espc_prepare_artifact_dirs() ||
         !espc_build_unique_artifact_path(source_path, ".espreport.json",
@@ -575,7 +597,12 @@ pcap_analysis_store_status_t pcap_analysis_export_report_json(
             scan_summary->truncated_tail ? "true" : "false",
             loaded_from_cache ? "true" : "false");
     espc_json_string(report, pcap_reader_filter_name(active_filter));
-    fprintf(report, ",\"active_filter_matches\":%lu},\n", (unsigned long)matches);
+    char quick_description[160];
+    pcap_flow_filter_describe(quick_filter, quick_description, sizeof(quick_description));
+    fputs(",\"quick_filter\":", report);
+    espc_json_string(report, quick_description);
+    fprintf(report, ",\"protocol_filter_matches\":%lu,\"selected_matches\":%lu},\n",
+            (unsigned long)matches, (unsigned long)selected_matches);
     fputs("  \"protocols\":", report);
     espc_json_text_counters(report, summary->protocols, summary->protocol_count);
     fputs(",\n  \"endpoints\":", report);
@@ -645,26 +672,122 @@ pcap_analysis_store_status_t pcap_analysis_export_report_json(
         espc_json_string(report,
                          pcap_flow_confidence_name(
                              (pcap_app_confidence_t)flow->app_confidence));
+        fputs(",\"server_name\":", report);
+        espc_json_string(report, flow->server_name);
+        fputs(",\"application_detail\":", report);
+        espc_json_string(report, flow->application_detail);
         uint64_t duration_us = flow->last_time_us >= flow->first_time_us
                                    ? flow->last_time_us - flow->first_time_us : 0;
         fprintf(report,
                 ",\"first_packet\":%lu,\"last_packet\":%lu,"
-                "\"duration_us\":%llu,\"originator_packets\":%lu,"
+                "\"duration_us\":%llu,\"tls_version\":%u,\"originator_packets\":%lu,"
                 "\"responder_packets\":%lu,\"originator_bytes\":%llu,"
-                "\"responder_bytes\":%llu}",
+                "\"responder_bytes\":%llu,\"handshake_rtt_us\":%llu,"
+                "\"originator_retransmissions\":%lu,"
+                "\"responder_retransmissions\":%lu,\"zero_window_packets\":%lu}",
                 (unsigned long)flow->first_packet + 1U,
                 (unsigned long)flow->last_packet + 1U,
                 (unsigned long long)duration_us,
+                flow->tls_version,
                 (unsigned long)flow->originator_packets,
                 (unsigned long)flow->responder_packets,
                 (unsigned long long)flow->originator_bytes,
-                (unsigned long long)flow->responder_bytes);
+                (unsigned long long)flow->responder_bytes,
+                (unsigned long long)flow->handshake_rtt_us,
+                (unsigned long)flow->originator_retransmissions,
+                (unsigned long)flow->responder_retransmissions,
+                (unsigned long)flow->zero_window_packets);
     }
     fprintf(report,
-            "],\n  \"flow_limits\":{\"limited\":%s,\"overflow_packets\":%lu},"
-            "\n  \"devices\":[],\n  \"alerts\":[]\n}\n",
+            "],\n  \"flow_limits\":{\"limited\":%s,\"overflow_packets\":%lu,"
+            "\"devices_limited\":%s,\"alerts_limited\":%s},\n",
             flow_analysis->flow_limited ? "true" : "false",
-            (unsigned long)flow_analysis->overflow_packets);
+            (unsigned long)flow_analysis->overflow_packets,
+            flow_analysis->device_limited ? "true" : "false",
+            flow_analysis->alert_limited ? "true" : "false");
+    fputs("  \"devices\":[", report);
+    for (uint32_t i = 0; i < flow_analysis->device_count; i++) {
+        const pcap_device_entry_t *device = &flow_analysis->devices[i];
+        if (i) fputc(',', report);
+        fputs("{\"address\":", report);
+        espc_json_string(report, device->address);
+        fputs(",\"mac\":", report);
+        espc_json_string(report, device->mac);
+        fputs(",\"hostname\":", report);
+        espc_json_string(report, device->hostname);
+        fprintf(report,
+                ",\"internal\":%s,\"first_time_us\":%llu,\"last_time_us\":%llu,"
+                "\"sent_packets\":%lu,\"received_packets\":%lu,"
+                "\"sent_bytes\":%llu,\"received_bytes\":%llu,\"services\":[",
+                device->internal ? "true" : "false",
+                (unsigned long long)device->first_time_us,
+                (unsigned long long)device->last_time_us,
+                (unsigned long)device->sent_packets,
+                (unsigned long)device->received_packets,
+                (unsigned long long)device->sent_bytes,
+                (unsigned long long)device->received_bytes);
+        for (uint16_t service_index = 0; service_index < device->service_count;
+             service_index++) {
+            const pcap_device_service_t *service = &device->services[service_index];
+            if (service_index) fputc(',', report);
+            fprintf(report, "{\"transport\":\"%s\",\"port\":%u,\"application\":",
+                    pcap_flow_transport_name(service->ip_protocol), service->port);
+            espc_json_string(report,
+                             pcap_flow_application_name(
+                                 (pcap_application_t)service->application));
+            fprintf(report, ",\"packets\":%lu,\"bytes\":%llu}",
+                    (unsigned long)service->packets,
+                    (unsigned long long)service->bytes);
+        }
+        fprintf(report, "],\"services_limited\":%s}",
+                device->service_limited ? "true" : "false");
+    }
+    fputs("],\n  \"network_health\":{\"level\":", report);
+    espc_json_string(report,
+                     pcap_flow_health_name((pcap_health_level_t)flow_analysis->health_level));
+    fprintf(report,
+            ",\"analyzed_packets\":%lu,\"dns_packets\":%lu,"
+            "\"dns_error_packets\":%lu,\"dns_suspicious_names\":%lu,"
+            "\"broadcast_packets\":%lu},\n  \"alerts\":[",
+            (unsigned long)flow_analysis->analyzed_packets,
+            (unsigned long)flow_analysis->dns_packets,
+            (unsigned long)flow_analysis->dns_error_packets,
+            (unsigned long)flow_analysis->dns_suspicious_names,
+            (unsigned long)flow_analysis->broadcast_packets);
+    for (uint32_t i = 0; i < flow_analysis->alert_count; i++) {
+        const pcap_security_alert_t *alert = &flow_analysis->alerts[i];
+        if (i) fputc(',', report);
+        fputs("{\"type\":", report);
+        espc_json_string(report, pcap_flow_alert_name((pcap_alert_type_t)alert->type));
+        fputs(",\"severity\":", report);
+        espc_json_string(report, pcap_flow_health_name((pcap_health_level_t)alert->severity));
+        fputs(",\"confidence\":", report);
+        espc_json_string(report,
+                         pcap_flow_confidence_name(
+                             (pcap_app_confidence_t)alert->confidence));
+        fputs(",\"source\":", report);
+        espc_json_string(report, alert->source);
+        fputs(",\"target\":", report);
+        espc_json_string(report, alert->target);
+        fputs(",\"detail\":", report);
+        espc_json_string(report, alert->detail);
+        fprintf(report,
+                ",\"service_port\":%u,\"flow_id\":%u,\"first_packet\":%lu,"
+                "\"last_packet\":%lu,\"first_time_us\":%llu,\"last_time_us\":%llu,"
+                "\"evidence_packets\":[",
+                alert->service_port,
+                alert->flow_id == PCAP_FLOW_ID_NONE ? 0U : alert->flow_id + 1U,
+                (unsigned long)alert->first_packet + 1U,
+                (unsigned long)alert->last_packet + 1U,
+                (unsigned long long)alert->first_time_us,
+                (unsigned long long)alert->last_time_us);
+        for (uint8_t evidence = 0; evidence < alert->evidence_count; evidence++) {
+            if (evidence) fputc(',', report);
+            fprintf(report, "%lu", (unsigned long)alert->evidence_packets[evidence] + 1U);
+        }
+        fputs("]}", report);
+    }
+    fputs("]\n}\n", report);
 
     bool ok = !ferror(report) && fflush(report) == 0;
     if (ok) {
@@ -766,10 +889,12 @@ pcap_analysis_store_status_t pcap_analysis_export_filtered_pcap(
 }
 
 pcap_analysis_store_status_t pcap_analysis_filter_profile_save(
-    pcap_packet_filter_t active_filter, char *output_path, size_t output_path_size)
+    pcap_packet_filter_t active_filter, const pcap_flow_filter_t *quick_filter,
+    char *output_path, size_t output_path_size)
 {
     if (active_filter < PCAP_FILTER_ALL || active_filter >= PCAP_FILTER_COUNT ||
-        !output_path || output_path_size == 0 || !espc_prepare_artifact_dirs()) {
+        !quick_filter || !output_path || output_path_size == 0 ||
+        !espc_prepare_artifact_dirs()) {
         return PCAP_ANALYSIS_STORE_INVALID;
     }
     int profile_path_len = snprintf(output_path, output_path_size, "%s", ESPC_LAST_PROFILE);
@@ -785,9 +910,33 @@ pcap_analysis_store_status_t pcap_analysis_filter_profile_save(
     fprintf(profile,
             "{\n  \"schema\":\"espshark-filter\",\n  \"schema_version\":%u,\n"
             "  \"name\":\"Last saved filter\",\n  \"packet_filter\":%d,\n"
-            "  \"packet_filter_name\":\"%s\"\n}\n",
+            "  \"packet_filter_name\":\"%s\",\n  \"quick_filter\":{"
+            "\"enabled\":%s,\"has_any_address\":%s,\"any_address\":",
             PCAP_ANALYSIS_FILTER_SCHEMA_VERSION, (int)active_filter,
-            pcap_reader_filter_name(active_filter));
+            pcap_reader_filter_name(active_filter),
+            quick_filter->enabled ? "true" : "false",
+            quick_filter->has_any_address ? "true" : "false");
+    espc_json_string(profile, quick_filter->any_address);
+    fprintf(profile, ",\"has_source_address\":%s,\"source_address\":",
+            quick_filter->has_source_address ? "true" : "false");
+    espc_json_string(profile, quick_filter->source_address);
+    fprintf(profile, ",\"has_destination_address\":%s,\"destination_address\":",
+            quick_filter->has_destination_address ? "true" : "false");
+    espc_json_string(profile, quick_filter->destination_address);
+    fprintf(profile, ",\"has_any_mac\":%s,\"any_mac\":",
+            quick_filter->has_any_mac ? "true" : "false");
+    espc_json_string(profile, quick_filter->any_mac);
+    fprintf(profile,
+            ",\"has_port\":%s,\"port\":%u,\"has_flow\":%s,\"flow_id\":%u,"
+            "\"has_application\":%s,\"application\":%u,"
+            "\"has_time_window\":%s,\"time_start_us\":%llu,\"time_end_us\":%llu}"
+            "\n}\n",
+            quick_filter->has_port ? "true" : "false", quick_filter->port,
+            quick_filter->has_flow ? "true" : "false", quick_filter->flow_id,
+            quick_filter->has_application ? "true" : "false", quick_filter->application,
+            quick_filter->has_time_window ? "true" : "false",
+            (unsigned long long)quick_filter->time_start_us,
+            (unsigned long long)quick_filter->time_end_us);
     bool ok = !ferror(profile) && fflush(profile) == 0;
     if (ok) {
         int fd = fileno(profile);
@@ -806,10 +955,57 @@ pcap_analysis_store_status_t pcap_analysis_filter_profile_save(
     return PCAP_ANALYSIS_STORE_OK;
 }
 
-pcap_analysis_store_status_t pcap_analysis_filter_profile_load(
-    pcap_packet_filter_t *active_filter_out, char *input_path, size_t input_path_size)
+static bool espc_profile_long(const char *text, const char *key, long long *value_out)
 {
-    if (!active_filter_out) return PCAP_ANALYSIS_STORE_INVALID;
+    const char *field = strstr(text, key);
+    field = field ? strchr(field, ':') : NULL;
+    if (!field) return false;
+    char *end = NULL;
+    long long value = strtoll(field + 1, &end, 10);
+    if (end == field + 1) return false;
+    *value_out = value;
+    return true;
+}
+
+static bool espc_profile_bool(const char *text, const char *key, bool *value_out)
+{
+    const char *field = strstr(text, key);
+    field = field ? strchr(field, ':') : NULL;
+    if (!field) return false;
+    field++;
+    while (*field && isspace((unsigned char)*field)) field++;
+    if (strncmp(field, "true", 4U) == 0) {
+        *value_out = true;
+        return true;
+    }
+    if (strncmp(field, "false", 5U) == 0) {
+        *value_out = false;
+        return true;
+    }
+    return false;
+}
+
+static bool espc_profile_string(const char *text, const char *key,
+                                char *output, size_t output_size)
+{
+    const char *field = strstr(text, key);
+    field = field ? strchr(field, ':') : NULL;
+    field = field ? strchr(field, '\"') : NULL;
+    if (!field || !output || output_size == 0U) return false;
+    field++;
+    size_t length = 0U;
+    while (field[length] && field[length] != '\"') length++;
+    if (field[length] != '\"' || length >= output_size) return false;
+    memcpy(output, field, length);
+    output[length] = '\0';
+    return true;
+}
+
+pcap_analysis_store_status_t pcap_analysis_filter_profile_load(
+    pcap_packet_filter_t *active_filter_out, pcap_flow_filter_t *quick_filter_out,
+    char *input_path, size_t input_path_size)
+{
+    if (!active_filter_out || !quick_filter_out) return PCAP_ANALYSIS_STORE_INVALID;
     if (input_path && input_path_size > 0) {
         int written = snprintf(input_path, input_path_size, "%s", ESPC_LAST_PROFILE);
         if (written <= 0 || (size_t)written >= input_path_size) {
@@ -818,7 +1014,7 @@ pcap_analysis_store_status_t pcap_analysis_filter_profile_load(
     }
     FILE *profile = fopen(ESPC_LAST_PROFILE, "rb");
     if (!profile) return PCAP_ANALYSIS_STORE_NOT_FOUND;
-    char text[512];
+    char text[1536];
     size_t length = fread(text, 1, sizeof(text) - 1U, profile);
     bool read_ok = !ferror(profile) && feof(profile);
     fclose(profile);
@@ -836,14 +1032,54 @@ pcap_analysis_store_status_t pcap_analysis_filter_profile_load(
         version != PCAP_ANALYSIS_FILTER_SCHEMA_VERSION) {
         return PCAP_ANALYSIS_STORE_INVALID;
     }
-    const char *field = strstr(text, "\"packet_filter\"");
-    field = field ? strchr(field, ':') : NULL;
-    if (!field) return PCAP_ANALYSIS_STORE_INVALID;
-    char *end = NULL;
-    long value = strtol(field + 1, &end, 10);
-    if (end == field + 1 || value < PCAP_FILTER_ALL || value >= PCAP_FILTER_COUNT) {
+    long long value = 0;
+    if (!espc_profile_long(text, "\"packet_filter\"", &value) ||
+        value < PCAP_FILTER_ALL || value >= PCAP_FILTER_COUNT) {
         return PCAP_ANALYSIS_STORE_INVALID;
     }
+    pcap_flow_filter_clear(quick_filter_out);
+    long long number = 0;
+    if (!espc_profile_bool(text, "\"enabled\"", &quick_filter_out->enabled) ||
+        !espc_profile_bool(text, "\"has_any_address\"",
+                           &quick_filter_out->has_any_address) ||
+        !espc_profile_string(text, "\"any_address\"", quick_filter_out->any_address,
+                             sizeof(quick_filter_out->any_address)) ||
+        !espc_profile_bool(text, "\"has_source_address\"",
+                           &quick_filter_out->has_source_address) ||
+        !espc_profile_string(text, "\"source_address\"", quick_filter_out->source_address,
+                             sizeof(quick_filter_out->source_address)) ||
+        !espc_profile_bool(text, "\"has_destination_address\"",
+                           &quick_filter_out->has_destination_address) ||
+        !espc_profile_string(text, "\"destination_address\"",
+                             quick_filter_out->destination_address,
+                             sizeof(quick_filter_out->destination_address)) ||
+        !espc_profile_bool(text, "\"has_any_mac\"", &quick_filter_out->has_any_mac) ||
+        !espc_profile_string(text, "\"any_mac\"", quick_filter_out->any_mac,
+                             sizeof(quick_filter_out->any_mac)) ||
+        !espc_profile_bool(text, "\"has_port\"", &quick_filter_out->has_port) ||
+        !espc_profile_long(text, "\"port\"", &number) || number < 0 || number > UINT16_MAX) {
+        return PCAP_ANALYSIS_STORE_INVALID;
+    }
+    quick_filter_out->port = (uint16_t)number;
+    if (!espc_profile_bool(text, "\"has_flow\"", &quick_filter_out->has_flow) ||
+        !espc_profile_long(text, "\"flow_id\"", &number) ||
+        number < 0 || number > UINT16_MAX) return PCAP_ANALYSIS_STORE_INVALID;
+    quick_filter_out->flow_id = (uint16_t)number;
+    if (!espc_profile_bool(text, "\"has_application\"",
+                           &quick_filter_out->has_application) ||
+        !espc_profile_long(text, "\"application\"", &number) ||
+        number < 0 || number >= PCAP_APP_COUNT) return PCAP_ANALYSIS_STORE_INVALID;
+    quick_filter_out->application = (uint8_t)number;
+    if (!espc_profile_bool(text, "\"has_time_window\"",
+                           &quick_filter_out->has_time_window) ||
+        !espc_profile_long(text, "\"time_start_us\"", &number) || number < 0) {
+        return PCAP_ANALYSIS_STORE_INVALID;
+    }
+    quick_filter_out->time_start_us = (uint64_t)number;
+    if (!espc_profile_long(text, "\"time_end_us\"", &number) || number < 0) {
+        return PCAP_ANALYSIS_STORE_INVALID;
+    }
+    quick_filter_out->time_end_us = (uint64_t)number;
     *active_filter_out = (pcap_packet_filter_t)value;
     return PCAP_ANALYSIS_STORE_OK;
 }

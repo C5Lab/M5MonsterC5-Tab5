@@ -100,6 +100,10 @@ typedef struct {
     char destination[64];
     char source_mac[18];
     char destination_mac[18];
+    char arp_sender_ip[64];
+    char arp_target_ip[64];
+    char arp_sender_mac[18];
+    char arp_target_mac[18];
     char info[128];
     char dns_query[96];
     char dns_first_answer[80];
@@ -110,7 +114,9 @@ typedef struct {
     uint32_t payload_captured_length;
     uint16_t source_port;
     uint16_t destination_port;
+    uint16_t tcp_window;
     uint16_t ether_type;
+    uint16_t arp_operation;
     uint16_t dns_id;
     uint16_t dns_qtype;
     uint16_t dns_question_count;

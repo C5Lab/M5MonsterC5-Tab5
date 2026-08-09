@@ -1161,6 +1161,71 @@ typedef struct {
 #define PCAP_VIEWER_COL_SOURCE          230
 #define PCAP_VIEWER_COL_DESTINATION     230
 #define PCAP_VIEWER_COL_LENGTH           80
+#define PCAP_MAP_MAX_NODES               48
+#define PCAP_MAP_PRIMARY_NODES           46
+#define PCAP_MAP_MAX_EDGES              128
+#define PCAP_MAP_MAX_CANDIDATES PCAP_FLOW_MAX_DEVICES
+
+typedef enum {
+    PCAP_MAP_MODE_TRAFFIC = 0,
+    PCAP_MAP_MODE_THREATS,
+    PCAP_MAP_MODE_SERVICES,
+    PCAP_MAP_MODE_COUNT,
+} pcap_map_mode_t;
+
+typedef enum {
+    PCAP_MAP_NODE_LOCAL = 0,
+    PCAP_MAP_NODE_EXTERNAL,
+    PCAP_MAP_NODE_MULTICAST,
+    PCAP_MAP_NODE_BROADCAST,
+    PCAP_MAP_NODE_OTHER_LOCAL,
+    PCAP_MAP_NODE_OTHER_EXTERNAL,
+} pcap_map_node_kind_t;
+
+typedef struct {
+    char address[64];
+    char mac[18];
+    char hostname[96];
+    uint64_t sent_bytes;
+    uint64_t received_bytes;
+    uint32_t sent_packets;
+    uint32_t received_packets;
+    uint32_t flow_count;
+    uint16_t service_count;
+    uint16_t device_index;
+    uint16_t grouped_nodes;
+    uint8_t kind;
+    uint8_t alert_count;
+    uint8_t alert_severity;
+} pcap_map_node_t;
+
+typedef struct {
+    uint16_t source;
+    uint16_t target;
+    uint16_t representative_flow_id;
+    uint16_t flow_count;
+    uint64_t forward_bytes;
+    uint64_t reverse_bytes;
+    uint32_t forward_packets;
+    uint32_t reverse_packets;
+    uint64_t primary_app_bytes;
+    uint8_t primary_app;
+    uint8_t alert_count;
+    uint8_t alert_severity;
+} pcap_map_edge_t;
+
+typedef struct {
+    uint16_t node_count;
+    uint16_t edge_count;
+    uint16_t hidden_nodes;
+    uint16_t hidden_edges;
+    uint16_t local_nodes;
+    uint16_t external_nodes;
+    uint16_t global_alerts;
+    bool limited;
+    pcap_map_node_t nodes[PCAP_MAP_MAX_NODES];
+    pcap_map_edge_t edges[PCAP_MAP_MAX_EDGES];
+} pcap_map_graph_t;
 
 typedef struct {
     char path[PCAP_VIEWER_PATH_MAX];
@@ -1220,6 +1285,13 @@ typedef struct pcap_viewer_state {
     lv_obj_t *artifact_spinner;
     lv_obj_t *artifact_status_label;
     lv_obj_t *artifact_actions;
+    pcap_map_graph_t *map_graph;
+    pcap_map_mode_t map_mode;
+    int map_selected_node;
+    lv_obj_t *map_stage;
+    lv_obj_t *map_detail_label;
+    lv_obj_t *map_filter_btn;
+    lv_obj_t *map_mode_buttons[PCAP_MAP_MODE_COUNT];
 } pcap_viewer_state_t;
 
 typedef struct {
@@ -8079,6 +8151,23 @@ static void hidden_ssid_arp_confirm_cb(const char *ssid)
     show_arp_poison_page();
 }
 
+static void hidden_ssid_mitm_confirm_cb(const char *ssid)
+{
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx || !ssid || ssid[0] == '\0') return;
+
+    scan_view_t v = get_scan_view(ctx);
+    if (v.sel_count <= 0) return;
+    int idx = v.sel_indices[0];
+    if (idx < 0 || idx >= v.net_count) return;
+
+    strncpy(v.nets[idx].ssid, ssid, sizeof(v.nets[idx].ssid) - 1);
+    v.nets[idx].ssid[sizeof(v.nets[idx].ssid) - 1] = '\0';
+    ESP_LOGI(TAG, "MITM: Hidden network resolved as '%s' (%s)",
+             v.nets[idx].ssid, v.nets[idx].bssid);
+    show_mitm_popup();
+}
+
 static void hidden_ssid_rogueap_confirm_cb(const char *ssid)
 {
     tab_context_t *ctx = get_current_ctx();
@@ -8232,6 +8321,12 @@ static void handle_selected_attack(const char *attack_name)
                 lv_obj_set_style_text_color(ctx->scan_status_label, COLOR_MATERIAL_RED, 0);
                 bsp_display_unlock();
             }
+            return;
+        }
+        int idx = v.sel_indices[0];
+        if (idx < 0 || idx >= v.net_count) return;
+        if (v.nets[idx].ssid[0] == '\0') {
+            show_hidden_ssid_popup(hidden_ssid_mitm_confirm_cb);
             return;
         }
         show_mitm_popup();
@@ -8658,10 +8753,12 @@ static void mitm_connect_and_start_cb(lv_event_t *e)
         : (ctx->mitm_use_saved_password ? WIFI_CONNECT_AUTH_SAVED
                                         : WIFI_CONNECT_AUTH_PASSWORD);
     if (!build_wifi_connect_command(cmd, sizeof(cmd), ssid, password, auth_mode)) {
-        ESP_LOGW(TAG, "MITM: wifi_connect command too long, aborting");
+        ESP_LOGW(TAG, "MITM: invalid SSID/password or wifi_connect command too long");
         bsp_display_lock(0);
         if (ctx->mitm_status_label) {
-            lv_label_set_text(ctx->mitm_status_label, "SSID/password too long");
+            lv_label_set_text(ctx->mitm_status_label,
+                              ssid[0] ? "SSID/password too long"
+                                      : "Enter hidden SSID first");
             lv_obj_set_style_text_color(ctx->mitm_status_label, COLOR_MATERIAL_RED, 0);
         }
         return;
@@ -34406,6 +34503,15 @@ static void show_pcap_captures_page(void)
 // ESPShark local PCAP analysis (Tab5 SD)
 //==================================================================================
 
+static void pcap_viewer_copy_text(char *destination, size_t destination_size,
+                                  const char *source)
+{
+    if (!destination || destination_size == 0U) return;
+    size_t length = source ? strnlen(source, destination_size - 1U) : 0U;
+    if (length > 0U) memcpy(destination, source, length);
+    destination[length] = '\0';
+}
+
 static pcap_viewer_state_t *pcap_viewer_get_state(tab_context_t *ctx, bool create)
 {
     if (!ctx) {
@@ -34433,6 +34539,15 @@ static void pcap_viewer_close_detail(pcap_viewer_state_t *state)
         lv_obj_del(state->detail_overlay);
     }
     state->detail_overlay = NULL;
+    state->map_stage = NULL;
+    state->map_detail_label = NULL;
+    state->map_filter_btn = NULL;
+    memset(state->map_mode_buttons, 0, sizeof(state->map_mode_buttons));
+    state->map_selected_node = -1;
+    if (state->map_graph) {
+        heap_caps_free(state->map_graph);
+        state->map_graph = NULL;
+    }
 }
 
 static void pcap_viewer_release_capture(pcap_viewer_state_t *state)
@@ -34512,7 +34627,7 @@ static void pcap_viewer_scan_directory(pcap_viewer_state_t *state, const char *d
             continue;
         }
         pcap_viewer_file_t *file = &state->files[state->file_count++];
-        snprintf(file->path, sizeof(file->path), "%s", path);
+        pcap_viewer_copy_text(file->path, sizeof(file->path), path);
         size_t name_length = strnlen(entry->d_name, sizeof(file->name) - 1U);
         memcpy(file->name, entry->d_name, name_length);
         file->name[name_length] = '\0';
@@ -34929,6 +35044,14 @@ static void pcap_viewer_load_task(void *arg)
         (state->load_status == PCAP_READER_OK ||
          state->load_status == PCAP_READER_LIMIT_REACHED ||
          state->load_status == PCAP_READER_TRUNCATED)) {
+        if (state->status_label && bsp_display_lock(50)) {
+            if (state->status_label && lv_obj_is_valid(state->status_label)) {
+                lv_label_set_text(state->status_label,
+                                  "Building flows, devices and Network Health...\n"
+                                  "Analyzing bounded offline evidence");
+            }
+            bsp_display_unlock();
+        }
         pcap_reader_status_t flow_status = pcap_flow_analysis_build(
             state->reader, &state->capture_info, state->packet_index,
             state->scan_summary.indexed_packets, state->flow_analysis,
@@ -35009,9 +35132,9 @@ static void pcap_viewer_start_file_load(pcap_viewer_state_t *state, const char *
     char selected_name[96];
     const char *fallback_name = strrchr(path, '/');
     fallback_name = fallback_name ? fallback_name + 1 : path;
-    snprintf(selected_path, sizeof(selected_path), "%s", path);
-    snprintf(selected_name, sizeof(selected_name), "%s",
-             name && name[0] ? name : fallback_name);
+    pcap_viewer_copy_text(selected_path, sizeof(selected_path), path);
+    pcap_viewer_copy_text(selected_name, sizeof(selected_name),
+                          name && name[0] ? name : fallback_name);
     pcap_viewer_release_capture(state);
     state->packet_index = heap_caps_calloc(PCAP_VIEWER_MAX_INDEXED_PACKETS,
                                            sizeof(pcap_packet_index_t),
@@ -35033,8 +35156,8 @@ static void pcap_viewer_start_file_load(pcap_viewer_state_t *state, const char *
         return;
     }
 
-    snprintf(state->selected_path, sizeof(state->selected_path), "%s", selected_path);
-    snprintf(state->selected_name, sizeof(state->selected_name), "%s", selected_name);
+    pcap_viewer_copy_text(state->selected_path, sizeof(state->selected_path), selected_path);
+    pcap_viewer_copy_text(state->selected_name, sizeof(state->selected_name), selected_name);
     state->cancel_requested = false;
     state->loading = true;
     state->force_reanalyze = force_reanalyze;
@@ -35139,9 +35262,11 @@ enum {
     PCAP_DETAIL_FILTER_PORT,
     PCAP_DETAIL_FILTER_TIME,
     PCAP_DETAIL_FOLLOW_FLOW,
+    PCAP_DETAIL_FOLLOW_HEX,
 };
 
-static void pcap_viewer_follow_flow(pcap_viewer_state_t *state, uint16_t flow_id)
+static void pcap_viewer_follow_flow_mode(pcap_viewer_state_t *state, uint16_t flow_id,
+                                         pcap_flow_stream_mode_t mode)
 {
     if (!state || !state->reader || !state->packet_index || !state->flow_analysis ||
         flow_id == PCAP_FLOW_ID_NONE || flow_id >= state->flow_analysis->flow_count) {
@@ -35153,17 +35278,25 @@ static void pcap_viewer_follow_flow(pcap_viewer_state_t *state, uint16_t flow_id
         return;
     }
     pcap_flow_stream_result_t result;
-    pcap_reader_status_t status = pcap_flow_build_stream(
+    pcap_reader_status_t status = pcap_flow_build_stream_ex(
         state->reader, state->packet_index, state->scan_summary.indexed_packets,
-        state->flow_analysis, flow_id, stream, 24576, &result);
+        state->flow_analysis, flow_id, mode, stream, 24576, &result);
     if (status == PCAP_READER_OK) {
-        pcap_viewer_show_summary_popup(state, LV_SYMBOL_LIST " Follow Stream Lite", stream);
+        pcap_viewer_show_summary_popup(
+            state, mode == PCAP_FLOW_STREAM_HEX
+                       ? LV_SYMBOL_LIST " Follow Stream HEX"
+                       : LV_SYMBOL_LIST " Follow Stream ASCII", stream);
     } else {
         snprintf(stream, 24576, "Could not build stream: %s",
                  pcap_reader_status_name(status));
         pcap_viewer_show_summary_popup(state, "Follow Stream", stream);
     }
     heap_caps_free(stream);
+}
+
+static void pcap_viewer_follow_flow(pcap_viewer_state_t *state, uint16_t flow_id)
+{
+    pcap_viewer_follow_flow_mode(state, flow_id, PCAP_FLOW_STREAM_ASCII);
 }
 
 static void pcap_viewer_detail_action_cb(lv_event_t *e)
@@ -35185,26 +35318,30 @@ static void pcap_viewer_detail_action_cb(lv_event_t *e)
         pcap_viewer_follow_flow(state, flow_id);
         return;
     }
+    if (action == PCAP_DETAIL_FOLLOW_HEX) {
+        pcap_viewer_follow_flow_mode(state, flow_id, PCAP_FLOW_STREAM_HEX);
+        return;
+    }
 
     pcap_flow_filter_clear(&state->quick_filter);
     state->quick_filter.enabled = true;
     if (action == PCAP_DETAIL_FILTER_SOURCE_HOST && details.source[0]) {
         state->quick_filter.has_any_address = true;
-        snprintf(state->quick_filter.any_address, sizeof(state->quick_filter.any_address),
-                 "%s", details.source);
+        pcap_viewer_copy_text(state->quick_filter.any_address,
+                              sizeof(state->quick_filter.any_address), details.source);
     } else if (action == PCAP_DETAIL_FILTER_DESTINATION_HOST && details.destination[0]) {
         state->quick_filter.has_any_address = true;
-        snprintf(state->quick_filter.any_address, sizeof(state->quick_filter.any_address),
-                 "%s", details.destination);
+        pcap_viewer_copy_text(state->quick_filter.any_address,
+                              sizeof(state->quick_filter.any_address), details.destination);
     } else if (action == PCAP_DETAIL_FILTER_SOURCE_MAC && details.source_mac[0]) {
         state->quick_filter.has_any_mac = true;
-        snprintf(state->quick_filter.any_mac, sizeof(state->quick_filter.any_mac),
-                 "%s", details.source_mac);
+        pcap_viewer_copy_text(state->quick_filter.any_mac,
+                              sizeof(state->quick_filter.any_mac), details.source_mac);
     } else if (action == PCAP_DETAIL_FILTER_DESTINATION_MAC &&
                details.destination_mac[0]) {
         state->quick_filter.has_any_mac = true;
-        snprintf(state->quick_filter.any_mac, sizeof(state->quick_filter.any_mac),
-                 "%s", details.destination_mac);
+        pcap_viewer_copy_text(state->quick_filter.any_mac,
+                              sizeof(state->quick_filter.any_mac), details.destination_mac);
     } else if (action == PCAP_DETAIL_FILTER_PORT &&
                (details.destination_port || details.source_port)) {
         state->quick_filter.has_port = true;
@@ -35433,6 +35570,8 @@ static void pcap_viewer_packet_detail_cb(lv_event_t *e)
                                   details.source_port || details.destination_port);
     pcap_viewer_add_detail_action(actions, "TIME +/-5s", PCAP_DETAIL_FILTER_TIME, true);
     pcap_viewer_add_detail_action(actions, "FOLLOW", PCAP_DETAIL_FOLLOW_FLOW,
+                                  packet_flow != PCAP_FLOW_ID_NONE);
+    pcap_viewer_add_detail_action(actions, "FOLLOW HEX", PCAP_DETAIL_FOLLOW_HEX,
                                   packet_flow != PCAP_FLOW_ID_NONE);
 
     lv_obj_t *close_btn = lv_btn_create(popup);
@@ -35920,6 +36059,16 @@ static void pcap_viewer_summary_cb(lv_event_t *e)
                                 (unsigned long long)summary->wifi_probe_requests,
                                 (unsigned long long)summary->wifi_probe_responses,
                                 (unsigned long long)summary->wifi_deauthentications);
+        if (state->flow_analysis) {
+            pcap_viewer_append_text(
+                text_buffer, 8192, &position,
+                "Health: %s | alerts %lu | devices %lu | flows %lu\n",
+                pcap_flow_health_name(
+                    (pcap_health_level_t)state->flow_analysis->health_level),
+                (unsigned long)state->flow_analysis->alert_count,
+                (unsigned long)state->flow_analysis->device_count,
+                (unsigned long)state->flow_analysis->flow_count);
+        }
         pcap_viewer_append_top_text(text_buffer, 8192, &position, "Protocols",
                                     summary->protocols, summary->protocol_count, 10,
                                     summary->protocol_table_approximate);
@@ -36021,6 +36170,17 @@ static void pcap_viewer_connection_follow_cb(lv_event_t *e)
     pcap_viewer_follow_flow(state, flow_id);
 }
 
+static void pcap_viewer_connection_hex_cb(lv_event_t *e)
+{
+    uintptr_t encoded = (uintptr_t)lv_event_get_user_data(e);
+    tab_context_t *ctx = get_current_ctx();
+    pcap_viewer_state_t *state = pcap_viewer_get_state(ctx, false);
+    if (!state || encoded == 0U) return;
+    uint16_t flow_id = (uint16_t)(encoded - 1U);
+    pcap_viewer_close_detail(state);
+    pcap_viewer_follow_flow_mode(state, flow_id, PCAP_FLOW_STREAM_HEX);
+}
+
 static const char *pcap_viewer_tcp_state(const pcap_flow_entry_t *flow)
 {
     if (!flow || flow->ip_protocol != 6) return "DATAGRAM";
@@ -36090,7 +36250,7 @@ static void pcap_viewer_connections_cb(lv_event_t *e)
         uint16_t flow_id = order[i];
         const pcap_flow_entry_t *flow = &state->flow_analysis->flows[flow_id];
         lv_obj_t *row = lv_obj_create(list);
-        lv_obj_set_size(row, lv_pct(100), 56);
+        lv_obj_set_size(row, lv_pct(100), 84);
         lv_obj_set_style_bg_color(row, (i & 1U) ? ui_card_pressed_color() : ui_card_color(), 0);
         lv_obj_set_style_border_width(row, 1, 0);
         lv_obj_set_style_border_color(row, ui_border_color(), 0);
@@ -36103,9 +36263,19 @@ static void pcap_viewer_connections_cb(lv_event_t *e)
         double duration = flow->last_time_us >= flow->first_time_us
                               ? (double)(flow->last_time_us - flow->first_time_us) / 1000000.0
                               : 0.0;
+        char tcp_diagnostics[112] = {0};
+        if (flow->ip_protocol == 6U) {
+            snprintf(tcp_diagnostics, sizeof(tcp_diagnostics),
+                     "RTT %s%.2f ms | retrans %lu/%lu | zero-window %lu",
+                     flow->handshake_rtt_us ? "" : "~",
+                     (double)flow->handshake_rtt_us / 1000.0,
+                     (unsigned long)flow->originator_retransmissions,
+                     (unsigned long)flow->responder_retransmissions,
+                     (unsigned long)flow->zero_window_packets);
+        }
         lv_obj_t *label = lv_label_create(row);
         lv_label_set_text_fmt(label,
-                              "#%u  %s:%u  ->  %s:%u\n%s | %s | %s | %.3fs | %lu/%lu pkt | %llu/%llu B",
+                              "#%u  %s:%u  ->  %s:%u\n%s | %s | %s | %.3fs | %lu/%lu pkt | %llu/%llu B\n%s%s%s%s%s%s",
                               (unsigned)flow_id + 1U,
                               flow->originator, flow->originator_port,
                               flow->responder, flow->responder_port,
@@ -36117,7 +36287,12 @@ static void pcap_viewer_connections_cb(lv_event_t *e)
                               (unsigned long)flow->originator_packets,
                               (unsigned long)flow->responder_packets,
                               (unsigned long long)flow->originator_bytes,
-                              (unsigned long long)flow->responder_bytes);
+                              (unsigned long long)flow->responder_bytes,
+                              flow->server_name[0] ? "server: " : "",
+                              flow->server_name[0] ? flow->server_name : "",
+                              flow->server_name[0] && flow->application_detail[0] ? " | " : "",
+                              flow->application_detail[0] ? flow->application_detail : "",
+                              tcp_diagnostics[0] ? "\n" : "", tcp_diagnostics);
         lv_obj_set_flex_grow(label, 1);
         lv_obj_set_width(label, 0);
         lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
@@ -36127,6 +36302,8 @@ static void pcap_viewer_connections_cb(lv_event_t *e)
                                  (uintptr_t)flow_id + 1U, lv_color_hex(0x087EA4));
         pcap_viewer_small_action(row, "FOLLOW", pcap_viewer_connection_follow_cb,
                                  (uintptr_t)flow_id + 1U, COLOR_MATERIAL_PURPLE);
+        pcap_viewer_small_action(row, "HEX", pcap_viewer_connection_hex_cb,
+                                 (uintptr_t)flow_id + 1U, COLOR_MATERIAL_TEAL);
     }
     if (shown < count) {
         lv_obj_t *limited = lv_label_create(list);
@@ -36206,6 +36383,1081 @@ static void pcap_viewer_protocols_cb(lv_event_t *e)
     }
 }
 
+static void pcap_viewer_device_filter_cb(lv_event_t *e)
+{
+    uintptr_t encoded = (uintptr_t)lv_event_get_user_data(e);
+    tab_context_t *ctx = get_current_ctx();
+    pcap_viewer_state_t *state = pcap_viewer_get_state(ctx, false);
+    if (!state || !state->flow_analysis || encoded == 0U) return;
+    uint32_t device_index = (uint32_t)(encoded - 1U);
+    if (device_index >= state->flow_analysis->device_count) return;
+    const pcap_device_entry_t *device = &state->flow_analysis->devices[device_index];
+    pcap_flow_filter_clear(&state->quick_filter);
+    state->quick_filter.enabled = true;
+    state->quick_filter.has_any_address = true;
+    pcap_viewer_copy_text(state->quick_filter.any_address,
+                          sizeof(state->quick_filter.any_address), device->address);
+    state->packet_page = 0;
+    pcap_viewer_close_detail(state);
+    pcap_viewer_render_capture_page(state);
+}
+
+static void pcap_viewer_devices_cb(lv_event_t *e)
+{
+    pcap_viewer_state_t *state = (pcap_viewer_state_t *)lv_event_get_user_data(e);
+    if (!state || !state->flow_analysis) return;
+    lv_obj_t *list = pcap_viewer_create_analysis_list(
+        state, LV_SYMBOL_HOME " Devices & Services (tap to filter)");
+    if (!list) return;
+    if (state->flow_analysis->device_limited) {
+        lv_obj_t *warning = lv_label_create(list);
+        lv_label_set_text(warning,
+                          "DEVICE TABLE LIMITED - inventory is a bounded capture sample.");
+        lv_obj_set_style_text_color(warning, COLOR_MATERIAL_AMBER, 0);
+    }
+    uint16_t order[PCAP_FLOW_MAX_DEVICES];
+    uint32_t count = state->flow_analysis->device_count;
+    for (uint16_t i = 0; i < count; i++) order[i] = i;
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t best = i;
+        for (uint32_t j = i + 1U; j < count; j++) {
+            const pcap_device_entry_t *candidate =
+                &state->flow_analysis->devices[order[j]];
+            const pcap_device_entry_t *selected =
+                &state->flow_analysis->devices[order[best]];
+            uint64_t candidate_bytes = candidate->sent_bytes + candidate->received_bytes;
+            uint64_t selected_bytes = selected->sent_bytes + selected->received_bytes;
+            if (candidate_bytes > selected_bytes) best = j;
+        }
+        uint16_t swap = order[i];
+        order[i] = order[best];
+        order[best] = swap;
+    }
+    for (uint32_t row_index = 0; row_index < count; row_index++) {
+        uint16_t device_index = order[row_index];
+        const pcap_device_entry_t *device =
+            &state->flow_analysis->devices[device_index];
+        lv_obj_t *row = lv_btn_create(list);
+        lv_obj_set_size(row, lv_pct(100), 66);
+        lv_obj_set_style_bg_color(row,
+                                  (row_index & 1U) ? ui_card_pressed_color() : ui_card_color(), 0);
+        lv_obj_set_style_border_width(row, 1, 0);
+        lv_obj_set_style_border_color(row, ui_border_color(), 0);
+        lv_obj_set_style_radius(row, 7, 0);
+        lv_obj_add_event_cb(row, pcap_viewer_device_filter_cb, LV_EVENT_CLICKED,
+                            (void *)(uintptr_t)(device_index + 1U));
+        char services[160] = {0};
+        size_t position = 0U;
+        for (uint16_t service_index = 0;
+             service_index < device->service_count && service_index < 5U;
+             service_index++) {
+            const pcap_device_service_t *service = &device->services[service_index];
+            int written = snprintf(services + position, sizeof(services) - position,
+                                   "%s%s/%u", service_index ? ", " : "",
+                                   pcap_flow_transport_name(service->ip_protocol),
+                                   service->port);
+            if (written < 0 || (size_t)written >= sizeof(services) - position) break;
+            position += (size_t)written;
+        }
+        lv_obj_t *label = lv_label_create(row);
+        lv_label_set_text_fmt(
+            label, "%s%s%s  |  %s  |  %s\nTX %llu B/%lu pkt | RX %llu B/%lu pkt | services: %s%s",
+            device->internal ? "LAN  " : "WAN  ", device->address,
+            device->hostname[0] ? "  " : "", device->hostname[0] ? device->hostname : "no name",
+            device->mac[0] ? device->mac : "no MAC",
+            (unsigned long long)device->sent_bytes, (unsigned long)device->sent_packets,
+            (unsigned long long)device->received_bytes, (unsigned long)device->received_packets,
+            services[0] ? services : "none", device->service_limited ? " + LIMITED" : "");
+        lv_obj_set_width(label, lv_pct(100));
+        lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
+        lv_obj_set_style_text_font(label, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(label, ui_text_color(), 0);
+        lv_obj_center(label);
+    }
+}
+
+static void pcap_viewer_alert_filter_cb(lv_event_t *e)
+{
+    uintptr_t encoded = (uintptr_t)lv_event_get_user_data(e);
+    tab_context_t *ctx = get_current_ctx();
+    pcap_viewer_state_t *state = pcap_viewer_get_state(ctx, false);
+    if (!state || !state->flow_analysis || encoded == 0U) return;
+    uint32_t alert_index = (uint32_t)(encoded - 1U);
+    if (alert_index >= state->flow_analysis->alert_count) return;
+    const pcap_security_alert_t *alert = &state->flow_analysis->alerts[alert_index];
+    pcap_flow_filter_clear(&state->quick_filter);
+    state->quick_filter.enabled = true;
+    if (alert->type == PCAP_ALERT_ARP_CONFLICT) {
+        state->packet_filter = PCAP_FILTER_ARP;
+    } else if (alert->type == PCAP_ALERT_DNS_ANOMALY) {
+        state->packet_filter = PCAP_FILTER_DNS;
+    }
+    if (alert->flow_id != PCAP_FLOW_ID_NONE &&
+        alert->flow_id < state->flow_analysis->flow_count) {
+        state->quick_filter.has_flow = true;
+        state->quick_filter.flow_id = alert->flow_id;
+    } else if (alert->type != PCAP_ALERT_ARP_CONFLICT &&
+               alert->type != PCAP_ALERT_DNS_ANOMALY && alert->source[0] &&
+               strchr(alert->source, ' ') == NULL) {
+        state->quick_filter.has_any_address = true;
+        pcap_viewer_copy_text(state->quick_filter.any_address,
+                              sizeof(state->quick_filter.any_address), alert->source);
+    }
+    if (alert->first_time_us > 0U && alert->last_time_us >= alert->first_time_us) {
+        state->quick_filter.has_time_window = true;
+        state->quick_filter.time_start_us = alert->first_time_us;
+        state->quick_filter.time_end_us = alert->last_time_us;
+    }
+    state->packet_page = 0;
+    pcap_viewer_close_detail(state);
+    pcap_viewer_render_capture_page(state);
+}
+
+static void pcap_viewer_health_cb(lv_event_t *e)
+{
+    pcap_viewer_state_t *state = (pcap_viewer_state_t *)lv_event_get_user_data(e);
+    if (!state || !state->flow_analysis) return;
+    lv_obj_t *list = pcap_viewer_create_analysis_list(
+        state, LV_SYMBOL_WARNING " Network Health & Evidence");
+    if (!list) return;
+    lv_obj_t *health = lv_label_create(list);
+    lv_label_set_text_fmt(
+        health,
+        "%s | %lu alert(s) | %lu devices | DNS errors %lu/%lu | DNS-name indicators %lu | group traffic %lu/%lu\n"
+        "Heuristics describe evidence in this capture; they are not a security verdict.",
+        pcap_flow_health_name((pcap_health_level_t)state->flow_analysis->health_level),
+        (unsigned long)state->flow_analysis->alert_count,
+        (unsigned long)state->flow_analysis->device_count,
+        (unsigned long)state->flow_analysis->dns_error_packets,
+        (unsigned long)state->flow_analysis->dns_packets,
+        (unsigned long)state->flow_analysis->dns_suspicious_names,
+        (unsigned long)state->flow_analysis->broadcast_packets,
+        (unsigned long)state->flow_analysis->analyzed_packets);
+    lv_obj_set_width(health, lv_pct(100));
+    lv_label_set_long_mode(health, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_color(
+        health, state->flow_analysis->health_level >= PCAP_HEALTH_SUSPICIOUS
+                    ? COLOR_MATERIAL_RED
+                    : (state->flow_analysis->health_level == PCAP_HEALTH_WATCH
+                           ? COLOR_MATERIAL_AMBER : COLOR_MATERIAL_GREEN), 0);
+    for (uint32_t i = 0; i < state->flow_analysis->alert_count; i++) {
+        const pcap_security_alert_t *alert = &state->flow_analysis->alerts[i];
+        lv_obj_t *row = lv_btn_create(list);
+        lv_obj_set_size(row, lv_pct(100), 72);
+        lv_obj_set_style_bg_color(row, (i & 1U) ? ui_card_pressed_color() : ui_card_color(), 0);
+        lv_obj_set_style_border_width(row, 1, 0);
+        lv_obj_set_style_border_color(row,
+                                      alert->severity >= PCAP_HEALTH_SUSPICIOUS
+                                          ? COLOR_MATERIAL_RED : COLOR_MATERIAL_AMBER, 0);
+        lv_obj_set_style_radius(row, 7, 0);
+        lv_obj_add_event_cb(row, pcap_viewer_alert_filter_cb, LV_EVENT_CLICKED,
+                            (void *)(uintptr_t)(i + 1U));
+        lv_obj_t *label = lv_label_create(row);
+        lv_label_set_text_fmt(
+            label, "%s | %s | %s | evidence %u | packets #%lu-#%lu\n%s",
+            pcap_flow_alert_name((pcap_alert_type_t)alert->type),
+            pcap_flow_health_name((pcap_health_level_t)alert->severity),
+            pcap_flow_confidence_name((pcap_app_confidence_t)alert->confidence),
+            alert->evidence_count, (unsigned long)alert->first_packet + 1U,
+            (unsigned long)alert->last_packet + 1U, alert->detail);
+        lv_obj_set_width(label, lv_pct(100));
+        lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
+        lv_obj_set_style_text_font(label, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(label, ui_text_color(), 0);
+        lv_obj_center(label);
+    }
+    if (state->flow_analysis->alert_limited) {
+        lv_obj_t *warning = lv_label_create(list);
+        lv_label_set_text(warning, "ALERT TABLE LIMITED - additional findings were omitted.");
+        lv_obj_set_style_text_color(warning, COLOR_MATERIAL_AMBER, 0);
+    }
+}
+
+static bool pcap_map_mac_valid(const char *mac)
+{
+    return mac && mac[0] && strcasecmp(mac, "00:00:00:00:00:00") != 0 &&
+           strcasecmp(mac, "FF:FF:FF:FF:FF:FF") != 0;
+}
+
+static pcap_map_node_kind_t pcap_map_classify_node(const char *address,
+                                                   const char *mac,
+                                                   bool internal)
+{
+    if (mac && strcasecmp(mac, "FF:FF:FF:FF:FF:FF") == 0) {
+        return PCAP_MAP_NODE_BROADCAST;
+    }
+    if (address && address[0]) {
+        if (strncasecmp(address, "ff", 2) == 0 && strchr(address, ':')) {
+            return PCAP_MAP_NODE_MULTICAST;
+        }
+        unsigned int a = 0, b = 0, c = 0, d = 0;
+        if (sscanf(address, "%u.%u.%u.%u", &a, &b, &c, &d) == 4 &&
+            a <= 255U && b <= 255U && c <= 255U && d <= 255U) {
+            if (a >= 224U && a <= 239U) return PCAP_MAP_NODE_MULTICAST;
+            if (a == 255U || d == 255U) return PCAP_MAP_NODE_BROADCAST;
+        }
+    }
+    return internal ? PCAP_MAP_NODE_LOCAL : PCAP_MAP_NODE_EXTERNAL;
+}
+
+static int pcap_map_find_candidate(const pcap_map_node_t *candidates,
+                                   uint16_t count, const char *address,
+                                   const char *mac, pcap_map_node_kind_t kind)
+{
+    if (!candidates) return -1;
+    for (uint16_t i = 0; i < count; i++) {
+        const pcap_map_node_t *candidate = &candidates[i];
+        if (kind == PCAP_MAP_NODE_MULTICAST || kind == PCAP_MAP_NODE_BROADCAST) {
+            if (candidate->kind == (uint8_t)kind) return (int)i;
+            continue;
+        }
+        if (candidate->kind != (uint8_t)kind) continue;
+        if (kind == PCAP_MAP_NODE_LOCAL && pcap_map_mac_valid(mac) &&
+            pcap_map_mac_valid(candidate->mac) &&
+            strcasecmp(candidate->mac, mac) == 0) {
+            return (int)i;
+        }
+        if (address && address[0] && candidate->address[0] &&
+            strcasecmp(candidate->address, address) == 0) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+static int pcap_map_candidate_for_endpoint(const pcap_map_node_t *candidates,
+                                           uint16_t count, const char *address,
+                                           const char *mac)
+{
+    if (!candidates || !address) return -1;
+    for (uint16_t i = 0; i < count; i++) {
+        if (candidates[i].address[0] &&
+            strcasecmp(candidates[i].address, address) == 0) return (int)i;
+    }
+    if (pcap_map_mac_valid(mac)) {
+        for (uint16_t i = 0; i < count; i++) {
+            if (pcap_map_mac_valid(candidates[i].mac) &&
+                strcasecmp(candidates[i].mac, mac) == 0) return (int)i;
+        }
+    }
+    pcap_map_node_kind_t kind = pcap_map_classify_node(address, mac, false);
+    if (kind == PCAP_MAP_NODE_MULTICAST || kind == PCAP_MAP_NODE_BROADCAST) {
+        return pcap_map_find_candidate(candidates, count, address, mac, kind);
+    }
+    return -1;
+}
+
+static void pcap_map_note_alert(pcap_map_node_t *node,
+                                const pcap_security_alert_t *alert)
+{
+    if (!node || !alert) return;
+    if (node->alert_count < UINT8_MAX) node->alert_count++;
+    if (alert->severity > node->alert_severity) {
+        node->alert_severity = alert->severity;
+    }
+}
+
+static uint64_t pcap_map_node_score(const pcap_map_node_t *node)
+{
+    if (!node) return 0U;
+    uint64_t score = node->sent_bytes + node->received_bytes;
+    score += ((uint64_t)node->sent_packets + node->received_packets) * 32ULL;
+    score += (uint64_t)node->flow_count * 1024ULL;
+    if (node->kind == PCAP_MAP_NODE_MULTICAST ||
+        node->kind == PCAP_MAP_NODE_BROADCAST) score |= (3ULL << 62);
+    if (node->alert_count > 0U) score |= (1ULL << 63);
+    return score;
+}
+
+static int pcap_map_find_raw_edge(const pcap_map_edge_t *edges, uint16_t count,
+                                  uint16_t source, uint16_t target)
+{
+    for (uint16_t i = 0; i < count; i++) {
+        if ((edges[i].source == source && edges[i].target == target) ||
+            (edges[i].source == target && edges[i].target == source)) return (int)i;
+    }
+    return -1;
+}
+
+static bool pcap_map_is_service_application(uint8_t application)
+{
+    return application > PCAP_APP_WIFI_MGMT && application < PCAP_APP_COUNT;
+}
+
+static uint64_t pcap_map_edge_score(const pcap_map_edge_t *edge)
+{
+    if (!edge) return 0U;
+    uint64_t score = edge->forward_bytes + edge->reverse_bytes;
+    score += ((uint64_t)edge->forward_packets + edge->reverse_packets) * 32ULL;
+    if (pcap_map_is_service_application(edge->primary_app)) score |= (1ULL << 62);
+    if (edge->alert_count > 0U) score |= (1ULL << 63);
+    return score;
+}
+
+static void pcap_map_aggregate_group_node(pcap_map_node_t *group,
+                                          const pcap_map_node_t *candidate)
+{
+    if (!group || !candidate) return;
+    group->sent_bytes += candidate->sent_bytes;
+    group->received_bytes += candidate->received_bytes;
+    group->sent_packets += candidate->sent_packets;
+    group->received_packets += candidate->received_packets;
+    group->flow_count += candidate->flow_count;
+    if ((uint32_t)group->service_count + candidate->service_count > UINT16_MAX) {
+        group->service_count = UINT16_MAX;
+    } else {
+        group->service_count += candidate->service_count;
+    }
+    group->grouped_nodes++;
+    if ((uint16_t)group->alert_count + candidate->alert_count > UINT8_MAX) {
+        group->alert_count = UINT8_MAX;
+    } else {
+        group->alert_count += candidate->alert_count;
+    }
+    if (candidate->alert_severity > group->alert_severity) {
+        group->alert_severity = candidate->alert_severity;
+    }
+}
+
+static bool pcap_map_build_graph(const pcap_flow_analysis_t *analysis,
+                                 pcap_map_graph_t *graph)
+{
+    if (!analysis || !graph) return false;
+    memset(graph, 0, sizeof(*graph));
+    pcap_map_node_t *candidates = heap_caps_calloc(
+        PCAP_MAP_MAX_CANDIDATES, sizeof(*candidates), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    pcap_map_edge_t *raw_edges = heap_caps_calloc(
+        PCAP_FLOW_MAX_FLOWS, sizeof(*raw_edges), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!candidates || !raw_edges) {
+        if (candidates) heap_caps_free(candidates);
+        if (raw_edges) heap_caps_free(raw_edges);
+        return false;
+    }
+
+    uint16_t candidate_count = 0U;
+    uint32_t device_count = analysis->device_count < PCAP_MAP_MAX_CANDIDATES
+                                ? analysis->device_count : PCAP_MAP_MAX_CANDIDATES;
+    for (uint16_t device_index = 0; device_index < device_count; device_index++) {
+        const pcap_device_entry_t *device = &analysis->devices[device_index];
+        pcap_map_node_kind_t kind = pcap_map_classify_node(
+            device->address, device->mac, device->internal);
+        int found = pcap_map_find_candidate(candidates, candidate_count,
+                                            device->address, device->mac, kind);
+        if (found < 0) {
+            if (candidate_count >= PCAP_MAP_MAX_CANDIDATES) break;
+            found = candidate_count++;
+            pcap_map_node_t *candidate = &candidates[found];
+            candidate->kind = (uint8_t)kind;
+            candidate->device_index = device_index;
+            candidate->grouped_nodes = 1U;
+            pcap_viewer_copy_text(candidate->address, sizeof(candidate->address),
+                                  kind == PCAP_MAP_NODE_MULTICAST ? "MULTICAST" :
+                                  (kind == PCAP_MAP_NODE_BROADCAST ? "BROADCAST" :
+                                                                   device->address));
+            pcap_viewer_copy_text(candidate->mac, sizeof(candidate->mac), device->mac);
+            pcap_viewer_copy_text(candidate->hostname, sizeof(candidate->hostname),
+                                  device->hostname);
+        } else if (candidates[found].grouped_nodes < UINT16_MAX) {
+            candidates[found].grouped_nodes++;
+            if (!candidates[found].hostname[0] && device->hostname[0]) {
+                pcap_viewer_copy_text(candidates[found].hostname,
+                                      sizeof(candidates[found].hostname), device->hostname);
+            }
+        }
+        pcap_map_node_t *candidate = &candidates[found];
+        candidate->sent_bytes += device->sent_bytes;
+        candidate->received_bytes += device->received_bytes;
+        candidate->sent_packets += device->sent_packets;
+        candidate->received_packets += device->received_packets;
+        if ((uint32_t)candidate->service_count + device->service_count > UINT16_MAX) {
+            candidate->service_count = UINT16_MAX;
+        } else {
+            candidate->service_count += device->service_count;
+        }
+    }
+
+    for (uint16_t flow_id = 0; flow_id < analysis->flow_count; flow_id++) {
+        const pcap_flow_entry_t *flow = &analysis->flows[flow_id];
+        int source = pcap_map_candidate_for_endpoint(
+            candidates, candidate_count, flow->originator, flow->originator_mac);
+        int target = pcap_map_candidate_for_endpoint(
+            candidates, candidate_count, flow->responder, flow->responder_mac);
+        if (source >= 0 && candidates[source].flow_count < UINT32_MAX) {
+            candidates[source].flow_count++;
+        }
+        if (target >= 0 && target != source && candidates[target].flow_count < UINT32_MAX) {
+            candidates[target].flow_count++;
+        }
+    }
+
+    for (uint16_t alert_index = 0; alert_index < analysis->alert_count; alert_index++) {
+        const pcap_security_alert_t *alert = &analysis->alerts[alert_index];
+        int source = pcap_map_candidate_for_endpoint(
+            candidates, candidate_count, alert->source, NULL);
+        int target = pcap_map_candidate_for_endpoint(
+            candidates, candidate_count, alert->target, NULL);
+        if (alert->flow_id != PCAP_FLOW_ID_NONE &&
+            alert->flow_id < analysis->flow_count) {
+            const pcap_flow_entry_t *flow = &analysis->flows[alert->flow_id];
+            source = pcap_map_candidate_for_endpoint(
+                candidates, candidate_count, flow->originator, flow->originator_mac);
+            target = pcap_map_candidate_for_endpoint(
+                candidates, candidate_count, flow->responder, flow->responder_mac);
+        }
+        if (source >= 0) pcap_map_note_alert(&candidates[source], alert);
+        if (target >= 0 && target != source) pcap_map_note_alert(&candidates[target], alert);
+    }
+
+    uint16_t candidate_order[PCAP_MAP_MAX_CANDIDATES];
+    for (uint16_t i = 0; i < candidate_count; i++) candidate_order[i] = i;
+    for (uint16_t i = 0; i < candidate_count; i++) {
+        uint16_t best = i;
+        for (uint16_t j = i + 1U; j < candidate_count; j++) {
+            if (pcap_map_node_score(&candidates[candidate_order[j]]) >
+                pcap_map_node_score(&candidates[candidate_order[best]])) best = j;
+        }
+        uint16_t swap = candidate_order[i];
+        candidate_order[i] = candidate_order[best];
+        candidate_order[best] = swap;
+    }
+
+    uint8_t candidate_to_node[PCAP_MAP_MAX_CANDIDATES];
+    memset(candidate_to_node, UINT8_MAX, sizeof(candidate_to_node));
+    uint16_t primary_count = candidate_count <= PCAP_MAP_MAX_NODES
+                                 ? candidate_count : PCAP_MAP_PRIMARY_NODES;
+    for (uint16_t i = 0; i < primary_count; i++) {
+        uint16_t candidate_index = candidate_order[i];
+        candidate_to_node[candidate_index] = (uint8_t)graph->node_count;
+        graph->nodes[graph->node_count++] = candidates[candidate_index];
+    }
+
+    uint16_t omitted_local = 0U;
+    uint16_t omitted_external = 0U;
+    for (uint16_t i = primary_count; i < candidate_count; i++) {
+        pcap_map_node_kind_t kind = (pcap_map_node_kind_t)candidates[candidate_order[i]].kind;
+        if (kind == PCAP_MAP_NODE_LOCAL) omitted_local++;
+        else omitted_external++;
+    }
+    int local_group = -1;
+    int external_group = -1;
+    if (omitted_local > 0U && graph->node_count < PCAP_MAP_MAX_NODES) {
+        local_group = graph->node_count++;
+        graph->nodes[local_group].kind = PCAP_MAP_NODE_OTHER_LOCAL;
+        graph->nodes[local_group].device_index = UINT16_MAX;
+        pcap_viewer_copy_text(graph->nodes[local_group].address,
+                              sizeof(graph->nodes[local_group].address), "OTHER LAN");
+    }
+    if (omitted_external > 0U && graph->node_count < PCAP_MAP_MAX_NODES) {
+        external_group = graph->node_count++;
+        graph->nodes[external_group].kind = PCAP_MAP_NODE_OTHER_EXTERNAL;
+        graph->nodes[external_group].device_index = UINT16_MAX;
+        pcap_viewer_copy_text(graph->nodes[external_group].address,
+                              sizeof(graph->nodes[external_group].address), "INTERNET");
+    }
+    for (uint16_t i = primary_count; i < candidate_count; i++) {
+        uint16_t candidate_index = candidate_order[i];
+        pcap_map_node_kind_t kind = (pcap_map_node_kind_t)candidates[candidate_index].kind;
+        int group = kind == PCAP_MAP_NODE_LOCAL ? local_group : external_group;
+        if (group < 0) continue;
+        candidate_to_node[candidate_index] = (uint8_t)group;
+        pcap_map_aggregate_group_node(&graph->nodes[group], &candidates[candidate_index]);
+    }
+
+    for (uint16_t i = 0; i < candidate_count; i++) {
+        if (candidates[i].kind == PCAP_MAP_NODE_LOCAL) graph->local_nodes++;
+        else if (candidates[i].kind == PCAP_MAP_NODE_EXTERNAL) graph->external_nodes++;
+    }
+    graph->hidden_nodes = candidate_count > primary_count
+                              ? candidate_count - primary_count : 0U;
+
+    uint16_t raw_edge_count = 0U;
+    for (uint16_t flow_id = 0; flow_id < analysis->flow_count; flow_id++) {
+        const pcap_flow_entry_t *flow = &analysis->flows[flow_id];
+        int source_candidate = pcap_map_candidate_for_endpoint(
+            candidates, candidate_count, flow->originator, flow->originator_mac);
+        int target_candidate = pcap_map_candidate_for_endpoint(
+            candidates, candidate_count, flow->responder, flow->responder_mac);
+        if (source_candidate < 0 || target_candidate < 0) continue;
+        uint8_t source = candidate_to_node[source_candidate];
+        uint8_t target = candidate_to_node[target_candidate];
+        if (source == UINT8_MAX || target == UINT8_MAX || source == target) continue;
+        int edge_index = pcap_map_find_raw_edge(raw_edges, raw_edge_count, source, target);
+        if (edge_index < 0) {
+            if (raw_edge_count >= PCAP_FLOW_MAX_FLOWS) continue;
+            edge_index = raw_edge_count++;
+            raw_edges[edge_index].source = source;
+            raw_edges[edge_index].target = target;
+            raw_edges[edge_index].representative_flow_id = flow_id;
+        }
+        pcap_map_edge_t *edge = &raw_edges[edge_index];
+        bool forward = edge->source == source;
+        if (forward) {
+            edge->forward_bytes += flow->originator_bytes;
+            edge->reverse_bytes += flow->responder_bytes;
+            edge->forward_packets += flow->originator_packets;
+            edge->reverse_packets += flow->responder_packets;
+        } else {
+            edge->forward_bytes += flow->responder_bytes;
+            edge->reverse_bytes += flow->originator_bytes;
+            edge->forward_packets += flow->responder_packets;
+            edge->reverse_packets += flow->originator_packets;
+        }
+        if (edge->flow_count < UINT16_MAX) edge->flow_count++;
+        uint64_t flow_bytes = flow->originator_bytes + flow->responder_bytes;
+        if (flow_bytes >= edge->primary_app_bytes) {
+            edge->primary_app_bytes = flow_bytes;
+            edge->primary_app = flow->app_protocol;
+            edge->representative_flow_id = flow_id;
+        }
+    }
+
+    for (uint16_t alert_index = 0; alert_index < analysis->alert_count; alert_index++) {
+        const pcap_security_alert_t *alert = &analysis->alerts[alert_index];
+        int source_candidate = pcap_map_candidate_for_endpoint(
+            candidates, candidate_count, alert->source, NULL);
+        int target_candidate = pcap_map_candidate_for_endpoint(
+            candidates, candidate_count, alert->target, NULL);
+        if (alert->flow_id != PCAP_FLOW_ID_NONE && alert->flow_id < analysis->flow_count) {
+            const pcap_flow_entry_t *flow = &analysis->flows[alert->flow_id];
+            source_candidate = pcap_map_candidate_for_endpoint(
+                candidates, candidate_count, flow->originator, flow->originator_mac);
+            target_candidate = pcap_map_candidate_for_endpoint(
+                candidates, candidate_count, flow->responder, flow->responder_mac);
+        }
+        uint8_t source = source_candidate >= 0 ? candidate_to_node[source_candidate] : UINT8_MAX;
+        uint8_t target = target_candidate >= 0 ? candidate_to_node[target_candidate] : UINT8_MAX;
+        int edge_index = source != UINT8_MAX && target != UINT8_MAX
+                             ? pcap_map_find_raw_edge(raw_edges, raw_edge_count, source, target) : -1;
+        if (edge_index >= 0) {
+            pcap_map_edge_t *edge = &raw_edges[edge_index];
+            if (edge->alert_count < UINT8_MAX) edge->alert_count++;
+            if (alert->severity > edge->alert_severity) edge->alert_severity = alert->severity;
+        } else if (source != UINT8_MAX &&
+                   (alert->type == PCAP_ALERT_HOST_SWEEP ||
+                    alert->type == PCAP_ALERT_WORM_LIKE_SPREAD)) {
+            for (uint16_t edge_id = 0; edge_id < raw_edge_count; edge_id++) {
+                pcap_map_edge_t *edge = &raw_edges[edge_id];
+                if (edge->source != source && edge->target != source) continue;
+                if (edge->alert_count < UINT8_MAX) edge->alert_count++;
+                if (alert->severity > edge->alert_severity) {
+                    edge->alert_severity = alert->severity;
+                }
+            }
+        }
+    }
+
+    uint16_t edge_order[PCAP_FLOW_MAX_FLOWS];
+    for (uint16_t i = 0; i < raw_edge_count; i++) edge_order[i] = i;
+    for (uint16_t i = 0; i < raw_edge_count; i++) {
+        uint16_t best = i;
+        for (uint16_t j = i + 1U; j < raw_edge_count; j++) {
+            if (pcap_map_edge_score(&raw_edges[edge_order[j]]) >
+                pcap_map_edge_score(&raw_edges[edge_order[best]])) best = j;
+        }
+        uint16_t swap = edge_order[i];
+        edge_order[i] = edge_order[best];
+        edge_order[best] = swap;
+    }
+    graph->edge_count = raw_edge_count < PCAP_MAP_MAX_EDGES
+                            ? raw_edge_count : PCAP_MAP_MAX_EDGES;
+    for (uint16_t i = 0; i < graph->edge_count; i++) {
+        graph->edges[i] = raw_edges[edge_order[i]];
+    }
+    graph->hidden_edges = raw_edge_count > graph->edge_count
+                              ? raw_edge_count - graph->edge_count : 0U;
+    graph->global_alerts = analysis->alert_count;
+    graph->limited = analysis->flow_limited || analysis->device_limited ||
+                     graph->hidden_nodes > 0U || graph->hidden_edges > 0U;
+    heap_caps_free(raw_edges);
+    heap_caps_free(candidates);
+    return true;
+}
+
+static const char *pcap_map_kind_name(pcap_map_node_kind_t kind)
+{
+    switch (kind) {
+        case PCAP_MAP_NODE_LOCAL: return "LOCAL DEVICE";
+        case PCAP_MAP_NODE_EXTERNAL: return "EXTERNAL ENDPOINT";
+        case PCAP_MAP_NODE_MULTICAST: return "MULTICAST GROUP";
+        case PCAP_MAP_NODE_BROADCAST: return "BROADCAST GROUP";
+        case PCAP_MAP_NODE_OTHER_LOCAL: return "COLLAPSED LOCAL DEVICES";
+        case PCAP_MAP_NODE_OTHER_EXTERNAL: return "COLLAPSED INTERNET ENDPOINTS";
+        default: return "ENDPOINT";
+    }
+}
+
+static lv_color_t pcap_map_node_color(const pcap_map_node_t *node)
+{
+    if (!node) return ui_muted_color();
+    if (node->alert_severity >= PCAP_HEALTH_SUSPICIOUS) return COLOR_MATERIAL_RED;
+    if (node->alert_count > 0U) return COLOR_MATERIAL_AMBER;
+    switch ((pcap_map_node_kind_t)node->kind) {
+        case PCAP_MAP_NODE_LOCAL: return COLOR_MATERIAL_GREEN;
+        case PCAP_MAP_NODE_EXTERNAL: return COLOR_MATERIAL_PURPLE;
+        case PCAP_MAP_NODE_MULTICAST: return COLOR_MATERIAL_CYAN;
+        case PCAP_MAP_NODE_BROADCAST: return COLOR_MATERIAL_AMBER;
+        case PCAP_MAP_NODE_OTHER_LOCAL: return COLOR_MATERIAL_TEAL;
+        case PCAP_MAP_NODE_OTHER_EXTERNAL: return lv_color_hex(0x7E57C2);
+        default: return ui_muted_color();
+    }
+}
+
+static lv_color_t pcap_map_application_color(uint8_t application)
+{
+    switch ((pcap_application_t)application) {
+        case PCAP_APP_DNS:
+        case PCAP_APP_MDNS:
+        case PCAP_APP_LLMNR:
+        case PCAP_APP_NBNS: return COLOR_MATERIAL_PURPLE;
+        case PCAP_APP_HTTP:
+        case PCAP_APP_FTP:
+        case PCAP_APP_TELNET: return COLOR_MATERIAL_AMBER;
+        case PCAP_APP_TLS:
+        case PCAP_APP_QUIC:
+        case PCAP_APP_SSH: return COLOR_MATERIAL_CYAN;
+        case PCAP_APP_SMB:
+        case PCAP_APP_MQTT:
+        case PCAP_APP_BITTORRENT:
+        case PCAP_APP_BITTORRENT_DHT: return COLOR_MATERIAL_GREEN;
+        default: return lv_color_hex(0x607D8B);
+    }
+}
+
+static void pcap_map_node_center(const pcap_map_graph_t *graph, uint16_t node_index,
+                                 int width, int height, int *x, int *y)
+{
+    if (!graph || node_index >= graph->node_count || !x || !y) return;
+    const pcap_map_node_t *node = &graph->nodes[node_index];
+    bool local = node->kind == PCAP_MAP_NODE_LOCAL ||
+                 node->kind == PCAP_MAP_NODE_OTHER_LOCAL;
+    bool external = node->kind == PCAP_MAP_NODE_EXTERNAL ||
+                    node->kind == PCAP_MAP_NODE_OTHER_EXTERNAL;
+    uint16_t count = 0U;
+    uint16_t ordinal = 0U;
+    for (uint16_t i = 0; i < graph->node_count; i++) {
+        const pcap_map_node_t *candidate = &graph->nodes[i];
+        bool same_lane = local
+                             ? (candidate->kind == PCAP_MAP_NODE_LOCAL ||
+                                candidate->kind == PCAP_MAP_NODE_OTHER_LOCAL)
+                             : external
+                                   ? (candidate->kind == PCAP_MAP_NODE_EXTERNAL ||
+                                      candidate->kind == PCAP_MAP_NODE_OTHER_EXTERNAL)
+                                   : (candidate->kind == PCAP_MAP_NODE_MULTICAST ||
+                                      candidate->kind == PCAP_MAP_NODE_BROADCAST);
+        if (!same_lane) continue;
+        if (i < node_index) ordinal++;
+        count++;
+    }
+    if (!local && !external) {
+        *x = width / 2;
+        *y = count <= 1U ? height / 2
+                         : height / 2 - 38 + (int)ordinal * 76;
+        return;
+    }
+    double angle = count > 1U
+                       ? ((2.0 * 3.14159265358979323846 * ordinal) / count) : 0.0;
+    int center_x = local ? width * 27 / 100 : width * 73 / 100;
+    int radius_x = width * 20 / 100;
+    int radius_y = height * 38 / 100;
+    *x = center_x + (int)((double)radius_x * cos(angle));
+    *y = height / 2 + (int)((double)radius_y * sin(angle));
+    *x = iot_recon_clamp_int(*x, 34, width - 34);
+    *y = iot_recon_clamp_int(*y, 28, height - 42);
+}
+
+static int pcap_map_node_size(const pcap_map_graph_t *graph,
+                              const pcap_map_node_t *node)
+{
+    if (!graph || !node) return 20;
+    uint64_t maximum = 1U;
+    for (uint16_t i = 0; i < graph->node_count; i++) {
+        uint64_t bytes = graph->nodes[i].sent_bytes + graph->nodes[i].received_bytes;
+        if (bytes > maximum) maximum = bytes;
+    }
+    uint64_t bytes = node->sent_bytes + node->received_bytes;
+    int size = bytes >= maximum / 4U ? 34 : (bytes >= maximum / 16U ? 28 : 22);
+    if (node->alert_count > 0U) size += 4;
+    return size;
+}
+
+static void pcap_map_add_line(lv_obj_t *stage, int x1, int y1, int x2, int y2,
+                              int source_radius, int target_radius,
+                              lv_color_t color, lv_opa_t opacity, int width)
+{
+    iot_recon_trim_line_to_nodes(&x1, &y1, &x2, &y2,
+                                 source_radius, target_radius);
+    lv_point_precise_t *points = lv_malloc(sizeof(*points) * 2U);
+    if (!points) return;
+    points[0].x = x1;
+    points[0].y = y1;
+    points[1].x = x2;
+    points[1].y = y2;
+    lv_obj_t *line = lv_line_create(stage);
+    lv_line_set_points_mutable(line, points, 2);
+    lv_obj_add_event_cb(line, iot_recon_line_points_delete_cb, LV_EVENT_DELETE, points);
+    lv_obj_set_style_line_color(line, color, 0);
+    lv_obj_set_style_line_opa(line, opacity, 0);
+    lv_obj_set_style_line_width(line, width, 0);
+}
+
+static void pcap_map_update_mode_buttons(pcap_viewer_state_t *state)
+{
+    if (!state) return;
+    for (int i = 0; i < PCAP_MAP_MODE_COUNT; i++) {
+        lv_obj_t *button = state->map_mode_buttons[i];
+        if (!button || !lv_obj_is_valid(button)) continue;
+        lv_obj_set_style_border_width(button, i == state->map_mode ? 3 : 1, 0);
+        lv_obj_set_style_border_color(button,
+                                      i == state->map_mode ? COLOR_NEON_CYAN
+                                                           : ui_border_color(), 0);
+        lv_obj_set_style_bg_opa(button, i == state->map_mode ? LV_OPA_COVER : LV_OPA_70, 0);
+    }
+}
+
+static void pcap_map_node_click_cb(lv_event_t *e);
+
+static void pcap_map_render_stage(pcap_viewer_state_t *state)
+{
+    if (!state || !state->map_graph || !state->map_stage ||
+        !lv_obj_is_valid(state->map_stage)) return;
+    lv_obj_clean(state->map_stage);
+    lv_obj_update_layout(state->map_stage);
+    int width = lv_obj_get_content_width(state->map_stage);
+    int height = lv_obj_get_content_height(state->map_stage);
+    if (width < 200 || height < 120) return;
+    const pcap_map_graph_t *graph = state->map_graph;
+    if (graph->node_count == 0U) {
+        lv_obj_t *empty = lv_label_create(state->map_stage);
+        lv_label_set_text(empty,
+                          "No decoded IP endpoints in this capture.\n"
+                          "Handshake-only and encrypted 802.11 PCAPs cannot build a communication map.");
+        lv_obj_set_width(empty, lv_pct(90));
+        lv_label_set_long_mode(empty, LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_text_align(empty, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_color(empty, COLOR_MATERIAL_AMBER, 0);
+        lv_obj_center(empty);
+        pcap_map_update_mode_buttons(state);
+        return;
+    }
+    uint64_t maximum_edge_bytes = 1U;
+    for (uint16_t i = 0; i < graph->edge_count; i++) {
+        uint64_t bytes = graph->edges[i].forward_bytes + graph->edges[i].reverse_bytes;
+        if (bytes > maximum_edge_bytes) maximum_edge_bytes = bytes;
+    }
+    for (uint16_t i = 0; i < graph->edge_count; i++) {
+        const pcap_map_edge_t *edge = &graph->edges[i];
+        if (edge->source >= graph->node_count || edge->target >= graph->node_count) continue;
+        bool service_edge = pcap_map_is_service_application(edge->primary_app);
+        if (state->map_mode == PCAP_MAP_MODE_SERVICES && !service_edge) continue;
+        int x1 = 0, y1 = 0, x2 = 0, y2 = 0;
+        pcap_map_node_center(graph, edge->source, width, height, &x1, &y1);
+        pcap_map_node_center(graph, edge->target, width, height, &x2, &y2);
+        uint64_t bytes = edge->forward_bytes + edge->reverse_bytes;
+        int line_width = bytes >= maximum_edge_bytes / 4U
+                             ? 5 : (bytes >= maximum_edge_bytes / 16U ? 3 : 1);
+        lv_color_t color = pcap_map_application_color(edge->primary_app);
+        lv_opa_t opacity = LV_OPA_60;
+        if (state->map_mode == PCAP_MAP_MODE_THREATS) {
+            if (edge->alert_count > 0U) {
+                color = edge->alert_severity >= PCAP_HEALTH_SUSPICIOUS
+                            ? COLOR_MATERIAL_RED : COLOR_MATERIAL_AMBER;
+                opacity = LV_OPA_90;
+                line_width += 2;
+            } else {
+                opacity = LV_OPA_20;
+            }
+        }
+        pcap_map_add_line(state->map_stage, x1, y1, x2, y2,
+                          pcap_map_node_size(graph, &graph->nodes[edge->source]) / 2,
+                          pcap_map_node_size(graph, &graph->nodes[edge->target]) / 2,
+                          color, opacity, line_width);
+    }
+
+    for (uint16_t i = 0; i < graph->node_count; i++) {
+        const pcap_map_node_t *node = &graph->nodes[i];
+        int x = 0, y = 0;
+        pcap_map_node_center(graph, i, width, height, &x, &y);
+        int size = pcap_map_node_size(graph, node);
+        lv_color_t color = pcap_map_node_color(node);
+        bool muted = (state->map_mode == PCAP_MAP_MODE_THREATS && node->alert_count == 0U) ||
+                     (state->map_mode == PCAP_MAP_MODE_SERVICES &&
+                      node->service_count == 0U && node->alert_count == 0U);
+        lv_obj_t *dot = lv_obj_create(state->map_stage);
+        lv_obj_set_size(dot, size, size);
+        lv_obj_set_pos(dot, x - size / 2, y - size / 2);
+        lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_bg_color(dot, color, 0);
+        lv_obj_set_style_bg_opa(dot, muted ? LV_OPA_30 : LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(dot, node->alert_count > 0U ? 3 : 2, 0);
+        lv_obj_set_style_border_color(dot, lv_color_lighten(color, 35), 0);
+        lv_obj_set_style_shadow_width(dot, node->alert_count > 0U ? 16 : 8, 0);
+        lv_obj_set_style_shadow_color(dot, color, 0);
+        lv_obj_clear_flag(dot, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(dot, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(dot, pcap_map_node_click_cb, LV_EVENT_CLICKED,
+                            (void *)(uintptr_t)(i + 1U));
+
+        bool show_label = i < 22U || node->alert_count > 0U ||
+                          node->kind >= PCAP_MAP_NODE_MULTICAST;
+        if (!show_label) continue;
+        lv_obj_t *label = lv_label_create(state->map_stage);
+        if (node->kind == PCAP_MAP_NODE_OTHER_LOCAL ||
+            node->kind == PCAP_MAP_NODE_OTHER_EXTERNAL) {
+            lv_label_set_text_fmt(label, "%s +%u", node->address,
+                                  (unsigned)node->grouped_nodes);
+        } else if (node->hostname[0]) {
+            lv_label_set_text(label, node->hostname);
+        } else {
+            lv_label_set_text(label, node->address);
+        }
+        lv_obj_set_width(label, 124);
+        lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
+        lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_font(label, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(label, muted ? ui_muted_color() : ui_text_color(), 0);
+        lv_obj_set_pos(label, x - 62, y + size / 2 + 3);
+    }
+    pcap_map_update_mode_buttons(state);
+}
+
+static bool pcap_map_node_filterable(const pcap_map_node_t *node)
+{
+    if (!node) return false;
+    return node->kind == PCAP_MAP_NODE_LOCAL || node->kind == PCAP_MAP_NODE_EXTERNAL;
+}
+
+static void pcap_map_node_click_cb(lv_event_t *e)
+{
+    uintptr_t encoded = (uintptr_t)lv_event_get_user_data(e);
+    pcap_viewer_state_t *state = pcap_viewer_get_state(get_current_ctx(), false);
+    if (!state || !state->map_graph || encoded == 0U) return;
+    uint16_t node_index = (uint16_t)(encoded - 1U);
+    if (node_index >= state->map_graph->node_count) return;
+    state->map_selected_node = node_index;
+    const pcap_map_node_t *node = &state->map_graph->nodes[node_index];
+    if (state->map_detail_label && lv_obj_is_valid(state->map_detail_label)) {
+        lv_label_set_text_fmt(
+            state->map_detail_label,
+            "%s | %s%s%s | MAC %s | %lu flow(s) | services %u | alerts %u\n"
+            "TX %llu B / %lu pkt   RX %llu B / %lu pkt%s",
+            pcap_map_kind_name((pcap_map_node_kind_t)node->kind), node->address,
+            node->hostname[0] ? " | " : "", node->hostname[0] ? node->hostname : "",
+            node->mac[0] ? node->mac : "n/a", (unsigned long)node->flow_count,
+            (unsigned)node->service_count, (unsigned)node->alert_count,
+            (unsigned long long)node->sent_bytes, (unsigned long)node->sent_packets,
+            (unsigned long long)node->received_bytes, (unsigned long)node->received_packets,
+            node->grouped_nodes > 1U ? " | merged/grouped endpoints" : "");
+    }
+    if (state->map_filter_btn && lv_obj_is_valid(state->map_filter_btn)) {
+        if (pcap_map_node_filterable(node)) lv_obj_clear_state(state->map_filter_btn,
+                                                                LV_STATE_DISABLED);
+        else lv_obj_add_state(state->map_filter_btn, LV_STATE_DISABLED);
+    }
+}
+
+static void pcap_map_filter_selected_cb(lv_event_t *e)
+{
+    pcap_viewer_state_t *state = (pcap_viewer_state_t *)lv_event_get_user_data(e);
+    if (!state || !state->map_graph || state->map_selected_node < 0 ||
+        state->map_selected_node >= state->map_graph->node_count) return;
+    pcap_map_node_t selected = state->map_graph->nodes[state->map_selected_node];
+    if (!pcap_map_node_filterable(&selected)) return;
+    pcap_viewer_close_detail(state);
+    pcap_flow_filter_clear(&state->quick_filter);
+    state->quick_filter.enabled = true;
+    if (selected.kind == PCAP_MAP_NODE_LOCAL && pcap_map_mac_valid(selected.mac)) {
+        state->quick_filter.has_any_mac = true;
+        pcap_viewer_copy_text(state->quick_filter.any_mac,
+                              sizeof(state->quick_filter.any_mac), selected.mac);
+    } else {
+        state->quick_filter.has_any_address = true;
+        pcap_viewer_copy_text(state->quick_filter.any_address,
+                              sizeof(state->quick_filter.any_address), selected.address);
+    }
+    state->packet_page = 0;
+    pcap_viewer_render_capture_page(state);
+}
+
+static void pcap_map_mode_cb(lv_event_t *e)
+{
+    uintptr_t encoded = (uintptr_t)lv_event_get_user_data(e);
+    pcap_viewer_state_t *state = pcap_viewer_get_state(get_current_ctx(), false);
+    if (!state || encoded == 0U || encoded > PCAP_MAP_MODE_COUNT) return;
+    state->map_mode = (pcap_map_mode_t)(encoded - 1U);
+    pcap_map_render_stage(state);
+}
+
+static lv_obj_t *pcap_map_add_mode_button(pcap_viewer_state_t *state,
+                                          lv_obj_t *parent, const char *text,
+                                          pcap_map_mode_t mode, lv_color_t color)
+{
+    lv_obj_t *button = lv_btn_create(parent);
+    lv_obj_set_size(button, 0, 40);
+    lv_obj_set_flex_grow(button, 1);
+    lv_obj_set_style_bg_color(button, color, 0);
+    lv_obj_set_style_radius(button, 8, 0);
+    lv_obj_add_event_cb(button, pcap_map_mode_cb, LV_EVENT_CLICKED,
+                        (void *)(uintptr_t)(mode + 1U));
+    lv_obj_t *label = lv_label_create(button);
+    lv_label_set_text(label, text);
+    lv_obj_set_style_text_font(label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(label, lv_color_white(), 0);
+    lv_obj_center(label);
+    state->map_mode_buttons[mode] = button;
+    return button;
+}
+
+static void pcap_viewer_map_cb(lv_event_t *e)
+{
+    pcap_viewer_state_t *state = (pcap_viewer_state_t *)lv_event_get_user_data(e);
+    if (!state || !state->flow_analysis) return;
+    pcap_viewer_close_detail(state);
+    state->map_graph = heap_caps_calloc(1, sizeof(*state->map_graph),
+                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!state->map_graph || !pcap_map_build_graph(state->flow_analysis,
+                                                   state->map_graph)) {
+        if (state->map_graph) {
+            heap_caps_free(state->map_graph);
+            state->map_graph = NULL;
+        }
+        pcap_viewer_show_summary_popup(state, "ESPShark Map", "Not enough PSRAM to build map.");
+        return;
+    }
+    state->map_mode = PCAP_MAP_MODE_TRAFFIC;
+    state->map_selected_node = -1;
+    state->detail_overlay = lv_obj_create(lv_scr_act());
+    lv_obj_remove_style_all(state->detail_overlay);
+    lv_obj_set_size(state->detail_overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(state->detail_overlay, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(state->detail_overlay, LV_OPA_80, 0);
+    lv_obj_add_flag(state->detail_overlay, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(state->detail_overlay, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *popup = lv_obj_create(state->detail_overlay);
+    lv_obj_set_size(popup, lv_pct(96), lv_pct(94));
+    lv_obj_center(popup);
+    style_surface_panel(popup, 12);
+    lv_obj_set_style_border_width(popup, 2, 0);
+    lv_obj_set_style_border_color(popup, COLOR_NEON_CYAN, 0);
+    lv_obj_set_style_pad_all(popup, 9, 0);
+    lv_obj_set_style_pad_row(popup, 6, 0);
+    lv_obj_set_flex_flow(popup, LV_FLEX_FLOW_COLUMN);
+    lv_obj_clear_flag(popup, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *header = lv_obj_create(popup);
+    lv_obj_set_size(header, lv_pct(100), 42);
+    lv_obj_set_style_bg_opa(header, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(header, 0, 0);
+    lv_obj_set_style_pad_all(header, 0, 0);
+    lv_obj_set_style_pad_column(header, 10, 0);
+    lv_obj_set_flex_flow(header, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(header, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(header, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *title = lv_label_create(header);
+    lv_label_set_text(title, "ESPShark Communication Map");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, COLOR_NEON_CYAN, 0);
+    lv_obj_set_flex_grow(title, 1);
+    lv_obj_t *scope = lv_label_create(header);
+    lv_label_set_text_fmt(scope, "OBSERVED IN CAPTURE%s | %u nodes | %u links",
+                          state->scan_summary.indexed_packets < state->scan_summary.packet_count
+                              ? " / SAMPLE" : "",
+                          (unsigned)state->map_graph->node_count,
+                          (unsigned)state->map_graph->edge_count);
+    lv_obj_set_style_text_font(scope, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(scope, state->map_graph->limited
+                                          ? COLOR_MATERIAL_AMBER : COLOR_NEON_GREEN, 0);
+    lv_obj_t *close = lv_btn_create(header);
+    lv_obj_set_size(close, 90, 38);
+    lv_obj_set_style_bg_color(close, COLOR_MATERIAL_BLUE, 0);
+    lv_obj_set_style_radius(close, 8, 0);
+    lv_obj_add_event_cb(close, pcap_viewer_packet_detail_close_cb,
+                        LV_EVENT_CLICKED, state);
+    lv_obj_t *close_label = lv_label_create(close);
+    lv_label_set_text(close_label, "CLOSE");
+    lv_obj_center(close_label);
+
+    lv_obj_t *controls = lv_obj_create(popup);
+    lv_obj_set_size(controls, lv_pct(100), 42);
+    lv_obj_set_style_bg_opa(controls, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(controls, 0, 0);
+    lv_obj_set_style_pad_all(controls, 0, 0);
+    lv_obj_set_style_pad_column(controls, 8, 0);
+    lv_obj_set_flex_flow(controls, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(controls, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(controls, LV_OBJ_FLAG_SCROLLABLE);
+    pcap_map_add_mode_button(state, controls, "TRAFFIC", PCAP_MAP_MODE_TRAFFIC,
+                             lv_color_hex(0x087EA4));
+    pcap_map_add_mode_button(state, controls, "THREATS", PCAP_MAP_MODE_THREATS,
+                             COLOR_MATERIAL_RED);
+    pcap_map_add_mode_button(state, controls, "SERVICES", PCAP_MAP_MODE_SERVICES,
+                             COLOR_MATERIAL_PURPLE);
+    lv_obj_t *legend = lv_label_create(controls);
+    lv_label_set_text(legend, "LAN green | WAN purple | groups cyan | alert red/amber");
+    lv_obj_set_width(legend, 430);
+    lv_label_set_long_mode(legend, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_font(legend, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(legend, ui_muted_color(), 0);
+
+    state->map_stage = lv_obj_create(popup);
+    lv_obj_set_size(state->map_stage, lv_pct(100), 0);
+    lv_obj_set_flex_grow(state->map_stage, 1);
+    lv_obj_set_style_bg_color(state->map_stage, lv_color_hex(0x050A14), 0);
+    lv_obj_set_style_border_width(state->map_stage, 1, 0);
+    lv_obj_set_style_border_color(state->map_stage, ui_border_color(), 0);
+    lv_obj_set_style_radius(state->map_stage, 8, 0);
+    lv_obj_set_style_pad_all(state->map_stage, 8, 0);
+    lv_obj_clear_flag(state->map_stage, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *detail = lv_obj_create(popup);
+    lv_obj_set_size(detail, lv_pct(100), 68);
+    lv_obj_set_style_bg_color(detail, ui_card_color(), 0);
+    lv_obj_set_style_border_width(detail, 1, 0);
+    lv_obj_set_style_border_color(detail, ui_border_color(), 0);
+    lv_obj_set_style_radius(detail, 8, 0);
+    lv_obj_set_style_pad_all(detail, 6, 0);
+    lv_obj_set_style_pad_column(detail, 8, 0);
+    lv_obj_set_flex_flow(detail, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(detail, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(detail, LV_OBJ_FLAG_SCROLLABLE);
+    state->map_detail_label = lv_label_create(detail);
+    lv_label_set_text_fmt(
+        state->map_detail_label,
+        "Tap a node for evidence | observed devices LAN %u / WAN %u | alerts %u%s\n"
+        "Absence of a link does not prove absence of communication.",
+        (unsigned)state->map_graph->local_nodes,
+        (unsigned)state->map_graph->external_nodes,
+        (unsigned)state->map_graph->global_alerts,
+        state->map_graph->limited ? " | MAP LIMITED" : "");
+    lv_obj_set_width(state->map_detail_label, 0);
+    lv_obj_set_flex_grow(state->map_detail_label, 1);
+    lv_label_set_long_mode(state->map_detail_label, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_font(state->map_detail_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(state->map_detail_label, ui_text_color(), 0);
+    state->map_filter_btn = lv_btn_create(detail);
+    lv_obj_set_size(state->map_filter_btn, 150, 44);
+    lv_obj_set_style_bg_color(state->map_filter_btn, COLOR_MATERIAL_TEAL, 0);
+    lv_obj_set_style_radius(state->map_filter_btn, 8, 0);
+    lv_obj_add_state(state->map_filter_btn, LV_STATE_DISABLED);
+    lv_obj_add_event_cb(state->map_filter_btn, pcap_map_filter_selected_cb,
+                        LV_EVENT_CLICKED, state);
+    lv_obj_t *filter_label = lv_label_create(state->map_filter_btn);
+    lv_label_set_text(filter_label, "FILTER NODE");
+    lv_obj_set_style_text_color(filter_label, lv_color_white(), 0);
+    lv_obj_center(filter_label);
+    lv_obj_update_layout(popup);
+    pcap_map_render_stage(state);
+    ESP_LOGI(TAG, "[ESPShark] Communication map: nodes=%u edges=%u hidden_nodes=%u hidden_edges=%u alerts=%u",
+             (unsigned)state->map_graph->node_count,
+             (unsigned)state->map_graph->edge_count,
+             (unsigned)state->map_graph->hidden_nodes,
+             (unsigned)state->map_graph->hidden_edges,
+             (unsigned)state->map_graph->global_alerts);
+}
+
 static void pcap_viewer_clear_quick_filter_cb(lv_event_t *e)
 {
     pcap_viewer_state_t *state = (pcap_viewer_state_t *)lv_event_get_user_data(e);
@@ -36271,11 +37523,13 @@ static void pcap_viewer_artifact_task(void *arg)
     char output_path[PCAP_ANALYSIS_STORE_PATH_MAX] = {0};
     pcap_analysis_store_status_t result = PCAP_ANALYSIS_STORE_INVALID;
     if (state->artifact_action == PCAP_ARTIFACT_EXPORT_REPORT) {
+        uint32_t selected_matches = pcap_viewer_filtered_packet_count(state);
         result = pcap_analysis_export_report_json(
             state->selected_path, &state->capture_info, &state->scan_summary,
             state->summary, state->flow_analysis, state->packet_flags,
             state->scan_summary.indexed_packets,
-            state->packet_filter, state->cache_hit, output_path, sizeof(output_path));
+            state->packet_filter, &state->quick_filter, selected_matches,
+            state->cache_hit, output_path, sizeof(output_path));
         if (result == PCAP_ANALYSIS_STORE_OK) {
             snprintf(state->artifact_message, sizeof(state->artifact_message),
                      "Analysis report saved:\n%s", output_path);
@@ -36340,8 +37594,8 @@ static void pcap_viewer_tool_action_cb(lv_event_t *e)
     if (action == PCAP_TOOL_REANALYZE) {
         char path[PCAP_VIEWER_PATH_MAX];
         char name[96];
-        snprintf(path, sizeof(path), "%s", state->selected_path);
-        snprintf(name, sizeof(name), "%s", state->selected_name);
+        pcap_viewer_copy_text(path, sizeof(path), state->selected_path);
+        pcap_viewer_copy_text(name, sizeof(name), state->selected_name);
         pcap_viewer_close_tools_popup(state);
         pcap_viewer_start_file_load(state, path, name, true);
         return;
@@ -36353,6 +37607,7 @@ static void pcap_viewer_tool_action_cb(lv_event_t *e)
         pcap_analysis_store_status_t result = PCAP_ANALYSIS_STORE_INVALID;
         if (action == PCAP_TOOL_SAVE_FILTER) {
             result = pcap_analysis_filter_profile_save(state->packet_filter,
+                                                       &state->quick_filter,
                                                        artifact_path, sizeof(artifact_path));
             snprintf(state->artifact_message, sizeof(state->artifact_message),
                      result == PCAP_ANALYSIS_STORE_OK
@@ -36362,10 +37617,19 @@ static void pcap_viewer_tool_action_cb(lv_event_t *e)
                          ? artifact_path : pcap_analysis_store_status_name(result));
         } else if (action == PCAP_TOOL_LOAD_FILTER) {
             pcap_packet_filter_t loaded_filter = PCAP_FILTER_ALL;
+            pcap_flow_filter_t loaded_quick_filter;
+            pcap_flow_filter_clear(&loaded_quick_filter);
             result = pcap_analysis_filter_profile_load(&loaded_filter,
+                                                       &loaded_quick_filter,
                                                        artifact_path, sizeof(artifact_path));
             if (result == PCAP_ANALYSIS_STORE_OK) {
                 state->packet_filter = loaded_filter;
+                state->quick_filter = loaded_quick_filter;
+                if (state->quick_filter.has_flow &&
+                    (!state->flow_analysis ||
+                     state->quick_filter.flow_id >= state->flow_analysis->flow_count)) {
+                    state->quick_filter.has_flow = false;
+                }
                 state->packet_page = 0;
                 snprintf(state->artifact_message, sizeof(state->artifact_message),
                          "Loaded filter %s from:\n%s",
@@ -36594,7 +37858,7 @@ static void pcap_viewer_render_capture_page(pcap_viewer_state_t *state)
                           state->cache_hit
                               ? "#5EDCA3 CACHE HIT - analysis loaded from SD#"
                               : (state->cache_available
-                                     ? "#52B6FF ANALYZED - cache v2 saved#"
+                                     ? "#52B6FF ANALYZED - cache v3 saved#"
                                      : "#F9A825 ANALYZED - cache unavailable#"));
     lv_label_set_recolor(summary_label, true);
     lv_obj_set_width(summary_label, lv_pct(100));
@@ -36603,73 +37867,156 @@ static void pcap_viewer_render_capture_page(pcap_viewer_state_t *state)
     lv_obj_set_style_text_color(summary_label, ui_text_color(), 0);
 
     lv_obj_t *analysis_actions = lv_obj_create(page);
-    lv_obj_set_size(analysis_actions, lv_pct(100), 46);
+    lv_obj_set_size(analysis_actions, lv_pct(100), 92);
     lv_obj_set_style_bg_opa(analysis_actions, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(analysis_actions, 0, 0);
     lv_obj_set_style_pad_all(analysis_actions, 0, 0);
-    lv_obj_set_style_pad_column(analysis_actions, 10, 0);
-    lv_obj_set_flex_flow(analysis_actions, LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_row(analysis_actions, 6, 0);
+    lv_obj_set_flex_flow(analysis_actions, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(analysis_actions, LV_FLEX_ALIGN_START,
                           LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_clear_flag(analysis_actions, LV_OBJ_FLAG_SCROLLABLE);
 
-    lv_obj_t *overview_btn = lv_btn_create(analysis_actions);
-    lv_obj_set_size(overview_btn, 190, 42);
+    lv_obj_t *analysis_row_top = lv_obj_create(analysis_actions);
+    lv_obj_set_size(analysis_row_top, lv_pct(100), 42);
+    lv_obj_set_style_bg_opa(analysis_row_top, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(analysis_row_top, 0, 0);
+    lv_obj_set_style_pad_all(analysis_row_top, 0, 0);
+    lv_obj_set_style_pad_column(analysis_row_top, 8, 0);
+    lv_obj_set_flex_flow(analysis_row_top, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(analysis_row_top, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(analysis_row_top, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *analysis_row_bottom = lv_obj_create(analysis_actions);
+    lv_obj_set_size(analysis_row_bottom, lv_pct(100), 42);
+    lv_obj_set_style_bg_opa(analysis_row_bottom, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(analysis_row_bottom, 0, 0);
+    lv_obj_set_style_pad_all(analysis_row_bottom, 0, 0);
+    lv_obj_set_style_pad_column(analysis_row_bottom, 8, 0);
+    lv_obj_set_flex_flow(analysis_row_bottom, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(analysis_row_bottom, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(analysis_row_bottom, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *overview_btn = lv_btn_create(analysis_row_top);
+    lv_obj_set_size(overview_btn, 0, 42);
+    lv_obj_set_flex_grow(overview_btn, 1);
     lv_obj_set_style_bg_color(overview_btn, lv_color_hex(0x087EA4), 0);
     lv_obj_set_style_radius(overview_btn, 8, 0);
     lv_obj_add_event_cb(overview_btn, pcap_viewer_summary_cb,
                         LV_EVENT_CLICKED, (void *)(uintptr_t)1U);
     lv_obj_t *overview_label = lv_label_create(overview_btn);
     lv_label_set_text(overview_label, LV_SYMBOL_EYE_OPEN " OVERVIEW");
+    lv_obj_set_style_text_font(overview_label, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(overview_label, lv_color_white(), 0);
     lv_obj_center(overview_label);
 
-    lv_obj_t *dns_btn = lv_btn_create(analysis_actions);
-    lv_obj_set_size(dns_btn, 190, 42);
+    lv_obj_t *dns_btn = lv_btn_create(analysis_row_top);
+    lv_obj_set_size(dns_btn, 0, 42);
+    lv_obj_set_flex_grow(dns_btn, 1);
     lv_obj_set_style_bg_color(dns_btn, COLOR_MATERIAL_PURPLE, 0);
     lv_obj_set_style_radius(dns_btn, 8, 0);
     lv_obj_add_event_cb(dns_btn, pcap_viewer_summary_cb,
                         LV_EVENT_CLICKED, (void *)(uintptr_t)2U);
     lv_obj_t *dns_label = lv_label_create(dns_btn);
-    lv_label_set_text_fmt(dns_label, LV_SYMBOL_LIST " DNS SUMMARY (%llu)",
+    lv_label_set_text_fmt(dns_label, LV_SYMBOL_LIST " DNS (%llu)",
                           state->summary
                               ? (unsigned long long)state->summary->dns_packets : 0ULL);
+    lv_obj_set_style_text_font(dns_label, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(dns_label, lv_color_white(), 0);
     lv_obj_center(dns_label);
 
-    lv_obj_t *connections_btn = lv_btn_create(analysis_actions);
-    lv_obj_set_size(connections_btn, 190, 42);
+    lv_obj_t *connections_btn = lv_btn_create(analysis_row_top);
+    lv_obj_set_size(connections_btn, 0, 42);
+    lv_obj_set_flex_grow(connections_btn, 1);
     lv_obj_set_style_bg_color(connections_btn, COLOR_MATERIAL_BLUE, 0);
     lv_obj_set_style_radius(connections_btn, 8, 0);
     lv_obj_add_event_cb(connections_btn, pcap_viewer_connections_cb,
                         LV_EVENT_CLICKED, state);
     lv_obj_t *connections_label = lv_label_create(connections_btn);
-    lv_label_set_text_fmt(connections_label, LV_SYMBOL_LIST " CONNECTIONS (%lu)",
+    lv_label_set_text_fmt(connections_label, LV_SYMBOL_LIST " FLOWS (%lu)",
                           state->flow_analysis
                               ? (unsigned long)state->flow_analysis->flow_count : 0UL);
     lv_obj_set_style_text_font(connections_label, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(connections_label, lv_color_white(), 0);
     lv_obj_center(connections_label);
 
-    lv_obj_t *protocols_btn = lv_btn_create(analysis_actions);
-    lv_obj_set_size(protocols_btn, 180, 42);
+    lv_obj_t *protocols_btn = lv_btn_create(analysis_row_top);
+    lv_obj_set_size(protocols_btn, 0, 42);
+    lv_obj_set_flex_grow(protocols_btn, 1);
     lv_obj_set_style_bg_color(protocols_btn, COLOR_MATERIAL_AMBER, 0);
     lv_obj_set_style_radius(protocols_btn, 8, 0);
     lv_obj_add_event_cb(protocols_btn, pcap_viewer_protocols_cb,
                         LV_EVENT_CLICKED, state);
     lv_obj_t *protocols_label = lv_label_create(protocols_btn);
-    lv_label_set_text(protocols_label, LV_SYMBOL_LIST " TOP PROTOCOLS");
+    lv_label_set_text(protocols_label, LV_SYMBOL_LIST " APPS");
     lv_obj_set_style_text_font(protocols_label, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(protocols_label, lv_color_white(), 0);
     lv_obj_center(protocols_label);
 
-    lv_obj_t *tools_btn = lv_btn_create(analysis_actions);
-    lv_obj_set_size(tools_btn, 220, 42);
+    lv_obj_t *devices_btn = lv_btn_create(analysis_row_bottom);
+    lv_obj_set_size(devices_btn, 0, 42);
+    lv_obj_set_flex_grow(devices_btn, 1);
+    lv_obj_set_style_bg_color(devices_btn, COLOR_MATERIAL_GREEN, 0);
+    lv_obj_set_style_radius(devices_btn, 8, 0);
+    lv_obj_add_event_cb(devices_btn, pcap_viewer_devices_cb,
+                        LV_EVENT_CLICKED, state);
+    lv_obj_t *devices_label = lv_label_create(devices_btn);
+    lv_label_set_text_fmt(devices_label, LV_SYMBOL_HOME " DEVICES (%lu)",
+                          state->flow_analysis
+                              ? (unsigned long)state->flow_analysis->device_count : 0UL);
+    lv_obj_set_style_text_font(devices_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(devices_label, lv_color_white(), 0);
+    lv_obj_center(devices_label);
+
+    lv_obj_t *health_btn = lv_btn_create(analysis_row_bottom);
+    lv_obj_set_size(health_btn, 0, 42);
+    lv_obj_set_flex_grow(health_btn, 1);
+    lv_color_t health_color = !state->flow_analysis
+                                  ? lv_color_hex(0x555555)
+                                  : (state->flow_analysis->health_level >= PCAP_HEALTH_SUSPICIOUS
+                                         ? COLOR_MATERIAL_RED
+                                         : (state->flow_analysis->health_level == PCAP_HEALTH_WATCH
+                                                ? COLOR_MATERIAL_AMBER
+                                                : COLOR_MATERIAL_TEAL));
+    lv_obj_set_style_bg_color(health_btn, health_color, 0);
+    lv_obj_set_style_radius(health_btn, 8, 0);
+    lv_obj_add_event_cb(health_btn, pcap_viewer_health_cb,
+                        LV_EVENT_CLICKED, state);
+    lv_obj_t *health_label = lv_label_create(health_btn);
+    lv_label_set_text_fmt(
+        health_label, LV_SYMBOL_WARNING " HEALTH %s (%lu)",
+        state->flow_analysis
+            ? pcap_flow_health_name((pcap_health_level_t)state->flow_analysis->health_level)
+            : "N/A",
+        state->flow_analysis ? (unsigned long)state->flow_analysis->alert_count : 0UL);
+    lv_obj_set_style_text_font(health_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(health_label, lv_color_white(), 0);
+    lv_obj_center(health_label);
+
+    lv_obj_t *map_btn = lv_btn_create(analysis_row_bottom);
+    lv_obj_set_size(map_btn, 0, 42);
+    lv_obj_set_flex_grow(map_btn, 1);
+    lv_obj_set_style_bg_color(map_btn, lv_color_hex(0x1565C0), 0);
+    lv_obj_set_style_radius(map_btn, 8, 0);
+    lv_obj_add_event_cb(map_btn, pcap_viewer_map_cb,
+                        LV_EVENT_CLICKED, state);
+    lv_obj_t *map_label = lv_label_create(map_btn);
+    lv_label_set_text(map_label, "MAP");
+    lv_obj_set_style_text_font(map_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(map_label, lv_color_white(), 0);
+    lv_obj_center(map_label);
+
+    lv_obj_t *tools_btn = lv_btn_create(analysis_row_bottom);
+    lv_obj_set_size(tools_btn, 0, 42);
+    lv_obj_set_flex_grow(tools_btn, 1);
     lv_obj_set_style_bg_color(tools_btn, COLOR_MATERIAL_TEAL, 0);
     lv_obj_set_style_radius(tools_btn, 8, 0);
     lv_obj_add_event_cb(tools_btn, pcap_viewer_tools_cb, LV_EVENT_CLICKED, state);
     lv_obj_t *tools_label = lv_label_create(tools_btn);
-    lv_label_set_text(tools_label, LV_SYMBOL_SAVE " CACHE / EXPORT");
+    lv_label_set_text(tools_label, LV_SYMBOL_SAVE " EXPORT");
+    lv_obj_set_style_text_font(tools_label, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(tools_label, lv_color_white(), 0);
     lv_obj_center(tools_label);
 
