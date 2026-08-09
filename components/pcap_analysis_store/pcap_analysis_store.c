@@ -705,6 +705,12 @@ pcap_analysis_store_status_t pcap_analysis_export_report_json(
             (unsigned long)flow_analysis->overflow_packets,
             flow_analysis->device_limited ? "true" : "false",
             flow_analysis->alert_limited ? "true" : "false");
+    fprintf(report,
+            "  \"inventory\":{\"local_devices\":%lu,\"remote_endpoints\":%lu,"
+            "\"bounded_sample\":%s},\n",
+            (unsigned long)pcap_flow_local_device_count(flow_analysis),
+            (unsigned long)pcap_flow_remote_endpoint_count(flow_analysis),
+            flow_analysis->device_limited ? "true" : "false");
     fputs("  \"devices\":[", report);
     for (uint32_t i = 0; i < flow_analysis->device_count; i++) {
         const pcap_device_entry_t *device = &flow_analysis->devices[i];

@@ -36062,11 +36062,12 @@ static void pcap_viewer_summary_cb(lv_event_t *e)
         if (state->flow_analysis) {
             pcap_viewer_append_text(
                 text_buffer, 8192, &position,
-                "Health: %s | alerts %lu | devices %lu | flows %lu\n",
+                "Health: %s | alerts %lu | local devices %lu | remote endpoints %lu | flows %lu\n",
                 pcap_flow_health_name(
                     (pcap_health_level_t)state->flow_analysis->health_level),
                 (unsigned long)state->flow_analysis->alert_count,
-                (unsigned long)state->flow_analysis->device_count,
+                (unsigned long)pcap_flow_local_device_count(state->flow_analysis),
+                (unsigned long)pcap_flow_remote_endpoint_count(state->flow_analysis),
                 (unsigned long)state->flow_analysis->flow_count);
         }
         pcap_viewer_append_top_text(text_buffer, 8192, &position, "Protocols",
@@ -36394,39 +36395,195 @@ static void pcap_viewer_device_filter_cb(lv_event_t *e)
     const pcap_device_entry_t *device = &state->flow_analysis->devices[device_index];
     pcap_flow_filter_clear(&state->quick_filter);
     state->quick_filter.enabled = true;
-    state->quick_filter.has_any_address = true;
-    pcap_viewer_copy_text(state->quick_filter.any_address,
-                          sizeof(state->quick_filter.any_address), device->address);
+    if (device->internal && device->mac[0]) {
+        state->quick_filter.has_any_mac = true;
+        pcap_viewer_copy_text(state->quick_filter.any_mac,
+                              sizeof(state->quick_filter.any_mac), device->mac);
+    } else {
+        state->quick_filter.has_any_address = true;
+        pcap_viewer_copy_text(state->quick_filter.any_address,
+                              sizeof(state->quick_filter.any_address), device->address);
+    }
     state->packet_page = 0;
     pcap_viewer_close_detail(state);
     pcap_viewer_render_capture_page(state);
 }
 
-static void pcap_viewer_devices_cb(lv_event_t *e)
+static uint64_t pcap_viewer_inventory_bytes(const pcap_flow_analysis_t *analysis,
+                                            uint16_t device_index, bool local_group)
 {
-    pcap_viewer_state_t *state = (pcap_viewer_state_t *)lv_event_get_user_data(e);
+    if (!analysis || device_index >= analysis->device_count) return 0U;
+    const pcap_device_entry_t *representative = &analysis->devices[device_index];
+    uint64_t bytes = 0U;
+    for (uint32_t i = 0; i < analysis->device_count; i++) {
+        const pcap_device_entry_t *candidate = &analysis->devices[i];
+        if (i == device_index ||
+            (local_group && pcap_flow_same_local_device(representative, candidate))) {
+            bytes += candidate->sent_bytes + candidate->received_bytes;
+        }
+    }
+    return bytes;
+}
+
+static bool pcap_viewer_local_device_representative(
+    const pcap_flow_analysis_t *analysis, uint16_t device_index)
+{
+    if (!analysis || device_index >= analysis->device_count ||
+        !analysis->devices[device_index].internal) return false;
+    for (uint16_t previous = 0; previous < device_index; previous++) {
+        if (pcap_flow_same_local_device(&analysis->devices[device_index],
+                                        &analysis->devices[previous])) return false;
+    }
+    return true;
+}
+
+static void pcap_viewer_inventory_services(const pcap_flow_analysis_t *analysis,
+                                           uint16_t device_index, bool local_group,
+                                           char *output, size_t output_size,
+                                           bool *limited_out)
+{
+    if (!output || output_size == 0U) return;
+    output[0] = '\0';
+    if (limited_out) *limited_out = false;
+    if (!analysis || device_index >= analysis->device_count) return;
+    const pcap_device_entry_t *representative = &analysis->devices[device_index];
+    struct {
+        uint16_t port;
+        uint8_t protocol;
+    } visible[5];
+    uint16_t visible_count = 0U;
+    bool more_services = false;
+    for (uint32_t i = 0; i < analysis->device_count; i++) {
+        const pcap_device_entry_t *candidate = &analysis->devices[i];
+        if (i != device_index &&
+            (!local_group || !pcap_flow_same_local_device(representative, candidate))) continue;
+        if (candidate->service_limited) more_services = true;
+        for (uint16_t service_index = 0; service_index < candidate->service_count;
+             service_index++) {
+            const pcap_device_service_t *service = &candidate->services[service_index];
+            bool duplicate = false;
+            for (uint16_t visible_index = 0; visible_index < visible_count; visible_index++) {
+                if (visible[visible_index].port == service->port &&
+                    visible[visible_index].protocol == service->ip_protocol) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (duplicate) continue;
+            if (visible_count >= 5U) {
+                more_services = true;
+                continue;
+            }
+            visible[visible_count].port = service->port;
+            visible[visible_count].protocol = service->ip_protocol;
+            visible_count++;
+        }
+    }
+    size_t position = 0U;
+    for (uint16_t i = 0; i < visible_count; i++) {
+        pcap_viewer_append_text(output, output_size, &position, "%s%s/%u",
+                                i ? ", " : "",
+                                pcap_flow_transport_name(visible[i].protocol),
+                                visible[i].port);
+    }
+    if (more_services) pcap_viewer_append_text(output, output_size, &position, " + more");
+    if (limited_out) *limited_out = more_services;
+}
+
+static void pcap_viewer_devices_cb(lv_event_t *e);
+static void pcap_viewer_remote_endpoints_cb(lv_event_t *e);
+
+static void pcap_viewer_inventory_mode_button(lv_obj_t *parent, const char *text,
+                                              bool active, lv_event_cb_t callback,
+                                              pcap_viewer_state_t *state)
+{
+    lv_obj_t *button = lv_btn_create(parent);
+    lv_obj_set_size(button, 0, 40);
+    lv_obj_set_flex_grow(button, 1);
+    lv_obj_set_style_bg_color(button,
+                              active ? COLOR_MATERIAL_GREEN : ui_card_pressed_color(), 0);
+    lv_obj_set_style_border_width(button, active ? 2 : 1, 0);
+    lv_obj_set_style_border_color(button,
+                                  active ? COLOR_NEON_CYAN : ui_border_color(), 0);
+    lv_obj_set_style_radius(button, 7, 0);
+    lv_obj_add_event_cb(button, callback, LV_EVENT_CLICKED, state);
+    lv_obj_t *label = lv_label_create(button);
+    lv_label_set_text(label, text);
+    lv_obj_set_style_text_font(label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(label, lv_color_white(), 0);
+    lv_obj_center(label);
+}
+
+static void pcap_viewer_render_inventory(pcap_viewer_state_t *state, bool remote_mode)
+{
     if (!state || !state->flow_analysis) return;
+    const pcap_flow_analysis_t *analysis = state->flow_analysis;
+    uint32_t local_count = pcap_flow_local_device_count(analysis);
+    uint32_t remote_count = pcap_flow_remote_endpoint_count(analysis);
     lv_obj_t *list = pcap_viewer_create_analysis_list(
-        state, LV_SYMBOL_HOME " Devices & Services (tap to filter)");
+        state, remote_mode ? LV_SYMBOL_GPS " Remote Endpoints (tap to filter)"
+                           : LV_SYMBOL_HOME " Local Devices (tap to filter)");
     if (!list) return;
-    if (state->flow_analysis->device_limited) {
+
+    lv_obj_t *mode_row = lv_obj_create(list);
+    lv_obj_set_size(mode_row, lv_pct(100), 44);
+    lv_obj_set_style_bg_opa(mode_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(mode_row, 0, 0);
+    lv_obj_set_style_pad_all(mode_row, 0, 0);
+    lv_obj_set_style_pad_column(mode_row, 8, 0);
+    lv_obj_set_flex_flow(mode_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(mode_row, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(mode_row, LV_OBJ_FLAG_SCROLLABLE);
+    char local_text[48];
+    char remote_text[48];
+    snprintf(local_text, sizeof(local_text), "LOCAL DEVICES (%lu)",
+             (unsigned long)local_count);
+    snprintf(remote_text, sizeof(remote_text), "REMOTE (%lu%s)",
+             (unsigned long)remote_count, analysis->device_limited ? "+" : "");
+    pcap_viewer_inventory_mode_button(mode_row, local_text, !remote_mode,
+                                      pcap_viewer_devices_cb, state);
+    pcap_viewer_inventory_mode_button(mode_row, remote_text, remote_mode,
+                                      pcap_viewer_remote_endpoints_cb, state);
+
+    lv_obj_t *explanation = lv_label_create(list);
+    lv_label_set_text(
+        explanation,
+        remote_mode
+            ? "Internet peers are kept as separate IP endpoints. Their MAC often belongs to the gateway."
+            : "Private/link-local IPv4 and IPv6 addresses sharing a MAC are one local device.");
+    lv_obj_set_width(explanation, lv_pct(100));
+    lv_label_set_long_mode(explanation, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(explanation, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(explanation, COLOR_MATERIAL_CYAN, 0);
+
+    if (analysis->device_limited) {
         lv_obj_t *warning = lv_label_create(list);
-        lv_label_set_text(warning,
-                          "DEVICE TABLE LIMITED - inventory is a bounded capture sample.");
+        lv_label_set_text(
+            warning,
+            remote_mode
+                ? "ENDPOINT TABLE LIMITED - remote results are a bounded sample."
+                : "ENDPOINT TABLE LIMITED - local entries are prioritized over WAN, but this remains a capture sample.");
+        lv_obj_set_width(warning, lv_pct(100));
+        lv_label_set_long_mode(warning, LV_LABEL_LONG_WRAP);
         lv_obj_set_style_text_color(warning, COLOR_MATERIAL_AMBER, 0);
     }
+
     uint16_t order[PCAP_FLOW_MAX_DEVICES];
-    uint32_t count = state->flow_analysis->device_count;
-    for (uint16_t i = 0; i < count; i++) order[i] = i;
+    uint32_t count = 0U;
+    for (uint16_t i = 0; i < analysis->device_count; i++) {
+        if ((remote_mode && !analysis->devices[i].internal) ||
+            (!remote_mode && pcap_viewer_local_device_representative(analysis, i))) {
+            order[count++] = i;
+        }
+    }
     for (uint32_t i = 0; i < count; i++) {
         uint32_t best = i;
         for (uint32_t j = i + 1U; j < count; j++) {
-            const pcap_device_entry_t *candidate =
-                &state->flow_analysis->devices[order[j]];
-            const pcap_device_entry_t *selected =
-                &state->flow_analysis->devices[order[best]];
-            uint64_t candidate_bytes = candidate->sent_bytes + candidate->received_bytes;
-            uint64_t selected_bytes = selected->sent_bytes + selected->received_bytes;
+            uint64_t candidate_bytes =
+                pcap_viewer_inventory_bytes(analysis, order[j], !remote_mode);
+            uint64_t selected_bytes =
+                pcap_viewer_inventory_bytes(analysis, order[best], !remote_mode);
             if (candidate_bytes > selected_bytes) best = j;
         }
         uint16_t swap = order[i];
@@ -36435,10 +36592,9 @@ static void pcap_viewer_devices_cb(lv_event_t *e)
     }
     for (uint32_t row_index = 0; row_index < count; row_index++) {
         uint16_t device_index = order[row_index];
-        const pcap_device_entry_t *device =
-            &state->flow_analysis->devices[device_index];
+        const pcap_device_entry_t *device = &analysis->devices[device_index];
         lv_obj_t *row = lv_btn_create(list);
-        lv_obj_set_size(row, lv_pct(100), 66);
+        lv_obj_set_size(row, lv_pct(100), remote_mode ? 66 : 82);
         lv_obj_set_style_bg_color(row,
                                   (row_index & 1U) ? ui_card_pressed_color() : ui_card_color(), 0);
         lv_obj_set_style_border_width(row, 1, 0);
@@ -36447,33 +36603,77 @@ static void pcap_viewer_devices_cb(lv_event_t *e)
         lv_obj_add_event_cb(row, pcap_viewer_device_filter_cb, LV_EVENT_CLICKED,
                             (void *)(uintptr_t)(device_index + 1U));
         char services[160] = {0};
-        size_t position = 0U;
-        for (uint16_t service_index = 0;
-             service_index < device->service_count && service_index < 5U;
-             service_index++) {
-            const pcap_device_service_t *service = &device->services[service_index];
-            int written = snprintf(services + position, sizeof(services) - position,
-                                   "%s%s/%u", service_index ? ", " : "",
-                                   pcap_flow_transport_name(service->ip_protocol),
-                                   service->port);
-            if (written < 0 || (size_t)written >= sizeof(services) - position) break;
-            position += (size_t)written;
-        }
+        bool services_limited = false;
+        pcap_viewer_inventory_services(analysis, device_index, !remote_mode,
+                                       services, sizeof(services), &services_limited);
         lv_obj_t *label = lv_label_create(row);
-        lv_label_set_text_fmt(
-            label, "%s%s%s  |  %s  |  %s\nTX %llu B/%lu pkt | RX %llu B/%lu pkt | services: %s%s",
-            device->internal ? "LAN  " : "WAN  ", device->address,
-            device->hostname[0] ? "  " : "", device->hostname[0] ? device->hostname : "no name",
-            device->mac[0] ? device->mac : "no MAC",
-            (unsigned long long)device->sent_bytes, (unsigned long)device->sent_packets,
-            (unsigned long long)device->received_bytes, (unsigned long)device->received_packets,
-            services[0] ? services : "none", device->service_limited ? " + LIMITED" : "");
+        if (remote_mode) {
+            lv_label_set_text_fmt(
+                label, "WAN  %s  |  %s\nTX %llu B/%lu pkt | RX %llu B/%lu pkt | services: %s%s",
+                device->address, device->hostname[0] ? device->hostname : "no name",
+                (unsigned long long)device->sent_bytes, (unsigned long)device->sent_packets,
+                (unsigned long long)device->received_bytes,
+                (unsigned long)device->received_packets,
+                services[0] ? services : "none", services_limited ? " [LIMITED]" : "");
+        } else {
+            char addresses[192] = {0};
+            size_t address_position = 0U;
+            uint32_t aliases = 0U;
+            uint64_t sent_bytes = 0U;
+            uint64_t received_bytes = 0U;
+            uint32_t sent_packets = 0U;
+            uint32_t received_packets = 0U;
+            const char *hostname = device->hostname;
+            for (uint32_t i = 0; i < analysis->device_count; i++) {
+                const pcap_device_entry_t *alias = &analysis->devices[i];
+                if (!pcap_flow_same_local_device(device, alias)) continue;
+                if (!hostname[0] && alias->hostname[0]) hostname = alias->hostname;
+                if (aliases < 3U) {
+                    pcap_viewer_append_text(addresses, sizeof(addresses), &address_position,
+                                            "%s%s", aliases ? " | " : "", alias->address);
+                }
+                aliases++;
+                sent_bytes += alias->sent_bytes;
+                received_bytes += alias->received_bytes;
+                sent_packets += alias->sent_packets;
+                received_packets += alias->received_packets;
+            }
+            if (aliases > 3U) {
+                pcap_viewer_append_text(addresses, sizeof(addresses), &address_position,
+                                        " | +%lu address(es)", (unsigned long)(aliases - 3U));
+            }
+            lv_label_set_text_fmt(
+                label, "LAN  %s  |  %s\nIP %s\nTX %llu B/%lu pkt | RX %llu B/%lu pkt | services: %s%s",
+                hostname[0] ? hostname : "no name", device->mac[0] ? device->mac : "no MAC",
+                addresses[0] ? addresses : device->address,
+                (unsigned long long)sent_bytes, (unsigned long)sent_packets,
+                (unsigned long long)received_bytes, (unsigned long)received_packets,
+                services[0] ? services : "none", services_limited ? " [LIMITED]" : "");
+        }
         lv_obj_set_width(label, lv_pct(100));
         lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
         lv_obj_set_style_text_font(label, &lv_font_montserrat_12, 0);
         lv_obj_set_style_text_color(label, ui_text_color(), 0);
         lv_obj_center(label);
     }
+    if (count == 0U) {
+        lv_obj_t *empty = lv_label_create(list);
+        lv_label_set_text(empty, remote_mode ? "No remote endpoints in the indexed sample."
+                                             : "No local devices in the indexed sample.");
+        lv_obj_set_style_text_color(empty, ui_muted_color(), 0);
+    }
+}
+
+static void pcap_viewer_devices_cb(lv_event_t *e)
+{
+    pcap_viewer_render_inventory(
+        (pcap_viewer_state_t *)lv_event_get_user_data(e), false);
+}
+
+static void pcap_viewer_remote_endpoints_cb(lv_event_t *e)
+{
+    pcap_viewer_render_inventory(
+        (pcap_viewer_state_t *)lv_event_get_user_data(e), true);
 }
 
 static void pcap_viewer_alert_filter_cb(lv_event_t *e)
@@ -36523,11 +36723,12 @@ static void pcap_viewer_health_cb(lv_event_t *e)
     lv_obj_t *health = lv_label_create(list);
     lv_label_set_text_fmt(
         health,
-        "%s | %lu alert(s) | %lu devices | DNS errors %lu/%lu | DNS-name indicators %lu | group traffic %lu/%lu\n"
+        "%s | %lu alert(s) | %lu local device(s) | %lu remote endpoint(s) | DNS errors %lu/%lu | DNS-name indicators %lu | group traffic %lu/%lu\n"
         "Heuristics describe evidence in this capture; they are not a security verdict.",
         pcap_flow_health_name((pcap_health_level_t)state->flow_analysis->health_level),
         (unsigned long)state->flow_analysis->alert_count,
-        (unsigned long)state->flow_analysis->device_count,
+        (unsigned long)pcap_flow_local_device_count(state->flow_analysis),
+        (unsigned long)pcap_flow_remote_endpoint_count(state->flow_analysis),
         (unsigned long)state->flow_analysis->dns_error_packets,
         (unsigned long)state->flow_analysis->dns_packets,
         (unsigned long)state->flow_analysis->dns_suspicious_names,
@@ -37858,7 +38059,7 @@ static void pcap_viewer_render_capture_page(pcap_viewer_state_t *state)
                           state->cache_hit
                               ? "#5EDCA3 CACHE HIT - analysis loaded from SD#"
                               : (state->cache_available
-                                     ? "#52B6FF ANALYZED - cache v3 saved#"
+                                     ? "#52B6FF ANALYZED - cache v4 saved#"
                                      : "#F9A825 ANALYZED - cache unavailable#"));
     lv_label_set_recolor(summary_label, true);
     lv_obj_set_width(summary_label, lv_pct(100));
@@ -37965,7 +38166,8 @@ static void pcap_viewer_render_capture_page(pcap_viewer_state_t *state)
     lv_obj_t *devices_label = lv_label_create(devices_btn);
     lv_label_set_text_fmt(devices_label, LV_SYMBOL_HOME " DEVICES (%lu)",
                           state->flow_analysis
-                              ? (unsigned long)state->flow_analysis->device_count : 0UL);
+                              ? (unsigned long)pcap_flow_local_device_count(
+                                    state->flow_analysis) : 0UL);
     lv_obj_set_style_text_font(devices_label, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(devices_label, lv_color_white(), 0);
     lv_obj_center(devices_label);

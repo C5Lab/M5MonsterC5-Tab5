@@ -243,6 +243,11 @@ const char *pcap_flow_transport_name(uint8_t ip_protocol);
 const char *pcap_flow_health_name(pcap_health_level_t level);
 const char *pcap_flow_alert_name(pcap_alert_type_t type);
 
+bool pcap_flow_same_local_device(const pcap_device_entry_t *left,
+                                 const pcap_device_entry_t *right);
+uint32_t pcap_flow_local_device_count(const pcap_flow_analysis_t *analysis);
+uint32_t pcap_flow_remote_endpoint_count(const pcap_flow_analysis_t *analysis);
+
 bool pcap_flow_filter_matches(
     const pcap_flow_filter_t *filter,
     const pcap_flow_analysis_t *analysis,

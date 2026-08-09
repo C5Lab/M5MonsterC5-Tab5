@@ -102,6 +102,12 @@ static bool mac_is_group(const char *mac)
     return sscanf(mac, "%2x", &first) == 1 && (first & 1U) != 0U;
 }
 
+static bool mac_is_usable_identity(const char *mac)
+{
+    return mac && mac[0] && !mac_is_group(mac) &&
+           strcasecmp(mac, "00:00:00:00:00:00") != 0;
+}
+
 static uint16_t read_payload_be16(const uint8_t *data)
 {
     return (uint16_t)(((uint16_t)data[0] << 8) | data[1]);
@@ -450,6 +456,23 @@ static int find_device(const pcap_flow_analysis_t *analysis, const char *address
     return -1;
 }
 
+static int find_remote_device_replacement(const pcap_flow_analysis_t *analysis)
+{
+    if (!analysis) return -1;
+    int replacement = -1;
+    uint64_t replacement_bytes = UINT64_MAX;
+    for (uint32_t i = 0; i < analysis->device_count; i++) {
+        const pcap_device_entry_t *device = &analysis->devices[i];
+        if (device->internal) continue;
+        uint64_t bytes = device->sent_bytes + device->received_bytes;
+        if (replacement < 0 || bytes < replacement_bytes) {
+            replacement = (int)i;
+            replacement_bytes = bytes;
+        }
+    }
+    return replacement;
+}
+
 static pcap_device_entry_t *observe_device(pcap_flow_analysis_t *analysis,
                                            const char *address, const char *mac,
                                            uint64_t time_us, bool sent,
@@ -460,16 +483,20 @@ static pcap_device_entry_t *observe_device(pcap_flow_analysis_t *analysis,
     if (index < 0) {
         if (analysis->device_count >= PCAP_FLOW_MAX_DEVICES) {
             analysis->device_limited = true;
-            return NULL;
+            if (!address_is_internal(address)) return NULL;
+            index = find_remote_device_replacement(analysis);
+            if (index < 0) return NULL;
+            memset(&analysis->devices[index], 0, sizeof(analysis->devices[index]));
+        } else {
+            index = (int)analysis->device_count++;
         }
-        index = (int)analysis->device_count++;
         pcap_device_entry_t *created = &analysis->devices[index];
         copy_text(created->address, sizeof(created->address), address, strlen(address));
         created->internal = address_is_internal(address);
         created->first_time_us = time_us;
     }
     pcap_device_entry_t *device = &analysis->devices[index];
-    if (mac && mac[0] && !mac_is_group(mac)) {
+    if (mac_is_usable_identity(mac)) {
         copy_text(device->mac, sizeof(device->mac), mac, strlen(mac));
     }
     if (device->first_time_us == 0U || time_us < device->first_time_us) {
@@ -484,6 +511,46 @@ static pcap_device_entry_t *observe_device(pcap_flow_analysis_t *analysis,
         device->received_bytes += captured_bytes;
     }
     return device;
+}
+
+bool pcap_flow_same_local_device(const pcap_device_entry_t *left,
+                                 const pcap_device_entry_t *right)
+{
+    if (!left || !right || !left->internal || !right->internal) return false;
+    if (mac_is_usable_identity(left->mac) && mac_is_usable_identity(right->mac)) {
+        return strcasecmp(left->mac, right->mac) == 0;
+    }
+    return left->address[0] && right->address[0] &&
+           strcasecmp(left->address, right->address) == 0;
+}
+
+uint32_t pcap_flow_local_device_count(const pcap_flow_analysis_t *analysis)
+{
+    if (!analysis) return 0U;
+    uint32_t count = 0U;
+    for (uint32_t i = 0; i < analysis->device_count; i++) {
+        const pcap_device_entry_t *device = &analysis->devices[i];
+        if (!device->internal) continue;
+        bool already_counted = false;
+        for (uint32_t previous = 0; previous < i; previous++) {
+            if (pcap_flow_same_local_device(device, &analysis->devices[previous])) {
+                already_counted = true;
+                break;
+            }
+        }
+        if (!already_counted) count++;
+    }
+    return count;
+}
+
+uint32_t pcap_flow_remote_endpoint_count(const pcap_flow_analysis_t *analysis)
+{
+    if (!analysis) return 0U;
+    uint32_t count = 0U;
+    for (uint32_t i = 0; i < analysis->device_count; i++) {
+        if (!analysis->devices[i].internal) count++;
+    }
+    return count;
 }
 
 static void add_device_service(pcap_flow_analysis_t *analysis, const char *address,
