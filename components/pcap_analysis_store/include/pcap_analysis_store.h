@@ -7,14 +7,15 @@
 #include "pcap_reader.h"
 #include "pcap_summary.h"
 #include "pcap_flow.h"
+#include "pcap_investigation.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 #define PCAP_ANALYSIS_STORE_PATH_MAX 384U
-#define PCAP_ANALYSIS_CACHE_SCHEMA_VERSION 4U
-#define PCAP_ANALYSIS_REPORT_SCHEMA_VERSION 4U
+#define PCAP_ANALYSIS_CACHE_SCHEMA_VERSION 5U
+#define PCAP_ANALYSIS_REPORT_SCHEMA_VERSION 5U
 #define PCAP_ANALYSIS_FILTER_SCHEMA_VERSION 2U
 
 typedef enum {
@@ -72,6 +73,7 @@ pcap_analysis_store_status_t pcap_analysis_export_report_json(
     const pcap_scan_summary_t *scan_summary,
     const pcap_summary_t *summary,
     const pcap_flow_analysis_t *flow_analysis,
+    const pcap_investigation_t *investigation,
     const uint32_t *packet_flags,
     size_t packet_flag_count,
     pcap_packet_filter_t active_filter,

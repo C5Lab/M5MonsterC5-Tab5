@@ -538,7 +538,8 @@ static void espc_json_text_counters(FILE *file, const pcap_summary_text_counter_
 pcap_analysis_store_status_t pcap_analysis_export_report_json(
     const char *source_path, const pcap_capture_info_t *capture_info,
     const pcap_scan_summary_t *scan_summary, const pcap_summary_t *summary,
-    const pcap_flow_analysis_t *flow_analysis, const uint32_t *packet_flags,
+    const pcap_flow_analysis_t *flow_analysis,
+    const pcap_investigation_t *investigation, const uint32_t *packet_flags,
     size_t packet_flag_count,
     pcap_packet_filter_t active_filter, const pcap_flow_filter_t *quick_filter,
     uint32_t selected_matches, bool loaded_from_cache,
@@ -676,11 +677,15 @@ pcap_analysis_store_status_t pcap_analysis_export_report_json(
         espc_json_string(report, flow->server_name);
         fputs(",\"application_detail\":", report);
         espc_json_string(report, flow->application_detail);
+        fputs(",\"tls_client_fingerprint\":", report);
+        espc_json_string(report, flow->tls_fingerprint);
         uint64_t duration_us = flow->last_time_us >= flow->first_time_us
                                    ? flow->last_time_us - flow->first_time_us : 0;
         fprintf(report,
                 ",\"first_packet\":%lu,\"last_packet\":%lu,"
-                "\"duration_us\":%llu,\"tls_version\":%u,\"originator_packets\":%lu,"
+                "\"duration_us\":%llu,\"tls_version\":%u,\"tls_cipher_count\":%u,"
+                "\"tls_extension_count\":%u,\"cleartext_credential_marker\":%s,"
+                "\"originator_packets\":%lu,"
                 "\"responder_packets\":%lu,\"originator_bytes\":%llu,"
                 "\"responder_bytes\":%llu,\"handshake_rtt_us\":%llu,"
                 "\"originator_retransmissions\":%lu,"
@@ -689,6 +694,9 @@ pcap_analysis_store_status_t pcap_analysis_export_report_json(
                 (unsigned long)flow->last_packet + 1U,
                 (unsigned long long)duration_us,
                 flow->tls_version,
+                flow->tls_cipher_count,
+                flow->tls_extension_count,
+                flow->credential_indicator ? "true" : "false",
                 (unsigned long)flow->originator_packets,
                 (unsigned long)flow->responder_packets,
                 (unsigned long long)flow->originator_bytes,
@@ -791,9 +799,78 @@ pcap_analysis_store_status_t pcap_analysis_export_report_json(
             if (evidence) fputc(',', report);
             fprintf(report, "%lu", (unsigned long)alert->evidence_packets[evidence] + 1U);
         }
+        fputs("],\"timeline\":[", report);
+        for (uint32_t i = 0; i < investigation->timeline_count; i++) {
+            const pcap_investigation_event_t *event = &investigation->timeline[i];
+            if (i) fputc(',', report);
+            fputs("{\"type\":", report);
+            espc_json_string(report, pcap_investigation_event_name(
+                                         (pcap_investigation_event_type_t)event->type));
+            fputs(",\"severity\":", report);
+            espc_json_string(report, pcap_flow_health_name(
+                                         (pcap_health_level_t)event->severity));
+            fputs(",\"actor\":", report);
+            espc_json_string(report, event->actor);
+            fputs(",\"detail\":", report);
+            espc_json_string(report, event->detail);
+            fprintf(report,
+                    ",\"time_us\":%llu,\"packet\":%lu,\"flow_id\":%u}",
+                    (unsigned long long)event->time_us,
+                    event->type == PCAP_INV_EVENT_DEVICE_FIRST_SEEN
+                        ? 0UL : (unsigned long)event->packet_number + 1U,
+                    event->flow_id == PCAP_FLOW_ID_NONE ? 0U : event->flow_id + 1U);
+        }
         fputs("]}", report);
     }
-    fputs("]\n}\n", report);
+    fputs("],\n  \"investigation\":", report);
+    if (!investigation) {
+        fputs("null", report);
+    } else {
+        fprintf(report,
+                "{\"finding_count\":%lu,\"watch_count\":%lu,"
+                "\"suspicious_count\":%lu,\"critical_count\":%lu,"
+                "\"ioc_matches\":%lu,\"intel_loaded\":%s,"
+                "\"timeline_count\":%lu,\"findings_limited\":%s,\"findings\":[",
+                (unsigned long)investigation->finding_count,
+                (unsigned long)investigation->watch_count,
+                (unsigned long)investigation->suspicious_count,
+                (unsigned long)investigation->critical_count,
+                (unsigned long)investigation->ioc_matches,
+                investigation->intel_loaded ? "true" : "false",
+                (unsigned long)investigation->timeline_count,
+                investigation->finding_limited ? "true" : "false");
+        for (uint32_t i = 0; i < investigation->finding_count; i++) {
+            const pcap_investigation_finding_t *finding = &investigation->findings[i];
+            if (i) fputc(',', report);
+            fputs("{\"type\":", report);
+            espc_json_string(report, pcap_investigation_finding_name(
+                                         (pcap_investigation_finding_type_t)finding->type));
+            fputs(",\"severity\":", report);
+            espc_json_string(report, pcap_flow_health_name(
+                                         (pcap_health_level_t)finding->severity));
+            fputs(",\"confidence\":", report);
+            espc_json_string(report, pcap_flow_confidence_name(
+                                         (pcap_app_confidence_t)finding->confidence));
+            fputs(",\"source\":", report);
+            espc_json_string(report, finding->source);
+            fputs(",\"target\":", report);
+            espc_json_string(report, finding->target);
+            fputs(",\"detail\":", report);
+            espc_json_string(report, finding->detail);
+            fprintf(report,
+                    ",\"service_port\":%u,\"flow_id\":%u,\"first_packet\":%lu,"
+                    "\"last_packet\":%lu,\"first_time_us\":%llu,"
+                    "\"last_time_us\":%llu}",
+                    finding->service_port,
+                    finding->flow_id == PCAP_FLOW_ID_NONE ? 0U : finding->flow_id + 1U,
+                    (unsigned long)finding->first_packet + 1U,
+                    (unsigned long)finding->last_packet + 1U,
+                    (unsigned long long)finding->first_time_us,
+                    (unsigned long long)finding->last_time_us);
+        }
+        fputs("]}", report);
+    }
+    fputs("\n}\n", report);
 
     bool ok = !ferror(report) && fflush(report) == 0;
     if (ok) {

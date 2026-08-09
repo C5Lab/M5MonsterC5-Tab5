@@ -55,6 +55,26 @@ static bool payload_contains(const uint8_t *payload, size_t length,
     return false;
 }
 
+static bool payload_contains_ci(const uint8_t *payload, size_t length,
+                                const char *needle)
+{
+    if (!payload || !needle) return false;
+    size_t needle_length = strlen(needle);
+    if (needle_length == 0U || length < needle_length) return false;
+    for (size_t i = 0; i + needle_length <= length; i++) {
+        bool equal = true;
+        for (size_t j = 0; j < needle_length; j++) {
+            if (tolower((unsigned char)payload[i + j]) !=
+                tolower((unsigned char)needle[j])) {
+                equal = false;
+                break;
+            }
+        }
+        if (equal) return true;
+    }
+    return false;
+}
+
 static void copy_text(char *destination, size_t destination_size,
                       const char *source, size_t source_length)
 {
@@ -85,6 +105,11 @@ static bool address_is_internal(const char *address)
            strncasecmp(address, "fd", 2U) == 0 || strcmp(address, "::1") == 0;
 }
 
+bool pcap_flow_address_is_internal(const char *address)
+{
+    return address_is_internal(address);
+}
+
 static bool address_is_multicast(const char *address)
 {
     if (!address || !address[0]) return false;
@@ -111,6 +136,15 @@ static bool mac_is_usable_identity(const char *mac)
 static uint16_t read_payload_be16(const uint8_t *data)
 {
     return (uint16_t)(((uint16_t)data[0] << 8) | data[1]);
+}
+
+static uint64_t fingerprint_update(uint64_t hash, const uint8_t *data, size_t length)
+{
+    for (size_t i = 0; data && i < length; i++) {
+        hash ^= data[i];
+        hash *= 1099511628211ULL;
+    }
+    return hash;
 }
 
 static void extract_http_metadata(const uint8_t *payload, size_t length,
@@ -142,8 +176,10 @@ static void extract_tls_client_hello(const uint8_t *payload, size_t length,
                                      pcap_flow_entry_t *flow)
 {
     if (!payload || !flow || length < 11U || payload[0] != 0x16U ||
-        payload[5] != 0x01U) return;
+        payload[5] != 0x01U || flow->tls_fingerprint[0]) return;
     flow->tls_version = read_payload_be16(payload + 9U);
+    uint64_t fingerprint = 1469598103934665603ULL;
+    fingerprint = fingerprint_update(fingerprint, payload + 9U, 2U);
     size_t position = 43U;
     if (position >= length) return;
     size_t session_length = payload[position++];
@@ -152,6 +188,8 @@ static void extract_tls_client_hello(const uint8_t *payload, size_t length,
     size_t cipher_length = read_payload_be16(payload + position);
     position += 2U;
     if (position + cipher_length + 1U > length) return;
+    flow->tls_cipher_count = (uint16_t)(cipher_length / 2U);
+    fingerprint = fingerprint_update(fingerprint, payload + position, cipher_length);
     position += cipher_length;
     size_t compression_length = payload[position++];
     if (position + compression_length + 2U > length) return;
@@ -164,6 +202,8 @@ static void extract_tls_client_hello(const uint8_t *payload, size_t length,
     while (position + 4U <= extensions_end) {
         uint16_t type = read_payload_be16(payload + position);
         size_t extension_length = read_payload_be16(payload + position + 2U);
+        fingerprint = fingerprint_update(fingerprint, payload + position, 2U);
+        flow->tls_extension_count++;
         position += 4U;
         if (position + extension_length > extensions_end) break;
         if (type == 0U && extension_length >= 5U) {
@@ -189,14 +229,34 @@ static void extract_tls_client_hello(const uint8_t *payload, size_t length,
         }
         position += extension_length;
     }
+    char fingerprint_text[sizeof(flow->tls_fingerprint)];
+    snprintf(fingerprint_text, sizeof(fingerprint_text), "%016llx",
+             (unsigned long long)fingerprint);
+    copy_text(flow->tls_fingerprint, sizeof(flow->tls_fingerprint), fingerprint_text,
+              sizeof(fingerprint_text));
     if (flow->application_detail[0] == '\0') {
+        uint16_t tls_version = flow->tls_version;
         if (alpn[0]) {
             snprintf(flow->application_detail, sizeof(flow->application_detail),
-                     "TLS 0x%04X | ALPN %s", flow->tls_version, alpn);
+                     "TLS 0x%04X | ALPN %s | CH-FNV64 %s", tls_version, alpn,
+                     fingerprint_text);
         } else {
             snprintf(flow->application_detail, sizeof(flow->application_detail),
-                     "TLS 0x%04X", flow->tls_version);
+                     "TLS 0x%04X | CH-FNV64 %s", tls_version, fingerprint_text);
         }
+    }
+}
+
+static void extract_smb_metadata(const uint8_t *payload, size_t length,
+                                 pcap_flow_entry_t *flow)
+{
+    static const uint8_t smb1[] = {0xFF, 'S', 'M', 'B'};
+    static const uint8_t smb2[] = {0xFE, 'S', 'M', 'B'};
+    if (!payload || !flow || flow->application_detail[0]) return;
+    if (payload_contains(payload, length, smb1, sizeof(smb1))) {
+        copy_text(flow->application_detail, sizeof(flow->application_detail), "SMB1", 4U);
+    } else if (payload_contains(payload, length, smb2, sizeof(smb2))) {
+        copy_text(flow->application_detail, sizeof(flow->application_detail), "SMB2/3", 6U);
     }
 }
 
@@ -224,8 +284,20 @@ static void update_flow_metadata(pcap_flow_entry_t *flow, pcap_application_t app
     if (!flow || !payload || payload_length == 0U) return;
     if (application == PCAP_APP_HTTP) extract_http_metadata(payload, payload_length, flow);
     if (application == PCAP_APP_TLS) extract_tls_client_hello(payload, payload_length, flow);
+    if (application == PCAP_APP_SMB) extract_smb_metadata(payload, payload_length, flow);
     if (application == PCAP_APP_BITTORRENT) {
         extract_bittorrent_metadata(payload, payload_length, flow);
+    }
+    if (application == PCAP_APP_HTTP || application == PCAP_APP_FTP ||
+        application == PCAP_APP_SMTP || application == PCAP_APP_IMAP ||
+        application == PCAP_APP_POP3) {
+        flow->credential_indicator = flow->credential_indicator ||
+            payload_contains_ci(payload, payload_length, "Authorization: Basic ") ||
+            payload_contains_ci(payload, payload_length, "Proxy-Authorization: Basic ") ||
+            payload_contains_ci(payload, payload_length, "USER ") ||
+            payload_contains_ci(payload, payload_length, "PASS ") ||
+            payload_contains_ci(payload, payload_length, "AUTH LOGIN") ||
+            payload_contains_ci(payload, payload_length, "AUTH PLAIN");
     }
 }
 
@@ -239,6 +311,17 @@ static bool looks_like_http(const uint8_t *payload, size_t length)
         if (payload_starts(payload, length, markers[i])) return true;
     }
     return false;
+}
+
+static bool looks_like_rtsp(const uint8_t *payload, size_t length)
+{
+    return payload_starts(payload, length, "RTSP/") ||
+           ((payload_starts(payload, length, "OPTIONS ") ||
+             payload_starts(payload, length, "DESCRIBE ") ||
+             payload_starts(payload, length, "SETUP ") ||
+             payload_starts(payload, length, "PLAY ") ||
+             payload_starts(payload, length, "TEARDOWN ")) &&
+            payload_contains_ci(payload, length, "rtsp://"));
 }
 
 static bool looks_like_tls(const uint8_t *payload, size_t length)
@@ -325,6 +408,10 @@ static pcap_application_t classify_application(const pcap_packet_details_t *deta
         *confidence = PCAP_APP_CONFIDENCE_CONFIRMED;
         return PCAP_APP_BITTORRENT_DHT;
     }
+    if (looks_like_rtsp(payload, payload_length)) {
+        *confidence = PCAP_APP_CONFIDENCE_CONFIRMED;
+        return PCAP_APP_RTSP;
+    }
     if (looks_like_http(payload, payload_length)) {
         *confidence = PCAP_APP_CONFIDENCE_CONFIRMED;
         return PCAP_APP_HTTP;
@@ -378,6 +465,13 @@ static pcap_application_t classify_application(const pcap_packet_details_t *deta
         port_is(source, destination, 587)) return PCAP_APP_SMTP;
     if (port_is(source, destination, 143) || port_is(source, destination, 993)) return PCAP_APP_IMAP;
     if (port_is(source, destination, 110) || port_is(source, destination, 995)) return PCAP_APP_POP3;
+    if (port_is(source, destination, 3389)) return PCAP_APP_RDP;
+    if (port_in_range(source, destination, 5900, 5909)) return PCAP_APP_VNC;
+    if (port_is(source, destination, 554)) return PCAP_APP_RTSP;
+    if (port_is(source, destination, 5683) || port_is(source, destination, 5684)) return PCAP_APP_COAP;
+    if (port_is(source, destination, 6379)) return PCAP_APP_REDIS;
+    if (port_is(source, destination, 3306) || port_is(source, destination, 5432) ||
+        port_is(source, destination, 27017)) return PCAP_APP_DATABASE;
 
     *confidence = PCAP_APP_CONFIDENCE_TRANSPORT;
     return details->ip_protocol == 6 ? PCAP_APP_TCP :
@@ -744,7 +838,12 @@ static void build_flow_alerts(pcap_flow_analysis_t *analysis)
         }
         pcap_application_t app = (pcap_application_t)flow->app_protocol;
         if (app == PCAP_APP_TELNET || app == PCAP_APP_FTP || app == PCAP_APP_HTTP ||
-            app == PCAP_APP_SMTP || app == PCAP_APP_POP3 || app == PCAP_APP_IMAP) {
+            (app == PCAP_APP_SMTP && flow->responder_port != 465U) ||
+            (app == PCAP_APP_POP3 && flow->responder_port != 995U) ||
+            (app == PCAP_APP_IMAP && flow->responder_port != 993U) ||
+            app == PCAP_APP_RTSP || app == PCAP_APP_REDIS ||
+            app == PCAP_APP_DATABASE ||
+            (app == PCAP_APP_COAP && flow->responder_port == 5683U)) {
             char detail[160];
             snprintf(detail, sizeof(detail), "%.23s observed between %.35s and %.35s on port %u",
                      pcap_flow_application_name(app), flow->originator, flow->responder,
@@ -1128,7 +1227,8 @@ const char *pcap_flow_application_name(pcap_application_t application)
         "802.11 MGMT", "DNS", "mDNS", "DHCP", "HTTP",
         "HTTPS/TLS", "QUIC", "SSDP/UPnP", "NTP", "SSH", "FTP", "Telnet",
         "SMB", "MQTT", "BitTorrent", "BitTorrent DHT", "LLMNR", "NBNS",
-        "SMTP", "IMAP", "POP3"
+        "SMTP", "IMAP", "POP3", "RDP", "VNC", "RTSP", "CoAP", "Redis",
+        "Database"
     };
     return application < PCAP_APP_COUNT ? names[application] : "Unknown";
 }

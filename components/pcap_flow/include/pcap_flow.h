@@ -48,6 +48,12 @@ typedef enum {
     PCAP_APP_SMTP,
     PCAP_APP_IMAP,
     PCAP_APP_POP3,
+    PCAP_APP_RDP,
+    PCAP_APP_VNC,
+    PCAP_APP_RTSP,
+    PCAP_APP_COAP,
+    PCAP_APP_REDIS,
+    PCAP_APP_DATABASE,
     PCAP_APP_COUNT,
 } pcap_application_t;
 
@@ -90,6 +96,10 @@ typedef struct {
     bool originator_sequence_seen;
     bool responder_sequence_seen;
     uint16_t tls_version;
+    uint16_t tls_cipher_count;
+    uint16_t tls_extension_count;
+    char tls_fingerprint[17];
+    bool credential_indicator;
     char server_name[96];
     char application_detail[128];
 } pcap_flow_entry_t;
@@ -241,6 +251,7 @@ const char *pcap_flow_application_name(pcap_application_t application);
 const char *pcap_flow_confidence_name(pcap_app_confidence_t confidence);
 const char *pcap_flow_transport_name(uint8_t ip_protocol);
 const char *pcap_flow_health_name(pcap_health_level_t level);
+bool pcap_flow_address_is_internal(const char *address);
 const char *pcap_flow_alert_name(pcap_alert_type_t type);
 
 bool pcap_flow_same_local_device(const pcap_device_entry_t *left,
