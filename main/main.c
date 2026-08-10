@@ -207,6 +207,7 @@ typedef struct {
     int channel;
     int rssi;            // Signal strength in dBm
     char band[8];        // "2.4GHz" or "5GHz"
+    char security[24];
     char vendor[48];
     int client_count;
     char clients[MAX_CLIENTS_PER_NETWORK][18];  // MAC addresses of clients
@@ -1968,7 +1969,7 @@ static void prepare_observer_attack_override(tab_context_t *ctx, int observer_id
     snprintf(ctx->observer_attack_network.ssid, sizeof(ctx->observer_attack_network.ssid), "%s", net->ssid);
     snprintf(ctx->observer_attack_network.bssid, sizeof(ctx->observer_attack_network.bssid), "%s", net->bssid);
     snprintf(ctx->observer_attack_network.band, sizeof(ctx->observer_attack_network.band), "%s", net->band);
-    snprintf(ctx->observer_attack_network.security, sizeof(ctx->observer_attack_network.security), "%s", "Unknown");
+    snprintf(ctx->observer_attack_network.security, sizeof(ctx->observer_attack_network.security), "%s", net->security);
 
     ctx->observer_attack_override_active = true;
     ctx->observer_attack_override_sel_index = 0;
@@ -8752,15 +8753,23 @@ static void mitm_connect_and_start_cb(lv_event_t *e)
     int idx = v.sel_indices[0];
     if (idx < 0 || idx >= v.net_count) return;
     const char *ssid = v.nets[idx].ssid;
-    bool is_open = wifi_network_security_is_open(v.nets[idx].security);
+    bool security_is_open = wifi_network_security_is_open(v.nets[idx].security);
 
     const char *password = NULL;
     if (ctx->mitm_password_input) {
         password = lv_textarea_get_text(ctx->mitm_password_input);
     }
+    bool password_provided = password != NULL && password[0] != '\0';
 
-    if (!is_open && !ctx->mitm_use_saved_password &&
-        (password == NULL || strlen(password) == 0)) {
+    // Credentials take precedence over an incomplete/unknown security value.
+    // Observer attacks used to lose the security field and therefore discarded
+    // a password that had just been found in the Evil Twin database.
+    wifi_connect_auth_mode_t auth_mode = WIFI_CONNECT_AUTH_OPEN;
+    if (ctx->mitm_use_saved_password) {
+        auth_mode = WIFI_CONNECT_AUTH_SAVED;
+    } else if (password_provided) {
+        auth_mode = WIFI_CONNECT_AUTH_PASSWORD;
+    } else if (!security_is_open) {
         if (ctx->mitm_status_label) {
             lv_label_set_text(ctx->mitm_status_label, "Enter password first");
             lv_obj_set_style_text_color(ctx->mitm_status_label, COLOR_MATERIAL_RED, 0);
@@ -8768,7 +8777,10 @@ static void mitm_connect_and_start_cb(lv_event_t *e)
         return;
     }
 
-    ESP_LOGI(TAG, "MITM: Connecting to %s%s", ssid, is_open ? " (open)" : "");
+    const char *auth_label = auth_mode == WIFI_CONNECT_AUTH_SAVED
+        ? "saved password"
+        : (auth_mode == WIFI_CONNECT_AUTH_PASSWORD ? "entered password" : "open");
+    ESP_LOGI(TAG, "MITM: Connecting to %s (%s)", ssid, auth_label);
 
     if (ctx->mitm_keyboard) {
         lv_obj_add_flag(ctx->mitm_keyboard, LV_OBJ_FLAG_HIDDEN);
@@ -8784,10 +8796,6 @@ static void mitm_connect_and_start_cb(lv_event_t *e)
     vTaskDelay(pdMS_TO_TICKS(50));
 
     char cmd[256];
-    wifi_connect_auth_mode_t auth_mode = is_open
-        ? WIFI_CONNECT_AUTH_OPEN
-        : (ctx->mitm_use_saved_password ? WIFI_CONNECT_AUTH_SAVED
-                                        : WIFI_CONNECT_AUTH_PASSWORD);
     if (!build_wifi_connect_command(cmd, sizeof(cmd), ssid, password, auth_mode)) {
         ESP_LOGW(TAG, "MITM: invalid SSID/password or wifi_connect command too long");
         bsp_display_lock(0);
@@ -9094,7 +9102,7 @@ static void show_mitm_popup(void)
     }
     // For every secured network, let JanOS resolve --saved against eviltwin.txt,
     // portals.txt and home.txt. If it fails, the callback switches to manual input.
-    ctx->mitm_use_saved_password = !is_open;
+    ctx->mitm_use_saved_password = mitm_password_known || !is_open;
 
     ctx->mitm_status_label = lv_label_create(ctx->mitm_popup);
     if (mitm_password_known) {
@@ -14782,18 +14790,26 @@ static void show_network_popup(int network_idx)
 
     if (network_idx < 0 || network_idx >= ctx->observer_network_count) return;
     if (ctx->popup_open) return;  // Already showing a popup on this tab
-    if (ctx->observer_start_active || ctx->observer_inspect_task != NULL) {
-        ESP_LOGW(TAG, "Observer popup ignored while initial scan/inspect is active");
-        return;
-    }
+
+    bool opening_during_startup =
+        ctx->observer_start_active || ctx->observer_inspect_task != NULL;
 
     observer_network_t *net = &ctx->observer_networks[network_idx];
     ESP_LOGI(TAG, "Opening popup for network: %s (scan_index=%d)", net->ssid, net->scan_index);
 
+    // Publish the popup request before cancelling inspect. observer_start_task
+    // uses this flag to hand the UART directly to popup_focus_task instead of
+    // racing it by starting the all-network sniffer first.
     ctx->popup_open = true;
     ctx->popup_network_idx = network_idx;
     ctx->popup_focus_ready = false;
     ctx->popup_focus_cancel = false;
+
+    if (opening_during_startup) {
+        ESP_LOGI(TAG,
+                 "Observer popup requested during initial inspect; stopping inspect and handing over UART");
+        cancel_observer_inspect_task(ctx);
+    }
 
     // Stop main observer timer for this context
     if (ctx->observer_timer != NULL) {
@@ -15759,29 +15775,59 @@ static bool parse_scan_to_observer(const char *line, observer_network_t *net)
 
     if (field_idx < 8) return false;
 
-    // fields[0] = index, fields[1] = SSID, fields[3] = BSSID, fields[4] = channel, fields[6] = RSSI, fields[7] = band
+    // Vendor strings containing a comma can be split by older JanOS CSV
+    // quoting, so anchor the remaining fields on the first valid MAC address
+    // instead of assuming that BSSID is always fields[3].
+    int bssid_field = -1;
+    for (int i = 2; i < field_idx; i++) {
+        if (observer_scan_field_is_mac(fields[i])) {
+            bssid_field = i;
+            break;
+        }
+    }
+    if (bssid_field < 0 || bssid_field + 4 >= field_idx) return false;
+
     net->scan_index = atoi(fields[0]);  // 1-based index for select_networks command
+    if (net->scan_index <= 0) return false;
 
     strncpy(net->ssid, fields[1], sizeof(net->ssid) - 1);
     net->ssid[sizeof(net->ssid) - 1] = '\0';
 
-    strncpy(net->bssid, fields[3], sizeof(net->bssid) - 1);
+    strncpy(net->bssid, fields[bssid_field], sizeof(net->bssid) - 1);
     net->bssid[sizeof(net->bssid) - 1] = '\0';
 
-    net->channel = atoi(fields[4]);
-    net->rssi = atoi(fields[6]);
+    net->channel = atoi(fields[bssid_field + 1]);
 
-    strncpy(net->band, fields[7], sizeof(net->band) - 1);
+    strncpy(net->security, fields[bssid_field + 2], sizeof(net->security) - 1);
+    net->security[sizeof(net->security) - 1] = '\0';
+
+    net->rssi = atoi(fields[bssid_field + 3]);
+
+    strncpy(net->band, fields[bssid_field + 4], sizeof(net->band) - 1);
     net->band[sizeof(net->band) - 1] = '\0';
 
     net->vendor[0] = '\0';
-    // JanOS format in logs: vendor is usually the 3rd field (index 2).
-    if (field_idx >= 3 && fields[2] && fields[2][0] != '\0') {
-        strncpy(net->vendor, fields[2], sizeof(net->vendor) - 1);
-        net->vendor[sizeof(net->vendor) - 1] = '\0';
-    } else if (field_idx >= 9 && fields[8] && fields[8][0] != '\0') {
+    // JanOS normally puts vendor before BSSID. Preserve all pieces when an
+    // older CSV response split a vendor such as "Vendor Name, Inc.".
+    for (int i = 2; i < bssid_field; i++) {
+        if (!fields[i] || fields[i][0] == '\0') continue;
+        char *part = fields[i];
+        while (*part == '"') part++;
+        size_t part_len = strlen(part);
+        while (part_len > 0 && part[part_len - 1] == '"') {
+            part[--part_len] = '\0';
+        }
+        trim_ascii_whitespace(part);
+        if (part[0] == '\0') continue;
+
+        size_t used = strlen(net->vendor);
+        snprintf(net->vendor + used, sizeof(net->vendor) - used,
+                 "%s%s", used > 0 ? ", " : "", part);
+    }
+    if (net->vendor[0] == '\0' && field_idx > bssid_field + 5 &&
+        fields[bssid_field + 5] && fields[bssid_field + 5][0] != '\0') {
         // Fallback for alternate format with vendor as 9th field.
-        strncpy(net->vendor, fields[8], sizeof(net->vendor) - 1);
+        strncpy(net->vendor, fields[bssid_field + 5], sizeof(net->vendor) - 1);
         net->vendor[sizeof(net->vendor) - 1] = '\0';
     }
 
@@ -15872,8 +15918,9 @@ static void observer_start_task(void *arg)
                             if (parse_scan_to_observer(line_buffer, &net)) {
                                 ctx->observer_networks[scanned_count] = net;
                                 scanned_count++;
-                                ESP_LOGI(TAG, "[%s] Parsed network #%d: '%s' BSSID=%s CH%d %s %ddBm",
-                                         uart_name, net.scan_index, net.ssid, net.bssid, net.channel, net.band, net.rssi);
+                                ESP_LOGI(TAG, "[%s] Parsed network #%d: '%s' BSSID=%s CH%d %s %s %ddBm",
+                                         uart_name, net.scan_index, net.ssid, net.bssid,
+                                         net.channel, net.security, net.band, net.rssi);
                             }
                         }
 
@@ -15929,6 +15976,17 @@ static void observer_start_task(void *arg)
 
     if (!ctx->observer_running) {
         ESP_LOGI(TAG, "[%s] Observer stopped during inspect", uart_name);
+        ctx->observer_start_active = false;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    // A row may be clicked as soon as the scan table is populated, while the
+    // optional inspect pass is still running. In that case the popup owns the
+    // next UART transition; do not start the global sniffer underneath it.
+    if (ctx->popup_open) {
+        ESP_LOGI(TAG, "[%s] Popup requested during startup; UART handed to popup focus task",
+                 uart_name);
         ctx->observer_start_active = false;
         vTaskDelete(NULL);
         return;
