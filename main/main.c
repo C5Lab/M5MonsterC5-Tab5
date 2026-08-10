@@ -622,6 +622,7 @@ typedef struct {
     observer_network_t *observer_networks;  // PSRAM
     int observer_network_count;
     bool observer_running;
+    volatile bool observer_start_active;
     bool observer_page_visible;
     TaskHandle_t observer_task;
     TimerHandle_t observer_timer;
@@ -2465,7 +2466,10 @@ static void client_row_click_cb(lv_event_t *e);
 static void show_network_popup(int network_idx);
 static void close_network_popup(void);
 static void destroy_network_popup_ui(tab_context_t *ctx);
+static void quiesce_observer_for_attack(tab_context_t *ctx);
 static void pause_observer_for_attack(tab_context_t *ctx);
+static bool wait_for_observer_uart_idle(tab_context_t *ctx, uint32_t timeout_ms);
+static bool observer_handshaker_prepare_selection(tab_context_t *ctx, wifi_network_t *target);
 static void show_deauth_popup(int network_idx, int client_idx);
 static void destroy_deauth_popup_ui(void);
 static void close_deauth_popup(void);
@@ -8436,10 +8440,12 @@ static void observer_attack_tile_event_cb(lv_event_t *e)
         xTimerStop(ctx->popup_timer, 0);
     }
 
-    // Stop the popup sniffer before launching any attack — firmware rejects
-    // commands (wifi_connect, etc.) while a sniffer/scan operation is active.
-    uart_send_command_for_tab("stop");
-    vTaskDelay(pdMS_TO_TICKS(150));
+    // Handshaker performs a full Observer task shutdown in
+    // show_handshaker_popup(). Other attacks keep the legacy stop sequence.
+    if (strcmp(attack_name, "Handshaker") != 0) {
+        uart_send_command_for_tab("stop");
+        vTaskDelay(pdMS_TO_TICKS(150));
+    }
 
     handle_selected_attack(attack_name);
 }
@@ -9151,15 +9157,22 @@ static void handshaker_popup_close_cb(lv_event_t *e)
     tab_context_t *ctx = get_current_ctx();
     if (!ctx) return;
 
-    // Stop monitoring task
+    // Stop JanOS first, then wait for the UART reader to leave before deleting
+    // any LVGL objects it may still reference.
     ctx->handshaker_monitoring = false;
-    if (ctx->handshaker_task != NULL) {
-        vTaskDelay(pdMS_TO_TICKS(100));  // Give task time to exit
-        ctx->handshaker_task = NULL;
-    }
-
-    // Send stop command to current tab's UART
     uart_send_command_for_tab("stop");
+
+    if (ctx->handshaker_task != NULL) {
+        for (int wait = 0; wait < 50 && ctx->handshaker_task != NULL; wait++) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+        if (ctx->handshaker_task != NULL) {
+            ESP_LOGW(TAG, "Handshaker monitor did not stop in time; deleting task");
+            vTaskDelete(ctx->handshaker_task);
+            ctx->handshaker_task = NULL;
+            handshaker_monitor_task_handle = NULL;
+        }
+    }
 
     // Delete overlay (popup is child, will be deleted too)
     if (ctx->handshaker_popup_overlay) {
@@ -9524,6 +9537,9 @@ static void handshaker_monitor_task(void *arg)
     }
 
     ESP_LOGI(TAG, "Handshaker monitor task ended");
+    if (ctx) {
+        ctx->handshaker_task = NULL;
+    }
     handshaker_monitor_task_handle = NULL;
     vTaskDelete(NULL);
 }
@@ -9535,12 +9551,60 @@ static void show_handshaker_popup(void)
     if (!ctx) return;
     if (ctx->handshaker_popup != NULL) return;  // Already showing in this tab
 
-    if (ctx->popup_open) {
-        if (ctx->observer_running) {
-            pause_observer_for_attack(ctx);
+    scan_view_t hsv = get_scan_view(ctx);
+    bool launched_from_observer = ctx->observer_attack_override_active;
+
+    // Observer attacks must always carry one valid target. Starting JanOS
+    // handshaker without a selection intentionally means "attack all".
+    if (launched_from_observer) {
+        if (hsv.sel_count != 1 || !hsv.sel_indices || !hsv.nets) {
+            ESP_LOGE(TAG, "Observer Handshaker aborted: invalid target snapshot");
+            clear_observer_attack_override(ctx);
+            return;
         }
+
+        int target_idx = hsv.sel_indices[0];
+        if (target_idx < 0 || target_idx >= hsv.net_count || hsv.nets[target_idx].index <= 0) {
+            ESP_LOGE(TAG, "Observer Handshaker aborted: invalid scan index");
+            clear_observer_attack_override(ctx);
+            return;
+        }
+
+        ESP_LOGI(TAG, "Observer Handshaker target: SSID='%s' BSSID=%s scan_index=%d",
+                 hsv.nets[target_idx].ssid,
+                 hsv.nets[target_idx].bssid,
+                 hsv.nets[target_idx].index);
+
+        // Stop every producer/consumer belonging to Network Observer before
+        // handing the UART to Handshaker.
+        quiesce_observer_for_attack(ctx);
+        if (ctx->popup_open) {
+            destroy_network_popup_ui(ctx);
+        }
+        if (!wait_for_observer_uart_idle(ctx, 2000)) {
+            ESP_LOGE(TAG, "Observer Handshaker aborted: Observer UART tasks still active");
+            clear_observer_attack_override(ctx);
+            return;
+        }
+
+        if (!observer_handshaker_prepare_selection(ctx, &hsv.nets[target_idx])) {
+            ESP_LOGE(TAG, "Observer Handshaker aborted: JanOS rejected target selection");
+            if (ctx->observer_status_label) {
+                lv_label_set_text(ctx->observer_status_label,
+                                  "Target selection failed - restart Observer");
+                lv_obj_set_style_text_color(ctx->observer_status_label,
+                                            COLOR_MATERIAL_RED, 0);
+            }
+            clear_observer_attack_override(ctx);
+            return;
+        }
+    } else if (ctx->popup_open) {
+        pause_observer_for_attack(ctx);
         destroy_network_popup_ui(ctx);
-        vTaskDelay(pdMS_TO_TICKS(150));
+        if (!wait_for_observer_uart_idle(ctx, 2000)) {
+            ESP_LOGE(TAG, "Handshaker aborted: Observer UART tasks still active");
+            return;
+        }
     }
 
     lv_obj_t *container = get_current_tab_container();
@@ -9594,7 +9658,6 @@ static void show_handshaker_popup(void)
     lv_obj_set_scroll_dir(network_scroll, LV_DIR_VER);
 
     // Add selected networks to list
-    scan_view_t hsv = get_scan_view(ctx);
     for (int i = 0; i < hsv.sel_count; i++) {
         int idx = hsv.sel_indices[i];
         if (idx >= 0 && idx < hsv.net_count) {
@@ -9673,21 +9736,25 @@ static void show_handshaker_popup(void)
         uart_flush_input(uart_port);
     }
 
-    // Build select_networks command with 1-based indices
-    char cmd[128];
-    snprintf(cmd, sizeof(cmd), "select_networks");
-    for (int i = 0; i < hsv.sel_count; i++) {
-        int idx = hsv.sel_indices[i];
-        if (idx >= 0 && idx < hsv.net_count) {
-            char num[8];
-            snprintf(num, sizeof(num), " %d", hsv.nets[idx].index);  // .index is 1-based
-            strncat(cmd, num, sizeof(cmd) - strlen(cmd) - 1);
+    if (!launched_from_observer) {
+        // Build select_networks command with 1-based indices for the regular
+        // Scan & Attack flow. Observer selection was already verified above.
+        char cmd[128];
+        snprintf(cmd, sizeof(cmd), "select_networks");
+        for (int i = 0; i < hsv.sel_count; i++) {
+            int idx = hsv.sel_indices[i];
+            if (idx >= 0 && idx < hsv.net_count) {
+                char num[8];
+                snprintf(num, sizeof(num), " %d", hsv.nets[idx].index);  // .index is 1-based
+                strncat(cmd, num, sizeof(cmd) - strlen(cmd) - 1);
+            }
         }
-    }
 
-    // Send select_networks command to current tab's UART
-    uart_send_command_for_tab(cmd);
-    vTaskDelay(pdMS_TO_TICKS(100));
+        ESP_LOGI(TAG, "Handshaker selection command: %s", cmd);
+
+        uart_send_command_for_tab(cmd);
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
 
     // Send start_handshake command to current tab's UART
     uart_send_command_for_tab("start_handshake");
@@ -9700,7 +9767,18 @@ static void show_handshaker_popup(void)
         ctx->handshaker_monitoring = true;
     }
 
-    xTaskCreate(handshaker_monitor_task, "hs_monitor", 4096, (void*)ctx, 5, &handshaker_monitor_task_handle);
+    ctx->handshaker_task = NULL;
+    BaseType_t task_result = xTaskCreate(handshaker_monitor_task, "hs_monitor", 4096,
+                                         (void*)ctx, 5, &ctx->handshaker_task);
+    if (task_result == pdPASS) {
+        handshaker_monitor_task_handle = ctx->handshaker_task;
+    } else {
+        ESP_LOGE(TAG, "Failed to start Handshaker monitor task");
+        ctx->handshaker_monitoring = false;
+        handshaker_monitoring = false;
+        uart_send_command_for_tab("stop");
+        handshaker_set_done_state(ctx, false);
+    }
 }
 
 // ======================= ARP Poison Attack Functions =======================
@@ -14099,17 +14177,22 @@ static void destroy_network_popup_ui(tab_context_t *ctx)
     ctx->popup_network_idx = -1;
 }
 
-static void pause_observer_for_attack(tab_context_t *ctx)
+static void quiesce_observer_for_attack(tab_context_t *ctx)
 {
-    if (!ctx || !ctx->observer_running) return;
+    if (!ctx) return;
 
     ctx->observer_running = false;
 
     if (ctx->observer_timer != NULL) {
         xTimerStop(ctx->observer_timer, 0);
     }
+    if (ctx->popup_timer != NULL) {
+        xTimerStop(ctx->popup_timer, 0);
+    }
 
-    uart_send_command_for_tab("stop");
+    // inspect_observer_task uses its own active flag and otherwise continues
+    // issuing uart_flush()/inspect_network even after observer_running=false.
+    cancel_observer_inspect_task(ctx);
 
     if (ctx->observer_start_btn) {
         lv_obj_clear_state(ctx->observer_start_btn, LV_STATE_DISABLED);
@@ -14120,6 +14203,152 @@ static void pause_observer_for_attack(tab_context_t *ctx)
     if (ctx->observer_status_label) {
         lv_label_set_text(ctx->observer_status_label, "Observer paused for attack");
     }
+}
+
+static void pause_observer_for_attack(tab_context_t *ctx)
+{
+    if (!ctx) return;
+    quiesce_observer_for_attack(ctx);
+    uart_send_command_for_tab("stop");
+}
+
+static bool wait_for_observer_uart_idle(tab_context_t *ctx, uint32_t timeout_ms)
+{
+    if (!ctx) return false;
+
+    TickType_t start = xTaskGetTickCount();
+    TickType_t timeout = pdMS_TO_TICKS(timeout_ms);
+
+    while (ctx->observer_start_active ||
+           ctx->observer_task != NULL ||
+           ctx->observer_inspect_task != NULL) {
+        if ((xTaskGetTickCount() - start) >= timeout) {
+            ESP_LOGE(TAG,
+                     "Observer UART idle timeout: start=%d poll=%p inspect=%p",
+                     ctx->observer_start_active,
+                     (void *)ctx->observer_task,
+                     (void *)ctx->observer_inspect_task);
+            return false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    ESP_LOGI(TAG, "Observer UART tasks stopped; attack may take ownership");
+    return true;
+}
+
+static bool observer_transition_has_error(const char *line)
+{
+    if (!line) return false;
+    return strstr(line, "non-zero error code") != NULL ||
+           strstr(line, "(ERROR)") != NULL ||
+           strstr(line, "FAILED") != NULL ||
+           strstr(line, "Invalid network") != NULL;
+}
+
+static bool observer_wait_for_janos_marker(tab_id_t tab, uart_port_t port,
+                                           const char *marker, uint32_t timeout_ms)
+{
+    char rx[512];
+    char line[512];
+    int line_pos = 0;
+    TickType_t start = xTaskGetTickCount();
+    TickType_t timeout = pdMS_TO_TICKS(timeout_ms);
+
+    while ((xTaskGetTickCount() - start) < timeout) {
+        int len = transport_read_bytes_tab(tab, port, rx, sizeof(rx) - 1,
+                                           pdMS_TO_TICKS(100));
+        if (len <= 0) continue;
+        rx[len] = '\0';
+
+        for (int i = 0; i < len; i++) {
+            char c = rx[i];
+            if (c == '\n' || c == '\r') {
+                if (line_pos == 0) continue;
+                line[line_pos] = '\0';
+                ESP_LOGI(TAG, "Observer transition UART: %s", line);
+                if (observer_transition_has_error(line)) return false;
+                if (strstr(line, marker) != NULL) return true;
+                line_pos = 0;
+            } else if (line_pos < (int)sizeof(line) - 1) {
+                line[line_pos++] = c;
+            }
+        }
+    }
+
+    ESP_LOGE(TAG, "Observer transition timeout waiting for: %s", marker);
+    return false;
+}
+
+static bool observer_select_target_and_wait(tab_id_t tab, uart_port_t port,
+                                            const wifi_network_t *target)
+{
+    char cmd[40];
+    snprintf(cmd, sizeof(cmd), "select_networks %d", target->index);
+    uart_send_command_for_tab(cmd);
+    ESP_LOGI(TAG, "Observer Handshaker selection command: %s", cmd);
+
+    char rx[512];
+    char line[512];
+    int line_pos = 0;
+    bool saw_response = false;
+    bool saw_command_echo = false;
+    TickType_t start = xTaskGetTickCount();
+    TickType_t timeout = pdMS_TO_TICKS(3000);
+
+    while ((xTaskGetTickCount() - start) < timeout) {
+        int len = transport_read_bytes_tab(tab, port, rx, sizeof(rx) - 1,
+                                           pdMS_TO_TICKS(100));
+        if (len <= 0) continue;
+        rx[len] = '\0';
+
+        for (int i = 0; i < len; i++) {
+            char c = rx[i];
+            if (c == '\n' || c == '\r') {
+                if (line_pos == 0) continue;
+                line[line_pos] = '\0';
+                trim_ascii_whitespace(line);
+                ESP_LOGI(TAG, "Observer selection UART: %s", line);
+                saw_response = true;
+                if (strstr(line, "select_networks") != NULL) saw_command_echo = true;
+                if (observer_transition_has_error(line)) return false;
+                if (strcmp(line, ">") == 0 && saw_command_echo) return true;
+                line_pos = 0;
+            } else if (line_pos < (int)sizeof(line) - 1) {
+                line[line_pos++] = c;
+            }
+        }
+    }
+
+    ESP_LOGE(TAG, "Observer Handshaker: selection response incomplete (received=%d)",
+             saw_response);
+    return false;
+}
+
+static bool observer_handshaker_prepare_selection(tab_context_t *ctx, wifi_network_t *target)
+{
+    if (!ctx || !target || target->index <= 0) return false;
+
+    tab_id_t tab = tab_id_for_ctx(ctx);
+    uart_port_t port = uart_port_for_tab(tab);
+
+    // Drop stale sniffer output, stop the active Observer sniffer once and
+    // wait until JanOS has fully reset WiFi. Keep the existing scan results;
+    // unselect_networks caused the selected index to be rejected on JanOS.
+    if (tab == TAB_USB) {
+        usb_flush_input(120);
+    } else if (!tab_is_internal(tab)) {
+        uart_flush_input(port);
+    }
+
+    uart_send_command_for_tab("stop");
+    if (!observer_wait_for_janos_marker(tab, port,
+                                        "All operations stopped", 5000)) {
+        return false;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(250));
+    return observer_select_target_and_wait(tab, port, target);
 }
 
 // Close network popup and resume normal monitoring
@@ -15143,6 +15372,7 @@ static void observer_start_task(void *arg)
     // Check if PSRAM buffers are allocated
     if (!observer_rx_buffer || !observer_line_buffer || !ctx->observer_networks) {
         ESP_LOGE(TAG, "[%s] PSRAM buffers not allocated!", uart_name);
+        ctx->observer_start_active = false;
         vTaskDelete(NULL);
         return;
     }
@@ -15232,6 +15462,7 @@ static void observer_start_task(void *arg)
 
     if (!ctx->observer_running) {
         ESP_LOGI(TAG, "[%s] Observer stopped during scan", uart_name);
+        ctx->observer_start_active = false;
         vTaskDelete(NULL);
         return;
     }
@@ -15260,6 +15491,7 @@ static void observer_start_task(void *arg)
 
     if (!ctx->observer_running) {
         ESP_LOGI(TAG, "[%s] Observer stopped during inspect", uart_name);
+        ctx->observer_start_active = false;
         vTaskDelete(NULL);
         return;
     }
@@ -15273,6 +15505,12 @@ static void observer_start_task(void *arg)
     bsp_display_unlock();
 
     vTaskDelay(pdMS_TO_TICKS(500));  // Short delay
+    if (!ctx->observer_running) {
+        ESP_LOGI(TAG, "[%s] Observer stopped before sniffer start", uart_name);
+        ctx->observer_start_active = false;
+        vTaskDelete(NULL);
+        return;
+    }
     uart_flush(uart_port);
     char sniffer_cmd[] = "start_sniffer_noscan\r\n";
     transport_write_bytes_tab(task_tab, uart_port, sniffer_cmd, strlen(sniffer_cmd));
@@ -15311,6 +15549,7 @@ static void observer_start_task(void *arg)
     }
 
     ESP_LOGI(TAG, "[%s] Observer start task finished", uart_name);
+    ctx->observer_start_active = false;
     vTaskDelete(NULL);
 }
 
@@ -15322,13 +15561,14 @@ static void observer_start_btn_cb(lv_event_t *e)
     tab_context_t *ctx = get_current_ctx();
     if (!ctx) return;
 
-    if (ctx->observer_running) {
+    if (ctx->observer_running || ctx->observer_start_active) {
         ESP_LOGW(TAG, "Observer already running on tab %d", current_tab);
         return;
     }
 
     ESP_LOGI(TAG, "Starting Network Observer on tab %d", current_tab);
     ctx->observer_running = true;
+    ctx->observer_start_active = true;
 
     // Disable start button, enable stop button
     if (ctx->observer_start_btn) {
@@ -15345,7 +15585,13 @@ static void observer_start_btn_cb(lv_event_t *e)
 
     // Start observer task for current tab's UART, pass ctx
     // All devices use the same flow - fully independent
-    xTaskCreate(observer_start_task, "obs_start", 8192, (void*)ctx, 5, NULL);
+    BaseType_t task_result = xTaskCreate(observer_start_task, "obs_start", 8192,
+                                         (void*)ctx, 5, NULL);
+    if (task_result != pdPASS) {
+        ESP_LOGE(TAG, "Failed to start Network Observer task");
+        ctx->observer_running = false;
+        ctx->observer_start_active = false;
+    }
 }
 
 // Stop button click handler
@@ -15363,6 +15609,8 @@ static void observer_stop_btn_cb(lv_event_t *e)
 
     ESP_LOGI(TAG, "Stopping Network Observer on tab %d", current_tab);
     ctx->observer_running = false;
+
+    cancel_observer_inspect_task(ctx);
 
     // Stop timer for this context
     if (ctx->observer_timer != NULL) {
