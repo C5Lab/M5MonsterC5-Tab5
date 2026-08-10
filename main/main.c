@@ -9576,19 +9576,21 @@ static void show_handshaker_popup(void)
                  hsv.nets[target_idx].index);
 
         // Stop every producer/consumer belonging to Network Observer before
-        // handing the UART to Handshaker.
+        // handing the UART to Handshaker. Suspend polling without deleting the
+        // network popup; it stays visible while JanOS prepares the target.
+        bool observer_popup_was_open = ctx->popup_open;
         quiesce_observer_for_attack(ctx);
-        if (ctx->popup_open) {
-            destroy_network_popup_ui(ctx);
-        }
+        ctx->popup_open = false;
         if (!wait_for_observer_uart_idle(ctx, 2000)) {
             ESP_LOGE(TAG, "Observer Handshaker aborted: Observer UART tasks still active");
+            ctx->popup_open = observer_popup_was_open;
             clear_observer_attack_override(ctx);
             return;
         }
 
         if (!observer_handshaker_prepare_selection(ctx, &hsv.nets[target_idx])) {
             ESP_LOGE(TAG, "Observer Handshaker aborted: JanOS rejected target selection");
+            ctx->popup_open = observer_popup_was_open;
             if (ctx->observer_status_label) {
                 lv_label_set_text(ctx->observer_status_label,
                                   "Target selection failed - restart Observer");
@@ -9597,6 +9599,10 @@ static void show_handshaker_popup(void)
             }
             clear_observer_attack_override(ctx);
             return;
+        }
+
+        if (observer_popup_was_open) {
+            destroy_network_popup_ui(ctx);
         }
     } else if (ctx->popup_open) {
         pause_observer_for_attack(ctx);
@@ -14246,6 +14252,46 @@ static bool observer_transition_has_error(const char *line)
            strstr(line, "Invalid network") != NULL;
 }
 
+static bool observer_scan_field_is_mac(const char *value)
+{
+    if (!value || strlen(value) != 17) return false;
+    for (int i = 0; i < 17; i++) {
+        if ((i + 1) % 3 == 0) {
+            if (value[i] != ':') return false;
+        } else if (!isxdigit((unsigned char)value[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool observer_parse_scan_identity(const char *line, int *index_out,
+                                         char *ssid_out, size_t ssid_size,
+                                         char *bssid_out, size_t bssid_size)
+{
+    if (!line || line[0] != '"' || !index_out || !ssid_out || !bssid_out) return false;
+
+    char temp[512];
+    snprintf(temp, sizeof(temp), "%s", line);
+    char *fields[12] = {0};
+    int field_count = parse_csv_mixed_fields(temp, fields, 12);
+    if (field_count < 2) return false;
+
+    int index = atoi(fields[0]);
+    if (index <= 0) return false;
+
+    *index_out = index;
+    snprintf(ssid_out, ssid_size, "%s", fields[1] ? fields[1] : "");
+    bssid_out[0] = '\0';
+    for (int i = 2; i < field_count; i++) {
+        if (observer_scan_field_is_mac(fields[i])) {
+            snprintf(bssid_out, bssid_size, "%s", fields[i]);
+            break;
+        }
+    }
+    return true;
+}
+
 static bool observer_wait_for_janos_marker(tab_id_t tab, uart_port_t port,
                                            const char *marker, uint32_t timeout_ms)
 {
@@ -14325,6 +14371,92 @@ static bool observer_select_target_and_wait(tab_id_t tab, uart_port_t port,
     return false;
 }
 
+static bool observer_rescan_handshaker_target(tab_id_t tab, uart_port_t port,
+                                               wifi_network_t *target)
+{
+    if (!target || target->ssid[0] == '\0') return false;
+
+    const bool target_has_mac = observer_scan_field_is_mac(target->bssid);
+    int matched_index = 0;
+    int ssid_matches = 0;
+    char matched_bssid[18] = {0};
+    char rx[1024];
+    char line[512];
+    int line_pos = 0;
+    TickType_t start = xTaskGetTickCount();
+    TickType_t timeout = pdMS_TO_TICKS(UART_RX_TIMEOUT);
+
+    transport_write_bytes_tab(tab, port, "scan_networks\r\n", 15);
+    ESP_LOGI(TAG, "Observer Handshaker: refreshing target '%s' after WiFi reset",
+             target->ssid);
+
+    while ((xTaskGetTickCount() - start) < timeout) {
+        int len = transport_read_bytes_tab(tab, port, rx, sizeof(rx) - 1,
+                                           pdMS_TO_TICKS(100));
+        if (len <= 0) continue;
+        rx[len] = '\0';
+
+        for (int i = 0; i < len; i++) {
+            char c = rx[i];
+            if (c == '\n' || c == '\r') {
+                if (line_pos == 0) continue;
+                line[line_pos] = '\0';
+
+                if (observer_transition_has_error(line)) return false;
+                if (line[0] == '"') {
+                    int scanned_index = 0;
+                    char scanned_ssid[33] = {0};
+                    char scanned_bssid[18] = {0};
+                    if (observer_parse_scan_identity(line, &scanned_index,
+                                                     scanned_ssid, sizeof(scanned_ssid),
+                                                     scanned_bssid, sizeof(scanned_bssid))) {
+                        bool bssid_match = target_has_mac && scanned_bssid[0] &&
+                                           strcasecmp(scanned_bssid, target->bssid) == 0;
+                        bool ssid_match = strcmp(scanned_ssid, target->ssid) == 0;
+                        if (bssid_match) {
+                            matched_index = scanned_index;
+                            snprintf(matched_bssid, sizeof(matched_bssid), "%s", scanned_bssid);
+                        } else if (!target_has_mac && ssid_match) {
+                            ssid_matches++;
+                            matched_index = scanned_index;
+                            snprintf(matched_bssid, sizeof(matched_bssid), "%s", scanned_bssid);
+                        }
+                    }
+                }
+
+                if (strstr(line, "Scan results printed") != NULL) {
+                    if (target_has_mac && matched_index <= 0) {
+                        ESP_LOGE(TAG, "Observer Handshaker: target BSSID %s not found after rescan",
+                                 target->bssid);
+                        return false;
+                    }
+                    if (!target_has_mac && ssid_matches != 1) {
+                        ESP_LOGE(TAG,
+                                 "Observer Handshaker: SSID '%s' is missing or ambiguous (%d matches)",
+                                 target->ssid, ssid_matches);
+                        return false;
+                    }
+
+                    target->index = matched_index;
+                    if (matched_bssid[0]) {
+                        snprintf(target->bssid, sizeof(target->bssid), "%s", matched_bssid);
+                    }
+                    ESP_LOGI(TAG,
+                             "Observer Handshaker: refreshed target '%s' BSSID=%s scan_index=%d",
+                             target->ssid, target->bssid, target->index);
+                    return true;
+                }
+                line_pos = 0;
+            } else if (line_pos < (int)sizeof(line) - 1) {
+                line[line_pos++] = c;
+            }
+        }
+    }
+
+    ESP_LOGE(TAG, "Observer Handshaker: rescan timed out");
+    return false;
+}
+
 static bool observer_handshaker_prepare_selection(tab_context_t *ctx, wifi_network_t *target)
 {
     if (!ctx || !target || target->index <= 0) return false;
@@ -14348,6 +14480,7 @@ static bool observer_handshaker_prepare_selection(tab_context_t *ctx, wifi_netwo
     }
 
     vTaskDelay(pdMS_TO_TICKS(250));
+    if (!observer_rescan_handshaker_target(tab, port, target)) return false;
     return observer_select_target_and_wait(tab, port, target);
 }
 
