@@ -552,9 +552,14 @@ typedef struct {
 
     // Network popup (clients, deauth)
     lv_obj_t *network_popup;
+    lv_obj_t *popup_title_label;
     lv_obj_t *popup_clients_container;
     int popup_network_idx;
     bool popup_open;
+    bool popup_focus_ready;
+    volatile bool popup_focus_active;
+    volatile bool popup_focus_cancel;
+    TaskHandle_t popup_focus_task;
     TimerHandle_t popup_timer;
 
     // Deauth popup
@@ -626,6 +631,8 @@ typedef struct {
     bool observer_page_visible;
     TaskHandle_t observer_task;
     TimerHandle_t observer_timer;
+    char *observer_rx_buffer;       // Per-tab PSRAM UART buffer
+    char *observer_line_buffer;     // Per-tab PSRAM line buffer
 
     // Karma2 (Probes & Karma on Observer)
     lv_obj_t *karma2_probes_popup_overlay;
@@ -1619,9 +1626,7 @@ static void style_danger_button(lv_obj_t *btn)
     lv_obj_set_style_radius(btn, 8, 0);
 }
 
-// Observer global variables (large arrays in PSRAM)
-static observer_network_t *observer_networks = NULL;  // Allocated in PSRAM
-// Note: observer_task_handle is now per-context (ctx->observer_task)
+// Observer polling state is per-context (ctx->observer_task / popup_focus_task).
 #define POPUP_POLL_INTERVAL_MS  10000  // 10 seconds
 
 // Deauth popup state
@@ -1645,10 +1650,6 @@ static TaskHandle_t handshaker_monitor_task_handle = NULL;
 static char evil_twin_html_files[20][64];  // Max 20 files, 64 chars each
 static volatile bool evil_twin_monitoring = false;
 static TaskHandle_t evil_twin_monitor_task_handle = NULL;
-
-// PSRAM buffers for observer (allocated once)
-static char *observer_rx_buffer = NULL;
-static char *observer_line_buffer = NULL;
 
 // LVGL UI elements - pages
 static lv_obj_t *tiles_container = NULL;
@@ -1837,6 +1838,18 @@ static void init_tab_context(tab_context_t *ctx) {
         ctx->observer_networks = heap_caps_calloc(MAX_OBSERVER_NETWORKS, sizeof(observer_network_t), MALLOC_CAP_SPIRAM);
         if (!ctx->observer_networks) {
             ESP_LOGE(TAG, "Failed to allocate observer_networks in PSRAM");
+        }
+    }
+    if (!ctx->observer_rx_buffer) {
+        ctx->observer_rx_buffer = heap_caps_malloc(UART_BUF_SIZE, MALLOC_CAP_SPIRAM);
+        if (!ctx->observer_rx_buffer) {
+            ESP_LOGE(TAG, "Failed to allocate observer RX buffer in PSRAM");
+        }
+    }
+    if (!ctx->observer_line_buffer) {
+        ctx->observer_line_buffer = heap_caps_malloc(OBSERVER_LINE_BUFFER_SIZE, MALLOC_CAP_SPIRAM);
+        if (!ctx->observer_line_buffer) {
+            ESP_LOGE(TAG, "Failed to allocate observer line buffer in PSRAM");
         }
     }
 
@@ -2466,6 +2479,7 @@ static void client_row_click_cb(lv_event_t *e);
 static void show_network_popup(int network_idx);
 static void close_network_popup(void);
 static void destroy_network_popup_ui(tab_context_t *ctx);
+static void popup_focus_task(void *arg);
 static void quiesce_observer_for_attack(tab_context_t *ctx);
 static void pause_observer_for_attack(tab_context_t *ctx);
 static bool wait_for_observer_uart_idle(tab_context_t *ctx, uint32_t timeout_ms);
@@ -8431,6 +8445,17 @@ static void observer_attack_tile_event_cb(lv_event_t *e)
     int observer_idx = ctx->popup_network_idx;
     if (observer_idx < 0 || observer_idx >= ctx->observer_network_count) return;
 
+    if (ctx->popup_focus_active || !ctx->popup_focus_ready) {
+        ESP_LOGW(TAG, "Observer attack ignored: popup target is not ready");
+        if (ctx->observer_status_label) {
+            lv_label_set_text(ctx->observer_status_label,
+                              "Preparing selected network - please wait");
+            lv_obj_set_style_text_color(ctx->observer_status_label,
+                                        COLOR_MATERIAL_AMBER, 0);
+        }
+        return;
+    }
+
     prepare_observer_attack_override(ctx, observer_idx);
     ctx->observer_attack_return_to_observer =
         (strcmp(attack_name, "ARP Poison") == 0 || strcmp(attack_name, "Rogue AP") == 0 || strcmp(attack_name, "Nmap") == 0);
@@ -14117,10 +14142,9 @@ static void popup_poll_task(void *arg);
 // Popup timer callback - triggers poll task every 10s
 static void popup_timer_callback(TimerHandle_t xTimer)
 {
-    (void)xTimer;
-
-    tab_context_t *ctx = get_current_ctx();
-    if (!ctx || !ctx->popup_open || !ctx->observer_running) return;
+    tab_context_t *ctx = (tab_context_t *)pvTimerGetTimerID(xTimer);
+    if (!ctx || !ctx->popup_open || !ctx->popup_focus_ready ||
+        !ctx->observer_running) return;
 
     // Only start new poll if previous one finished
     if (ctx->observer_task == NULL) {
@@ -14169,6 +14193,8 @@ static void destroy_network_popup_ui(tab_context_t *ctx)
 {
     if (!ctx) return;
 
+    ctx->popup_focus_cancel = true;
+
     if (ctx->popup_timer != NULL) {
         xTimerStop(ctx->popup_timer, 0);
     }
@@ -14176,10 +14202,12 @@ static void destroy_network_popup_ui(tab_context_t *ctx)
     if (ctx->network_popup) {
         lv_obj_del(ctx->network_popup);
         ctx->network_popup = NULL;
+        ctx->popup_title_label = NULL;
         ctx->popup_clients_container = NULL;
     }
 
     ctx->popup_open = false;
+    ctx->popup_focus_ready = false;
     ctx->popup_network_idx = -1;
 }
 
@@ -14195,6 +14223,7 @@ static void quiesce_observer_for_attack(tab_context_t *ctx)
     if (ctx->popup_timer != NULL) {
         xTimerStop(ctx->popup_timer, 0);
     }
+    ctx->popup_focus_cancel = true;
 
     // inspect_observer_task uses its own active flag and otherwise continues
     // issuing uart_flush()/inspect_network even after observer_running=false.
@@ -14227,13 +14256,15 @@ static bool wait_for_observer_uart_idle(tab_context_t *ctx, uint32_t timeout_ms)
 
     while (ctx->observer_start_active ||
            ctx->observer_task != NULL ||
-           ctx->observer_inspect_task != NULL) {
+           ctx->observer_inspect_task != NULL ||
+           ctx->popup_focus_task != NULL) {
         if ((xTaskGetTickCount() - start) >= timeout) {
             ESP_LOGE(TAG,
-                     "Observer UART idle timeout: start=%d poll=%p inspect=%p",
+                     "Observer UART idle timeout: start=%d poll=%p inspect=%p focus=%p",
                      ctx->observer_start_active,
                      (void *)ctx->observer_task,
-                     (void *)ctx->observer_inspect_task);
+                     (void *)ctx->observer_inspect_task,
+                     (void *)ctx->popup_focus_task);
             return false;
         }
         vTaskDelay(pdMS_TO_TICKS(10));
@@ -14292,8 +14323,38 @@ static bool observer_parse_scan_identity(const char *line, int *index_out,
     return true;
 }
 
+static bool observer_contains_case_insensitive(const char *haystack, const char *needle)
+{
+    if (!haystack || !needle || needle[0] == '\0') return false;
+    size_t needle_len = strlen(needle);
+    for (const char *p = haystack; *p; p++) {
+        if (strncasecmp(p, needle, needle_len) == 0) return true;
+    }
+    return false;
+}
+
+static void observer_send_command_to_transport(tab_id_t tab, uart_port_t port,
+                                                const char *cmd, const char *purpose)
+{
+    if (!cmd || tab_is_internal(tab)) return;
+    transport_write_bytes_tab(tab, port, cmd, strlen(cmd));
+    transport_write_bytes_tab(tab, port, "\r\n", 2);
+    ESP_LOGI(TAG, "Observer %s command: %s",
+             purpose ? purpose : "transition", cmd);
+}
+
+static void observer_flush_transport_input(tab_id_t tab, uart_port_t port)
+{
+    if (tab == TAB_USB) {
+        usb_flush_input(120);
+    } else if (!tab_is_internal(tab)) {
+        uart_flush_input(port);
+    }
+}
+
 static bool observer_wait_for_janos_marker(tab_id_t tab, uart_port_t port,
-                                           const char *marker, uint32_t timeout_ms)
+                                           const char *marker, uint32_t timeout_ms,
+                                           volatile bool *cancel)
 {
     char rx[512];
     char line[512];
@@ -14302,6 +14363,7 @@ static bool observer_wait_for_janos_marker(tab_id_t tab, uart_port_t port,
     TickType_t timeout = pdMS_TO_TICKS(timeout_ms);
 
     while ((xTaskGetTickCount() - start) < timeout) {
+        if (cancel && *cancel) return false;
         int len = transport_read_bytes_tab(tab, port, rx, sizeof(rx) - 1,
                                            pdMS_TO_TICKS(100));
         if (len <= 0) continue;
@@ -14327,22 +14389,25 @@ static bool observer_wait_for_janos_marker(tab_id_t tab, uart_port_t port,
 }
 
 static bool observer_select_target_and_wait(tab_id_t tab, uart_port_t port,
-                                            const wifi_network_t *target)
+                                            const wifi_network_t *target,
+                                            const char *purpose,
+                                            volatile bool *cancel)
 {
     char cmd[40];
     snprintf(cmd, sizeof(cmd), "select_networks %d", target->index);
-    uart_send_command_for_tab(cmd);
-    ESP_LOGI(TAG, "Observer Handshaker selection command: %s", cmd);
+    observer_send_command_to_transport(tab, port, cmd, purpose);
 
     char rx[512];
     char line[512];
     int line_pos = 0;
     bool saw_response = false;
     bool saw_command_echo = false;
+    bool saw_target = false;
     TickType_t start = xTaskGetTickCount();
     TickType_t timeout = pdMS_TO_TICKS(3000);
 
     while ((xTaskGetTickCount() - start) < timeout) {
+        if (cancel && *cancel) return false;
         int len = transport_read_bytes_tab(tab, port, rx, sizeof(rx) - 1,
                                            pdMS_TO_TICKS(100));
         if (len <= 0) continue;
@@ -14357,8 +14422,14 @@ static bool observer_select_target_and_wait(tab_id_t tab, uart_port_t port,
                 ESP_LOGI(TAG, "Observer selection UART: %s", line);
                 saw_response = true;
                 if (strstr(line, "select_networks") != NULL) saw_command_echo = true;
+                if ((observer_scan_field_is_mac(target->bssid) &&
+                     observer_contains_case_insensitive(line, target->bssid)) ||
+                    (!observer_scan_field_is_mac(target->bssid) && target->ssid[0] &&
+                     strstr(line, target->ssid) != NULL)) {
+                    saw_target = true;
+                }
                 if (observer_transition_has_error(line)) return false;
-                if (strcmp(line, ">") == 0 && saw_command_echo) return true;
+                if (strcmp(line, ">") == 0 && saw_command_echo && saw_target) return true;
                 line_pos = 0;
             } else if (line_pos < (int)sizeof(line) - 1) {
                 line[line_pos++] = c;
@@ -14366,17 +14437,21 @@ static bool observer_select_target_and_wait(tab_id_t tab, uart_port_t port,
         }
     }
 
-    ESP_LOGE(TAG, "Observer Handshaker: selection response incomplete (received=%d)",
-             saw_response);
+    ESP_LOGE(TAG,
+             "Observer %s: selection response incomplete (received=%d echo=%d target=%d)",
+             purpose ? purpose : "transition", saw_response,
+             saw_command_echo, saw_target);
     return false;
 }
 
-static bool observer_rescan_handshaker_target(tab_id_t tab, uart_port_t port,
-                                               wifi_network_t *target)
+static bool observer_rescan_target(tab_id_t tab, uart_port_t port,
+                                   wifi_network_t *target, const char *purpose,
+                                   volatile bool *cancel)
 {
-    if (!target || target->ssid[0] == '\0') return false;
+    if (!target) return false;
 
     const bool target_has_mac = observer_scan_field_is_mac(target->bssid);
+    if (!target_has_mac && target->ssid[0] == '\0') return false;
     int matched_index = 0;
     int ssid_matches = 0;
     char matched_bssid[18] = {0};
@@ -14386,11 +14461,12 @@ static bool observer_rescan_handshaker_target(tab_id_t tab, uart_port_t port,
     TickType_t start = xTaskGetTickCount();
     TickType_t timeout = pdMS_TO_TICKS(UART_RX_TIMEOUT);
 
-    transport_write_bytes_tab(tab, port, "scan_networks\r\n", 15);
-    ESP_LOGI(TAG, "Observer Handshaker: refreshing target '%s' after WiFi reset",
-             target->ssid);
+    observer_send_command_to_transport(tab, port, "scan_networks", purpose);
+    ESP_LOGI(TAG, "Observer %s: refreshing target '%s' after WiFi reset",
+             purpose ? purpose : "transition", target->ssid);
 
     while ((xTaskGetTickCount() - start) < timeout) {
+        if (cancel && *cancel) return false;
         int len = transport_read_bytes_tab(tab, port, rx, sizeof(rx) - 1,
                                            pdMS_TO_TICKS(100));
         if (len <= 0) continue;
@@ -14426,14 +14502,14 @@ static bool observer_rescan_handshaker_target(tab_id_t tab, uart_port_t port,
 
                 if (strstr(line, "Scan results printed") != NULL) {
                     if (target_has_mac && matched_index <= 0) {
-                        ESP_LOGE(TAG, "Observer Handshaker: target BSSID %s not found after rescan",
-                                 target->bssid);
+                        ESP_LOGE(TAG, "Observer %s: target BSSID %s not found after rescan",
+                                 purpose ? purpose : "transition", target->bssid);
                         return false;
                     }
                     if (!target_has_mac && ssid_matches != 1) {
                         ESP_LOGE(TAG,
-                                 "Observer Handshaker: SSID '%s' is missing or ambiguous (%d matches)",
-                                 target->ssid, ssid_matches);
+                                 "Observer %s: SSID '%s' is missing or ambiguous (%d matches)",
+                                 purpose ? purpose : "transition", target->ssid, ssid_matches);
                         return false;
                     }
 
@@ -14442,7 +14518,8 @@ static bool observer_rescan_handshaker_target(tab_id_t tab, uart_port_t port,
                         snprintf(target->bssid, sizeof(target->bssid), "%s", matched_bssid);
                     }
                     ESP_LOGI(TAG,
-                             "Observer Handshaker: refreshed target '%s' BSSID=%s scan_index=%d",
+                             "Observer %s: refreshed target '%s' BSSID=%s scan_index=%d",
+                             purpose ? purpose : "transition",
                              target->ssid, target->bssid, target->index);
                     return true;
                 }
@@ -14453,11 +14530,15 @@ static bool observer_rescan_handshaker_target(tab_id_t tab, uart_port_t port,
         }
     }
 
-    ESP_LOGE(TAG, "Observer Handshaker: rescan timed out");
+    ESP_LOGE(TAG, "Observer %s: rescan timed out",
+             purpose ? purpose : "transition");
     return false;
 }
 
-static bool observer_handshaker_prepare_selection(tab_context_t *ctx, wifi_network_t *target)
+static bool observer_prepare_target_selection(tab_context_t *ctx,
+                                              wifi_network_t *target,
+                                              const char *purpose,
+                                              volatile bool *cancel)
 {
     if (!ctx || !target || target->index <= 0) return false;
 
@@ -14467,21 +14548,171 @@ static bool observer_handshaker_prepare_selection(tab_context_t *ctx, wifi_netwo
     // Drop stale sniffer output, stop the active Observer sniffer once and
     // wait until JanOS has fully reset WiFi. Keep the existing scan results;
     // unselect_networks caused the selected index to be rejected on JanOS.
-    if (tab == TAB_USB) {
-        usb_flush_input(120);
-    } else if (!tab_is_internal(tab)) {
-        uart_flush_input(port);
-    }
+    observer_flush_transport_input(tab, port);
 
-    uart_send_command_for_tab("stop");
+    observer_send_command_to_transport(tab, port, "stop", purpose);
     if (!observer_wait_for_janos_marker(tab, port,
-                                        "All operations stopped", 5000)) {
+                                        "All operations stopped", 5000,
+                                        cancel)) {
         return false;
     }
 
+    if (cancel && *cancel) return false;
     vTaskDelay(pdMS_TO_TICKS(250));
-    if (!observer_rescan_handshaker_target(tab, port, target)) return false;
-    return observer_select_target_and_wait(tab, port, target);
+    if (!observer_rescan_target(tab, port, target, purpose, cancel)) return false;
+    return observer_select_target_and_wait(tab, port, target, purpose, cancel);
+}
+
+static bool observer_handshaker_prepare_selection(tab_context_t *ctx, wifi_network_t *target)
+{
+    return observer_prepare_target_selection(ctx, target, "Handshaker", NULL);
+}
+
+static bool observer_wait_for_command_prompt(tab_id_t tab, uart_port_t port,
+                                             const char *cmd, const char *purpose,
+                                             uint32_t timeout_ms)
+{
+    char rx[512];
+    char line[512];
+    int line_pos = 0;
+    bool saw_echo = false;
+    TickType_t start = xTaskGetTickCount();
+    TickType_t timeout = pdMS_TO_TICKS(timeout_ms);
+
+    observer_send_command_to_transport(tab, port, cmd, purpose);
+    while ((xTaskGetTickCount() - start) < timeout) {
+        int len = transport_read_bytes_tab(tab, port, rx, sizeof(rx) - 1,
+                                           pdMS_TO_TICKS(100));
+        if (len <= 0) continue;
+        rx[len] = '\0';
+        for (int i = 0; i < len; i++) {
+            char c = rx[i];
+            if (c == '\n' || c == '\r') {
+                if (line_pos == 0) continue;
+                line[line_pos] = '\0';
+                trim_ascii_whitespace(line);
+                ESP_LOGI(TAG, "Observer %s UART: %s",
+                         purpose ? purpose : "transition", line);
+                if (observer_transition_has_error(line)) return false;
+                if (strstr(line, cmd) != NULL) saw_echo = true;
+                if (strcmp(line, ">") == 0 && saw_echo) return true;
+                line_pos = 0;
+            } else if (line_pos < (int)sizeof(line) - 1) {
+                line[line_pos++] = c;
+            }
+        }
+    }
+
+    ESP_LOGE(TAG, "Observer %s: timeout waiting for '%s'",
+             purpose ? purpose : "transition", cmd);
+    return false;
+}
+
+static void observer_set_popup_title(tab_context_t *ctx, const char *text,
+                                     lv_color_t color)
+{
+    if (!ctx || !text) return;
+    if (bsp_display_lock(100)) {
+        if (ctx->popup_title_label && lv_obj_is_valid(ctx->popup_title_label)) {
+            lv_label_set_text(ctx->popup_title_label, text);
+            lv_obj_set_style_text_color(ctx->popup_title_label, color, 0);
+        }
+        bsp_display_unlock();
+    }
+}
+
+static bool observer_wait_for_popup_uart_idle(tab_context_t *ctx,
+                                              uint32_t timeout_ms)
+{
+    TickType_t start = xTaskGetTickCount();
+    TickType_t timeout = pdMS_TO_TICKS(timeout_ms);
+    while (ctx && (ctx->observer_start_active || ctx->observer_task != NULL ||
+                   ctx->observer_inspect_task != NULL)) {
+        if (ctx->popup_focus_cancel ||
+            (xTaskGetTickCount() - start) >= timeout) return false;
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    return ctx != NULL;
+}
+
+static void popup_focus_task(void *arg)
+{
+    tab_context_t *ctx = (tab_context_t *)arg;
+    if (!ctx) {
+        vTaskDelete(NULL);
+        return;
+    }
+
+    if (!observer_wait_for_popup_uart_idle(ctx, 7000) ||
+        ctx->popup_focus_cancel || !ctx->popup_open) {
+        goto done;
+    }
+
+    int observer_idx = ctx->popup_network_idx;
+    if (observer_idx < 0 || observer_idx >= ctx->observer_network_count) goto failed;
+
+    observer_network_t *source = &ctx->observer_networks[observer_idx];
+    wifi_network_t target = {0};
+    target.index = source->scan_index;
+    target.channel = source->channel;
+    target.rssi = source->rssi;
+    snprintf(target.ssid, sizeof(target.ssid), "%s", source->ssid);
+    snprintf(target.bssid, sizeof(target.bssid), "%s", source->bssid);
+    snprintf(target.band, sizeof(target.band), "%s", source->band);
+
+    if (!observer_prepare_target_selection(ctx, &target, "Popup",
+                                           &ctx->popup_focus_cancel)) {
+        if (ctx->popup_focus_cancel) goto done;
+        goto failed;
+    }
+    if (ctx->popup_focus_cancel || !ctx->popup_open) goto done;
+
+    // Keep the Observer snapshot aligned with JanOS after the refresh scan.
+    source->scan_index = target.index;
+    if (target.bssid[0]) {
+        snprintf(source->bssid, sizeof(source->bssid), "%s", target.bssid);
+    }
+
+    tab_id_t tab = tab_id_for_ctx(ctx);
+    uart_port_t port = uart_port_for_tab(tab);
+    observer_send_command_to_transport(tab, port, "start_sniffer", "Popup");
+    vTaskDelay(pdMS_TO_TICKS(500));
+    if (ctx->popup_focus_cancel || !ctx->popup_open) goto done;
+
+    ctx->popup_focus_ready = true;
+    char title[96];
+    snprintf(title, sizeof(title), "Scanning only %s",
+             target.ssid[0] ? target.ssid : "selected network");
+    observer_set_popup_title(ctx, title, COLOR_MATERIAL_TEAL);
+
+    if (ctx->popup_timer != NULL) {
+        vTimerSetTimerID(ctx->popup_timer, (void *)ctx);
+        xTimerStart(ctx->popup_timer, 0);
+    }
+    if (ctx->observer_task == NULL) {
+        xTaskCreate(popup_poll_task, "popup_poll", 8192,
+                    (void *)ctx, 5, &ctx->observer_task);
+    }
+    goto done;
+
+failed:
+    ESP_LOGE(TAG, "Observer popup: failed to focus selected network");
+    observer_set_popup_title(ctx, "Target selection failed",
+                             COLOR_MATERIAL_RED);
+    if (ctx->observer_status_label) {
+        if (bsp_display_lock(100)) {
+            lv_label_set_text(ctx->observer_status_label,
+                              "Popup target failed - close and retry");
+            lv_obj_set_style_text_color(ctx->observer_status_label,
+                                        COLOR_MATERIAL_RED, 0);
+            bsp_display_unlock();
+        }
+    }
+
+done:
+    ctx->popup_focus_active = false;
+    ctx->popup_focus_task = NULL;
+    vTaskDelete(NULL);
 }
 
 // Close network popup and resume normal monitoring
@@ -14494,10 +14725,40 @@ static void close_network_popup(void)
 
     destroy_network_popup_ui(ctx);
 
-    // Send unselect_networks to monitor all networks again
-    uart_send_command_for_tab("unselect_networks");
-    vTaskDelay(pdMS_TO_TICKS(100));
-    uart_send_command_for_tab("start_sniffer_noscan");
+    // A timer stop only prevents future callbacks. Wait until the in-flight
+    // focus/poll reader has actually released this transport.
+    TickType_t wait_start = xTaskGetTickCount();
+    while ((ctx->popup_focus_task != NULL || ctx->observer_task != NULL) &&
+           (xTaskGetTickCount() - wait_start) < pdMS_TO_TICKS(3000)) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    if (ctx->popup_focus_task != NULL || ctx->observer_task != NULL) {
+        ESP_LOGE(TAG, "Observer popup close: UART task did not stop in time");
+        ctx->observer_running = false;
+        if (ctx->observer_status_label) {
+            lv_label_set_text(ctx->observer_status_label,
+                              "Observer stopped - UART task timeout");
+            lv_obj_set_style_text_color(ctx->observer_status_label,
+                                        COLOR_MATERIAL_RED, 0);
+        }
+        return;
+    }
+
+    tab_id_t tab = tab_id_for_ctx(ctx);
+    uart_port_t port = uart_port_for_tab(tab);
+    if (!observer_wait_for_command_prompt(tab, port, "unselect_networks",
+                                          "Popup close", 5000)) {
+        ctx->observer_running = false;
+        if (ctx->observer_status_label) {
+            lv_label_set_text(ctx->observer_status_label,
+                              "Observer resume failed - restart Observer");
+            lv_obj_set_style_text_color(ctx->observer_status_label,
+                                        COLOR_MATERIAL_RED, 0);
+        }
+        return;
+    }
+    observer_send_command_to_transport(tab, port, "start_sniffer_noscan",
+                                       "Popup close");
 
     // Restart main observer timer (20s) for this context
     if (ctx->observer_timer != NULL && ctx->observer_running) {
@@ -14521,12 +14782,18 @@ static void show_network_popup(int network_idx)
 
     if (network_idx < 0 || network_idx >= ctx->observer_network_count) return;
     if (ctx->popup_open) return;  // Already showing a popup on this tab
+    if (ctx->observer_start_active || ctx->observer_inspect_task != NULL) {
+        ESP_LOGW(TAG, "Observer popup ignored while initial scan/inspect is active");
+        return;
+    }
 
     observer_network_t *net = &ctx->observer_networks[network_idx];
     ESP_LOGI(TAG, "Opening popup for network: %s (scan_index=%d)", net->ssid, net->scan_index);
 
     ctx->popup_open = true;
     ctx->popup_network_idx = network_idx;
+    ctx->popup_focus_ready = false;
+    ctx->popup_focus_cancel = false;
 
     // Stop main observer timer for this context
     if (ctx->observer_timer != NULL) {
@@ -14534,20 +14801,14 @@ static void show_network_popup(int network_idx)
         ESP_LOGI(TAG, "Stopped observer timer for tab %d", current_tab);
     }
 
-    // Send commands to focus on this network
-    // Use UART based on current tab
-    char cmd[32];
-    snprintf(cmd, sizeof(cmd), "select_networks %d", net->scan_index);
-
-    uart_send_command_for_tab("stop");
-        vTaskDelay(pdMS_TO_TICKS(200));
-    uart_send_command_for_tab(cmd);
-        vTaskDelay(pdMS_TO_TICKS(100));
-    uart_send_command_for_tab("start_sniffer");
-
     // Create popup overlay
     lv_obj_t *container = get_current_tab_container();
-    if (!container) return;
+    if (!container) {
+        ctx->popup_open = false;
+        ctx->popup_network_idx = -1;
+        ctx->popup_focus_cancel = true;
+        return;
+    }
     ctx->network_popup = lv_obj_create(container);
     lv_obj_set_size(ctx->network_popup, 640, enable_red_team ? 700 : 640);
     lv_obj_center(ctx->network_popup);
@@ -14573,8 +14834,9 @@ static void show_network_popup(int network_idx)
 
     // Title
     lv_obj_t *title = lv_label_create(header);
+    ctx->popup_title_label = title;
     const char *ssid_display = strlen(net->ssid) > 0 ? net->ssid : "Unknown";
-    lv_label_set_text_fmt(title, "Scanning only %s", ssid_display);
+    lv_label_set_text_fmt(title, "Preparing %s...", ssid_display);
     lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
     lv_obj_set_style_text_color(title, COLOR_MATERIAL_TEAL, 0);
     lv_obj_align(title, LV_ALIGN_LEFT_MID, 0, 0);
@@ -14655,19 +14917,23 @@ static void show_network_popup(int network_idx)
         ctx->popup_timer = xTimerCreate("popup_timer",
                                    pdMS_TO_TICKS(POPUP_POLL_INTERVAL_MS),
                                    pdTRUE,  // Auto-reload
-                                   NULL,
+                                   (void *)ctx,
                                    popup_timer_callback);
+    } else {
+        vTimerSetTimerID(ctx->popup_timer, (void *)ctx);
     }
 
-    if (ctx->popup_timer != NULL) {
-        xTimerStart(ctx->popup_timer, 0);
-        ESP_LOGI(TAG, "Started popup timer (10s polling)");
-
-        // Do first poll after a short delay
-        vTaskDelay(pdMS_TO_TICKS(2000));
-        if (ctx->popup_open && ctx->observer_task == NULL) {
-            xTaskCreate(popup_poll_task, "popup_poll", 8192, (void*)ctx, 5, &ctx->observer_task);
-        }
+    ctx->popup_focus_active = true;
+    BaseType_t focus_result = xTaskCreate(popup_focus_task, "popup_focus", 8192,
+                                          (void *)ctx, 5,
+                                          &ctx->popup_focus_task);
+    if (focus_result != pdPASS) {
+        ctx->popup_focus_active = false;
+        ctx->popup_focus_task = NULL;
+        ctx->popup_focus_ready = false;
+        lv_label_set_text(title, "Failed to start target task");
+        lv_obj_set_style_text_color(title, COLOR_MATERIAL_RED, 0);
+        ESP_LOGE(TAG, "Failed to create Observer popup focus task");
     }
 }
 
@@ -14712,10 +14978,17 @@ static void popup_poll_task(void *arg)
         return;
     }
 
-    ESP_LOGI(TAG, "Popup poll task started for network idx %d", ctx->popup_network_idx);
+    ESP_LOGD(TAG, "Popup poll task started for network idx %d", ctx->popup_network_idx);
 
-    if (!observer_rx_buffer || !observer_line_buffer || !ctx->observer_networks) {
+    if (!ctx->observer_rx_buffer || !ctx->observer_line_buffer || !ctx->observer_networks) {
         ESP_LOGE(TAG, "PSRAM buffers not allocated!");
+        ctx->observer_task = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    int target_network_idx = ctx->popup_network_idx;
+    if (target_network_idx < 0 || target_network_idx >= ctx->observer_network_count) {
         ctx->observer_task = NULL;
         vTaskDelete(NULL);
         return;
@@ -14725,24 +14998,28 @@ static void popup_poll_task(void *arg)
     tab_id_t task_tab = tab_id_for_ctx(ctx);
     uart_port_t uart_port = (task_tab == TAB_MBUS && uart2_initialized) ? UART2_NUM : UART_NUM;
 
-    uart_flush(uart_port);
+    observer_flush_transport_input(task_tab, uart_port);
     char cmd[] = "show_sniffer_results\r\n";
     transport_write_bytes_tab(task_tab, uart_port, cmd, strlen(cmd));
 
-    char *rx_buffer = observer_rx_buffer;
-    char *line_buffer = observer_line_buffer;
+    char *rx_buffer = ctx->observer_rx_buffer;
+    char *line_buffer = ctx->observer_line_buffer;
     int line_pos = 0;
     int current_network_idx = -1;
+    bool saw_result_data = false;
+    int empty_reads = 0;
+    bool response_done = false;
 
     // DON'T clear client data - accumulate clients over time
 
     TickType_t start_time = xTaskGetTickCount();
     TickType_t timeout_ticks = pdMS_TO_TICKS(5000);
 
-    while ((xTaskGetTickCount() - start_time) < timeout_ticks) {
+    while (!response_done && (xTaskGetTickCount() - start_time) < timeout_ticks) {
         int len = transport_read_bytes_tab(task_tab, uart_port, (uint8_t*)rx_buffer, UART_BUF_SIZE - 1, pdMS_TO_TICKS(100));
 
         if (len > 0) {
+            empty_reads = 0;
             rx_buffer[len] = '\0';
 
             for (int i = 0; i < len; i++) {
@@ -14754,18 +15031,26 @@ static void popup_poll_task(void *arg)
 
                         ESP_LOGD(TAG, "POPUP SNIFFER LINE: '%s'", line_buffer);
 
+                        char prompt_check[OBSERVER_LINE_BUFFER_SIZE];
+                        snprintf(prompt_check, sizeof(prompt_check), "%s", line_buffer);
+                        trim_ascii_whitespace(prompt_check);
+                        if (strcmp(prompt_check, ">") == 0) {
+                            response_done = true;
+                            line_pos = 0;
+                            break;
+                        }
+
                         // Check for network line (doesn't start with space)
                         if (line_buffer[0] != ' ' && line_buffer[0] != '\t') {
                             observer_network_t parsed_net = {0};
                             if (parse_sniffer_network_line(line_buffer, &parsed_net)) {
-                                // Find this network in our existing list by SSID
+                                saw_result_data = true;
                                 current_network_idx = -1;
-                                for (int n = 0; n < ctx->observer_network_count; n++) {
-                                    if (strcmp(ctx->observer_networks[n].ssid, parsed_net.ssid) == 0) {
-                                        current_network_idx = n;
-                                        // Don't overwrite client_count - we track it via add_client_mac
-                                        break;
-                                    }
+                                observer_network_t *target =
+                                    &ctx->observer_networks[target_network_idx];
+                                if (strcmp(target->ssid, parsed_net.ssid) == 0 &&
+                                    target->channel == parsed_net.channel) {
+                                    current_network_idx = target_network_idx;
                                 }
                             } else {
                                 current_network_idx = -1;
@@ -14776,6 +15061,7 @@ static void popup_poll_task(void *arg)
                             observer_network_t *net = &ctx->observer_networks[current_network_idx];
                             char mac[18];
                             if (parse_sniffer_client_line(line_buffer, mac, sizeof(mac))) {
+                                saw_result_data = true;
                                 // Add client if not already present (accumulate)
                                 if (add_client_mac(net, mac)) {
                                     ESP_LOGI(TAG, "  -> NEW client: %s for '%s'", mac, net->ssid);
@@ -14789,6 +15075,8 @@ static void popup_poll_task(void *arg)
                     line_buffer[line_pos++] = c;
                 }
             }
+        } else if (saw_result_data && ++empty_reads >= 10) {
+            response_done = true;
         }
 
         if (!ctx->popup_open) {
@@ -14804,7 +15092,7 @@ static void popup_poll_task(void *arg)
         bsp_display_unlock();
     }
 
-    ESP_LOGI(TAG, "Popup poll task finished");
+    ESP_LOGD(TAG, "Popup poll task finished");
     ctx->observer_task = NULL;
     vTaskDelete(NULL);
 }
@@ -15287,10 +15575,10 @@ static void observer_poll_task(void *arg)
     uart_port_t uart_port = (task_tab == TAB_MBUS && uart2_initialized) ? UART2_NUM : UART_NUM;
     const char *uart_name = tab_transport_name(task_tab);
 
-    ESP_LOGI(TAG, "[%s] Observer poll task started", uart_name);
+    ESP_LOGD(TAG, "[%s] Observer poll task started", uart_name);
 
     // Check if PSRAM buffers are allocated
-    if (!observer_rx_buffer || !observer_line_buffer || !ctx->observer_networks) {
+    if (!ctx->observer_rx_buffer || !ctx->observer_line_buffer || !ctx->observer_networks) {
         ESP_LOGE(TAG, "[%s] PSRAM buffers not allocated!", uart_name);
         ctx->observer_task = NULL;
         vTaskDelete(NULL);
@@ -15298,17 +15586,20 @@ static void observer_poll_task(void *arg)
     }
 
     // Flush UART buffer
-    uart_flush(uart_port);
+    observer_flush_transport_input(task_tab, uart_port);
 
     // Send show_sniffer_results command to correct UART
     char cmd[] = "show_sniffer_results\r\n";
     transport_write_bytes_tab(task_tab, uart_port, cmd, strlen(cmd));
-    ESP_LOGI(TAG, "[%s] Sent: show_sniffer_results", uart_name);
+    ESP_LOGD(TAG, "[%s] Sent: show_sniffer_results", uart_name);
 
     // Use PSRAM-allocated buffers
-    char *rx_buffer = observer_rx_buffer;
-    char *line_buffer = observer_line_buffer;
+    char *rx_buffer = ctx->observer_rx_buffer;
+    char *line_buffer = ctx->observer_line_buffer;
     int line_pos = 0;
+    bool saw_result_data = false;
+    int empty_reads = 0;
+    bool response_done = false;
 
     // Track current network being updated (index into ctx->observer_networks)
     int current_network_idx = -1;
@@ -15318,10 +15609,11 @@ static void observer_poll_task(void *arg)
     TickType_t start_time = xTaskGetTickCount();
     TickType_t timeout_ticks = pdMS_TO_TICKS(5000);  // 5 second timeout for response
 
-    while ((xTaskGetTickCount() - start_time) < timeout_ticks) {
+    while (!response_done && (xTaskGetTickCount() - start_time) < timeout_ticks) {
         int len = transport_read_bytes_tab(task_tab, uart_port, rx_buffer, UART_BUF_SIZE - 1, pdMS_TO_TICKS(100));
 
         if (len > 0) {
+            empty_reads = 0;
             rx_buffer[len] = '\0';
 
             for (int i = 0; i < len; i++) {
@@ -15332,20 +15624,30 @@ static void observer_poll_task(void *arg)
                         line_buffer[line_pos] = '\0';
                         ESP_LOGD(TAG, "Observer line: %s", line_buffer);
 
-                        // Log every line received for debugging
-                        ESP_LOGI(TAG, "SNIFFER LINE: '%s'", line_buffer);
+                        ESP_LOGD(TAG, "SNIFFER LINE: '%s'", line_buffer);
+
+                        char prompt_check[OBSERVER_LINE_BUFFER_SIZE];
+                        snprintf(prompt_check, sizeof(prompt_check), "%s", line_buffer);
+                        trim_ascii_whitespace(prompt_check);
+                        if (strcmp(prompt_check, ">") == 0) {
+                            response_done = true;
+                            line_pos = 0;
+                            break;
+                        }
 
                         // Check for network line (doesn't start with space)
                         if (line_buffer[0] != ' ' && line_buffer[0] != '\t') {
                             observer_network_t parsed_net = {0};
                             if (parse_sniffer_network_line(line_buffer, &parsed_net)) {
+                                saw_result_data = true;
                                 // Find this network in our existing list by SSID
                                 current_network_idx = -1;
                                 for (int n = 0; n < ctx->observer_network_count; n++) {
-                                    if (strcmp(ctx->observer_networks[n].ssid, parsed_net.ssid) == 0) {
+                                    if (strcmp(ctx->observer_networks[n].ssid, parsed_net.ssid) == 0 &&
+                                        ctx->observer_networks[n].channel == parsed_net.channel) {
                                         current_network_idx = n;
                                         // Don't overwrite client_count - we track it via add_client_mac
-                                        ESP_LOGI(TAG, "[%s] Found network '%s' at idx %d (count: %d)",
+                                        ESP_LOGD(TAG, "[%s] Found network '%s' at idx %d (count: %d)",
                                                  uart_name, parsed_net.ssid, n, ctx->observer_networks[n].client_count);
                                         break;
                                     }
@@ -15363,6 +15665,7 @@ static void observer_poll_task(void *arg)
                             observer_network_t *net = &ctx->observer_networks[current_network_idx];
                             char mac[18];
                             if (parse_sniffer_client_line(line_buffer, mac, sizeof(mac))) {
+                                saw_result_data = true;
                                 // Add client if not already present (accumulate)
                                 if (add_client_mac(net, mac)) {
                                     ESP_LOGI(TAG, "  -> NEW client: %s for '%s' (total: %d)", mac, net->ssid, net->client_count);
@@ -15378,6 +15681,8 @@ static void observer_poll_task(void *arg)
                     line_buffer[line_pos++] = c;
                 }
             }
+        } else if (saw_result_data && ++empty_reads >= 10) {
+            response_done = true;
         }
 
         // Check if observer was stopped
@@ -15388,21 +15693,21 @@ static void observer_poll_task(void *arg)
     }
 
     // Log summary of parsed data
-    ESP_LOGI(TAG, "[%s] === SNIFFER UPDATE SUMMARY ===", uart_name);
-    ESP_LOGI(TAG, "[%s] Total networks: %d", uart_name, ctx->observer_network_count);
+    ESP_LOGD(TAG, "[%s] === SNIFFER UPDATE SUMMARY ===", uart_name);
+    ESP_LOGD(TAG, "[%s] Total networks: %d", uart_name, ctx->observer_network_count);
     int networks_with_clients = 0;
     for (int i = 0; i < ctx->observer_network_count; i++) {
         if (ctx->observer_networks[i].client_count > 0) {
             networks_with_clients++;
-            ESP_LOGI(TAG, "[%s] Network %d: '%s' CH%d clients=%d",
+            ESP_LOGD(TAG, "[%s] Network %d: '%s' CH%d clients=%d",
                      uart_name, i, ctx->observer_networks[i].ssid, ctx->observer_networks[i].channel, ctx->observer_networks[i].client_count);
             for (int j = 0; j < MAX_CLIENTS_PER_NETWORK && ctx->observer_networks[i].clients[j][0] != '\0'; j++) {
-                ESP_LOGI(TAG, "[%s]   Client %d: %s", uart_name, j, ctx->observer_networks[i].clients[j]);
+                ESP_LOGD(TAG, "[%s]   Client %d: %s", uart_name, j, ctx->observer_networks[i].clients[j]);
             }
         }
     }
-    ESP_LOGI(TAG, "[%s] Networks with clients: %d/%d", uart_name, networks_with_clients, ctx->observer_network_count);
-    ESP_LOGI(TAG, "[%s] ==============================", uart_name);
+    ESP_LOGD(TAG, "[%s] Networks with clients: %d/%d", uart_name, networks_with_clients, ctx->observer_network_count);
+    ESP_LOGD(TAG, "[%s] ==============================", uart_name);
 
     // Update UI if observer is still running
     if (ctx->observer_running && ctx->observer_networks) {
@@ -15419,7 +15724,7 @@ static void observer_poll_task(void *arg)
         bsp_display_unlock();
     }
 
-    ESP_LOGI(TAG, "[%s] Observer poll task finished", uart_name);
+    ESP_LOGD(TAG, "[%s] Observer poll task finished", uart_name);
     ctx->observer_task = NULL;
     vTaskDelete(NULL);
 }
@@ -15503,7 +15808,7 @@ static void observer_start_task(void *arg)
     ESP_LOGI(TAG, "[%s] Observer start task - scanning networks first", uart_name);
 
     // Check if PSRAM buffers are allocated
-    if (!observer_rx_buffer || !observer_line_buffer || !ctx->observer_networks) {
+    if (!ctx->observer_rx_buffer || !ctx->observer_line_buffer || !ctx->observer_networks) {
         ESP_LOGE(TAG, "[%s] PSRAM buffers not allocated!", uart_name);
         ctx->observer_start_active = false;
         vTaskDelete(NULL);
@@ -15522,7 +15827,7 @@ static void observer_start_task(void *arg)
     memset(ctx->observer_networks, 0, sizeof(observer_network_t) * MAX_OBSERVER_NETWORKS);
 
     // Flush UART buffer
-    uart_flush(uart_port);
+    observer_flush_transport_input(task_tab, uart_port);
 
     // Step 1: Run scan_networks
     char scan_cmd[] = "scan_networks\r\n";
@@ -15530,8 +15835,8 @@ static void observer_start_task(void *arg)
     ESP_LOGI(TAG, "[%s] Sent: scan_networks", uart_name);
 
     // Wait for scan to complete - use PSRAM buffers
-    char *rx_buffer = observer_rx_buffer;
-    char *line_buffer = observer_line_buffer;
+    char *rx_buffer = ctx->observer_rx_buffer;
+    char *line_buffer = ctx->observer_line_buffer;
     int line_pos = 0;
     bool scan_complete = false;
     int scanned_count = 0;
@@ -15644,7 +15949,7 @@ static void observer_start_task(void *arg)
         vTaskDelete(NULL);
         return;
     }
-    uart_flush(uart_port);
+    observer_flush_transport_input(task_tab, uart_port);
     char sniffer_cmd[] = "start_sniffer_noscan\r\n";
     transport_write_bytes_tab(task_tab, uart_port, sniffer_cmd, strlen(sniffer_cmd));
     ESP_LOGI(TAG, "[%s] Sent: start_sniffer_noscan", uart_name);
@@ -49673,15 +49978,6 @@ void app_main(void)
 
     // Initialize all tab contexts with PSRAM allocations
     init_all_tab_contexts();
-
-    // Legacy observer buffers (shared between tabs for UART I/O)
-    observer_networks = heap_caps_calloc(MAX_OBSERVER_NETWORKS, sizeof(observer_network_t), MALLOC_CAP_SPIRAM);
-    observer_rx_buffer = heap_caps_malloc(UART_BUF_SIZE, MALLOC_CAP_SPIRAM);
-    observer_line_buffer = heap_caps_malloc(OBSERVER_LINE_BUFFER_SIZE, MALLOC_CAP_SPIRAM);
-
-    if (!observer_networks || !observer_rx_buffer || !observer_line_buffer) {
-        ESP_LOGE(TAG, "Failed to allocate legacy observer PSRAM buffers!");
-    }
 
     // Allocate buffer for ESP Modem WiFi scan results
     ESP_LOGI(TAG, "Allocating ESP Modem buffers in PSRAM...");
