@@ -8448,6 +8448,12 @@ static void observer_attack_tile_event_cb(lv_event_t *e)
 
     if (ctx->popup_focus_active || !ctx->popup_focus_ready) {
         ESP_LOGW(TAG, "Observer attack ignored: popup target is not ready");
+        if (ctx->popup_title_label && lv_obj_is_valid(ctx->popup_title_label)) {
+            lv_label_set_text(ctx->popup_title_label,
+                              "Please wait - preparing selected network...");
+            lv_obj_set_style_text_color(ctx->popup_title_label,
+                                        COLOR_MATERIAL_AMBER, 0);
+        }
         if (ctx->observer_status_label) {
             lv_label_set_text(ctx->observer_status_label,
                               "Preparing selected network - please wait");
@@ -14361,12 +14367,14 @@ static void observer_flush_transport_input(tab_id_t tab, uart_port_t port)
 }
 
 static bool observer_wait_for_janos_marker(tab_id_t tab, uart_port_t port,
+                                           const char *command,
                                            const char *marker, uint32_t timeout_ms,
                                            volatile bool *cancel)
 {
     char rx[512];
     char line[512];
     int line_pos = 0;
+    bool saw_command_echo = false;
     TickType_t start = xTaskGetTickCount();
     TickType_t timeout = pdMS_TO_TICKS(timeout_ms);
 
@@ -14382,8 +14390,18 @@ static bool observer_wait_for_janos_marker(tab_id_t tab, uart_port_t port,
             if (c == '\n' || c == '\r') {
                 if (line_pos == 0) continue;
                 line[line_pos] = '\0';
+                trim_ascii_whitespace(line);
                 ESP_LOGI(TAG, "Observer transition UART: %s", line);
-                if (observer_transition_has_error(line)) return false;
+
+                if (command && strcmp(line, command) == 0) {
+                    saw_command_echo = true;
+                }
+                if (observer_transition_has_error(line)) {
+                    if (saw_command_echo) return false;
+                    ESP_LOGW(TAG,
+                             "Observer transition: ignoring stale error before '%s' echo",
+                             command ? command : "command");
+                }
                 if (strstr(line, marker) != NULL) return true;
                 line_pos = 0;
             } else if (line_pos < (int)sizeof(line) - 1) {
@@ -14411,6 +14429,7 @@ static bool observer_select_target_and_wait(tab_id_t tab, uart_port_t port,
     bool saw_response = false;
     bool saw_command_echo = false;
     bool saw_target = false;
+    bool saw_command_error = false;
     TickType_t start = xTaskGetTickCount();
     TickType_t timeout = pdMS_TO_TICKS(3000);
 
@@ -14436,8 +14455,17 @@ static bool observer_select_target_and_wait(tab_id_t tab, uart_port_t port,
                      strstr(line, target->ssid) != NULL)) {
                     saw_target = true;
                 }
-                if (observer_transition_has_error(line)) return false;
-                if (strcmp(line, ">") == 0 && saw_command_echo && saw_target) return true;
+                if (observer_transition_has_error(line)) {
+                    if (saw_command_echo) {
+                        saw_command_error = true;
+                    } else {
+                        ESP_LOGW(TAG,
+                                 "Observer selection: ignoring stale error before command echo");
+                    }
+                }
+                if (strcmp(line, ">") == 0 && saw_command_echo) {
+                    return !saw_command_error && saw_target;
+                }
                 line_pos = 0;
             } else if (line_pos < (int)sizeof(line) - 1) {
                 line[line_pos++] = c;
@@ -14560,6 +14588,7 @@ static bool observer_prepare_target_selection(tab_context_t *ctx,
 
     observer_send_command_to_transport(tab, port, "stop", purpose);
     if (!observer_wait_for_janos_marker(tab, port,
+                                        "stop",
                                         "All operations stopped", 5000,
                                         cancel)) {
         return false;
@@ -14567,6 +14596,21 @@ static bool observer_prepare_target_selection(tab_context_t *ctx,
 
     if (cancel && *cancel) return false;
     vTaskDelay(pdMS_TO_TICKS(250));
+
+    // JanOS preserves the scan table across stop, so the Observer index is
+    // normally still valid. Validate it against the expected BSSID and avoid
+    // a costly full scan on every popup open. If JanOS rejects it (or the index
+    // now points at another BSSID), refresh by BSSID and retry once.
+    if (observer_select_target_and_wait(tab, port, target, purpose, cancel)) {
+        ESP_LOGI(TAG, "Observer %s: reused preserved scan_index=%d for '%s'",
+                 purpose ? purpose : "transition", target->index, target->ssid);
+        return true;
+    }
+
+    if (cancel && *cancel) return false;
+    ESP_LOGW(TAG,
+             "Observer %s: preserved scan_index=%d rejected; refreshing target",
+             purpose ? purpose : "transition", target->index);
     if (!observer_rescan_target(tab, port, target, purpose, cancel)) return false;
     return observer_select_target_and_wait(tab, port, target, purpose, cancel);
 }
