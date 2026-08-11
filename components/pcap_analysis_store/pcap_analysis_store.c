@@ -319,6 +319,7 @@ pcap_analysis_store_status_t pcap_analysis_cache_load(
         flow_analysis_out->analyzed_packets != header.indexed_packets ||
         flow_analysis_out->flow_count > PCAP_FLOW_MAX_FLOWS ||
         flow_analysis_out->device_count > PCAP_FLOW_MAX_DEVICES ||
+        flow_analysis_out->dns_name_count > PCAP_FLOW_MAX_DNS_NAMES ||
         flow_analysis_out->alert_count > PCAP_FLOW_MAX_ALERTS ||
         flow_analysis_out->health_level > PCAP_HEALTH_CRITICAL) {
         return PCAP_ANALYSIS_STORE_INVALID;
@@ -708,10 +709,12 @@ pcap_analysis_store_status_t pcap_analysis_export_report_json(
     }
     fprintf(report,
             "],\n  \"flow_limits\":{\"limited\":%s,\"overflow_packets\":%lu,"
-            "\"devices_limited\":%s,\"alerts_limited\":%s},\n",
+            "\"devices_limited\":%s,\"dns_names_limited\":%s,"
+            "\"alerts_limited\":%s},\n",
             flow_analysis->flow_limited ? "true" : "false",
             (unsigned long)flow_analysis->overflow_packets,
             flow_analysis->device_limited ? "true" : "false",
+            flow_analysis->dns_name_limited ? "true" : "false",
             flow_analysis->alert_limited ? "true" : "false");
     fprintf(report,
             "  \"inventory\":{\"local_devices\":%lu,\"remote_endpoints\":%lu,"
@@ -755,6 +758,17 @@ pcap_analysis_store_status_t pcap_analysis_export_report_json(
         }
         fprintf(report, "],\"services_limited\":%s}",
                 device->service_limited ? "true" : "false");
+    }
+    fputs("],\n  \"dns_names\":[", report);
+    for (uint32_t i = 0; i < flow_analysis->dns_name_count; i++) {
+        const pcap_dns_name_entry_t *entry = &flow_analysis->dns_names[i];
+        if (i) fputc(',', report);
+        fputs("{\"address\":", report);
+        espc_json_string(report, entry->address);
+        fputs(",\"hostname\":", report);
+        espc_json_string(report, entry->hostname);
+        fprintf(report, ",\"observations\":%lu}",
+                (unsigned long)entry->observations);
     }
     fputs("],\n  \"network_health\":{\"level\":", report);
     espc_json_string(report,

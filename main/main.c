@@ -1163,6 +1163,9 @@ typedef struct {
 #define PCAP_VIEWER_PATH_MAX            288
 #define PCAP_VIEWER_PACKET_PAGE_SIZE    20
 #define PCAP_VIEWER_MAX_INDEXED_PACKETS 4096
+#define PCAP_DNS_DETAIL_MAX_CLIENTS     16U
+#define PCAP_DNS_DETAIL_MAX_ADDRESSES   16U
+#define PCAP_DNS_DETAIL_MAX_FLOWS       24U
 #define PCAP_VIEWER_HEX_BYTES           256
 #define PCAP_VIEWER_ROW_HEIGHT           40
 #define PCAP_VIEWER_ENDPOINT_HEIGHT      32
@@ -1286,6 +1289,9 @@ typedef struct pcap_viewer_state {
     lv_obj_t *page_label;
     lv_obj_t *prev_btn;
     lv_obj_t *next_btn;
+    lv_obj_t *fqdn_btn;
+    lv_obj_t *fqdn_label;
+    bool show_fqdn;
     lv_obj_t *filter_buttons[PCAP_FILTER_COUNT];
     lv_obj_t *detail_overlay;
     uint32_t detail_packet_index;
@@ -1307,6 +1313,25 @@ typedef struct pcap_viewer_state {
     lv_obj_t *map_filter_btn;
     lv_obj_t *map_mode_buttons[PCAP_MAP_MODE_COUNT];
 } pcap_viewer_state_t;
+
+typedef struct {
+    uint16_t flow_id;
+    uint64_t bytes;
+} pcap_dns_related_flow_t;
+
+typedef struct {
+    char clients[PCAP_DNS_DETAIL_MAX_CLIENTS][64];
+    char addresses[PCAP_DNS_DETAIL_MAX_ADDRESSES][64];
+    pcap_dns_related_flow_t flows[PCAP_DNS_DETAIL_MAX_FLOWS];
+    uint16_t client_count;
+    uint16_t address_count;
+    uint16_t flow_count;
+    uint32_t query_packets;
+    uint32_t response_packets;
+    bool client_limited;
+    bool address_limited;
+    bool flow_limited;
+} pcap_dns_domain_detail_t;
 
 typedef struct {
     tab_context_t *ctx;
@@ -2791,6 +2816,7 @@ static void pcap_viewer_tools_cb(lv_event_t *e);
 static void pcap_viewer_show_summary_popup(pcap_viewer_state_t *state,
                                            const char *title_text,
                                            const char *body_text);
+static void pcap_viewer_show_dns_top(pcap_viewer_state_t *state);
 static void pcap_viewer_start_file_load(pcap_viewer_state_t *state, const char *path,
                                         const char *name, bool force_reanalyze);
 static void compromised_file_copy_cb(lv_event_t *e);
@@ -35383,6 +35409,9 @@ static void pcap_viewer_release_capture(pcap_viewer_state_t *state)
     state->force_reanalyze = false;
     state->packet_page = 0;
     state->packet_filter = PCAP_FILTER_ALL;
+    state->show_fqdn = false;
+    state->fqdn_btn = NULL;
+    state->fqdn_label = NULL;
     pcap_flow_filter_clear(&state->quick_filter);
     state->selected_path[0] = '\0';
     state->selected_name[0] = '\0';
@@ -35475,6 +35504,8 @@ static lv_obj_t *pcap_viewer_create_page(pcap_viewer_state_t *state, lv_obj_t *p
     state->page_label = NULL;
     state->prev_btn = NULL;
     state->next_btn = NULL;
+    state->fqdn_btn = NULL;
+    state->fqdn_label = NULL;
     memset(state->filter_buttons, 0, sizeof(state->filter_buttons));
     state->ctx->pcap_viewer_page = lv_obj_create(parent);
     lv_obj_t *page = state->ctx->pcap_viewer_page;
@@ -35990,6 +36021,7 @@ static void pcap_viewer_start_file_load(pcap_viewer_state_t *state, const char *
     state->load_status = PCAP_READER_OK;
     state->summary_status = PCAP_READER_OK;
     state->packet_filter = PCAP_FILTER_ALL;
+    state->show_fqdn = false;
     pcap_flow_filter_clear(&state->quick_filter);
     pcap_viewer_render_loading_page(state);
     if (xTaskCreate(pcap_viewer_load_task, "pcap_index", 8192, state, 5,
@@ -36028,7 +36060,40 @@ static void pcap_viewer_format_endpoint(const char *address, uint16_t port,
     }
 }
 
-static void pcap_viewer_format_table_endpoint(const char *address, uint16_t port,
+static const char *pcap_viewer_packet_hostname(const pcap_viewer_state_t *state,
+                                               uint32_t packet_number,
+                                               const char *address)
+{
+    if (!state || !state->show_fqdn || !state->flow_analysis ||
+        !address || !address[0]) return NULL;
+    const pcap_flow_analysis_t *analysis = state->flow_analysis;
+    if (packet_number < analysis->analyzed_packets) {
+        uint16_t flow_id = analysis->packet_flow_id[packet_number];
+        if (flow_id != PCAP_FLOW_ID_NONE && flow_id < analysis->flow_count) {
+            const pcap_flow_entry_t *flow = &analysis->flows[flow_id];
+            if (flow->server_name[0] &&
+                strcasecmp(flow->responder, address) == 0) {
+                return flow->server_name;
+            }
+        }
+    }
+    return pcap_flow_hostname_for_address(analysis, address);
+}
+
+static uint32_t pcap_viewer_fqdn_hint_count(const pcap_viewer_state_t *state)
+{
+    if (!state || !state->flow_analysis) return 0U;
+    const pcap_flow_analysis_t *analysis = state->flow_analysis;
+    uint32_t count = analysis->dns_name_count;
+    for (uint32_t i = 0; i < analysis->flow_count; i++) {
+        if (analysis->flows[i].server_name[0]) count++;
+    }
+    return count;
+}
+
+static void pcap_viewer_format_table_endpoint(const pcap_viewer_state_t *state,
+                                              uint32_t packet_number,
+                                              const char *address, uint16_t port,
                                               char *output, size_t output_size)
 {
     if (!output || output_size == 0) {
@@ -36036,6 +36101,14 @@ static void pcap_viewer_format_table_endpoint(const char *address, uint16_t port
     }
     if (!address || !address[0]) {
         snprintf(output, output_size, "-");
+        return;
+    }
+
+    const char *hostname = pcap_viewer_packet_hostname(state, packet_number, address);
+    if (hostname && hostname[0] && strcasecmp(hostname, address) != 0) {
+        char endpoint[96];
+        pcap_viewer_format_endpoint(address, port, endpoint, sizeof(endpoint));
+        snprintf(output, output_size, "%s\n%s", hostname, endpoint);
         return;
     }
 
@@ -36516,6 +36589,41 @@ static void pcap_viewer_filter_cb(lv_event_t *e)
     pcap_viewer_render_packet_page(state);
 }
 
+static void pcap_viewer_update_fqdn_toggle(pcap_viewer_state_t *state)
+{
+    if (!state || !state->fqdn_btn || !lv_obj_is_valid(state->fqdn_btn) ||
+        !state->fqdn_label || !lv_obj_is_valid(state->fqdn_label)) {
+        return;
+    }
+    uint32_t hints = pcap_viewer_fqdn_hint_count(state);
+    lv_label_set_text_fmt(state->fqdn_label, "%s\n%lu name hint%s",
+                          state->show_fqdn ? "FQDN ON" : "SHOW FQDN",
+                          (unsigned long)hints, hints == 1U ? "" : "s");
+    lv_obj_set_style_bg_color(state->fqdn_btn,
+                              state->show_fqdn
+                                  ? (hints > 0U ? COLOR_MATERIAL_GREEN
+                                                : COLOR_MATERIAL_AMBER)
+                                  : lv_color_hex(0x37474F), 0);
+    lv_obj_set_style_border_color(state->fqdn_btn,
+                                  state->show_fqdn
+                                      ? (hints > 0U ? COLOR_NEON_GREEN
+                                                    : COLOR_MATERIAL_AMBER)
+                                      : ui_border_color(), 0);
+}
+
+static void pcap_viewer_fqdn_toggle_cb(lv_event_t *e)
+{
+    pcap_viewer_state_t *state =
+        (pcap_viewer_state_t *)lv_event_get_user_data(e);
+    if (!state || state->loading || !state->flow_analysis) return;
+    state->show_fqdn = !state->show_fqdn;
+    ESP_LOGI(TAG, "[ESPShark] Packet endpoint FQDN display %s (%lu mappings)",
+             state->show_fqdn ? "enabled" : "disabled",
+             (unsigned long)state->flow_analysis->dns_name_count);
+    pcap_viewer_update_fqdn_toggle(state);
+    pcap_viewer_render_packet_page(state);
+}
+
 static void pcap_viewer_render_packet_page(pcap_viewer_state_t *state)
 {
     if (!state || !state->packet_list || !lv_obj_is_valid(state->packet_list) ||
@@ -36535,10 +36643,21 @@ static void pcap_viewer_render_packet_page(pcap_viewer_state_t *state)
     if (end_match > filtered) end_match = filtered;
 
     if (state->page_label && lv_obj_is_valid(state->page_label)) {
-        lv_label_set_text_fmt(state->page_label, "Page %d/%d | %lu indexed match | %llu total",
-                              state->packet_page + 1, total_pages,
-                              (unsigned long)filtered,
-                              (unsigned long long)state->scan_summary.packet_count);
+        if (state->show_fqdn) {
+            lv_label_set_text_fmt(
+                state->page_label,
+                "Page %d/%d | %lu match | %llu total | FQDN %lu hints",
+                state->packet_page + 1, total_pages,
+                (unsigned long)filtered,
+                (unsigned long long)state->scan_summary.packet_count,
+                (unsigned long)pcap_viewer_fqdn_hint_count(state));
+        } else {
+            lv_label_set_text_fmt(state->page_label,
+                                  "Page %d/%d | %lu indexed match | %llu total",
+                                  state->packet_page + 1, total_pages,
+                                  (unsigned long)filtered,
+                                  (unsigned long long)state->scan_summary.packet_count);
+        }
     }
     if (state->prev_btn) {
         if (state->packet_page <= 0) lv_obj_add_state(state->prev_btn, LV_STATE_DISABLED);
@@ -36583,10 +36702,11 @@ static void pcap_viewer_render_packet_page(pcap_viewer_state_t *state)
         }
         double packet_time = (double)packet->timestamp_seconds +
                              ((double)packet->timestamp_fraction / fraction_scale);
-        char source[96], destination[96];
-        pcap_viewer_format_table_endpoint(details.source, details.source_port,
+        char source[192], destination[192];
+        pcap_viewer_format_table_endpoint(state, i, details.source, details.source_port,
                                           source, sizeof(source));
-        pcap_viewer_format_table_endpoint(details.destination, details.destination_port,
+        pcap_viewer_format_table_endpoint(state, i, details.destination,
+                                          details.destination_port,
                                           destination, sizeof(destination));
 
         lv_obj_t *row = lv_obj_create(state->packet_list);
@@ -36789,6 +36909,10 @@ static void pcap_viewer_summary_cb(lv_event_t *e)
     if (!state || !state->summary || state->summary_status != PCAP_READER_OK) {
         return;
     }
+    if (summary_kind == 2U) {
+        pcap_viewer_show_dns_top(state);
+        return;
+    }
 
     char *text_buffer = heap_caps_malloc(8192, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!text_buffer) {
@@ -36799,50 +36923,7 @@ static void pcap_viewer_summary_cb(lv_event_t *e)
     const pcap_summary_t *summary = state->summary;
     bool sampled = summary->analyzed_packets < state->scan_summary.packet_count;
 
-    if (summary_kind == 2U) {
-        pcap_viewer_append_text(text_buffer, 8192, &position,
-                                "Scope: %llu indexed packet(s)%s\n"
-                                "DNS packets: %llu | queries: %llu | responses: %llu\n"
-                                "RCODE: NOERROR %llu | NXDOMAIN %llu | SERVFAIL %llu | other %llu\n"
-                                "Observed unique domains: %llu%s\n"
-                                "Long names (>=50 chars): %llu | >=5 labels: %llu\n",
-                                (unsigned long long)summary->analyzed_packets,
-                                sampled ? " (capture sample)" : "",
-                                (unsigned long long)summary->dns_packets,
-                                (unsigned long long)summary->dns_queries,
-                                (unsigned long long)summary->dns_responses,
-                                (unsigned long long)summary->dns_noerror,
-                                (unsigned long long)summary->dns_nxdomain,
-                                (unsigned long long)summary->dns_servfail,
-                                (unsigned long long)summary->dns_other_rcode,
-                                (unsigned long long)summary->dns_unique_domains_observed,
-                                summary->dns_domain_table_approximate ? " (approximate)" : "",
-                                (unsigned long long)summary->dns_long_names,
-                                (unsigned long long)summary->dns_many_label_names);
-        if (summary->dns_packets == 0) {
-            pcap_viewer_append_text(text_buffer, 8192, &position,
-                                    "\nNo decoded DNS was found. Encrypted 802.11 payloads "
-                                    "and handshake-only PCAPs do not expose DNS.\n");
-        }
-        pcap_viewer_append_top_text(text_buffer, 8192, &position, "Query types",
-                                    summary->dns_types, summary->dns_type_count, 10,
-                                    summary->dns_type_table_approximate);
-        pcap_viewer_append_top_text(text_buffer, 8192, &position, "Top domains",
-                                    summary->dns_domains, summary->dns_domain_count, 12,
-                                    summary->dns_domain_table_approximate);
-        pcap_viewer_append_top_text(text_buffer, 8192, &position, "Top answers",
-                                    summary->dns_answers, summary->dns_answer_count, 10,
-                                    summary->dns_answer_table_approximate);
-        pcap_viewer_append_top_text(text_buffer, 8192, &position, "DNS clients",
-                                    summary->dns_clients, summary->dns_client_count, 8,
-                                    summary->dns_client_table_approximate);
-        pcap_viewer_append_top_text(text_buffer, 8192, &position, "DNS servers",
-                                    summary->dns_servers, summary->dns_server_count, 8,
-                                    summary->dns_server_table_approximate);
-        pcap_viewer_append_text(text_buffer, 8192, &position,
-                                "\nLong-name counters are indicators, not a security verdict.\n");
-        pcap_viewer_show_summary_popup(state, LV_SYMBOL_LIST " DNS Summary", text_buffer);
-    } else {
+    {
         double fraction_scale = state->capture_info.timestamp_resolution ==
                                     PCAP_TIMESTAMP_NANOSECONDS ? 1000000000.0 : 1000000.0;
         double duration = 0;
@@ -37035,6 +37116,428 @@ static lv_obj_t *pcap_viewer_small_action(lv_obj_t *parent, const char *text,
     lv_obj_set_style_text_font(label, &lv_font_montserrat_12, 0);
     lv_obj_center(label);
     return button;
+}
+
+static bool pcap_viewer_dns_name_equal(const char *left, const char *right)
+{
+    if (!left || !right) return false;
+    size_t left_len = strlen(left);
+    size_t right_len = strlen(right);
+    while (left_len > 0U && left[left_len - 1U] == '.') left_len--;
+    while (right_len > 0U && right[right_len - 1U] == '.') right_len--;
+    return left_len == right_len && left_len > 0U &&
+           strncasecmp(left, right, left_len) == 0;
+}
+
+static void pcap_viewer_dns_add_unique(char entries[][64], uint16_t *count,
+                                       uint16_t capacity, bool *limited,
+                                       const char *value)
+{
+    if (!entries || !count || !value || !value[0]) return;
+    for (uint16_t i = 0; i < *count; i++) {
+        if (strcasecmp(entries[i], value) == 0) return;
+    }
+    if (*count >= capacity) {
+        if (limited) *limited = true;
+        return;
+    }
+    pcap_viewer_copy_text(entries[*count], sizeof(entries[*count]), value);
+    (*count)++;
+}
+
+static bool pcap_viewer_dns_flow_uses_address(
+    const pcap_flow_entry_t *flow, const pcap_dns_domain_detail_t *detail)
+{
+    if (!flow || !detail) return false;
+    for (uint16_t i = 0; i < detail->address_count; i++) {
+        if (strcasecmp(flow->originator, detail->addresses[i]) == 0 ||
+            strcasecmp(flow->responder, detail->addresses[i]) == 0) return true;
+    }
+    return false;
+}
+
+static void pcap_viewer_dns_add_related_flow(pcap_dns_domain_detail_t *detail,
+                                             uint16_t flow_id, uint64_t bytes)
+{
+    if (!detail) return;
+    if (detail->flow_count < PCAP_DNS_DETAIL_MAX_FLOWS) {
+        detail->flows[detail->flow_count].flow_id = flow_id;
+        detail->flows[detail->flow_count].bytes = bytes;
+        detail->flow_count++;
+        return;
+    }
+    detail->flow_limited = true;
+    uint16_t smallest = 0;
+    for (uint16_t i = 1; i < detail->flow_count; i++) {
+        if (detail->flows[i].bytes < detail->flows[smallest].bytes) smallest = i;
+    }
+    if (bytes > detail->flows[smallest].bytes) {
+        detail->flows[smallest].flow_id = flow_id;
+        detail->flows[smallest].bytes = bytes;
+    }
+}
+
+static bool pcap_viewer_dns_build_domain_detail(
+    pcap_viewer_state_t *state, const char *domain, pcap_dns_domain_detail_t *detail)
+{
+    if (!state || !domain || !detail || !state->reader || !state->packet_index ||
+        !state->summary) return false;
+    uint32_t packet_count = (uint32_t)state->summary->analyzed_packets;
+    if (packet_count > state->scan_summary.indexed_packets) {
+        packet_count = state->scan_summary.indexed_packets;
+    }
+    if (packet_count > PCAP_VIEWER_MAX_INDEXED_PACKETS) {
+        packet_count = PCAP_VIEWER_MAX_INDEXED_PACKETS;
+    }
+    for (uint32_t i = 0; i < packet_count; i++) {
+        pcap_packet_details_t packet_details;
+        if (pcap_reader_describe_packet(state->reader, &state->packet_index[i],
+                                        &packet_details) != PCAP_READER_OK ||
+            !packet_details.dns_valid ||
+            !pcap_viewer_dns_name_equal(packet_details.dns_query, domain)) continue;
+        if (packet_details.dns_response) {
+            detail->response_packets++;
+            for (uint8_t address_index = 0;
+                 address_index < packet_details.dns_address_count;
+                 address_index++) {
+                pcap_viewer_dns_add_unique(
+                    detail->addresses, &detail->address_count,
+                    PCAP_DNS_DETAIL_MAX_ADDRESSES, &detail->address_limited,
+                    packet_details.dns_addresses[address_index]);
+            }
+            if (packet_details.dns_address_count == 0U) {
+                pcap_viewer_dns_add_unique(detail->addresses,
+                                           &detail->address_count,
+                                           PCAP_DNS_DETAIL_MAX_ADDRESSES,
+                                           &detail->address_limited,
+                                           packet_details.dns_first_address);
+            }
+            if (packet_details.dns_address_limited) {
+                detail->address_limited = true;
+            }
+        } else {
+            detail->query_packets++;
+            pcap_viewer_dns_add_unique(detail->clients, &detail->client_count,
+                                       PCAP_DNS_DETAIL_MAX_CLIENTS,
+                                       &detail->client_limited,
+                                       packet_details.source);
+        }
+    }
+    if (state->flow_analysis) {
+        const pcap_flow_analysis_t *analysis = state->flow_analysis;
+        for (uint32_t i = 0; i < analysis->dns_name_count; i++) {
+            const pcap_dns_name_entry_t *entry = &analysis->dns_names[i];
+            if (pcap_viewer_dns_name_equal(entry->hostname, domain)) {
+                pcap_viewer_dns_add_unique(detail->addresses, &detail->address_count,
+                                           PCAP_DNS_DETAIL_MAX_ADDRESSES,
+                                           &detail->address_limited, entry->address);
+            }
+        }
+        for (uint16_t flow_id = 0; flow_id < analysis->flow_count; flow_id++) {
+            const pcap_flow_entry_t *flow = &analysis->flows[flow_id];
+            if (!pcap_viewer_dns_name_equal(flow->server_name, domain) &&
+                !pcap_viewer_dns_flow_uses_address(flow, detail)) continue;
+            pcap_viewer_dns_add_related_flow(
+                detail, flow_id, flow->originator_bytes + flow->responder_bytes);
+        }
+    }
+    for (uint16_t i = 0; i < detail->flow_count; i++) {
+        uint16_t best = i;
+        for (uint16_t j = i + 1U; j < detail->flow_count; j++) {
+            if (detail->flows[j].bytes > detail->flows[best].bytes) best = j;
+        }
+        pcap_dns_related_flow_t swap = detail->flows[i];
+        detail->flows[i] = detail->flows[best];
+        detail->flows[best] = swap;
+    }
+    return true;
+}
+
+static lv_obj_t *pcap_viewer_dns_section_title(lv_obj_t *list, const char *text)
+{
+    lv_obj_t *label = lv_label_create(list);
+    lv_label_set_text(label, text);
+    lv_obj_set_width(label, lv_pct(100));
+    lv_obj_set_style_text_font(label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(label, COLOR_NEON_CYAN, 0);
+    lv_obj_set_style_pad_top(label, 7, 0);
+    return label;
+}
+
+static void pcap_viewer_dns_add_counter_section(
+    lv_obj_t *list, const char *heading,
+    const pcap_summary_text_counter_t *entries, uint16_t count,
+    uint16_t limit, bool approximate)
+{
+    if (!list || !heading || !entries) return;
+    char title[96];
+    snprintf(title, sizeof(title), "%s%s", heading,
+             approximate ? " (approximate)" : "");
+    pcap_viewer_dns_section_title(list, title);
+    uint16_t shown = count < limit ? count : limit;
+    if (shown == 0U) {
+        lv_obj_t *empty = lv_label_create(list);
+        lv_label_set_text(empty, "  none");
+        lv_obj_set_style_text_color(empty, ui_muted_color(), 0);
+        return;
+    }
+    for (uint16_t i = 0; i < shown; i++) {
+        lv_obj_t *entry = lv_label_create(list);
+        lv_label_set_text_fmt(entry, "  %u. %s  -  %llu", (unsigned)i + 1U,
+                              entries[i].label,
+                              (unsigned long long)entries[i].count);
+        lv_obj_set_width(entry, lv_pct(100));
+        lv_label_set_long_mode(entry, LV_LABEL_LONG_DOT);
+        lv_obj_set_style_text_font(entry, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(entry, ui_text_color(), 0);
+    }
+}
+
+static void pcap_viewer_dns_back_cb(lv_event_t *e)
+{
+    pcap_viewer_state_t *state = (pcap_viewer_state_t *)lv_event_get_user_data(e);
+    pcap_viewer_show_dns_top(state);
+}
+
+static void pcap_viewer_dns_domain_cb(lv_event_t *e)
+{
+    uintptr_t encoded = (uintptr_t)lv_event_get_user_data(e);
+    tab_context_t *ctx = get_current_ctx();
+    pcap_viewer_state_t *state = pcap_viewer_get_state(ctx, false);
+    if (!state || !state->summary || encoded == 0U) return;
+    uint16_t domain_index = (uint16_t)(encoded - 1U);
+    if (domain_index >= state->summary->dns_domain_count) return;
+    const char *domain = state->summary->dns_domains[domain_index].label;
+    pcap_dns_domain_detail_t *detail = heap_caps_calloc(
+        1, sizeof(*detail), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!detail) {
+        pcap_viewer_show_summary_popup(state, "DNS domain", "Not enough PSRAM.");
+        return;
+    }
+    if (!pcap_viewer_dns_build_domain_detail(state, domain, detail)) {
+        heap_caps_free(detail);
+        pcap_viewer_show_summary_popup(state, "DNS domain",
+                                       "Could not inspect indexed DNS packets.");
+        return;
+    }
+
+    char title[128];
+    snprintf(title, sizeof(title), LV_SYMBOL_LIST " DNS: %.96s", domain);
+    lv_obj_t *list = pcap_viewer_create_analysis_list(state, title);
+    if (!list) {
+        heap_caps_free(detail);
+        return;
+    }
+    lv_obj_t *back = lv_btn_create(list);
+    lv_obj_set_size(back, 190, 38);
+    lv_obj_set_style_bg_color(back, COLOR_MATERIAL_BLUE, 0);
+    lv_obj_set_style_radius(back, 7, 0);
+    lv_obj_add_event_cb(back, pcap_viewer_dns_back_cb, LV_EVENT_CLICKED, state);
+    lv_obj_t *back_label = lv_label_create(back);
+    lv_label_set_text(back_label, LV_SYMBOL_LEFT " BACK TO DNS");
+    lv_obj_center(back_label);
+
+    lv_obj_t *summary = lv_label_create(list);
+    lv_label_set_text_fmt(
+        summary,
+        "DNS queries %lu | responses %lu | clients %u%s | resolved IPs %u%s\n"
+        "Related flows are correlated by DNS address or exact TLS SNI / HTTP Host.",
+        (unsigned long)detail->query_packets,
+        (unsigned long)detail->response_packets,
+        (unsigned)detail->client_count, detail->client_limited ? "+" : "",
+        (unsigned)detail->address_count, detail->address_limited ? "+" : "");
+    lv_obj_set_width(summary, lv_pct(100));
+    lv_label_set_long_mode(summary, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(summary, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(summary, ui_muted_color(), 0);
+
+    pcap_viewer_dns_section_title(list, "WHO QUERIED IT");
+    if (detail->client_count == 0U) {
+        lv_obj_t *none = lv_label_create(list);
+        lv_label_set_text(none, "  No decoded query client in the indexed sample.");
+        lv_obj_set_style_text_color(none, ui_muted_color(), 0);
+    }
+    for (uint16_t i = 0; i < detail->client_count; i++) {
+        const char *hostname = state->flow_analysis
+                                   ? pcap_flow_hostname_for_address(
+                                         state->flow_analysis, detail->clients[i])
+                                   : NULL;
+        lv_obj_t *client = lv_label_create(list);
+        if (hostname && hostname[0] && strcasecmp(hostname, detail->clients[i]) != 0) {
+            lv_label_set_text_fmt(client, "  %s  (%s)", hostname, detail->clients[i]);
+        } else {
+            lv_label_set_text_fmt(client, "  %s", detail->clients[i]);
+        }
+        lv_obj_set_width(client, lv_pct(100));
+        lv_label_set_long_mode(client, LV_LABEL_LONG_DOT);
+        lv_obj_set_style_text_color(client, ui_text_color(), 0);
+    }
+
+    pcap_viewer_dns_section_title(list, "RESOLVED ADDRESSES");
+    if (detail->address_count == 0U) {
+        lv_obj_t *none = lv_label_create(list);
+        lv_label_set_text(none, "  No A/AAAA address decoded in the indexed sample.");
+        lv_obj_set_style_text_color(none, ui_muted_color(), 0);
+    }
+    for (uint16_t i = 0; i < detail->address_count; i++) {
+        lv_obj_t *address = lv_label_create(list);
+        lv_label_set_text_fmt(address, "  %s", detail->addresses[i]);
+        lv_obj_set_width(address, lv_pct(100));
+        lv_label_set_long_mode(address, LV_LABEL_LONG_DOT);
+        lv_obj_set_style_text_color(address, ui_text_color(), 0);
+    }
+
+    pcap_viewer_dns_section_title(list, "RELATED FLOWS  (largest first)");
+    if (detail->flow_count == 0U) {
+        lv_obj_t *none = lv_label_create(list);
+        lv_label_set_text(none,
+                          "  No matching TCP/UDP flow was found in the indexed sample.");
+        lv_obj_set_style_text_color(none, ui_muted_color(), 0);
+    }
+    for (uint16_t i = 0; i < detail->flow_count; i++) {
+        uint16_t flow_id = detail->flows[i].flow_id;
+        const pcap_flow_entry_t *flow = &state->flow_analysis->flows[flow_id];
+        lv_obj_t *row = lv_obj_create(list);
+        lv_obj_set_size(row, lv_pct(100), 76);
+        lv_obj_set_style_bg_color(row, (i & 1U) ? ui_card_pressed_color() : ui_card_color(), 0);
+        lv_obj_set_style_border_width(row, 1, 0);
+        lv_obj_set_style_border_color(row, ui_border_color(), 0);
+        lv_obj_set_style_pad_all(row, 5, 0);
+        lv_obj_set_style_pad_column(row, 7, 0);
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START,
+                              LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_t *label = lv_label_create(row);
+        lv_label_set_text_fmt(
+            label, "#%u  %s:%u  ->  %s:%u\n%s/%s | %lu packets | %llu bytes%s%s",
+            (unsigned)flow_id + 1U, flow->originator, flow->originator_port,
+            flow->responder, flow->responder_port,
+            pcap_flow_transport_name(flow->ip_protocol),
+            pcap_flow_application_name((pcap_application_t)flow->app_protocol),
+            (unsigned long)(flow->originator_packets + flow->responder_packets),
+            (unsigned long long)detail->flows[i].bytes,
+            flow->server_name[0] ? " | host: " : "",
+            flow->server_name[0] ? flow->server_name : "");
+        lv_obj_set_flex_grow(label, 1);
+        lv_obj_set_width(label, 0);
+        lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
+        lv_obj_set_style_text_font(label, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(label, ui_text_color(), 0);
+        pcap_viewer_small_action(row, "FILTER", pcap_viewer_connection_filter_cb,
+                                 (uintptr_t)flow_id + 1U, lv_color_hex(0x087EA4));
+        pcap_viewer_small_action(row, "FOLLOW", pcap_viewer_connection_follow_cb,
+                                 (uintptr_t)flow_id + 1U, COLOR_MATERIAL_PURPLE);
+        pcap_viewer_small_action(row, "HEX", pcap_viewer_connection_hex_cb,
+                                 (uintptr_t)flow_id + 1U, COLOR_MATERIAL_TEAL);
+    }
+    if (detail->flow_limited) {
+        lv_obj_t *limited = lv_label_create(list);
+        lv_label_set_text_fmt(limited,
+                              "Showing the %u largest related flows (bounded view).",
+                              (unsigned)PCAP_DNS_DETAIL_MAX_FLOWS);
+        lv_obj_set_style_text_color(limited, COLOR_MATERIAL_AMBER, 0);
+    }
+    heap_caps_free(detail);
+}
+
+static void pcap_viewer_show_dns_top(pcap_viewer_state_t *state)
+{
+    if (!state || !state->summary) return;
+    const pcap_summary_t *summary = state->summary;
+    bool sampled = summary->analyzed_packets < state->scan_summary.packet_count;
+    lv_obj_t *list = pcap_viewer_create_analysis_list(
+        state, LV_SYMBOL_LIST " DNS (tap a domain for hosts and flows)");
+    if (!list) return;
+
+    lv_obj_t *overview = lv_label_create(list);
+    lv_label_set_text_fmt(
+        overview,
+        "Scope: %llu indexed packet(s)%s\n"
+        "DNS packets %llu | queries %llu | responses %llu | unique domains %llu%s\n"
+        "RCODE: NOERROR %llu | NXDOMAIN %llu | SERVFAIL %llu | other %llu\n"
+        "Long names >=50 chars %llu | >=5 labels %llu",
+        (unsigned long long)summary->analyzed_packets,
+        sampled ? " (capture sample)" : "",
+        (unsigned long long)summary->dns_packets,
+        (unsigned long long)summary->dns_queries,
+        (unsigned long long)summary->dns_responses,
+        (unsigned long long)summary->dns_unique_domains_observed,
+        summary->dns_domain_table_approximate ? " (approximate)" : "",
+        (unsigned long long)summary->dns_noerror,
+        (unsigned long long)summary->dns_nxdomain,
+        (unsigned long long)summary->dns_servfail,
+        (unsigned long long)summary->dns_other_rcode,
+        (unsigned long long)summary->dns_long_names,
+        (unsigned long long)summary->dns_many_label_names);
+    lv_obj_set_width(overview, lv_pct(100));
+    lv_label_set_long_mode(overview, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(overview, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(overview, ui_text_color(), 0);
+
+    pcap_viewer_dns_section_title(
+        list, summary->dns_domain_table_approximate
+                  ? "TOP DOMAINS (approximate) - TAP TO INSPECT"
+                  : "TOP DOMAINS - TAP TO INSPECT");
+    uint16_t shown = summary->dns_domain_count < 24U
+                         ? summary->dns_domain_count : 24U;
+    if (shown == 0U) {
+        lv_obj_t *none = lv_label_create(list);
+        lv_label_set_text(none,
+                          "No decoded DNS names. Encrypted Wi-Fi payloads and "
+                          "handshake-only captures do not expose DNS.");
+        lv_obj_set_width(none, lv_pct(100));
+        lv_label_set_long_mode(none, LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_text_color(none, ui_muted_color(), 0);
+    }
+    for (uint16_t i = 0; i < shown; i++) {
+        lv_obj_t *row = lv_btn_create(list);
+        lv_obj_set_size(row, lv_pct(100), 54);
+        lv_obj_set_style_bg_color(row, (i & 1U) ? ui_card_pressed_color() : ui_card_color(), 0);
+        lv_obj_set_style_border_width(row, 1, 0);
+        lv_obj_set_style_border_color(row, ui_border_color(), 0);
+        lv_obj_set_style_radius(row, 7, 0);
+        lv_obj_add_event_cb(row, pcap_viewer_dns_domain_cb, LV_EVENT_CLICKED,
+                            (void *)(uintptr_t)(i + 1U));
+        lv_obj_t *label = lv_label_create(row);
+        lv_label_set_text_fmt(label, "%u. %s\n%llu DNS packet observation(s)  " LV_SYMBOL_RIGHT,
+                              (unsigned)i + 1U,
+                              summary->dns_domains[i].label,
+                              (unsigned long long)summary->dns_domains[i].count);
+        lv_obj_set_width(label, lv_pct(100));
+        lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
+        lv_obj_set_style_text_font(label, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(label, ui_text_color(), 0);
+        lv_obj_center(label);
+    }
+    if (shown < summary->dns_domain_count) {
+        lv_obj_t *limited = lv_label_create(list);
+        lv_label_set_text_fmt(limited, "Showing top %u of %u tracked domains.",
+                              (unsigned)shown,
+                              (unsigned)summary->dns_domain_count);
+        lv_obj_set_style_text_color(limited, COLOR_MATERIAL_AMBER, 0);
+    }
+
+    pcap_viewer_dns_add_counter_section(list, "QUERY TYPES", summary->dns_types,
+                                        summary->dns_type_count, 10U,
+                                        summary->dns_type_table_approximate);
+    pcap_viewer_dns_add_counter_section(list, "TOP ANSWERS", summary->dns_answers,
+                                        summary->dns_answer_count, 10U,
+                                        summary->dns_answer_table_approximate);
+    pcap_viewer_dns_add_counter_section(list, "DNS CLIENTS", summary->dns_clients,
+                                        summary->dns_client_count, 8U,
+                                        summary->dns_client_table_approximate);
+    pcap_viewer_dns_add_counter_section(list, "DNS SERVERS", summary->dns_servers,
+                                        summary->dns_server_count, 8U,
+                                        summary->dns_server_table_approximate);
+    lv_obj_t *note = lv_label_create(list);
+    lv_label_set_text(note,
+                      "Long-name counters and DNS-to-flow correlation are investigative "
+                      "hints, not a security verdict.");
+    lv_obj_set_width(note, lv_pct(100));
+    lv_label_set_long_mode(note, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(note, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(note, ui_muted_color(), 0);
 }
 
 static void pcap_viewer_connections_cb(lv_event_t *e)
@@ -39308,7 +39811,7 @@ static void pcap_viewer_render_capture_page(pcap_viewer_state_t *state)
                           state->cache_hit
                               ? "#5EDCA3 CACHE HIT - analysis loaded from SD#"
                               : (state->cache_available
-                                     ? "#52B6FF ANALYZED - cache v5 saved#"
+                                     ? "#52B6FF ANALYZED - current cache saved#"
                                      : "#F9A825 ANALYZED - cache unavailable#"));
     lv_label_set_recolor(summary_label, true);
     lv_obj_set_width(summary_label, lv_pct(100));
@@ -39522,6 +40025,19 @@ static void pcap_viewer_render_capture_page(pcap_viewer_state_t *state)
     lv_obj_set_style_bg_color(filter_bar, COLOR_NEON_CYAN, LV_PART_SCROLLBAR);
     lv_obj_set_style_bg_opa(filter_bar, LV_OPA_70, LV_PART_SCROLLBAR);
     lv_obj_set_style_radius(filter_bar, LV_RADIUS_CIRCLE, LV_PART_SCROLLBAR);
+
+    state->fqdn_btn = lv_btn_create(filter_bar);
+    lv_obj_set_size(state->fqdn_btn, 122, 38);
+    lv_obj_set_style_border_width(state->fqdn_btn, 1, 0);
+    lv_obj_set_style_radius(state->fqdn_btn, 7, 0);
+    lv_obj_set_style_pad_all(state->fqdn_btn, 4, 0);
+    lv_obj_add_event_cb(state->fqdn_btn, pcap_viewer_fqdn_toggle_cb,
+                        LV_EVENT_CLICKED, state);
+    state->fqdn_label = lv_label_create(state->fqdn_btn);
+    lv_obj_set_style_text_font(state->fqdn_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(state->fqdn_label, lv_color_white(), 0);
+    lv_obj_center(state->fqdn_label);
+    pcap_viewer_update_fqdn_toggle(state);
 
     for (int filter = 0; filter < PCAP_FILTER_COUNT; filter++) {
         const char *filter_name = pcap_reader_filter_name((pcap_packet_filter_t)filter);

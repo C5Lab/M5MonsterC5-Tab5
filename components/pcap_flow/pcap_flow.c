@@ -105,6 +105,25 @@ static bool address_is_internal(const char *address)
            strncasecmp(address, "fd", 2U) == 0 || strcmp(address, "::1") == 0;
 }
 
+static bool address_is_ip_literal(const char *address)
+{
+    if (!address || !address[0]) return false;
+    unsigned a = 0, b = 0, c = 0, d = 0;
+    char trailing = '\0';
+    if (sscanf(address, "%u.%u.%u.%u%c", &a, &b, &c, &d, &trailing) == 4) {
+        return a <= 255U && b <= 255U && c <= 255U && d <= 255U;
+    }
+    bool has_colon = false;
+    for (const unsigned char *cursor = (const unsigned char *)address; *cursor; cursor++) {
+        if (*cursor == ':') {
+            has_colon = true;
+        } else if (!isxdigit(*cursor) && *cursor != '.') {
+            return false;
+        }
+    }
+    return has_colon;
+}
+
 bool pcap_flow_address_is_internal(const char *address)
 {
     return address_is_internal(address);
@@ -550,6 +569,68 @@ static int find_device(const pcap_flow_analysis_t *analysis, const char *address
     return -1;
 }
 
+static int find_dns_name(const pcap_flow_analysis_t *analysis, const char *address)
+{
+    if (!analysis || !address || !address[0]) return -1;
+    for (uint32_t i = 0; i < analysis->dns_name_count; i++) {
+        if (strcasecmp(analysis->dns_names[i].address, address) == 0) return (int)i;
+    }
+    return -1;
+}
+
+const char *pcap_flow_hostname_for_address(const pcap_flow_analysis_t *analysis,
+                                           const char *address)
+{
+    int dns_index = find_dns_name(analysis, address);
+    if (dns_index >= 0 && analysis->dns_names[dns_index].hostname[0]) {
+        return analysis->dns_names[dns_index].hostname;
+    }
+    int device_index = find_device(analysis, address);
+    if (device_index >= 0 && analysis->devices[device_index].hostname[0]) {
+        return analysis->devices[device_index].hostname;
+    }
+    if (analysis && address && address[0]) {
+        for (uint32_t i = 0; i < analysis->flow_count; i++) {
+            const pcap_flow_entry_t *flow = &analysis->flows[i];
+            if (flow->server_name[0] &&
+                strcasecmp(flow->responder, address) == 0) {
+                return flow->server_name;
+            }
+        }
+    }
+    return NULL;
+}
+
+static void observe_dns_name(pcap_flow_analysis_t *analysis, const char *address,
+                             const char *hostname)
+{
+    if (!analysis || !address_is_ip_literal(address) || !hostname || !hostname[0]) return;
+    int index = find_dns_name(analysis, address);
+    if (index < 0) {
+        if (analysis->dns_name_count >= PCAP_FLOW_MAX_DNS_NAMES) {
+            analysis->dns_name_limited = true;
+            return;
+        }
+        index = (int)analysis->dns_name_count++;
+        copy_text(analysis->dns_names[index].address,
+                  sizeof(analysis->dns_names[index].address), address, strlen(address));
+        size_t hostname_length = strlen(hostname);
+        while (hostname_length > 0U && hostname[hostname_length - 1U] == '.') {
+            hostname_length--;
+        }
+        copy_text(analysis->dns_names[index].hostname,
+                  sizeof(analysis->dns_names[index].hostname), hostname, hostname_length);
+    }
+    analysis->dns_names[index].observations++;
+    int device_index = find_device(analysis, address);
+    if (device_index >= 0 && analysis->devices[device_index].hostname[0] == '\0') {
+        copy_text(analysis->devices[device_index].hostname,
+                  sizeof(analysis->devices[device_index].hostname),
+                  analysis->dns_names[index].hostname,
+                  strlen(analysis->dns_names[index].hostname));
+    }
+}
+
 static int find_remote_device_replacement(const pcap_flow_analysis_t *analysis)
 {
     if (!analysis) return -1;
@@ -590,6 +671,12 @@ static pcap_device_entry_t *observe_device(pcap_flow_analysis_t *analysis,
         created->first_time_us = time_us;
     }
     pcap_device_entry_t *device = &analysis->devices[index];
+    if (device->hostname[0] == '\0') {
+        const char *hostname = pcap_flow_hostname_for_address(analysis, address);
+        if (hostname) {
+            copy_text(device->hostname, sizeof(device->hostname), hostname, strlen(hostname));
+        }
+    }
     if (mac_is_usable_identity(mac)) {
         copy_text(device->mac, sizeof(device->mac), mac, strlen(mac));
     }
@@ -1056,13 +1143,23 @@ pcap_reader_status_t pcap_flow_analysis_build(
             if (details.dns_response && details.dns_rcode != 0U) {
                 analysis->dns_error_packets++;
             }
-            if (details.dns_response && details.dns_query[0] &&
-                details.dns_first_answer[0]) {
-                int answer_device = find_device(analysis, details.dns_first_answer);
-                if (answer_device >= 0 && analysis->devices[answer_device].hostname[0] == '\0') {
-                    copy_text(analysis->devices[answer_device].hostname,
-                              sizeof(analysis->devices[answer_device].hostname),
-                              details.dns_query, strlen(details.dns_query));
+            if (details.dns_response) {
+                const char *hostname = details.dns_query[0]
+                                           ? details.dns_query
+                                           : details.dns_first_address_owner;
+                if (hostname && hostname[0]) {
+                    for (uint8_t address_index = 0;
+                         address_index < details.dns_address_count;
+                         address_index++) {
+                        observe_dns_name(analysis,
+                                         details.dns_addresses[address_index],
+                                         hostname);
+                    }
+                    if (details.dns_address_count == 0U &&
+                        details.dns_first_address[0]) {
+                        observe_dns_name(analysis, details.dns_first_address,
+                                         hostname);
+                    }
                 }
             }
             if (!details.dns_response && details.dns_query[0]) {

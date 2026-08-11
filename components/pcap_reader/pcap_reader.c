@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 #define PCAP_GLOBAL_HEADER_SIZE       24U
 #define PCAP_PACKET_HEADER_SIZE       16U
@@ -496,6 +497,31 @@ static bool dns_decode_name(const uint8_t *message, size_t message_length,
     return false;
 }
 
+static void dns_record_address(pcap_packet_details_t *details,
+                               const char *owner_name, const char *address)
+{
+    if (!details || !address || !address[0]) return;
+    if (details->dns_first_address[0] == '\0') {
+        snprintf(details->dns_first_address, sizeof(details->dns_first_address),
+                 "%s", address);
+        if (owner_name && owner_name[0]) {
+            snprintf(details->dns_first_address_owner,
+                     sizeof(details->dns_first_address_owner), "%s", owner_name);
+        }
+    }
+    for (uint8_t i = 0; i < details->dns_address_count; i++) {
+        if (strcasecmp(details->dns_addresses[i], address) == 0) return;
+    }
+    if (details->dns_address_count >= PCAP_DNS_MAX_PACKET_ADDRESSES) {
+        details->dns_address_limited = true;
+        return;
+    }
+    snprintf(details->dns_addresses[details->dns_address_count],
+             sizeof(details->dns_addresses[details->dns_address_count]),
+             "%s", address);
+    details->dns_address_count++;
+}
+
 static void describe_dns(const uint8_t *data, size_t length, pcap_packet_details_t *details)
 {
     if (!data || !details || length < 12) {
@@ -541,14 +567,24 @@ static void describe_dns(const uint8_t *data, size_t length, pcap_packet_details
         if (offset + data_length > length) {
             break;
         }
-        if (details->dns_first_answer[0] == '\0') {
-            if (answer_type == 1 && data_length == 4) {
-                format_ipv4(data + offset, details->dns_first_answer,
-                            sizeof(details->dns_first_answer));
-            } else if (answer_type == 28 && data_length == 16) {
-                format_ipv6(data + offset, details->dns_first_answer,
-                            sizeof(details->dns_first_answer));
-            } else if (answer_type == 2 || answer_type == 5 || answer_type == 12) {
+        if (answer_type == 1 && data_length == 4) {
+            char address[64];
+            format_ipv4(data + offset, address, sizeof(address));
+            dns_record_address(details, owner_name, address);
+            if (details->dns_first_answer[0] == '\0') {
+                snprintf(details->dns_first_answer, sizeof(details->dns_first_answer),
+                         "%s", address);
+            }
+        } else if (answer_type == 28 && data_length == 16) {
+            char address[64];
+            format_ipv6(data + offset, address, sizeof(address));
+            dns_record_address(details, owner_name, address);
+            if (details->dns_first_answer[0] == '\0') {
+                snprintf(details->dns_first_answer, sizeof(details->dns_first_answer),
+                         "%s", address);
+            }
+        } else if (details->dns_first_answer[0] == '\0') {
+            if (answer_type == 2 || answer_type == 5 || answer_type == 12) {
                 size_t name_offset = offset;
                 (void)dns_decode_name(data, length, &name_offset,
                                       details->dns_first_answer,
@@ -659,10 +695,11 @@ static void describe_transport(const uint8_t *data, size_t length, uint8_t ip_pr
             if (payload_length < 2) return;
             uint16_t declared_length = read_be16(payload);
             dns_offset = 2;
-            if (declared_length < 12U || declared_length > payload_length - dns_offset) {
-                return;
-            }
-            dns_length = declared_length;
+            if (declared_length < 12U) return;
+            size_t available_length = payload_length - dns_offset;
+            dns_length = declared_length < available_length
+                             ? declared_length : available_length;
+            if (dns_length < 12U) return;
         }
         describe_dns(payload + dns_offset, dns_length, details);
     } else if (strcmp(application, "HTTP") == 0 && payload_length > 0) {

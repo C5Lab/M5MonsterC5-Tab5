@@ -18,6 +18,7 @@ extern "C" {
 #define PCAP_FLOW_DEVICE_SERVICES    12U
 #define PCAP_FLOW_MAX_ALERTS          64U
 #define PCAP_FLOW_ALERT_EVIDENCE       6U
+#define PCAP_FLOW_MAX_DNS_NAMES      128U
 
 typedef enum {
     PCAP_APP_UNKNOWN = 0,
@@ -128,6 +129,12 @@ typedef struct {
     pcap_device_service_t services[PCAP_FLOW_DEVICE_SERVICES];
 } pcap_device_entry_t;
 
+typedef struct {
+    char address[64];
+    char hostname[96];
+    uint32_t observations;
+} pcap_dns_name_entry_t;
+
 typedef enum {
     PCAP_HEALTH_INSUFFICIENT = 0,
     PCAP_HEALTH_HEALTHY,
@@ -183,6 +190,7 @@ typedef struct {
     uint32_t overflow_packets;
     uint32_t device_count;
     uint32_t alert_count;
+    uint32_t dns_name_count;
     uint32_t dns_packets;
     uint32_t dns_error_packets;
     uint32_t dns_suspicious_names;
@@ -190,6 +198,7 @@ typedef struct {
     bool flow_limited;
     bool device_limited;
     bool alert_limited;
+    bool dns_name_limited;
     uint8_t health_level;
     uint16_t packet_flow_id[PCAP_FLOW_MAX_PACKET_MAP];
     uint8_t packet_direction[PCAP_FLOW_MAX_PACKET_MAP];
@@ -198,6 +207,7 @@ typedef struct {
     pcap_flow_entry_t flows[PCAP_FLOW_MAX_FLOWS];
     pcap_app_summary_t applications[PCAP_APP_COUNT];
     pcap_device_entry_t devices[PCAP_FLOW_MAX_DEVICES];
+    pcap_dns_name_entry_t dns_names[PCAP_FLOW_MAX_DNS_NAMES];
     pcap_security_alert_t alerts[PCAP_FLOW_MAX_ALERTS];
 } pcap_flow_analysis_t;
 
@@ -258,6 +268,8 @@ bool pcap_flow_same_local_device(const pcap_device_entry_t *left,
                                  const pcap_device_entry_t *right);
 uint32_t pcap_flow_local_device_count(const pcap_flow_analysis_t *analysis);
 uint32_t pcap_flow_remote_endpoint_count(const pcap_flow_analysis_t *analysis);
+const char *pcap_flow_hostname_for_address(const pcap_flow_analysis_t *analysis,
+                                           const char *address);
 
 bool pcap_flow_filter_matches(
     const pcap_flow_filter_t *filter,

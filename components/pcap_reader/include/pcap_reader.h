@@ -29,6 +29,8 @@ extern "C" {
 #define PCAP_PACKET_FLAG_MALFORMED   (1UL << 13)
 #define PCAP_PACKET_FLAG_TRUNCATED   (1UL << 14)
 
+#define PCAP_DNS_MAX_PACKET_ADDRESSES 4U
+
 typedef enum {
     PCAP_FILTER_ALL = 0,
     PCAP_FILTER_DNS,
@@ -107,6 +109,9 @@ typedef struct {
     char info[128];
     char dns_query[96];
     char dns_first_answer[80];
+    char dns_first_address[64];
+    char dns_first_address_owner[96];
+    char dns_addresses[PCAP_DNS_MAX_PACKET_ADDRESSES][64];
     uint32_t flags;
     uint32_t tcp_sequence;
     uint32_t tcp_acknowledgment;
@@ -124,10 +129,12 @@ typedef struct {
     uint8_t ip_protocol;
     uint8_t tcp_flags;
     uint8_t dns_rcode;
+    uint8_t dns_address_count;
     uint8_t wifi_frame_type;
     uint8_t wifi_frame_subtype;
     bool dns_valid;
     bool dns_response;
+    bool dns_address_limited;
     bool malformed;
     bool payload_truncated;
 } pcap_packet_details_t;
