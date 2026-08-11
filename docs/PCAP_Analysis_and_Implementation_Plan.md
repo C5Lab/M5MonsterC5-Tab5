@@ -2,9 +2,9 @@
 
 > **Status implementacji ESPShark Offline v6:** **COMPLETE** — zakres opisany w sekcji 0 jest obecny w kodzie na gałęzi `development`.
 > **Status transferu:** MITM PCAP i lokalna analiza MVP są potwierdzone sprzętowo.
-> **Bramka wydania v6:** pełny build ESP-IDF 5.4.1 sprzed korekty FQDN zakończony sukcesem; po korekcie z sekcji 32 kompilację i test sprzętowy wykonuje właściciel projektu.
-> **Ostatnia aktualizacja i audyt kodu:** 2026-08-11, `development` HEAD `1f2700f` oraz lokalna implementacja FQDN/cache v7, interaktywnego DNS drill-down i korekty wieloadresowych odpowiedzi DNS; ostatni bazowy commit ESPShark `1816750`.
-> **Zakres dokumentu:** sekcja 0 jest kanonicznym bilansem funkcji, sekcja 29 opisuje bazę v5, sekcja 30 zmianę v6, sekcja 31 interaktywny DNS, sekcja 32 korektę FQDN, a sekcje 25–28 pokazują historię rozwoju; wcześniejsze plany i TODO nie zmieniają statusu końcowego.
+> **Bramka wydania v6:** pełny build ESP-IDF 5.4.1 sprzed korekty FQDN zakończony sukcesem; po zmianach z sekcji 32–33 kompilację i test sprzętowy wykonuje właściciel projektu.
+> **Ostatnia aktualizacja i audyt kodu:** 2026-08-11, `development` HEAD `1f2700f` oraz lokalna implementacja FQDN/cache v7, interaktywnego DNS drill-down i hierarchicznej mapy topology; ostatni bazowy commit ESPShark `1816750`.
+> **Zakres dokumentu:** sekcja 0 jest kanonicznym bilansem funkcji, sekcja 29 opisuje bazę v5, sekcja 30 zmianę v6, sekcja 31 interaktywny DNS, sekcja 32 korektę FQDN, sekcja 33 mapę topology, a sekcje 25–28 pokazują historię rozwoju; wcześniejsze plany i TODO nie zmieniają statusu końcowego.
 
 ## 0. Kanoniczny stan końcowy ESPShark Offline v6
 
@@ -36,8 +36,9 @@ checklisty opisują drogę do v6 i nie mogą nadpisywać statusu z tej sekcji.
 - [x] `NETWORK HEALTH` z confidence i dowodami: port scan, host sweep,
   ARP conflict, DNS anomaly, beaconing, exfil candidate, cleartext services,
   worm-like spread, excessive broadcast, weak TLS i TCP quality.
-- [x] `COMMUNICATION MAP` w trybach Traffic, Threats i Services, z limitami,
-  grupowaniem LAN/WAN/multicast/broadcast i filtrowaniem wybranego węzła.
+- [x] `NETWORK TOPOLOGY` z domyślną hierarchią Internet → wnioskowana brama
+  → urządzenia LAN oraz trybami Traffic, Threats i Services; kliknięcie
+  urządzenia otwiera pełne Device Summary lub filtruje jego dowody.
 - [x] `OFFLINE INVESTIGATION`: Findings, Timeline, Device Dossier, risk score,
   lokalne IOC/rules, wykrywanie ekspozycji administracyjnej, cleartext auth,
   SMB1, MQTT cleartext, encrypted DNS i burstów deauthentication.
@@ -54,7 +55,7 @@ checklisty opisują drogę do v6 i nie mogą nadpisywać statusu z tej sekcji.
 
 Zakres implementacyjny ESPShark Offline v6 jest zamknięty. Funkcja jest
 `IMPLEMENTED`, gdy istnieje kompletna ścieżka backend + UI i kod znajduje się
-w bieżącej gałęzi. Testy z sekcji 30.4, 31.3 i 32.3 są bramką jakości wydania
+w bieżącej gałęzi. Testy z sekcji 30.4, 31.3, 32.3 i 33.3 są bramką jakości wydania
 `HARDWARE-VERIFIED`, a nie częścią brakującej implementacji.
 
 ### 0.3. Świadomie poza zakresem v6
@@ -70,7 +71,7 @@ Poniższe pozycje są opcjonalnymi rozszerzeniami, nie brakami v6:
 
 Pełne limity interpretacyjne i bezpieczeństwa wyniku znajdują się w sekcji
 29.7, a jedyny obowiązkowy krok przed oznaczeniem wydania jako
-`HARDWARE-VERIFIED` znajduje się w sekcjach 30.4, 31.3 i 32.3.
+`HARDWARE-VERIFIED` znajduje się w sekcjach 30.4, 31.3, 32.3 i 33.3.
 
 ## 1. Cel dokumentu
 
@@ -1236,6 +1237,7 @@ Każdy wpis musi zawierać:
 
 | Data | Zakres | Zmiany | Weryfikacja | CoreS3 / uwagi |
 |---|---|---|---|---|
+| 2026-08-11 | ESPShark Offline v6 — hierarchiczna Network Topology | Dodano domyślny widok `TOPOLOGY` inspirowany kontrolerami sieciowymi: pionowy tor Internet → heurystyczna brama/router → `LAN / UNKNOWN L2 FABRIC` oraz przewijalna rama z maksymalnie 12 najważniejszymi urządzeniami w jednej lub dwóch kolumnach. Role `GW/INFRA/SRV/IOT/LAN` wynikają z hostname, usług i relacji MAC z endpointami WAN. Grafy `TRAFFIC`, `THREATS`, `SERVICES` używają rozdzielonych pionowych pasów LAN/WAN. Kliknięcie urządzenia aktywuje pełne `DEVICE SUMMARY` i `FILTER NODE`. | Kontrola statyczna oraz `git diff --check`; zgodnie z decyzją właściciela nie uruchomiono kompilacji. Test sprzętowy opisuje sekcja 33.3. | Topologia jest jawnie oznaczona `INFERRED FROM PCAP`. Nie twierdzi, że zna fizyczne porty switcha, AP ani okablowanie; CoreS3 wymaga ciaśniejszego układu kart. |
 | 2026-08-11 | ESPShark Offline v6 — korekta `SHOW FQDN` | Parser zachowuje do czterech unikalnych A/AAAA z jednej odpowiedzi zamiast wyłącznie pierwszego, wykorzystuje częściowe odpowiedzi DNS/TCP mieszczące się w oknie dekodera oraz nazwę owner dla odpowiedzi bez question. Tabela preferuje dokładny SNI/HTTP Host bieżącego flow, potem mapę DNS/device. Przycisk i pager pokazują liczbę dostępnych name hints. Cache schema podniesiono do v7, aby wcześniejszy pusty lub niepełny cache przebudował się automatycznie. | Kontrola statyczna i `git diff --check`; zgodnie z decyzją właściciela nie uruchomiono kompilacji. Test sprzętowy opisuje sekcja 32.3. | Bez zapytań sieciowych i bez zmian JanOS. Nazwa z SNI/Host jest przypisana do konkretnego flow; globalna relacja IP/FQDN nadal jest wskazówką, szczególnie dla współdzielonych adresów CDN. |
 | 2026-08-11 | ESPShark Offline v6 — interaktywny DNS | Zastąpiono statyczne Top Domains interaktywną listą. Kliknięcie domeny pokazuje klientów zapytań, rozwiązane adresy A/AAAA i największe flow skorelowane przez adres DNS albo dokładny TLS SNI/HTTP Host; każde flow ma `FILTER`, `FOLLOW` ASCII i `HEX` oraz powrót do listy DNS. | Pełny build ESP-IDF 5.4.1 zakończony sukcesem; firmware ma 71% wolnego miejsca w najmniejszej partycji app. Drill-down ma jawne limity 16 klientów, 16 adresów i 24 największych flow. Pozostał test sprzętowy z sekcji 31.3. | Funkcja analizuje tylko indeksowaną próbkę PCAP i istniejącą tabelę flow, nie wykonuje zapytań DNS do Internetu i nie wymaga zmiany JanOS ani schema cache. |
 | 2026-08-11 | ESPShark Offline v6 — FQDN | Dodano bounded mapę DNS `IP → FQDN`, obsługę CNAME przed A/AAAA, przełącznik `SHOW FQDN` w tabeli Source/Destination, cache/report schema v6 oraz eksport mapowań w JSON. | Pełny build ESP-IDF 5.4.1 zakończony sukcesem; komponenty przeszły `-Werror`, firmware ma 71% wolnego miejsca w najmniejszej partycji app. Pozostał test sprzętowy z sekcji 30.4. | Funkcja jest lokalna dla analizy PCAP na Tab5, nie wymaga zmian JanOS ani zapytań DNS do Internetu. |
@@ -3107,3 +3109,68 @@ przypisany do bieżącego flow.
 - [ ] Otworzyć capture ponownie i poczekać na automatyczną przebudowę cache v7.
 - [ ] Sprawdzić liczbę `name hints`, włączyć `FQDN ON` i potwierdzić nazwy nad
   IP:port dla DNS wieloadresowego oraz HTTPS z SNI.
+
+## 33. ESPShark — hierarchiczna Network Topology — 2026-08-11
+
+### 33.1. Widok i interakcje
+
+- [x] `MAP` otwiera domyślnie `TOPOLOGY`, a dotychczasowe widoki dowodowe
+  `TRAFFIC`, `THREATS` i `SERVICES` pozostają dostępne jednym kliknięciem.
+- [x] Topology prezentuje kartę Internet, wykrytą lub jawną brakującą bramę,
+  `LAN / UNKNOWN L2 FABRIC` i do 12 najważniejszych lokalnych węzłów w
+  przewijalnym pionowym układzie jednej lub dwóch kolumn.
+- [x] Karty mają role `GW`, `INFRA`, `SRV`, `IOT`, `LAN`, hostname/IP, liczbę
+  flow oraz kolory roli; alert nadpisuje kolor na amber/red.
+- [x] Kliknięcie lokalnego urządzenia aktualizuje dolny panel i aktywuje
+  `DEVICE SUMMARY` oraz `FILTER NODE`.
+- [x] Kliknięcie dowolnego rzeczywistego węzła otwiera modalny `Host Quick View`
+  bez konieczności przewijania do dolnego panelu. Widok pokazuje IP/MAC,
+  hostname, rolę, TX/RX, pakiety, flow, usługi, alerty oraz — dla lokalnej
+  tożsamości — risk, findingi, aliasy, peers, usługi i nazwy DNS/SNI.
+- [x] `Host Quick View` oferuje filtry `ALL TRAFFIC`, dokładne kierunki
+  `SENT / SRC` i `RECV / DST`, a także do czterech filtrów `host AND service
+  port`. Opis aktywnego filtra rozróżnia HOST/MAC/SRC/DST i pokazuje połączony
+  warunek portu.
+- [x] Modal pokazuje pięć największych powiązanych flow według bajtów; każde ma
+  bezpośrednie akcje `FILTER`, `FOLLOW` i `HEX`. `BACK TO MAP` zamyka tylko
+  quick view, natomiast `DOSSIER` przechodzi do pełnej karty urządzenia.
+- [x] `DEVICE SUMMARY` używa pełnego istniejącego Device Dossier: rola, risk,
+  MAC/vendor, aliasy IPv4/IPv6, aktywność, usługi, top peers, DNS/SNI i findingi.
+- [x] Karty mają stałą wysokość i odstęp, są zamknięte we wspólnej ramie LAN,
+  a ostatni nieparzysty węzeł jest centrowany; podpis i footer mają własne
+  pasy, dlatego nie konkurują o miejsce z kartami.
+- [x] `TRAFFIC`, `THREATS` i `SERVICES` rozmieszczają węzły w przewijalnych
+  pionowych pasach `LOCAL / LAN`, środkowym multicast/broadcast oraz
+  `REMOTE / WAN`, z odstępem 72 px zamiast kolizyjnego układu kołowego.
+
+### 33.2. Zasady inferencji
+
+- [x] Kandydat bramy otrzymuje punkty za hostname infrastruktury, DNS/DHCP
+  oraz MAC współdzielony z obserwowanymi endpointami WAN; brak wystarczających
+  dowodów pokazuje `gateway not visible in sample` zamiast zgadywania adresu.
+- [x] Role infrastruktury, serwera/NAS, IoT i klienta są heurystykami na
+  podstawie hostname i obserwowanych usług.
+- [x] Widok ma stałe limity i grupowanie; dodatkowe urządzenia pozostają w
+  pełnym grafie Traffic oraz inwentarzu Local Devices.
+- [x] Etykieta `INFERRED FROM PCAP` wyjaśnia, że linie są logiczne. Classic
+  PCAP bez danych kontrolera nie ujawnia fizycznych switchy, AP, portów ani
+  kompletnego okablowania jak UniFi Controller.
+- [x] Funkcja korzysta z istniejącego cache v7 i nie zmienia jego schema.
+
+### 33.3. Weryfikacja właściciela projektu
+
+- [x] Kontrola statyczna zmienionych plików i `git diff --check` bez błędów.
+- [ ] Wykonać kompilację ESP-IDF — Codex nie uruchamia jej bez jawnego polecenia.
+- [ ] Na capture domowym porównać wybór bramy i role z rzeczywistą siecią.
+- [ ] Kliknąć kartę LAN, otworzyć `DEVICE SUMMARY`, wrócić do mapy i sprawdzić
+  `FILTER NODE` dla tego samego urządzenia.
+- [ ] Sprawdzić 1, 6, 7, 12 i ponad 12 lokalnych urządzeń oraz capture bez
+  widocznej bramy; przewijanie pionowe ma dojść do ostatniej karty, a żadna
+  karta ani etykieta nie może nałożyć się na sąsiednią.
+- [ ] W `TRAFFIC`, `THREATS` i `SERVICES` sprawdzić capture z dużą liczbą
+  endpointów: pasy LAN/WAN mają zachować odstępy, a scrollbar ma prowadzić do
+  ostatniego opisanego węzła.
+- [ ] Kliknąć host lokalny, gateway i endpoint WAN; sprawdzić Quick View,
+  `BACK TO MAP`, przewijanie zawartości, filtry ALL/SRC/DST/service oraz akcje
+  FILTER/FOLLOW/HEX przy top flow. Dla hosta z wieloma adresami `ALL TRAFFIC`
+  ma użyć MAC, natomiast SRC/DST świadomie filtrują dokładny widoczny adres.

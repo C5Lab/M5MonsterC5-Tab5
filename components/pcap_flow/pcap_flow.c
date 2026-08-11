@@ -1447,10 +1447,34 @@ void pcap_flow_filter_describe(const pcap_flow_filter_t *filter,
     } else if (filter->has_application) {
         snprintf(output, output_size, "APP %s",
                  pcap_flow_application_name((pcap_application_t)filter->application));
+    } else if (filter->has_source_address) {
+        if (filter->has_port) {
+            snprintf(output, output_size, "SRC %s AND PORT %u",
+                     filter->source_address, filter->port);
+        } else {
+            snprintf(output, output_size, "SRC %s", filter->source_address);
+        }
+    } else if (filter->has_destination_address) {
+        if (filter->has_port) {
+            snprintf(output, output_size, "DST %s AND PORT %u",
+                     filter->destination_address, filter->port);
+        } else {
+            snprintf(output, output_size, "DST %s", filter->destination_address);
+        }
     } else if (filter->has_any_address) {
-        snprintf(output, output_size, "HOST %s", filter->any_address);
+        if (filter->has_port) {
+            snprintf(output, output_size, "HOST %s AND PORT %u",
+                     filter->any_address, filter->port);
+        } else {
+            snprintf(output, output_size, "HOST %s", filter->any_address);
+        }
     } else if (filter->has_any_mac) {
-        snprintf(output, output_size, "MAC %s", filter->any_mac);
+        if (filter->has_port) {
+            snprintf(output, output_size, "MAC %s AND PORT %u",
+                     filter->any_mac, filter->port);
+        } else {
+            snprintf(output, output_size, "MAC %s", filter->any_mac);
+        }
     } else if (filter->has_port) {
         snprintf(output, output_size, "PORT %u", filter->port);
     } else if (filter->has_time_window) {
