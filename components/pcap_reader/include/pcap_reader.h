@@ -165,6 +165,29 @@ pcap_reader_status_t pcap_reader_describe_packet(pcap_reader_t *reader,
                                                  const pcap_packet_index_t *packet,
                                                  pcap_packet_details_t *details_out);
 
+/* Sequential iteration over the whole file. Unlike pcap_reader_scan() this does
+ * not need an index array, so a caller can walk every record of a capture that
+ * is far larger than the indexed-packet ceiling used by the packet table. */
+pcap_reader_status_t pcap_reader_iterate_begin(pcap_reader_t *reader);
+
+/* Reads the next record. On success *have_packet_out is true and buffer holds
+ * up to buffer_capacity bytes of the frame; PCAP_READER_LIMIT_REACHED means the
+ * frame was longer than the buffer and only its prefix was copied. At the end
+ * of the file the call returns PCAP_READER_OK with *have_packet_out false. */
+pcap_reader_status_t pcap_reader_iterate_next(pcap_reader_t *reader,
+                                              pcap_packet_index_t *packet_out,
+                                              uint8_t *buffer,
+                                              size_t buffer_capacity,
+                                              size_t *bytes_read_out,
+                                              bool *have_packet_out);
+
+/* Decodes a frame that the caller already holds in memory. */
+void pcap_reader_describe_bytes(uint32_t link_type, const uint8_t *data, size_t length,
+                                bool payload_truncated,
+                                pcap_packet_details_t *details_out);
+
+uint32_t pcap_reader_link_type(const pcap_reader_t *reader);
+
 const char *pcap_reader_status_name(pcap_reader_status_t status);
 const char *pcap_reader_link_type_name(uint32_t link_type);
 const char *pcap_reader_filter_name(pcap_packet_filter_t filter);

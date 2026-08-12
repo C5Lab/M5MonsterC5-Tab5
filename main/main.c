@@ -13,6 +13,7 @@
 #include <math.h>
 #include <stdint.h>
 #include <stdarg.h>
+#include <limits.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/idf_additions.h"
@@ -52,6 +53,7 @@
 #include "pcap_flow.h"
 #include "pcap_analysis_store.h"
 #include "pcap_investigation.h"
+#include "pcap_extract.h"
 
 // Captive portal includes
 #include "esp_http_server.h"
@@ -331,6 +333,9 @@ typedef struct {
 
 #define WARDRIVE_BLACKLIST_MAX 64
 
+/* Above this size a Monster capture is flagged in the list: the HTTP download
+ * has no Range/resume, so an interrupted transfer restarts from zero. */
+#define COMPROMISED_LARGE_FILE_WARN_BYTES (8L * 1024L * 1024L)
 #define WARDRIVE_WIGLE_MAX_FILES 256
 #define WARDRIVE_WIGLE_PAGE_SIZE  20
 #define WARDRIVE_WIGLE_PATH_MAX  160
@@ -1274,6 +1279,7 @@ typedef enum {
     PCAP_ARTIFACT_EXPORT_REPORT,
     PCAP_ARTIFACT_EXPORT_FILTERED_PCAP,
     PCAP_ARTIFACT_EXPORT_HTML,
+    PCAP_ARTIFACT_EXTRACT_OBJECTS,
 } pcap_artifact_action_t;
 
 typedef struct pcap_viewer_state {
@@ -1326,6 +1332,13 @@ typedef struct pcap_viewer_state {
     lv_obj_t *artifact_spinner;
     lv_obj_t *artifact_status_label;
     lv_obj_t *artifact_actions;
+    pcap_extract_result_t *extract_result;
+    pcap_extract_status_t extract_status;
+    char extract_phase[16];
+    volatile uint32_t extract_done;
+    volatile uint32_t extract_total;
+    bool extract_show_on_finish;
+    lv_timer_t *extract_progress_timer;
     pcap_map_graph_t *map_graph;
     pcap_map_mode_t map_mode;
     int map_selected_node;
@@ -1381,6 +1394,8 @@ typedef struct {
     int tab;
     char remote_path[WARDRIVE_WIGLE_PATH_MAX];
     char file_name[96];
+    /* From "list_dir -s"; 0 when the size is unknown. Decides Wi-Fi vs M-BUS. */
+    long size_bytes;
 } compromised_transfer_task_args_t;
 
 typedef struct {
@@ -16634,8 +16649,18 @@ static esp_err_t esp_modem_wifi_init(void)
     ESP_LOGI(TAG, "Waiting for ESP-Hosted transport...");
     vTaskDelay(pdMS_TO_TICKS(2000));  // Give time for SDIO connection
 
-    // Create default WiFi station
-    esp_netif_create_default_wifi_sta();
+    /* Create the default WiFi station netif exactly once.
+     *
+     * Every failure path below leaves esp_modem_wifi_initialized false, so a
+     * retry re-enters this function. esp_netif_create_default_wifi_sta() asserts
+     * internally when a netif with the same if_key already exists, which turned
+     * "the transfer failed, try again" into a panic and reboot. Reuse whatever
+     * is already registered instead of creating a duplicate. */
+    if (!esp_netif_get_handle_from_ifkey("WIFI_STA_DEF")) {
+        esp_netif_create_default_wifi_sta();
+    } else {
+        ESP_LOGW(TAG, "Reusing the WiFi STA netif left by an earlier attempt");
+    }
 
     // Initialize WiFi (via esp_hosted remote)
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
@@ -29171,6 +29196,84 @@ static bool compromised_extract_file_token(const char *line, char *out, size_t o
     return false;
 }
 
+/* Parses one line of "list_dir <path> -s", which JanOS prints as
+ * "<index> <size_bytes> <name>". The size field is consumed only when it is a
+ * complete run of digits followed by whitespace, so a plain "<index> <name>"
+ * line from older firmware - including a name that starts with digits - still
+ * parses, just with size 0. The name is the rest of the line, which keeps
+ * spaces inside long file names intact. */
+static bool compromised_extract_sized_file_entry(const char *line, char *out, size_t out_sz,
+                                                 const char *const *exts, size_t ext_count,
+                                                 long *size_out)
+{
+    if (size_out) {
+        *size_out = 0;
+    }
+    if (!line || !out || out_sz == 0 || !exts || ext_count == 0) {
+        return false;
+    }
+
+    while (isspace((unsigned char)*line)) {
+        line++;
+    }
+    const char *cursor = line;
+    if (!isdigit((unsigned char)*cursor)) {
+        return false;
+    }
+    while (isdigit((unsigned char)*cursor)) {
+        cursor++;
+    }
+    if (!isspace((unsigned char)*cursor)) {
+        return false;
+    }
+    while (isspace((unsigned char)*cursor)) {
+        cursor++;
+    }
+
+    const char *probe = cursor;
+    while (isdigit((unsigned char)*probe)) {
+        probe++;
+    }
+    if (probe != cursor && isspace((unsigned char)*probe)) {
+        if (size_out) {
+            unsigned long long parsed = strtoull(cursor, NULL, 10);
+            *size_out = parsed > (unsigned long long)LONG_MAX ? LONG_MAX : (long)parsed;
+        }
+        cursor = probe;
+        while (isspace((unsigned char)*cursor)) {
+            cursor++;
+        }
+    }
+
+    const char *end = cursor + strlen(cursor);
+    while (end > cursor && isspace((unsigned char)*(end - 1))) {
+        end--;
+    }
+    while (end > cursor && (*(end - 1) == '"' || *(end - 1) == '\'')) {
+        end--;
+    }
+    while (cursor < end && (*cursor == '"' || *cursor == '\'')) {
+        cursor++;
+    }
+    if (end <= cursor) {
+        return false;
+    }
+
+    size_t token_len = (size_t)(end - cursor);
+    if (token_len >= out_sz) {
+        return false;
+    }
+    memcpy(out, cursor, token_len);
+    out[token_len] = '\0';
+
+    for (size_t i = 0; i < ext_count; i++) {
+        if (str_ends_with_ext(out, exts[i])) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static int compromised_load_handshake_files(tab_context_t *ctx, tab_id_t active_tab, uart_port_t uart_port)
 {
     if (!ctx || tab_is_internal(active_tab)) {
@@ -29252,7 +29355,9 @@ static int compromised_load_pcap_capture_files(tab_context_t *ctx, tab_id_t acti
         compromised_transport_flush(active_tab, uart_port);
 
         char cmd[128];
-        snprintf(cmd, sizeof(cmd), "list_dir %s", dirs[i]);
+        /* "-s" makes JanOS append the byte size. Firmware without the flag
+         * ignores it and the parser falls back to size 0. */
+        snprintf(cmd, sizeof(cmd), "list_dir %s -s", dirs[i]);
         transport_write_bytes_tab(active_tab, uart_port, cmd, strlen(cmd));
         transport_write_bytes_tab(active_tab, uart_port, "\r\n", 2);
 
@@ -29268,8 +29373,12 @@ static int compromised_load_pcap_capture_files(tab_context_t *ctx, tab_id_t acti
         char *line = strtok(rx_buffer, "\n\r");
         while (line && ctx->wardrive_wigle_file_count < WARDRIVE_WIGLE_MAX_FILES) {
             char token[WARDRIVE_WIGLE_PATH_MAX] = {0};
-            if (compromised_extract_file_token(line, token, sizeof(token), exts, 1)) {
-                wardrive_wigle_store_file(ctx, dirs[i], token);
+            long size_bytes = 0;
+            if (compromised_extract_sized_file_entry(line, token, sizeof(token), exts, 1,
+                                                     &size_bytes) &&
+                wardrive_wigle_store_file(ctx, dirs[i], token)) {
+                ctx->wardrive_wigle_files[ctx->wardrive_wigle_file_count - 1].size_bytes =
+                    size_bytes;
             }
             line = strtok(NULL, "\n\r");
         }
@@ -30830,10 +30939,23 @@ static void show_compromised_file_page(compromised_file_kind_t kind)
         lv_obj_set_width(name_lbl, lv_pct(100));
         lv_label_set_long_mode(name_lbl, LV_LABEL_LONG_WRAP);
 
+        /* Sizes only exist for listings fetched with "list_dir -s". Other kinds
+         * leave size_bytes at 0, so stay silent rather than claiming the file is
+         * empty. A multi-megabyte capture is worth flagging, because the
+         * transfer has no resume and a drop costs the whole thing. */
+        bool oversized = file->size_bytes >= COMPROMISED_LARGE_FILE_WARN_BYTES;
         lv_obj_t *path_lbl = lv_label_create(info);
-        lv_label_set_text(path_lbl, file->path);
+        if (file->size_bytes > 0) {
+            char size_text[32];
+            wardrive_human_size(file->size_bytes, size_text, sizeof(size_text));
+            lv_label_set_text_fmt(path_lbl, "%s\n%s%s", file->path, size_text,
+                                  oversized ? "  -  large, transfer cannot resume" : "");
+        } else {
+            lv_label_set_text(path_lbl, file->path);
+        }
         lv_obj_set_style_text_font(path_lbl, &lv_font_montserrat_12, 0);
-        lv_obj_set_style_text_color(path_lbl, ui_muted_color(), 0);
+        lv_obj_set_style_text_color(path_lbl,
+                                    oversized ? COLOR_MATERIAL_AMBER : ui_muted_color(), 0);
         lv_obj_set_width(path_lbl, lv_pct(100));
         lv_label_set_long_mode(path_lbl, LV_LABEL_LONG_WRAP);
 
@@ -35424,6 +35546,14 @@ static void pcap_viewer_release_capture(pcap_viewer_state_t *state)
         heap_caps_free(state->investigation);
         state->investigation = NULL;
     }
+    if (state->extract_result) {
+        heap_caps_free(state->extract_result);
+        state->extract_result = NULL;
+    }
+    state->extract_status = PCAP_EXTRACT_OK;
+    state->extract_phase[0] = '\0';
+    state->extract_done = 0;
+    state->extract_total = 0;
     memset(&state->baseline_diff, 0, sizeof(state->baseline_diff));
     state->baseline_status = PCAP_INVESTIGATION_NOT_FOUND;
     memset(&state->capture_info, 0, sizeof(state->capture_info));
@@ -35746,19 +35876,88 @@ static void show_pcap_viewer_page(void)
     state->notice[0] = '\0';
 }
 
+static void compromised_format_duration(uint64_t seconds, char *out, size_t out_size)
+{
+    if (seconds >= 3600U) {
+        snprintf(out, out_size, "%lluh %llum", (unsigned long long)(seconds / 3600U),
+                 (unsigned long long)((seconds % 3600U) / 60U));
+    } else if (seconds >= 60U) {
+        snprintf(out, out_size, "%llum %llus", (unsigned long long)(seconds / 60U),
+                 (unsigned long long)(seconds % 60U));
+    } else {
+        snprintf(out, out_size, "%llus", (unsigned long long)seconds);
+    }
+}
+
+/* Read rate and remaining time for the indexing phases. Indexing a large
+ * capture takes minutes, and a bare percentage says nothing about whether it is
+ * about to finish or has barely started. Same smoothing as the transfer popup:
+ * the raw per-callback delta is far too jumpy to drive an ETA. */
+static int64_t pcap_index_rate_start_us;
+static int64_t pcap_index_rate_last_us;
+static uint64_t pcap_index_rate_last_units;
+static double pcap_index_rate_ups;
+
+static void pcap_index_rate_reset(void)
+{
+    pcap_index_rate_start_us = 0;
+    pcap_index_rate_last_us = 0;
+    pcap_index_rate_last_units = 0;
+    pcap_index_rate_ups = 0.0;
+}
+
+/* Returns the smoothed rate in units per second, 0 until it is meaningful. */
+static double pcap_index_rate_update(uint64_t done_units)
+{
+    int64_t now_us = esp_timer_get_time();
+    if (pcap_index_rate_start_us == 0 || done_units < pcap_index_rate_last_units) {
+        pcap_index_rate_start_us = now_us;
+        pcap_index_rate_last_us = now_us;
+        pcap_index_rate_last_units = done_units;
+        pcap_index_rate_ups = 0.0;
+        return 0.0;
+    }
+    if (now_us - pcap_index_rate_last_us >= 250000 &&
+        done_units > pcap_index_rate_last_units) {
+        double sample = (double)(done_units - pcap_index_rate_last_units) * 1000000.0 /
+                        (double)(now_us - pcap_index_rate_last_us);
+        pcap_index_rate_ups = pcap_index_rate_ups > 0.0
+                                  ? (pcap_index_rate_ups * 0.7) + (sample * 0.3)
+                                  : sample;
+        pcap_index_rate_last_us = now_us;
+        pcap_index_rate_last_units = done_units;
+    }
+    return pcap_index_rate_ups;
+}
+
 static void pcap_viewer_progress_cb(uint64_t offset, uint64_t file_size,
                                     uint64_t packet_count, void *user_ctx)
 {
     pcap_viewer_state_t *state = (pcap_viewer_state_t *)user_ctx;
-    if (!state || !state->status_label || !bsp_display_lock(50)) {
+    if (!state || !state->status_label) {
+        return;
+    }
+    double bps = pcap_index_rate_update(offset);
+    if (!bsp_display_lock(50)) {
         return;
     }
     if (state->status_label && lv_obj_is_valid(state->status_label)) {
         int percent = file_size > 0 ? (int)((offset * 100U) / file_size) : 0;
         if (percent > 100) percent = 100;
-        lv_label_set_text_fmt(state->status_label,
-                              "Indexing packets... %d%%\n%llu packet(s)",
-                              percent, (unsigned long long)packet_count);
+        if (bps >= 1.0 && file_size > offset) {
+            char eta_text[24];
+            compromised_format_duration((uint64_t)((double)(file_size - offset) / bps),
+                                        eta_text, sizeof(eta_text));
+            lv_label_set_text_fmt(state->status_label,
+                                  "Indexing packets... %d%%\n%llu packet(s)\n"
+                                  "%.0f KB/s  -  %s left",
+                                  percent, (unsigned long long)packet_count,
+                                  bps / 1024.0, eta_text);
+        } else {
+            lv_label_set_text_fmt(state->status_label,
+                                  "Indexing packets... %d%%\n%llu packet(s)",
+                                  percent, (unsigned long long)packet_count);
+        }
     }
     bsp_display_unlock();
 }
@@ -35767,17 +35966,33 @@ static void pcap_viewer_summary_progress_cb(size_t processed_packets,
                                             size_t total_packets, void *user_ctx)
 {
     pcap_viewer_state_t *state = (pcap_viewer_state_t *)user_ctx;
-    if (!state || !state->status_label || !bsp_display_lock(50)) {
+    if (!state || !state->status_label) {
+        return;
+    }
+    double pps = pcap_index_rate_update(processed_packets);
+    if (!bsp_display_lock(50)) {
         return;
     }
     if (state->status_label && lv_obj_is_valid(state->status_label)) {
         int percent = total_packets > 0
                           ? (int)((processed_packets * 100U) / total_packets) : 100;
         if (percent > 100) percent = 100;
-        lv_label_set_text_fmt(state->status_label,
-                              "Building Zeek-style summary... %d%%\n%u/%u indexed packets",
-                              percent, (unsigned)processed_packets,
-                              (unsigned)total_packets);
+        if (pps >= 1.0 && total_packets > processed_packets) {
+            char eta_text[24];
+            compromised_format_duration(
+                (uint64_t)((double)(total_packets - processed_packets) / pps),
+                eta_text, sizeof(eta_text));
+            lv_label_set_text_fmt(state->status_label,
+                                  "Building Zeek-style summary... %d%%\n"
+                                  "%u/%u indexed packets\n%.0f pkt/s  -  %s left",
+                                  percent, (unsigned)processed_packets,
+                                  (unsigned)total_packets, pps, eta_text);
+        } else {
+            lv_label_set_text_fmt(state->status_label,
+                                  "Building Zeek-style summary... %d%%\n%u/%u indexed packets",
+                                  percent, (unsigned)processed_packets,
+                                  (unsigned)total_packets);
+        }
     }
     bsp_display_unlock();
 }
@@ -35870,6 +36085,7 @@ static void pcap_viewer_load_task(void *arg)
         memset(state->summary, 0, sizeof(*state->summary));
         memset(state->packet_flags, 0,
                PCAP_VIEWER_MAX_INDEXED_PACKETS * sizeof(*state->packet_flags));
+        pcap_index_rate_reset();
         state->load_status = pcap_reader_scan(state->reader, state->packet_index,
                                               PCAP_VIEWER_MAX_INDEXED_PACKETS,
                                               &state->scan_summary,
@@ -40255,9 +40471,64 @@ static void pcap_viewer_close_tools_popup(pcap_viewer_state_t *state)
     state->artifact_actions = NULL;
 }
 
+static void pcap_viewer_show_objects(pcap_viewer_state_t *state);
+
+/* Runs on the extraction task, so it only stores counters. The LVGL timer in
+ * pcap_viewer_extract_progress_timer_cb() is what touches the widgets. */
+static void pcap_viewer_extract_progress_cb(const char *phase, uint32_t done,
+                                            uint32_t total, void *user_ctx)
+{
+    pcap_viewer_state_t *state = (pcap_viewer_state_t *)user_ctx;
+    if (!state) return;
+    snprintf(state->extract_phase, sizeof(state->extract_phase), "%.15s",
+             phase ? phase : "");
+    state->extract_done = done;
+    state->extract_total = total;
+}
+
+static void pcap_viewer_extract_progress_timer_cb(lv_timer_t *timer)
+{
+    pcap_viewer_state_t *state = (pcap_viewer_state_t *)lv_timer_get_user_data(timer);
+    if (!state) {
+        lv_timer_del(timer);
+        return;
+    }
+    if (!state->artifact_running) {
+        state->extract_progress_timer = NULL;
+        lv_timer_del(timer);
+        return;
+    }
+    if (!state->artifact_status_label || !lv_obj_is_valid(state->artifact_status_label)) {
+        return;
+    }
+    uint32_t done = state->extract_done;
+    uint32_t total = state->extract_total;
+    unsigned percent = total > 0 ? (unsigned)((uint64_t)done * 100ULL / total) : 0U;
+    if (percent > 100U) percent = 100U;
+    lv_label_set_text_fmt(state->artifact_status_label,
+                          "Rebuilding HTTP objects...\n%s %u%%\n"
+                          "Only plaintext HTTP can be carved.",
+                          strcmp(state->extract_phase, "carve") == 0
+                              ? "Carving streams" : "Scanning capture",
+                          percent);
+}
+
 static void pcap_viewer_artifact_finish_async(void *user_data)
 {
     pcap_viewer_state_t *state = (pcap_viewer_state_t *)user_data;
+    if (state && state->extract_progress_timer) {
+        lv_timer_del(state->extract_progress_timer);
+        state->extract_progress_timer = NULL;
+    }
+    if (state && state->extract_show_on_finish) {
+        state->extract_show_on_finish = false;
+        if (state->artifact_success && state->extract_result &&
+            state->extract_result->object_count > 0) {
+            pcap_viewer_close_tools_popup(state);
+            pcap_viewer_show_objects(state);
+            return;
+        }
+    }
     if (!state || !state->artifact_overlay ||
         !lv_obj_is_valid(state->artifact_overlay)) {
         return;
@@ -40329,6 +40600,51 @@ static void pcap_viewer_artifact_task(void *arg)
                      state->scan_summary.index_limited
                          ? "\nNote: source analysis is index-limited; export contains the analyzed sample."
                          : "");
+        }
+    } else if (state->artifact_action == PCAP_ARTIFACT_EXTRACT_OBJECTS) {
+        const pcap_extract_result_t *objects = state->extract_result;
+        state->extract_status = objects
+                                    ? pcap_extract_run(state->selected_path,
+                                                       state->extract_result,
+                                                       &state->cancel_requested,
+                                                       pcap_viewer_extract_progress_cb,
+                                                       state)
+                                    : PCAP_EXTRACT_NO_MEMORY;
+        if (!objects) {
+            result = PCAP_ANALYSIS_STORE_INVALID;
+            snprintf(state->artifact_message, sizeof(state->artifact_message),
+                     "Object extraction failed: %s",
+                     pcap_extract_status_name(PCAP_EXTRACT_NO_MEMORY));
+        } else if (state->extract_status == PCAP_EXTRACT_OK) {
+            result = PCAP_ANALYSIS_STORE_OK;
+            snprintf(state->artifact_message, sizeof(state->artifact_message),
+                     "Extracted %lu object(s), %llu B written.\n%.200s\n"
+                     "%lu HTTP response(s) in %lu session(s); "
+                     "%lu encrypted flow(s) could not be carved.%s%s%s%s",
+                     (unsigned long)objects->object_count,
+                     (unsigned long long)objects->written_bytes,
+                     objects->directory,
+                     (unsigned long)objects->http_responses,
+                     (unsigned long)objects->session_count,
+                     (unsigned long)objects->encrypted_flows,
+                     objects->object_limited ? "\nOBJECT LIMIT reached." : "",
+                     objects->session_limited ? "\nSESSION LIMIT reached." : "",
+                     objects->segment_limited ? "\nSEGMENT LIMIT reached." : "",
+                     objects->capture_truncated ? "\nCapture tail is truncated." : "");
+        } else {
+            result = PCAP_ANALYSIS_STORE_INVALID;
+            if (state->extract_status == PCAP_EXTRACT_NOTHING_FOUND) {
+                snprintf(state->artifact_message, sizeof(state->artifact_message),
+                         "No plaintext HTTP object could be reconstructed.\n"
+                         "%lu HTTP response(s), %lu encrypted flow(s).\n"
+                         "TLS, QUIC and VPN payloads stay encrypted without keys.",
+                         (unsigned long)objects->http_responses,
+                         (unsigned long)objects->encrypted_flows);
+            } else {
+                snprintf(state->artifact_message, sizeof(state->artifact_message),
+                         "Object extraction failed: %s",
+                         pcap_extract_status_name(state->extract_status));
+            }
         }
     } else if (state->artifact_action == PCAP_ARTIFACT_EXPORT_HTML) {
         pcap_investigation_status_t html_status = pcap_investigation_export_html(
@@ -40631,6 +40947,377 @@ static void pcap_viewer_tools_cb(lv_event_t *e)
                                 lv_color_hex(0x555555), PCAP_TOOL_CLOSE);
 }
 
+/* ---------------------------------------------------------------------------
+ * Extracted objects
+ *
+ * Carving runs on demand and never during a normal capture open. Every artifact
+ * is a derived copy: the source PCAP is only ever read.
+ * ------------------------------------------------------------------------ */
+
+#define PCAP_VIEWER_PREVIEW_BYTES   2048
+#define PCAP_VIEWER_PREVIEW_TEXT    6144
+
+static void pcap_viewer_start_extraction(pcap_viewer_state_t *state)
+{
+    if (!state || state->loading || state->artifact_running || !state->reader) {
+        return;
+    }
+    if (!state->extract_result) {
+        state->extract_result = heap_caps_calloc(1, sizeof(pcap_extract_result_t),
+                                                 MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    }
+    if (!state->extract_result) {
+        pcap_viewer_show_summary_popup(state, "Extracted Objects",
+                                       "Not enough PSRAM to run object extraction.");
+        return;
+    }
+
+    pcap_viewer_close_detail(state);
+    pcap_viewer_close_tools_popup(state);
+    state->artifact_overlay = lv_obj_create(lv_scr_act());
+    lv_obj_remove_style_all(state->artifact_overlay);
+    lv_obj_set_size(state->artifact_overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(state->artifact_overlay, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(state->artifact_overlay, LV_OPA_70, 0);
+    lv_obj_add_flag(state->artifact_overlay, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(state->artifact_overlay, LV_OBJ_FLAG_SCROLLABLE);
+
+    state->artifact_popup = lv_obj_create(state->artifact_overlay);
+    lv_obj_set_size(state->artifact_popup, 860, 460);
+    lv_obj_center(state->artifact_popup);
+    style_surface_panel(state->artifact_popup, 14);
+    lv_obj_set_style_pad_all(state->artifact_popup, 20, 0);
+    lv_obj_set_style_pad_row(state->artifact_popup, 14, 0);
+    lv_obj_set_flex_flow(state->artifact_popup, LV_FLEX_FLOW_COLUMN);
+    lv_obj_clear_flag(state->artifact_popup, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(state->artifact_popup);
+    lv_label_set_text(title, LV_SYMBOL_DOWNLOAD " ESPShark Extracted Objects");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, COLOR_NEON_CYAN, 0);
+
+    state->artifact_status_label = lv_label_create(state->artifact_popup);
+    lv_label_set_text(state->artifact_status_label, "Rebuilding HTTP objects...");
+    lv_obj_set_width(state->artifact_status_label, lv_pct(100));
+    lv_label_set_long_mode(state->artifact_status_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(state->artifact_status_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(state->artifact_status_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(state->artifact_status_label, COLOR_MATERIAL_AMBER, 0);
+
+    state->artifact_spinner = lv_spinner_create(state->artifact_popup);
+    lv_obj_set_size(state->artifact_spinner, 58, 58);
+    lv_spinner_set_anim_params(state->artifact_spinner, 1000, 200);
+    lv_obj_set_style_arc_color(state->artifact_spinner, COLOR_NEON_CYAN, LV_PART_INDICATOR);
+
+    state->artifact_actions = lv_obj_create(state->artifact_popup);
+    lv_obj_set_size(state->artifact_actions, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(state->artifact_actions, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(state->artifact_actions, 0, 0);
+    lv_obj_set_style_pad_all(state->artifact_actions, 0, 0);
+    lv_obj_set_style_pad_gap(state->artifact_actions, 10, 0);
+    lv_obj_set_flex_flow(state->artifact_actions, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_flex_align(state->artifact_actions, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(state->artifact_actions, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(state->artifact_actions, LV_OBJ_FLAG_HIDDEN);
+    pcap_viewer_add_tool_button(state->artifact_actions, "CLOSE",
+                                lv_color_hex(0x555555), PCAP_TOOL_CLOSE);
+
+    state->cancel_requested = false;
+    state->artifact_action = PCAP_ARTIFACT_EXTRACT_OBJECTS;
+    state->artifact_running = true;
+    state->artifact_success = false;
+    state->extract_show_on_finish = true;
+    state->extract_phase[0] = '\0';
+    state->extract_done = 0;
+    state->extract_total = 0;
+    snprintf(state->artifact_message, sizeof(state->artifact_message), "Working...");
+
+    if (state->extract_progress_timer) {
+        lv_timer_del(state->extract_progress_timer);
+    }
+    state->extract_progress_timer =
+        lv_timer_create(pcap_viewer_extract_progress_timer_cb, 300, state);
+
+    if (xTaskCreate(pcap_viewer_artifact_task, "pcap_extract", 8192, state, 5,
+                    &state->artifact_task) != pdTRUE) {
+        if (state->extract_progress_timer) {
+            lv_timer_del(state->extract_progress_timer);
+            state->extract_progress_timer = NULL;
+        }
+        state->artifact_running = false;
+        state->artifact_task = NULL;
+        state->artifact_action = PCAP_ARTIFACT_NONE;
+        state->extract_show_on_finish = false;
+        snprintf(state->artifact_message, sizeof(state->artifact_message),
+                 "Could not start the extraction task.");
+        pcap_viewer_artifact_finish_async(state);
+    }
+}
+
+static void pcap_viewer_object_preview_cb(lv_event_t *e)
+{
+    uintptr_t encoded = (uintptr_t)lv_event_get_user_data(e);
+    pcap_viewer_state_t *state = pcap_viewer_get_state(get_current_ctx(), false);
+    if (!state || !state->extract_result || encoded == 0U) return;
+    uint32_t index = (uint32_t)(encoded - 1U);
+    if (index >= state->extract_result->object_count) return;
+    const pcap_extract_object_t *object = &state->extract_result->objects[index];
+
+    uint8_t *raw = heap_caps_malloc(PCAP_VIEWER_PREVIEW_BYTES,
+                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    char *text = heap_caps_malloc(PCAP_VIEWER_PREVIEW_TEXT,
+                                  MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!raw || !text) {
+        heap_caps_free(raw);
+        heap_caps_free(text);
+        return;
+    }
+    size_t bytes_read = 0;
+    pcap_extract_status_t status = pcap_extract_read_object(
+        state->extract_result, index, raw, PCAP_VIEWER_PREVIEW_BYTES, &bytes_read);
+
+    size_t position = 0;
+    pcap_viewer_append_text(text, PCAP_VIEWER_PREVIEW_TEXT, &position,
+                            "%s\n%s | %llu B | %s | confidence %s\n"
+                            "HTTP %u %s%s%s%s\n%s:%u -> %s:%u | packets %lu-%lu\n"
+                            "SHA-256 %s\n"
+                            "Untrusted artifact: never run or unpack it on the device.\n"
+                            "----------------------------------------\n",
+                            object->name, pcap_extract_type_name(object->type),
+                            (unsigned long long)object->bytes,
+                            pcap_extract_state_name(object->state),
+                            pcap_extract_confidence_name(object->confidence),
+                            object->http_status,
+                            object->host[0] ? object->host : "(no Host)",
+                            object->url[0] ? " " : "", object->url,
+                            object->encoded ? " | stored compressed" : "",
+                            object->server, object->server_port,
+                            object->client, object->client_port,
+                            (unsigned long)object->first_packet,
+                            (unsigned long)object->last_packet,
+                            object->sha256);
+
+    if (status != PCAP_EXTRACT_OK) {
+        pcap_viewer_append_text(text, PCAP_VIEWER_PREVIEW_TEXT, &position,
+                                "Preview unavailable: %s\n",
+                                pcap_extract_status_name(status));
+    } else if (object->encoded || !pcap_extract_type_is_text(object->type)) {
+        /* Binary and compressed artifacts are only ever shown as bytes. */
+        size_t shown = bytes_read < 512U ? bytes_read : 512U;
+        for (size_t offset = 0; offset < shown; offset += 16U) {
+            pcap_viewer_append_text(text, PCAP_VIEWER_PREVIEW_TEXT, &position,
+                                    "%04X  ", (unsigned)offset);
+            for (size_t i = 0; i < 16U; i++) {
+                if (offset + i < shown) {
+                    pcap_viewer_append_text(text, PCAP_VIEWER_PREVIEW_TEXT, &position,
+                                            "%02X ", raw[offset + i]);
+                } else {
+                    pcap_viewer_append_text(text, PCAP_VIEWER_PREVIEW_TEXT, &position,
+                                            "   ");
+                }
+            }
+            pcap_viewer_append_text(text, PCAP_VIEWER_PREVIEW_TEXT, &position, " ");
+            for (size_t i = 0; i < 16U && offset + i < shown; i++) {
+                unsigned char c = raw[offset + i];
+                pcap_viewer_append_text(text, PCAP_VIEWER_PREVIEW_TEXT, &position,
+                                        "%c", isprint(c) ? (char)c : '.');
+            }
+            pcap_viewer_append_text(text, PCAP_VIEWER_PREVIEW_TEXT, &position, "\n");
+        }
+    } else {
+        /* HTML is shown as source text, never rendered as a live page. */
+        for (size_t i = 0; i < bytes_read && position + 2U < PCAP_VIEWER_PREVIEW_TEXT; i++) {
+            unsigned char c = raw[i];
+            char shown = (c == '\n' || c == '\t') ? (char)c
+                                                  : (isprint(c) ? (char)c : '.');
+            if (c == '\r') continue;
+            text[position++] = shown;
+            text[position] = '\0';
+        }
+    }
+    if (bytes_read >= PCAP_VIEWER_PREVIEW_BYTES || position + 64U >= PCAP_VIEWER_PREVIEW_TEXT) {
+        pcap_viewer_append_text(text, PCAP_VIEWER_PREVIEW_TEXT, &position,
+                                "\n[PREVIEW TRUNCATED - the saved file is complete]\n");
+    }
+
+    char popup_title[96];
+    snprintf(popup_title, sizeof(popup_title), LV_SYMBOL_FILE " %.72s", object->name);
+    pcap_viewer_show_summary_popup(state, popup_title, text);
+    heap_caps_free(raw);
+    heap_caps_free(text);
+}
+
+static void pcap_viewer_object_filter_cb(lv_event_t *e)
+{
+    uintptr_t encoded = (uintptr_t)lv_event_get_user_data(e);
+    pcap_viewer_state_t *state = pcap_viewer_get_state(get_current_ctx(), false);
+    if (!state || !state->extract_result || encoded == 0U) return;
+    uint32_t index = (uint32_t)(encoded - 1U);
+    if (index >= state->extract_result->object_count) return;
+    const pcap_extract_object_t *object = &state->extract_result->objects[index];
+    pcap_flow_filter_clear(&state->quick_filter);
+    state->quick_filter.enabled = true;
+    state->quick_filter.has_any_address = true;
+    snprintf(state->quick_filter.any_address, sizeof(state->quick_filter.any_address),
+             "%s", object->server);
+    state->quick_filter.has_port = true;
+    state->quick_filter.port = object->server_port;
+    state->packet_page = 0;
+    pcap_viewer_close_detail(state);
+    pcap_viewer_render_capture_page(state);
+}
+
+/* The list is rebuilt from a button that lives inside it, so the rebuild is
+ * deferred instead of deleting the tree from within its own event. */
+static void pcap_viewer_show_objects_async(void *user_data)
+{
+    pcap_viewer_show_objects((pcap_viewer_state_t *)user_data);
+}
+
+static void pcap_viewer_start_extraction_async(void *user_data)
+{
+    pcap_viewer_state_t *state = (pcap_viewer_state_t *)user_data;
+    if (!state) return;
+    pcap_viewer_close_detail(state);
+    pcap_viewer_start_extraction(state);
+}
+
+static void pcap_viewer_object_delete_cb(lv_event_t *e)
+{
+    uintptr_t encoded = (uintptr_t)lv_event_get_user_data(e);
+    pcap_viewer_state_t *state = pcap_viewer_get_state(get_current_ctx(), false);
+    if (!state || !state->extract_result || encoded == 0U) return;
+    uint32_t index = (uint32_t)(encoded - 1U);
+    if (index >= state->extract_result->object_count) return;
+    pcap_extract_delete_object(state->extract_result, index);
+    lv_async_call(pcap_viewer_show_objects_async, state);
+}
+
+static void pcap_viewer_object_reextract_cb(lv_event_t *e)
+{
+    pcap_viewer_state_t *state = (pcap_viewer_state_t *)lv_event_get_user_data(e);
+    if (!state) return;
+    lv_async_call(pcap_viewer_start_extraction_async, state);
+}
+
+static void pcap_viewer_show_objects(pcap_viewer_state_t *state)
+{
+    if (!state || !state->extract_result) return;
+    const pcap_extract_result_t *objects = state->extract_result;
+    char title[96];
+    snprintf(title, sizeof(title), LV_SYMBOL_DOWNLOAD " Extracted Objects (%lu)",
+             (unsigned long)objects->object_count);
+    lv_obj_t *list = pcap_viewer_create_analysis_list(state, title);
+    if (!list) return;
+
+    lv_obj_t *notice = lv_label_create(list);
+    lv_label_set_text_fmt(notice,
+                          "%s\n"
+                          "%lu HTTP response(s) in %lu session(s) | %lu encrypted flow(s) "
+                          "cannot be carved without keys.%s%s%s%s\n"
+                          "Artifacts are untrusted derived copies. The capture is unchanged.",
+                          objects->directory,
+                          (unsigned long)objects->http_responses,
+                          (unsigned long)objects->session_count,
+                          (unsigned long)objects->encrypted_flows,
+                          objects->object_limited ? "\nOBJECT LIMIT reached." : "",
+                          objects->session_limited ? "\nSESSION LIMIT reached." : "",
+                          objects->segment_limited ? "\nSEGMENT LIMIT reached." : "",
+                          objects->budget_reached ? "\nSESSION BYTE BUDGET reached." : "");
+    lv_obj_set_width(notice, lv_pct(100));
+    lv_label_set_long_mode(notice, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(notice, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(notice, ui_muted_color(), 0);
+
+    for (uint32_t i = 0; i < objects->object_count; i++) {
+        const pcap_extract_object_t *object = &objects->objects[i];
+        lv_obj_t *row = lv_btn_create(list);
+        lv_obj_set_size(row, lv_pct(100), 84);
+        lv_obj_set_style_bg_color(row, (i & 1U) ? ui_card_pressed_color() : ui_card_color(), 0);
+        lv_obj_set_style_border_width(row, 1, 0);
+        lv_obj_set_style_border_color(row,
+                                      object->state == PCAP_EXTRACT_STATE_COMPLETE
+                                          ? COLOR_MATERIAL_GREEN
+                                          : (object->state == PCAP_EXTRACT_STATE_PARTIAL
+                                                 ? COLOR_MATERIAL_RED : COLOR_MATERIAL_AMBER),
+                                      0);
+        lv_obj_set_style_pad_all(row, 5, 0);
+        lv_obj_set_style_pad_column(row, 7, 0);
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START,
+                              LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+        char size_text[32];
+        pcap_viewer_format_size(object->bytes, size_text, sizeof(size_text));
+        lv_obj_t *label = lv_label_create(row);
+        lv_label_set_text_fmt(label,
+                              "%lu. %s  (%s, %s)\n"
+                              "%s | HTTP %u | %s%s%s | %s | conf %s%s\n"
+                              "%s:%u | packets %lu-%lu | sha %.16s",
+                              (unsigned long)i + 1UL, object->name,
+                              pcap_extract_type_name(object->type), size_text,
+                              object->host[0] ? object->host : "(no Host)",
+                              object->http_status,
+                              object->url[0] ? object->url : "/",
+                              object->chunked ? " | chunked" : "",
+                              object->encoded ? " | compressed" : "",
+                              pcap_extract_state_name(object->state),
+                              pcap_extract_confidence_name(object->confidence),
+                              object->saved ? "" : " | NOT SAVED",
+                              object->server, object->server_port,
+                              (unsigned long)object->first_packet,
+                              (unsigned long)object->last_packet,
+                              object->sha256);
+        lv_obj_set_flex_grow(label, 1);
+        lv_obj_set_width(label, 0);
+        lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
+        lv_obj_set_style_text_font(label, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(label, ui_text_color(), 0);
+        pcap_viewer_small_action(row, "PREVIEW", pcap_viewer_object_preview_cb,
+                                 (uintptr_t)i + 1U, COLOR_MATERIAL_PURPLE);
+        pcap_viewer_small_action(row, "PACKETS", pcap_viewer_object_filter_cb,
+                                 (uintptr_t)i + 1U, lv_color_hex(0x087EA4));
+        pcap_viewer_small_action(row, "DELETE", pcap_viewer_object_delete_cb,
+                                 (uintptr_t)i + 1U, COLOR_MATERIAL_RED);
+    }
+
+    if (objects->object_count == 0) {
+        lv_obj_t *empty = lv_label_create(list);
+        lv_label_set_text(empty,
+                          "No plaintext HTTP object was reconstructed.\n"
+                          "TLS, QUIC, SSH and VPN traffic stays encrypted, and a capture "
+                          "that starts mid-download has no response header to bound.");
+        lv_obj_set_width(empty, lv_pct(100));
+        lv_label_set_long_mode(empty, LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_text_color(empty, COLOR_MATERIAL_AMBER, 0);
+    }
+
+    lv_obj_t *again = lv_btn_create(list);
+    lv_obj_set_size(again, lv_pct(100), 44);
+    lv_obj_set_style_bg_color(again, COLOR_MATERIAL_AMBER, 0);
+    lv_obj_set_style_radius(again, 8, 0);
+    lv_obj_add_event_cb(again, pcap_viewer_object_reextract_cb, LV_EVENT_CLICKED, state);
+    lv_obj_t *again_label = lv_label_create(again);
+    lv_label_set_text(again_label, "RE-EXTRACT (replaces the copies for this capture)");
+    lv_obj_set_style_text_font(again_label, &lv_font_montserrat_12, 0);
+    lv_obj_center(again_label);
+}
+
+static void pcap_viewer_objects_cb(lv_event_t *e)
+{
+    pcap_viewer_state_t *state = (pcap_viewer_state_t *)lv_event_get_user_data(e);
+    if (!state || state->loading || state->artifact_running || !state->reader) {
+        return;
+    }
+    if (state->extract_result && state->extract_status == PCAP_EXTRACT_OK) {
+        pcap_viewer_show_objects(state);
+        return;
+    }
+    pcap_viewer_start_extraction(state);
+}
+
 static void pcap_viewer_render_capture_page(pcap_viewer_state_t *state)
 {
     if (!state || !state->ctx || !state->ctx->pcap_viewer_page ||
@@ -40697,7 +41384,7 @@ static void pcap_viewer_render_capture_page(pcap_viewer_state_t *state)
     lv_obj_set_style_text_color(summary_label, ui_text_color(), 0);
 
     lv_obj_t *analysis_actions = lv_obj_create(page);
-    lv_obj_set_size(analysis_actions, lv_pct(100), 92);
+    lv_obj_set_size(analysis_actions, lv_pct(100), 138);
     lv_obj_set_style_bg_opa(analysis_actions, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(analysis_actions, 0, 0);
     lv_obj_set_style_pad_all(analysis_actions, 0, 0);
@@ -40728,6 +41415,17 @@ static void pcap_viewer_render_capture_page(pcap_viewer_state_t *state)
     lv_obj_set_flex_align(analysis_row_bottom, LV_FLEX_ALIGN_START,
                           LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_clear_flag(analysis_row_bottom, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *analysis_row_third = lv_obj_create(analysis_actions);
+    lv_obj_set_size(analysis_row_third, lv_pct(100), 42);
+    lv_obj_set_style_bg_opa(analysis_row_third, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(analysis_row_third, 0, 0);
+    lv_obj_set_style_pad_all(analysis_row_third, 0, 0);
+    lv_obj_set_style_pad_column(analysis_row_third, 8, 0);
+    lv_obj_set_flex_flow(analysis_row_third, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(analysis_row_third, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(analysis_row_third, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *overview_btn = lv_btn_create(analysis_row_top);
     lv_obj_set_size(overview_btn, 0, 42);
@@ -40850,6 +41548,24 @@ static void pcap_viewer_render_capture_page(pcap_viewer_state_t *state)
     lv_obj_set_style_text_font(tools_label, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(tools_label, lv_color_white(), 0);
     lv_obj_center(tools_label);
+
+    lv_obj_t *objects_btn = lv_btn_create(analysis_row_third);
+    lv_obj_set_size(objects_btn, 0, 42);
+    lv_obj_set_flex_grow(objects_btn, 1);
+    lv_obj_set_style_bg_color(objects_btn, lv_color_hex(0x8E24AA), 0);
+    lv_obj_set_style_radius(objects_btn, 8, 0);
+    lv_obj_add_event_cb(objects_btn, pcap_viewer_objects_cb, LV_EVENT_CLICKED, state);
+    lv_obj_t *objects_label = lv_label_create(objects_btn);
+    if (state->extract_result && state->extract_status == PCAP_EXTRACT_OK) {
+        lv_label_set_text_fmt(objects_label, LV_SYMBOL_DOWNLOAD " OBJECTS (%lu)",
+                              (unsigned long)state->extract_result->object_count);
+    } else {
+        lv_label_set_text(objects_label,
+                          LV_SYMBOL_DOWNLOAD " EXTRACT FILES (HTTP objects)");
+    }
+    lv_obj_set_style_text_font(objects_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(objects_label, lv_color_white(), 0);
+    lv_obj_center(objects_label);
 
     if (state->quick_filter.enabled) {
         char filter_description[128];
@@ -50311,6 +51027,27 @@ static void compromised_transfer_set_stage(const char *status, const char *detai
     bsp_display_unlock();
 }
 
+/* Rate and remaining time for the transfer popup.
+ *
+ * Only bytes moved during this attempt count: a resumed transfer starts from a
+ * non-zero offset, and treating that prefix as if it had just been received
+ * would report a wildly optimistic rate. The rate is smoothed because block
+ * ACKs make the raw per-sample value jump around. */
+static int64_t compromised_rate_start_us;
+static uint64_t compromised_rate_start_bytes;
+static int64_t compromised_rate_last_us;
+static uint64_t compromised_rate_last_bytes;
+static double compromised_rate_bps;
+
+static void compromised_rate_reset(void)
+{
+    compromised_rate_start_us = 0;
+    compromised_rate_start_bytes = 0;
+    compromised_rate_last_us = 0;
+    compromised_rate_last_bytes = 0;
+    compromised_rate_bps = 0.0;
+}
+
 static void compromised_transfer_progress_cb(const janos_file_transfer_progress_t *progress,
                                              void *user_ctx)
 {
@@ -50325,21 +51062,85 @@ static void compromised_transfer_progress_cb(const janos_file_transfer_progress_
         percent = value > 100U ? 100 : (int)value;
     }
 
+    if (progress->state == JANOS_FILE_TRANSFER_QUERYING) {
+        compromised_rate_reset();
+    }
+
     char detail[256];
     if (progress->state == JANOS_FILE_TRANSFER_DOWNLOADING && progress->bytes_total > 0) {
-        snprintf(detail, sizeof(detail), "%llu / %llu bytes (%d%%)",
-                 (unsigned long long)progress->bytes_received,
-                 (unsigned long long)progress->bytes_total,
-                 percent);
+        int64_t now_us = esp_timer_get_time();
+        if (compromised_rate_start_us == 0) {
+            compromised_rate_start_us = now_us;
+            compromised_rate_start_bytes = progress->bytes_received;
+            compromised_rate_last_us = now_us;
+            compromised_rate_last_bytes = progress->bytes_received;
+        } else if (now_us > compromised_rate_last_us &&
+                   progress->bytes_received > compromised_rate_last_bytes) {
+            double sample = (double)(progress->bytes_received - compromised_rate_last_bytes) *
+                            1000000.0 / (double)(now_us - compromised_rate_last_us);
+            compromised_rate_bps = compromised_rate_bps > 0.0
+                                       ? (compromised_rate_bps * 0.7) + (sample * 0.3)
+                                       : sample;
+            compromised_rate_last_us = now_us;
+            compromised_rate_last_bytes = progress->bytes_received;
+        }
+
+        char received_text[32];
+        char total_text[32];
+        wardrive_human_size((long)progress->bytes_received, received_text,
+                            sizeof(received_text));
+        wardrive_human_size((long)progress->bytes_total, total_text, sizeof(total_text));
+
+        if (compromised_rate_bps >= 1.0) {
+            uint64_t remaining = progress->bytes_total > progress->bytes_received
+                                     ? progress->bytes_total - progress->bytes_received : 0;
+            char eta_text[24];
+            compromised_format_duration((uint64_t)((double)remaining / compromised_rate_bps),
+                                        eta_text, sizeof(eta_text));
+            snprintf(detail, sizeof(detail), "%s / %s (%d%%)\n%.1f KB/s  -  %s left",
+                     received_text, total_text, percent,
+                     compromised_rate_bps / 1024.0, eta_text);
+        } else {
+            snprintf(detail, sizeof(detail), "%s / %s (%d%%)",
+                     received_text, total_text, percent);
+        }
     } else if (progress->state == JANOS_FILE_TRANSFER_DONE) {
-        snprintf(detail, sizeof(detail), "%llu bytes, CRC32 %08lX",
-                 (unsigned long long)progress->bytes_received,
-                 (unsigned long)progress->crc32);
+        char size_text[32];
+        wardrive_human_size((long)progress->bytes_received, size_text, sizeof(size_text));
+        uint64_t moved = progress->bytes_received > compromised_rate_start_bytes
+                             ? progress->bytes_received - compromised_rate_start_bytes : 0;
+        int64_t elapsed_us = compromised_rate_start_us
+                                 ? esp_timer_get_time() - compromised_rate_start_us : 0;
+        if (elapsed_us > 1000000 && moved > 0) {
+            char elapsed_text[24];
+            compromised_format_duration((uint64_t)(elapsed_us / 1000000), elapsed_text,
+                                        sizeof(elapsed_text));
+            snprintf(detail, sizeof(detail), "%s, CRC32 %08lX\n%s at %.1f KB/s",
+                     size_text, (unsigned long)progress->crc32, elapsed_text,
+                     (double)moved * 1000000.0 / (double)elapsed_us / 1024.0);
+        } else {
+            snprintf(detail, sizeof(detail), "%s, CRC32 %08lX", size_text,
+                     (unsigned long)progress->crc32);
+        }
         percent = 100;
     } else if (progress->message) {
         snprintf(detail, sizeof(detail), "%s", progress->message);
     } else {
         detail[0] = '\0';
+    }
+
+    /* Kept from the hunt for the Wi-Fi transfer failures: a collapsing pool is
+     * invisible without sampling it as the transfer runs. Sparse enough now not
+     * to bury the rest of the log during a multi-minute copy. */
+    static int64_t last_memory_log_us;
+    int64_t now_us = esp_timer_get_time();
+    if (progress->state != JANOS_FILE_TRANSFER_DOWNLOADING ||
+            now_us - last_memory_log_us > 10000000) {
+        last_memory_log_us = now_us;
+        char context[48];
+        snprintf(context, sizeof(context), "transfer %s %d%%",
+                 janos_file_transfer_state_name(progress->state), percent);
+        log_memory_stats(context);
     }
 
     compromised_transfer_set_stage(janos_file_transfer_state_name(progress->state),
@@ -51020,6 +51821,495 @@ static void compromised_transfer_delete_current_task(void)
     vTaskDelete(NULL);
 }
 
+/* ---------------------------------------------------------------------------
+ * JanOS file transfer over the M-BUS UART.
+ *
+ * The Wi-Fi path through the C6 co-processor cannot carry more than about a
+ * megabyte: its SDIO stream buffer has to grow mid-transfer out of a
+ * DMA-capable pool that is permanently fragmented below 2 KB, and the RX path
+ * then wedges for good. This console link, by contrast, has never failed. It
+ * is slower at the default 115200, so the baud rate is raised for the duration
+ * of the transfer and dropped back afterwards.
+ *
+ * Wire format is defined by send_file on the JanOS side: a text header, then
+ * fixed blocks of "FTB\x01" + index + length + CRC32 + payload, each answered
+ * with a single ACK/NAK/CAN byte. Block length is carried in the header, so no
+ * byte stuffing is needed.
+ * ------------------------------------------------------------------------ */
+
+#define JANOS_UART_FT_ACK           0x06
+#define JANOS_UART_FT_NAK           0x15
+#define JANOS_UART_FT_CAN           0x18
+#define JANOS_UART_FT_BLOCK_MAX     4096
+#define JANOS_UART_FT_HEADER_BYTES  16
+#define JANOS_UART_FT_RETRIES          3
+#define JANOS_UART_FT_DEFAULT_BAUD 115200
+
+/* The console is raised to this rate for the duration of a transfer, which
+ * takes 115200's ~10.8 KB/s to roughly 85 KB/s.
+ *
+ * Two things make that safe. JanOS reverts to 115200 by itself after 60 seconds
+ * without a command, so an abandoned transfer can no longer leave the Monster
+ * fast while the Tab5 drops back. And it suppresses that revert while a
+ * transfer is running, so a long send is not cut in half. Without both of
+ * those, set this back to JANOS_UART_FT_DEFAULT_BAUD. */
+/* 921600 carried about a megabyte and then the Monster stopped sending, so the
+ * line is marginal at that rate over the M-BUS connector. Stop-and-wait ACKs
+ * cap throughput at roughly a third of the line rate anyway - measured 36.7 KB/s
+ * at 921600 - so halving the signalling rate costs only about a quarter of the
+ * speed while giving the physical layer far more margin. */
+#define JANOS_UART_FT_FAST_BAUD    460800
+
+/* Below this the Wi-Fi path is both faster and reliable, so it stays in use. */
+#define JANOS_UART_TRANSFER_MIN_BYTES (1024L * 1024L)
+
+static uint32_t janos_uart_crc32(uint32_t crc, const uint8_t *data, size_t len)
+{
+    crc = ~crc;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (int bit = 0; bit < 8; bit++) {
+            uint32_t mask = (uint32_t)-(int32_t)(crc & 1U);
+            crc = (crc >> 1) ^ (0xEDB88320U & mask);
+        }
+    }
+    return ~crc;
+}
+
+/* Reads one line without over-reading into the binary stream that follows. */
+static bool janos_uart_read_line(tab_id_t tab, uart_port_t port, char *out,
+                                 size_t out_size, uint32_t timeout_ms)
+{
+    size_t len = 0;
+    int64_t deadline = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
+    out[0] = '\0';
+    while (esp_timer_get_time() < deadline) {
+        uint8_t c = 0;
+        if (transport_read_bytes_tab(tab, port, &c, 1, pdMS_TO_TICKS(50)) != 1) {
+            continue;
+        }
+        if (c == '\n') {
+            out[len] = '\0';
+            return true;
+        }
+        if (c == '\r') {
+            continue;
+        }
+        if (len + 1 < out_size) {
+            out[len++] = (char)c;
+        }
+    }
+    out[len] = '\0';
+    return false;
+}
+
+/* Collects lines until the terminating marker, keeping the first line that
+ * starts with `keep_prefix` so the caller can parse or report it. */
+static bool janos_uart_wait_marker(tab_id_t tab, uart_port_t port, const char *marker,
+                                   const char *keep_prefix, char *keep, size_t keep_size,
+                                   uint32_t timeout_ms)
+{
+    if (keep && keep_size) {
+        keep[0] = '\0';
+    }
+    char line[256];
+    int64_t deadline = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
+    while (esp_timer_get_time() < deadline) {
+        if (!janos_uart_read_line(tab, port, line, sizeof(line), 1500)) {
+            continue;
+        }
+        if (keep && keep_size && keep[0] == '\0' && keep_prefix &&
+            strstr(line, keep_prefix)) {
+            snprintf(keep, keep_size, "%s", line);
+        }
+        if (strstr(line, marker)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static uint64_t janos_uart_field_u64(const char *line, const char *key, int base)
+{
+    const char *found = strstr(line, key);
+    if (!found) {
+        return 0;
+    }
+    return strtoull(found + strlen(key), NULL, base);
+}
+
+/* Raises the console baud rate. JanOS answers at the old rate, switches, and
+ * reverts to 115200 by itself if the confirmation does not arrive - so a failed
+ * switch degrades to a slow link instead of a dead one. */
+static bool janos_uart_set_baud(tab_id_t tab, uart_port_t port, int rate)
+{
+    if (tab_is_internal(tab) || tab == TAB_USB) {
+        return false; /* USB CDC has no meaningful line rate to change. */
+    }
+    if (rate == JANOS_UART_FT_DEFAULT_BAUD) {
+        return false; /* Nothing to raise, and nothing to restore afterwards. */
+    }
+    char command[48];
+    snprintf(command, sizeof(command), "uart_baud %d\r\n", rate);
+    compromised_transport_flush(tab, port);
+    transport_write_bytes_tab(tab, port, command, strlen(command));
+    if (!janos_uart_wait_marker(tab, port, "[UARTB] END", NULL, NULL, 0, 3000)) {
+        ESP_LOGW(TAG, "[UART-FT] Monster did not acknowledge baud %d", rate);
+        return false;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(60));
+    if (uart_set_baudrate(port, rate) != ESP_OK) {
+        return false;
+    }
+    vTaskDelay(pdMS_TO_TICKS(60));
+    compromised_transport_flush(tab, port);
+
+    transport_write_bytes_tab(tab, port, "uart_baud_confirm\r\n", 19);
+    if (!janos_uart_wait_marker(tab, port, "[UARTB] END", NULL, NULL, 0, 3000)) {
+        /* Not confirmed: JanOS falls back on its own, so follow it back down. */
+        ESP_LOGW(TAG, "[UART-FT] Baud %d not confirmed; returning to %d",
+                 rate, JANOS_UART_FT_DEFAULT_BAUD);
+        uart_set_baudrate(port, JANOS_UART_FT_DEFAULT_BAUD);
+        vTaskDelay(pdMS_TO_TICKS(11000));
+        compromised_transport_flush(tab, port);
+        return false;
+    }
+    ESP_LOGI(TAG, "[UART-FT] Console running at %d baud", rate);
+    return true;
+}
+
+/* Is the Monster console answering at the rate the port is set to right now? */
+static bool janos_uart_console_alive(tab_id_t tab, uart_port_t port)
+{
+    compromised_transport_flush(tab, port);
+    transport_write_bytes_tab(tab, port, "uart_baud_status\r\n", 18);
+    return janos_uart_wait_marker(tab, port, "[UARTB] END", NULL, NULL, 0, 1500);
+}
+
+/* Brings both ends back to the default rate.
+ *
+ * A blind switch is not enough: if the transfer was abandoned while JanOS was
+ * still inside send_file, the REPL never saw the command telling it to slow
+ * down, and the Monster is still running fast. So probe the default first, and
+ * if nothing answers, go back up, command the change properly, and come down
+ * together. */
+static void janos_uart_restore_baud(tab_id_t tab, uart_port_t port, int fast_rate)
+{
+    char command[48];
+    snprintf(command, sizeof(command), "uart_baud %d\r\n", JANOS_UART_FT_DEFAULT_BAUD);
+
+    for (int attempt = 0; attempt < 2; attempt++) {
+        transport_write_bytes_tab(tab, port, command, strlen(command));
+        janos_uart_wait_marker(tab, port, "[UARTB] END", NULL, NULL, 0, 2000);
+        vTaskDelay(pdMS_TO_TICKS(60));
+        uart_set_baudrate(port, JANOS_UART_FT_DEFAULT_BAUD);
+        vTaskDelay(pdMS_TO_TICKS(60));
+        compromised_transport_flush(tab, port);
+        transport_write_bytes_tab(tab, port, "uart_baud_confirm\r\n", 19);
+        janos_uart_wait_marker(tab, port, "[UARTB] END", NULL, NULL, 0, 2000);
+
+        if (janos_uart_console_alive(tab, port)) {
+            ESP_LOGI(TAG, "[UART-FT] Console back at %d baud",
+                     JANOS_UART_FT_DEFAULT_BAUD);
+            return;
+        }
+        /* Silence at the default rate means the Monster is still running fast. */
+        ESP_LOGW(TAG, "[UART-FT] No console at %d baud; retrying from %d",
+                 JANOS_UART_FT_DEFAULT_BAUD, fast_rate);
+        uart_set_baudrate(port, fast_rate);
+        vTaskDelay(pdMS_TO_TICKS(60));
+        compromised_transport_flush(tab, port);
+    }
+
+    uart_set_baudrate(port, JANOS_UART_FT_DEFAULT_BAUD);
+    ESP_LOGE(TAG, "[UART-FT] Could not resynchronise the console. "
+                  "Reboot the Monster to recover M-BUS.");
+}
+
+static void janos_uart_emit_progress(janos_file_transfer_state_t state,
+                                     uint64_t received, uint64_t total,
+                                     uint32_t crc32, esp_err_t error,
+                                     const char *message)
+{
+    janos_file_transfer_progress_t progress = {
+        .state = state,
+        .bytes_received = received,
+        .bytes_total = total,
+        .crc32 = crc32,
+        .http_status = 0,
+        .error = error,
+        .message = message,
+    };
+    compromised_transfer_progress_cb(&progress, NULL);
+}
+
+/* Hunts for the block magic instead of assuming the binary stream starts on the
+ * byte right after the text header. JanOS writes a blank line between the two,
+ * and a NAK retry can leave stray bytes behind, so exact alignment is not
+ * something the receiver should depend on. */
+static bool janos_uart_sync_magic(tab_id_t tab, uart_port_t port, uint8_t *head,
+                                  uint32_t timeout_ms)
+{
+    static const uint8_t magic[4] = { 'F', 'T', 'B', 0x01 };
+    size_t matched = 0;
+    int64_t deadline = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
+    while (matched < sizeof(magic) && esp_timer_get_time() < deadline) {
+        uint8_t c = 0;
+        if (transport_read_bytes_tab(tab, port, &c, 1, pdMS_TO_TICKS(100)) != 1) {
+            continue;
+        }
+        if (c == magic[matched]) {
+            head[matched++] = c;
+        } else {
+            /* A byte that breaks the run may itself start the real magic. */
+            matched = (c == magic[0]) ? 1U : 0U;
+            head[0] = c;
+        }
+    }
+    return matched == sizeof(magic);
+}
+
+/* JanOS answers send_file only after checksumming the whole requested range, so
+ * the wait for the header scales with the file rather than being a flat value. */
+static uint32_t janos_uart_header_timeout_ms(uint64_t size_bytes)
+{
+    uint64_t timeout = 15000U + (size_bytes / 1024U) * 4U;
+    if (timeout > 180000U) {
+        timeout = 180000U;
+    }
+    return (uint32_t)timeout;
+}
+
+static esp_err_t janos_uart_download(tab_id_t tab, uart_port_t port,
+                                     const char *remote_path, const char *local_path,
+                                     uint64_t expected_size,
+                                     const volatile bool *cancel,
+                                     janos_file_transfer_result_t *result)
+{
+    if (!remote_path || !local_path || !result) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    memset(result, 0, sizeof(*result));
+    snprintf(result->final_path, sizeof(result->final_path), "%s", local_path);
+    snprintf(result->part_path, sizeof(result->part_path), "%s.part", local_path);
+    if (access(result->final_path, F_OK) == 0) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /* Resume where a previous attempt stopped, folding the existing prefix into
+     * the CRC so the check still covers the whole file. */
+    uint64_t resume_from = 0;
+    struct stat part_info;
+    if (stat(result->part_path, &part_info) == 0 && part_info.st_size > 0) {
+        FILE *prefix = fopen(result->part_path, "rb");
+        if (prefix) {
+            uint8_t chunk[512];
+            size_t got = 0;
+            while ((got = fread(chunk, 1, sizeof(chunk), prefix)) > 0) {
+                result->crc32 = janos_uart_crc32(result->crc32, chunk, got);
+                resume_from += got;
+            }
+            fclose(prefix);
+            ESP_LOGI(TAG, "[UART-FT] Resuming %s at %llu bytes",
+                     result->part_path, (unsigned long long)resume_from);
+        } else {
+            unlink(result->part_path);
+        }
+    }
+
+    janos_uart_emit_progress(JANOS_FILE_TRANSFER_QUERYING, resume_from, expected_size,
+                             result->crc32, ESP_OK,
+                             "Monster is checksumming the file before sending");
+
+    char command[320];
+    snprintf(command, sizeof(command), "send_file %s %llu\r\n", remote_path,
+             (unsigned long long)resume_from);
+    compromised_transport_flush(tab, port);
+    transport_write_bytes_tab(tab, port, command, strlen(command));
+
+    char header[256];
+    if (!janos_uart_wait_marker(tab, port, "[FT] END", "[FT] ", header, sizeof(header),
+                                janos_uart_header_timeout_ms(expected_size))) {
+        janos_uart_emit_progress(JANOS_FILE_TRANSFER_ERROR, resume_from, 0, result->crc32,
+                                 ESP_FAIL, "Monster did not answer send_file");
+        return ESP_FAIL;
+    }
+    if (!strstr(header, "begin")) {
+        ESP_LOGE(TAG, "[UART-FT] %s", header);
+        janos_uart_emit_progress(JANOS_FILE_TRANSFER_ERROR, resume_from, 0, result->crc32,
+                                 ESP_FAIL, "Monster refused the file");
+        return ESP_FAIL;
+    }
+
+    result->remote_size_before = janos_uart_field_u64(header, "size=", 10);
+    uint64_t expected_crc = janos_uart_field_u64(header, "crc32=", 16);
+    if (result->remote_size_before == 0 || resume_from > result->remote_size_before) {
+        janos_uart_emit_progress(JANOS_FILE_TRANSFER_ERROR, resume_from, 0, result->crc32,
+                                 ESP_ERR_INVALID_SIZE, "Reported file size is unusable");
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    FILE *file = fopen(result->part_path, resume_from > 0 ? "ab" : "wb");
+    uint8_t *block = malloc(JANOS_UART_FT_BLOCK_MAX);
+    if (!file || !block) {
+        if (file) fclose(file);
+        free(block);
+        janos_uart_emit_progress(JANOS_FILE_TRANSFER_ERROR, resume_from,
+                                 result->remote_size_before, result->crc32,
+                                 ESP_ERR_NO_MEM, "Could not open .part or allocate buffer");
+        return ESP_ERR_NO_MEM;
+    }
+
+    result->bytes_written = resume_from;
+    esp_err_t err = ESP_OK;
+    unsigned retries = 0;
+    unsigned long nak_total = 0;
+    int64_t last_progress_us = 0;
+
+    while (result->bytes_written < result->remote_size_before) {
+        if (cancel && *cancel) {
+            uint8_t can = JANOS_UART_FT_CAN;
+            transport_write_bytes_tab(tab, port, (const char *)&can, 1);
+            err = ESP_ERR_INVALID_STATE;
+            break;
+        }
+
+        uint8_t head[JANOS_UART_FT_HEADER_BYTES];
+        if (!janos_uart_sync_magic(tab, port, head, 6000)) {
+            /* Silence here almost always means the Monster gave up and printed a
+             * text reason, which the magic hunt skipped over. Grab it. */
+            char reason[192];
+            reason[0] = '\0';
+            janos_uart_read_line(tab, port, reason, sizeof(reason), 500);
+            ESP_LOGE(TAG, "[UART-FT] No block magic after %llu bytes "
+                     "(nak=%lu, last line: %s)",
+                     (unsigned long long)result->bytes_written,
+                     (unsigned long)nak_total, reason[0] ? reason : "none");
+            err = ESP_ERR_INVALID_RESPONSE;
+            break;
+        }
+        size_t got = 4;
+        int64_t deadline = esp_timer_get_time() + 6000000;
+        while (got < sizeof(head) && esp_timer_get_time() < deadline) {
+            int read = transport_read_bytes_tab(tab, port, head + got,
+                                                sizeof(head) - got, pdMS_TO_TICKS(200));
+            if (read > 0) got += (size_t)read;
+        }
+        if (got != sizeof(head)) {
+            ESP_LOGE(TAG, "[UART-FT] Truncated block header after %llu bytes",
+                     (unsigned long long)result->bytes_written);
+            err = ESP_ERR_INVALID_RESPONSE;
+            break;
+        }
+
+        uint32_t length = (uint32_t)head[8] | ((uint32_t)head[9] << 8) |
+                          ((uint32_t)head[10] << 16) | ((uint32_t)head[11] << 24);
+        uint32_t block_crc = (uint32_t)head[12] | ((uint32_t)head[13] << 8) |
+                             ((uint32_t)head[14] << 16) | ((uint32_t)head[15] << 24);
+        if (length == 0 || length > JANOS_UART_FT_BLOCK_MAX) {
+            err = ESP_ERR_INVALID_RESPONSE;
+            break;
+        }
+
+        got = 0;
+        deadline = esp_timer_get_time() + 6000000;
+        while (got < length && esp_timer_get_time() < deadline) {
+            int read = transport_read_bytes_tab(tab, port, block + got, length - got,
+                                                pdMS_TO_TICKS(200));
+            if (read > 0) got += (size_t)read;
+        }
+
+        uint8_t reply = JANOS_UART_FT_ACK;
+        if (got != length || janos_uart_crc32(0, block, length) != block_crc) {
+            nak_total++;
+            /* Worth seeing: a short read points at a dropped byte on the line,
+             * a full read with a bad CRC points at corruption. */
+            ESP_LOGW(TAG, "[UART-FT] Block at %llu B rejected (%s), retry %u/%u",
+                     (unsigned long long)result->bytes_written,
+                     got != length ? "short read" : "bad CRC",
+                     retries + 1U, JANOS_UART_FT_RETRIES);
+            if (++retries > JANOS_UART_FT_RETRIES) {
+                err = ESP_ERR_INVALID_CRC;
+                reply = JANOS_UART_FT_CAN;
+                transport_write_bytes_tab(tab, port, (const char *)&reply, 1);
+                break;
+            }
+            reply = JANOS_UART_FT_NAK;
+            transport_write_bytes_tab(tab, port, (const char *)&reply, 1);
+            continue;
+        }
+
+        if (fwrite(block, 1, length, file) != length) {
+            reply = JANOS_UART_FT_CAN;
+            transport_write_bytes_tab(tab, port, (const char *)&reply, 1);
+            err = ESP_FAIL;
+            break;
+        }
+        transport_write_bytes_tab(tab, port, (const char *)&reply, 1);
+
+        retries = 0;
+        result->crc32 = janos_uart_crc32(result->crc32, block, length);
+        result->bytes_written += length;
+
+        int64_t now = esp_timer_get_time();
+        if (now - last_progress_us >= 200000) {
+            janos_uart_emit_progress(JANOS_FILE_TRANSFER_DOWNLOADING, result->bytes_written,
+                                     result->remote_size_before, result->crc32, ESP_OK,
+                                     "Downloading over M-BUS");
+            last_progress_us = now;
+        }
+    }
+
+    fflush(file);
+    int fd = fileno(file);
+    if (fd >= 0) fsync(fd);
+    fclose(file);
+    free(block);
+
+    if (err != ESP_OK) {
+        janos_uart_emit_progress(JANOS_FILE_TRANSFER_ERROR, result->bytes_written,
+                                 result->remote_size_before, result->crc32, err,
+                                 "Transfer interrupted; .part was kept for resume");
+        return err;
+    }
+
+    /* The trailer reports what the Monster actually sent, so prefer it over the
+     * value announced up front. */
+    char trailer[192];
+    if (janos_uart_wait_marker(tab, port, "[FT] END", "[FT] done", trailer,
+                               sizeof(trailer), 5000) && strstr(trailer, "crc32=")) {
+        expected_crc = (uint32_t)janos_uart_field_u64(trailer, "crc32=", 16);
+    }
+
+    if (expected_crc != 0 && result->crc32 != expected_crc) {
+        ESP_LOGE(TAG, "[UART-FT] CRC mismatch: local %08lX vs Monster %08lX",
+                 (unsigned long)result->crc32, (unsigned long)expected_crc);
+        janos_uart_emit_progress(JANOS_FILE_TRANSFER_ERROR, result->bytes_written,
+                                 result->remote_size_before, result->crc32,
+                                 ESP_ERR_INVALID_CRC, "CRC32 does not match the Monster copy");
+        return ESP_ERR_INVALID_CRC;
+    }
+
+    janos_uart_emit_progress(JANOS_FILE_TRANSFER_COMMITTING, result->bytes_written,
+                             result->remote_size_before, result->crc32, ESP_OK,
+                             "Finalizing local file");
+    if (rename(result->part_path, result->final_path) != 0) {
+        janos_uart_emit_progress(JANOS_FILE_TRANSFER_ERROR, result->bytes_written,
+                                 result->remote_size_before, result->crc32, ESP_FAIL,
+                                 "Could not rename .part file");
+        return ESP_FAIL;
+    }
+
+    janos_uart_emit_progress(JANOS_FILE_TRANSFER_DONE, result->bytes_written,
+                             result->remote_size_before, result->crc32, ESP_OK,
+                             "Transfer complete");
+    ESP_LOGI(TAG, "[UART-FT] Saved %s (%llu bytes, CRC32 %08lX, %lu retried block(s))",
+             result->final_path, (unsigned long long)result->bytes_written,
+             (unsigned long)result->crc32, nak_total);
+    return ESP_OK;
+}
+
 static void compromised_transfer_task(void *arg)
 {
     compromised_transfer_task_args_t *args = (compromised_transfer_task_args_t *)arg;
@@ -51048,6 +52338,55 @@ static void compromised_transfer_task(void *arg)
 
     if (compromised_transfer_ui.cancel_requested) {
         result_err = ESP_ERR_INVALID_STATE;
+        goto cleanup;
+    }
+
+    /* Anything the Wi-Fi path cannot finish goes over M-BUS instead. That path
+     * needs neither the admin portal nor the C6, so it skips both. */
+    bool use_uart = args->size_bytes >= JANOS_UART_TRANSFER_MIN_BYTES &&
+                    !tab_is_internal(tab);
+    ESP_LOGI(TAG, "[Monster transfer] %s (%ld B) -> %s (threshold %ld B)",
+             args->file_name, args->size_bytes,
+             use_uart ? "M-BUS UART" : "Wi-Fi",
+             (long)JANOS_UART_TRANSFER_MIN_BYTES);
+
+    if (use_uart) {
+        char uart_local_path[256];
+        if (!janos_transfer_build_unique_local_path(tab, args->file_name,
+                                                    uart_local_path, sizeof(uart_local_path))) {
+            result_err = ESP_ERR_INVALID_SIZE;
+            snprintf(final_detail, sizeof(final_detail),
+                     "Could not create a unique local filename.");
+            goto cleanup;
+        }
+
+        compromised_transfer_set_stage("Switching M-BUS to high speed...",
+                                       "Wi-Fi cannot carry a file this size", 0);
+        bool fast = janos_uart_set_baud(tab, uart_port, JANOS_UART_FT_FAST_BAUD);
+
+        compromised_transfer_set_stage("Copying over M-BUS...",
+                                       fast ? "Console raised to 921600 baud"
+                                            : "Console stayed at 115200 baud", 0);
+        result_err = janos_uart_download(tab, uart_port, args->remote_path, uart_local_path,
+                                         (uint64_t)args->size_bytes,
+                                         &compromised_transfer_ui.cancel_requested, &result);
+
+        if (fast) {
+            janos_uart_restore_baud(tab, uart_port, JANOS_UART_FT_FAST_BAUD);
+        }
+
+        if (result_err == ESP_OK) {
+            snprintf(final_detail, sizeof(final_detail),
+                     "Copied over M-BUS.\n%s\n%llu bytes, CRC32 %08lX",
+                     result.final_path, (unsigned long long)result.bytes_written,
+                     (unsigned long)result.crc32);
+        } else {
+            snprintf(final_detail, sizeof(final_detail),
+                     "M-BUS copy failed: %s\n%llu of %llu bytes kept in .part for resume",
+                     esp_err_to_name(result_err),
+                     (unsigned long long)result.bytes_written,
+                     (unsigned long long)result.remote_size_before);
+        }
         goto cleanup;
     }
 
@@ -51445,6 +52784,7 @@ static void compromised_file_copy_cb(lv_event_t *e)
     args->tab = current_tab;
     snprintf(args->remote_path, sizeof(args->remote_path), "%s", file->path);
     snprintf(args->file_name, sizeof(args->file_name), "%s", file->name);
+    args->size_bytes = file->size_bytes;
 
     compromised_transfer_ui.active = true;
     compromised_transfer_ui.cancel_requested = false;

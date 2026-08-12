@@ -96,6 +96,15 @@ static const char TAG[] = "H_SDIO_DRV";
  */
 #define DO_COMBINED_REG_READ (1)
 
+/* The packet-length register is only consulted when the host does not assume a
+ * fixed max-size read. Without this the index is set but never used in
+ * H_SDIO_ALWAYS_HOST_RX_MAX_TRANSPORT_SIZE mode, which warns. */
+#if DO_COMBINED_REG_READ && (H_SDIO_HOST_RX_MODE != H_SDIO_ALWAYS_HOST_RX_MAX_TRANSPORT_SIZE)
+  #define SDIO_USE_PACKET_LEN_INDEX (1)
+#else
+  #define SDIO_USE_PACKET_LEN_INDEX (0)
+#endif
+
 /** Constants/Macros **/
 
 // default queue sizes if unable to get from transport config
@@ -204,7 +213,10 @@ static void sdio_data_to_rx_buf_task(void const* pvParameters);
 /* Backport of the ESP-Hosted 2.12 OOM handling. ESP-Hosted 2.8.5 used
  * assertions for transient SDIO RX allocation failures, which rebooted the
  * whole P4 when internal/DMA RAM was temporarily fragmented. */
+#if H_SDIO_HOST_RX_MODE == H_SDIO_HOST_STREAMING_MODE
+/* Only the streaming reader copies packets out of the stream buffer. */
 static bool sdio_rx_oom_logged;
+#endif
 static bool sdio_tx_dma_reserved;
 static bool sdio_rx_dma_reserved_logged;
 
@@ -1056,6 +1068,8 @@ static void sdio_read_task(void const* pvParameters)
 
 #if DO_COMBINED_REG_READ
 	uint32_t *intr_index = NULL;
+#endif
+#if SDIO_USE_PACKET_LEN_INDEX
 	uint32_t *read_len_index = NULL;
 #endif
 
@@ -1118,7 +1132,9 @@ static void sdio_read_task(void const* pvParameters)
 		}
 
 		intr_index = (uint32_t *)&reg_buf[INT_RAW_INDEX];
+#if SDIO_USE_PACKET_LEN_INDEX
 		read_len_index = (uint32_t *)&reg_buf[PACKET_LEN_INDEX];
+#endif
 
 		interrupts = *intr_index;
 #else

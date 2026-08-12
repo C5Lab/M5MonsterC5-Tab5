@@ -1331,7 +1331,13 @@ int rpc_wifi_get_config(wifi_interface_t interface, wifi_config_t *conf)
 
 	resp = rpc_slaveif_wifi_get_config(req);
 
-	g_h.funcs->_h_memcpy(conf, &resp->u.wifi_config.u, sizeof(wifi_config_t));
+	/* resp is NULL when the co-processor did not answer in time. Every other
+	 * getter in this file guards the copy the same way; this one did not, so an
+	 * RPC timeout dereferenced NULL and panicked the host instead of returning
+	 * a failure. rpc_rsp_callback() already handles a NULL response. */
+	if (resp && resp->resp_event_status == SUCCESS) {
+		g_h.funcs->_h_memcpy(conf, &resp->u.wifi_config.u, sizeof(wifi_config_t));
+	}
 
 	return rpc_rsp_callback(resp);
 }

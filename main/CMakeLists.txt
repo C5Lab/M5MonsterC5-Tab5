@@ -19,6 +19,6 @@ idf_component_register(SRCS
                     "screens/subghz_weather_screen.c"
                     "screens/subghz_settings_screen.c"
                     INCLUDE_DIRS "." "screens"
-                    REQUIRES lvgl m5stack_tab5 nvs_flash esp_lvgl_port driver esp_netif esp_event esp_wifi espressif__esp_hosted esp_http_server esp_http_client fatfs janos_file_transfer pcap_reader pcap_summary pcap_flow pcap_analysis_store pcap_investigation pthread)
+                    REQUIRES lvgl m5stack_tab5 nvs_flash esp_lvgl_port driver esp_netif esp_event esp_wifi espressif__esp_hosted esp_http_server esp_http_client fatfs janos_file_transfer pcap_reader pcap_summary pcap_flow pcap_analysis_store pcap_investigation pcap_extract pthread)
 
 target_compile_definitions(${COMPONENT_LIB} PRIVATE LV_LVGL_H_INCLUDE_SIMPLE)

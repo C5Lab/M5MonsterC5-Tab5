@@ -1,10 +1,10 @@
 # PCAP na M5Stack Tab5 i JanOS — stan końcowy, analiza i rozszerzenia
 
 > **Status implementacji ESPShark Offline v6:** **COMPLETE** — zakres opisany w sekcji 0 jest obecny w kodzie na gałęzi `development`.
-> **Status transferu:** MITM PCAP i lokalna analiza MVP są potwierdzone sprzętowo.
+> **Status transferu:** zapis PCAP i lokalna analiza MVP są potwierdzone sprzętowo; obecny ARP MITM nie jest uznany za niezawodną bramę, ponieważ nie przepuszcza ruchu poprawnie w każdej badanej sieci.
 > **Bramka wydania v6:** pełny build ESP-IDF 5.4.1 sprzed korekty FQDN zakończony sukcesem; po zmianach z sekcji 32–33 kompilację i test sprzętowy wykonuje właściciel projektu.
 > **Ostatnia aktualizacja i audyt kodu:** 2026-08-11, `development` HEAD `1f2700f` oraz lokalna implementacja FQDN/cache v7, interaktywnego DNS drill-down i hierarchicznej mapy topology; ostatni bazowy commit ESPShark `1816750`.
-> **Zakres dokumentu:** sekcja 0 jest kanonicznym bilansem funkcji, sekcja 29 opisuje bazę v5, sekcja 30 zmianę v6, sekcja 31 interaktywny DNS, sekcja 32 korektę FQDN, sekcja 33 mapę topology, a sekcje 25–28 pokazują historię rozwoju; wcześniejsze plany i TODO nie zmieniają statusu końcowego.
+> **Zakres dokumentu:** sekcja 0 jest kanonicznym bilansem funkcji, sekcja 29 opisuje bazę v5, sekcja 30 zmianę v6, sekcja 31 interaktywny DNS, sekcja 32 korektę FQDN, sekcja 33 mapę topology, sekcja 34 opisuje zaimplementowany offline object extraction, sekcja 35 planuje docelową bramę capture JanOS, sekcja 36 dokumentuje audyt wydajności indeksowania, sekcja 37 naprawę zawisu transferu SDIO, a sekcje 25–28 pokazują historię rozwoju; nowe rozszerzenia nie zmieniają statusu końcowego v6.
 
 ## 0. Kanoniczny stan końcowy ESPShark Offline v6
 
@@ -68,6 +68,11 @@ Poniższe pozycje są opcjonalnymi rozszerzeniami, nie brakami v6:
 - LRU/manager miejsca cache, osobny eksport Follow Stream i GraphML;
 - Duplicate ACK, RTT danych, pełna analiza TCP window i wiele profili baseline;
 - Near Live/True Live oraz aktywne skanowanie sieci.
+- tryb JanOS Capture Gateway.
+
+Wydobywanie obiektów HTTP z payloadu przestało być poza zakresem: sekcja 34
+opisuje zaimplementowany komponent `pcap_extract`, który jest rozszerzeniem
+ponad bilans v6.
 
 Pełne limity interpretacyjne i bezpieczeństwa wyniku znajdują się w sekcji
 29.7, a jedyny obowiązkowy krok przed oznaczeniem wydania jako
@@ -458,15 +463,32 @@ HTTP przez `JanOS-Admin` przenosi dane binarne. Jest szybszy i nie blokuje parse
 12. Jeśli użytkownik wybrał `Move`, Tab5 wysyła polecenie usunięcia zdalnego pliku.
 13. Tab5 zatrzymuje `JanOS-Admin` i przywraca poprzedni stan swojego Wi-Fi.
 
-### 8.4. Wznawianie
+### 8.4. Wznawianie — zaimplementowane 2026-08-12
 
-Pierwszy działający wariant może pobierać cały plik od początku. Docelowo należy dodać:
+- [x] Obsługa nagłówka HTTP `Range` w `admin_download_handler()` po stronie JanOS,
+  z `Accept-Ranges: bytes`, odpowiedzią `206 Partial Content` i `Content-Range`.
+  Zakres poza plikiem daje `416` z `Content-Range: bytes */TOTAL`.
+- [x] Wznowienie na podstawie rozmiaru lokalnego `.part`. Istniejący `.part` nie
+  powoduje już odmowy transferu, tylko wysłanie `Range: bytes=<offset>-`
+  i dopisanie do pliku w trybie `ab`.
+- [x] CRC32 pozostaje poprawne dla całego pliku: prefiks z `.part` jest
+  doczytywany i wliczany do sumy przed wznowieniem (`crc32_of_prefix()`).
+- [x] Odrzucenie wznowienia, gdy `.part` nie jest krótszy od zdalnego pliku —
+  wtedy należy do innego capture i jest kasowany.
+- [x] Odrzucenie wznowienia, gdy Monster odpowie `200` zamiast `206` (starszy
+  firmware bez obsługi `Range`) — prefiks jest wtedy porzucany, nie doklejany.
+- [x] Plik lokalny jest otwierany dopiero po zaakceptowaniu żądania przez
+  serwer, więc odmowa nie ucina `.part`, który wciąż nadaje się do wznowienia.
+- [x] Sprawdzanie wolnego miejsca dotyczy tylko brakującej reszty pliku.
 
-- obsługę nagłówka HTTP `Range` po stronie JanOS;
-- odpowiedzi `206 Partial Content`;
-- `Content-Length`, `Content-Range` i stabilny identyfikator pliku;
-- wznowienie na podstawie rozmiaru lokalnego `.part`;
-- odrzucenie wznowienia, jeśli rozmiar, mtime lub identyfikator zdalnego pliku się zmienił.
+Bez `Content-Length`: `httpd_resp_send_chunk()` włącza `Transfer-Encoding:
+chunked`, co wyklucza ten nagłówek. Rozmiar całkowity Tab5 i tak zna z
+`/api/list`, a postęp liczy z `Content-Range`.
+
+Nie zrobione świadomie: **automatyczne ponawianie**. Dziś ponowne naciśnięcie
+kopiowania wznawia transfer od miejsca przerwania, co przy zrywającym się łączu
+wystarcza, żeby duży plik dojechał w kilku podejściach. Pętla retry wymagałaby
+przebudowy cyklu Wi-Fi i jest osobnym zadaniem.
 
 ### 8.5. Bezpieczeństwo i niezawodność
 
@@ -608,7 +630,7 @@ Podczas otwierania:
 
 Dla bardzo dużych plików można przechowywać jeden offset co 64/128 pakietów, a pozostałe rekordy odnajdywać krótkim skanem sekwencyjnym. Przy dostępnej pamięci P4 pełny indeks 32-bitowych offsetów również jest praktyczny dla plików mniejszych niż 4 GB.
 
-Warto rozważyć włączenie `CONFIG_FATFS_USE_FASTSEEK` na Tab5 po wykonaniu testów regresji SD.
+`CONFIG_FATFS_USE_FASTSEEK` jest włączone — patrz sekcja 36.
 
 ### 10.4. Walidacja pliku
 
@@ -3174,3 +3196,594 @@ przypisany do bieżącego flow.
   `BACK TO MAP`, przewijanie zawartości, filtry ALL/SRC/DST/service oraz akcje
   FILTER/FOLLOW/HEX przy top flow. Dla hosta z wieloma adresami `ALL TRAFFIC`
   ma użyć MAC, natomiast SRC/DST świadomie filtrują dokładny widoczny adres.
+
+## 34. ESPShark — Extracted Objects / offline file carving
+
+> **Status:** `MVP-A + chunked` zaimplementowany w komponencie
+> `components/pcap_extract` i w ekranie `EXTRACT FILES` / `OBJECTS`.
+> Kompilacja i test sprzętowy należą do właściciela projektu — patrz 34.6 i 34.8.
+
+### 34.1. Wniosek wykonalności
+
+Wydobywanie `TXT`, `JPG`, `PNG`, `PDF`, archiwów i innych rozpoznawalnych
+obiektów z PCAP jest możliwe, ale wyłącznie wtedy, gdy bajty obiektu rzeczywiście
+znajdują się w capture. Funkcja nie może być przedstawiana jako deszyfrowanie:
+TLS/HTTPS, QUIC, SSH, VPN i szyfrowane komunikatory zwykle pozwolą wskazać flow,
+SNI lub metadane, lecz nie dadzą jawnego pliku bez kluczy sesji i osobnego,
+świadomie skonfigurowanego mechanizmu deszyfrującego.
+
+Najpewniejszą metodą jest parser protokołu, który wyznacza dokładne granice
+obiektu. Wyszukiwanie sygnatur `magic bytes` w surowym strumieniu może być
+drugą warstwą odzysku, ale ma niższą wiarygodność, może dawać false positive i
+nie zawsze potrafi określić koniec pliku. Oryginalny PCAP pozostaje źródłem
+dowodowym, a każdy wydobyty obiekt jest artefaktem pochodnym i stanowi
+potencjalnie niebezpieczne dane wejściowe.
+
+### 34.2. Zakres pierwszego wydania
+
+- [x] Ekran `EXTRACT FILES` / `OBJECTS` uruchamiany jawnie dla wybranego PCAP;
+  ekstrakcja nie odbywa się automatycznie przy otwarciu capture. Przycisk
+  startuje przebieg, a po jego zakończeniu otwiera listę obiektów.
+- [x] Rekonstrukcja kierunku server→client z obsługą retransmisji, nakładania
+  segmentów, dowolnej kolejności i jawnych luk w danych. Kierunek client→server
+  jest parsowany wyłącznie po to, by odczytać metodę, URL i `Host`; nie jest
+  składany w plik, bo tam nie ma treści pobieranego obiektu.
+- [x] HTTP/1.x response body: `Content-Length`, `Transfer-Encoding: chunked`,
+  odpowiedź do zamknięcia połączenia, brak body dla `1xx/204/304` i odpowiedzi
+  na `HEAD`, oraz zakończenie sesji po udanym `CONNECT` (tunel TLS).
+- [x] Rozpoznawanie `text/plain`, HTML, JSON, XML, JPEG, PNG, GIF, WebP, PDF,
+  ZIP i GZIP przez połączenie nagłówka MIME z walidowaną sygnaturą. Rozjazd
+  MIME kontra sygnatura daje jawny status `MISMATCH`, nie cichy wybór.
+- [ ] Zapisywać rekordy DNS TXT jako osobne artefakty tekstowe/evidence, bez
+  udawania, że są zrekonstruowanym plikiem TCP.
+- [ ] Umożliwić odzysk `SIGNATURE_ONLY` z jawnie niższym confidence dla
+  kompletnego JPEG/PNG/GIF/PDF/ZIP znalezionego poza rozpoznanym HTTP.
+- [x] Brak deszyfrowania TLS/QUIC, brak SMB file extraction, brak wykonywania
+  JavaScript i brak automatycznego rozpakowywania archiwów.
+
+Zaimplementowane limity: 4 MiB na obiekt (`PCAP_EXTRACT_OBJECT_BYTE_LIMIT`),
+32 MiB na cały przebieg (`PCAP_EXTRACT_RUN_BYTE_LIMIT`), 64 obiekty, 48 sesji
+TCP, 16384 segmenty i 256 KiB maksymalnej zerowanej luki. Żaden obiekt nie jest
+buforowany w RAM — bajty idą prosto do `*.part`. Przekroczenie limitu kończy
+artefakt jako `TRUNCATED`, nigdy jako pozornie kompletny plik.
+
+### 34.3. Zrealizowany przepływ i komponenty
+
+```text
+classic PCAP na SD
+        |
+        v
+przebieg 1: pcap_reader_iterate_next() po CAŁYM pliku
+        |
+        +-- wykrycie sesji HTTP (linia żądania albo "HTTP/1.")
+        +-- FIFO metod i URL-i z kierunku client->server
+        +-- deskryptory segmentów server->client (offset, seq, długość)
+        |
+        v
+qsort po (sesja, sekwencja względna, numer pakietu)
+        |
+        v
+przebieg 2: odtworzenie strumienia sesji z pliku
+        |
+        +-- przycięcie retransmisji, jawne luki
+        v
+maszyna stanów HTTP: RESYNC -> HEADER -> body
+        |
+        v
+writer .part -> SHA-256 w locie -> fsync -> rename -> manifest.json
+        |
+        v
+                 OBJECTS UI (PREVIEW / PACKETS / DELETE)
+```
+
+- [x] Niezależny od LVGL komponent `components/pcap_extract`
+  (`REQUIRES pcap_reader fatfs mbedtls`).
+- [x] Nowy iterator `pcap_reader_iterate_begin()` / `pcap_reader_iterate_next()`
+  przechodzi cały poprawny prefiks pliku, bez indeksu i bez limitu 4096 rekordów
+  używanego przez tabelę pakietów. Dodany też `pcap_reader_describe_bytes()`,
+  żeby dekodować ramkę już wczytaną do pamięci.
+- [x] Zamiast okna reorder zastosowano deskryptory segmentów w PSRAM
+  (16384 × 32 B ≈ 512 KiB) posortowane globalnie po sekwencji względnej.
+  Daje to poprawną kolejność niezależnie od tego, jak bardzo ruch był
+  pomieszany, przy stałym i przewidywalnym koszcie pamięci. Sekwencje są
+  względne wobec bazy sesji, więc zawinięcie licznika TCP nie psuje sortowania.
+- [x] Zapis prosto do `*.part`, SHA-256 liczone w czasie zapisu, `fflush`,
+  `fsync`, a dopiero potem atomowy `rename`.
+- [x] Nazwa z `Content-Disposition` albo z ostatniego segmentu URL jest
+  sanitizowana (bez ścieżek, bez `..`, bez znaków sterujących), dostaje
+  rozszerzenie zgodne z **wykrytym** typem, a kolizje rozwiązuje sufiks `_NN`.
+- [x] `manifest.json` (`schema espshark-objects`, v1) z 5-tuple, zakresem
+  pakietów, URL/Host, deklarowanym i wykrytym MIME, rozmiarem, luką, SHA-256,
+  confidence oraz stanem `COMPLETE`, `PARTIAL`, `GAPS` lub `TRUNCATED`.
+- [x] PCAP pozostaje nietknięty — jest wyłącznie czytany. `DELETE` usuwa tylko
+  kopię pochodną.
+
+Katalog wyjściowy: `/sdcard/lab/espshark/objects/<capture>/`. Ponowny przebieg
+dla tego samego capture czyści zawartość tego katalogu — jest on w całości
+własnością ESPSharka.
+
+**Luki w strumieniu są wypełniane zerami**, żeby zachować offsety wewnątrz
+pliku, a liczba sfabrykowanych bajtów trafia do `gap_bytes` w manifeście i do
+statusu `GAPS`. Luka w nagłówku albo w ramkowaniu `chunked` jest nienaprawialna:
+obiekt kończy się jako `PARTIAL`, a parser wraca do `RESYNC`.
+
+### 34.4. Etapy implementacji
+
+1. `MVP-A` — **zrobione**: reassembly, HTTP `Content-Length`, tekst,
+   JPEG/PNG/PDF, atomowy zapis i manifest.
+2. `MVP-B` — **zrobione**: wiele kandydatów w jednym przebiegu, chunked
+   encoding, body do zamknięcia połączenia, ZIP/GIF/WebP/GZIP/JSON/XML,
+   progress z anulowaniem oraz jawne luki i retransmisje.
+3. `MVP-C` — **do zrobienia**: ograniczona dekompresja HTTP gzip/deflate z
+   limitem współczynnika ekspansji, miniatury obrazów i sygnatury poza HTTP.
+   Obecnie treść z `Content-Encoding` jest zapisywana w postaci skompresowanej
+   i jawnie oznaczana jako `compressed`.
+4. `Later`: SMTP/MIME i base64, FTP/TFTP oraz eksport paczki śledczej.
+   SMB i deszyfrowanie pozostają osobnymi projektami ze względu na złożoność.
+
+### 34.5. Interfejs i bezpieczny podgląd
+
+- [x] Lista pokazuje typ, nazwę, rozmiar, host, URL, status HTTP, zakres
+  pakietów, `chunked`/`compressed`, status i confidence oraz skrót SHA-256.
+  Kolor ramki wiersza koduje `COMPLETE` / `GAPS|TRUNCATED` / `PARTIAL`.
+- [x] Akcje `PREVIEW`, `PACKETS` i `DELETE`. `PACKETS` ustawia quick filter na
+  adres i port serwera, więc prowadzi z artefaktu z powrotem do ruchu.
+  `PREVIEW` łączy rolę dawnych `HEX` i podglądu tekstu.
+- [x] Podgląd tekstu ma limit bajtów i bezpieczne kodowanie znaków; HTML jest
+  wyświetlany jako źródło, nigdy renderowany jako aktywna strona.
+- [ ] Podgląd obrazu z ograniczoną miniaturą i kontrolowanym dekoderem.
+  Obecnie obrazy, archiwa i formaty nieznane mają wyłącznie metadane i HEX —
+  świadomie, bo dekoder obrazu na niezaufanych bajtach to osobne ryzyko.
+- [x] Ekran pokazuje ostrzeżenie, że artefakty są niezaufanymi kopiami
+  pochodnymi i nie wolno ich uruchamiać ani rozpakowywać na urządzeniu.
+
+### 34.6. Testy i kryterium akceptacji
+
+- [ ] Fixture: pełny HTTP dla każdego wspieranego typu i porównanie SHA-256.
+- [ ] Fixture: segmenty poza kolejnością, retransmisje, overlap, brak segmentu,
+  ucięty PCAP, chunked i body zamykane przez FIN.
+- [ ] Fixture: błędny MIME, fałszywa sygnatura, brak znacznika końca, bardzo
+  duży obiekt, archive bomb i złośliwa nazwa `Content-Disposition`.
+- [ ] TLS/QUIC bez kluczy nie generuje fałszywego pliku; UI wyjaśnia
+  `encrypted payload — metadata only`.
+- [ ] Anulowanie, brak miejsca i reset zasilania pozostawiają co najwyżej
+  rozpoznawalny plik `.part`, nigdy wynik oznaczony jako `COMPLETE`.
+- [ ] Wynik z luką ma status `GAPS/PARTIAL`, zakres pakietów prowadzi do
+  właściwego flow, a oryginalny PCAP pozostaje bitowo niezmieniony.
+
+### 34.7. Świadome ograniczenia obecnej implementacji
+
+- Działa wyłącznie na **jawnym HTTP/1.x**. HTTPS, QUIC, SSH i VPN dają flow,
+  SNI i metadane, ale nie plik. UI mówi to wprost i podaje licznik
+  `encrypted flow(s)`.
+- Capture rozpoczęty w połowie pobierania nie ma nagłówka odpowiedzi, więc nie
+  da się wyznaczyć granic obiektu. Taki strumień jest pomijany, nie zgadywany.
+- Baza sekwencji sesji jest brana z pierwszego pakietu server→client w
+  kolejności zapisu. Jeżeli pierwszy zapisany pakiet tej sesji był mocno poza
+  kolejnością, wcześniejsze bajty trafią za koniec strumienia i obiekt skończy
+  się jako `PARTIAL` — bez uszkodzenia pliku i bez fałszywego `COMPLETE`.
+- Nagłówek odpowiedzi dłuższy niż 4096 B powoduje `RESYNC`, czyli pominięcie
+  tej odpowiedzi.
+- HTTP/2 i HTTP/3 nie są obsługiwane.
+- Przy `keep-alive` kolejność URL-i jest odtwarzana z FIFO czterech ostatnich
+  żądań. Przy głębszym pipeliningu URL przy obiekcie może się rozjechać; sam
+  plik i jego bajty pozostają poprawne.
+
+### 34.8. Weryfikacja właściciela projektu
+
+- [ ] Zbudować ESP-IDF 5.4.1 z nowym komponentem `pcap_extract`.
+- [ ] Otworzyć capture z jawnym pobraniem po HTTP, uruchomić `EXTRACT FILES`
+  i porównać SHA-256 wydobytego pliku z oryginałem na PC.
+- [ ] Sprawdzić `manifest.json` oraz to, że capture ma niezmieniony rozmiar
+  i sumę kontrolną po ekstrakcji.
+- [ ] Potwierdzić, że capture wyłącznie HTTPS kończy się komunikatem
+  `No plaintext HTTP object` i nie tworzy żadnego pliku.
+
+## 35. JanOS — Capture Gateway zamiast ARP MITM — analiza i propozycja
+
+### 35.1. Odpowiedź techniczna
+
+Nie da się zagwarantować „100% każdego ruchu i pakietu” tylko przez połączenie
+JanOS jako zwykłego klienta STA z istniejącą siecią Wi-Fi. Punkt dostępowy
+przekazuje unicast innych klientów bezpośrednio do ich adresatów, więc JanOS
+nie otrzymuje tych ramek. Więcej CPU, dłuższy capture ani większa kolejka nie
+naprawiają braku widoczności.
+
+Realny cel brzmi: **przechwycić cały routowany IPv4 wybranych klientów, którzy
+połączą się z SSID wystawionym przez JanOS, z jawnym licznikiem ewentualnych
+dropów**. JanOS musi być ich rzeczywistą bramą, a nie obserwatorem obok bramy.
+Jest to router/NAPT typu APSTA. „Transparent proxy” byłoby mylącą nazwą, bo
+klasyczny HTTP/SOCKS proxy obsługuje tylko aplikacje, które go używają, a nie
+wszystkie pakiety.
+
+```text
+badane urządzenie
+  IP z DHCP JanOS, gateway = JanOS
+           |
+           | Wi-Fi do dedykowanego SSID
+           v
+JanOS SoftAP / downstream (np. 10.42.0.1/24)
+  capture przed NAT -> routing/firewall -> IPv4 NAPT
+           |
+           v
+JanOS STA / upstream -> domowy AP/router -> Internet
+```
+
+Ta architektura obejmuje ruch klienta, ponieważ nie ma on innej bramy na tym
+SSID. Nadal nie daje dostępu do treści TLS/QUIC/VPN i nie gwarantuje ramek,
+które nie przechodzą przez stos IP JanOS.
+
+### 35.2. Co obecnie robi JanOS i dlaczego jest to kruche
+
+Audyt lokalnego JanOS 1.7.0 wykazał:
+
+- `start_pcap net` wymaga wcześniejszego `wifi_connect` i pracuje na jednym
+  `WIFI_STA_DEF`;
+- jednorazowo skanuje podsieć ARP, kopiuje hosty widoczne w ograniczonej
+  tablicy lwIP, a następnie co 2 sekundy zatruwa hosty i bramę;
+- hooki `netif->input` i `netif->linkoutput` kopiują pakiet do kolejki PCAP,
+  po czym wywołują pierwotny handler. Same nie tworzą jawnej ścieżki relay;
+- build włącza `CONFIG_LWIP_IP_FORWARD=y` oraz
+  `IP_FORWARD_ALLOW_TX_ON_RX_NETIF=1`, ale `CONFIG_LWIP_IPV4_NAPT` jest
+  wyłączone;
+- `wifi_connect` niszczy istniejący `WIFI_AP_DEF` i wraca do trybu STA, więc
+  nie może być bezpośrednio użyty do stałej bramy APSTA;
+- writer ma kolejkę 256 wskaźników, alokację `malloc` na każdy pakiet,
+  nieblokujący enqueue i jawny licznik dropów; pakiety net większe niż 1600 B
+  są pomijane przez hook.
+
+ARP MITM może być blokowany przez izolację klientów AP, dynamic ARP inspection,
+statyczne wpisy ARP i zabezpieczenia hosta. Obejmuje tylko IPv4, może pominąć
+nowe lub śpiące hosty i próbuje routować ruch z powrotem przez ten sam interfejs.
+Można go ulepszać jako tryb laboratoryjny dla jednego wskazanego hosta, lecz nie
+powinien być fundamentem trybu kompletnego capture.
+
+### 35.3. Potwierdzona ścieżka w ESP-IDF 6.0.1
+
+Używana lokalnie wersja ESP-IDF zawiera oficjalny przykład `wifi/softap_sta`:
+tworzy osobne netify AP i STA, ustawia STA jako trasę domyślną, przekazuje DNS
+do AP i wywołuje `esp_netif_napt_enable(esp_netif_ap)`. API pozwala włączyć
+NAPT na jednym interfejsie. W bieżącym JanOS opcja
+`CONFIG_LWIP_IPV4_NAPT` nie jest jeszcze włączona.
+
+Nie należy włączać NAPT na interfejsie upstream. Funkcja ma być aktywna na
+netifie downstream/AP, którego klienci używają jako bramy.
+
+### 35.4. Proponowana implementacja `capture_gateway`
+
+- [ ] Dodać oddzielny lifecycle/komendę, np.
+  `capture_gateway start <upstream-ssid> [password]`, zamiast łączyć ją z
+  obecnym `wifi_connect` i destrukcyjnym przełączaniem trybów.
+- [ ] Utworzyć trwałe `WIFI_STA_DEF` i `WIFI_AP_DEF`, skonfigurować APSTA,
+  połączyć STA upstream, a SoftAP uruchomić na tej samej częstotliwości/kanale,
+  którego wymaga pojedyncze radio.
+- [ ] Nadać AP osobną prywatną podsieć, uruchomić DHCP server i przekazać
+  klientom adres JanOS jako gateway oraz kontrolowany DNS.
+- [ ] Włączyć `CONFIG_LWIP_IPV4_NAPT=y`, ustawić STA jako default netif i
+  dopiero po uzyskaniu upstream IP wywołać `esp_netif_napt_enable(ap_netif)`.
+- [ ] Capture podpiąć po stronie AP przed NAT: `input` rejestruje ruch od
+  klienta, `linkoutput` ruch wracający do klienta. Zachowuje to jego prawdziwy
+  adres downstream i unika podwójnego zapisu pre-/post-NAT.
+- [ ] Zapisać w manifeście sesji SSID, BSSID, kanał, adresację AP/STA, czas,
+  snaplen, liczbę ramek, dropy, maksymalne użycie kolejki i powód zatrzymania.
+- [ ] Zastąpić `malloc` per packet stałą pulą bloków w PSRAM lub bounded ring,
+  dodać watermark/backpressure telemetry, zapis partiami i rotację plików.
+- [ ] Używać `.part`, synchronizować zapis i atomowo finalizować PCAP; pokazać
+  `CAPTURE DEGRADED`, gdy wystąpi choć jeden drop lub błąd SD.
+- [ ] Dodać `status`, `stop` i watchdog ścieżki danych. Utrata upstream nie może
+  po cichu oznaczać sukcesu — klienci pozostają widoczni, ale UI pokazuje
+  `UPSTREAM DOWN`.
+- [ ] Domyślnie izolować klientów na SoftAP, aby ich ruch peer-to-peer nie
+  omijał warstwy L3/capture, albo jawnie oznaczyć taki ruch jako niegwarantowany.
+- [ ] Oddzielić ten tryb od radio/promiscuous capture; jednoczesna zmiana kanału
+  lub monitor mode nie może zerwać bramy bez ostrzeżenia.
+
+### 35.5. Granice określenia „100%”
+
+- Jedno radio APSTA odbiera i nadaje ten sam ruch, pracuje na jednym kanale i
+  ma niższą przepustowość oraz większe opóźnienie. Dla stabilnego rozwiązania
+  docelowego lepsze są dwa niezależne interfejsy/radia, np. SoftAP downstream
+  plus Ethernet lub drugi moduł Wi-Fi upstream.
+- Capture po stronie AP może objąć wszystkie **routowane pakiety IPv4 klientów
+  tego SSID**, ale nie ruch urządzeń pozostających na głównym AP ani ruch RF
+  innych stacji.
+- IPv6 może ominąć założenia IPv4. MVP powinno być jawnie IPv4-only i nie
+  reklamować IPv6; późniejszy etap wymaga prawidłowego routingu IPv6, prefiksu,
+  RA/NDP i polityki firewall, nie prostego NAPT.
+- Ruch klient-klient, część ramek sterujących/zarządzających Wi-Fi oraz pakiety
+  odrzucone przed hookiem wymagają osobnego punktu obserwacji. „Każdy pakiet IP
+  przechodzący przez bramę” i „każda ramka w eterze” to różne produkty.
+- HTTPS/TLS, QUIC, SSH i VPN pozostają zaszyfrowane. Instalowanie CA i aktywny
+  TLS interception jest osobnym, inwazyjnym trybem, nie działa z pinningiem i
+  może być używane wyłącznie na własnych, świadomie skonfigurowanych klientach.
+- Żaden system PCAP nie gwarantuje zera strat bez pomiaru. Dowodem kompletności
+  są liczniki RX/captured/dropped, brak błędów SD i test obciążeniowy, nie sama
+  obecność pliku.
+
+### 35.6. Kolejność realizacji i kryteria akceptacji
+
+1. `Gateway MVP`: jeden klient, IPv4 APSTA+NAPT, DHCP/DNS, ping/DNS/HTTP/HTTPS
+   działają przez JanOS; PCAP z AP zawiera oba kierunki i oryginalny IP klienta.
+2. `Capture hardening`: pula buforów, atomowy writer, telemetry dropów, rotacja,
+   utrata/odzyskanie upstream i poprawne sprzątanie netifów.
+3. `Multi-client`: izolacja, limity per klient/flow, lista klientów, wybór hosta,
+   start/stop capture i przekazanie pliku do ESPShark.
+4. `Performance`: pomiar TCP/UDP przy capture włączonym/wyłączonym, wolna SD,
+   pełna kolejka, długie flow i kontrolowany reset zasilania.
+
+- [ ] Porównać liczbę pakietów po obu stronach testowego generatora z liczbą
+  rekordów PCAP i uzasadnić każdą różnicę protokołem lub licznikiem dropów.
+- [ ] Potwierdzić brak wycieku IPv6 i brak alternatywnej bramy w MVP IPv4-only.
+- [ ] Potwierdzić, że zatrzymanie capture przywraca normalne APSTA/NAPT albo
+  bezpiecznie rozłącza klientów, nie zostawiając zatrutych wpisów ARP.
+- [ ] Dopiero po tych testach nazywać tryb `Capture Gateway`; nie oznaczać go
+  jako `100%` ani `transparent TLS proxy`.
+
+## 36. Wydajność indeksowania PCAP — audyt i zmiana konfiguracji FATFS
+
+### 36.1. Wniosek audytu
+
+Indeksowanie kilkumegabajtowego capture jest wolne z powodu **wzorca dostępu do
+pliku**, a nie braku mocy. Sprzęt i build są już wykorzystane maksymalnie:
+
+| Parametr | Ustawienie |
+|---|---|
+| CPU | `CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ=360` (maksimum P4) |
+| Optymalizacja | `CONFIG_COMPILER_OPTIMIZATION_PERF` (`-O2`) |
+| PSRAM | HEX, 200 MHz, XIP z PSRAM |
+| SD | 4-bit, `SDMMC_FREQ_HIGHSPEED` (40 MHz) |
+
+Przy takim łączu czysto sekwencyjny odczyt 10 MB to około jednej sekundy. Każdy
+czas znacząco dłuższy jest narzutem, nie transferem.
+
+### 36.2. Zidentyfikowane źródła narzutu
+
+1. **Bufor stdio miał 128 bajtów.** `CONFIG_FATFS_VFS_FSTAT_BLKSIZE=0` oznacza
+   w ESP-IDF fallback do newlibowego `BLKSIZ`, czyli 128 B. Newlib dociąga bufor
+   przez `__srefill`, który czyta dokładnie rozmiar bufora, więc każdy
+   `fread(512)` w `pcap_reader_describe_packet()` to cztery osobne przejścia
+   newlib → VFS → FatFs. Skan czyta 16-bajtowe nagłówki rekordów, więc dostawał
+   jeden dostęp do karty na każde 128 B zamiast na kilka KB.
+2. **Brak fast-seek.** Bez `CONFIG_FATFS_USE_FASTSEEK` każdy `f_lseek` wstecz
+   przechodzi łańcuch klastrów od początku pliku.
+3. **Podwójny odczyt tego samego pakietu.** `pcap_flow_analysis_build()` woła
+   `pcap_reader_describe_packet()` (seek + 512 B), a zaraz po nim
+   `pcap_reader_read_packet()` na tym samym offsecie — czyli seek **wstecz**
+   o 512 B i drugi odczyt tych samych bajtów. Przy 128-bajtowym buforze to nie
+   mieściło się w buforze i wymuszało realny `lseek`, a więc pełne przejście
+   łańcucha FAT.
+
+Dla capture 10 MB (~10 tys. pakietów, 4096 indeksowanych) trzy przebiegi —
+`pcap_reader_scan`, `pcap_summary_build` i `pcap_flow_analysis_build` — dają
+rzędu 80 tys. operacji VFS i kilka tysięcy przejść łańcucha klastrów.
+
+### 36.3. Wprowadzona zmiana
+
+W `sdkconfig.defaults` oraz w bieżącym `sdkconfig`:
+
+```text
+CONFIG_FATFS_VFS_FSTAT_BLKSIZE=4096
+CONFIG_FATFS_USE_FASTSEEK=y
+CONFIG_FATFS_FAST_SEEK_BUFFER_SIZE=256
+```
+
+Bufor pliku rośnie ze 128 B do 4 KiB, więc odczyt 512 B to jedno dociągnięcie
+zamiast czterech, a skan nagłówków rekordów dostaje realne read-ahead. Fast-seek
+buduje tablicę CLMT automatycznie przy otwarciu pliku w trybie odczytu
+(`components/fatfs/vfs/vfs_fat.c`), więc sama opcja Kconfig wystarcza. Bufor
+CLMT podniesiony z domyślnych 64 do 256 słów, bo przy zbyt małym buforze
+`f_lseek(CREATE_LINKMAP)` zwraca błąd i FatFs po cichu wraca do wolnej ścieżki.
+
+Koszt pamięci: 4 KiB na otwarty plik oraz 1 KiB tablicy CLMT na otwarty plik
+w trybie odczytu. Przy `max_files = 5` dla SD to kilkanaście KiB, a
+`CONFIG_FATFS_ALLOC_PREFER_EXTRAM=y` kieruje alokacje CLMT do PSRAM.
+
+Uwaga o zapisie: większy bufor oznacza, że dane zapisywane przez `stdio` dłużej
+czekają na wypchnięcie. Jedyny długo żyjący dopisywany plik z wymaganiem
+trwałości, czyli journal `upload_state`, wykonuje jawnie `fflush()`, `fsync()`
+i `fclose()`, więc zmiana go nie dotyczy.
+
+### 36.4. Weryfikacja właściciela projektu
+
+- [ ] Zmierzyć czas otwarcia tego samego capture przed i po zmianie.
+- [ ] Regresja SD: wardrive, transfer z Monstera, OTA i eksporty ESPSharka.
+- [ ] Sprawdzić w logu, czy nie pojawia się `fast-seek not activated`; jeśli tak,
+  plik jest mocno pofragmentowany i `CONFIG_FATFS_FAST_SEEK_BUFFER_SIZE` trzeba
+  podnieść.
+
+### 36.5. Nie wykonane, świadomie odłożone
+
+Poniższe dają dalszy zysk, ale nie zostały wprowadzone razem ze zmianą
+konfiguracji, żeby dało się zmierzyć efekt każdej zmiany osobno:
+
+- `setvbuf()` z buforem 32 KiB w PSRAM przypiętym do `FILE*` w
+  `pcap_reader_open()` — działa lokalnie, bez globalnej konfiguracji;
+- usunięcie podwójnego odczytu w `pcap_flow_analysis_build()` przez
+  `pcap_reader_describe_bytes()` zamiast `pcap_reader_describe_packet()`;
+- scalenie `pcap_summary_build()` i `pcap_flow_analysis_build()` w jeden przebieg;
+- docelowo jeden strumieniowy przebieg `pcap_reader_iterate_next()` robiący
+  scan, summary i flow naraz, bez ani jednego seeka.
+
+## 37. Zawis transferu dużego PCAP-a — SDIO RX w ESP-Hosted
+
+### 37.1. Objaw
+
+Kopiowanie dużego capture z Monstera przerywa się po kilkudziesięciu sekundach,
+a razem z nim pada całe Wi-Fi Tab5:
+
+```text
+W H_SDIO_DRV: RX stream buffer allocation failed (len=3072); retrying
+W rpc_core:   Timeout waiting for Resp for Req[0x11b]
+E rpc_core:   Response not received for [0x11b]
+I wifi_scanner: [MBus] Monster file transfer finished: ESP_FAIL
+```
+
+### 37.2. Przyczyna
+
+Problem nie leży w warstwie pliku. `janos_file_transfer` pobiera strumieniowo
+buforem 8 KiB, a przy `CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=0` ta alokacja idzie
+do PSRAM. Kończy się **wewnętrzny RAM z DMA**, którego używa sterownik SDIO:
+
+```c
+void *hosted_malloc_align(size_t size, size_t align) {
+    return heap_caps_aligned_alloc(align, size,
+             MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+}
+```
+
+Przy `CONFIG_ESP_HOSTED_SDIO_OPTIMIZATION_RX_STREAMING_MODE=y` host czyta
+wszystko, co slave nazbierał w kolejce — kilka pakietów sklejonych w jeden
+transfer. Tymczasem `sdio_rx_stream_buffers_reserve()` rezerwowało bufory o
+rozmiarze `MAX_SDIO_BUFFER_SIZE`, a to jest `ESP_TRANSPORT_SDIO_MAX_BUF_SIZE`,
+czyli 1536 B — **rozmiar jednego pakietu, nie strumienia**. Zaobserwowane
+`len=3072` to 512×6, czyli dwa pakiety sklejone.
+
+Sterownik próbował więc powiększyć bufor w locie, z wewnętrznego DMA RAM-u,
+dokładnie wtedy gdy Wi-Fi wysycało tę samą pulę. Po nieudanej alokacji ścieżka
+błędu robiła `pending = true; msleep(1); continue;` w nieskończoność. Bufor
+nigdy nie rósł, kolejka slave'a nigdy się nie opróżniała, transport był
+zakleszczony na stałe — stąd timeouty RPC i śmierć całego Wi-Fi, nie tylko
+pobierania.
+
+Wcześniejsza łatka z commita `c5ede59` („backport graceful SDIO RX
+allocation-failure handling to prevent P4 reboots") zamieniła **reboot P4** na
+**zawis transferu**. Objaw złagodzony, przyczyna została.
+
+### 37.3. Wprowadzona zmiana
+
+W `managed_components/espressif__esp_hosted/host/drivers/transport/sdio/sdio_drv.c`:
+
+- **rozmiar rezerwy pozostaje `MAX_SDIO_BUFFER_SIZE`** (1536 B), czyli bez zmian
+  wobec stanu sprzed poprawki. Dwie próby jego podniesienia zablokowały boot —
+  patrz 37.3.1. Stała `H_SDIO_RX_STREAM_BUFFER_SIZE` istnieje wraz z limitem
+  `H_SDIO_RX_DMA_KEEP_FREE`, żeby ewentualne podniesienie było świadome
+  i samoograniczające, ale domyślnie nic dodatkowego nie rezerwuje;
+- rezerwacja nigdy nie zwalnia bufora, który akurat opróżnia
+  `sdio_data_to_rx_buf_task()`. `read_index` ustawia wyłącznie producent, a
+  funkcja działa na producencie, więc wartość może się tylko wyzerować —
+  sprawdzenie jest zachowawcze, nie wyścigowe;
+- ścieżka powiększania w `sdio_rx_get_buffer()` **najpierw zwalnia** za mały
+  bufor, dopiero potem alokuje większy. Za mały bufor i tak nie obsłuży tego
+  transferu, więc trzymanie go nic nie daje, a szczytowe zapotrzebowanie spada
+  z dwóch buforów do jednego;
+- po nieudanej alokacji sterownik ponawia rezerwację i co 64 nieudane próby
+  loguje `ESP_LOGE` z licznikiem, zamiast kręcić się bez śladu w logu.
+  Odzyskanie łącza również jest logowane;
+- logi rezerwacji i niepowodzenia raportują `heap_caps_get_free_size()` oraz
+  `heap_caps_get_largest_free_block()` dla `MALLOC_CAP_INTERNAL|MALLOC_CAP_DMA`,
+  żeby następne zgłoszenie dało się zdiagnozować bez zgadywania.
+
+Koszt przy starcie: **zero** — rezerwa jest taka sama jak przed poprawką.
+
+### 37.3.1. Dwa bootloopy i wniosek o rezerwie
+
+Pierwsza wersja tej zmiany rezerwowała 2 × 16 KiB i **zablokowała boot**:
+
+```text
+I H_SDIO_DRV: Reserved 2 SDIO RX DMA stream buffers of 16384 B
+              (internal DMA free=26220 largest=25600)
+assert failed: xTaskCreateStaticPinnedToCore
+              freertos_tasks_c_additions.h:300 (xPortCheckValidTCBMem(pxTaskBuffer))
+```
+
+Powód jest widoczny w `heap_init` tej płytki:
+
+```text
+At 4FF2B070 len 0000FF50 (63 KiB): RAM
+At 4FF3AFC0 len 00004BF0 (18 KiB): RAM
+At 4FF73DE0 len 0000C220 (48 KiB): RAM
+At 5010809C len 00007F64 (31 KiB): RTCRAM
+At 30100068 len 00001F98  (7 KiB): TCM
+```
+
+**Cały wewnętrzny RAM do alokacji dynamicznej to około 129 KiB**, nie setki
+kilobajtów. Rezerwa 32 KiB zabrała jedną czwartą, zostało 26 KiB, i przy
+`vTaskStartScheduler()` blok kontrolny zadania idle trafił do TCM
+(`0x30100068` widoczne na stosie), którego `xPortCheckValidTCBMem()` nie
+akceptuje.
+
+Druga próba zeszła do 2 × 4 KiB, zostawiając `free=50796 largest=49152`, i
+**też nie wstała** — tym razem wcześniej, na `xPortcheckValidStackMem`, bo stos
+zadania idle trafił do TCM (`0x301001e8`). To jest kluczowa obserwacja: mimo
+raportowanych 48 KiB największego wolnego bloku FreeRTOS nie mógł umieścić
+stosu 3072 B w prawidłowej pamięci. Pule, z których brane są stosy zadań, są
+w tym momencie startu praktycznie wyczerpane, a 48 KiB leży w puli, do której
+alokator wtedy nie sięga. Każdy kilobajt zabrany przez rezerwę dobija ten
+margines.
+
+Wniosek wpisany w kod: **rezerwa zostaje przy `MAX_SDIO_BUFFER_SIZE`**, czyli
+profil pamięci przy starcie jest identyczny jak w działającej wersji. Tym, co
+faktycznie naprawia zawis transferu, jest zmiana kolejności w
+`sdio_rx_get_buffer()` — zwolnienie za małego bufora **przed** alokacją
+większego zmniejsza szczytowe zapotrzebowanie z 1536 + 3072 = 4608 B do
+3072 B — a to nie kosztuje przy starcie nic.
+
+Stała `H_SDIO_RX_STREAM_BUFFER_SIZE` i limit `H_SDIO_RX_DMA_KEEP_FREE` = 48 KiB
+zostają w kodzie z ostrzeżeniem, żeby ewentualne podniesienie było świadome i
+samoograniczające. Podnoszenie ich bez pomiaru na sprzęcie kończy się
+bootloopem.
+
+Bilans wolnego wewnętrznego DMA RAM po rezerwacji: ~55,9 KiB przy 1536 B
+(działa), ~50,8 KiB przy 4 KiB (bootloop), ~26,2 KiB przy 16 KiB (bootloop).
+
+### 37.3.2. Pomiar, który rozstrzygnął sprawę
+
+Po dodaniu logowania stanu puli DMA transfer dużego PCAP-a dał:
+
+```text
+W RX stream buffer 0 grown to 3072 B                              (t=117 s)
+W RX stream buffer allocation failed (len=3072,
+     internal DMA free=9583 largest=1984); retrying               (t=240 s)
+```
+
+Pierwszy bufor urósł do 3072 B bez problemu. Drugi, 122 sekundy później, już
+nie — bo **w trakcie transferu wolny wewnętrzny DMA RAM spada z ~50 KB przy
+starcie do 9,5 KB, a największy ciągły blok do 1984 B**. Aktywny stos
+Wi-Fi/lwIP zjada w tym czasie około 40 KB i nie oddaje ich.
+
+To zamyka temat strojenia rozmiaru rezerwy. Nie da się zarezerwować więcej przy
+starcie (bootloop już przy +5 KB) ani doalokować w trakcie (1984 B ciągłego
+bloku). Przy takim budżecie **tryb streaming jest na tej płytce niewykonalny**,
+bo z definicji wymaga bufora o rozmiarze zależnym od ruchu.
+
+Zmiana w `sdkconfig` i `sdkconfig.defaults`:
+
+```text
+CONFIG_ESP_HOSTED_SDIO_OPTIMIZATION_RX_MAX_SIZE=y
+# CONFIG_ESP_HOSTED_SDIO_OPTIMIZATION_RX_STREAMING_MODE is not set
+```
+
+W trybie pakietowym `len_from_slave` jest na sztywno równe
+`MAX_TRANSPORT_BUFFER_SIZE` (1536 B), a bufory pochodzą z **mempoola** —
+recyklingowanych bloków stałego rozmiaru zwalnianych po konsumpcji. Ścieżka
+powiększania nie jest w tym trybie w ogóle kompilowana, więc awaria, o której
+mowa w 37.2, przestaje być możliwa. Tryb ten pomija też odczyt rejestru
+długości, co odzyskuje część różnicy w przepustowości.
+
+Możliwe uzupełnienie, jeśli ciasnota wewnętrznego DMA RAM będzie wracać:
+`CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y` przeniosłoby bufory Wi-Fi i lwIP do
+PSRAM. Na tej płytce radio jest na C6, więc host nie potrzebuje dla nich DMA.
+Nie włączone razem z powyższym, żeby dało się rozdzielić efekty.
+
+### 37.4. Świadomie odrzucone
+
+Przycinanie `len_from_slave` do rozmiaru bufora wyglądało kusząco, ale strumień
+to sklejone poramkowane pakiety. Ucięcie na granicy bloku rozjeżdża parser na
+ostatnim, niekompletnym pakiecie; trzeba by zwracać liczbę skonsumowanych bajtów
+i cofać licznik slave'a. Za duża ingerencja w protokół jak na ten problem.
+
+### 37.5. Weryfikacja właściciela projektu
+
+- [ ] Skopiować duży PCAP i potwierdzić, że transfer kończy się sukcesem.
+- [ ] Potwierdzić w logu `SDIO Host operating in PACKET MODE` zamiast
+  `STREAMING MODE`.
+- [ ] Skopiować duży PCAP i sprawdzić, czy transfer dochodzi do końca.
+  Komunikaty `RX stream buffer ...` nie mogą się już pojawić — ten kod nie jest
+  w tym trybie kompilowany.
+- [ ] Porównać czas transferu tego samego pliku ze streamingiem i bez, żeby
+  wiedzieć, ile realnie kosztuje zmiana trybu.
+- [ ] Jeśli transfer nadal pada, sprawdzić w logu wolny wewnętrzny DMA RAM i
+  rozważyć `CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y`.
+- [ ] Awaryjnie, gdyby to nie wystarczyło: `CONFIG_ESP_HOSTED_SDIO_OPTIMIZATION_RX_MAX_SIZE=y`
+  zamiast trybu streaming. Wtedy `len_from_slave` jest na sztywno równe 1536 i
+  ścieżka powiększania staje się martwym kodem, kosztem przepustowości.

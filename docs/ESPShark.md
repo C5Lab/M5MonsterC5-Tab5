@@ -48,6 +48,7 @@ dump: every summary should lead back to the traffic that supports it.
 | Network map | Inferred hierarchy plus traffic, threat, and service graph modes |
 | Security | Explainable alerts and investigation findings with evidence packet references |
 | Comparison | Save a known-good baseline and compare later captures |
+| Extracted objects | Plaintext HTTP file carving with SHA-256, manifest and explicit COMPLETE/GAPS/PARTIAL/TRUNCATED state |
 | Evidence output | JSON report, standalone HTML report, filtered PCAP, filter profiles, analysis cache |
 
 ---
@@ -614,7 +615,70 @@ PCAP remains the authoritative evidence file.
 
 ---
 
-## 19. Embedded limits and honest partial results
+## 19. Extracted objects
+
+`EXTRACT FILES` reconstructs the files that actually travelled through a
+capture. It rebuilds the server-to-client byte stream of plaintext HTTP/1.x
+conversations and writes every response body it can bound to the SD card.
+
+**This is carving, not decryption.** HTTPS, QUIC, SSH and VPN payloads stay
+encrypted; those conversations are counted as `encrypted flow(s)` and produce no
+file. A capture that starts in the middle of a download has no response header
+to bound the object, so it is skipped rather than guessed at.
+
+### How it works
+
+Extraction runs only when asked, never on capture open. It then makes two passes
+over the **whole** capture, independent of the 4,096-record ceiling used by the
+packet table:
+
+1. **Discovery** walks every record, recognizes HTTP sessions from a request
+   line or an `HTTP/1.` response, remembers each request's method, URL and
+   `Host`, and records a descriptor for every server-to-client payload segment.
+2. **Carving** sorts those descriptors by TCP sequence, trims retransmissions,
+   makes gaps explicit, and feeds the resulting byte stream into an HTTP state
+   machine that writes each response body straight to disk.
+
+Body boundaries come from `Content-Length`, `Transfer-Encoding: chunked`, or
+connection close. Responses that carry no body—`1xx`, `204`, `304`, and answers
+to `HEAD`—are recognized as such, and a successful `CONNECT` ends the session
+because what follows is a TLS tunnel.
+
+### Result states
+
+Every object carries an explicit state rather than an implied success:
+
+| State | Meaning |
+|---|---|
+| `COMPLETE` | Every declared body byte was present in the capture |
+| `GAPS` | Missing TCP bytes were zero-filled to preserve file offsets |
+| `PARTIAL` | The stream ended, or framing was lost, before the body did |
+| `TRUNCATED` | The 4 MiB per-object ceiling was reached |
+
+Confidence compares the declared `Content-Type` against the validated magic
+bytes: `HIGH` when they agree, `MEDIUM` when only one identifies the type,
+`MISMATCH` when they disagree, and `LOW` when neither does. The file extension
+follows the **detected** type, not the server's claim.
+
+### Output and safety
+
+Objects land in `/sdcard/lab/espshark/objects/<capture>/` next to a
+`manifest.json` recording the 5-tuple, packet range, URL and `Host`, declared
+and detected type, size, gap bytes, SHA-256, state and confidence. Each file is
+written to `*.part`, hashed while writing, `fsync`ed, and only then renamed—so
+an interrupted run leaves a recognizable partial file, never a false
+`COMPLETE`. Re-running replaces that directory's contents.
+
+The source PCAP is only ever read. `DELETE` removes the derived copy alone.
+
+Extracted files are untrusted input. `PREVIEW` shows bounded text with safe
+character encoding, renders HTML as source rather than as a live page, and
+falls back to hex for images, archives and unknown formats. Nothing is executed
+or unpacked on the device.
+
+---
+
+## 20. Embedded limits and honest partial results
 
 ESPShark is intentionally resource-bounded. Current principal limits include:
 
@@ -638,6 +702,12 @@ ESPShark is intentionally resource-bounded. Current principal limits include:
 | DNS detail clients | 16 |
 | DNS detail addresses | 16 |
 | DNS detail related flows | 24 |
+| Extracted objects | 64 |
+| Extracted HTTP sessions | 48 |
+| Extracted stream segments | 16,384 |
+| Bytes per extracted object | 4 MiB |
+| Bytes per extraction run | 32 MiB |
+| Zero-filled gap inside one object | 256 KiB |
 
 When a limit is reached, ESPShark uses visible states such as **LIMITED**,
 **TRUNCATED**, or **INCOMPLETE**. These are part of the trust model: absence from
@@ -645,7 +715,7 @@ a partial view must not be interpreted as absence from the original capture.
 
 ---
 
-## 20. What ESPShark cannot prove
+## 21. What ESPShark cannot prove
 
 Packet analysis is limited by the capture itself. Important boundaries include:
 
@@ -654,6 +724,7 @@ Packet analysis is limited by the capture itself. Important boundaries include:
 - switched, routed, NATed, or monitor-mode capture points see different traffic;
 - encrypted application payload remains unavailable without decryption keys;
 - ESPShark does not currently perform TLS or WPA session decryption;
+- object extraction only recovers plaintext HTTP/1.x, never HTTPS, HTTP/2 or HTTP/3;
 - encrypted DNS reduces the names observable from traditional DNS packets;
 - topology and device roles are inferred, not physically discovered;
 - one IP address can represent many FQDNs and one FQDN can resolve to many IPs;
@@ -667,16 +738,17 @@ hypotheses, and find supporting packets—not to replace professional judgment.
 
 ---
 
-## 21. Main implementation components
+## 22. Main implementation components
 
 | Component | Responsibility |
 |---|---|
-| `pcap_reader` | Classic-PCAP validation, record access and link-layer decoding |
+| `pcap_reader` | Classic-PCAP validation, record access, full-file iteration and link-layer decoding |
 | `pcap_summary` | Capture-level counts, endpoints, ports, DNS and Wi-Fi summaries |
 | `pcap_flow` | Flows, applications, devices, names, streams and security alerts |
 | `pcap_investigation` | Findings, timeline, baseline diff, local IOC/rule correlation |
 | `pcap_analysis_store` | Versioned cache and report persistence |
-| ESPShark UI | Hub, tables, pivots, dossiers, graphs, Follow Stream and exports |
+| `pcap_extract` | TCP stream reassembly, HTTP object carving, hashing and manifest |
+| ESPShark UI | Hub, tables, pivots, dossiers, graphs, Follow Stream, objects and exports |
 
 This separation keeps the analysis model independent from the screen that
 presents it. A UI action selects or filters existing evidence; it does not
@@ -684,7 +756,7 @@ silently redefine what the analyzer observed.
 
 ---
 
-## 22. Glossary
+## 23. Glossary
 
 | Term | Meaning in ESPShark |
 |---|---|

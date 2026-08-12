@@ -79,6 +79,16 @@ CONFIG_ESP_HOSTED_PRIV_SDIO_PIN_D2_4BIT_BUS_SLOT_1=9
 CONFIG_ESP_HOSTED_PRIV_SDIO_PIN_D3_4BIT_BUS_SLOT_1=8
 CONFIG_ESP_HOSTED_SDIO_GPIO_RESET_SLAVE=15
 
+# SDIO RX: fixed max-packet reads instead of streaming aggregates.
+# Streaming mode sizes its RX buffer from whatever the slave queued and has to
+# grow it mid-transfer out of DMA-capable memory. Measured on this board during
+# a transfer: 9387 B free but the largest contiguous block is 1920 B, while the
+# stream asks for 2048-3072. The pool is permanently fragmented below 2 KB, so
+# that allocation can never succeed and the RX path wedges for good (Wi-Fi then
+# dies with RPC timeouts). Packet mode reads a fixed 1536 B into recycled
+# mempool blocks, so nothing is ever allocated on the hot path.
+CONFIG_ESP_HOSTED_SDIO_OPTIMIZATION_RX_MAX_SIZE=y
+
 # WiFi Remote settings
 CONFIG_WIFI_RMT_STATIC_RX_BUFFER_NUM=16
 CONFIG_WIFI_RMT_DYNAMIC_RX_BUFFER_NUM=64
@@ -87,6 +97,16 @@ CONFIG_WIFI_RMT_DYNAMIC_TX_BUFFER_NUM=64
 # FATFS Long File Name support (for SD card HTML files)
 CONFIG_FATFS_LFN_HEAP=y
 CONFIG_FATFS_MAX_LFN=255
+
+# FATFS read performance (ESPShark PCAP indexing).
+# Without these, newlib falls back to a 128-byte file buffer and every backward
+# lseek walks the FAT cluster chain from the start of the file, which dominates
+# the cost of indexing a multi-megabyte capture. See doc section 36.
+CONFIG_FATFS_VFS_FSTAT_BLKSIZE=4096
+CONFIG_FATFS_USE_FASTSEEK=y
+# CLMT entries per open read-mode file; too small and fast-seek silently falls
+# back to the slow path on a fragmented file.
+CONFIG_FATFS_FAST_SEEK_BUFFER_SIZE=256
 
 # HTTP server - increase header buffer for modern browsers
 CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024

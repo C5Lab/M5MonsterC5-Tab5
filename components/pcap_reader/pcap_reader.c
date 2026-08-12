@@ -1099,6 +1099,99 @@ pcap_reader_status_t pcap_reader_describe_packet(pcap_reader_t *reader,
     return status;
 }
 
+pcap_reader_status_t pcap_reader_iterate_begin(pcap_reader_t *reader)
+{
+    if (!reader || !reader->file) {
+        return PCAP_READER_INVALID_ARG;
+    }
+    clearerr(reader->file);
+    if (fseek(reader->file, PCAP_GLOBAL_HEADER_SIZE, SEEK_SET) != 0) {
+        return PCAP_READER_IO_ERROR;
+    }
+    return PCAP_READER_OK;
+}
+
+pcap_reader_status_t pcap_reader_iterate_next(pcap_reader_t *reader,
+                                              pcap_packet_index_t *packet_out,
+                                              uint8_t *buffer,
+                                              size_t buffer_capacity,
+                                              size_t *bytes_read_out,
+                                              bool *have_packet_out)
+{
+    if (!reader || !reader->file || !packet_out || !buffer || buffer_capacity == 0 ||
+        !bytes_read_out || !have_packet_out) {
+        return PCAP_READER_INVALID_ARG;
+    }
+    *bytes_read_out = 0;
+    *have_packet_out = false;
+    memset(packet_out, 0, sizeof(*packet_out));
+
+    uint8_t record_header[PCAP_PACKET_HEADER_SIZE];
+    size_t read_count = fread(record_header, 1, sizeof(record_header), reader->file);
+    if (read_count == 0 && feof(reader->file)) {
+        return PCAP_READER_OK;
+    }
+    if (read_count != sizeof(record_header)) {
+        return ferror(reader->file) ? PCAP_READER_IO_ERROR : PCAP_READER_TRUNCATED;
+    }
+
+    uint32_t captured_length = read_u32(record_header + 8, reader->little_endian);
+    uint32_t original_length = read_u32(record_header + 12, reader->little_endian);
+    long data_offset = ftell(reader->file);
+    if (data_offset < 0) {
+        return PCAP_READER_IO_ERROR;
+    }
+    if (captured_length == 0 || captured_length > reader->info.snaplen ||
+        captured_length > PCAP_MAX_SNAPLEN) {
+        return PCAP_READER_INVALID_FORMAT;
+    }
+    if ((uint64_t)data_offset + captured_length > reader->info.file_size) {
+        return PCAP_READER_TRUNCATED;
+    }
+
+    packet_out->data_offset = (uint64_t)data_offset;
+    packet_out->timestamp_seconds = read_u32(record_header, reader->little_endian);
+    packet_out->timestamp_fraction = read_u32(record_header + 4, reader->little_endian);
+    packet_out->captured_length = captured_length;
+    packet_out->original_length = original_length;
+
+    size_t wanted = captured_length < buffer_capacity ? captured_length : buffer_capacity;
+    size_t actual = fread(buffer, 1, wanted, reader->file);
+    *bytes_read_out = actual;
+    if (actual != wanted) {
+        return PCAP_READER_IO_ERROR;
+    }
+    if (actual < captured_length &&
+        fseek(reader->file, (long)(captured_length - actual), SEEK_CUR) != 0) {
+        return PCAP_READER_IO_ERROR;
+    }
+    *have_packet_out = true;
+    return actual < captured_length ? PCAP_READER_LIMIT_REACHED : PCAP_READER_OK;
+}
+
+void pcap_reader_describe_bytes(uint32_t link_type, const uint8_t *data, size_t length,
+                                bool payload_truncated,
+                                pcap_packet_details_t *details_out)
+{
+    if (!details_out) {
+        return;
+    }
+    memset(details_out, 0, sizeof(*details_out));
+    details_out->payload_truncated = payload_truncated;
+    describe_packet_bytes(link_type, data, length, details_out);
+    if (details_out->malformed) {
+        details_out->flags |= PCAP_PACKET_FLAG_MALFORMED;
+    }
+    if (details_out->payload_truncated) {
+        details_out->flags |= PCAP_PACKET_FLAG_TRUNCATED;
+    }
+}
+
+uint32_t pcap_reader_link_type(const pcap_reader_t *reader)
+{
+    return reader ? reader->info.link_type : 0U;
+}
+
 const char *pcap_reader_status_name(pcap_reader_status_t status)
 {
     switch (status) {

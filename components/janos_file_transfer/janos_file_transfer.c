@@ -401,6 +401,35 @@ static uint32_t crc32_update(uint32_t crc, const uint8_t *data, size_t len)
     return ~crc;
 }
 
+/* Folds an already downloaded .part prefix into the running CRC, so a resumed
+ * transfer still verifies the whole file and not only the bytes fetched now. */
+static esp_err_t crc32_of_prefix(const char *path, uint64_t length, uint32_t *crc_out)
+{
+    FILE *file = fopen(path, "rb");
+    if (!file) {
+        return ESP_FAIL;
+    }
+    uint8_t chunk[1024];
+    uint32_t crc = 0;
+    uint64_t remaining = length;
+    esp_err_t err = ESP_OK;
+    while (remaining > 0) {
+        size_t want = remaining > sizeof(chunk) ? sizeof(chunk) : (size_t)remaining;
+        size_t got = fread(chunk, 1, want, file);
+        if (got == 0) {
+            err = ESP_FAIL;
+            break;
+        }
+        crc = crc32_update(crc, chunk, got);
+        remaining -= got;
+    }
+    fclose(file);
+    if (err == ESP_OK) {
+        *crc_out = crc;
+    }
+    return err;
+}
+
 static esp_err_t check_free_space(const char *mount_point, uint64_t needed)
 {
     uint64_t total = 0;
@@ -450,7 +479,9 @@ esp_err_t janos_file_transfer_download(const janos_file_transfer_config_t *confi
     snprintf(result->final_path, sizeof(result->final_path), "%s", config->local_path);
     snprintf(result->part_path, sizeof(result->part_path), "%s.part", config->local_path);
 
-    if (access(result->final_path, F_OK) == 0 || access(result->part_path, F_OK) == 0) {
+    /* A finished file is never overwritten. A leftover .part, on the other hand,
+     * is a previous attempt that was cut short and is resumed further down. */
+    if (access(result->final_path, F_OK) == 0) {
         return ESP_ERR_INVALID_STATE;
     }
     if (transfer_cancelled(config)) {
@@ -469,7 +500,37 @@ esp_err_t janos_file_transfer_download(const janos_file_transfer_config_t *confi
         return err;
     }
 
-    err = check_free_space(config->storage_mount_point, result->remote_size_before);
+    /* Resume a partial download. JanOS serves HTTP Range, and a large capture
+     * rarely survives one uninterrupted attempt, so continuing beats restarting.
+     * A .part that is not shorter than the remote file belongs to something
+     * else entirely and is discarded rather than trusted. */
+    uint64_t resume_from = 0;
+    struct stat part_info;
+    if (stat(result->part_path, &part_info) == 0 && part_info.st_size > 0) {
+        resume_from = (uint64_t)part_info.st_size;
+        if (resume_from >= result->remote_size_before) {
+            ESP_LOGW(TAG, "Discarding stale %s (%llu B vs remote %llu B)",
+                     result->part_path, (unsigned long long)resume_from,
+                     (unsigned long long)result->remote_size_before);
+            unlink(result->part_path);
+            resume_from = 0;
+        } else if (crc32_of_prefix(result->part_path, resume_from,
+                                   &result->crc32) != ESP_OK) {
+            ESP_LOGW(TAG, "Could not re-read %s; restarting the download",
+                     result->part_path);
+            unlink(result->part_path);
+            result->crc32 = 0;
+            resume_from = 0;
+        } else {
+            result->bytes_written = resume_from;
+            ESP_LOGI(TAG, "Resuming %s at %llu of %llu bytes", result->part_path,
+                     (unsigned long long)resume_from,
+                     (unsigned long long)result->remote_size_before);
+        }
+    }
+
+    err = check_free_space(config->storage_mount_point,
+                           result->remote_size_before - resume_from);
     if (err != ESP_OK) {
         emit_progress(config, JANOS_FILE_TRANSFER_ERROR, 0, result->remote_size_before,
                       0, 0, err, "Not enough free space on local SD");
@@ -499,18 +560,9 @@ esp_err_t janos_file_transfer_download(const janos_file_transfer_config_t *confi
         return err;
     }
 
-    FILE *file = fopen(result->part_path, "wb");
-    if (!file) {
-        err = ESP_FAIL;
-        emit_progress(config, JANOS_FILE_TRANSFER_ERROR, 0, result->remote_size_before,
-                      0, 0, err, "Could not create local .part file");
-        return err;
-    }
-
     size_t buffer_size = normalized_buffer_size(config->io_buffer_size);
     uint8_t *buffer = malloc(buffer_size);
     if (!buffer) {
-        fclose(file);
         emit_progress(config, JANOS_FILE_TRANSFER_ERROR, 0, result->remote_size_before,
                       0, 0, ESP_ERR_NO_MEM, "Could not allocate transfer buffer");
         return ESP_ERR_NO_MEM;
@@ -527,24 +579,58 @@ esp_err_t janos_file_transfer_download(const janos_file_transfer_config_t *confi
     esp_http_client_handle_t client = esp_http_client_init(&client_config);
     if (!client) {
         free(buffer);
-        fclose(file);
         return ESP_ERR_NO_MEM;
+    }
+    if (resume_from > 0) {
+        char range[48];
+        snprintf(range, sizeof(range), "bytes=%llu-", (unsigned long long)resume_from);
+        esp_http_client_set_header(client, "Range", range);
     }
 
     err = esp_http_client_open(client, 0);
     if (err == ESP_OK) {
         (void)esp_http_client_fetch_headers(client);
         result->http_status = esp_http_client_get_status_code(client);
-        if (result->http_status != 200) {
+        if (result->http_status == 200 && resume_from > 0) {
+            /* Firmware without Range support answers with the whole file, so the
+             * partial prefix has to be thrown away rather than appended to. */
+            ESP_LOGW(TAG, "Monster ignored Range; restarting from zero");
+            resume_from = 0;
+            result->bytes_written = 0;
+            result->crc32 = 0;
+        } else if (result->http_status != 200 && result->http_status != 206) {
             err = result->http_status == 404 ? ESP_ERR_NOT_FOUND : ESP_FAIL;
         }
     }
 
+    /* Opened only once the server has agreed, so that a request the Monster
+     * refused never truncates a .part that is still worth resuming. */
+    FILE *file = NULL;
+    if (err == ESP_OK) {
+        file = fopen(result->part_path, resume_from > 0 ? "ab" : "wb");
+        if (!file) {
+            err = ESP_FAIL;
+        }
+    }
+    if (!file) {
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        free(buffer);
+        if (err == ESP_OK) {
+            err = ESP_FAIL;
+        }
+        emit_progress(config, JANOS_FILE_TRANSFER_ERROR, result->bytes_written,
+                      result->remote_size_before, result->crc32, result->http_status,
+                      err, "Monster refused the download or the .part could not be opened");
+        return err;
+    }
+
     int64_t last_progress_us = 0;
     if (err == ESP_OK) {
-        emit_progress(config, JANOS_FILE_TRANSFER_DOWNLOADING, 0,
-                      result->remote_size_before, 0, result->http_status, ESP_OK,
-                      "Downloading from Monster");
+        emit_progress(config, JANOS_FILE_TRANSFER_DOWNLOADING, result->bytes_written,
+                      result->remote_size_before, result->crc32, result->http_status,
+                      ESP_OK, resume_from > 0 ? "Resuming download from Monster"
+                                              : "Downloading from Monster");
     }
 
     while (err == ESP_OK) {
