@@ -3787,3 +3787,147 @@ i cofać licznik slave'a. Za duża ingerencja w protokół jak na ten problem.
 - [ ] Awaryjnie, gdyby to nie wystarczyło: `CONFIG_ESP_HOSTED_SDIO_OPTIMIZATION_RX_MAX_SIZE=y`
   zamiast trybu streaming. Wtedy `len_from_slave` jest na sztywno równe 1536 i
   ścieżka powiększania staje się martwym kodem, kosztem przepustowości.
+
+## 38. Capture Gateway (GITM) — sterowany z Tab5, wykonywany na JanOS
+
+### 38.1. Uzgodniona architektura
+
+Decyzja właściciela: **gateway działa na JanOS/C5, a Tab5 jest tylko panelem
+sterowania i monitoringu**. Tab5 nie robi APSTA/NAPT na własnym radiu C6 —
+wysyła komendy przez UART do Monstera, a JanOS realizuje `capture_gateway`
+zgodnie z [§35.4](#354-proponowana-implementacja-capture_gateway) i zapisuje
+PCAP lokalnie na SD Monstera. Plik trafia na Tab5 istniejącym transferem
+(`COPY TO TAB5`), po czym otwiera się w ESPShark.
+
+To jest most (bridge/gateway) w środku ruchu — klient łączy się z SSID
+wystawionym przez JanOS, dostaje z DHCP `gateway = JanOS`, a cały jego routowany
+IPv4 przechodzi przez stos JanOS przed NAT i jest zapisywany. Nie jest to
+podsłuch w eterze ani odszyfrowywanie TLS; granice opisuje [§35.5](#355-granice-określenia-100).
+
+Prerekwizyt: **komenda `capture_gateway` musi istnieć w firmware JanOS**
+(osobne repo C5). Bez niej Tab5 wyśle komendy, ale nic nie zestawi mostu.
+Sekcja [§35](#35-janos--capture-gateway-zamiast-arp-mitm) pozostaje planem strony
+JanOS; ta sekcja definiuje wyłącznie stronę Tab5 oraz kontrakt UART między nimi.
+
+### 38.2. Kontrakt UART Tab5 ↔ JanOS (zgodny z realnym firmware)
+
+> **Źródło prawdy:** `projectZero/ESP32C5/docs/janos-capture-gateway.md`,
+> sekcja 8 („Integration contract"). Pierwotny kontrakt w tej sekcji był
+> **zmyślony i błędny** (prefiks `GATEWAY:`, upstream jako argument
+> `capture_gateway`) — poprawiono 2026‑08‑14 po sprzętowym timeoutcie.
+
+Kluczowe fakty, których wcześniejsza wersja nie uwzględniała:
+
+- **Upstream NIE jest argumentem `capture_gateway`.** Najpierw łączymy STA:
+  `wifi_connect "<up_ssid>" <pass|--saved>` (czekamy na `SUCCESS`), a dopiero
+  potem startujemy bramę. Bez tego JanOS zwraca „No upstream IPv4 connection".
+- **Komenda startu bierze tylko SSID/hasło AP** (capture SSID), opcjonalnie
+  `--pcap-name`:
+  ```text
+  wifi_connect "<up_ssid>" <pass|--saved>
+  capture_gateway start "<gw_ssid>" ["<gw_pass>"] [--pcap-name <basename>]
+  capture_gateway status
+  stop                        # uniwersalne; NIE `capture_gateway stop`
+  ```
+  Brak `gw_pass` ⇒ **AP open**; `gw_pass` 8–63 B ⇒ WPA2‑PSK. Cudzysłowy dla
+  spacji; `"` escapować jako `\"`; nigdy CR/LF z pola UI.
+- **Odpowiedzi maszynowe mają prefiks `[CGW]` / `[CGW_CLIENT]`**, nie `GATEWAY:`.
+  Blok statusu kończy dokładna linia `[CGW] END` — commit snapshotu dopiero po niej.
+- **Sukces startu** = kompletny blok z `active=1` **i** `capture=active`
+  (nie pojedyncza linia „started"). Timeout ≥25 s, bo start potrafi ~15 s
+  odzyskiwać STA. Znany, obsługiwany przypadek: `upstream did not recover after
+  APSTA switch` → rollback do `active=0` → jeden retry (reconnect + start).
+- **Status** (skrót pól używanych przez Tab5):
+  ```text
+  [CGW] status active=1 upstream=1 napt=1 clients=2 channel=6
+  [CGW] capture=active file=/sdcard/lab/pcaps/<n>.pcap packets=<n> drops=<n> file_bytes=<u64>
+  [CGW] rate_limit_kbps=4096 ... rate_queue_drops=<n>
+  [CGW_CLIENT] mac=.. ip=10.42.0.x
+  [CGW] END
+  ```
+  `file_bytes` parsować jako u64. `drops>0` lub `rate_queue_drops>0` ⇒ DEGRADED.
+- **Stop** = uniwersalne `stop`; finał to `[PCAP_FINAL] file=... frames=... drops=...`.
+  `capture_gateway stop` **odmawia** przy aktywnym recorderze — nie używać.
+- Transfer pliku dopiero **po** stopie (istniejący `JanOS-Admin` / ESPShark).
+
+### 38.3. Trzy kroki UX na Tab5
+
+Dokładnie wg zamówienia właściciela; UI wzorowane na
+[`show_mitm_popup`](../main/main.c#L9017) (jeden popup, trzy fazy):
+
+1. **Klient (skan + łączenie).** Upstream wybierany z istniejącej listy skanu
+   ataków — jak MITM wymaga zaznaczenia **dokładnie 1 sieci**
+   ([dispatch attack_name](../main/main.c#L8403)). Ukryty SSID → prompt jak
+   [`hidden_ssid_mitm_confirm_cb`](../main/main.c#L8242). Hasło upstream
+   podpowiadane z zapisanych baz (eviltwin/portals/home), tak jak MITM.
+2. **Parametry GW (free text).** Pole „GW SSID" (wolny tekst, 1–32 znaki, filtr
+   znaków bezpiecznych) + pole „GW hasło" (puste ⇒ Open; jeśli niepuste, min. 8
+   znaków dla WPA2). Przycisk `Start Gateway` wysyła `capture_gateway start ...`.
+3. **Live + tylko STOP.** Po potwierdzonym bloku `active=1`/`capture=active`
+   popup chowa inputy i pokazuje: stan upstream, GW SSID, **liczbę klientów**,
+   **packets/file_bytes**, flagę DEGRADED (drops) i nazwę pliku. Jedyny przycisk:
+   **STOP** → uniwersalne `stop`, czeka na `[PCAP_FINAL]`. Tło: task
+   `capture_gw_monitor_task` odpytuje `capture_gateway status` co ~1,5 s i
+   aktualizuje etykiety pod `bsp_display_lock` (wzorzec jak observer/scan task).
+
+**STOP** wysyła `capture_gateway stop`, pokazuje podsumowanie (pakiety/dropy),
+i proponuje `Copy to Tab5` dla zapisanego pliku (reuse istniejącego transferu
+per‑plik), potem `Close`.
+
+### 38.4. Strona Tab5 — zakres implementacji
+
+- [x] Dwa wejścia do tego samego popupu (`capture_gw_open(bool standalone, ...)`):
+  - **scan mode** — kafel „Gateway" (`"Capture GW"`) obok
+    [MITM](../main/main.c#L6812) jako czwarty kafel row 3 siatki ataków; przez
+    [`handle_selected_attack`](../main/main.c#L8342) (wymóg `sel_count == 1`,
+    ukryty SSID przez `hidden_ssid_gw_confirm_cb`); upstream = zaznaczona sieć.
+  - **standalone** — kafel „Gateway" w [Global WiFi Attacks](../main/main.c#L45857)
+    (red‑team only) przez [`global_attack_tile_event_cb`](../main/main.c#L45622);
+    bez zaznaczenia, użytkownik **wpisuje upstream SSID** w polu popupu. JanOS
+    i tak przyjmuje upstream jako tekst, więc skan nie jest wymagany.
+- [x] Pola w kontekście zakładki (`gw_*`): overlay, popup, `gw_input_col`,
+  `gw_status_label`, `gw_stats_label`, `gw_up_pass_input`, `gw_ssid_input`,
+  `gw_pass_input`, keyboard, `gw_stop_btn`, `gw_close_btn`, `gw_running`,
+  `gw_monitor_task_handle`, `gw_tab`/`gw_uart_port`, `gw_pcap_filename`,
+  `gw_ap_ssid`.
+- [x] [`capture_gw_start_cb`](../main/main.c#L9510) — waliduje (SSID ≤32,
+  hasło WPA2 ≥8 lub puste, brak `"`), buduje `capture_gateway start "..." ...`,
+  wysyła, parsuje do `GATEWAY: started`/`error` i wyłuskuje `PCAP filename:`;
+  po sukcesie chowa inputy, pokazuje live + STOP, startuje monitor task.
+- [x] [`capture_gw_monitor_task`](../main/main.c#L9436) — pętla ~1 s: flush,
+  `capture_gateway status`, bounded read, parsuj `up/clients/packets/bytes/drops`,
+  update UI pod `bsp_display_lock(200)`; kończy przy `gw_running=false`.
+- [x] [`capture_gw_stop_cb`](../main/main.c#L9667) — `gw_running=false`, czeka
+  aż monitor task wyjdzie, wysyła `capture_gateway stop`, parsuje
+  `GATEWAY: stopped packets=/drops=`, pokazuje podsumowanie i odsłania `Close`.
+- [x] Reużyto transportu: `uart_send_command_for_tab` (start),
+  `transport_write_bytes_tab`/`transport_read_bytes_tab` (status/stop na
+  zapamiętanym `gw_tab`/`gw_uart_port`), `uart_flush`/`usbh_cdc_flush_rx_buffer`.
+- [~] `Copy to Tab5` w popupie **świadomie odłożone** — podsumowanie STOP pokazuje
+  nazwę pliku i kieruje do istniejącego `READ FROM MONSTER / COPY TO TAB5` w
+  ESPShark, zamiast duplikować pipeline transferu (`compromised_transfer`).
+
+Tab5 **nie** wymaga zmian w sdkconfig — cały NAPT/forwarding/capture jest po
+stronie JanOS. Żadnego lokalnego APSTA na C6. Panel jest gotowy; end‑to‑end
+zadziała po dodaniu komendy `capture_gateway` w firmware JanOS (§35.4).
+
+### 38.5. Testy i kryterium akceptacji (strona Tab5)
+
+- [ ] Start z hasłem upstream i pustym `gw_pass` → JanOS podnosi AP open, log
+  `GATEWAY: ap up ... auth=OPEN`, Tab5 pokazuje nazwę pliku.
+- [ ] Podłączenie telefonu do GW SSID → licznik `clients` rośnie do 1, `packets`
+  i `bytes` rosną podczas ruchu (ping/DNS/HTTP), ekran się odświeża co ~1 s.
+- [ ] STOP → `GATEWAY: stopped`, plik zamknięty; `Copy to Tab5` przenosi PCAP,
+  ESPShark otwiera go i widać oba kierunki oraz prawdziwe IP klienta.
+- [ ] Utrata upstream w trakcie → status pokazuje `up=0` (nie „sukces po cichu").
+- [ ] Anulowanie w fazie parametrów nie wysyła żadnej komendy start.
+
+### 38.6. Świadome ograniczenia
+
+- Realizacja mostu i jego „100%" zależy od JanOS ([§35.5](#355-granice-określenia-100)):
+  jedno radio APSTA, IPv4-only, brak ruchu klient‑klient i RF innych stacji,
+  TLS/QUIC/VPN dalej szyfrowane.
+- Tab5 pokazuje tylko to, co JanOS raportuje w `status`; wiarygodność liczników
+  (captured/dropped) jest dowodem kompletności, nie sama obecność pliku.
+- Dopóki JanOS nie implementuje `capture_gateway`, panel Tab5 jest gotowy, ale
+  most nie powstanie — to prerekwizyt z osobnego repo C5.

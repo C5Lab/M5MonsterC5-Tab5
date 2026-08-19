@@ -607,6 +607,28 @@ typedef struct {
     lv_obj_t *mitm_btn_row;
     bool mitm_use_saved_password;
 
+    // Capture Gateway (GITM) popup - JanOS runs the bridge, Tab5 drives it
+    lv_obj_t *gw_popup_overlay;
+    lv_obj_t *gw_popup;
+    lv_obj_t *gw_input_col;       // holds inputs + Start/Cancel (setup phase)
+    lv_obj_t *gw_status_label;    // setup-phase hint / error line
+    lv_obj_t *gw_stats_label;     // live stats (running / stopped phase)
+    lv_obj_t *gw_up_ssid_input;   // upstream Wi-Fi SSID (standalone mode only; scan mode uses the selection)
+    lv_obj_t *gw_up_pass_input;   // upstream Wi-Fi password (empty = try saved on JanOS)
+    lv_obj_t *gw_ssid_input;      // free-text SSID for the gateway AP
+    bool gw_standalone;           // true when launched from Global WiFi attack (no scan selection)
+    bool gw_up_is_open;           // upstream is an open network (known in scan mode)
+    lv_obj_t *gw_pass_input;      // gateway AP password (empty = open)
+    lv_obj_t *gw_keyboard;
+    lv_obj_t *gw_stop_btn;
+    lv_obj_t *gw_close_btn;
+    volatile bool gw_running;
+    TaskHandle_t gw_monitor_task_handle;
+    int gw_tab;              // tab_id_t of the session (typedef defined later in file)
+    uart_port_t gw_uart_port;
+    char gw_pcap_filename[128];
+    char gw_ap_ssid[33];
+
     // Handshaker popup (per-network)
     lv_obj_t *handshaker_popup_overlay;
     lv_obj_t *handshaker_popup;
@@ -1735,7 +1757,17 @@ static bool mbus_detected = false;
 // SD card presence on Tab5 itself (checked via /sdcard mount point)
 static bool internal_sd_present = false;
 static bool board_detection_popup_open = false;
-static lv_timer_t *board_detect_retry_timer = NULL;
+// Retry detection runs on its own task, not an LVGL timer: detect_boards()
+// blocks ~3s on UART ping timeouts, and running that from an LVGL timer froze
+// the whole UI (the "Continue Anyway" button and touch-to-wake stopped
+// responding because the LVGL task never got to read the touch panel).
+static TaskHandle_t board_detect_retry_task_handle = NULL;
+static volatile bool board_detect_retry_stop = false;
+// Set while a UART board probe is running, so the retry task and the hotplug
+// redetect never talk to the same UARTs at once.
+static volatile bool board_probe_in_progress = false;
+// Boot-time probe task (runs once, behind the splash).
+static TaskHandle_t boot_detect_task_handle = NULL;
 static lv_obj_t *board_detect_popup = NULL;
 static lv_obj_t *board_detect_overlay = NULL;
 
@@ -2573,6 +2605,12 @@ static void handshaker_monitor_task(void *arg);
 static void show_mitm_popup(void);
 static void mitm_connect_and_start_cb(lv_event_t *e);
 static void mitm_popup_close_cb(lv_event_t *e);
+static void show_capture_gw_popup(void);
+static void show_capture_gw_popup_standalone(void);
+static void capture_gw_start_cb(lv_event_t *e);
+static void capture_gw_stop_cb(lv_event_t *e);
+static void capture_gw_close_cb(lv_event_t *e);
+static void capture_gw_monitor_task(void *arg);
 static void show_arp_poison_page(void);
 static void show_rogue_ap_page(void);
 static void show_rogue_ap_popup(tab_context_t *ctx);
@@ -2686,7 +2724,7 @@ static void janos_copy_version_token(const char *src, char *dst);
 static void show_version_mismatch_popup(void);
 static void show_ota_page(void);
 static void show_no_board_popup(void);
-static void board_detect_retry_cb(lv_timer_t *timer);
+static void board_detect_retry_task(void *arg);
 static void board_detect_popup_close_cb(lv_event_t *e);
 static void reload_gui_for_detection(void);
 static void detection_complete_cb(lv_timer_t *timer);
@@ -4123,6 +4161,7 @@ static bool usb_log_tuned = false;
 static bool board_redetect_pending = false;
 static bool usb_debug_logs = true;
 static bool usb_cdc_preferred_valid = false;
+static bool usb_cdc_driver_installed = false;
 static uint8_t usb_cdc_preferred_itf = 0;
 static uint16_t usb_last_vid = 0;
 static uint16_t usb_last_pid = 0;
@@ -4293,6 +4332,11 @@ static void usb_cdc_new_dev_cb(usb_device_handle_t usb_dev, void *user_data)
         }
     }
 
+    if (usb_cdc_preferred_valid) {
+        // Drop any retry backoff so the next usb_transport_init() picks this up.
+        usb_next_retry_ms = 0;
+    }
+
     if (usb_debug_logs) {
         ESP_LOGI(TAG, "[USB] new_dev_cb: vid=0x%04X pid=0x%04X class=0x%02X pref_itf=%u valid=%d",
                  device_desc->idVendor,
@@ -4349,6 +4393,13 @@ static void board_redetect_cb(void *user_data)
     ESP_LOGI(TAG, "board_redetect_cb called");
     board_redetect_pending = false;
 
+    // The retry task may be mid-probe on the same UARTs; it re-probes every 3s
+    // anyway, so skip this pass instead of talking over it.
+    if (board_probe_in_progress) {
+        ESP_LOGI(TAG, "Redetect: probe already in progress, skipping");
+        return;
+    }
+
     bool prev_grove = grove_detected;
     bool prev_usb = usb_detected;
     bool prev_uart2 = mbus_detected;
@@ -4357,6 +4408,7 @@ static void board_redetect_cb(void *user_data)
     bool prev_mbus_sd = mbus_ctx.sd_card_present;
     bool prev_internal_sd = internal_sd_present;
 
+    board_probe_in_progress = true;
     detect_boards();
 
     // One SD probe only, and only after the board answered ping.
@@ -4364,6 +4416,7 @@ static void board_redetect_cb(void *user_data)
 
     // Re-probe Sub-GHz availability so the home tile reflects the new state.
     check_all_subghz_status();
+    board_probe_in_progress = false;
 
     bool changed = (prev_grove != grove_detected) ||
                    (prev_usb != usb_detected) ||
@@ -4547,23 +4600,30 @@ static void usb_transport_init(void)
         ESP_LOGI(TAG, "[USB] USB host already installed");
     }
 
-    usbh_cdc_driver_config_t config = {
-        .task_stack_size = 4096,
-        .task_priority = 5,
-        .task_coreid = -1,
-        .skip_init_usb_host_driver = true,
-        .new_dev_cb = usb_cdc_new_dev_cb,
-        .user_data = NULL,
-    };
-    if (usb_debug_logs) {
-        ESP_LOGI(TAG, "[USB] CDC driver config: stack=%d prio=%d core=%d",
-                 config.task_stack_size, config.task_priority, config.task_coreid);
-    }
+    esp_err_t err = ESP_OK;
 
-    esp_err_t err = usbh_cdc_driver_install(&config);
-    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
-        ESP_LOGE(TAG, "[USB] CDC driver install failed: %s", esp_err_to_name(err));
-        return;
+    // Install once. Re-installing on every detection retry made the component
+    // itself log "usbh_cdc already installed" at ERROR level each pass.
+    if (!usb_cdc_driver_installed) {
+        usbh_cdc_driver_config_t config = {
+            .task_stack_size = 4096,
+            .task_priority = 5,
+            .task_coreid = -1,
+            .skip_init_usb_host_driver = true,
+            .new_dev_cb = usb_cdc_new_dev_cb,
+            .user_data = NULL,
+        };
+        if (usb_debug_logs) {
+            ESP_LOGI(TAG, "[USB] CDC driver config: stack=%d prio=%d core=%d",
+                     config.task_stack_size, config.task_priority, config.task_coreid);
+        }
+
+        err = usbh_cdc_driver_install(&config);
+        if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+            ESP_LOGE(TAG, "[USB] CDC driver install failed: %s", esp_err_to_name(err));
+            return;
+        }
+        usb_cdc_driver_installed = true;
     }
 
     if (usb_debug_logs) {
@@ -4577,6 +4637,10 @@ static void usb_transport_init(void)
         if (usb_debug_logs) {
             ESP_LOGW(TAG, "[USB] No CDC-DATA or bulk IN/OUT interface found, ignoring device");
         }
+        // Nothing usable is attached: back off so the 100ms wait above does not
+        // run on every detection retry. usb_cdc_new_dev_cb clears this the
+        // moment a device shows up.
+        usb_next_retry_ms = now_ms + 5000;
         return;
     }
 
@@ -4624,6 +4688,7 @@ static __attribute__((unused)) void usb_transport_deinit(void)
     }
 
     usbh_cdc_driver_uninstall();
+    usb_cdc_driver_installed = false;
     if (usb_host_started_by_us) {
         bsp_usb_host_stop();
         usb_host_started_by_us = false;
@@ -6246,22 +6311,26 @@ static void splash_timer_cb(lv_timer_t *timer)
     }
 }
 
-// Detection complete callback - runs detection, reports it in the boot log,
-// builds the real UI behind the splash and schedules the closing fade.
-static void detection_complete_cb(lv_timer_t *timer)
+// The boot probes themselves: ~3-5s of blocking UART timeouts when nothing is
+// connected. Kept in one place so the task and the inline fallback agree.
+static void boot_detect_run_probes(void)
 {
-    (void)timer;
-    detection_timer = NULL;
-
-    if (intro_detection_done || intro_finishing) return;
-
-    ESP_LOGI(TAG, "Detection timer complete, running board detection");
-
-    // Run board detection (blocking UART probes).
+    board_probe_in_progress = true;
     detect_boards();
     check_all_sd_cards();
     check_all_versions();
     check_all_subghz_status();
+    board_probe_in_progress = false;
+}
+
+// Detection finished - reports it in the boot log, builds the real UI behind
+// the splash and schedules the closing fade. Runs on the LVGL thread.
+static void boot_detection_done_async(void *user_data)
+{
+    (void)user_data;
+
+    if (intro_detection_done || intro_finishing) return;
+
     intro_detection_done = true;
 
     ESP_LOGI(TAG, "Detection complete: uart1=%d, mbus=%d, grove=%d, usb=%d",
@@ -6300,6 +6369,37 @@ static void detection_complete_cb(lv_timer_t *timer)
     if (intro_finish_timer) { lv_timer_del(intro_finish_timer); intro_finish_timer = NULL; }
     intro_finish_timer = lv_timer_create(intro_finish_cb, 900, NULL);
     lv_timer_set_repeat_count(intro_finish_timer, 1);
+}
+
+// Boot probe task: keeps the blocking UART timeouts off the LVGL thread so the
+// intro animation and its boot log keep running while the Monster is probed.
+static void boot_detect_task(void *arg)
+{
+    (void)arg;
+    boot_detect_run_probes();
+    lv_async_call(boot_detection_done_async, NULL);
+    boot_detect_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+// Detection timer fired - kick off the probe task. `intro_detection_done` stays
+// false until the probe really finishes, so tap-to-skip still waits for it.
+static void detection_complete_cb(lv_timer_t *timer)
+{
+    (void)timer;
+    detection_timer = NULL;
+
+    if (intro_detection_done || intro_finishing || boot_detect_task_handle) return;
+
+    ESP_LOGI(TAG, "Detection timer complete, running board detection");
+
+    if (xTaskCreate(boot_detect_task, "boot_detect", 6144, NULL, 4,
+                    &boot_detect_task_handle) != pdPASS) {
+        boot_detect_task_handle = NULL;
+        ESP_LOGE(TAG, "Failed to start boot detection task - probing inline");
+        boot_detect_run_probes();
+        boot_detection_done_async(NULL);
+    }
 }
 
 static void play_startup_beep(void)
@@ -6793,10 +6893,20 @@ static void create_attack_action_bar(lv_obj_t *parent, lv_event_cb_t callback, l
             } else {
                 b9 = create_small_tile(attack_row3, LV_SYMBOL_GPS, "Radar", COLOR_MATERIAL_BLUE, callback, "Radar");
             }
+            // Capture Gateway (GITM): connect upstream + raise our own AP on JanOS,
+            // route + capture the client's traffic. Shares row 3 as a fourth tile.
+            lv_obj_t *b10 = create_small_tile(attack_row3, LV_SYMBOL_LOOP, "Gateway", COLOR_MATERIAL_BLUE, callback, "Capture GW");
 
             lv_obj_set_size(b1, bw, 72); lv_obj_set_size(b2, bw, 72); lv_obj_set_size(b3, bw_last, 72);
             lv_obj_set_size(b4, bw, 72); lv_obj_set_size(b5, bw, 72); lv_obj_set_size(b6, bw_last, 72);
-            lv_obj_set_size(b7, bw, 72); lv_obj_set_size(b8, bw, 72); lv_obj_set_size(b9, bw_last, 72);
+
+            // Row 3 now holds four tiles; size them on a 4-column grid (3 gaps).
+            const lv_coord_t gap4 = 24;
+            lv_coord_t bw4 = (row_inner_w - gap4) / 4;
+            if (bw4 < 52) bw4 = 52;
+            lv_coord_t bw4_last = bw4 + (row_inner_w - gap4 - bw4 * 4);
+            lv_obj_set_size(b7, bw4, 72); lv_obj_set_size(b8, bw4, 72);
+            lv_obj_set_size(b9, bw4, 72); lv_obj_set_size(b10, bw4_last, 72);
         }
     } else {
         // Non-red-team: ARP + Nmap (+ Karma if requested)
@@ -8256,6 +8366,23 @@ static void hidden_ssid_mitm_confirm_cb(const char *ssid)
     show_mitm_popup();
 }
 
+static void hidden_ssid_gw_confirm_cb(const char *ssid)
+{
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx || !ssid || ssid[0] == '\0') return;
+
+    scan_view_t v = get_scan_view(ctx);
+    if (v.sel_count <= 0) return;
+    int idx = v.sel_indices[0];
+    if (idx < 0 || idx >= v.net_count) return;
+
+    strncpy(v.nets[idx].ssid, ssid, sizeof(v.nets[idx].ssid) - 1);
+    v.nets[idx].ssid[sizeof(v.nets[idx].ssid) - 1] = '\0';
+    ESP_LOGI(TAG, "Capture GW: Hidden upstream resolved as '%s' (%s)",
+             v.nets[idx].ssid, v.nets[idx].bssid);
+    show_capture_gw_popup();
+}
+
 static void hidden_ssid_rogueap_confirm_cb(const char *ssid)
 {
     tab_context_t *ctx = get_current_ctx();
@@ -8418,6 +8545,27 @@ static void handle_selected_attack(const char *attack_name)
             return;
         }
         show_mitm_popup();
+        return;
+    }
+
+    if (strcmp(attack_name, "Capture GW") == 0) {
+        if (v.sel_count != 1) {
+            ESP_LOGW(TAG, "Capture GW requires exactly 1 network, selected: %d", v.sel_count);
+            if (ctx->scan_status_label) {
+                bsp_display_lock(0);
+                lv_label_set_text(ctx->scan_status_label, "Select exactly 1 upstream network for Gateway");
+                lv_obj_set_style_text_color(ctx->scan_status_label, COLOR_MATERIAL_RED, 0);
+                bsp_display_unlock();
+            }
+            return;
+        }
+        int idx = v.sel_indices[0];
+        if (idx < 0 || idx >= v.net_count) return;
+        if (v.nets[idx].ssid[0] == '\0') {
+            show_hidden_ssid_popup(hidden_ssid_gw_confirm_cb);
+            return;
+        }
+        show_capture_gw_popup();
         return;
     }
 
@@ -9247,6 +9395,925 @@ static void show_mitm_popup(void)
     lv_keyboard_set_textarea(ctx->mitm_keyboard, ctx->mitm_password_input);
     lv_obj_add_event_cb(ctx->mitm_keyboard, mitm_keyboard_cb, LV_EVENT_ALL, NULL);
     lv_obj_add_flag(ctx->mitm_keyboard, LV_OBJ_FLAG_HIDDEN);
+}
+
+// ======================= Capture Gateway (GITM) Functions =======================
+//
+// JanOS/C5 runs the actual bridge (STA upstream + our own SoftAP + NAPT +
+// capture before NAT, PCAP saved on the Monster SD). Tab5 is the control panel:
+// it sends `capture_gateway start/status/stop` over the tab UART and shows what
+// JanOS reports. See docs/PCAP_Analysis_and_Implementation_Plan.md section 38.
+
+// Pull an unsigned value out of a "key=<n>" token inside a status line.
+static bool gw_extract_ulong(const char *line, const char *key, unsigned long *out)
+{
+    const char *p = strstr(line, key);
+    if (!p) return false;
+    p += strlen(key);
+    if (*p < '0' || *p > '9') return false;
+    *out = strtoul(p, NULL, 10);
+    return true;
+}
+
+// Same, but 64-bit (for file_bytes, which can exceed 32 bits).
+static bool gw_extract_ull(const char *line, const char *key, unsigned long long *out)
+{
+    const char *p = strstr(line, key);
+    if (!p) return false;
+    p += strlen(key);
+    if (*p < '0' || *p > '9') return false;
+    *out = strtoull(p, NULL, 10);
+    return true;
+}
+
+// Human-readable byte size into a small buffer (e.g. "9.2 MB").
+static void gw_format_bytes(unsigned long long bytes, char *out, size_t out_size)
+{
+    if (bytes >= 1024ULL * 1024ULL) {
+        snprintf(out, out_size, "%.1f MB", (double)bytes / (1024.0 * 1024.0));
+    } else if (bytes >= 1024ULL) {
+        snprintf(out, out_size, "%.1f KB", (double)bytes / 1024.0);
+    } else {
+        snprintf(out, out_size, "%llu B", bytes);
+    }
+}
+
+// Copy the trailing basename of a "/sdcard/.../<name>.pcap" path, stopping at
+// the first whitespace/quote. Returns true if a plausible filename was found.
+static bool gw_extract_pcap_name(const char *buf, char *out, size_t out_size)
+{
+    const char *fp = strstr(buf, "/sdcard/");
+    if (!fp) return false;
+    const char *slash = fp;
+    for (const char *s = fp; *s && *s != '\r' && *s != '\n' && *s != ' ' && *s != '"'; s++) {
+        if (*s == '/') slash = s;
+    }
+    slash++;  // skip past the last '/'
+    size_t n = 0;
+    while (slash[n] && slash[n] != '\r' && slash[n] != '\n' && slash[n] != ' ' &&
+           slash[n] != '"' && n < out_size - 1) {
+        out[n] = slash[n];
+        n++;
+    }
+    out[n] = '\0';
+    return n > 0;
+}
+
+static void capture_gw_set_status(tab_context_t *ctx, const char *text, lv_color_t color)
+{
+    if (ctx && ctx->gw_status_label) {
+        lv_label_set_text(ctx->gw_status_label, text);
+        lv_obj_set_style_text_color(ctx->gw_status_label, color, 0);
+    }
+}
+
+static void capture_gw_keyboard_cb(lv_event_t *e)
+{
+    lv_event_code_t code = lv_event_get_code(e);
+    lv_obj_t *kb = lv_event_get_target(e);
+    if (code == LV_EVENT_READY || code == LV_EVENT_CANCEL) {
+        lv_obj_add_flag(kb, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+// Any of the three text fields shares the single on-screen keyboard.
+static void capture_gw_focus_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx || !ctx->gw_keyboard) return;
+    lv_obj_t *ta = lv_event_get_target(e);
+    lv_keyboard_set_textarea(ctx->gw_keyboard, ta);
+    lv_obj_clear_flag(ctx->gw_keyboard, LV_OBJ_FLAG_HIDDEN);
+}
+
+// Delete the popup and clear all handles. Safe to call from setup, running or
+// stopped phase; if a monitor task is still alive it is stopped first.
+static void capture_gw_teardown(tab_context_t *ctx)
+{
+    if (!ctx) return;
+
+    if (ctx->gw_running) {
+        ctx->gw_running = false;
+        bsp_display_unlock();
+        for (int i = 0; i < 20 && ctx->gw_monitor_task_handle != NULL; i++) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+        // Best-effort: universal `stop` finalizes the PCAP and tears the bridge
+        // down (capture_gateway stop refuses while the recorder hook is active).
+        const char *stop_cmd = "stop\r\n";
+        transport_write_bytes_tab((tab_id_t)ctx->gw_tab, ctx->gw_uart_port, stop_cmd, strlen(stop_cmd));
+        bsp_display_lock(0);
+    }
+
+    if (ctx->gw_popup_overlay) {
+        lv_obj_del(ctx->gw_popup_overlay);
+    }
+    ctx->gw_popup_overlay = NULL;
+    ctx->gw_popup = NULL;
+    ctx->gw_input_col = NULL;
+    ctx->gw_status_label = NULL;
+    ctx->gw_stats_label = NULL;
+    ctx->gw_up_ssid_input = NULL;
+    ctx->gw_up_pass_input = NULL;
+    ctx->gw_ssid_input = NULL;
+    ctx->gw_pass_input = NULL;
+    ctx->gw_keyboard = NULL;
+    ctx->gw_stop_btn = NULL;
+    ctx->gw_close_btn = NULL;
+    ctx->gw_pcap_filename[0] = '\0';
+    ctx->gw_ap_ssid[0] = '\0';
+    ctx->observer_attack_return_to_observer = false;
+    clear_observer_attack_override(ctx);
+}
+
+static void capture_gw_close_cb(lv_event_t *e)
+{
+    (void)e;
+    ESP_LOGI(TAG, "Capture GW popup closed");
+    capture_gw_teardown(get_current_ctx());
+}
+
+// Connect the upstream STA via the existing `wifi_connect` command and wait for
+// SUCCESS. Empty password -> --saved (JanOS tries eviltwin/portals/home) unless
+// the network is known-open. Returns true when JanOS reports SUCCESS.
+static bool gw_connect_upstream(tab_id_t tab, uart_port_t port,
+                                const char *up_ssid, const char *up_pass, bool up_is_open)
+{
+    wifi_connect_auth_mode_t auth = WIFI_CONNECT_AUTH_OPEN;
+    if (up_pass[0] != '\0') {
+        auth = WIFI_CONNECT_AUTH_PASSWORD;
+    } else if (!up_is_open) {
+        auth = WIFI_CONNECT_AUTH_SAVED;
+    }
+
+    char cmd[256];
+    if (!build_wifi_connect_command(cmd, sizeof(cmd), up_ssid, up_pass, auth)) {
+        return false;
+    }
+
+    if (tab == TAB_USB && usb_cdc_handle) {
+        usbh_cdc_flush_rx_buffer(usb_cdc_handle);
+    } else {
+        uart_flush(port);
+    }
+    transport_write_bytes_tab(tab, port, cmd, strlen(cmd));
+    transport_write_bytes_tab(tab, port, "\r\n", 2);
+
+    char rx[1024];
+    int total = 0, elapsed = 0;
+    while (elapsed < 15000 && total < (int)sizeof(rx) - 64) {
+        int len = transport_read_bytes_tab(tab, port, rx + total,
+                                           sizeof(rx) - total - 1, pdMS_TO_TICKS(200));
+        if (len > 0) {
+            total += len;
+            rx[total] = '\0';
+            if (strstr(rx, "SUCCESS")) return true;
+            if (strstr(rx, "FAILED") || strstr(rx, "Error")) return false;
+        }
+        elapsed += 200;
+    }
+    return false;
+}
+
+// Send `capture_gateway start ...` and wait for a complete [CGW] block.
+// Returns 1 = active+capture (success), 0 = "upstream did not recover" (retryable),
+// -1 = other failure/timeout. On success, copies the PCAP basename into file_out.
+static int gw_start_and_wait(tab_id_t tab, uart_port_t port, const char *start_cmd,
+                             char *file_out, size_t file_sz)
+{
+    if (tab == TAB_USB && usb_cdc_handle) {
+        usbh_cdc_flush_rx_buffer(usb_cdc_handle);
+    } else {
+        uart_flush(port);
+    }
+    transport_write_bytes_tab(tab, port, start_cmd, strlen(start_cmd));
+    transport_write_bytes_tab(tab, port, "\r\n", 2);
+
+    static char acc[3072];
+    int acc_len = 0;
+    acc[0] = '\0';
+    char rx[512];
+    int elapsed = 0;
+    // Gateway start can spend ~15s recovering the STA before it arms the PCAP.
+    const int timeout_ms = 26000;
+
+    while (elapsed < timeout_ms) {
+        int len = transport_read_bytes_tab(tab, port, rx, sizeof(rx) - 1, pdMS_TO_TICKS(200));
+        if (len > 0) {
+            rx[len] = '\0';
+            if (acc_len + len < (int)sizeof(acc) - 1) {
+                memcpy(acc + acc_len, rx, len);
+                acc_len += len;
+                acc[acc_len] = '\0';
+            }
+            if (strstr(acc, "upstream did not recover after APSTA switch")) {
+                return 0;
+            }
+            if (strstr(acc, "[CGW] END")) {
+                unsigned long active = 0;
+                gw_extract_ulong(acc, " active=", &active);
+                if (active == 1 && strstr(acc, "capture=active")) {
+                    if (file_out && file_sz) {
+                        file_out[0] = '\0';
+                        gw_extract_pcap_name(acc, file_out, file_sz);
+                    }
+                    return 1;
+                }
+                return -1;
+            }
+        }
+        elapsed += 200;
+    }
+    return -1;
+}
+
+// One `capture_gateway status` round-trip; true when the complete block reports
+// active=1 and capture=active. Used to reconcile after an ambiguous start.
+static bool gw_status_is_active(tab_id_t tab, uart_port_t port, char *file_out, size_t file_sz)
+{
+    if (tab == TAB_USB && usb_cdc_handle) {
+        usbh_cdc_flush_rx_buffer(usb_cdc_handle);
+    } else {
+        uart_flush(port);
+    }
+    const char *cmd = "capture_gateway status\r\n";
+    transport_write_bytes_tab(tab, port, cmd, strlen(cmd));
+
+    char acc[1024];
+    int acc_len = 0;
+    acc[0] = '\0';
+    char rx[512];
+    int elapsed = 0;
+    while (elapsed < 3000) {
+        int len = transport_read_bytes_tab(tab, port, rx, sizeof(rx) - 1, pdMS_TO_TICKS(100));
+        if (len > 0) {
+            rx[len] = '\0';
+            if (acc_len + len < (int)sizeof(acc) - 1) {
+                memcpy(acc + acc_len, rx, len);
+                acc_len += len;
+                acc[acc_len] = '\0';
+            }
+            if (strstr(acc, "[CGW] END")) break;
+        }
+        elapsed += 100;
+    }
+    if (!strstr(acc, "[CGW] END")) return false;
+    unsigned long active = 0;
+    gw_extract_ulong(acc, " active=", &active);
+    bool ok = (active == 1) && (strstr(acc, "capture=active") != NULL);
+    if (ok && file_out && file_sz) {
+        gw_extract_pcap_name(acc, file_out, file_sz);
+    }
+    return ok;
+}
+
+// Poll `capture_gateway status`, parse the [CGW] block and refresh the live stats.
+static void capture_gw_monitor_task(void *arg)
+{
+    tab_context_t *ctx = (tab_context_t *)arg;
+    tab_id_t tab = (tab_id_t)ctx->gw_tab;
+    uart_port_t port = ctx->gw_uart_port;
+    char rx[512];
+
+    while (ctx->gw_running) {
+        // ~1.5s cadence, but stay responsive to STOP.
+        for (int i = 0; i < 15 && ctx->gw_running; i++) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+        if (!ctx->gw_running) break;
+
+        if (tab == TAB_USB && usb_cdc_handle) {
+            usbh_cdc_flush_rx_buffer(usb_cdc_handle);
+        } else {
+            uart_flush(port);
+        }
+        const char *status_cmd = "capture_gateway status\r\n";
+        transport_write_bytes_tab(tab, port, status_cmd, strlen(status_cmd));
+
+        char acc[1024];
+        int acc_len = 0;
+        acc[0] = '\0';
+        int elapsed = 0;
+        while (elapsed < 1500 && ctx->gw_running) {
+            int len = transport_read_bytes_tab(tab, port, rx, sizeof(rx) - 1,
+                                               pdMS_TO_TICKS(100));
+            if (len > 0) {
+                rx[len] = '\0';
+                if (acc_len + len < (int)sizeof(acc) - 1) {
+                    memcpy(acc + acc_len, rx, len);
+                    acc_len += len;
+                    acc[acc_len] = '\0';
+                }
+                if (strstr(acc, "[CGW] END")) break;
+            }
+            elapsed += 100;
+        }
+
+        if (!strstr(acc, "[CGW] END") || !ctx->gw_running) continue;
+
+        unsigned long active = 0, up = 0, clients = 0, packets = 0, drops = 0, rate_qdrops = 0;
+        unsigned long long fbytes = 0;
+        gw_extract_ulong(acc, " active=", &active);
+        gw_extract_ulong(acc, " upstream=", &up);
+        gw_extract_ulong(acc, " clients=", &clients);
+        gw_extract_ulong(acc, " packets=", &packets);
+        gw_extract_ulong(acc, " drops=", &drops);
+        gw_extract_ulong(acc, " rate_queue_drops=", &rate_qdrops);
+        gw_extract_ull(acc, " file_bytes=", &fbytes);
+        if (ctx->gw_pcap_filename[0] == '\0') {
+            gw_extract_pcap_name(acc, ctx->gw_pcap_filename, sizeof(ctx->gw_pcap_filename));
+        }
+
+        char size_str[24];
+        gw_format_bytes(fbytes, size_str, sizeof(size_str));
+        bool degraded = (drops > 0) || (rate_qdrops > 0);
+
+        if (bsp_display_lock(200)) {
+            if (ctx->gw_running && ctx->gw_stats_label) {
+                lv_label_set_text_fmt(ctx->gw_stats_label,
+                    "%s  Upstream: %s\n"
+                    "AP: %s   Clients: %lu\n"
+                    "File: %s\n"
+                    "Packets: %lu   Size: %s\n"
+                    "%s",
+                    up ? LV_SYMBOL_OK : LV_SYMBOL_WARNING,
+                    up ? "connected" : "DOWN (no Internet)",
+                    ctx->gw_ap_ssid[0] ? ctx->gw_ap_ssid : "-",
+                    clients,
+                    ctx->gw_pcap_filename[0] ? ctx->gw_pcap_filename : "(pending)",
+                    packets, size_str,
+                    degraded ? LV_SYMBOL_WARNING " DEGRADED - drops>0"
+                             : LV_SYMBOL_OK " healthy (no drops)");
+                lv_obj_set_style_text_color(ctx->gw_stats_label,
+                    degraded ? COLOR_MATERIAL_AMBER
+                             : (up ? COLOR_MATERIAL_GREEN : COLOR_MATERIAL_AMBER), 0);
+            }
+            bsp_display_unlock();
+        }
+    }
+
+    ctx->gw_monitor_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+static void capture_gw_start_cb(lv_event_t *e)
+{
+    (void)e;
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx) return;
+
+    // Upstream SSID: typed field in standalone mode, scan selection otherwise.
+    char up_ssid_buf[33] = {0};
+    const char *up_ssid;
+    if (ctx->gw_standalone) {
+        const char *typed = ctx->gw_up_ssid_input ? lv_textarea_get_text(ctx->gw_up_ssid_input) : "";
+        if (!typed || typed[0] == '\0') {
+            capture_gw_set_status(ctx, "Enter the upstream Wi-Fi SSID to bridge", COLOR_MATERIAL_RED);
+            return;
+        }
+        snprintf(up_ssid_buf, sizeof(up_ssid_buf), "%s", typed);
+        up_ssid = up_ssid_buf;
+    } else {
+        scan_view_t v = get_scan_view(ctx);
+        if (v.sel_count == 0) return;
+        int idx = v.sel_indices[0];
+        if (idx < 0 || idx >= v.net_count) return;
+        up_ssid = v.nets[idx].ssid;
+    }
+
+    const char *up_pass = ctx->gw_up_pass_input ? lv_textarea_get_text(ctx->gw_up_pass_input) : "";
+    const char *gw_ssid = ctx->gw_ssid_input ? lv_textarea_get_text(ctx->gw_ssid_input) : "";
+    const char *gw_pass = ctx->gw_pass_input ? lv_textarea_get_text(ctx->gw_pass_input) : "";
+    if (!up_pass) up_pass = "";
+    if (!gw_ssid) gw_ssid = "";
+    if (!gw_pass) gw_pass = "";
+
+    // Validate the gateway AP parameters (upstream is a scanned network already).
+    if (gw_ssid[0] == '\0') {
+        capture_gw_set_status(ctx, "Enter a name (SSID) for the Gateway AP", COLOR_MATERIAL_RED);
+        return;
+    }
+    if (strlen(gw_ssid) > 32) {
+        capture_gw_set_status(ctx, "Gateway SSID too long (max 32 chars)", COLOR_MATERIAL_RED);
+        return;
+    }
+    if (gw_pass[0] != '\0' && strlen(gw_pass) < 8) {
+        capture_gw_set_status(ctx, "Gateway password needs 8+ chars (or leave empty = open)",
+                              COLOR_MATERIAL_RED);
+        return;
+    }
+    // The command wraps every field in double quotes, so a literal quote would
+    // break parsing on JanOS. Reject rather than mis-send.
+    if (strchr(up_ssid, '"') || strchr(up_pass, '"') ||
+        strchr(gw_ssid, '"') || strchr(gw_pass, '"')) {
+        capture_gw_set_status(ctx, "Quote character (\") is not allowed in SSID/password",
+                              COLOR_MATERIAL_RED);
+        return;
+    }
+
+    // JanOS start takes only the capture (AP) SSID + optional WPA2 password.
+    // The upstream is connected separately with wifi_connect first.
+    char start_cmd[128];
+    int n;
+    if (gw_pass[0] != '\0') {
+        n = snprintf(start_cmd, sizeof(start_cmd),
+                     "capture_gateway start \"%s\" \"%s\"", gw_ssid, gw_pass);
+    } else {
+        n = snprintf(start_cmd, sizeof(start_cmd),
+                     "capture_gateway start \"%s\"", gw_ssid);
+    }
+    if (n <= 0 || n >= (int)sizeof(start_cmd)) {
+        capture_gw_set_status(ctx, "SSID/password too long", COLOR_MATERIAL_RED);
+        return;
+    }
+
+    // Snapshot everything the blocking phase needs before releasing the lock.
+    snprintf(ctx->gw_ap_ssid, sizeof(ctx->gw_ap_ssid), "%s", gw_ssid);
+    ctx->gw_pcap_filename[0] = '\0';
+    bool up_is_open = ctx->gw_up_is_open;
+    char up_ssid_local[33], up_pass_local[65];
+    snprintf(up_ssid_local, sizeof(up_ssid_local), "%s", up_ssid);
+    snprintf(up_pass_local, sizeof(up_pass_local), "%s", up_pass);
+
+    tab_id_t tab = current_tab;
+    uart_port_t port = uart_port_for_tab(tab);
+
+    if (ctx->gw_keyboard) lv_obj_add_flag(ctx->gw_keyboard, LV_OBJ_FLAG_HIDDEN);
+    capture_gw_set_status(ctx, "Connecting upstream Wi-Fi...", COLOR_MATERIAL_AMBER);
+    lv_refr_now(NULL);
+    bsp_display_unlock();
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    // Step 1: connect the upstream STA via wifi_connect.
+    bool connected = gw_connect_upstream(tab, port, up_ssid_local, up_pass_local, up_is_open);
+
+    // Step 2: start the gateway; one automatic retry on the documented
+    // "upstream did not recover after APSTA switch" rollback.
+    char fname[128] = {0};
+    int result = -1;
+    if (connected) {
+        for (int attempt = 0; attempt < 2; attempt++) {
+            result = gw_start_and_wait(tab, port, start_cmd, fname, sizeof(fname));
+            if (result == 1) break;
+            if (result == 0 && attempt == 0) {
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                if (!gw_connect_upstream(tab, port, up_ssid_local, up_pass_local, up_is_open)) {
+                    result = -1;
+                    break;
+                }
+                continue;  // retry the start once
+            }
+            // Ambiguous result: let a full status block decide.
+            if (gw_status_is_active(tab, port, fname, sizeof(fname))) {
+                result = 1;
+            }
+            break;
+        }
+    }
+
+    bsp_display_lock(0);
+
+    if (result == 1) {
+        ESP_LOGI(TAG, "Capture GW: bridge up (AP '%s'), PCAP %s",
+                 ctx->gw_ap_ssid, fname[0] ? fname : "(pending)");
+        snprintf(ctx->gw_pcap_filename, sizeof(ctx->gw_pcap_filename), "%s", fname);
+        ctx->gw_tab = tab;
+        ctx->gw_uart_port = port;
+
+        if (ctx->gw_input_col) lv_obj_add_flag(ctx->gw_input_col, LV_OBJ_FLAG_HIDDEN);
+        if (ctx->gw_status_label) lv_obj_add_flag(ctx->gw_status_label, LV_OBJ_FLAG_HIDDEN);
+
+        if (ctx->gw_stats_label) {
+            lv_obj_clear_flag(ctx->gw_stats_label, LV_OBJ_FLAG_HIDDEN);
+            lv_label_set_text_fmt(ctx->gw_stats_label,
+                LV_SYMBOL_LOOP "  Gateway running\n"
+                "AP: %s\n"
+                "File: %s\n\n"
+                "Waiting for clients...",
+                ctx->gw_ap_ssid, fname[0] ? fname : "(pending)");
+            lv_obj_set_style_text_color(ctx->gw_stats_label, COLOR_MATERIAL_GREEN, 0);
+        }
+        if (ctx->gw_stop_btn) lv_obj_clear_flag(ctx->gw_stop_btn, LV_OBJ_FLAG_HIDDEN);
+
+        ctx->gw_running = true;
+        if (xTaskCreate(capture_gw_monitor_task, "gw_monitor", 6144, ctx, 4,
+                        &ctx->gw_monitor_task_handle) != pdPASS) {
+            ctx->gw_monitor_task_handle = NULL;
+            ESP_LOGW(TAG, "Capture GW: failed to start monitor task");
+        }
+    } else if (!connected) {
+        ESP_LOGW(TAG, "Capture GW: upstream connect failed for '%s'", up_ssid_local);
+        capture_gw_set_status(ctx,
+            "Upstream Wi-Fi connect failed.\nCheck the SSID/password and retry.",
+            COLOR_MATERIAL_RED);
+    } else {
+        ESP_LOGW(TAG, "Capture GW: gateway did not reach active state");
+        capture_gw_set_status(ctx,
+            "Gateway start failed on JanOS.\n"
+            "Check upstream IPv4 and SD on the Monster, then retry.",
+            COLOR_MATERIAL_RED);
+    }
+}
+
+static void capture_gw_stop_cb(lv_event_t *e)
+{
+    (void)e;
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx) return;
+
+    ESP_LOGI(TAG, "Capture GW: STOP pressed");
+    ctx->gw_running = false;
+    tab_id_t tab = (tab_id_t)ctx->gw_tab;
+    uart_port_t port = ctx->gw_uart_port;
+
+    if (ctx->gw_stats_label) {
+        lv_label_set_text(ctx->gw_stats_label, "Stopping gateway...");
+        lv_obj_set_style_text_color(ctx->gw_stats_label, COLOR_MATERIAL_AMBER, 0);
+    }
+    if (ctx->gw_stop_btn) lv_obj_add_state(ctx->gw_stop_btn, LV_STATE_DISABLED);
+    lv_refr_now(NULL);
+
+    bsp_display_unlock();
+
+    // Let the monitor task finish its current poll and exit before we take over
+    // the UART, so status and stop replies don't interleave.
+    for (int i = 0; i < 20 && ctx->gw_monitor_task_handle != NULL; i++) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
+    if (tab == TAB_USB && usb_cdc_handle) {
+        usbh_cdc_flush_rx_buffer(usb_cdc_handle);
+    } else {
+        uart_flush(port);
+    }
+    // Universal `stop` restores the hooks, drains the writer, finalizes the PCAP
+    // and emits [PCAP_FINAL], then tears the gateway down. `capture_gateway stop`
+    // refuses while the recorder hook is active, so it must not be used here.
+    const char *stop_cmd = "stop\r\n";
+    transport_write_bytes_tab(tab, port, stop_cmd, strlen(stop_cmd));
+
+    char acc[2048];
+    int acc_len = 0;
+    acc[0] = '\0';
+    char rx[512];
+    unsigned long frames = 0, drops = 0;
+    bool got_summary = false;
+    int elapsed = 0;
+    while (elapsed < 12000) {
+        int len = transport_read_bytes_tab(tab, port, rx, sizeof(rx) - 1,
+                                           pdMS_TO_TICKS(200));
+        if (len > 0) {
+            rx[len] = '\0';
+            if (acc_len + len < (int)sizeof(acc) - 1) {
+                memcpy(acc + acc_len, rx, len);
+                acc_len += len;
+                acc[acc_len] = '\0';
+            }
+            char *fp = strstr(acc, "[PCAP_FINAL]");
+            if (fp) {
+                gw_extract_ulong(fp, " frames=", &frames);
+                gw_extract_ulong(fp, " drops=", &drops);
+                if (ctx->gw_pcap_filename[0] == '\0') {
+                    gw_extract_pcap_name(fp, ctx->gw_pcap_filename, sizeof(ctx->gw_pcap_filename));
+                }
+                got_summary = true;
+                break;
+            }
+        }
+        elapsed += 200;
+    }
+
+    bsp_display_lock(0);
+
+    if (ctx->gw_stop_btn) lv_obj_add_flag(ctx->gw_stop_btn, LV_OBJ_FLAG_HIDDEN);
+    if (ctx->gw_close_btn) lv_obj_clear_flag(ctx->gw_close_btn, LV_OBJ_FLAG_HIDDEN);
+
+    if (ctx->gw_stats_label) {
+        if (got_summary) {
+            lv_label_set_text_fmt(ctx->gw_stats_label,
+                "%s  Gateway stopped\n"
+                "File: %s\n"
+                "Frames: %lu    Drops: %lu\n\n"
+                "Copy it to Tab5 from ESPShark\n(READ FROM MONSTER / COPY TO TAB5).",
+                drops > 0 ? LV_SYMBOL_WARNING : LV_SYMBOL_OK,
+                ctx->gw_pcap_filename[0] ? ctx->gw_pcap_filename : "(unknown)",
+                frames, drops);
+        } else {
+            lv_label_set_text_fmt(ctx->gw_stats_label,
+                LV_SYMBOL_WARNING "  Stop sent, no [PCAP_FINAL] from JanOS\n"
+                "File: %s\n\n"
+                "Verify on the Monster that the capture closed.",
+                ctx->gw_pcap_filename[0] ? ctx->gw_pcap_filename : "(unknown)");
+        }
+        lv_obj_set_style_text_color(ctx->gw_stats_label,
+            (got_summary && drops == 0) ? COLOR_MATERIAL_GREEN : COLOR_MATERIAL_AMBER, 0);
+    }
+}
+
+static void capture_gw_open(bool standalone, const char *up_ssid_in,
+                            const char *up_band, const char *up_security)
+{
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx) return;
+    if (ctx->gw_popup != NULL) return;
+
+    const char *ssid_display = (up_ssid_in && up_ssid_in[0]) ? up_ssid_in : "(Hidden)";
+    // Standalone can't know the upstream security, so always offer the password
+    // field (empty = open, or JanOS tries its saved credentials).
+    bool up_is_open = (!standalone) && wifi_network_security_is_open(up_security);
+
+    ctx->gw_standalone = standalone;
+    ctx->gw_up_is_open = up_is_open;
+    ctx->gw_running = false;
+    ctx->gw_monitor_task_handle = NULL;
+    ctx->gw_up_ssid_input = NULL;
+    ctx->gw_pcap_filename[0] = '\0';
+    ctx->gw_ap_ssid[0] = '\0';
+
+    lv_obj_t *container = get_current_tab_container();
+    if (!container) return;
+
+    ctx->gw_popup_overlay = lv_obj_create(container);
+    lv_obj_remove_style_all(ctx->gw_popup_overlay);
+    lv_obj_set_size(ctx->gw_popup_overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(ctx->gw_popup_overlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(ctx->gw_popup_overlay, LV_OPA_50, 0);
+    lv_obj_clear_flag(ctx->gw_popup_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(ctx->gw_popup_overlay, LV_OBJ_FLAG_CLICKABLE);
+
+    ctx->gw_popup = lv_obj_create(ctx->gw_popup_overlay);
+    lv_obj_set_size(ctx->gw_popup, 560, standalone ? 530 : 470);
+    lv_obj_center(ctx->gw_popup);
+    lv_obj_set_style_bg_color(ctx->gw_popup, lv_color_hex(0x101826), 0);
+    lv_obj_set_style_border_color(ctx->gw_popup, COLOR_MATERIAL_BLUE, 0);
+    lv_obj_set_style_border_width(ctx->gw_popup, 2, 0);
+    lv_obj_set_style_radius(ctx->gw_popup, 16, 0);
+    lv_obj_set_style_shadow_width(ctx->gw_popup, 30, 0);
+    lv_obj_set_style_shadow_color(ctx->gw_popup, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_shadow_opa(ctx->gw_popup, LV_OPA_50, 0);
+    lv_obj_set_style_pad_all(ctx->gw_popup, 20, 0);
+    lv_obj_set_flex_flow(ctx->gw_popup, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(ctx->gw_popup, 10, 0);
+    lv_obj_set_flex_align(ctx->gw_popup, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+
+    lv_obj_t *title = lv_label_create(ctx->gw_popup);
+    lv_label_set_text_fmt(title, LV_SYMBOL_LOOP "  Capture Gateway");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_BLUE, 0);
+
+    lv_obj_t *info_label = lv_label_create(ctx->gw_popup);
+    if (standalone) {
+        lv_label_set_text(info_label, "Standalone - enter the upstream Wi-Fi to bridge");
+    } else {
+        lv_label_set_text_fmt(info_label, "Upstream: %s  |  %s  |  %s",
+                              ssid_display, up_band ? up_band : "-",
+                              up_security ? up_security : "-");
+    }
+    lv_obj_set_style_text_font(info_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(info_label, lv_color_hex(0xAAAAAA), 0);
+
+    // ---- Setup phase container (inputs + Start/Cancel) ----
+    ctx->gw_input_col = lv_obj_create(ctx->gw_popup);
+    lv_obj_set_size(ctx->gw_input_col, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(ctx->gw_input_col, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(ctx->gw_input_col, 0, 0);
+    lv_obj_set_style_pad_all(ctx->gw_input_col, 0, 0);
+    lv_obj_set_flex_flow(ctx->gw_input_col, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(ctx->gw_input_col, 10, 0);
+    lv_obj_set_flex_align(ctx->gw_input_col, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(ctx->gw_input_col, LV_OBJ_FLAG_SCROLLABLE);
+
+    // Upstream SSID (standalone only) - the network JanOS connects to as client.
+    if (standalone) {
+        lv_obj_t *ups_row = lv_obj_create(ctx->gw_input_col);
+        lv_obj_set_size(ups_row, lv_pct(100), LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_opa(ups_row, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(ups_row, 0, 0);
+        lv_obj_set_style_pad_all(ups_row, 0, 0);
+        lv_obj_set_flex_flow(ups_row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(ups_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                              LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_column(ups_row, 10, 0);
+        lv_obj_clear_flag(ups_row, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *ups_label = lv_label_create(ups_row);
+        lv_label_set_text(ups_label, "Upstream:");
+        lv_obj_set_style_text_font(ups_label, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(ups_label, lv_color_hex(0xFFFFFF), 0);
+
+        ctx->gw_up_ssid_input = lv_textarea_create(ups_row);
+        lv_obj_set_size(ctx->gw_up_ssid_input, 330, 40);
+        lv_textarea_set_one_line(ctx->gw_up_ssid_input, true);
+        lv_textarea_set_max_length(ctx->gw_up_ssid_input, 32);
+        lv_textarea_set_placeholder_text(ctx->gw_up_ssid_input, "SSID to connect to");
+        lv_obj_set_style_bg_color(ctx->gw_up_ssid_input, lv_color_hex(0x1A1A1A), 0);
+        lv_obj_set_style_border_color(ctx->gw_up_ssid_input, COLOR_MATERIAL_BLUE, 0);
+        lv_obj_set_style_border_width(ctx->gw_up_ssid_input, 1, 0);
+        lv_obj_set_style_text_color(ctx->gw_up_ssid_input, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_add_event_cb(ctx->gw_up_ssid_input, capture_gw_focus_cb, LV_EVENT_CLICKED, NULL);
+        lv_obj_add_event_cb(ctx->gw_up_ssid_input, capture_gw_focus_cb, LV_EVENT_FOCUSED, NULL);
+    }
+
+    // Upstream password (hidden for open networks; empty = JanOS tries saved).
+    if (!up_is_open) {
+        lv_obj_t *up_row = lv_obj_create(ctx->gw_input_col);
+        lv_obj_set_size(up_row, lv_pct(100), LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_opa(up_row, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(up_row, 0, 0);
+        lv_obj_set_style_pad_all(up_row, 0, 0);
+        lv_obj_set_flex_flow(up_row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(up_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                              LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_column(up_row, 10, 0);
+        lv_obj_clear_flag(up_row, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *up_label = lv_label_create(up_row);
+        lv_label_set_text(up_label, "Upstream pass:");
+        lv_obj_set_style_text_font(up_label, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(up_label, lv_color_hex(0xFFFFFF), 0);
+
+        ctx->gw_up_pass_input = lv_textarea_create(up_row);
+        lv_obj_set_size(ctx->gw_up_pass_input, 300, 40);
+        lv_textarea_set_one_line(ctx->gw_up_pass_input, true);
+        lv_textarea_set_password_mode(ctx->gw_up_pass_input, true);
+        lv_textarea_set_placeholder_text(ctx->gw_up_pass_input, "empty = try saved on JanOS");
+        lv_obj_set_style_bg_color(ctx->gw_up_pass_input, lv_color_hex(0x1A1A1A), 0);
+        lv_obj_set_style_border_color(ctx->gw_up_pass_input, COLOR_MATERIAL_BLUE, 0);
+        lv_obj_set_style_border_width(ctx->gw_up_pass_input, 1, 0);
+        lv_obj_set_style_text_color(ctx->gw_up_pass_input, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_add_event_cb(ctx->gw_up_pass_input, capture_gw_focus_cb, LV_EVENT_CLICKED, NULL);
+        lv_obj_add_event_cb(ctx->gw_up_pass_input, capture_gw_focus_cb, LV_EVENT_FOCUSED, NULL);
+    }
+
+    // Gateway AP SSID (free text).
+    lv_obj_t *ssid_row = lv_obj_create(ctx->gw_input_col);
+    lv_obj_set_size(ssid_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(ssid_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(ssid_row, 0, 0);
+    lv_obj_set_style_pad_all(ssid_row, 0, 0);
+    lv_obj_set_flex_flow(ssid_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(ssid_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(ssid_row, 10, 0);
+    lv_obj_clear_flag(ssid_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *ssid_label = lv_label_create(ssid_row);
+    lv_label_set_text(ssid_label, "GW SSID:");
+    lv_obj_set_style_text_font(ssid_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(ssid_label, lv_color_hex(0xFFFFFF), 0);
+
+    ctx->gw_ssid_input = lv_textarea_create(ssid_row);
+    lv_obj_set_size(ctx->gw_ssid_input, 330, 40);
+    lv_textarea_set_one_line(ctx->gw_ssid_input, true);
+    lv_textarea_set_max_length(ctx->gw_ssid_input, 32);
+    lv_textarea_set_placeholder_text(ctx->gw_ssid_input, "name of your gateway AP");
+    lv_obj_set_style_bg_color(ctx->gw_ssid_input, lv_color_hex(0x1A1A1A), 0);
+    lv_obj_set_style_border_color(ctx->gw_ssid_input, COLOR_MATERIAL_BLUE, 0);
+    lv_obj_set_style_border_width(ctx->gw_ssid_input, 1, 0);
+    lv_obj_set_style_text_color(ctx->gw_ssid_input, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_add_event_cb(ctx->gw_ssid_input, capture_gw_focus_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(ctx->gw_ssid_input, capture_gw_focus_cb, LV_EVENT_FOCUSED, NULL);
+
+    // Gateway AP password (empty = open).
+    lv_obj_t *pass_row = lv_obj_create(ctx->gw_input_col);
+    lv_obj_set_size(pass_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(pass_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(pass_row, 0, 0);
+    lv_obj_set_style_pad_all(pass_row, 0, 0);
+    lv_obj_set_flex_flow(pass_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(pass_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(pass_row, 10, 0);
+    lv_obj_clear_flag(pass_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *pass_label = lv_label_create(pass_row);
+    lv_label_set_text(pass_label, "GW pass:");
+    lv_obj_set_style_text_font(pass_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(pass_label, lv_color_hex(0xFFFFFF), 0);
+
+    ctx->gw_pass_input = lv_textarea_create(pass_row);
+    lv_obj_set_size(ctx->gw_pass_input, 330, 40);
+    lv_textarea_set_one_line(ctx->gw_pass_input, true);
+    lv_textarea_set_password_mode(ctx->gw_pass_input, true);
+    lv_textarea_set_placeholder_text(ctx->gw_pass_input, "empty = open AP");
+    lv_obj_set_style_bg_color(ctx->gw_pass_input, lv_color_hex(0x1A1A1A), 0);
+    lv_obj_set_style_border_color(ctx->gw_pass_input, COLOR_MATERIAL_BLUE, 0);
+    lv_obj_set_style_border_width(ctx->gw_pass_input, 1, 0);
+    lv_obj_set_style_text_color(ctx->gw_pass_input, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_add_event_cb(ctx->gw_pass_input, capture_gw_focus_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(ctx->gw_pass_input, capture_gw_focus_cb, LV_EVENT_FOCUSED, NULL);
+
+    // Buttons: Start / Cancel
+    lv_obj_t *btn_row = lv_obj_create(ctx->gw_input_col);
+    lv_obj_set_size(btn_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(btn_row, 0, 0);
+    lv_obj_set_style_pad_all(btn_row, 0, 0);
+    lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(btn_row, 10, 0);
+    lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *start_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(start_btn, 250, 50);
+    lv_obj_set_style_bg_color(start_btn, COLOR_MATERIAL_GREEN, 0);
+    lv_obj_set_style_bg_color(start_btn, lv_color_hex(0x2E7D32), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(start_btn, 8, 0);
+    lv_obj_add_event_cb(start_btn, capture_gw_start_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *start_label = lv_label_create(start_btn);
+    lv_label_set_text(start_label, LV_SYMBOL_PLAY " Start Gateway");
+    lv_obj_set_style_text_font(start_label, &lv_font_montserrat_16, 0);
+    lv_obj_center(start_label);
+
+    lv_obj_t *cancel_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(cancel_btn, 150, 50);
+    lv_obj_set_style_bg_color(cancel_btn, lv_color_hex(0x555555), 0);
+    lv_obj_set_style_bg_color(cancel_btn, lv_color_hex(0x333333), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(cancel_btn, 8, 0);
+    lv_obj_add_event_cb(cancel_btn, capture_gw_close_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *cancel_label = lv_label_create(cancel_btn);
+    lv_label_set_text(cancel_label, "Cancel");
+    lv_obj_set_style_text_font(cancel_label, &lv_font_montserrat_16, 0);
+    lv_obj_center(cancel_label);
+
+    // ---- Setup hint / error line ----
+    ctx->gw_status_label = lv_label_create(ctx->gw_popup);
+    lv_label_set_text(ctx->gw_status_label,
+                      standalone ? "Enter upstream Wi-Fi (+password if needed) and name\n"
+                                   "the gateway AP, then Start."
+                                 : up_is_open ? "Open upstream. Name the gateway AP, then Start."
+                                              : "Enter upstream password (or leave empty to use\n"
+                                                "saved JanOS credentials), name the AP, then Start.");
+    lv_obj_set_style_text_font(ctx->gw_status_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(ctx->gw_status_label, lv_color_hex(0xCCCCCC), 0);
+    lv_obj_set_style_text_align(ctx->gw_status_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(ctx->gw_status_label, lv_pct(100));
+
+    // ---- Running / stopped phase: live stats (hidden until started) ----
+    ctx->gw_stats_label = lv_label_create(ctx->gw_popup);
+    lv_label_set_text(ctx->gw_stats_label, "");
+    lv_obj_set_style_text_font(ctx->gw_stats_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(ctx->gw_stats_label, COLOR_MATERIAL_GREEN, 0);
+    lv_obj_set_style_text_align(ctx->gw_stats_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(ctx->gw_stats_label, lv_pct(100));
+    lv_obj_add_flag(ctx->gw_stats_label, LV_OBJ_FLAG_HIDDEN);
+
+    // ---- STOP button (hidden until running) ----
+    ctx->gw_stop_btn = lv_btn_create(ctx->gw_popup);
+    lv_obj_set_size(ctx->gw_stop_btn, lv_pct(100), 50);
+    lv_obj_set_style_bg_color(ctx->gw_stop_btn, COLOR_MATERIAL_RED, 0);
+    lv_obj_set_style_bg_color(ctx->gw_stop_btn, lv_color_hex(0xCC0000), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(ctx->gw_stop_btn, 8, 0);
+    lv_obj_add_event_cb(ctx->gw_stop_btn, capture_gw_stop_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_flag(ctx->gw_stop_btn, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_t *stop_label = lv_label_create(ctx->gw_stop_btn);
+    lv_label_set_text(stop_label, LV_SYMBOL_STOP " STOP GATEWAY");
+    lv_obj_set_style_text_font(stop_label, &lv_font_montserrat_18, 0);
+    lv_obj_center(stop_label);
+
+    // ---- Close button (hidden until stopped) ----
+    ctx->gw_close_btn = lv_btn_create(ctx->gw_popup);
+    lv_obj_set_size(ctx->gw_close_btn, lv_pct(100), 50);
+    lv_obj_set_style_bg_color(ctx->gw_close_btn, COLOR_MATERIAL_BLUE, 0);
+    lv_obj_set_style_bg_color(ctx->gw_close_btn, lv_color_hex(0x1565C0), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(ctx->gw_close_btn, 8, 0);
+    lv_obj_add_event_cb(ctx->gw_close_btn, capture_gw_close_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_flag(ctx->gw_close_btn, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_t *close_label = lv_label_create(ctx->gw_close_btn);
+    lv_label_set_text(close_label, "Close");
+    lv_obj_set_style_text_font(close_label, &lv_font_montserrat_16, 0);
+    lv_obj_center(close_label);
+
+    // ---- Shared on-screen keyboard ----
+    ctx->gw_keyboard = lv_keyboard_create(ctx->gw_popup_overlay);
+    lv_obj_set_size(ctx->gw_keyboard, lv_pct(100), 260);
+    lv_obj_align(ctx->gw_keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
+    style_on_screen_keyboard(ctx->gw_keyboard);
+    lv_keyboard_set_textarea(ctx->gw_keyboard, ctx->gw_ssid_input);
+    lv_obj_add_event_cb(ctx->gw_keyboard, capture_gw_keyboard_cb, LV_EVENT_ALL, NULL);
+    lv_obj_add_flag(ctx->gw_keyboard, LV_OBJ_FLAG_HIDDEN);
+}
+
+// Scan-based entry: upstream is the single selected network from the attack view.
+static void show_capture_gw_popup(void)
+{
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx) return;
+    scan_view_t v = get_scan_view(ctx);
+    if (v.sel_count == 0) return;
+    int idx = v.sel_indices[0];
+    if (idx < 0 || idx >= v.net_count) return;
+    wifi_network_t *net = &v.nets[idx];
+    capture_gw_open(false, net->ssid, net->band, net->security);
+}
+
+// Standalone entry (Global WiFi attack): the user types the upstream network.
+static void show_capture_gw_popup_standalone(void)
+{
+    capture_gw_open(true, "", "", "");
 }
 
 // ======================= Handshaker Attack Functions =======================
@@ -44922,6 +45989,12 @@ static void global_attack_tile_event_cb(lv_event_t *e)
         show_beacon_spam_page();
         return;
     }
+
+    // Handle standalone Capture Gateway (GITM) - upstream typed in the popup
+    if (strcmp(attack_name, "Capture GW") == 0) {
+        show_capture_gw_popup_standalone();
+        return;
+    }
 }
 
 // Show Global WiFi Attacks page
@@ -45024,6 +46097,11 @@ static void show_global_attacks_page(void)
     // Beacon Spam - Cyan - Red Team only
     if (enable_red_team) {
         create_tile(tiles, LV_SYMBOL_WIFI, "Beacon Spam", COLOR_MATERIAL_CYAN, global_attack_tile_event_cb, "Beacon Spam");
+    }
+
+    // Capture Gateway (GITM) - Blue - Red Team only (standalone, upstream typed in popup)
+    if (enable_red_team) {
+        create_tile(tiles, LV_SYMBOL_LOOP, "Gateway", COLOR_MATERIAL_BLUE, global_attack_tile_event_cb, "Capture GW");
     }
 
     // Set current visible page
@@ -46135,11 +47213,9 @@ static void board_detect_popup_close_cb(lv_event_t *e)
 {
     ESP_LOGI(TAG, "User closed 'No Board Detected' popup");
 
-    // Stop retry timer
-    if (board_detect_retry_timer) {
-        lv_timer_del(board_detect_retry_timer);
-        board_detect_retry_timer = NULL;
-    }
+    // Ask the retry task to stop. It exits within ~100ms; if it is mid-probe it
+    // finishes that probe first (ping only, no UI work) and then returns.
+    board_detect_retry_stop = true;
 
     // Close popup
     if (board_detect_overlay) {
@@ -46154,49 +47230,67 @@ static void board_detect_popup_close_cb(lv_event_t *e)
     show_main_tiles();
 }
 
-// Retry board detection callback (called every 1s while popup is open)
-static void board_detect_retry_cb(lv_timer_t *timer)
+// Runs on the LVGL thread (via lv_async_call) once the retry task found a board.
+static void board_detect_found_async(void *user_data)
 {
+    (void)user_data;
+
+    // The user may have pressed "Continue Anyway" while the probe was running.
     if (!board_detection_popup_open) {
-        // Popup was closed, stop timer
-        if (board_detect_retry_timer) {
-            lv_timer_del(board_detect_retry_timer);
-            board_detect_retry_timer = NULL;
-        }
         return;
     }
 
-    ESP_LOGI(TAG, "Retrying board detection...");
+    ESP_LOGI(TAG, "Board detected! Closing popup and showing main UI.");
 
-    // Try detection again
-    detect_boards();
-
-    // Re-probe Sub-GHz availability so the home tile reflects the new state.
-    check_all_subghz_status();
-
-    // If any board detected, close popup and show main tiles
-    if (uart1_detected || mbus_detected) {
-        ESP_LOGI(TAG, "Board detected! Closing popup and showing main UI.");
-
-        // Stop retry timer
-        if (board_detect_retry_timer) {
-            lv_timer_del(board_detect_retry_timer);
-            board_detect_retry_timer = NULL;
-        }
-
-        // Close popup
-        if (board_detect_overlay) {
-            lv_obj_del(board_detect_overlay);
-            board_detect_overlay = NULL;
-            board_detect_popup = NULL;
-        }
-
-        board_detection_popup_open = false;
-
-        // Reload GUI to reflect detected config and show main tiles
-        reload_gui_for_detection();
-        show_main_tiles();
+    if (board_detect_overlay) {
+        lv_obj_del(board_detect_overlay);
+        board_detect_overlay = NULL;
+        board_detect_popup = NULL;
     }
+
+    board_detection_popup_open = false;
+
+    // Reload GUI to reflect detected config and show main tiles
+    reload_gui_for_detection();
+    show_main_tiles();
+}
+
+// Retry board detection while the popup is open. Runs on its own task because
+// each detect_boards() pass blocks ~3s on ping timeouts - on the LVGL thread
+// that starved touch handling completely.
+static void board_detect_retry_task(void *arg)
+{
+    (void)arg;
+    ESP_LOGI(TAG, "Board detection retry task started (3s interval)");
+
+    while (!board_detect_retry_stop) {
+        // Sleep in slices so "Continue Anyway" tears the task down promptly.
+        for (int i = 0; i < 30 && !board_detect_retry_stop; i++) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+        if (board_detect_retry_stop) break;
+
+        // A hotplug redetect owns the UARTs right now - try again next round.
+        if (board_probe_in_progress) continue;
+
+        ESP_LOGI(TAG, "Retrying board detection...");
+        board_probe_in_progress = true;
+        detect_boards();
+        // Re-probe Sub-GHz availability so the home tile reflects the new state.
+        check_all_subghz_status();
+        board_probe_in_progress = false;
+
+        if (board_detect_retry_stop) break;
+
+        if (uart1_detected || mbus_detected) {
+            lv_async_call(board_detect_found_async, NULL);
+            break;
+        }
+    }
+
+    ESP_LOGI(TAG, "Board detection retry task stopped");
+    board_detect_retry_task_handle = NULL;
+    vTaskDelete(NULL);
 }
 
 // Show "No Board Detected" popup with retry logic
@@ -46251,7 +47345,7 @@ static void show_no_board_popup(void)
 
     // Status label (shows retry status)
     lv_obj_t *status = lv_label_create(board_detect_popup);
-    lv_label_set_text(status, "Retrying every 1 second...");
+    lv_label_set_text(status, "Retrying every 3 seconds...");
     lv_obj_set_style_text_font(status, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(status, lv_color_hex(0x888888), 0);
 
@@ -46267,9 +47361,17 @@ static void show_no_board_popup(void)
     lv_obj_set_style_text_font(btn_label, &lv_font_montserrat_14, 0);
     lv_obj_center(btn_label);
 
-    // Start retry timer (1 second interval)
-    board_detect_retry_timer = lv_timer_create(board_detect_retry_cb, 3000, NULL);
-    ESP_LOGI(TAG, "Started board detection retry timer (3s interval)");
+    // Start the retry task (3s interval). It must not run on the LVGL thread:
+    // the ping timeouts would block touch input and the button below would be
+    // unclickable.
+    board_detect_retry_stop = false;
+    if (board_detect_retry_task_handle == NULL) {
+        if (xTaskCreate(board_detect_retry_task, "board_retry", 5120, NULL, 4,
+                        &board_detect_retry_task_handle) != pdPASS) {
+            board_detect_retry_task_handle = NULL;
+            ESP_LOGE(TAG, "Failed to start board detection retry task");
+        }
+    }
 }
 
 //==================================================================================
