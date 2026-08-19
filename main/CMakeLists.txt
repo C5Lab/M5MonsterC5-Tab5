@@ -2,6 +2,7 @@ idf_component_register(SRCS
                     "main.c"
                     "lv_font_lato_regular_ttf.c"
                     "screens/psram_dynarr.c"
+                    "screens/cgw_parser.c"
                     "screens/subghz_parser.c"
                     "screens/subghz_signal_list.c"
                     "screens/subghz_rf_settings.c"

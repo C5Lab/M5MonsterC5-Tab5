@@ -39,6 +39,7 @@
 #include "usb/usb_helpers.h"
 #include "usb/usb_types_ch9.h"
 #include "screens/subghz_host.h"
+#include "screens/cgw_parser.h"
 
 // ESP-Hosted includes for WiFi via ESP32C6 SDIO
 #include "esp_hosted.h"
@@ -483,6 +484,84 @@ typedef struct {
 // COMPLETE TAB CONTEXT - All UI, data, and state for one tab (Grove/USB/MBus/INTERNAL)
 // Each tab is a fully independent space with its own LVGL objects and state
 // ============================================================================
+// GITM (JanOS Capture Gateway) page state.
+//
+// Kept behind a pointer and allocated in PSRAM rather than inlined into
+// tab_context_t: that struct has four file-scope instances, so anything stored
+// inline costs scarce internal RAM. This block is ~1.4 KiB per tab.
+typedef struct {
+    // GITM is the display name only; the wire protocol stays capture_gateway /
+    // [CGW] per janos-capture-gateway.md section 8.11.
+    lv_obj_t *page;
+    lv_obj_t *state_chip;     // IDLE / CONNECTING / STARTING / RUNNING / ...
+    lv_obj_t *status_label;   // hint and error line, shared by all phases
+    lv_obj_t *body;           // scrollable column holding the three steps
+
+    // Step 1 - upstream (the Internet side)
+    lv_obj_t *step1;
+    lv_obj_t *s1_chev;
+    lv_obj_t *s1_summary;
+    lv_obj_t *s1_content;
+    lv_obj_t *scan_btn;
+    lv_obj_t *net_list;
+    lv_obj_t *up_pass_row;
+    lv_obj_t *up_pass_input;
+    lv_obj_t *connect_btn;
+
+    // Step 2 - our own AP
+    lv_obj_t *step2;
+    lv_obj_t *s2_chev;
+    lv_obj_t *s2_summary;
+    lv_obj_t *s2_content;
+    lv_obj_t *ap_ssid_input;
+    lv_obj_t *sec_dd;         // Open | WPA2 selector (contract section 8.2)
+    lv_obj_t *ap_pass_row;
+    lv_obj_t *ap_pass_input;
+    lv_obj_t *prefix_input;
+    lv_obj_t *name_preview;
+    lv_obj_t *open_warn;
+    lv_obj_t *start_btn;
+
+    // Step 3 - live session
+    lv_obj_t *live;
+    lv_obj_t *live_content;
+    lv_obj_t *live_hdr;       // AP / upstream / NAPT / DNS
+    lv_obj_t *live_warn;      // open AP + client_isolation warnings
+    lv_obj_t *clients_hdr;
+    lv_obj_t *clients_list;
+    lv_obj_t *cap_label;      // file, packets, size
+    lv_obj_t *rec_label;      // recorder health
+    lv_obj_t *shaper_label;   // limiter health (separate from the recorder)
+    lv_obj_t *stop_btn;
+    lv_obj_t *copy_btn;       // revealed once the capture is finalized
+    lv_obj_t *keyboard;
+
+    // Session state. The page owns its own scan cache so entering GITM never
+    // disturbs the attack-view selection in ctx->networks.
+    wifi_network_t *nets;     // PSRAM, MAX_NETWORKS entries
+    int  net_count;
+    int  up_index;            // index into gitm_nets, -1 when nothing picked
+    bool up_is_open;
+    bool ap_wpa2;
+    bool s1_collapsed;
+    bool s2_collapsed;
+    char up_ssid[33];
+    char up_pass[65];
+    char ap_ssid[33];
+    char ap_pass[65];
+    char pcap_basename[96];   // controller-generated, sent as --pcap-name
+    char preselect_ssid[33];  // seeded when opened from a scan selection
+    volatile int  state;      // gitm_state_t
+    volatile bool stop_request;
+    volatile bool session_active;
+    TaskHandle_t session_task;
+    int tab;                  // tab_id_t of the session (typedef comes later)
+    uart_port_t uart_port;
+    cgw_snapshot_t snap;      // last published status snapshot
+    cgw_final_t final;        // [PCAP_FINAL] summary after stop
+    char client_sig[CGW_MAX_CLIENTS * 18 + 8];  // last rendered client set
+} gitm_ctx_t;
+
 typedef struct {
     // =====================================================================
     // MAIN CONTAINER AND NAVIGATION
@@ -607,27 +686,8 @@ typedef struct {
     lv_obj_t *mitm_btn_row;
     bool mitm_use_saved_password;
 
-    // Capture Gateway (GITM) popup - JanOS runs the bridge, Tab5 drives it
-    lv_obj_t *gw_popup_overlay;
-    lv_obj_t *gw_popup;
-    lv_obj_t *gw_input_col;       // holds inputs + Start/Cancel (setup phase)
-    lv_obj_t *gw_status_label;    // setup-phase hint / error line
-    lv_obj_t *gw_stats_label;     // live stats (running / stopped phase)
-    lv_obj_t *gw_up_ssid_input;   // upstream Wi-Fi SSID (standalone mode only; scan mode uses the selection)
-    lv_obj_t *gw_up_pass_input;   // upstream Wi-Fi password (empty = try saved on JanOS)
-    lv_obj_t *gw_ssid_input;      // free-text SSID for the gateway AP
-    bool gw_standalone;           // true when launched from Global WiFi attack (no scan selection)
-    bool gw_up_is_open;           // upstream is an open network (known in scan mode)
-    lv_obj_t *gw_pass_input;      // gateway AP password (empty = open)
-    lv_obj_t *gw_keyboard;
-    lv_obj_t *gw_stop_btn;
-    lv_obj_t *gw_close_btn;
-    volatile bool gw_running;
-    TaskHandle_t gw_monitor_task_handle;
-    int gw_tab;              // tab_id_t of the session (typedef defined later in file)
-    uart_port_t gw_uart_port;
-    char gw_pcap_filename[128];
-    char gw_ap_ssid[33];
+    // GITM page state, allocated in PSRAM on first use (see gitm_ctx()).
+    gitm_ctx_t *gitm;
 
     // Handshaker popup (per-network)
     lv_obj_t *handshaker_popup_overlay;
@@ -659,6 +719,7 @@ typedef struct {
     bool observer_page_visible;
     TaskHandle_t observer_task;
     TimerHandle_t observer_timer;
+    volatile bool observer_teardown_active;   // a stop is already on its way
     char *observer_rx_buffer;       // Per-tab PSRAM UART buffer
     char *observer_line_buffer;     // Per-tab PSRAM line buffer
 
@@ -1912,6 +1973,7 @@ static void hide_all_pages(tab_context_t *ctx) {
     if (ctx->arp_poison_page) lv_obj_add_flag(ctx->arp_poison_page, LV_OBJ_FLAG_HIDDEN);
     if (ctx->nmap_page) lv_obj_add_flag(ctx->nmap_page, LV_OBJ_FLAG_HIDDEN);
     if (ctx->wardrive_page) lv_obj_add_flag(ctx->wardrive_page, LV_OBJ_FLAG_HIDDEN);
+    if (ctx->gitm && ctx->gitm->page) lv_obj_add_flag(ctx->gitm->page, LV_OBJ_FLAG_HIDDEN);
     if (ctx->antisurv_page) lv_obj_add_flag(ctx->antisurv_page, LV_OBJ_FLAG_HIDDEN);
     if (ctx->iot_page) lv_obj_add_flag(ctx->iot_page, LV_OBJ_FLAG_HIDDEN);
     if (ctx->sd_admin_page) lv_obj_add_flag(ctx->sd_admin_page, LV_OBJ_FLAG_HIDDEN);
@@ -2605,12 +2667,8 @@ static void handshaker_monitor_task(void *arg);
 static void show_mitm_popup(void);
 static void mitm_connect_and_start_cb(lv_event_t *e);
 static void mitm_popup_close_cb(lv_event_t *e);
-static void show_capture_gw_popup(void);
-static void show_capture_gw_popup_standalone(void);
-static void capture_gw_start_cb(lv_event_t *e);
-static void capture_gw_stop_cb(lv_event_t *e);
-static void capture_gw_close_cb(lv_event_t *e);
-static void capture_gw_monitor_task(void *arg);
+static void show_gitm_page(void);
+static void show_gitm_page_from_scan(void);
 static void show_arp_poison_page(void);
 static void show_rogue_ap_page(void);
 static void show_rogue_ap_popup(tab_context_t *ctx);
@@ -5411,6 +5469,123 @@ static bool extract_inspect_uptime(const char *line, char *out, size_t out_sz)
     return len > 0;
 }
 
+// ======================= Captured password lookup =========================
+//
+// JanOS stores captured Wi-Fi passwords on its SD card and prints them with
+// `show_pass evil`, one `"SSID", "password"` row per line. Caching that table
+// per tab lets every network list say - with no extra round trip - whether we
+// already hold the key to a given SSID, and lets the GITM upstream step fill it
+// in for you.
+//
+// The fetch has to run on whichever task currently owns the transport, right
+// after a scan, so it can never interleave with another command.
+
+// Parse one `"SSID", "password"` row into the cache.
+static void creds_parse_line(tab_context_t *ctx, const char *line)
+{
+    if (ctx->evil_twin_entry_count >= EVIL_TWIN_MAX_ENTRIES) return;
+    if (line[0] != '"') return;
+
+    const char *ssid_start = line + 1;
+    const char *ssid_end = strchr(ssid_start, '"');
+    if (!ssid_end) return;
+    // The separator is exactly `", ` followed by the opening quote. The `&&`
+    // short-circuit stops this walking past the terminator on a truncated line.
+    if (ssid_end[1] != ',' || ssid_end[2] != ' ' || ssid_end[3] != '"') return;
+
+    const char *pass_start = ssid_end + 4;
+    const char *pass_end = strchr(pass_start, '"');
+    if (!pass_end) return;
+
+    size_t ssid_len = (size_t)(ssid_end - ssid_start);
+    size_t pass_len = (size_t)(pass_end - pass_start);
+    if (ssid_len == 0 || ssid_len > 32 || pass_len == 0 || pass_len > 64) return;
+
+    evil_twin_entry_t *e = &ctx->evil_twin_entries[ctx->evil_twin_entry_count];
+    memcpy(e->ssid, ssid_start, ssid_len);
+    e->ssid[ssid_len] = '\0';
+    memcpy(e->password, pass_start, pass_len);
+    e->password[pass_len] = '\0';
+    ctx->evil_twin_entry_count++;
+}
+
+// Refresh this tab's captured-password cache. Call only from a task that holds
+// the transport and is not mid-command.
+static void creds_fetch(tab_context_t *ctx, tab_id_t tab, uart_port_t port)
+{
+    if (!ctx || !ctx->evil_twin_entries) return;
+    ctx->evil_twin_entry_count = 0;
+
+    if (tab == TAB_USB && usb_cdc_handle) {
+        usbh_cdc_flush_rx_buffer(usb_cdc_handle);
+    } else {
+        uart_flush(port);
+    }
+    transport_write_bytes_tab(tab, port, "show_pass evil\r\n", 16);
+
+    // `show_pass` prints no terminator, so this drains until JanOS goes quiet.
+    // A flat 2 s wait would be charged to every scan; instead we stop 400 ms
+    // after the last byte, and only fall back to the hard cap if nothing comes.
+    char rx[512];
+    char line[320];
+    int line_pos = 0;
+    const TickType_t start = xTaskGetTickCount();
+    const TickType_t hard_cap = pdMS_TO_TICKS(2000);
+    const TickType_t quiet_for = pdMS_TO_TICKS(400);
+    TickType_t last_data = start;
+    bool saw_data = false;
+
+    while ((xTaskGetTickCount() - start) < hard_cap) {
+        int len = transport_read_bytes_tab(tab, port, rx, sizeof(rx) - 1,
+                                           pdMS_TO_TICKS(100));
+        if (len <= 0) {
+            if (saw_data && (xTaskGetTickCount() - last_data) >= quiet_for) break;
+            continue;
+        }
+        saw_data = true;
+        last_data = xTaskGetTickCount();
+        for (int i = 0; i < len; i++) {
+            char c = rx[i];
+            if (c == '\n' || c == '\r') {
+                if (line_pos > 0) {
+                    line[line_pos] = '\0';
+                    line_pos = 0;
+                    creds_parse_line(ctx, line);
+                }
+                continue;
+            }
+            if (line_pos < (int)sizeof(line) - 1) line[line_pos++] = c;
+        }
+    }
+    ESP_LOGI(TAG, "[%s] Cached %d captured password(s)",
+             tab_transport_name(tab), ctx->evil_twin_entry_count);
+}
+
+// The password we hold for `ssid`, or NULL when we have none.
+static const char *creds_lookup(tab_context_t *ctx, const char *ssid)
+{
+    if (!ctx || !ctx->evil_twin_entries || !ssid || ssid[0] == '\0') return NULL;
+    for (int i = 0; i < ctx->evil_twin_entry_count; i++) {
+        if (strcmp(ctx->evil_twin_entries[i].ssid, ssid) == 0) {
+            return ctx->evil_twin_entries[i].password;
+        }
+    }
+    return NULL;
+}
+
+static bool creds_have(tab_context_t *ctx, const char *ssid)
+{
+    return creds_lookup(ctx, ssid) != NULL;
+}
+
+// Recolor-markup badge appended to a network row when we hold its password.
+// Every list that renders a row must use this, including the inspect tasks that
+// rewrite rows in place - otherwise the badge is painted and then overwritten.
+static const char *creds_badge(tab_context_t *ctx, const char *ssid)
+{
+    return creds_have(ctx, ssid) ? "  |  #55DD99 password saved#" : "";
+}
+
 static void inspect_networks_task(void *arg)
 {
     tab_id_t tab = (tab_id_t)(uintptr_t)arg;
@@ -5511,11 +5686,12 @@ static void inspect_networks_task(void *arg)
                 const char *sec_col_s   = strstr(net->security, "WPA3") ? "#55DD55" :
                                           strstr(net->security, "WPA2") ? "#00CCCC" : "#FF6666";
                 lv_label_set_text_fmt(ctx->inspect_info_labels[i - 1],
-                    "#5599FF %s#  |  #5599FF CH%d#  |  %s %s#  |  %s %s#  |  %s %d dBm#\n%s  |  Uptime: %s\nVendor: %s",
+                    "#5599FF %s#  |  #5599FF CH%d#  |  %s %s#  |  %s %s#  |  %s %d dBm#%s\n%s  |  Uptime: %s\nVendor: %s",
                     net->bssid, net->channel,
                     band_col_s, net->band,
                     sec_col_s, net->security,
                     rssi_col_s, net->rssi,
+                    creds_badge(ctx, net->ssid),
                     mfp_capable ? "#FF5555 MFP On#" : "#55DD55 MFP Off#",
                     up_text, vendor_display);
             }
@@ -5589,10 +5765,11 @@ static void inspect_observer_task(void *arg)
                     const char *rssi_col_oa = net->rssi > -50 ? "#55DD55" : (net->rssi > -70 ? "#FFAA00" : "#FF5555");
                     const char *band_col_oa = strstr(net->band, "5") ? "#CC66FF" : "#FFAA33";
                     lv_label_set_text_fmt(ctx->observer_inspect_info_labels[i],
-                        "#5599FF %s#  |  #5599FF CH%d#  |  %s %s#  |  %s %d dBm#\n%s  |  Uptime: %s\nVendor: %s",
+                        "#5599FF %s#  |  #5599FF CH%d#  |  %s %s#  |  %s %d dBm#%s\n%s  |  Uptime: %s\nVendor: %s",
                         net->bssid, net->channel,
                         band_col_oa, net->band,
                         rssi_col_oa, net->rssi,
+                        creds_badge(ctx, net->ssid),
                         net->mfp_capable ? "#FF5555 MFP On#" : "#55DD55 MFP Off#",
                         up_text, net->vendor[0] ? net->vendor : "-");
                 }
@@ -5661,10 +5838,11 @@ static void inspect_observer_task(void *arg)
                     const char *rssi_col_ob = net->rssi > -50 ? "#55DD55" : (net->rssi > -70 ? "#FFAA00" : "#FF5555");
                     const char *band_col_ob = strstr(net->band, "5") ? "#CC66FF" : "#FFAA33";
                     lv_label_set_text_fmt(ctx->observer_inspect_info_labels[i],
-                        "#5599FF %s#  |  #5599FF CH%d#  |  %s %s#  |  %s %d dBm#\n%s  |  Uptime: %s\nVendor: %s",
+                        "#5599FF %s#  |  #5599FF CH%d#  |  %s %s#  |  %s %d dBm#%s\n%s  |  Uptime: %s\nVendor: %s",
                         net->bssid, net->channel,
                         band_col_ob, net->band,
                         rssi_col_ob, net->rssi,
+                        creds_badge(ctx, net->ssid),
                         mfp_capable ? "#FF5555 MFP On#" : "#55DD55 MFP Off#",
                         up_text, net->vendor[0] ? net->vendor : "-");
                 }
@@ -5780,6 +5958,13 @@ static void wifi_scan_task(void *arg)
     log_memory_stats("RX-scan");
     ESP_LOGI(TAG, "[%s] Scan finished. Found %d networks", uart_name, ctx->network_count);
 
+    // The UART is idle here and the inspect pass has not started yet, so this
+    // is the safe moment to refresh the cache. Done before taking the display
+    // lock: the drain can run for up to 2 s and must not stall rendering.
+    if (scan_complete) {
+        creds_fetch(ctx, scan_tab, uart_port);
+    }
+
     // Update UI on main thread
     bsp_display_lock(0);
 
@@ -5879,11 +6064,12 @@ static void wifi_scan_task(void *arg)
                                      strstr(net->security, "WPA2") ? "#00CCCC" : "#FF6666";
             lv_label_set_recolor(info_label, true);
             lv_label_set_text_fmt(info_label,
-                "#5599FF %s#  |  #5599FF CH%d#  |  %s %s#  |  %s %s#  |  %s %d dBm#\nVendor: %s",
+                "#5599FF %s#  |  #5599FF CH%d#  |  %s %s#  |  %s %s#  |  %s %d dBm#%s\nVendor: %s",
                 net->bssid, net->channel,
                 band_col, net->band,
                 sec_col, net->security,
                 rssi_col, net->rssi,
+                creds_badge(ctx, net->ssid),
                 vendor_display);
             lv_obj_set_style_text_font(info_label, &lv_font_montserrat_12, 0);
             lv_obj_set_style_text_color(info_label, lv_color_hex(0x888888), 0);
@@ -6489,59 +6675,11 @@ static void play_startup_beep(void)
             break;
     }
 
-    ESP_LOGI(TAG, "Playing startup melody: %s at %d%%", melody_name, BOOT_SOUND_VOLUME_PERCENT);
-
     const int pause_ms = (selected_mode == BOOT_SOUND_MODE_STAR_WARS) ? 42 : 20;
     const int final_silence_ms = 160;
-    int total_ms = 0;
-    for (int n = 0; n < melody_notes; n++)
-        total_ms += melody[n].ms + pause_ms;
-    total_ms += final_silence_ms;
 
-    const int total_samples = MELODY_SR * total_ms / 1000;
-    const size_t buf_bytes = total_samples * 2 * sizeof(int16_t);
-
-    int16_t *buf = heap_caps_malloc(buf_bytes, MALLOC_CAP_SPIRAM);
-    if (!buf) {
-        ESP_LOGE(TAG, "Failed to allocate melody buffer (%d bytes)", (int)buf_bytes);
-        vTaskDelete(NULL);
-        return;
-    }
-    memset(buf, 0, buf_bytes);
-
-    int pos = 0;
-    for (int n = 0; n < melody_notes; n++) {
-        float freq = melody[n].freq;
-        int note_samples = MELODY_SR * melody[n].ms / 1000;
-        int attack = MELODY_SR * 5 / 1000;
-        int release = MELODY_SR * 15 / 1000;
-
-        for (int i = 0; i < note_samples; i++) {
-            float t = (float)i / MELODY_SR;
-            float env = 1.0f;
-            if (i < attack)
-                env = (float)i / attack;
-            else if (i >= note_samples - release)
-                env = (float)(note_samples - 1 - i) / (release - 1);
-
-            int16_t s = (int16_t)(sinf(2.0f * M_PI * freq * t) * env * 0.85f * 32767.0f);
-            buf[pos++] = s;
-            buf[pos++] = s;
-        }
-
-        int gap = MELODY_SR * pause_ms / 1000;
-        for (int i = 0; i < gap; i++) {
-            buf[pos++] = 0;
-            buf[pos++] = 0;
-        }
-    }
-
-    int final_gap = MELODY_SR * final_silence_ms / 1000;
-    for (int i = 0; i < final_gap; i++) {
-        buf[pos++] = 0;
-        buf[pos++] = 0;
-    }
-
+    // The codec is opened *before* any sample is rendered, so the very first
+    // buffer we produce can go straight out.
     int restore_volume = 80;
     if (codec->get_volume) {
         int current_volume = codec->get_volume();
@@ -6549,13 +6687,79 @@ static void play_startup_beep(void)
             restore_volume = current_volume;
         }
     }
-
     codec->set_volume(BOOT_SOUND_VOLUME_PERCENT);
     codec->i2s_reconfig_clk_fn(MELODY_SR, 16, I2S_SLOT_MODE_STEREO);
 
+    // One note at a time, not the whole melody up front. Rendering everything
+    // first delayed the first audible sample by the full render time, which on
+    // this board is far from free: all code is XIP from PSRAM and competes with
+    // the LVGL boot intro for bandwidth.
+    int longest_ms = final_silence_ms;
+    for (int n = 0; n < melody_notes; n++) {
+        int span = melody[n].ms + pause_ms;
+        if (span > longest_ms) longest_ms = span;
+    }
+    const int chunk_samples = MELODY_SR * longest_ms / 1000 + 8;
+    const size_t chunk_bytes = (size_t)chunk_samples * 2 * sizeof(int16_t);
+
+    int16_t *buf = heap_caps_malloc(chunk_bytes, MALLOC_CAP_SPIRAM);
+    if (!buf) {
+        ESP_LOGE(TAG, "Failed to allocate melody buffer (%d bytes)", (int)chunk_bytes);
+        codec->set_volume(restore_volume);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    ESP_LOGI(TAG, "Playing startup melody: %s at %d%%", melody_name, BOOT_SOUND_VOLUME_PERCENT);
+
     size_t bytes_written = 0;
-    codec->i2s_write(buf, pos * sizeof(int16_t), &bytes_written, portMAX_DELAY);
-    vTaskDelay(pdMS_TO_TICKS(final_silence_ms + 40));
+    const int attack = MELODY_SR * 5 / 1000;
+    const int release = MELODY_SR * 15 / 1000;
+    const int gap_samples = MELODY_SR * pause_ms / 1000;
+
+    for (int n = 0; n < melody_notes; n++) {
+        const int note_samples = MELODY_SR * melody[n].ms / 1000;
+
+        // Two-term recurrence ("magic circle") oscillator: one sinf per note
+        // instead of one per sample. sinf() per sample was the actual cost here
+        // - tens of thousands of libm calls through the PSRAM instruction cache.
+        const float k = 2.0f * sinf((float)M_PI * melody[n].freq / MELODY_SR);
+        float osc_c = 1.0f;   // tracks cos
+        float osc_s = 0.0f;   // tracks sin
+
+        int pos = 0;
+        for (int i = 0; i < note_samples; i++) {
+            osc_c -= k * osc_s;
+            osc_s += k * osc_c;
+
+            float env = 1.0f;
+            if (i < attack) {
+                env = (float)i / attack;
+            } else if (i >= note_samples - release) {
+                env = (float)(note_samples - 1 - i) / (release - 1);
+            }
+
+            int16_t s = (int16_t)(osc_s * env * 0.85f * 32767.0f);
+            buf[pos++] = s;
+            buf[pos++] = s;
+        }
+        for (int i = 0; i < gap_samples; i++) {
+            buf[pos++] = 0;
+            buf[pos++] = 0;
+        }
+
+        size_t chunk_done = 0;
+        codec->i2s_write(buf, pos * sizeof(int16_t), &chunk_done, portMAX_DELAY);
+        bytes_written += chunk_done;
+    }
+
+    const int final_gap = MELODY_SR * final_silence_ms / 1000;
+    memset(buf, 0, (size_t)final_gap * 2 * sizeof(int16_t));
+    size_t tail_done = 0;
+    codec->i2s_write(buf, (size_t)final_gap * 2 * sizeof(int16_t), &tail_done, portMAX_DELAY);
+    bytes_written += tail_done;
+
+    vTaskDelay(pdMS_TO_TICKS(40));
     codec->set_volume(restore_volume);
 
     heap_caps_free(buf);
@@ -6598,17 +6802,6 @@ static void show_splash_screen(void)
 
     splash_timer = lv_timer_create(splash_timer_cb, INTRO_TICK_MS, NULL);
 
-    if (boot_sound_mode != BOOT_SOUND_MODE_OFF) {
-        // Play startup melody in background task to not block UI (unchanged).
-        xTaskCreate(
-            (TaskFunction_t)play_startup_beep,
-            "melody",
-            8192,
-            NULL,
-            3,
-            NULL
-        );
-    }
 }
 
 // Scan button click handler
@@ -6895,7 +7088,7 @@ static void create_attack_action_bar(lv_obj_t *parent, lv_event_cb_t callback, l
             }
             // Capture Gateway (GITM): connect upstream + raise our own AP on JanOS,
             // route + capture the client's traffic. Shares row 3 as a fourth tile.
-            lv_obj_t *b10 = create_small_tile(attack_row3, LV_SYMBOL_LOOP, "Gateway", COLOR_MATERIAL_BLUE, callback, "Capture GW");
+            lv_obj_t *b10 = create_small_tile(attack_row3, LV_SYMBOL_LOOP, "GITM", COLOR_MATERIAL_BLUE, callback, "Capture GW");
 
             lv_obj_set_size(b1, bw, 72); lv_obj_set_size(b2, bw, 72); lv_obj_set_size(b3, bw_last, 72);
             lv_obj_set_size(b4, bw, 72); lv_obj_set_size(b5, bw, 72); lv_obj_set_size(b6, bw_last, 72);
@@ -8378,9 +8571,9 @@ static void hidden_ssid_gw_confirm_cb(const char *ssid)
 
     strncpy(v.nets[idx].ssid, ssid, sizeof(v.nets[idx].ssid) - 1);
     v.nets[idx].ssid[sizeof(v.nets[idx].ssid) - 1] = '\0';
-    ESP_LOGI(TAG, "Capture GW: Hidden upstream resolved as '%s' (%s)",
+    ESP_LOGI(TAG, "GITM: hidden upstream resolved as '%s' (%s)",
              v.nets[idx].ssid, v.nets[idx].bssid);
-    show_capture_gw_popup();
+    show_gitm_page_from_scan();
 }
 
 static void hidden_ssid_rogueap_confirm_cb(const char *ssid)
@@ -8549,23 +8742,17 @@ static void handle_selected_attack(const char *attack_name)
     }
 
     if (strcmp(attack_name, "Capture GW") == 0) {
-        if (v.sel_count != 1) {
-            ESP_LOGW(TAG, "Capture GW requires exactly 1 network, selected: %d", v.sel_count);
-            if (ctx->scan_status_label) {
-                bsp_display_lock(0);
-                lv_label_set_text(ctx->scan_status_label, "Select exactly 1 upstream network for Gateway");
-                lv_obj_set_style_text_color(ctx->scan_status_label, COLOR_MATERIAL_RED, 0);
-                bsp_display_unlock();
+        // The GITM page scans for its own upstream, so a selection here is only
+        // a shortcut. One selected network is carried in preselected; a hidden
+        // one is resolved first so JanOS receives a real SSID.
+        if (v.sel_count == 1) {
+            int idx = v.sel_indices[0];
+            if (idx >= 0 && idx < v.net_count && v.nets[idx].ssid[0] == '\0') {
+                show_hidden_ssid_popup(hidden_ssid_gw_confirm_cb);
+                return;
             }
-            return;
         }
-        int idx = v.sel_indices[0];
-        if (idx < 0 || idx >= v.net_count) return;
-        if (v.nets[idx].ssid[0] == '\0') {
-            show_hidden_ssid_popup(hidden_ssid_gw_confirm_cb);
-            return;
-        }
-        show_capture_gw_popup();
+        show_gitm_page_from_scan();
         return;
     }
 
@@ -9397,77 +9584,853 @@ static void show_mitm_popup(void)
     lv_obj_add_flag(ctx->mitm_keyboard, LV_OBJ_FLAG_HIDDEN);
 }
 
-// ======================= Capture Gateway (GITM) Functions =======================
+// ======================= GITM (JanOS Capture Gateway) =======================
 //
-// JanOS/C5 runs the actual bridge (STA upstream + our own SoftAP + NAPT +
-// capture before NAT, PCAP saved on the Monster SD). Tab5 is the control panel:
-// it sends `capture_gateway start/status/stop` over the tab UART and shows what
-// JanOS reports. See docs/PCAP_Analysis_and_Implementation_Plan.md section 38.
+// GITM = Gate-in-the-Middle. JanOS/C5 becomes the real IPv4 gateway for the
+// test client: it holds the upstream STA, raises our own SoftAP, performs NAPT
+// and records downstream traffic to PCAP on the Monster SD *before* address
+// translation, so the client's real address survives into the capture.
+//
+// Tab5 owns the forms, the validation, the PCAP basename and the presentation;
+// JanOS owns the radio, the capture lifecycle and the file. The controller
+// contract implemented here is section 8 of
+//   projectZero/ESP32C5/docs/janos-capture-gateway.md
+// "GITM" is the display name only - the wire protocol stays `capture_gateway`
+// and `[CGW]` (section 8.11), so firmware compatibility is unaffected.
+//
+// Flow, matching the state machine of section 8.6:
+//   IDLE -> CONNECTING (wifi_connect) -> STARTING (capture_gateway start)
+//        -> [RECOVERING on the documented APSTA rollback] -> RUNNING
+//        -> STOPPING (universal `stop`) -> FINALIZED (active=0 confirmed)
 
-// Pull an unsigned value out of a "key=<n>" token inside a status line.
-static bool gw_extract_ulong(const char *line, const char *key, unsigned long *out)
+typedef enum {
+    GITM_IDLE = 0,
+    GITM_CONNECTING,
+    GITM_STARTING,
+    GITM_RECOVERING,
+    GITM_RUNNING,
+    GITM_STOPPING,
+    GITM_FINALIZED,
+} gitm_state_t;
+
+// Section 8.6: at most two automatic retries of the APSTA-recovery failure.
+#define GITM_MAX_START_RETRIES 2
+// Section 8.6: start can spend ~15 s recovering the STA before arming the SD.
+#define GITM_START_TIMEOUT_MS  26000
+#define GITM_STATUS_TIMEOUT_MS 4000
+#define GITM_STOP_TIMEOUT_MS   15000
+// Steady-state counter refresh. JanOS announces the things that actually
+// matter (clients joining or leaving, upstream loss) on its own, so the poll
+// only has to carry packets/bytes and does not need to be fast.
+#define GITM_POLL_INTERVAL_MS  3000
+// Slice we listen on between polls; also the worst-case delay on a STOP press.
+#define GITM_EVENT_WINDOW_MS   250
+
+static void show_gitm_page(void);
+static void gitm_render_live(tab_context_t *ctx);
+static void gitm_render_net_list(tab_context_t *ctx);
+static void gitm_net_row_cb(lv_event_t *e);
+static void gitm_restore_setup(tab_context_t *ctx);
+static void gitm_set_collapsed(lv_obj_t *content, lv_obj_t *chev, bool collapsed);
+static void gitm_collapse_upstream(tab_context_t *ctx);
+static void gitm_collapse_ap(tab_context_t *ctx);
+
+// Fetch this tab's GITM state, allocating it in PSRAM on first use. Returns NULL
+// only when PSRAM is exhausted, in which case the page simply does not open.
+static gitm_ctx_t *gitm_ctx(tab_context_t *ctx)
 {
-    const char *p = strstr(line, key);
-    if (!p) return false;
-    p += strlen(key);
-    if (*p < '0' || *p > '9') return false;
-    *out = strtoul(p, NULL, 10);
-    return true;
+    if (!ctx) return NULL;
+    if (!ctx->gitm) {
+        ctx->gitm = heap_caps_calloc(1, sizeof(gitm_ctx_t), MALLOC_CAP_SPIRAM);
+        if (!ctx->gitm) {
+            ESP_LOGE(TAG, "GITM: failed to allocate page state in PSRAM");
+            return NULL;
+        }
+        ctx->gitm->up_index = -1;
+    }
+    return ctx->gitm;
 }
 
-// Same, but 64-bit (for file_bytes, which can exceed 32 bits).
-static bool gw_extract_ull(const char *line, const char *key, unsigned long long *out)
+// ---------------------------------------------------------------------------
+// Small helpers
+// ---------------------------------------------------------------------------
+
+static void gitm_flush_rx(tab_id_t tab, uart_port_t port)
 {
-    const char *p = strstr(line, key);
-    if (!p) return false;
-    p += strlen(key);
-    if (*p < '0' || *p > '9') return false;
-    *out = strtoull(p, NULL, 10);
-    return true;
+    if (tab == TAB_USB && usb_cdc_handle) {
+        usbh_cdc_flush_rx_buffer(usb_cdc_handle);
+    } else {
+        uart_flush(port);
+    }
 }
 
-// Human-readable byte size into a small buffer (e.g. "9.2 MB").
-static void gw_format_bytes(unsigned long long bytes, char *out, size_t out_size)
+// Mirror the whole JanOS conversation to the serial console. A GITM failure is
+// almost always something the Monster said, and without this the console shows
+// nothing at all. Set to 0 to silence the per-line RX echo.
+#define GITM_LOG_TRAFFIC 1
+
+// Log an outgoing command with CR/LF stripped. Callers must pass an already
+// redacted string when the command carries a password.
+static void gitm_log_tx(const char *cmd)
+{
+    char clean[192];
+    size_t n = 0;
+    for (const char *p = cmd; *p && n < sizeof(clean) - 1; p++) {
+        if (*p != '\r' && *p != '\n') clean[n++] = *p;
+    }
+    clean[n] = '\0';
+    ESP_LOGI(TAG, "GITM > %s", clean);
+}
+
+#if GITM_LOG_TRAFFIC
+#define GITM_LOG_RX(line) ESP_LOGI(TAG, "GITM < %s", (line))
+#else
+#define GITM_LOG_RX(line) do { (void)(line); } while (0)
+#endif
+
+static void gitm_format_bytes(uint64_t bytes, char *out, size_t out_size)
 {
     if (bytes >= 1024ULL * 1024ULL) {
         snprintf(out, out_size, "%.1f MB", (double)bytes / (1024.0 * 1024.0));
     } else if (bytes >= 1024ULL) {
         snprintf(out, out_size, "%.1f KB", (double)bytes / 1024.0);
     } else {
-        snprintf(out, out_size, "%llu B", bytes);
+        snprintf(out, out_size, "%llu B", (unsigned long long)bytes);
     }
 }
 
-// Copy the trailing basename of a "/sdcard/.../<name>.pcap" path, stopping at
-// the first whitespace/quote. Returns true if a plausible filename was found.
-static bool gw_extract_pcap_name(const char *buf, char *out, size_t out_size)
+// Group a packet counter so six-digit values stay readable at a glance.
+static void gitm_format_count(uint32_t n, char *out, size_t out_size)
 {
-    const char *fp = strstr(buf, "/sdcard/");
-    if (!fp) return false;
-    const char *slash = fp;
-    for (const char *s = fp; *s && *s != '\r' && *s != '\n' && *s != ' ' && *s != '"'; s++) {
-        if (*s == '/') slash = s;
+    if (n >= 1000000) {
+        snprintf(out, out_size, "%lu %03lu %03lu",
+                 (unsigned long)(n / 1000000), (unsigned long)((n / 1000) % 1000),
+                 (unsigned long)(n % 1000));
+    } else if (n >= 1000) {
+        snprintf(out, out_size, "%lu %03lu",
+                 (unsigned long)(n / 1000), (unsigned long)(n % 1000));
+    } else {
+        snprintf(out, out_size, "%lu", (unsigned long)n);
     }
-    slash++;  // skip past the last '/'
+}
+
+// Section 8.2: the controller generates the basename, sanitized to the safe
+// character set JanOS accepts ([A-Za-z0-9._-]) and stamped from the Tab5 clock,
+// which is the better real-time source in this pairing.
+static void gitm_build_pcap_basename(const char *prefix, char *out, size_t out_size)
+{
+    char clean[40];
     size_t n = 0;
-    while (slash[n] && slash[n] != '\r' && slash[n] != '\n' && slash[n] != ' ' &&
-           slash[n] != '"' && n < out_size - 1) {
-        out[n] = slash[n];
-        n++;
+    for (const char *p = prefix ? prefix : ""; *p && n < sizeof(clean) - 1; p++) {
+        char c = *p;
+        bool safe = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                    (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-';
+        if (safe) {
+            clean[n++] = c;
+        } else if (c == ' ' && n > 0 && clean[n - 1] != '_') {
+            clean[n++] = '_';
+        }
     }
-    out[n] = '\0';
-    return n > 0;
+    clean[n] = '\0';
+    // A leading dot would be rejected by JanOS as a path escape.
+    const char *base = clean;
+    while (*base == '.') base++;
+    if (*base == '\0') base = "gitm";
+
+    time_t now = time(NULL);
+    struct tm tmv;
+    localtime_r(&now, &tmv);
+    snprintf(out, out_size, "%s_%04d%02d%02d_%02d%02d%02d",
+             base, tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
+             tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
 }
 
-static void capture_gw_set_status(tab_context_t *ctx, const char *text, lv_color_t color)
+static const char *gitm_state_name(int st)
 {
-    if (ctx && ctx->gw_status_label) {
-        lv_label_set_text(ctx->gw_status_label, text);
-        lv_obj_set_style_text_color(ctx->gw_status_label, color, 0);
+    switch (st) {
+        case GITM_CONNECTING: return "CONNECTING";
+        case GITM_STARTING:   return "STARTING";
+        case GITM_RECOVERING: return "RECOVERING";
+        case GITM_RUNNING:    return "RUNNING";
+        case GITM_STOPPING:   return "STOPPING";
+        case GITM_FINALIZED:  return "FINALIZED";
+        default:              return "IDLE";
     }
 }
 
-static void capture_gw_keyboard_cb(lv_event_t *e)
+static lv_color_t gitm_state_color(int st, const cgw_snapshot_t *snap)
+{
+    switch (st) {
+        case GITM_RUNNING:
+            // Section 8.8: recorder loss is evidence damage, while shaper loss
+            // and a downed upstream are operational warnings - never the same.
+            if (cgw_recorder_degraded(snap)) return COLOR_MATERIAL_RED;
+            if (cgw_shaper_degraded(snap) || !snap->upstream) return COLOR_MATERIAL_AMBER;
+            return COLOR_MATERIAL_GREEN;
+        case GITM_FINALIZED:  return COLOR_MATERIAL_BLUE;
+        case GITM_CONNECTING:
+        case GITM_STARTING:
+        case GITM_RECOVERING:
+        case GITM_STOPPING:   return COLOR_MATERIAL_AMBER;
+        default:              return lv_color_hex(0x888888);
+    }
+}
+
+// Push state and an optional message to the UI. Safe to call from a worker
+// task: the port mutex is recursive, so nesting inside a held lock is fine.
+static void gitm_set_state(tab_context_t *ctx, int st, const char *msg, lv_color_t msg_color)
+{
+    if (!ctx) return;
+    ctx->gitm->state = st;
+    if (!bsp_display_lock(300)) return;
+    if (ctx->gitm->state_chip) {
+        lv_label_set_text(ctx->gitm->state_chip, gitm_state_name(st));
+        lv_obj_set_style_text_color(ctx->gitm->state_chip,
+                                    gitm_state_color(st, &ctx->gitm->snap), 0);
+    }
+    if (msg && ctx->gitm->status_label) {
+        lv_label_set_text(ctx->gitm->status_label, msg);
+        lv_obj_set_style_text_color(ctx->gitm->status_label, msg_color, 0);
+    }
+    bsp_display_unlock();
+}
+
+static void gitm_set_hint(tab_context_t *ctx, const char *text, lv_color_t color)
+{
+    if (ctx && ctx->gitm->status_label) {
+        lv_label_set_text(ctx->gitm->status_label, text);
+        lv_obj_set_style_text_color(ctx->gitm->status_label, color, 0);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Line-oriented transport reader
+//
+// Sections 8.1/8.5: a UART read is not guaranteed to hold one whole line, and a
+// complete status response runs well past a kilobyte once JanOS log lines and
+// client rows are counted. Nothing here accumulates the response - lines are
+// dispatched as they complete, so the response size does not matter.
+// ---------------------------------------------------------------------------
+
+typedef bool (*gitm_line_fn)(const char *line, void *user);
+
+static bool gitm_read_lines(tab_id_t tab, uart_port_t port, int timeout_ms,
+                            gitm_line_fn on_line, void *user, bool echo)
+{
+    char rx[256];
+    char line[320];
+    int line_pos = 0;
+    TickType_t start = xTaskGetTickCount();
+    TickType_t limit = pdMS_TO_TICKS(timeout_ms);
+
+    while ((xTaskGetTickCount() - start) < limit) {
+        int len = transport_read_bytes_tab(tab, port, rx, sizeof(rx) - 1,
+                                           pdMS_TO_TICKS(100));
+        if (len <= 0) continue;
+        for (int i = 0; i < len; i++) {
+            char c = rx[i];
+            if (c == '\n' || c == '\r') {
+                if (line_pos > 0) {
+                    line[line_pos] = '\0';
+                    line_pos = 0;
+                    if (echo) GITM_LOG_RX(line);
+                    if (on_line(line, user)) return true;
+                }
+                continue;   // ignore empty lines (section 8.1)
+            }
+            // An over-long line is truncated rather than allowed to run into
+            // the next one; protocol lines are far below this bound.
+            if (line_pos < (int)sizeof(line) - 1) line[line_pos++] = c;
+        }
+    }
+    return false;
+}
+
+static bool gitm_status_line_cb(const char *line, void *user)
+{
+    return cgw_parse_line(line, (cgw_snapshot_t *)user);
+}
+
+// One `capture_gateway status` round trip. True when a complete block arrived.
+// `echo` off is for the steady-state poll: a full block every few seconds would
+// bury JanOS's own messages, which are the ones worth reading.
+static bool gitm_query_status(tab_id_t tab, uart_port_t port, cgw_snapshot_t *out,
+                              bool echo)
+{
+    gitm_flush_rx(tab, port);
+    const char *cmd = "capture_gateway status\r\n";
+    if (echo) gitm_log_tx(cmd);
+    transport_write_bytes_tab(tab, port, cmd, strlen(cmd));
+    cgw_snapshot_reset(out);
+    return gitm_read_lines(tab, port, GITM_STATUS_TIMEOUT_MS, gitm_status_line_cb,
+                           out, echo);
+}
+
+// JanOS pushes these by itself while a gateway is up, so we can react at once
+// rather than waiting for the next poll to notice.
+static bool gitm_event_line_cb(const char *line, void *user)
+{
+    (void)user;
+    return strstr(line, "Capture Gateway: client joined") != NULL ||
+           strstr(line, "Capture Gateway: client left") != NULL ||
+           strstr(line, "Capture Gateway: upstream down") != NULL ||
+           strstr(line, "Capture Gateway: upstream IPv4 and DNS refreshed") != NULL;
+}
+
+// Sit on the idle transport for one slice. True when JanOS said something that
+// makes the current snapshot stale.
+static bool gitm_wait_for_event(tab_id_t tab, uart_port_t port, int window_ms)
+{
+    return gitm_read_lines(tab, port, window_ms, gitm_event_line_cb, NULL, true);
+}
+
+// ---------------------------------------------------------------------------
+// Start / connect / stop exchanges
+// ---------------------------------------------------------------------------
+
+typedef struct {
+    cgw_snapshot_t snap;
+    bool recoverable;     // the one documented retryable start failure
+    bool needs_upstream;  // "No upstream IPv4 connection"
+    bool name_taken;      // the target PCAP already exists on the SD card
+    char err[112];        // newest human-readable diagnostic (section 8.8)
+} gitm_start_result_t;
+
+static bool gitm_start_line_cb(const char *line, void *user)
+{
+    gitm_start_result_t *r = (gitm_start_result_t *)user;
+
+    if (strstr(line, "upstream did not recover after APSTA switch")) r->recoverable = true;
+    if (strstr(line, "No upstream IPv4 connection")) r->needs_upstream = true;
+    if (strstr(line, "already exists")) r->name_taken = true;
+
+    // JanOS has no structured error block yet, so keep the newest human line.
+    if (strstr(line, "Capture Gateway:") || strstr(line, "No upstream IPv4") ||
+        strstr(line, "already exists")) {
+        const char *msg = strstr(line, "Capture Gateway:");
+        snprintf(r->err, sizeof(r->err), "%s", msg ? msg : line);
+    }
+
+    return cgw_parse_line(line, &r->snap);
+}
+
+// Send the start command and collect one complete block. The caller decides
+// what the result means - success is never inferred from a log line alone.
+static void gitm_send_start(tab_id_t tab, uart_port_t port, const char *cmd,
+                            gitm_start_result_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    // The caller logs a redacted form of this command; `cmd` itself carries the
+    // AP password in clear text and must not reach the console.
+    gitm_flush_rx(tab, port);
+    transport_write_bytes_tab(tab, port, cmd, strlen(cmd));
+    transport_write_bytes_tab(tab, port, "\r\n", 2);
+    gitm_read_lines(tab, port, GITM_START_TIMEOUT_MS, gitm_start_line_cb, out, true);
+}
+
+static bool gitm_final_line_cb(const char *line, void *user)
+{
+    return cgw_parse_final_line(line, (cgw_final_t *)user);
+}
+
+typedef struct {
+    bool success;
+    bool failed;
+} gitm_connect_result_t;
+
+static bool gitm_connect_line_cb(const char *line, void *user)
+{
+    gitm_connect_result_t *r = (gitm_connect_result_t *)user;
+    if (strstr(line, "SUCCESS")) { r->success = true; return true; }
+    if (strstr(line, "FAILED") || strstr(line, "Error")) { r->failed = true; return true; }
+    return false;
+}
+
+static bool gitm_connect_try(tab_id_t tab, uart_port_t port, const char *ssid,
+                             const char *pass, wifi_connect_auth_mode_t auth)
+{
+    char cmd[256];
+    if (!build_wifi_connect_command(cmd, sizeof(cmd), ssid, pass ? pass : "", auth)) {
+        return false;
+    }
+
+    // Never log the built command: it carries the passphrase in clear text.
+    ESP_LOGI(TAG, "GITM > wifi_connect \"%s\" %s", ssid,
+             auth == WIFI_CONNECT_AUTH_SAVED   ? "--saved"
+             : auth == WIFI_CONNECT_AUTH_OPEN  ? "(open)"
+                                               : "<password hidden>");
+
+    gitm_flush_rx(tab, port);
+    transport_write_bytes_tab(tab, port, cmd, strlen(cmd));
+    transport_write_bytes_tab(tab, port, "\r\n", 2);
+
+    gitm_connect_result_t r = {0};
+    gitm_read_lines(tab, port, 15000, gitm_connect_line_cb, &r, true);
+    return r.success;
+}
+
+// Credential policy for the upstream link.
+//
+// A password we hold (typed, or prefilled from the captured table) is tried
+// first because it is deterministic. If it is stale, we still fall back to
+// `--saved` so JanOS can resolve the network from its own eviltwin/portals/home
+// stores - the same mechanism the wardrive auto-upload connects with.
+static bool gitm_connect_upstream(tab_id_t tab, uart_port_t port,
+                                  const char *ssid, const char *pass, bool is_open)
+{
+    if (is_open) {
+        return gitm_connect_try(tab, port, ssid, "", WIFI_CONNECT_AUTH_OPEN);
+    }
+    if (pass && pass[0] != '\0') {
+        if (gitm_connect_try(tab, port, ssid, pass, WIFI_CONNECT_AUTH_PASSWORD)) {
+            return true;
+        }
+        ESP_LOGW(TAG, "GITM: supplied password rejected for '%s', trying --saved", ssid);
+    }
+    return gitm_connect_try(tab, port, ssid, "", WIFI_CONNECT_AUTH_SAVED);
+}
+
+// ---------------------------------------------------------------------------
+// Session tasks
+//
+// One task owns the transport for the whole GITM session, so a status poll can
+// never interleave with wifi_connect, start or stop (section 8.1).
+// ---------------------------------------------------------------------------
+
+static void gitm_publish_snapshot(tab_context_t *ctx, const cgw_snapshot_t *snap)
+{
+    if (!bsp_display_lock(300)) return;
+    ctx->gitm->snap = *snap;          // commit only complete blocks (section 8.3)
+    gitm_render_live(ctx);
+    bsp_display_unlock();
+}
+
+// Poll while running, then stop and finalize. Shared by the normal start path
+// and by the attach path that adopts a gateway JanOS was already running.
+static void gitm_run_and_stop(tab_context_t *ctx, tab_id_t tab, uart_port_t port)
+{
+    gitm_set_state(ctx, GITM_RUNNING, NULL, COLOR_MATERIAL_GREEN);
+
+    while (!ctx->gitm->stop_request) {
+        // Idle on the transport rather than sleeping on it: a client joining or
+        // the upstream dropping shows up immediately, and the periodic poll is
+        // left to carry nothing but the counters.
+        bool event = false;
+        for (int waited = 0;
+             waited < GITM_POLL_INTERVAL_MS && !ctx->gitm->stop_request;
+             waited += GITM_EVENT_WINDOW_MS) {
+            if (gitm_wait_for_event(tab, port, GITM_EVENT_WINDOW_MS)) {
+                event = true;
+                break;
+            }
+        }
+        if (ctx->gitm->stop_request) break;
+        if (event) ESP_LOGI(TAG, "GITM: JanOS reported a change, refreshing now");
+
+        cgw_snapshot_t snap;
+        if (!gitm_query_status(tab, port, &snap, false)) {
+            // Keep showing the last good view rather than blanking the screen.
+            ESP_LOGW(TAG, "GITM: status poll timed out, keeping the last snapshot");
+            continue;
+        }
+        if (!snap.active) {
+            // JanOS tore the session down by itself. Stop claiming RUNNING, and
+            // do not leave a STOP button pointing at a session that is gone.
+            gitm_publish_snapshot(ctx, &snap);
+            if (bsp_display_lock(300)) {
+                if (ctx->gitm->stop_btn) lv_obj_add_flag(ctx->gitm->stop_btn, LV_OBJ_FLAG_HIDDEN);
+                bsp_display_unlock();
+            }
+            gitm_set_state(ctx, GITM_IDLE,
+                           "JanOS reports the gateway is no longer active.\n"
+                           "Any capture it held was closed on its side.",
+                           COLOR_MATERIAL_RED);
+            gitm_restore_setup(ctx);
+            return;
+        }
+        gitm_publish_snapshot(ctx, &snap);
+        gitm_set_state(ctx, GITM_RUNNING, NULL, COLOR_MATERIAL_GREEN);
+
+        // One compact heartbeat per poll. The full block is still echoed for
+        // start, stop and any explicit reconciliation.
+        char size_str[24];
+        gitm_format_bytes(snap.file_bytes, size_str, sizeof(size_str));
+        ESP_LOGI(TAG, "GITM ~ up=%d napt=%d clients=%u pkt=%lu size=%s "
+                      "drops=%lu shaper=%lu",
+                 snap.upstream ? 1 : 0, snap.napt ? 1 : 0, snap.reported_clients,
+                 (unsigned long)snap.packets, size_str,
+                 (unsigned long)snap.drops, (unsigned long)snap.rate_queue_drops);
+    }
+
+    gitm_set_state(ctx, GITM_STOPPING,
+                   "Stopping and finalizing the PCAP...", COLOR_MATERIAL_AMBER);
+
+    // Universal `stop` only: `capture_gateway stop` refuses while the recorder
+    // hook is live, which would leave the AP up over an open file (section 8.7).
+    gitm_flush_rx(tab, port);
+    const char *stop_cmd = "stop\r\n";
+    gitm_log_tx(stop_cmd);
+    transport_write_bytes_tab(tab, port, stop_cmd, strlen(stop_cmd));
+
+    cgw_final_t fin;
+    memset(&fin, 0, sizeof(fin));
+    bool got_final = gitm_read_lines(tab, port, GITM_STOP_TIMEOUT_MS,
+                                     gitm_final_line_cb, &fin, true);
+
+    // Section 8.7: the file may only be offered once a complete idle block
+    // confirms the capture is really closed.
+    bool idle_confirmed = false;
+    for (int i = 0; i < 3 && !idle_confirmed; i++) {
+        cgw_snapshot_t snap;
+        if (gitm_query_status(tab, port, &snap, true) && !snap.active) {
+            idle_confirmed = true;
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(500));
+        }
+    }
+
+    if (bsp_display_lock(300)) {
+        ctx->gitm->final = fin;
+        bsp_display_unlock();
+    }
+
+    if (got_final && idle_confirmed) {
+        char frames[24];
+        char msg[224];
+        gitm_format_count(fin.frames, frames, sizeof(frames));
+        snprintf(msg, sizeof(msg),
+                 "Capture closed: %s frames, %lu dropped.\n"
+                 "The file is on the Monster SD and ready to copy.",
+                 frames, (unsigned long)fin.drops);
+        gitm_set_state(ctx, GITM_FINALIZED, msg,
+                       fin.drops > 0 ? COLOR_MATERIAL_AMBER : COLOR_MATERIAL_GREEN);
+    } else if (got_final) {
+        gitm_set_state(ctx, GITM_FINALIZED,
+                       "PCAP finalized, but JanOS never confirmed active=0.\n"
+                       "Verify on the Monster before trusting the file.",
+                       COLOR_MATERIAL_AMBER);
+    } else {
+        gitm_set_state(ctx, GITM_FINALIZED,
+                       "Stop sent, but no [PCAP_FINAL] arrived.\n"
+                       "Verify on the Monster that the capture closed.",
+                       COLOR_MATERIAL_AMBER);
+    }
+
+    if (bsp_display_lock(300)) {
+        gitm_render_live(ctx);
+        if (ctx->gitm->stop_btn) lv_obj_add_flag(ctx->gitm->stop_btn, LV_OBJ_FLAG_HIDDEN);
+        if (ctx->gitm->copy_btn) lv_obj_clear_flag(ctx->gitm->copy_btn, LV_OBJ_FLAG_HIDDEN);
+        bsp_display_unlock();
+    }
+}
+
+// Restore the setup form after a start that never reached RUNNING.
+static void gitm_restore_setup(tab_context_t *ctx)
+{
+    if (!bsp_display_lock(300)) return;
+    if (ctx->gitm->live)  lv_obj_add_flag(ctx->gitm->live, LV_OBJ_FLAG_HIDDEN);
+    if (ctx->gitm->step1) lv_obj_clear_flag(ctx->gitm->step1, LV_OBJ_FLAG_HIDDEN);
+    if (ctx->gitm->step2) lv_obj_clear_flag(ctx->gitm->step2, LV_OBJ_FLAG_HIDDEN);
+    // Reopen the AP form so the operator can change what failed.
+    ctx->gitm->s2_collapsed = false;
+    gitm_set_collapsed(ctx->gitm->s2_content, ctx->gitm->s2_chev, false);
+    if (ctx->gitm->start_btn) lv_obj_clear_state(ctx->gitm->start_btn, LV_STATE_DISABLED);
+    bsp_display_unlock();
+}
+
+static void gitm_session_task(void *arg)
+{
+    tab_context_t *ctx = (tab_context_t *)arg;
+    tab_id_t tab = (tab_id_t)ctx->gitm->tab;
+    uart_port_t port = ctx->gitm->uart_port;
+
+    // Worst case: 22 literal + quoted SSID (32) + quoted password (63) +
+    // " --pcap-name " + basename (95, the contract maximum) + NUL = 231 bytes.
+    char start_cmd[256];
+    if (ctx->gitm->ap_pass[0] != '\0') {
+        snprintf(start_cmd, sizeof(start_cmd),
+                 "capture_gateway start \"%s\" \"%s\" --pcap-name %s",
+                 ctx->gitm->ap_ssid, ctx->gitm->ap_pass, ctx->gitm->pcap_basename);
+    } else {
+        snprintf(start_cmd, sizeof(start_cmd),
+                 "capture_gateway start \"%s\" --pcap-name %s",
+                 ctx->gitm->ap_ssid, ctx->gitm->pcap_basename);
+    }
+
+    ESP_LOGI(TAG, "GITM > capture_gateway start \"%s\"%s --pcap-name %s",
+             ctx->gitm->ap_ssid,
+             ctx->gitm->ap_pass[0] ? " \"***\"" : "",
+             ctx->gitm->pcap_basename);
+
+    // ---- STARTING, with the documented recovery retries -------------------
+    gitm_start_result_t res;
+    memset(&res, 0, sizeof(res));
+    bool running = false;
+
+    for (int attempt = 0; attempt <= GITM_MAX_START_RETRIES && !ctx->gitm->stop_request;
+         attempt++) {
+        if (attempt == 0) {
+            gitm_set_state(ctx, GITM_STARTING, "Starting GITM on JanOS...",
+                           COLOR_MATERIAL_AMBER);
+        } else {
+            char msg[128];
+            snprintf(msg, sizeof(msg),
+                     "Upstream dropped on the APSTA switch.\n"
+                     "Recovering, attempt %d of %d...",
+                     attempt, GITM_MAX_START_RETRIES);
+            gitm_set_state(ctx, GITM_RECOVERING, msg, COLOR_MATERIAL_AMBER);
+
+            // Section 8.6: 1 s before the first retry, 2 s before the second,
+            // and a complete active=0 block is required before reconnecting.
+            vTaskDelay(pdMS_TO_TICKS(attempt == 1 ? 1000 : 2000));
+            cgw_snapshot_t idle;
+            if (!gitm_query_status(tab, port, &idle, true) || idle.active) {
+                ESP_LOGW(TAG, "GITM: rollback not confirmed, abandoning retry");
+                break;
+            }
+            if (!gitm_connect_upstream(tab, port, ctx->gitm->up_ssid,
+                                       ctx->gitm->up_pass, ctx->gitm->up_is_open)) {
+                break;
+            }
+            gitm_set_state(ctx, GITM_STARTING, NULL, COLOR_MATERIAL_AMBER);
+        }
+
+        gitm_send_start(tab, port, start_cmd, &res);
+
+        if (res.snap.complete && res.snap.active && res.snap.capture_active) {
+            running = true;
+            gitm_publish_snapshot(ctx, &res.snap);
+            break;
+        }
+
+        // Ambiguous outcome: only a complete status block decides (section 8.6).
+        cgw_snapshot_t probe;
+        if (gitm_query_status(tab, port, &probe, true) &&
+            probe.active && probe.capture_active) {
+            running = true;
+            gitm_publish_snapshot(ctx, &probe);
+            break;
+        }
+
+        // Only the APSTA rollback retries automatically; anything else needs an
+        // operator decision (sections 8.6 and 8.8).
+        if (!res.recoverable) break;
+    }
+
+    if (!running) {
+        char msg[224];
+        if (res.name_taken) {
+            snprintf(msg, sizeof(msg),
+                     "JanOS already has a capture named\n%s.pcap\n"
+                     "Change the PCAP prefix and start again.",
+                     ctx->gitm->pcap_basename);
+        } else if (res.needs_upstream) {
+            snprintf(msg, sizeof(msg),
+                     "JanOS reports no upstream IPv4.\n"
+                     "Reconnect the upstream network, then start again.");
+        } else if (res.err[0]) {
+            snprintf(msg, sizeof(msg), "GITM start failed.\n%s", res.err);
+        } else {
+            snprintf(msg, sizeof(msg),
+                     "GITM start failed or timed out.\n"
+                     "Check the SD card on the Monster, then retry.");
+        }
+        ESP_LOGW(TAG, "GITM: start failed (%s)", res.err[0] ? res.err : "no diagnostic");
+        gitm_set_state(ctx, GITM_IDLE, msg, COLOR_MATERIAL_RED);
+        gitm_restore_setup(ctx);
+    } else {
+        ESP_LOGI(TAG, "GITM: running, AP '%s', PCAP %s",
+                 ctx->gitm->ap_ssid, ctx->gitm->snap.file);
+        gitm_run_and_stop(ctx, tab, port);
+    }
+
+    ctx->gitm->stop_request = false;
+    ctx->gitm->session_task = NULL;
+    ctx->gitm->session_active = false;
+    vTaskDelete(NULL);
+}
+
+// Adopt a gateway that was already running when the page opened.
+static void gitm_adopt_task(void *arg)
+{
+    tab_context_t *ctx = (tab_context_t *)arg;
+    gitm_run_and_stop(ctx, (tab_id_t)ctx->gitm->tab, ctx->gitm->uart_port);
+    ctx->gitm->stop_request = false;
+    ctx->gitm->session_task = NULL;
+    ctx->gitm->session_active = false;
+    vTaskDelete(NULL);
+}
+
+// ---------------------------------------------------------------------------
+// Live view rendering (call with the display lock held)
+// ---------------------------------------------------------------------------
+
+static void gitm_render_clients(tab_context_t *ctx)
+{
+    if (!ctx->gitm->clients_list) return;
+    const cgw_snapshot_t *s = &ctx->gitm->snap;
+
+    if (ctx->gitm->clients_hdr) {
+        if (s->clients_truncated) {
+            lv_label_set_text_fmt(ctx->gitm->clients_hdr, "Clients (%u, showing %d)",
+                                  s->reported_clients, s->client_count);
+        } else {
+            lv_label_set_text_fmt(ctx->gitm->clients_hdr, "Clients (%u)",
+                                  s->reported_clients);
+        }
+    }
+
+    // Rebuild the rows only when the set of MACs actually changes; a 1.5 s poll
+    // would otherwise churn LVGL objects continuously.
+    char sig[CGW_MAX_CLIENTS * 18 + 8];
+    size_t pos = 0;
+    for (int i = 0; i < s->client_count && pos < sizeof(sig) - 20; i++) {
+        pos += snprintf(sig + pos, sizeof(sig) - pos, "%s|", s->clients[i].mac);
+    }
+    sig[pos] = '\0';
+
+    if (strcmp(sig, ctx->gitm->client_sig) == 0) {
+        // Same devices, but an address can still move from 0.0.0.0 to a lease.
+        uint32_t n = lv_obj_get_child_cnt(ctx->gitm->clients_list);
+        for (int i = 0; i < s->client_count && (uint32_t)i < n; i++) {
+            lv_obj_t *row = lv_obj_get_child(ctx->gitm->clients_list, i);
+            if (row) {
+                lv_label_set_text_fmt(row, "%s    %s", s->clients[i].mac,
+                                      s->clients[i].ip[0] ? s->clients[i].ip
+                                                          : "(no lease yet)");
+            }
+        }
+        return;
+    }
+    snprintf(ctx->gitm->client_sig, sizeof(ctx->gitm->client_sig), "%s", sig);
+
+    lv_obj_clean(ctx->gitm->clients_list);
+    if (s->client_count == 0) {
+        lv_obj_t *empty = lv_label_create(ctx->gitm->clients_list);
+        lv_label_set_text(empty, "No client has joined yet.");
+        lv_obj_set_style_text_font(empty, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(empty, ui_muted_color(), 0);
+        return;
+    }
+    for (int i = 0; i < s->client_count; i++) {
+        lv_obj_t *row = lv_label_create(ctx->gitm->clients_list);
+        lv_label_set_text_fmt(row, "%s    %s", s->clients[i].mac,
+                              s->clients[i].ip[0] ? s->clients[i].ip : "(no lease yet)");
+        lv_obj_set_style_text_font(row, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(row, lv_color_hex(0xDDDDDD), 0);
+    }
+}
+
+static void gitm_render_live(tab_context_t *ctx)
+{
+    if (!ctx || !ctx->gitm->live) return;
+    const cgw_snapshot_t *s = &ctx->gitm->snap;
+
+    if (ctx->gitm->live_hdr) {
+        lv_label_set_text_fmt(ctx->gitm->live_hdr,
+            "AP        %s   %s   ch %u\n"
+            "Upstream  %s   %s\n"
+            "NAPT %s   DNS %s%s",
+            s->ssid[0] ? s->ssid : ctx->gitm->ap_ssid,
+            s->security[0] ? s->security : (ctx->gitm->ap_wpa2 ? "wpa2" : "open"),
+            s->channel,
+            s->upstream_ssid[0] ? s->upstream_ssid : ctx->gitm->up_ssid,
+            s->upstream ? (s->sta_ip[0] ? s->sta_ip : "connected")
+                        : "DOWN - no Internet",
+            s->napt ? "on" : "off",
+            s->dns[0] ? s->dns : "-",
+            s->dns_proxy ? " (proxy)" : "");
+        lv_obj_set_style_text_color(ctx->gitm->live_hdr,
+            s->upstream ? lv_color_hex(0xDDDDDD) : COLOR_MATERIAL_AMBER, 0);
+    }
+
+    if (ctx->gitm->live_warn) {
+        // Section 8.8 asks for a visible warning on an open SSID and on the
+        // fact that clients are not isolated from one another.
+        bool open_ap = (s->security[0] ? strcmp(s->security, "open") == 0
+                                       : !ctx->gitm->ap_wpa2);
+        bool no_isolation = (strcmp(s->client_isolation, "off") == 0);
+        if (open_ap && no_isolation) {
+            lv_label_set_text(ctx->gitm->live_warn,
+                LV_SYMBOL_WARNING " Open AP, and clients are not isolated from each other.");
+        } else if (open_ap) {
+            lv_label_set_text(ctx->gitm->live_warn,
+                LV_SYMBOL_WARNING " Open AP - anyone in range can join and be recorded.");
+        } else if (no_isolation) {
+            lv_label_set_text(ctx->gitm->live_warn,
+                LV_SYMBOL_WARNING " Clients are not isolated from each other.");
+        } else {
+            lv_label_set_text(ctx->gitm->live_warn, "");
+        }
+    }
+
+    gitm_render_clients(ctx);
+
+    if (ctx->gitm->cap_label) {
+        char size_str[24], pkt_str[24];
+        gitm_format_bytes(s->file_bytes, size_str, sizeof(size_str));
+        gitm_format_count(s->packets, pkt_str, sizeof(pkt_str));
+        const char *name = cgw_file_basename(s);
+        lv_label_set_text_fmt(ctx->gitm->cap_label, "%s\n%s pkt        %s",
+                              name[0] ? name : "(pending)", pkt_str, size_str);
+    }
+
+    if (ctx->gitm->rec_label) {
+        if (cgw_recorder_degraded(s)) {
+            lv_label_set_text_fmt(ctx->gitm->rec_label,
+                LV_SYMBOL_WARNING " recorder  DEGRADED - %lu lost"
+                " (alloc %lu / queue %lu / write %lu)\n"
+                "                  queue %lu/%lu, peak %lu",
+                (unsigned long)s->drops, (unsigned long)s->drop_alloc,
+                (unsigned long)s->drop_queue, (unsigned long)s->drop_write,
+                (unsigned long)s->queue_depth, (unsigned long)s->queue_capacity,
+                (unsigned long)s->queue_high_water);
+            lv_obj_set_style_text_color(ctx->gitm->rec_label, COLOR_MATERIAL_RED, 0);
+        } else {
+            lv_label_set_text_fmt(ctx->gitm->rec_label,
+                LV_SYMBOL_OK " recorder  no loss        queue %lu/%lu, peak %lu",
+                (unsigned long)s->queue_depth, (unsigned long)s->queue_capacity,
+                (unsigned long)s->queue_high_water);
+            // A high-water mark at capacity means the writer is only just
+            // keeping up, even while drops are still zero (section 8.4).
+            bool tight = (s->queue_capacity > 0 &&
+                          s->queue_high_water >= s->queue_capacity);
+            lv_obj_set_style_text_color(ctx->gitm->rec_label,
+                tight ? COLOR_MATERIAL_AMBER : COLOR_MATERIAL_GREEN, 0);
+        }
+    }
+
+    if (ctx->gitm->shaper_label) {
+        if (cgw_shaper_degraded(s)) {
+            lv_label_set_text_fmt(ctx->gitm->shaper_label,
+                LV_SYMBOL_WARNING " shaper    %lu forwarded packets dropped\n"
+                "                  %lu -> %lu kbps, throttle %lu, pause %lu",
+                (unsigned long)s->rate_queue_drops,
+                (unsigned long)s->rate_limit_kbps, (unsigned long)s->rate_effective_kbps,
+                (unsigned long)s->throttle_events, (unsigned long)s->pause_events);
+            lv_obj_set_style_text_color(ctx->gitm->shaper_label, COLOR_MATERIAL_AMBER, 0);
+        } else if (s->rate_effective_kbps < s->rate_limit_kbps) {
+            // Expected protection, not damage - never rendered as an error.
+            lv_label_set_text_fmt(ctx->gitm->shaper_label,
+                LV_SYMBOL_OK " shaper    throttled %lu -> %lu kbps (protecting the writer)\n"
+                "                  throttle %lu, pause %lu",
+                (unsigned long)s->rate_limit_kbps, (unsigned long)s->rate_effective_kbps,
+                (unsigned long)s->throttle_events, (unsigned long)s->pause_events);
+            lv_obj_set_style_text_color(ctx->gitm->shaper_label, lv_color_hex(0xAAAAAA), 0);
+        } else {
+            lv_label_set_text_fmt(ctx->gitm->shaper_label,
+                LV_SYMBOL_OK " shaper    %lu kbps ceiling, no loss",
+                (unsigned long)s->rate_limit_kbps);
+            lv_obj_set_style_text_color(ctx->gitm->shaper_label, COLOR_MATERIAL_GREEN, 0);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Setup-phase UI callbacks
+// ---------------------------------------------------------------------------
+
+static void gitm_keyboard_cb(lv_event_t *e)
 {
     lv_event_code_t code = lv_event_get_code(e);
     lv_obj_t *kb = lv_event_get_target(e);
@@ -9476,844 +10439,1244 @@ static void capture_gw_keyboard_cb(lv_event_t *e)
     }
 }
 
-// Any of the three text fields shares the single on-screen keyboard.
-static void capture_gw_focus_cb(lv_event_t *e)
+static void gitm_focus_cb(lv_event_t *e)
 {
     tab_context_t *ctx = get_current_ctx();
-    if (!ctx || !ctx->gw_keyboard) return;
-    lv_obj_t *ta = lv_event_get_target(e);
-    lv_keyboard_set_textarea(ctx->gw_keyboard, ta);
-    lv_obj_clear_flag(ctx->gw_keyboard, LV_OBJ_FLAG_HIDDEN);
+    if (!ctx || !ctx->gitm || !ctx->gitm->keyboard) return;
+    lv_keyboard_set_textarea(ctx->gitm->keyboard, lv_event_get_target(e));
+    lv_obj_clear_flag(ctx->gitm->keyboard, LV_OBJ_FLAG_HIDDEN);
 }
 
-// Delete the popup and clear all handles. Safe to call from setup, running or
-// stopped phase; if a monitor task is still alive it is stopped first.
-static void capture_gw_teardown(tab_context_t *ctx)
+// Refresh the generated-name preview from the current prefix and clock.
+static void gitm_update_name_preview(tab_context_t *ctx)
 {
-    if (!ctx) return;
-
-    if (ctx->gw_running) {
-        ctx->gw_running = false;
-        bsp_display_unlock();
-        for (int i = 0; i < 20 && ctx->gw_monitor_task_handle != NULL; i++) {
-            vTaskDelay(pdMS_TO_TICKS(100));
-        }
-        // Best-effort: universal `stop` finalizes the PCAP and tears the bridge
-        // down (capture_gateway stop refuses while the recorder hook is active).
-        const char *stop_cmd = "stop\r\n";
-        transport_write_bytes_tab((tab_id_t)ctx->gw_tab, ctx->gw_uart_port, stop_cmd, strlen(stop_cmd));
-        bsp_display_lock(0);
-    }
-
-    if (ctx->gw_popup_overlay) {
-        lv_obj_del(ctx->gw_popup_overlay);
-    }
-    ctx->gw_popup_overlay = NULL;
-    ctx->gw_popup = NULL;
-    ctx->gw_input_col = NULL;
-    ctx->gw_status_label = NULL;
-    ctx->gw_stats_label = NULL;
-    ctx->gw_up_ssid_input = NULL;
-    ctx->gw_up_pass_input = NULL;
-    ctx->gw_ssid_input = NULL;
-    ctx->gw_pass_input = NULL;
-    ctx->gw_keyboard = NULL;
-    ctx->gw_stop_btn = NULL;
-    ctx->gw_close_btn = NULL;
-    ctx->gw_pcap_filename[0] = '\0';
-    ctx->gw_ap_ssid[0] = '\0';
-    ctx->observer_attack_return_to_observer = false;
-    clear_observer_attack_override(ctx);
+    if (!ctx || !ctx->gitm->name_preview) return;
+    const char *prefix = ctx->gitm->prefix_input
+                       ? lv_textarea_get_text(ctx->gitm->prefix_input) : "";
+    char base[96];
+    gitm_build_pcap_basename(prefix && prefix[0] ? prefix : "gitm", base, sizeof(base));
+    lv_label_set_text_fmt(ctx->gitm->name_preview, "saves as  %s.pcap", base);
 }
 
-static void capture_gw_close_cb(lv_event_t *e)
+static void gitm_prefix_changed_cb(lv_event_t *e)
 {
     (void)e;
-    ESP_LOGI(TAG, "Capture GW popup closed");
-    capture_gw_teardown(get_current_ctx());
+    gitm_update_name_preview(get_current_ctx());
 }
 
-// Connect the upstream STA via the existing `wifi_connect` command and wait for
-// SUCCESS. Empty password -> --saved (JanOS tries eviltwin/portals/home) unless
-// the network is known-open. Returns true when JanOS reports SUCCESS.
-static bool gw_connect_upstream(tab_id_t tab, uart_port_t port,
-                                const char *up_ssid, const char *up_pass, bool up_is_open)
+static void gitm_security_changed_cb(lv_event_t *e)
 {
-    wifi_connect_auth_mode_t auth = WIFI_CONNECT_AUTH_OPEN;
-    if (up_pass[0] != '\0') {
-        auth = WIFI_CONNECT_AUTH_PASSWORD;
-    } else if (!up_is_open) {
-        auth = WIFI_CONNECT_AUTH_SAVED;
-    }
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx || !ctx->gitm) return;
+    ctx->gitm->ap_wpa2 = (lv_dropdown_get_selected(lv_event_get_target(e)) == 1);
 
-    char cmd[256];
-    if (!build_wifi_connect_command(cmd, sizeof(cmd), up_ssid, up_pass, auth)) {
-        return false;
-    }
-
-    if (tab == TAB_USB && usb_cdc_handle) {
-        usbh_cdc_flush_rx_buffer(usb_cdc_handle);
-    } else {
-        uart_flush(port);
-    }
-    transport_write_bytes_tab(tab, port, cmd, strlen(cmd));
-    transport_write_bytes_tab(tab, port, "\r\n", 2);
-
-    char rx[1024];
-    int total = 0, elapsed = 0;
-    while (elapsed < 15000 && total < (int)sizeof(rx) - 64) {
-        int len = transport_read_bytes_tab(tab, port, rx + total,
-                                           sizeof(rx) - total - 1, pdMS_TO_TICKS(200));
-        if (len > 0) {
-            total += len;
-            rx[total] = '\0';
-            if (strstr(rx, "SUCCESS")) return true;
-            if (strstr(rx, "FAILED") || strstr(rx, "Error")) return false;
+    if (ctx->gitm->ap_pass_row) {
+        if (ctx->gitm->ap_wpa2) {
+            lv_obj_clear_flag(ctx->gitm->ap_pass_row, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(ctx->gitm->ap_pass_row, LV_OBJ_FLAG_HIDDEN);
         }
-        elapsed += 200;
     }
-    return false;
+    if (ctx->gitm->open_warn) {
+        if (ctx->gitm->ap_wpa2) {
+            lv_obj_add_flag(ctx->gitm->open_warn, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_clear_flag(ctx->gitm->open_warn, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
 }
 
-// Send `capture_gateway start ...` and wait for a complete [CGW] block.
-// Returns 1 = active+capture (success), 0 = "upstream did not recover" (retryable),
-// -1 = other failure/timeout. On success, copies the PCAP basename into file_out.
-static int gw_start_and_wait(tab_id_t tab, uart_port_t port, const char *start_cmd,
-                             char *file_out, size_t file_sz)
+// Apply a picked upstream row to the form. Shared by the tap handler and by the
+// preselection carried in from the attack view.
+static void gitm_apply_upstream_pick(tab_context_t *ctx, int idx)
 {
-    if (tab == TAB_USB && usb_cdc_handle) {
-        usbh_cdc_flush_rx_buffer(usb_cdc_handle);
-    } else {
-        uart_flush(port);
-    }
-    transport_write_bytes_tab(tab, port, start_cmd, strlen(start_cmd));
-    transport_write_bytes_tab(tab, port, "\r\n", 2);
+    if (idx < 0 || idx >= ctx->gitm->net_count) return;
+    ctx->gitm->up_index = idx;
+    ctx->gitm->up_is_open = wifi_network_security_is_open(ctx->gitm->nets[idx].security);
 
-    static char acc[3072];
-    int acc_len = 0;
-    acc[0] = '\0';
-    char rx[512];
-    int elapsed = 0;
-    // Gateway start can spend ~15s recovering the STA before it arms the PCAP.
-    const int timeout_ms = 26000;
-
-    while (elapsed < timeout_ms) {
-        int len = transport_read_bytes_tab(tab, port, rx, sizeof(rx) - 1, pdMS_TO_TICKS(200));
-        if (len > 0) {
-            rx[len] = '\0';
-            if (acc_len + len < (int)sizeof(acc) - 1) {
-                memcpy(acc + acc_len, rx, len);
-                acc_len += len;
-                acc[acc_len] = '\0';
-            }
-            if (strstr(acc, "upstream did not recover after APSTA switch")) {
-                return 0;
-            }
-            if (strstr(acc, "[CGW] END")) {
-                unsigned long active = 0;
-                gw_extract_ulong(acc, " active=", &active);
-                if (active == 1 && strstr(acc, "capture=active")) {
-                    if (file_out && file_sz) {
-                        file_out[0] = '\0';
-                        gw_extract_pcap_name(acc, file_out, file_sz);
-                    }
-                    return 1;
-                }
-                return -1;
-            }
+    // An open upstream needs no password field at all.
+    if (ctx->gitm->up_pass_row) {
+        if (ctx->gitm->up_is_open) {
+            lv_obj_add_flag(ctx->gitm->up_pass_row, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_clear_flag(ctx->gitm->up_pass_row, LV_OBJ_FLAG_HIDDEN);
         }
-        elapsed += 200;
     }
-    return -1;
+    if (ctx->gitm->connect_btn) {
+        lv_obj_clear_state(ctx->gitm->connect_btn, LV_STATE_DISABLED);
+    }
+
+    // Substitute a password we already hold, so the operator can see what will
+    // be used and correct it before connecting.
+    if (ctx->gitm->up_pass_input) {
+        const char *known = ctx->gitm->up_is_open
+                          ? NULL : creds_lookup(ctx, ctx->gitm->nets[idx].ssid);
+        lv_textarea_set_text(ctx->gitm->up_pass_input, known ? known : "");
+    }
+
+    gitm_render_net_list(ctx);
 }
 
-// One `capture_gateway status` round-trip; true when the complete block reports
-// active=1 and capture=active. Used to reconcile after an ambiguous start.
-static bool gw_status_is_active(tab_id_t tab, uart_port_t port, char *file_out, size_t file_sz)
+static void gitm_net_row_cb(lv_event_t *e)
 {
-    if (tab == TAB_USB && usb_cdc_handle) {
-        usbh_cdc_flush_rx_buffer(usb_cdc_handle);
-    } else {
-        uart_flush(port);
-    }
-    const char *cmd = "capture_gateway status\r\n";
-    transport_write_bytes_tab(tab, port, cmd, strlen(cmd));
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx || !ctx->gitm || ctx->gitm->session_active) return;
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (idx < 0 || idx >= ctx->gitm->net_count) return;
 
-    char acc[1024];
-    int acc_len = 0;
-    acc[0] = '\0';
-    char rx[512];
-    int elapsed = 0;
-    while (elapsed < 3000) {
-        int len = transport_read_bytes_tab(tab, port, rx, sizeof(rx) - 1, pdMS_TO_TICKS(100));
-        if (len > 0) {
-            rx[len] = '\0';
-            if (acc_len + len < (int)sizeof(acc) - 1) {
-                memcpy(acc + acc_len, rx, len);
-                acc_len += len;
-                acc[acc_len] = '\0';
-            }
-            if (strstr(acc, "[CGW] END")) break;
-        }
-        elapsed += 100;
+    gitm_apply_upstream_pick(ctx, idx);
+
+    wifi_network_t *net = &ctx->gitm->nets[idx];
+    if (net->ssid[0] == '\0') {
+        gitm_set_hint(ctx, "Hidden network - JanOS needs its real SSID to connect.",
+                      COLOR_MATERIAL_AMBER);
+    } else if (ctx->gitm->up_is_open) {
+        gitm_set_hint(ctx, "Open upstream. Press CONNECT.", lv_color_hex(0xCCCCCC));
+    } else if (creds_lookup(ctx, net->ssid)) {
+        gitm_set_hint(ctx,
+            "Captured password filled in for this network. Press CONNECT.",
+            COLOR_MATERIAL_GREEN);
+    } else {
+        gitm_set_hint(ctx,
+            "Leave the password empty to let JanOS try its saved credentials.",
+            lv_color_hex(0xCCCCCC));
     }
-    if (!strstr(acc, "[CGW] END")) return false;
-    unsigned long active = 0;
-    gw_extract_ulong(acc, " active=", &active);
-    bool ok = (active == 1) && (strstr(acc, "capture=active") != NULL);
-    if (ok && file_out && file_sz) {
-        gw_extract_pcap_name(acc, file_out, file_sz);
-    }
-    return ok;
 }
 
-// Poll `capture_gateway status`, parse the [CGW] block and refresh the live stats.
-static void capture_gw_monitor_task(void *arg)
+static void gitm_render_net_list(tab_context_t *ctx)
+{
+    if (!ctx || !ctx->gitm->net_list) return;
+    lv_obj_clean(ctx->gitm->net_list);
+
+    if (ctx->gitm->net_count == 0) {
+        lv_obj_t *empty = lv_label_create(ctx->gitm->net_list);
+        lv_label_set_text(empty, "No networks yet - press SCAN.");
+        lv_obj_set_style_text_font(empty, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(empty, ui_muted_color(), 0);
+        return;
+    }
+
+    for (int i = 0; i < ctx->gitm->net_count; i++) {
+        wifi_network_t *net = &ctx->gitm->nets[i];
+        bool picked = (i == ctx->gitm->up_index);
+
+        lv_obj_t *row = lv_obj_create(ctx->gitm->net_list);
+        lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
+        lv_obj_set_style_pad_all(row, 8, 0);
+        lv_obj_set_style_bg_color(row, picked ? lv_color_hex(0x14304A)
+                                              : lv_color_hex(0x2D2D2D), 0);
+        lv_obj_set_style_bg_color(row, lv_color_hex(0x3A3A3A), LV_STATE_PRESSED);
+        lv_obj_set_style_border_width(row, picked ? 2 : 0, 0);
+        lv_obj_set_style_border_color(row, COLOR_MATERIAL_BLUE, 0);
+        lv_obj_set_style_radius(row, 8, 0);
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_style_pad_row(row, 2, 0);
+        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_event_cb(row, gitm_net_row_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+
+        const bool have_pass = (creds_lookup(ctx, net->ssid) != NULL);
+
+        lv_obj_t *ssid = lv_label_create(row);
+        lv_label_set_text_fmt(ssid, "%s%s", picked ? LV_SYMBOL_OK "  " : "",
+                              net->ssid[0] ? net->ssid : "(Hidden)");
+        lv_obj_set_style_text_font(ssid, &lv_font_montserrat_18, 0);
+        lv_obj_set_style_text_color(ssid, picked ? COLOR_MATERIAL_BLUE
+                                                 : lv_color_hex(0xFFFFFF), 0);
+        lv_obj_clear_flag(ssid, LV_OBJ_FLAG_CLICKABLE);
+
+        lv_obj_t *info = lv_label_create(row);
+        lv_label_set_text_fmt(info, "%s  |  CH%d  |  %s  |  %s  |  %d dBm%s",
+                              net->bssid, net->channel, net->band,
+                              net->security, net->rssi,
+                              have_pass ? "  |  password saved" : "");
+        lv_obj_set_style_text_font(info, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(info, have_pass ? lv_color_hex(0x55AA77)
+                                                    : lv_color_hex(0x888888), 0);
+        lv_obj_clear_flag(info, LV_OBJ_FLAG_CLICKABLE);
+    }
+}
+
+// Scan for upstream candidates. Reuses the JanOS `scan_networks` command and
+// the shared line parser, but stores results in the page's own cache so the
+// attack view's selection is left untouched.
+static void gitm_scan_task(void *arg)
 {
     tab_context_t *ctx = (tab_context_t *)arg;
-    tab_id_t tab = (tab_id_t)ctx->gw_tab;
-    uart_port_t port = ctx->gw_uart_port;
+    tab_id_t tab = (tab_id_t)ctx->gitm->tab;
+    uart_port_t port = ctx->gitm->uart_port;
+
+    ctx->gitm->net_count = 0;
+    ctx->gitm->up_index = -1;
+
+    gitm_flush_rx(tab, port);
+    gitm_log_tx("scan_networks");
+    transport_write_bytes_tab(tab, port, "scan_networks\r\n", 15);
+
     char rx[512];
+    char line[512];
+    int line_pos = 0;
+    bool done = false;
+    TickType_t start = xTaskGetTickCount();
 
-    while (ctx->gw_running) {
-        // ~1.5s cadence, but stay responsive to STOP.
-        for (int i = 0; i < 15 && ctx->gw_running; i++) {
-            vTaskDelay(pdMS_TO_TICKS(100));
-        }
-        if (!ctx->gw_running) break;
+    while (!done && (xTaskGetTickCount() - start) < pdMS_TO_TICKS(UART_RX_TIMEOUT)) {
+        int len = transport_read_bytes_tab(tab, port, rx, sizeof(rx) - 1,
+                                           pdMS_TO_TICKS(100));
+        if (len <= 0) continue;
+        for (int i = 0; i < len && !done; i++) {
+            char c = rx[i];
+            if (c != '\n' && c != '\r') {
+                if (line_pos < (int)sizeof(line) - 1) line[line_pos++] = c;
+                continue;
+            }
+            if (line_pos == 0) continue;
+            line[line_pos] = '\0';
+            line_pos = 0;
+            GITM_LOG_RX(line);
 
-        if (tab == TAB_USB && usb_cdc_handle) {
-            usbh_cdc_flush_rx_buffer(usb_cdc_handle);
-        } else {
-            uart_flush(port);
-        }
-        const char *status_cmd = "capture_gateway status\r\n";
-        transport_write_bytes_tab(tab, port, status_cmd, strlen(status_cmd));
-
-        char acc[1024];
-        int acc_len = 0;
-        acc[0] = '\0';
-        int elapsed = 0;
-        while (elapsed < 1500 && ctx->gw_running) {
-            int len = transport_read_bytes_tab(tab, port, rx, sizeof(rx) - 1,
-                                               pdMS_TO_TICKS(100));
-            if (len > 0) {
-                rx[len] = '\0';
-                if (acc_len + len < (int)sizeof(acc) - 1) {
-                    memcpy(acc + acc_len, rx, len);
-                    acc_len += len;
-                    acc[acc_len] = '\0';
+            if (strstr(line, "Scan results printed")) { done = true; break; }
+            if (line[0] == '"' && ctx->gitm->net_count < MAX_NETWORKS) {
+                wifi_network_t net;
+                if (parse_network_line(line, &net)) {
+                    ctx->gitm->nets[ctx->gitm->net_count++] = net;
                 }
-                if (strstr(acc, "[CGW] END")) break;
             }
-            elapsed += 100;
-        }
-
-        if (!strstr(acc, "[CGW] END") || !ctx->gw_running) continue;
-
-        unsigned long active = 0, up = 0, clients = 0, packets = 0, drops = 0, rate_qdrops = 0;
-        unsigned long long fbytes = 0;
-        gw_extract_ulong(acc, " active=", &active);
-        gw_extract_ulong(acc, " upstream=", &up);
-        gw_extract_ulong(acc, " clients=", &clients);
-        gw_extract_ulong(acc, " packets=", &packets);
-        gw_extract_ulong(acc, " drops=", &drops);
-        gw_extract_ulong(acc, " rate_queue_drops=", &rate_qdrops);
-        gw_extract_ull(acc, " file_bytes=", &fbytes);
-        if (ctx->gw_pcap_filename[0] == '\0') {
-            gw_extract_pcap_name(acc, ctx->gw_pcap_filename, sizeof(ctx->gw_pcap_filename));
-        }
-
-        char size_str[24];
-        gw_format_bytes(fbytes, size_str, sizeof(size_str));
-        bool degraded = (drops > 0) || (rate_qdrops > 0);
-
-        if (bsp_display_lock(200)) {
-            if (ctx->gw_running && ctx->gw_stats_label) {
-                lv_label_set_text_fmt(ctx->gw_stats_label,
-                    "%s  Upstream: %s\n"
-                    "AP: %s   Clients: %lu\n"
-                    "File: %s\n"
-                    "Packets: %lu   Size: %s\n"
-                    "%s",
-                    up ? LV_SYMBOL_OK : LV_SYMBOL_WARNING,
-                    up ? "connected" : "DOWN (no Internet)",
-                    ctx->gw_ap_ssid[0] ? ctx->gw_ap_ssid : "-",
-                    clients,
-                    ctx->gw_pcap_filename[0] ? ctx->gw_pcap_filename : "(pending)",
-                    packets, size_str,
-                    degraded ? LV_SYMBOL_WARNING " DEGRADED - drops>0"
-                             : LV_SYMBOL_OK " healthy (no drops)");
-                lv_obj_set_style_text_color(ctx->gw_stats_label,
-                    degraded ? COLOR_MATERIAL_AMBER
-                             : (up ? COLOR_MATERIAL_GREEN : COLOR_MATERIAL_AMBER), 0);
-            }
-            bsp_display_unlock();
         }
     }
 
-    ctx->gw_monitor_task_handle = NULL;
+    // Same task, same transport: no risk of interleaving with the scan.
+    creds_fetch(ctx, tab, port);
+
+    if (bsp_display_lock(500)) {
+        // Re-apply a preselection carried in from the attack view.
+        int pre = -1;
+        if (ctx->gitm->preselect_ssid[0]) {
+            for (int i = 0; i < ctx->gitm->net_count; i++) {
+                if (strcmp(ctx->gitm->nets[i].ssid, ctx->gitm->preselect_ssid) == 0) {
+                    pre = i;
+                    break;
+                }
+            }
+            ctx->gitm->preselect_ssid[0] = '\0';
+        }
+
+        if (pre >= 0) {
+            gitm_apply_upstream_pick(ctx, pre);
+        } else {
+            gitm_render_net_list(ctx);
+            if (ctx->gitm->connect_btn) {
+                lv_obj_add_state(ctx->gitm->connect_btn, LV_STATE_DISABLED);
+            }
+        }
+
+        if (ctx->gitm->scan_btn) lv_obj_clear_state(ctx->gitm->scan_btn, LV_STATE_DISABLED);
+        gitm_set_hint(ctx,
+            done ? "Pick the network that provides Internet, then CONNECT."
+                 : "Scan timed out. Check the Monster link and try again.",
+            done ? lv_color_hex(0xCCCCCC) : COLOR_MATERIAL_RED);
+        bsp_display_unlock();
+    }
+
+    ctx->gitm->session_active = false;
     vTaskDelete(NULL);
 }
 
-static void capture_gw_start_cb(lv_event_t *e)
+static void gitm_scan_cb(lv_event_t *e)
 {
     (void)e;
     tab_context_t *ctx = get_current_ctx();
-    if (!ctx) return;
+    if (!ctx || !ctx->gitm || ctx->gitm->session_active || !ctx->gitm->nets) return;
 
-    // Upstream SSID: typed field in standalone mode, scan selection otherwise.
-    char up_ssid_buf[33] = {0};
-    const char *up_ssid;
-    if (ctx->gw_standalone) {
-        const char *typed = ctx->gw_up_ssid_input ? lv_textarea_get_text(ctx->gw_up_ssid_input) : "";
-        if (!typed || typed[0] == '\0') {
-            capture_gw_set_status(ctx, "Enter the upstream Wi-Fi SSID to bridge", COLOR_MATERIAL_RED);
-            return;
-        }
-        snprintf(up_ssid_buf, sizeof(up_ssid_buf), "%s", typed);
-        up_ssid = up_ssid_buf;
-    } else {
-        scan_view_t v = get_scan_view(ctx);
-        if (v.sel_count == 0) return;
-        int idx = v.sel_indices[0];
-        if (idx < 0 || idx >= v.net_count) return;
-        up_ssid = v.nets[idx].ssid;
-    }
+    ctx->gitm->tab = (int)current_tab;
+    ctx->gitm->uart_port = uart_port_for_tab(current_tab);
 
-    const char *up_pass = ctx->gw_up_pass_input ? lv_textarea_get_text(ctx->gw_up_pass_input) : "";
-    const char *gw_ssid = ctx->gw_ssid_input ? lv_textarea_get_text(ctx->gw_ssid_input) : "";
-    const char *gw_pass = ctx->gw_pass_input ? lv_textarea_get_text(ctx->gw_pass_input) : "";
-    if (!up_pass) up_pass = "";
-    if (!gw_ssid) gw_ssid = "";
-    if (!gw_pass) gw_pass = "";
+    if (ctx->gitm->scan_btn) lv_obj_add_state(ctx->gitm->scan_btn, LV_STATE_DISABLED);
+    if (ctx->gitm->connect_btn) lv_obj_add_state(ctx->gitm->connect_btn, LV_STATE_DISABLED);
+    gitm_set_hint(ctx, "Scanning...", COLOR_MATERIAL_AMBER);
+    if (ctx->gitm->net_list) lv_obj_clean(ctx->gitm->net_list);
 
-    // Validate the gateway AP parameters (upstream is a scanned network already).
-    if (gw_ssid[0] == '\0') {
-        capture_gw_set_status(ctx, "Enter a name (SSID) for the Gateway AP", COLOR_MATERIAL_RED);
-        return;
-    }
-    if (strlen(gw_ssid) > 32) {
-        capture_gw_set_status(ctx, "Gateway SSID too long (max 32 chars)", COLOR_MATERIAL_RED);
-        return;
-    }
-    if (gw_pass[0] != '\0' && strlen(gw_pass) < 8) {
-        capture_gw_set_status(ctx, "Gateway password needs 8+ chars (or leave empty = open)",
-                              COLOR_MATERIAL_RED);
-        return;
-    }
-    // The command wraps every field in double quotes, so a literal quote would
-    // break parsing on JanOS. Reject rather than mis-send.
-    if (strchr(up_ssid, '"') || strchr(up_pass, '"') ||
-        strchr(gw_ssid, '"') || strchr(gw_pass, '"')) {
-        capture_gw_set_status(ctx, "Quote character (\") is not allowed in SSID/password",
-                              COLOR_MATERIAL_RED);
-        return;
-    }
-
-    // JanOS start takes only the capture (AP) SSID + optional WPA2 password.
-    // The upstream is connected separately with wifi_connect first.
-    char start_cmd[128];
-    int n;
-    if (gw_pass[0] != '\0') {
-        n = snprintf(start_cmd, sizeof(start_cmd),
-                     "capture_gateway start \"%s\" \"%s\"", gw_ssid, gw_pass);
-    } else {
-        n = snprintf(start_cmd, sizeof(start_cmd),
-                     "capture_gateway start \"%s\"", gw_ssid);
-    }
-    if (n <= 0 || n >= (int)sizeof(start_cmd)) {
-        capture_gw_set_status(ctx, "SSID/password too long", COLOR_MATERIAL_RED);
-        return;
-    }
-
-    // Snapshot everything the blocking phase needs before releasing the lock.
-    snprintf(ctx->gw_ap_ssid, sizeof(ctx->gw_ap_ssid), "%s", gw_ssid);
-    ctx->gw_pcap_filename[0] = '\0';
-    bool up_is_open = ctx->gw_up_is_open;
-    char up_ssid_local[33], up_pass_local[65];
-    snprintf(up_ssid_local, sizeof(up_ssid_local), "%s", up_ssid);
-    snprintf(up_pass_local, sizeof(up_pass_local), "%s", up_pass);
-
-    tab_id_t tab = current_tab;
-    uart_port_t port = uart_port_for_tab(tab);
-
-    if (ctx->gw_keyboard) lv_obj_add_flag(ctx->gw_keyboard, LV_OBJ_FLAG_HIDDEN);
-    capture_gw_set_status(ctx, "Connecting upstream Wi-Fi...", COLOR_MATERIAL_AMBER);
-    lv_refr_now(NULL);
-    bsp_display_unlock();
-    vTaskDelay(pdMS_TO_TICKS(50));
-
-    // Step 1: connect the upstream STA via wifi_connect.
-    bool connected = gw_connect_upstream(tab, port, up_ssid_local, up_pass_local, up_is_open);
-
-    // Step 2: start the gateway; one automatic retry on the documented
-    // "upstream did not recover after APSTA switch" rollback.
-    char fname[128] = {0};
-    int result = -1;
-    if (connected) {
-        for (int attempt = 0; attempt < 2; attempt++) {
-            result = gw_start_and_wait(tab, port, start_cmd, fname, sizeof(fname));
-            if (result == 1) break;
-            if (result == 0 && attempt == 0) {
-                vTaskDelay(pdMS_TO_TICKS(1000));
-                if (!gw_connect_upstream(tab, port, up_ssid_local, up_pass_local, up_is_open)) {
-                    result = -1;
-                    break;
-                }
-                continue;  // retry the start once
-            }
-            // Ambiguous result: let a full status block decide.
-            if (gw_status_is_active(tab, port, fname, sizeof(fname))) {
-                result = 1;
-            }
-            break;
-        }
-    }
-
-    bsp_display_lock(0);
-
-    if (result == 1) {
-        ESP_LOGI(TAG, "Capture GW: bridge up (AP '%s'), PCAP %s",
-                 ctx->gw_ap_ssid, fname[0] ? fname : "(pending)");
-        snprintf(ctx->gw_pcap_filename, sizeof(ctx->gw_pcap_filename), "%s", fname);
-        ctx->gw_tab = tab;
-        ctx->gw_uart_port = port;
-
-        if (ctx->gw_input_col) lv_obj_add_flag(ctx->gw_input_col, LV_OBJ_FLAG_HIDDEN);
-        if (ctx->gw_status_label) lv_obj_add_flag(ctx->gw_status_label, LV_OBJ_FLAG_HIDDEN);
-
-        if (ctx->gw_stats_label) {
-            lv_obj_clear_flag(ctx->gw_stats_label, LV_OBJ_FLAG_HIDDEN);
-            lv_label_set_text_fmt(ctx->gw_stats_label,
-                LV_SYMBOL_LOOP "  Gateway running\n"
-                "AP: %s\n"
-                "File: %s\n\n"
-                "Waiting for clients...",
-                ctx->gw_ap_ssid, fname[0] ? fname : "(pending)");
-            lv_obj_set_style_text_color(ctx->gw_stats_label, COLOR_MATERIAL_GREEN, 0);
-        }
-        if (ctx->gw_stop_btn) lv_obj_clear_flag(ctx->gw_stop_btn, LV_OBJ_FLAG_HIDDEN);
-
-        ctx->gw_running = true;
-        if (xTaskCreate(capture_gw_monitor_task, "gw_monitor", 6144, ctx, 4,
-                        &ctx->gw_monitor_task_handle) != pdPASS) {
-            ctx->gw_monitor_task_handle = NULL;
-            ESP_LOGW(TAG, "Capture GW: failed to start monitor task");
-        }
-    } else if (!connected) {
-        ESP_LOGW(TAG, "Capture GW: upstream connect failed for '%s'", up_ssid_local);
-        capture_gw_set_status(ctx,
-            "Upstream Wi-Fi connect failed.\nCheck the SSID/password and retry.",
-            COLOR_MATERIAL_RED);
-    } else {
-        ESP_LOGW(TAG, "Capture GW: gateway did not reach active state");
-        capture_gw_set_status(ctx,
-            "Gateway start failed on JanOS.\n"
-            "Check upstream IPv4 and SD on the Monster, then retry.",
-            COLOR_MATERIAL_RED);
+    ctx->gitm->session_active = true;   // also guards the shared transport
+    if (xTaskCreate(gitm_scan_task, "gitm_scan", 6144, ctx, 5, NULL) != pdPASS) {
+        ctx->gitm->session_active = false;
+        ESP_LOGW(TAG, "GITM: failed to start the scan task");
+        if (ctx->gitm->scan_btn) lv_obj_clear_state(ctx->gitm->scan_btn, LV_STATE_DISABLED);
+        gitm_set_hint(ctx, "Could not start the scan task.", COLOR_MATERIAL_RED);
     }
 }
 
-static void capture_gw_stop_cb(lv_event_t *e)
+// Connect the chosen upstream in its own task so the page keeps redrawing.
+static void gitm_connect_task(void *arg)
 {
-    (void)e;
-    tab_context_t *ctx = get_current_ctx();
-    if (!ctx) return;
+    tab_context_t *ctx = (tab_context_t *)arg;
+    bool ok = gitm_connect_upstream((tab_id_t)ctx->gitm->tab, ctx->gitm->uart_port,
+                                    ctx->gitm->up_ssid, ctx->gitm->up_pass,
+                                    ctx->gitm->up_is_open);
 
-    ESP_LOGI(TAG, "Capture GW: STOP pressed");
-    ctx->gw_running = false;
-    tab_id_t tab = (tab_id_t)ctx->gw_tab;
-    uart_port_t port = ctx->gw_uart_port;
-
-    if (ctx->gw_stats_label) {
-        lv_label_set_text(ctx->gw_stats_label, "Stopping gateway...");
-        lv_obj_set_style_text_color(ctx->gw_stats_label, COLOR_MATERIAL_AMBER, 0);
-    }
-    if (ctx->gw_stop_btn) lv_obj_add_state(ctx->gw_stop_btn, LV_STATE_DISABLED);
-    lv_refr_now(NULL);
-
-    bsp_display_unlock();
-
-    // Let the monitor task finish its current poll and exit before we take over
-    // the UART, so status and stop replies don't interleave.
-    for (int i = 0; i < 20 && ctx->gw_monitor_task_handle != NULL; i++) {
-        vTaskDelay(pdMS_TO_TICKS(100));
-    }
-
-    if (tab == TAB_USB && usb_cdc_handle) {
-        usbh_cdc_flush_rx_buffer(usb_cdc_handle);
-    } else {
-        uart_flush(port);
-    }
-    // Universal `stop` restores the hooks, drains the writer, finalizes the PCAP
-    // and emits [PCAP_FINAL], then tears the gateway down. `capture_gateway stop`
-    // refuses while the recorder hook is active, so it must not be used here.
-    const char *stop_cmd = "stop\r\n";
-    transport_write_bytes_tab(tab, port, stop_cmd, strlen(stop_cmd));
-
-    char acc[2048];
-    int acc_len = 0;
-    acc[0] = '\0';
-    char rx[512];
-    unsigned long frames = 0, drops = 0;
-    bool got_summary = false;
-    int elapsed = 0;
-    while (elapsed < 12000) {
-        int len = transport_read_bytes_tab(tab, port, rx, sizeof(rx) - 1,
-                                           pdMS_TO_TICKS(200));
-        if (len > 0) {
-            rx[len] = '\0';
-            if (acc_len + len < (int)sizeof(acc) - 1) {
-                memcpy(acc + acc_len, rx, len);
-                acc_len += len;
-                acc[acc_len] = '\0';
-            }
-            char *fp = strstr(acc, "[PCAP_FINAL]");
-            if (fp) {
-                gw_extract_ulong(fp, " frames=", &frames);
-                gw_extract_ulong(fp, " drops=", &drops);
-                if (ctx->gw_pcap_filename[0] == '\0') {
-                    gw_extract_pcap_name(fp, ctx->gw_pcap_filename, sizeof(ctx->gw_pcap_filename));
-                }
-                got_summary = true;
-                break;
-            }
-        }
-        elapsed += 200;
-    }
-
-    bsp_display_lock(0);
-
-    if (ctx->gw_stop_btn) lv_obj_add_flag(ctx->gw_stop_btn, LV_OBJ_FLAG_HIDDEN);
-    if (ctx->gw_close_btn) lv_obj_clear_flag(ctx->gw_close_btn, LV_OBJ_FLAG_HIDDEN);
-
-    if (ctx->gw_stats_label) {
-        if (got_summary) {
-            lv_label_set_text_fmt(ctx->gw_stats_label,
-                "%s  Gateway stopped\n"
-                "File: %s\n"
-                "Frames: %lu    Drops: %lu\n\n"
-                "Copy it to Tab5 from ESPShark\n(READ FROM MONSTER / COPY TO TAB5).",
-                drops > 0 ? LV_SYMBOL_WARNING : LV_SYMBOL_OK,
-                ctx->gw_pcap_filename[0] ? ctx->gw_pcap_filename : "(unknown)",
-                frames, drops);
+    if (bsp_display_lock(500)) {
+        if (ok) {
+            // Fold step 1 away; step 2 becomes the part of the page you work in.
+            gitm_collapse_upstream(ctx);
+            if (ctx->gitm->step2) lv_obj_clear_flag(ctx->gitm->step2, LV_OBJ_FLAG_HIDDEN);
+            ctx->gitm->s2_collapsed = false;
+            gitm_set_collapsed(ctx->gitm->s2_content, ctx->gitm->s2_chev, false);
+            gitm_update_name_preview(ctx);
+            gitm_set_hint(ctx, "Name your GITM access point, then START.",
+                          lv_color_hex(0xCCCCCC));
         } else {
-            lv_label_set_text_fmt(ctx->gw_stats_label,
-                LV_SYMBOL_WARNING "  Stop sent, no [PCAP_FINAL] from JanOS\n"
-                "File: %s\n\n"
-                "Verify on the Monster that the capture closed.",
-                ctx->gw_pcap_filename[0] ? ctx->gw_pcap_filename : "(unknown)");
+            if (ctx->gitm->connect_btn) lv_obj_clear_state(ctx->gitm->connect_btn, LV_STATE_DISABLED);
+            if (ctx->gitm->scan_btn) lv_obj_clear_state(ctx->gitm->scan_btn, LV_STATE_DISABLED);
+            // JanOS could not resolve a saved credential; ask for one explicitly.
+            if (ctx->gitm->up_pass_row) lv_obj_clear_flag(ctx->gitm->up_pass_row, LV_OBJ_FLAG_HIDDEN);
+            gitm_set_hint(ctx,
+                "Upstream connect failed.\n"
+                "Enter the password manually, or pick another network.",
+                COLOR_MATERIAL_RED);
         }
-        lv_obj_set_style_text_color(ctx->gw_stats_label,
-            (got_summary && drops == 0) ? COLOR_MATERIAL_GREEN : COLOR_MATERIAL_AMBER, 0);
+        bsp_display_unlock();
+    }
+
+    gitm_set_state(ctx, GITM_IDLE, NULL, lv_color_hex(0xCCCCCC));
+    ctx->gitm->session_active = false;
+    vTaskDelete(NULL);
+}
+
+static void gitm_connect_cb(lv_event_t *e)
+{
+    (void)e;
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx || !ctx->gitm || ctx->gitm->session_active) return;
+    if (ctx->gitm->up_index < 0 || ctx->gitm->up_index >= ctx->gitm->net_count) {
+        gitm_set_hint(ctx, "Pick an upstream network first.", COLOR_MATERIAL_RED);
+        return;
+    }
+
+    wifi_network_t *net = &ctx->gitm->nets[ctx->gitm->up_index];
+    if (net->ssid[0] == '\0') {
+        gitm_set_hint(ctx,
+            "This network hides its SSID. Pick a named one, or reveal it\n"
+            "from the scan page first.", COLOR_MATERIAL_RED);
+        return;
+    }
+
+    const char *pass = ctx->gitm->up_pass_input
+                     ? lv_textarea_get_text(ctx->gitm->up_pass_input) : "";
+    if (!pass) pass = "";
+    if (strchr(net->ssid, '"') || strchr(pass, '"')) {
+        gitm_set_hint(ctx, "A double quote is not allowed in the SSID or password.",
+                      COLOR_MATERIAL_RED);
+        return;
+    }
+
+    snprintf(ctx->gitm->up_ssid, sizeof(ctx->gitm->up_ssid), "%s", net->ssid);
+    snprintf(ctx->gitm->up_pass, sizeof(ctx->gitm->up_pass), "%s", pass);
+    ctx->gitm->tab = (int)current_tab;
+    ctx->gitm->uart_port = uart_port_for_tab(current_tab);
+
+    if (ctx->gitm->keyboard) lv_obj_add_flag(ctx->gitm->keyboard, LV_OBJ_FLAG_HIDDEN);
+    if (ctx->gitm->connect_btn) lv_obj_add_state(ctx->gitm->connect_btn, LV_STATE_DISABLED);
+    if (ctx->gitm->scan_btn) lv_obj_add_state(ctx->gitm->scan_btn, LV_STATE_DISABLED);
+    gitm_set_state(ctx, GITM_CONNECTING, "Connecting the upstream Wi-Fi...",
+                   COLOR_MATERIAL_AMBER);
+
+    ctx->gitm->session_active = true;
+    if (xTaskCreate(gitm_connect_task, "gitm_conn", 6144, ctx, 5, NULL) != pdPASS) {
+        ctx->gitm->session_active = false;
+        ESP_LOGW(TAG, "GITM: failed to start the connect task");
+        gitm_set_state(ctx, GITM_IDLE, "Could not start the connect task.",
+                       COLOR_MATERIAL_RED);
     }
 }
 
-static void capture_gw_open(bool standalone, const char *up_ssid_in,
-                            const char *up_band, const char *up_security)
+static void gitm_start_cb(lv_event_t *e)
 {
+    (void)e;
     tab_context_t *ctx = get_current_ctx();
-    if (!ctx) return;
-    if (ctx->gw_popup != NULL) return;
+    if (!ctx || !ctx->gitm || ctx->gitm->session_active) return;
 
-    const char *ssid_display = (up_ssid_in && up_ssid_in[0]) ? up_ssid_in : "(Hidden)";
-    // Standalone can't know the upstream security, so always offer the password
-    // field (empty = open, or JanOS tries its saved credentials).
-    bool up_is_open = (!standalone) && wifi_network_security_is_open(up_security);
+    const char *ssid = ctx->gitm->ap_ssid_input
+                     ? lv_textarea_get_text(ctx->gitm->ap_ssid_input) : "";
+    const char *pass = ctx->gitm->ap_pass_input
+                     ? lv_textarea_get_text(ctx->gitm->ap_pass_input) : "";
+    const char *prefix = ctx->gitm->prefix_input
+                       ? lv_textarea_get_text(ctx->gitm->prefix_input) : "";
+    if (!ssid) ssid = "";
+    if (!pass) pass = "";
+    if (!prefix) prefix = "";
 
-    ctx->gw_standalone = standalone;
-    ctx->gw_up_is_open = up_is_open;
-    ctx->gw_running = false;
-    ctx->gw_monitor_task_handle = NULL;
-    ctx->gw_up_ssid_input = NULL;
-    ctx->gw_pcap_filename[0] = '\0';
-    ctx->gw_ap_ssid[0] = '\0';
+    if (ssid[0] == '\0') {
+        gitm_set_hint(ctx, "Give your access point a name (SSID).", COLOR_MATERIAL_RED);
+        return;
+    }
+    if (strlen(ssid) > 32) {
+        gitm_set_hint(ctx, "AP SSID is too long (32 characters max).", COLOR_MATERIAL_RED);
+        return;
+    }
+    // WPA2 only: JanOS rejects anything outside 8-63 bytes.
+    if (ctx->gitm->ap_wpa2 && (strlen(pass) < 8 || strlen(pass) > 63)) {
+        gitm_set_hint(ctx, "A WPA2 password must be 8-63 characters.", COLOR_MATERIAL_RED);
+        return;
+    }
+    // Every field is sent inside double quotes, so a literal quote would break
+    // parsing on JanOS. Refuse rather than mis-send.
+    if (strchr(ssid, '"') || strchr(pass, '"')) {
+        gitm_set_hint(ctx, "A double quote is not allowed in the SSID or password.",
+                      COLOR_MATERIAL_RED);
+        return;
+    }
+
+    snprintf(ctx->gitm->ap_ssid, sizeof(ctx->gitm->ap_ssid), "%s", ssid);
+    snprintf(ctx->gitm->ap_pass, sizeof(ctx->gitm->ap_pass), "%s",
+             ctx->gitm->ap_wpa2 ? pass : "");
+    gitm_build_pcap_basename(prefix[0] ? prefix : "gitm",
+                             ctx->gitm->pcap_basename, sizeof(ctx->gitm->pcap_basename));
+
+    ctx->gitm->tab = (int)current_tab;
+    ctx->gitm->uart_port = uart_port_for_tab(current_tab);
+    ctx->gitm->stop_request = false;
+    cgw_snapshot_reset(&ctx->gitm->snap);
+    memset(&ctx->gitm->final, 0, sizeof(ctx->gitm->final));
+    ctx->gitm->client_sig[0] = '\0';
+
+    if (ctx->gitm->keyboard) lv_obj_add_flag(ctx->gitm->keyboard, LV_OBJ_FLAG_HIDDEN);
+    // Both setup steps fold to a one-line summary; the live view takes over.
+    gitm_collapse_upstream(ctx);
+    gitm_collapse_ap(ctx);
+    if (ctx->gitm->live) lv_obj_clear_flag(ctx->gitm->live, LV_OBJ_FLAG_HIDDEN);
+    if (ctx->gitm->stop_btn) {
+        lv_obj_clear_flag(ctx->gitm->stop_btn, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_state(ctx->gitm->stop_btn, LV_STATE_DISABLED);
+    }
+    if (ctx->gitm->copy_btn) lv_obj_add_flag(ctx->gitm->copy_btn, LV_OBJ_FLAG_HIDDEN);
+    gitm_render_live(ctx);
+
+    ctx->gitm->session_active = true;
+    if (xTaskCreate(gitm_session_task, "gitm_session", 8192, ctx, 4,
+                    &ctx->gitm->session_task) != pdPASS) {
+        ctx->gitm->session_active = false;
+        ctx->gitm->session_task = NULL;
+        ESP_LOGW(TAG, "GITM: failed to start the session task");
+        gitm_set_state(ctx, GITM_IDLE, "Could not start the session task.",
+                       COLOR_MATERIAL_RED);
+        gitm_restore_setup(ctx);
+    }
+}
+
+static void gitm_stop_cb(lv_event_t *e)
+{
+    (void)e;
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx || !ctx->gitm || !ctx->gitm->session_active) return;
+
+    ESP_LOGI(TAG, "GITM: stop requested");
+    ctx->gitm->stop_request = true;
+    if (ctx->gitm->stop_btn) lv_obj_add_state(ctx->gitm->stop_btn, LV_STATE_DISABLED);
+    gitm_set_state(ctx, GITM_STOPPING, "Stopping and finalizing the PCAP...",
+                   COLOR_MATERIAL_AMBER);
+}
+
+// Hand the finalized capture to ESPShark, which already implements the
+// JanOS-Admin HTTP transfer described in contract section 8.7.
+static void gitm_copy_cb(lv_event_t *e)
+{
+    (void)e;
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx || !ctx->gitm) return;
+
+    const char *remote = ctx->gitm->final.file[0] ? ctx->gitm->final.file
+                                                 : ctx->gitm->snap.file;
+    if (remote[0] == '\0') {
+        gitm_set_hint(ctx, "No finalized capture path to copy.", COLOR_MATERIAL_RED);
+        return;
+    }
+    ESP_LOGI(TAG, "GITM: handing %s over to ESPShark", remote);
+    show_espshark_page();
+}
+
+// ---- Leaving a live GITM session ------------------------------------------
+//
+// Walking out silently is worse here than in the observer: the stop is what
+// drains the writer, closes the PCAP and emits [PCAP_FINAL]. Leaving while that
+// is still in flight means the next command collides with it, and the operator
+// has no idea whether the capture on the Monster is a complete file yet.
+
+static lv_obj_t *gitm_exit_overlay = NULL;
+static lv_obj_t *gitm_exit_status = NULL;
+static lv_obj_t *gitm_exit_btn_row = NULL;
+
+static void close_gitm_exit_confirm(void)
+{
+    if (gitm_exit_overlay) {
+        lv_obj_del(gitm_exit_overlay);
+        gitm_exit_overlay = NULL;
+    }
+    gitm_exit_status = NULL;
+    gitm_exit_btn_row = NULL;
+}
+
+// Leave the page for real. Call with the display lock held.
+static void gitm_leave_page(tab_context_t *ctx)
+{
+    if (ctx->gitm->keyboard) lv_obj_add_flag(ctx->gitm->keyboard, LV_OBJ_FLAG_HIDDEN);
+    if (ctx->gitm->page) lv_obj_add_flag(ctx->gitm->page, LV_OBJ_FLAG_HIDDEN);
+
+    ctx->observer_attack_return_to_observer = false;
+    clear_observer_attack_override(ctx);
+
+    if (ctx->tiles) {
+        lv_obj_clear_flag(ctx->tiles, LV_OBJ_FLAG_HIDDEN);
+        ctx->current_visible_page = ctx->tiles;
+    }
+}
+
+// The session task owns the stop sequence; this just watches it finish so the
+// page is not torn away from under a capture that is still being closed.
+static void gitm_exit_wait_task(void *arg)
+{
+    tab_context_t *ctx = (tab_context_t *)arg;
+
+    int waited = 0;
+    while (ctx->gitm->session_active && waited < 30000) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        waited += 100;
+    }
+    if (ctx->gitm->session_active) {
+        ESP_LOGW(TAG, "GITM: session still finalizing after %d ms, leaving anyway", waited);
+    } else {
+        ESP_LOGI(TAG, "GITM: session finalized after %d ms, leaving the page", waited);
+    }
+
+    if (bsp_display_lock(0)) {
+        close_gitm_exit_confirm();
+        gitm_leave_page(ctx);
+        bsp_display_unlock();
+    }
+    vTaskDelete(NULL);
+}
+
+static void gitm_exit_cancel_cb(lv_event_t *e)
+{
+    (void)e;
+    close_gitm_exit_confirm();
+}
+
+static void gitm_exit_confirm_cb(lv_event_t *e)
+{
+    (void)e;
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx || !ctx->gitm) return;
+
+    ctx->gitm->stop_request = true;
+    ESP_LOGI(TAG, "GITM: leaving the page, stop requested");
+
+    if (gitm_exit_btn_row) lv_obj_add_flag(gitm_exit_btn_row, LV_OBJ_FLAG_HIDDEN);
+    if (gitm_exit_status) {
+        lv_label_set_text(gitm_exit_status,
+                          "Stopping and finalizing the PCAP...\n"
+                          "Waiting for JanOS to close the file.");
+        lv_obj_set_style_text_color(gitm_exit_status, COLOR_MATERIAL_AMBER, 0);
+    }
+
+    if (xTaskCreate(gitm_exit_wait_task, "gitm_exit", 4096, ctx, 5, NULL) != pdPASS) {
+        // Could not watch it finish, but the stop is already requested, so do
+        // not trap the operator on the page.
+        ESP_LOGW(TAG, "GITM: could not start the exit waiter, leaving immediately");
+        close_gitm_exit_confirm();
+        gitm_leave_page(ctx);
+    }
+}
+
+static void show_gitm_exit_confirm(void)
+{
+    if (gitm_exit_overlay != NULL) return;
 
     lv_obj_t *container = get_current_tab_container();
     if (!container) return;
 
-    ctx->gw_popup_overlay = lv_obj_create(container);
-    lv_obj_remove_style_all(ctx->gw_popup_overlay);
-    lv_obj_set_size(ctx->gw_popup_overlay, lv_pct(100), lv_pct(100));
-    lv_obj_set_style_bg_color(ctx->gw_popup_overlay, lv_color_hex(0x000000), 0);
-    lv_obj_set_style_bg_opa(ctx->gw_popup_overlay, LV_OPA_50, 0);
-    lv_obj_clear_flag(ctx->gw_popup_overlay, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(ctx->gw_popup_overlay, LV_OBJ_FLAG_CLICKABLE);
+    gitm_exit_overlay = lv_obj_create(container);
+    lv_obj_remove_style_all(gitm_exit_overlay);
+    lv_obj_set_size(gitm_exit_overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(gitm_exit_overlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(gitm_exit_overlay, LV_OPA_50, 0);
+    lv_obj_clear_flag(gitm_exit_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(gitm_exit_overlay, LV_OBJ_FLAG_CLICKABLE);
 
-    ctx->gw_popup = lv_obj_create(ctx->gw_popup_overlay);
-    lv_obj_set_size(ctx->gw_popup, 560, standalone ? 530 : 470);
-    lv_obj_center(ctx->gw_popup);
-    lv_obj_set_style_bg_color(ctx->gw_popup, lv_color_hex(0x101826), 0);
-    lv_obj_set_style_border_color(ctx->gw_popup, COLOR_MATERIAL_BLUE, 0);
-    lv_obj_set_style_border_width(ctx->gw_popup, 2, 0);
-    lv_obj_set_style_radius(ctx->gw_popup, 16, 0);
-    lv_obj_set_style_shadow_width(ctx->gw_popup, 30, 0);
-    lv_obj_set_style_shadow_color(ctx->gw_popup, lv_color_hex(0x000000), 0);
-    lv_obj_set_style_shadow_opa(ctx->gw_popup, LV_OPA_50, 0);
-    lv_obj_set_style_pad_all(ctx->gw_popup, 20, 0);
-    lv_obj_set_flex_flow(ctx->gw_popup, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_pad_row(ctx->gw_popup, 10, 0);
-    lv_obj_set_flex_align(ctx->gw_popup, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+    lv_obj_t *popup = lv_obj_create(gitm_exit_overlay);
+    lv_obj_set_size(popup, 560, 380);
+    lv_obj_center(popup);
+    lv_obj_set_style_bg_color(popup, lv_color_hex(0x0A1A1A), 0);
+    lv_obj_set_style_border_color(popup, COLOR_MATERIAL_BLUE, 0);
+    lv_obj_set_style_border_width(popup, 2, 0);
+    lv_obj_set_style_radius(popup, 16, 0);
+    lv_obj_set_style_shadow_width(popup, 30, 0);
+    lv_obj_set_style_shadow_color(popup, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_shadow_opa(popup, LV_OPA_50, 0);
+    lv_obj_set_style_pad_all(popup, 20, 0);
+    lv_obj_set_flex_flow(popup, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(popup, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
                           LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(popup, 14, 0);
+    lv_obj_clear_flag(popup, LV_OBJ_FLAG_SCROLLABLE);
 
-    lv_obj_t *title = lv_label_create(ctx->gw_popup);
-    lv_label_set_text_fmt(title, LV_SYMBOL_LOOP "  Capture Gateway");
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_t *icon = lv_label_create(popup);
+    lv_label_set_text(icon, LV_SYMBOL_LOOP);
+    lv_obj_set_style_text_font(icon, &lv_font_montserrat_44, 0);
+    lv_obj_set_style_text_color(icon, COLOR_MATERIAL_BLUE, 0);
+
+    lv_obj_t *title = lv_label_create(popup);
+    lv_label_set_text(title, "GITM IS RUNNING");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_22, 0);
     lv_obj_set_style_text_color(title, COLOR_MATERIAL_BLUE, 0);
 
-    lv_obj_t *info_label = lv_label_create(ctx->gw_popup);
-    if (standalone) {
-        lv_label_set_text(info_label, "Standalone - enter the upstream Wi-Fi to bridge");
-    } else {
-        lv_label_set_text_fmt(info_label, "Upstream: %s  |  %s  |  %s",
-                              ssid_display, up_band ? up_band : "-",
-                              up_security ? up_security : "-");
-    }
-    lv_obj_set_style_text_font(info_label, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(info_label, lv_color_hex(0xAAAAAA), 0);
+    gitm_exit_status = lv_label_create(popup);
+    lv_label_set_text(gitm_exit_status,
+                      "Leaving sends stop to JanOS: it closes any\n"
+                      "open capture and takes the gateway down.\n"
+                      "Clients on the AP lose their connection.");
+    lv_obj_set_style_text_font(gitm_exit_status, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(gitm_exit_status, lv_color_hex(0xCCCCCC), 0);
+    lv_obj_set_style_text_align(gitm_exit_status, LV_TEXT_ALIGN_CENTER, 0);
 
-    // ---- Setup phase container (inputs + Start/Cancel) ----
-    ctx->gw_input_col = lv_obj_create(ctx->gw_popup);
-    lv_obj_set_size(ctx->gw_input_col, lv_pct(100), LV_SIZE_CONTENT);
-    lv_obj_set_style_bg_opa(ctx->gw_input_col, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(ctx->gw_input_col, 0, 0);
-    lv_obj_set_style_pad_all(ctx->gw_input_col, 0, 0);
-    lv_obj_set_flex_flow(ctx->gw_input_col, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_pad_row(ctx->gw_input_col, 10, 0);
-    lv_obj_set_flex_align(ctx->gw_input_col, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
-                          LV_FLEX_ALIGN_CENTER);
-    lv_obj_clear_flag(ctx->gw_input_col, LV_OBJ_FLAG_SCROLLABLE);
+    gitm_exit_btn_row = lv_obj_create(popup);
+    lv_obj_remove_style_all(gitm_exit_btn_row);
+    lv_obj_set_size(gitm_exit_btn_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(gitm_exit_btn_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(gitm_exit_btn_row, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(gitm_exit_btn_row, 20, 0);
+    lv_obj_set_style_pad_top(gitm_exit_btn_row, 8, 0);
 
-    // Upstream SSID (standalone only) - the network JanOS connects to as client.
-    if (standalone) {
-        lv_obj_t *ups_row = lv_obj_create(ctx->gw_input_col);
-        lv_obj_set_size(ups_row, lv_pct(100), LV_SIZE_CONTENT);
-        lv_obj_set_style_bg_opa(ups_row, LV_OPA_TRANSP, 0);
-        lv_obj_set_style_border_width(ups_row, 0, 0);
-        lv_obj_set_style_pad_all(ups_row, 0, 0);
-        lv_obj_set_flex_flow(ups_row, LV_FLEX_FLOW_ROW);
-        lv_obj_set_flex_align(ups_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
-                              LV_FLEX_ALIGN_CENTER);
-        lv_obj_set_style_pad_column(ups_row, 10, 0);
-        lv_obj_clear_flag(ups_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *stay_btn = lv_btn_create(gitm_exit_btn_row);
+    lv_obj_set_size(stay_btn, 170, 54);
+    lv_obj_set_style_bg_color(stay_btn, lv_color_hex(0x1A3333), 0);
+    lv_obj_set_style_bg_color(stay_btn, lv_color_hex(0x2A4444), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(stay_btn, 8, 0);
+    lv_obj_add_event_cb(stay_btn, gitm_exit_cancel_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *stay_lbl = lv_label_create(stay_btn);
+    lv_label_set_text(stay_lbl, "Keep capturing");
+    lv_obj_set_style_text_font(stay_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_center(stay_lbl);
 
-        lv_obj_t *ups_label = lv_label_create(ups_row);
-        lv_label_set_text(ups_label, "Upstream:");
-        lv_obj_set_style_text_font(ups_label, &lv_font_montserrat_14, 0);
-        lv_obj_set_style_text_color(ups_label, lv_color_hex(0xFFFFFF), 0);
-
-        ctx->gw_up_ssid_input = lv_textarea_create(ups_row);
-        lv_obj_set_size(ctx->gw_up_ssid_input, 330, 40);
-        lv_textarea_set_one_line(ctx->gw_up_ssid_input, true);
-        lv_textarea_set_max_length(ctx->gw_up_ssid_input, 32);
-        lv_textarea_set_placeholder_text(ctx->gw_up_ssid_input, "SSID to connect to");
-        lv_obj_set_style_bg_color(ctx->gw_up_ssid_input, lv_color_hex(0x1A1A1A), 0);
-        lv_obj_set_style_border_color(ctx->gw_up_ssid_input, COLOR_MATERIAL_BLUE, 0);
-        lv_obj_set_style_border_width(ctx->gw_up_ssid_input, 1, 0);
-        lv_obj_set_style_text_color(ctx->gw_up_ssid_input, lv_color_hex(0xFFFFFF), 0);
-        lv_obj_add_event_cb(ctx->gw_up_ssid_input, capture_gw_focus_cb, LV_EVENT_CLICKED, NULL);
-        lv_obj_add_event_cb(ctx->gw_up_ssid_input, capture_gw_focus_cb, LV_EVENT_FOCUSED, NULL);
-    }
-
-    // Upstream password (hidden for open networks; empty = JanOS tries saved).
-    if (!up_is_open) {
-        lv_obj_t *up_row = lv_obj_create(ctx->gw_input_col);
-        lv_obj_set_size(up_row, lv_pct(100), LV_SIZE_CONTENT);
-        lv_obj_set_style_bg_opa(up_row, LV_OPA_TRANSP, 0);
-        lv_obj_set_style_border_width(up_row, 0, 0);
-        lv_obj_set_style_pad_all(up_row, 0, 0);
-        lv_obj_set_flex_flow(up_row, LV_FLEX_FLOW_ROW);
-        lv_obj_set_flex_align(up_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
-                              LV_FLEX_ALIGN_CENTER);
-        lv_obj_set_style_pad_column(up_row, 10, 0);
-        lv_obj_clear_flag(up_row, LV_OBJ_FLAG_SCROLLABLE);
-
-        lv_obj_t *up_label = lv_label_create(up_row);
-        lv_label_set_text(up_label, "Upstream pass:");
-        lv_obj_set_style_text_font(up_label, &lv_font_montserrat_14, 0);
-        lv_obj_set_style_text_color(up_label, lv_color_hex(0xFFFFFF), 0);
-
-        ctx->gw_up_pass_input = lv_textarea_create(up_row);
-        lv_obj_set_size(ctx->gw_up_pass_input, 300, 40);
-        lv_textarea_set_one_line(ctx->gw_up_pass_input, true);
-        lv_textarea_set_password_mode(ctx->gw_up_pass_input, true);
-        lv_textarea_set_placeholder_text(ctx->gw_up_pass_input, "empty = try saved on JanOS");
-        lv_obj_set_style_bg_color(ctx->gw_up_pass_input, lv_color_hex(0x1A1A1A), 0);
-        lv_obj_set_style_border_color(ctx->gw_up_pass_input, COLOR_MATERIAL_BLUE, 0);
-        lv_obj_set_style_border_width(ctx->gw_up_pass_input, 1, 0);
-        lv_obj_set_style_text_color(ctx->gw_up_pass_input, lv_color_hex(0xFFFFFF), 0);
-        lv_obj_add_event_cb(ctx->gw_up_pass_input, capture_gw_focus_cb, LV_EVENT_CLICKED, NULL);
-        lv_obj_add_event_cb(ctx->gw_up_pass_input, capture_gw_focus_cb, LV_EVENT_FOCUSED, NULL);
-    }
-
-    // Gateway AP SSID (free text).
-    lv_obj_t *ssid_row = lv_obj_create(ctx->gw_input_col);
-    lv_obj_set_size(ssid_row, lv_pct(100), LV_SIZE_CONTENT);
-    lv_obj_set_style_bg_opa(ssid_row, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(ssid_row, 0, 0);
-    lv_obj_set_style_pad_all(ssid_row, 0, 0);
-    lv_obj_set_flex_flow(ssid_row, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(ssid_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
-                          LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_column(ssid_row, 10, 0);
-    lv_obj_clear_flag(ssid_row, LV_OBJ_FLAG_SCROLLABLE);
-
-    lv_obj_t *ssid_label = lv_label_create(ssid_row);
-    lv_label_set_text(ssid_label, "GW SSID:");
-    lv_obj_set_style_text_font(ssid_label, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(ssid_label, lv_color_hex(0xFFFFFF), 0);
-
-    ctx->gw_ssid_input = lv_textarea_create(ssid_row);
-    lv_obj_set_size(ctx->gw_ssid_input, 330, 40);
-    lv_textarea_set_one_line(ctx->gw_ssid_input, true);
-    lv_textarea_set_max_length(ctx->gw_ssid_input, 32);
-    lv_textarea_set_placeholder_text(ctx->gw_ssid_input, "name of your gateway AP");
-    lv_obj_set_style_bg_color(ctx->gw_ssid_input, lv_color_hex(0x1A1A1A), 0);
-    lv_obj_set_style_border_color(ctx->gw_ssid_input, COLOR_MATERIAL_BLUE, 0);
-    lv_obj_set_style_border_width(ctx->gw_ssid_input, 1, 0);
-    lv_obj_set_style_text_color(ctx->gw_ssid_input, lv_color_hex(0xFFFFFF), 0);
-    lv_obj_add_event_cb(ctx->gw_ssid_input, capture_gw_focus_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_add_event_cb(ctx->gw_ssid_input, capture_gw_focus_cb, LV_EVENT_FOCUSED, NULL);
-
-    // Gateway AP password (empty = open).
-    lv_obj_t *pass_row = lv_obj_create(ctx->gw_input_col);
-    lv_obj_set_size(pass_row, lv_pct(100), LV_SIZE_CONTENT);
-    lv_obj_set_style_bg_opa(pass_row, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(pass_row, 0, 0);
-    lv_obj_set_style_pad_all(pass_row, 0, 0);
-    lv_obj_set_flex_flow(pass_row, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(pass_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
-                          LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_column(pass_row, 10, 0);
-    lv_obj_clear_flag(pass_row, LV_OBJ_FLAG_SCROLLABLE);
-
-    lv_obj_t *pass_label = lv_label_create(pass_row);
-    lv_label_set_text(pass_label, "GW pass:");
-    lv_obj_set_style_text_font(pass_label, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(pass_label, lv_color_hex(0xFFFFFF), 0);
-
-    ctx->gw_pass_input = lv_textarea_create(pass_row);
-    lv_obj_set_size(ctx->gw_pass_input, 330, 40);
-    lv_textarea_set_one_line(ctx->gw_pass_input, true);
-    lv_textarea_set_password_mode(ctx->gw_pass_input, true);
-    lv_textarea_set_placeholder_text(ctx->gw_pass_input, "empty = open AP");
-    lv_obj_set_style_bg_color(ctx->gw_pass_input, lv_color_hex(0x1A1A1A), 0);
-    lv_obj_set_style_border_color(ctx->gw_pass_input, COLOR_MATERIAL_BLUE, 0);
-    lv_obj_set_style_border_width(ctx->gw_pass_input, 1, 0);
-    lv_obj_set_style_text_color(ctx->gw_pass_input, lv_color_hex(0xFFFFFF), 0);
-    lv_obj_add_event_cb(ctx->gw_pass_input, capture_gw_focus_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_add_event_cb(ctx->gw_pass_input, capture_gw_focus_cb, LV_EVENT_FOCUSED, NULL);
-
-    // Buttons: Start / Cancel
-    lv_obj_t *btn_row = lv_obj_create(ctx->gw_input_col);
-    lv_obj_set_size(btn_row, lv_pct(100), LV_SIZE_CONTENT);
-    lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(btn_row, 0, 0);
-    lv_obj_set_style_pad_all(btn_row, 0, 0);
-    lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
-                          LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_column(btn_row, 10, 0);
-    lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
-
-    lv_obj_t *start_btn = lv_btn_create(btn_row);
-    lv_obj_set_size(start_btn, 250, 50);
-    lv_obj_set_style_bg_color(start_btn, COLOR_MATERIAL_GREEN, 0);
-    lv_obj_set_style_bg_color(start_btn, lv_color_hex(0x2E7D32), LV_STATE_PRESSED);
-    lv_obj_set_style_radius(start_btn, 8, 0);
-    lv_obj_add_event_cb(start_btn, capture_gw_start_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *start_label = lv_label_create(start_btn);
-    lv_label_set_text(start_label, LV_SYMBOL_PLAY " Start Gateway");
-    lv_obj_set_style_text_font(start_label, &lv_font_montserrat_16, 0);
-    lv_obj_center(start_label);
-
-    lv_obj_t *cancel_btn = lv_btn_create(btn_row);
-    lv_obj_set_size(cancel_btn, 150, 50);
-    lv_obj_set_style_bg_color(cancel_btn, lv_color_hex(0x555555), 0);
-    lv_obj_set_style_bg_color(cancel_btn, lv_color_hex(0x333333), LV_STATE_PRESSED);
-    lv_obj_set_style_radius(cancel_btn, 8, 0);
-    lv_obj_add_event_cb(cancel_btn, capture_gw_close_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *cancel_label = lv_label_create(cancel_btn);
-    lv_label_set_text(cancel_label, "Cancel");
-    lv_obj_set_style_text_font(cancel_label, &lv_font_montserrat_16, 0);
-    lv_obj_center(cancel_label);
-
-    // ---- Setup hint / error line ----
-    ctx->gw_status_label = lv_label_create(ctx->gw_popup);
-    lv_label_set_text(ctx->gw_status_label,
-                      standalone ? "Enter upstream Wi-Fi (+password if needed) and name\n"
-                                   "the gateway AP, then Start."
-                                 : up_is_open ? "Open upstream. Name the gateway AP, then Start."
-                                              : "Enter upstream password (or leave empty to use\n"
-                                                "saved JanOS credentials), name the AP, then Start.");
-    lv_obj_set_style_text_font(ctx->gw_status_label, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(ctx->gw_status_label, lv_color_hex(0xCCCCCC), 0);
-    lv_obj_set_style_text_align(ctx->gw_status_label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_width(ctx->gw_status_label, lv_pct(100));
-
-    // ---- Running / stopped phase: live stats (hidden until started) ----
-    ctx->gw_stats_label = lv_label_create(ctx->gw_popup);
-    lv_label_set_text(ctx->gw_stats_label, "");
-    lv_obj_set_style_text_font(ctx->gw_stats_label, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(ctx->gw_stats_label, COLOR_MATERIAL_GREEN, 0);
-    lv_obj_set_style_text_align(ctx->gw_stats_label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_width(ctx->gw_stats_label, lv_pct(100));
-    lv_obj_add_flag(ctx->gw_stats_label, LV_OBJ_FLAG_HIDDEN);
-
-    // ---- STOP button (hidden until running) ----
-    ctx->gw_stop_btn = lv_btn_create(ctx->gw_popup);
-    lv_obj_set_size(ctx->gw_stop_btn, lv_pct(100), 50);
-    lv_obj_set_style_bg_color(ctx->gw_stop_btn, COLOR_MATERIAL_RED, 0);
-    lv_obj_set_style_bg_color(ctx->gw_stop_btn, lv_color_hex(0xCC0000), LV_STATE_PRESSED);
-    lv_obj_set_style_radius(ctx->gw_stop_btn, 8, 0);
-    lv_obj_add_event_cb(ctx->gw_stop_btn, capture_gw_stop_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_add_flag(ctx->gw_stop_btn, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_t *stop_label = lv_label_create(ctx->gw_stop_btn);
-    lv_label_set_text(stop_label, LV_SYMBOL_STOP " STOP GATEWAY");
-    lv_obj_set_style_text_font(stop_label, &lv_font_montserrat_18, 0);
-    lv_obj_center(stop_label);
-
-    // ---- Close button (hidden until stopped) ----
-    ctx->gw_close_btn = lv_btn_create(ctx->gw_popup);
-    lv_obj_set_size(ctx->gw_close_btn, lv_pct(100), 50);
-    lv_obj_set_style_bg_color(ctx->gw_close_btn, COLOR_MATERIAL_BLUE, 0);
-    lv_obj_set_style_bg_color(ctx->gw_close_btn, lv_color_hex(0x1565C0), LV_STATE_PRESSED);
-    lv_obj_set_style_radius(ctx->gw_close_btn, 8, 0);
-    lv_obj_add_event_cb(ctx->gw_close_btn, capture_gw_close_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_add_flag(ctx->gw_close_btn, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_t *close_label = lv_label_create(ctx->gw_close_btn);
-    lv_label_set_text(close_label, "Close");
-    lv_obj_set_style_text_font(close_label, &lv_font_montserrat_16, 0);
-    lv_obj_center(close_label);
-
-    // ---- Shared on-screen keyboard ----
-    ctx->gw_keyboard = lv_keyboard_create(ctx->gw_popup_overlay);
-    lv_obj_set_size(ctx->gw_keyboard, lv_pct(100), 260);
-    lv_obj_align(ctx->gw_keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
-    style_on_screen_keyboard(ctx->gw_keyboard);
-    lv_keyboard_set_textarea(ctx->gw_keyboard, ctx->gw_ssid_input);
-    lv_obj_add_event_cb(ctx->gw_keyboard, capture_gw_keyboard_cb, LV_EVENT_ALL, NULL);
-    lv_obj_add_flag(ctx->gw_keyboard, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_t *quit_btn = lv_btn_create(gitm_exit_btn_row);
+    lv_obj_set_size(quit_btn, 210, 54);
+    lv_obj_set_style_bg_color(quit_btn, COLOR_MATERIAL_RED, 0);
+    lv_obj_set_style_bg_color(quit_btn, lv_color_hex(0xCC0000), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(quit_btn, 8, 0);
+    lv_obj_add_event_cb(quit_btn, gitm_exit_confirm_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *quit_lbl = lv_label_create(quit_btn);
+    lv_label_set_text(quit_lbl, LV_SYMBOL_STOP " Stop and exit");
+    lv_obj_set_style_text_font(quit_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_center(quit_lbl);
 }
 
-// Scan-based entry: upstream is the single selected network from the attack view.
-static void show_capture_gw_popup(void)
+static void gitm_back_cb(lv_event_t *e)
+{
+    (void)e;
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx || !ctx->gitm) return;
+
+    // A live bridge must never be abandoned over an open PCAP: ask, then let the
+    // session task run its stop sequence to completion before the page closes.
+    // Only the states where JanOS may actually hold a gateway qualify - a scan
+    // or an upstream connect leaves nothing running - and a stop already in
+    // flight needs no second prompt.
+    const int st = ctx->gitm->state;
+    const bool gateway_may_be_up = (st == GITM_STARTING || st == GITM_RECOVERING ||
+                                    st == GITM_RUNNING);
+    if (ctx->gitm->session_active && gateway_may_be_up && !ctx->gitm->stop_request) {
+        ESP_LOGI(TAG, "GITM: gateway may be up (state %s), asking before leaving",
+                 gitm_state_name(st));
+        show_gitm_exit_confirm();
+        return;
+    }
+
+    gitm_leave_page(ctx);
+}
+
+// ---------------------------------------------------------------------------
+// Page construction
+// ---------------------------------------------------------------------------
+
+// A collapsible step panel, styled to match the Network Observer page.
+//
+// The header stays visible at all times and carries a chevron, the step title
+// and a one-line summary of what was chosen; the content column folds away once
+// the step is settled, so the step you are actually working on owns the screen.
+static lv_obj_t *gitm_make_section(lv_obj_t *parent, const char *title,
+                                   lv_color_t accent, lv_event_cb_t toggle_cb,
+                                   void *toggle_data,
+                                   lv_obj_t **out_chev, lv_obj_t **out_summary,
+                                   lv_obj_t **out_content)
+{
+    lv_obj_t *box = lv_obj_create(parent);
+    lv_obj_set_size(box, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_color(box, lv_color_hex(0x0A1A1A), 0);
+    lv_obj_set_style_border_color(box, lv_color_hex(0x1A3333), 0);
+    lv_obj_set_style_border_width(box, 1, 0);
+    lv_obj_set_style_radius(box, 12, 0);
+    lv_obj_set_style_pad_all(box, 12, 0);
+    lv_obj_set_flex_flow(box, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(box, 8, 0);
+    lv_obj_clear_flag(box, LV_OBJ_FLAG_SCROLLABLE);
+
+    // ---- header (always visible, tap to fold) ----
+    lv_obj_t *head = lv_obj_create(box);
+    lv_obj_set_size(head, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(head, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(head, 0, 0);
+    lv_obj_set_style_pad_all(head, 0, 0);
+    lv_obj_set_flex_flow(head, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(head, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(head, 10, 0);
+    lv_obj_clear_flag(head, LV_OBJ_FLAG_SCROLLABLE);
+    if (toggle_cb) {
+        lv_obj_add_flag(head, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(head, toggle_cb, LV_EVENT_CLICKED, toggle_data);
+    }
+
+    lv_obj_t *chev = lv_label_create(head);
+    lv_label_set_text(chev, LV_SYMBOL_DOWN);
+    lv_obj_set_style_text_font(chev, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(chev, accent, 0);
+    lv_obj_clear_flag(chev, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t *title_lbl = lv_label_create(head);
+    lv_label_set_text(title_lbl, title ? title : "");
+    lv_obj_set_style_text_font(title_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(title_lbl, accent, 0);
+    lv_obj_clear_flag(title_lbl, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t *summary = lv_label_create(head);
+    lv_label_set_text(summary, "");
+    lv_obj_set_style_text_font(summary, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(summary, lv_color_hex(0xCCCCCC), 0);
+    lv_obj_set_flex_grow(summary, 1);
+    lv_label_set_long_mode(summary, LV_LABEL_LONG_DOT);
+    lv_obj_clear_flag(summary, LV_OBJ_FLAG_CLICKABLE);
+
+    // ---- content (folds away) ----
+    lv_obj_t *content = lv_obj_create(box);
+    lv_obj_set_size(content, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(content, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(content, 0, 0);
+    lv_obj_set_style_pad_all(content, 0, 0);
+    lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(content, 8, 0);
+    lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLLABLE);
+
+    if (out_chev) *out_chev = chev;
+    if (out_summary) *out_summary = summary;
+    if (out_content) *out_content = content;
+    return box;
+}
+
+// Fold or unfold one section and point its chevron the right way.
+static void gitm_set_collapsed(lv_obj_t *content, lv_obj_t *chev, bool collapsed)
+{
+    if (content) {
+        if (collapsed) {
+            lv_obj_add_flag(content, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_clear_flag(content, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    if (chev) lv_label_set_text(chev, collapsed ? LV_SYMBOL_RIGHT : LV_SYMBOL_DOWN);
+}
+
+static void gitm_toggle_section_cb(lv_event_t *e)
 {
     tab_context_t *ctx = get_current_ctx();
-    if (!ctx) return;
-    scan_view_t v = get_scan_view(ctx);
-    if (v.sel_count == 0) return;
-    int idx = v.sel_indices[0];
-    if (idx < 0 || idx >= v.net_count) return;
-    wifi_network_t *net = &v.nets[idx];
-    capture_gw_open(false, net->ssid, net->band, net->security);
+    if (!ctx || !ctx->gitm) return;
+    int which = (int)(intptr_t)lv_event_get_user_data(e);
+
+    if (which == 1) {
+        ctx->gitm->s1_collapsed = !ctx->gitm->s1_collapsed;
+        gitm_set_collapsed(ctx->gitm->s1_content, ctx->gitm->s1_chev,
+                           ctx->gitm->s1_collapsed);
+    } else if (which == 2) {
+        ctx->gitm->s2_collapsed = !ctx->gitm->s2_collapsed;
+        gitm_set_collapsed(ctx->gitm->s2_content, ctx->gitm->s2_chev,
+                           ctx->gitm->s2_collapsed);
+    }
 }
 
-// Standalone entry (Global WiFi attack): the user types the upstream network.
-static void show_capture_gw_popup_standalone(void)
+// Fold step 1 down to "which upstream we are on".
+static void gitm_collapse_upstream(tab_context_t *ctx)
 {
-    capture_gw_open(true, "", "", "");
+    if (!ctx->gitm) return;
+    ctx->gitm->s1_collapsed = true;
+    gitm_set_collapsed(ctx->gitm->s1_content, ctx->gitm->s1_chev, true);
+    if (ctx->gitm->s1_summary) {
+        lv_label_set_text_fmt(ctx->gitm->s1_summary, LV_SYMBOL_OK "  %s",
+                              ctx->gitm->up_ssid[0] ? ctx->gitm->up_ssid : "connected");
+        lv_obj_set_style_text_color(ctx->gitm->s1_summary, COLOR_MATERIAL_GREEN, 0);
+    }
+}
+
+// Fold step 2 down to "what AP we raised and where it records".
+static void gitm_collapse_ap(tab_context_t *ctx)
+{
+    if (!ctx->gitm) return;
+    ctx->gitm->s2_collapsed = true;
+    gitm_set_collapsed(ctx->gitm->s2_content, ctx->gitm->s2_chev, true);
+    if (ctx->gitm->s2_summary) {
+        lv_label_set_text_fmt(ctx->gitm->s2_summary, LV_SYMBOL_OK "  %s  %s",
+                              ctx->gitm->ap_ssid[0] ? ctx->gitm->ap_ssid : "-",
+                              ctx->gitm->ap_wpa2 ? "WPA2" : "Open");
+        lv_obj_set_style_text_color(ctx->gitm->s2_summary, COLOR_MATERIAL_GREEN, 0);
+    }
+}
+
+// A "label + textarea" row, returned so the caller can hide the whole row.
+static lv_obj_t *gitm_make_field(lv_obj_t *parent, const char *label_text,
+                                 lv_obj_t **out_ta, const char *placeholder,
+                                 bool password, uint32_t max_len)
+{
+    lv_obj_t *row = lv_obj_create(parent);
+    lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(row, 0, 0);
+    lv_obj_set_style_pad_all(row, 0, 0);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(row, 10, 0);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *lbl = lv_label_create(row);
+    lv_label_set_text(lbl, label_text);
+    lv_obj_set_width(lbl, 160);
+    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(lbl, lv_color_hex(0xFFFFFF), 0);
+
+    lv_obj_t *ta = lv_textarea_create(row);
+    lv_obj_set_height(ta, 44);
+    lv_obj_set_flex_grow(ta, 1);
+    lv_textarea_set_one_line(ta, true);
+    if (max_len) lv_textarea_set_max_length(ta, max_len);
+    if (password) lv_textarea_set_password_mode(ta, true);
+    lv_textarea_set_placeholder_text(ta, placeholder);
+    lv_obj_set_style_bg_color(ta, lv_color_hex(0x102020), 0);
+    lv_obj_set_style_border_color(ta, lv_color_hex(0x1A3333), 0);
+    lv_obj_set_style_border_width(ta, 1, 0);
+    lv_obj_set_style_text_color(ta, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_add_event_cb(ta, gitm_focus_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(ta, gitm_focus_cb, LV_EVENT_FOCUSED, NULL);
+
+    if (out_ta) *out_ta = ta;
+    return row;
+}
+
+static lv_obj_t *gitm_make_button(lv_obj_t *parent, const char *text,
+                                  lv_color_t color, lv_color_t pressed,
+                                  int32_t w, lv_event_cb_t cb)
+{
+    lv_obj_t *btn = lv_btn_create(parent);
+    lv_obj_set_size(btn, w, 50);
+    lv_obj_set_style_bg_color(btn, color, 0);
+    lv_obj_set_style_bg_color(btn, pressed, LV_STATE_PRESSED);
+    lv_obj_set_style_bg_color(btn, lv_color_hex(0x2A3A3A), LV_STATE_DISABLED);
+    lv_obj_set_style_text_color(btn, lv_color_hex(0x7A8A8A), LV_STATE_DISABLED);
+    lv_obj_set_style_radius(btn, 8, 0);
+    lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *lbl = lv_label_create(btn);
+    lv_label_set_text(lbl, text);
+    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, 0);
+    lv_obj_center(lbl);
+    return btn;
+}
+
+// Ask JanOS what it is doing before offering to start anything. Section 8.6
+// requires this so a restarted UI attaches to a live gateway instead of
+// starting a second session on top of it.
+static void gitm_attach_task(void *arg)
+{
+    tab_context_t *ctx = (tab_context_t *)arg;
+    cgw_snapshot_t snap;
+    bool answered = gitm_query_status((tab_id_t)ctx->gitm->tab, ctx->gitm->uart_port,
+                                      &snap, true);
+
+    if (answered && snap.active && snap.capture_active) {
+        ESP_LOGI(TAG, "GITM: adopting a gateway already running on JanOS");
+        snprintf(ctx->gitm->ap_ssid, sizeof(ctx->gitm->ap_ssid), "%s", snap.ssid);
+        snprintf(ctx->gitm->up_ssid, sizeof(ctx->gitm->up_ssid), "%s", snap.upstream_ssid);
+        ctx->gitm->ap_wpa2 = (strcmp(snap.security, "wpa2") == 0);
+        ctx->gitm->stop_request = false;
+        ctx->gitm->client_sig[0] = '\0';
+
+        if (bsp_display_lock(500)) {
+            ctx->gitm->snap = snap;
+            gitm_collapse_upstream(ctx);
+            gitm_collapse_ap(ctx);
+            if (ctx->gitm->step2) lv_obj_clear_flag(ctx->gitm->step2, LV_OBJ_FLAG_HIDDEN);
+            if (ctx->gitm->live)  lv_obj_clear_flag(ctx->gitm->live, LV_OBJ_FLAG_HIDDEN);
+            if (ctx->gitm->stop_btn) {
+                lv_obj_clear_flag(ctx->gitm->stop_btn, LV_OBJ_FLAG_HIDDEN);
+                lv_obj_clear_state(ctx->gitm->stop_btn, LV_STATE_DISABLED);
+            }
+            if (ctx->gitm->copy_btn) lv_obj_add_flag(ctx->gitm->copy_btn, LV_OBJ_FLAG_HIDDEN);
+            gitm_render_live(ctx);
+            bsp_display_unlock();
+        }
+        gitm_set_state(ctx, GITM_RUNNING,
+                       "Adopted a GITM session already running on JanOS.",
+                       COLOR_MATERIAL_GREEN);
+
+        ctx->gitm->session_active = true;
+        if (xTaskCreate(gitm_adopt_task, "gitm_adopt", 8192, ctx, 4,
+                        &ctx->gitm->session_task) != pdPASS) {
+            ctx->gitm->session_active = false;
+            ctx->gitm->session_task = NULL;
+            ESP_LOGW(TAG, "GITM: failed to start the adopt task");
+        }
+        vTaskDelete(NULL);
+        return;
+    }
+
+    if (bsp_display_lock(500)) {
+        gitm_set_hint(ctx,
+            answered ? "JanOS is idle. Scan, then pick the network that provides Internet."
+                     : "No answer from JanOS. Check the Monster link, then SCAN.",
+            answered ? lv_color_hex(0xCCCCCC) : COLOR_MATERIAL_AMBER);
+        if (ctx->gitm->scan_btn) lv_obj_clear_state(ctx->gitm->scan_btn, LV_STATE_DISABLED);
+        bsp_display_unlock();
+    }
+    vTaskDelete(NULL);
+}
+
+static void show_gitm_page(void)
+{
+    tab_context_t *ctx = get_current_ctx();
+    lv_obj_t *container = get_current_tab_container();
+    if (!ctx || !container) return;
+    if (!gitm_ctx(ctx)) return;
+
+    hide_all_pages(ctx);
+
+    if (ctx->gitm->page) {
+        lv_obj_clear_flag(ctx->gitm->page, LV_OBJ_FLAG_HIDDEN);
+        ctx->current_visible_page = ctx->gitm->page;
+        // Reconcile with JanOS on every entry, unless our own session is live.
+        if (!ctx->gitm->session_active) {
+            ctx->gitm->tab = (int)current_tab;
+            ctx->gitm->uart_port = uart_port_for_tab(current_tab);
+            if (ctx->gitm->scan_btn) lv_obj_add_state(ctx->gitm->scan_btn, LV_STATE_DISABLED);
+            gitm_set_hint(ctx, "Asking JanOS for its current state...", COLOR_MATERIAL_AMBER);
+            xTaskCreate(gitm_attach_task, "gitm_attach", 6144, ctx, 5, NULL);
+        }
+        return;
+    }
+
+    ESP_LOGI(TAG, "Creating the GITM page for tab %d", current_tab);
+
+    if (!ctx->gitm->nets) {
+        ctx->gitm->nets = heap_caps_calloc(MAX_NETWORKS, sizeof(wifi_network_t),
+                                           MALLOC_CAP_SPIRAM);
+        if (!ctx->gitm->nets) {
+            ESP_LOGE(TAG, "GITM: failed to allocate the scan cache in PSRAM");
+            return;
+        }
+    }
+    ctx->gitm->net_count = 0;
+    ctx->gitm->up_index = -1;
+    ctx->gitm->ap_wpa2 = false;
+    ctx->gitm->state = GITM_IDLE;
+    ctx->gitm->tab = (int)current_tab;
+    ctx->gitm->uart_port = uart_port_for_tab(current_tab);
+    ctx->gitm->client_sig[0] = '\0';
+    ctx->gitm->s1_collapsed = false;
+    ctx->gitm->s2_collapsed = false;
+    cgw_snapshot_reset(&ctx->gitm->snap);
+    memset(&ctx->gitm->final, 0, sizeof(ctx->gitm->final));
+
+    // Lists are sized from the panel so the page fills the screen rather than
+    // leaving a band of dead space under a fixed-height box.
+    const int vres = lv_disp_get_ver_res(NULL);
+    int net_list_h = vres - 520;
+    if (net_list_h < 220) net_list_h = 220;
+    int client_list_h = vres - 900;
+    if (client_list_h < 120) client_list_h = 120;
+
+    ctx->gitm->page = lv_obj_create(container);
+    lv_obj_set_size(ctx->gitm->page, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(ctx->gitm->page, lv_color_hex(0x0A1A1A), 0);
+    lv_obj_set_style_border_width(ctx->gitm->page, 0, 0);
+    lv_obj_set_style_pad_all(ctx->gitm->page, 16, 0);
+    lv_obj_set_flex_flow(ctx->gitm->page, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(ctx->gitm->page, 10, 0);
+    lv_obj_clear_flag(ctx->gitm->page, LV_OBJ_FLAG_SCROLLABLE);
+
+    // ---- Header row: back, title, state chip (Network Observer layout) ----
+    lv_obj_t *header = lv_obj_create(ctx->gitm->page);
+    lv_obj_set_size(header, lv_pct(100), 56);
+    lv_obj_set_style_bg_opa(header, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(header, 0, 0);
+    lv_obj_set_style_pad_all(header, 0, 0);
+    lv_obj_clear_flag(header, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *back_btn = lv_btn_create(header);
+    lv_obj_set_size(back_btn, 72, 44);
+    lv_obj_align(back_btn, LV_ALIGN_LEFT_MID, 0, 0);
+    lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x1A3333), 0);
+    lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x2A4444), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(back_btn, 8, 0);
+    lv_obj_add_event_cb(back_btn, gitm_back_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *back_icon = lv_label_create(back_btn);
+    lv_label_set_text(back_icon, LV_SYMBOL_LEFT);
+    lv_obj_set_style_text_color(back_icon, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_center(back_icon);
+
+    lv_obj_t *title = lv_label_create(header);
+    lv_label_set_text(title, "GITM");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_TEAL, 0);
+    lv_obj_align_to(title, back_btn, LV_ALIGN_OUT_RIGHT_MID, 12, -8);
+
+    // Presentation fixed by contract section 8.11.
+    lv_obj_t *subtitle = lv_label_create(header);
+    lv_label_set_text(subtitle, "Gate-in-the-Middle");
+    lv_obj_set_style_text_font(subtitle, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(subtitle, lv_color_hex(0x6C8A8A), 0);
+    lv_obj_align_to(subtitle, title, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 2);
+
+    ctx->gitm->state_chip = lv_label_create(header);
+    lv_label_set_text(ctx->gitm->state_chip, "IDLE");
+    lv_obj_set_style_text_font(ctx->gitm->state_chip, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(ctx->gitm->state_chip, lv_color_hex(0x888888), 0);
+    lv_obj_set_style_bg_color(ctx->gitm->state_chip, lv_color_hex(0x102020), 0);
+    lv_obj_set_style_bg_opa(ctx->gitm->state_chip, LV_OPA_COVER, 0);
+    lv_obj_set_style_pad_all(ctx->gitm->state_chip, 10, 0);
+    lv_obj_set_style_radius(ctx->gitm->state_chip, 8, 0);
+    lv_obj_align(ctx->gitm->state_chip, LV_ALIGN_RIGHT_MID, 0, 0);
+
+    // ---- Hint / error line, shared by every phase ----
+    ctx->gitm->status_label = lv_label_create(ctx->gitm->page);
+    lv_label_set_text(ctx->gitm->status_label, "Asking JanOS for its current state...");
+    lv_obj_set_style_text_font(ctx->gitm->status_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(ctx->gitm->status_label, COLOR_MATERIAL_AMBER, 0);
+    lv_obj_set_width(ctx->gitm->status_label, lv_pct(100));
+    lv_label_set_long_mode(ctx->gitm->status_label, LV_LABEL_LONG_WRAP);
+
+    // ---- Scrollable body holding the three steps ----
+    ctx->gitm->body = lv_obj_create(ctx->gitm->page);
+    lv_obj_set_width(ctx->gitm->body, lv_pct(100));
+    lv_obj_set_flex_grow(ctx->gitm->body, 1);
+    lv_obj_set_style_bg_opa(ctx->gitm->body, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(ctx->gitm->body, 0, 0);
+    lv_obj_set_style_pad_all(ctx->gitm->body, 0, 0);
+    lv_obj_set_flex_flow(ctx->gitm->body, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(ctx->gitm->body, 10, 0);
+    lv_obj_set_scroll_dir(ctx->gitm->body, LV_DIR_VER);
+
+    // =========================== Step 1: upstream ==========================
+    ctx->gitm->step1 = gitm_make_section(
+        ctx->gitm->body, "1.  Internet", COLOR_MATERIAL_BLUE,
+        gitm_toggle_section_cb, (void *)(intptr_t)1,
+        &ctx->gitm->s1_chev, &ctx->gitm->s1_summary, &ctx->gitm->s1_content);
+
+    ctx->gitm->net_list = lv_obj_create(ctx->gitm->s1_content);
+    lv_obj_set_size(ctx->gitm->net_list, lv_pct(100), net_list_h);
+    lv_obj_set_style_bg_color(ctx->gitm->net_list, lv_color_hex(0x061212), 0);
+    lv_obj_set_style_border_color(ctx->gitm->net_list, lv_color_hex(0x1A3333), 0);
+    lv_obj_set_style_border_width(ctx->gitm->net_list, 1, 0);
+    lv_obj_set_style_radius(ctx->gitm->net_list, 8, 0);
+    lv_obj_set_style_pad_all(ctx->gitm->net_list, 6, 0);
+    lv_obj_set_flex_flow(ctx->gitm->net_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(ctx->gitm->net_list, 6, 0);
+    lv_obj_set_scroll_dir(ctx->gitm->net_list, LV_DIR_VER);
+
+    ctx->gitm->up_pass_row = gitm_make_field(ctx->gitm->s1_content, "Upstream pass:",
+                                             &ctx->gitm->up_pass_input,
+                                             "empty = try saved on JanOS", true, 64);
+    lv_obj_add_flag(ctx->gitm->up_pass_row, LV_OBJ_FLAG_HIDDEN);
+
+    lv_obj_t *s1_btns = lv_obj_create(ctx->gitm->s1_content);
+    lv_obj_set_size(s1_btns, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(s1_btns, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(s1_btns, 0, 0);
+    lv_obj_set_style_pad_all(s1_btns, 0, 0);
+    lv_obj_set_flex_flow(s1_btns, LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_column(s1_btns, 10, 0);
+    lv_obj_clear_flag(s1_btns, LV_OBJ_FLAG_SCROLLABLE);
+
+    ctx->gitm->scan_btn = gitm_make_button(s1_btns, LV_SYMBOL_REFRESH " SCAN",
+                                           lv_color_hex(0x1A3333), lv_color_hex(0x2A4444),
+                                           220, gitm_scan_cb);
+    ctx->gitm->connect_btn = gitm_make_button(s1_btns, LV_SYMBOL_WIFI " CONNECT",
+                                              COLOR_MATERIAL_TEAL, lv_color_hex(0x00695C),
+                                              280, gitm_connect_cb);
+    lv_obj_add_state(ctx->gitm->connect_btn, LV_STATE_DISABLED);
+
+    // ============================ Step 2: our AP ===========================
+    ctx->gitm->step2 = gitm_make_section(
+        ctx->gitm->body, "2.  Your AP", COLOR_MATERIAL_TEAL,
+        gitm_toggle_section_cb, (void *)(intptr_t)2,
+        &ctx->gitm->s2_chev, &ctx->gitm->s2_summary, &ctx->gitm->s2_content);
+    lv_obj_add_flag(ctx->gitm->step2, LV_OBJ_FLAG_HIDDEN);
+
+    gitm_make_field(ctx->gitm->s2_content, "AP SSID:", &ctx->gitm->ap_ssid_input,
+                    "name clients will see", false, 32);
+
+    lv_obj_t *sec_row = lv_obj_create(ctx->gitm->s2_content);
+    lv_obj_set_size(sec_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(sec_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(sec_row, 0, 0);
+    lv_obj_set_style_pad_all(sec_row, 0, 0);
+    lv_obj_set_flex_flow(sec_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(sec_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(sec_row, 10, 0);
+    lv_obj_clear_flag(sec_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *sec_lbl = lv_label_create(sec_row);
+    lv_label_set_text(sec_lbl, "Security:");
+    lv_obj_set_width(sec_lbl, 160);
+    lv_obj_set_style_text_font(sec_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(sec_lbl, lv_color_hex(0xFFFFFF), 0);
+
+    ctx->gitm->sec_dd = lv_dropdown_create(sec_row);
+    lv_dropdown_set_options(ctx->gitm->sec_dd, "Open\nWPA2");
+    lv_obj_set_size(ctx->gitm->sec_dd, 220, 44);
+    lv_obj_set_style_bg_color(ctx->gitm->sec_dd, lv_color_hex(0x102020), 0);
+    lv_obj_set_style_border_color(ctx->gitm->sec_dd, lv_color_hex(0x1A3333), 0);
+    lv_obj_set_style_text_color(ctx->gitm->sec_dd, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_add_event_cb(ctx->gitm->sec_dd, gitm_security_changed_cb,
+                        LV_EVENT_VALUE_CHANGED, NULL);
+
+    ctx->gitm->ap_pass_row = gitm_make_field(ctx->gitm->s2_content, "AP password:",
+                                             &ctx->gitm->ap_pass_input,
+                                             "8-63 characters", true, 63);
+    lv_obj_add_flag(ctx->gitm->ap_pass_row, LV_OBJ_FLAG_HIDDEN);
+
+    ctx->gitm->open_warn = lv_label_create(ctx->gitm->s2_content);
+    lv_label_set_text(ctx->gitm->open_warn,
+        LV_SYMBOL_WARNING " Open AP - anyone in range can join and will be recorded.");
+    lv_obj_set_style_text_font(ctx->gitm->open_warn, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(ctx->gitm->open_warn, COLOR_MATERIAL_AMBER, 0);
+    lv_obj_set_width(ctx->gitm->open_warn, lv_pct(100));
+    lv_label_set_long_mode(ctx->gitm->open_warn, LV_LABEL_LONG_WRAP);
+
+    gitm_make_field(ctx->gitm->s2_content, "PCAP prefix:", &ctx->gitm->prefix_input,
+                    "gitm", false, 32);
+    lv_obj_add_event_cb(ctx->gitm->prefix_input, gitm_prefix_changed_cb,
+                        LV_EVENT_VALUE_CHANGED, NULL);
+
+    ctx->gitm->name_preview = lv_label_create(ctx->gitm->s2_content);
+    lv_label_set_text(ctx->gitm->name_preview, "");
+    lv_obj_set_style_text_font(ctx->gitm->name_preview, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(ctx->gitm->name_preview, lv_color_hex(0x6C8A8A), 0);
+
+    ctx->gitm->start_btn = gitm_make_button(ctx->gitm->s2_content,
+                                            LV_SYMBOL_PLAY "  START GITM",
+                                            COLOR_MATERIAL_GREEN, lv_color_hex(0x2E7D32),
+                                            lv_pct(100), gitm_start_cb);
+
+    // ============================ Step 3: live =============================
+    ctx->gitm->live = gitm_make_section(ctx->gitm->body, "3.  Live", COLOR_MATERIAL_GREEN,
+                                        NULL, NULL, NULL, NULL, &ctx->gitm->live_content);
+    lv_obj_add_flag(ctx->gitm->live, LV_OBJ_FLAG_HIDDEN);
+
+    ctx->gitm->live_hdr = lv_label_create(ctx->gitm->live_content);
+    lv_label_set_text(ctx->gitm->live_hdr, "");
+    lv_obj_set_style_text_font(ctx->gitm->live_hdr, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(ctx->gitm->live_hdr, lv_color_hex(0xDDDDDD), 0);
+    lv_obj_set_width(ctx->gitm->live_hdr, lv_pct(100));
+
+    ctx->gitm->live_warn = lv_label_create(ctx->gitm->live_content);
+    lv_label_set_text(ctx->gitm->live_warn, "");
+    lv_obj_set_style_text_font(ctx->gitm->live_warn, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(ctx->gitm->live_warn, COLOR_MATERIAL_AMBER, 0);
+    lv_obj_set_width(ctx->gitm->live_warn, lv_pct(100));
+    lv_label_set_long_mode(ctx->gitm->live_warn, LV_LABEL_LONG_WRAP);
+
+    ctx->gitm->clients_hdr = lv_label_create(ctx->gitm->live_content);
+    lv_label_set_text(ctx->gitm->clients_hdr, "Clients (0)");
+    lv_obj_set_style_text_font(ctx->gitm->clients_hdr, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(ctx->gitm->clients_hdr, COLOR_MATERIAL_TEAL, 0);
+
+    ctx->gitm->clients_list = lv_obj_create(ctx->gitm->live_content);
+    lv_obj_set_size(ctx->gitm->clients_list, lv_pct(100), client_list_h);
+    lv_obj_set_style_bg_color(ctx->gitm->clients_list, lv_color_hex(0x061212), 0);
+    lv_obj_set_style_border_color(ctx->gitm->clients_list, lv_color_hex(0x1A3333), 0);
+    lv_obj_set_style_border_width(ctx->gitm->clients_list, 1, 0);
+    lv_obj_set_style_radius(ctx->gitm->clients_list, 8, 0);
+    lv_obj_set_style_pad_all(ctx->gitm->clients_list, 8, 0);
+    lv_obj_set_flex_flow(ctx->gitm->clients_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(ctx->gitm->clients_list, 4, 0);
+    lv_obj_set_scroll_dir(ctx->gitm->clients_list, LV_DIR_VER);
+
+    lv_obj_t *cap_hdr = lv_label_create(ctx->gitm->live_content);
+    lv_label_set_text(cap_hdr, "Capture");
+    lv_obj_set_style_text_font(cap_hdr, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(cap_hdr, COLOR_MATERIAL_TEAL, 0);
+
+    ctx->gitm->cap_label = lv_label_create(ctx->gitm->live_content);
+    lv_label_set_text(ctx->gitm->cap_label, "");
+    lv_obj_set_style_text_font(ctx->gitm->cap_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(ctx->gitm->cap_label, lv_color_hex(0xDDDDDD), 0);
+    lv_obj_set_width(ctx->gitm->cap_label, lv_pct(100));
+
+    ctx->gitm->rec_label = lv_label_create(ctx->gitm->live_content);
+    lv_label_set_text(ctx->gitm->rec_label, "");
+    lv_obj_set_style_text_font(ctx->gitm->rec_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(ctx->gitm->rec_label, COLOR_MATERIAL_GREEN, 0);
+    lv_obj_set_width(ctx->gitm->rec_label, lv_pct(100));
+
+    ctx->gitm->shaper_label = lv_label_create(ctx->gitm->live_content);
+    lv_label_set_text(ctx->gitm->shaper_label, "");
+    lv_obj_set_style_text_font(ctx->gitm->shaper_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(ctx->gitm->shaper_label, COLOR_MATERIAL_GREEN, 0);
+    lv_obj_set_width(ctx->gitm->shaper_label, lv_pct(100));
+
+    ctx->gitm->stop_btn = gitm_make_button(ctx->gitm->live_content,
+                                           LV_SYMBOL_STOP "  STOP GITM",
+                                           COLOR_MATERIAL_RED, lv_color_hex(0xCC0000),
+                                           lv_pct(100), gitm_stop_cb);
+    lv_obj_add_flag(ctx->gitm->stop_btn, LV_OBJ_FLAG_HIDDEN);
+
+    ctx->gitm->copy_btn = gitm_make_button(ctx->gitm->live_content,
+                                           LV_SYMBOL_DOWNLOAD "  COPY TO TAB5 / ESPSHARK",
+                                           COLOR_MATERIAL_BLUE, lv_color_hex(0x1565C0),
+                                           lv_pct(100), gitm_copy_cb);
+    lv_obj_add_flag(ctx->gitm->copy_btn, LV_OBJ_FLAG_HIDDEN);
+
+    // ---- Shared on-screen keyboard ----
+    ctx->gitm->keyboard = lv_keyboard_create(ctx->gitm->page);
+    lv_obj_set_size(ctx->gitm->keyboard, lv_pct(100), 260);
+    lv_obj_align(ctx->gitm->keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
+    style_on_screen_keyboard(ctx->gitm->keyboard);
+    lv_keyboard_set_textarea(ctx->gitm->keyboard, ctx->gitm->ap_ssid_input);
+    lv_obj_add_event_cb(ctx->gitm->keyboard, gitm_keyboard_cb, LV_EVENT_ALL, NULL);
+    lv_obj_add_flag(ctx->gitm->keyboard, LV_OBJ_FLAG_HIDDEN);
+
+    gitm_render_net_list(ctx);
+    gitm_update_name_preview(ctx);
+    ctx->current_visible_page = ctx->gitm->page;
+
+    // Section 8.6: always ask what JanOS is doing before offering to start.
+    if (ctx->gitm->scan_btn) lv_obj_add_state(ctx->gitm->scan_btn, LV_STATE_DISABLED);
+    xTaskCreate(gitm_attach_task, "gitm_attach", 6144, ctx, 5, NULL);
+}
+
+// Entry from the scan / observer attack bar: carry the highlighted network in
+// as a preselection. A selection is a convenience now, not a requirement - the
+// page scans on its own.
+static void show_gitm_page_from_scan(void)
+{
+    tab_context_t *ctx = get_current_ctx();
+    if (!gitm_ctx(ctx)) return;
+
+    ctx->gitm->preselect_ssid[0] = '\0';
+    scan_view_t v = get_scan_view(ctx);
+    if (v.sel_count == 1) {
+        int idx = v.sel_indices[0];
+        if (idx >= 0 && idx < v.net_count && v.nets[idx].ssid[0]) {
+            snprintf(ctx->gitm->preselect_ssid, sizeof(ctx->gitm->preselect_ssid),
+                     "%s", v.nets[idx].ssid);
+        }
+    }
+    show_gitm_page();
 }
 
 // ======================= Handshaker Attack Functions =======================
@@ -10325,7 +11688,7 @@ static void handshaker_popup_close_cb(lv_event_t *e)
     ESP_LOGI(TAG, "Handshaker popup closed - sending stop command");
 
     tab_context_t *ctx = get_current_ctx();
-    if (!ctx) return;
+    if (!ctx || !ctx->gitm) return;
 
     // Stop JanOS first, then wait for the UART reader to leave before deleting
     // any LVGL objects it may still reference.
@@ -10718,7 +12081,7 @@ static void handshaker_monitor_task(void *arg)
 static void show_handshaker_popup(void)
 {
     tab_context_t *ctx = get_current_ctx();
-    if (!ctx) return;
+    if (!ctx || !ctx->gitm) return;
     if (ctx->handshaker_popup != NULL) return;  // Already showing in this tab
 
     scan_view_t hsv = get_scan_view(ctx);
@@ -16361,21 +17724,24 @@ static void update_observer_table(tab_context_t *ctx)
         lv_label_set_recolor(info_label, true);
         const char *rssi_col_nr = net->rssi > -50 ? "#55DD55" : (net->rssi > -70 ? "#FFAA00" : "#FF5555");
         const char *band_col_nr = strstr(net->band, "5") ? "#CC66FF" : "#FFAA33";
+        const char *pass_badge = creds_badge(ctx, net->ssid);
         if (net->inspected) {
             lv_label_set_text_fmt(info_label,
-                "#5599FF %s#  |  #5599FF CH%d#  |  %s %s#  |  %s %d dBm#\n%s  |  Uptime: %s\nVendor: %s",
+                "#5599FF %s#  |  #5599FF CH%d#  |  %s %s#  |  %s %d dBm#%s\n%s  |  Uptime: %s\nVendor: %s",
                 net->bssid, net->channel,
                 band_col_nr, net->band,
                 rssi_col_nr, net->rssi,
+                pass_badge,
                 net->mfp_capable ? "#FF5555 MFP On#" : "#55DD55 MFP Off#",
                 net->uptime[0] ? net->uptime : "?",
                 net->vendor[0] ? net->vendor : "-");
         } else {
             lv_label_set_text_fmt(info_label,
-                "#5599FF %s#  |  #5599FF CH%d#  |  %s %s#  |  %s %d dBm#\nVendor: %s",
+                "#5599FF %s#  |  #5599FF CH%d#  |  %s %s#  |  %s %d dBm#%s\nVendor: %s",
                 net->bssid, net->channel,
                 band_col_nr, net->band,
                 rssi_col_nr, net->rssi,
+                pass_badge,
                 net->vendor[0] ? net->vendor : "-");
         }
         lv_obj_set_style_text_font(info_label, &lv_font_montserrat_12, 0);
@@ -17112,6 +18478,10 @@ static void observer_start_task(void *arg)
     ctx->observer_network_count = scanned_count;
     ESP_LOGI(TAG, "[%s] Scan complete: %d networks", uart_name, ctx->observer_network_count);
 
+    // Scan is done and inspect has not started, so the UART is free: refresh
+    // the captured-password cache before the rows are built.
+    creds_fetch(ctx, task_tab, uart_port);
+
     // Update UI immediately with scanned networks (all with 0 clients)
     bsp_display_lock(0);
     if (ctx->observer_status_label) {
@@ -17225,6 +18595,259 @@ static void observer_start_task(void *arg)
 }
 
 // Start button click handler
+// ---- Observer shutdown -----------------------------------------------------
+//
+// Clearing observer_running is not enough by itself. observer_start_task may
+// already be past its own `observer_running` check and about to send
+// `start_sniffer_noscan`; a `stop` issued at that moment is overtaken, the
+// Monster keeps sniffing, and every later command is swallowed by the sniffer.
+// The same applies to inspect_observer_task, which is mid-conversation on the
+// same transport. So the teardown waits for both workers to actually leave
+// before the stop goes out, which means it cannot run on the LVGL thread.
+
+typedef struct {
+    tab_context_t *ctx;
+    bool leave_page;   // true when the user is walking out of the page
+} observer_teardown_args_t;
+
+static lv_obj_t *observer_exit_overlay = NULL;
+static lv_obj_t *observer_exit_status = NULL;
+static lv_obj_t *observer_exit_btn_row = NULL;
+
+static void close_observer_exit_confirm(void)
+{
+    if (observer_exit_overlay) {
+        lv_obj_del(observer_exit_overlay);
+        observer_exit_overlay = NULL;
+    }
+    observer_exit_status = NULL;
+    observer_exit_btn_row = NULL;
+}
+
+// True while anything of ours is still driving the Monster.
+static bool observer_session_busy(tab_context_t *ctx)
+{
+    return ctx && (ctx->observer_running || ctx->observer_start_active ||
+                   ctx->observer_inspect_active || ctx->observer_inspect_task != NULL);
+}
+
+static void observer_teardown_task(void *arg)
+{
+    observer_teardown_args_t *a = (observer_teardown_args_t *)arg;
+    tab_context_t *ctx = a->ctx;
+    tab_id_t tab = tab_id_for_ctx(ctx);
+    uart_port_t port = uart_port_for_tab(tab);
+    const char *uart_name = tab_transport_name(tab);
+
+    // Ask both workers to wind down.
+    ctx->observer_running = false;
+    ctx->observer_inspect_active = false;
+
+    // Then wait for them to be gone, so nothing can transmit after our stop.
+    int waited = 0;
+    while (waited < 4000 &&
+           (ctx->observer_start_active || ctx->observer_inspect_task != NULL)) {
+        vTaskDelay(pdMS_TO_TICKS(20));
+        waited += 20;
+    }
+    if (ctx->observer_start_active || ctx->observer_inspect_task != NULL) {
+        ESP_LOGW(TAG, "[%s] Observer teardown: workers still alive after %d ms, "
+                      "sending stop anyway", uart_name, waited);
+    } else {
+        ESP_LOGI(TAG, "[%s] Observer teardown: workers idle after %d ms", uart_name, waited);
+    }
+
+    if (ctx->observer_timer != NULL) {
+        xTimerStop(ctx->observer_timer, 0);
+    }
+
+    observer_flush_transport_input(tab, port);
+    const char *stop_cmd = "stop\r\n";
+    transport_write_bytes_tab(tab, port, stop_cmd, strlen(stop_cmd));
+    ESP_LOGI(TAG, "[%s] Observer teardown: sent stop", uart_name);
+
+    // Drain the reply so the next command starts on a clean line.
+    char drain[256];
+    for (int i = 0; i < 15; i++) {
+        transport_read_bytes_tab(tab, port, drain, sizeof(drain) - 1, pdMS_TO_TICKS(100));
+    }
+    ESP_LOGI(TAG, "[%s] Observer teardown: transport idle", uart_name);
+
+    if (bsp_display_lock(0)) {
+        close_observer_exit_confirm();
+
+        if (a->leave_page) {
+            ctx->observer_page_visible = false;
+            update_portal_icon();
+            if (ctx->observer_page) {
+                lv_obj_add_flag(ctx->observer_page, LV_OBJ_FLAG_HIDDEN);
+            }
+            if (ctx->tiles) {
+                lv_obj_clear_flag(ctx->tiles, LV_OBJ_FLAG_HIDDEN);
+                ctx->current_visible_page = ctx->tiles;
+            }
+        } else {
+            if (ctx->observer_start_btn) {
+                lv_obj_clear_state(ctx->observer_start_btn, LV_STATE_DISABLED);
+            }
+            if (ctx->observer_stop_btn) {
+                lv_obj_add_state(ctx->observer_stop_btn, LV_STATE_DISABLED);
+            }
+            if (ctx->observer_status_label) {
+                lv_label_set_text(ctx->observer_status_label, "Stopped");
+            }
+        }
+        bsp_display_unlock();
+    }
+
+    ctx->observer_teardown_active = false;
+    heap_caps_free(a);
+    vTaskDelete(NULL);
+}
+
+// Kick off the teardown. Returns false only if the task could not be created,
+// in which case the caller must not pretend the Monster was stopped.
+static bool observer_begin_teardown(tab_context_t *ctx, bool leave_page)
+{
+    if (ctx->observer_teardown_active) {
+        ESP_LOGI(TAG, "Observer teardown already in flight, not starting a second");
+        return true;
+    }
+
+    observer_teardown_args_t *a = heap_caps_malloc(sizeof(*a), MALLOC_CAP_SPIRAM);
+    if (!a) {
+        ESP_LOGE(TAG, "Observer teardown: out of PSRAM");
+        return false;
+    }
+    a->ctx = ctx;
+    a->leave_page = leave_page;
+    ctx->observer_teardown_active = true;
+
+    if (xTaskCreate(observer_teardown_task, "obs_teardown", 4096, a, 5, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "Observer teardown: failed to create task");
+        ctx->observer_teardown_active = false;
+        heap_caps_free(a);
+        return false;
+    }
+    return true;
+}
+
+static void observer_exit_cancel_cb(lv_event_t *e)
+{
+    (void)e;
+    close_observer_exit_confirm();
+}
+
+static void observer_exit_confirm_cb(lv_event_t *e)
+{
+    (void)e;
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx) return;
+
+    // Hold the popup open with a progress line: the wait for the workers plus
+    // the stop round trip can take a couple of seconds, and a screen that just
+    // sat there would invite a second tap.
+    if (observer_exit_btn_row) lv_obj_add_flag(observer_exit_btn_row, LV_OBJ_FLAG_HIDDEN);
+    if (observer_exit_status) {
+        lv_label_set_text(observer_exit_status, "Stopping the Monster...");
+        lv_obj_set_style_text_color(observer_exit_status, COLOR_MATERIAL_AMBER, 0);
+    }
+
+    if (!observer_begin_teardown(ctx, true)) {
+        if (observer_exit_status) {
+            lv_label_set_text(observer_exit_status,
+                              "Could not start the shutdown task.\nTry again.");
+            lv_obj_set_style_text_color(observer_exit_status, COLOR_MATERIAL_RED, 0);
+        }
+        if (observer_exit_btn_row) lv_obj_clear_flag(observer_exit_btn_row, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+// Asked before walking out of a live observer session, because leaving without
+// a stop leaves the Monster sniffing and every later command goes unanswered.
+static void show_observer_exit_confirm(void)
+{
+    if (observer_exit_overlay != NULL) return;
+
+    lv_obj_t *container = get_current_tab_container();
+    if (!container) return;
+
+    observer_exit_overlay = lv_obj_create(container);
+    lv_obj_remove_style_all(observer_exit_overlay);
+    lv_obj_set_size(observer_exit_overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(observer_exit_overlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(observer_exit_overlay, LV_OPA_50, 0);
+    lv_obj_clear_flag(observer_exit_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(observer_exit_overlay, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t *popup = lv_obj_create(observer_exit_overlay);
+    lv_obj_set_size(popup, 540, 360);
+    lv_obj_center(popup);
+    lv_obj_set_style_bg_color(popup, lv_color_hex(0x0A1A1A), 0);
+    lv_obj_set_style_border_color(popup, COLOR_MATERIAL_TEAL, 0);
+    lv_obj_set_style_border_width(popup, 2, 0);
+    lv_obj_set_style_radius(popup, 16, 0);
+    lv_obj_set_style_shadow_width(popup, 30, 0);
+    lv_obj_set_style_shadow_color(popup, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_shadow_opa(popup, LV_OPA_50, 0);
+    lv_obj_set_style_pad_all(popup, 20, 0);
+    lv_obj_set_flex_flow(popup, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(popup, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(popup, 14, 0);
+    lv_obj_clear_flag(popup, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *icon = lv_label_create(popup);
+    lv_label_set_text(icon, LV_SYMBOL_EYE_OPEN);
+    lv_obj_set_style_text_font(icon, &lv_font_montserrat_44, 0);
+    lv_obj_set_style_text_color(icon, COLOR_MATERIAL_TEAL, 0);
+
+    lv_obj_t *title = lv_label_create(popup);
+    lv_label_set_text(title, "OBSERVER IS RUNNING");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_22, 0);
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_TEAL, 0);
+
+    observer_exit_status = lv_label_create(popup);
+    lv_label_set_text(observer_exit_status,
+                      "Leaving will send stop to the Monster.\n"
+                      "Without it the sniffer keeps running and\n"
+                      "later commands get no answer.");
+    lv_obj_set_style_text_font(observer_exit_status, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(observer_exit_status, lv_color_hex(0xCCCCCC), 0);
+    lv_obj_set_style_text_align(observer_exit_status, LV_TEXT_ALIGN_CENTER, 0);
+
+    observer_exit_btn_row = lv_obj_create(popup);
+    lv_obj_remove_style_all(observer_exit_btn_row);
+    lv_obj_set_size(observer_exit_btn_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(observer_exit_btn_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(observer_exit_btn_row, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(observer_exit_btn_row, 20, 0);
+    lv_obj_set_style_pad_top(observer_exit_btn_row, 8, 0);
+
+    lv_obj_t *stay_btn = lv_btn_create(observer_exit_btn_row);
+    lv_obj_set_size(stay_btn, 160, 54);
+    lv_obj_set_style_bg_color(stay_btn, lv_color_hex(0x1A3333), 0);
+    lv_obj_set_style_bg_color(stay_btn, lv_color_hex(0x2A4444), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(stay_btn, 8, 0);
+    lv_obj_add_event_cb(stay_btn, observer_exit_cancel_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *stay_lbl = lv_label_create(stay_btn);
+    lv_label_set_text(stay_lbl, "Keep running");
+    lv_obj_set_style_text_font(stay_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_center(stay_lbl);
+
+    lv_obj_t *quit_btn = lv_btn_create(observer_exit_btn_row);
+    lv_obj_set_size(quit_btn, 200, 54);
+    lv_obj_set_style_bg_color(quit_btn, COLOR_MATERIAL_RED, 0);
+    lv_obj_set_style_bg_color(quit_btn, lv_color_hex(0xCC0000), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(quit_btn, 8, 0);
+    lv_obj_add_event_cb(quit_btn, observer_exit_confirm_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *quit_lbl = lv_label_create(quit_btn);
+    lv_label_set_text(quit_lbl, LV_SYMBOL_STOP " Stop and exit");
+    lv_obj_set_style_text_font(quit_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_center(quit_lbl);
+}
+
 static void observer_start_btn_cb(lv_event_t *e)
 {
     (void)e;
@@ -17279,28 +18902,30 @@ static void observer_stop_btn_cb(lv_event_t *e)
     }
 
     ESP_LOGI(TAG, "Stopping Network Observer on tab %d", current_tab);
-    ctx->observer_running = false;
 
-    cancel_observer_inspect_task(ctx);
-
-    // Stop timer for this context
-    if (ctx->observer_timer != NULL) {
-        xTimerStop(ctx->observer_timer, 0);
-    }
-
-    // Send stop command to current tab's UART
-    uart_send_command_for_tab("stop");
-
-    // Update UI
-    if (ctx->observer_start_btn) {
-        lv_obj_clear_state(ctx->observer_start_btn, LV_STATE_DISABLED);
-    }
+    // Disable both buttons for the duration: the teardown task re-enables Start
+    // once the Monster has actually acknowledged the stop.
     if (ctx->observer_stop_btn) {
         lv_obj_add_state(ctx->observer_stop_btn, LV_STATE_DISABLED);
     }
-
+    if (ctx->observer_start_btn) {
+        lv_obj_add_state(ctx->observer_start_btn, LV_STATE_DISABLED);
+    }
     if (ctx->observer_status_label) {
-        lv_label_set_text(ctx->observer_status_label, "Stopped");
+        lv_label_set_text(ctx->observer_status_label, "Stopping...");
+    }
+
+    if (!observer_begin_teardown(ctx, false)) {
+        // Nothing was scheduled, so do not leave the UI claiming it stopped.
+        if (ctx->observer_start_btn) {
+            lv_obj_clear_state(ctx->observer_start_btn, LV_STATE_DISABLED);
+        }
+        if (ctx->observer_stop_btn) {
+            lv_obj_clear_state(ctx->observer_stop_btn, LV_STATE_DISABLED);
+        }
+        if (ctx->observer_status_label) {
+            lv_label_set_text(ctx->observer_status_label, "Could not stop - try again");
+        }
     }
 }
 
@@ -17461,23 +19086,21 @@ static void observer_back_btn_event_cb(lv_event_t *e)
         return;
     }
 
+    // Walking out of a live session without a stop leaves the Monster sniffing,
+    // and every later command then goes unanswered. Confirm, then tear down for
+    // real; the teardown task leaves the page once the stop has gone out.
+    if (ctx->observer_teardown_active) {
+        ESP_LOGI(TAG, "Observer back button: stop already on its way, leaving now");
+    } else if (observer_session_busy(ctx)) {
+        ESP_LOGI(TAG, "Observer back button: session live, asking before leaving");
+        show_observer_exit_confirm();
+        return;
+    }
+
     ESP_LOGI(TAG, "Observer back button clicked, returning to tiles for tab %d", current_tab);
 
     // Mark observer page as not visible in context
     ctx->observer_page_visible = false;
-
-    // Stop inspect task
-    cancel_observer_inspect_task(ctx);
-
-    // Stop observer for current tab
-    if (ctx->observer_running) {
-        ctx->observer_running = false;
-
-        if (ctx->observer_timer != NULL) {
-            xTimerStop(ctx->observer_timer, 0);
-        }
-        uart_send_command_for_tab("stop");
-    }
 
     // Update portal icon visibility
     update_portal_icon();
@@ -45992,7 +47615,7 @@ static void global_attack_tile_event_cb(lv_event_t *e)
 
     // Handle standalone Capture Gateway (GITM) - upstream typed in the popup
     if (strcmp(attack_name, "Capture GW") == 0) {
-        show_capture_gw_popup_standalone();
+        show_gitm_page();
         return;
     }
 }
@@ -46101,7 +47724,7 @@ static void show_global_attacks_page(void)
 
     // Capture Gateway (GITM) - Blue - Red Team only (standalone, upstream typed in popup)
     if (enable_red_team) {
-        create_tile(tiles, LV_SYMBOL_LOOP, "Gateway", COLOR_MATERIAL_BLUE, global_attack_tile_event_cb, "Capture GW");
+        create_tile(tiles, LV_SYMBOL_LOOP, "GITM", COLOR_MATERIAL_BLUE, global_attack_tile_event_cb, "Capture GW");
     }
 
     // Set current visible page
@@ -53961,6 +55584,17 @@ void app_main(void)
     load_dashboard_from_nvs();
     load_clock_settings_from_nvs();
     load_wd_autoupload_from_nvs();
+
+    // Kick the startup melody off here, the first moment both prerequisites are
+    // met: the codec is up and NVS has told us which melody to play. It used to
+    // start from show_splash_screen(), i.e. only after UART init, the USB host
+    // enumeration wait and the full display bring-up.
+    if (boot_sound_mode != BOOT_SOUND_MODE_OFF) {
+        // Priority 6 keeps it above the LVGL task (5): it spends almost all of
+        // its life blocked inside i2s_write, so it steals no real CPU, but it
+        // must not be starved between buffers or the DMA underruns.
+        xTaskCreate((TaskFunction_t)play_startup_beep, "melody", 4096, NULL, 6, NULL);
+    }
 
     // Initialize both UARTs for board detection
     // UART1: Grove (TX=53, RX=54) - always initialized
