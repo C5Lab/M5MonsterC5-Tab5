@@ -39,9 +39,14 @@ The contract itself lives in the JanOS repository at
 
 ## `boot_melody_osc_test.c`
 
-Covers the two-term recurrence oscillator in `play_startup_beep()` (main.c),
-which replaced a per-sample `sinf()` call so the startup melody can stream
-instead of being rendered in full before the first sample reaches the codec.
+Covers the shared tone renderer `audio_play_notes()` (main.c), which the startup
+melody and the UI alert chime both go through:
+
+- the two-term recurrence oscillator, which replaced a per-sample `sinf()` call
+  so a tune can stream instead of being rendered in full before the first sample
+  reaches the codec;
+- the per-note envelope clamp, which lets an alert tone ask for a 140 ms decay
+  on a 70 ms note without the attack and release ramps ever overlapping.
 
 ```sh
 gcc -std=c11 -Wall -Wextra -O2 -o /tmp/boot_melody_osc_test \
@@ -53,3 +58,10 @@ For every note in all three melodies it checks that the recurrence holds pitch
 within one cent, that its amplitude does not drift over the longest note, and
 that the exact `int16_t` conversion the firmware performs (including the 0.85
 gain) never wraps.
+
+For the envelope it checks, on every note length the melodies use and on every
+note of the four alert tones (join, win, warn, alarm), that the ramps never
+overlap, that the release hands over at exactly 1.0, that each note starts and
+ends in silence, and that no boot melody note is short enough to be clamped -
+i.e. sharing the renderer with the alerts left the startup melody sounding
+exactly as it did.

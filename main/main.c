@@ -16,6 +16,7 @@
 #include <limits.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "freertos/idf_additions.h"
 #include "freertos/event_groups.h"
 #include "freertos/timers.h"
@@ -560,6 +561,15 @@ typedef struct {
     cgw_snapshot_t snap;      // last published status snapshot
     cgw_final_t final;        // [PCAP_FINAL] summary after stop
     char client_sig[CGW_MAX_CLIENTS * 18 + 8];  // last rendered client set
+
+    // Client set the join chime has already accounted for. Kept apart from
+    // `snap` so a snapshot that never reached the screen (display lock busy)
+    // cannot swallow an arrival, and so a chime never fires twice for one MAC.
+    char chime_macs[CGW_MAX_CLIENTS][18];
+    int  chime_mac_count;
+    bool chime_armed;         // false until the first snapshot of a session
+    bool warn_upstream_down;  // last published upstream state, for the warning
+    bool warn_degraded;       // last published recorder-loss state
 } gitm_ctx_t;
 
 typedef struct {
@@ -1549,6 +1559,29 @@ typedef enum {
 static boot_sound_mode_t boot_sound_mode = BOOT_SOUND_MODE_NOKIA;
 
 #define BOOT_SOUND_VOLUME_PERCENT 69
+
+// Alert chime: a short ping for the few events worth hearing while nobody is
+// watching the screen. Today that is a client joining the GITM capture AP. The
+// switch sits next to "Boot sound" in the theme popup.
+//
+// Keep this at the boot melody's level. esp_codec_dev maps 0..100% onto -50..0
+// dB *linearly in dB*, so "half volume" is -25 dB, not half as loud: the first
+// version of this chime asked for 45% and a 0.30 digital gain, landed 21 dB
+// under the melody, and was inaudible on the Tab5 speaker. Gentleness comes
+// from the envelope and the register, not from burying the signal.
+static bool alert_sound_enabled = true;
+
+#define ALERT_SOUND_VOLUME_PERCENT 69
+
+// Four things the box can say. Kept few on purpose: an alert vocabulary you
+// have to look up is worse than no alert at all.
+typedef enum {
+    ALERT_TONE_JOIN = 0,   // somebody walked into a network of ours
+    ALERT_TONE_WIN,        // loot: a handshake, a password, a finished upload
+    ALERT_TONE_WARN,       // something we were relying on just broke
+    ALERT_TONE_ALARM,      // hostile: a follower on our tail, a deauth storm
+    ALERT_TONE_COUNT,
+} alert_tone_t;
 
 // Dashboard footer quotes (10 lines)
 static const char *home_footer_quotes[] = {
@@ -2754,6 +2787,8 @@ static void show_theme_popup(void);
 static void style_theme_switch(lv_obj_t *sw);
 static void theme_dark_mode_switch_cb(lv_event_t *e);
 static void theme_boot_sound_dropdown_cb(lv_event_t *e);
+static void theme_alert_sound_switch_cb(lv_event_t *e);
+static void alert_chime_play(alert_tone_t tone);
 static void show_red_team_settings_page(void);
 static void show_screen_timeout_popup(void);
 static void show_screen_brightness_popup(void);
@@ -2763,6 +2798,7 @@ static void init_uart2(void);
 static void deinit_uart2(void);
 static void load_red_team_from_nvs(void);
 static void save_boot_sound_to_nvs(boot_sound_mode_t mode);
+static void save_alert_sound_to_nvs(bool enabled);
 static void save_dashboard_to_nvs(bool enabled);
 static void save_dark_mode_to_nvs(bool enabled);
 static void load_dashboard_from_nvs(void);
@@ -4571,6 +4607,11 @@ static void usb_cdc_disconnect_cb(usbh_cdc_handle_t cdc_handle, void *user_data)
     (void)user_data;
     if (usb_cdc_handle == cdc_handle) {
         usb_cdc_handle = NULL;
+    }
+    if (usb_transport_ready) {
+        // A Monster that was actually talking to us just went away, which
+        // during a long attack is exactly what nobody notices in time.
+        alert_chime_play(ALERT_TONE_WARN);
     }
     usb_cdc_connected = false;
     usb_transport_ready = false;
@@ -6588,6 +6629,179 @@ static void detection_complete_cb(lv_timer_t *timer)
     }
 }
 
+// ---------------------------------------------------------------------------
+// Tone playback
+//
+// The startup melody and the short UI chimes render the same way, so the
+// renderer lives in one place. It blocks inside i2s_write for the whole tune,
+// so it belongs in a throwaway task - never on the LVGL thread.
+// ---------------------------------------------------------------------------
+
+#define MELODY_SR  48000
+
+typedef struct { float freq; int ms; } melody_note_t;
+
+// One tune at a time: two players would interleave their buffers into the same
+// I2S stream and fight over the codec volume. A request that arrives while the
+// speaker is busy is dropped rather than queued - a notification beep is only
+// worth anything while it is still news.
+static SemaphoreHandle_t audio_tone_mutex = NULL;
+
+// The BSP's "reconfigure the clock" call is really an esp_codec_dev close +
+// open, and closing powers the ES8388 DAC down and mutes it (es8388_stop).
+// Doing that before every tune threw away the opening of a short chime while
+// the DAC came back up. Nothing else in the firmware touches the codec, so the
+// format is set once and then left alone.
+static bool audio_fmt_ready = false;
+
+// Silence written straight after that one configuration, so the DAC power-up
+// settles against zeros instead of eating the first note.
+#define AUDIO_WARMUP_MS 120
+
+// `gain` is the peak amplitude (0..1), `attack_ms`/`release_ms` shape each note,
+// `pause_ms` separates them and `tail_ms` is the silence flushed afterwards so
+// the codec does not clip the last note.
+static void audio_play_notes(const melody_note_t *notes, int count, const char *what,
+                             int volume_pct, float gain, int attack_ms, int release_ms,
+                             int pause_ms, int tail_ms)
+{
+    if (!notes || count <= 0) return;
+
+    bsp_codec_config_t *codec = bsp_get_codec_handle();
+    if (!codec || !codec->i2s_write || !codec->set_volume || !codec->i2s_reconfig_clk_fn) {
+        ESP_LOGW(TAG, "Audio codec not available, skipping %s", what);
+        return;
+    }
+
+    if (!audio_tone_mutex || xSemaphoreTake(audio_tone_mutex, 0) != pdTRUE) {
+        ESP_LOGI(TAG, "Speaker is busy, skipping %s", what);
+        return;
+    }
+
+    // The codec is opened *before* any sample is rendered, so the very first
+    // buffer we produce can go straight out.
+    int restore_volume = 80;
+    if (codec->get_volume) {
+        int current_volume = codec->get_volume();
+        if (current_volume >= 0 && current_volume <= 100) {
+            restore_volume = current_volume;
+        }
+    }
+    codec->set_volume(volume_pct);
+
+    bool warm_up = !audio_fmt_ready;
+    if (warm_up) {
+        codec->i2s_reconfig_clk_fn(MELODY_SR, 16, I2S_SLOT_MODE_STEREO);
+        audio_fmt_ready = true;
+    }
+
+    // One note at a time, not the whole tune up front. Rendering everything
+    // first delayed the first audible sample by the full render time, which on
+    // this board is far from free: all code is XIP from PSRAM and competes with
+    // the LVGL boot intro for bandwidth.
+    int longest_ms = tail_ms;
+    if (warm_up && AUDIO_WARMUP_MS > longest_ms) longest_ms = AUDIO_WARMUP_MS;
+    for (int n = 0; n < count; n++) {
+        int span = notes[n].ms + pause_ms;
+        if (span > longest_ms) longest_ms = span;
+    }
+    const int chunk_samples = MELODY_SR * longest_ms / 1000 + 8;
+    const size_t chunk_bytes = (size_t)chunk_samples * 2 * sizeof(int16_t);
+
+    int16_t *buf = heap_caps_malloc(chunk_bytes, MALLOC_CAP_SPIRAM);
+    if (!buf) {
+        ESP_LOGE(TAG, "Failed to allocate the %s buffer (%d bytes)", what, (int)chunk_bytes);
+        codec->set_volume(restore_volume);
+        xSemaphoreGive(audio_tone_mutex);
+        return;
+    }
+
+    ESP_LOGI(TAG, "Playing %s at %d%% (gain %.2f)", what, volume_pct, (double)gain);
+
+    size_t bytes_written = 0;
+    bool write_failed = false;
+    const int gap_samples = MELODY_SR * pause_ms / 1000;
+
+    if (warm_up) {
+        const int warm_samples = MELODY_SR * AUDIO_WARMUP_MS / 1000;
+        const size_t warm_bytes = (size_t)warm_samples * 2 * sizeof(int16_t);
+        memset(buf, 0, warm_bytes);
+        size_t warm_done = 0;
+        if (codec->i2s_write(buf, warm_bytes, &warm_done, portMAX_DELAY) != ESP_OK) {
+            write_failed = true;
+        }
+    }
+
+    for (int n = 0; n < count; n++) {
+        const int note_samples = MELODY_SR * notes[n].ms / 1000;
+        if (note_samples < 4) continue;
+
+        // The envelope is clamped per note: a chime wants a long soft tail,
+        // which has to fold into a note shorter than the tail itself.
+        int attack = MELODY_SR * attack_ms / 1000;
+        int release = MELODY_SR * release_ms / 1000;
+        if (attack > note_samples / 4) attack = note_samples / 4;
+        if (release > note_samples / 2) release = note_samples / 2;
+        if (release < 2) release = 2;
+
+        // Two-term recurrence ("magic circle") oscillator: one sinf per note
+        // instead of one per sample. sinf() per sample was the actual cost here
+        // - tens of thousands of libm calls through the PSRAM instruction cache.
+        const float k = 2.0f * sinf((float)M_PI * notes[n].freq / MELODY_SR);
+        float osc_c = 1.0f;   // tracks cos
+        float osc_s = 0.0f;   // tracks sin
+
+        int pos = 0;
+        for (int i = 0; i < note_samples; i++) {
+            osc_c -= k * osc_s;
+            osc_s += k * osc_c;
+
+            float env = 1.0f;
+            if (i < attack) {
+                env = (float)i / attack;
+            } else if (i >= note_samples - release) {
+                env = (float)(note_samples - 1 - i) / (release - 1);
+            }
+
+            int16_t s = (int16_t)(osc_s * env * gain * 32767.0f);
+            buf[pos++] = s;
+            buf[pos++] = s;
+        }
+        for (int i = 0; i < gap_samples; i++) {
+            buf[pos++] = 0;
+            buf[pos++] = 0;
+        }
+
+        size_t chunk_done = 0;
+        if (codec->i2s_write(buf, pos * sizeof(int16_t), &chunk_done, portMAX_DELAY) != ESP_OK) {
+            write_failed = true;
+        }
+        bytes_written += chunk_done;
+    }
+
+    if (tail_ms > 0) {
+        const int final_gap = MELODY_SR * tail_ms / 1000;
+        memset(buf, 0, (size_t)final_gap * 2 * sizeof(int16_t));
+        size_t tail_done = 0;
+        if (codec->i2s_write(buf, (size_t)final_gap * 2 * sizeof(int16_t), &tail_done,
+                             portMAX_DELAY) != ESP_OK) {
+            write_failed = true;
+        }
+        bytes_written += tail_done;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(40));
+    codec->set_volume(restore_volume);
+
+    heap_caps_free(buf);
+    xSemaphoreGive(audio_tone_mutex);
+    if (write_failed) {
+        ESP_LOGW(TAG, "Finished %s, but the codec rejected at least one buffer", what);
+    } else {
+        ESP_LOGI(TAG, "Finished %s (%d bytes written)", what, (int)bytes_written);
+    }
+}
+
 static void play_startup_beep(void)
 {
     boot_sound_mode_t selected_mode = boot_sound_mode;
@@ -6597,19 +6811,8 @@ static void play_startup_beep(void)
         return;
     }
 
-    bsp_codec_config_t *codec = bsp_get_codec_handle();
-    if (!codec || !codec->i2s_write || !codec->set_volume || !codec->i2s_reconfig_clk_fn) {
-        ESP_LOGW(TAG, "Audio codec not available, skipping startup melody");
-        vTaskDelete(NULL);
-        return;
-    }
-
-    #define MELODY_SR  48000
-
-    typedef struct { float freq; int ms; } note_t;
-
     // Nokia Tune (Gran Vals by Francisco Tarrega)
-    static const note_t nokia_tune[] = {
+    static const melody_note_t nokia_tune[] = {
         { 659.25f, 125 },  // E5  eighth
         { 587.33f, 125 },  // D5  eighth
         { 369.99f, 250 },  // F#4 quarter
@@ -6626,7 +6829,7 @@ static void play_startup_beep(void)
     };
 
     // Intel-like startup jingle (short 5-note motif).
-    static const note_t intel_jingle[] = {
+    static const melody_note_t intel_jingle[] = {
         { 622.25f, 100 },  // D#5
         { 659.25f, 100 },  // E5
         { 493.88f, 110 },  // B4
@@ -6635,7 +6838,7 @@ static void play_startup_beep(void)
     };
 
     // Star Wars main motif (slower intro phrase).
-    static const note_t star_wars_motif[] = {
+    static const melody_note_t star_wars_motif[] = {
         { 440.00f, 380 },  // A4
         { 440.00f, 380 },  // A4
         { 440.00f, 380 },  // A4
@@ -6647,124 +6850,153 @@ static void play_startup_beep(void)
         { 440.00f, 680 },  // A4
     };
 
-    const note_t *melody = nokia_tune;
+    const melody_note_t *melody = nokia_tune;
     int melody_notes = (int)(sizeof(nokia_tune) / sizeof(nokia_tune[0]));
-    const char *melody_name = "Nokia";
+    const char *what = "the Nokia startup melody";
 
     switch (selected_mode) {
         case BOOT_SOUND_MODE_NOKIA:
             melody = nokia_tune;
             melody_notes = (int)(sizeof(nokia_tune) / sizeof(nokia_tune[0]));
-            melody_name = "Nokia";
+            what = "the Nokia startup melody";
             break;
         case BOOT_SOUND_MODE_INTEL:
             melody = intel_jingle;
             melody_notes = (int)(sizeof(intel_jingle) / sizeof(intel_jingle[0]));
-            melody_name = "Intel";
+            what = "the Intel startup melody";
             break;
         case BOOT_SOUND_MODE_STAR_WARS:
             melody = star_wars_motif;
             melody_notes = (int)(sizeof(star_wars_motif) / sizeof(star_wars_motif[0]));
-            melody_name = "Star Wars";
+            what = "the Star Wars startup melody";
             break;
         case BOOT_SOUND_MODE_OFF:
         default:
             melody = nokia_tune;
             melody_notes = (int)(sizeof(nokia_tune) / sizeof(nokia_tune[0]));
-            melody_name = "Nokia";
+            what = "the Nokia startup melody";
             break;
     }
 
     const int pause_ms = (selected_mode == BOOT_SOUND_MODE_STAR_WARS) ? 42 : 20;
-    const int final_silence_ms = 160;
 
-    // The codec is opened *before* any sample is rendered, so the very first
-    // buffer we produce can go straight out.
-    int restore_volume = 80;
-    if (codec->get_volume) {
-        int current_volume = codec->get_volume();
-        if (current_volume >= 0 && current_volume <= 100) {
-            restore_volume = current_volume;
-        }
-    }
-    codec->set_volume(BOOT_SOUND_VOLUME_PERCENT);
-    codec->i2s_reconfig_clk_fn(MELODY_SR, 16, I2S_SLOT_MODE_STEREO);
+    audio_play_notes(melody, melody_notes, what, BOOT_SOUND_VOLUME_PERCENT,
+                     0.85f, 5, 15, pause_ms, 160);
+    vTaskDelete(NULL);
+}
 
-    // One note at a time, not the whole melody up front. Rendering everything
-    // first delayed the first audible sample by the full render time, which on
-    // this board is far from free: all code is XIP from PSRAM and competes with
-    // the LVGL boot intro for bandwidth.
-    int longest_ms = final_silence_ms;
-    for (int n = 0; n < melody_notes; n++) {
-        int span = melody[n].ms + pause_ms;
-        if (span > longest_ms) longest_ms = span;
-    }
-    const int chunk_samples = MELODY_SR * longest_ms / 1000 + 8;
-    const size_t chunk_bytes = (size_t)chunk_samples * 2 * sizeof(int16_t);
+// "Someone arrived", not "alarm": an ascending fourth in the middle register,
+// with a long decay on the second note. Nothing above D5, so it carries across
+// a room without turning into a shriek.
+static const melody_note_t alert_notes_join[] = {
+    { 440.00f,  70 },  // A4
+    { 587.33f, 190 },  // D5
+};
 
-    int16_t *buf = heap_caps_malloc(chunk_bytes, MALLOC_CAP_SPIRAM);
-    if (!buf) {
-        ESP_LOGE(TAG, "Failed to allocate melody buffer (%d bytes)", (int)chunk_bytes);
-        codec->set_volume(restore_volume);
-        vTaskDelete(NULL);
+// Loot. An A major triad on the way up - the one tune here allowed to sound
+// pleased with itself.
+static const melody_note_t alert_notes_win[] = {
+    { 440.00f,  70 },  // A4
+    { 554.37f,  70 },  // C#5
+    { 659.25f, 230 },  // E5
+};
+
+// The same fourth as the join chime, walked backwards and slower. Falling
+// intervals read as "something dropped" without any training.
+static const melody_note_t alert_notes_warn[] = {
+    { 587.33f, 110 },  // D5
+    { 440.00f, 260 },  // A4
+};
+
+// A two-tone siren, four pulses. This is the only tone meant to be unpleasant,
+// because it is the only one you must not miss.
+//
+// It started life three octaves lower, on E4, and was inaudible on hardware
+// even at a higher volume than the join chime - the Tab5 speaker is a
+// micro-driver whose output falls away below roughly 600 Hz, so pitch, not
+// level, was what buried it. Urgency here comes from the alternating interval
+// and the rhythm; keep every alert tone inside the band the driver can
+// actually move, i.e. do not go below the join chime's A4.
+static const melody_note_t alert_notes_alarm[] = {
+    { 880.00f, 110 },  // A5
+    { 698.46f, 110 },  // F5
+    { 880.00f, 110 },  // A5
+    { 698.46f, 150 },  // F5
+};
+
+typedef struct {
+    const melody_note_t *notes;
+    int   count;
+    const char *name;
+    int   volume_pct;
+    float gain;
+    int   attack_ms;
+    int   release_ms;
+    int   pause_ms;
+    int   tail_ms;
+    int   cooldown_ms;   // shortest gap between two of this kind
+} alert_tone_def_t;
+
+// Cooldowns are not politeness, they are correctness: JanOS reports one
+// handshake over two or three SUCCESS lines, a rogue AP repeats its client
+// count every poll, and a deauth storm is hundreds of lines a minute. Without
+// a floor between repeats the speaker turns into a machine gun and the alert
+// stops carrying information.
+static const alert_tone_def_t alert_tones[ALERT_TONE_COUNT] = {
+    [ALERT_TONE_JOIN] = {
+        alert_notes_join, (int)(sizeof(alert_notes_join) / sizeof(alert_notes_join[0])),
+        "the client-join chime", ALERT_SOUND_VOLUME_PERCENT, 0.75f, 12, 140, 12, 60, 2000,
+    },
+    [ALERT_TONE_WIN] = {
+        alert_notes_win, (int)(sizeof(alert_notes_win) / sizeof(alert_notes_win[0])),
+        "the capture chime", ALERT_SOUND_VOLUME_PERCENT, 0.80f, 10, 130, 10, 60, 2500,
+    },
+    [ALERT_TONE_WARN] = {
+        alert_notes_warn, (int)(sizeof(alert_notes_warn) / sizeof(alert_notes_warn[0])),
+        "the warning chime", ALERT_SOUND_VOLUME_PERCENT, 0.80f, 14, 200, 14, 80, 3000,
+    },
+    [ALERT_TONE_ALARM] = {
+        alert_notes_alarm, (int)(sizeof(alert_notes_alarm) / sizeof(alert_notes_alarm[0])),
+        "the alarm", 75, 0.85f, 8, 60, 45, 80, 15000,
+    },
+};
+
+static uint32_t alert_last_tick[ALERT_TONE_COUNT];   // 0 = never played
+
+static void alert_chime_task(void *arg)
+{
+    const alert_tone_def_t *def = (const alert_tone_def_t *)arg;
+    audio_play_notes(def->notes, def->count, def->name, def->volume_pct, def->gain,
+                     def->attack_ms, def->release_ms, def->pause_ms, def->tail_ms);
+    vTaskDelete(NULL);
+}
+
+// Fire and forget. Callers are UART monitor tasks that must not sit inside
+// i2s_write while the Monster keeps talking, an httpd handler owing a client a
+// response, and LVGL callbacks that must not block at all - so the tune gets
+// its own short-lived task.
+//
+// `alert_last_tick` is written without a lock. Two tasks racing on the same
+// kind can at worst let one extra chime through, which is cheaper than a mutex
+// on a path that must never block its caller.
+static void alert_chime_play(alert_tone_t tone)
+{
+    if (!alert_sound_enabled) return;
+    if (tone < 0 || tone >= ALERT_TONE_COUNT) return;
+
+    const alert_tone_def_t *def = &alert_tones[tone];
+    uint32_t now = (uint32_t)xTaskGetTickCount();
+    uint32_t last = alert_last_tick[tone];
+    if (last != 0 && (now - last) < (uint32_t)pdMS_TO_TICKS(def->cooldown_ms)) {
         return;
     }
+    alert_last_tick[tone] = now ? now : 1;   // 0 is the "never played" marker
 
-    ESP_LOGI(TAG, "Playing startup melody: %s at %d%%", melody_name, BOOT_SOUND_VOLUME_PERCENT);
-
-    size_t bytes_written = 0;
-    const int attack = MELODY_SR * 5 / 1000;
-    const int release = MELODY_SR * 15 / 1000;
-    const int gap_samples = MELODY_SR * pause_ms / 1000;
-
-    for (int n = 0; n < melody_notes; n++) {
-        const int note_samples = MELODY_SR * melody[n].ms / 1000;
-
-        // Two-term recurrence ("magic circle") oscillator: one sinf per note
-        // instead of one per sample. sinf() per sample was the actual cost here
-        // - tens of thousands of libm calls through the PSRAM instruction cache.
-        const float k = 2.0f * sinf((float)M_PI * melody[n].freq / MELODY_SR);
-        float osc_c = 1.0f;   // tracks cos
-        float osc_s = 0.0f;   // tracks sin
-
-        int pos = 0;
-        for (int i = 0; i < note_samples; i++) {
-            osc_c -= k * osc_s;
-            osc_s += k * osc_c;
-
-            float env = 1.0f;
-            if (i < attack) {
-                env = (float)i / attack;
-            } else if (i >= note_samples - release) {
-                env = (float)(note_samples - 1 - i) / (release - 1);
-            }
-
-            int16_t s = (int16_t)(osc_s * env * 0.85f * 32767.0f);
-            buf[pos++] = s;
-            buf[pos++] = s;
-        }
-        for (int i = 0; i < gap_samples; i++) {
-            buf[pos++] = 0;
-            buf[pos++] = 0;
-        }
-
-        size_t chunk_done = 0;
-        codec->i2s_write(buf, pos * sizeof(int16_t), &chunk_done, portMAX_DELAY);
-        bytes_written += chunk_done;
+    // Priority 6, like the boot melody: almost always blocked in i2s_write, but
+    // it must not be starved between buffers or the DMA underruns.
+    if (xTaskCreate(alert_chime_task, "chime", 4096, (void *)def, 6, NULL) != pdPASS) {
+        ESP_LOGW(TAG, "Failed to start the alert chime task");
     }
-
-    const int final_gap = MELODY_SR * final_silence_ms / 1000;
-    memset(buf, 0, (size_t)final_gap * 2 * sizeof(int16_t));
-    size_t tail_done = 0;
-    codec->i2s_write(buf, (size_t)final_gap * 2 * sizeof(int16_t), &tail_done, portMAX_DELAY);
-    bytes_written += tail_done;
-
-    vTaskDelay(pdMS_TO_TICKS(40));
-    codec->set_volume(restore_volume);
-
-    heap_caps_free(buf);
-    ESP_LOGI(TAG, "Startup melody done (%s, %d bytes written)", melody_name, (int)bytes_written);
-    vTaskDelete(NULL);
 }
 
 // Show the procedural retro boot intro (all LVGL primitives, no bitmap asset).
@@ -9651,6 +9883,19 @@ static gitm_ctx_t *gitm_ctx(tab_context_t *ctx)
     return ctx->gitm;
 }
 
+// Forget everything we know about the connected clients. Called whenever a new
+// session begins, so the join chime cannot fire for a device that was already
+// on the AP before this page owned it.
+static void gitm_reset_client_tracking(tab_context_t *ctx)
+{
+    if (!ctx || !ctx->gitm) return;
+    ctx->gitm->client_sig[0] = '\0';
+    ctx->gitm->chime_mac_count = 0;
+    ctx->gitm->chime_armed = false;
+    ctx->gitm->warn_upstream_down = false;
+    ctx->gitm->warn_degraded = false;
+}
+
 // ---------------------------------------------------------------------------
 // Small helpers
 // ---------------------------------------------------------------------------
@@ -9997,8 +10242,69 @@ static bool gitm_connect_upstream(tab_id_t tab, uart_port_t port,
 // never interleave with wifi_connect, start or stop (section 8.1).
 // ---------------------------------------------------------------------------
 
+// Ring the chime when the snapshot carries a MAC the previous one did not.
+// The first complete block of a session only seeds the set: adopting a gateway
+// that already has clients is not an arrival, and neither is a device that
+// merely picked up a DHCP lease it was missing a poll ago.
+//
+// Runs on the session task, off the display lock, and keeps its own copy of the
+// MAC set - a snapshot that never reaches the screen must not swallow a join.
+static void gitm_note_client_arrivals(tab_context_t *ctx, const cgw_snapshot_t *snap)
+{
+    gitm_ctx_t *g = ctx->gitm;
+    bool joined = false;
+
+    for (int i = 0; i < snap->client_count && i < CGW_MAX_CLIENTS; i++) {
+        bool known = false;
+        for (int k = 0; k < g->chime_mac_count; k++) {
+            if (strcasecmp(snap->clients[i].mac, g->chime_macs[k]) == 0) {
+                known = true;
+                break;
+            }
+        }
+        if (known) continue;
+        joined = true;
+        if (g->chime_armed) {
+            ESP_LOGI(TAG, "GITM: %s joined the capture AP (%s)", snap->clients[i].mac,
+                     snap->clients[i].ip[0] ? snap->clients[i].ip : "no lease yet");
+        }
+    }
+
+    g->chime_mac_count = 0;
+    for (int i = 0; i < snap->client_count && i < CGW_MAX_CLIENTS; i++) {
+        memcpy(g->chime_macs[g->chime_mac_count++], snap->clients[i].mac,
+               sizeof(g->chime_macs[0]));
+    }
+
+    // One chime per refresh, however many devices arrived at once: a burst of
+    // joins should sound like a doorbell, not like a fire alarm.
+    if (joined && g->chime_armed) alert_chime_play(ALERT_TONE_JOIN);
+    g->chime_armed = true;
+}
+
+// Warn on the transition, never on the state: the page is already red, and the
+// chime exists for the operator who is not looking at it. Runs before the
+// arrival check, which is what arms the page after its first block.
+static void gitm_note_health(tab_context_t *ctx, const cgw_snapshot_t *snap)
+{
+    gitm_ctx_t *g = ctx->gitm;
+    bool upstream_down = !snap->upstream;
+    bool degraded = cgw_recorder_degraded(snap);
+
+    if (g->chime_armed) {
+        if ((upstream_down && !g->warn_upstream_down) ||
+            (degraded && !g->warn_degraded)) {
+            alert_chime_play(ALERT_TONE_WARN);
+        }
+    }
+    g->warn_upstream_down = upstream_down;
+    g->warn_degraded = degraded;
+}
+
 static void gitm_publish_snapshot(tab_context_t *ctx, const cgw_snapshot_t *snap)
 {
+    gitm_note_health(ctx, snap);
+    gitm_note_client_arrivals(ctx, snap);
     if (!bsp_display_lock(300)) return;
     ctx->gitm->snap = *snap;          // commit only complete blocks (section 8.3)
     gitm_render_live(ctx);
@@ -10835,7 +11141,7 @@ static void gitm_start_cb(lv_event_t *e)
     ctx->gitm->stop_request = false;
     cgw_snapshot_reset(&ctx->gitm->snap);
     memset(&ctx->gitm->final, 0, sizeof(ctx->gitm->final));
-    ctx->gitm->client_sig[0] = '\0';
+    gitm_reset_client_tracking(ctx);
 
     if (ctx->gitm->keyboard) lv_obj_add_flag(ctx->gitm->keyboard, LV_OBJ_FLAG_HIDDEN);
     // Both setup steps fold to a one-line summary; the live view takes over.
@@ -11303,7 +11609,7 @@ static void gitm_attach_task(void *arg)
         snprintf(ctx->gitm->up_ssid, sizeof(ctx->gitm->up_ssid), "%s", snap.upstream_ssid);
         ctx->gitm->ap_wpa2 = (strcmp(snap.security, "wpa2") == 0);
         ctx->gitm->stop_request = false;
-        ctx->gitm->client_sig[0] = '\0';
+        gitm_reset_client_tracking(ctx);
 
         if (bsp_display_lock(500)) {
             ctx->gitm->snap = snap;
@@ -11384,7 +11690,7 @@ static void show_gitm_page(void)
     ctx->gitm->state = GITM_IDLE;
     ctx->gitm->tab = (int)current_tab;
     ctx->gitm->uart_port = uart_port_for_tab(current_tab);
-    ctx->gitm->client_sig[0] = '\0';
+    gitm_reset_client_tracking(ctx);
     ctx->gitm->s1_collapsed = false;
     ctx->gitm->s2_collapsed = false;
     cgw_snapshot_reset(&ctx->gitm->snap);
@@ -11765,6 +12071,11 @@ static void handshaker_set_done_state(tab_context_t *ctx, bool show_wpasec_butto
 static void append_handshaker_log(const char *message, hs_log_type_t log_type)
 {
     if (!message || strlen(message) == 0) return;
+
+    // Every success path in the monitor funnels through here, so one call
+    // covers "captured", "saved for SSID" and the file-written line. JanOS
+    // emits two or three of those per handshake; the cooldown collapses them.
+    if (log_type == HS_LOG_SUCCESS) alert_chime_play(ALERT_TONE_WIN);
 
     // Determine color based on log type
     lv_color_t text_color;
@@ -15135,6 +15446,8 @@ static void karma_monitor_task(void *arg)
                             }
                             mac[j] = '\0';
 
+                            alert_chime_play(ALERT_TONE_JOIN);
+
                             bsp_display_lock(0);
                             if (karma_attack_mac_label) {
                                 lv_label_set_text_fmt(karma_attack_mac_label, "Last MAC connected: %s", mac);
@@ -15158,6 +15471,7 @@ static void karma_monitor_task(void *arg)
                             }
 
                             if (strlen(pass) > 0) {
+                                alert_chime_play(ALERT_TONE_WIN);
                                 bsp_display_lock(0);
                                 if (karma_attack_password_label) {
                                     lv_label_set_text_fmt(karma_attack_password_label, "Password obtained: %s", pass);
@@ -15476,6 +15790,8 @@ static void evil_twin_monitor_task(void *arg)
                                 mac_len++;
                             }
 
+                            alert_chime_play(ALERT_TONE_JOIN);
+
                             // Update status with client connected message
                             char status_text[256];
                             snprintf(status_text, sizeof(status_text),
@@ -15520,6 +15836,7 @@ static void evil_twin_monitor_task(void *arg)
                             strncpy(captured_pwd, pwd_start, pwd_len);
 
                             ESP_LOGI(TAG, "[%s] PASSWORD CAPTURED! SSID: %s, Password: %s", uart_name, captured_ssid, captured_pwd);
+                            alert_chime_play(ALERT_TONE_WIN);
 
                             // Update UI on main thread
                             if (ctx->evil_twin_status_label) {
@@ -20476,6 +20793,8 @@ static void append_global_handshaker_log_ctx(tab_context_t *ctx, const char *mes
 {
     if (!ctx || !message || strlen(message) == 0) return;
 
+    if (log_type == HS_LOG_SUCCESS) alert_chime_play(ALERT_TONE_WIN);
+
     // Determine color based on log type
     lv_color_t text_color;
     switch (log_type) {
@@ -21097,6 +21416,7 @@ static void update_phishing_portal_capture(tab_context_t *ctx, const char *captu
     snprintf(data_msg, sizeof(data_msg), "Last captured: %s", captured_text);
 
     ESP_LOGI(TAG, "Portal captured: %s", captured_text);
+    alert_chime_play(ALERT_TONE_WIN);
 
     // Update UI
     bsp_display_lock(0);
@@ -27126,6 +27446,7 @@ static void wardrive_autoupload_task(void *arg)
 
     // 5) Final result.
     ESP_LOGI(TAG, "auto-upload: DONE ok=%d | %s", overall_ok, summary[0] ? summary : "(nothing pending)");
+    alert_chime_play(overall_ok ? ALERT_TONE_WIN : ALERT_TONE_WARN);
     if (overall_ok && g_wd_autoupload_poweroff) {
         // Cancellable countdown: one "Stay on" button, ticking once a second. The
         // vTaskDelay yields to LVGL, so the tap is picked up between ticks.
@@ -27444,6 +27765,7 @@ static void wardrive_monitor_task(void *arg)
                     low_batt_stop_sent = true;
                     ESP_LOGW(TAG, "Wardrive: battery %d%% <= %d%% - graceful stop",
                              batt_pct, WARDRIVE_LOW_BATT_PCT);
+                    alert_chime_play(ALERT_TONE_WARN);
                     if (active_tab == TAB_MBUS) uart2_send_command("stop");
                     else uart_send_command("stop");
                     bsp_display_lock(0);
@@ -27552,6 +27874,7 @@ static void wardrive_monitor_task(void *arg)
                         if (ctx->wardrive_gps_fix && strstr(line_buffer, "GPS fix lost") != NULL) {
                             ctx->wardrive_gps_fix = false;
                             ESP_LOGW(TAG, "Wardrive: GPS fix lost");
+                            alert_chime_play(ALERT_TONE_WARN);
 
                             bsp_display_lock(0);
                             show_wardrive_gps_overlay(ctx);
@@ -27583,6 +27906,7 @@ static void wardrive_monitor_task(void *arg)
                         // No GPS fix obtained -> timeout, stop wardrive
                         if (strstr(line_buffer, "No GPS fix obtained") != NULL) {
                             ESP_LOGW(TAG, "Wardrive: No GPS fix - timed out");
+                            alert_chime_play(ALERT_TONE_WARN);
 
                             bsp_display_lock(0);
                             if (ctx->wardrive_gps_label) {
@@ -29948,6 +30272,7 @@ static void antisurv_monitor_task(void *arg)
 
                     if (strstr(line_buffer, "[FOLLOWER]") != NULL) {
                         ctx->antisurv_follower_count++;
+                        alert_chime_play(ALERT_TONE_ALARM);
 
                         // Pull out MAC and name for a compact row
                         char mac[20] = "?";
@@ -34669,6 +34994,7 @@ static void rogue_ap_monitor_task(void *arg)
                             mac[j] = '\0';
                             snprintf(current_mac, sizeof(current_mac), "%s", mac);
                             client_count++;
+                            alert_chime_play(ALERT_TONE_JOIN);
 
                             bsp_display_lock(0);
                             if (ctx->rogue_ap_status_label) {
@@ -34691,6 +35017,7 @@ static void rogue_ap_monitor_task(void *arg)
                             count_ptr += 22;  // Skip "Portal: Client count = "
                             int parsed_count = atoi(count_ptr);
                             if (parsed_count != client_count) {
+                                if (parsed_count > client_count) alert_chime_play(ALERT_TONE_JOIN);
                                 client_count = parsed_count;
                                 bsp_display_lock(0);
                                 if (ctx->rogue_ap_status_label) {
@@ -34734,6 +35061,7 @@ static void rogue_ap_monitor_task(void *arg)
                             }
 
                             if (strlen(pass) > 0) {
+                                alert_chime_play(ALERT_TONE_WIN);
                                 bsp_display_lock(0);
                                 if (ctx->rogue_ap_status_label) {
                                     char status[512];
@@ -35688,6 +36016,7 @@ static void save_portal_data(const char *ssid, const char *form_data)
         fprintf(f, "SSID: %s\nData: %s\n---\n", ssid, form_data);
         fclose(f);
         ESP_LOGI(TAG, "Portal data saved for SSID: %s", ssid);
+        alert_chime_play(ALERT_TONE_WIN);
 
         // Increment new data counter and update portal icon
         portal_new_data_count++;
@@ -44595,6 +44924,9 @@ static void deauth_detector_task(void *arg)
                         if (parse_deauth_line(line_buffer, &entry)) {
                             ESP_LOGI(TAG, "Deauth detected: CH%d %s (%s) RSSI=%d",
                                      entry.channel, entry.ap_name, entry.bssid, entry.rssi);
+                            // A flood is hundreds of frames a minute; the 15 s
+                            // cooldown on ALARM is what makes this survivable.
+                            alert_chime_play(ALERT_TONE_ALARM);
 
                             // Shift entries down (newest first)
                             if (deauth_entry_count < DEAUTH_DETECTOR_MAX_ENTRIES) {
@@ -47747,6 +48079,7 @@ static __attribute__((unused)) lv_obj_t *settings_popup_obj = NULL;
 #define NVS_KEY_DASHBOARD       "dashboard"
 #define NVS_KEY_DARK_MODE       "dark_mode"
 #define NVS_KEY_BOOT_SOUND      "boot_sound"
+#define NVS_KEY_ALERT_SOUND     "alert_sound"
 #define NVS_KEY_CLOCK_24H       "clock_24h"
 #define NVS_KEY_CLOCK_DST       "clock_dst"
 #define NVS_KEY_CLOCK_SHOW      "clock_show"
@@ -47913,6 +48246,16 @@ static void load_screen_settings_from_nvs(void)
             ESP_LOGI(TAG, "No Boot Sound setting in NVS, using default: %s", boot_sound_mode_name(boot_sound_mode));
         }
 
+        uint8_t alert_sound = 1;
+        err = nvs_get_u8(nvs, NVS_KEY_ALERT_SOUND, &alert_sound);
+        if (err == ESP_OK) {
+            alert_sound_enabled = (alert_sound != 0);
+            ESP_LOGI(TAG, "Loaded Alert Sound from NVS: %s", alert_sound_enabled ? "ON" : "OFF");
+        } else {
+            alert_sound_enabled = true;
+            ESP_LOGI(TAG, "No Alert Sound setting in NVS, using default: ON");
+        }
+
         nvs_close(nvs);
     } else {
         ESP_LOGI(TAG, "NVS not available, using default screen settings");
@@ -48069,6 +48412,20 @@ static void save_boot_sound_to_nvs(boot_sound_mode_t mode)
         ESP_LOGI(TAG, "Saved Boot Sound to NVS: %s", boot_sound_mode_name(mode));
     } else {
         ESP_LOGE(TAG, "Failed to open NVS for writing Boot Sound: %s", esp_err_to_name(err));
+    }
+}
+
+static void save_alert_sound_to_nvs(bool enabled)
+{
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs);
+    if (err == ESP_OK) {
+        nvs_set_u8(nvs, NVS_KEY_ALERT_SOUND, enabled ? 1 : 0);
+        nvs_commit(nvs);
+        nvs_close(nvs);
+        ESP_LOGI(TAG, "Saved Alert Sound to NVS: %s", enabled ? "ON" : "OFF");
+    } else {
+        ESP_LOGE(TAG, "Failed to open NVS for writing Alert Sound: %s", esp_err_to_name(err));
     }
 }
 
@@ -50238,6 +50595,19 @@ static void theme_boot_sound_dropdown_cb(lv_event_t *e)
     save_boot_sound_to_nvs(boot_sound_mode);
 }
 
+static void theme_alert_sound_switch_cb(lv_event_t *e)
+{
+    lv_obj_t *sw = lv_event_get_target(e);
+    bool enabled = lv_obj_has_state(sw, LV_STATE_CHECKED);
+    if (alert_sound_enabled == enabled) return;
+
+    alert_sound_enabled = enabled;
+    save_alert_sound_to_nvs(alert_sound_enabled);
+    // Play it once on the way in, so the volume is a decision and not a
+    // surprise the next time somebody walks into the capture AP.
+    if (enabled) alert_chime_play(ALERT_TONE_JOIN);
+}
+
 static void style_theme_switch(lv_obj_t *sw)
 {
     lv_obj_set_size(sw, 70, 36);
@@ -50589,7 +50959,7 @@ static void show_theme_popup(void)
     style_modal_overlay(theme_popup_overlay, dark_mode_enabled ? LV_OPA_50 : LV_OPA_30);
 
     theme_popup_obj = lv_obj_create(theme_popup_overlay);
-    lv_obj_set_size(theme_popup_obj, 430, 430);
+    lv_obj_set_size(theme_popup_obj, 430, 500);
     lv_obj_center(theme_popup_obj);
     style_popup_card(theme_popup_obj, 12, ui_tab_icon_color());
     lv_obj_set_style_pad_all(theme_popup_obj, 18, 0);
@@ -50674,11 +51044,33 @@ static void show_theme_popup(void)
     }
     lv_obj_add_event_cb(boot_sound_dropdown, theme_boot_sound_dropdown_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
+    lv_obj_t *alert_sound_row = lv_obj_create(theme_popup_obj);
+    lv_obj_set_size(alert_sound_row, lv_pct(100), 56);
+    lv_obj_set_style_bg_opa(alert_sound_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(alert_sound_row, 0, 0);
+    lv_obj_set_style_pad_all(alert_sound_row, 0, 0);
+    lv_obj_set_flex_flow(alert_sound_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(alert_sound_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(alert_sound_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *alert_sound_row_label = lv_label_create(alert_sound_row);
+    lv_label_set_text(alert_sound_row_label, "Alert sound");
+    lv_obj_set_style_text_font(alert_sound_row_label, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_color(alert_sound_row_label, ui_text_color(), 0);
+
+    lv_obj_t *alert_sound_switch = lv_switch_create(alert_sound_row);
+    style_theme_switch(alert_sound_switch);
+    if (alert_sound_enabled) {
+        lv_obj_add_state(alert_sound_switch, LV_STATE_CHECKED);
+    }
+    lv_obj_add_event_cb(alert_sound_switch, theme_alert_sound_switch_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
     lv_obj_t *desc = lv_label_create(theme_popup_obj);
     lv_label_set_text(desc,
         "Dark mode switches between dark and light palette.\n"
         "Dashboard ON/OFF toggles bottom telemetry cards on Home.\n"
-        "Boot sound selects startup melody at 69% volume.");
+        "Boot sound selects startup melody at 69% volume.\n"
+        "Alert sound: joins, captures, warnings and follower alarms.");
     lv_obj_set_style_text_font(desc, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(desc, ui_muted_color(), 0);
     lv_obj_set_width(desc, lv_pct(100));
@@ -53987,6 +54379,12 @@ static void compromised_transfer_show_popup(const char *file_name)
 static void compromised_transfer_finish_ui_unlocked(bool success, const char *detail)
 {
     compromised_transfer_ui.active = false;
+    // A cancel is the operator's own decision - they do not need to be told.
+    if (success) {
+        alert_chime_play(ALERT_TONE_WIN);
+    } else if (!compromised_transfer_ui.cancel_requested) {
+        alert_chime_play(ALERT_TONE_WARN);
+    }
     if (compromised_transfer_ui.status_label &&
         lv_obj_is_valid(compromised_transfer_ui.status_label)) {
         lv_label_set_text(compromised_transfer_ui.status_label,
@@ -55561,6 +55959,13 @@ void app_main(void)
 
     // Initialize audio codec (ES8388 speaker + ES7210 mic)
     bsp_codec_init();
+
+    // Guards the speaker against two tunes at once. Created here, before the
+    // startup melody and long before any page can ask for a chime.
+    audio_tone_mutex = xSemaphoreCreateMutex();
+    if (!audio_tone_mutex) {
+        ESP_LOGE(TAG, "Failed to create the audio mutex, sounds stay silent");
+    }
 
     // Initialize SD card
     ESP_LOGI(TAG, "Initializing SD card...");
