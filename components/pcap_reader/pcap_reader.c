@@ -1192,6 +1192,24 @@ uint32_t pcap_reader_link_type(const pcap_reader_t *reader)
     return reader ? reader->info.link_type : 0U;
 }
 
+pcap_timestamp_resolution_t pcap_reader_timestamp_resolution(const pcap_reader_t *reader)
+{
+    return reader ? reader->info.timestamp_resolution : PCAP_TIMESTAMP_MICROSECONDS;
+}
+
+uint64_t pcap_reader_packet_time_us(const pcap_packet_index_t *packet,
+                                    pcap_timestamp_resolution_t resolution)
+{
+    if (!packet) return 0U;
+    uint64_t scale = (resolution == PCAP_TIMESTAMP_NANOSECONDS) ? 1000000000ULL : 1000000ULL;
+    uint64_t fraction = packet->timestamp_fraction;
+    /* A malformed record can carry a fraction past one second; clamping keeps
+     * it inside its own second instead of shifting it into the next one. */
+    if (fraction >= scale) fraction = scale - 1U;
+    return (uint64_t)packet->timestamp_seconds * 1000000ULL +
+           ((resolution == PCAP_TIMESTAMP_NANOSECONDS) ? fraction / 1000U : fraction);
+}
+
 const char *pcap_reader_status_name(pcap_reader_status_t status)
 {
     switch (status) {

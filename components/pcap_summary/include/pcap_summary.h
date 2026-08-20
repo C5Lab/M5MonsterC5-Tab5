@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 #include "pcap_reader.h"
+#include "pcap_summary_reducers.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -17,18 +18,12 @@ extern "C" {
 #define PCAP_SUMMARY_MAX_DNS_ANSWERS  24U
 #define PCAP_SUMMARY_MAX_DNS_PEERS    16U
 #define PCAP_SUMMARY_MAX_DNS_TYPES    16U
+#define PCAP_SUMMARY_MAX_HOST_PAIRS   24U
+#define PCAP_SUMMARY_MAX_SERVICES     24U
 
-typedef struct {
-    char label[96];
-    uint64_t count;
-    uint64_t bytes;
-} pcap_summary_text_counter_t;
-
-typedef struct {
-    uint16_t port;
-    uint8_t ip_protocol;
-    uint64_t count;
-} pcap_summary_port_counter_t;
+/* Ratios below this many samples are still reported, but carry the low-sample
+ * marker so a 100% built out of two packets is never read as a trend. */
+#define PCAP_SUMMARY_MIN_RATIO_SAMPLES 20U
 
 typedef struct {
     uint64_t analyzed_packets;
@@ -61,6 +56,11 @@ typedef struct {
     uint64_t dns_many_label_names;
     uint64_t dns_unique_domains_observed;
 
+    /* Capture span the time-window reducers were configured with, taken from
+     * the indexed records so an out-of-order file cannot shift the buckets. */
+    uint64_t first_timestamp_us;
+    uint64_t last_timestamp_us;
+
     uint16_t protocol_count;
     uint16_t endpoint_count;
     uint16_t port_count;
@@ -69,6 +69,8 @@ typedef struct {
     uint16_t dns_client_count;
     uint16_t dns_server_count;
     uint16_t dns_type_count;
+    uint16_t host_pair_count;
+    uint16_t service_count;
 
     bool protocol_table_approximate;
     bool endpoint_table_approximate;
@@ -78,6 +80,11 @@ typedef struct {
     bool dns_client_table_approximate;
     bool dns_server_table_approximate;
     bool dns_type_table_approximate;
+    bool host_pair_table_approximate;
+    bool service_table_approximate;
+    /* Set when an endpoint or host pair could not be reduced to a canonical
+     * key, so the unique counts below are a floor rather than a total. */
+    bool key_normalization_skipped;
 
     pcap_summary_text_counter_t protocols[PCAP_SUMMARY_MAX_PROTOCOLS];
     pcap_summary_text_counter_t endpoints[PCAP_SUMMARY_MAX_ENDPOINTS];
@@ -87,6 +94,30 @@ typedef struct {
     pcap_summary_text_counter_t dns_clients[PCAP_SUMMARY_MAX_DNS_PEERS];
     pcap_summary_text_counter_t dns_servers[PCAP_SUMMARY_MAX_DNS_PEERS];
     pcap_summary_text_counter_t dns_types[PCAP_SUMMARY_MAX_DNS_TYPES];
+    pcap_summary_text_counter_t host_pairs[PCAP_SUMMARY_MAX_HOST_PAIRS];
+    pcap_summary_text_counter_t services[PCAP_SUMMARY_MAX_SERVICES];
+
+    /* Distinct-key sketches. Unlike the bounded tables above these keep
+     * counting after the table is full, and never count an evicted key twice. */
+    pcap_unique_t unique_endpoints;
+    pcap_unique_t unique_host_pairs;
+    pcap_unique_t unique_domains;
+
+    /* Ratio reducers. Each one carries its denominator, so an empty sample is
+     * rendered as "n/a" instead of a confident zero. */
+    pcap_ratio_t tcp_share;             /* TCP packets over analyzed packets */
+    pcap_ratio_t udp_share;
+    pcap_ratio_t malformed_ratio;
+    pcap_ratio_t truncated_ratio;
+    pcap_ratio_t dns_answered_ratio;    /* responses over queries */
+    pcap_ratio_t dns_nxdomain_ratio;    /* NXDOMAIN over responses */
+    pcap_ratio_t top_pair_share;        /* busiest host pair over analyzed packets */
+    pcap_ratio_t top_talker_share;      /* busiest endpoint over analyzed packets */
+
+    /* Time-window reducers over the capture span. */
+    pcap_window_t packet_window;
+    pcap_window_t dns_nxdomain_window;
+    pcap_window_t deauthentication_window;
 } pcap_summary_t;
 
 typedef void (*pcap_summary_progress_cb_t)(size_t processed_packets,

@@ -65,3 +65,65 @@ overlap, that the release hands over at exactly 1.0, that each note starts and
 ends in silence, and that no boot melody note is short enough to be clamped -
 i.e. sharing the renderer with the alerts left the startup melody sounding
 exactly as it did.
+
+## `pcap_summary_reducers_test.c`
+
+Covers `components/pcap_summary/pcap_summary_reducers.c` - the key normalizers
+and the aggregation primitives the PCAP summary is built from. This is the unit
+test list of `docs/PCAP_Analysis_and_Implementation_Plan.md` section 22.9:
+empty, single element, ties, limits, overflow and deterministic order.
+
+```sh
+gcc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -g \
+    -Icomponents/pcap_summary/include -o /tmp/reducers_test \
+    tests/pcap_summary_reducers_test.c \
+    components/pcap_summary/pcap_summary_reducers.c
+/tmp/reducers_test
+```
+
+What it pins down:
+
+- a key that does not fit its buffer is refused, never clipped, because a
+  clipped key merges two different observations into one row;
+- `A -> B` and `B -> A` produce the same host-pair key, with the port stripped
+  and MAC case folded;
+- a domain loses its root dot and its case, so `WWW.Example.COM.` and
+  `www.example.com` are one key;
+- ties sort lexicographically, so the table never depends on insertion order;
+- an evicting table raises `approximate`, and counters saturate instead of
+  wrapping;
+- a ratio carries its denominator: zero samples render as `n/a`, a thin sample
+  is labelled `low sample`, and `0/100` stays a real zero;
+- window buckets hold both edges of the capture span, out-of-span samples are
+  counted apart, and the burst score is 1.0 for a flat capture;
+- the distinct-key sketch counts a returning key once and admits when its load
+  makes the count approximate.
+
+## `pcap_summary_report_test.c`
+
+End-to-end over the analysis stack: it synthesizes PCAP files on disk, runs
+`pcap_reader` -> `pcap_summary` -> `pcap_summary_render_report()` and compares
+the result with a baseline embedded in the test.
+
+```sh
+gcc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -g \
+    -Icomponents/pcap_summary/include -Icomponents/pcap_reader/include \
+    -o /tmp/report_test tests/pcap_summary_report_test.c \
+    components/pcap_summary/pcap_summary.c \
+    components/pcap_summary/pcap_summary_reducers.c \
+    components/pcap_summary/pcap_summary_report.c \
+    components/pcap_reader/pcap_reader.c
+/tmp/report_test            # fixtures go to /tmp, or to the directory in argv[1]
+```
+
+The fixtures are the acceptance list of section 22.9: a reference capture whose
+whole report is pinned byte for byte, an empty capture, a 10-byte file that must
+be refused, a capture whose last record is cut, records with broken protocol
+data and a lying `caplen`, an NXDOMAIN burst, one-pair dominance and a
+high-cardinality capture. It also renders the same file twice and requires
+identical bytes, and renders into a 400-byte buffer to check that a clipped
+report says `[report truncated]`.
+
+When a deliberate wording change breaks the baseline, the test prints the actual
+report between `----8<----` markers so the new text can be reviewed and pasted
+into `reference_report[]`.

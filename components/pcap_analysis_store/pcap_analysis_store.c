@@ -1,5 +1,7 @@
 #include "pcap_analysis_store.h"
 
+#include "pcap_summary_report.h"
+
 #include <ctype.h>
 #include <errno.h>
 #include <limits.h>
@@ -521,6 +523,40 @@ static void espc_json_string(FILE *file, const char *value)
     fputc('"', file);
 }
 
+/* A ratio is exported with its denominator and its flags, so a consumer can
+ * tell "nothing was observed" from "observed and zero". */
+static void espc_json_ratio(FILE *file, const pcap_ratio_t *ratio)
+{
+    if (!ratio || !ratio->valid) {
+        fputs("{\"valid\":false}", file);
+        return;
+    }
+    fprintf(file,
+            "{\"valid\":true,\"value\":%.4f,\"numerator\":%llu,\"denominator\":%llu,"
+            "\"low_sample\":%s}",
+            ratio->value, (unsigned long long)ratio->numerator,
+            (unsigned long long)ratio->denominator,
+            ratio->low_sample ? "true" : "false");
+}
+
+static void espc_json_window(FILE *file, const pcap_window_t *window)
+{
+    if (!window || !window->configured) {
+        fputs("{\"configured\":false}", file);
+        return;
+    }
+    uint16_t peak_index = 0;
+    uint32_t peak = pcap_window_peak(window, &peak_index);
+    fprintf(file,
+            "{\"configured\":true,\"bucket_seconds\":%.6f,\"buckets\":%u,"
+            "\"total\":%llu,\"peak\":%lu,\"peak_bucket\":%u,\"burst_score\":%.2f,"
+            "\"out_of_range\":%llu}",
+            pcap_window_bucket_seconds(window), window->bucket_count,
+            (unsigned long long)window->total, (unsigned long)peak,
+            peak_index, pcap_window_burst_score(window),
+            (unsigned long long)window->out_of_range);
+}
+
 static void espc_json_text_counters(FILE *file, const pcap_summary_text_counter_t *items,
                                     uint16_t count)
 {
@@ -616,7 +652,45 @@ pcap_analysis_store_status_t pcap_analysis_export_report_json(
                 summary->ports[i].ip_protocol == 6 ? "TCP" : "UDP",
                 summary->ports[i].port, (unsigned long long)summary->ports[i].count);
     }
-    fputs("],\n  \"dns\":{", report);
+    fputs("],\n  \"host_pairs\":", report);
+    espc_json_text_counters(report, summary->host_pairs, summary->host_pair_count);
+    fputs(",\n  \"services\":", report);
+    espc_json_text_counters(report, summary->services, summary->service_count);
+    fprintf(report,
+            ",\n  \"metrics\":{\"unique_endpoints\":%llu,\"unique_endpoints_approximate\":%s,"
+            "\"unique_host_pairs\":%llu,\"unique_host_pairs_approximate\":%s,"
+            "\"unique_domains\":%llu,\"unique_domains_approximate\":%s,"
+            "\"key_normalization_skipped\":%s,",
+            (unsigned long long)summary->unique_endpoints.distinct,
+            summary->unique_endpoints.approximate ? "true" : "false",
+            (unsigned long long)summary->unique_host_pairs.distinct,
+            summary->unique_host_pairs.approximate ? "true" : "false",
+            (unsigned long long)summary->unique_domains.distinct,
+            summary->unique_domains.approximate ? "true" : "false",
+            summary->key_normalization_skipped ? "true" : "false");
+    fputs("\"tcp_share\":", report);
+    espc_json_ratio(report, &summary->tcp_share);
+    fputs(",\"udp_share\":", report);
+    espc_json_ratio(report, &summary->udp_share);
+    fputs(",\"malformed_ratio\":", report);
+    espc_json_ratio(report, &summary->malformed_ratio);
+    fputs(",\"truncated_ratio\":", report);
+    espc_json_ratio(report, &summary->truncated_ratio);
+    fputs(",\"dns_answered_ratio\":", report);
+    espc_json_ratio(report, &summary->dns_answered_ratio);
+    fputs(",\"dns_nxdomain_ratio\":", report);
+    espc_json_ratio(report, &summary->dns_nxdomain_ratio);
+    fputs(",\"top_pair_share\":", report);
+    espc_json_ratio(report, &summary->top_pair_share);
+    fputs(",\"top_talker_share\":", report);
+    espc_json_ratio(report, &summary->top_talker_share);
+    fputs(",\"packet_window\":", report);
+    espc_json_window(report, &summary->packet_window);
+    fputs(",\"dns_nxdomain_window\":", report);
+    espc_json_window(report, &summary->dns_nxdomain_window);
+    fputs(",\"deauthentication_window\":", report);
+    espc_json_window(report, &summary->deauthentication_window);
+    fputs("},\n  \"dns\":{", report);
     fprintf(report,
             "\"packets\":%llu,\"queries\":%llu,\"responses\":%llu,"
             "\"nxdomain\":%llu,\"servfail\":%llu,\"unique_domains_observed\":%llu,",
@@ -982,6 +1056,58 @@ pcap_analysis_store_status_t pcap_analysis_export_filtered_pcap(
         return PCAP_ANALYSIS_STORE_IO_ERROR;
     }
     if (exported_packets_out) *exported_packets_out = exported;
+    return PCAP_ANALYSIS_STORE_OK;
+}
+
+pcap_analysis_store_status_t pcap_analysis_export_summary_text(
+    const char *source_path, const pcap_capture_info_t *capture_info,
+    const pcap_scan_summary_t *scan_summary, const pcap_summary_t *summary,
+    char *output_path, size_t output_path_size)
+{
+    if (!source_path || !capture_info || !scan_summary || !summary || !output_path ||
+        output_path_size == 0 || !espc_prepare_artifact_dirs() ||
+        !espc_build_unique_artifact_path(source_path, ".espsummary.txt",
+                                         output_path, output_path_size)) {
+        return PCAP_ANALYSIS_STORE_INVALID;
+    }
+    char temp_path[PCAP_ANALYSIS_STORE_PATH_MAX + 8U];
+    if (snprintf(temp_path, sizeof(temp_path), "%s.tmp", output_path) >= (int)sizeof(temp_path)) {
+        return PCAP_ANALYSIS_STORE_LIMIT;
+    }
+    /* The report is rendered in one piece so the file on the card is either the
+     * whole text or nothing; it is freed before the rename. */
+    char *text = malloc(PCAP_SUMMARY_REPORT_SUGGESTED_SIZE);
+    if (!text) return PCAP_ANALYSIS_STORE_LIMIT;
+    size_t length = pcap_summary_render_report(capture_info, scan_summary, summary,
+                                               text, PCAP_SUMMARY_REPORT_SUGGESTED_SIZE);
+    if (length == 0) {
+        free(text);
+        return PCAP_ANALYSIS_STORE_INVALID;
+    }
+
+    FILE *file = fopen(temp_path, "wb");
+    if (!file) {
+        free(text);
+        return PCAP_ANALYSIS_STORE_IO_ERROR;
+    }
+    fprintf(file, "Source: %s\n\n", source_path);
+    bool ok = fwrite(text, 1, length, file) == length;
+    free(text);
+    if (ok) ok = !ferror(file) && fflush(file) == 0;
+    if (ok) {
+        int fd = fileno(file);
+        if (fd >= 0) ok = fsync(fd) == 0;
+    }
+    if (fclose(file) != 0) ok = false;
+    if (!ok) {
+        remove(temp_path);
+        return PCAP_ANALYSIS_STORE_IO_ERROR;
+    }
+    remove(output_path);
+    if (rename(temp_path, output_path) != 0) {
+        remove(temp_path);
+        return PCAP_ANALYSIS_STORE_IO_ERROR;
+    }
     return PCAP_ANALYSIS_STORE_OK;
 }
 

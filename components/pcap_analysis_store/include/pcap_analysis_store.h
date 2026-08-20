@@ -14,8 +14,8 @@ extern "C" {
 #endif
 
 #define PCAP_ANALYSIS_STORE_PATH_MAX 384U
-#define PCAP_ANALYSIS_CACHE_SCHEMA_VERSION 7U
-#define PCAP_ANALYSIS_REPORT_SCHEMA_VERSION 6U
+#define PCAP_ANALYSIS_CACHE_SCHEMA_VERSION 8U
+#define PCAP_ANALYSIS_REPORT_SCHEMA_VERSION 7U
 #define PCAP_ANALYSIS_FILTER_SCHEMA_VERSION 2U
 
 typedef enum {
@@ -94,6 +94,16 @@ pcap_analysis_store_status_t pcap_analysis_export_filtered_pcap(
     char *output_path,
     size_t output_path_size,
     uint32_t *exported_packets_out);
+
+/* Writes the deterministic English summary from pcap_summary_render_report()
+ * next to the other exports, as a plain .txt sidecar of the capture. */
+pcap_analysis_store_status_t pcap_analysis_export_summary_text(
+    const char *source_path,
+    const pcap_capture_info_t *capture_info,
+    const pcap_scan_summary_t *scan_summary,
+    const pcap_summary_t *summary,
+    char *output_path,
+    size_t output_path_size);
 
 pcap_analysis_store_status_t pcap_analysis_filter_profile_save(
     pcap_packet_filter_t active_filter,

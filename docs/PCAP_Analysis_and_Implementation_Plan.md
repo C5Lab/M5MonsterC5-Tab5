@@ -4,7 +4,7 @@
 > **Status transferu:** zapis PCAP i lokalna analiza MVP są potwierdzone sprzętowo; obecny ARP MITM nie jest uznany za niezawodną bramę, ponieważ nie przepuszcza ruchu poprawnie w każdej badanej sieci.
 > **Bramka wydania v6:** pełny build ESP-IDF 5.4.1 sprzed korekty FQDN zakończony sukcesem; po zmianach z sekcji 32–33 kompilację i test sprzętowy wykonuje właściciel projektu.
 > **Ostatnia aktualizacja i audyt kodu:** 2026-08-11, `development` HEAD `1f2700f` oraz lokalna implementacja FQDN/cache v7, interaktywnego DNS drill-down i hierarchicznej mapy topology; ostatni bazowy commit ESPShark `1816750`.
-> **Zakres dokumentu:** sekcja 0 jest kanonicznym bilansem funkcji, sekcja 29 opisuje bazę v5, sekcja 30 zmianę v6, sekcja 31 interaktywny DNS, sekcja 32 korektę FQDN, sekcja 33 mapę topology, sekcja 34 opisuje zaimplementowany offline object extraction, sekcja 35 planuje docelową bramę capture JanOS, sekcja 36 dokumentuje audyt wydajności indeksowania, sekcja 37 naprawę zawisu transferu SDIO, a sekcje 25–28 pokazują historię rozwoju; nowe rozszerzenia nie zmieniają statusu końcowego v6.
+> **Zakres dokumentu:** sekcja 0 jest kanonicznym bilansem funkcji, sekcja 29 opisuje bazę v5, sekcja 30 zmianę v6, sekcja 31 interaktywny DNS, sekcja 32 korektę FQDN, sekcja 33 mapę topology, sekcja 34 opisuje zaimplementowany offline object extraction, sekcja 35 planuje docelową bramę capture JanOS, sekcja 36 dokumentuje audyt wydajności indeksowania, sekcja 37 naprawę zawisu transferu SDIO, sekcja 39 zamyka reduktory i deterministyczny raport EN z planu sekcji 22, a sekcje 25–28 pokazują historię rozwoju; nowe rozszerzenia nie zmieniają statusu końcowego v6.
 
 ## 0. Kanoniczny stan końcowy ESPShark Offline v6
 
@@ -1259,6 +1259,7 @@ Każdy wpis musi zawierać:
 
 | Data | Zakres | Zmiany | Weryfikacja | CoreS3 / uwagi |
 |---|---|---|---|---|
+| 2026-08-20 | Reduktory summary, normalizacja kluczy i raport EN | Zamknięto etapy 3–5 planu Zeek-derived summary: nowa biblioteka `pcap_summary_reducers` (klucze, top-k, ratio, time-window, szkic unique), deterministyczny renderer `pcap_summary_report` w układzie Capture/Traffic/Protocols/Anomalies/IOC, tabele `host_pairs` i `services`, osiem ratio i trzy okna czasowe w `pcap_summary_t`, nowe akcesory czasu w `pcap_reader`, obiekt `metrics` w eksporcie JSON oraz przycisk `EXPORT TEXT SUMMARY` zapisujący `<capture>.espsummary.txt`. Cache schema v8, report schema v7. | Dwa zestawy testów hosta (`tests/pcap_summary_reducers_test.c`, `tests/pcap_summary_report_test.c`) z ASan/UBSan i baseline’em raportu bajt w bajt przechodzą; wszystkie zmienione pliki C skompilowane do obiektu flagami z `build/compile_commands.json` bez ostrzeżeń przy `-Werror`. Pełny build i test sprzętowy opisuje sekcja 39.4. | Warstwa metryk nie zależy od LVGL ani ESP-IDF i buduje się na hoście, więc przenosi się na CoreS3 bez zmian; rosnąca `pcap_summary_t` (29 384 B) pozostaje w PSRAM. |
 | 2026-08-11 | ESPShark Offline v6 — hierarchiczna Network Topology | Dodano domyślny widok `TOPOLOGY` inspirowany kontrolerami sieciowymi: pionowy tor Internet → heurystyczna brama/router → `LAN / UNKNOWN L2 FABRIC` oraz przewijalna rama z maksymalnie 12 najważniejszymi urządzeniami w jednej lub dwóch kolumnach. Role `GW/INFRA/SRV/IOT/LAN` wynikają z hostname, usług i relacji MAC z endpointami WAN. Grafy `TRAFFIC`, `THREATS`, `SERVICES` używają rozdzielonych pionowych pasów LAN/WAN. Kliknięcie urządzenia aktywuje pełne `DEVICE SUMMARY` i `FILTER NODE`. | Kontrola statyczna oraz `git diff --check`; zgodnie z decyzją właściciela nie uruchomiono kompilacji. Test sprzętowy opisuje sekcja 33.3. | Topologia jest jawnie oznaczona `INFERRED FROM PCAP`. Nie twierdzi, że zna fizyczne porty switcha, AP ani okablowanie; CoreS3 wymaga ciaśniejszego układu kart. |
 | 2026-08-11 | ESPShark Offline v6 — korekta `SHOW FQDN` | Parser zachowuje do czterech unikalnych A/AAAA z jednej odpowiedzi zamiast wyłącznie pierwszego, wykorzystuje częściowe odpowiedzi DNS/TCP mieszczące się w oknie dekodera oraz nazwę owner dla odpowiedzi bez question. Tabela preferuje dokładny SNI/HTTP Host bieżącego flow, potem mapę DNS/device. Przycisk i pager pokazują liczbę dostępnych name hints. Cache schema podniesiono do v7, aby wcześniejszy pusty lub niepełny cache przebudował się automatycznie. | Kontrola statyczna i `git diff --check`; zgodnie z decyzją właściciela nie uruchomiono kompilacji. Test sprzętowy opisuje sekcja 32.3. | Bez zapytań sieciowych i bez zmian JanOS. Nazwa z SNI/Host jest przypisana do konkretnego flow; globalna relacja IP/FQDN nadal jest wskazówką, szczególnie dla współdzielonych adresów CDN. |
 | 2026-08-11 | ESPShark Offline v6 — interaktywny DNS | Zastąpiono statyczne Top Domains interaktywną listą. Kliknięcie domeny pokazuje klientów zapytań, rozwiązane adresy A/AAAA i największe flow skorelowane przez adres DNS albo dokładny TLS SNI/HTTP Host; każde flow ma `FILTER`, `FOLLOW` ASCII i `HEX` oraz powrót do listy DNS. | Pełny build ESP-IDF 5.4.1 zakończony sukcesem; firmware ma 71% wolnego miejsca w najmniejszej partycji app. Drill-down ma jawne limity 16 klientów, 16 adresów i 24 największych flow. Pozostał test sprzętowy z sekcji 31.3. | Funkcja analizuje tylko indeksowaną próbkę PCAP i istniejącą tabelę flow, nie wykonuje zapytań DNS do Internetu i nie wymaga zmiany JanOS ani schema cache. |
@@ -1695,7 +1696,7 @@ JanOS firmware remains unchanged.
 
 ### 22.1. Cel i status
 
-Status: **fundament `pcap_reader`, ograniczony `pcap_summary`, filtry oraz pierwsze ekrany `Overview`/`DNS Summary` są zaimplementowane; generator referencyjny i porównanie z pełnym Zeekiem pozostają etapem badawczym**.
+Status: **etapy 3, 4 i 5 zamknięte 2026-08-20** — biblioteka reduktorów (`sum`, `unique`, `top-k`, `ratio`, `time-window`), normalizacja kluczy oraz deterministyczny renderer tekstu EN żyją w `components/pcap_summary` i mają testy hosta z baseline’em bajt w bajt (sekcja 39). **Otwarte pozostaje wyłącznie porównanie z pełnym Zeekiem**: generator referencyjny, mapowanie pól na `conn.log`/`dns.log`/`http.log`/`ssl.log`, benchmark pamięci na P4 oraz regresja `btest`.
 
 Lokalne źródła referencyjne Zeek:
 
@@ -1828,12 +1829,12 @@ Pierwsza implementacja nie używa C++, STL, RTTI ani wyjątków. Stan summary je
 
 Etap zależy od 22.5.
 
-- [ ] Użyć Zeek SumStats jako referencji zachowania, nie kopiować automatycznie całego frameworka.
-- [ ] Zaimplementować reduktory: `sum`, `unique`, `top-k`, `ratio`, `time-window`. **W toku:** działają sumy, ograniczone Top-N i licznik observed-unique DNS; ratio i time-window pozostają otwarte.
-- [ ] Dodać normalizację kluczy: IP/host pair, service, domain, SNI, filename/hash.
-- [ ] Zapewnić deterministyczne sortowanie, w tym regułę rozstrzygania remisów. **W toku:** wynik jest sortowany malejąco po count, a remisy leksykograficznie albo według transport/port; wymaga baseline testu.
-- [ ] Dodać limity cardinality oraz sygnał `truncated/approximate` po ich osiągnięciu. **W toku:** wszystkie tabele mają stałą pojemność i osobną flagę `approximate`; pozostaje walidacja na capture o dużej kardynalności.
-- [ ] Ocenić, czy unique wymaga dokładnego zbioru w PSRAM, czy kontrolowanego algorytmu przybliżonego.
+- [x] Użyć Zeek SumStats jako referencji zachowania, nie kopiować automatycznie całego frameworka. Wzorowano się na zachowaniu reduktorów, kod powstał od zera w C11 bez zależności od frameworka.
+- [x] Zaimplementować reduktory: `sum`, `unique`, `top-k`, `ratio`, `time-window`. Wszystkie żyją w `components/pcap_summary/pcap_summary_reducers.c`. `ratio` niesie licznik, mianownik oraz flagi `valid`/`low_sample`; `time-window` ma stałe 64 kubełki rozpięte na czasie capture i wynik `burst score` = szczyt/średnia.
+- [x] Dodać normalizację kluczy: IP/host pair, service, domain, SNI, filename/hash. `pcap_key_domain`, `pcap_key_sni`, `pcap_key_host`, `pcap_key_host_pair`, `pcap_key_service`, `pcap_key_filename`, `pcap_key_hash`. Klucz, który nie mieści się w buforze, jest odrzucany zamiast przycinany — przycięcie sklejałoby dwie różne obserwacje w jeden wiersz. Summary używa domeny, hosta, pary i usługi; SNI, filename i hash są wspólnym kontraktem dla `pcap_flow` oraz `pcap_extract` i czekają na podpięcie tam.
+- [x] Zapewnić deterministyczne sortowanie, w tym regułę rozstrzygania remisów. Malejąco po count, remis leksykograficznie po etykiecie albo po `transport, port`. Test `tests/pcap_summary_reducers_test.c` sprawdza kolejność remisów i powtarzalność tabeli bajt w bajt, a `tests/pcap_summary_report_test.c` porównuje cały raport z baseline'em.
+- [x] Dodać limity cardinality oraz sygnał `truncated/approximate` po ich osiągnięciu. Fixture z 200 unikalnymi domenami potwierdza, że tabela zatrzymuje się na `PCAP_SUMMARY_MAX_DNS_DOMAINS`, podnosi `approximate` i że raport to pokazuje.
+- [x] Ocenić, czy unique wymaga dokładnego zbioru w PSRAM, czy kontrolowanego algorytmu przybliżonego. **Decyzja:** dokładny zbiór przy stałej pojemności jest niemożliwy, a poprzednie liczenie unikatów przez wynik wstawienia do tabeli zawyżało wynik przy każdym powrocie wyeksmitowanego klucza. Wprowadzono deterministyczny szkic bitmapowy 4096 bitów z dwiema pozycjami FNV-1a (`pcap_unique_t`, 536 B): kolizja może wyłącznie zaniżyć wynik, nigdy go nie zawyżyć, a po przekroczeniu 256 kluczy zapala się flaga `approximate`.
 
 ### 22.7. Etap 5 — algorytm sekcji medium-detail EN
 
@@ -1899,17 +1900,19 @@ Nie należy dodawać kodu Zeek do firmware Tab5 przed zakończeniem bramki wykon
 
 Etap zależy od 22.8.
 
-- [ ] Testy jednostkowe reduktorów: empty, single element, ties, limits, overflow i deterministic order.
-- [ ] Testy integracyjne `PCAP → summary` z tekstowym baseline.
-- [ ] Porównanie pomocniczych pól z `conn.log`, `dns.log`, `http.log`, `ssl.log`, `weird.log` i `notice.log`.
-- [ ] Test pustego PCAP.
-- [ ] Test one-flow dominance.
-- [ ] Test uciętego nagłówka globalnego i uciętego ostatniego rekordu.
-- [ ] Test malformed protocol data i invalid caplen/origlen.
-- [ ] Test DNS NXDOMAIN burst, TLS alerts i malformed HTTP.
-- [ ] Test deterministyczności: identyczny output bajt w bajt dla tego samego wejścia i konfiguracji.
-- [ ] Benchmark czasu, peak internal RAM, peak PSRAM i liczby pominiętych rekordów.
-- [ ] Regresja Zeek `btest` dla zmienionego adaptera/pluginu, jeśli repo Zeek będzie modyfikowane.
+Testy hosta żyją w `tests/` i uruchamiają się bez Tab5; komendy podaje `tests/README.md`.
+
+- [x] Testy jednostkowe reduktorów: empty, single element, ties, limits, overflow i deterministic order — `tests/pcap_summary_reducers_test.c`, kompilowany z ASan i UBSan.
+- [x] Testy integracyjne `PCAP → summary` z tekstowym baseline — `tests/pcap_summary_report_test.c` syntetyzuje capture referencyjny i porównuje cały raport z literałem w teście.
+- [ ] Porównanie pomocniczych pól z `conn.log`, `dns.log`, `http.log`, `ssl.log`, `weird.log` i `notice.log`. To jedyna pozostała zależność od uruchomienia pełnego Zeeka na PC.
+- [x] Test pustego PCAP — sam nagłówek globalny; wszystkie ratio muszą wyjść `n/a (no samples)`, a sekcje `none observed`.
+- [x] Test one-flow dominance — 95 na 100 pakietów w jednej parze; raport nazywa dominację w sekcji Anomalies.
+- [x] Test uciętego nagłówka globalnego i uciętego ostatniego rekordu — plik 10-bajtowy jest odrzucany przy otwarciu, a capture z uciętym ogonem zachowuje poprawny prefiks i raportuje `truncated tail`.
+- [x] Test malformed protocol data i invalid caplen/origlen — ramka bez treści IPv4, nagłówek IPv4 kłamiący o długości i rekord deklarujący 400 B przy 20 B danych.
+- [x] Test DNS NXDOMAIN burst — 30 odpowiedzi NXDOMAIN w 30 ms wewnątrz minuty ruchu; `burst score` przekracza 5, a raport podnosi wskaźnik. TLS alerts i malformed HTTP pozostają otwarte, bo dekoder nie wystawia jeszcze tych sygnałów.
+- [x] Test deterministyczności: identyczny output bajt w bajt dla tego samego wejścia i konfiguracji — dwa przebiegi tego samego pliku porównywane przez `strcmp` na raporcie i `memcmp` na całej strukturze summary.
+- [ ] Benchmark czasu, peak internal RAM, peak PSRAM i liczby pominiętych rekordów. Wymaga pomiaru na sprzęcie; struktura `pcap_summary_t` urosła z ~21 KB do 29 384 B i nadal leży w PSRAM.
+- [ ] Regresja Zeek `btest` dla zmienionego adaptera/pluginu, jeśli repo Zeek będzie modyfikowane. Nie dotyczy: nie zmodyfikowano repozytorium Zeeka.
 - [ ] Przegląd `doc/security-considerations.rst` przed uznaniem parser-path za gotowy.
 
 Minimalne kryterium akceptacji MVP:
@@ -3931,3 +3934,111 @@ zadziała po dodaniu komendy `capture_gateway` w firmware JanOS (§35.4).
   (captured/dropped) jest dowodem kompletności, nie sama obecność pliku.
 - Dopóki JanOS nie implementuje `capture_gateway`, panel Tab5 jest gotowy, ale
   most nie powstanie — to prerekwizyt z osobnego repo C5.
+
+---
+
+## 39. Reduktory summary, normalizacja kluczy i raport EN — 2026-08-20
+
+Zamknięcie etapów 3–5 planu Zeek-derived summary z [§22](#22-plan-zeek-derived-pcap-summary-dla-tab5).
+Warstwa metryk nie ma zależności od LVGL ani ESP-IDF, więc ten sam kod buduje się
+na hoście i jest testowany bez Tab5.
+
+### 39.1. Co powstało
+
+- `components/pcap_summary/pcap_summary_reducers.{h,c}` — biblioteka reduktorów:
+  - normalizacja kluczy `domain`, `sni`, `host`, `host pair`, `service`,
+    `filename`, `hash`; klucz, który nie mieści się w buforze, jest **odrzucany**,
+    nie przycinany, a wołający dostaje `false` i zachowuje surową wartość;
+  - `top-k` w stylu Space-Saving z sumowaniem saturującym i flagą `approximate`;
+  - `ratio` z licznikiem, mianownikiem oraz flagami `valid` i `low_sample`;
+  - `time-window` — 64 kubełki na czasie capture, `burst score` = szczyt/średnia;
+  - `unique` — deterministyczny szkic bitmapowy 4096 bitów (kolizja może tylko
+    zaniżyć wynik) z flagą `approximate` powyżej 256 kluczy.
+- `components/pcap_summary/pcap_summary_report.{h,c}` — deterministyczny renderer
+  tekstu EN w układzie `Capture / Traffic / Protocols / Anomalies / IOC` wg
+  [§22.7](#227-etap-5--algorytm-sekcji-medium-detail-en). Nie czyta zegara ani
+  plików, więc ten sam capture zawsze daje te same bajty. Raport, który się nie
+  zmieścił, kończy się linią `[report truncated]`.
+- `pcap_summary_t` dostało: tabele `host_pairs` i `services`, trzy szkice unique,
+  osiem ratio (`tcp/udp share`, `malformed`, `truncated`, `dns answered`,
+  `dns nxdomain`, `top pair`, `top talker`) oraz trzy okna czasowe (pakiety,
+  NXDOMAIN, deauth). Rozmiar struktury: 29 384 B, nadal w PSRAM.
+- `pcap_reader` wystawia `pcap_reader_timestamp_resolution()` oraz
+  `pcap_reader_packet_time_us()`, bo okna czasowe potrzebują rozpiętości capture
+  przed pierwszą próbką, a plik nie gwarantuje kolejności rekordów.
+- UI: `OVERVIEW` pokazuje liczby unikatów, ratio z mianownikami, najbardziej
+  zajęte okno i burst NXDOMAIN oraz nowe listy `Top services` i `Top host pairs`.
+  `EXPORT` dostał przycisk **`EXPORT TEXT SUMMARY`**, który zapisuje raport jako
+  `<capture>.espsummary.txt` obok pozostałych artefaktów (zapis atomowy: temp,
+  `fsync`, `rename`).
+- Eksport JSON zawiera obiekt `metrics` z ratio, oknami i licznikami unique;
+  `PCAP_ANALYSIS_REPORT_SCHEMA_VERSION` = 7.
+- `PCAP_ANALYSIS_CACHE_SCHEMA_VERSION` = 8 — layout `pcap_summary_t` się zmienił,
+  więc starszy cache ma się przebudować, a nie zostać wczytany jako zgodny.
+
+### 39.2. Decyzje, które zmieniają wynik analizy
+
+- **Domeny DNS są normalizowane** (małe litery, bez kropki korzenia), więc
+  `WWW.Example.COM.` i `www.example.com` to jeden wiersz zamiast dwóch.
+- **Etykiety endpointów zostają surowe.** Tabela endpointów nadal pokazuje to, co
+  wypisał dekoder, żeby tabela pakietów, widoki flow i summary nazywały hosta
+  identycznie. Normalizacja dotyczy kluczy pochodnych: par i szkiców unique.
+- **Usługa to niższy port pary.** Port klienta jest efemeryczny i nic nie mówi o
+  usłudze; liczenie obu końców zapychało tabelę numerami 51xxx.
+- **`dns_unique_domains_observed` pochodzi teraz ze szkicu**, nie z wyniku
+  wstawienia do tabeli. Poprzednia wersja liczyła ponownie każdy powrót
+  wyeksmitowanej domeny i zawyżała wynik bez ograniczenia.
+
+### 39.3. Testy hosta
+
+Uruchamiane bez Tab5; na Windowsie te same komendy działają w WSL na
+`/mnt/c/...`. Obie binarki budowane są z `-Werror` oraz ASan i UBSan.
+
+```sh
+gcc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -g \
+    -Icomponents/pcap_summary/include \
+    -o /tmp/reducers_test tests/pcap_summary_reducers_test.c \
+    components/pcap_summary/pcap_summary_reducers.c
+/tmp/reducers_test
+
+gcc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -g \
+    -Icomponents/pcap_summary/include -Icomponents/pcap_reader/include \
+    -o /tmp/report_test tests/pcap_summary_report_test.c \
+    components/pcap_summary/pcap_summary.c \
+    components/pcap_summary/pcap_summary_reducers.c \
+    components/pcap_summary/pcap_summary_report.c \
+    components/pcap_reader/pcap_reader.c
+/tmp/report_test
+```
+
+Zakres pokrycia opisuje [§22.9](#229-etap-7--testy-i-kryteria-akceptacji).
+
+### 39.4. Weryfikacja właściciela projektu
+
+- [x] Każdy zmieniony plik C skompilowany do obiektu flagami z
+  `build/compile_commands.json` (`main.c`, `pcap_summary*.c`, `pcap_reader.c`,
+  `pcap_analysis_store.c`, `pcap_investigation.c`, `pcap_flow.c`,
+  `pcap_extract.c`) — bez ostrzeżeń przy `-Werror`.
+- [x] Oba zestawy testów hosta przechodzą, w tym baseline raportu bajt w bajt.
+- [ ] Pełny build ESP-IDF 5.4.1 i wgranie firmware — po stronie właściciela.
+- [ ] Otworzyć znany capture i sprawdzić w `OVERVIEW` liczby unikatów, ratio z
+  mianownikami oraz listy `Top services` i `Top host pairs`.
+- [ ] `EXPORT -> EXPORT TEXT SUMMARY`, otworzyć `<capture>.espsummary.txt` na PC i
+  porównać sekcje Traffic/Protocols z Wiresharkiem.
+- [ ] Otworzyć capture bez cache, potwierdzić przebudowę do schema v8 i identyczny
+  raport po ponownym otwarciu z `CACHE HIT`.
+- [ ] Sprawdzić duży capture pod kątem czasu analizy i zajętości PSRAM po wzroście
+  `pcap_summary_t` do 29 384 B.
+
+### 39.5. Świadome ograniczenia
+
+- Sekcja IOC opiera się wyłącznie na lokalnych, deterministycznych regułach i
+  mówi `observed indicator`, nigdy `known malicious`; żaden wpis nie jest
+  sprawdzany w zewnętrznym feedzie.
+- `pcap_key_sni`, `pcap_key_filename` i `pcap_key_hash` są przetestowane, ale
+  jeszcze nie podpięte w `pcap_flow` i `pcap_extract` — to osobna zmiana,
+  ponieważ ruszy klucze flow i nazwy w manifeście ekstrakcji.
+- Raport opisuje **próbkę indeksowaną**, tę samą, na której pracuje reszta
+  ESPSharka. Przy `index limited` mówi to wprost w linii `analysis`.
+- Okna czasowe mają stałą liczbę kubełków, więc szerokość okna zależy od długości
+  capture; raport zawsze podaje ją w sekundach obok wyniku.

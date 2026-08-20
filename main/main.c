@@ -76,7 +76,7 @@ extern void pthread_internal_local_storage_destructor_callback(TaskHandle_t hand
 
 
 #define JANOS_TAB_VERSION "1.5.3"
-#define JANOS_VERSION_REQUIRED "1.7.1"
+#define JANOS_VERSION_REQUIRED "1.7.2"
 
 #include "lwip/netdb.h"
 #include <dirent.h>
@@ -1372,6 +1372,7 @@ typedef enum {
     PCAP_ARTIFACT_EXPORT_REPORT,
     PCAP_ARTIFACT_EXPORT_FILTERED_PCAP,
     PCAP_ARTIFACT_EXPORT_HTML,
+    PCAP_ARTIFACT_EXPORT_SUMMARY_TEXT,
     PCAP_ARTIFACT_EXTRACT_OBJECTS,
 } pcap_artifact_action_t;
 
@@ -40237,6 +40238,52 @@ static void pcap_viewer_summary_cb(lv_event_t *e)
                 (unsigned long)pcap_flow_remote_endpoint_count(state->flow_analysis),
                 (unsigned long)state->flow_analysis->flow_count);
         }
+        {
+            /* Distinct-key sketches and ratio reducers. Each ratio prints its
+             * own denominator, so an empty sample reads as "n/a" instead of a
+             * confident zero. */
+            char nxdomain_text[64];
+            char answered_text[64];
+            char pair_text[64];
+            char malformed_text[64];
+            pcap_ratio_format(&summary->dns_nxdomain_ratio, nxdomain_text,
+                              sizeof(nxdomain_text));
+            pcap_ratio_format(&summary->dns_answered_ratio, answered_text,
+                              sizeof(answered_text));
+            pcap_ratio_format(&summary->top_pair_share, pair_text, sizeof(pair_text));
+            pcap_ratio_format(&summary->malformed_ratio, malformed_text,
+                              sizeof(malformed_text));
+            pcap_viewer_append_text(
+                text_buffer, 8192, &position,
+                "Unique: %llu endpoint(s)%s | %llu host pair(s)%s | %llu DNS name(s)%s\n"
+                "DNS answered %s | NXDOMAIN %s\n"
+                "Top pair share %s | malformed %s\n",
+                (unsigned long long)summary->unique_endpoints.distinct,
+                summary->unique_endpoints.approximate ? " (approx)" : "",
+                (unsigned long long)summary->unique_host_pairs.distinct,
+                summary->unique_host_pairs.approximate ? " (approx)" : "",
+                (unsigned long long)summary->unique_domains.distinct,
+                summary->unique_domains.approximate ? " (approx)" : "",
+                answered_text, nxdomain_text, pair_text, malformed_text);
+            if (summary->packet_window.configured && summary->packet_window.total >= 20U) {
+                uint16_t peak_bucket = 0;
+                uint32_t peak = pcap_window_peak(&summary->packet_window, &peak_bucket);
+                pcap_viewer_append_text(
+                    text_buffer, 8192, &position,
+                    "Busiest %.3f s window: %lu packet(s), %.1fx the average\n",
+                    pcap_window_bucket_seconds(&summary->packet_window),
+                    (unsigned long)peak,
+                    pcap_window_burst_score(&summary->packet_window));
+            }
+            if (summary->dns_nxdomain_window.total >= 10U &&
+                pcap_window_burst_score(&summary->dns_nxdomain_window) >= 3.0) {
+                pcap_viewer_append_text(
+                    text_buffer, 8192, &position,
+                    "NXDOMAIN burst: %lu in one %.3f s window\n",
+                    (unsigned long)pcap_window_peak(&summary->dns_nxdomain_window, NULL),
+                    pcap_window_bucket_seconds(&summary->dns_nxdomain_window));
+            }
+        }
         pcap_viewer_append_top_text(text_buffer, 8192, &position, "Protocols",
                                     summary->protocols, summary->protocol_count, 10,
                                     summary->protocol_table_approximate);
@@ -40256,6 +40303,12 @@ static void pcap_viewer_summary_cb(lv_event_t *e)
                                     summary->ports[i].port,
                                     (unsigned long long)summary->ports[i].count);
         }
+        pcap_viewer_append_top_text(text_buffer, 8192, &position, "Top services",
+                                    summary->services, summary->service_count, 8,
+                                    summary->service_table_approximate);
+        pcap_viewer_append_top_text(text_buffer, 8192, &position, "Top host pairs",
+                                    summary->host_pairs, summary->host_pair_count, 8,
+                                    summary->host_pair_table_approximate);
         pcap_viewer_show_summary_popup(state, LV_SYMBOL_EYE_OPEN " PCAP Overview", text_buffer);
     }
     heap_caps_free(text_buffer);
@@ -43466,6 +43519,7 @@ enum {
     PCAP_TOOL_EXPORT_REPORT = 1,
     PCAP_TOOL_EXPORT_FILTERED,
     PCAP_TOOL_EXPORT_HTML,
+    PCAP_TOOL_EXPORT_SUMMARY,
     PCAP_TOOL_SET_BASELINE,
     PCAP_TOOL_COMPARE_BASELINE,
     PCAP_TOOL_SAVE_FILTER,
@@ -43682,6 +43736,18 @@ static void pcap_viewer_artifact_task(void *arg)
                      "HTML export failed: %s",
                      pcap_investigation_status_name(html_status));
         }
+    } else if (state->artifact_action == PCAP_ARTIFACT_EXPORT_SUMMARY_TEXT) {
+        result = pcap_analysis_export_summary_text(
+            state->selected_path, &state->capture_info, &state->scan_summary,
+            state->summary, output_path, sizeof(output_path));
+        if (result == PCAP_ANALYSIS_STORE_OK) {
+            snprintf(state->artifact_message, sizeof(state->artifact_message),
+                     "Text summary saved:\n%s%s", output_path,
+                     state->scan_summary.index_limited
+                         ? "\nNote: the analysis is index-limited, so the summary "
+                           "describes the analyzed sample."
+                         : "");
+        }
     }
     if (result != PCAP_ANALYSIS_STORE_OK && state->artifact_message[0] == '\0') {
         snprintf(state->artifact_message, sizeof(state->artifact_message),
@@ -43821,15 +43887,27 @@ static void pcap_viewer_tool_action_cb(lv_event_t *e)
         return;
     }
 
-    if (action != PCAP_TOOL_EXPORT_REPORT && action != PCAP_TOOL_EXPORT_FILTERED &&
-        action != PCAP_TOOL_EXPORT_HTML) {
-        return;
+    const char *artifact_status_text = NULL;
+    switch (action) {
+        case PCAP_TOOL_EXPORT_REPORT:
+            state->artifact_action = PCAP_ARTIFACT_EXPORT_REPORT;
+            artifact_status_text = "Writing portable ESPShark JSON report...";
+            break;
+        case PCAP_TOOL_EXPORT_FILTERED:
+            state->artifact_action = PCAP_ARTIFACT_EXPORT_FILTERED_PCAP;
+            artifact_status_text = "Writing a Wireshark/Zeek-compatible filtered PCAP...";
+            break;
+        case PCAP_TOOL_EXPORT_HTML:
+            state->artifact_action = PCAP_ARTIFACT_EXPORT_HTML;
+            artifact_status_text = "Writing standalone ESPShark investigation HTML...";
+            break;
+        case PCAP_TOOL_EXPORT_SUMMARY:
+            state->artifact_action = PCAP_ARTIFACT_EXPORT_SUMMARY_TEXT;
+            artifact_status_text = "Writing the deterministic English summary...";
+            break;
+        default:
+            return;
     }
-    state->artifact_action = action == PCAP_TOOL_EXPORT_REPORT
-                                 ? PCAP_ARTIFACT_EXPORT_REPORT
-                                 : (action == PCAP_TOOL_EXPORT_FILTERED
-                                        ? PCAP_ARTIFACT_EXPORT_FILTERED_PCAP
-                                        : PCAP_ARTIFACT_EXPORT_HTML);
     state->artifact_running = true;
     state->artifact_success = false;
     snprintf(state->artifact_message, sizeof(state->artifact_message), "Working...");
@@ -43840,13 +43918,7 @@ static void pcap_viewer_tool_action_cb(lv_event_t *e)
         lv_obj_clear_flag(state->artifact_spinner, LV_OBJ_FLAG_HIDDEN);
     }
     if (state->artifact_status_label && lv_obj_is_valid(state->artifact_status_label)) {
-        lv_label_set_text(
-            state->artifact_status_label,
-            state->artifact_action == PCAP_ARTIFACT_EXPORT_REPORT
-                ? "Writing portable ESPShark JSON report..."
-                : (state->artifact_action == PCAP_ARTIFACT_EXPORT_FILTERED_PCAP
-                       ? "Writing a Wireshark/Zeek-compatible filtered PCAP..."
-                       : "Writing standalone ESPShark investigation HTML..."));
+        lv_label_set_text(state->artifact_status_label, artifact_status_text);
         lv_obj_set_style_text_color(state->artifact_status_label, COLOR_MATERIAL_AMBER, 0);
     }
     if (xTaskCreate(pcap_viewer_artifact_task, "pcap_export", 8192, state, 5,
@@ -43950,6 +44022,8 @@ static void pcap_viewer_tools_cb(lv_event_t *e)
                                 COLOR_MATERIAL_PURPLE, PCAP_TOOL_EXPORT_FILTERED);
     pcap_viewer_add_tool_button(state->artifact_actions, "EXPORT HTML REPORT",
                                 COLOR_MATERIAL_ORANGE, PCAP_TOOL_EXPORT_HTML);
+    pcap_viewer_add_tool_button(state->artifact_actions, "EXPORT TEXT SUMMARY",
+                                COLOR_MATERIAL_TEAL, PCAP_TOOL_EXPORT_SUMMARY);
     pcap_viewer_add_tool_button(state->artifact_actions, "SET AS BASELINE",
                                 COLOR_MATERIAL_GREEN, PCAP_TOOL_SET_BASELINE);
     pcap_viewer_add_tool_button(state->artifact_actions, "COMPARE BASELINE",

@@ -187,6 +187,12 @@ void pcap_reader_describe_bytes(uint32_t link_type, const uint8_t *data, size_t 
                                 pcap_packet_details_t *details_out);
 
 uint32_t pcap_reader_link_type(const pcap_reader_t *reader);
+pcap_timestamp_resolution_t pcap_reader_timestamp_resolution(const pcap_reader_t *reader);
+
+/* Record timestamp in microseconds since the epoch. Nanosecond captures are
+ * reduced to microseconds, which is the resolution every aggregate uses. */
+uint64_t pcap_reader_packet_time_us(const pcap_packet_index_t *packet,
+                                    pcap_timestamp_resolution_t resolution);
 
 const char *pcap_reader_status_name(pcap_reader_status_t status);
 const char *pcap_reader_link_type_name(uint32_t link_type);
