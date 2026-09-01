@@ -570,6 +570,18 @@ typedef struct {
     bool chime_armed;         // false until the first snapshot of a session
     bool warn_upstream_down;  // last published upstream state, for the warning
     bool warn_degraded;       // last published recorder-loss state
+
+    // Rogue GITM overlay. Deauth the victim off its real AP, raise a same-SSID
+    // mirror on JanOS and route the victim through our own uplink while the
+    // capture gateway records it. The whole [CGW] live view and session engine
+    // are shared with the clean gateway; only the setup form (a popup) and the
+    // start command (start_rogue_gitm instead of capture_gateway start) differ.
+    bool rogue;
+    char victim_ssid[33];       // SSID mirrored to the victim (= scan SSID)
+    char victim_bssid[18];      // real AP BSSID, excluded from the uplink pick
+    unsigned victim_channel;    // the uplink must share this channel
+    int  victim_scan_index;     // 1-based index as printed by scan_networks
+    char mirror_pass[65];       // the real passphrase clients expect on the mirror
 } gitm_ctx_t;
 
 typedef struct {
@@ -2703,6 +2715,7 @@ static void mitm_connect_and_start_cb(lv_event_t *e);
 static void mitm_popup_close_cb(lv_event_t *e);
 static void show_gitm_page(void);
 static void show_gitm_page_from_scan(void);
+static void show_rogue_gitm_popup(tab_context_t *ctx, int victim_view_idx);
 static void show_arp_poison_page(void);
 static void show_rogue_ap_page(void);
 static void show_rogue_ap_popup(tab_context_t *ctx);
@@ -7248,7 +7261,7 @@ static lv_obj_t *create_small_tile(lv_obj_t *parent, const char *icon, const cha
 static void create_attack_action_bar(lv_obj_t *parent, lv_event_cb_t callback, lv_event_cb_t karma_callback)
 {
     bool three_cols = enable_red_team;
-    lv_coord_t bar_h = three_cols ? 240 : 162;
+    lv_coord_t bar_h = three_cols ? 318 : 162;
 
     lv_obj_t *attack_bar = lv_obj_create(parent);
     lv_obj_set_size(attack_bar, lv_pct(100), bar_h);
@@ -7300,6 +7313,17 @@ static void create_attack_action_bar(lv_obj_t *parent, lv_event_cb_t callback, l
             lv_obj_set_flex_align(attack_row3, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
             lv_obj_clear_flag(attack_row3, LV_OBJ_FLAG_SCROLLABLE);
 
+            // Row 4 carries the single Rogue GITM tile at full width.
+            lv_obj_t *attack_row4 = lv_obj_create(attack_bar);
+            lv_obj_set_size(attack_row4, lv_pct(100), 72);
+            lv_obj_set_style_bg_opa(attack_row4, LV_OPA_TRANSP, 0);
+            lv_obj_set_style_border_width(attack_row4, 0, 0);
+            lv_obj_set_style_pad_all(attack_row4, 0, 0);
+            lv_obj_set_style_pad_gap(attack_row4, 8, 0);
+            lv_obj_set_flex_flow(attack_row4, LV_FLEX_FLOW_ROW);
+            lv_obj_set_flex_align(attack_row4, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+            lv_obj_clear_flag(attack_row4, LV_OBJ_FLAG_SCROLLABLE);
+
             const lv_coord_t gap3 = 16;
             lv_coord_t bw = (row_inner_w - gap3) / 3;
             if (bw < 60) bw = 60;
@@ -7333,6 +7357,12 @@ static void create_attack_action_bar(lv_obj_t *parent, lv_event_cb_t callback, l
             lv_coord_t bw4_last = bw4 + (row_inner_w - gap4 - bw4 * 4);
             lv_obj_set_size(b7, bw4, 72); lv_obj_set_size(b8, bw4, 72);
             lv_obj_set_size(b9, bw4, 72); lv_obj_set_size(b10, bw4_last, 72);
+
+            // Rogue GITM: deauth + same-SSID mirror + capture through our uplink.
+            // Kept apart from the clean GITM tile as its own full-width row.
+            lv_obj_t *b11 = create_small_tile(attack_row4, LV_SYMBOL_LOOP, "Rogue GITM",
+                                              COLOR_LAB5_MAGENTA, callback, "Rogue GITM");
+            lv_obj_set_size(b11, row_inner_w, 72);
         }
     } else {
         // Non-red-team: ARP + Nmap (+ Karma if requested)
@@ -8825,6 +8855,23 @@ static void hidden_ssid_rogueap_confirm_cb(const char *ssid)
     show_rogue_ap_page();
 }
 
+static void hidden_ssid_rogue_gitm_confirm_cb(const char *ssid)
+{
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx || !ssid || ssid[0] == '\0') return;
+
+    scan_view_t v = get_scan_view(ctx);
+    if (v.sel_count <= 0) return;
+    int idx = v.sel_indices[0];
+    if (idx < 0 || idx >= v.net_count) return;
+
+    strncpy(v.nets[idx].ssid, ssid, sizeof(v.nets[idx].ssid) - 1);
+    v.nets[idx].ssid[sizeof(v.nets[idx].ssid) - 1] = '\0';
+    ESP_LOGI(TAG, "Rogue GITM: hidden victim resolved as '%s' (%s)",
+             v.nets[idx].ssid, v.nets[idx].bssid);
+    show_rogue_gitm_popup(ctx, idx);
+}
+
 static void hidden_ssid_wardrive_confirm_cb(const char *ssid)
 {
     tab_context_t *ctx = get_current_ctx();
@@ -8986,6 +9033,32 @@ static void handle_selected_attack(const char *attack_name)
             }
         }
         show_gitm_page_from_scan();
+        return;
+    }
+
+    if (strcmp(attack_name, "Rogue GITM") == 0) {
+        if (v.sel_count != 1) {
+            ESP_LOGW(TAG, "Rogue GITM requires exactly 1 network, selected: %d", v.sel_count);
+            if (ctx->scan_status_label) {
+                bsp_display_lock(0);
+                lv_label_set_text(ctx->scan_status_label, "Select exactly 1 network for Rogue GITM");
+                lv_obj_set_style_text_color(ctx->scan_status_label, COLOR_MATERIAL_RED, 0);
+                bsp_display_unlock();
+            }
+            return;
+        }
+
+        int vic = v.sel_indices[0];
+        if (vic < 0 || vic >= v.net_count) return;
+
+        // The SSID is mirrored back to the victim, so a hidden one has to be
+        // resolved first; the confirm callback reopens the picker.
+        if (v.nets[vic].ssid[0] == '\0') {
+            show_hidden_ssid_popup(hidden_ssid_rogue_gitm_confirm_cb);
+            return;
+        }
+
+        show_rogue_gitm_popup(ctx, vic);
         return;
     }
 
@@ -10152,8 +10225,10 @@ static bool gitm_start_line_cb(const char *line, void *user)
 
     // JanOS has no structured error block yet, so keep the newest human line.
     if (strstr(line, "Capture Gateway:") || strstr(line, "No upstream IPv4") ||
-        strstr(line, "already exists")) {
+        strstr(line, "already exists") || strstr(line, "Rogue GITM") ||
+        strstr(line, "refused")) {
         const char *msg = strstr(line, "Capture Gateway:");
+        if (!msg) msg = strstr(line, "Rogue GITM");
         snprintf(r->err, sizeof(r->err), "%s", msg ? msg : line);
     }
 
@@ -11962,8 +12037,12 @@ static void show_gitm_page(void)
     ctx->current_visible_page = ctx->gitm->page;
 
     // Section 8.6: always ask what JanOS is doing before offering to start.
-    if (ctx->gitm->scan_btn) lv_obj_add_state(ctx->gitm->scan_btn, LV_STATE_DISABLED);
-    xTaskCreate(gitm_attach_task, "gitm_attach", 6144, ctx, 5, NULL);
+    // A rogue session opens this page only to reuse its live view; it already
+    // owns the transport, so the reconcile would collide with the start.
+    if (!ctx->gitm->session_active) {
+        if (ctx->gitm->scan_btn) lv_obj_add_state(ctx->gitm->scan_btn, LV_STATE_DISABLED);
+        xTaskCreate(gitm_attach_task, "gitm_attach", 6144, ctx, 5, NULL);
+    }
 }
 
 // Entry from the scan / observer attack bar: carry the highlighted network in
@@ -11984,6 +12063,489 @@ static void show_gitm_page_from_scan(void)
         }
     }
     show_gitm_page();
+}
+
+// ============================ Rogue GITM ===================================
+//
+// Deauth the victim off its real AP, mirror that SSID on JanOS with the real
+// passphrase, and route the victim through an uplink picked on the victim's own
+// channel while the capture gateway records everything. The running screen and
+// the whole [CGW] engine belong to the clean GITM page; only this setup popup
+// and the start_rogue_gitm command are new here.
+
+static lv_obj_t *rogue_gitm_overlay;
+static lv_obj_t *rogue_gitm_popup;
+static lv_obj_t *rogue_gitm_uplink_dd;
+static lv_obj_t *rogue_gitm_home_row;
+static lv_obj_t *rogue_gitm_home_input;
+static lv_obj_t *rogue_gitm_mirror_input;
+static lv_obj_t *rogue_gitm_status_label;
+static lv_obj_t *rogue_gitm_keyboard;
+static int rogue_gitm_uplink_map[MAX_NETWORKS];  // dropdown row -> scan-view index
+static int rogue_gitm_uplink_count;
+static int rogue_gitm_victim_idx;                // index into the scan view
+
+static void rogue_gitm_close_popup(void)
+{
+    if (rogue_gitm_overlay) {
+        lv_obj_del(rogue_gitm_overlay);   // deletes the popup and keyboard children too
+        rogue_gitm_overlay = NULL;
+    }
+    rogue_gitm_popup = NULL;
+    rogue_gitm_uplink_dd = NULL;
+    rogue_gitm_home_row = NULL;
+    rogue_gitm_home_input = NULL;
+    rogue_gitm_mirror_input = NULL;
+    rogue_gitm_status_label = NULL;
+    rogue_gitm_keyboard = NULL;
+}
+
+static void rogue_gitm_input_focus_cb(lv_event_t *e)
+{
+    lv_obj_t *ta = lv_event_get_target(e);
+    if (!rogue_gitm_keyboard || !ta) return;
+    lv_keyboard_set_textarea(rogue_gitm_keyboard, ta);
+    lv_obj_clear_flag(rogue_gitm_keyboard, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void rogue_gitm_keyboard_cb(lv_event_t *e)
+{
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_READY || code == LV_EVENT_CANCEL) {
+        if (rogue_gitm_keyboard) lv_obj_add_flag(rogue_gitm_keyboard, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+// Uplink choice drives the home password field: open networks need none, and a
+// secured one is prefilled from the captured-password table when we hold it.
+static void rogue_gitm_uplink_changed_cb(lv_event_t *e)
+{
+    (void)e;
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx || !rogue_gitm_uplink_dd || !rogue_gitm_home_input) return;
+
+    int sel = lv_dropdown_get_selected(rogue_gitm_uplink_dd);
+    if (sel < 0 || sel >= rogue_gitm_uplink_count) return;
+
+    scan_view_t v = get_scan_view(ctx);
+    int idx = rogue_gitm_uplink_map[sel];
+    if (idx < 0 || idx >= v.net_count) return;
+
+    if (wifi_network_security_is_open(v.nets[idx].security)) {
+        lv_textarea_set_text(rogue_gitm_home_input, "");
+        if (rogue_gitm_home_row) lv_obj_add_flag(rogue_gitm_home_row, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        if (rogue_gitm_home_row) lv_obj_clear_flag(rogue_gitm_home_row, LV_OBJ_FLAG_HIDDEN);
+        const char *known = creds_lookup(ctx, v.nets[idx].ssid);
+        lv_textarea_set_text(rogue_gitm_home_input, known ? known : "");
+    }
+}
+
+static void rogue_gitm_cancel_cb(lv_event_t *e)
+{
+    (void)e;
+    rogue_gitm_close_popup();
+}
+
+// One task owns the transport for the whole session: connect the uplink, arm
+// the deauth + mirror, then hand over to the shared [CGW] poll/stop loop.
+static void rogue_gitm_session_task(void *arg)
+{
+    tab_context_t *ctx = (tab_context_t *)arg;
+    gitm_ctx_t *g = ctx->gitm;
+    tab_id_t tab = (tab_id_t)g->tab;
+    uart_port_t port = g->uart_port;
+    bool failed = false;
+
+    gitm_set_state(ctx, GITM_CONNECTING, "Connecting the uplink Wi-Fi...",
+                   COLOR_MATERIAL_AMBER);
+
+    if (!gitm_connect_upstream(tab, port, g->up_ssid, g->up_pass, g->up_is_open)) {
+        gitm_set_state(ctx, GITM_IDLE,
+                       "Uplink connect failed.\n"
+                       "Check the uplink password, then start again.",
+                       COLOR_MATERIAL_RED);
+        failed = true;
+    } else {
+        // Select only the victim so JanOS knows what to deauth and mirror. The
+        // uplink BSSID must never appear here or the gateway is refused.
+        char sel_cmd[32];
+        snprintf(sel_cmd, sizeof(sel_cmd), "select_networks %d", g->victim_scan_index);
+        gitm_flush_rx(tab, port);
+        gitm_log_tx(sel_cmd);
+        transport_write_bytes_tab(tab, port, sel_cmd, strlen(sel_cmd));
+        transport_write_bytes_tab(tab, port, "\r\n", 2);
+        vTaskDelay(pdMS_TO_TICKS(150));   // let JanOS apply the selection
+
+        char esc_ssid[80], esc_pass[160], start_cmd[256];
+        beacon_spam_escape_quoted_arg(g->victim_ssid, esc_ssid, sizeof(esc_ssid));
+        beacon_spam_escape_quoted_arg(g->mirror_pass, esc_pass, sizeof(esc_pass));
+        snprintf(start_cmd, sizeof(start_cmd), "start_rogue_gitm \"%s\" \"%s\"",
+                 esc_ssid, esc_pass);
+        // Never log the real command: it carries the mirror passphrase.
+        ESP_LOGI(TAG, "Rogue GITM > start_rogue_gitm \"%s\" \"***\"", g->victim_ssid);
+
+        gitm_set_state(ctx, GITM_STARTING,
+                       "Deauthing the victim and raising the mirror...",
+                       COLOR_MATERIAL_AMBER);
+
+        gitm_start_result_t res;
+        gitm_send_start(tab, port, start_cmd, &res);
+
+        bool running = res.snap.complete && res.snap.active && res.snap.capture_active;
+        if (running) {
+            gitm_publish_snapshot(ctx, &res.snap);
+        } else {
+            // Success is never inferred from a log line; only a full block decides.
+            cgw_snapshot_t probe;
+            if (gitm_query_status(tab, port, &probe, true) &&
+                probe.active && probe.capture_active) {
+                running = true;
+                gitm_publish_snapshot(ctx, &probe);
+            }
+        }
+
+        if (running) {
+            ESP_LOGI(TAG, "Rogue GITM: running, mirror '%s', uplink '%s'",
+                     g->victim_ssid, g->up_ssid);
+            gitm_run_and_stop(ctx, tab, port);   // [CGW] poll + universal stop + [PCAP_FINAL]
+        } else {
+            char msg[224];
+            if (res.needs_upstream) {
+                snprintf(msg, sizeof(msg),
+                         "JanOS reports no upstream IPv4.\n"
+                         "Reconnect the uplink network, then start again.");
+            } else if (res.err[0]) {
+                snprintf(msg, sizeof(msg), "Rogue GITM refused.\n%s", res.err);
+            } else {
+                snprintf(msg, sizeof(msg),
+                         "Rogue GITM start failed or timed out.\n"
+                         "Check the SD card on the Monster, then retry.");
+            }
+            ESP_LOGW(TAG, "Rogue GITM: start failed (%s)",
+                     res.err[0] ? res.err : "no diagnostic");
+            gitm_set_state(ctx, GITM_IDLE, msg, COLOR_MATERIAL_RED);
+            failed = true;
+        }
+    }
+
+    if (failed && bsp_display_lock(300)) {
+        if (g->stop_btn) lv_obj_add_flag(g->stop_btn, LV_OBJ_FLAG_HIDDEN);
+        bsp_display_unlock();
+    }
+
+    g->stop_request = false;
+    g->session_task = NULL;
+    g->session_active = false;
+    vTaskDelete(NULL);
+}
+
+static void rogue_gitm_start_cb(lv_event_t *e)
+{
+    (void)e;
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx || !gitm_ctx(ctx) || ctx->gitm->session_active) return;
+    if (!rogue_gitm_uplink_dd || !rogue_gitm_mirror_input) return;
+
+    scan_view_t v = get_scan_view(ctx);
+    if (rogue_gitm_victim_idx < 0 || rogue_gitm_victim_idx >= v.net_count) return;
+    wifi_network_t *vic = &v.nets[rogue_gitm_victim_idx];
+
+    int sel = lv_dropdown_get_selected(rogue_gitm_uplink_dd);
+    if (sel < 0 || sel >= rogue_gitm_uplink_count) {
+        if (rogue_gitm_status_label) {
+            lv_label_set_text(rogue_gitm_status_label, "Pick an uplink network.");
+            lv_obj_set_style_text_color(rogue_gitm_status_label, COLOR_MATERIAL_RED, 0);
+        }
+        return;
+    }
+    int up_idx = rogue_gitm_uplink_map[sel];
+    if (up_idx < 0 || up_idx >= v.net_count) return;
+    wifi_network_t *up = &v.nets[up_idx];
+    bool up_open = wifi_network_security_is_open(up->security);
+
+    const char *home_pass = (!up_open && rogue_gitm_home_input)
+                          ? lv_textarea_get_text(rogue_gitm_home_input) : "";
+    if (!home_pass) home_pass = "";
+    const char *mirror_pass = lv_textarea_get_text(rogue_gitm_mirror_input);
+    if (!mirror_pass) mirror_pass = "";
+
+    // JanOS mirrors a WPA2 SSID, so the passphrase must be a legal one.
+    if (strlen(mirror_pass) < 8 || strlen(mirror_pass) > 63) {
+        if (rogue_gitm_status_label) {
+            lv_label_set_text(rogue_gitm_status_label,
+                              "The mirror password must be 8-63 characters.");
+            lv_obj_set_style_text_color(rogue_gitm_status_label, COLOR_MATERIAL_RED, 0);
+        }
+        return;
+    }
+    // Every argument is sent inside double quotes; a literal quote would break it.
+    if (strchr(vic->ssid, '"') || strchr(mirror_pass, '"') ||
+        strchr(up->ssid, '"') || strchr(home_pass, '"')) {
+        if (rogue_gitm_status_label) {
+            lv_label_set_text(rogue_gitm_status_label,
+                              "A double quote is not allowed in a name or password.");
+            lv_obj_set_style_text_color(rogue_gitm_status_label, COLOR_MATERIAL_RED, 0);
+        }
+        return;
+    }
+
+    // Copy every value out before the popup and its widgets are destroyed.
+    char victim_ssid[33], victim_bssid[18], up_ssid[33], up_pass[65], mpass[65];
+    unsigned victim_channel = (unsigned)vic->channel;
+    int victim_scan_index = vic->index;
+    snprintf(victim_ssid, sizeof(victim_ssid), "%s", vic->ssid);
+    snprintf(victim_bssid, sizeof(victim_bssid), "%s", vic->bssid);
+    snprintf(up_ssid, sizeof(up_ssid), "%s", up->ssid);
+    snprintf(up_pass, sizeof(up_pass), "%s", home_pass);
+    snprintf(mpass, sizeof(mpass), "%s", mirror_pass);
+
+    rogue_gitm_close_popup();
+
+    // Reuse the clean GITM page only for its live view. Marking the session
+    // active before showing the page suppresses that page's JanOS reconcile,
+    // which would otherwise fight this task for the transport.
+    gitm_ctx_t *g = ctx->gitm;
+    g->session_active = true;
+    show_gitm_page();
+
+    g->rogue = true;
+    snprintf(g->victim_ssid, sizeof(g->victim_ssid), "%s", victim_ssid);
+    snprintf(g->victim_bssid, sizeof(g->victim_bssid), "%s", victim_bssid);
+    g->victim_channel = victim_channel;
+    g->victim_scan_index = victim_scan_index;
+    snprintf(g->mirror_pass, sizeof(g->mirror_pass), "%s", mpass);
+    snprintf(g->up_ssid, sizeof(g->up_ssid), "%s", up_ssid);
+    snprintf(g->up_pass, sizeof(g->up_pass), "%s", up_pass);
+    g->up_is_open = up_open;
+    // The live header labels the mirror as "AP": show the victim SSID as WPA2.
+    snprintf(g->ap_ssid, sizeof(g->ap_ssid), "%s", victim_ssid);
+    g->ap_wpa2 = true;
+    g->tab = (int)current_tab;
+    g->uart_port = uart_port_for_tab(current_tab);
+    g->stop_request = false;
+    cgw_snapshot_reset(&g->snap);
+    memset(&g->final, 0, sizeof(g->final));
+    gitm_reset_client_tracking(ctx);
+
+    if (bsp_display_lock(300)) {
+        if (g->keyboard) lv_obj_add_flag(g->keyboard, LV_OBJ_FLAG_HIDDEN);
+        // The rogue setup lived in a popup, so fold the wizard steps away and
+        // let the live view own the page.
+        if (g->step1) lv_obj_add_flag(g->step1, LV_OBJ_FLAG_HIDDEN);
+        if (g->step2) lv_obj_add_flag(g->step2, LV_OBJ_FLAG_HIDDEN);
+        if (g->live) lv_obj_clear_flag(g->live, LV_OBJ_FLAG_HIDDEN);
+        if (g->stop_btn) {
+            lv_obj_clear_flag(g->stop_btn, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_clear_state(g->stop_btn, LV_STATE_DISABLED);
+        }
+        if (g->copy_btn) lv_obj_add_flag(g->copy_btn, LV_OBJ_FLAG_HIDDEN);
+        gitm_render_live(ctx);
+        bsp_display_unlock();
+    }
+
+    if (xTaskCreate(rogue_gitm_session_task, "rogue_gitm", 8192, ctx, 4,
+                    &g->session_task) != pdPASS) {
+        g->session_active = false;
+        g->session_task = NULL;
+        ESP_LOGW(TAG, "Rogue GITM: failed to start the session task");
+        gitm_set_state(ctx, GITM_IDLE, "Could not start the session task.",
+                       COLOR_MATERIAL_RED);
+    }
+}
+
+static lv_obj_t *rogue_gitm_pass_row(lv_obj_t *parent, const char *label_text,
+                                     lv_obj_t **out_input, const char *placeholder)
+{
+    lv_obj_t *row = lv_obj_create(parent);
+    lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(row, 0, 0);
+    lv_obj_set_style_pad_all(row, 0, 0);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(row, 10, 0);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *lbl = lv_label_create(row);
+    lv_label_set_text(lbl, label_text);
+    lv_obj_set_width(lbl, 150);
+    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(lbl, lv_color_hex(0xFFFFFF), 0);
+
+    lv_obj_t *ta = lv_textarea_create(row);
+    lv_obj_set_flex_grow(ta, 1);
+    lv_textarea_set_one_line(ta, true);
+    lv_textarea_set_password_mode(ta, true);
+    lv_textarea_set_placeholder_text(ta, placeholder);
+    lv_obj_set_style_bg_color(ta, lv_color_hex(0x1A1A1A), 0);
+    lv_obj_set_style_border_color(ta, COLOR_LAB5_MAGENTA, 0);
+    lv_obj_set_style_border_width(ta, 1, 0);
+    lv_obj_set_style_text_color(ta, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_add_event_cb(ta, rogue_gitm_input_focus_cb, LV_EVENT_FOCUSED, NULL);
+    lv_obj_add_event_cb(ta, rogue_gitm_input_focus_cb, LV_EVENT_CLICKED, NULL);
+    *out_input = ta;
+    return row;
+}
+
+static void show_rogue_gitm_popup(tab_context_t *ctx, int victim_view_idx)
+{
+    if (!ctx || rogue_gitm_overlay) return;
+
+    // The uplink picker needs the whole scan list, but the observer override
+    // exposes only the one selected network. Send the operator to the scan page
+    // rather than open a picker that can never find an uplink.
+    if (ctx->observer_attack_override_active) {
+        ESP_LOGW(TAG, "Rogue GITM: unavailable from the observer popup (needs the full scan)");
+        if (ctx->observer_status_label) {
+            lv_label_set_text(ctx->observer_status_label,
+                "Rogue GITM: open it from WiFi Scan & Attack (needs the full scan).");
+            lv_obj_set_style_text_color(ctx->observer_status_label, COLOR_MATERIAL_AMBER, 0);
+        }
+        return;
+    }
+
+    scan_view_t v = get_scan_view(ctx);
+    if (victim_view_idx < 0 || victim_view_idx >= v.net_count) return;
+    wifi_network_t *vic = &v.nets[victim_view_idx];
+
+    // Uplink candidates: named networks on the victim's channel, minus the
+    // victim's own AP. JanOS refuses a gateway whose STA is off-channel.
+    rogue_gitm_victim_idx = victim_view_idx;
+    rogue_gitm_uplink_count = 0;
+    char options[1024];
+    size_t opos = 0;
+    options[0] = '\0';
+    for (int i = 0; i < v.net_count && rogue_gitm_uplink_count < MAX_NETWORKS; i++) {
+        if (i == victim_view_idx) continue;
+        if (v.nets[i].ssid[0] == '\0') continue;
+        if (v.nets[i].channel != vic->channel) continue;
+        if (strcmp(v.nets[i].bssid, vic->bssid) == 0) continue;
+        const char *sec = v.nets[i].security[0] ? v.nets[i].security : "?";
+        int n = snprintf(options + opos, sizeof(options) - opos, "%s%s  ch%d  %s",
+                         opos ? "\n" : "", v.nets[i].ssid, v.nets[i].channel, sec);
+        if (n < 0 || (size_t)n >= sizeof(options) - opos) break;
+        opos += (size_t)n;
+        rogue_gitm_uplink_map[rogue_gitm_uplink_count++] = i;
+    }
+
+    if (rogue_gitm_uplink_count == 0) {
+        if (ctx->scan_status_label) {
+            bsp_display_lock(0);
+            lv_label_set_text_fmt(ctx->scan_status_label,
+                                  "No other network on ch %d for the uplink", vic->channel);
+            lv_obj_set_style_text_color(ctx->scan_status_label, COLOR_MATERIAL_RED, 0);
+            bsp_display_unlock();
+        }
+        return;
+    }
+
+    lv_obj_t *container = get_current_tab_container();
+    if (!container) return;
+
+    rogue_gitm_overlay = lv_obj_create(container);
+    lv_obj_remove_style_all(rogue_gitm_overlay);
+    lv_obj_set_size(rogue_gitm_overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(rogue_gitm_overlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(rogue_gitm_overlay, LV_OPA_50, 0);
+    lv_obj_clear_flag(rogue_gitm_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(rogue_gitm_overlay, LV_OBJ_FLAG_CLICKABLE);
+
+    rogue_gitm_popup = lv_obj_create(rogue_gitm_overlay);
+    lv_obj_set_size(rogue_gitm_popup, 600, 540);
+    lv_obj_align(rogue_gitm_popup, LV_ALIGN_TOP_MID, 0, 40);
+    lv_obj_set_style_bg_color(rogue_gitm_popup, lv_color_hex(0x1A1A2A), 0);
+    lv_obj_set_style_border_color(rogue_gitm_popup, COLOR_LAB5_MAGENTA, 0);
+    lv_obj_set_style_border_width(rogue_gitm_popup, 2, 0);
+    lv_obj_set_style_radius(rogue_gitm_popup, 16, 0);
+    lv_obj_set_style_pad_all(rogue_gitm_popup, 20, 0);
+    lv_obj_set_flex_flow(rogue_gitm_popup, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(rogue_gitm_popup, 12, 0);
+    lv_obj_set_flex_align(rogue_gitm_popup, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    lv_obj_t *title = lv_label_create(rogue_gitm_popup);
+    lv_label_set_text_fmt(title, LV_SYMBOL_LOOP "  Rogue GITM - %s", vic->ssid);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, COLOR_LAB5_MAGENTA, 0);
+
+    lv_obj_t *victim_info = lv_label_create(rogue_gitm_popup);
+    lv_label_set_text_fmt(victim_info,
+                          "Victim / mirror SSID: %s\nBSSID %s   ch %d   %s",
+                          vic->ssid, vic->bssid, vic->channel,
+                          vic->security[0] ? vic->security : "?");
+    lv_obj_set_style_text_font(victim_info, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(victim_info, lv_color_hex(0xAAAAAA), 0);
+    lv_obj_set_width(victim_info, lv_pct(100));
+
+    lv_obj_t *up_label = lv_label_create(rogue_gitm_popup);
+    lv_label_set_text_fmt(up_label, "Uplink (Internet, ch %d):", vic->channel);
+    lv_obj_set_style_text_font(up_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(up_label, lv_color_hex(0xFFFFFF), 0);
+
+    rogue_gitm_uplink_dd = lv_dropdown_create(rogue_gitm_popup);
+    lv_dropdown_set_options(rogue_gitm_uplink_dd, options);
+    lv_obj_set_width(rogue_gitm_uplink_dd, lv_pct(100));
+    lv_obj_set_style_bg_color(rogue_gitm_uplink_dd, lv_color_hex(0x102020), 0);
+    lv_obj_set_style_border_color(rogue_gitm_uplink_dd, COLOR_LAB5_MAGENTA, 0);
+    lv_obj_set_style_text_color(rogue_gitm_uplink_dd, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_add_event_cb(rogue_gitm_uplink_dd, rogue_gitm_uplink_changed_cb,
+                        LV_EVENT_VALUE_CHANGED, NULL);
+
+    rogue_gitm_home_row = rogue_gitm_pass_row(rogue_gitm_popup, "Uplink pass:",
+                                              &rogue_gitm_home_input,
+                                              "empty = try saved on JanOS");
+    rogue_gitm_pass_row(rogue_gitm_popup, "Mirror pass:", &rogue_gitm_mirror_input,
+                        "8-63 chars, the real password");
+
+    rogue_gitm_status_label = lv_label_create(rogue_gitm_popup);
+    lv_label_set_text(rogue_gitm_status_label,
+        "Uplink and victim share a channel. The mirror uses the victim's real password.");
+    lv_obj_set_style_text_font(rogue_gitm_status_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(rogue_gitm_status_label, lv_color_hex(0xAAAAAA), 0);
+    lv_obj_set_width(rogue_gitm_status_label, lv_pct(100));
+    lv_label_set_long_mode(rogue_gitm_status_label, LV_LABEL_LONG_WRAP);
+
+    lv_obj_t *btn_row = lv_obj_create(rogue_gitm_popup);
+    lv_obj_set_size(btn_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(btn_row, 0, 0);
+    lv_obj_set_style_pad_all(btn_row, 0, 0);
+    lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *cancel_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(cancel_btn, 240, 56);
+    lv_obj_set_style_bg_color(cancel_btn, lv_color_hex(0x333344), 0);
+    lv_obj_set_style_radius(cancel_btn, 10, 0);
+    lv_obj_add_event_cb(cancel_btn, rogue_gitm_cancel_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *cancel_lbl = lv_label_create(cancel_btn);
+    lv_label_set_text(cancel_lbl, LV_SYMBOL_CLOSE "  Cancel");
+    lv_obj_set_style_text_color(cancel_lbl, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_center(cancel_lbl);
+
+    lv_obj_t *start_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(start_btn, 260, 56);
+    lv_obj_set_style_bg_color(start_btn, COLOR_MATERIAL_GREEN, 0);
+    lv_obj_set_style_radius(start_btn, 10, 0);
+    lv_obj_add_event_cb(start_btn, rogue_gitm_start_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *start_lbl = lv_label_create(start_btn);
+    lv_label_set_text(start_lbl, LV_SYMBOL_PLAY "  Start");
+    lv_obj_set_style_text_color(start_lbl, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_center(start_lbl);
+
+    rogue_gitm_keyboard = lv_keyboard_create(rogue_gitm_overlay);
+    lv_obj_set_size(rogue_gitm_keyboard, lv_pct(100), 300);
+    lv_obj_align(rogue_gitm_keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
+    style_on_screen_keyboard(rogue_gitm_keyboard);
+    lv_obj_add_event_cb(rogue_gitm_keyboard, rogue_gitm_keyboard_cb, LV_EVENT_ALL, NULL);
+    lv_obj_add_flag(rogue_gitm_keyboard, LV_OBJ_FLAG_HIDDEN);
+
+    // Prefill the mirror password from the captured table when we hold it, and
+    // set the uplink password field from the initial dropdown selection.
+    const char *mknown = creds_lookup(ctx, vic->ssid);
+    if (mknown && rogue_gitm_mirror_input) lv_textarea_set_text(rogue_gitm_mirror_input, mknown);
+    rogue_gitm_uplink_changed_cb(NULL);
 }
 
 // ======================= Handshaker Attack Functions =======================
