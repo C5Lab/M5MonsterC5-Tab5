@@ -341,6 +341,13 @@ typedef struct {
 #define WARDRIVE_WIGLE_MAX_FILES 256
 #define WARDRIVE_WIGLE_PAGE_SIZE  20
 #define WARDRIVE_WIGLE_PATH_MAX  160
+// Ceiling for a wardrive_files / wardrive_cleanup round-trip. Firmware without
+// the scan cache reads every log on the card (three passes per file for the
+// listing, one for the cleanup), which on a ~27MB working dir lands around
+// 135s and 100s respectively - a shorter ceiling truncates the listing rather
+// than making anything faster. With the cache both finish in seconds and this
+// never comes into play.
+#define WARDRIVE_LISTING_TIMEOUT_MS 180000
 #define WARDRIVE_WIGLE_OTHER_SSID "__WARDRIVE_WIGLE_OTHER__"
 static const char wpasec_other_ssid_user_data[] = WPASEC_OTHER_SSID;
 static const char wardrive_wigle_other_ssid_user_data[] = WARDRIVE_WIGLE_OTHER_SSID;
@@ -378,6 +385,18 @@ typedef struct {
     int wdgwars_failed;
     int wdgwars_rate_limited;
     bool valid;
+    /* Completeness of the listing that produced this summary. `announced` is the
+     * file count JanOS >= 1.7.2 puts on "[WARD_FILE] BEGIN count=N" (0 on older
+     * firmware, which does not send it). `truncated` means the listing we parsed
+     * is known to be short - no END marker, fewer rows than announced, the rx
+     * buffer filled up, or the file cap was hit. Both are filled in *after* the
+     * parse loop: wardrive_parse_file_summary_line() memsets this struct when the
+     * SUMMARY line arrives, so anything set earlier would be wiped. `parsed` is
+     * how many file rows we actually got, which is what the warning reports -
+     * `files` above comes from the SUMMARY line and is absent when truncated. */
+    int announced;
+    int parsed;
+    bool truncated;
 } wardrive_file_summary_t;
 
 #define WARDRIVE_UPLOAD_STATE_MAX 256
@@ -583,6 +602,10 @@ typedef struct {
     int  victim_scan_index;     // 1-based index as printed by scan_networks
     char mirror_pass[65];       // the real passphrase clients expect on the mirror
 } gitm_ctx_t;
+
+// Defined further down (it embeds the path array); the tab context only needs
+// a pointer, to stage a pending Clean while its confirm dialog is up.
+struct compromised_cleanup_task_args_s;
 
 typedef struct {
     // =====================================================================
@@ -826,6 +849,12 @@ typedef struct {
     lv_obj_t *wardrive_gps_popup;
     lv_obj_t *wardrive_gps_label;
     volatile bool wardrive_monitoring;
+    // Bumped by every explicit stop and every start. The monitor task captures it
+    // on entry and exits as soon as it no longer matches, which is what keeps a
+    // stop/start cycle from ending up with two tasks on one UART: clearing
+    // wardrive_monitoring alone is racy, because a task still mid-iteration sees
+    // the flag set back to true by the next start and just keeps going.
+    volatile uint32_t wardrive_run_generation;
     bool wardrive_gps_fix;
     bool wardrive_use_external_gps;
     TaskHandle_t wardrive_task;
@@ -847,6 +876,10 @@ typedef struct {
     volatile bool wardrive_upload_menu_loading;
     bool wardrive_upload_menu_loaded;
     TaskHandle_t wardrive_upload_menu_task;
+    // Subtitle of the open upload menu, so the loader task can show "n/N" while
+    // the listing streams in. Nulled by its own LV_EVENT_DELETE handler, and only
+    // ever touched under the display lock - the popup can close mid-load.
+    lv_obj_t *wardrive_upload_menu_subtitle;
     wardrive_upload_provider_t wardrive_upload_provider;
     wardrive_upload_mode_t wardrive_upload_mode;
     lv_obj_t *wardrive_wigle_popup_overlay;
@@ -1047,12 +1080,23 @@ typedef struct {
     char wardrive_cleanup_service[12];
     char wardrive_cleanup_status[16];
     char compromised_cleanup_log_buffer[1536];
+    // "Clean" wipes a whole directory, so the args are staged here while the
+    // confirm dialog is up and only handed to the worker on Yes. Freed by the
+    // overlay's LV_EVENT_DELETE handler, so a tab switch cannot leak them.
+    lv_obj_t *compromised_confirm_overlay;
+    struct compromised_cleanup_task_args_s *compromised_cleanup_pending;
 
     // Background loader for the compromised/wardrive file listing (so the listing,
     // which can hash several MB of wardrive logs, runs off the UI thread with a
     // live spinner instead of freezing the GUI).
     volatile bool compromised_files_loading;   // guard: a load task is in flight
     bool compromised_files_loaded;             // data ready in ctx, render from cache
+    lv_obj_t *compromised_files_loading_label; // spinner caption, for live progress
+    // Bulk-delete bar on the Wardrive Files page. The button caption carries the
+    // live selection count, so the checkbox handler needs to reach it; both are
+    // nulled by the button's own LV_EVENT_DELETE.
+    lv_obj_t *wardrive_files_delete_btn;
+    lv_obj_t *wardrive_files_delete_lbl;
     compromised_file_kind_t compromised_files_load_kind;
     TaskHandle_t compromised_files_load_task;
 
@@ -1475,7 +1519,7 @@ typedef struct {
     bool flow_limited;
 } pcap_dns_domain_detail_t;
 
-typedef struct {
+typedef struct compromised_cleanup_task_args_s {
     tab_context_t *ctx;
     compromised_file_kind_t kind;
     compromised_cleanup_action_t action;
@@ -2880,6 +2924,7 @@ static void phishing_portal_monitor_task(void *arg);
 static void show_wardrive_page(void);
 static void wardrive_start_cb(lv_event_t *e);
 static void wardrive_stop_cb(lv_event_t *e);
+static void wardrive_request_stop(tab_context_t *ctx);
 static void wardrive_back_cb(lv_event_t *e);
 static void wardrive_monitor_task(void *arg);
 static void update_wardrive_table(tab_context_t *ctx);
@@ -3007,6 +3052,8 @@ static void compromised_file_copy_cb(lv_event_t *e);
 static void compromised_files_sync_cb(lv_event_t *e);
 static void compromised_file_delete_cb(lv_event_t *e);
 static void compromised_file_clean_cb(lv_event_t *e);
+static void show_compromised_delete_confirm(tab_context_t *ctx,
+                                            compromised_cleanup_task_args_t *task_args);
 static void close_compromised_cleanup_popup(tab_context_t *ctx);
 static void compromised_files_load_task(void *arg);
 static void compromised_files_load_async_render(void *user_data);
@@ -22978,6 +23025,17 @@ static void wardrive_upload_menu_load_async_render(void *user_data)
     show_wardrive_upload_menu(ctx);
 }
 
+// The subtitle label is handed to the background loader through the context, so
+// drop the pointer the moment LVGL destroys it - otherwise closing the menu
+// mid-listing leaves the loader writing into freed memory.
+static void wardrive_upload_menu_subtitle_delete_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (ctx && ctx->wardrive_upload_menu_subtitle == lv_event_get_target(e)) {
+        ctx->wardrive_upload_menu_subtitle = NULL;
+    }
+}
+
 static void show_wardrive_upload_menu(tab_context_t *ctx)
 {
     if (!ctx || !ctx->wardrive_page || ctx->wardrive_upload_menu_overlay) {
@@ -23023,6 +23081,12 @@ static void show_wardrive_upload_menu(tab_context_t *ctx)
     lv_obj_set_width(subtitle, lv_pct(95));
     lv_obj_set_style_text_align(subtitle, LV_TEXT_ALIGN_CENTER, 0);
     lv_label_set_long_mode(subtitle, LV_LABEL_LONG_WRAP);
+
+    // Publish the subtitle so the background loader can report listing progress
+    // into it, and clear the pointer when LVGL deletes the label - the loader may
+    // still be running when the user closes the popup.
+    ctx->wardrive_upload_menu_subtitle = subtitle;
+    lv_obj_add_event_cb(subtitle, wardrive_upload_menu_subtitle_delete_cb, LV_EVENT_DELETE, ctx);
 
     // Window is split top/bottom: "To Upload" (files still on the card) over
     // "Uploaded" (history of past upload attempts). Each half scrolls on its own.
@@ -23760,6 +23824,104 @@ static bool wardrive_parse_file_summary_line(tab_context_t *ctx, const char *lin
     return true;
 }
 
+// Read and discard whatever the module is still emitting, until it goes quiet.
+// Used after a listing we abandoned: those leftover bytes would otherwise be read
+// back as the answer to the *next* command (an upload_state reply carrying
+// [WARD_FILE] lines is exactly this).
+static void wardrive_drain_transport(tab_id_t active_tab, uart_port_t uart_port)
+{
+    char sink[256];
+    int idle_reads = 0;
+    int elapsed_ms = 0;
+    int dropped = 0;
+    const int poll_ms = 250;
+    // 3s of quiet before calling it done: firmware without the scan cache pauses
+    // for seconds between files, so a shorter window would hand back control while
+    // the module is still mid-sentence. Best-effort either way - it cannot outwait
+    // a listing that has another minute of work left.
+    while (elapsed_ms < 15000 && idle_reads < 12) {
+        int len = transport_read_bytes_tab(active_tab, uart_port, sink, sizeof(sink),
+                                           pdMS_TO_TICKS(poll_ms));
+        if (len > 0) {
+            dropped += len;
+            idle_reads = 0;
+        } else {
+            idle_reads++;
+        }
+        elapsed_ms += poll_ms;
+    }
+
+    if (active_tab == TAB_USB && usb_cdc_handle) {
+        usbh_cdc_flush_rx_buffer(usb_cdc_handle);
+    } else {
+        uart_flush(uart_port);
+    }
+
+    if (dropped > 0) {
+        ESP_LOGW(TAG, "[%s] drained %d leftover byte(s) after an incomplete listing",
+                 tab_transport_name(active_tab), dropped);
+    }
+}
+
+// Live "n/N" while a listing streams in, written into whichever caption is on
+// screen: the upload menu's subtitle or the Files page's spinner label. A no-op
+// when neither is up, and the pointers are only read under the display lock -
+// either screen can be closed from the UI thread mid-listing.
+static void wardrive_listing_report_progress(tab_context_t *ctx, const char *rx_buffer,
+                                             int *announced, int *reported)
+{
+    if (!ctx || !rx_buffer || !announced || !reported) {
+        return;
+    }
+
+    if (*announced <= 0) {
+        const char *begin = strstr(rx_buffer, "[WARD_FILE] BEGIN");
+        // Only read count= once the whole line has arrived, otherwise a half-read
+        // "count=6" of a "count=63" would stick as the announced total.
+        size_t n = begin ? strcspn(begin, "\r\n") : 0;
+        if (begin && begin[n] != '\0') {
+            char begin_line[96];
+            if (n >= sizeof(begin_line)) {
+                n = sizeof(begin_line) - 1;
+            }
+            memcpy(begin_line, begin, n);
+            begin_line[n] = '\0';
+            *announced = wardrive_marker_get_int(begin_line, "count", 0);
+        }
+    }
+
+    int seen = 0;
+    for (const char *p = strstr(rx_buffer, "[WARD_FILE] filename="); p != NULL;
+         p = strstr(p + 1, "[WARD_FILE] filename=")) {
+        seen++;
+    }
+    if (seen == *reported) {
+        return;
+    }
+    *reported = seen;
+
+    bsp_display_lock(0);
+    if (ctx->wardrive_upload_menu_subtitle) {
+        if (*announced > 0) {
+            lv_label_set_text_fmt(ctx->wardrive_upload_menu_subtitle,
+                                  "Loading wardrive status... %d/%d", seen, *announced);
+        } else {
+            lv_label_set_text_fmt(ctx->wardrive_upload_menu_subtitle,
+                                  "Loading wardrive status... %d file(s)", seen);
+        }
+    }
+    if (ctx->compromised_files_loading_label) {
+        if (*announced > 0) {
+            lv_label_set_text_fmt(ctx->compromised_files_loading_label,
+                                  "Loading wardrive files... %d/%d", seen, *announced);
+        } else {
+            lv_label_set_text_fmt(ctx->compromised_files_loading_label,
+                                  "Loading wardrive files... %d so far", seen);
+        }
+    }
+    bsp_display_unlock();
+}
+
 static int wardrive_load_files_from_command(tab_context_t *ctx, tab_id_t active_tab,
                                             uart_port_t uart_port, int timeout_ms)
 {
@@ -23768,6 +23930,9 @@ static int wardrive_load_files_from_command(tab_context_t *ctx, tab_id_t active_
     }
 
     ctx->wardrive_file_summary.valid = false;
+    ctx->wardrive_file_summary.truncated = false;
+    ctx->wardrive_file_summary.announced = 0;
+    ctx->wardrive_file_summary.parsed = 0;
 
     if (active_tab == TAB_USB && usb_cdc_handle) {
         usbh_cdc_flush_rx_buffer(usb_cdc_handle);
@@ -23778,10 +23943,14 @@ static int wardrive_load_files_from_command(tab_context_t *ctx, tab_id_t active_
     transport_write_bytes_tab(active_tab, uart_port, "wardrive_files", strlen("wardrive_files"));
     transport_write_bytes_tab(active_tab, uart_port, "\r\n", 2);
 
-    // Big PSRAM buffer: a full wardrive_files listing (24+ files with interleaved
-    // preflight/sanitize lines) easily exceeds 16KB. Keep it in PSRAM so a large
-    // buffer never eats scarce internal RAM; fall back only to a small internal
-    // buffer (which may truncate the listing) if PSRAM is unavailable.
+    // Sizing, measured against a real card (63 files): one "[WARD_FILE] filename="
+    // line is 122 bytes with CRLF and the SUMMARY line is 241, so a listing from
+    // JanOS >= 1.7.2 is ~7.8KB. Older firmware interleaves an 88-byte preflight
+    // line per file on top, which pushes the same listing to ~14KB. Keep the
+    // buffer in PSRAM so neither case eats the scarce internal RAM; the small
+    // internal fallback covers roughly 60 files of new-style output and less of
+    // the old, so a listing that fills it is reported as truncated below rather
+    // than silently cut.
     size_t rx_size = 65536;
     char *rx_buffer = heap_caps_malloc(rx_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!rx_buffer) {
@@ -23797,7 +23966,10 @@ static int wardrive_load_files_from_command(tab_context_t *ctx, tab_id_t active_
     int rx_len = 0;
     int elapsed_ms = 0;
     int empty_reads = 0;
+    int announced = 0;
+    int reported_progress = -1;
     bool saw_end_marker = false;
+    bool buffer_full = false;
     const int poll_ms = 250;
     while (elapsed_ms < timeout_ms && rx_len < (int)rx_size - 1) {
         int len = transport_read_bytes_tab(active_tab, uart_port,
@@ -23815,13 +23987,22 @@ static int wardrive_load_files_from_command(tab_context_t *ctx, tab_id_t active_
             if (strstr(rx_buffer, "Unrecognized command") != NULL) {
                 break;
             }
+            wardrive_listing_report_progress(ctx, rx_buffer, &announced, &reported_progress);
         } else {
             empty_reads++;
+            // Only bail on silence *before* BEGIN, i.e. the module never answered.
+            // After BEGIN silence is normal work: firmware without the scan cache
+            // goes quiet for ~30s while it hashes and preflights a 3MB log, and
+            // treating that as death is what truncates the listing. The timeout
+            // above is the only ceiling once the listing has started.
             if (empty_reads >= 6 && strstr(rx_buffer, "[WARD_FILE] BEGIN") == NULL) {
                 break;
             }
         }
         elapsed_ms += poll_ms;
+    }
+    if (rx_len >= (int)rx_size - 1) {
+        buffer_full = true;
     }
     if (rx_len <= 0) {
         free(rx_buffer);
@@ -23834,25 +24015,55 @@ static int wardrive_load_files_from_command(tab_context_t *ctx, tab_id_t active_
 
     bool saw_begin = false;
     bool saw_end = false;
+    bool hit_file_cap = false;
     int added = 0;
     char *line = strtok(rx_buffer, "\n\r");
-    while (line && ctx->wardrive_wigle_file_count < WARDRIVE_WIGLE_MAX_FILES) {
+    while (line) {
         while (isspace((unsigned char)*line)) {
             line++;
         }
-        if (strcmp(line, "[WARD_FILE] BEGIN") == 0) {
+        // Prefix match, not strcmp: JanOS >= 1.7.2 appends "count=N" to BEGIN, and
+        // the wire contract is append-only, so END may grow fields too.
+        if (strncmp(line, "[WARD_FILE] BEGIN", 17) == 0) {
             saw_begin = true;
-        } else if (strcmp(line, "[WARD_FILE] END") == 0) {
+            announced = wardrive_marker_get_int(line, "count", announced);
+        } else if (strncmp(line, "[WARD_FILE] END", 15) == 0) {
             saw_end = true;
         } else if (wardrive_parse_file_summary_line(ctx, line)) {
             /* summary parsed */
+        } else if (ctx->wardrive_wigle_file_count >= WARDRIVE_WIGLE_MAX_FILES) {
+            if (strstr(line, "[WARD_FILE] filename=") != NULL) {
+                hit_file_cap = true;
+            }
         } else if (wardrive_parse_file_marker_line(ctx, line)) {
             added++;
         }
         line = strtok(NULL, "\n\r");
     }
 
+    // Completeness verdict. Assigned here, after the parse loop, because parsing
+    // the SUMMARY line memsets the summary struct.
+    bool truncated = !saw_end || buffer_full || hit_file_cap ||
+                     (announced > 0 && added < announced);
+    ctx->wardrive_file_summary.announced = announced;
+    ctx->wardrive_file_summary.parsed = added;
+    ctx->wardrive_file_summary.truncated = truncated;
+    if (truncated) {
+        ESP_LOGW(TAG, "[%s] wardrive_files listing truncated: %d parsed, %d announced "
+                      "(end=%d buffer_full=%d cap=%d)",
+                 tab_transport_name(active_tab), added, announced,
+                 saw_end ? 1 : 0, buffer_full ? 1 : 0, hit_file_cap ? 1 : 0);
+    }
+
     free(rx_buffer);
+
+    // A listing we gave up on leaves the module still printing. Those bytes would
+    // otherwise land in the next command's response - that is how an upload_state
+    // reply ends up containing [WARD_FILE] lines - so drain to silence first.
+    if (truncated) {
+        wardrive_drain_transport(active_tab, uart_port);
+    }
+
     return (saw_begin || saw_end || added > 0 || ctx->wardrive_file_summary.valid) ? added : 0;
 }
 
@@ -23876,7 +24087,11 @@ static int wardrive_load_upload_state_from_command(tab_context_t *ctx, tab_id_t 
     transport_write_bytes_tab(active_tab, uart_port, "upload_state", strlen("upload_state"));
     transport_write_bytes_tab(active_tab, uart_port, "\r\n", 2);
 
-    size_t rx_size = 32768;
+    // upload_state.csv is append-only on the module - one row per upload attempt,
+    // both services, forever - so a card with a long history answers with tens of
+    // KB. 32KB already overflowed on a real one, and an overflow here silently
+    // shortens the "Uploaded" history. Keep it in PSRAM and report a fill.
+    size_t rx_size = 65536;
     char *rx_buffer = heap_caps_malloc(rx_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!rx_buffer) {
         rx_size = 8192;
@@ -23924,6 +24139,15 @@ static int wardrive_load_upload_state_from_command(tab_context_t *ctx, tab_id_t 
     rx_buffer[(rx_len < (int)rx_size) ? rx_len : (int)rx_size - 1] = '\0';
     ESP_LOGI(TAG, "[%s] upload_state response (%d bytes, end=%d): %s",
              tab_transport_name(active_tab), rx_len, saw_end_marker ? 1 : 0, rx_buffer);
+    if (!saw_end_marker) {
+        // The journal only feeds the "Uploaded" history panel, so a short read is
+        // cosmetic rather than dangerous - but say so, because the panel then
+        // quietly stops short of the oldest entries.
+        ESP_LOGW(TAG, "[%s] upload_state incomplete (%d bytes, buffer_full=%d) - "
+                      "history panel will be short",
+                 tab_transport_name(active_tab), rx_len,
+                 (rx_len >= (int)rx_size - 1) ? 1 : 0);
+    }
 
     bool saw_begin = false;
     bool saw_end = false;
@@ -24163,8 +24387,36 @@ static void wardrive_format_summary_text(const wardrive_file_summary_t *summary,
         return;
     }
     out[0] = '\0';
-    if (!summary->valid) {
+    // A truncated listing has no SUMMARY line (it never arrived), so valid is
+    // false exactly when the warning matters most - do not gate on it alone.
+    if (!summary->valid && !summary->truncated) {
         return;
+    }
+
+    size_t len = 0;
+    if (summary->truncated) {
+        int n;
+        if (summary->announced > 0) {
+            n = snprintf(out, out_sz,
+                         "#" WARD_HEX_FAILED " listing truncated - showing %d of %d file(s)#",
+                         summary->parsed, summary->announced);
+        } else {
+            n = snprintf(out, out_sz,
+                         "#" WARD_HEX_FAILED " listing incomplete - showing %d file(s)#",
+                         summary->parsed);
+        }
+        if (n < 0 || (size_t)n >= out_sz) {
+            return;
+        }
+        len = (size_t)n;
+        if (!summary->valid) {
+            return;
+        }
+        n = snprintf(out + len, out_sz - len, "\n");
+        if (n < 0 || (size_t)n >= out_sz - len) {
+            return;
+        }
+        len += (size_t)n;
     }
 
     // Recolored, aligned summary (requires lv_label_set_recolor(true) on the label).
@@ -24174,7 +24426,7 @@ static void wardrive_format_summary_text(const wardrive_file_summary_t *summary,
         snprintf(bad_seg, sizeof(bad_seg), "  #" WARD_HEX_BAD " %d bad#", summary->bad);
     }
 
-    snprintf(out, out_sz,
+    snprintf(out + len, out_sz - len,
              "#ffffff %d files#   #" WARD_HEX_WIFI " %d WiFi#  "
              "#" WARD_HEX_BLE " %d BLE#  #" WARD_HEX_BT " %d BT#%s\n"
              "WiGLE  #" WARD_HEX_DONE " %d ok#  #" WARD_HEX_PENDING " %d pend#  "
@@ -24294,7 +24546,8 @@ static void wardrive_wigle_load_file_list(tab_context_t *ctx, tab_id_t active_ta
         return;
     }
 
-    int marker_files = wardrive_load_files_from_command(ctx, active_tab, uart_port, 120000);
+    int marker_files = wardrive_load_files_from_command(ctx, active_tab, uart_port,
+                                                    WARDRIVE_LISTING_TIMEOUT_MS);
     if (marker_files > 0 || ctx->wardrive_file_summary.valid) {
         ESP_LOGI(TAG, "[%s] Wardrive files loaded from wardrive_files: %d",
                  tab_transport_name(active_tab), marker_files);
@@ -24313,6 +24566,13 @@ static void wardrive_wigle_load_file_list(tab_context_t *ctx, tab_id_t active_ta
         true,
         true
     };
+
+    // Falling back to a plain directory listing: whatever wardrive_files managed
+    // to say is no longer what the list shows, so its truncation verdict must not
+    // be reported against these entries.
+    ctx->wardrive_file_summary.truncated = false;
+    ctx->wardrive_file_summary.announced = 0;
+    ctx->wardrive_file_summary.parsed = 0;
 
     for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
         wardrive_wigle_load_files_from_dir(ctx, active_tab, uart_port, dirs[i], require_marker[i]);
@@ -26984,20 +27244,7 @@ static void wardrive_stop_cb(lv_event_t *e)
     if (!ctx) ctx = get_current_ctx();
     ESP_LOGI(TAG, "Wardrive stopped - sending stop command");
 
-    // Send stop command to the correct UART based on this tab
-    tab_id_t active_tab = tab_id_for_ctx(ctx);
-    if (active_tab == TAB_MBUS) {
-        uart2_send_command("stop");
-    } else {
-        uart_send_command("stop");
-    }
-
-    // Stop monitoring task
-    ctx->wardrive_monitoring = false;
-    if (ctx->wardrive_task != NULL) {
-        vTaskDelay(pdMS_TO_TICKS(100));
-        ctx->wardrive_task = NULL;
-    }
+    wardrive_request_stop(ctx);
 
     // Dismiss GPS overlay if showing
     close_wardrive_gps_overlay(ctx);
@@ -28192,10 +28439,41 @@ static void wardrive_autoupload_check(tab_context_t *ctx, const wardrive_network
     }
 }
 
+// Ask the running scan to stop: tell the module and clear the flag. Callers own
+// the UI side. Not used by the auto-upload handoff, which needs the task to reach
+// its own tail and launch the upload worker.
+static void wardrive_request_stop(tab_context_t *ctx)
+{
+    if (!ctx) return;
+
+    tab_id_t active_tab = tab_id_for_ctx(ctx);
+    if (active_tab == TAB_MBUS) {
+        uart2_send_command("stop");
+    } else {
+        uart_send_command("stop");
+    }
+
+    // An explicit stop overrides a pending auto-upload handoff: the user asked for
+    // idle, not for a connect-and-upload run.
+    ctx->wardrive_autoupload_requested = false;
+    ctx->wardrive_monitoring = false;
+
+    // Deliberately no generation bump. Clearing the flag is enough to end this run,
+    // and leaving the generation alone lets the task recognise itself as the
+    // current one on the way out, so it clears its own handle. The bump belongs to
+    // wardrive_begin_scan(), which is where a straggler could actually be revived.
+    // The handle is never cleared here: doing so used to let a straggler wipe the
+    // *next* task's handle when it finally exited.
+}
+
 // Core of "start wardrive", shared by the Start button and the auto-upload Resume button.
 static void wardrive_begin_scan(tab_context_t *ctx)
 {
     if (!ctx || ctx->wardrive_monitoring) return;
+
+    // Retire any monitor task still finishing its last iteration before this run's
+    // flag goes up, so it cannot mistake our start for its own.
+    ctx->wardrive_run_generation++;
 
     close_wardrive_wigle_popup_ctx(ctx);
 
@@ -28228,6 +28506,12 @@ static void wardrive_begin_scan(tab_context_t *ctx)
     ESP_LOGI(TAG, "Wardrive start - sending %s command", start_cmd);
 
     tab_id_t active_tab = tab_id_for_ctx(ctx);
+
+    // Drop whatever the module said about the previous run - the stop summary and
+    // the tail of its last CSV batch are still in the driver's buffer, and the new
+    // monitor task would read them as this run's output.
+    uart_flush_input((active_tab == TAB_MBUS) ? UART2_NUM : UART_NUM);
+
     if (active_tab == TAB_MBUS) {
         uart2_send_command("unselect_networks");
     } else {
@@ -28271,7 +28555,30 @@ static void wardrive_begin_scan(tab_context_t *ctx)
     bsp_display_unlock();
 
     ctx->wardrive_monitoring = true;
-    xTaskCreate(wardrive_monitor_task, "wd_monitor", 8192, (void*)ctx, 5, &ctx->wardrive_task);
+    if (xTaskCreate(wardrive_monitor_task, "wd_monitor", 8192, (void*)ctx, 5,
+                    &ctx->wardrive_task) != pdPASS) {
+        // Without the reader nothing ever leaves "Starting wardrive..." and Start
+        // stays greyed out, so undo the run rather than leaving the page wedged.
+        ESP_LOGE(TAG, "Wardrive: failed to start monitor task");
+        ctx->wardrive_monitoring = false;
+        ctx->wardrive_task = NULL;
+        ctx->wardrive_run_generation++;
+        if (active_tab == TAB_MBUS) uart2_send_command("stop");
+        else uart_send_command("stop");
+
+        bsp_display_lock(0);
+        close_wardrive_gps_overlay(ctx);
+        if (ctx->wardrive_start_btn) lv_obj_clear_state(ctx->wardrive_start_btn, LV_STATE_DISABLED);
+        if (ctx->wardrive_stop_btn) lv_obj_add_state(ctx->wardrive_stop_btn, LV_STATE_DISABLED);
+        if (ctx->wardrive_trace_btn) lv_obj_clear_state(ctx->wardrive_trace_btn, LV_STATE_DISABLED);
+        if (ctx->wardrive_upload_btn) lv_obj_clear_state(ctx->wardrive_upload_btn, LV_STATE_DISABLED);
+        if (ctx->wardrive_setup_btn) lv_obj_clear_state(ctx->wardrive_setup_btn, LV_STATE_DISABLED);
+        if (ctx->wardrive_status_label) {
+            lv_label_set_text(ctx->wardrive_status_label, "Could not start - out of memory");
+            lv_obj_set_style_text_color(ctx->wardrive_status_label, COLOR_MATERIAL_RED, 0);
+        }
+        bsp_display_unlock();
+    }
 }
 
 static void wardrive_monitor_task(void *arg)
@@ -28286,7 +28593,12 @@ static void wardrive_monitor_task(void *arg)
     tab_id_t active_tab = tab_id_for_ctx(ctx);
     uart_port_t uart_port = (active_tab == TAB_MBUS) ? UART2_NUM : UART_NUM;
 
-    ESP_LOGI(TAG, "Wardrive monitor task started (tab=%d, uart=%d)", active_tab, uart_port);
+    // Whose run this is. Once it no longer matches, a newer start (or a stop) has
+    // taken over the transport and this task must get off it.
+    const uint32_t my_generation = ctx->wardrive_run_generation;
+
+    ESP_LOGI(TAG, "Wardrive monitor task started (tab=%d, uart=%d, gen=%lu)",
+             active_tab, uart_port, (unsigned long)my_generation);
 
     char rx_buffer[512];
     char line_buffer[512];
@@ -28303,7 +28615,7 @@ static void wardrive_monitor_task(void *arg)
     int low_batt_hits = 0;
     bool low_batt_stop_sent = false;
 
-    while (ctx->wardrive_monitoring) {
+    while (ctx->wardrive_monitoring && ctx->wardrive_run_generation == my_generation) {
         if (ctx->wardrive_use_external_gps) {
             wardrive_push_external_gps_update(active_tab,
                                               uart_port,
@@ -28580,7 +28892,17 @@ static void wardrive_monitor_task(void *arg)
         vTaskDelay(pdMS_TO_TICKS(50));
     }
 
-    ESP_LOGI(TAG, "Wardrive monitor task ended");
+    // Only the task that still owns the run may touch shared state on the way out;
+    // a straggler retired by a newer start must not clear the new task's handle or
+    // steal its auto-upload handoff.
+    bool still_current = (ctx->wardrive_run_generation == my_generation);
+    ESP_LOGI(TAG, "Wardrive monitor task ended (gen=%lu, current=%d)",
+             (unsigned long)my_generation, still_current ? 1 : 0);
+
+    if (!still_current) {
+        vTaskDelete(NULL);
+        return;
+    }
 
     // Auto-upload handoff: the user confirmed a home network, so launch the upload
     // worker (which now owns the transport) instead of returning to idle.
@@ -28623,17 +28945,7 @@ static void wardrive_back_cb(lv_event_t *e)
 
     // Stop if running
     if (ctx->wardrive_monitoring) {
-        tab_id_t active_tab = tab_id_for_ctx(ctx);
-        if (active_tab == TAB_MBUS) {
-            uart2_send_command("stop");
-        } else {
-            uart_send_command("stop");
-        }
-        ctx->wardrive_monitoring = false;
-        if (ctx->wardrive_task != NULL) {
-            vTaskDelay(pdMS_TO_TICKS(100));
-            ctx->wardrive_task = NULL;
-        }
+        wardrive_request_stop(ctx);
     }
 
     // Dismiss GPS overlay
@@ -32679,6 +32991,88 @@ static void compromised_listing_reset_files(tab_context_t *ctx)
     wardrive_upload_state_reset(ctx);
 }
 
+// Remove one entry from the in-memory listing, keeping the rest in order. Used
+// after the module confirmed a delete, so the page can re-render from cache
+// instead of re-reading the whole directory (a wardrive listing costs the module
+// a full pass over every log on the card).
+static bool compromised_listing_drop_path(tab_context_t *ctx, const char *path)
+{
+    if (!ctx || !ctx->wardrive_wigle_files || !path || path[0] == '\0') {
+        return false;
+    }
+
+    for (int i = 0; i < ctx->wardrive_wigle_file_count; i++) {
+        if (strcmp(ctx->wardrive_wigle_files[i].path, path) != 0) {
+            continue;
+        }
+        int remaining = ctx->wardrive_wigle_file_count - i - 1;
+        if (remaining > 0) {
+            memmove(&ctx->wardrive_wigle_files[i], &ctx->wardrive_wigle_files[i + 1],
+                    (size_t)remaining * sizeof(wardrive_wigle_file_t));
+        }
+        ctx->wardrive_wigle_file_count--;
+        memset(&ctx->wardrive_wigle_files[ctx->wardrive_wigle_file_count], 0,
+               sizeof(wardrive_wigle_file_t));
+        return true;
+    }
+
+    return false;
+}
+
+static void wardrive_summary_tally_status(const char *status, int *ok, int *pending,
+                                          int *failed, int *rate_limited)
+{
+    if (status && strcmp(status, "done") == 0) {
+        (*ok)++;
+    } else if (status && strcmp(status, "failed") == 0) {
+        (*failed)++;
+    } else if (status && strcmp(status, "rate_limited") == 0) {
+        (*rate_limited)++;
+    } else {
+        (*pending)++;
+    }
+}
+
+// Rebuild the summary from the entries still in the listing, after some were
+// dropped. Exact rather than approximate: the module derives rows and devices
+// from wifi+ble+bt, and every field we need is already stored per file.
+static void wardrive_recompute_file_summary(tab_context_t *ctx)
+{
+    if (!ctx || !ctx->wardrive_wigle_files || !ctx->wardrive_file_summary.valid) {
+        return;
+    }
+
+    wardrive_file_summary_t *s = &ctx->wardrive_file_summary;
+    int announced = s->announced;
+
+    memset(s, 0, sizeof(*s));
+    s->valid = true;
+
+    for (int i = 0; i < ctx->wardrive_wigle_file_count; i++) {
+        const wardrive_wigle_file_t *f = &ctx->wardrive_wigle_files[i];
+        if (f->name[0] == '\0') {
+            continue;
+        }
+        s->files++;
+        s->bytes += f->size_bytes;
+        s->wifi += f->wifi_rows;
+        s->ble += f->ble_rows;
+        s->bt += f->bt_rows;
+        s->bad += f->bad_rows;
+        wardrive_summary_tally_status(f->wigle_status, &s->wigle_ok, &s->wigle_pending,
+                                      &s->wigle_failed, &s->wigle_rate_limited);
+        wardrive_summary_tally_status(f->wdgwars_status, &s->wdgwars_ok, &s->wdgwars_pending,
+                                      &s->wdgwars_failed, &s->wdgwars_rate_limited);
+    }
+
+    s->rows = s->wifi + s->ble + s->bt;
+    s->devices = s->rows;
+    s->parsed = s->files;
+    // Only a complete listing is ever pruned (see compromised_cleanup_task), so
+    // announced follows the file count down and truncated stays false.
+    s->announced = (announced > 0) ? s->files : 0;
+}
+
 static void compromised_transport_lock_begin(tab_id_t tab, uart_port_t uart_port, bool *usb_lock_set)
 {
     if (usb_lock_set) {
@@ -32991,11 +33385,18 @@ static int compromised_load_wardrive_files(tab_context_t *ctx, tab_id_t active_t
     bool usb_lock_set = false;
     compromised_transport_lock_begin(active_tab, uart_port, &usb_lock_set);
 
-    int marker_files = wardrive_load_files_from_command(ctx, active_tab, uart_port, 120000);
+    int marker_files = wardrive_load_files_from_command(ctx, active_tab, uart_port,
+                                                    WARDRIVE_LISTING_TIMEOUT_MS);
     if (marker_files > 0 || ctx->wardrive_file_summary.valid) {
         compromised_transport_lock_end(usb_lock_set);
         return ctx->wardrive_wigle_file_count;
     }
+
+    // See wardrive_wigle_load_file_list(): the fallback listing below replaces the
+    // marker output entirely, so its truncation verdict no longer applies.
+    ctx->wardrive_file_summary.truncated = false;
+    ctx->wardrive_file_summary.announced = 0;
+    ctx->wardrive_file_summary.parsed = 0;
 
     char rx_buffer[4096];
     for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]) &&
@@ -33057,6 +33458,156 @@ static void compromised_build_delete_path(const char *src_path, char *out, size_
     snprintf(out, out_sz, "%s", trimmed);
 }
 
+// JanOS sets repl_config.max_cmdline_length = 256. esp_console truncates a longer
+// line silently (strlcpy) and linenoise's dumb reader leaves an exactly-256-char
+// line unterminated, so a too-long command would delete a half-named file rather
+// than fail. Keep the whole line under that, with margin.
+#define COMPROMISED_DELETE_CMD_MAX 250
+// esp_console_split_argv() stops at argc == max_cmdline_args - 1 (32 - 1 = 31);
+// argv[0] is "file_delete", so 30 paths. The line budget above bites long before
+// this does (~6 wardrive paths, ~4 handshake paths), but bound the loop anyway.
+#define COMPROMISED_DELETE_ARGS_MAX 30
+
+// Quote one path for esp_console_split_argv(), which understands "..." plus \"
+// and \\ inside them. Handshake filenames are built from SSIDs, so a quote or a
+// backslash in the name is possible and must not end the argument early - that
+// would hand the module a different path than the one we meant to delete.
+static bool compromised_quote_delete_arg(const char *path, char *out, size_t out_sz)
+{
+    if (!path || path[0] == '\0' || !out || out_sz < 4) {
+        return false;
+    }
+
+    size_t o = 0;
+    out[o++] = '"';
+    for (const char *p = path; *p; p++) {
+        size_t need = (*p == '"' || *p == '\\') ? 2u : 1u;
+        if (o + need + 2 > out_sz) { // + closing quote + NUL
+            return false;
+        }
+        if (need == 2) {
+            out[o++] = '\\';
+        }
+        out[o++] = *p;
+    }
+    out[o++] = '"';
+    out[o] = '\0';
+    return true;
+}
+
+// Pack as many of paths[start..count-1] into one `file_delete` line as the
+// module's console will accept. Returns how many were packed; 0 means even the
+// first one does not fit, and the caller must fail that path outright instead of
+// sending a truncated line.
+static int compromised_pack_delete_cmd(char paths[][WARDRIVE_WIGLE_PATH_MAX], int count,
+                                       int start, char *cmd, size_t cmd_sz)
+{
+    if (!paths || !cmd || cmd_sz < 32 || start < 0 || start >= count) {
+        return 0;
+    }
+
+    int len = snprintf(cmd, cmd_sz, "file_delete");
+    if (len < 0 || (size_t)len >= cmd_sz) {
+        return 0;
+    }
+
+    int packed = 0;
+    for (int i = start; i < count && packed < COMPROMISED_DELETE_ARGS_MAX; i++) {
+        char rel[WARDRIVE_WIGLE_PATH_MAX];
+        compromised_build_delete_path(paths[i], rel, sizeof(rel));
+
+        char quoted[WARDRIVE_WIGLE_PATH_MAX * 2 + 4];
+        if (rel[0] == '\0' || !compromised_quote_delete_arg(rel, quoted, sizeof(quoted))) {
+            break; // caller fails this one and resumes packing after it
+        }
+
+        size_t arg_len = strlen(quoted);
+        if ((size_t)len + 1 + arg_len + 1 > cmd_sz) { // space + arg + NUL
+            break;
+        }
+        cmd[len++] = ' ';
+        memcpy(cmd + len, quoted, arg_len);
+        len += (int)arg_len;
+        cmd[len] = '\0';
+        packed++;
+    }
+
+    return packed;
+}
+
+// Map a delete response back onto the paths of the batch that produced it.
+// JanOS >= 1.7.2 prints one "[FILE_DELETE] ... result=..." per path, in argv
+// order; ok[i] is set from the i-th such line. Returns how many markers were
+// found, which is 0 on firmware that does not emit them.
+//
+// Deliberately positional: wardrive_marker_get_value() cuts a value at the first
+// space, so path= is unreadable for exactly the names (spaces) that matter here.
+static int compromised_parse_delete_results(const char *rx, int expected, bool *ok)
+{
+    if (!rx || !ok || expected <= 0) {
+        return 0;
+    }
+
+    int seen = 0;
+    const char *p = rx;
+    while (seen < expected && (p = strstr(p, "[FILE_DELETE]")) != NULL) {
+        char marker_line[WARDRIVE_WIGLE_PATH_MAX + 96];
+        size_t n = strcspn(p, "\r\n");
+        if (n >= sizeof(marker_line)) {
+            n = sizeof(marker_line) - 1;
+        }
+        memcpy(marker_line, p, n);
+        marker_line[n] = '\0';
+
+        char result[24] = {0};
+        wardrive_marker_get_value(marker_line, "result", result, sizeof(result));
+        ok[seen++] = (strcmp(result, "ok") == 0);
+        p += 13; // past "[FILE_DELETE]"
+    }
+
+    return seen;
+}
+
+// Send one already-packed batch and fill ok[0..count-1]. Returns true when the
+// module answered with per-path markers; false means the reply could not be
+// mapped (older firmware, or a lost response) and the caller should retry those
+// paths one at a time.
+static bool compromised_delete_batch_locked(tab_id_t tab, uart_port_t uart_port,
+                                            const char *cmd, int count, bool *ok,
+                                            char *rx_buffer, size_t rx_buffer_sz)
+{
+    if (tab_is_internal(tab) || !cmd || cmd[0] == '\0' || !ok || count <= 0 ||
+        !rx_buffer || rx_buffer_sz < 2) {
+        return false;
+    }
+
+    compromised_transport_flush(tab, uart_port);
+    transport_write_bytes_tab(tab, uart_port, cmd, strlen(cmd));
+    transport_write_bytes_tab(tab, uart_port, "\r\n", 2);
+
+    // One sd_sync() on the module covers the whole batch, but each path still
+    // costs a stat+unlink, so scale the ceiling with the batch size.
+    uint32_t timeout_ms = 600 + 400u * (uint32_t)count;
+    if (timeout_ms > 5000) {
+        timeout_ms = 5000;
+    }
+
+    int rx_len = home_collect_uart_response(tab, uart_port, rx_buffer, rx_buffer_sz, timeout_ms);
+    ESP_LOGI(TAG, "[%s] Batch delete of %d file(s) (%d bytes): %s",
+             tab_transport_name(tab), count, rx_len, rx_buffer);
+
+    int mapped = compromised_parse_delete_results(rx_buffer, count, ok);
+    if (mapped == count) {
+        return true;
+    }
+
+    // Partial or absent markers: do not guess which path they belonged to.
+    for (int i = 0; i < count; i++) {
+        ok[i] = false;
+    }
+    return false;
+}
+
 static bool compromised_delete_file_locked(tab_id_t tab, uart_port_t uart_port, const char *src_path,
                                            char *delete_path, size_t delete_path_sz,
                                            char *rx_buffer, size_t rx_buffer_sz)
@@ -33073,34 +33624,42 @@ static bool compromised_delete_file_locked(tab_id_t tab, uart_port_t uart_port, 
         return false;
     }
 
-    compromised_transport_flush(tab, uart_port);
+    // Always quoted, never bare: once the module accepts several paths per line, a
+    // bare path with a space in it splits into two arguments and deletes files we
+    // never named. esp_console has understood quotes since forever, so there is no
+    // firmware where the bare form works and this one does not - hence no retry.
+    char quoted[WARDRIVE_WIGLE_PATH_MAX * 2 + 4];
+    if (!compromised_quote_delete_arg(delete_path, quoted, sizeof(quoted))) {
+        ESP_LOGW(TAG, "[%s] Delete skipped, path does not fit quoting: %s",
+                 tab_transport_name(tab), delete_path);
+        rx_buffer[0] = '\0';
+        return false;
+    }
 
-    char cmd[WARDRIVE_WIGLE_PATH_MAX + 24];
-    snprintf(cmd, sizeof(cmd), "file_delete %s", delete_path);
+    char cmd[COMPROMISED_DELETE_CMD_MAX];
+    int cmd_len = snprintf(cmd, sizeof(cmd), "file_delete %s", quoted);
+    if (cmd_len < 0 || (size_t)cmd_len >= sizeof(cmd)) {
+        ESP_LOGW(TAG, "[%s] Delete skipped, command line too long for: %s",
+                 tab_transport_name(tab), delete_path);
+        rx_buffer[0] = '\0';
+        return false;
+    }
+
+    compromised_transport_flush(tab, uart_port);
     transport_write_bytes_tab(tab, uart_port, cmd, strlen(cmd));
     transport_write_bytes_tab(tab, uart_port, "\r\n", 2);
 
-    int rx_len = home_collect_uart_response(tab, uart_port, rx_buffer, rx_buffer_sz, 900);
+    int rx_len = home_collect_uart_response(tab, uart_port, rx_buffer, rx_buffer_sz, 1500);
     ESP_LOGI(TAG, "[%s] Delete response for %s (%d bytes): %s",
              tab_transport_name(tab), delete_path, rx_len, rx_buffer);
-    if (strstr(rx_buffer, "Deleted ") != NULL) {
-        return true;
-    }
 
-    if (strchr(delete_path, ' ') != NULL) {
-        compromised_transport_flush(tab, uart_port);
-        snprintf(cmd, sizeof(cmd), "file_delete \"%s\"", delete_path);
-        transport_write_bytes_tab(tab, uart_port, cmd, strlen(cmd));
-        transport_write_bytes_tab(tab, uart_port, "\r\n", 2);
-        rx_len = home_collect_uart_response(tab, uart_port, rx_buffer, rx_buffer_sz, 900);
-        ESP_LOGI(TAG, "[%s] Quoted delete response for %s (%d bytes): %s",
-                 tab_transport_name(tab), delete_path, rx_len, rx_buffer);
-        if (strstr(rx_buffer, "Deleted ") != NULL) {
-            return true;
-        }
+    // Prefer the machine-readable marker (JanOS >= 1.7.2); fall back to the human
+    // line, which older firmware is the only thing to print.
+    bool ok = false;
+    if (compromised_parse_delete_results(rx_buffer, 1, &ok) == 1) {
+        return ok;
     }
-
-    return false;
+    return strstr(rx_buffer, "Deleted ") != NULL;
 }
 
 static void compromised_delete_handshake_companion_locked(tab_id_t tab, uart_port_t uart_port,
@@ -33493,6 +34052,9 @@ static void compromised_cleanup_async_refresh(void *user_data)
     } else if (page_slot && *page_slot) {
         lv_obj_del(*page_slot);
         *page_slot = NULL;
+        // Nobody consumed the pruned cache; drop the staged flag so the next open
+        // reads a fresh listing rather than rendering it much later.
+        ctx->compromised_files_loaded = false;
     }
 
     if (kind == COMPROMISED_FILE_KIND_HANDSHAKE) {
@@ -33741,8 +34303,9 @@ static void wardrive_cleanup_task(void *arg)
     int total_len = 0;
     int elapsed_ms = 0;
     int empty_reads = 0;
+    bool saw_end_marker = false;
     const int poll_ms = 250;
-    while (elapsed_ms < 120000 && total_len < (int)rx_size - 1) {
+    while (elapsed_ms < WARDRIVE_LISTING_TIMEOUT_MS && total_len < (int)rx_size - 1) {
         int len = transport_read_bytes_tab(tab, uart_port, rx + total_len,
                                            rx_size - 1 - total_len,
                                            pdMS_TO_TICKS(poll_ms));
@@ -33750,27 +34313,38 @@ static void wardrive_cleanup_task(void *arg)
             total_len += len;
             rx[total_len] = '\0';
             empty_reads = 0;
-            if (strstr(rx, "[WARD_CLEANUP] END") != NULL ||
-                strstr(rx, "Usage: wardrive_cleanup") != NULL ||
+            if (strstr(rx, "[WARD_CLEANUP] END") != NULL) {
+                saw_end_marker = true;
+                break;
+            }
+            if (strstr(rx, "Usage: wardrive_cleanup") != NULL ||
                 strstr(rx, "Unrecognized command") != NULL) {
                 break;
             }
         } else {
             empty_reads++;
+            // Silence only counts before BEGIN. wardrive_cleanup hashes every file
+            // it scans, so once it has started a long quiet stretch is a big log
+            // being read, not a hang - see wardrive_load_files_from_command().
             if (empty_reads >= 8 && strstr(rx, "[WARD_CLEANUP] BEGIN") == NULL) {
                 break;
             }
         }
         elapsed_ms += poll_ms;
     }
+    bool cleanup_buffer_full = (total_len >= (int)rx_size - 1);
     compromised_transport_lock_end(usb_lock_set);
 
     int scanned = 0, matched = 0, moved = 0, failed = 0, dry_run = args->move ? 0 : 1;
+    int announced = 0;
     int shown = 0;
     char *line = strtok(rx, "\n\r");
     while (line) {
         while (isspace((unsigned char)*line)) line++;
-        if (strstr(line, "[WARD_CLEANUP] filename=") != NULL) {
+        if (strstr(line, "[WARD_CLEANUP] BEGIN") != NULL) {
+            // count= is appended by JanOS >= 1.7.2; absent on older firmware.
+            announced = wardrive_marker_get_int(line, "count", 0);
+        } else if (strstr(line, "[WARD_CLEANUP] filename=") != NULL) {
             char filename[96] = {0};
             char action[24] = {0};
             wardrive_marker_get_value(line, "filename", filename, sizeof(filename));
@@ -33797,7 +34371,34 @@ static void wardrive_cleanup_task(void *arg)
         bsp_display_unlock();
     }
 
+    // Same completeness check as the file listing: without END, or with fewer
+    // scanned files than the module announced, what we show is a partial result -
+    // dangerous to read as "nothing else matched".
+    bool cleanup_truncated = !saw_end_marker || cleanup_buffer_full ||
+                             (announced > 0 && scanned < announced);
+    if (cleanup_truncated) {
+        char warn[96];
+        if (announced > 0) {
+            snprintf(warn, sizeof(warn), "[WARN] incomplete: scanned %d of %d",
+                     scanned, announced);
+        } else {
+            snprintf(warn, sizeof(warn), "[WARN] incomplete response from module");
+        }
+        ESP_LOGW(TAG, "[%s] wardrive_cleanup %s", tab_transport_name(tab), warn);
+        bsp_display_lock(0);
+        compromised_cleanup_append_log(ctx, warn);
+        bsp_display_unlock();
+    }
+
     free(rx);
+
+    // Whatever the module is still printing must not become the next command's
+    // answer (the Files page reloads right after this task finishes).
+    if (cleanup_truncated) {
+        compromised_transport_lock_begin(tab, uart_port, &usb_lock_set);
+        wardrive_drain_transport(tab, uart_port);
+        compromised_transport_lock_end(usb_lock_set);
+    }
 
     bsp_display_lock(0);
     if (ctx->compromised_cleanup_spinner) {
@@ -33884,7 +34485,7 @@ static void wardrive_fix_task(void *arg)
     int elapsed_ms = 0;
     int empty_reads = 0;
     const int poll_ms = 250;
-    while (elapsed_ms < 120000 && total_len < (int)rx_size - 1) {
+    while (elapsed_ms < WARDRIVE_LISTING_TIMEOUT_MS && total_len < (int)rx_size - 1) {
         int len = transport_read_bytes_tab(tab, uart_port, rx + total_len,
                                            rx_size - 1 - total_len,
                                            pdMS_TO_TICKS(poll_ms));
@@ -33993,59 +34594,108 @@ static void compromised_cleanup_task(void *arg)
     int success_count = 0;
     int failed_count = 0;
 
+    // Response buffer for a whole batch: each path answers with a [FILE_DELETE]
+    // marker plus the legacy "Deleted <full path>" line, so budget generously and
+    // keep it off this task's 8KB stack.
+    const size_t rx_size = 2048;
+    char *rx_buffer = heap_caps_malloc(rx_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!rx_buffer) {
+        rx_buffer = malloc(rx_size);
+    }
+
     bool usb_lock_set = false;
     compromised_transport_lock_begin(tab, uart_port, &usb_lock_set);
 
-    for (int i = 0; i < total; i++) {
-        char *path = task_args->paths[i];
-        if (path[0] == '\0') {
+    // Batching is probed, not version-gated: firmware older than 1.7.2 ignores the
+    // extra arguments and answers for the first path only, which leaves the rest
+    // untouched (safe) but unconfirmed. The first unmappable reply drops us back
+    // to one path per command for the remainder of the run.
+    bool batch_mode = (rx_buffer != NULL && total > 1);
+
+    int i = 0;
+    while (i < total) {
+        if (task_args->paths[i][0] == '\0') {
+            i++; // empty slot: skipped without counting, as before
             continue;
         }
 
-        const char *name = strrchr(path, '/');
-        name = name ? (name + 1) : path;
+        int handled = 0;
+        bool ok[COMPROMISED_DELETE_ARGS_MAX] = { false };
 
-        char delete_path[WARDRIVE_WIGLE_PATH_MAX];
-        char rx_buffer[512];
-        bool ok = compromised_delete_file_locked(tab, uart_port, path,
-                                                 delete_path, sizeof(delete_path),
-                                                 rx_buffer, sizeof(rx_buffer));
-        if (task_args->kind == COMPROMISED_FILE_KIND_HANDSHAKE) {
-            compromised_delete_handshake_companion_locked(tab, uart_port, path);
-        }
-        if (ok) {
-            success_count++;
-        } else {
-            failed_count++;
-        }
-
-        ESP_LOGI(TAG, "[%s] %s %d/%d: %s -> %s",
-                 tab_transport_name(tab),
-                 task_args->action == COMPROMISED_CLEANUP_ACTION_DELETE ? "Delete" : "Clean",
-                 i + 1, total, delete_path[0] ? delete_path : name, ok ? "OK" : "FAIL");
-
-        char status[160];
-        if (task_args->action == COMPROMISED_CLEANUP_ACTION_DELETE && total == 1) {
-            snprintf(status, sizeof(status), "Deleting file...");
-        } else {
-            snprintf(status, sizeof(status), "Deleting %d/%d files...", i + 1, total);
+        if (batch_mode) {
+            char cmd[COMPROMISED_DELETE_CMD_MAX];
+            int packed = compromised_pack_delete_cmd(task_args->paths, total, i,
+                                                     cmd, sizeof(cmd));
+            if (packed > 1) {
+                if (compromised_delete_batch_locked(tab, uart_port, cmd, packed, ok,
+                                                    rx_buffer, rx_size)) {
+                    handled = packed;
+                } else {
+                    ESP_LOGW(TAG, "[%s] Batch delete unmappable, falling back to one per command",
+                             tab_transport_name(tab));
+                    batch_mode = false;
+                }
+            }
         }
 
-        char line[240];
-        snprintf(line, sizeof(line), "%s %s",
-                 ok ? "[OK]" : "[FAIL]", name);
-
-        bsp_display_lock(0);
-        if (ctx->compromised_cleanup_status_label) {
-            lv_label_set_text(ctx->compromised_cleanup_status_label, status);
+        if (handled == 0) {
+            // Single path: either batching is off, only one path fits on a line, or
+            // this path cannot be packed at all (and must be failed, never sent
+            // truncated - compromised_delete_file_locked() rejects it for us).
+            char delete_path[WARDRIVE_WIGLE_PATH_MAX];
+            char single_rx[512];
+            ok[0] = compromised_delete_file_locked(tab, uart_port, task_args->paths[i],
+                                                   delete_path, sizeof(delete_path),
+                                                   single_rx, sizeof(single_rx));
+            handled = 1;
         }
-        compromised_cleanup_append_log(ctx, line);
-        bsp_display_unlock();
 
+        for (int k = 0; k < handled; k++) {
+            char *path = task_args->paths[i + k];
+            const char *name = strrchr(path, '/');
+            name = name ? (name + 1) : path;
+
+            // Companion .hccapx files are best-effort and never counted, exactly as
+            // before - a handshake without one is normal.
+            if (task_args->kind == COMPROMISED_FILE_KIND_HANDSHAKE) {
+                compromised_delete_handshake_companion_locked(tab, uart_port, path);
+            }
+
+            if (ok[k]) {
+                success_count++;
+            } else {
+                failed_count++;
+            }
+
+            ESP_LOGI(TAG, "[%s] %s %d/%d: %s -> %s",
+                     tab_transport_name(tab),
+                     task_args->action == COMPROMISED_CLEANUP_ACTION_DELETE ? "Delete" : "Clean",
+                     i + k + 1, total, name, ok[k] ? "OK" : "FAIL");
+
+            char status[160];
+            if (task_args->action == COMPROMISED_CLEANUP_ACTION_DELETE && total == 1) {
+                snprintf(status, sizeof(status), "Deleting file...");
+            } else {
+                snprintf(status, sizeof(status), "Deleting %d/%d files...", i + k + 1, total);
+            }
+
+            char line[240];
+            snprintf(line, sizeof(line), "%s %s", ok[k] ? "[OK]" : "[FAIL]", name);
+
+            bsp_display_lock(0);
+            if (ctx->compromised_cleanup_status_label) {
+                lv_label_set_text(ctx->compromised_cleanup_status_label, status);
+            }
+            compromised_cleanup_append_log(ctx, line);
+            bsp_display_unlock();
+        }
+
+        i += handled;
         vTaskDelay(pdMS_TO_TICKS(80));
     }
 
     compromised_transport_lock_end(usb_lock_set);
+    free(rx_buffer);
 
     bsp_display_lock(0);
     if (ctx->compromised_cleanup_status_label) {
@@ -34058,6 +34708,41 @@ static void compromised_cleanup_task(void *arg)
     bsp_display_unlock();
 
     vTaskDelay(pdMS_TO_TICKS(350));
+
+    // Deleting a file used to cost a full re-listing, which on the wardrive page
+    // means the module re-reads every log on the card. When every delete in this
+    // run was confirmed we know exactly what changed, so drop those entries from
+    // the in-memory listing and let the page re-render from cache instead.
+    //
+    // Anything less than a clean sweep falls back to the re-listing: a failure
+    // means our view and the card's have diverged, and a listing that was already
+    // truncated is not a cache worth preserving.
+    bool prune_cache = (failed_count == 0 && success_count > 0 &&
+                        !ctx->wardrive_file_summary.truncated);
+    if (prune_cache) {
+        bsp_display_lock(0);
+        for (int p = 0; p < total; p++) {
+            if (task_args->paths[p][0] != '\0') {
+                compromised_listing_drop_path(ctx, task_args->paths[p]);
+            }
+        }
+        // The checkbox pointers belong to the upload popup's rows, which are gone
+        // once this page rebuilds; keep the selection count in step with them.
+        int selected = 0;
+        for (int p = 0; p < ctx->wardrive_wigle_file_count; p++) {
+            ctx->wardrive_wigle_files[p].checkbox = NULL;
+            if (ctx->wardrive_wigle_files[p].selected) {
+                selected++;
+            }
+        }
+        ctx->wardrive_wigle_selected_count = selected;
+        wardrive_recompute_file_summary(ctx);
+        ctx->compromised_files_loaded = true;
+        bsp_display_unlock();
+
+        ESP_LOGI(TAG, "[%s] Listing pruned locally (%d deleted, %d left) - no re-listing",
+                 tab_transport_name(tab), success_count, ctx->wardrive_wigle_file_count);
+    }
 
     ctx->compromised_cleanup_running = false;
     ctx->compromised_cleanup_task = NULL;
@@ -34213,6 +34898,186 @@ static void compromised_add_single_file_controls(tab_context_t *ctx, lv_obj_t *p
     lv_obj_center(delete_lbl);
 }
 
+//==================================================================================
+// Wardrive Files - bulk selection
+//==================================================================================
+// The page deliberately has no blanket "Clean": a wardrive log that has not been
+// uploaded yet is the only copy of hours of driving, so bulk deletion here goes
+// through an explicit selection. "Uploaded" is the safe shortcut - it picks only
+// files both services already have, which is the case where deleting actually
+// makes sense (Archive done merely moves them, so it frees no space on the card).
+
+static void wardrive_files_refresh_delete_btn(tab_context_t *ctx)
+{
+    if (!ctx || !ctx->wardrive_files_delete_btn) {
+        return;
+    }
+
+    int selected = ctx->wardrive_wigle_selected_count;
+    if (ctx->wardrive_files_delete_lbl) {
+        lv_label_set_text_fmt(ctx->wardrive_files_delete_lbl,
+                              LV_SYMBOL_TRASH " Delete (%d)", selected);
+    }
+    if (selected > 0) {
+        lv_obj_clear_state(ctx->wardrive_files_delete_btn, LV_STATE_DISABLED);
+    } else {
+        lv_obj_add_state(ctx->wardrive_files_delete_btn, LV_STATE_DISABLED);
+    }
+}
+
+static void wardrive_files_delete_btn_delete_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (ctx && ctx->wardrive_files_delete_btn == lv_event_get_target(e)) {
+        ctx->wardrive_files_delete_btn = NULL;
+        ctx->wardrive_files_delete_lbl = NULL;
+    }
+}
+
+static void wardrive_files_checkbox_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = get_current_ctx();
+    wardrive_wigle_file_t *file = (wardrive_wigle_file_t *)lv_event_get_user_data(e);
+    if (!ctx || !file) {
+        return;
+    }
+
+    bool checked = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+    if (file->selected == checked) {
+        return;
+    }
+    file->selected = checked;
+    if (checked) {
+        ctx->wardrive_wigle_selected_count++;
+    } else if (ctx->wardrive_wigle_selected_count > 0) {
+        ctx->wardrive_wigle_selected_count--;
+    }
+    wardrive_files_refresh_delete_btn(ctx);
+}
+
+// Apply a selection rule to every listed file and push it into the checkboxes that
+// are already on screen, so the page does not have to be rebuilt - a rebuild would
+// re-issue the whole UART listing.
+typedef enum {
+    WARDRIVE_SELECT_ALL,
+    WARDRIVE_SELECT_NONE,
+    WARDRIVE_SELECT_UPLOADED,
+} wardrive_select_mode_t;
+
+static void wardrive_files_apply_selection(tab_context_t *ctx, wardrive_select_mode_t mode)
+{
+    if (!ctx || !ctx->wardrive_wigle_files) {
+        return;
+    }
+
+    int selected = 0;
+    for (int i = 0; i < ctx->wardrive_wigle_file_count; i++) {
+        wardrive_wigle_file_t *file = &ctx->wardrive_wigle_files[i];
+        if (file->name[0] == '\0') {
+            continue;
+        }
+
+        bool want;
+        switch (mode) {
+            case WARDRIVE_SELECT_NONE:
+                want = false;
+                break;
+            case WARDRIVE_SELECT_UPLOADED:
+                // Both services, not either: a file WiGLE has but WDGWars does not
+                // is still pending work.
+                want = (strcmp(file->wigle_status, "done") == 0 &&
+                        strcmp(file->wdgwars_status, "done") == 0);
+                break;
+            case WARDRIVE_SELECT_ALL:
+            default:
+                want = true;
+                break;
+        }
+
+        file->selected = want;
+        if (want) {
+            selected++;
+        }
+        if (file->checkbox) {
+            if (want) {
+                lv_obj_add_state(file->checkbox, LV_STATE_CHECKED);
+            } else {
+                lv_obj_clear_state(file->checkbox, LV_STATE_CHECKED);
+            }
+        }
+    }
+
+    ctx->wardrive_wigle_selected_count = selected;
+    wardrive_files_refresh_delete_btn(ctx);
+}
+
+static void wardrive_files_select_all_cb(lv_event_t *e)
+{
+    (void)e;
+    wardrive_files_apply_selection(get_current_ctx(), WARDRIVE_SELECT_ALL);
+}
+
+static void wardrive_files_select_none_cb(lv_event_t *e)
+{
+    (void)e;
+    wardrive_files_apply_selection(get_current_ctx(), WARDRIVE_SELECT_NONE);
+}
+
+static void wardrive_files_select_uploaded_cb(lv_event_t *e)
+{
+    (void)e;
+    wardrive_files_apply_selection(get_current_ctx(), WARDRIVE_SELECT_UPLOADED);
+}
+
+static void wardrive_files_delete_selected_cb(lv_event_t *e)
+{
+    (void)e;
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx || !ctx->wardrive_wigle_files || ctx->compromised_cleanup_running ||
+        ctx->compromised_confirm_overlay || ctx->wardrive_wigle_selected_count <= 0) {
+        return;
+    }
+
+    compromised_cleanup_task_args_t *task_args = calloc(1, sizeof(*task_args));
+    if (!task_args) {
+        ESP_LOGW(TAG, "Failed to allocate selected-delete task args");
+        return;
+    }
+
+    task_args->ctx = ctx;
+    task_args->kind = COMPROMISED_FILE_KIND_WARDRIVE;
+    task_args->action = COMPROMISED_CLEANUP_ACTION_CLEAN;
+    for (int i = 0; i < ctx->wardrive_wigle_file_count &&
+                    task_args->path_count < WARDRIVE_WIGLE_MAX_FILES; i++) {
+        wardrive_wigle_file_t *file = &ctx->wardrive_wigle_files[i];
+        if (!file->selected || file->path[0] == '\0') {
+            continue;
+        }
+        snprintf(task_args->paths[task_args->path_count],
+                 sizeof(task_args->paths[task_args->path_count]), "%s", file->path);
+        task_args->path_count++;
+    }
+
+    if (task_args->path_count <= 0) {
+        free(task_args);
+        return;
+    }
+
+    // Same confirm and the same worker as Clean, so batching, per-path results and
+    // the local listing prune all apply unchanged.
+    show_compromised_delete_confirm(ctx, task_args);
+}
+
+// The spinner caption is published to the background loader, so drop the pointer
+// the moment LVGL destroys it - the listing can still be streaming in.
+static void compromised_files_loading_label_delete_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (ctx && ctx->compromised_files_loading_label == lv_event_get_target(e)) {
+        ctx->compromised_files_loading_label = NULL;
+    }
+}
+
 static void show_compromised_file_page(compromised_file_kind_t kind)
 {
     tab_context_t *ctx = get_current_ctx();
@@ -34364,6 +35229,66 @@ static void show_compromised_file_page(compromised_file_kind_t kind)
     lv_obj_set_style_text_font(status_label, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(status_label, ui_muted_color(), 0);
 
+    // Bulk selection, wardrive only. This page has no "Clean" on purpose - see
+    // wardrive_files_apply_selection() - so bulk deletion runs through here.
+    lv_obj_t *select_bar = NULL;
+    ctx->wardrive_files_delete_btn = NULL;
+    ctx->wardrive_files_delete_lbl = NULL;
+    if (kind == COMPROMISED_FILE_KIND_WARDRIVE) {
+        select_bar = lv_obj_create(*page_slot);
+        lv_obj_remove_style_all(select_bar);
+        lv_obj_set_size(select_bar, lv_pct(100), LV_SIZE_CONTENT);
+        lv_obj_set_flex_flow(select_bar, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(select_bar, LV_FLEX_ALIGN_START,
+                              LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_column(select_bar, 8, 0);
+        lv_obj_set_style_pad_bottom(select_bar, 4, 0);
+        lv_obj_clear_flag(select_bar, LV_OBJ_FLAG_SCROLLABLE);
+
+        static const struct {
+            const char *text;
+            lv_event_cb_t cb;
+        } select_buttons[] = {
+            { "Uploaded", wardrive_files_select_uploaded_cb },
+            { "All",      wardrive_files_select_all_cb },
+            { "None",     wardrive_files_select_none_cb },
+        };
+        for (size_t b = 0; b < sizeof(select_buttons) / sizeof(select_buttons[0]); b++) {
+            lv_obj_t *btn = lv_btn_create(select_bar);
+            lv_obj_set_size(btn, 110, 44);
+            lv_obj_set_style_bg_color(btn, lv_color_hex(0x455A64), 0);
+            lv_obj_set_style_bg_color(btn, lv_color_hex(0x555555), LV_STATE_DISABLED);
+            lv_obj_set_style_radius(btn, 8, 0);
+            lv_obj_add_event_cb(btn, select_buttons[b].cb, LV_EVENT_CLICKED, ctx);
+            if (!ctx->compromised_files_loaded) {
+                lv_obj_add_state(btn, LV_STATE_DISABLED);
+            }
+
+            lv_obj_t *lbl = lv_label_create(btn);
+            lv_label_set_text(lbl, select_buttons[b].text);
+            lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
+            lv_obj_set_style_text_color(lbl, lv_color_hex(0xFFFFFF), 0);
+            lv_obj_center(lbl);
+        }
+
+        ctx->wardrive_files_delete_btn = lv_btn_create(select_bar);
+        lv_obj_set_size(ctx->wardrive_files_delete_btn, 150, 44);
+        style_danger_button(ctx->wardrive_files_delete_btn);
+        lv_obj_set_style_bg_color(ctx->wardrive_files_delete_btn,
+                                  lv_color_hex(0x555555), LV_STATE_DISABLED);
+        lv_obj_add_event_cb(ctx->wardrive_files_delete_btn, wardrive_files_delete_selected_cb,
+                            LV_EVENT_CLICKED, ctx);
+        lv_obj_add_event_cb(ctx->wardrive_files_delete_btn, wardrive_files_delete_btn_delete_cb,
+                            LV_EVENT_DELETE, ctx);
+        lv_obj_add_state(ctx->wardrive_files_delete_btn, LV_STATE_DISABLED);
+
+        ctx->wardrive_files_delete_lbl = lv_label_create(ctx->wardrive_files_delete_btn);
+        lv_label_set_text(ctx->wardrive_files_delete_lbl, LV_SYMBOL_TRASH " Delete (0)");
+        lv_obj_set_style_text_font(ctx->wardrive_files_delete_lbl, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(ctx->wardrive_files_delete_lbl, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_center(ctx->wardrive_files_delete_lbl);
+    }
+
     lv_obj_t *list_container = lv_obj_create(*page_slot);
     lv_obj_set_size(list_container, lv_pct(100), LV_SIZE_CONTENT);
     lv_obj_set_flex_grow(list_container, 1);
@@ -34413,6 +35338,13 @@ static void show_compromised_file_page(compromised_file_kind_t kind)
         lv_obj_set_style_text_font(loading_lbl, &lv_font_montserrat_16, 0);
         lv_obj_set_style_text_color(loading_lbl, ui_muted_color(), 0);
         lv_obj_align(loading_lbl, LV_ALIGN_CENTER, 0, 70);
+
+        // Hand the label to the loader so a wardrive listing - minutes long on
+        // firmware without the scan cache - counts files instead of showing a bare
+        // spinner. Nulled on delete; the page can be left mid-load.
+        ctx->compromised_files_loading_label = loading_lbl;
+        lv_obj_add_event_cb(loading_lbl, compromised_files_loading_label_delete_cb,
+                            LV_EVENT_DELETE, ctx);
 
         lv_obj_move_foreground(loading_box);
 
@@ -34466,7 +35398,10 @@ static void show_compromised_file_page(compromised_file_kind_t kind)
         lv_obj_set_style_text_color(empty, ui_muted_color(), 0);
         lv_obj_set_style_text_align(empty, LV_TEXT_ALIGN_CENTER, 0);
         lv_obj_set_width(empty, lv_pct(100));
-    } else if (kind == COMPROMISED_FILE_KIND_WARDRIVE && ctx->wardrive_file_summary.valid) {
+    } else if (kind == COMPROMISED_FILE_KIND_WARDRIVE &&
+               (ctx->wardrive_file_summary.valid || ctx->wardrive_file_summary.truncated)) {
+        // truncated also passes: that is the case with no SUMMARY line, where the
+        // formatter emits the "listing truncated" warning on its own.
         char summary[320];
         wardrive_format_summary_text(&ctx->wardrive_file_summary, summary, sizeof(summary));
         lv_label_set_text(status_label, summary);
@@ -34501,6 +35436,26 @@ static void show_compromised_file_page(compromised_file_kind_t kind)
         lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN,
                               LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
         lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+        // Selection checkbox, wardrive only. The pointer is kept on the entry so
+        // the Uploaded/All/None buttons can tick boxes in place instead of forcing
+        // a page rebuild, which would re-issue the whole UART listing.
+        file->checkbox = NULL;
+        if (kind == COMPROMISED_FILE_KIND_WARDRIVE) {
+            lv_obj_t *cb = lv_checkbox_create(row);
+            lv_checkbox_set_text(cb, "");
+            lv_obj_set_size(cb, 44, 44);          // touch target, matches the upload popup
+            lv_obj_set_ext_click_area(cb, 12);
+            lv_obj_set_style_bg_color(cb, lv_color_hex(0x3D3D3D), LV_PART_INDICATOR);
+            lv_obj_set_style_border_color(cb, lv_color_hex(0x888888), LV_PART_INDICATOR);
+            lv_obj_set_style_bg_color(cb, COLOR_MATERIAL_TEAL,
+                                      LV_PART_INDICATOR | LV_STATE_CHECKED);
+            if (file->selected) {
+                lv_obj_add_state(cb, LV_STATE_CHECKED);
+            }
+            lv_obj_add_event_cb(cb, wardrive_files_checkbox_cb, LV_EVENT_VALUE_CHANGED, file);
+            file->checkbox = cb;
+        }
 
         lv_obj_t *info = lv_obj_create(row);
         lv_obj_remove_style_all(info);
@@ -34654,6 +35609,12 @@ static void show_compromised_file_page(compromised_file_kind_t kind)
         lv_obj_center(delete_lbl);
     }
 
+    // Selection can survive a rebuild (a prune keeps the entries it did not drop),
+    // so bring the button's count in line with what the boxes now show.
+    if (kind == COMPROMISED_FILE_KIND_WARDRIVE) {
+        wardrive_files_refresh_delete_btn(ctx);
+    }
+
     // Wardrive only: append the upload journal (upload_state). Files that were
     // already uploaded get moved to the "uploaded" archive folder, so they are
     // gone from the working-dir listing above - this is the only record left.
@@ -34715,7 +35676,7 @@ static void show_compromised_file_page(compromised_file_kind_t kind)
 static void compromised_file_delete_cb(lv_event_t *e)
 {
     tab_context_t *ctx = get_current_ctx();
-    if (!ctx || ctx->compromised_cleanup_running) {
+    if (!ctx || ctx->compromised_cleanup_running || ctx->compromised_confirm_overlay) {
         return;
     }
 
@@ -34742,9 +35703,9 @@ static void compromised_file_delete_cb(lv_event_t *e)
     task_args->path_count = 1;
     snprintf(task_args->paths[0], sizeof(task_args->paths[0]), "%s", path);
 
-    if (!compromised_start_cleanup_operation(ctx, task_args)) {
-        free(task_args);
-    }
+    // Same confirm as Clean: one tap on a bin icon should not be enough to erase a
+    // capture off the card. The dialog owns task_args from here on.
+    show_compromised_delete_confirm(ctx, task_args);
 }
 
 static void wardrive_fix_file_cb(lv_event_t *e)
@@ -34802,10 +35763,217 @@ static void wardrive_fix_file_cb(lv_event_t *e)
     }
 }
 
+static void compromised_delete_confirm_close(tab_context_t *ctx)
+{
+    if (ctx && ctx->compromised_confirm_overlay) {
+        lv_obj_del(ctx->compromised_confirm_overlay);
+        ctx->compromised_confirm_overlay = NULL;
+    }
+}
+
+// The staged args outlive the dialog only if the user says Yes; every other way
+// out of the dialog - No, or the whole tab being torn down - lands here.
+static void compromised_delete_confirm_destroy_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx) {
+        return;
+    }
+    if (ctx->compromised_cleanup_pending) {
+        free(ctx->compromised_cleanup_pending);
+        ctx->compromised_cleanup_pending = NULL;
+    }
+    if (ctx->compromised_confirm_overlay == lv_event_get_target(e)) {
+        ctx->compromised_confirm_overlay = NULL;
+    }
+}
+
+static void compromised_delete_confirm_no_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx) {
+        ctx = get_current_ctx();
+    }
+    compromised_delete_confirm_close(ctx); // the delete handler frees the args
+}
+
+static void compromised_delete_confirm_yes_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx) {
+        ctx = get_current_ctx();
+    }
+    if (!ctx) {
+        return;
+    }
+
+    // Take ownership before closing, so the overlay's delete handler does not
+    // free the args out from under the worker task.
+    compromised_cleanup_task_args_t *task_args =
+        (compromised_cleanup_task_args_t *)ctx->compromised_cleanup_pending;
+    ctx->compromised_cleanup_pending = NULL;
+    compromised_delete_confirm_close(ctx);
+
+    if (!task_args) {
+        return;
+    }
+    if (ctx->compromised_cleanup_running || !compromised_start_cleanup_operation(ctx, task_args)) {
+        free(task_args);
+    }
+}
+
+// Guards both the per-file bin and Clean: either way a tap erases something from
+// the card for good, so name what is about to go and make the user aim at a red
+// button to confirm it. Takes ownership of task_args in every path.
+static void show_compromised_delete_confirm(tab_context_t *ctx,
+                                            compromised_cleanup_task_args_t *task_args)
+{
+    if (!ctx || !task_args) {
+        return;
+    }
+    if (ctx->compromised_confirm_overlay) {
+        free(task_args);
+        return;
+    }
+
+    lv_obj_t *container = get_container_for_tab(tab_id_for_ctx(ctx));
+    if (!container) {
+        free(task_args);
+        return;
+    }
+
+    ctx->compromised_cleanup_pending = (struct compromised_cleanup_task_args_s *)task_args;
+
+    ctx->compromised_confirm_overlay = lv_obj_create(container);
+    style_modal_overlay(ctx->compromised_confirm_overlay, LV_OPA_50);
+    lv_obj_add_flag(ctx->compromised_confirm_overlay, LV_OBJ_FLAG_FLOATING);
+    lv_obj_move_foreground(ctx->compromised_confirm_overlay);
+    lv_obj_add_event_cb(ctx->compromised_confirm_overlay, compromised_delete_confirm_destroy_cb,
+                        LV_EVENT_DELETE, ctx);
+
+    lv_obj_t *popup = lv_obj_create(ctx->compromised_confirm_overlay);
+    lv_obj_set_size(popup, 560, LV_SIZE_CONTENT);
+    lv_obj_center(popup);
+    lv_obj_set_style_bg_color(popup, lv_color_hex(0x1A1A2A), 0);
+    lv_obj_set_style_border_color(popup, COLOR_MATERIAL_RED, 0);
+    lv_obj_set_style_border_width(popup, 3, 0);
+    lv_obj_set_style_radius(popup, 16, 0);
+    lv_obj_set_style_shadow_width(popup, 30, 0);
+    lv_obj_set_style_shadow_color(popup, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_shadow_opa(popup, LV_OPA_50, 0);
+    lv_obj_set_style_pad_all(popup, 20, 0);
+    lv_obj_set_flex_flow(popup, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(popup, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(popup, 14, 0);
+    lv_obj_clear_flag(popup, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *icon = lv_label_create(popup);
+    lv_label_set_text(icon, LV_SYMBOL_WARNING);
+    lv_obj_set_style_text_font(icon, &lv_font_montserrat_44, 0);
+    lv_obj_set_style_text_color(icon, COLOR_MATERIAL_RED, 0);
+
+    // The per-file bin sends one path; Clean sends the directory. Evil twin and
+    // portal seed a single-file listing, so "all" would read oddly there too.
+    bool single = (task_args->path_count == 1);
+    lv_obj_t *title = lv_label_create(popup);
+    if (single) {
+        lv_label_set_text_fmt(title, "DELETE THIS %s FILE",
+                              compromised_tile_name_for_kind(task_args->kind));
+    } else {
+        lv_label_set_text_fmt(title, "DELETE ALL %d %s FILES",
+                              task_args->path_count,
+                              compromised_tile_name_for_kind(task_args->kind));
+    }
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_RED, 0);
+    lv_obj_set_width(title, lv_pct(100));
+    lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(title, LV_LABEL_LONG_WRAP);
+
+    // Name a few of them: a count alone does not tell the user whether this is the
+    // directory they think it is.
+    char preview[224] = "";
+    int written = 0;
+    int shown = 0;
+    for (int i = 0; i < task_args->path_count && shown < 3; i++) {
+        const char *name = strrchr(task_args->paths[i], '/');
+        name = name ? (name + 1) : task_args->paths[i];
+        int n = snprintf(preview + written, sizeof(preview) - (size_t)written,
+                         "%s%s", shown ? "\n" : "", name);
+        if (n < 0 || (size_t)n >= sizeof(preview) - (size_t)written) {
+            break;
+        }
+        written += n;
+        shown++;
+    }
+    if (shown < task_args->path_count) {
+        snprintf(preview + written, sizeof(preview) - (size_t)written,
+                 "\n...and %d more", task_args->path_count - shown);
+    }
+
+    lv_obj_t *list_lbl = lv_label_create(popup);
+    lv_label_set_text(list_lbl, preview);
+    lv_obj_set_style_text_font(list_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(list_lbl, lv_color_hex(0xCCCCCC), 0);
+    lv_obj_set_width(list_lbl, lv_pct(100));
+    lv_obj_set_style_text_align(list_lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(list_lbl, LV_LABEL_LONG_WRAP);
+
+    lv_obj_t *message = lv_label_create(popup);
+    if (task_args->kind == COMPROMISED_FILE_KIND_HANDSHAKE) {
+        lv_label_set_text(message,
+                          single
+                              ? "Erased from the module's SD card, together with its\n"
+                                ".hccapx companion. This cannot be undone."
+                              : "Erased from the module's SD card, together with their\n"
+                                ".hccapx companions. This cannot be undone.");
+    } else {
+        lv_label_set_text(message, "Erased from the module's SD card. This cannot be undone.");
+    }
+    lv_obj_set_style_text_font(message, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(message, lv_color_hex(0xAAAAAA), 0);
+    lv_obj_set_width(message, lv_pct(100));
+    lv_obj_set_style_text_align(message, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(message, LV_LABEL_LONG_WRAP);
+
+    lv_obj_t *btn_row = lv_obj_create(popup);
+    lv_obj_remove_style_all(btn_row);
+    lv_obj_set_size(btn_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(btn_row, 30, 0);
+    lv_obj_set_style_pad_top(btn_row, 6, 0);
+
+    // Cancel first and green: the safe option is the one the thumb lands on.
+    lv_obj_t *no_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(no_btn, 160, 52);
+    lv_obj_set_style_bg_color(no_btn, COLOR_MATERIAL_GREEN, 0);
+    lv_obj_set_style_radius(no_btn, 8, 0);
+    lv_obj_add_event_cb(no_btn, compromised_delete_confirm_no_cb, LV_EVENT_CLICKED, ctx);
+
+    lv_obj_t *no_lbl = lv_label_create(no_btn);
+    lv_label_set_text(no_lbl, "Cancel");
+    lv_obj_set_style_text_font(no_lbl, &lv_font_montserrat_18, 0);
+    lv_obj_center(no_lbl);
+
+    lv_obj_t *yes_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(yes_btn, 160, 52);
+    style_danger_button(yes_btn);
+    lv_obj_add_event_cb(yes_btn, compromised_delete_confirm_yes_cb, LV_EVENT_CLICKED, ctx);
+
+    lv_obj_t *yes_lbl = lv_label_create(yes_btn);
+    lv_label_set_text(yes_lbl, single ? LV_SYMBOL_TRASH " Delete file"
+                                      : LV_SYMBOL_TRASH " Delete all");
+    lv_obj_set_style_text_font(yes_lbl, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_color(yes_lbl, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_center(yes_lbl);
+}
+
 static void compromised_file_clean_cb(lv_event_t *e)
 {
     tab_context_t *ctx = get_current_ctx();
-    if (!ctx || ctx->wardrive_wigle_file_count <= 0 || ctx->compromised_cleanup_running) {
+    if (!ctx || ctx->wardrive_wigle_file_count <= 0 || ctx->compromised_cleanup_running ||
+        ctx->compromised_confirm_overlay) {
         return;
     }
 
@@ -34834,9 +36002,8 @@ static void compromised_file_clean_cb(lv_event_t *e)
         return;
     }
 
-    if (!compromised_start_cleanup_operation(ctx, task_args)) {
-        free(task_args);
-    }
+    // Staged, not started: the worker only runs if the confirm dialog says so.
+    show_compromised_delete_confirm(ctx, task_args);
 }
 
 static lv_obj_t *espshark_create_action_card(lv_obj_t *parent, const char *icon,
