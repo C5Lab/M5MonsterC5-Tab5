@@ -1,0 +1,692 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Middle Man — Tab5 Lab</title>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600&family=Space+Grotesk:wght@500;600;700&family=JetBrains+Mono:wght@500&display=swap');
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        :root {
+            color-scheme: dark;
+            --bg: #0b111b;
+            --bg-alt: #0f1724;
+            --ink: #e6eef8;
+            --muted: #95a4bc;
+            --line: rgba(148, 163, 184, 0.2);
+            --card: rgba(20, 31, 48, 0.9);
+            --card-strong: rgba(8, 14, 24, 0.92);
+            --accent: #ff8a63;
+            --accent-dark: #ff6d42;
+            --accent-soft: rgba(255, 138, 99, 0.15);
+            --info: #7db2ff;
+            --shadow-lg: 0 24px 60px rgba(6, 10, 18, 0.6);
+            --shadow-md: 0 16px 30px rgba(6, 10, 18, 0.4);
+            --shadow-sm: 0 6px 16px rgba(6, 10, 18, 0.4);
+        }
+
+        body {
+            font-family: 'Manrope', 'Segoe UI', sans-serif;
+            color: var(--ink);
+            background:
+                radial-gradient(circle at 12% 8%, rgba(255, 138, 99, 0.18), transparent 40%),
+                radial-gradient(circle at 88% 14%, rgba(125, 178, 255, 0.18), transparent 45%),
+                linear-gradient(180deg, var(--bg-alt) 0%, var(--bg) 100%);
+            min-height: 100vh;
+            padding: 32px 20px 80px;
+        }
+
+        body::before {
+            content: "";
+            position: fixed;
+            inset: 0;
+            background-image:
+                linear-gradient(90deg, rgba(148, 163, 184, 0.08) 1px, transparent 1px),
+                linear-gradient(180deg, rgba(148, 163, 184, 0.08) 1px, transparent 1px);
+            background-size: 36px 36px;
+            opacity: 0.22;
+            pointer-events: none;
+            z-index: 0;
+        }
+
+        .container {
+            position: relative;
+            z-index: 1;
+            max-width: 1100px;
+            margin: 0 auto;
+        }
+
+        .brand {
+            display: flex;
+            align-items: center;
+            gap: 14px;
+            font-family: 'Space Grotesk', sans-serif;
+            font-weight: 700;
+            letter-spacing: -0.02em;
+        }
+
+        .brand-mark {
+            position: relative;
+            width: 44px;
+            height: 44px;
+            border-radius: 14px;
+            display: grid;
+            place-items: center;
+            background: linear-gradient(160deg, rgba(255, 138, 99, 0.98) 0%, rgba(255, 195, 174, 0.92) 100%);
+            color: #2a1b16;
+            font-size: 0.9rem;
+            font-family: 'JetBrains Mono', monospace;
+            border: 1px solid rgba(255, 255, 255, 0.18);
+            box-shadow:
+                0 18px 28px rgba(7, 11, 18, 0.35),
+                0 10px 18px rgba(255, 122, 89, 0.28),
+                inset 0 2px 6px rgba(255, 255, 255, 0.35),
+                inset 0 -6px 10px rgba(122, 63, 45, 0.35);
+            overflow: hidden;
+        }
+
+        .brand-mark::after {
+            content: "";
+            position: absolute;
+            inset: 3px;
+            border-radius: 11px;
+            box-shadow: inset 0 1px 2px rgba(255, 255, 255, 0.35);
+            pointer-events: none;
+        }
+
+        .brand-mark img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            display: block;
+            transform: scale(1.06);
+        }
+
+        .brand small {
+            display: block;
+            font-weight: 500;
+            color: var(--muted);
+            font-size: 0.75rem;
+            margin-top: 2px;
+        }
+
+        .sub-header {
+            display: grid;
+            gap: 18px;
+            padding: 20px 22px;
+            background: rgba(20, 31, 48, 0.9);
+            border: 1px solid var(--line);
+            border-radius: 18px;
+            box-shadow: var(--shadow-sm);
+            backdrop-filter: blur(14px);
+            margin-bottom: 28px;
+        }
+
+        .sub-header-top {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 16px;
+            flex-wrap: wrap;
+        }
+
+        .back-button {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 10px 18px;
+            border-radius: 999px;
+            border: 1px solid rgba(255, 138, 99, 0.4);
+            color: var(--accent);
+            text-decoration: none;
+            font-weight: 600;
+            font-size: 0.9rem;
+            background: rgba(255, 138, 99, 0.08);
+            transition: transform 0.2s ease, box-shadow 0.2s ease, color 0.2s ease;
+        }
+
+        .back-button:hover {
+            transform: translateY(-2px);
+            box-shadow: var(--shadow-sm);
+            color: var(--ink);
+        }
+
+        .eyebrow {
+            font-family: 'JetBrains Mono', monospace;
+            text-transform: uppercase;
+            letter-spacing: 0.2em;
+            font-size: 0.7rem;
+            color: var(--info);
+            margin-bottom: 12px;
+        }
+
+        h1 {
+            font-family: 'Space Grotesk', sans-serif;
+            font-size: 2.2rem;
+            line-height: 1.1;
+            margin-bottom: 12px;
+        }
+
+        .lede {
+            font-size: 1rem;
+            color: var(--muted);
+            line-height: 1.7;
+            max-width: 760px;
+        }
+
+        .accordion {
+            display: grid;
+            gap: 18px;
+        }
+
+        .accordion-item {
+            background:
+                linear-gradient(180deg, rgba(8, 14, 24, 0.92) 0%, rgba(8, 14, 24, 0.8) 100%),
+                linear-gradient(90deg, rgba(8, 14, 24, 0.7) 0%, transparent 16%, transparent 84%, rgba(8, 14, 24, 0.7) 100%);
+            border: 1px solid var(--line);
+            border-radius: 22px;
+            box-shadow: var(--shadow-md);
+            overflow: hidden;
+        }
+
+        .accordion-trigger {
+            width: 100%;
+            border: 0;
+            background: transparent;
+            color: inherit;
+            padding: 22px 24px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 20px;
+            cursor: pointer;
+            text-align: left;
+        }
+
+        .accordion-trigger:hover {
+            background: rgba(255, 138, 99, 0.05);
+        }
+
+        .accordion-heading {
+            display: grid;
+            gap: 8px;
+        }
+
+        .section-kicker {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.75rem;
+            color: var(--info);
+            text-transform: uppercase;
+            letter-spacing: 0.2em;
+        }
+
+        .section-title {
+            font-family: 'Space Grotesk', sans-serif;
+            font-size: 1.35rem;
+        }
+
+        .section-summary {
+            color: var(--muted);
+            line-height: 1.6;
+            font-size: 0.95rem;
+            max-width: 700px;
+        }
+
+        .chevron {
+            flex: 0 0 auto;
+            width: 18px;
+            height: 18px;
+            border-right: 2px solid var(--accent);
+            border-bottom: 2px solid var(--accent);
+            transform: rotate(45deg);
+            transition: transform 0.25s ease;
+            margin-right: 6px;
+        }
+
+        .accordion-item.open .chevron {
+            transform: rotate(225deg);
+            margin-top: 8px;
+        }
+
+        .accordion-panel {
+            display: grid;
+            grid-template-rows: 0fr;
+            transition: grid-template-rows 0.3s ease;
+        }
+
+        .accordion-item.open .accordion-panel {
+            grid-template-rows: 1fr;
+        }
+
+        .accordion-panel-inner {
+            overflow: hidden;
+        }
+
+        .accordion-body {
+            padding: 0 24px 24px;
+            display: grid;
+            gap: 18px;
+        }
+
+        .content-card {
+            background: rgba(20, 31, 48, 0.58);
+            border: 1px solid rgba(148, 163, 184, 0.18);
+            border-radius: 18px;
+            padding: 22px;
+            display: grid;
+            gap: 16px;
+        }
+
+        .content-card p,
+        .content-card li {
+            color: var(--muted);
+            line-height: 1.75;
+            font-size: 0.98rem;
+        }
+
+        .content-card strong {
+            color: var(--ink);
+        }
+
+        .content-card ul {
+            padding-left: 18px;
+            display: grid;
+            gap: 10px;
+        }
+
+        .inline-code {
+            font-family: 'JetBrains Mono', monospace;
+            color: var(--ink);
+            background: rgba(255, 138, 99, 0.12);
+            border: 1px solid rgba(255, 138, 99, 0.18);
+            border-radius: 10px;
+            padding: 2px 8px;
+            font-size: 0.92em;
+        }
+
+        .media-frame {
+            display: grid;
+            gap: 12px;
+            max-width: 760px;
+            margin: 0 auto;
+        }
+
+        .media-button {
+            border-radius: 18px;
+            border: 1px solid var(--line);
+            overflow: hidden;
+            cursor: pointer;
+            position: relative;
+            background: #0b111b;
+            box-shadow: var(--shadow-sm);
+            transition: transform 0.3s ease, box-shadow 0.3s ease;
+            padding: 0;
+            width: 100%;
+            text-align: left;
+            appearance: none;
+        }
+
+        .media-button img {
+            width: 100%;
+            height: auto;
+            max-height: 340px;
+            object-fit: contain;
+            display: block;
+        }
+
+        .media-button:hover {
+            transform: translateY(-4px);
+            box-shadow: var(--shadow-lg);
+        }
+
+        .zoom-hint {
+            position: absolute;
+            right: 16px;
+            bottom: 16px;
+            background: rgba(6, 10, 18, 0.78);
+            color: #fff;
+            font-size: 0.75rem;
+            padding: 6px 12px;
+            border-radius: 999px;
+            letter-spacing: 0.05em;
+            text-transform: uppercase;
+        }
+
+        .media-caption {
+            color: var(--muted);
+            font-size: 0.92rem;
+        }
+
+        .flow-list {
+            display: grid;
+            gap: 14px;
+        }
+
+        .flow-item {
+            display: grid;
+            gap: 8px;
+            padding-left: 18px;
+            border-left: 2px solid rgba(255, 138, 99, 0.25);
+        }
+
+        .flow-item span {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.78rem;
+            color: var(--info);
+            text-transform: uppercase;
+            letter-spacing: 0.16em;
+        }
+
+        .flow-item p {
+            color: var(--muted);
+            line-height: 1.7;
+        }
+
+        .modal {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(10, 15, 23, 0.8);
+            backdrop-filter: blur(10px);
+            z-index: 1000;
+            align-items: center;
+            justify-content: center;
+            animation: fadeIn 0.3s ease;
+        }
+
+        .modal.active {
+            display: flex;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; }
+            to { opacity: 1; }
+        }
+
+        .modal-content {
+            position: relative;
+            max-width: min(92vw, 1040px);
+            max-height: 90%;
+            animation: slideIn 0.3s ease;
+            text-align: left;
+        }
+
+        @keyframes slideIn {
+            from {
+                transform: scale(0.8);
+                opacity: 0;
+            }
+            to {
+                transform: scale(1);
+                opacity: 1;
+            }
+        }
+
+        .modal-image {
+            max-width: 100%;
+            max-height: 90vh;
+            border-radius: 18px;
+            box-shadow: 0 18px 50px rgba(0, 0, 0, 0.45);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .modal-close {
+            position: absolute;
+            top: -48px;
+            right: 0;
+            font-size: 2.2em;
+            color: white;
+            cursor: pointer;
+            transition: color 0.3s ease;
+        }
+
+        .modal-close:hover {
+            color: var(--info);
+        }
+
+        .modal-info {
+            position: absolute;
+            bottom: -40px;
+            left: 0;
+            color: white;
+            font-size: 1.05rem;
+            font-weight: 600;
+        }
+
+        @media (max-width: 768px) {
+            body {
+                padding: 24px 16px 60px;
+            }
+
+            h1 {
+                font-size: 1.8rem;
+            }
+
+            .accordion-trigger {
+                padding: 20px 18px;
+            }
+
+            .accordion-body {
+                padding: 0 18px 18px;
+            }
+
+            .content-card {
+                padding: 18px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header class="sub-header">
+            <div class="sub-header-top">
+                <div class="brand">
+                    <div class="brand-mark">
+                        <img src="LAB5_logo.png" alt="Tab5 logo">
+                    </div>
+                    <div>
+                        Tab5 Lab
+                        <small>Visual documentation</small>
+                    </div>
+                </div>
+                <a class="back-button" href="../index.html">Back</a>
+            </div>
+            <div class="sub-header-body">
+                <p class="eyebrow">Tutorial</p>
+                <h1>Middle Man</h1>
+                <p class="lede">Three traffic interception models: ARP MITM on an existing LAN, GITM on a controlled gateway, and Rogue GITM with a cloned real Wi-Fi network.</p>
+            </div>
+        </header>
+
+        <section class="accordion" aria-label="Middle Man sections">
+            <article class="accordion-item open">
+                <button class="accordion-trigger" type="button" aria-expanded="true">
+                    <div class="accordion-heading">
+                        <span class="section-kicker">Section 01</span>
+                        <h2 class="section-title">Introduction</h2>
+                        <p class="section-summary">The same goal in each case, but a different way to place the device between the phone and the Internet.</p>
+                    </div>
+                    <span class="chevron" aria-hidden="true"></span>
+                </button>
+                <div class="accordion-panel">
+                    <div class="accordion-panel-inner">
+                        <div class="accordion-body">
+                            <div class="content-card">
+                                <p>This page groups <strong>three middle-man attack variants</strong> used in Lab5 Monster. In every mode, the device sits on the traffic path and can record it, but it gets into that position in a different way.</p>
+                                <ul>
+                                    <li><strong>ARP MITM</strong>: Lab5 Monster places itself between the phone and the router on the same LAN, records the traffic, and forwards it onward.</li>
+                                    <li><strong>GITM</strong>: Lab5 Monster serves its own network with Internet access. The phone joins it like normal Wi-Fi, while traffic is recorded quietly in the background.</li>
+                                    <li><strong>Rogue GITM</strong>: the original network is deauthenticated and a clone is created, so phones usually switch automatically. That clone still provides Internet access and monitors all traffic.</li>
+                                </ul>
+                                <p>Below is a short description of each mode and where the interception actually happens.</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </article>
+
+            <article class="accordion-item">
+                <button class="accordion-trigger" type="button" aria-expanded="false">
+                    <div class="accordion-heading">
+                        <span class="section-kicker">Section 02</span>
+                        <h2 class="section-title">ARP MITM</h2>
+                        <p class="section-summary">The phone and router both trust Lab5 Monster as the other side, so all traffic flows through the device.</p>
+                    </div>
+                    <span class="chevron" aria-hidden="true"></span>
+                </button>
+                <div class="accordion-panel">
+                    <div class="accordion-panel-inner">
+                        <div class="accordion-body">
+                            <div class="content-card">
+                                <p>In <strong>ARP MITM</strong>, Lab5 Monster operates on the same network as the phone and the router. Forged ARP replies make the phone send packets to the device instead of directly to the router, and the router does the same in the other direction.</p>
+                                <p>The result is simple: Lab5 Monster sits between them, records the traffic, and forwards it onward, so Internet access still works. This is classic MITM inside an existing LAN, without creating a new Wi-Fi network.</p>
+                                <p>The limitation is also simple: this mode only works when all devices are already on the same local Layer 2 network.</p>
+                            </div>
+                            <figure class="media-frame">
+                                <button class="media-button" type="button" data-image="middle-man/arp-mitm.jpeg" data-caption="ARP MITM: Lab5 Monster intercepts traffic between the phone and the router.">
+                                    <img src="middle-man/arp-mitm.jpeg" alt="ARP poisoning active on a local network path">
+                                    <span class="zoom-hint">Zoom</span>
+                                </button>
+                                <figcaption class="media-caption">ARP MITM diagram preview. Click to open the full-size image.</figcaption>
+                            </figure>
+                        </div>
+                    </div>
+                </div>
+            </article>
+
+            <article class="accordion-item">
+                <button class="accordion-trigger" type="button" aria-expanded="false">
+                    <div class="accordion-heading">
+                        <span class="section-kicker">Section 03</span>
+                        <h2 class="section-title">GITM</h2>
+                        <p class="section-summary">Lab5 Monster provides its own Wi-Fi and becomes the gateway itself, so all traffic passes through it from the start.</p>
+                    </div>
+                    <span class="chevron" aria-hidden="true"></span>
+                </button>
+                <div class="accordion-panel">
+                    <div class="accordion-panel-inner">
+                        <div class="accordion-body">
+                            <div class="content-card">
+                                <p><strong>GITM</strong> does not impersonate the router on someone else's network. Instead, Lab5 Monster starts its own Wi-Fi and gives the client Internet access as the real gateway.</p>
+                                <p>The phone joins that network intentionally. All of its traffic passes through <span class="inline-code">capture_gateway</span>, so the device can record it before packets are translated by NAT onto the upstream link.</p>
+                                <p>This creates a cleaner and more controlled scenario than ARP MITM: there is no need to poison ARP, because the client uses Lab5 Monster as its gateway from the beginning.</p>
+                            </div>
+                            <div class="content-card flow-list">
+                                <div class="flow-item">
+                                    <span>Upstream</span>
+                                    <p>First, Lab5 Monster needs its own Internet uplink through <span class="inline-code">wifi_connect</span>.</p>
+                                </div>
+                                <div class="flow-item">
+                                    <span>Gateway Start</span>
+                                    <p>Then <span class="inline-code">capture_gateway</span> creates the Wi-Fi network, DHCP, DNS proxy, routing, and PCAP recording in one flow.</p>
+                                </div>
+                                <div class="flow-item">
+                                    <span>Capture Scope</span>
+                                    <p>The recorded traffic is limited to clients connected to that staged network, before NAT translation.</p>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </article>
+
+            <article class="accordion-item">
+                <button class="accordion-trigger" type="button" aria-expanded="false">
+                    <div class="accordion-heading">
+                        <span class="section-kicker">Section 04</span>
+                        <h2 class="section-title">Rogue GITM</h2>
+                        <p class="section-summary">A clone of the real network takes over clients and routes their traffic through Lab5 Monster.</p>
+                    </div>
+                    <span class="chevron" aria-hidden="true"></span>
+                </button>
+                <div class="accordion-panel">
+                    <div class="accordion-panel-inner">
+                        <div class="accordion-body">
+                            <div class="content-card">
+                                <p><span class="inline-code">start_rogue_gitm</span> combines a fake access point with GITM mode. Lab5 Monster creates a clone of the real network with the same SSID and password, but routes all traffic through itself.</p>
+                                <p>To make phones switch automatically, the original network can be deauthenticated. To the client, this looks like a brief disconnect followed by a reconnect to the same network, but in practice it lands on a clone controlled by the device.</p>
+                                <p>From that moment on, the clone provides Internet access and monitors all traffic. It is still GITM, but with a more aggressive client takeover than the standard mode where the user chooses the network manually.</p>
+                            </div>
+                            <figure class="media-frame">
+                                <button class="media-button" type="button" data-image="middle-man/rogue-gitm.png" data-caption="Rogue GITM: a cloned network takes over clients and records their traffic.">
+                                    <img src="middle-man/rogue-gitm.png" alt="Diagram showing Rogue GITM mirrored AP and gateway capture flow">
+                                    <span class="zoom-hint">Zoom</span>
+                                </button>
+                                <figcaption class="media-caption">Rogue GITM diagram preview. Click to open the full-size image.</figcaption>
+                            </figure>
+                        </div>
+                    </div>
+                </div>
+            </article>
+        </section>
+    </div>
+
+    <div class="modal" id="modal">
+        <div class="modal-content">
+            <span class="modal-close" onclick="closeModal()">&times;</span>
+            <img class="modal-image" id="modalImage" alt="Full size">
+            <div class="modal-info" id="modalInfo"></div>
+        </div>
+    </div>
+
+    <script>
+        function setAccordionState(item, isOpen) {
+            item.classList.toggle('open', isOpen);
+            const trigger = item.querySelector('.accordion-trigger');
+            trigger.setAttribute('aria-expanded', String(isOpen));
+        }
+
+        document.querySelectorAll('.accordion-item').forEach((item) => {
+            const trigger = item.querySelector('.accordion-trigger');
+            trigger.addEventListener('click', () => {
+                const isOpen = item.classList.contains('open');
+                setAccordionState(item, !isOpen);
+            });
+        });
+
+        function openModal(imagePath, imageText) {
+            const modal = document.getElementById('modal');
+            const modalImage = document.getElementById('modalImage');
+            const modalInfo = document.getElementById('modalInfo');
+
+            modalImage.src = imagePath;
+            modalInfo.textContent = imageText;
+            modal.classList.add('active');
+            document.body.style.overflow = 'hidden';
+        }
+
+        function closeModal() {
+            const modal = document.getElementById('modal');
+            modal.classList.remove('active');
+            document.body.style.overflow = 'auto';
+        }
+
+        document.querySelectorAll('.media-button').forEach((button) => {
+            button.addEventListener('click', () => {
+                openModal(button.dataset.image, button.dataset.caption);
+            });
+        });
+
+        document.getElementById('modal').addEventListener('click', function(event) {
+            if (event.target === this) {
+                closeModal();
+            }
+        });
+
+        document.addEventListener('keydown', function(event) {
+            if (event.key === 'Escape') {
+                closeModal();
+            }
+        });
+    </script>
+</body>
+</html>
