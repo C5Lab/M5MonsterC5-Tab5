@@ -75,7 +75,7 @@ extern void pthread_internal_local_storage_destructor_callback(TaskHandle_t hand
 #endif
 
 
-#define JANOS_TAB_VERSION "1.5.3"
+#define JANOS_TAB_VERSION "1.5.4"
 #define JANOS_VERSION_REQUIRED "1.7.2"
 
 #include "lwip/netdb.h"
@@ -12604,15 +12604,18 @@ static void handshaker_popup_close_cb(lv_event_t *e)
     ESP_LOGI(TAG, "Handshaker popup closed - sending stop command");
 
     tab_context_t *ctx = get_current_ctx();
-    if (!ctx || !ctx->gitm) return;
+    if (!ctx) return;
 
     // Stop JanOS first, then wait for the UART reader to leave before deleting
-    // any LVGL objects it may still reference.
+    // any LVGL objects it may still reference. The reader needs one read timeout
+    // (100 ms) plus at most one contended log update (50 ms) to notice the
+    // cleared flag, so 1 s of headroom means the force-delete below stays a
+    // last resort rather than the normal path.
     ctx->handshaker_monitoring = false;
     uart_send_command_for_tab("stop");
 
     if (ctx->handshaker_task != NULL) {
-        for (int wait = 0; wait < 50 && ctx->handshaker_task != NULL; wait++) {
+        for (int wait = 0; wait < 100 && ctx->handshaker_task != NULL; wait++) {
             vTaskDelay(pdMS_TO_TICKS(10));
         }
         if (ctx->handshaker_task != NULL) {
@@ -12657,7 +12660,11 @@ static void handshaker_set_done_state(tab_context_t *ctx, bool show_wpasec_butto
 {
     if (!ctx) return;
 
-    bsp_display_lock(0);
+    // Bounded wait: the monitor task calls this, and the LVGL task may be
+    // sitting in handshaker_popup_close_cb() holding the display lock while it
+    // waits for that very task to exit. Blocking forever here would deadlock
+    // both until the close path force-deletes us.
+    if (!bsp_display_lock(200)) return;
 
     if (ctx->handshaker_stop_btn) {
         lv_obj_set_style_bg_color(ctx->handshaker_stop_btn, COLOR_MATERIAL_GREEN, 0);
@@ -12729,8 +12736,11 @@ static void append_handshaker_log(const char *message, hs_log_type_t log_type)
     }
     strncat(handshaker_log_buffer, message, sizeof(handshaker_log_buffer) - strlen(handshaker_log_buffer) - 1);
 
-    // Update UI
-    bsp_display_lock(0);
+    // Update UI. Bounded wait for the same reason as handshaker_set_done_state:
+    // the closing LVGL task holds the display lock while waiting for us. The
+    // label is rendered from the whole buffer, so a skipped repaint costs
+    // nothing - the next line that does get the lock shows this text too.
+    if (!bsp_display_lock(50)) return;
     if (handshaker_status_label) {
         lv_label_set_text(handshaker_status_label, handshaker_log_buffer);
         // Set color for last message (entire label gets same color - latest determines it)
@@ -12763,6 +12773,7 @@ static void handshaker_monitor_task(void *arg)
     // Track state for detecting "already captured" scenario
     int networks_attacked_this_cycle = -1;
     int handshakes_so_far = -1;
+    bool janos_finished = false;   // set when JanOS reports its own cleanup
     if (ctx) {
         ctx->handshaker_capture_success = false;
     }
@@ -12775,6 +12786,11 @@ static void handshaker_monitor_task(void *arg)
             rx_buffer[len] = '\0';
 
             for (int i = 0; i < len; i++) {
+                // A Stop from the UI has to be honoured mid-chunk. The LVGL task
+                // holds the display lock while it waits for this task to leave,
+                // so every further line would only burn the log's lock timeout.
+                if (!ctx->handshaker_monitoring && !janos_finished) break;
+
                 char c = rx_buffer[i];
 
                 if (c == '\n' || c == '\r') {
@@ -12976,6 +12992,7 @@ static void handshaker_monitor_task(void *arg)
                         }
 
                         if (attack_finished) {
+                            janos_finished = true;
                             handshaker_set_done_state(ctx, ctx->handshaker_capture_success);
                             ctx->handshaker_monitoring = false;
                             handshaker_monitoring = false;
@@ -13002,7 +13019,7 @@ static void handshaker_monitor_task(void *arg)
 static void show_handshaker_popup(void)
 {
     tab_context_t *ctx = get_current_ctx();
-    if (!ctx || !ctx->gitm) return;
+    if (!ctx) return;
     if (ctx->handshaker_popup != NULL) return;  // Already showing in this tab
 
     scan_view_t hsv = get_scan_view(ctx);
