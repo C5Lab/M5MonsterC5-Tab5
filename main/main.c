@@ -50510,8 +50510,10 @@ static void detect_boards(void)
              mbus_detected ? "YES" : "NO");
 }
 
-// Check SD card presence on a specific tab using 'sd_status' command
-// Returns true if SD card is present, false otherwise
+// Check SD card presence on a specific tab using 'sd_status' command.
+// Retries for ~1.5s (like SubGHz): early SD_NONE is treated as "not ready yet"
+// so dual-board boot (no empty-port ping delay) does not false-negative.
+// Returns true if SD card is present, false otherwise.
 static bool check_sd_card_for_tab(tab_id_t tab)
 {
     if (tab == TAB_INTERNAL) {
@@ -50527,8 +50529,10 @@ static bool check_sd_card_for_tab(tab_id_t tab)
     ESP_LOGI(TAG, "[%s] Checking SD card presence...", tab_name);
 
     const char *cmd = "sd_status\r\n";
-    static const int64_t timeout_us = 300000; // one 300 ms probe
+    static const int64_t timeout_us = 1500000; // 1.5s window
+    static const int64_t resend_us = 400000;   // resend every 400 ms
     bool usb_locked = false;
+    bool saw_sd_none = false;
 
     if (tab == TAB_USB) {
         usb_rx_exclusive = true;
@@ -50538,6 +50542,7 @@ static bool check_sd_card_for_tab(tab_id_t tab)
     char rx_buffer[128];
     int total_len = 0;
     int64_t start_time = esp_timer_get_time();
+    int64_t last_cmd_us = start_time - resend_us; // first send immediate
 
     rx_buffer[0] = '\0';
 
@@ -50547,13 +50552,24 @@ static bool check_sd_card_for_tab(tab_id_t tab)
         uart_flush_input(uart_port);
     }
 
-    transport_write_bytes_tab(tab, uart_port, cmd, strlen(cmd));
+    while ((esp_timer_get_time() - start_time) < timeout_us) {
+        if ((esp_timer_get_time() - last_cmd_us) >= resend_us) {
+            transport_write_bytes_tab(tab, uart_port, cmd, strlen(cmd));
+            last_cmd_us = esp_timer_get_time();
+            // Fresh response window after each resend
+            total_len = 0;
+            rx_buffer[0] = '\0';
+        }
 
-    while ((esp_timer_get_time() - start_time) < timeout_us &&
-           total_len < (int)sizeof(rx_buffer) - 1) {
+        int space = (int)sizeof(rx_buffer) - 1 - total_len;
+        if (space <= 0) {
+            total_len = 0;
+            rx_buffer[0] = '\0';
+            space = (int)sizeof(rx_buffer) - 1;
+        }
+
         int len = transport_read_bytes_tab(tab, uart_port, rx_buffer + total_len,
-                                           sizeof(rx_buffer) - 1 - total_len,
-                                           pdMS_TO_TICKS(50));
+                                           space, pdMS_TO_TICKS(50));
         if (len <= 0) {
             continue;
         }
@@ -50563,18 +50579,27 @@ static bool check_sd_card_for_tab(tab_id_t tab)
 
         if (strstr(rx_buffer, "SD_OK") != NULL) {
             if (usb_locked) usb_rx_exclusive = false;
-            ESP_LOGI(TAG, "[%s] SD card present", tab_name);
+            if (saw_sd_none) {
+                ESP_LOGI(TAG, "[%s] SD card present (recovered after SD_NONE)", tab_name);
+            } else {
+                ESP_LOGI(TAG, "[%s] SD card present", tab_name);
+            }
             return true;
         }
         if (strstr(rx_buffer, "SD_NONE") != NULL) {
-            if (usb_locked) usb_rx_exclusive = false;
-            ESP_LOGW(TAG, "[%s] SD card not ready/not present", tab_name);
-            return false;
+            // Not ready yet — keep probing until timeout (dual-board race).
+            saw_sd_none = true;
+            total_len = 0;
+            rx_buffer[0] = '\0';
         }
     }
 
     if (usb_locked) usb_rx_exclusive = false;
-    ESP_LOGW(TAG, "[%s] SD status unknown after one probe, response: '%s'", tab_name, rx_buffer);
+    if (saw_sd_none) {
+        ESP_LOGW(TAG, "[%s] SD card not ready/not present", tab_name);
+    } else {
+        ESP_LOGW(TAG, "[%s] SD status unknown after probe, response: '%s'", tab_name, rx_buffer);
+    }
     return false;
 }
 
@@ -51059,6 +51084,7 @@ static void board_detect_retry_task(void *arg)
         ESP_LOGI(TAG, "Retrying board detection...");
         board_probe_in_progress = true;
         detect_boards();
+        check_all_sd_cards();
         // Re-probe Sub-GHz availability so the home tile reflects the new state.
         check_all_subghz_status();
         board_probe_in_progress = false;
