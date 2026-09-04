@@ -20,4 +20,6 @@
 
 /** Exported Functions **/
 
+void sdio_reserve_dma_buffers(void);
+
 #endif /* __SDIO_DRV_H */

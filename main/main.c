@@ -12,9 +12,13 @@
 #include <errno.h>
 #include <math.h>
 #include <stdint.h>
+#include <stdarg.h>
+#include <limits.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "freertos/idf_additions.h"
+#include "freertos/event_groups.h"
 #include "freertos/timers.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
@@ -36,25 +40,48 @@
 #include "usb/usb_helpers.h"
 #include "usb/usb_types_ch9.h"
 #include "screens/subghz_host.h"
+#include "screens/cgw_parser.h"
 
 // ESP-Hosted includes for WiFi via ESP32C6 SDIO
 #include "esp_hosted.h"
 #include "esp_wifi.h"
 #include "esp_netif.h"
 #include "esp_event.h"
+#include "esp_system.h"
 #include "esp_vfs_fat.h"
+#include "janos_file_transfer.h"
+#include "pcap_reader.h"
+#include "pcap_summary.h"
+#include "pcap_flow.h"
+#include "pcap_analysis_store.h"
+#include "pcap_investigation.h"
+#include "pcap_extract.h"
 
 // Captive portal includes
 #include "esp_http_server.h"
 #include "lwip/sockets.h"
 
+#if defined(CONFIG_SPIRAM_XIP_FROM_PSRAM) && CONFIG_SPIRAM_XIP_FROM_PSRAM && \
+    defined(CONFIG_FREERTOS_TLSP_DELETION_CALLBACKS) && CONFIG_FREERTOS_TLSP_DELETION_CALLBACKS
+/*
+ * ESP-IDF 5.4.1 keeps this cleanup entry point private, but it is the same
+ * routine used by pthread-created tasks before they delete themselves.  With
+ * PSRAM XIP enabled on dual-core ESP32-P4, the generic FreeRTOS delete hook
+ * rejects its 0x480... callback address before it can run.  Calling it while
+ * the task is still alive releases the LwIP per-thread semaphore and clears
+ * the callback slot, so vTaskDelete() no longer reaches that faulty check.
+ */
+extern void pthread_internal_local_storage_destructor_callback(TaskHandle_t handle);
+#endif
 
-#define JANOS_TAB_VERSION "1.5.2"
-#define JANOS_VERSION_REQUIRED "1.7.1"
+
+#define JANOS_TAB_VERSION "1.5.3"
+#define JANOS_VERSION_REQUIRED "1.7.2"
 
 #include "lwip/netdb.h"
 #include <dirent.h>
 #include <sys/stat.h>
+#include <unistd.h>
 #include <time.h>
 #include <sys/time.h>
 
@@ -184,6 +211,7 @@ typedef struct {
     int channel;
     int rssi;            // Signal strength in dBm
     char band[8];        // "2.4GHz" or "5GHz"
+    char security[24];
     char vendor[48];
     int client_count;
     char clients[MAX_CLIENTS_PER_NETWORK][18];  // MAC addresses of clients
@@ -307,9 +335,19 @@ typedef struct {
 
 #define WARDRIVE_BLACKLIST_MAX 64
 
+/* Above this size a Monster capture is flagged in the list: the HTTP download
+ * has no Range/resume, so an interrupted transfer restarts from zero. */
+#define COMPROMISED_LARGE_FILE_WARN_BYTES (8L * 1024L * 1024L)
 #define WARDRIVE_WIGLE_MAX_FILES 256
 #define WARDRIVE_WIGLE_PAGE_SIZE  20
 #define WARDRIVE_WIGLE_PATH_MAX  160
+// Ceiling for a wardrive_files / wardrive_cleanup round-trip. Firmware without
+// the scan cache reads every log on the card (three passes per file for the
+// listing, one for the cleanup), which on a ~27MB working dir lands around
+// 135s and 100s respectively - a shorter ceiling truncates the listing rather
+// than making anything faster. With the cache both finish in seconds and this
+// never comes into play.
+#define WARDRIVE_LISTING_TIMEOUT_MS 180000
 #define WARDRIVE_WIGLE_OTHER_SSID "__WARDRIVE_WIGLE_OTHER__"
 static const char wpasec_other_ssid_user_data[] = WPASEC_OTHER_SSID;
 static const char wardrive_wigle_other_ssid_user_data[] = WARDRIVE_WIGLE_OTHER_SSID;
@@ -325,6 +363,7 @@ typedef struct {
     int bt_rows;
     int bad_rows;
     bool selected;
+    bool tab5_synced;
     lv_obj_t *checkbox;
 } wardrive_wigle_file_t;
 
@@ -346,6 +385,18 @@ typedef struct {
     int wdgwars_failed;
     int wdgwars_rate_limited;
     bool valid;
+    /* Completeness of the listing that produced this summary. `announced` is the
+     * file count JanOS >= 1.7.2 puts on "[WARD_FILE] BEGIN count=N" (0 on older
+     * firmware, which does not send it). `truncated` means the listing we parsed
+     * is known to be short - no END marker, fewer rows than announced, the rx
+     * buffer filled up, or the file cap was hit. Both are filled in *after* the
+     * parse loop: wardrive_parse_file_summary_line() memsets this struct when the
+     * SUMMARY line arrives, so anything set earlier would be wiped. `parsed` is
+     * how many file rows we actually got, which is what the warning reports -
+     * `files` above comes from the SUMMARY line and is absent when truncated. */
+    int announced;
+    int parsed;
+    bool truncated;
 } wardrive_file_summary_t;
 
 #define WARDRIVE_UPLOAD_STATE_MAX 256
@@ -389,6 +440,7 @@ typedef enum {
     COMPROMISED_FILE_KIND_WARDRIVE = 1,
     COMPROMISED_FILE_KIND_EVIL_TWIN = 2,
     COMPROMISED_FILE_KIND_PORTAL = 3,
+    COMPROMISED_FILE_KIND_PCAP_CAPTURE = 4,
 } compromised_file_kind_t;
 
 typedef enum {
@@ -452,6 +504,109 @@ typedef struct {
 // COMPLETE TAB CONTEXT - All UI, data, and state for one tab (Grove/USB/MBus/INTERNAL)
 // Each tab is a fully independent space with its own LVGL objects and state
 // ============================================================================
+// GITM (JanOS Capture Gateway) page state.
+//
+// Kept behind a pointer and allocated in PSRAM rather than inlined into
+// tab_context_t: that struct has four file-scope instances, so anything stored
+// inline costs scarce internal RAM. This block is ~1.4 KiB per tab.
+typedef struct {
+    // GITM is the display name only; the wire protocol stays capture_gateway /
+    // [CGW] per janos-capture-gateway.md section 8.11.
+    lv_obj_t *page;
+    lv_obj_t *state_chip;     // IDLE / CONNECTING / STARTING / RUNNING / ...
+    lv_obj_t *status_label;   // hint and error line, shared by all phases
+    lv_obj_t *body;           // scrollable column holding the three steps
+
+    // Step 1 - upstream (the Internet side)
+    lv_obj_t *step1;
+    lv_obj_t *s1_chev;
+    lv_obj_t *s1_summary;
+    lv_obj_t *s1_content;
+    lv_obj_t *scan_btn;
+    lv_obj_t *net_list;
+    lv_obj_t *up_pass_row;
+    lv_obj_t *up_pass_input;
+    lv_obj_t *connect_btn;
+
+    // Step 2 - our own AP
+    lv_obj_t *step2;
+    lv_obj_t *s2_chev;
+    lv_obj_t *s2_summary;
+    lv_obj_t *s2_content;
+    lv_obj_t *ap_ssid_input;
+    lv_obj_t *sec_dd;         // Open | WPA2 selector (contract section 8.2)
+    lv_obj_t *ap_pass_row;
+    lv_obj_t *ap_pass_input;
+    lv_obj_t *prefix_input;
+    lv_obj_t *name_preview;
+    lv_obj_t *open_warn;
+    lv_obj_t *start_btn;
+
+    // Step 3 - live session
+    lv_obj_t *live;
+    lv_obj_t *live_content;
+    lv_obj_t *live_hdr;       // AP / upstream / NAPT / DNS
+    lv_obj_t *live_warn;      // open AP + client_isolation warnings
+    lv_obj_t *clients_hdr;
+    lv_obj_t *clients_list;
+    lv_obj_t *cap_label;      // file, packets, size
+    lv_obj_t *rec_label;      // recorder health
+    lv_obj_t *shaper_label;   // limiter health (separate from the recorder)
+    lv_obj_t *stop_btn;
+    lv_obj_t *copy_btn;       // revealed once the capture is finalized
+    lv_obj_t *keyboard;
+
+    // Session state. The page owns its own scan cache so entering GITM never
+    // disturbs the attack-view selection in ctx->networks.
+    wifi_network_t *nets;     // PSRAM, MAX_NETWORKS entries
+    int  net_count;
+    int  up_index;            // index into gitm_nets, -1 when nothing picked
+    bool up_is_open;
+    bool ap_wpa2;
+    bool s1_collapsed;
+    bool s2_collapsed;
+    char up_ssid[33];
+    char up_pass[65];
+    char ap_ssid[33];
+    char ap_pass[65];
+    char pcap_basename[96];   // controller-generated, sent as --pcap-name
+    char preselect_ssid[33];  // seeded when opened from a scan selection
+    volatile int  state;      // gitm_state_t
+    volatile bool stop_request;
+    volatile bool session_active;
+    TaskHandle_t session_task;
+    int tab;                  // tab_id_t of the session (typedef comes later)
+    uart_port_t uart_port;
+    cgw_snapshot_t snap;      // last published status snapshot
+    cgw_final_t final;        // [PCAP_FINAL] summary after stop
+    char client_sig[CGW_MAX_CLIENTS * 18 + 8];  // last rendered client set
+
+    // Client set the join chime has already accounted for. Kept apart from
+    // `snap` so a snapshot that never reached the screen (display lock busy)
+    // cannot swallow an arrival, and so a chime never fires twice for one MAC.
+    char chime_macs[CGW_MAX_CLIENTS][18];
+    int  chime_mac_count;
+    bool chime_armed;         // false until the first snapshot of a session
+    bool warn_upstream_down;  // last published upstream state, for the warning
+    bool warn_degraded;       // last published recorder-loss state
+
+    // Rogue GITM overlay. Deauth the victim off its real AP, raise a same-SSID
+    // mirror on JanOS and route the victim through our own uplink while the
+    // capture gateway records it. The whole [CGW] live view and session engine
+    // are shared with the clean gateway; only the setup form (a popup) and the
+    // start command (start_rogue_gitm instead of capture_gateway start) differ.
+    bool rogue;
+    char victim_ssid[33];       // SSID mirrored to the victim (= scan SSID)
+    char victim_bssid[18];      // real AP BSSID, excluded from the uplink pick
+    unsigned victim_channel;    // the uplink must share this channel
+    int  victim_scan_index;     // 1-based index as printed by scan_networks
+    char mirror_pass[65];       // the real passphrase clients expect on the mirror
+} gitm_ctx_t;
+
+// Defined further down (it embeds the path array); the tab context only needs
+// a pointer, to stage a pending Clean while its confirm dialog is up.
+struct compromised_cleanup_task_args_s;
+
 typedef struct {
     // =====================================================================
     // MAIN CONTAINER AND NAVIGATION
@@ -527,9 +682,14 @@ typedef struct {
 
     // Network popup (clients, deauth)
     lv_obj_t *network_popup;
+    lv_obj_t *popup_title_label;
     lv_obj_t *popup_clients_container;
     int popup_network_idx;
     bool popup_open;
+    bool popup_focus_ready;
+    volatile bool popup_focus_active;
+    volatile bool popup_focus_cancel;
+    TaskHandle_t popup_focus_task;
     TimerHandle_t popup_timer;
 
     // Deauth popup
@@ -571,6 +731,9 @@ typedef struct {
     lv_obj_t *mitm_btn_row;
     bool mitm_use_saved_password;
 
+    // GITM page state, allocated in PSRAM on first use (see gitm_ctx()).
+    gitm_ctx_t *gitm;
+
     // Handshaker popup (per-network)
     lv_obj_t *handshaker_popup_overlay;
     lv_obj_t *handshaker_popup;
@@ -597,9 +760,13 @@ typedef struct {
     observer_network_t *observer_networks;  // PSRAM
     int observer_network_count;
     bool observer_running;
+    volatile bool observer_start_active;
     bool observer_page_visible;
     TaskHandle_t observer_task;
     TimerHandle_t observer_timer;
+    volatile bool observer_teardown_active;   // a stop is already on its way
+    char *observer_rx_buffer;       // Per-tab PSRAM UART buffer
+    char *observer_line_buffer;     // Per-tab PSRAM line buffer
 
     // Karma2 (Probes & Karma on Observer)
     lv_obj_t *karma2_probes_popup_overlay;
@@ -682,6 +849,12 @@ typedef struct {
     lv_obj_t *wardrive_gps_popup;
     lv_obj_t *wardrive_gps_label;
     volatile bool wardrive_monitoring;
+    // Bumped by every explicit stop and every start. The monitor task captures it
+    // on entry and exits as soon as it no longer matches, which is what keeps a
+    // stop/start cycle from ending up with two tasks on one UART: clearing
+    // wardrive_monitoring alone is racy, because a task still mid-iteration sees
+    // the flag set back to true by the next start and just keeps going.
+    volatile uint32_t wardrive_run_generation;
     bool wardrive_gps_fix;
     bool wardrive_use_external_gps;
     TaskHandle_t wardrive_task;
@@ -703,6 +876,10 @@ typedef struct {
     volatile bool wardrive_upload_menu_loading;
     bool wardrive_upload_menu_loaded;
     TaskHandle_t wardrive_upload_menu_task;
+    // Subtitle of the open upload menu, so the loader task can show "n/N" while
+    // the listing streams in. Nulled by its own LV_EVENT_DELETE handler, and only
+    // ever touched under the display lock - the popup can close mid-load.
+    lv_obj_t *wardrive_upload_menu_subtitle;
     wardrive_upload_provider_t wardrive_upload_provider;
     wardrive_upload_mode_t wardrive_upload_mode;
     lv_obj_t *wardrive_wigle_popup_overlay;
@@ -883,6 +1060,10 @@ typedef struct {
     lv_obj_t *portal_data_page;
     lv_obj_t *handshakes_page;
     lv_obj_t *wardrive_files_page;
+    lv_obj_t *espshark_page;
+    lv_obj_t *pcap_captures_page;
+    lv_obj_t *pcap_viewer_page;
+    struct pcap_viewer_state *pcap_viewer;
     lv_obj_t *compromised_cleanup_overlay;
     lv_obj_t *compromised_cleanup_popup;
     lv_obj_t *compromised_cleanup_spinner;
@@ -899,12 +1080,23 @@ typedef struct {
     char wardrive_cleanup_service[12];
     char wardrive_cleanup_status[16];
     char compromised_cleanup_log_buffer[1536];
+    // "Clean" wipes a whole directory, so the args are staged here while the
+    // confirm dialog is up and only handed to the worker on Yes. Freed by the
+    // overlay's LV_EVENT_DELETE handler, so a tab switch cannot leak them.
+    lv_obj_t *compromised_confirm_overlay;
+    struct compromised_cleanup_task_args_s *compromised_cleanup_pending;
 
     // Background loader for the compromised/wardrive file listing (so the listing,
     // which can hash several MB of wardrive logs, runs off the UI thread with a
     // live spinner instead of freezing the GUI).
     volatile bool compromised_files_loading;   // guard: a load task is in flight
     bool compromised_files_loaded;             // data ready in ctx, render from cache
+    lv_obj_t *compromised_files_loading_label; // spinner caption, for live progress
+    // Bulk-delete bar on the Wardrive Files page. The button caption carries the
+    // live selection count, so the checkbox handler needs to reach it; both are
+    // nulled by the button's own LV_EVENT_DELETE.
+    lv_obj_t *wardrive_files_delete_btn;
+    lv_obj_t *wardrive_files_delete_lbl;
     compromised_file_kind_t compromised_files_load_kind;
     TaskHandle_t compromised_files_load_task;
 
@@ -1120,7 +1312,214 @@ typedef struct {
     bool has_subghz;
 } tab_context_t;
 
+#define PCAP_VIEWER_ROOT                "/sdcard/lab/pcaps"
+#define PCAP_VIEWER_MAX_FILES           128
+#define PCAP_VIEWER_PATH_MAX            288
+#define PCAP_VIEWER_PACKET_PAGE_SIZE    20
+#define PCAP_VIEWER_MAX_INDEXED_PACKETS 4096
+#define PCAP_DNS_DETAIL_MAX_CLIENTS     16U
+#define PCAP_DNS_DETAIL_MAX_ADDRESSES   16U
+#define PCAP_DNS_DETAIL_MAX_FLOWS       24U
+#define PCAP_VIEWER_HEX_BYTES           256
+#define PCAP_VIEWER_ROW_HEIGHT           40
+#define PCAP_VIEWER_ENDPOINT_HEIGHT      32
+#define PCAP_VIEWER_COL_NO_TIME         150
+#define PCAP_VIEWER_COL_PROTOCOL        100
+#define PCAP_VIEWER_COL_SOURCE          230
+#define PCAP_VIEWER_COL_DESTINATION     230
+#define PCAP_VIEWER_COL_LENGTH           80
+#define PCAP_MAP_MAX_NODES               48
+#define PCAP_MAP_PRIMARY_NODES           46
+#define PCAP_MAP_MAX_EDGES              128
+#define PCAP_MAP_TOPOLOGY_MAX_DEVICES    12
+#define PCAP_MAP_MAX_CANDIDATES PCAP_FLOW_MAX_DEVICES
+
+typedef enum {
+    PCAP_MAP_MODE_TOPOLOGY = 0,
+    PCAP_MAP_MODE_TRAFFIC,
+    PCAP_MAP_MODE_THREATS,
+    PCAP_MAP_MODE_SERVICES,
+    PCAP_MAP_MODE_COUNT,
+} pcap_map_mode_t;
+
+typedef enum {
+    PCAP_MAP_ROLE_CLIENT = 0,
+    PCAP_MAP_ROLE_GATEWAY,
+    PCAP_MAP_ROLE_INFRASTRUCTURE,
+    PCAP_MAP_ROLE_SERVER,
+    PCAP_MAP_ROLE_IOT,
+    PCAP_MAP_ROLE_WAN_SERVICE,
+    PCAP_MAP_ROLE_GROUP,
+} pcap_map_role_t;
+
+typedef enum {
+    PCAP_MAP_NODE_LOCAL = 0,
+    PCAP_MAP_NODE_EXTERNAL,
+    PCAP_MAP_NODE_MULTICAST,
+    PCAP_MAP_NODE_BROADCAST,
+    PCAP_MAP_NODE_OTHER_LOCAL,
+    PCAP_MAP_NODE_OTHER_EXTERNAL,
+} pcap_map_node_kind_t;
+
+typedef enum {
+    PCAP_MAP_FILTER_ALL = 1,
+    PCAP_MAP_FILTER_SOURCE,
+    PCAP_MAP_FILTER_DESTINATION,
+    PCAP_MAP_FILTER_SERVICE,
+} pcap_map_filter_action_t;
+
 typedef struct {
+    char address[64];
+    char mac[18];
+    char hostname[96];
+    uint64_t sent_bytes;
+    uint64_t received_bytes;
+    uint32_t sent_packets;
+    uint32_t received_packets;
+    uint32_t flow_count;
+    uint16_t service_count;
+    uint16_t device_index;
+    uint16_t grouped_nodes;
+    uint8_t kind;
+    uint8_t role;
+    uint8_t alert_count;
+    uint8_t alert_severity;
+} pcap_map_node_t;
+
+typedef struct {
+    uint16_t source;
+    uint16_t target;
+    uint16_t representative_flow_id;
+    uint16_t flow_count;
+    uint64_t forward_bytes;
+    uint64_t reverse_bytes;
+    uint32_t forward_packets;
+    uint32_t reverse_packets;
+    uint64_t primary_app_bytes;
+    uint8_t primary_app;
+    uint8_t alert_count;
+    uint8_t alert_severity;
+} pcap_map_edge_t;
+
+typedef struct {
+    uint16_t node_count;
+    uint16_t edge_count;
+    uint16_t hidden_nodes;
+    uint16_t hidden_edges;
+    uint16_t local_nodes;
+    uint16_t external_nodes;
+    uint16_t global_alerts;
+    int16_t gateway_node;
+    bool limited;
+    pcap_map_node_t nodes[PCAP_MAP_MAX_NODES];
+    pcap_map_edge_t edges[PCAP_MAP_MAX_EDGES];
+} pcap_map_graph_t;
+
+typedef struct {
+    char path[PCAP_VIEWER_PATH_MAX];
+    char name[96];
+    uint64_t size_bytes;
+    bool analyzed;
+    uint32_t cached_packets;
+} pcap_viewer_file_t;
+
+typedef enum {
+    PCAP_ARTIFACT_NONE = 0,
+    PCAP_ARTIFACT_EXPORT_REPORT,
+    PCAP_ARTIFACT_EXPORT_FILTERED_PCAP,
+    PCAP_ARTIFACT_EXPORT_HTML,
+    PCAP_ARTIFACT_EXPORT_SUMMARY_TEXT,
+    PCAP_ARTIFACT_EXTRACT_OBJECTS,
+} pcap_artifact_action_t;
+
+typedef struct pcap_viewer_state {
+    tab_context_t *ctx;
+    pcap_viewer_file_t files[PCAP_VIEWER_MAX_FILES];
+    int file_count;
+    pcap_reader_t *reader;
+    pcap_capture_info_t capture_info;
+    pcap_packet_index_t *packet_index;
+    uint32_t *packet_flags;
+    pcap_summary_t *summary;
+    pcap_flow_analysis_t *flow_analysis;
+    pcap_investigation_t *investigation;
+    pcap_investigation_diff_t baseline_diff;
+    pcap_investigation_status_t baseline_status;
+    pcap_flow_filter_t quick_filter;
+    pcap_scan_summary_t scan_summary;
+    pcap_reader_status_t load_status;
+    pcap_reader_status_t summary_status;
+    bool cache_hit;
+    bool cache_available;
+    bool force_reanalyze;
+    pcap_analysis_cache_info_t cache_info;
+    volatile bool loading;
+    volatile bool cancel_requested;
+    TaskHandle_t task;
+    int packet_page;
+    char selected_path[PCAP_VIEWER_PATH_MAX];
+    char selected_name[96];
+    char notice[192];
+    pcap_packet_filter_t packet_filter;
+    lv_obj_t *status_label;
+    lv_obj_t *packet_list;
+    lv_obj_t *page_label;
+    lv_obj_t *prev_btn;
+    lv_obj_t *next_btn;
+    lv_obj_t *fqdn_btn;
+    lv_obj_t *fqdn_label;
+    bool show_fqdn;
+    lv_obj_t *filter_buttons[PCAP_FILTER_COUNT];
+    lv_obj_t *detail_overlay;
+    uint32_t detail_packet_index;
+    volatile bool artifact_running;
+    TaskHandle_t artifact_task;
+    pcap_artifact_action_t artifact_action;
+    bool artifact_success;
+    char artifact_message[512];
+    lv_obj_t *artifact_overlay;
+    lv_obj_t *artifact_popup;
+    lv_obj_t *artifact_spinner;
+    lv_obj_t *artifact_status_label;
+    lv_obj_t *artifact_actions;
+    pcap_extract_result_t *extract_result;
+    pcap_extract_status_t extract_status;
+    char extract_phase[16];
+    volatile uint32_t extract_done;
+    volatile uint32_t extract_total;
+    bool extract_show_on_finish;
+    lv_timer_t *extract_progress_timer;
+    pcap_map_graph_t *map_graph;
+    pcap_map_mode_t map_mode;
+    int map_selected_node;
+    lv_obj_t *map_stage;
+    lv_obj_t *map_detail_label;
+    lv_obj_t *map_node_overlay;
+    lv_obj_t *map_summary_btn;
+    lv_obj_t *map_filter_btn;
+    lv_obj_t *map_mode_buttons[PCAP_MAP_MODE_COUNT];
+} pcap_viewer_state_t;
+
+typedef struct {
+    uint16_t flow_id;
+    uint64_t bytes;
+} pcap_dns_related_flow_t;
+
+typedef struct {
+    char clients[PCAP_DNS_DETAIL_MAX_CLIENTS][64];
+    char addresses[PCAP_DNS_DETAIL_MAX_ADDRESSES][64];
+    pcap_dns_related_flow_t flows[PCAP_DNS_DETAIL_MAX_FLOWS];
+    uint16_t client_count;
+    uint16_t address_count;
+    uint16_t flow_count;
+    uint32_t query_packets;
+    uint32_t response_packets;
+    bool client_limited;
+    bool address_limited;
+    bool flow_limited;
+} pcap_dns_domain_detail_t;
+
+typedef struct compromised_cleanup_task_args_s {
     tab_context_t *ctx;
     compromised_file_kind_t kind;
     compromised_cleanup_action_t action;
@@ -1139,6 +1538,50 @@ typedef struct {
     tab_context_t *ctx;
     char file[96];
 } wardrive_fix_task_args_t;
+
+typedef struct {
+    tab_context_t *ctx;
+    int tab;
+    char remote_path[WARDRIVE_WIGLE_PATH_MAX];
+    char file_name[96];
+    /* From "list_dir -s"; 0 when the size is unknown. Decides Wi-Fi vs M-BUS. */
+    long size_bytes;
+} compromised_transfer_task_args_t;
+
+typedef struct {
+    char remote_path[WARDRIVE_WIGLE_PATH_MAX];
+    char file_name[96];
+} compromised_sync_item_t;
+
+typedef struct {
+    tab_context_t *ctx;
+    int tab;
+    compromised_file_kind_t kind;
+    int item_count;
+    compromised_sync_item_t items[];
+} compromised_sync_task_args_t;
+
+typedef struct {
+    int current;
+    int total;
+    const char *file_name;
+} compromised_sync_progress_ctx_t;
+
+typedef struct {
+    volatile bool active;
+    volatile bool cancel_requested;
+    bool sync_mode;
+    TaskHandle_t task;
+    lv_obj_t *overlay;
+    lv_obj_t *popup;
+    lv_obj_t *status_label;
+    lv_obj_t *detail_label;
+    lv_obj_t *progress_bar;
+    lv_obj_t *action_btn;
+    lv_obj_t *action_label;
+} compromised_transfer_ui_t;
+
+static compromised_transfer_ui_t compromised_transfer_ui;
 
 typedef enum {
     TAB_GROVE = 0,
@@ -1173,6 +1616,29 @@ typedef enum {
 static boot_sound_mode_t boot_sound_mode = BOOT_SOUND_MODE_NOKIA;
 
 #define BOOT_SOUND_VOLUME_PERCENT 69
+
+// Alert chime: a short ping for the few events worth hearing while nobody is
+// watching the screen. Today that is a client joining the GITM capture AP. The
+// switch sits next to "Boot sound" in the theme popup.
+//
+// Keep this at the boot melody's level. esp_codec_dev maps 0..100% onto -50..0
+// dB *linearly in dB*, so "half volume" is -25 dB, not half as loud: the first
+// version of this chime asked for 45% and a 0.30 digital gain, landed 21 dB
+// under the melody, and was inaudible on the Tab5 speaker. Gentleness comes
+// from the envelope and the register, not from burying the signal.
+static bool alert_sound_enabled = true;
+
+#define ALERT_SOUND_VOLUME_PERCENT 69
+
+// Four things the box can say. Kept few on purpose: an alert vocabulary you
+// have to look up is worse than no alert at all.
+typedef enum {
+    ALERT_TONE_JOIN = 0,   // somebody walked into a network of ours
+    ALERT_TONE_WIN,        // loot: a handshake, a password, a finished upload
+    ALERT_TONE_WARN,       // something we were relying on just broke
+    ALERT_TONE_ALARM,      // hostile: a follower on our tail, a deauth storm
+    ALERT_TONE_COUNT,
+} alert_tone_t;
 
 // Dashboard footer quotes (10 lines)
 static const char *home_footer_quotes[] = {
@@ -1397,9 +1863,7 @@ static void style_danger_button(lv_obj_t *btn)
     lv_obj_set_style_radius(btn, 8, 0);
 }
 
-// Observer global variables (large arrays in PSRAM)
-static observer_network_t *observer_networks = NULL;  // Allocated in PSRAM
-// Note: observer_task_handle is now per-context (ctx->observer_task)
+// Observer polling state is per-context (ctx->observer_task / popup_focus_task).
 #define POPUP_POLL_INTERVAL_MS  10000  // 10 seconds
 
 // Deauth popup state
@@ -1424,10 +1888,6 @@ static char evil_twin_html_files[20][64];  // Max 20 files, 64 chars each
 static volatile bool evil_twin_monitoring = false;
 static TaskHandle_t evil_twin_monitor_task_handle = NULL;
 
-// PSRAM buffers for observer (allocated once)
-static char *observer_rx_buffer = NULL;
-static char *observer_line_buffer = NULL;
-
 // LVGL UI elements - pages
 static lv_obj_t *tiles_container = NULL;
 static lv_obj_t *observer_page = NULL;
@@ -1448,7 +1908,17 @@ static bool mbus_detected = false;
 // SD card presence on Tab5 itself (checked via /sdcard mount point)
 static bool internal_sd_present = false;
 static bool board_detection_popup_open = false;
-static lv_timer_t *board_detect_retry_timer = NULL;
+// Retry detection runs on its own task, not an LVGL timer: detect_boards()
+// blocks ~3s on UART ping timeouts, and running that from an LVGL timer froze
+// the whole UI (the "Continue Anyway" button and touch-to-wake stopped
+// responding because the LVGL task never got to read the touch panel).
+static TaskHandle_t board_detect_retry_task_handle = NULL;
+static volatile bool board_detect_retry_stop = false;
+// Set while a UART board probe is running, so the retry task and the hotplug
+// redetect never talk to the same UARTs at once.
+static volatile bool board_probe_in_progress = false;
+// Boot-time probe task (runs once, behind the splash).
+static TaskHandle_t boot_detect_task_handle = NULL;
 static lv_obj_t *board_detect_popup = NULL;
 static lv_obj_t *board_detect_overlay = NULL;
 
@@ -1580,6 +2050,9 @@ static void hide_all_pages(tab_context_t *ctx) {
     if (ctx->portal_data_page) lv_obj_add_flag(ctx->portal_data_page, LV_OBJ_FLAG_HIDDEN);
     if (ctx->handshakes_page) lv_obj_add_flag(ctx->handshakes_page, LV_OBJ_FLAG_HIDDEN);
     if (ctx->wardrive_files_page) lv_obj_add_flag(ctx->wardrive_files_page, LV_OBJ_FLAG_HIDDEN);
+    if (ctx->espshark_page) lv_obj_add_flag(ctx->espshark_page, LV_OBJ_FLAG_HIDDEN);
+    if (ctx->pcap_captures_page) lv_obj_add_flag(ctx->pcap_captures_page, LV_OBJ_FLAG_HIDDEN);
+    if (ctx->pcap_viewer_page) lv_obj_add_flag(ctx->pcap_viewer_page, LV_OBJ_FLAG_HIDDEN);
     if (ctx->deauth_detector_page) lv_obj_add_flag(ctx->deauth_detector_page, LV_OBJ_FLAG_HIDDEN);
     if (ctx->bt_menu_page) lv_obj_add_flag(ctx->bt_menu_page, LV_OBJ_FLAG_HIDDEN);
     if (ctx->bt_airtag_page) lv_obj_add_flag(ctx->bt_airtag_page, LV_OBJ_FLAG_HIDDEN);
@@ -1590,6 +2063,7 @@ static void hide_all_pages(tab_context_t *ctx) {
     if (ctx->arp_poison_page) lv_obj_add_flag(ctx->arp_poison_page, LV_OBJ_FLAG_HIDDEN);
     if (ctx->nmap_page) lv_obj_add_flag(ctx->nmap_page, LV_OBJ_FLAG_HIDDEN);
     if (ctx->wardrive_page) lv_obj_add_flag(ctx->wardrive_page, LV_OBJ_FLAG_HIDDEN);
+    if (ctx->gitm && ctx->gitm->page) lv_obj_add_flag(ctx->gitm->page, LV_OBJ_FLAG_HIDDEN);
     if (ctx->antisurv_page) lv_obj_add_flag(ctx->antisurv_page, LV_OBJ_FLAG_HIDDEN);
     if (ctx->iot_page) lv_obj_add_flag(ctx->iot_page, LV_OBJ_FLAG_HIDDEN);
     if (ctx->sd_admin_page) lv_obj_add_flag(ctx->sd_admin_page, LV_OBJ_FLAG_HIDDEN);
@@ -1612,6 +2086,18 @@ static void init_tab_context(tab_context_t *ctx) {
         ctx->observer_networks = heap_caps_calloc(MAX_OBSERVER_NETWORKS, sizeof(observer_network_t), MALLOC_CAP_SPIRAM);
         if (!ctx->observer_networks) {
             ESP_LOGE(TAG, "Failed to allocate observer_networks in PSRAM");
+        }
+    }
+    if (!ctx->observer_rx_buffer) {
+        ctx->observer_rx_buffer = heap_caps_malloc(UART_BUF_SIZE, MALLOC_CAP_SPIRAM);
+        if (!ctx->observer_rx_buffer) {
+            ESP_LOGE(TAG, "Failed to allocate observer RX buffer in PSRAM");
+        }
+    }
+    if (!ctx->observer_line_buffer) {
+        ctx->observer_line_buffer = heap_caps_malloc(OBSERVER_LINE_BUFFER_SIZE, MALLOC_CAP_SPIRAM);
+        if (!ctx->observer_line_buffer) {
+            ESP_LOGE(TAG, "Failed to allocate observer line buffer in PSRAM");
         }
     }
 
@@ -1730,7 +2216,7 @@ static void prepare_observer_attack_override(tab_context_t *ctx, int observer_id
     snprintf(ctx->observer_attack_network.ssid, sizeof(ctx->observer_attack_network.ssid), "%s", net->ssid);
     snprintf(ctx->observer_attack_network.bssid, sizeof(ctx->observer_attack_network.bssid), "%s", net->bssid);
     snprintf(ctx->observer_attack_network.band, sizeof(ctx->observer_attack_network.band), "%s", net->band);
-    snprintf(ctx->observer_attack_network.security, sizeof(ctx->observer_attack_network.security), "%s", "Unknown");
+    snprintf(ctx->observer_attack_network.security, sizeof(ctx->observer_attack_network.security), "%s", net->security);
 
     ctx->observer_attack_override_active = true;
     ctx->observer_attack_override_sel_index = 0;
@@ -2241,7 +2727,11 @@ static void client_row_click_cb(lv_event_t *e);
 static void show_network_popup(int network_idx);
 static void close_network_popup(void);
 static void destroy_network_popup_ui(tab_context_t *ctx);
+static void popup_focus_task(void *arg);
+static void quiesce_observer_for_attack(tab_context_t *ctx);
 static void pause_observer_for_attack(tab_context_t *ctx);
+static bool wait_for_observer_uart_idle(tab_context_t *ctx, uint32_t timeout_ms);
+static bool observer_handshaker_prepare_selection(tab_context_t *ctx, wifi_network_t *target);
 static void show_deauth_popup(int network_idx, int client_idx);
 static void destroy_deauth_popup_ui(void);
 static void close_deauth_popup(void);
@@ -2267,6 +2757,9 @@ static void handshaker_monitor_task(void *arg);
 static void show_mitm_popup(void);
 static void mitm_connect_and_start_cb(lv_event_t *e);
 static void mitm_popup_close_cb(lv_event_t *e);
+static void show_gitm_page(void);
+static void show_gitm_page_from_scan(void);
+static void show_rogue_gitm_popup(tab_context_t *ctx, int victim_view_idx);
 static void show_arp_poison_page(void);
 static void show_rogue_ap_page(void);
 static void show_rogue_ap_popup(tab_context_t *ctx);
@@ -2352,6 +2845,8 @@ static void show_theme_popup(void);
 static void style_theme_switch(lv_obj_t *sw);
 static void theme_dark_mode_switch_cb(lv_event_t *e);
 static void theme_boot_sound_dropdown_cb(lv_event_t *e);
+static void theme_alert_sound_switch_cb(lv_event_t *e);
+static void alert_chime_play(alert_tone_t tone);
 static void show_red_team_settings_page(void);
 static void show_screen_timeout_popup(void);
 static void show_screen_brightness_popup(void);
@@ -2361,6 +2856,7 @@ static void init_uart2(void);
 static void deinit_uart2(void);
 static void load_red_team_from_nvs(void);
 static void save_boot_sound_to_nvs(boot_sound_mode_t mode);
+static void save_alert_sound_to_nvs(bool enabled);
 static void save_dashboard_to_nvs(bool enabled);
 static void save_dark_mode_to_nvs(bool enabled);
 static void load_dashboard_from_nvs(void);
@@ -2380,7 +2876,7 @@ static void janos_copy_version_token(const char *src, char *dst);
 static void show_version_mismatch_popup(void);
 static void show_ota_page(void);
 static void show_no_board_popup(void);
-static void board_detect_retry_cb(lv_timer_t *timer);
+static void board_detect_retry_task(void *arg);
 static void board_detect_popup_close_cb(lv_event_t *e);
 static void reload_gui_for_detection(void);
 static void detection_complete_cb(lv_timer_t *timer);
@@ -2428,6 +2924,7 @@ static void phishing_portal_monitor_task(void *arg);
 static void show_wardrive_page(void);
 static void wardrive_start_cb(lv_event_t *e);
 static void wardrive_stop_cb(lv_event_t *e);
+static void wardrive_request_stop(tab_context_t *ctx);
 static void wardrive_back_cb(lv_event_t *e);
 static void wardrive_monitor_task(void *arg);
 static void update_wardrive_table(tab_context_t *ctx);
@@ -2538,11 +3035,29 @@ static void show_evil_twin_passwords_page(void);
 static void show_portal_data_page(void);
 static void show_handshakes_page(void);
 static void show_wardrive_files_page(void);
+static void show_espshark_page(void);
+static void show_pcap_captures_page(void);
+static void show_pcap_viewer_page(void);
+static void pcap_viewer_render_capture_page(pcap_viewer_state_t *state);
+static void pcap_viewer_render_packet_page(pcap_viewer_state_t *state);
+static void pcap_viewer_file_open_cb(lv_event_t *e);
+static void pcap_viewer_tools_cb(lv_event_t *e);
+static void pcap_viewer_show_summary_popup(pcap_viewer_state_t *state,
+                                           const char *title_text,
+                                           const char *body_text);
+static void pcap_viewer_show_dns_top(pcap_viewer_state_t *state);
+static void pcap_viewer_start_file_load(pcap_viewer_state_t *state, const char *path,
+                                        const char *name, bool force_reanalyze);
+static void compromised_file_copy_cb(lv_event_t *e);
+static void compromised_files_sync_cb(lv_event_t *e);
 static void compromised_file_delete_cb(lv_event_t *e);
 static void compromised_file_clean_cb(lv_event_t *e);
+static void show_compromised_delete_confirm(tab_context_t *ctx,
+                                            compromised_cleanup_task_args_t *task_args);
 static void close_compromised_cleanup_popup(tab_context_t *ctx);
 static void compromised_files_load_task(void *arg);
 static void compromised_files_load_async_render(void *user_data);
+static bool janos_sync_state_has_local_copy(tab_id_t tab, const char *remote_path);
 static void wardrive_cleanup_move_confirm_cb(lv_event_t *e);
 static void wardrive_cleanup_close_cb(lv_event_t *e);
 static void wardrive_cleanup_dry_run_cb(lv_event_t *e);
@@ -3801,6 +4316,7 @@ static bool usb_log_tuned = false;
 static bool board_redetect_pending = false;
 static bool usb_debug_logs = true;
 static bool usb_cdc_preferred_valid = false;
+static bool usb_cdc_driver_installed = false;
 static uint8_t usb_cdc_preferred_itf = 0;
 static uint16_t usb_last_vid = 0;
 static uint16_t usb_last_pid = 0;
@@ -3971,6 +4487,11 @@ static void usb_cdc_new_dev_cb(usb_device_handle_t usb_dev, void *user_data)
         }
     }
 
+    if (usb_cdc_preferred_valid) {
+        // Drop any retry backoff so the next usb_transport_init() picks this up.
+        usb_next_retry_ms = 0;
+    }
+
     if (usb_debug_logs) {
         ESP_LOGI(TAG, "[USB] new_dev_cb: vid=0x%04X pid=0x%04X class=0x%02X pref_itf=%u valid=%d",
                  device_desc->idVendor,
@@ -4027,6 +4548,13 @@ static void board_redetect_cb(void *user_data)
     ESP_LOGI(TAG, "board_redetect_cb called");
     board_redetect_pending = false;
 
+    // The retry task may be mid-probe on the same UARTs; it re-probes every 3s
+    // anyway, so skip this pass instead of talking over it.
+    if (board_probe_in_progress) {
+        ESP_LOGI(TAG, "Redetect: probe already in progress, skipping");
+        return;
+    }
+
     bool prev_grove = grove_detected;
     bool prev_usb = usb_detected;
     bool prev_uart2 = mbus_detected;
@@ -4035,6 +4563,7 @@ static void board_redetect_cb(void *user_data)
     bool prev_mbus_sd = mbus_ctx.sd_card_present;
     bool prev_internal_sd = internal_sd_present;
 
+    board_probe_in_progress = true;
     detect_boards();
 
     // One SD probe only, and only after the board answered ping.
@@ -4042,6 +4571,7 @@ static void board_redetect_cb(void *user_data)
 
     // Re-probe Sub-GHz availability so the home tile reflects the new state.
     check_all_subghz_status();
+    board_probe_in_progress = false;
 
     bool changed = (prev_grove != grove_detected) ||
                    (prev_usb != usb_detected) ||
@@ -4139,6 +4669,11 @@ static void usb_cdc_disconnect_cb(usbh_cdc_handle_t cdc_handle, void *user_data)
     if (usb_cdc_handle == cdc_handle) {
         usb_cdc_handle = NULL;
     }
+    if (usb_transport_ready) {
+        // A Monster that was actually talking to us just went away, which
+        // during a long attack is exactly what nobody notices in time.
+        alert_chime_play(ALERT_TONE_WARN);
+    }
     usb_cdc_connected = false;
     usb_transport_ready = false;
     usb_transport_warned = false;
@@ -4225,23 +4760,30 @@ static void usb_transport_init(void)
         ESP_LOGI(TAG, "[USB] USB host already installed");
     }
 
-    usbh_cdc_driver_config_t config = {
-        .task_stack_size = 4096,
-        .task_priority = 5,
-        .task_coreid = -1,
-        .skip_init_usb_host_driver = true,
-        .new_dev_cb = usb_cdc_new_dev_cb,
-        .user_data = NULL,
-    };
-    if (usb_debug_logs) {
-        ESP_LOGI(TAG, "[USB] CDC driver config: stack=%d prio=%d core=%d",
-                 config.task_stack_size, config.task_priority, config.task_coreid);
-    }
+    esp_err_t err = ESP_OK;
 
-    esp_err_t err = usbh_cdc_driver_install(&config);
-    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
-        ESP_LOGE(TAG, "[USB] CDC driver install failed: %s", esp_err_to_name(err));
-        return;
+    // Install once. Re-installing on every detection retry made the component
+    // itself log "usbh_cdc already installed" at ERROR level each pass.
+    if (!usb_cdc_driver_installed) {
+        usbh_cdc_driver_config_t config = {
+            .task_stack_size = 4096,
+            .task_priority = 5,
+            .task_coreid = -1,
+            .skip_init_usb_host_driver = true,
+            .new_dev_cb = usb_cdc_new_dev_cb,
+            .user_data = NULL,
+        };
+        if (usb_debug_logs) {
+            ESP_LOGI(TAG, "[USB] CDC driver config: stack=%d prio=%d core=%d",
+                     config.task_stack_size, config.task_priority, config.task_coreid);
+        }
+
+        err = usbh_cdc_driver_install(&config);
+        if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+            ESP_LOGE(TAG, "[USB] CDC driver install failed: %s", esp_err_to_name(err));
+            return;
+        }
+        usb_cdc_driver_installed = true;
     }
 
     if (usb_debug_logs) {
@@ -4255,6 +4797,10 @@ static void usb_transport_init(void)
         if (usb_debug_logs) {
             ESP_LOGW(TAG, "[USB] No CDC-DATA or bulk IN/OUT interface found, ignoring device");
         }
+        // Nothing usable is attached: back off so the 100ms wait above does not
+        // run on every detection retry. usb_cdc_new_dev_cb clears this the
+        // moment a device shows up.
+        usb_next_retry_ms = now_ms + 5000;
         return;
     }
 
@@ -4302,6 +4848,7 @@ static __attribute__((unused)) void usb_transport_deinit(void)
     }
 
     usbh_cdc_driver_uninstall();
+    usb_cdc_driver_installed = false;
     if (usb_host_started_by_us) {
         bsp_usb_host_stop();
         usb_host_started_by_us = false;
@@ -5024,6 +5571,123 @@ static bool extract_inspect_uptime(const char *line, char *out, size_t out_sz)
     return len > 0;
 }
 
+// ======================= Captured password lookup =========================
+//
+// JanOS stores captured Wi-Fi passwords on its SD card and prints them with
+// `show_pass evil`, one `"SSID", "password"` row per line. Caching that table
+// per tab lets every network list say - with no extra round trip - whether we
+// already hold the key to a given SSID, and lets the GITM upstream step fill it
+// in for you.
+//
+// The fetch has to run on whichever task currently owns the transport, right
+// after a scan, so it can never interleave with another command.
+
+// Parse one `"SSID", "password"` row into the cache.
+static void creds_parse_line(tab_context_t *ctx, const char *line)
+{
+    if (ctx->evil_twin_entry_count >= EVIL_TWIN_MAX_ENTRIES) return;
+    if (line[0] != '"') return;
+
+    const char *ssid_start = line + 1;
+    const char *ssid_end = strchr(ssid_start, '"');
+    if (!ssid_end) return;
+    // The separator is exactly `", ` followed by the opening quote. The `&&`
+    // short-circuit stops this walking past the terminator on a truncated line.
+    if (ssid_end[1] != ',' || ssid_end[2] != ' ' || ssid_end[3] != '"') return;
+
+    const char *pass_start = ssid_end + 4;
+    const char *pass_end = strchr(pass_start, '"');
+    if (!pass_end) return;
+
+    size_t ssid_len = (size_t)(ssid_end - ssid_start);
+    size_t pass_len = (size_t)(pass_end - pass_start);
+    if (ssid_len == 0 || ssid_len > 32 || pass_len == 0 || pass_len > 64) return;
+
+    evil_twin_entry_t *e = &ctx->evil_twin_entries[ctx->evil_twin_entry_count];
+    memcpy(e->ssid, ssid_start, ssid_len);
+    e->ssid[ssid_len] = '\0';
+    memcpy(e->password, pass_start, pass_len);
+    e->password[pass_len] = '\0';
+    ctx->evil_twin_entry_count++;
+}
+
+// Refresh this tab's captured-password cache. Call only from a task that holds
+// the transport and is not mid-command.
+static void creds_fetch(tab_context_t *ctx, tab_id_t tab, uart_port_t port)
+{
+    if (!ctx || !ctx->evil_twin_entries) return;
+    ctx->evil_twin_entry_count = 0;
+
+    if (tab == TAB_USB && usb_cdc_handle) {
+        usbh_cdc_flush_rx_buffer(usb_cdc_handle);
+    } else {
+        uart_flush(port);
+    }
+    transport_write_bytes_tab(tab, port, "show_pass evil\r\n", 16);
+
+    // `show_pass` prints no terminator, so this drains until JanOS goes quiet.
+    // A flat 2 s wait would be charged to every scan; instead we stop 400 ms
+    // after the last byte, and only fall back to the hard cap if nothing comes.
+    char rx[512];
+    char line[320];
+    int line_pos = 0;
+    const TickType_t start = xTaskGetTickCount();
+    const TickType_t hard_cap = pdMS_TO_TICKS(2000);
+    const TickType_t quiet_for = pdMS_TO_TICKS(400);
+    TickType_t last_data = start;
+    bool saw_data = false;
+
+    while ((xTaskGetTickCount() - start) < hard_cap) {
+        int len = transport_read_bytes_tab(tab, port, rx, sizeof(rx) - 1,
+                                           pdMS_TO_TICKS(100));
+        if (len <= 0) {
+            if (saw_data && (xTaskGetTickCount() - last_data) >= quiet_for) break;
+            continue;
+        }
+        saw_data = true;
+        last_data = xTaskGetTickCount();
+        for (int i = 0; i < len; i++) {
+            char c = rx[i];
+            if (c == '\n' || c == '\r') {
+                if (line_pos > 0) {
+                    line[line_pos] = '\0';
+                    line_pos = 0;
+                    creds_parse_line(ctx, line);
+                }
+                continue;
+            }
+            if (line_pos < (int)sizeof(line) - 1) line[line_pos++] = c;
+        }
+    }
+    ESP_LOGI(TAG, "[%s] Cached %d captured password(s)",
+             tab_transport_name(tab), ctx->evil_twin_entry_count);
+}
+
+// The password we hold for `ssid`, or NULL when we have none.
+static const char *creds_lookup(tab_context_t *ctx, const char *ssid)
+{
+    if (!ctx || !ctx->evil_twin_entries || !ssid || ssid[0] == '\0') return NULL;
+    for (int i = 0; i < ctx->evil_twin_entry_count; i++) {
+        if (strcmp(ctx->evil_twin_entries[i].ssid, ssid) == 0) {
+            return ctx->evil_twin_entries[i].password;
+        }
+    }
+    return NULL;
+}
+
+static bool creds_have(tab_context_t *ctx, const char *ssid)
+{
+    return creds_lookup(ctx, ssid) != NULL;
+}
+
+// Recolor-markup badge appended to a network row when we hold its password.
+// Every list that renders a row must use this, including the inspect tasks that
+// rewrite rows in place - otherwise the badge is painted and then overwritten.
+static const char *creds_badge(tab_context_t *ctx, const char *ssid)
+{
+    return creds_have(ctx, ssid) ? "  |  #55DD99 password saved#" : "";
+}
+
 static void inspect_networks_task(void *arg)
 {
     tab_id_t tab = (tab_id_t)(uintptr_t)arg;
@@ -5124,11 +5788,12 @@ static void inspect_networks_task(void *arg)
                 const char *sec_col_s   = strstr(net->security, "WPA3") ? "#55DD55" :
                                           strstr(net->security, "WPA2") ? "#00CCCC" : "#FF6666";
                 lv_label_set_text_fmt(ctx->inspect_info_labels[i - 1],
-                    "#5599FF %s#  |  #5599FF CH%d#  |  %s %s#  |  %s %s#  |  %s %d dBm#\n%s  |  Uptime: %s\nVendor: %s",
+                    "#5599FF %s#  |  #5599FF CH%d#  |  %s %s#  |  %s %s#  |  %s %d dBm#%s\n%s  |  Uptime: %s\nVendor: %s",
                     net->bssid, net->channel,
                     band_col_s, net->band,
                     sec_col_s, net->security,
                     rssi_col_s, net->rssi,
+                    creds_badge(ctx, net->ssid),
                     mfp_capable ? "#FF5555 MFP On#" : "#55DD55 MFP Off#",
                     up_text, vendor_display);
             }
@@ -5202,10 +5867,11 @@ static void inspect_observer_task(void *arg)
                     const char *rssi_col_oa = net->rssi > -50 ? "#55DD55" : (net->rssi > -70 ? "#FFAA00" : "#FF5555");
                     const char *band_col_oa = strstr(net->band, "5") ? "#CC66FF" : "#FFAA33";
                     lv_label_set_text_fmt(ctx->observer_inspect_info_labels[i],
-                        "#5599FF %s#  |  #5599FF CH%d#  |  %s %s#  |  %s %d dBm#\n%s  |  Uptime: %s\nVendor: %s",
+                        "#5599FF %s#  |  #5599FF CH%d#  |  %s %s#  |  %s %d dBm#%s\n%s  |  Uptime: %s\nVendor: %s",
                         net->bssid, net->channel,
                         band_col_oa, net->band,
                         rssi_col_oa, net->rssi,
+                        creds_badge(ctx, net->ssid),
                         net->mfp_capable ? "#FF5555 MFP On#" : "#55DD55 MFP Off#",
                         up_text, net->vendor[0] ? net->vendor : "-");
                 }
@@ -5274,10 +5940,11 @@ static void inspect_observer_task(void *arg)
                     const char *rssi_col_ob = net->rssi > -50 ? "#55DD55" : (net->rssi > -70 ? "#FFAA00" : "#FF5555");
                     const char *band_col_ob = strstr(net->band, "5") ? "#CC66FF" : "#FFAA33";
                     lv_label_set_text_fmt(ctx->observer_inspect_info_labels[i],
-                        "#5599FF %s#  |  #5599FF CH%d#  |  %s %s#  |  %s %d dBm#\n%s  |  Uptime: %s\nVendor: %s",
+                        "#5599FF %s#  |  #5599FF CH%d#  |  %s %s#  |  %s %d dBm#%s\n%s  |  Uptime: %s\nVendor: %s",
                         net->bssid, net->channel,
                         band_col_ob, net->band,
                         rssi_col_ob, net->rssi,
+                        creds_badge(ctx, net->ssid),
                         mfp_capable ? "#FF5555 MFP On#" : "#55DD55 MFP Off#",
                         up_text, net->vendor[0] ? net->vendor : "-");
                 }
@@ -5393,6 +6060,13 @@ static void wifi_scan_task(void *arg)
     log_memory_stats("RX-scan");
     ESP_LOGI(TAG, "[%s] Scan finished. Found %d networks", uart_name, ctx->network_count);
 
+    // The UART is idle here and the inspect pass has not started yet, so this
+    // is the safe moment to refresh the cache. Done before taking the display
+    // lock: the drain can run for up to 2 s and must not stall rendering.
+    if (scan_complete) {
+        creds_fetch(ctx, scan_tab, uart_port);
+    }
+
     // Update UI on main thread
     bsp_display_lock(0);
 
@@ -5492,11 +6166,12 @@ static void wifi_scan_task(void *arg)
                                      strstr(net->security, "WPA2") ? "#00CCCC" : "#FF6666";
             lv_label_set_recolor(info_label, true);
             lv_label_set_text_fmt(info_label,
-                "#5599FF %s#  |  #5599FF CH%d#  |  %s %s#  |  %s %s#  |  %s %d dBm#\nVendor: %s",
+                "#5599FF %s#  |  #5599FF CH%d#  |  %s %s#  |  %s %s#  |  %s %d dBm#%s\nVendor: %s",
                 net->bssid, net->channel,
                 band_col, net->band,
                 sec_col, net->security,
                 rssi_col, net->rssi,
+                creds_badge(ctx, net->ssid),
                 vendor_display);
             lv_obj_set_style_text_font(info_label, &lv_font_montserrat_12, 0);
             lv_obj_set_style_text_color(info_label, lv_color_hex(0x888888), 0);
@@ -5924,22 +6599,26 @@ static void splash_timer_cb(lv_timer_t *timer)
     }
 }
 
-// Detection complete callback - runs detection, reports it in the boot log,
-// builds the real UI behind the splash and schedules the closing fade.
-static void detection_complete_cb(lv_timer_t *timer)
+// The boot probes themselves: ~3-5s of blocking UART timeouts when nothing is
+// connected. Kept in one place so the task and the inline fallback agree.
+static void boot_detect_run_probes(void)
 {
-    (void)timer;
-    detection_timer = NULL;
-
-    if (intro_detection_done || intro_finishing) return;
-
-    ESP_LOGI(TAG, "Detection timer complete, running board detection");
-
-    // Run board detection (blocking UART probes).
+    board_probe_in_progress = true;
     detect_boards();
     check_all_sd_cards();
     check_all_versions();
     check_all_subghz_status();
+    board_probe_in_progress = false;
+}
+
+// Detection finished - reports it in the boot log, builds the real UI behind
+// the splash and schedules the closing fade. Runs on the LVGL thread.
+static void boot_detection_done_async(void *user_data)
+{
+    (void)user_data;
+
+    if (intro_detection_done || intro_finishing) return;
+
     intro_detection_done = true;
 
     ESP_LOGI(TAG, "Detection complete: uart1=%d, mbus=%d, grove=%d, usb=%d",
@@ -5980,6 +6659,210 @@ static void detection_complete_cb(lv_timer_t *timer)
     lv_timer_set_repeat_count(intro_finish_timer, 1);
 }
 
+// Boot probe task: keeps the blocking UART timeouts off the LVGL thread so the
+// intro animation and its boot log keep running while the Monster is probed.
+static void boot_detect_task(void *arg)
+{
+    (void)arg;
+    boot_detect_run_probes();
+    lv_async_call(boot_detection_done_async, NULL);
+    boot_detect_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+// Detection timer fired - kick off the probe task. `intro_detection_done` stays
+// false until the probe really finishes, so tap-to-skip still waits for it.
+static void detection_complete_cb(lv_timer_t *timer)
+{
+    (void)timer;
+    detection_timer = NULL;
+
+    if (intro_detection_done || intro_finishing || boot_detect_task_handle) return;
+
+    ESP_LOGI(TAG, "Detection timer complete, running board detection");
+
+    if (xTaskCreate(boot_detect_task, "boot_detect", 6144, NULL, 4,
+                    &boot_detect_task_handle) != pdPASS) {
+        boot_detect_task_handle = NULL;
+        ESP_LOGE(TAG, "Failed to start boot detection task - probing inline");
+        boot_detect_run_probes();
+        boot_detection_done_async(NULL);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tone playback
+//
+// The startup melody and the short UI chimes render the same way, so the
+// renderer lives in one place. It blocks inside i2s_write for the whole tune,
+// so it belongs in a throwaway task - never on the LVGL thread.
+// ---------------------------------------------------------------------------
+
+#define MELODY_SR  48000
+
+typedef struct { float freq; int ms; } melody_note_t;
+
+// One tune at a time: two players would interleave their buffers into the same
+// I2S stream and fight over the codec volume. A request that arrives while the
+// speaker is busy is dropped rather than queued - a notification beep is only
+// worth anything while it is still news.
+static SemaphoreHandle_t audio_tone_mutex = NULL;
+
+// The BSP's "reconfigure the clock" call is really an esp_codec_dev close +
+// open, and closing powers the ES8388 DAC down and mutes it (es8388_stop).
+// Doing that before every tune threw away the opening of a short chime while
+// the DAC came back up. Nothing else in the firmware touches the codec, so the
+// format is set once and then left alone.
+static bool audio_fmt_ready = false;
+
+// Silence written straight after that one configuration, so the DAC power-up
+// settles against zeros instead of eating the first note.
+#define AUDIO_WARMUP_MS 120
+
+// `gain` is the peak amplitude (0..1), `attack_ms`/`release_ms` shape each note,
+// `pause_ms` separates them and `tail_ms` is the silence flushed afterwards so
+// the codec does not clip the last note.
+static void audio_play_notes(const melody_note_t *notes, int count, const char *what,
+                             int volume_pct, float gain, int attack_ms, int release_ms,
+                             int pause_ms, int tail_ms)
+{
+    if (!notes || count <= 0) return;
+
+    bsp_codec_config_t *codec = bsp_get_codec_handle();
+    if (!codec || !codec->i2s_write || !codec->set_volume || !codec->i2s_reconfig_clk_fn) {
+        ESP_LOGW(TAG, "Audio codec not available, skipping %s", what);
+        return;
+    }
+
+    if (!audio_tone_mutex || xSemaphoreTake(audio_tone_mutex, 0) != pdTRUE) {
+        ESP_LOGI(TAG, "Speaker is busy, skipping %s", what);
+        return;
+    }
+
+    // The codec is opened *before* any sample is rendered, so the very first
+    // buffer we produce can go straight out.
+    int restore_volume = 80;
+    if (codec->get_volume) {
+        int current_volume = codec->get_volume();
+        if (current_volume >= 0 && current_volume <= 100) {
+            restore_volume = current_volume;
+        }
+    }
+    codec->set_volume(volume_pct);
+
+    bool warm_up = !audio_fmt_ready;
+    if (warm_up) {
+        codec->i2s_reconfig_clk_fn(MELODY_SR, 16, I2S_SLOT_MODE_STEREO);
+        audio_fmt_ready = true;
+    }
+
+    // One note at a time, not the whole tune up front. Rendering everything
+    // first delayed the first audible sample by the full render time, which on
+    // this board is far from free: all code is XIP from PSRAM and competes with
+    // the LVGL boot intro for bandwidth.
+    int longest_ms = tail_ms;
+    if (warm_up && AUDIO_WARMUP_MS > longest_ms) longest_ms = AUDIO_WARMUP_MS;
+    for (int n = 0; n < count; n++) {
+        int span = notes[n].ms + pause_ms;
+        if (span > longest_ms) longest_ms = span;
+    }
+    const int chunk_samples = MELODY_SR * longest_ms / 1000 + 8;
+    const size_t chunk_bytes = (size_t)chunk_samples * 2 * sizeof(int16_t);
+
+    int16_t *buf = heap_caps_malloc(chunk_bytes, MALLOC_CAP_SPIRAM);
+    if (!buf) {
+        ESP_LOGE(TAG, "Failed to allocate the %s buffer (%d bytes)", what, (int)chunk_bytes);
+        codec->set_volume(restore_volume);
+        xSemaphoreGive(audio_tone_mutex);
+        return;
+    }
+
+    ESP_LOGI(TAG, "Playing %s at %d%% (gain %.2f)", what, volume_pct, (double)gain);
+
+    size_t bytes_written = 0;
+    bool write_failed = false;
+    const int gap_samples = MELODY_SR * pause_ms / 1000;
+
+    if (warm_up) {
+        const int warm_samples = MELODY_SR * AUDIO_WARMUP_MS / 1000;
+        const size_t warm_bytes = (size_t)warm_samples * 2 * sizeof(int16_t);
+        memset(buf, 0, warm_bytes);
+        size_t warm_done = 0;
+        if (codec->i2s_write(buf, warm_bytes, &warm_done, portMAX_DELAY) != ESP_OK) {
+            write_failed = true;
+        }
+    }
+
+    for (int n = 0; n < count; n++) {
+        const int note_samples = MELODY_SR * notes[n].ms / 1000;
+        if (note_samples < 4) continue;
+
+        // The envelope is clamped per note: a chime wants a long soft tail,
+        // which has to fold into a note shorter than the tail itself.
+        int attack = MELODY_SR * attack_ms / 1000;
+        int release = MELODY_SR * release_ms / 1000;
+        if (attack > note_samples / 4) attack = note_samples / 4;
+        if (release > note_samples / 2) release = note_samples / 2;
+        if (release < 2) release = 2;
+
+        // Two-term recurrence ("magic circle") oscillator: one sinf per note
+        // instead of one per sample. sinf() per sample was the actual cost here
+        // - tens of thousands of libm calls through the PSRAM instruction cache.
+        const float k = 2.0f * sinf((float)M_PI * notes[n].freq / MELODY_SR);
+        float osc_c = 1.0f;   // tracks cos
+        float osc_s = 0.0f;   // tracks sin
+
+        int pos = 0;
+        for (int i = 0; i < note_samples; i++) {
+            osc_c -= k * osc_s;
+            osc_s += k * osc_c;
+
+            float env = 1.0f;
+            if (i < attack) {
+                env = (float)i / attack;
+            } else if (i >= note_samples - release) {
+                env = (float)(note_samples - 1 - i) / (release - 1);
+            }
+
+            int16_t s = (int16_t)(osc_s * env * gain * 32767.0f);
+            buf[pos++] = s;
+            buf[pos++] = s;
+        }
+        for (int i = 0; i < gap_samples; i++) {
+            buf[pos++] = 0;
+            buf[pos++] = 0;
+        }
+
+        size_t chunk_done = 0;
+        if (codec->i2s_write(buf, pos * sizeof(int16_t), &chunk_done, portMAX_DELAY) != ESP_OK) {
+            write_failed = true;
+        }
+        bytes_written += chunk_done;
+    }
+
+    if (tail_ms > 0) {
+        const int final_gap = MELODY_SR * tail_ms / 1000;
+        memset(buf, 0, (size_t)final_gap * 2 * sizeof(int16_t));
+        size_t tail_done = 0;
+        if (codec->i2s_write(buf, (size_t)final_gap * 2 * sizeof(int16_t), &tail_done,
+                             portMAX_DELAY) != ESP_OK) {
+            write_failed = true;
+        }
+        bytes_written += tail_done;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(40));
+    codec->set_volume(restore_volume);
+
+    heap_caps_free(buf);
+    xSemaphoreGive(audio_tone_mutex);
+    if (write_failed) {
+        ESP_LOGW(TAG, "Finished %s, but the codec rejected at least one buffer", what);
+    } else {
+        ESP_LOGI(TAG, "Finished %s (%d bytes written)", what, (int)bytes_written);
+    }
+}
+
 static void play_startup_beep(void)
 {
     boot_sound_mode_t selected_mode = boot_sound_mode;
@@ -5989,19 +6872,8 @@ static void play_startup_beep(void)
         return;
     }
 
-    bsp_codec_config_t *codec = bsp_get_codec_handle();
-    if (!codec || !codec->i2s_write || !codec->set_volume || !codec->i2s_reconfig_clk_fn) {
-        ESP_LOGW(TAG, "Audio codec not available, skipping startup melody");
-        vTaskDelete(NULL);
-        return;
-    }
-
-    #define MELODY_SR  48000
-
-    typedef struct { float freq; int ms; } note_t;
-
     // Nokia Tune (Gran Vals by Francisco Tarrega)
-    static const note_t nokia_tune[] = {
+    static const melody_note_t nokia_tune[] = {
         { 659.25f, 125 },  // E5  eighth
         { 587.33f, 125 },  // D5  eighth
         { 369.99f, 250 },  // F#4 quarter
@@ -6018,7 +6890,7 @@ static void play_startup_beep(void)
     };
 
     // Intel-like startup jingle (short 5-note motif).
-    static const note_t intel_jingle[] = {
+    static const melody_note_t intel_jingle[] = {
         { 622.25f, 100 },  // D#5
         { 659.25f, 100 },  // E5
         { 493.88f, 110 },  // B4
@@ -6027,7 +6899,7 @@ static void play_startup_beep(void)
     };
 
     // Star Wars main motif (slower intro phrase).
-    static const note_t star_wars_motif[] = {
+    static const melody_note_t star_wars_motif[] = {
         { 440.00f, 380 },  // A4
         { 440.00f, 380 },  // A4
         { 440.00f, 380 },  // A4
@@ -6039,106 +6911,153 @@ static void play_startup_beep(void)
         { 440.00f, 680 },  // A4
     };
 
-    const note_t *melody = nokia_tune;
+    const melody_note_t *melody = nokia_tune;
     int melody_notes = (int)(sizeof(nokia_tune) / sizeof(nokia_tune[0]));
-    const char *melody_name = "Nokia";
+    const char *what = "the Nokia startup melody";
 
     switch (selected_mode) {
         case BOOT_SOUND_MODE_NOKIA:
             melody = nokia_tune;
             melody_notes = (int)(sizeof(nokia_tune) / sizeof(nokia_tune[0]));
-            melody_name = "Nokia";
+            what = "the Nokia startup melody";
             break;
         case BOOT_SOUND_MODE_INTEL:
             melody = intel_jingle;
             melody_notes = (int)(sizeof(intel_jingle) / sizeof(intel_jingle[0]));
-            melody_name = "Intel";
+            what = "the Intel startup melody";
             break;
         case BOOT_SOUND_MODE_STAR_WARS:
             melody = star_wars_motif;
             melody_notes = (int)(sizeof(star_wars_motif) / sizeof(star_wars_motif[0]));
-            melody_name = "Star Wars";
+            what = "the Star Wars startup melody";
             break;
         case BOOT_SOUND_MODE_OFF:
         default:
             melody = nokia_tune;
             melody_notes = (int)(sizeof(nokia_tune) / sizeof(nokia_tune[0]));
-            melody_name = "Nokia";
+            what = "the Nokia startup melody";
             break;
     }
 
-    ESP_LOGI(TAG, "Playing startup melody: %s at %d%%", melody_name, BOOT_SOUND_VOLUME_PERCENT);
-
     const int pause_ms = (selected_mode == BOOT_SOUND_MODE_STAR_WARS) ? 42 : 20;
-    const int final_silence_ms = 160;
-    int total_ms = 0;
-    for (int n = 0; n < melody_notes; n++)
-        total_ms += melody[n].ms + pause_ms;
-    total_ms += final_silence_ms;
 
-    const int total_samples = MELODY_SR * total_ms / 1000;
-    const size_t buf_bytes = total_samples * 2 * sizeof(int16_t);
+    audio_play_notes(melody, melody_notes, what, BOOT_SOUND_VOLUME_PERCENT,
+                     0.85f, 5, 15, pause_ms, 160);
+    vTaskDelete(NULL);
+}
 
-    int16_t *buf = heap_caps_malloc(buf_bytes, MALLOC_CAP_SPIRAM);
-    if (!buf) {
-        ESP_LOGE(TAG, "Failed to allocate melody buffer (%d bytes)", (int)buf_bytes);
-        vTaskDelete(NULL);
+// "Someone arrived", not "alarm": an ascending fourth in the middle register,
+// with a long decay on the second note. Nothing above D5, so it carries across
+// a room without turning into a shriek.
+static const melody_note_t alert_notes_join[] = {
+    { 440.00f,  70 },  // A4
+    { 587.33f, 190 },  // D5
+};
+
+// Loot. An A major triad on the way up - the one tune here allowed to sound
+// pleased with itself.
+static const melody_note_t alert_notes_win[] = {
+    { 440.00f,  70 },  // A4
+    { 554.37f,  70 },  // C#5
+    { 659.25f, 230 },  // E5
+};
+
+// The same fourth as the join chime, walked backwards and slower. Falling
+// intervals read as "something dropped" without any training.
+static const melody_note_t alert_notes_warn[] = {
+    { 587.33f, 110 },  // D5
+    { 440.00f, 260 },  // A4
+};
+
+// A two-tone siren, four pulses. This is the only tone meant to be unpleasant,
+// because it is the only one you must not miss.
+//
+// It started life three octaves lower, on E4, and was inaudible on hardware
+// even at a higher volume than the join chime - the Tab5 speaker is a
+// micro-driver whose output falls away below roughly 600 Hz, so pitch, not
+// level, was what buried it. Urgency here comes from the alternating interval
+// and the rhythm; keep every alert tone inside the band the driver can
+// actually move, i.e. do not go below the join chime's A4.
+static const melody_note_t alert_notes_alarm[] = {
+    { 880.00f, 110 },  // A5
+    { 698.46f, 110 },  // F5
+    { 880.00f, 110 },  // A5
+    { 698.46f, 150 },  // F5
+};
+
+typedef struct {
+    const melody_note_t *notes;
+    int   count;
+    const char *name;
+    int   volume_pct;
+    float gain;
+    int   attack_ms;
+    int   release_ms;
+    int   pause_ms;
+    int   tail_ms;
+    int   cooldown_ms;   // shortest gap between two of this kind
+} alert_tone_def_t;
+
+// Cooldowns are not politeness, they are correctness: JanOS reports one
+// handshake over two or three SUCCESS lines, a rogue AP repeats its client
+// count every poll, and a deauth storm is hundreds of lines a minute. Without
+// a floor between repeats the speaker turns into a machine gun and the alert
+// stops carrying information.
+static const alert_tone_def_t alert_tones[ALERT_TONE_COUNT] = {
+    [ALERT_TONE_JOIN] = {
+        alert_notes_join, (int)(sizeof(alert_notes_join) / sizeof(alert_notes_join[0])),
+        "the client-join chime", ALERT_SOUND_VOLUME_PERCENT, 0.75f, 12, 140, 12, 60, 2000,
+    },
+    [ALERT_TONE_WIN] = {
+        alert_notes_win, (int)(sizeof(alert_notes_win) / sizeof(alert_notes_win[0])),
+        "the capture chime", ALERT_SOUND_VOLUME_PERCENT, 0.80f, 10, 130, 10, 60, 2500,
+    },
+    [ALERT_TONE_WARN] = {
+        alert_notes_warn, (int)(sizeof(alert_notes_warn) / sizeof(alert_notes_warn[0])),
+        "the warning chime", ALERT_SOUND_VOLUME_PERCENT, 0.80f, 14, 200, 14, 80, 3000,
+    },
+    [ALERT_TONE_ALARM] = {
+        alert_notes_alarm, (int)(sizeof(alert_notes_alarm) / sizeof(alert_notes_alarm[0])),
+        "the alarm", 75, 0.85f, 8, 60, 45, 80, 15000,
+    },
+};
+
+static uint32_t alert_last_tick[ALERT_TONE_COUNT];   // 0 = never played
+
+static void alert_chime_task(void *arg)
+{
+    const alert_tone_def_t *def = (const alert_tone_def_t *)arg;
+    audio_play_notes(def->notes, def->count, def->name, def->volume_pct, def->gain,
+                     def->attack_ms, def->release_ms, def->pause_ms, def->tail_ms);
+    vTaskDelete(NULL);
+}
+
+// Fire and forget. Callers are UART monitor tasks that must not sit inside
+// i2s_write while the Monster keeps talking, an httpd handler owing a client a
+// response, and LVGL callbacks that must not block at all - so the tune gets
+// its own short-lived task.
+//
+// `alert_last_tick` is written without a lock. Two tasks racing on the same
+// kind can at worst let one extra chime through, which is cheaper than a mutex
+// on a path that must never block its caller.
+static void alert_chime_play(alert_tone_t tone)
+{
+    if (!alert_sound_enabled) return;
+    if (tone < 0 || tone >= ALERT_TONE_COUNT) return;
+
+    const alert_tone_def_t *def = &alert_tones[tone];
+    uint32_t now = (uint32_t)xTaskGetTickCount();
+    uint32_t last = alert_last_tick[tone];
+    if (last != 0 && (now - last) < (uint32_t)pdMS_TO_TICKS(def->cooldown_ms)) {
         return;
     }
-    memset(buf, 0, buf_bytes);
+    alert_last_tick[tone] = now ? now : 1;   // 0 is the "never played" marker
 
-    int pos = 0;
-    for (int n = 0; n < melody_notes; n++) {
-        float freq = melody[n].freq;
-        int note_samples = MELODY_SR * melody[n].ms / 1000;
-        int attack = MELODY_SR * 5 / 1000;
-        int release = MELODY_SR * 15 / 1000;
-
-        for (int i = 0; i < note_samples; i++) {
-            float t = (float)i / MELODY_SR;
-            float env = 1.0f;
-            if (i < attack)
-                env = (float)i / attack;
-            else if (i >= note_samples - release)
-                env = (float)(note_samples - 1 - i) / (release - 1);
-
-            int16_t s = (int16_t)(sinf(2.0f * M_PI * freq * t) * env * 0.85f * 32767.0f);
-            buf[pos++] = s;
-            buf[pos++] = s;
-        }
-
-        int gap = MELODY_SR * pause_ms / 1000;
-        for (int i = 0; i < gap; i++) {
-            buf[pos++] = 0;
-            buf[pos++] = 0;
-        }
+    // Priority 6, like the boot melody: almost always blocked in i2s_write, but
+    // it must not be starved between buffers or the DMA underruns.
+    if (xTaskCreate(alert_chime_task, "chime", 4096, (void *)def, 6, NULL) != pdPASS) {
+        ESP_LOGW(TAG, "Failed to start the alert chime task");
     }
-
-    int final_gap = MELODY_SR * final_silence_ms / 1000;
-    for (int i = 0; i < final_gap; i++) {
-        buf[pos++] = 0;
-        buf[pos++] = 0;
-    }
-
-    int restore_volume = 80;
-    if (codec->get_volume) {
-        int current_volume = codec->get_volume();
-        if (current_volume >= 0 && current_volume <= 100) {
-            restore_volume = current_volume;
-        }
-    }
-
-    codec->set_volume(BOOT_SOUND_VOLUME_PERCENT);
-    codec->i2s_reconfig_clk_fn(MELODY_SR, 16, I2S_SLOT_MODE_STEREO);
-
-    size_t bytes_written = 0;
-    codec->i2s_write(buf, pos * sizeof(int16_t), &bytes_written, portMAX_DELAY);
-    vTaskDelay(pdMS_TO_TICKS(final_silence_ms + 40));
-    codec->set_volume(restore_volume);
-
-    heap_caps_free(buf);
-    ESP_LOGI(TAG, "Startup melody done (%s, %d bytes written)", melody_name, (int)bytes_written);
-    vTaskDelete(NULL);
 }
 
 // Show the procedural retro boot intro (all LVGL primitives, no bitmap asset).
@@ -6176,17 +7095,6 @@ static void show_splash_screen(void)
 
     splash_timer = lv_timer_create(splash_timer_cb, INTRO_TICK_MS, NULL);
 
-    if (boot_sound_mode != BOOT_SOUND_MODE_OFF) {
-        // Play startup melody in background task to not block UI (unchanged).
-        xTaskCreate(
-            (TaskFunction_t)play_startup_beep,
-            "melody",
-            8192,
-            NULL,
-            3,
-            NULL
-        );
-    }
 }
 
 // Scan button click handler
@@ -6400,7 +7308,7 @@ static lv_obj_t *create_small_tile(lv_obj_t *parent, const char *icon, const cha
 static void create_attack_action_bar(lv_obj_t *parent, lv_event_cb_t callback, lv_event_cb_t karma_callback)
 {
     bool three_cols = enable_red_team;
-    lv_coord_t bar_h = three_cols ? 240 : 162;
+    lv_coord_t bar_h = three_cols ? 318 : 162;
 
     lv_obj_t *attack_bar = lv_obj_create(parent);
     lv_obj_set_size(attack_bar, lv_pct(100), bar_h);
@@ -6452,6 +7360,17 @@ static void create_attack_action_bar(lv_obj_t *parent, lv_event_cb_t callback, l
             lv_obj_set_flex_align(attack_row3, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
             lv_obj_clear_flag(attack_row3, LV_OBJ_FLAG_SCROLLABLE);
 
+            // Row 4 carries the single Rogue GITM tile at full width.
+            lv_obj_t *attack_row4 = lv_obj_create(attack_bar);
+            lv_obj_set_size(attack_row4, lv_pct(100), 72);
+            lv_obj_set_style_bg_opa(attack_row4, LV_OPA_TRANSP, 0);
+            lv_obj_set_style_border_width(attack_row4, 0, 0);
+            lv_obj_set_style_pad_all(attack_row4, 0, 0);
+            lv_obj_set_style_pad_gap(attack_row4, 8, 0);
+            lv_obj_set_flex_flow(attack_row4, LV_FLEX_FLOW_ROW);
+            lv_obj_set_flex_align(attack_row4, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+            lv_obj_clear_flag(attack_row4, LV_OBJ_FLAG_SCROLLABLE);
+
             const lv_coord_t gap3 = 16;
             lv_coord_t bw = (row_inner_w - gap3) / 3;
             if (bw < 60) bw = 60;
@@ -6471,10 +7390,26 @@ static void create_attack_action_bar(lv_obj_t *parent, lv_event_cb_t callback, l
             } else {
                 b9 = create_small_tile(attack_row3, LV_SYMBOL_GPS, "Radar", COLOR_MATERIAL_BLUE, callback, "Radar");
             }
+            // Capture Gateway (GITM): connect upstream + raise our own AP on JanOS,
+            // route + capture the client's traffic. Shares row 3 as a fourth tile.
+            lv_obj_t *b10 = create_small_tile(attack_row3, LV_SYMBOL_LOOP, "GITM", COLOR_MATERIAL_BLUE, callback, "Capture GW");
 
             lv_obj_set_size(b1, bw, 72); lv_obj_set_size(b2, bw, 72); lv_obj_set_size(b3, bw_last, 72);
             lv_obj_set_size(b4, bw, 72); lv_obj_set_size(b5, bw, 72); lv_obj_set_size(b6, bw_last, 72);
-            lv_obj_set_size(b7, bw, 72); lv_obj_set_size(b8, bw, 72); lv_obj_set_size(b9, bw_last, 72);
+
+            // Row 3 now holds four tiles; size them on a 4-column grid (3 gaps).
+            const lv_coord_t gap4 = 24;
+            lv_coord_t bw4 = (row_inner_w - gap4) / 4;
+            if (bw4 < 52) bw4 = 52;
+            lv_coord_t bw4_last = bw4 + (row_inner_w - gap4 - bw4 * 4);
+            lv_obj_set_size(b7, bw4, 72); lv_obj_set_size(b8, bw4, 72);
+            lv_obj_set_size(b9, bw4, 72); lv_obj_set_size(b10, bw4_last, 72);
+
+            // Rogue GITM: deauth + same-SSID mirror + capture through our uplink.
+            // Kept apart from the clean GITM tile as its own full-width row.
+            lv_obj_t *b11 = create_small_tile(attack_row4, LV_SYMBOL_LOOP, "Rogue GITM",
+                                              COLOR_LAB5_MAGENTA, callback, "Rogue GITM");
+            lv_obj_set_size(b11, row_inner_w, 72);
         }
     } else {
         // Non-red-team: ARP + Nmap (+ Karma if requested)
@@ -7917,6 +8852,40 @@ static void hidden_ssid_arp_confirm_cb(const char *ssid)
     show_arp_poison_page();
 }
 
+static void hidden_ssid_mitm_confirm_cb(const char *ssid)
+{
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx || !ssid || ssid[0] == '\0') return;
+
+    scan_view_t v = get_scan_view(ctx);
+    if (v.sel_count <= 0) return;
+    int idx = v.sel_indices[0];
+    if (idx < 0 || idx >= v.net_count) return;
+
+    strncpy(v.nets[idx].ssid, ssid, sizeof(v.nets[idx].ssid) - 1);
+    v.nets[idx].ssid[sizeof(v.nets[idx].ssid) - 1] = '\0';
+    ESP_LOGI(TAG, "MITM: Hidden network resolved as '%s' (%s)",
+             v.nets[idx].ssid, v.nets[idx].bssid);
+    show_mitm_popup();
+}
+
+static void hidden_ssid_gw_confirm_cb(const char *ssid)
+{
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx || !ssid || ssid[0] == '\0') return;
+
+    scan_view_t v = get_scan_view(ctx);
+    if (v.sel_count <= 0) return;
+    int idx = v.sel_indices[0];
+    if (idx < 0 || idx >= v.net_count) return;
+
+    strncpy(v.nets[idx].ssid, ssid, sizeof(v.nets[idx].ssid) - 1);
+    v.nets[idx].ssid[sizeof(v.nets[idx].ssid) - 1] = '\0';
+    ESP_LOGI(TAG, "GITM: hidden upstream resolved as '%s' (%s)",
+             v.nets[idx].ssid, v.nets[idx].bssid);
+    show_gitm_page_from_scan();
+}
+
 static void hidden_ssid_rogueap_confirm_cb(const char *ssid)
 {
     tab_context_t *ctx = get_current_ctx();
@@ -7931,6 +8900,23 @@ static void hidden_ssid_rogueap_confirm_cb(const char *ssid)
         }
     }
     show_rogue_ap_page();
+}
+
+static void hidden_ssid_rogue_gitm_confirm_cb(const char *ssid)
+{
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx || !ssid || ssid[0] == '\0') return;
+
+    scan_view_t v = get_scan_view(ctx);
+    if (v.sel_count <= 0) return;
+    int idx = v.sel_indices[0];
+    if (idx < 0 || idx >= v.net_count) return;
+
+    strncpy(v.nets[idx].ssid, ssid, sizeof(v.nets[idx].ssid) - 1);
+    v.nets[idx].ssid[sizeof(v.nets[idx].ssid) - 1] = '\0';
+    ESP_LOGI(TAG, "Rogue GITM: hidden victim resolved as '%s' (%s)",
+             v.nets[idx].ssid, v.nets[idx].bssid);
+    show_rogue_gitm_popup(ctx, idx);
 }
 
 static void hidden_ssid_wardrive_confirm_cb(const char *ssid)
@@ -8072,7 +9058,54 @@ static void handle_selected_attack(const char *attack_name)
             }
             return;
         }
+        int idx = v.sel_indices[0];
+        if (idx < 0 || idx >= v.net_count) return;
+        if (v.nets[idx].ssid[0] == '\0') {
+            show_hidden_ssid_popup(hidden_ssid_mitm_confirm_cb);
+            return;
+        }
         show_mitm_popup();
+        return;
+    }
+
+    if (strcmp(attack_name, "Capture GW") == 0) {
+        // The GITM page scans for its own upstream, so a selection here is only
+        // a shortcut. One selected network is carried in preselected; a hidden
+        // one is resolved first so JanOS receives a real SSID.
+        if (v.sel_count == 1) {
+            int idx = v.sel_indices[0];
+            if (idx >= 0 && idx < v.net_count && v.nets[idx].ssid[0] == '\0') {
+                show_hidden_ssid_popup(hidden_ssid_gw_confirm_cb);
+                return;
+            }
+        }
+        show_gitm_page_from_scan();
+        return;
+    }
+
+    if (strcmp(attack_name, "Rogue GITM") == 0) {
+        if (v.sel_count != 1) {
+            ESP_LOGW(TAG, "Rogue GITM requires exactly 1 network, selected: %d", v.sel_count);
+            if (ctx->scan_status_label) {
+                bsp_display_lock(0);
+                lv_label_set_text(ctx->scan_status_label, "Select exactly 1 network for Rogue GITM");
+                lv_obj_set_style_text_color(ctx->scan_status_label, COLOR_MATERIAL_RED, 0);
+                bsp_display_unlock();
+            }
+            return;
+        }
+
+        int vic = v.sel_indices[0];
+        if (vic < 0 || vic >= v.net_count) return;
+
+        // The SSID is mirrored back to the victim, so a hidden one has to be
+        // resolved first; the confirm callback reopens the picker.
+        if (v.nets[vic].ssid[0] == '\0') {
+            show_hidden_ssid_popup(hidden_ssid_rogue_gitm_confirm_cb);
+            return;
+        }
+
+        show_rogue_gitm_popup(ctx, vic);
         return;
     }
 
@@ -8165,6 +9198,23 @@ static void observer_attack_tile_event_cb(lv_event_t *e)
     int observer_idx = ctx->popup_network_idx;
     if (observer_idx < 0 || observer_idx >= ctx->observer_network_count) return;
 
+    if (ctx->popup_focus_active || !ctx->popup_focus_ready) {
+        ESP_LOGW(TAG, "Observer attack ignored: popup target is not ready");
+        if (ctx->popup_title_label && lv_obj_is_valid(ctx->popup_title_label)) {
+            lv_label_set_text(ctx->popup_title_label,
+                              "Please wait - preparing selected network...");
+            lv_obj_set_style_text_color(ctx->popup_title_label,
+                                        COLOR_MATERIAL_AMBER, 0);
+        }
+        if (ctx->observer_status_label) {
+            lv_label_set_text(ctx->observer_status_label,
+                              "Preparing selected network - please wait");
+            lv_obj_set_style_text_color(ctx->observer_status_label,
+                                        COLOR_MATERIAL_AMBER, 0);
+        }
+        return;
+    }
+
     prepare_observer_attack_override(ctx, observer_idx);
     ctx->observer_attack_return_to_observer =
         (strcmp(attack_name, "ARP Poison") == 0 || strcmp(attack_name, "Rogue AP") == 0 || strcmp(attack_name, "Nmap") == 0);
@@ -8174,10 +9224,12 @@ static void observer_attack_tile_event_cb(lv_event_t *e)
         xTimerStop(ctx->popup_timer, 0);
     }
 
-    // Stop the popup sniffer before launching any attack — firmware rejects
-    // commands (wifi_connect, etc.) while a sniffer/scan operation is active.
-    uart_send_command_for_tab("stop");
-    vTaskDelay(pdMS_TO_TICKS(150));
+    // Handshaker performs a full Observer task shutdown in
+    // show_handshaker_popup(). Other attacks keep the legacy stop sequence.
+    if (strcmp(attack_name, "Handshaker") != 0) {
+        uart_send_command_for_tab("stop");
+        vTaskDelay(pdMS_TO_TICKS(150));
+    }
 
     handle_selected_attack(attack_name);
 }
@@ -8459,14 +9511,23 @@ static void mitm_connect_and_start_cb(lv_event_t *e)
     int idx = v.sel_indices[0];
     if (idx < 0 || idx >= v.net_count) return;
     const char *ssid = v.nets[idx].ssid;
-    bool is_open = wifi_network_security_is_open(v.nets[idx].security);
+    bool security_is_open = wifi_network_security_is_open(v.nets[idx].security);
 
     const char *password = NULL;
     if (ctx->mitm_password_input) {
         password = lv_textarea_get_text(ctx->mitm_password_input);
     }
+    bool password_provided = password != NULL && password[0] != '\0';
 
-    if (!is_open && (password == NULL || strlen(password) == 0)) {
+    // Credentials take precedence over an incomplete/unknown security value.
+    // Observer attacks used to lose the security field and therefore discarded
+    // a password that had just been found in the Evil Twin database.
+    wifi_connect_auth_mode_t auth_mode = WIFI_CONNECT_AUTH_OPEN;
+    if (ctx->mitm_use_saved_password) {
+        auth_mode = WIFI_CONNECT_AUTH_SAVED;
+    } else if (password_provided) {
+        auth_mode = WIFI_CONNECT_AUTH_PASSWORD;
+    } else if (!security_is_open) {
         if (ctx->mitm_status_label) {
             lv_label_set_text(ctx->mitm_status_label, "Enter password first");
             lv_obj_set_style_text_color(ctx->mitm_status_label, COLOR_MATERIAL_RED, 0);
@@ -8474,7 +9535,10 @@ static void mitm_connect_and_start_cb(lv_event_t *e)
         return;
     }
 
-    ESP_LOGI(TAG, "MITM: Connecting to %s%s", ssid, is_open ? " (open)" : "");
+    const char *auth_label = auth_mode == WIFI_CONNECT_AUTH_SAVED
+        ? "saved password"
+        : (auth_mode == WIFI_CONNECT_AUTH_PASSWORD ? "entered password" : "open");
+    ESP_LOGI(TAG, "MITM: Connecting to %s (%s)", ssid, auth_label);
 
     if (ctx->mitm_keyboard) {
         lv_obj_add_flag(ctx->mitm_keyboard, LV_OBJ_FLAG_HIDDEN);
@@ -8490,23 +9554,26 @@ static void mitm_connect_and_start_cb(lv_event_t *e)
     vTaskDelay(pdMS_TO_TICKS(50));
 
     char cmd[256];
-    wifi_connect_auth_mode_t auth_mode =
-        (is_open || password == NULL || strlen(password) == 0)
-            ? WIFI_CONNECT_AUTH_OPEN
-            : (ctx->mitm_use_saved_password ? WIFI_CONNECT_AUTH_SAVED
-                                             : WIFI_CONNECT_AUTH_PASSWORD);
     if (!build_wifi_connect_command(cmd, sizeof(cmd), ssid, password, auth_mode)) {
-        ESP_LOGW(TAG, "MITM: wifi_connect command too long, aborting");
+        ESP_LOGW(TAG, "MITM: invalid SSID/password or wifi_connect command too long");
         bsp_display_lock(0);
         if (ctx->mitm_status_label) {
-            lv_label_set_text(ctx->mitm_status_label, "SSID/password too long");
+            lv_label_set_text(ctx->mitm_status_label,
+                              ssid[0] ? "SSID/password too long"
+                                      : "Enter hidden SSID first");
             lv_obj_set_style_text_color(ctx->mitm_status_label, COLOR_MATERIAL_RED, 0);
         }
         return;
     }
+    tab_id_t mitm_tab = current_tab;
+    uart_port_t uart_port = uart_port_for_tab(mitm_tab);
+    if (mitm_tab == TAB_USB && usb_cdc_handle) {
+        usbh_cdc_flush_rx_buffer(usb_cdc_handle);
+    } else {
+        uart_flush(uart_port);
+    }
     uart_send_command_for_tab(cmd);
 
-    uart_port_t uart_port = get_current_uart();
     static char rx_buffer[2048];
     int total_len = 0;
     bool success = false;
@@ -8514,8 +9581,9 @@ static void mitm_connect_and_start_cb(lv_event_t *e)
     int elapsed_ms = 0;
 
     while (elapsed_ms < timeout_ms && total_len < (int)sizeof(rx_buffer) - 256) {
-        int len = transport_read_bytes(uart_port, rx_buffer + total_len,
-                                       sizeof(rx_buffer) - total_len - 1, pdMS_TO_TICKS(200));
+        int len = transport_read_bytes_tab(mitm_tab, uart_port, rx_buffer + total_len,
+                                           sizeof(rx_buffer) - total_len - 1,
+                                           pdMS_TO_TICKS(200));
         if (len > 0) {
             total_len += len;
             rx_buffer[total_len] = '\0';
@@ -8542,7 +9610,7 @@ static void mitm_connect_and_start_cb(lv_event_t *e)
 
         char pcap_filename[256] = {0};
         {
-            uart_port_t pcap_port = get_current_uart();
+            uart_port_t pcap_port = uart_port_for_tab(mitm_tab);
             char pcap_rx[512];
             char pcap_line[256];
             int pcap_line_pos = 0;
@@ -8550,7 +9618,9 @@ static void mitm_connect_and_start_cb(lv_event_t *e)
             int pcap_empty = 0;
 
             while (pcap_retries-- > 0) {
-                int plen = transport_read_bytes(pcap_port, pcap_rx, sizeof(pcap_rx) - 1, pdMS_TO_TICKS(100));
+                int plen = transport_read_bytes_tab(mitm_tab, pcap_port, pcap_rx,
+                                                    sizeof(pcap_rx) - 1,
+                                                    pdMS_TO_TICKS(100));
                 if (plen > 0) {
                     pcap_rx[plen] = '\0';
                     pcap_empty = 0;
@@ -8612,9 +9682,21 @@ static void mitm_connect_and_start_cb(lv_event_t *e)
         }
     } else {
         ESP_LOGW(TAG, "MITM: Connection failed to %s", ssid);
+        bool saved_password_failed = ctx->mitm_use_saved_password;
+        ctx->mitm_use_saved_password = false;
+        if (ctx->mitm_password_input) {
+            lv_textarea_set_placeholder_text(ctx->mitm_password_input,
+                                             "Enter password manually");
+        }
         if (ctx->mitm_status_label) {
-            lv_label_set_text_fmt(ctx->mitm_status_label,
-                "Connection failed to %s\nCheck password and try again.", ssid);
+            if (saved_password_failed) {
+                lv_label_set_text_fmt(ctx->mitm_status_label,
+                    "Saved password was not accepted for %s.\n"
+                    "Enter or correct the password and try again.", ssid);
+            } else {
+                lv_label_set_text_fmt(ctx->mitm_status_label,
+                    "Connection failed to %s\nCheck password and try again.", ssid);
+            }
             lv_obj_set_style_text_color(ctx->mitm_status_label, COLOR_MATERIAL_RED, 0);
         }
     }
@@ -8633,6 +9715,7 @@ static void show_mitm_popup(void)
 
     wifi_network_t *net = &v.nets[idx];
     const char *ssid_display = strlen(net->ssid) > 0 ? net->ssid : "(Hidden)";
+    bool is_open = wifi_network_security_is_open(net->security);
 
     // Check Evil Twin DB for a saved password.
     char mitm_found_password[65] = {0};
@@ -8641,16 +9724,24 @@ static void show_mitm_popup(void)
         evil_twin_entry_count = 0;
         memset(evil_twin_entries, 0, sizeof(evil_twin_entries));
 
-        uart_port_t uart_port = get_current_uart();
-        uart_flush(uart_port);
-        uart_send_command_for_tab("show_pass evil");
+        tab_id_t active_tab = current_tab;
+        uart_port_t uart_port = uart_port_for_tab(active_tab);
+        if (active_tab == TAB_USB && usb_cdc_handle) {
+            usbh_cdc_flush_rx_buffer(usb_cdc_handle);
+        } else {
+            uart_flush(uart_port);
+        }
+        transport_write_bytes_tab(active_tab, uart_port, "show_pass evil\r\n", 16);
+        vTaskDelay(pdMS_TO_TICKS(200));
 
         char rx_buffer[512];
-        int retries = 10;
+        int retries = 16;
         int empty_reads = 0;
 
         while (retries-- > 0 && evil_twin_entry_count < 50) {
-            int len = transport_read_bytes(uart_port, rx_buffer, sizeof(rx_buffer) - 1, pdMS_TO_TICKS(100));
+            int len = transport_read_bytes_tab(active_tab, uart_port, rx_buffer,
+                                               sizeof(rx_buffer) - 1,
+                                               pdMS_TO_TICKS(100));
             if (len > 0) {
                 rx_buffer[len] = '\0';
                 empty_reads = 0;
@@ -8677,7 +9768,7 @@ static void show_mitm_popup(void)
                 }
             } else {
                 empty_reads++;
-                if (empty_reads >= 3) break;
+                if (empty_reads >= 6) break;
             }
             vTaskDelay(pdMS_TO_TICKS(50));
         }
@@ -8751,6 +9842,7 @@ static void show_mitm_popup(void)
     lv_obj_set_size(ctx->mitm_password_input, 320, 40);
     lv_textarea_set_one_line(ctx->mitm_password_input, true);
     lv_textarea_set_placeholder_text(ctx->mitm_password_input, "WiFi password");
+    lv_textarea_set_password_mode(ctx->mitm_password_input, true);
     lv_obj_set_style_bg_color(ctx->mitm_password_input, lv_color_hex(0x1A1A1A), 0);
     lv_obj_set_style_border_color(ctx->mitm_password_input, COLOR_MATERIAL_TEAL, 0);
     lv_obj_set_style_border_width(ctx->mitm_password_input, 1, 0);
@@ -8760,18 +9852,32 @@ static void show_mitm_popup(void)
 
     if (mitm_password_known) {
         lv_textarea_set_text(ctx->mitm_password_input, mitm_found_password);
-        ctx->mitm_use_saved_password = true;
+    } else if (!is_open) {
+        lv_textarea_set_placeholder_text(ctx->mitm_password_input,
+                                         "Saved password on JanOS");
     } else {
-        ctx->mitm_use_saved_password = false;
+        lv_obj_add_flag(ctx->mitm_pass_row, LV_OBJ_FLAG_HIDDEN);
     }
+    // For every secured network, let JanOS resolve --saved against eviltwin.txt,
+    // portals.txt and home.txt. If it fails, the callback switches to manual input.
+    ctx->mitm_use_saved_password = mitm_password_known || !is_open;
 
     ctx->mitm_status_label = lv_label_create(ctx->mitm_popup);
-    lv_label_set_text(ctx->mitm_status_label,
-        mitm_password_known ? "Saved password found. Press Connect & Start."
-                            : "Enter WiFi password to connect and start PCAP capture.");
+    if (mitm_password_known) {
+        lv_label_set_text(ctx->mitm_status_label,
+                          "Known password found. Press Connect & Start.");
+    } else if (!is_open) {
+        lv_label_set_text(ctx->mitm_status_label,
+                          "JanOS saved passwords will be tried automatically.\n"
+                          "If none matches, manual input will be enabled.");
+    } else {
+        lv_label_set_text(ctx->mitm_status_label,
+                          "Open network. Press Connect & Start.");
+    }
     lv_obj_set_style_text_font(ctx->mitm_status_label, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(ctx->mitm_status_label,
-        mitm_password_known ? COLOR_MATERIAL_GREEN : lv_color_hex(0xCCCCCC), 0);
+        (mitm_password_known || !is_open) ? COLOR_MATERIAL_GREEN
+                                         : lv_color_hex(0xCCCCCC), 0);
     lv_obj_set_style_text_align(ctx->mitm_status_label, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_width(ctx->mitm_status_label, lv_pct(100));
 
@@ -8831,6 +9937,2664 @@ static void show_mitm_popup(void)
     lv_obj_add_flag(ctx->mitm_keyboard, LV_OBJ_FLAG_HIDDEN);
 }
 
+// ======================= GITM (JanOS Capture Gateway) =======================
+//
+// GITM = Gate-in-the-Middle. JanOS/C5 becomes the real IPv4 gateway for the
+// test client: it holds the upstream STA, raises our own SoftAP, performs NAPT
+// and records downstream traffic to PCAP on the Monster SD *before* address
+// translation, so the client's real address survives into the capture.
+//
+// Tab5 owns the forms, the validation, the PCAP basename and the presentation;
+// JanOS owns the radio, the capture lifecycle and the file. The controller
+// contract implemented here is section 8 of
+//   projectZero/ESP32C5/docs/janos-capture-gateway.md
+// "GITM" is the display name only - the wire protocol stays `capture_gateway`
+// and `[CGW]` (section 8.11), so firmware compatibility is unaffected.
+//
+// Flow, matching the state machine of section 8.6:
+//   IDLE -> CONNECTING (wifi_connect) -> STARTING (capture_gateway start)
+//        -> [RECOVERING on the documented APSTA rollback] -> RUNNING
+//        -> STOPPING (universal `stop`) -> FINALIZED (active=0 confirmed)
+
+typedef enum {
+    GITM_IDLE = 0,
+    GITM_CONNECTING,
+    GITM_STARTING,
+    GITM_RECOVERING,
+    GITM_RUNNING,
+    GITM_STOPPING,
+    GITM_FINALIZED,
+} gitm_state_t;
+
+// Section 8.6: at most two automatic retries of the APSTA-recovery failure.
+#define GITM_MAX_START_RETRIES 2
+// Section 8.6: start can spend ~15 s recovering the STA before arming the SD.
+#define GITM_START_TIMEOUT_MS  26000
+#define GITM_STATUS_TIMEOUT_MS 4000
+#define GITM_STOP_TIMEOUT_MS   15000
+// Steady-state counter refresh. JanOS announces the things that actually
+// matter (clients joining or leaving, upstream loss) on its own, so the poll
+// only has to carry packets/bytes and does not need to be fast.
+#define GITM_POLL_INTERVAL_MS  3000
+// Slice we listen on between polls; also the worst-case delay on a STOP press.
+#define GITM_EVENT_WINDOW_MS   250
+
+static void show_gitm_page(void);
+static void gitm_render_live(tab_context_t *ctx);
+static void gitm_render_net_list(tab_context_t *ctx);
+static void gitm_net_row_cb(lv_event_t *e);
+static void gitm_restore_setup(tab_context_t *ctx);
+static void gitm_set_collapsed(lv_obj_t *content, lv_obj_t *chev, bool collapsed);
+static void gitm_collapse_upstream(tab_context_t *ctx);
+static void gitm_collapse_ap(tab_context_t *ctx);
+
+// Fetch this tab's GITM state, allocating it in PSRAM on first use. Returns NULL
+// only when PSRAM is exhausted, in which case the page simply does not open.
+static gitm_ctx_t *gitm_ctx(tab_context_t *ctx)
+{
+    if (!ctx) return NULL;
+    if (!ctx->gitm) {
+        ctx->gitm = heap_caps_calloc(1, sizeof(gitm_ctx_t), MALLOC_CAP_SPIRAM);
+        if (!ctx->gitm) {
+            ESP_LOGE(TAG, "GITM: failed to allocate page state in PSRAM");
+            return NULL;
+        }
+        ctx->gitm->up_index = -1;
+    }
+    return ctx->gitm;
+}
+
+// Forget everything we know about the connected clients. Called whenever a new
+// session begins, so the join chime cannot fire for a device that was already
+// on the AP before this page owned it.
+static void gitm_reset_client_tracking(tab_context_t *ctx)
+{
+    if (!ctx || !ctx->gitm) return;
+    ctx->gitm->client_sig[0] = '\0';
+    ctx->gitm->chime_mac_count = 0;
+    ctx->gitm->chime_armed = false;
+    ctx->gitm->warn_upstream_down = false;
+    ctx->gitm->warn_degraded = false;
+}
+
+// ---------------------------------------------------------------------------
+// Small helpers
+// ---------------------------------------------------------------------------
+
+static void gitm_flush_rx(tab_id_t tab, uart_port_t port)
+{
+    if (tab == TAB_USB && usb_cdc_handle) {
+        usbh_cdc_flush_rx_buffer(usb_cdc_handle);
+    } else {
+        uart_flush(port);
+    }
+}
+
+// Mirror the whole JanOS conversation to the serial console. A GITM failure is
+// almost always something the Monster said, and without this the console shows
+// nothing at all. Set to 0 to silence the per-line RX echo.
+#define GITM_LOG_TRAFFIC 1
+
+// Log an outgoing command with CR/LF stripped. Callers must pass an already
+// redacted string when the command carries a password.
+static void gitm_log_tx(const char *cmd)
+{
+    char clean[192];
+    size_t n = 0;
+    for (const char *p = cmd; *p && n < sizeof(clean) - 1; p++) {
+        if (*p != '\r' && *p != '\n') clean[n++] = *p;
+    }
+    clean[n] = '\0';
+    ESP_LOGI(TAG, "GITM > %s", clean);
+}
+
+#if GITM_LOG_TRAFFIC
+#define GITM_LOG_RX(line) ESP_LOGI(TAG, "GITM < %s", (line))
+#else
+#define GITM_LOG_RX(line) do { (void)(line); } while (0)
+#endif
+
+static void gitm_format_bytes(uint64_t bytes, char *out, size_t out_size)
+{
+    if (bytes >= 1024ULL * 1024ULL) {
+        snprintf(out, out_size, "%.1f MB", (double)bytes / (1024.0 * 1024.0));
+    } else if (bytes >= 1024ULL) {
+        snprintf(out, out_size, "%.1f KB", (double)bytes / 1024.0);
+    } else {
+        snprintf(out, out_size, "%llu B", (unsigned long long)bytes);
+    }
+}
+
+// Group a packet counter so six-digit values stay readable at a glance.
+static void gitm_format_count(uint32_t n, char *out, size_t out_size)
+{
+    if (n >= 1000000) {
+        snprintf(out, out_size, "%lu %03lu %03lu",
+                 (unsigned long)(n / 1000000), (unsigned long)((n / 1000) % 1000),
+                 (unsigned long)(n % 1000));
+    } else if (n >= 1000) {
+        snprintf(out, out_size, "%lu %03lu",
+                 (unsigned long)(n / 1000), (unsigned long)(n % 1000));
+    } else {
+        snprintf(out, out_size, "%lu", (unsigned long)n);
+    }
+}
+
+// Section 8.2: the controller generates the basename, sanitized to the safe
+// character set JanOS accepts ([A-Za-z0-9._-]) and stamped from the Tab5 clock,
+// which is the better real-time source in this pairing.
+static void gitm_build_pcap_basename(const char *prefix, char *out, size_t out_size)
+{
+    char clean[40];
+    size_t n = 0;
+    for (const char *p = prefix ? prefix : ""; *p && n < sizeof(clean) - 1; p++) {
+        char c = *p;
+        bool safe = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                    (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-';
+        if (safe) {
+            clean[n++] = c;
+        } else if (c == ' ' && n > 0 && clean[n - 1] != '_') {
+            clean[n++] = '_';
+        }
+    }
+    clean[n] = '\0';
+    // A leading dot would be rejected by JanOS as a path escape.
+    const char *base = clean;
+    while (*base == '.') base++;
+    if (*base == '\0') base = "gitm";
+
+    time_t now = time(NULL);
+    struct tm tmv;
+    localtime_r(&now, &tmv);
+    snprintf(out, out_size, "%s_%04d%02d%02d_%02d%02d%02d",
+             base, tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
+             tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
+}
+
+static const char *gitm_state_name(int st)
+{
+    switch (st) {
+        case GITM_CONNECTING: return "CONNECTING";
+        case GITM_STARTING:   return "STARTING";
+        case GITM_RECOVERING: return "RECOVERING";
+        case GITM_RUNNING:    return "RUNNING";
+        case GITM_STOPPING:   return "STOPPING";
+        case GITM_FINALIZED:  return "FINALIZED";
+        default:              return "IDLE";
+    }
+}
+
+static lv_color_t gitm_state_color(int st, const cgw_snapshot_t *snap)
+{
+    switch (st) {
+        case GITM_RUNNING:
+            // Section 8.8: recorder loss is evidence damage, while shaper loss
+            // and a downed upstream are operational warnings - never the same.
+            if (cgw_recorder_degraded(snap)) return COLOR_MATERIAL_RED;
+            if (cgw_shaper_degraded(snap) || !snap->upstream) return COLOR_MATERIAL_AMBER;
+            return COLOR_MATERIAL_GREEN;
+        case GITM_FINALIZED:  return COLOR_MATERIAL_BLUE;
+        case GITM_CONNECTING:
+        case GITM_STARTING:
+        case GITM_RECOVERING:
+        case GITM_STOPPING:   return COLOR_MATERIAL_AMBER;
+        default:              return lv_color_hex(0x888888);
+    }
+}
+
+// Push state and an optional message to the UI. Safe to call from a worker
+// task: the port mutex is recursive, so nesting inside a held lock is fine.
+static void gitm_set_state(tab_context_t *ctx, int st, const char *msg, lv_color_t msg_color)
+{
+    if (!ctx) return;
+    ctx->gitm->state = st;
+    if (!bsp_display_lock(300)) return;
+    if (ctx->gitm->state_chip) {
+        lv_label_set_text(ctx->gitm->state_chip, gitm_state_name(st));
+        lv_obj_set_style_text_color(ctx->gitm->state_chip,
+                                    gitm_state_color(st, &ctx->gitm->snap), 0);
+    }
+    if (msg && ctx->gitm->status_label) {
+        lv_label_set_text(ctx->gitm->status_label, msg);
+        lv_obj_set_style_text_color(ctx->gitm->status_label, msg_color, 0);
+    }
+    bsp_display_unlock();
+}
+
+static void gitm_set_hint(tab_context_t *ctx, const char *text, lv_color_t color)
+{
+    if (ctx && ctx->gitm->status_label) {
+        lv_label_set_text(ctx->gitm->status_label, text);
+        lv_obj_set_style_text_color(ctx->gitm->status_label, color, 0);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Line-oriented transport reader
+//
+// Sections 8.1/8.5: a UART read is not guaranteed to hold one whole line, and a
+// complete status response runs well past a kilobyte once JanOS log lines and
+// client rows are counted. Nothing here accumulates the response - lines are
+// dispatched as they complete, so the response size does not matter.
+// ---------------------------------------------------------------------------
+
+typedef bool (*gitm_line_fn)(const char *line, void *user);
+
+static bool gitm_read_lines(tab_id_t tab, uart_port_t port, int timeout_ms,
+                            gitm_line_fn on_line, void *user, bool echo)
+{
+    char rx[256];
+    char line[320];
+    int line_pos = 0;
+    TickType_t start = xTaskGetTickCount();
+    TickType_t limit = pdMS_TO_TICKS(timeout_ms);
+
+    while ((xTaskGetTickCount() - start) < limit) {
+        int len = transport_read_bytes_tab(tab, port, rx, sizeof(rx) - 1,
+                                           pdMS_TO_TICKS(100));
+        if (len <= 0) continue;
+        for (int i = 0; i < len; i++) {
+            char c = rx[i];
+            if (c == '\n' || c == '\r') {
+                if (line_pos > 0) {
+                    line[line_pos] = '\0';
+                    line_pos = 0;
+                    if (echo) GITM_LOG_RX(line);
+                    if (on_line(line, user)) return true;
+                }
+                continue;   // ignore empty lines (section 8.1)
+            }
+            // An over-long line is truncated rather than allowed to run into
+            // the next one; protocol lines are far below this bound.
+            if (line_pos < (int)sizeof(line) - 1) line[line_pos++] = c;
+        }
+    }
+    return false;
+}
+
+static bool gitm_status_line_cb(const char *line, void *user)
+{
+    return cgw_parse_line(line, (cgw_snapshot_t *)user);
+}
+
+// One `capture_gateway status` round trip. True when a complete block arrived.
+// `echo` off is for the steady-state poll: a full block every few seconds would
+// bury JanOS's own messages, which are the ones worth reading.
+static bool gitm_query_status(tab_id_t tab, uart_port_t port, cgw_snapshot_t *out,
+                              bool echo)
+{
+    gitm_flush_rx(tab, port);
+    const char *cmd = "capture_gateway status\r\n";
+    if (echo) gitm_log_tx(cmd);
+    transport_write_bytes_tab(tab, port, cmd, strlen(cmd));
+    cgw_snapshot_reset(out);
+    return gitm_read_lines(tab, port, GITM_STATUS_TIMEOUT_MS, gitm_status_line_cb,
+                           out, echo);
+}
+
+// JanOS pushes these by itself while a gateway is up, so we can react at once
+// rather than waiting for the next poll to notice.
+static bool gitm_event_line_cb(const char *line, void *user)
+{
+    (void)user;
+    return strstr(line, "Capture Gateway: client joined") != NULL ||
+           strstr(line, "Capture Gateway: client left") != NULL ||
+           strstr(line, "Capture Gateway: upstream down") != NULL ||
+           strstr(line, "Capture Gateway: upstream IPv4 and DNS refreshed") != NULL;
+}
+
+// Sit on the idle transport for one slice. True when JanOS said something that
+// makes the current snapshot stale.
+static bool gitm_wait_for_event(tab_id_t tab, uart_port_t port, int window_ms)
+{
+    return gitm_read_lines(tab, port, window_ms, gitm_event_line_cb, NULL, true);
+}
+
+// ---------------------------------------------------------------------------
+// Start / connect / stop exchanges
+// ---------------------------------------------------------------------------
+
+typedef struct {
+    cgw_snapshot_t snap;
+    bool recoverable;     // the one documented retryable start failure
+    bool needs_upstream;  // "No upstream IPv4 connection"
+    bool name_taken;      // the target PCAP already exists on the SD card
+    char err[112];        // newest human-readable diagnostic (section 8.8)
+} gitm_start_result_t;
+
+static bool gitm_start_line_cb(const char *line, void *user)
+{
+    gitm_start_result_t *r = (gitm_start_result_t *)user;
+
+    if (strstr(line, "upstream did not recover after APSTA switch")) r->recoverable = true;
+    if (strstr(line, "No upstream IPv4 connection")) r->needs_upstream = true;
+    if (strstr(line, "already exists")) r->name_taken = true;
+
+    // JanOS has no structured error block yet, so keep the newest human line.
+    if (strstr(line, "Capture Gateway:") || strstr(line, "No upstream IPv4") ||
+        strstr(line, "already exists") || strstr(line, "Rogue GITM") ||
+        strstr(line, "refused")) {
+        const char *msg = strstr(line, "Capture Gateway:");
+        if (!msg) msg = strstr(line, "Rogue GITM");
+        snprintf(r->err, sizeof(r->err), "%s", msg ? msg : line);
+    }
+
+    return cgw_parse_line(line, &r->snap);
+}
+
+// Send the start command and collect one complete block. The caller decides
+// what the result means - success is never inferred from a log line alone.
+static void gitm_send_start(tab_id_t tab, uart_port_t port, const char *cmd,
+                            gitm_start_result_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    // The caller logs a redacted form of this command; `cmd` itself carries the
+    // AP password in clear text and must not reach the console.
+    gitm_flush_rx(tab, port);
+    transport_write_bytes_tab(tab, port, cmd, strlen(cmd));
+    transport_write_bytes_tab(tab, port, "\r\n", 2);
+    gitm_read_lines(tab, port, GITM_START_TIMEOUT_MS, gitm_start_line_cb, out, true);
+}
+
+static bool gitm_final_line_cb(const char *line, void *user)
+{
+    return cgw_parse_final_line(line, (cgw_final_t *)user);
+}
+
+typedef struct {
+    bool success;
+    bool failed;
+} gitm_connect_result_t;
+
+static bool gitm_connect_line_cb(const char *line, void *user)
+{
+    gitm_connect_result_t *r = (gitm_connect_result_t *)user;
+    if (strstr(line, "SUCCESS")) { r->success = true; return true; }
+    if (strstr(line, "FAILED") || strstr(line, "Error")) { r->failed = true; return true; }
+    return false;
+}
+
+static bool gitm_connect_try(tab_id_t tab, uart_port_t port, const char *ssid,
+                             const char *pass, wifi_connect_auth_mode_t auth)
+{
+    char cmd[256];
+    if (!build_wifi_connect_command(cmd, sizeof(cmd), ssid, pass ? pass : "", auth)) {
+        return false;
+    }
+
+    // Never log the built command: it carries the passphrase in clear text.
+    ESP_LOGI(TAG, "GITM > wifi_connect \"%s\" %s", ssid,
+             auth == WIFI_CONNECT_AUTH_SAVED   ? "--saved"
+             : auth == WIFI_CONNECT_AUTH_OPEN  ? "(open)"
+                                               : "<password hidden>");
+
+    gitm_flush_rx(tab, port);
+    transport_write_bytes_tab(tab, port, cmd, strlen(cmd));
+    transport_write_bytes_tab(tab, port, "\r\n", 2);
+
+    gitm_connect_result_t r = {0};
+    gitm_read_lines(tab, port, 15000, gitm_connect_line_cb, &r, true);
+    return r.success;
+}
+
+// Credential policy for the upstream link.
+//
+// A password we hold (typed, or prefilled from the captured table) is tried
+// first because it is deterministic. If it is stale, we still fall back to
+// `--saved` so JanOS can resolve the network from its own eviltwin/portals/home
+// stores - the same mechanism the wardrive auto-upload connects with.
+static bool gitm_connect_upstream(tab_id_t tab, uart_port_t port,
+                                  const char *ssid, const char *pass, bool is_open)
+{
+    if (is_open) {
+        return gitm_connect_try(tab, port, ssid, "", WIFI_CONNECT_AUTH_OPEN);
+    }
+    if (pass && pass[0] != '\0') {
+        if (gitm_connect_try(tab, port, ssid, pass, WIFI_CONNECT_AUTH_PASSWORD)) {
+            return true;
+        }
+        ESP_LOGW(TAG, "GITM: supplied password rejected for '%s', trying --saved", ssid);
+    }
+    return gitm_connect_try(tab, port, ssid, "", WIFI_CONNECT_AUTH_SAVED);
+}
+
+// ---------------------------------------------------------------------------
+// Session tasks
+//
+// One task owns the transport for the whole GITM session, so a status poll can
+// never interleave with wifi_connect, start or stop (section 8.1).
+// ---------------------------------------------------------------------------
+
+// Ring the chime when the snapshot carries a MAC the previous one did not.
+// The first complete block of a session only seeds the set: adopting a gateway
+// that already has clients is not an arrival, and neither is a device that
+// merely picked up a DHCP lease it was missing a poll ago.
+//
+// Runs on the session task, off the display lock, and keeps its own copy of the
+// MAC set - a snapshot that never reaches the screen must not swallow a join.
+static void gitm_note_client_arrivals(tab_context_t *ctx, const cgw_snapshot_t *snap)
+{
+    gitm_ctx_t *g = ctx->gitm;
+    bool joined = false;
+
+    for (int i = 0; i < snap->client_count && i < CGW_MAX_CLIENTS; i++) {
+        bool known = false;
+        for (int k = 0; k < g->chime_mac_count; k++) {
+            if (strcasecmp(snap->clients[i].mac, g->chime_macs[k]) == 0) {
+                known = true;
+                break;
+            }
+        }
+        if (known) continue;
+        joined = true;
+        if (g->chime_armed) {
+            ESP_LOGI(TAG, "GITM: %s joined the capture AP (%s)", snap->clients[i].mac,
+                     snap->clients[i].ip[0] ? snap->clients[i].ip : "no lease yet");
+        }
+    }
+
+    g->chime_mac_count = 0;
+    for (int i = 0; i < snap->client_count && i < CGW_MAX_CLIENTS; i++) {
+        memcpy(g->chime_macs[g->chime_mac_count++], snap->clients[i].mac,
+               sizeof(g->chime_macs[0]));
+    }
+
+    // One chime per refresh, however many devices arrived at once: a burst of
+    // joins should sound like a doorbell, not like a fire alarm.
+    if (joined && g->chime_armed) alert_chime_play(ALERT_TONE_JOIN);
+    g->chime_armed = true;
+}
+
+// Warn on the transition, never on the state: the page is already red, and the
+// chime exists for the operator who is not looking at it. Runs before the
+// arrival check, which is what arms the page after its first block.
+static void gitm_note_health(tab_context_t *ctx, const cgw_snapshot_t *snap)
+{
+    gitm_ctx_t *g = ctx->gitm;
+    bool upstream_down = !snap->upstream;
+    bool degraded = cgw_recorder_degraded(snap);
+
+    if (g->chime_armed) {
+        if ((upstream_down && !g->warn_upstream_down) ||
+            (degraded && !g->warn_degraded)) {
+            alert_chime_play(ALERT_TONE_WARN);
+        }
+    }
+    g->warn_upstream_down = upstream_down;
+    g->warn_degraded = degraded;
+}
+
+static void gitm_publish_snapshot(tab_context_t *ctx, const cgw_snapshot_t *snap)
+{
+    gitm_note_health(ctx, snap);
+    gitm_note_client_arrivals(ctx, snap);
+    if (!bsp_display_lock(300)) return;
+    ctx->gitm->snap = *snap;          // commit only complete blocks (section 8.3)
+    gitm_render_live(ctx);
+    bsp_display_unlock();
+}
+
+// Poll while running, then stop and finalize. Shared by the normal start path
+// and by the attach path that adopts a gateway JanOS was already running.
+static void gitm_run_and_stop(tab_context_t *ctx, tab_id_t tab, uart_port_t port)
+{
+    gitm_set_state(ctx, GITM_RUNNING, NULL, COLOR_MATERIAL_GREEN);
+
+    while (!ctx->gitm->stop_request) {
+        // Idle on the transport rather than sleeping on it: a client joining or
+        // the upstream dropping shows up immediately, and the periodic poll is
+        // left to carry nothing but the counters.
+        bool event = false;
+        for (int waited = 0;
+             waited < GITM_POLL_INTERVAL_MS && !ctx->gitm->stop_request;
+             waited += GITM_EVENT_WINDOW_MS) {
+            if (gitm_wait_for_event(tab, port, GITM_EVENT_WINDOW_MS)) {
+                event = true;
+                break;
+            }
+        }
+        if (ctx->gitm->stop_request) break;
+        if (event) ESP_LOGI(TAG, "GITM: JanOS reported a change, refreshing now");
+
+        cgw_snapshot_t snap;
+        if (!gitm_query_status(tab, port, &snap, false)) {
+            // Keep showing the last good view rather than blanking the screen.
+            ESP_LOGW(TAG, "GITM: status poll timed out, keeping the last snapshot");
+            continue;
+        }
+        if (!snap.active) {
+            // JanOS tore the session down by itself. Stop claiming RUNNING, and
+            // do not leave a STOP button pointing at a session that is gone.
+            gitm_publish_snapshot(ctx, &snap);
+            if (bsp_display_lock(300)) {
+                if (ctx->gitm->stop_btn) lv_obj_add_flag(ctx->gitm->stop_btn, LV_OBJ_FLAG_HIDDEN);
+                bsp_display_unlock();
+            }
+            gitm_set_state(ctx, GITM_IDLE,
+                           "JanOS reports the gateway is no longer active.\n"
+                           "Any capture it held was closed on its side.",
+                           COLOR_MATERIAL_RED);
+            gitm_restore_setup(ctx);
+            return;
+        }
+        gitm_publish_snapshot(ctx, &snap);
+        gitm_set_state(ctx, GITM_RUNNING, NULL, COLOR_MATERIAL_GREEN);
+
+        // One compact heartbeat per poll. The full block is still echoed for
+        // start, stop and any explicit reconciliation.
+        char size_str[24];
+        gitm_format_bytes(snap.file_bytes, size_str, sizeof(size_str));
+        ESP_LOGI(TAG, "GITM ~ up=%d napt=%d clients=%u pkt=%lu size=%s "
+                      "drops=%lu shaper=%lu",
+                 snap.upstream ? 1 : 0, snap.napt ? 1 : 0, snap.reported_clients,
+                 (unsigned long)snap.packets, size_str,
+                 (unsigned long)snap.drops, (unsigned long)snap.rate_queue_drops);
+    }
+
+    gitm_set_state(ctx, GITM_STOPPING,
+                   "Stopping and finalizing the PCAP...", COLOR_MATERIAL_AMBER);
+
+    // Universal `stop` only: `capture_gateway stop` refuses while the recorder
+    // hook is live, which would leave the AP up over an open file (section 8.7).
+    gitm_flush_rx(tab, port);
+    const char *stop_cmd = "stop\r\n";
+    gitm_log_tx(stop_cmd);
+    transport_write_bytes_tab(tab, port, stop_cmd, strlen(stop_cmd));
+
+    cgw_final_t fin;
+    memset(&fin, 0, sizeof(fin));
+    bool got_final = gitm_read_lines(tab, port, GITM_STOP_TIMEOUT_MS,
+                                     gitm_final_line_cb, &fin, true);
+
+    // Section 8.7: the file may only be offered once a complete idle block
+    // confirms the capture is really closed.
+    bool idle_confirmed = false;
+    for (int i = 0; i < 3 && !idle_confirmed; i++) {
+        cgw_snapshot_t snap;
+        if (gitm_query_status(tab, port, &snap, true) && !snap.active) {
+            idle_confirmed = true;
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(500));
+        }
+    }
+
+    if (bsp_display_lock(300)) {
+        ctx->gitm->final = fin;
+        bsp_display_unlock();
+    }
+
+    if (got_final && idle_confirmed) {
+        char frames[24];
+        char msg[224];
+        gitm_format_count(fin.frames, frames, sizeof(frames));
+        snprintf(msg, sizeof(msg),
+                 "Capture closed: %s frames, %lu dropped.\n"
+                 "The file is on the Monster SD and ready to copy.",
+                 frames, (unsigned long)fin.drops);
+        gitm_set_state(ctx, GITM_FINALIZED, msg,
+                       fin.drops > 0 ? COLOR_MATERIAL_AMBER : COLOR_MATERIAL_GREEN);
+    } else if (got_final) {
+        gitm_set_state(ctx, GITM_FINALIZED,
+                       "PCAP finalized, but JanOS never confirmed active=0.\n"
+                       "Verify on the Monster before trusting the file.",
+                       COLOR_MATERIAL_AMBER);
+    } else {
+        gitm_set_state(ctx, GITM_FINALIZED,
+                       "Stop sent, but no [PCAP_FINAL] arrived.\n"
+                       "Verify on the Monster that the capture closed.",
+                       COLOR_MATERIAL_AMBER);
+    }
+
+    if (bsp_display_lock(300)) {
+        gitm_render_live(ctx);
+        if (ctx->gitm->stop_btn) lv_obj_add_flag(ctx->gitm->stop_btn, LV_OBJ_FLAG_HIDDEN);
+        if (ctx->gitm->copy_btn) lv_obj_clear_flag(ctx->gitm->copy_btn, LV_OBJ_FLAG_HIDDEN);
+        bsp_display_unlock();
+    }
+}
+
+// Restore the setup form after a start that never reached RUNNING.
+static void gitm_restore_setup(tab_context_t *ctx)
+{
+    if (!bsp_display_lock(300)) return;
+    if (ctx->gitm->live)  lv_obj_add_flag(ctx->gitm->live, LV_OBJ_FLAG_HIDDEN);
+    if (ctx->gitm->step1) lv_obj_clear_flag(ctx->gitm->step1, LV_OBJ_FLAG_HIDDEN);
+    if (ctx->gitm->step2) lv_obj_clear_flag(ctx->gitm->step2, LV_OBJ_FLAG_HIDDEN);
+    // Reopen the AP form so the operator can change what failed.
+    ctx->gitm->s2_collapsed = false;
+    gitm_set_collapsed(ctx->gitm->s2_content, ctx->gitm->s2_chev, false);
+    if (ctx->gitm->start_btn) lv_obj_clear_state(ctx->gitm->start_btn, LV_STATE_DISABLED);
+    bsp_display_unlock();
+}
+
+static void gitm_session_task(void *arg)
+{
+    tab_context_t *ctx = (tab_context_t *)arg;
+    tab_id_t tab = (tab_id_t)ctx->gitm->tab;
+    uart_port_t port = ctx->gitm->uart_port;
+
+    // Worst case: 22 literal + quoted SSID (32) + quoted password (63) +
+    // " --pcap-name " + basename (95, the contract maximum) + NUL = 231 bytes.
+    char start_cmd[256];
+    if (ctx->gitm->ap_pass[0] != '\0') {
+        snprintf(start_cmd, sizeof(start_cmd),
+                 "capture_gateway start \"%s\" \"%s\" --pcap-name %s",
+                 ctx->gitm->ap_ssid, ctx->gitm->ap_pass, ctx->gitm->pcap_basename);
+    } else {
+        snprintf(start_cmd, sizeof(start_cmd),
+                 "capture_gateway start \"%s\" --pcap-name %s",
+                 ctx->gitm->ap_ssid, ctx->gitm->pcap_basename);
+    }
+
+    ESP_LOGI(TAG, "GITM > capture_gateway start \"%s\"%s --pcap-name %s",
+             ctx->gitm->ap_ssid,
+             ctx->gitm->ap_pass[0] ? " \"***\"" : "",
+             ctx->gitm->pcap_basename);
+
+    // ---- STARTING, with the documented recovery retries -------------------
+    gitm_start_result_t res;
+    memset(&res, 0, sizeof(res));
+    bool running = false;
+
+    for (int attempt = 0; attempt <= GITM_MAX_START_RETRIES && !ctx->gitm->stop_request;
+         attempt++) {
+        if (attempt == 0) {
+            gitm_set_state(ctx, GITM_STARTING, "Starting GITM on JanOS...",
+                           COLOR_MATERIAL_AMBER);
+        } else {
+            char msg[128];
+            snprintf(msg, sizeof(msg),
+                     "Upstream dropped on the APSTA switch.\n"
+                     "Recovering, attempt %d of %d...",
+                     attempt, GITM_MAX_START_RETRIES);
+            gitm_set_state(ctx, GITM_RECOVERING, msg, COLOR_MATERIAL_AMBER);
+
+            // Section 8.6: 1 s before the first retry, 2 s before the second,
+            // and a complete active=0 block is required before reconnecting.
+            vTaskDelay(pdMS_TO_TICKS(attempt == 1 ? 1000 : 2000));
+            cgw_snapshot_t idle;
+            if (!gitm_query_status(tab, port, &idle, true) || idle.active) {
+                ESP_LOGW(TAG, "GITM: rollback not confirmed, abandoning retry");
+                break;
+            }
+            if (!gitm_connect_upstream(tab, port, ctx->gitm->up_ssid,
+                                       ctx->gitm->up_pass, ctx->gitm->up_is_open)) {
+                break;
+            }
+            gitm_set_state(ctx, GITM_STARTING, NULL, COLOR_MATERIAL_AMBER);
+        }
+
+        gitm_send_start(tab, port, start_cmd, &res);
+
+        if (res.snap.complete && res.snap.active && res.snap.capture_active) {
+            running = true;
+            gitm_publish_snapshot(ctx, &res.snap);
+            break;
+        }
+
+        // Ambiguous outcome: only a complete status block decides (section 8.6).
+        cgw_snapshot_t probe;
+        if (gitm_query_status(tab, port, &probe, true) &&
+            probe.active && probe.capture_active) {
+            running = true;
+            gitm_publish_snapshot(ctx, &probe);
+            break;
+        }
+
+        // Only the APSTA rollback retries automatically; anything else needs an
+        // operator decision (sections 8.6 and 8.8).
+        if (!res.recoverable) break;
+    }
+
+    if (!running) {
+        char msg[224];
+        if (res.name_taken) {
+            snprintf(msg, sizeof(msg),
+                     "JanOS already has a capture named\n%s.pcap\n"
+                     "Change the PCAP prefix and start again.",
+                     ctx->gitm->pcap_basename);
+        } else if (res.needs_upstream) {
+            snprintf(msg, sizeof(msg),
+                     "JanOS reports no upstream IPv4.\n"
+                     "Reconnect the upstream network, then start again.");
+        } else if (res.err[0]) {
+            snprintf(msg, sizeof(msg), "GITM start failed.\n%s", res.err);
+        } else {
+            snprintf(msg, sizeof(msg),
+                     "GITM start failed or timed out.\n"
+                     "Check the SD card on the Monster, then retry.");
+        }
+        ESP_LOGW(TAG, "GITM: start failed (%s)", res.err[0] ? res.err : "no diagnostic");
+        gitm_set_state(ctx, GITM_IDLE, msg, COLOR_MATERIAL_RED);
+        gitm_restore_setup(ctx);
+    } else {
+        ESP_LOGI(TAG, "GITM: running, AP '%s', PCAP %s",
+                 ctx->gitm->ap_ssid, ctx->gitm->snap.file);
+        gitm_run_and_stop(ctx, tab, port);
+    }
+
+    ctx->gitm->stop_request = false;
+    ctx->gitm->session_task = NULL;
+    ctx->gitm->session_active = false;
+    vTaskDelete(NULL);
+}
+
+// Adopt a gateway that was already running when the page opened.
+static void gitm_adopt_task(void *arg)
+{
+    tab_context_t *ctx = (tab_context_t *)arg;
+    gitm_run_and_stop(ctx, (tab_id_t)ctx->gitm->tab, ctx->gitm->uart_port);
+    ctx->gitm->stop_request = false;
+    ctx->gitm->session_task = NULL;
+    ctx->gitm->session_active = false;
+    vTaskDelete(NULL);
+}
+
+// ---------------------------------------------------------------------------
+// Live view rendering (call with the display lock held)
+// ---------------------------------------------------------------------------
+
+static void gitm_render_clients(tab_context_t *ctx)
+{
+    if (!ctx->gitm->clients_list) return;
+    const cgw_snapshot_t *s = &ctx->gitm->snap;
+
+    if (ctx->gitm->clients_hdr) {
+        if (s->clients_truncated) {
+            lv_label_set_text_fmt(ctx->gitm->clients_hdr, "Clients (%u, showing %d)",
+                                  s->reported_clients, s->client_count);
+        } else {
+            lv_label_set_text_fmt(ctx->gitm->clients_hdr, "Clients (%u)",
+                                  s->reported_clients);
+        }
+    }
+
+    // Rebuild the rows only when the set of MACs actually changes; a 1.5 s poll
+    // would otherwise churn LVGL objects continuously.
+    char sig[CGW_MAX_CLIENTS * 18 + 8];
+    size_t pos = 0;
+    for (int i = 0; i < s->client_count && pos < sizeof(sig) - 20; i++) {
+        pos += snprintf(sig + pos, sizeof(sig) - pos, "%s|", s->clients[i].mac);
+    }
+    sig[pos] = '\0';
+
+    if (strcmp(sig, ctx->gitm->client_sig) == 0) {
+        // Same devices, but an address can still move from 0.0.0.0 to a lease.
+        uint32_t n = lv_obj_get_child_cnt(ctx->gitm->clients_list);
+        for (int i = 0; i < s->client_count && (uint32_t)i < n; i++) {
+            lv_obj_t *row = lv_obj_get_child(ctx->gitm->clients_list, i);
+            if (row) {
+                lv_label_set_text_fmt(row, "%s    %s", s->clients[i].mac,
+                                      s->clients[i].ip[0] ? s->clients[i].ip
+                                                          : "(no lease yet)");
+            }
+        }
+        return;
+    }
+    snprintf(ctx->gitm->client_sig, sizeof(ctx->gitm->client_sig), "%s", sig);
+
+    lv_obj_clean(ctx->gitm->clients_list);
+    if (s->client_count == 0) {
+        lv_obj_t *empty = lv_label_create(ctx->gitm->clients_list);
+        lv_label_set_text(empty, "No client has joined yet.");
+        lv_obj_set_style_text_font(empty, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(empty, ui_muted_color(), 0);
+        return;
+    }
+    for (int i = 0; i < s->client_count; i++) {
+        lv_obj_t *row = lv_label_create(ctx->gitm->clients_list);
+        lv_label_set_text_fmt(row, "%s    %s", s->clients[i].mac,
+                              s->clients[i].ip[0] ? s->clients[i].ip : "(no lease yet)");
+        lv_obj_set_style_text_font(row, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(row, lv_color_hex(0xDDDDDD), 0);
+    }
+}
+
+static void gitm_render_live(tab_context_t *ctx)
+{
+    if (!ctx || !ctx->gitm->live) return;
+    const cgw_snapshot_t *s = &ctx->gitm->snap;
+
+    if (ctx->gitm->live_hdr) {
+        lv_label_set_text_fmt(ctx->gitm->live_hdr,
+            "AP        %s   %s   ch %u\n"
+            "Upstream  %s   %s\n"
+            "NAPT %s   DNS %s%s",
+            s->ssid[0] ? s->ssid : ctx->gitm->ap_ssid,
+            s->security[0] ? s->security : (ctx->gitm->ap_wpa2 ? "wpa2" : "open"),
+            s->channel,
+            s->upstream_ssid[0] ? s->upstream_ssid : ctx->gitm->up_ssid,
+            s->upstream ? (s->sta_ip[0] ? s->sta_ip : "connected")
+                        : "DOWN - no Internet",
+            s->napt ? "on" : "off",
+            s->dns[0] ? s->dns : "-",
+            s->dns_proxy ? " (proxy)" : "");
+        lv_obj_set_style_text_color(ctx->gitm->live_hdr,
+            s->upstream ? lv_color_hex(0xDDDDDD) : COLOR_MATERIAL_AMBER, 0);
+    }
+
+    if (ctx->gitm->live_warn) {
+        // Section 8.8 asks for a visible warning on an open SSID and on the
+        // fact that clients are not isolated from one another.
+        bool open_ap = (s->security[0] ? strcmp(s->security, "open") == 0
+                                       : !ctx->gitm->ap_wpa2);
+        bool no_isolation = (strcmp(s->client_isolation, "off") == 0);
+        if (open_ap && no_isolation) {
+            lv_label_set_text(ctx->gitm->live_warn,
+                LV_SYMBOL_WARNING " Open AP, and clients are not isolated from each other.");
+        } else if (open_ap) {
+            lv_label_set_text(ctx->gitm->live_warn,
+                LV_SYMBOL_WARNING " Open AP - anyone in range can join and be recorded.");
+        } else if (no_isolation) {
+            lv_label_set_text(ctx->gitm->live_warn,
+                LV_SYMBOL_WARNING " Clients are not isolated from each other.");
+        } else {
+            lv_label_set_text(ctx->gitm->live_warn, "");
+        }
+    }
+
+    gitm_render_clients(ctx);
+
+    if (ctx->gitm->cap_label) {
+        char size_str[24], pkt_str[24];
+        gitm_format_bytes(s->file_bytes, size_str, sizeof(size_str));
+        gitm_format_count(s->packets, pkt_str, sizeof(pkt_str));
+        const char *name = cgw_file_basename(s);
+        lv_label_set_text_fmt(ctx->gitm->cap_label, "%s\n%s pkt        %s",
+                              name[0] ? name : "(pending)", pkt_str, size_str);
+    }
+
+    if (ctx->gitm->rec_label) {
+        if (cgw_recorder_degraded(s)) {
+            lv_label_set_text_fmt(ctx->gitm->rec_label,
+                LV_SYMBOL_WARNING " recorder  DEGRADED - %lu lost"
+                " (alloc %lu / queue %lu / write %lu)\n"
+                "                  queue %lu/%lu, peak %lu",
+                (unsigned long)s->drops, (unsigned long)s->drop_alloc,
+                (unsigned long)s->drop_queue, (unsigned long)s->drop_write,
+                (unsigned long)s->queue_depth, (unsigned long)s->queue_capacity,
+                (unsigned long)s->queue_high_water);
+            lv_obj_set_style_text_color(ctx->gitm->rec_label, COLOR_MATERIAL_RED, 0);
+        } else {
+            lv_label_set_text_fmt(ctx->gitm->rec_label,
+                LV_SYMBOL_OK " recorder  no loss        queue %lu/%lu, peak %lu",
+                (unsigned long)s->queue_depth, (unsigned long)s->queue_capacity,
+                (unsigned long)s->queue_high_water);
+            // A high-water mark at capacity means the writer is only just
+            // keeping up, even while drops are still zero (section 8.4).
+            bool tight = (s->queue_capacity > 0 &&
+                          s->queue_high_water >= s->queue_capacity);
+            lv_obj_set_style_text_color(ctx->gitm->rec_label,
+                tight ? COLOR_MATERIAL_AMBER : COLOR_MATERIAL_GREEN, 0);
+        }
+    }
+
+    if (ctx->gitm->shaper_label) {
+        if (cgw_shaper_degraded(s)) {
+            lv_label_set_text_fmt(ctx->gitm->shaper_label,
+                LV_SYMBOL_WARNING " shaper    %lu forwarded packets dropped\n"
+                "                  %lu -> %lu kbps, throttle %lu, pause %lu",
+                (unsigned long)s->rate_queue_drops,
+                (unsigned long)s->rate_limit_kbps, (unsigned long)s->rate_effective_kbps,
+                (unsigned long)s->throttle_events, (unsigned long)s->pause_events);
+            lv_obj_set_style_text_color(ctx->gitm->shaper_label, COLOR_MATERIAL_AMBER, 0);
+        } else if (s->rate_effective_kbps < s->rate_limit_kbps) {
+            // Expected protection, not damage - never rendered as an error.
+            lv_label_set_text_fmt(ctx->gitm->shaper_label,
+                LV_SYMBOL_OK " shaper    throttled %lu -> %lu kbps (protecting the writer)\n"
+                "                  throttle %lu, pause %lu",
+                (unsigned long)s->rate_limit_kbps, (unsigned long)s->rate_effective_kbps,
+                (unsigned long)s->throttle_events, (unsigned long)s->pause_events);
+            lv_obj_set_style_text_color(ctx->gitm->shaper_label, lv_color_hex(0xAAAAAA), 0);
+        } else {
+            lv_label_set_text_fmt(ctx->gitm->shaper_label,
+                LV_SYMBOL_OK " shaper    %lu kbps ceiling, no loss",
+                (unsigned long)s->rate_limit_kbps);
+            lv_obj_set_style_text_color(ctx->gitm->shaper_label, COLOR_MATERIAL_GREEN, 0);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Setup-phase UI callbacks
+// ---------------------------------------------------------------------------
+
+static void gitm_keyboard_cb(lv_event_t *e)
+{
+    lv_event_code_t code = lv_event_get_code(e);
+    lv_obj_t *kb = lv_event_get_target(e);
+    if (code == LV_EVENT_READY || code == LV_EVENT_CANCEL) {
+        lv_obj_add_flag(kb, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void gitm_focus_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx || !ctx->gitm || !ctx->gitm->keyboard) return;
+    lv_keyboard_set_textarea(ctx->gitm->keyboard, lv_event_get_target(e));
+    lv_obj_clear_flag(ctx->gitm->keyboard, LV_OBJ_FLAG_HIDDEN);
+}
+
+// Refresh the generated-name preview from the current prefix and clock.
+static void gitm_update_name_preview(tab_context_t *ctx)
+{
+    if (!ctx || !ctx->gitm->name_preview) return;
+    const char *prefix = ctx->gitm->prefix_input
+                       ? lv_textarea_get_text(ctx->gitm->prefix_input) : "";
+    char base[96];
+    gitm_build_pcap_basename(prefix && prefix[0] ? prefix : "gitm", base, sizeof(base));
+    lv_label_set_text_fmt(ctx->gitm->name_preview, "saves as  %s.pcap", base);
+}
+
+static void gitm_prefix_changed_cb(lv_event_t *e)
+{
+    (void)e;
+    gitm_update_name_preview(get_current_ctx());
+}
+
+static void gitm_security_changed_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx || !ctx->gitm) return;
+    ctx->gitm->ap_wpa2 = (lv_dropdown_get_selected(lv_event_get_target(e)) == 1);
+
+    if (ctx->gitm->ap_pass_row) {
+        if (ctx->gitm->ap_wpa2) {
+            lv_obj_clear_flag(ctx->gitm->ap_pass_row, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(ctx->gitm->ap_pass_row, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    if (ctx->gitm->open_warn) {
+        if (ctx->gitm->ap_wpa2) {
+            lv_obj_add_flag(ctx->gitm->open_warn, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_clear_flag(ctx->gitm->open_warn, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+}
+
+// Apply a picked upstream row to the form. Shared by the tap handler and by the
+// preselection carried in from the attack view.
+static void gitm_apply_upstream_pick(tab_context_t *ctx, int idx)
+{
+    if (idx < 0 || idx >= ctx->gitm->net_count) return;
+    ctx->gitm->up_index = idx;
+    ctx->gitm->up_is_open = wifi_network_security_is_open(ctx->gitm->nets[idx].security);
+
+    // An open upstream needs no password field at all.
+    if (ctx->gitm->up_pass_row) {
+        if (ctx->gitm->up_is_open) {
+            lv_obj_add_flag(ctx->gitm->up_pass_row, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_clear_flag(ctx->gitm->up_pass_row, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    if (ctx->gitm->connect_btn) {
+        lv_obj_clear_state(ctx->gitm->connect_btn, LV_STATE_DISABLED);
+    }
+
+    // Substitute a password we already hold, so the operator can see what will
+    // be used and correct it before connecting.
+    if (ctx->gitm->up_pass_input) {
+        const char *known = ctx->gitm->up_is_open
+                          ? NULL : creds_lookup(ctx, ctx->gitm->nets[idx].ssid);
+        lv_textarea_set_text(ctx->gitm->up_pass_input, known ? known : "");
+    }
+
+    gitm_render_net_list(ctx);
+}
+
+static void gitm_net_row_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx || !ctx->gitm || ctx->gitm->session_active) return;
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (idx < 0 || idx >= ctx->gitm->net_count) return;
+
+    gitm_apply_upstream_pick(ctx, idx);
+
+    wifi_network_t *net = &ctx->gitm->nets[idx];
+    if (net->ssid[0] == '\0') {
+        gitm_set_hint(ctx, "Hidden network - JanOS needs its real SSID to connect.",
+                      COLOR_MATERIAL_AMBER);
+    } else if (ctx->gitm->up_is_open) {
+        gitm_set_hint(ctx, "Open upstream. Press CONNECT.", lv_color_hex(0xCCCCCC));
+    } else if (creds_lookup(ctx, net->ssid)) {
+        gitm_set_hint(ctx,
+            "Captured password filled in for this network. Press CONNECT.",
+            COLOR_MATERIAL_GREEN);
+    } else {
+        gitm_set_hint(ctx,
+            "Leave the password empty to let JanOS try its saved credentials.",
+            lv_color_hex(0xCCCCCC));
+    }
+}
+
+static void gitm_render_net_list(tab_context_t *ctx)
+{
+    if (!ctx || !ctx->gitm->net_list) return;
+    lv_obj_clean(ctx->gitm->net_list);
+
+    if (ctx->gitm->net_count == 0) {
+        lv_obj_t *empty = lv_label_create(ctx->gitm->net_list);
+        lv_label_set_text(empty, "No networks yet - press SCAN.");
+        lv_obj_set_style_text_font(empty, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(empty, ui_muted_color(), 0);
+        return;
+    }
+
+    for (int i = 0; i < ctx->gitm->net_count; i++) {
+        wifi_network_t *net = &ctx->gitm->nets[i];
+        bool picked = (i == ctx->gitm->up_index);
+
+        lv_obj_t *row = lv_obj_create(ctx->gitm->net_list);
+        lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
+        lv_obj_set_style_pad_all(row, 8, 0);
+        lv_obj_set_style_bg_color(row, picked ? lv_color_hex(0x14304A)
+                                              : lv_color_hex(0x2D2D2D), 0);
+        lv_obj_set_style_bg_color(row, lv_color_hex(0x3A3A3A), LV_STATE_PRESSED);
+        lv_obj_set_style_border_width(row, picked ? 2 : 0, 0);
+        lv_obj_set_style_border_color(row, COLOR_MATERIAL_BLUE, 0);
+        lv_obj_set_style_radius(row, 8, 0);
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_style_pad_row(row, 2, 0);
+        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_event_cb(row, gitm_net_row_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+
+        const bool have_pass = (creds_lookup(ctx, net->ssid) != NULL);
+
+        lv_obj_t *ssid = lv_label_create(row);
+        lv_label_set_text_fmt(ssid, "%s%s", picked ? LV_SYMBOL_OK "  " : "",
+                              net->ssid[0] ? net->ssid : "(Hidden)");
+        lv_obj_set_style_text_font(ssid, &lv_font_montserrat_18, 0);
+        lv_obj_set_style_text_color(ssid, picked ? COLOR_MATERIAL_BLUE
+                                                 : lv_color_hex(0xFFFFFF), 0);
+        lv_obj_clear_flag(ssid, LV_OBJ_FLAG_CLICKABLE);
+
+        lv_obj_t *info = lv_label_create(row);
+        lv_label_set_text_fmt(info, "%s  |  CH%d  |  %s  |  %s  |  %d dBm%s",
+                              net->bssid, net->channel, net->band,
+                              net->security, net->rssi,
+                              have_pass ? "  |  password saved" : "");
+        lv_obj_set_style_text_font(info, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(info, have_pass ? lv_color_hex(0x55AA77)
+                                                    : lv_color_hex(0x888888), 0);
+        lv_obj_clear_flag(info, LV_OBJ_FLAG_CLICKABLE);
+    }
+}
+
+// Scan for upstream candidates. Reuses the JanOS `scan_networks` command and
+// the shared line parser, but stores results in the page's own cache so the
+// attack view's selection is left untouched.
+static void gitm_scan_task(void *arg)
+{
+    tab_context_t *ctx = (tab_context_t *)arg;
+    tab_id_t tab = (tab_id_t)ctx->gitm->tab;
+    uart_port_t port = ctx->gitm->uart_port;
+
+    ctx->gitm->net_count = 0;
+    ctx->gitm->up_index = -1;
+
+    gitm_flush_rx(tab, port);
+    gitm_log_tx("scan_networks");
+    transport_write_bytes_tab(tab, port, "scan_networks\r\n", 15);
+
+    char rx[512];
+    char line[512];
+    int line_pos = 0;
+    bool done = false;
+    TickType_t start = xTaskGetTickCount();
+
+    while (!done && (xTaskGetTickCount() - start) < pdMS_TO_TICKS(UART_RX_TIMEOUT)) {
+        int len = transport_read_bytes_tab(tab, port, rx, sizeof(rx) - 1,
+                                           pdMS_TO_TICKS(100));
+        if (len <= 0) continue;
+        for (int i = 0; i < len && !done; i++) {
+            char c = rx[i];
+            if (c != '\n' && c != '\r') {
+                if (line_pos < (int)sizeof(line) - 1) line[line_pos++] = c;
+                continue;
+            }
+            if (line_pos == 0) continue;
+            line[line_pos] = '\0';
+            line_pos = 0;
+            GITM_LOG_RX(line);
+
+            if (strstr(line, "Scan results printed")) { done = true; break; }
+            if (line[0] == '"' && ctx->gitm->net_count < MAX_NETWORKS) {
+                wifi_network_t net;
+                if (parse_network_line(line, &net)) {
+                    ctx->gitm->nets[ctx->gitm->net_count++] = net;
+                }
+            }
+        }
+    }
+
+    // Same task, same transport: no risk of interleaving with the scan.
+    creds_fetch(ctx, tab, port);
+
+    if (bsp_display_lock(500)) {
+        // Re-apply a preselection carried in from the attack view.
+        int pre = -1;
+        if (ctx->gitm->preselect_ssid[0]) {
+            for (int i = 0; i < ctx->gitm->net_count; i++) {
+                if (strcmp(ctx->gitm->nets[i].ssid, ctx->gitm->preselect_ssid) == 0) {
+                    pre = i;
+                    break;
+                }
+            }
+            ctx->gitm->preselect_ssid[0] = '\0';
+        }
+
+        if (pre >= 0) {
+            gitm_apply_upstream_pick(ctx, pre);
+        } else {
+            gitm_render_net_list(ctx);
+            if (ctx->gitm->connect_btn) {
+                lv_obj_add_state(ctx->gitm->connect_btn, LV_STATE_DISABLED);
+            }
+        }
+
+        if (ctx->gitm->scan_btn) lv_obj_clear_state(ctx->gitm->scan_btn, LV_STATE_DISABLED);
+        gitm_set_hint(ctx,
+            done ? "Pick the network that provides Internet, then CONNECT."
+                 : "Scan timed out. Check the Monster link and try again.",
+            done ? lv_color_hex(0xCCCCCC) : COLOR_MATERIAL_RED);
+        bsp_display_unlock();
+    }
+
+    ctx->gitm->session_active = false;
+    vTaskDelete(NULL);
+}
+
+static void gitm_scan_cb(lv_event_t *e)
+{
+    (void)e;
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx || !ctx->gitm || ctx->gitm->session_active || !ctx->gitm->nets) return;
+
+    ctx->gitm->tab = (int)current_tab;
+    ctx->gitm->uart_port = uart_port_for_tab(current_tab);
+
+    if (ctx->gitm->scan_btn) lv_obj_add_state(ctx->gitm->scan_btn, LV_STATE_DISABLED);
+    if (ctx->gitm->connect_btn) lv_obj_add_state(ctx->gitm->connect_btn, LV_STATE_DISABLED);
+    gitm_set_hint(ctx, "Scanning...", COLOR_MATERIAL_AMBER);
+    if (ctx->gitm->net_list) lv_obj_clean(ctx->gitm->net_list);
+
+    ctx->gitm->session_active = true;   // also guards the shared transport
+    if (xTaskCreate(gitm_scan_task, "gitm_scan", 6144, ctx, 5, NULL) != pdPASS) {
+        ctx->gitm->session_active = false;
+        ESP_LOGW(TAG, "GITM: failed to start the scan task");
+        if (ctx->gitm->scan_btn) lv_obj_clear_state(ctx->gitm->scan_btn, LV_STATE_DISABLED);
+        gitm_set_hint(ctx, "Could not start the scan task.", COLOR_MATERIAL_RED);
+    }
+}
+
+// Connect the chosen upstream in its own task so the page keeps redrawing.
+static void gitm_connect_task(void *arg)
+{
+    tab_context_t *ctx = (tab_context_t *)arg;
+    bool ok = gitm_connect_upstream((tab_id_t)ctx->gitm->tab, ctx->gitm->uart_port,
+                                    ctx->gitm->up_ssid, ctx->gitm->up_pass,
+                                    ctx->gitm->up_is_open);
+
+    if (bsp_display_lock(500)) {
+        if (ok) {
+            // Fold step 1 away; step 2 becomes the part of the page you work in.
+            gitm_collapse_upstream(ctx);
+            if (ctx->gitm->step2) lv_obj_clear_flag(ctx->gitm->step2, LV_OBJ_FLAG_HIDDEN);
+            ctx->gitm->s2_collapsed = false;
+            gitm_set_collapsed(ctx->gitm->s2_content, ctx->gitm->s2_chev, false);
+            gitm_update_name_preview(ctx);
+            gitm_set_hint(ctx, "Name your GITM access point, then START.",
+                          lv_color_hex(0xCCCCCC));
+        } else {
+            if (ctx->gitm->connect_btn) lv_obj_clear_state(ctx->gitm->connect_btn, LV_STATE_DISABLED);
+            if (ctx->gitm->scan_btn) lv_obj_clear_state(ctx->gitm->scan_btn, LV_STATE_DISABLED);
+            // JanOS could not resolve a saved credential; ask for one explicitly.
+            if (ctx->gitm->up_pass_row) lv_obj_clear_flag(ctx->gitm->up_pass_row, LV_OBJ_FLAG_HIDDEN);
+            gitm_set_hint(ctx,
+                "Upstream connect failed.\n"
+                "Enter the password manually, or pick another network.",
+                COLOR_MATERIAL_RED);
+        }
+        bsp_display_unlock();
+    }
+
+    gitm_set_state(ctx, GITM_IDLE, NULL, lv_color_hex(0xCCCCCC));
+    ctx->gitm->session_active = false;
+    vTaskDelete(NULL);
+}
+
+static void gitm_connect_cb(lv_event_t *e)
+{
+    (void)e;
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx || !ctx->gitm || ctx->gitm->session_active) return;
+    if (ctx->gitm->up_index < 0 || ctx->gitm->up_index >= ctx->gitm->net_count) {
+        gitm_set_hint(ctx, "Pick an upstream network first.", COLOR_MATERIAL_RED);
+        return;
+    }
+
+    wifi_network_t *net = &ctx->gitm->nets[ctx->gitm->up_index];
+    if (net->ssid[0] == '\0') {
+        gitm_set_hint(ctx,
+            "This network hides its SSID. Pick a named one, or reveal it\n"
+            "from the scan page first.", COLOR_MATERIAL_RED);
+        return;
+    }
+
+    const char *pass = ctx->gitm->up_pass_input
+                     ? lv_textarea_get_text(ctx->gitm->up_pass_input) : "";
+    if (!pass) pass = "";
+    if (strchr(net->ssid, '"') || strchr(pass, '"')) {
+        gitm_set_hint(ctx, "A double quote is not allowed in the SSID or password.",
+                      COLOR_MATERIAL_RED);
+        return;
+    }
+
+    snprintf(ctx->gitm->up_ssid, sizeof(ctx->gitm->up_ssid), "%s", net->ssid);
+    snprintf(ctx->gitm->up_pass, sizeof(ctx->gitm->up_pass), "%s", pass);
+    ctx->gitm->tab = (int)current_tab;
+    ctx->gitm->uart_port = uart_port_for_tab(current_tab);
+
+    if (ctx->gitm->keyboard) lv_obj_add_flag(ctx->gitm->keyboard, LV_OBJ_FLAG_HIDDEN);
+    if (ctx->gitm->connect_btn) lv_obj_add_state(ctx->gitm->connect_btn, LV_STATE_DISABLED);
+    if (ctx->gitm->scan_btn) lv_obj_add_state(ctx->gitm->scan_btn, LV_STATE_DISABLED);
+    gitm_set_state(ctx, GITM_CONNECTING, "Connecting the upstream Wi-Fi...",
+                   COLOR_MATERIAL_AMBER);
+
+    ctx->gitm->session_active = true;
+    if (xTaskCreate(gitm_connect_task, "gitm_conn", 6144, ctx, 5, NULL) != pdPASS) {
+        ctx->gitm->session_active = false;
+        ESP_LOGW(TAG, "GITM: failed to start the connect task");
+        gitm_set_state(ctx, GITM_IDLE, "Could not start the connect task.",
+                       COLOR_MATERIAL_RED);
+    }
+}
+
+static void gitm_start_cb(lv_event_t *e)
+{
+    (void)e;
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx || !ctx->gitm || ctx->gitm->session_active) return;
+
+    const char *ssid = ctx->gitm->ap_ssid_input
+                     ? lv_textarea_get_text(ctx->gitm->ap_ssid_input) : "";
+    const char *pass = ctx->gitm->ap_pass_input
+                     ? lv_textarea_get_text(ctx->gitm->ap_pass_input) : "";
+    const char *prefix = ctx->gitm->prefix_input
+                       ? lv_textarea_get_text(ctx->gitm->prefix_input) : "";
+    if (!ssid) ssid = "";
+    if (!pass) pass = "";
+    if (!prefix) prefix = "";
+
+    if (ssid[0] == '\0') {
+        gitm_set_hint(ctx, "Give your access point a name (SSID).", COLOR_MATERIAL_RED);
+        return;
+    }
+    if (strlen(ssid) > 32) {
+        gitm_set_hint(ctx, "AP SSID is too long (32 characters max).", COLOR_MATERIAL_RED);
+        return;
+    }
+    // WPA2 only: JanOS rejects anything outside 8-63 bytes.
+    if (ctx->gitm->ap_wpa2 && (strlen(pass) < 8 || strlen(pass) > 63)) {
+        gitm_set_hint(ctx, "A WPA2 password must be 8-63 characters.", COLOR_MATERIAL_RED);
+        return;
+    }
+    // Every field is sent inside double quotes, so a literal quote would break
+    // parsing on JanOS. Refuse rather than mis-send.
+    if (strchr(ssid, '"') || strchr(pass, '"')) {
+        gitm_set_hint(ctx, "A double quote is not allowed in the SSID or password.",
+                      COLOR_MATERIAL_RED);
+        return;
+    }
+
+    snprintf(ctx->gitm->ap_ssid, sizeof(ctx->gitm->ap_ssid), "%s", ssid);
+    snprintf(ctx->gitm->ap_pass, sizeof(ctx->gitm->ap_pass), "%s",
+             ctx->gitm->ap_wpa2 ? pass : "");
+    gitm_build_pcap_basename(prefix[0] ? prefix : "gitm",
+                             ctx->gitm->pcap_basename, sizeof(ctx->gitm->pcap_basename));
+
+    ctx->gitm->tab = (int)current_tab;
+    ctx->gitm->uart_port = uart_port_for_tab(current_tab);
+    ctx->gitm->stop_request = false;
+    cgw_snapshot_reset(&ctx->gitm->snap);
+    memset(&ctx->gitm->final, 0, sizeof(ctx->gitm->final));
+    gitm_reset_client_tracking(ctx);
+
+    if (ctx->gitm->keyboard) lv_obj_add_flag(ctx->gitm->keyboard, LV_OBJ_FLAG_HIDDEN);
+    // Both setup steps fold to a one-line summary; the live view takes over.
+    gitm_collapse_upstream(ctx);
+    gitm_collapse_ap(ctx);
+    if (ctx->gitm->live) lv_obj_clear_flag(ctx->gitm->live, LV_OBJ_FLAG_HIDDEN);
+    if (ctx->gitm->stop_btn) {
+        lv_obj_clear_flag(ctx->gitm->stop_btn, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_state(ctx->gitm->stop_btn, LV_STATE_DISABLED);
+    }
+    if (ctx->gitm->copy_btn) lv_obj_add_flag(ctx->gitm->copy_btn, LV_OBJ_FLAG_HIDDEN);
+    gitm_render_live(ctx);
+
+    ctx->gitm->session_active = true;
+    if (xTaskCreate(gitm_session_task, "gitm_session", 8192, ctx, 4,
+                    &ctx->gitm->session_task) != pdPASS) {
+        ctx->gitm->session_active = false;
+        ctx->gitm->session_task = NULL;
+        ESP_LOGW(TAG, "GITM: failed to start the session task");
+        gitm_set_state(ctx, GITM_IDLE, "Could not start the session task.",
+                       COLOR_MATERIAL_RED);
+        gitm_restore_setup(ctx);
+    }
+}
+
+static void gitm_stop_cb(lv_event_t *e)
+{
+    (void)e;
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx || !ctx->gitm || !ctx->gitm->session_active) return;
+
+    ESP_LOGI(TAG, "GITM: stop requested");
+    ctx->gitm->stop_request = true;
+    if (ctx->gitm->stop_btn) lv_obj_add_state(ctx->gitm->stop_btn, LV_STATE_DISABLED);
+    gitm_set_state(ctx, GITM_STOPPING, "Stopping and finalizing the PCAP...",
+                   COLOR_MATERIAL_AMBER);
+}
+
+// Hand the finalized capture to ESPShark, which already implements the
+// JanOS-Admin HTTP transfer described in contract section 8.7.
+static void gitm_copy_cb(lv_event_t *e)
+{
+    (void)e;
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx || !ctx->gitm) return;
+
+    const char *remote = ctx->gitm->final.file[0] ? ctx->gitm->final.file
+                                                 : ctx->gitm->snap.file;
+    if (remote[0] == '\0') {
+        gitm_set_hint(ctx, "No finalized capture path to copy.", COLOR_MATERIAL_RED);
+        return;
+    }
+    ESP_LOGI(TAG, "GITM: handing %s over to ESPShark", remote);
+    show_espshark_page();
+}
+
+// ---- Leaving a live GITM session ------------------------------------------
+//
+// Walking out silently is worse here than in the observer: the stop is what
+// drains the writer, closes the PCAP and emits [PCAP_FINAL]. Leaving while that
+// is still in flight means the next command collides with it, and the operator
+// has no idea whether the capture on the Monster is a complete file yet.
+
+static lv_obj_t *gitm_exit_overlay = NULL;
+static lv_obj_t *gitm_exit_status = NULL;
+static lv_obj_t *gitm_exit_btn_row = NULL;
+
+static void close_gitm_exit_confirm(void)
+{
+    if (gitm_exit_overlay) {
+        lv_obj_del(gitm_exit_overlay);
+        gitm_exit_overlay = NULL;
+    }
+    gitm_exit_status = NULL;
+    gitm_exit_btn_row = NULL;
+}
+
+// Leave the page for real. Call with the display lock held.
+static void gitm_leave_page(tab_context_t *ctx)
+{
+    if (ctx->gitm->keyboard) lv_obj_add_flag(ctx->gitm->keyboard, LV_OBJ_FLAG_HIDDEN);
+    if (ctx->gitm->page) lv_obj_add_flag(ctx->gitm->page, LV_OBJ_FLAG_HIDDEN);
+
+    ctx->observer_attack_return_to_observer = false;
+    clear_observer_attack_override(ctx);
+
+    if (ctx->tiles) {
+        lv_obj_clear_flag(ctx->tiles, LV_OBJ_FLAG_HIDDEN);
+        ctx->current_visible_page = ctx->tiles;
+    }
+}
+
+// The session task owns the stop sequence; this just watches it finish so the
+// page is not torn away from under a capture that is still being closed.
+static void gitm_exit_wait_task(void *arg)
+{
+    tab_context_t *ctx = (tab_context_t *)arg;
+
+    int waited = 0;
+    while (ctx->gitm->session_active && waited < 30000) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        waited += 100;
+    }
+    if (ctx->gitm->session_active) {
+        ESP_LOGW(TAG, "GITM: session still finalizing after %d ms, leaving anyway", waited);
+    } else {
+        ESP_LOGI(TAG, "GITM: session finalized after %d ms, leaving the page", waited);
+    }
+
+    if (bsp_display_lock(0)) {
+        close_gitm_exit_confirm();
+        gitm_leave_page(ctx);
+        bsp_display_unlock();
+    }
+    vTaskDelete(NULL);
+}
+
+static void gitm_exit_cancel_cb(lv_event_t *e)
+{
+    (void)e;
+    close_gitm_exit_confirm();
+}
+
+static void gitm_exit_confirm_cb(lv_event_t *e)
+{
+    (void)e;
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx || !ctx->gitm) return;
+
+    ctx->gitm->stop_request = true;
+    ESP_LOGI(TAG, "GITM: leaving the page, stop requested");
+
+    if (gitm_exit_btn_row) lv_obj_add_flag(gitm_exit_btn_row, LV_OBJ_FLAG_HIDDEN);
+    if (gitm_exit_status) {
+        lv_label_set_text(gitm_exit_status,
+                          "Stopping and finalizing the PCAP...\n"
+                          "Waiting for JanOS to close the file.");
+        lv_obj_set_style_text_color(gitm_exit_status, COLOR_MATERIAL_AMBER, 0);
+    }
+
+    if (xTaskCreate(gitm_exit_wait_task, "gitm_exit", 4096, ctx, 5, NULL) != pdPASS) {
+        // Could not watch it finish, but the stop is already requested, so do
+        // not trap the operator on the page.
+        ESP_LOGW(TAG, "GITM: could not start the exit waiter, leaving immediately");
+        close_gitm_exit_confirm();
+        gitm_leave_page(ctx);
+    }
+}
+
+static void show_gitm_exit_confirm(void)
+{
+    if (gitm_exit_overlay != NULL) return;
+
+    lv_obj_t *container = get_current_tab_container();
+    if (!container) return;
+
+    gitm_exit_overlay = lv_obj_create(container);
+    lv_obj_remove_style_all(gitm_exit_overlay);
+    lv_obj_set_size(gitm_exit_overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(gitm_exit_overlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(gitm_exit_overlay, LV_OPA_50, 0);
+    lv_obj_clear_flag(gitm_exit_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(gitm_exit_overlay, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t *popup = lv_obj_create(gitm_exit_overlay);
+    lv_obj_set_size(popup, 560, 380);
+    lv_obj_center(popup);
+    lv_obj_set_style_bg_color(popup, lv_color_hex(0x0A1A1A), 0);
+    lv_obj_set_style_border_color(popup, COLOR_MATERIAL_BLUE, 0);
+    lv_obj_set_style_border_width(popup, 2, 0);
+    lv_obj_set_style_radius(popup, 16, 0);
+    lv_obj_set_style_shadow_width(popup, 30, 0);
+    lv_obj_set_style_shadow_color(popup, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_shadow_opa(popup, LV_OPA_50, 0);
+    lv_obj_set_style_pad_all(popup, 20, 0);
+    lv_obj_set_flex_flow(popup, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(popup, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(popup, 14, 0);
+    lv_obj_clear_flag(popup, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *icon = lv_label_create(popup);
+    lv_label_set_text(icon, LV_SYMBOL_LOOP);
+    lv_obj_set_style_text_font(icon, &lv_font_montserrat_44, 0);
+    lv_obj_set_style_text_color(icon, COLOR_MATERIAL_BLUE, 0);
+
+    lv_obj_t *title = lv_label_create(popup);
+    lv_label_set_text(title, "GITM IS RUNNING");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_22, 0);
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_BLUE, 0);
+
+    gitm_exit_status = lv_label_create(popup);
+    lv_label_set_text(gitm_exit_status,
+                      "Leaving sends stop to JanOS: it closes any\n"
+                      "open capture and takes the gateway down.\n"
+                      "Clients on the AP lose their connection.");
+    lv_obj_set_style_text_font(gitm_exit_status, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(gitm_exit_status, lv_color_hex(0xCCCCCC), 0);
+    lv_obj_set_style_text_align(gitm_exit_status, LV_TEXT_ALIGN_CENTER, 0);
+
+    gitm_exit_btn_row = lv_obj_create(popup);
+    lv_obj_remove_style_all(gitm_exit_btn_row);
+    lv_obj_set_size(gitm_exit_btn_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(gitm_exit_btn_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(gitm_exit_btn_row, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(gitm_exit_btn_row, 20, 0);
+    lv_obj_set_style_pad_top(gitm_exit_btn_row, 8, 0);
+
+    lv_obj_t *stay_btn = lv_btn_create(gitm_exit_btn_row);
+    lv_obj_set_size(stay_btn, 170, 54);
+    lv_obj_set_style_bg_color(stay_btn, lv_color_hex(0x1A3333), 0);
+    lv_obj_set_style_bg_color(stay_btn, lv_color_hex(0x2A4444), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(stay_btn, 8, 0);
+    lv_obj_add_event_cb(stay_btn, gitm_exit_cancel_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *stay_lbl = lv_label_create(stay_btn);
+    lv_label_set_text(stay_lbl, "Keep capturing");
+    lv_obj_set_style_text_font(stay_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_center(stay_lbl);
+
+    lv_obj_t *quit_btn = lv_btn_create(gitm_exit_btn_row);
+    lv_obj_set_size(quit_btn, 210, 54);
+    lv_obj_set_style_bg_color(quit_btn, COLOR_MATERIAL_RED, 0);
+    lv_obj_set_style_bg_color(quit_btn, lv_color_hex(0xCC0000), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(quit_btn, 8, 0);
+    lv_obj_add_event_cb(quit_btn, gitm_exit_confirm_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *quit_lbl = lv_label_create(quit_btn);
+    lv_label_set_text(quit_lbl, LV_SYMBOL_STOP " Stop and exit");
+    lv_obj_set_style_text_font(quit_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_center(quit_lbl);
+}
+
+static void gitm_back_cb(lv_event_t *e)
+{
+    (void)e;
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx || !ctx->gitm) return;
+
+    // A live bridge must never be abandoned over an open PCAP: ask, then let the
+    // session task run its stop sequence to completion before the page closes.
+    // Only the states where JanOS may actually hold a gateway qualify - a scan
+    // or an upstream connect leaves nothing running - and a stop already in
+    // flight needs no second prompt.
+    const int st = ctx->gitm->state;
+    const bool gateway_may_be_up = (st == GITM_STARTING || st == GITM_RECOVERING ||
+                                    st == GITM_RUNNING);
+    if (ctx->gitm->session_active && gateway_may_be_up && !ctx->gitm->stop_request) {
+        ESP_LOGI(TAG, "GITM: gateway may be up (state %s), asking before leaving",
+                 gitm_state_name(st));
+        show_gitm_exit_confirm();
+        return;
+    }
+
+    gitm_leave_page(ctx);
+}
+
+// ---------------------------------------------------------------------------
+// Page construction
+// ---------------------------------------------------------------------------
+
+// A collapsible step panel, styled to match the Network Observer page.
+//
+// The header stays visible at all times and carries a chevron, the step title
+// and a one-line summary of what was chosen; the content column folds away once
+// the step is settled, so the step you are actually working on owns the screen.
+static lv_obj_t *gitm_make_section(lv_obj_t *parent, const char *title,
+                                   lv_color_t accent, lv_event_cb_t toggle_cb,
+                                   void *toggle_data,
+                                   lv_obj_t **out_chev, lv_obj_t **out_summary,
+                                   lv_obj_t **out_content)
+{
+    lv_obj_t *box = lv_obj_create(parent);
+    lv_obj_set_size(box, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_color(box, lv_color_hex(0x0A1A1A), 0);
+    lv_obj_set_style_border_color(box, lv_color_hex(0x1A3333), 0);
+    lv_obj_set_style_border_width(box, 1, 0);
+    lv_obj_set_style_radius(box, 12, 0);
+    lv_obj_set_style_pad_all(box, 12, 0);
+    lv_obj_set_flex_flow(box, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(box, 8, 0);
+    lv_obj_clear_flag(box, LV_OBJ_FLAG_SCROLLABLE);
+
+    // ---- header (always visible, tap to fold) ----
+    lv_obj_t *head = lv_obj_create(box);
+    lv_obj_set_size(head, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(head, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(head, 0, 0);
+    lv_obj_set_style_pad_all(head, 0, 0);
+    lv_obj_set_flex_flow(head, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(head, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(head, 10, 0);
+    lv_obj_clear_flag(head, LV_OBJ_FLAG_SCROLLABLE);
+    if (toggle_cb) {
+        lv_obj_add_flag(head, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(head, toggle_cb, LV_EVENT_CLICKED, toggle_data);
+    }
+
+    lv_obj_t *chev = lv_label_create(head);
+    lv_label_set_text(chev, LV_SYMBOL_DOWN);
+    lv_obj_set_style_text_font(chev, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(chev, accent, 0);
+    lv_obj_clear_flag(chev, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t *title_lbl = lv_label_create(head);
+    lv_label_set_text(title_lbl, title ? title : "");
+    lv_obj_set_style_text_font(title_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(title_lbl, accent, 0);
+    lv_obj_clear_flag(title_lbl, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t *summary = lv_label_create(head);
+    lv_label_set_text(summary, "");
+    lv_obj_set_style_text_font(summary, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(summary, lv_color_hex(0xCCCCCC), 0);
+    lv_obj_set_flex_grow(summary, 1);
+    lv_label_set_long_mode(summary, LV_LABEL_LONG_DOT);
+    lv_obj_clear_flag(summary, LV_OBJ_FLAG_CLICKABLE);
+
+    // ---- content (folds away) ----
+    lv_obj_t *content = lv_obj_create(box);
+    lv_obj_set_size(content, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(content, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(content, 0, 0);
+    lv_obj_set_style_pad_all(content, 0, 0);
+    lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(content, 8, 0);
+    lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLLABLE);
+
+    if (out_chev) *out_chev = chev;
+    if (out_summary) *out_summary = summary;
+    if (out_content) *out_content = content;
+    return box;
+}
+
+// Fold or unfold one section and point its chevron the right way.
+static void gitm_set_collapsed(lv_obj_t *content, lv_obj_t *chev, bool collapsed)
+{
+    if (content) {
+        if (collapsed) {
+            lv_obj_add_flag(content, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_clear_flag(content, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    if (chev) lv_label_set_text(chev, collapsed ? LV_SYMBOL_RIGHT : LV_SYMBOL_DOWN);
+}
+
+static void gitm_toggle_section_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx || !ctx->gitm) return;
+    int which = (int)(intptr_t)lv_event_get_user_data(e);
+
+    if (which == 1) {
+        ctx->gitm->s1_collapsed = !ctx->gitm->s1_collapsed;
+        gitm_set_collapsed(ctx->gitm->s1_content, ctx->gitm->s1_chev,
+                           ctx->gitm->s1_collapsed);
+    } else if (which == 2) {
+        ctx->gitm->s2_collapsed = !ctx->gitm->s2_collapsed;
+        gitm_set_collapsed(ctx->gitm->s2_content, ctx->gitm->s2_chev,
+                           ctx->gitm->s2_collapsed);
+    }
+}
+
+// Fold step 1 down to "which upstream we are on".
+static void gitm_collapse_upstream(tab_context_t *ctx)
+{
+    if (!ctx->gitm) return;
+    ctx->gitm->s1_collapsed = true;
+    gitm_set_collapsed(ctx->gitm->s1_content, ctx->gitm->s1_chev, true);
+    if (ctx->gitm->s1_summary) {
+        lv_label_set_text_fmt(ctx->gitm->s1_summary, LV_SYMBOL_OK "  %s",
+                              ctx->gitm->up_ssid[0] ? ctx->gitm->up_ssid : "connected");
+        lv_obj_set_style_text_color(ctx->gitm->s1_summary, COLOR_MATERIAL_GREEN, 0);
+    }
+}
+
+// Fold step 2 down to "what AP we raised and where it records".
+static void gitm_collapse_ap(tab_context_t *ctx)
+{
+    if (!ctx->gitm) return;
+    ctx->gitm->s2_collapsed = true;
+    gitm_set_collapsed(ctx->gitm->s2_content, ctx->gitm->s2_chev, true);
+    if (ctx->gitm->s2_summary) {
+        lv_label_set_text_fmt(ctx->gitm->s2_summary, LV_SYMBOL_OK "  %s  %s",
+                              ctx->gitm->ap_ssid[0] ? ctx->gitm->ap_ssid : "-",
+                              ctx->gitm->ap_wpa2 ? "WPA2" : "Open");
+        lv_obj_set_style_text_color(ctx->gitm->s2_summary, COLOR_MATERIAL_GREEN, 0);
+    }
+}
+
+// A "label + textarea" row, returned so the caller can hide the whole row.
+static lv_obj_t *gitm_make_field(lv_obj_t *parent, const char *label_text,
+                                 lv_obj_t **out_ta, const char *placeholder,
+                                 bool password, uint32_t max_len)
+{
+    lv_obj_t *row = lv_obj_create(parent);
+    lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(row, 0, 0);
+    lv_obj_set_style_pad_all(row, 0, 0);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(row, 10, 0);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *lbl = lv_label_create(row);
+    lv_label_set_text(lbl, label_text);
+    lv_obj_set_width(lbl, 160);
+    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(lbl, lv_color_hex(0xFFFFFF), 0);
+
+    lv_obj_t *ta = lv_textarea_create(row);
+    lv_obj_set_height(ta, 44);
+    lv_obj_set_flex_grow(ta, 1);
+    lv_textarea_set_one_line(ta, true);
+    if (max_len) lv_textarea_set_max_length(ta, max_len);
+    if (password) lv_textarea_set_password_mode(ta, true);
+    lv_textarea_set_placeholder_text(ta, placeholder);
+    lv_obj_set_style_bg_color(ta, lv_color_hex(0x102020), 0);
+    lv_obj_set_style_border_color(ta, lv_color_hex(0x1A3333), 0);
+    lv_obj_set_style_border_width(ta, 1, 0);
+    lv_obj_set_style_text_color(ta, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_add_event_cb(ta, gitm_focus_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(ta, gitm_focus_cb, LV_EVENT_FOCUSED, NULL);
+
+    if (out_ta) *out_ta = ta;
+    return row;
+}
+
+static lv_obj_t *gitm_make_button(lv_obj_t *parent, const char *text,
+                                  lv_color_t color, lv_color_t pressed,
+                                  int32_t w, lv_event_cb_t cb)
+{
+    lv_obj_t *btn = lv_btn_create(parent);
+    lv_obj_set_size(btn, w, 50);
+    lv_obj_set_style_bg_color(btn, color, 0);
+    lv_obj_set_style_bg_color(btn, pressed, LV_STATE_PRESSED);
+    lv_obj_set_style_bg_color(btn, lv_color_hex(0x2A3A3A), LV_STATE_DISABLED);
+    lv_obj_set_style_text_color(btn, lv_color_hex(0x7A8A8A), LV_STATE_DISABLED);
+    lv_obj_set_style_radius(btn, 8, 0);
+    lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *lbl = lv_label_create(btn);
+    lv_label_set_text(lbl, text);
+    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, 0);
+    lv_obj_center(lbl);
+    return btn;
+}
+
+// Ask JanOS what it is doing before offering to start anything. Section 8.6
+// requires this so a restarted UI attaches to a live gateway instead of
+// starting a second session on top of it.
+static void gitm_attach_task(void *arg)
+{
+    tab_context_t *ctx = (tab_context_t *)arg;
+    cgw_snapshot_t snap;
+    bool answered = gitm_query_status((tab_id_t)ctx->gitm->tab, ctx->gitm->uart_port,
+                                      &snap, true);
+
+    if (answered && snap.active && snap.capture_active) {
+        ESP_LOGI(TAG, "GITM: adopting a gateway already running on JanOS");
+        snprintf(ctx->gitm->ap_ssid, sizeof(ctx->gitm->ap_ssid), "%s", snap.ssid);
+        snprintf(ctx->gitm->up_ssid, sizeof(ctx->gitm->up_ssid), "%s", snap.upstream_ssid);
+        ctx->gitm->ap_wpa2 = (strcmp(snap.security, "wpa2") == 0);
+        ctx->gitm->stop_request = false;
+        gitm_reset_client_tracking(ctx);
+
+        if (bsp_display_lock(500)) {
+            ctx->gitm->snap = snap;
+            gitm_collapse_upstream(ctx);
+            gitm_collapse_ap(ctx);
+            if (ctx->gitm->step2) lv_obj_clear_flag(ctx->gitm->step2, LV_OBJ_FLAG_HIDDEN);
+            if (ctx->gitm->live)  lv_obj_clear_flag(ctx->gitm->live, LV_OBJ_FLAG_HIDDEN);
+            if (ctx->gitm->stop_btn) {
+                lv_obj_clear_flag(ctx->gitm->stop_btn, LV_OBJ_FLAG_HIDDEN);
+                lv_obj_clear_state(ctx->gitm->stop_btn, LV_STATE_DISABLED);
+            }
+            if (ctx->gitm->copy_btn) lv_obj_add_flag(ctx->gitm->copy_btn, LV_OBJ_FLAG_HIDDEN);
+            gitm_render_live(ctx);
+            bsp_display_unlock();
+        }
+        gitm_set_state(ctx, GITM_RUNNING,
+                       "Adopted a GITM session already running on JanOS.",
+                       COLOR_MATERIAL_GREEN);
+
+        ctx->gitm->session_active = true;
+        if (xTaskCreate(gitm_adopt_task, "gitm_adopt", 8192, ctx, 4,
+                        &ctx->gitm->session_task) != pdPASS) {
+            ctx->gitm->session_active = false;
+            ctx->gitm->session_task = NULL;
+            ESP_LOGW(TAG, "GITM: failed to start the adopt task");
+        }
+        vTaskDelete(NULL);
+        return;
+    }
+
+    if (bsp_display_lock(500)) {
+        gitm_set_hint(ctx,
+            answered ? "JanOS is idle. Scan, then pick the network that provides Internet."
+                     : "No answer from JanOS. Check the Monster link, then SCAN.",
+            answered ? lv_color_hex(0xCCCCCC) : COLOR_MATERIAL_AMBER);
+        if (ctx->gitm->scan_btn) lv_obj_clear_state(ctx->gitm->scan_btn, LV_STATE_DISABLED);
+        bsp_display_unlock();
+    }
+    vTaskDelete(NULL);
+}
+
+static void show_gitm_page(void)
+{
+    tab_context_t *ctx = get_current_ctx();
+    lv_obj_t *container = get_current_tab_container();
+    if (!ctx || !container) return;
+    if (!gitm_ctx(ctx)) return;
+
+    hide_all_pages(ctx);
+
+    if (ctx->gitm->page) {
+        lv_obj_clear_flag(ctx->gitm->page, LV_OBJ_FLAG_HIDDEN);
+        ctx->current_visible_page = ctx->gitm->page;
+        // Reconcile with JanOS on every entry, unless our own session is live.
+        if (!ctx->gitm->session_active) {
+            ctx->gitm->tab = (int)current_tab;
+            ctx->gitm->uart_port = uart_port_for_tab(current_tab);
+            if (ctx->gitm->scan_btn) lv_obj_add_state(ctx->gitm->scan_btn, LV_STATE_DISABLED);
+            gitm_set_hint(ctx, "Asking JanOS for its current state...", COLOR_MATERIAL_AMBER);
+            xTaskCreate(gitm_attach_task, "gitm_attach", 6144, ctx, 5, NULL);
+        }
+        return;
+    }
+
+    ESP_LOGI(TAG, "Creating the GITM page for tab %d", current_tab);
+
+    if (!ctx->gitm->nets) {
+        ctx->gitm->nets = heap_caps_calloc(MAX_NETWORKS, sizeof(wifi_network_t),
+                                           MALLOC_CAP_SPIRAM);
+        if (!ctx->gitm->nets) {
+            ESP_LOGE(TAG, "GITM: failed to allocate the scan cache in PSRAM");
+            return;
+        }
+    }
+    ctx->gitm->net_count = 0;
+    ctx->gitm->up_index = -1;
+    ctx->gitm->ap_wpa2 = false;
+    ctx->gitm->state = GITM_IDLE;
+    ctx->gitm->tab = (int)current_tab;
+    ctx->gitm->uart_port = uart_port_for_tab(current_tab);
+    gitm_reset_client_tracking(ctx);
+    ctx->gitm->s1_collapsed = false;
+    ctx->gitm->s2_collapsed = false;
+    cgw_snapshot_reset(&ctx->gitm->snap);
+    memset(&ctx->gitm->final, 0, sizeof(ctx->gitm->final));
+
+    // Lists are sized from the panel so the page fills the screen rather than
+    // leaving a band of dead space under a fixed-height box.
+    const int vres = lv_disp_get_ver_res(NULL);
+    int net_list_h = vres - 520;
+    if (net_list_h < 220) net_list_h = 220;
+    int client_list_h = vres - 900;
+    if (client_list_h < 120) client_list_h = 120;
+
+    ctx->gitm->page = lv_obj_create(container);
+    lv_obj_set_size(ctx->gitm->page, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(ctx->gitm->page, lv_color_hex(0x0A1A1A), 0);
+    lv_obj_set_style_border_width(ctx->gitm->page, 0, 0);
+    lv_obj_set_style_pad_all(ctx->gitm->page, 16, 0);
+    lv_obj_set_flex_flow(ctx->gitm->page, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(ctx->gitm->page, 10, 0);
+    lv_obj_clear_flag(ctx->gitm->page, LV_OBJ_FLAG_SCROLLABLE);
+
+    // ---- Header row: back, title, state chip (Network Observer layout) ----
+    lv_obj_t *header = lv_obj_create(ctx->gitm->page);
+    lv_obj_set_size(header, lv_pct(100), 56);
+    lv_obj_set_style_bg_opa(header, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(header, 0, 0);
+    lv_obj_set_style_pad_all(header, 0, 0);
+    lv_obj_clear_flag(header, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *back_btn = lv_btn_create(header);
+    lv_obj_set_size(back_btn, 72, 44);
+    lv_obj_align(back_btn, LV_ALIGN_LEFT_MID, 0, 0);
+    lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x1A3333), 0);
+    lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x2A4444), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(back_btn, 8, 0);
+    lv_obj_add_event_cb(back_btn, gitm_back_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *back_icon = lv_label_create(back_btn);
+    lv_label_set_text(back_icon, LV_SYMBOL_LEFT);
+    lv_obj_set_style_text_color(back_icon, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_center(back_icon);
+
+    lv_obj_t *title = lv_label_create(header);
+    lv_label_set_text(title, "GITM");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_TEAL, 0);
+    lv_obj_align_to(title, back_btn, LV_ALIGN_OUT_RIGHT_MID, 12, -8);
+
+    // Presentation fixed by contract section 8.11.
+    lv_obj_t *subtitle = lv_label_create(header);
+    lv_label_set_text(subtitle, "Gate-in-the-Middle");
+    lv_obj_set_style_text_font(subtitle, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(subtitle, lv_color_hex(0x6C8A8A), 0);
+    lv_obj_align_to(subtitle, title, LV_ALIGN_OUT_BOTTOM_LEFT, 0, 2);
+
+    ctx->gitm->state_chip = lv_label_create(header);
+    lv_label_set_text(ctx->gitm->state_chip, "IDLE");
+    lv_obj_set_style_text_font(ctx->gitm->state_chip, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(ctx->gitm->state_chip, lv_color_hex(0x888888), 0);
+    lv_obj_set_style_bg_color(ctx->gitm->state_chip, lv_color_hex(0x102020), 0);
+    lv_obj_set_style_bg_opa(ctx->gitm->state_chip, LV_OPA_COVER, 0);
+    lv_obj_set_style_pad_all(ctx->gitm->state_chip, 10, 0);
+    lv_obj_set_style_radius(ctx->gitm->state_chip, 8, 0);
+    lv_obj_align(ctx->gitm->state_chip, LV_ALIGN_RIGHT_MID, 0, 0);
+
+    // ---- Hint / error line, shared by every phase ----
+    ctx->gitm->status_label = lv_label_create(ctx->gitm->page);
+    lv_label_set_text(ctx->gitm->status_label, "Asking JanOS for its current state...");
+    lv_obj_set_style_text_font(ctx->gitm->status_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(ctx->gitm->status_label, COLOR_MATERIAL_AMBER, 0);
+    lv_obj_set_width(ctx->gitm->status_label, lv_pct(100));
+    lv_label_set_long_mode(ctx->gitm->status_label, LV_LABEL_LONG_WRAP);
+
+    // ---- Scrollable body holding the three steps ----
+    ctx->gitm->body = lv_obj_create(ctx->gitm->page);
+    lv_obj_set_width(ctx->gitm->body, lv_pct(100));
+    lv_obj_set_flex_grow(ctx->gitm->body, 1);
+    lv_obj_set_style_bg_opa(ctx->gitm->body, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(ctx->gitm->body, 0, 0);
+    lv_obj_set_style_pad_all(ctx->gitm->body, 0, 0);
+    lv_obj_set_flex_flow(ctx->gitm->body, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(ctx->gitm->body, 10, 0);
+    lv_obj_set_scroll_dir(ctx->gitm->body, LV_DIR_VER);
+
+    // =========================== Step 1: upstream ==========================
+    ctx->gitm->step1 = gitm_make_section(
+        ctx->gitm->body, "1.  Internet", COLOR_MATERIAL_BLUE,
+        gitm_toggle_section_cb, (void *)(intptr_t)1,
+        &ctx->gitm->s1_chev, &ctx->gitm->s1_summary, &ctx->gitm->s1_content);
+
+    ctx->gitm->net_list = lv_obj_create(ctx->gitm->s1_content);
+    lv_obj_set_size(ctx->gitm->net_list, lv_pct(100), net_list_h);
+    lv_obj_set_style_bg_color(ctx->gitm->net_list, lv_color_hex(0x061212), 0);
+    lv_obj_set_style_border_color(ctx->gitm->net_list, lv_color_hex(0x1A3333), 0);
+    lv_obj_set_style_border_width(ctx->gitm->net_list, 1, 0);
+    lv_obj_set_style_radius(ctx->gitm->net_list, 8, 0);
+    lv_obj_set_style_pad_all(ctx->gitm->net_list, 6, 0);
+    lv_obj_set_flex_flow(ctx->gitm->net_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(ctx->gitm->net_list, 6, 0);
+    lv_obj_set_scroll_dir(ctx->gitm->net_list, LV_DIR_VER);
+
+    ctx->gitm->up_pass_row = gitm_make_field(ctx->gitm->s1_content, "Upstream pass:",
+                                             &ctx->gitm->up_pass_input,
+                                             "empty = try saved on JanOS", true, 64);
+    lv_obj_add_flag(ctx->gitm->up_pass_row, LV_OBJ_FLAG_HIDDEN);
+
+    lv_obj_t *s1_btns = lv_obj_create(ctx->gitm->s1_content);
+    lv_obj_set_size(s1_btns, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(s1_btns, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(s1_btns, 0, 0);
+    lv_obj_set_style_pad_all(s1_btns, 0, 0);
+    lv_obj_set_flex_flow(s1_btns, LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_column(s1_btns, 10, 0);
+    lv_obj_clear_flag(s1_btns, LV_OBJ_FLAG_SCROLLABLE);
+
+    ctx->gitm->scan_btn = gitm_make_button(s1_btns, LV_SYMBOL_REFRESH " SCAN",
+                                           lv_color_hex(0x1A3333), lv_color_hex(0x2A4444),
+                                           220, gitm_scan_cb);
+    ctx->gitm->connect_btn = gitm_make_button(s1_btns, LV_SYMBOL_WIFI " CONNECT",
+                                              COLOR_MATERIAL_TEAL, lv_color_hex(0x00695C),
+                                              280, gitm_connect_cb);
+    lv_obj_add_state(ctx->gitm->connect_btn, LV_STATE_DISABLED);
+
+    // ============================ Step 2: our AP ===========================
+    ctx->gitm->step2 = gitm_make_section(
+        ctx->gitm->body, "2.  Your AP", COLOR_MATERIAL_TEAL,
+        gitm_toggle_section_cb, (void *)(intptr_t)2,
+        &ctx->gitm->s2_chev, &ctx->gitm->s2_summary, &ctx->gitm->s2_content);
+    lv_obj_add_flag(ctx->gitm->step2, LV_OBJ_FLAG_HIDDEN);
+
+    gitm_make_field(ctx->gitm->s2_content, "AP SSID:", &ctx->gitm->ap_ssid_input,
+                    "name clients will see", false, 32);
+
+    lv_obj_t *sec_row = lv_obj_create(ctx->gitm->s2_content);
+    lv_obj_set_size(sec_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(sec_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(sec_row, 0, 0);
+    lv_obj_set_style_pad_all(sec_row, 0, 0);
+    lv_obj_set_flex_flow(sec_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(sec_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(sec_row, 10, 0);
+    lv_obj_clear_flag(sec_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *sec_lbl = lv_label_create(sec_row);
+    lv_label_set_text(sec_lbl, "Security:");
+    lv_obj_set_width(sec_lbl, 160);
+    lv_obj_set_style_text_font(sec_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(sec_lbl, lv_color_hex(0xFFFFFF), 0);
+
+    ctx->gitm->sec_dd = lv_dropdown_create(sec_row);
+    lv_dropdown_set_options(ctx->gitm->sec_dd, "Open\nWPA2");
+    lv_obj_set_size(ctx->gitm->sec_dd, 220, 44);
+    lv_obj_set_style_bg_color(ctx->gitm->sec_dd, lv_color_hex(0x102020), 0);
+    lv_obj_set_style_border_color(ctx->gitm->sec_dd, lv_color_hex(0x1A3333), 0);
+    lv_obj_set_style_text_color(ctx->gitm->sec_dd, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_add_event_cb(ctx->gitm->sec_dd, gitm_security_changed_cb,
+                        LV_EVENT_VALUE_CHANGED, NULL);
+
+    ctx->gitm->ap_pass_row = gitm_make_field(ctx->gitm->s2_content, "AP password:",
+                                             &ctx->gitm->ap_pass_input,
+                                             "8-63 characters", true, 63);
+    lv_obj_add_flag(ctx->gitm->ap_pass_row, LV_OBJ_FLAG_HIDDEN);
+
+    ctx->gitm->open_warn = lv_label_create(ctx->gitm->s2_content);
+    lv_label_set_text(ctx->gitm->open_warn,
+        LV_SYMBOL_WARNING " Open AP - anyone in range can join and will be recorded.");
+    lv_obj_set_style_text_font(ctx->gitm->open_warn, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(ctx->gitm->open_warn, COLOR_MATERIAL_AMBER, 0);
+    lv_obj_set_width(ctx->gitm->open_warn, lv_pct(100));
+    lv_label_set_long_mode(ctx->gitm->open_warn, LV_LABEL_LONG_WRAP);
+
+    gitm_make_field(ctx->gitm->s2_content, "PCAP prefix:", &ctx->gitm->prefix_input,
+                    "gitm", false, 32);
+    lv_obj_add_event_cb(ctx->gitm->prefix_input, gitm_prefix_changed_cb,
+                        LV_EVENT_VALUE_CHANGED, NULL);
+
+    ctx->gitm->name_preview = lv_label_create(ctx->gitm->s2_content);
+    lv_label_set_text(ctx->gitm->name_preview, "");
+    lv_obj_set_style_text_font(ctx->gitm->name_preview, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(ctx->gitm->name_preview, lv_color_hex(0x6C8A8A), 0);
+
+    ctx->gitm->start_btn = gitm_make_button(ctx->gitm->s2_content,
+                                            LV_SYMBOL_PLAY "  START GITM",
+                                            COLOR_MATERIAL_GREEN, lv_color_hex(0x2E7D32),
+                                            lv_pct(100), gitm_start_cb);
+
+    // ============================ Step 3: live =============================
+    ctx->gitm->live = gitm_make_section(ctx->gitm->body, "3.  Live", COLOR_MATERIAL_GREEN,
+                                        NULL, NULL, NULL, NULL, &ctx->gitm->live_content);
+    lv_obj_add_flag(ctx->gitm->live, LV_OBJ_FLAG_HIDDEN);
+
+    ctx->gitm->live_hdr = lv_label_create(ctx->gitm->live_content);
+    lv_label_set_text(ctx->gitm->live_hdr, "");
+    lv_obj_set_style_text_font(ctx->gitm->live_hdr, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(ctx->gitm->live_hdr, lv_color_hex(0xDDDDDD), 0);
+    lv_obj_set_width(ctx->gitm->live_hdr, lv_pct(100));
+
+    ctx->gitm->live_warn = lv_label_create(ctx->gitm->live_content);
+    lv_label_set_text(ctx->gitm->live_warn, "");
+    lv_obj_set_style_text_font(ctx->gitm->live_warn, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(ctx->gitm->live_warn, COLOR_MATERIAL_AMBER, 0);
+    lv_obj_set_width(ctx->gitm->live_warn, lv_pct(100));
+    lv_label_set_long_mode(ctx->gitm->live_warn, LV_LABEL_LONG_WRAP);
+
+    ctx->gitm->clients_hdr = lv_label_create(ctx->gitm->live_content);
+    lv_label_set_text(ctx->gitm->clients_hdr, "Clients (0)");
+    lv_obj_set_style_text_font(ctx->gitm->clients_hdr, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(ctx->gitm->clients_hdr, COLOR_MATERIAL_TEAL, 0);
+
+    ctx->gitm->clients_list = lv_obj_create(ctx->gitm->live_content);
+    lv_obj_set_size(ctx->gitm->clients_list, lv_pct(100), client_list_h);
+    lv_obj_set_style_bg_color(ctx->gitm->clients_list, lv_color_hex(0x061212), 0);
+    lv_obj_set_style_border_color(ctx->gitm->clients_list, lv_color_hex(0x1A3333), 0);
+    lv_obj_set_style_border_width(ctx->gitm->clients_list, 1, 0);
+    lv_obj_set_style_radius(ctx->gitm->clients_list, 8, 0);
+    lv_obj_set_style_pad_all(ctx->gitm->clients_list, 8, 0);
+    lv_obj_set_flex_flow(ctx->gitm->clients_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(ctx->gitm->clients_list, 4, 0);
+    lv_obj_set_scroll_dir(ctx->gitm->clients_list, LV_DIR_VER);
+
+    lv_obj_t *cap_hdr = lv_label_create(ctx->gitm->live_content);
+    lv_label_set_text(cap_hdr, "Capture");
+    lv_obj_set_style_text_font(cap_hdr, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(cap_hdr, COLOR_MATERIAL_TEAL, 0);
+
+    ctx->gitm->cap_label = lv_label_create(ctx->gitm->live_content);
+    lv_label_set_text(ctx->gitm->cap_label, "");
+    lv_obj_set_style_text_font(ctx->gitm->cap_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(ctx->gitm->cap_label, lv_color_hex(0xDDDDDD), 0);
+    lv_obj_set_width(ctx->gitm->cap_label, lv_pct(100));
+
+    ctx->gitm->rec_label = lv_label_create(ctx->gitm->live_content);
+    lv_label_set_text(ctx->gitm->rec_label, "");
+    lv_obj_set_style_text_font(ctx->gitm->rec_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(ctx->gitm->rec_label, COLOR_MATERIAL_GREEN, 0);
+    lv_obj_set_width(ctx->gitm->rec_label, lv_pct(100));
+
+    ctx->gitm->shaper_label = lv_label_create(ctx->gitm->live_content);
+    lv_label_set_text(ctx->gitm->shaper_label, "");
+    lv_obj_set_style_text_font(ctx->gitm->shaper_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(ctx->gitm->shaper_label, COLOR_MATERIAL_GREEN, 0);
+    lv_obj_set_width(ctx->gitm->shaper_label, lv_pct(100));
+
+    ctx->gitm->stop_btn = gitm_make_button(ctx->gitm->live_content,
+                                           LV_SYMBOL_STOP "  STOP GITM",
+                                           COLOR_MATERIAL_RED, lv_color_hex(0xCC0000),
+                                           lv_pct(100), gitm_stop_cb);
+    lv_obj_add_flag(ctx->gitm->stop_btn, LV_OBJ_FLAG_HIDDEN);
+
+    ctx->gitm->copy_btn = gitm_make_button(ctx->gitm->live_content,
+                                           LV_SYMBOL_DOWNLOAD "  COPY TO TAB5 / ESPSHARK",
+                                           COLOR_MATERIAL_BLUE, lv_color_hex(0x1565C0),
+                                           lv_pct(100), gitm_copy_cb);
+    lv_obj_add_flag(ctx->gitm->copy_btn, LV_OBJ_FLAG_HIDDEN);
+
+    // ---- Shared on-screen keyboard ----
+    ctx->gitm->keyboard = lv_keyboard_create(ctx->gitm->page);
+    lv_obj_set_size(ctx->gitm->keyboard, lv_pct(100), 260);
+    lv_obj_align(ctx->gitm->keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
+    style_on_screen_keyboard(ctx->gitm->keyboard);
+    lv_keyboard_set_textarea(ctx->gitm->keyboard, ctx->gitm->ap_ssid_input);
+    lv_obj_add_event_cb(ctx->gitm->keyboard, gitm_keyboard_cb, LV_EVENT_ALL, NULL);
+    lv_obj_add_flag(ctx->gitm->keyboard, LV_OBJ_FLAG_HIDDEN);
+
+    gitm_render_net_list(ctx);
+    gitm_update_name_preview(ctx);
+    ctx->current_visible_page = ctx->gitm->page;
+
+    // Section 8.6: always ask what JanOS is doing before offering to start.
+    // A rogue session opens this page only to reuse its live view; it already
+    // owns the transport, so the reconcile would collide with the start.
+    if (!ctx->gitm->session_active) {
+        if (ctx->gitm->scan_btn) lv_obj_add_state(ctx->gitm->scan_btn, LV_STATE_DISABLED);
+        xTaskCreate(gitm_attach_task, "gitm_attach", 6144, ctx, 5, NULL);
+    }
+}
+
+// Entry from the scan / observer attack bar: carry the highlighted network in
+// as a preselection. A selection is a convenience now, not a requirement - the
+// page scans on its own.
+static void show_gitm_page_from_scan(void)
+{
+    tab_context_t *ctx = get_current_ctx();
+    if (!gitm_ctx(ctx)) return;
+
+    ctx->gitm->preselect_ssid[0] = '\0';
+    scan_view_t v = get_scan_view(ctx);
+    if (v.sel_count == 1) {
+        int idx = v.sel_indices[0];
+        if (idx >= 0 && idx < v.net_count && v.nets[idx].ssid[0]) {
+            snprintf(ctx->gitm->preselect_ssid, sizeof(ctx->gitm->preselect_ssid),
+                     "%s", v.nets[idx].ssid);
+        }
+    }
+    show_gitm_page();
+}
+
+// ============================ Rogue GITM ===================================
+//
+// Deauth the victim off its real AP, mirror that SSID on JanOS with the real
+// passphrase, and route the victim through an uplink picked on the victim's own
+// channel while the capture gateway records everything. The running screen and
+// the whole [CGW] engine belong to the clean GITM page; only this setup popup
+// and the start_rogue_gitm command are new here.
+
+static lv_obj_t *rogue_gitm_overlay;
+static lv_obj_t *rogue_gitm_popup;
+static lv_obj_t *rogue_gitm_uplink_dd;
+static lv_obj_t *rogue_gitm_home_row;
+static lv_obj_t *rogue_gitm_home_input;
+static lv_obj_t *rogue_gitm_mirror_input;
+static lv_obj_t *rogue_gitm_status_label;
+static lv_obj_t *rogue_gitm_keyboard;
+static int rogue_gitm_uplink_map[MAX_NETWORKS];  // dropdown row -> scan-view index
+static int rogue_gitm_uplink_count;
+static int rogue_gitm_victim_idx;                // index into the scan view
+
+static void rogue_gitm_close_popup(void)
+{
+    if (rogue_gitm_overlay) {
+        lv_obj_del(rogue_gitm_overlay);   // deletes the popup and keyboard children too
+        rogue_gitm_overlay = NULL;
+    }
+    rogue_gitm_popup = NULL;
+    rogue_gitm_uplink_dd = NULL;
+    rogue_gitm_home_row = NULL;
+    rogue_gitm_home_input = NULL;
+    rogue_gitm_mirror_input = NULL;
+    rogue_gitm_status_label = NULL;
+    rogue_gitm_keyboard = NULL;
+}
+
+static void rogue_gitm_input_focus_cb(lv_event_t *e)
+{
+    lv_obj_t *ta = lv_event_get_target(e);
+    if (!rogue_gitm_keyboard || !ta) return;
+    lv_keyboard_set_textarea(rogue_gitm_keyboard, ta);
+    lv_obj_clear_flag(rogue_gitm_keyboard, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void rogue_gitm_keyboard_cb(lv_event_t *e)
+{
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_READY || code == LV_EVENT_CANCEL) {
+        if (rogue_gitm_keyboard) lv_obj_add_flag(rogue_gitm_keyboard, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+// Uplink choice drives the home password field: open networks need none, and a
+// secured one is prefilled from the captured-password table when we hold it.
+static void rogue_gitm_uplink_changed_cb(lv_event_t *e)
+{
+    (void)e;
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx || !rogue_gitm_uplink_dd || !rogue_gitm_home_input) return;
+
+    int sel = lv_dropdown_get_selected(rogue_gitm_uplink_dd);
+    if (sel < 0 || sel >= rogue_gitm_uplink_count) return;
+
+    scan_view_t v = get_scan_view(ctx);
+    int idx = rogue_gitm_uplink_map[sel];
+    if (idx < 0 || idx >= v.net_count) return;
+
+    if (wifi_network_security_is_open(v.nets[idx].security)) {
+        lv_textarea_set_text(rogue_gitm_home_input, "");
+        if (rogue_gitm_home_row) lv_obj_add_flag(rogue_gitm_home_row, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        if (rogue_gitm_home_row) lv_obj_clear_flag(rogue_gitm_home_row, LV_OBJ_FLAG_HIDDEN);
+        const char *known = creds_lookup(ctx, v.nets[idx].ssid);
+        lv_textarea_set_text(rogue_gitm_home_input, known ? known : "");
+    }
+}
+
+static void rogue_gitm_cancel_cb(lv_event_t *e)
+{
+    (void)e;
+    rogue_gitm_close_popup();
+}
+
+// One task owns the transport for the whole session: connect the uplink, arm
+// the deauth + mirror, then hand over to the shared [CGW] poll/stop loop.
+static void rogue_gitm_session_task(void *arg)
+{
+    tab_context_t *ctx = (tab_context_t *)arg;
+    gitm_ctx_t *g = ctx->gitm;
+    tab_id_t tab = (tab_id_t)g->tab;
+    uart_port_t port = g->uart_port;
+    bool failed = false;
+
+    gitm_set_state(ctx, GITM_CONNECTING, "Connecting the uplink Wi-Fi...",
+                   COLOR_MATERIAL_AMBER);
+
+    if (!gitm_connect_upstream(tab, port, g->up_ssid, g->up_pass, g->up_is_open)) {
+        gitm_set_state(ctx, GITM_IDLE,
+                       "Uplink connect failed.\n"
+                       "Check the uplink password, then start again.",
+                       COLOR_MATERIAL_RED);
+        failed = true;
+    } else {
+        // Select only the victim so JanOS knows what to deauth and mirror. The
+        // uplink BSSID must never appear here or the gateway is refused.
+        char sel_cmd[32];
+        snprintf(sel_cmd, sizeof(sel_cmd), "select_networks %d", g->victim_scan_index);
+        gitm_flush_rx(tab, port);
+        gitm_log_tx(sel_cmd);
+        transport_write_bytes_tab(tab, port, sel_cmd, strlen(sel_cmd));
+        transport_write_bytes_tab(tab, port, "\r\n", 2);
+        vTaskDelay(pdMS_TO_TICKS(150));   // let JanOS apply the selection
+
+        char esc_ssid[80], esc_pass[160], start_cmd[256];
+        beacon_spam_escape_quoted_arg(g->victim_ssid, esc_ssid, sizeof(esc_ssid));
+        beacon_spam_escape_quoted_arg(g->mirror_pass, esc_pass, sizeof(esc_pass));
+        snprintf(start_cmd, sizeof(start_cmd), "start_rogue_gitm \"%s\" \"%s\"",
+                 esc_ssid, esc_pass);
+        // Never log the real command: it carries the mirror passphrase.
+        ESP_LOGI(TAG, "Rogue GITM > start_rogue_gitm \"%s\" \"***\"", g->victim_ssid);
+
+        gitm_set_state(ctx, GITM_STARTING,
+                       "Deauthing the victim and raising the mirror...",
+                       COLOR_MATERIAL_AMBER);
+
+        gitm_start_result_t res;
+        gitm_send_start(tab, port, start_cmd, &res);
+
+        bool running = res.snap.complete && res.snap.active && res.snap.capture_active;
+        if (running) {
+            gitm_publish_snapshot(ctx, &res.snap);
+        } else {
+            // Success is never inferred from a log line; only a full block decides.
+            cgw_snapshot_t probe;
+            if (gitm_query_status(tab, port, &probe, true) &&
+                probe.active && probe.capture_active) {
+                running = true;
+                gitm_publish_snapshot(ctx, &probe);
+            }
+        }
+
+        if (running) {
+            ESP_LOGI(TAG, "Rogue GITM: running, mirror '%s', uplink '%s'",
+                     g->victim_ssid, g->up_ssid);
+            gitm_run_and_stop(ctx, tab, port);   // [CGW] poll + universal stop + [PCAP_FINAL]
+        } else {
+            char msg[224];
+            if (res.needs_upstream) {
+                snprintf(msg, sizeof(msg),
+                         "JanOS reports no upstream IPv4.\n"
+                         "Reconnect the uplink network, then start again.");
+            } else if (res.err[0]) {
+                snprintf(msg, sizeof(msg), "Rogue GITM refused.\n%s", res.err);
+            } else {
+                snprintf(msg, sizeof(msg),
+                         "Rogue GITM start failed or timed out.\n"
+                         "Check the SD card on the Monster, then retry.");
+            }
+            ESP_LOGW(TAG, "Rogue GITM: start failed (%s)",
+                     res.err[0] ? res.err : "no diagnostic");
+            gitm_set_state(ctx, GITM_IDLE, msg, COLOR_MATERIAL_RED);
+            failed = true;
+        }
+    }
+
+    if (failed && bsp_display_lock(300)) {
+        if (g->stop_btn) lv_obj_add_flag(g->stop_btn, LV_OBJ_FLAG_HIDDEN);
+        bsp_display_unlock();
+    }
+
+    g->stop_request = false;
+    g->session_task = NULL;
+    g->session_active = false;
+    vTaskDelete(NULL);
+}
+
+static void rogue_gitm_start_cb(lv_event_t *e)
+{
+    (void)e;
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx || !gitm_ctx(ctx) || ctx->gitm->session_active) return;
+    if (!rogue_gitm_uplink_dd || !rogue_gitm_mirror_input) return;
+
+    scan_view_t v = get_scan_view(ctx);
+    if (rogue_gitm_victim_idx < 0 || rogue_gitm_victim_idx >= v.net_count) return;
+    wifi_network_t *vic = &v.nets[rogue_gitm_victim_idx];
+
+    int sel = lv_dropdown_get_selected(rogue_gitm_uplink_dd);
+    if (sel < 0 || sel >= rogue_gitm_uplink_count) {
+        if (rogue_gitm_status_label) {
+            lv_label_set_text(rogue_gitm_status_label, "Pick an uplink network.");
+            lv_obj_set_style_text_color(rogue_gitm_status_label, COLOR_MATERIAL_RED, 0);
+        }
+        return;
+    }
+    int up_idx = rogue_gitm_uplink_map[sel];
+    if (up_idx < 0 || up_idx >= v.net_count) return;
+    wifi_network_t *up = &v.nets[up_idx];
+    bool up_open = wifi_network_security_is_open(up->security);
+
+    const char *home_pass = (!up_open && rogue_gitm_home_input)
+                          ? lv_textarea_get_text(rogue_gitm_home_input) : "";
+    if (!home_pass) home_pass = "";
+    const char *mirror_pass = lv_textarea_get_text(rogue_gitm_mirror_input);
+    if (!mirror_pass) mirror_pass = "";
+
+    // JanOS mirrors a WPA2 SSID, so the passphrase must be a legal one.
+    if (strlen(mirror_pass) < 8 || strlen(mirror_pass) > 63) {
+        if (rogue_gitm_status_label) {
+            lv_label_set_text(rogue_gitm_status_label,
+                              "The mirror password must be 8-63 characters.");
+            lv_obj_set_style_text_color(rogue_gitm_status_label, COLOR_MATERIAL_RED, 0);
+        }
+        return;
+    }
+    // Every argument is sent inside double quotes; a literal quote would break it.
+    if (strchr(vic->ssid, '"') || strchr(mirror_pass, '"') ||
+        strchr(up->ssid, '"') || strchr(home_pass, '"')) {
+        if (rogue_gitm_status_label) {
+            lv_label_set_text(rogue_gitm_status_label,
+                              "A double quote is not allowed in a name or password.");
+            lv_obj_set_style_text_color(rogue_gitm_status_label, COLOR_MATERIAL_RED, 0);
+        }
+        return;
+    }
+
+    // Copy every value out before the popup and its widgets are destroyed.
+    char victim_ssid[33], victim_bssid[18], up_ssid[33], up_pass[65], mpass[65];
+    unsigned victim_channel = (unsigned)vic->channel;
+    int victim_scan_index = vic->index;
+    snprintf(victim_ssid, sizeof(victim_ssid), "%s", vic->ssid);
+    snprintf(victim_bssid, sizeof(victim_bssid), "%s", vic->bssid);
+    snprintf(up_ssid, sizeof(up_ssid), "%s", up->ssid);
+    snprintf(up_pass, sizeof(up_pass), "%s", home_pass);
+    snprintf(mpass, sizeof(mpass), "%s", mirror_pass);
+
+    rogue_gitm_close_popup();
+
+    // Reuse the clean GITM page only for its live view. Marking the session
+    // active before showing the page suppresses that page's JanOS reconcile,
+    // which would otherwise fight this task for the transport.
+    gitm_ctx_t *g = ctx->gitm;
+    g->session_active = true;
+    show_gitm_page();
+
+    g->rogue = true;
+    snprintf(g->victim_ssid, sizeof(g->victim_ssid), "%s", victim_ssid);
+    snprintf(g->victim_bssid, sizeof(g->victim_bssid), "%s", victim_bssid);
+    g->victim_channel = victim_channel;
+    g->victim_scan_index = victim_scan_index;
+    snprintf(g->mirror_pass, sizeof(g->mirror_pass), "%s", mpass);
+    snprintf(g->up_ssid, sizeof(g->up_ssid), "%s", up_ssid);
+    snprintf(g->up_pass, sizeof(g->up_pass), "%s", up_pass);
+    g->up_is_open = up_open;
+    // The live header labels the mirror as "AP": show the victim SSID as WPA2.
+    snprintf(g->ap_ssid, sizeof(g->ap_ssid), "%s", victim_ssid);
+    g->ap_wpa2 = true;
+    g->tab = (int)current_tab;
+    g->uart_port = uart_port_for_tab(current_tab);
+    g->stop_request = false;
+    cgw_snapshot_reset(&g->snap);
+    memset(&g->final, 0, sizeof(g->final));
+    gitm_reset_client_tracking(ctx);
+
+    if (bsp_display_lock(300)) {
+        if (g->keyboard) lv_obj_add_flag(g->keyboard, LV_OBJ_FLAG_HIDDEN);
+        // The rogue setup lived in a popup, so fold the wizard steps away and
+        // let the live view own the page.
+        if (g->step1) lv_obj_add_flag(g->step1, LV_OBJ_FLAG_HIDDEN);
+        if (g->step2) lv_obj_add_flag(g->step2, LV_OBJ_FLAG_HIDDEN);
+        if (g->live) lv_obj_clear_flag(g->live, LV_OBJ_FLAG_HIDDEN);
+        if (g->stop_btn) {
+            lv_obj_clear_flag(g->stop_btn, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_clear_state(g->stop_btn, LV_STATE_DISABLED);
+        }
+        if (g->copy_btn) lv_obj_add_flag(g->copy_btn, LV_OBJ_FLAG_HIDDEN);
+        gitm_render_live(ctx);
+        bsp_display_unlock();
+    }
+
+    if (xTaskCreate(rogue_gitm_session_task, "rogue_gitm", 8192, ctx, 4,
+                    &g->session_task) != pdPASS) {
+        g->session_active = false;
+        g->session_task = NULL;
+        ESP_LOGW(TAG, "Rogue GITM: failed to start the session task");
+        gitm_set_state(ctx, GITM_IDLE, "Could not start the session task.",
+                       COLOR_MATERIAL_RED);
+    }
+}
+
+static lv_obj_t *rogue_gitm_pass_row(lv_obj_t *parent, const char *label_text,
+                                     lv_obj_t **out_input, const char *placeholder)
+{
+    lv_obj_t *row = lv_obj_create(parent);
+    lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(row, 0, 0);
+    lv_obj_set_style_pad_all(row, 0, 0);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(row, 10, 0);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *lbl = lv_label_create(row);
+    lv_label_set_text(lbl, label_text);
+    lv_obj_set_width(lbl, 150);
+    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(lbl, lv_color_hex(0xFFFFFF), 0);
+
+    lv_obj_t *ta = lv_textarea_create(row);
+    lv_obj_set_flex_grow(ta, 1);
+    lv_textarea_set_one_line(ta, true);
+    lv_textarea_set_password_mode(ta, true);
+    lv_textarea_set_placeholder_text(ta, placeholder);
+    lv_obj_set_style_bg_color(ta, lv_color_hex(0x1A1A1A), 0);
+    lv_obj_set_style_border_color(ta, COLOR_LAB5_MAGENTA, 0);
+    lv_obj_set_style_border_width(ta, 1, 0);
+    lv_obj_set_style_text_color(ta, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_add_event_cb(ta, rogue_gitm_input_focus_cb, LV_EVENT_FOCUSED, NULL);
+    lv_obj_add_event_cb(ta, rogue_gitm_input_focus_cb, LV_EVENT_CLICKED, NULL);
+    *out_input = ta;
+    return row;
+}
+
+static void show_rogue_gitm_popup(tab_context_t *ctx, int victim_view_idx)
+{
+    if (!ctx || rogue_gitm_overlay) return;
+
+    // The uplink picker needs the whole scan list, but the observer override
+    // exposes only the one selected network. Send the operator to the scan page
+    // rather than open a picker that can never find an uplink.
+    if (ctx->observer_attack_override_active) {
+        ESP_LOGW(TAG, "Rogue GITM: unavailable from the observer popup (needs the full scan)");
+        if (ctx->observer_status_label) {
+            lv_label_set_text(ctx->observer_status_label,
+                "Rogue GITM: open it from WiFi Scan & Attack (needs the full scan).");
+            lv_obj_set_style_text_color(ctx->observer_status_label, COLOR_MATERIAL_AMBER, 0);
+        }
+        return;
+    }
+
+    scan_view_t v = get_scan_view(ctx);
+    if (victim_view_idx < 0 || victim_view_idx >= v.net_count) return;
+    wifi_network_t *vic = &v.nets[victim_view_idx];
+
+    // Uplink candidates: named networks on the victim's channel, minus the
+    // victim's own AP. JanOS refuses a gateway whose STA is off-channel.
+    rogue_gitm_victim_idx = victim_view_idx;
+    rogue_gitm_uplink_count = 0;
+    char options[1024];
+    size_t opos = 0;
+    options[0] = '\0';
+    for (int i = 0; i < v.net_count && rogue_gitm_uplink_count < MAX_NETWORKS; i++) {
+        if (i == victim_view_idx) continue;
+        if (v.nets[i].ssid[0] == '\0') continue;
+        if (v.nets[i].channel != vic->channel) continue;
+        if (strcmp(v.nets[i].bssid, vic->bssid) == 0) continue;
+        const char *sec = v.nets[i].security[0] ? v.nets[i].security : "?";
+        int n = snprintf(options + opos, sizeof(options) - opos, "%s%s  ch%d  %s",
+                         opos ? "\n" : "", v.nets[i].ssid, v.nets[i].channel, sec);
+        if (n < 0 || (size_t)n >= sizeof(options) - opos) break;
+        opos += (size_t)n;
+        rogue_gitm_uplink_map[rogue_gitm_uplink_count++] = i;
+    }
+
+    if (rogue_gitm_uplink_count == 0) {
+        if (ctx->scan_status_label) {
+            bsp_display_lock(0);
+            lv_label_set_text_fmt(ctx->scan_status_label,
+                                  "No other network on ch %d for the uplink", vic->channel);
+            lv_obj_set_style_text_color(ctx->scan_status_label, COLOR_MATERIAL_RED, 0);
+            bsp_display_unlock();
+        }
+        return;
+    }
+
+    lv_obj_t *container = get_current_tab_container();
+    if (!container) return;
+
+    rogue_gitm_overlay = lv_obj_create(container);
+    lv_obj_remove_style_all(rogue_gitm_overlay);
+    lv_obj_set_size(rogue_gitm_overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(rogue_gitm_overlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(rogue_gitm_overlay, LV_OPA_50, 0);
+    lv_obj_clear_flag(rogue_gitm_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(rogue_gitm_overlay, LV_OBJ_FLAG_CLICKABLE);
+
+    rogue_gitm_popup = lv_obj_create(rogue_gitm_overlay);
+    lv_obj_set_size(rogue_gitm_popup, 600, 540);
+    lv_obj_align(rogue_gitm_popup, LV_ALIGN_TOP_MID, 0, 40);
+    lv_obj_set_style_bg_color(rogue_gitm_popup, lv_color_hex(0x1A1A2A), 0);
+    lv_obj_set_style_border_color(rogue_gitm_popup, COLOR_LAB5_MAGENTA, 0);
+    lv_obj_set_style_border_width(rogue_gitm_popup, 2, 0);
+    lv_obj_set_style_radius(rogue_gitm_popup, 16, 0);
+    lv_obj_set_style_pad_all(rogue_gitm_popup, 20, 0);
+    lv_obj_set_flex_flow(rogue_gitm_popup, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(rogue_gitm_popup, 12, 0);
+    lv_obj_set_flex_align(rogue_gitm_popup, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    lv_obj_t *title = lv_label_create(rogue_gitm_popup);
+    lv_label_set_text_fmt(title, LV_SYMBOL_LOOP "  Rogue GITM - %s", vic->ssid);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, COLOR_LAB5_MAGENTA, 0);
+
+    lv_obj_t *victim_info = lv_label_create(rogue_gitm_popup);
+    lv_label_set_text_fmt(victim_info,
+                          "Victim / mirror SSID: %s\nBSSID %s   ch %d   %s",
+                          vic->ssid, vic->bssid, vic->channel,
+                          vic->security[0] ? vic->security : "?");
+    lv_obj_set_style_text_font(victim_info, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(victim_info, lv_color_hex(0xAAAAAA), 0);
+    lv_obj_set_width(victim_info, lv_pct(100));
+
+    lv_obj_t *up_label = lv_label_create(rogue_gitm_popup);
+    lv_label_set_text_fmt(up_label, "Uplink (Internet, ch %d):", vic->channel);
+    lv_obj_set_style_text_font(up_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(up_label, lv_color_hex(0xFFFFFF), 0);
+
+    rogue_gitm_uplink_dd = lv_dropdown_create(rogue_gitm_popup);
+    lv_dropdown_set_options(rogue_gitm_uplink_dd, options);
+    lv_obj_set_width(rogue_gitm_uplink_dd, lv_pct(100));
+    lv_obj_set_style_bg_color(rogue_gitm_uplink_dd, lv_color_hex(0x102020), 0);
+    lv_obj_set_style_border_color(rogue_gitm_uplink_dd, COLOR_LAB5_MAGENTA, 0);
+    lv_obj_set_style_text_color(rogue_gitm_uplink_dd, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_add_event_cb(rogue_gitm_uplink_dd, rogue_gitm_uplink_changed_cb,
+                        LV_EVENT_VALUE_CHANGED, NULL);
+
+    rogue_gitm_home_row = rogue_gitm_pass_row(rogue_gitm_popup, "Uplink pass:",
+                                              &rogue_gitm_home_input,
+                                              "empty = try saved on JanOS");
+    rogue_gitm_pass_row(rogue_gitm_popup, "Mirror pass:", &rogue_gitm_mirror_input,
+                        "8-63 chars, the real password");
+
+    rogue_gitm_status_label = lv_label_create(rogue_gitm_popup);
+    lv_label_set_text(rogue_gitm_status_label,
+        "Uplink and victim share a channel. The mirror uses the victim's real password.");
+    lv_obj_set_style_text_font(rogue_gitm_status_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(rogue_gitm_status_label, lv_color_hex(0xAAAAAA), 0);
+    lv_obj_set_width(rogue_gitm_status_label, lv_pct(100));
+    lv_label_set_long_mode(rogue_gitm_status_label, LV_LABEL_LONG_WRAP);
+
+    lv_obj_t *btn_row = lv_obj_create(rogue_gitm_popup);
+    lv_obj_set_size(btn_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(btn_row, 0, 0);
+    lv_obj_set_style_pad_all(btn_row, 0, 0);
+    lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *cancel_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(cancel_btn, 240, 56);
+    lv_obj_set_style_bg_color(cancel_btn, lv_color_hex(0x333344), 0);
+    lv_obj_set_style_radius(cancel_btn, 10, 0);
+    lv_obj_add_event_cb(cancel_btn, rogue_gitm_cancel_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *cancel_lbl = lv_label_create(cancel_btn);
+    lv_label_set_text(cancel_lbl, LV_SYMBOL_CLOSE "  Cancel");
+    lv_obj_set_style_text_color(cancel_lbl, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_center(cancel_lbl);
+
+    lv_obj_t *start_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(start_btn, 260, 56);
+    lv_obj_set_style_bg_color(start_btn, COLOR_MATERIAL_GREEN, 0);
+    lv_obj_set_style_radius(start_btn, 10, 0);
+    lv_obj_add_event_cb(start_btn, rogue_gitm_start_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *start_lbl = lv_label_create(start_btn);
+    lv_label_set_text(start_lbl, LV_SYMBOL_PLAY "  Start");
+    lv_obj_set_style_text_color(start_lbl, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_center(start_lbl);
+
+    rogue_gitm_keyboard = lv_keyboard_create(rogue_gitm_overlay);
+    lv_obj_set_size(rogue_gitm_keyboard, lv_pct(100), 300);
+    lv_obj_align(rogue_gitm_keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
+    style_on_screen_keyboard(rogue_gitm_keyboard);
+    lv_obj_add_event_cb(rogue_gitm_keyboard, rogue_gitm_keyboard_cb, LV_EVENT_ALL, NULL);
+    lv_obj_add_flag(rogue_gitm_keyboard, LV_OBJ_FLAG_HIDDEN);
+
+    // Prefill the mirror password from the captured table when we hold it, and
+    // set the uplink password field from the initial dropdown selection.
+    const char *mknown = creds_lookup(ctx, vic->ssid);
+    if (mknown && rogue_gitm_mirror_input) lv_textarea_set_text(rogue_gitm_mirror_input, mknown);
+    rogue_gitm_uplink_changed_cb(NULL);
+}
+
 // ======================= Handshaker Attack Functions =======================
 
 // Close Handshaker popup - sends stop command
@@ -8840,17 +12604,24 @@ static void handshaker_popup_close_cb(lv_event_t *e)
     ESP_LOGI(TAG, "Handshaker popup closed - sending stop command");
 
     tab_context_t *ctx = get_current_ctx();
-    if (!ctx) return;
+    if (!ctx || !ctx->gitm) return;
 
-    // Stop monitoring task
+    // Stop JanOS first, then wait for the UART reader to leave before deleting
+    // any LVGL objects it may still reference.
     ctx->handshaker_monitoring = false;
-    if (ctx->handshaker_task != NULL) {
-        vTaskDelay(pdMS_TO_TICKS(100));  // Give task time to exit
-        ctx->handshaker_task = NULL;
-    }
-
-    // Send stop command to current tab's UART
     uart_send_command_for_tab("stop");
+
+    if (ctx->handshaker_task != NULL) {
+        for (int wait = 0; wait < 50 && ctx->handshaker_task != NULL; wait++) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+        if (ctx->handshaker_task != NULL) {
+            ESP_LOGW(TAG, "Handshaker monitor did not stop in time; deleting task");
+            vTaskDelete(ctx->handshaker_task);
+            ctx->handshaker_task = NULL;
+            handshaker_monitor_task_handle = NULL;
+        }
+    }
 
     // Delete overlay (popup is child, will be deleted too)
     if (ctx->handshaker_popup_overlay) {
@@ -8910,6 +12681,11 @@ static void handshaker_set_done_state(tab_context_t *ctx, bool show_wpasec_butto
 static void append_handshaker_log(const char *message, hs_log_type_t log_type)
 {
     if (!message || strlen(message) == 0) return;
+
+    // Every success path in the monitor funnels through here, so one call
+    // covers "captured", "saved for SSID" and the file-written line. JanOS
+    // emits two or three of those per handshake; the cooldown collapses them.
+    if (log_type == HS_LOG_SUCCESS) alert_chime_play(ALERT_TONE_WIN);
 
     // Determine color based on log type
     lv_color_t text_color;
@@ -9215,6 +12991,9 @@ static void handshaker_monitor_task(void *arg)
     }
 
     ESP_LOGI(TAG, "Handshaker monitor task ended");
+    if (ctx) {
+        ctx->handshaker_task = NULL;
+    }
     handshaker_monitor_task_handle = NULL;
     vTaskDelete(NULL);
 }
@@ -9223,15 +13002,69 @@ static void handshaker_monitor_task(void *arg)
 static void show_handshaker_popup(void)
 {
     tab_context_t *ctx = get_current_ctx();
-    if (!ctx) return;
+    if (!ctx || !ctx->gitm) return;
     if (ctx->handshaker_popup != NULL) return;  // Already showing in this tab
 
-    if (ctx->popup_open) {
-        if (ctx->observer_running) {
-            pause_observer_for_attack(ctx);
+    scan_view_t hsv = get_scan_view(ctx);
+    bool launched_from_observer = ctx->observer_attack_override_active;
+
+    // Observer attacks must always carry one valid target. Starting JanOS
+    // handshaker without a selection intentionally means "attack all".
+    if (launched_from_observer) {
+        if (hsv.sel_count != 1 || !hsv.sel_indices || !hsv.nets) {
+            ESP_LOGE(TAG, "Observer Handshaker aborted: invalid target snapshot");
+            clear_observer_attack_override(ctx);
+            return;
         }
+
+        int target_idx = hsv.sel_indices[0];
+        if (target_idx < 0 || target_idx >= hsv.net_count || hsv.nets[target_idx].index <= 0) {
+            ESP_LOGE(TAG, "Observer Handshaker aborted: invalid scan index");
+            clear_observer_attack_override(ctx);
+            return;
+        }
+
+        ESP_LOGI(TAG, "Observer Handshaker target: SSID='%s' BSSID=%s scan_index=%d",
+                 hsv.nets[target_idx].ssid,
+                 hsv.nets[target_idx].bssid,
+                 hsv.nets[target_idx].index);
+
+        // Stop every producer/consumer belonging to Network Observer before
+        // handing the UART to Handshaker. Suspend polling without deleting the
+        // network popup; it stays visible while JanOS prepares the target.
+        bool observer_popup_was_open = ctx->popup_open;
+        quiesce_observer_for_attack(ctx);
+        ctx->popup_open = false;
+        if (!wait_for_observer_uart_idle(ctx, 2000)) {
+            ESP_LOGE(TAG, "Observer Handshaker aborted: Observer UART tasks still active");
+            ctx->popup_open = observer_popup_was_open;
+            clear_observer_attack_override(ctx);
+            return;
+        }
+
+        if (!observer_handshaker_prepare_selection(ctx, &hsv.nets[target_idx])) {
+            ESP_LOGE(TAG, "Observer Handshaker aborted: JanOS rejected target selection");
+            ctx->popup_open = observer_popup_was_open;
+            if (ctx->observer_status_label) {
+                lv_label_set_text(ctx->observer_status_label,
+                                  "Target selection failed - restart Observer");
+                lv_obj_set_style_text_color(ctx->observer_status_label,
+                                            COLOR_MATERIAL_RED, 0);
+            }
+            clear_observer_attack_override(ctx);
+            return;
+        }
+
+        if (observer_popup_was_open) {
+            destroy_network_popup_ui(ctx);
+        }
+    } else if (ctx->popup_open) {
+        pause_observer_for_attack(ctx);
         destroy_network_popup_ui(ctx);
-        vTaskDelay(pdMS_TO_TICKS(150));
+        if (!wait_for_observer_uart_idle(ctx, 2000)) {
+            ESP_LOGE(TAG, "Handshaker aborted: Observer UART tasks still active");
+            return;
+        }
     }
 
     lv_obj_t *container = get_current_tab_container();
@@ -9285,7 +13118,6 @@ static void show_handshaker_popup(void)
     lv_obj_set_scroll_dir(network_scroll, LV_DIR_VER);
 
     // Add selected networks to list
-    scan_view_t hsv = get_scan_view(ctx);
     for (int i = 0; i < hsv.sel_count; i++) {
         int idx = hsv.sel_indices[i];
         if (idx >= 0 && idx < hsv.net_count) {
@@ -9364,21 +13196,25 @@ static void show_handshaker_popup(void)
         uart_flush_input(uart_port);
     }
 
-    // Build select_networks command with 1-based indices
-    char cmd[128];
-    snprintf(cmd, sizeof(cmd), "select_networks");
-    for (int i = 0; i < hsv.sel_count; i++) {
-        int idx = hsv.sel_indices[i];
-        if (idx >= 0 && idx < hsv.net_count) {
-            char num[8];
-            snprintf(num, sizeof(num), " %d", hsv.nets[idx].index);  // .index is 1-based
-            strncat(cmd, num, sizeof(cmd) - strlen(cmd) - 1);
+    if (!launched_from_observer) {
+        // Build select_networks command with 1-based indices for the regular
+        // Scan & Attack flow. Observer selection was already verified above.
+        char cmd[128];
+        snprintf(cmd, sizeof(cmd), "select_networks");
+        for (int i = 0; i < hsv.sel_count; i++) {
+            int idx = hsv.sel_indices[i];
+            if (idx >= 0 && idx < hsv.net_count) {
+                char num[8];
+                snprintf(num, sizeof(num), " %d", hsv.nets[idx].index);  // .index is 1-based
+                strncat(cmd, num, sizeof(cmd) - strlen(cmd) - 1);
+            }
         }
-    }
 
-    // Send select_networks command to current tab's UART
-    uart_send_command_for_tab(cmd);
-    vTaskDelay(pdMS_TO_TICKS(100));
+        ESP_LOGI(TAG, "Handshaker selection command: %s", cmd);
+
+        uart_send_command_for_tab(cmd);
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
 
     // Send start_handshake command to current tab's UART
     uart_send_command_for_tab("start_handshake");
@@ -9391,7 +13227,18 @@ static void show_handshaker_popup(void)
         ctx->handshaker_monitoring = true;
     }
 
-    xTaskCreate(handshaker_monitor_task, "hs_monitor", 4096, (void*)ctx, 5, &handshaker_monitor_task_handle);
+    ctx->handshaker_task = NULL;
+    BaseType_t task_result = xTaskCreate(handshaker_monitor_task, "hs_monitor", 4096,
+                                         (void*)ctx, 5, &ctx->handshaker_task);
+    if (task_result == pdPASS) {
+        handshaker_monitor_task_handle = ctx->handshaker_task;
+    } else {
+        ESP_LOGE(TAG, "Failed to start Handshaker monitor task");
+        ctx->handshaker_monitoring = false;
+        handshaker_monitoring = false;
+        uart_send_command_for_tab("stop");
+        handshaker_set_done_state(ctx, false);
+    }
 }
 
 // ======================= ARP Poison Attack Functions =======================
@@ -12209,6 +16056,8 @@ static void karma_monitor_task(void *arg)
                             }
                             mac[j] = '\0';
 
+                            alert_chime_play(ALERT_TONE_JOIN);
+
                             bsp_display_lock(0);
                             if (karma_attack_mac_label) {
                                 lv_label_set_text_fmt(karma_attack_mac_label, "Last MAC connected: %s", mac);
@@ -12232,6 +16081,7 @@ static void karma_monitor_task(void *arg)
                             }
 
                             if (strlen(pass) > 0) {
+                                alert_chime_play(ALERT_TONE_WIN);
                                 bsp_display_lock(0);
                                 if (karma_attack_password_label) {
                                     lv_label_set_text_fmt(karma_attack_password_label, "Password obtained: %s", pass);
@@ -12550,6 +16400,8 @@ static void evil_twin_monitor_task(void *arg)
                                 mac_len++;
                             }
 
+                            alert_chime_play(ALERT_TONE_JOIN);
+
                             // Update status with client connected message
                             char status_text[256];
                             snprintf(status_text, sizeof(status_text),
@@ -12594,6 +16446,7 @@ static void evil_twin_monitor_task(void *arg)
                             strncpy(captured_pwd, pwd_start, pwd_len);
 
                             ESP_LOGI(TAG, "[%s] PASSWORD CAPTURED! SSID: %s, Password: %s", uart_name, captured_ssid, captured_pwd);
+                            alert_chime_play(ALERT_TONE_WIN);
 
                             // Update UI on main thread
                             if (ctx->evil_twin_status_label) {
@@ -13724,10 +17577,9 @@ static void popup_poll_task(void *arg);
 // Popup timer callback - triggers poll task every 10s
 static void popup_timer_callback(TimerHandle_t xTimer)
 {
-    (void)xTimer;
-
-    tab_context_t *ctx = get_current_ctx();
-    if (!ctx || !ctx->popup_open || !ctx->observer_running) return;
+    tab_context_t *ctx = (tab_context_t *)pvTimerGetTimerID(xTimer);
+    if (!ctx || !ctx->popup_open || !ctx->popup_focus_ready ||
+        !ctx->observer_running) return;
 
     // Only start new poll if previous one finished
     if (ctx->observer_task == NULL) {
@@ -13776,6 +17628,8 @@ static void destroy_network_popup_ui(tab_context_t *ctx)
 {
     if (!ctx) return;
 
+    ctx->popup_focus_cancel = true;
+
     if (ctx->popup_timer != NULL) {
         xTimerStop(ctx->popup_timer, 0);
     }
@@ -13783,24 +17637,32 @@ static void destroy_network_popup_ui(tab_context_t *ctx)
     if (ctx->network_popup) {
         lv_obj_del(ctx->network_popup);
         ctx->network_popup = NULL;
+        ctx->popup_title_label = NULL;
         ctx->popup_clients_container = NULL;
     }
 
     ctx->popup_open = false;
+    ctx->popup_focus_ready = false;
     ctx->popup_network_idx = -1;
 }
 
-static void pause_observer_for_attack(tab_context_t *ctx)
+static void quiesce_observer_for_attack(tab_context_t *ctx)
 {
-    if (!ctx || !ctx->observer_running) return;
+    if (!ctx) return;
 
     ctx->observer_running = false;
 
     if (ctx->observer_timer != NULL) {
         xTimerStop(ctx->observer_timer, 0);
     }
+    if (ctx->popup_timer != NULL) {
+        xTimerStop(ctx->popup_timer, 0);
+    }
+    ctx->popup_focus_cancel = true;
 
-    uart_send_command_for_tab("stop");
+    // inspect_observer_task uses its own active flag and otherwise continues
+    // issuing uart_flush()/inspect_network even after observer_running=false.
+    cancel_observer_inspect_task(ctx);
 
     if (ctx->observer_start_btn) {
         lv_obj_clear_state(ctx->observer_start_btn, LV_STATE_DISABLED);
@@ -13813,6 +17675,519 @@ static void pause_observer_for_attack(tab_context_t *ctx)
     }
 }
 
+static void pause_observer_for_attack(tab_context_t *ctx)
+{
+    if (!ctx) return;
+    quiesce_observer_for_attack(ctx);
+    uart_send_command_for_tab("stop");
+}
+
+static bool wait_for_observer_uart_idle(tab_context_t *ctx, uint32_t timeout_ms)
+{
+    if (!ctx) return false;
+
+    TickType_t start = xTaskGetTickCount();
+    TickType_t timeout = pdMS_TO_TICKS(timeout_ms);
+
+    while (ctx->observer_start_active ||
+           ctx->observer_task != NULL ||
+           ctx->observer_inspect_task != NULL ||
+           ctx->popup_focus_task != NULL) {
+        if ((xTaskGetTickCount() - start) >= timeout) {
+            ESP_LOGE(TAG,
+                     "Observer UART idle timeout: start=%d poll=%p inspect=%p focus=%p",
+                     ctx->observer_start_active,
+                     (void *)ctx->observer_task,
+                     (void *)ctx->observer_inspect_task,
+                     (void *)ctx->popup_focus_task);
+            return false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    ESP_LOGI(TAG, "Observer UART tasks stopped; attack may take ownership");
+    return true;
+}
+
+static bool observer_transition_has_error(const char *line)
+{
+    if (!line) return false;
+    return strstr(line, "non-zero error code") != NULL ||
+           strstr(line, "(ERROR)") != NULL ||
+           strstr(line, "FAILED") != NULL ||
+           strstr(line, "Invalid network") != NULL;
+}
+
+static bool observer_scan_field_is_mac(const char *value)
+{
+    if (!value || strlen(value) != 17) return false;
+    for (int i = 0; i < 17; i++) {
+        if ((i + 1) % 3 == 0) {
+            if (value[i] != ':') return false;
+        } else if (!isxdigit((unsigned char)value[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool observer_parse_scan_identity(const char *line, int *index_out,
+                                         char *ssid_out, size_t ssid_size,
+                                         char *bssid_out, size_t bssid_size)
+{
+    if (!line || line[0] != '"' || !index_out || !ssid_out || !bssid_out) return false;
+
+    char temp[512];
+    snprintf(temp, sizeof(temp), "%s", line);
+    char *fields[12] = {0};
+    int field_count = parse_csv_mixed_fields(temp, fields, 12);
+    if (field_count < 2) return false;
+
+    int index = atoi(fields[0]);
+    if (index <= 0) return false;
+
+    *index_out = index;
+    snprintf(ssid_out, ssid_size, "%s", fields[1] ? fields[1] : "");
+    bssid_out[0] = '\0';
+    for (int i = 2; i < field_count; i++) {
+        if (observer_scan_field_is_mac(fields[i])) {
+            snprintf(bssid_out, bssid_size, "%s", fields[i]);
+            break;
+        }
+    }
+    return true;
+}
+
+static bool observer_contains_case_insensitive(const char *haystack, const char *needle)
+{
+    if (!haystack || !needle || needle[0] == '\0') return false;
+    size_t needle_len = strlen(needle);
+    for (const char *p = haystack; *p; p++) {
+        if (strncasecmp(p, needle, needle_len) == 0) return true;
+    }
+    return false;
+}
+
+static void observer_send_command_to_transport(tab_id_t tab, uart_port_t port,
+                                                const char *cmd, const char *purpose)
+{
+    if (!cmd || tab_is_internal(tab)) return;
+    transport_write_bytes_tab(tab, port, cmd, strlen(cmd));
+    transport_write_bytes_tab(tab, port, "\r\n", 2);
+    ESP_LOGI(TAG, "Observer %s command: %s",
+             purpose ? purpose : "transition", cmd);
+}
+
+static void observer_flush_transport_input(tab_id_t tab, uart_port_t port)
+{
+    if (tab == TAB_USB) {
+        usb_flush_input(120);
+    } else if (!tab_is_internal(tab)) {
+        uart_flush_input(port);
+    }
+}
+
+static bool observer_wait_for_janos_marker(tab_id_t tab, uart_port_t port,
+                                           const char *command,
+                                           const char *marker, uint32_t timeout_ms,
+                                           volatile bool *cancel)
+{
+    char rx[512];
+    char line[512];
+    int line_pos = 0;
+    bool saw_command_echo = false;
+    TickType_t start = xTaskGetTickCount();
+    TickType_t timeout = pdMS_TO_TICKS(timeout_ms);
+
+    while ((xTaskGetTickCount() - start) < timeout) {
+        if (cancel && *cancel) return false;
+        int len = transport_read_bytes_tab(tab, port, rx, sizeof(rx) - 1,
+                                           pdMS_TO_TICKS(100));
+        if (len <= 0) continue;
+        rx[len] = '\0';
+
+        for (int i = 0; i < len; i++) {
+            char c = rx[i];
+            if (c == '\n' || c == '\r') {
+                if (line_pos == 0) continue;
+                line[line_pos] = '\0';
+                trim_ascii_whitespace(line);
+                ESP_LOGI(TAG, "Observer transition UART: %s", line);
+
+                if (command && strcmp(line, command) == 0) {
+                    saw_command_echo = true;
+                }
+                if (observer_transition_has_error(line)) {
+                    if (saw_command_echo) return false;
+                    ESP_LOGW(TAG,
+                             "Observer transition: ignoring stale error before '%s' echo",
+                             command ? command : "command");
+                }
+                if (strstr(line, marker) != NULL) return true;
+                line_pos = 0;
+            } else if (line_pos < (int)sizeof(line) - 1) {
+                line[line_pos++] = c;
+            }
+        }
+    }
+
+    ESP_LOGE(TAG, "Observer transition timeout waiting for: %s", marker);
+    return false;
+}
+
+static bool observer_select_target_and_wait(tab_id_t tab, uart_port_t port,
+                                            const wifi_network_t *target,
+                                            const char *purpose,
+                                            volatile bool *cancel)
+{
+    char cmd[40];
+    snprintf(cmd, sizeof(cmd), "select_networks %d", target->index);
+    observer_send_command_to_transport(tab, port, cmd, purpose);
+
+    char rx[512];
+    char line[512];
+    int line_pos = 0;
+    bool saw_response = false;
+    bool saw_command_echo = false;
+    bool saw_target = false;
+    bool saw_command_error = false;
+    TickType_t start = xTaskGetTickCount();
+    TickType_t timeout = pdMS_TO_TICKS(3000);
+
+    while ((xTaskGetTickCount() - start) < timeout) {
+        if (cancel && *cancel) return false;
+        int len = transport_read_bytes_tab(tab, port, rx, sizeof(rx) - 1,
+                                           pdMS_TO_TICKS(100));
+        if (len <= 0) continue;
+        rx[len] = '\0';
+
+        for (int i = 0; i < len; i++) {
+            char c = rx[i];
+            if (c == '\n' || c == '\r') {
+                if (line_pos == 0) continue;
+                line[line_pos] = '\0';
+                trim_ascii_whitespace(line);
+                ESP_LOGI(TAG, "Observer selection UART: %s", line);
+                saw_response = true;
+                if (strstr(line, "select_networks") != NULL) saw_command_echo = true;
+                if ((observer_scan_field_is_mac(target->bssid) &&
+                     observer_contains_case_insensitive(line, target->bssid)) ||
+                    (!observer_scan_field_is_mac(target->bssid) && target->ssid[0] &&
+                     strstr(line, target->ssid) != NULL)) {
+                    saw_target = true;
+                }
+                if (observer_transition_has_error(line)) {
+                    if (saw_command_echo) {
+                        saw_command_error = true;
+                    } else {
+                        ESP_LOGW(TAG,
+                                 "Observer selection: ignoring stale error before command echo");
+                    }
+                }
+                if (strcmp(line, ">") == 0 && saw_command_echo) {
+                    return !saw_command_error && saw_target;
+                }
+                line_pos = 0;
+            } else if (line_pos < (int)sizeof(line) - 1) {
+                line[line_pos++] = c;
+            }
+        }
+    }
+
+    ESP_LOGE(TAG,
+             "Observer %s: selection response incomplete (received=%d echo=%d target=%d)",
+             purpose ? purpose : "transition", saw_response,
+             saw_command_echo, saw_target);
+    return false;
+}
+
+static bool observer_rescan_target(tab_id_t tab, uart_port_t port,
+                                   wifi_network_t *target, const char *purpose,
+                                   volatile bool *cancel)
+{
+    if (!target) return false;
+
+    const bool target_has_mac = observer_scan_field_is_mac(target->bssid);
+    if (!target_has_mac && target->ssid[0] == '\0') return false;
+    int matched_index = 0;
+    int ssid_matches = 0;
+    char matched_bssid[18] = {0};
+    char rx[1024];
+    char line[512];
+    int line_pos = 0;
+    TickType_t start = xTaskGetTickCount();
+    TickType_t timeout = pdMS_TO_TICKS(UART_RX_TIMEOUT);
+
+    observer_send_command_to_transport(tab, port, "scan_networks", purpose);
+    ESP_LOGI(TAG, "Observer %s: refreshing target '%s' after WiFi reset",
+             purpose ? purpose : "transition", target->ssid);
+
+    while ((xTaskGetTickCount() - start) < timeout) {
+        if (cancel && *cancel) return false;
+        int len = transport_read_bytes_tab(tab, port, rx, sizeof(rx) - 1,
+                                           pdMS_TO_TICKS(100));
+        if (len <= 0) continue;
+        rx[len] = '\0';
+
+        for (int i = 0; i < len; i++) {
+            char c = rx[i];
+            if (c == '\n' || c == '\r') {
+                if (line_pos == 0) continue;
+                line[line_pos] = '\0';
+
+                if (observer_transition_has_error(line)) return false;
+                if (line[0] == '"') {
+                    int scanned_index = 0;
+                    char scanned_ssid[33] = {0};
+                    char scanned_bssid[18] = {0};
+                    if (observer_parse_scan_identity(line, &scanned_index,
+                                                     scanned_ssid, sizeof(scanned_ssid),
+                                                     scanned_bssid, sizeof(scanned_bssid))) {
+                        bool bssid_match = target_has_mac && scanned_bssid[0] &&
+                                           strcasecmp(scanned_bssid, target->bssid) == 0;
+                        bool ssid_match = strcmp(scanned_ssid, target->ssid) == 0;
+                        if (bssid_match) {
+                            matched_index = scanned_index;
+                            snprintf(matched_bssid, sizeof(matched_bssid), "%s", scanned_bssid);
+                        } else if (!target_has_mac && ssid_match) {
+                            ssid_matches++;
+                            matched_index = scanned_index;
+                            snprintf(matched_bssid, sizeof(matched_bssid), "%s", scanned_bssid);
+                        }
+                    }
+                }
+
+                if (strstr(line, "Scan results printed") != NULL) {
+                    if (target_has_mac && matched_index <= 0) {
+                        ESP_LOGE(TAG, "Observer %s: target BSSID %s not found after rescan",
+                                 purpose ? purpose : "transition", target->bssid);
+                        return false;
+                    }
+                    if (!target_has_mac && ssid_matches != 1) {
+                        ESP_LOGE(TAG,
+                                 "Observer %s: SSID '%s' is missing or ambiguous (%d matches)",
+                                 purpose ? purpose : "transition", target->ssid, ssid_matches);
+                        return false;
+                    }
+
+                    target->index = matched_index;
+                    if (matched_bssid[0]) {
+                        snprintf(target->bssid, sizeof(target->bssid), "%s", matched_bssid);
+                    }
+                    ESP_LOGI(TAG,
+                             "Observer %s: refreshed target '%s' BSSID=%s scan_index=%d",
+                             purpose ? purpose : "transition",
+                             target->ssid, target->bssid, target->index);
+                    return true;
+                }
+                line_pos = 0;
+            } else if (line_pos < (int)sizeof(line) - 1) {
+                line[line_pos++] = c;
+            }
+        }
+    }
+
+    ESP_LOGE(TAG, "Observer %s: rescan timed out",
+             purpose ? purpose : "transition");
+    return false;
+}
+
+static bool observer_prepare_target_selection(tab_context_t *ctx,
+                                              wifi_network_t *target,
+                                              const char *purpose,
+                                              volatile bool *cancel)
+{
+    if (!ctx || !target || target->index <= 0) return false;
+
+    tab_id_t tab = tab_id_for_ctx(ctx);
+    uart_port_t port = uart_port_for_tab(tab);
+
+    // Drop stale sniffer output, stop the active Observer sniffer once and
+    // wait until JanOS has fully reset WiFi. Keep the existing scan results;
+    // unselect_networks caused the selected index to be rejected on JanOS.
+    observer_flush_transport_input(tab, port);
+
+    observer_send_command_to_transport(tab, port, "stop", purpose);
+    if (!observer_wait_for_janos_marker(tab, port,
+                                        "stop",
+                                        "All operations stopped", 5000,
+                                        cancel)) {
+        return false;
+    }
+
+    if (cancel && *cancel) return false;
+    vTaskDelay(pdMS_TO_TICKS(250));
+
+    // JanOS preserves the scan table across stop, so the Observer index is
+    // normally still valid. Validate it against the expected BSSID and avoid
+    // a costly full scan on every popup open. If JanOS rejects it (or the index
+    // now points at another BSSID), refresh by BSSID and retry once.
+    if (observer_select_target_and_wait(tab, port, target, purpose, cancel)) {
+        ESP_LOGI(TAG, "Observer %s: reused preserved scan_index=%d for '%s'",
+                 purpose ? purpose : "transition", target->index, target->ssid);
+        return true;
+    }
+
+    if (cancel && *cancel) return false;
+    ESP_LOGW(TAG,
+             "Observer %s: preserved scan_index=%d rejected; refreshing target",
+             purpose ? purpose : "transition", target->index);
+    if (!observer_rescan_target(tab, port, target, purpose, cancel)) return false;
+    return observer_select_target_and_wait(tab, port, target, purpose, cancel);
+}
+
+static bool observer_handshaker_prepare_selection(tab_context_t *ctx, wifi_network_t *target)
+{
+    return observer_prepare_target_selection(ctx, target, "Handshaker", NULL);
+}
+
+static bool observer_wait_for_command_prompt(tab_id_t tab, uart_port_t port,
+                                             const char *cmd, const char *purpose,
+                                             uint32_t timeout_ms)
+{
+    char rx[512];
+    char line[512];
+    int line_pos = 0;
+    bool saw_echo = false;
+    TickType_t start = xTaskGetTickCount();
+    TickType_t timeout = pdMS_TO_TICKS(timeout_ms);
+
+    observer_send_command_to_transport(tab, port, cmd, purpose);
+    while ((xTaskGetTickCount() - start) < timeout) {
+        int len = transport_read_bytes_tab(tab, port, rx, sizeof(rx) - 1,
+                                           pdMS_TO_TICKS(100));
+        if (len <= 0) continue;
+        rx[len] = '\0';
+        for (int i = 0; i < len; i++) {
+            char c = rx[i];
+            if (c == '\n' || c == '\r') {
+                if (line_pos == 0) continue;
+                line[line_pos] = '\0';
+                trim_ascii_whitespace(line);
+                ESP_LOGI(TAG, "Observer %s UART: %s",
+                         purpose ? purpose : "transition", line);
+                if (observer_transition_has_error(line)) return false;
+                if (strstr(line, cmd) != NULL) saw_echo = true;
+                if (strcmp(line, ">") == 0 && saw_echo) return true;
+                line_pos = 0;
+            } else if (line_pos < (int)sizeof(line) - 1) {
+                line[line_pos++] = c;
+            }
+        }
+    }
+
+    ESP_LOGE(TAG, "Observer %s: timeout waiting for '%s'",
+             purpose ? purpose : "transition", cmd);
+    return false;
+}
+
+static void observer_set_popup_title(tab_context_t *ctx, const char *text,
+                                     lv_color_t color)
+{
+    if (!ctx || !text) return;
+    if (bsp_display_lock(100)) {
+        if (ctx->popup_title_label && lv_obj_is_valid(ctx->popup_title_label)) {
+            lv_label_set_text(ctx->popup_title_label, text);
+            lv_obj_set_style_text_color(ctx->popup_title_label, color, 0);
+        }
+        bsp_display_unlock();
+    }
+}
+
+static bool observer_wait_for_popup_uart_idle(tab_context_t *ctx,
+                                              uint32_t timeout_ms)
+{
+    TickType_t start = xTaskGetTickCount();
+    TickType_t timeout = pdMS_TO_TICKS(timeout_ms);
+    while (ctx && (ctx->observer_start_active || ctx->observer_task != NULL ||
+                   ctx->observer_inspect_task != NULL)) {
+        if (ctx->popup_focus_cancel ||
+            (xTaskGetTickCount() - start) >= timeout) return false;
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    return ctx != NULL;
+}
+
+static void popup_focus_task(void *arg)
+{
+    tab_context_t *ctx = (tab_context_t *)arg;
+    if (!ctx) {
+        vTaskDelete(NULL);
+        return;
+    }
+
+    if (!observer_wait_for_popup_uart_idle(ctx, 7000) ||
+        ctx->popup_focus_cancel || !ctx->popup_open) {
+        goto done;
+    }
+
+    int observer_idx = ctx->popup_network_idx;
+    if (observer_idx < 0 || observer_idx >= ctx->observer_network_count) goto failed;
+
+    observer_network_t *source = &ctx->observer_networks[observer_idx];
+    wifi_network_t target = {0};
+    target.index = source->scan_index;
+    target.channel = source->channel;
+    target.rssi = source->rssi;
+    snprintf(target.ssid, sizeof(target.ssid), "%s", source->ssid);
+    snprintf(target.bssid, sizeof(target.bssid), "%s", source->bssid);
+    snprintf(target.band, sizeof(target.band), "%s", source->band);
+
+    if (!observer_prepare_target_selection(ctx, &target, "Popup",
+                                           &ctx->popup_focus_cancel)) {
+        if (ctx->popup_focus_cancel) goto done;
+        goto failed;
+    }
+    if (ctx->popup_focus_cancel || !ctx->popup_open) goto done;
+
+    // Keep the Observer snapshot aligned with JanOS after the refresh scan.
+    source->scan_index = target.index;
+    if (target.bssid[0]) {
+        snprintf(source->bssid, sizeof(source->bssid), "%s", target.bssid);
+    }
+
+    tab_id_t tab = tab_id_for_ctx(ctx);
+    uart_port_t port = uart_port_for_tab(tab);
+    observer_send_command_to_transport(tab, port, "start_sniffer", "Popup");
+    vTaskDelay(pdMS_TO_TICKS(500));
+    if (ctx->popup_focus_cancel || !ctx->popup_open) goto done;
+
+    ctx->popup_focus_ready = true;
+    char title[96];
+    snprintf(title, sizeof(title), "Scanning only %s",
+             target.ssid[0] ? target.ssid : "selected network");
+    observer_set_popup_title(ctx, title, COLOR_MATERIAL_TEAL);
+
+    if (ctx->popup_timer != NULL) {
+        vTimerSetTimerID(ctx->popup_timer, (void *)ctx);
+        xTimerStart(ctx->popup_timer, 0);
+    }
+    if (ctx->observer_task == NULL) {
+        xTaskCreate(popup_poll_task, "popup_poll", 8192,
+                    (void *)ctx, 5, &ctx->observer_task);
+    }
+    goto done;
+
+failed:
+    ESP_LOGE(TAG, "Observer popup: failed to focus selected network");
+    observer_set_popup_title(ctx, "Target selection failed",
+                             COLOR_MATERIAL_RED);
+    if (ctx->observer_status_label) {
+        if (bsp_display_lock(100)) {
+            lv_label_set_text(ctx->observer_status_label,
+                              "Popup target failed - close and retry");
+            lv_obj_set_style_text_color(ctx->observer_status_label,
+                                        COLOR_MATERIAL_RED, 0);
+            bsp_display_unlock();
+        }
+    }
+
+done:
+    ctx->popup_focus_active = false;
+    ctx->popup_focus_task = NULL;
+    vTaskDelete(NULL);
+}
+
 // Close network popup and resume normal monitoring
 static void close_network_popup(void)
 {
@@ -13823,10 +18198,40 @@ static void close_network_popup(void)
 
     destroy_network_popup_ui(ctx);
 
-    // Send unselect_networks to monitor all networks again
-    uart_send_command_for_tab("unselect_networks");
-    vTaskDelay(pdMS_TO_TICKS(100));
-    uart_send_command_for_tab("start_sniffer_noscan");
+    // A timer stop only prevents future callbacks. Wait until the in-flight
+    // focus/poll reader has actually released this transport.
+    TickType_t wait_start = xTaskGetTickCount();
+    while ((ctx->popup_focus_task != NULL || ctx->observer_task != NULL) &&
+           (xTaskGetTickCount() - wait_start) < pdMS_TO_TICKS(3000)) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    if (ctx->popup_focus_task != NULL || ctx->observer_task != NULL) {
+        ESP_LOGE(TAG, "Observer popup close: UART task did not stop in time");
+        ctx->observer_running = false;
+        if (ctx->observer_status_label) {
+            lv_label_set_text(ctx->observer_status_label,
+                              "Observer stopped - UART task timeout");
+            lv_obj_set_style_text_color(ctx->observer_status_label,
+                                        COLOR_MATERIAL_RED, 0);
+        }
+        return;
+    }
+
+    tab_id_t tab = tab_id_for_ctx(ctx);
+    uart_port_t port = uart_port_for_tab(tab);
+    if (!observer_wait_for_command_prompt(tab, port, "unselect_networks",
+                                          "Popup close", 5000)) {
+        ctx->observer_running = false;
+        if (ctx->observer_status_label) {
+            lv_label_set_text(ctx->observer_status_label,
+                              "Observer resume failed - restart Observer");
+            lv_obj_set_style_text_color(ctx->observer_status_label,
+                                        COLOR_MATERIAL_RED, 0);
+        }
+        return;
+    }
+    observer_send_command_to_transport(tab, port, "start_sniffer_noscan",
+                                       "Popup close");
 
     // Restart main observer timer (20s) for this context
     if (ctx->observer_timer != NULL && ctx->observer_running) {
@@ -13851,11 +18256,25 @@ static void show_network_popup(int network_idx)
     if (network_idx < 0 || network_idx >= ctx->observer_network_count) return;
     if (ctx->popup_open) return;  // Already showing a popup on this tab
 
+    bool opening_during_startup =
+        ctx->observer_start_active || ctx->observer_inspect_task != NULL;
+
     observer_network_t *net = &ctx->observer_networks[network_idx];
     ESP_LOGI(TAG, "Opening popup for network: %s (scan_index=%d)", net->ssid, net->scan_index);
 
+    // Publish the popup request before cancelling inspect. observer_start_task
+    // uses this flag to hand the UART directly to popup_focus_task instead of
+    // racing it by starting the all-network sniffer first.
     ctx->popup_open = true;
     ctx->popup_network_idx = network_idx;
+    ctx->popup_focus_ready = false;
+    ctx->popup_focus_cancel = false;
+
+    if (opening_during_startup) {
+        ESP_LOGI(TAG,
+                 "Observer popup requested during initial inspect; stopping inspect and handing over UART");
+        cancel_observer_inspect_task(ctx);
+    }
 
     // Stop main observer timer for this context
     if (ctx->observer_timer != NULL) {
@@ -13863,20 +18282,14 @@ static void show_network_popup(int network_idx)
         ESP_LOGI(TAG, "Stopped observer timer for tab %d", current_tab);
     }
 
-    // Send commands to focus on this network
-    // Use UART based on current tab
-    char cmd[32];
-    snprintf(cmd, sizeof(cmd), "select_networks %d", net->scan_index);
-
-    uart_send_command_for_tab("stop");
-        vTaskDelay(pdMS_TO_TICKS(200));
-    uart_send_command_for_tab(cmd);
-        vTaskDelay(pdMS_TO_TICKS(100));
-    uart_send_command_for_tab("start_sniffer");
-
     // Create popup overlay
     lv_obj_t *container = get_current_tab_container();
-    if (!container) return;
+    if (!container) {
+        ctx->popup_open = false;
+        ctx->popup_network_idx = -1;
+        ctx->popup_focus_cancel = true;
+        return;
+    }
     ctx->network_popup = lv_obj_create(container);
     lv_obj_set_size(ctx->network_popup, 640, enable_red_team ? 700 : 640);
     lv_obj_center(ctx->network_popup);
@@ -13902,8 +18315,9 @@ static void show_network_popup(int network_idx)
 
     // Title
     lv_obj_t *title = lv_label_create(header);
+    ctx->popup_title_label = title;
     const char *ssid_display = strlen(net->ssid) > 0 ? net->ssid : "Unknown";
-    lv_label_set_text_fmt(title, "Scanning only %s", ssid_display);
+    lv_label_set_text_fmt(title, "Preparing %s...", ssid_display);
     lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
     lv_obj_set_style_text_color(title, COLOR_MATERIAL_TEAL, 0);
     lv_obj_align(title, LV_ALIGN_LEFT_MID, 0, 0);
@@ -13984,19 +18398,23 @@ static void show_network_popup(int network_idx)
         ctx->popup_timer = xTimerCreate("popup_timer",
                                    pdMS_TO_TICKS(POPUP_POLL_INTERVAL_MS),
                                    pdTRUE,  // Auto-reload
-                                   NULL,
+                                   (void *)ctx,
                                    popup_timer_callback);
+    } else {
+        vTimerSetTimerID(ctx->popup_timer, (void *)ctx);
     }
 
-    if (ctx->popup_timer != NULL) {
-        xTimerStart(ctx->popup_timer, 0);
-        ESP_LOGI(TAG, "Started popup timer (10s polling)");
-
-        // Do first poll after a short delay
-        vTaskDelay(pdMS_TO_TICKS(2000));
-        if (ctx->popup_open && ctx->observer_task == NULL) {
-            xTaskCreate(popup_poll_task, "popup_poll", 8192, (void*)ctx, 5, &ctx->observer_task);
-        }
+    ctx->popup_focus_active = true;
+    BaseType_t focus_result = xTaskCreate(popup_focus_task, "popup_focus", 8192,
+                                          (void *)ctx, 5,
+                                          &ctx->popup_focus_task);
+    if (focus_result != pdPASS) {
+        ctx->popup_focus_active = false;
+        ctx->popup_focus_task = NULL;
+        ctx->popup_focus_ready = false;
+        lv_label_set_text(title, "Failed to start target task");
+        lv_obj_set_style_text_color(title, COLOR_MATERIAL_RED, 0);
+        ESP_LOGE(TAG, "Failed to create Observer popup focus task");
     }
 }
 
@@ -14041,10 +18459,17 @@ static void popup_poll_task(void *arg)
         return;
     }
 
-    ESP_LOGI(TAG, "Popup poll task started for network idx %d", ctx->popup_network_idx);
+    ESP_LOGD(TAG, "Popup poll task started for network idx %d", ctx->popup_network_idx);
 
-    if (!observer_rx_buffer || !observer_line_buffer || !ctx->observer_networks) {
+    if (!ctx->observer_rx_buffer || !ctx->observer_line_buffer || !ctx->observer_networks) {
         ESP_LOGE(TAG, "PSRAM buffers not allocated!");
+        ctx->observer_task = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    int target_network_idx = ctx->popup_network_idx;
+    if (target_network_idx < 0 || target_network_idx >= ctx->observer_network_count) {
         ctx->observer_task = NULL;
         vTaskDelete(NULL);
         return;
@@ -14054,24 +18479,28 @@ static void popup_poll_task(void *arg)
     tab_id_t task_tab = tab_id_for_ctx(ctx);
     uart_port_t uart_port = (task_tab == TAB_MBUS && uart2_initialized) ? UART2_NUM : UART_NUM;
 
-    uart_flush(uart_port);
+    observer_flush_transport_input(task_tab, uart_port);
     char cmd[] = "show_sniffer_results\r\n";
     transport_write_bytes_tab(task_tab, uart_port, cmd, strlen(cmd));
 
-    char *rx_buffer = observer_rx_buffer;
-    char *line_buffer = observer_line_buffer;
+    char *rx_buffer = ctx->observer_rx_buffer;
+    char *line_buffer = ctx->observer_line_buffer;
     int line_pos = 0;
     int current_network_idx = -1;
+    bool saw_result_data = false;
+    int empty_reads = 0;
+    bool response_done = false;
 
     // DON'T clear client data - accumulate clients over time
 
     TickType_t start_time = xTaskGetTickCount();
     TickType_t timeout_ticks = pdMS_TO_TICKS(5000);
 
-    while ((xTaskGetTickCount() - start_time) < timeout_ticks) {
+    while (!response_done && (xTaskGetTickCount() - start_time) < timeout_ticks) {
         int len = transport_read_bytes_tab(task_tab, uart_port, (uint8_t*)rx_buffer, UART_BUF_SIZE - 1, pdMS_TO_TICKS(100));
 
         if (len > 0) {
+            empty_reads = 0;
             rx_buffer[len] = '\0';
 
             for (int i = 0; i < len; i++) {
@@ -14083,18 +18512,26 @@ static void popup_poll_task(void *arg)
 
                         ESP_LOGD(TAG, "POPUP SNIFFER LINE: '%s'", line_buffer);
 
+                        char prompt_check[OBSERVER_LINE_BUFFER_SIZE];
+                        snprintf(prompt_check, sizeof(prompt_check), "%s", line_buffer);
+                        trim_ascii_whitespace(prompt_check);
+                        if (strcmp(prompt_check, ">") == 0) {
+                            response_done = true;
+                            line_pos = 0;
+                            break;
+                        }
+
                         // Check for network line (doesn't start with space)
                         if (line_buffer[0] != ' ' && line_buffer[0] != '\t') {
                             observer_network_t parsed_net = {0};
                             if (parse_sniffer_network_line(line_buffer, &parsed_net)) {
-                                // Find this network in our existing list by SSID
+                                saw_result_data = true;
                                 current_network_idx = -1;
-                                for (int n = 0; n < ctx->observer_network_count; n++) {
-                                    if (strcmp(ctx->observer_networks[n].ssid, parsed_net.ssid) == 0) {
-                                        current_network_idx = n;
-                                        // Don't overwrite client_count - we track it via add_client_mac
-                                        break;
-                                    }
+                                observer_network_t *target =
+                                    &ctx->observer_networks[target_network_idx];
+                                if (strcmp(target->ssid, parsed_net.ssid) == 0 &&
+                                    target->channel == parsed_net.channel) {
+                                    current_network_idx = target_network_idx;
                                 }
                             } else {
                                 current_network_idx = -1;
@@ -14105,6 +18542,7 @@ static void popup_poll_task(void *arg)
                             observer_network_t *net = &ctx->observer_networks[current_network_idx];
                             char mac[18];
                             if (parse_sniffer_client_line(line_buffer, mac, sizeof(mac))) {
+                                saw_result_data = true;
                                 // Add client if not already present (accumulate)
                                 if (add_client_mac(net, mac)) {
                                     ESP_LOGI(TAG, "  -> NEW client: %s for '%s'", mac, net->ssid);
@@ -14118,6 +18556,8 @@ static void popup_poll_task(void *arg)
                     line_buffer[line_pos++] = c;
                 }
             }
+        } else if (saw_result_data && ++empty_reads >= 10) {
+            response_done = true;
         }
 
         if (!ctx->popup_open) {
@@ -14133,7 +18573,7 @@ static void popup_poll_task(void *arg)
         bsp_display_unlock();
     }
 
-    ESP_LOGI(TAG, "Popup poll task finished");
+    ESP_LOGD(TAG, "Popup poll task finished");
     ctx->observer_task = NULL;
     vTaskDelete(NULL);
 }
@@ -14211,21 +18651,24 @@ static void update_observer_table(tab_context_t *ctx)
         lv_label_set_recolor(info_label, true);
         const char *rssi_col_nr = net->rssi > -50 ? "#55DD55" : (net->rssi > -70 ? "#FFAA00" : "#FF5555");
         const char *band_col_nr = strstr(net->band, "5") ? "#CC66FF" : "#FFAA33";
+        const char *pass_badge = creds_badge(ctx, net->ssid);
         if (net->inspected) {
             lv_label_set_text_fmt(info_label,
-                "#5599FF %s#  |  #5599FF CH%d#  |  %s %s#  |  %s %d dBm#\n%s  |  Uptime: %s\nVendor: %s",
+                "#5599FF %s#  |  #5599FF CH%d#  |  %s %s#  |  %s %d dBm#%s\n%s  |  Uptime: %s\nVendor: %s",
                 net->bssid, net->channel,
                 band_col_nr, net->band,
                 rssi_col_nr, net->rssi,
+                pass_badge,
                 net->mfp_capable ? "#FF5555 MFP On#" : "#55DD55 MFP Off#",
                 net->uptime[0] ? net->uptime : "?",
                 net->vendor[0] ? net->vendor : "-");
         } else {
             lv_label_set_text_fmt(info_label,
-                "#5599FF %s#  |  #5599FF CH%d#  |  %s %s#  |  %s %d dBm#\nVendor: %s",
+                "#5599FF %s#  |  #5599FF CH%d#  |  %s %s#  |  %s %d dBm#%s\nVendor: %s",
                 net->bssid, net->channel,
                 band_col_nr, net->band,
                 rssi_col_nr, net->rssi,
+                pass_badge,
                 net->vendor[0] ? net->vendor : "-");
         }
         lv_obj_set_style_text_font(info_label, &lv_font_montserrat_12, 0);
@@ -14616,10 +19059,10 @@ static void observer_poll_task(void *arg)
     uart_port_t uart_port = (task_tab == TAB_MBUS && uart2_initialized) ? UART2_NUM : UART_NUM;
     const char *uart_name = tab_transport_name(task_tab);
 
-    ESP_LOGI(TAG, "[%s] Observer poll task started", uart_name);
+    ESP_LOGD(TAG, "[%s] Observer poll task started", uart_name);
 
     // Check if PSRAM buffers are allocated
-    if (!observer_rx_buffer || !observer_line_buffer || !ctx->observer_networks) {
+    if (!ctx->observer_rx_buffer || !ctx->observer_line_buffer || !ctx->observer_networks) {
         ESP_LOGE(TAG, "[%s] PSRAM buffers not allocated!", uart_name);
         ctx->observer_task = NULL;
         vTaskDelete(NULL);
@@ -14627,17 +19070,20 @@ static void observer_poll_task(void *arg)
     }
 
     // Flush UART buffer
-    uart_flush(uart_port);
+    observer_flush_transport_input(task_tab, uart_port);
 
     // Send show_sniffer_results command to correct UART
     char cmd[] = "show_sniffer_results\r\n";
     transport_write_bytes_tab(task_tab, uart_port, cmd, strlen(cmd));
-    ESP_LOGI(TAG, "[%s] Sent: show_sniffer_results", uart_name);
+    ESP_LOGD(TAG, "[%s] Sent: show_sniffer_results", uart_name);
 
     // Use PSRAM-allocated buffers
-    char *rx_buffer = observer_rx_buffer;
-    char *line_buffer = observer_line_buffer;
+    char *rx_buffer = ctx->observer_rx_buffer;
+    char *line_buffer = ctx->observer_line_buffer;
     int line_pos = 0;
+    bool saw_result_data = false;
+    int empty_reads = 0;
+    bool response_done = false;
 
     // Track current network being updated (index into ctx->observer_networks)
     int current_network_idx = -1;
@@ -14647,10 +19093,11 @@ static void observer_poll_task(void *arg)
     TickType_t start_time = xTaskGetTickCount();
     TickType_t timeout_ticks = pdMS_TO_TICKS(5000);  // 5 second timeout for response
 
-    while ((xTaskGetTickCount() - start_time) < timeout_ticks) {
+    while (!response_done && (xTaskGetTickCount() - start_time) < timeout_ticks) {
         int len = transport_read_bytes_tab(task_tab, uart_port, rx_buffer, UART_BUF_SIZE - 1, pdMS_TO_TICKS(100));
 
         if (len > 0) {
+            empty_reads = 0;
             rx_buffer[len] = '\0';
 
             for (int i = 0; i < len; i++) {
@@ -14661,20 +19108,30 @@ static void observer_poll_task(void *arg)
                         line_buffer[line_pos] = '\0';
                         ESP_LOGD(TAG, "Observer line: %s", line_buffer);
 
-                        // Log every line received for debugging
-                        ESP_LOGI(TAG, "SNIFFER LINE: '%s'", line_buffer);
+                        ESP_LOGD(TAG, "SNIFFER LINE: '%s'", line_buffer);
+
+                        char prompt_check[OBSERVER_LINE_BUFFER_SIZE];
+                        snprintf(prompt_check, sizeof(prompt_check), "%s", line_buffer);
+                        trim_ascii_whitespace(prompt_check);
+                        if (strcmp(prompt_check, ">") == 0) {
+                            response_done = true;
+                            line_pos = 0;
+                            break;
+                        }
 
                         // Check for network line (doesn't start with space)
                         if (line_buffer[0] != ' ' && line_buffer[0] != '\t') {
                             observer_network_t parsed_net = {0};
                             if (parse_sniffer_network_line(line_buffer, &parsed_net)) {
+                                saw_result_data = true;
                                 // Find this network in our existing list by SSID
                                 current_network_idx = -1;
                                 for (int n = 0; n < ctx->observer_network_count; n++) {
-                                    if (strcmp(ctx->observer_networks[n].ssid, parsed_net.ssid) == 0) {
+                                    if (strcmp(ctx->observer_networks[n].ssid, parsed_net.ssid) == 0 &&
+                                        ctx->observer_networks[n].channel == parsed_net.channel) {
                                         current_network_idx = n;
                                         // Don't overwrite client_count - we track it via add_client_mac
-                                        ESP_LOGI(TAG, "[%s] Found network '%s' at idx %d (count: %d)",
+                                        ESP_LOGD(TAG, "[%s] Found network '%s' at idx %d (count: %d)",
                                                  uart_name, parsed_net.ssid, n, ctx->observer_networks[n].client_count);
                                         break;
                                     }
@@ -14692,6 +19149,7 @@ static void observer_poll_task(void *arg)
                             observer_network_t *net = &ctx->observer_networks[current_network_idx];
                             char mac[18];
                             if (parse_sniffer_client_line(line_buffer, mac, sizeof(mac))) {
+                                saw_result_data = true;
                                 // Add client if not already present (accumulate)
                                 if (add_client_mac(net, mac)) {
                                     ESP_LOGI(TAG, "  -> NEW client: %s for '%s' (total: %d)", mac, net->ssid, net->client_count);
@@ -14707,6 +19165,8 @@ static void observer_poll_task(void *arg)
                     line_buffer[line_pos++] = c;
                 }
             }
+        } else if (saw_result_data && ++empty_reads >= 10) {
+            response_done = true;
         }
 
         // Check if observer was stopped
@@ -14717,21 +19177,21 @@ static void observer_poll_task(void *arg)
     }
 
     // Log summary of parsed data
-    ESP_LOGI(TAG, "[%s] === SNIFFER UPDATE SUMMARY ===", uart_name);
-    ESP_LOGI(TAG, "[%s] Total networks: %d", uart_name, ctx->observer_network_count);
+    ESP_LOGD(TAG, "[%s] === SNIFFER UPDATE SUMMARY ===", uart_name);
+    ESP_LOGD(TAG, "[%s] Total networks: %d", uart_name, ctx->observer_network_count);
     int networks_with_clients = 0;
     for (int i = 0; i < ctx->observer_network_count; i++) {
         if (ctx->observer_networks[i].client_count > 0) {
             networks_with_clients++;
-            ESP_LOGI(TAG, "[%s] Network %d: '%s' CH%d clients=%d",
+            ESP_LOGD(TAG, "[%s] Network %d: '%s' CH%d clients=%d",
                      uart_name, i, ctx->observer_networks[i].ssid, ctx->observer_networks[i].channel, ctx->observer_networks[i].client_count);
             for (int j = 0; j < MAX_CLIENTS_PER_NETWORK && ctx->observer_networks[i].clients[j][0] != '\0'; j++) {
-                ESP_LOGI(TAG, "[%s]   Client %d: %s", uart_name, j, ctx->observer_networks[i].clients[j]);
+                ESP_LOGD(TAG, "[%s]   Client %d: %s", uart_name, j, ctx->observer_networks[i].clients[j]);
             }
         }
     }
-    ESP_LOGI(TAG, "[%s] Networks with clients: %d/%d", uart_name, networks_with_clients, ctx->observer_network_count);
-    ESP_LOGI(TAG, "[%s] ==============================", uart_name);
+    ESP_LOGD(TAG, "[%s] Networks with clients: %d/%d", uart_name, networks_with_clients, ctx->observer_network_count);
+    ESP_LOGD(TAG, "[%s] ==============================", uart_name);
 
     // Update UI if observer is still running
     if (ctx->observer_running && ctx->observer_networks) {
@@ -14748,7 +19208,7 @@ static void observer_poll_task(void *arg)
         bsp_display_unlock();
     }
 
-    ESP_LOGI(TAG, "[%s] Observer poll task finished", uart_name);
+    ESP_LOGD(TAG, "[%s] Observer poll task finished", uart_name);
     ctx->observer_task = NULL;
     vTaskDelete(NULL);
 }
@@ -14783,29 +19243,59 @@ static bool parse_scan_to_observer(const char *line, observer_network_t *net)
 
     if (field_idx < 8) return false;
 
-    // fields[0] = index, fields[1] = SSID, fields[3] = BSSID, fields[4] = channel, fields[6] = RSSI, fields[7] = band
+    // Vendor strings containing a comma can be split by older JanOS CSV
+    // quoting, so anchor the remaining fields on the first valid MAC address
+    // instead of assuming that BSSID is always fields[3].
+    int bssid_field = -1;
+    for (int i = 2; i < field_idx; i++) {
+        if (observer_scan_field_is_mac(fields[i])) {
+            bssid_field = i;
+            break;
+        }
+    }
+    if (bssid_field < 0 || bssid_field + 4 >= field_idx) return false;
+
     net->scan_index = atoi(fields[0]);  // 1-based index for select_networks command
+    if (net->scan_index <= 0) return false;
 
     strncpy(net->ssid, fields[1], sizeof(net->ssid) - 1);
     net->ssid[sizeof(net->ssid) - 1] = '\0';
 
-    strncpy(net->bssid, fields[3], sizeof(net->bssid) - 1);
+    strncpy(net->bssid, fields[bssid_field], sizeof(net->bssid) - 1);
     net->bssid[sizeof(net->bssid) - 1] = '\0';
 
-    net->channel = atoi(fields[4]);
-    net->rssi = atoi(fields[6]);
+    net->channel = atoi(fields[bssid_field + 1]);
 
-    strncpy(net->band, fields[7], sizeof(net->band) - 1);
+    strncpy(net->security, fields[bssid_field + 2], sizeof(net->security) - 1);
+    net->security[sizeof(net->security) - 1] = '\0';
+
+    net->rssi = atoi(fields[bssid_field + 3]);
+
+    strncpy(net->band, fields[bssid_field + 4], sizeof(net->band) - 1);
     net->band[sizeof(net->band) - 1] = '\0';
 
     net->vendor[0] = '\0';
-    // JanOS format in logs: vendor is usually the 3rd field (index 2).
-    if (field_idx >= 3 && fields[2] && fields[2][0] != '\0') {
-        strncpy(net->vendor, fields[2], sizeof(net->vendor) - 1);
-        net->vendor[sizeof(net->vendor) - 1] = '\0';
-    } else if (field_idx >= 9 && fields[8] && fields[8][0] != '\0') {
+    // JanOS normally puts vendor before BSSID. Preserve all pieces when an
+    // older CSV response split a vendor such as "Vendor Name, Inc.".
+    for (int i = 2; i < bssid_field; i++) {
+        if (!fields[i] || fields[i][0] == '\0') continue;
+        char *part = fields[i];
+        while (*part == '"') part++;
+        size_t part_len = strlen(part);
+        while (part_len > 0 && part[part_len - 1] == '"') {
+            part[--part_len] = '\0';
+        }
+        trim_ascii_whitespace(part);
+        if (part[0] == '\0') continue;
+
+        size_t used = strlen(net->vendor);
+        snprintf(net->vendor + used, sizeof(net->vendor) - used,
+                 "%s%s", used > 0 ? ", " : "", part);
+    }
+    if (net->vendor[0] == '\0' && field_idx > bssid_field + 5 &&
+        fields[bssid_field + 5] && fields[bssid_field + 5][0] != '\0') {
         // Fallback for alternate format with vendor as 9th field.
-        strncpy(net->vendor, fields[8], sizeof(net->vendor) - 1);
+        strncpy(net->vendor, fields[bssid_field + 5], sizeof(net->vendor) - 1);
         net->vendor[sizeof(net->vendor) - 1] = '\0';
     }
 
@@ -14832,8 +19322,9 @@ static void observer_start_task(void *arg)
     ESP_LOGI(TAG, "[%s] Observer start task - scanning networks first", uart_name);
 
     // Check if PSRAM buffers are allocated
-    if (!observer_rx_buffer || !observer_line_buffer || !ctx->observer_networks) {
+    if (!ctx->observer_rx_buffer || !ctx->observer_line_buffer || !ctx->observer_networks) {
         ESP_LOGE(TAG, "[%s] PSRAM buffers not allocated!", uart_name);
+        ctx->observer_start_active = false;
         vTaskDelete(NULL);
         return;
     }
@@ -14850,7 +19341,7 @@ static void observer_start_task(void *arg)
     memset(ctx->observer_networks, 0, sizeof(observer_network_t) * MAX_OBSERVER_NETWORKS);
 
     // Flush UART buffer
-    uart_flush(uart_port);
+    observer_flush_transport_input(task_tab, uart_port);
 
     // Step 1: Run scan_networks
     char scan_cmd[] = "scan_networks\r\n";
@@ -14858,8 +19349,8 @@ static void observer_start_task(void *arg)
     ESP_LOGI(TAG, "[%s] Sent: scan_networks", uart_name);
 
     // Wait for scan to complete - use PSRAM buffers
-    char *rx_buffer = observer_rx_buffer;
-    char *line_buffer = observer_line_buffer;
+    char *rx_buffer = ctx->observer_rx_buffer;
+    char *line_buffer = ctx->observer_line_buffer;
     int line_pos = 0;
     bool scan_complete = false;
     int scanned_count = 0;
@@ -14895,8 +19386,9 @@ static void observer_start_task(void *arg)
                             if (parse_scan_to_observer(line_buffer, &net)) {
                                 ctx->observer_networks[scanned_count] = net;
                                 scanned_count++;
-                                ESP_LOGI(TAG, "[%s] Parsed network #%d: '%s' BSSID=%s CH%d %s %ddBm",
-                                         uart_name, net.scan_index, net.ssid, net.bssid, net.channel, net.band, net.rssi);
+                                ESP_LOGI(TAG, "[%s] Parsed network #%d: '%s' BSSID=%s CH%d %s %s %ddBm",
+                                         uart_name, net.scan_index, net.ssid, net.bssid,
+                                         net.channel, net.security, net.band, net.rssi);
                             }
                         }
 
@@ -14913,6 +19405,10 @@ static void observer_start_task(void *arg)
     ctx->observer_network_count = scanned_count;
     ESP_LOGI(TAG, "[%s] Scan complete: %d networks", uart_name, ctx->observer_network_count);
 
+    // Scan is done and inspect has not started, so the UART is free: refresh
+    // the captured-password cache before the rows are built.
+    creds_fetch(ctx, task_tab, uart_port);
+
     // Update UI immediately with scanned networks (all with 0 clients)
     bsp_display_lock(0);
     if (ctx->observer_status_label) {
@@ -14923,6 +19419,7 @@ static void observer_start_task(void *arg)
 
     if (!ctx->observer_running) {
         ESP_LOGI(TAG, "[%s] Observer stopped during scan", uart_name);
+        ctx->observer_start_active = false;
         vTaskDelete(NULL);
         return;
     }
@@ -14951,6 +19448,18 @@ static void observer_start_task(void *arg)
 
     if (!ctx->observer_running) {
         ESP_LOGI(TAG, "[%s] Observer stopped during inspect", uart_name);
+        ctx->observer_start_active = false;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    // A row may be clicked as soon as the scan table is populated, while the
+    // optional inspect pass is still running. In that case the popup owns the
+    // next UART transition; do not start the global sniffer underneath it.
+    if (ctx->popup_open) {
+        ESP_LOGI(TAG, "[%s] Popup requested during startup; UART handed to popup focus task",
+                 uart_name);
+        ctx->observer_start_active = false;
         vTaskDelete(NULL);
         return;
     }
@@ -14964,7 +19473,13 @@ static void observer_start_task(void *arg)
     bsp_display_unlock();
 
     vTaskDelay(pdMS_TO_TICKS(500));  // Short delay
-    uart_flush(uart_port);
+    if (!ctx->observer_running) {
+        ESP_LOGI(TAG, "[%s] Observer stopped before sniffer start", uart_name);
+        ctx->observer_start_active = false;
+        vTaskDelete(NULL);
+        return;
+    }
+    observer_flush_transport_input(task_tab, uart_port);
     char sniffer_cmd[] = "start_sniffer_noscan\r\n";
     transport_write_bytes_tab(task_tab, uart_port, sniffer_cmd, strlen(sniffer_cmd));
     ESP_LOGI(TAG, "[%s] Sent: start_sniffer_noscan", uart_name);
@@ -15002,10 +19517,264 @@ static void observer_start_task(void *arg)
     }
 
     ESP_LOGI(TAG, "[%s] Observer start task finished", uart_name);
+    ctx->observer_start_active = false;
     vTaskDelete(NULL);
 }
 
 // Start button click handler
+// ---- Observer shutdown -----------------------------------------------------
+//
+// Clearing observer_running is not enough by itself. observer_start_task may
+// already be past its own `observer_running` check and about to send
+// `start_sniffer_noscan`; a `stop` issued at that moment is overtaken, the
+// Monster keeps sniffing, and every later command is swallowed by the sniffer.
+// The same applies to inspect_observer_task, which is mid-conversation on the
+// same transport. So the teardown waits for both workers to actually leave
+// before the stop goes out, which means it cannot run on the LVGL thread.
+
+typedef struct {
+    tab_context_t *ctx;
+    bool leave_page;   // true when the user is walking out of the page
+} observer_teardown_args_t;
+
+static lv_obj_t *observer_exit_overlay = NULL;
+static lv_obj_t *observer_exit_status = NULL;
+static lv_obj_t *observer_exit_btn_row = NULL;
+
+static void close_observer_exit_confirm(void)
+{
+    if (observer_exit_overlay) {
+        lv_obj_del(observer_exit_overlay);
+        observer_exit_overlay = NULL;
+    }
+    observer_exit_status = NULL;
+    observer_exit_btn_row = NULL;
+}
+
+// True while anything of ours is still driving the Monster.
+static bool observer_session_busy(tab_context_t *ctx)
+{
+    return ctx && (ctx->observer_running || ctx->observer_start_active ||
+                   ctx->observer_inspect_active || ctx->observer_inspect_task != NULL);
+}
+
+static void observer_teardown_task(void *arg)
+{
+    observer_teardown_args_t *a = (observer_teardown_args_t *)arg;
+    tab_context_t *ctx = a->ctx;
+    tab_id_t tab = tab_id_for_ctx(ctx);
+    uart_port_t port = uart_port_for_tab(tab);
+    const char *uart_name = tab_transport_name(tab);
+
+    // Ask both workers to wind down.
+    ctx->observer_running = false;
+    ctx->observer_inspect_active = false;
+
+    // Then wait for them to be gone, so nothing can transmit after our stop.
+    int waited = 0;
+    while (waited < 4000 &&
+           (ctx->observer_start_active || ctx->observer_inspect_task != NULL)) {
+        vTaskDelay(pdMS_TO_TICKS(20));
+        waited += 20;
+    }
+    if (ctx->observer_start_active || ctx->observer_inspect_task != NULL) {
+        ESP_LOGW(TAG, "[%s] Observer teardown: workers still alive after %d ms, "
+                      "sending stop anyway", uart_name, waited);
+    } else {
+        ESP_LOGI(TAG, "[%s] Observer teardown: workers idle after %d ms", uart_name, waited);
+    }
+
+    if (ctx->observer_timer != NULL) {
+        xTimerStop(ctx->observer_timer, 0);
+    }
+
+    observer_flush_transport_input(tab, port);
+    const char *stop_cmd = "stop\r\n";
+    transport_write_bytes_tab(tab, port, stop_cmd, strlen(stop_cmd));
+    ESP_LOGI(TAG, "[%s] Observer teardown: sent stop", uart_name);
+
+    // Drain the reply so the next command starts on a clean line.
+    char drain[256];
+    for (int i = 0; i < 15; i++) {
+        transport_read_bytes_tab(tab, port, drain, sizeof(drain) - 1, pdMS_TO_TICKS(100));
+    }
+    ESP_LOGI(TAG, "[%s] Observer teardown: transport idle", uart_name);
+
+    if (bsp_display_lock(0)) {
+        close_observer_exit_confirm();
+
+        if (a->leave_page) {
+            ctx->observer_page_visible = false;
+            update_portal_icon();
+            if (ctx->observer_page) {
+                lv_obj_add_flag(ctx->observer_page, LV_OBJ_FLAG_HIDDEN);
+            }
+            if (ctx->tiles) {
+                lv_obj_clear_flag(ctx->tiles, LV_OBJ_FLAG_HIDDEN);
+                ctx->current_visible_page = ctx->tiles;
+            }
+        } else {
+            if (ctx->observer_start_btn) {
+                lv_obj_clear_state(ctx->observer_start_btn, LV_STATE_DISABLED);
+            }
+            if (ctx->observer_stop_btn) {
+                lv_obj_add_state(ctx->observer_stop_btn, LV_STATE_DISABLED);
+            }
+            if (ctx->observer_status_label) {
+                lv_label_set_text(ctx->observer_status_label, "Stopped");
+            }
+        }
+        bsp_display_unlock();
+    }
+
+    ctx->observer_teardown_active = false;
+    heap_caps_free(a);
+    vTaskDelete(NULL);
+}
+
+// Kick off the teardown. Returns false only if the task could not be created,
+// in which case the caller must not pretend the Monster was stopped.
+static bool observer_begin_teardown(tab_context_t *ctx, bool leave_page)
+{
+    if (ctx->observer_teardown_active) {
+        ESP_LOGI(TAG, "Observer teardown already in flight, not starting a second");
+        return true;
+    }
+
+    observer_teardown_args_t *a = heap_caps_malloc(sizeof(*a), MALLOC_CAP_SPIRAM);
+    if (!a) {
+        ESP_LOGE(TAG, "Observer teardown: out of PSRAM");
+        return false;
+    }
+    a->ctx = ctx;
+    a->leave_page = leave_page;
+    ctx->observer_teardown_active = true;
+
+    if (xTaskCreate(observer_teardown_task, "obs_teardown", 4096, a, 5, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "Observer teardown: failed to create task");
+        ctx->observer_teardown_active = false;
+        heap_caps_free(a);
+        return false;
+    }
+    return true;
+}
+
+static void observer_exit_cancel_cb(lv_event_t *e)
+{
+    (void)e;
+    close_observer_exit_confirm();
+}
+
+static void observer_exit_confirm_cb(lv_event_t *e)
+{
+    (void)e;
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx) return;
+
+    // Hold the popup open with a progress line: the wait for the workers plus
+    // the stop round trip can take a couple of seconds, and a screen that just
+    // sat there would invite a second tap.
+    if (observer_exit_btn_row) lv_obj_add_flag(observer_exit_btn_row, LV_OBJ_FLAG_HIDDEN);
+    if (observer_exit_status) {
+        lv_label_set_text(observer_exit_status, "Stopping the Monster...");
+        lv_obj_set_style_text_color(observer_exit_status, COLOR_MATERIAL_AMBER, 0);
+    }
+
+    if (!observer_begin_teardown(ctx, true)) {
+        if (observer_exit_status) {
+            lv_label_set_text(observer_exit_status,
+                              "Could not start the shutdown task.\nTry again.");
+            lv_obj_set_style_text_color(observer_exit_status, COLOR_MATERIAL_RED, 0);
+        }
+        if (observer_exit_btn_row) lv_obj_clear_flag(observer_exit_btn_row, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+// Asked before walking out of a live observer session, because leaving without
+// a stop leaves the Monster sniffing and every later command goes unanswered.
+static void show_observer_exit_confirm(void)
+{
+    if (observer_exit_overlay != NULL) return;
+
+    lv_obj_t *container = get_current_tab_container();
+    if (!container) return;
+
+    observer_exit_overlay = lv_obj_create(container);
+    lv_obj_remove_style_all(observer_exit_overlay);
+    lv_obj_set_size(observer_exit_overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(observer_exit_overlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(observer_exit_overlay, LV_OPA_50, 0);
+    lv_obj_clear_flag(observer_exit_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(observer_exit_overlay, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t *popup = lv_obj_create(observer_exit_overlay);
+    lv_obj_set_size(popup, 540, 360);
+    lv_obj_center(popup);
+    lv_obj_set_style_bg_color(popup, lv_color_hex(0x0A1A1A), 0);
+    lv_obj_set_style_border_color(popup, COLOR_MATERIAL_TEAL, 0);
+    lv_obj_set_style_border_width(popup, 2, 0);
+    lv_obj_set_style_radius(popup, 16, 0);
+    lv_obj_set_style_shadow_width(popup, 30, 0);
+    lv_obj_set_style_shadow_color(popup, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_shadow_opa(popup, LV_OPA_50, 0);
+    lv_obj_set_style_pad_all(popup, 20, 0);
+    lv_obj_set_flex_flow(popup, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(popup, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(popup, 14, 0);
+    lv_obj_clear_flag(popup, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *icon = lv_label_create(popup);
+    lv_label_set_text(icon, LV_SYMBOL_EYE_OPEN);
+    lv_obj_set_style_text_font(icon, &lv_font_montserrat_44, 0);
+    lv_obj_set_style_text_color(icon, COLOR_MATERIAL_TEAL, 0);
+
+    lv_obj_t *title = lv_label_create(popup);
+    lv_label_set_text(title, "OBSERVER IS RUNNING");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_22, 0);
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_TEAL, 0);
+
+    observer_exit_status = lv_label_create(popup);
+    lv_label_set_text(observer_exit_status,
+                      "Leaving will send stop to the Monster.\n"
+                      "Without it the sniffer keeps running and\n"
+                      "later commands get no answer.");
+    lv_obj_set_style_text_font(observer_exit_status, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(observer_exit_status, lv_color_hex(0xCCCCCC), 0);
+    lv_obj_set_style_text_align(observer_exit_status, LV_TEXT_ALIGN_CENTER, 0);
+
+    observer_exit_btn_row = lv_obj_create(popup);
+    lv_obj_remove_style_all(observer_exit_btn_row);
+    lv_obj_set_size(observer_exit_btn_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(observer_exit_btn_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(observer_exit_btn_row, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(observer_exit_btn_row, 20, 0);
+    lv_obj_set_style_pad_top(observer_exit_btn_row, 8, 0);
+
+    lv_obj_t *stay_btn = lv_btn_create(observer_exit_btn_row);
+    lv_obj_set_size(stay_btn, 160, 54);
+    lv_obj_set_style_bg_color(stay_btn, lv_color_hex(0x1A3333), 0);
+    lv_obj_set_style_bg_color(stay_btn, lv_color_hex(0x2A4444), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(stay_btn, 8, 0);
+    lv_obj_add_event_cb(stay_btn, observer_exit_cancel_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *stay_lbl = lv_label_create(stay_btn);
+    lv_label_set_text(stay_lbl, "Keep running");
+    lv_obj_set_style_text_font(stay_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_center(stay_lbl);
+
+    lv_obj_t *quit_btn = lv_btn_create(observer_exit_btn_row);
+    lv_obj_set_size(quit_btn, 200, 54);
+    lv_obj_set_style_bg_color(quit_btn, COLOR_MATERIAL_RED, 0);
+    lv_obj_set_style_bg_color(quit_btn, lv_color_hex(0xCC0000), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(quit_btn, 8, 0);
+    lv_obj_add_event_cb(quit_btn, observer_exit_confirm_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *quit_lbl = lv_label_create(quit_btn);
+    lv_label_set_text(quit_lbl, LV_SYMBOL_STOP " Stop and exit");
+    lv_obj_set_style_text_font(quit_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_center(quit_lbl);
+}
+
 static void observer_start_btn_cb(lv_event_t *e)
 {
     (void)e;
@@ -15013,13 +19782,14 @@ static void observer_start_btn_cb(lv_event_t *e)
     tab_context_t *ctx = get_current_ctx();
     if (!ctx) return;
 
-    if (ctx->observer_running) {
+    if (ctx->observer_running || ctx->observer_start_active) {
         ESP_LOGW(TAG, "Observer already running on tab %d", current_tab);
         return;
     }
 
     ESP_LOGI(TAG, "Starting Network Observer on tab %d", current_tab);
     ctx->observer_running = true;
+    ctx->observer_start_active = true;
 
     // Disable start button, enable stop button
     if (ctx->observer_start_btn) {
@@ -15036,7 +19806,13 @@ static void observer_start_btn_cb(lv_event_t *e)
 
     // Start observer task for current tab's UART, pass ctx
     // All devices use the same flow - fully independent
-    xTaskCreate(observer_start_task, "obs_start", 8192, (void*)ctx, 5, NULL);
+    BaseType_t task_result = xTaskCreate(observer_start_task, "obs_start", 8192,
+                                         (void*)ctx, 5, NULL);
+    if (task_result != pdPASS) {
+        ESP_LOGE(TAG, "Failed to start Network Observer task");
+        ctx->observer_running = false;
+        ctx->observer_start_active = false;
+    }
 }
 
 // Stop button click handler
@@ -15053,26 +19829,30 @@ static void observer_stop_btn_cb(lv_event_t *e)
     }
 
     ESP_LOGI(TAG, "Stopping Network Observer on tab %d", current_tab);
-    ctx->observer_running = false;
 
-    // Stop timer for this context
-    if (ctx->observer_timer != NULL) {
-        xTimerStop(ctx->observer_timer, 0);
-    }
-
-    // Send stop command to current tab's UART
-    uart_send_command_for_tab("stop");
-
-    // Update UI
-    if (ctx->observer_start_btn) {
-        lv_obj_clear_state(ctx->observer_start_btn, LV_STATE_DISABLED);
-    }
+    // Disable both buttons for the duration: the teardown task re-enables Start
+    // once the Monster has actually acknowledged the stop.
     if (ctx->observer_stop_btn) {
         lv_obj_add_state(ctx->observer_stop_btn, LV_STATE_DISABLED);
     }
-
+    if (ctx->observer_start_btn) {
+        lv_obj_add_state(ctx->observer_start_btn, LV_STATE_DISABLED);
+    }
     if (ctx->observer_status_label) {
-        lv_label_set_text(ctx->observer_status_label, "Stopped");
+        lv_label_set_text(ctx->observer_status_label, "Stopping...");
+    }
+
+    if (!observer_begin_teardown(ctx, false)) {
+        // Nothing was scheduled, so do not leave the UI claiming it stopped.
+        if (ctx->observer_start_btn) {
+            lv_obj_clear_state(ctx->observer_start_btn, LV_STATE_DISABLED);
+        }
+        if (ctx->observer_stop_btn) {
+            lv_obj_clear_state(ctx->observer_stop_btn, LV_STATE_DISABLED);
+        }
+        if (ctx->observer_status_label) {
+            lv_label_set_text(ctx->observer_status_label, "Could not stop - try again");
+        }
     }
 }
 
@@ -15233,23 +20013,21 @@ static void observer_back_btn_event_cb(lv_event_t *e)
         return;
     }
 
+    // Walking out of a live session without a stop leaves the Monster sniffing,
+    // and every later command then goes unanswered. Confirm, then tear down for
+    // real; the teardown task leaves the page once the stop has gone out.
+    if (ctx->observer_teardown_active) {
+        ESP_LOGI(TAG, "Observer back button: stop already on its way, leaving now");
+    } else if (observer_session_busy(ctx)) {
+        ESP_LOGI(TAG, "Observer back button: session live, asking before leaving");
+        show_observer_exit_confirm();
+        return;
+    }
+
     ESP_LOGI(TAG, "Observer back button clicked, returning to tiles for tab %d", current_tab);
 
     // Mark observer page as not visible in context
     ctx->observer_page_visible = false;
-
-    // Stop inspect task
-    cancel_observer_inspect_task(ctx);
-
-    // Stop observer for current tab
-    if (ctx->observer_running) {
-        ctx->observer_running = false;
-
-        if (ctx->observer_timer != NULL) {
-            xTimerStop(ctx->observer_timer, 0);
-        }
-        uart_send_command_for_tab("stop");
-    }
 
     // Update portal icon visibility
     update_portal_icon();
@@ -15488,8 +20266,18 @@ static esp_err_t esp_modem_wifi_init(void)
     ESP_LOGI(TAG, "Waiting for ESP-Hosted transport...");
     vTaskDelay(pdMS_TO_TICKS(2000));  // Give time for SDIO connection
 
-    // Create default WiFi station
-    esp_netif_create_default_wifi_sta();
+    /* Create the default WiFi station netif exactly once.
+     *
+     * Every failure path below leaves esp_modem_wifi_initialized false, so a
+     * retry re-enters this function. esp_netif_create_default_wifi_sta() asserts
+     * internally when a netif with the same if_key already exists, which turned
+     * "the transfer failed, try again" into a panic and reboot. Reuse whatever
+     * is already registered instead of creating a duplicate. */
+    if (!esp_netif_get_handle_from_ifkey("WIFI_STA_DEF")) {
+        esp_netif_create_default_wifi_sta();
+    } else {
+        ESP_LOGW(TAG, "Reusing the WiFi STA netif left by an earlier attempt");
+    }
 
     // Initialize WiFi (via esp_hosted remote)
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
@@ -16615,6 +21403,8 @@ static void append_global_handshaker_log_ctx(tab_context_t *ctx, const char *mes
 {
     if (!ctx || !message || strlen(message) == 0) return;
 
+    if (log_type == HS_LOG_SUCCESS) alert_chime_play(ALERT_TONE_WIN);
+
     // Determine color based on log type
     lv_color_t text_color;
     switch (log_type) {
@@ -17236,6 +22026,7 @@ static void update_phishing_portal_capture(tab_context_t *ctx, const char *captu
     snprintf(data_msg, sizeof(data_msg), "Last captured: %s", captured_text);
 
     ESP_LOGI(TAG, "Portal captured: %s", captured_text);
+    alert_chime_play(ALERT_TONE_WIN);
 
     // Update UI
     bsp_display_lock(0);
@@ -18234,6 +23025,17 @@ static void wardrive_upload_menu_load_async_render(void *user_data)
     show_wardrive_upload_menu(ctx);
 }
 
+// The subtitle label is handed to the background loader through the context, so
+// drop the pointer the moment LVGL destroys it - otherwise closing the menu
+// mid-listing leaves the loader writing into freed memory.
+static void wardrive_upload_menu_subtitle_delete_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (ctx && ctx->wardrive_upload_menu_subtitle == lv_event_get_target(e)) {
+        ctx->wardrive_upload_menu_subtitle = NULL;
+    }
+}
+
 static void show_wardrive_upload_menu(tab_context_t *ctx)
 {
     if (!ctx || !ctx->wardrive_page || ctx->wardrive_upload_menu_overlay) {
@@ -18279,6 +23081,12 @@ static void show_wardrive_upload_menu(tab_context_t *ctx)
     lv_obj_set_width(subtitle, lv_pct(95));
     lv_obj_set_style_text_align(subtitle, LV_TEXT_ALIGN_CENTER, 0);
     lv_label_set_long_mode(subtitle, LV_LABEL_LONG_WRAP);
+
+    // Publish the subtitle so the background loader can report listing progress
+    // into it, and clear the pointer when LVGL deletes the label - the loader may
+    // still be running when the user closes the popup.
+    ctx->wardrive_upload_menu_subtitle = subtitle;
+    lv_obj_add_event_cb(subtitle, wardrive_upload_menu_subtitle_delete_cb, LV_EVENT_DELETE, ctx);
 
     // Window is split top/bottom: "To Upload" (files still on the card) over
     // "Uploaded" (history of past upload attempts). Each half scrolls on its own.
@@ -19016,6 +23824,104 @@ static bool wardrive_parse_file_summary_line(tab_context_t *ctx, const char *lin
     return true;
 }
 
+// Read and discard whatever the module is still emitting, until it goes quiet.
+// Used after a listing we abandoned: those leftover bytes would otherwise be read
+// back as the answer to the *next* command (an upload_state reply carrying
+// [WARD_FILE] lines is exactly this).
+static void wardrive_drain_transport(tab_id_t active_tab, uart_port_t uart_port)
+{
+    char sink[256];
+    int idle_reads = 0;
+    int elapsed_ms = 0;
+    int dropped = 0;
+    const int poll_ms = 250;
+    // 3s of quiet before calling it done: firmware without the scan cache pauses
+    // for seconds between files, so a shorter window would hand back control while
+    // the module is still mid-sentence. Best-effort either way - it cannot outwait
+    // a listing that has another minute of work left.
+    while (elapsed_ms < 15000 && idle_reads < 12) {
+        int len = transport_read_bytes_tab(active_tab, uart_port, sink, sizeof(sink),
+                                           pdMS_TO_TICKS(poll_ms));
+        if (len > 0) {
+            dropped += len;
+            idle_reads = 0;
+        } else {
+            idle_reads++;
+        }
+        elapsed_ms += poll_ms;
+    }
+
+    if (active_tab == TAB_USB && usb_cdc_handle) {
+        usbh_cdc_flush_rx_buffer(usb_cdc_handle);
+    } else {
+        uart_flush(uart_port);
+    }
+
+    if (dropped > 0) {
+        ESP_LOGW(TAG, "[%s] drained %d leftover byte(s) after an incomplete listing",
+                 tab_transport_name(active_tab), dropped);
+    }
+}
+
+// Live "n/N" while a listing streams in, written into whichever caption is on
+// screen: the upload menu's subtitle or the Files page's spinner label. A no-op
+// when neither is up, and the pointers are only read under the display lock -
+// either screen can be closed from the UI thread mid-listing.
+static void wardrive_listing_report_progress(tab_context_t *ctx, const char *rx_buffer,
+                                             int *announced, int *reported)
+{
+    if (!ctx || !rx_buffer || !announced || !reported) {
+        return;
+    }
+
+    if (*announced <= 0) {
+        const char *begin = strstr(rx_buffer, "[WARD_FILE] BEGIN");
+        // Only read count= once the whole line has arrived, otherwise a half-read
+        // "count=6" of a "count=63" would stick as the announced total.
+        size_t n = begin ? strcspn(begin, "\r\n") : 0;
+        if (begin && begin[n] != '\0') {
+            char begin_line[96];
+            if (n >= sizeof(begin_line)) {
+                n = sizeof(begin_line) - 1;
+            }
+            memcpy(begin_line, begin, n);
+            begin_line[n] = '\0';
+            *announced = wardrive_marker_get_int(begin_line, "count", 0);
+        }
+    }
+
+    int seen = 0;
+    for (const char *p = strstr(rx_buffer, "[WARD_FILE] filename="); p != NULL;
+         p = strstr(p + 1, "[WARD_FILE] filename=")) {
+        seen++;
+    }
+    if (seen == *reported) {
+        return;
+    }
+    *reported = seen;
+
+    bsp_display_lock(0);
+    if (ctx->wardrive_upload_menu_subtitle) {
+        if (*announced > 0) {
+            lv_label_set_text_fmt(ctx->wardrive_upload_menu_subtitle,
+                                  "Loading wardrive status... %d/%d", seen, *announced);
+        } else {
+            lv_label_set_text_fmt(ctx->wardrive_upload_menu_subtitle,
+                                  "Loading wardrive status... %d file(s)", seen);
+        }
+    }
+    if (ctx->compromised_files_loading_label) {
+        if (*announced > 0) {
+            lv_label_set_text_fmt(ctx->compromised_files_loading_label,
+                                  "Loading wardrive files... %d/%d", seen, *announced);
+        } else {
+            lv_label_set_text_fmt(ctx->compromised_files_loading_label,
+                                  "Loading wardrive files... %d so far", seen);
+        }
+    }
+    bsp_display_unlock();
+}
+
 static int wardrive_load_files_from_command(tab_context_t *ctx, tab_id_t active_tab,
                                             uart_port_t uart_port, int timeout_ms)
 {
@@ -19024,6 +23930,9 @@ static int wardrive_load_files_from_command(tab_context_t *ctx, tab_id_t active_
     }
 
     ctx->wardrive_file_summary.valid = false;
+    ctx->wardrive_file_summary.truncated = false;
+    ctx->wardrive_file_summary.announced = 0;
+    ctx->wardrive_file_summary.parsed = 0;
 
     if (active_tab == TAB_USB && usb_cdc_handle) {
         usbh_cdc_flush_rx_buffer(usb_cdc_handle);
@@ -19034,10 +23943,14 @@ static int wardrive_load_files_from_command(tab_context_t *ctx, tab_id_t active_
     transport_write_bytes_tab(active_tab, uart_port, "wardrive_files", strlen("wardrive_files"));
     transport_write_bytes_tab(active_tab, uart_port, "\r\n", 2);
 
-    // Big PSRAM buffer: a full wardrive_files listing (24+ files with interleaved
-    // preflight/sanitize lines) easily exceeds 16KB. Keep it in PSRAM so a large
-    // buffer never eats scarce internal RAM; fall back only to a small internal
-    // buffer (which may truncate the listing) if PSRAM is unavailable.
+    // Sizing, measured against a real card (63 files): one "[WARD_FILE] filename="
+    // line is 122 bytes with CRLF and the SUMMARY line is 241, so a listing from
+    // JanOS >= 1.7.2 is ~7.8KB. Older firmware interleaves an 88-byte preflight
+    // line per file on top, which pushes the same listing to ~14KB. Keep the
+    // buffer in PSRAM so neither case eats the scarce internal RAM; the small
+    // internal fallback covers roughly 60 files of new-style output and less of
+    // the old, so a listing that fills it is reported as truncated below rather
+    // than silently cut.
     size_t rx_size = 65536;
     char *rx_buffer = heap_caps_malloc(rx_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!rx_buffer) {
@@ -19053,7 +23966,10 @@ static int wardrive_load_files_from_command(tab_context_t *ctx, tab_id_t active_
     int rx_len = 0;
     int elapsed_ms = 0;
     int empty_reads = 0;
+    int announced = 0;
+    int reported_progress = -1;
     bool saw_end_marker = false;
+    bool buffer_full = false;
     const int poll_ms = 250;
     while (elapsed_ms < timeout_ms && rx_len < (int)rx_size - 1) {
         int len = transport_read_bytes_tab(active_tab, uart_port,
@@ -19071,13 +23987,22 @@ static int wardrive_load_files_from_command(tab_context_t *ctx, tab_id_t active_
             if (strstr(rx_buffer, "Unrecognized command") != NULL) {
                 break;
             }
+            wardrive_listing_report_progress(ctx, rx_buffer, &announced, &reported_progress);
         } else {
             empty_reads++;
+            // Only bail on silence *before* BEGIN, i.e. the module never answered.
+            // After BEGIN silence is normal work: firmware without the scan cache
+            // goes quiet for ~30s while it hashes and preflights a 3MB log, and
+            // treating that as death is what truncates the listing. The timeout
+            // above is the only ceiling once the listing has started.
             if (empty_reads >= 6 && strstr(rx_buffer, "[WARD_FILE] BEGIN") == NULL) {
                 break;
             }
         }
         elapsed_ms += poll_ms;
+    }
+    if (rx_len >= (int)rx_size - 1) {
+        buffer_full = true;
     }
     if (rx_len <= 0) {
         free(rx_buffer);
@@ -19090,25 +24015,55 @@ static int wardrive_load_files_from_command(tab_context_t *ctx, tab_id_t active_
 
     bool saw_begin = false;
     bool saw_end = false;
+    bool hit_file_cap = false;
     int added = 0;
     char *line = strtok(rx_buffer, "\n\r");
-    while (line && ctx->wardrive_wigle_file_count < WARDRIVE_WIGLE_MAX_FILES) {
+    while (line) {
         while (isspace((unsigned char)*line)) {
             line++;
         }
-        if (strcmp(line, "[WARD_FILE] BEGIN") == 0) {
+        // Prefix match, not strcmp: JanOS >= 1.7.2 appends "count=N" to BEGIN, and
+        // the wire contract is append-only, so END may grow fields too.
+        if (strncmp(line, "[WARD_FILE] BEGIN", 17) == 0) {
             saw_begin = true;
-        } else if (strcmp(line, "[WARD_FILE] END") == 0) {
+            announced = wardrive_marker_get_int(line, "count", announced);
+        } else if (strncmp(line, "[WARD_FILE] END", 15) == 0) {
             saw_end = true;
         } else if (wardrive_parse_file_summary_line(ctx, line)) {
             /* summary parsed */
+        } else if (ctx->wardrive_wigle_file_count >= WARDRIVE_WIGLE_MAX_FILES) {
+            if (strstr(line, "[WARD_FILE] filename=") != NULL) {
+                hit_file_cap = true;
+            }
         } else if (wardrive_parse_file_marker_line(ctx, line)) {
             added++;
         }
         line = strtok(NULL, "\n\r");
     }
 
+    // Completeness verdict. Assigned here, after the parse loop, because parsing
+    // the SUMMARY line memsets the summary struct.
+    bool truncated = !saw_end || buffer_full || hit_file_cap ||
+                     (announced > 0 && added < announced);
+    ctx->wardrive_file_summary.announced = announced;
+    ctx->wardrive_file_summary.parsed = added;
+    ctx->wardrive_file_summary.truncated = truncated;
+    if (truncated) {
+        ESP_LOGW(TAG, "[%s] wardrive_files listing truncated: %d parsed, %d announced "
+                      "(end=%d buffer_full=%d cap=%d)",
+                 tab_transport_name(active_tab), added, announced,
+                 saw_end ? 1 : 0, buffer_full ? 1 : 0, hit_file_cap ? 1 : 0);
+    }
+
     free(rx_buffer);
+
+    // A listing we gave up on leaves the module still printing. Those bytes would
+    // otherwise land in the next command's response - that is how an upload_state
+    // reply ends up containing [WARD_FILE] lines - so drain to silence first.
+    if (truncated) {
+        wardrive_drain_transport(active_tab, uart_port);
+    }
+
     return (saw_begin || saw_end || added > 0 || ctx->wardrive_file_summary.valid) ? added : 0;
 }
 
@@ -19132,7 +24087,11 @@ static int wardrive_load_upload_state_from_command(tab_context_t *ctx, tab_id_t 
     transport_write_bytes_tab(active_tab, uart_port, "upload_state", strlen("upload_state"));
     transport_write_bytes_tab(active_tab, uart_port, "\r\n", 2);
 
-    size_t rx_size = 32768;
+    // upload_state.csv is append-only on the module - one row per upload attempt,
+    // both services, forever - so a card with a long history answers with tens of
+    // KB. 32KB already overflowed on a real one, and an overflow here silently
+    // shortens the "Uploaded" history. Keep it in PSRAM and report a fill.
+    size_t rx_size = 65536;
     char *rx_buffer = heap_caps_malloc(rx_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!rx_buffer) {
         rx_size = 8192;
@@ -19180,6 +24139,15 @@ static int wardrive_load_upload_state_from_command(tab_context_t *ctx, tab_id_t 
     rx_buffer[(rx_len < (int)rx_size) ? rx_len : (int)rx_size - 1] = '\0';
     ESP_LOGI(TAG, "[%s] upload_state response (%d bytes, end=%d): %s",
              tab_transport_name(active_tab), rx_len, saw_end_marker ? 1 : 0, rx_buffer);
+    if (!saw_end_marker) {
+        // The journal only feeds the "Uploaded" history panel, so a short read is
+        // cosmetic rather than dangerous - but say so, because the panel then
+        // quietly stops short of the oldest entries.
+        ESP_LOGW(TAG, "[%s] upload_state incomplete (%d bytes, buffer_full=%d) - "
+                      "history panel will be short",
+                 tab_transport_name(active_tab), rx_len,
+                 (rx_len >= (int)rx_size - 1) ? 1 : 0);
+    }
 
     bool saw_begin = false;
     bool saw_end = false;
@@ -19419,8 +24387,36 @@ static void wardrive_format_summary_text(const wardrive_file_summary_t *summary,
         return;
     }
     out[0] = '\0';
-    if (!summary->valid) {
+    // A truncated listing has no SUMMARY line (it never arrived), so valid is
+    // false exactly when the warning matters most - do not gate on it alone.
+    if (!summary->valid && !summary->truncated) {
         return;
+    }
+
+    size_t len = 0;
+    if (summary->truncated) {
+        int n;
+        if (summary->announced > 0) {
+            n = snprintf(out, out_sz,
+                         "#" WARD_HEX_FAILED " listing truncated - showing %d of %d file(s)#",
+                         summary->parsed, summary->announced);
+        } else {
+            n = snprintf(out, out_sz,
+                         "#" WARD_HEX_FAILED " listing incomplete - showing %d file(s)#",
+                         summary->parsed);
+        }
+        if (n < 0 || (size_t)n >= out_sz) {
+            return;
+        }
+        len = (size_t)n;
+        if (!summary->valid) {
+            return;
+        }
+        n = snprintf(out + len, out_sz - len, "\n");
+        if (n < 0 || (size_t)n >= out_sz - len) {
+            return;
+        }
+        len += (size_t)n;
     }
 
     // Recolored, aligned summary (requires lv_label_set_recolor(true) on the label).
@@ -19430,7 +24426,7 @@ static void wardrive_format_summary_text(const wardrive_file_summary_t *summary,
         snprintf(bad_seg, sizeof(bad_seg), "  #" WARD_HEX_BAD " %d bad#", summary->bad);
     }
 
-    snprintf(out, out_sz,
+    snprintf(out + len, out_sz - len,
              "#ffffff %d files#   #" WARD_HEX_WIFI " %d WiFi#  "
              "#" WARD_HEX_BLE " %d BLE#  #" WARD_HEX_BT " %d BT#%s\n"
              "WiGLE  #" WARD_HEX_DONE " %d ok#  #" WARD_HEX_PENDING " %d pend#  "
@@ -19550,7 +24546,8 @@ static void wardrive_wigle_load_file_list(tab_context_t *ctx, tab_id_t active_ta
         return;
     }
 
-    int marker_files = wardrive_load_files_from_command(ctx, active_tab, uart_port, 120000);
+    int marker_files = wardrive_load_files_from_command(ctx, active_tab, uart_port,
+                                                    WARDRIVE_LISTING_TIMEOUT_MS);
     if (marker_files > 0 || ctx->wardrive_file_summary.valid) {
         ESP_LOGI(TAG, "[%s] Wardrive files loaded from wardrive_files: %d",
                  tab_transport_name(active_tab), marker_files);
@@ -19569,6 +24566,13 @@ static void wardrive_wigle_load_file_list(tab_context_t *ctx, tab_id_t active_ta
         true,
         true
     };
+
+    // Falling back to a plain directory listing: whatever wardrive_files managed
+    // to say is no longer what the list shows, so its truncation verdict must not
+    // be reported against these entries.
+    ctx->wardrive_file_summary.truncated = false;
+    ctx->wardrive_file_summary.announced = 0;
+    ctx->wardrive_file_summary.parsed = 0;
 
     for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
         wardrive_wigle_load_files_from_dir(ctx, active_tab, uart_port, dirs[i], require_marker[i]);
@@ -22240,20 +27244,7 @@ static void wardrive_stop_cb(lv_event_t *e)
     if (!ctx) ctx = get_current_ctx();
     ESP_LOGI(TAG, "Wardrive stopped - sending stop command");
 
-    // Send stop command to the correct UART based on this tab
-    tab_id_t active_tab = tab_id_for_ctx(ctx);
-    if (active_tab == TAB_MBUS) {
-        uart2_send_command("stop");
-    } else {
-        uart_send_command("stop");
-    }
-
-    // Stop monitoring task
-    ctx->wardrive_monitoring = false;
-    if (ctx->wardrive_task != NULL) {
-        vTaskDelay(pdMS_TO_TICKS(100));
-        ctx->wardrive_task = NULL;
-    }
+    wardrive_request_stop(ctx);
 
     // Dismiss GPS overlay if showing
     close_wardrive_gps_overlay(ctx);
@@ -23265,6 +28256,7 @@ static void wardrive_autoupload_task(void *arg)
 
     // 5) Final result.
     ESP_LOGI(TAG, "auto-upload: DONE ok=%d | %s", overall_ok, summary[0] ? summary : "(nothing pending)");
+    alert_chime_play(overall_ok ? ALERT_TONE_WIN : ALERT_TONE_WARN);
     if (overall_ok && g_wd_autoupload_poweroff) {
         // Cancellable countdown: one "Stay on" button, ticking once a second. The
         // vTaskDelay yields to LVGL, so the tap is picked up between ticks.
@@ -23447,10 +28439,41 @@ static void wardrive_autoupload_check(tab_context_t *ctx, const wardrive_network
     }
 }
 
+// Ask the running scan to stop: tell the module and clear the flag. Callers own
+// the UI side. Not used by the auto-upload handoff, which needs the task to reach
+// its own tail and launch the upload worker.
+static void wardrive_request_stop(tab_context_t *ctx)
+{
+    if (!ctx) return;
+
+    tab_id_t active_tab = tab_id_for_ctx(ctx);
+    if (active_tab == TAB_MBUS) {
+        uart2_send_command("stop");
+    } else {
+        uart_send_command("stop");
+    }
+
+    // An explicit stop overrides a pending auto-upload handoff: the user asked for
+    // idle, not for a connect-and-upload run.
+    ctx->wardrive_autoupload_requested = false;
+    ctx->wardrive_monitoring = false;
+
+    // Deliberately no generation bump. Clearing the flag is enough to end this run,
+    // and leaving the generation alone lets the task recognise itself as the
+    // current one on the way out, so it clears its own handle. The bump belongs to
+    // wardrive_begin_scan(), which is where a straggler could actually be revived.
+    // The handle is never cleared here: doing so used to let a straggler wipe the
+    // *next* task's handle when it finally exited.
+}
+
 // Core of "start wardrive", shared by the Start button and the auto-upload Resume button.
 static void wardrive_begin_scan(tab_context_t *ctx)
 {
     if (!ctx || ctx->wardrive_monitoring) return;
+
+    // Retire any monitor task still finishing its last iteration before this run's
+    // flag goes up, so it cannot mistake our start for its own.
+    ctx->wardrive_run_generation++;
 
     close_wardrive_wigle_popup_ctx(ctx);
 
@@ -23483,6 +28506,12 @@ static void wardrive_begin_scan(tab_context_t *ctx)
     ESP_LOGI(TAG, "Wardrive start - sending %s command", start_cmd);
 
     tab_id_t active_tab = tab_id_for_ctx(ctx);
+
+    // Drop whatever the module said about the previous run - the stop summary and
+    // the tail of its last CSV batch are still in the driver's buffer, and the new
+    // monitor task would read them as this run's output.
+    uart_flush_input((active_tab == TAB_MBUS) ? UART2_NUM : UART_NUM);
+
     if (active_tab == TAB_MBUS) {
         uart2_send_command("unselect_networks");
     } else {
@@ -23526,7 +28555,30 @@ static void wardrive_begin_scan(tab_context_t *ctx)
     bsp_display_unlock();
 
     ctx->wardrive_monitoring = true;
-    xTaskCreate(wardrive_monitor_task, "wd_monitor", 8192, (void*)ctx, 5, &ctx->wardrive_task);
+    if (xTaskCreate(wardrive_monitor_task, "wd_monitor", 8192, (void*)ctx, 5,
+                    &ctx->wardrive_task) != pdPASS) {
+        // Without the reader nothing ever leaves "Starting wardrive..." and Start
+        // stays greyed out, so undo the run rather than leaving the page wedged.
+        ESP_LOGE(TAG, "Wardrive: failed to start monitor task");
+        ctx->wardrive_monitoring = false;
+        ctx->wardrive_task = NULL;
+        ctx->wardrive_run_generation++;
+        if (active_tab == TAB_MBUS) uart2_send_command("stop");
+        else uart_send_command("stop");
+
+        bsp_display_lock(0);
+        close_wardrive_gps_overlay(ctx);
+        if (ctx->wardrive_start_btn) lv_obj_clear_state(ctx->wardrive_start_btn, LV_STATE_DISABLED);
+        if (ctx->wardrive_stop_btn) lv_obj_add_state(ctx->wardrive_stop_btn, LV_STATE_DISABLED);
+        if (ctx->wardrive_trace_btn) lv_obj_clear_state(ctx->wardrive_trace_btn, LV_STATE_DISABLED);
+        if (ctx->wardrive_upload_btn) lv_obj_clear_state(ctx->wardrive_upload_btn, LV_STATE_DISABLED);
+        if (ctx->wardrive_setup_btn) lv_obj_clear_state(ctx->wardrive_setup_btn, LV_STATE_DISABLED);
+        if (ctx->wardrive_status_label) {
+            lv_label_set_text(ctx->wardrive_status_label, "Could not start - out of memory");
+            lv_obj_set_style_text_color(ctx->wardrive_status_label, COLOR_MATERIAL_RED, 0);
+        }
+        bsp_display_unlock();
+    }
 }
 
 static void wardrive_monitor_task(void *arg)
@@ -23541,7 +28593,12 @@ static void wardrive_monitor_task(void *arg)
     tab_id_t active_tab = tab_id_for_ctx(ctx);
     uart_port_t uart_port = (active_tab == TAB_MBUS) ? UART2_NUM : UART_NUM;
 
-    ESP_LOGI(TAG, "Wardrive monitor task started (tab=%d, uart=%d)", active_tab, uart_port);
+    // Whose run this is. Once it no longer matches, a newer start (or a stop) has
+    // taken over the transport and this task must get off it.
+    const uint32_t my_generation = ctx->wardrive_run_generation;
+
+    ESP_LOGI(TAG, "Wardrive monitor task started (tab=%d, uart=%d, gen=%lu)",
+             active_tab, uart_port, (unsigned long)my_generation);
 
     char rx_buffer[512];
     char line_buffer[512];
@@ -23558,7 +28615,7 @@ static void wardrive_monitor_task(void *arg)
     int low_batt_hits = 0;
     bool low_batt_stop_sent = false;
 
-    while (ctx->wardrive_monitoring) {
+    while (ctx->wardrive_monitoring && ctx->wardrive_run_generation == my_generation) {
         if (ctx->wardrive_use_external_gps) {
             wardrive_push_external_gps_update(active_tab,
                                               uart_port,
@@ -23583,6 +28640,7 @@ static void wardrive_monitor_task(void *arg)
                     low_batt_stop_sent = true;
                     ESP_LOGW(TAG, "Wardrive: battery %d%% <= %d%% - graceful stop",
                              batt_pct, WARDRIVE_LOW_BATT_PCT);
+                    alert_chime_play(ALERT_TONE_WARN);
                     if (active_tab == TAB_MBUS) uart2_send_command("stop");
                     else uart_send_command("stop");
                     bsp_display_lock(0);
@@ -23691,6 +28749,7 @@ static void wardrive_monitor_task(void *arg)
                         if (ctx->wardrive_gps_fix && strstr(line_buffer, "GPS fix lost") != NULL) {
                             ctx->wardrive_gps_fix = false;
                             ESP_LOGW(TAG, "Wardrive: GPS fix lost");
+                            alert_chime_play(ALERT_TONE_WARN);
 
                             bsp_display_lock(0);
                             show_wardrive_gps_overlay(ctx);
@@ -23722,6 +28781,7 @@ static void wardrive_monitor_task(void *arg)
                         // No GPS fix obtained -> timeout, stop wardrive
                         if (strstr(line_buffer, "No GPS fix obtained") != NULL) {
                             ESP_LOGW(TAG, "Wardrive: No GPS fix - timed out");
+                            alert_chime_play(ALERT_TONE_WARN);
 
                             bsp_display_lock(0);
                             if (ctx->wardrive_gps_label) {
@@ -23832,7 +28892,17 @@ static void wardrive_monitor_task(void *arg)
         vTaskDelay(pdMS_TO_TICKS(50));
     }
 
-    ESP_LOGI(TAG, "Wardrive monitor task ended");
+    // Only the task that still owns the run may touch shared state on the way out;
+    // a straggler retired by a newer start must not clear the new task's handle or
+    // steal its auto-upload handoff.
+    bool still_current = (ctx->wardrive_run_generation == my_generation);
+    ESP_LOGI(TAG, "Wardrive monitor task ended (gen=%lu, current=%d)",
+             (unsigned long)my_generation, still_current ? 1 : 0);
+
+    if (!still_current) {
+        vTaskDelete(NULL);
+        return;
+    }
 
     // Auto-upload handoff: the user confirmed a home network, so launch the upload
     // worker (which now owns the transport) instead of returning to idle.
@@ -23875,17 +28945,7 @@ static void wardrive_back_cb(lv_event_t *e)
 
     // Stop if running
     if (ctx->wardrive_monitoring) {
-        tab_id_t active_tab = tab_id_for_ctx(ctx);
-        if (active_tab == TAB_MBUS) {
-            uart2_send_command("stop");
-        } else {
-            uart_send_command("stop");
-        }
-        ctx->wardrive_monitoring = false;
-        if (ctx->wardrive_task != NULL) {
-            vTaskDelay(pdMS_TO_TICKS(100));
-            ctx->wardrive_task = NULL;
-        }
+        wardrive_request_stop(ctx);
     }
 
     // Dismiss GPS overlay
@@ -26087,6 +31147,7 @@ static void antisurv_monitor_task(void *arg)
 
                     if (strstr(line_buffer, "[FOLLOWER]") != NULL) {
                         ctx->antisurv_follower_count++;
+                        alert_chime_play(ALERT_TONE_ALARM);
 
                         // Pull out MAC and name for a compact row
                         char mac[20] = "?";
@@ -27846,6 +32907,31 @@ static void compromised_data_back_btn_event_cb(lv_event_t *e)
     show_compromised_data_page();
 }
 
+static void espshark_back_btn_event_cb(lv_event_t *e)
+{
+    (void)e;
+    show_compromised_data_page();
+}
+
+static void espshark_remote_back_btn_event_cb(lv_event_t *e)
+{
+    (void)e;
+    show_espshark_page();
+}
+
+static void espshark_action_btn_event_cb(lv_event_t *e)
+{
+    const char *action = (const char *)lv_event_get_user_data(e);
+    if (!action) {
+        return;
+    }
+    if (strcmp(action, "monster") == 0) {
+        show_pcap_captures_page();
+    } else if (strcmp(action, "tab5") == 0) {
+        show_pcap_viewer_page();
+    }
+}
+
 // Back to main from compromised data page - hide page and show tiles
 static void compromised_data_main_back_btn_event_cb(lv_event_t *e)
 {
@@ -27878,6 +32964,8 @@ static void compromised_data_tile_event_cb(lv_event_t *e)
         show_handshakes_page();
     } else if (strcmp(tile_name, "Wardrive Files") == 0) {
         show_wardrive_files_page();
+    } else if (strcmp(tile_name, "ESPShark") == 0) {
+        show_espshark_page();
     }
 }
 
@@ -27901,6 +32989,88 @@ static void compromised_listing_reset_files(tab_context_t *ctx)
     ctx->wardrive_wigle_selected_count = 0;
     memset(&ctx->wardrive_file_summary, 0, sizeof(ctx->wardrive_file_summary));
     wardrive_upload_state_reset(ctx);
+}
+
+// Remove one entry from the in-memory listing, keeping the rest in order. Used
+// after the module confirmed a delete, so the page can re-render from cache
+// instead of re-reading the whole directory (a wardrive listing costs the module
+// a full pass over every log on the card).
+static bool compromised_listing_drop_path(tab_context_t *ctx, const char *path)
+{
+    if (!ctx || !ctx->wardrive_wigle_files || !path || path[0] == '\0') {
+        return false;
+    }
+
+    for (int i = 0; i < ctx->wardrive_wigle_file_count; i++) {
+        if (strcmp(ctx->wardrive_wigle_files[i].path, path) != 0) {
+            continue;
+        }
+        int remaining = ctx->wardrive_wigle_file_count - i - 1;
+        if (remaining > 0) {
+            memmove(&ctx->wardrive_wigle_files[i], &ctx->wardrive_wigle_files[i + 1],
+                    (size_t)remaining * sizeof(wardrive_wigle_file_t));
+        }
+        ctx->wardrive_wigle_file_count--;
+        memset(&ctx->wardrive_wigle_files[ctx->wardrive_wigle_file_count], 0,
+               sizeof(wardrive_wigle_file_t));
+        return true;
+    }
+
+    return false;
+}
+
+static void wardrive_summary_tally_status(const char *status, int *ok, int *pending,
+                                          int *failed, int *rate_limited)
+{
+    if (status && strcmp(status, "done") == 0) {
+        (*ok)++;
+    } else if (status && strcmp(status, "failed") == 0) {
+        (*failed)++;
+    } else if (status && strcmp(status, "rate_limited") == 0) {
+        (*rate_limited)++;
+    } else {
+        (*pending)++;
+    }
+}
+
+// Rebuild the summary from the entries still in the listing, after some were
+// dropped. Exact rather than approximate: the module derives rows and devices
+// from wifi+ble+bt, and every field we need is already stored per file.
+static void wardrive_recompute_file_summary(tab_context_t *ctx)
+{
+    if (!ctx || !ctx->wardrive_wigle_files || !ctx->wardrive_file_summary.valid) {
+        return;
+    }
+
+    wardrive_file_summary_t *s = &ctx->wardrive_file_summary;
+    int announced = s->announced;
+
+    memset(s, 0, sizeof(*s));
+    s->valid = true;
+
+    for (int i = 0; i < ctx->wardrive_wigle_file_count; i++) {
+        const wardrive_wigle_file_t *f = &ctx->wardrive_wigle_files[i];
+        if (f->name[0] == '\0') {
+            continue;
+        }
+        s->files++;
+        s->bytes += f->size_bytes;
+        s->wifi += f->wifi_rows;
+        s->ble += f->ble_rows;
+        s->bt += f->bt_rows;
+        s->bad += f->bad_rows;
+        wardrive_summary_tally_status(f->wigle_status, &s->wigle_ok, &s->wigle_pending,
+                                      &s->wigle_failed, &s->wigle_rate_limited);
+        wardrive_summary_tally_status(f->wdgwars_status, &s->wdgwars_ok, &s->wdgwars_pending,
+                                      &s->wdgwars_failed, &s->wdgwars_rate_limited);
+    }
+
+    s->rows = s->wifi + s->ble + s->bt;
+    s->devices = s->rows;
+    s->parsed = s->files;
+    // Only a complete listing is ever pruned (see compromised_cleanup_task), so
+    // announced follows the file count down and truncated stays false.
+    s->announced = (announced > 0) ? s->files : 0;
 }
 
 static void compromised_transport_lock_begin(tab_id_t tab, uart_port_t uart_port, bool *usb_lock_set)
@@ -27998,6 +33168,84 @@ static bool compromised_extract_file_token(const char *line, char *out, size_t o
     return false;
 }
 
+/* Parses one line of "list_dir <path> -s", which JanOS prints as
+ * "<index> <size_bytes> <name>". The size field is consumed only when it is a
+ * complete run of digits followed by whitespace, so a plain "<index> <name>"
+ * line from older firmware - including a name that starts with digits - still
+ * parses, just with size 0. The name is the rest of the line, which keeps
+ * spaces inside long file names intact. */
+static bool compromised_extract_sized_file_entry(const char *line, char *out, size_t out_sz,
+                                                 const char *const *exts, size_t ext_count,
+                                                 long *size_out)
+{
+    if (size_out) {
+        *size_out = 0;
+    }
+    if (!line || !out || out_sz == 0 || !exts || ext_count == 0) {
+        return false;
+    }
+
+    while (isspace((unsigned char)*line)) {
+        line++;
+    }
+    const char *cursor = line;
+    if (!isdigit((unsigned char)*cursor)) {
+        return false;
+    }
+    while (isdigit((unsigned char)*cursor)) {
+        cursor++;
+    }
+    if (!isspace((unsigned char)*cursor)) {
+        return false;
+    }
+    while (isspace((unsigned char)*cursor)) {
+        cursor++;
+    }
+
+    const char *probe = cursor;
+    while (isdigit((unsigned char)*probe)) {
+        probe++;
+    }
+    if (probe != cursor && isspace((unsigned char)*probe)) {
+        if (size_out) {
+            unsigned long long parsed = strtoull(cursor, NULL, 10);
+            *size_out = parsed > (unsigned long long)LONG_MAX ? LONG_MAX : (long)parsed;
+        }
+        cursor = probe;
+        while (isspace((unsigned char)*cursor)) {
+            cursor++;
+        }
+    }
+
+    const char *end = cursor + strlen(cursor);
+    while (end > cursor && isspace((unsigned char)*(end - 1))) {
+        end--;
+    }
+    while (end > cursor && (*(end - 1) == '"' || *(end - 1) == '\'')) {
+        end--;
+    }
+    while (cursor < end && (*cursor == '"' || *cursor == '\'')) {
+        cursor++;
+    }
+    if (end <= cursor) {
+        return false;
+    }
+
+    size_t token_len = (size_t)(end - cursor);
+    if (token_len >= out_sz) {
+        return false;
+    }
+    memcpy(out, cursor, token_len);
+    out[token_len] = '\0';
+
+    for (size_t i = 0; i < ext_count; i++) {
+        if (str_ends_with_ext(out, exts[i])) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static int compromised_load_handshake_files(tab_context_t *ctx, tab_id_t active_tab, uart_port_t uart_port)
 {
     if (!ctx || tab_is_internal(active_tab)) {
@@ -28053,6 +33301,69 @@ static int compromised_load_handshake_files(tab_context_t *ctx, tab_id_t active_
     return ctx->wardrive_wigle_file_count;
 }
 
+static int compromised_load_pcap_capture_files(tab_context_t *ctx, tab_id_t active_tab,
+                                               uart_port_t uart_port)
+{
+    if (!ctx || tab_is_internal(active_tab)) {
+        return 0;
+    }
+
+    static const char *dirs[] = {
+        "/sdcard/lab/pcaps",
+        "/lab/pcaps",
+        "/sdcard/pcaps",
+        "/pcaps"
+    };
+    static const char *exts[] = { ".pcap" };
+
+    compromised_listing_reset_files(ctx);
+
+    bool usb_lock_set = false;
+    compromised_transport_lock_begin(active_tab, uart_port, &usb_lock_set);
+
+    char rx_buffer[4096];
+    for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]) &&
+                       ctx->wardrive_wigle_file_count < WARDRIVE_WIGLE_MAX_FILES; i++) {
+        compromised_transport_flush(active_tab, uart_port);
+
+        char cmd[128];
+        /* "-s" makes JanOS append the byte size. Firmware without the flag
+         * ignores it and the parser falls back to size 0. */
+        snprintf(cmd, sizeof(cmd), "list_dir %s -s", dirs[i]);
+        transport_write_bytes_tab(active_tab, uart_port, cmd, strlen(cmd));
+        transport_write_bytes_tab(active_tab, uart_port, "\r\n", 2);
+
+        int rx_len = home_collect_uart_response(active_tab, uart_port, rx_buffer,
+                                                sizeof(rx_buffer), 1600);
+        if (rx_len <= 0) {
+            continue;
+        }
+
+        ESP_LOGI(TAG, "[%s] PCAP capture list response from %s: %s",
+                 tab_transport_name(active_tab), dirs[i], rx_buffer);
+
+        char *line = strtok(rx_buffer, "\n\r");
+        while (line && ctx->wardrive_wigle_file_count < WARDRIVE_WIGLE_MAX_FILES) {
+            char token[WARDRIVE_WIGLE_PATH_MAX] = {0};
+            long size_bytes = 0;
+            if (compromised_extract_sized_file_entry(line, token, sizeof(token), exts, 1,
+                                                     &size_bytes) &&
+                wardrive_wigle_store_file(ctx, dirs[i], token)) {
+                ctx->wardrive_wigle_files[ctx->wardrive_wigle_file_count - 1].size_bytes =
+                    size_bytes;
+            }
+            line = strtok(NULL, "\n\r");
+        }
+
+        if (ctx->wardrive_wigle_file_count > 0) {
+            break;
+        }
+    }
+
+    compromised_transport_lock_end(usb_lock_set);
+    return ctx->wardrive_wigle_file_count;
+}
+
 static int compromised_load_wardrive_files(tab_context_t *ctx, tab_id_t active_tab, uart_port_t uart_port)
 {
     if (!ctx || tab_is_internal(active_tab)) {
@@ -28074,11 +33385,18 @@ static int compromised_load_wardrive_files(tab_context_t *ctx, tab_id_t active_t
     bool usb_lock_set = false;
     compromised_transport_lock_begin(active_tab, uart_port, &usb_lock_set);
 
-    int marker_files = wardrive_load_files_from_command(ctx, active_tab, uart_port, 120000);
+    int marker_files = wardrive_load_files_from_command(ctx, active_tab, uart_port,
+                                                    WARDRIVE_LISTING_TIMEOUT_MS);
     if (marker_files > 0 || ctx->wardrive_file_summary.valid) {
         compromised_transport_lock_end(usb_lock_set);
         return ctx->wardrive_wigle_file_count;
     }
+
+    // See wardrive_wigle_load_file_list(): the fallback listing below replaces the
+    // marker output entirely, so its truncation verdict no longer applies.
+    ctx->wardrive_file_summary.truncated = false;
+    ctx->wardrive_file_summary.announced = 0;
+    ctx->wardrive_file_summary.parsed = 0;
 
     char rx_buffer[4096];
     for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]) &&
@@ -28140,6 +33458,156 @@ static void compromised_build_delete_path(const char *src_path, char *out, size_
     snprintf(out, out_sz, "%s", trimmed);
 }
 
+// JanOS sets repl_config.max_cmdline_length = 256. esp_console truncates a longer
+// line silently (strlcpy) and linenoise's dumb reader leaves an exactly-256-char
+// line unterminated, so a too-long command would delete a half-named file rather
+// than fail. Keep the whole line under that, with margin.
+#define COMPROMISED_DELETE_CMD_MAX 250
+// esp_console_split_argv() stops at argc == max_cmdline_args - 1 (32 - 1 = 31);
+// argv[0] is "file_delete", so 30 paths. The line budget above bites long before
+// this does (~6 wardrive paths, ~4 handshake paths), but bound the loop anyway.
+#define COMPROMISED_DELETE_ARGS_MAX 30
+
+// Quote one path for esp_console_split_argv(), which understands "..." plus \"
+// and \\ inside them. Handshake filenames are built from SSIDs, so a quote or a
+// backslash in the name is possible and must not end the argument early - that
+// would hand the module a different path than the one we meant to delete.
+static bool compromised_quote_delete_arg(const char *path, char *out, size_t out_sz)
+{
+    if (!path || path[0] == '\0' || !out || out_sz < 4) {
+        return false;
+    }
+
+    size_t o = 0;
+    out[o++] = '"';
+    for (const char *p = path; *p; p++) {
+        size_t need = (*p == '"' || *p == '\\') ? 2u : 1u;
+        if (o + need + 2 > out_sz) { // + closing quote + NUL
+            return false;
+        }
+        if (need == 2) {
+            out[o++] = '\\';
+        }
+        out[o++] = *p;
+    }
+    out[o++] = '"';
+    out[o] = '\0';
+    return true;
+}
+
+// Pack as many of paths[start..count-1] into one `file_delete` line as the
+// module's console will accept. Returns how many were packed; 0 means even the
+// first one does not fit, and the caller must fail that path outright instead of
+// sending a truncated line.
+static int compromised_pack_delete_cmd(char paths[][WARDRIVE_WIGLE_PATH_MAX], int count,
+                                       int start, char *cmd, size_t cmd_sz)
+{
+    if (!paths || !cmd || cmd_sz < 32 || start < 0 || start >= count) {
+        return 0;
+    }
+
+    int len = snprintf(cmd, cmd_sz, "file_delete");
+    if (len < 0 || (size_t)len >= cmd_sz) {
+        return 0;
+    }
+
+    int packed = 0;
+    for (int i = start; i < count && packed < COMPROMISED_DELETE_ARGS_MAX; i++) {
+        char rel[WARDRIVE_WIGLE_PATH_MAX];
+        compromised_build_delete_path(paths[i], rel, sizeof(rel));
+
+        char quoted[WARDRIVE_WIGLE_PATH_MAX * 2 + 4];
+        if (rel[0] == '\0' || !compromised_quote_delete_arg(rel, quoted, sizeof(quoted))) {
+            break; // caller fails this one and resumes packing after it
+        }
+
+        size_t arg_len = strlen(quoted);
+        if ((size_t)len + 1 + arg_len + 1 > cmd_sz) { // space + arg + NUL
+            break;
+        }
+        cmd[len++] = ' ';
+        memcpy(cmd + len, quoted, arg_len);
+        len += (int)arg_len;
+        cmd[len] = '\0';
+        packed++;
+    }
+
+    return packed;
+}
+
+// Map a delete response back onto the paths of the batch that produced it.
+// JanOS >= 1.7.2 prints one "[FILE_DELETE] ... result=..." per path, in argv
+// order; ok[i] is set from the i-th such line. Returns how many markers were
+// found, which is 0 on firmware that does not emit them.
+//
+// Deliberately positional: wardrive_marker_get_value() cuts a value at the first
+// space, so path= is unreadable for exactly the names (spaces) that matter here.
+static int compromised_parse_delete_results(const char *rx, int expected, bool *ok)
+{
+    if (!rx || !ok || expected <= 0) {
+        return 0;
+    }
+
+    int seen = 0;
+    const char *p = rx;
+    while (seen < expected && (p = strstr(p, "[FILE_DELETE]")) != NULL) {
+        char marker_line[WARDRIVE_WIGLE_PATH_MAX + 96];
+        size_t n = strcspn(p, "\r\n");
+        if (n >= sizeof(marker_line)) {
+            n = sizeof(marker_line) - 1;
+        }
+        memcpy(marker_line, p, n);
+        marker_line[n] = '\0';
+
+        char result[24] = {0};
+        wardrive_marker_get_value(marker_line, "result", result, sizeof(result));
+        ok[seen++] = (strcmp(result, "ok") == 0);
+        p += 13; // past "[FILE_DELETE]"
+    }
+
+    return seen;
+}
+
+// Send one already-packed batch and fill ok[0..count-1]. Returns true when the
+// module answered with per-path markers; false means the reply could not be
+// mapped (older firmware, or a lost response) and the caller should retry those
+// paths one at a time.
+static bool compromised_delete_batch_locked(tab_id_t tab, uart_port_t uart_port,
+                                            const char *cmd, int count, bool *ok,
+                                            char *rx_buffer, size_t rx_buffer_sz)
+{
+    if (tab_is_internal(tab) || !cmd || cmd[0] == '\0' || !ok || count <= 0 ||
+        !rx_buffer || rx_buffer_sz < 2) {
+        return false;
+    }
+
+    compromised_transport_flush(tab, uart_port);
+    transport_write_bytes_tab(tab, uart_port, cmd, strlen(cmd));
+    transport_write_bytes_tab(tab, uart_port, "\r\n", 2);
+
+    // One sd_sync() on the module covers the whole batch, but each path still
+    // costs a stat+unlink, so scale the ceiling with the batch size.
+    uint32_t timeout_ms = 600 + 400u * (uint32_t)count;
+    if (timeout_ms > 5000) {
+        timeout_ms = 5000;
+    }
+
+    int rx_len = home_collect_uart_response(tab, uart_port, rx_buffer, rx_buffer_sz, timeout_ms);
+    ESP_LOGI(TAG, "[%s] Batch delete of %d file(s) (%d bytes): %s",
+             tab_transport_name(tab), count, rx_len, rx_buffer);
+
+    int mapped = compromised_parse_delete_results(rx_buffer, count, ok);
+    if (mapped == count) {
+        return true;
+    }
+
+    // Partial or absent markers: do not guess which path they belonged to.
+    for (int i = 0; i < count; i++) {
+        ok[i] = false;
+    }
+    return false;
+}
+
 static bool compromised_delete_file_locked(tab_id_t tab, uart_port_t uart_port, const char *src_path,
                                            char *delete_path, size_t delete_path_sz,
                                            char *rx_buffer, size_t rx_buffer_sz)
@@ -28156,34 +33624,42 @@ static bool compromised_delete_file_locked(tab_id_t tab, uart_port_t uart_port, 
         return false;
     }
 
-    compromised_transport_flush(tab, uart_port);
+    // Always quoted, never bare: once the module accepts several paths per line, a
+    // bare path with a space in it splits into two arguments and deletes files we
+    // never named. esp_console has understood quotes since forever, so there is no
+    // firmware where the bare form works and this one does not - hence no retry.
+    char quoted[WARDRIVE_WIGLE_PATH_MAX * 2 + 4];
+    if (!compromised_quote_delete_arg(delete_path, quoted, sizeof(quoted))) {
+        ESP_LOGW(TAG, "[%s] Delete skipped, path does not fit quoting: %s",
+                 tab_transport_name(tab), delete_path);
+        rx_buffer[0] = '\0';
+        return false;
+    }
 
-    char cmd[WARDRIVE_WIGLE_PATH_MAX + 24];
-    snprintf(cmd, sizeof(cmd), "file_delete %s", delete_path);
+    char cmd[COMPROMISED_DELETE_CMD_MAX];
+    int cmd_len = snprintf(cmd, sizeof(cmd), "file_delete %s", quoted);
+    if (cmd_len < 0 || (size_t)cmd_len >= sizeof(cmd)) {
+        ESP_LOGW(TAG, "[%s] Delete skipped, command line too long for: %s",
+                 tab_transport_name(tab), delete_path);
+        rx_buffer[0] = '\0';
+        return false;
+    }
+
+    compromised_transport_flush(tab, uart_port);
     transport_write_bytes_tab(tab, uart_port, cmd, strlen(cmd));
     transport_write_bytes_tab(tab, uart_port, "\r\n", 2);
 
-    int rx_len = home_collect_uart_response(tab, uart_port, rx_buffer, rx_buffer_sz, 900);
+    int rx_len = home_collect_uart_response(tab, uart_port, rx_buffer, rx_buffer_sz, 1500);
     ESP_LOGI(TAG, "[%s] Delete response for %s (%d bytes): %s",
              tab_transport_name(tab), delete_path, rx_len, rx_buffer);
-    if (strstr(rx_buffer, "Deleted ") != NULL) {
-        return true;
-    }
 
-    if (strchr(delete_path, ' ') != NULL) {
-        compromised_transport_flush(tab, uart_port);
-        snprintf(cmd, sizeof(cmd), "file_delete \"%s\"", delete_path);
-        transport_write_bytes_tab(tab, uart_port, cmd, strlen(cmd));
-        transport_write_bytes_tab(tab, uart_port, "\r\n", 2);
-        rx_len = home_collect_uart_response(tab, uart_port, rx_buffer, rx_buffer_sz, 900);
-        ESP_LOGI(TAG, "[%s] Quoted delete response for %s (%d bytes): %s",
-                 tab_transport_name(tab), delete_path, rx_len, rx_buffer);
-        if (strstr(rx_buffer, "Deleted ") != NULL) {
-            return true;
-        }
+    // Prefer the machine-readable marker (JanOS >= 1.7.2); fall back to the human
+    // line, which older firmware is the only thing to print.
+    bool ok = false;
+    if (compromised_parse_delete_results(rx_buffer, 1, &ok) == 1) {
+        return ok;
     }
-
-    return false;
+    return strstr(rx_buffer, "Deleted ") != NULL;
 }
 
 static void compromised_delete_handshake_companion_locked(tab_id_t tab, uart_port_t uart_port,
@@ -28219,6 +33695,8 @@ static const char *compromised_title_for_kind(compromised_file_kind_t kind)
             return "Evil Twin Passwords";
         case COMPROMISED_FILE_KIND_PORTAL:
             return "Portal Data";
+        case COMPROMISED_FILE_KIND_PCAP_CAPTURE:
+            return "ESPShark - Monster SD";
         default:
             return "Compromised Files";
     }
@@ -28235,6 +33713,8 @@ static const char *compromised_empty_text_for_kind(compromised_file_kind_t kind)
             return "No Evil Twin file found on this tab.";
         case COMPROMISED_FILE_KIND_PORTAL:
             return "No portal data file found on this tab.";
+        case COMPROMISED_FILE_KIND_PCAP_CAPTURE:
+            return "No PCAP captures found on this tab.";
         default:
             return "No compromised files found on this tab.";
     }
@@ -28251,6 +33731,8 @@ static const char *compromised_tile_name_for_kind(compromised_file_kind_t kind)
             return "evil twin";
         case COMPROMISED_FILE_KIND_PORTAL:
             return "portal";
+        case COMPROMISED_FILE_KIND_PCAP_CAPTURE:
+            return "PCAP capture";
         default:
             return "compromised";
     }
@@ -28267,6 +33749,8 @@ static lv_color_t compromised_accent_for_kind(compromised_file_kind_t kind)
             return COLOR_MATERIAL_AMBER;
         case COMPROMISED_FILE_KIND_PORTAL:
             return COLOR_LAB5_MAGENTA;
+        case COMPROMISED_FILE_KIND_PCAP_CAPTURE:
+            return COLOR_MATERIAL_GREEN;
         default:
             return ui_tab_icon_color();
     }
@@ -28286,6 +33770,8 @@ static lv_obj_t **compromised_page_slot_for_kind(tab_context_t *ctx, compromised
             return &ctx->evil_twin_passwords_page;
         case COMPROMISED_FILE_KIND_PORTAL:
             return &ctx->portal_data_page;
+        case COMPROMISED_FILE_KIND_PCAP_CAPTURE:
+            return &ctx->pcap_captures_page;
         default:
             return NULL;
     }
@@ -28304,6 +33790,8 @@ static const char *compromised_cleanup_title_for_action(compromised_file_kind_t 
                 return "Deleting Evil Twin File";
             case COMPROMISED_FILE_KIND_PORTAL:
                 return "Deleting Portal File";
+            case COMPROMISED_FILE_KIND_PCAP_CAPTURE:
+                return "Deleting PCAP Capture";
             default:
                 return "Deleting File";
         }
@@ -28317,6 +33805,8 @@ static const char *compromised_cleanup_title_for_action(compromised_file_kind_t 
             return "Cleaning Evil Twin Data";
         case COMPROMISED_FILE_KIND_PORTAL:
             return "Cleaning Portal Data";
+        case COMPROMISED_FILE_KIND_PCAP_CAPTURE:
+            return "Cleaning PCAP Captures";
         default:
             return "Cleaning Files";
     }
@@ -28556,10 +34046,15 @@ static void compromised_cleanup_async_refresh(void *user_data)
             show_evil_twin_passwords_page();
         } else if (kind == COMPROMISED_FILE_KIND_PORTAL) {
             show_portal_data_page();
+        } else if (kind == COMPROMISED_FILE_KIND_PCAP_CAPTURE) {
+            show_pcap_captures_page();
         }
     } else if (page_slot && *page_slot) {
         lv_obj_del(*page_slot);
         *page_slot = NULL;
+        // Nobody consumed the pruned cache; drop the staged flag so the next open
+        // reads a fresh listing rather than rendering it much later.
+        ctx->compromised_files_loaded = false;
     }
 
     if (kind == COMPROMISED_FILE_KIND_HANDSHAKE) {
@@ -28596,6 +34091,8 @@ static void compromised_files_load_async_render(void *user_data)
         show_handshakes_page();
     } else if (kind == COMPROMISED_FILE_KIND_WARDRIVE) {
         show_wardrive_files_page();
+    } else if (kind == COMPROMISED_FILE_KIND_PCAP_CAPTURE) {
+        show_pcap_captures_page();
     } else {
         ctx->compromised_files_loaded = false;
     }
@@ -28617,6 +34114,13 @@ static void compromised_files_load_task(void *arg)
 
     if (kind == COMPROMISED_FILE_KIND_HANDSHAKE) {
         ctx->home_handshake_count = compromised_load_handshake_files(ctx, active_tab, uart_port);
+    } else if (kind == COMPROMISED_FILE_KIND_PCAP_CAPTURE) {
+        (void)compromised_load_pcap_capture_files(ctx, active_tab, uart_port);
+        for (int i = 0; i < ctx->wardrive_wigle_file_count; i++) {
+            wardrive_wigle_file_t *file = &ctx->wardrive_wigle_files[i];
+            file->tab5_synced = file->path[0] &&
+                                janos_sync_state_has_local_copy(active_tab, file->path);
+        }
     } else {
         (void)compromised_load_wardrive_files(ctx, active_tab, uart_port);
         if (kind == COMPROMISED_FILE_KIND_WARDRIVE) {
@@ -28799,8 +34303,9 @@ static void wardrive_cleanup_task(void *arg)
     int total_len = 0;
     int elapsed_ms = 0;
     int empty_reads = 0;
+    bool saw_end_marker = false;
     const int poll_ms = 250;
-    while (elapsed_ms < 120000 && total_len < (int)rx_size - 1) {
+    while (elapsed_ms < WARDRIVE_LISTING_TIMEOUT_MS && total_len < (int)rx_size - 1) {
         int len = transport_read_bytes_tab(tab, uart_port, rx + total_len,
                                            rx_size - 1 - total_len,
                                            pdMS_TO_TICKS(poll_ms));
@@ -28808,27 +34313,38 @@ static void wardrive_cleanup_task(void *arg)
             total_len += len;
             rx[total_len] = '\0';
             empty_reads = 0;
-            if (strstr(rx, "[WARD_CLEANUP] END") != NULL ||
-                strstr(rx, "Usage: wardrive_cleanup") != NULL ||
+            if (strstr(rx, "[WARD_CLEANUP] END") != NULL) {
+                saw_end_marker = true;
+                break;
+            }
+            if (strstr(rx, "Usage: wardrive_cleanup") != NULL ||
                 strstr(rx, "Unrecognized command") != NULL) {
                 break;
             }
         } else {
             empty_reads++;
+            // Silence only counts before BEGIN. wardrive_cleanup hashes every file
+            // it scans, so once it has started a long quiet stretch is a big log
+            // being read, not a hang - see wardrive_load_files_from_command().
             if (empty_reads >= 8 && strstr(rx, "[WARD_CLEANUP] BEGIN") == NULL) {
                 break;
             }
         }
         elapsed_ms += poll_ms;
     }
+    bool cleanup_buffer_full = (total_len >= (int)rx_size - 1);
     compromised_transport_lock_end(usb_lock_set);
 
     int scanned = 0, matched = 0, moved = 0, failed = 0, dry_run = args->move ? 0 : 1;
+    int announced = 0;
     int shown = 0;
     char *line = strtok(rx, "\n\r");
     while (line) {
         while (isspace((unsigned char)*line)) line++;
-        if (strstr(line, "[WARD_CLEANUP] filename=") != NULL) {
+        if (strstr(line, "[WARD_CLEANUP] BEGIN") != NULL) {
+            // count= is appended by JanOS >= 1.7.2; absent on older firmware.
+            announced = wardrive_marker_get_int(line, "count", 0);
+        } else if (strstr(line, "[WARD_CLEANUP] filename=") != NULL) {
             char filename[96] = {0};
             char action[24] = {0};
             wardrive_marker_get_value(line, "filename", filename, sizeof(filename));
@@ -28855,7 +34371,34 @@ static void wardrive_cleanup_task(void *arg)
         bsp_display_unlock();
     }
 
+    // Same completeness check as the file listing: without END, or with fewer
+    // scanned files than the module announced, what we show is a partial result -
+    // dangerous to read as "nothing else matched".
+    bool cleanup_truncated = !saw_end_marker || cleanup_buffer_full ||
+                             (announced > 0 && scanned < announced);
+    if (cleanup_truncated) {
+        char warn[96];
+        if (announced > 0) {
+            snprintf(warn, sizeof(warn), "[WARN] incomplete: scanned %d of %d",
+                     scanned, announced);
+        } else {
+            snprintf(warn, sizeof(warn), "[WARN] incomplete response from module");
+        }
+        ESP_LOGW(TAG, "[%s] wardrive_cleanup %s", tab_transport_name(tab), warn);
+        bsp_display_lock(0);
+        compromised_cleanup_append_log(ctx, warn);
+        bsp_display_unlock();
+    }
+
     free(rx);
+
+    // Whatever the module is still printing must not become the next command's
+    // answer (the Files page reloads right after this task finishes).
+    if (cleanup_truncated) {
+        compromised_transport_lock_begin(tab, uart_port, &usb_lock_set);
+        wardrive_drain_transport(tab, uart_port);
+        compromised_transport_lock_end(usb_lock_set);
+    }
 
     bsp_display_lock(0);
     if (ctx->compromised_cleanup_spinner) {
@@ -28942,7 +34485,7 @@ static void wardrive_fix_task(void *arg)
     int elapsed_ms = 0;
     int empty_reads = 0;
     const int poll_ms = 250;
-    while (elapsed_ms < 120000 && total_len < (int)rx_size - 1) {
+    while (elapsed_ms < WARDRIVE_LISTING_TIMEOUT_MS && total_len < (int)rx_size - 1) {
         int len = transport_read_bytes_tab(tab, uart_port, rx + total_len,
                                            rx_size - 1 - total_len,
                                            pdMS_TO_TICKS(poll_ms));
@@ -29051,59 +34594,108 @@ static void compromised_cleanup_task(void *arg)
     int success_count = 0;
     int failed_count = 0;
 
+    // Response buffer for a whole batch: each path answers with a [FILE_DELETE]
+    // marker plus the legacy "Deleted <full path>" line, so budget generously and
+    // keep it off this task's 8KB stack.
+    const size_t rx_size = 2048;
+    char *rx_buffer = heap_caps_malloc(rx_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!rx_buffer) {
+        rx_buffer = malloc(rx_size);
+    }
+
     bool usb_lock_set = false;
     compromised_transport_lock_begin(tab, uart_port, &usb_lock_set);
 
-    for (int i = 0; i < total; i++) {
-        char *path = task_args->paths[i];
-        if (path[0] == '\0') {
+    // Batching is probed, not version-gated: firmware older than 1.7.2 ignores the
+    // extra arguments and answers for the first path only, which leaves the rest
+    // untouched (safe) but unconfirmed. The first unmappable reply drops us back
+    // to one path per command for the remainder of the run.
+    bool batch_mode = (rx_buffer != NULL && total > 1);
+
+    int i = 0;
+    while (i < total) {
+        if (task_args->paths[i][0] == '\0') {
+            i++; // empty slot: skipped without counting, as before
             continue;
         }
 
-        const char *name = strrchr(path, '/');
-        name = name ? (name + 1) : path;
+        int handled = 0;
+        bool ok[COMPROMISED_DELETE_ARGS_MAX] = { false };
 
-        char delete_path[WARDRIVE_WIGLE_PATH_MAX];
-        char rx_buffer[512];
-        bool ok = compromised_delete_file_locked(tab, uart_port, path,
-                                                 delete_path, sizeof(delete_path),
-                                                 rx_buffer, sizeof(rx_buffer));
-        if (task_args->kind == COMPROMISED_FILE_KIND_HANDSHAKE) {
-            compromised_delete_handshake_companion_locked(tab, uart_port, path);
-        }
-        if (ok) {
-            success_count++;
-        } else {
-            failed_count++;
-        }
-
-        ESP_LOGI(TAG, "[%s] %s %d/%d: %s -> %s",
-                 tab_transport_name(tab),
-                 task_args->action == COMPROMISED_CLEANUP_ACTION_DELETE ? "Delete" : "Clean",
-                 i + 1, total, delete_path[0] ? delete_path : name, ok ? "OK" : "FAIL");
-
-        char status[160];
-        if (task_args->action == COMPROMISED_CLEANUP_ACTION_DELETE && total == 1) {
-            snprintf(status, sizeof(status), "Deleting file...");
-        } else {
-            snprintf(status, sizeof(status), "Deleting %d/%d files...", i + 1, total);
+        if (batch_mode) {
+            char cmd[COMPROMISED_DELETE_CMD_MAX];
+            int packed = compromised_pack_delete_cmd(task_args->paths, total, i,
+                                                     cmd, sizeof(cmd));
+            if (packed > 1) {
+                if (compromised_delete_batch_locked(tab, uart_port, cmd, packed, ok,
+                                                    rx_buffer, rx_size)) {
+                    handled = packed;
+                } else {
+                    ESP_LOGW(TAG, "[%s] Batch delete unmappable, falling back to one per command",
+                             tab_transport_name(tab));
+                    batch_mode = false;
+                }
+            }
         }
 
-        char line[240];
-        snprintf(line, sizeof(line), "%s %s",
-                 ok ? "[OK]" : "[FAIL]", name);
-
-        bsp_display_lock(0);
-        if (ctx->compromised_cleanup_status_label) {
-            lv_label_set_text(ctx->compromised_cleanup_status_label, status);
+        if (handled == 0) {
+            // Single path: either batching is off, only one path fits on a line, or
+            // this path cannot be packed at all (and must be failed, never sent
+            // truncated - compromised_delete_file_locked() rejects it for us).
+            char delete_path[WARDRIVE_WIGLE_PATH_MAX];
+            char single_rx[512];
+            ok[0] = compromised_delete_file_locked(tab, uart_port, task_args->paths[i],
+                                                   delete_path, sizeof(delete_path),
+                                                   single_rx, sizeof(single_rx));
+            handled = 1;
         }
-        compromised_cleanup_append_log(ctx, line);
-        bsp_display_unlock();
 
+        for (int k = 0; k < handled; k++) {
+            char *path = task_args->paths[i + k];
+            const char *name = strrchr(path, '/');
+            name = name ? (name + 1) : path;
+
+            // Companion .hccapx files are best-effort and never counted, exactly as
+            // before - a handshake without one is normal.
+            if (task_args->kind == COMPROMISED_FILE_KIND_HANDSHAKE) {
+                compromised_delete_handshake_companion_locked(tab, uart_port, path);
+            }
+
+            if (ok[k]) {
+                success_count++;
+            } else {
+                failed_count++;
+            }
+
+            ESP_LOGI(TAG, "[%s] %s %d/%d: %s -> %s",
+                     tab_transport_name(tab),
+                     task_args->action == COMPROMISED_CLEANUP_ACTION_DELETE ? "Delete" : "Clean",
+                     i + k + 1, total, name, ok[k] ? "OK" : "FAIL");
+
+            char status[160];
+            if (task_args->action == COMPROMISED_CLEANUP_ACTION_DELETE && total == 1) {
+                snprintf(status, sizeof(status), "Deleting file...");
+            } else {
+                snprintf(status, sizeof(status), "Deleting %d/%d files...", i + k + 1, total);
+            }
+
+            char line[240];
+            snprintf(line, sizeof(line), "%s %s", ok[k] ? "[OK]" : "[FAIL]", name);
+
+            bsp_display_lock(0);
+            if (ctx->compromised_cleanup_status_label) {
+                lv_label_set_text(ctx->compromised_cleanup_status_label, status);
+            }
+            compromised_cleanup_append_log(ctx, line);
+            bsp_display_unlock();
+        }
+
+        i += handled;
         vTaskDelay(pdMS_TO_TICKS(80));
     }
 
     compromised_transport_lock_end(usb_lock_set);
+    free(rx_buffer);
 
     bsp_display_lock(0);
     if (ctx->compromised_cleanup_status_label) {
@@ -29116,6 +34708,41 @@ static void compromised_cleanup_task(void *arg)
     bsp_display_unlock();
 
     vTaskDelay(pdMS_TO_TICKS(350));
+
+    // Deleting a file used to cost a full re-listing, which on the wardrive page
+    // means the module re-reads every log on the card. When every delete in this
+    // run was confirmed we know exactly what changed, so drop those entries from
+    // the in-memory listing and let the page re-render from cache instead.
+    //
+    // Anything less than a clean sweep falls back to the re-listing: a failure
+    // means our view and the card's have diverged, and a listing that was already
+    // truncated is not a cache worth preserving.
+    bool prune_cache = (failed_count == 0 && success_count > 0 &&
+                        !ctx->wardrive_file_summary.truncated);
+    if (prune_cache) {
+        bsp_display_lock(0);
+        for (int p = 0; p < total; p++) {
+            if (task_args->paths[p][0] != '\0') {
+                compromised_listing_drop_path(ctx, task_args->paths[p]);
+            }
+        }
+        // The checkbox pointers belong to the upload popup's rows, which are gone
+        // once this page rebuilds; keep the selection count in step with them.
+        int selected = 0;
+        for (int p = 0; p < ctx->wardrive_wigle_file_count; p++) {
+            ctx->wardrive_wigle_files[p].checkbox = NULL;
+            if (ctx->wardrive_wigle_files[p].selected) {
+                selected++;
+            }
+        }
+        ctx->wardrive_wigle_selected_count = selected;
+        wardrive_recompute_file_summary(ctx);
+        ctx->compromised_files_loaded = true;
+        bsp_display_unlock();
+
+        ESP_LOGI(TAG, "[%s] Listing pruned locally (%d deleted, %d left) - no re-listing",
+                 tab_transport_name(tab), success_count, ctx->wardrive_wigle_file_count);
+    }
 
     ctx->compromised_cleanup_running = false;
     ctx->compromised_cleanup_task = NULL;
@@ -29271,6 +34898,186 @@ static void compromised_add_single_file_controls(tab_context_t *ctx, lv_obj_t *p
     lv_obj_center(delete_lbl);
 }
 
+//==================================================================================
+// Wardrive Files - bulk selection
+//==================================================================================
+// The page deliberately has no blanket "Clean": a wardrive log that has not been
+// uploaded yet is the only copy of hours of driving, so bulk deletion here goes
+// through an explicit selection. "Uploaded" is the safe shortcut - it picks only
+// files both services already have, which is the case where deleting actually
+// makes sense (Archive done merely moves them, so it frees no space on the card).
+
+static void wardrive_files_refresh_delete_btn(tab_context_t *ctx)
+{
+    if (!ctx || !ctx->wardrive_files_delete_btn) {
+        return;
+    }
+
+    int selected = ctx->wardrive_wigle_selected_count;
+    if (ctx->wardrive_files_delete_lbl) {
+        lv_label_set_text_fmt(ctx->wardrive_files_delete_lbl,
+                              LV_SYMBOL_TRASH " Delete (%d)", selected);
+    }
+    if (selected > 0) {
+        lv_obj_clear_state(ctx->wardrive_files_delete_btn, LV_STATE_DISABLED);
+    } else {
+        lv_obj_add_state(ctx->wardrive_files_delete_btn, LV_STATE_DISABLED);
+    }
+}
+
+static void wardrive_files_delete_btn_delete_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (ctx && ctx->wardrive_files_delete_btn == lv_event_get_target(e)) {
+        ctx->wardrive_files_delete_btn = NULL;
+        ctx->wardrive_files_delete_lbl = NULL;
+    }
+}
+
+static void wardrive_files_checkbox_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = get_current_ctx();
+    wardrive_wigle_file_t *file = (wardrive_wigle_file_t *)lv_event_get_user_data(e);
+    if (!ctx || !file) {
+        return;
+    }
+
+    bool checked = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+    if (file->selected == checked) {
+        return;
+    }
+    file->selected = checked;
+    if (checked) {
+        ctx->wardrive_wigle_selected_count++;
+    } else if (ctx->wardrive_wigle_selected_count > 0) {
+        ctx->wardrive_wigle_selected_count--;
+    }
+    wardrive_files_refresh_delete_btn(ctx);
+}
+
+// Apply a selection rule to every listed file and push it into the checkboxes that
+// are already on screen, so the page does not have to be rebuilt - a rebuild would
+// re-issue the whole UART listing.
+typedef enum {
+    WARDRIVE_SELECT_ALL,
+    WARDRIVE_SELECT_NONE,
+    WARDRIVE_SELECT_UPLOADED,
+} wardrive_select_mode_t;
+
+static void wardrive_files_apply_selection(tab_context_t *ctx, wardrive_select_mode_t mode)
+{
+    if (!ctx || !ctx->wardrive_wigle_files) {
+        return;
+    }
+
+    int selected = 0;
+    for (int i = 0; i < ctx->wardrive_wigle_file_count; i++) {
+        wardrive_wigle_file_t *file = &ctx->wardrive_wigle_files[i];
+        if (file->name[0] == '\0') {
+            continue;
+        }
+
+        bool want;
+        switch (mode) {
+            case WARDRIVE_SELECT_NONE:
+                want = false;
+                break;
+            case WARDRIVE_SELECT_UPLOADED:
+                // Both services, not either: a file WiGLE has but WDGWars does not
+                // is still pending work.
+                want = (strcmp(file->wigle_status, "done") == 0 &&
+                        strcmp(file->wdgwars_status, "done") == 0);
+                break;
+            case WARDRIVE_SELECT_ALL:
+            default:
+                want = true;
+                break;
+        }
+
+        file->selected = want;
+        if (want) {
+            selected++;
+        }
+        if (file->checkbox) {
+            if (want) {
+                lv_obj_add_state(file->checkbox, LV_STATE_CHECKED);
+            } else {
+                lv_obj_clear_state(file->checkbox, LV_STATE_CHECKED);
+            }
+        }
+    }
+
+    ctx->wardrive_wigle_selected_count = selected;
+    wardrive_files_refresh_delete_btn(ctx);
+}
+
+static void wardrive_files_select_all_cb(lv_event_t *e)
+{
+    (void)e;
+    wardrive_files_apply_selection(get_current_ctx(), WARDRIVE_SELECT_ALL);
+}
+
+static void wardrive_files_select_none_cb(lv_event_t *e)
+{
+    (void)e;
+    wardrive_files_apply_selection(get_current_ctx(), WARDRIVE_SELECT_NONE);
+}
+
+static void wardrive_files_select_uploaded_cb(lv_event_t *e)
+{
+    (void)e;
+    wardrive_files_apply_selection(get_current_ctx(), WARDRIVE_SELECT_UPLOADED);
+}
+
+static void wardrive_files_delete_selected_cb(lv_event_t *e)
+{
+    (void)e;
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx || !ctx->wardrive_wigle_files || ctx->compromised_cleanup_running ||
+        ctx->compromised_confirm_overlay || ctx->wardrive_wigle_selected_count <= 0) {
+        return;
+    }
+
+    compromised_cleanup_task_args_t *task_args = calloc(1, sizeof(*task_args));
+    if (!task_args) {
+        ESP_LOGW(TAG, "Failed to allocate selected-delete task args");
+        return;
+    }
+
+    task_args->ctx = ctx;
+    task_args->kind = COMPROMISED_FILE_KIND_WARDRIVE;
+    task_args->action = COMPROMISED_CLEANUP_ACTION_CLEAN;
+    for (int i = 0; i < ctx->wardrive_wigle_file_count &&
+                    task_args->path_count < WARDRIVE_WIGLE_MAX_FILES; i++) {
+        wardrive_wigle_file_t *file = &ctx->wardrive_wigle_files[i];
+        if (!file->selected || file->path[0] == '\0') {
+            continue;
+        }
+        snprintf(task_args->paths[task_args->path_count],
+                 sizeof(task_args->paths[task_args->path_count]), "%s", file->path);
+        task_args->path_count++;
+    }
+
+    if (task_args->path_count <= 0) {
+        free(task_args);
+        return;
+    }
+
+    // Same confirm and the same worker as Clean, so batching, per-path results and
+    // the local listing prune all apply unchanged.
+    show_compromised_delete_confirm(ctx, task_args);
+}
+
+// The spinner caption is published to the background loader, so drop the pointer
+// the moment LVGL destroys it - the listing can still be streaming in.
+static void compromised_files_loading_label_delete_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (ctx && ctx->compromised_files_loading_label == lv_event_get_target(e)) {
+        ctx->compromised_files_loading_label = NULL;
+    }
+}
+
 static void show_compromised_file_page(compromised_file_kind_t kind)
 {
     tab_context_t *ctx = get_current_ctx();
@@ -29318,7 +35125,11 @@ static void show_compromised_file_page(compromised_file_kind_t kind)
     lv_obj_t *back_btn = lv_btn_create(header);
     lv_obj_set_size(back_btn, 72, 60);
     style_back_nav_button(back_btn);
-    lv_obj_add_event_cb(back_btn, compromised_data_back_btn_event_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(back_btn,
+                        kind == COMPROMISED_FILE_KIND_PCAP_CAPTURE
+                            ? espshark_remote_back_btn_event_cb
+                            : compromised_data_back_btn_event_cb,
+                        LV_EVENT_CLICKED, NULL);
 
     lv_obj_t *back_icon = lv_label_create(back_btn);
     lv_label_set_text(back_icon, LV_SYMBOL_LEFT);
@@ -29353,6 +35164,51 @@ static void show_compromised_file_page(compromised_file_kind_t kind)
         lv_obj_center(wpasec_lbl);
     }
 
+    // Both handshake and general PCAP pages expose the newest file in the header.
+    // Per-file copy remains available on every row.
+    bool is_copyable_pcap = (kind == COMPROMISED_FILE_KIND_HANDSHAKE ||
+                             kind == COMPROMISED_FILE_KIND_PCAP_CAPTURE);
+    if (is_copyable_pcap && ctx->compromised_files_loaded &&
+        ctx->wardrive_wigle_file_count > 0) {
+        int latest_index = ctx->wardrive_wigle_file_count - 1;
+        lv_obj_t *copy_latest_btn = lv_btn_create(header);
+        lv_obj_set_size(copy_latest_btn, 180, 50);
+        lv_obj_set_style_bg_color(copy_latest_btn, lv_color_hex(0x087EA4), 0);
+        lv_obj_set_style_bg_color(copy_latest_btn, lv_color_hex(0x05617F),
+                                  LV_STATE_PRESSED);
+        lv_obj_set_style_border_width(copy_latest_btn, 2, 0);
+        lv_obj_set_style_border_color(copy_latest_btn, COLOR_MATERIAL_CYAN, 0);
+        lv_obj_set_style_radius(copy_latest_btn, 8, 0);
+        lv_obj_add_event_cb(copy_latest_btn, compromised_file_copy_cb,
+                            LV_EVENT_CLICKED,
+                            compromised_make_user_data(kind, latest_index));
+
+        lv_obj_t *copy_latest_lbl = lv_label_create(copy_latest_btn);
+        lv_label_set_text(copy_latest_lbl, "Copy latest");
+        lv_obj_set_style_text_font(copy_latest_lbl, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(copy_latest_lbl, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_center(copy_latest_lbl);
+
+        lv_obj_t *sync_btn = lv_btn_create(header);
+        lv_obj_set_size(sync_btn, 155, 50);
+        lv_obj_set_style_bg_color(sync_btn, lv_color_hex(0x008F76), 0);
+        lv_obj_set_style_bg_color(sync_btn, lv_color_hex(0x006B58), LV_STATE_PRESSED);
+        lv_obj_set_style_border_width(sync_btn, 2, 0);
+        lv_obj_set_style_border_color(sync_btn, COLOR_NEON_GREEN, 0);
+        lv_obj_set_style_radius(sync_btn, 8, 0);
+        lv_obj_add_event_cb(sync_btn, compromised_files_sync_cb, LV_EVENT_CLICKED,
+                            compromised_make_user_data(kind, 0));
+
+        lv_obj_t *sync_lbl = lv_label_create(sync_btn);
+        lv_label_set_text(sync_lbl,
+                          kind == COMPROMISED_FILE_KIND_PCAP_CAPTURE
+                              ? LV_SYMBOL_REFRESH " Sync all"
+                              : LV_SYMBOL_REFRESH " Sync new");
+        lv_obj_set_style_text_font(sync_lbl, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(sync_lbl, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_center(sync_lbl);
+    }
+
     if (kind != COMPROMISED_FILE_KIND_WARDRIVE) {
         clean_btn = lv_btn_create(header);
         lv_obj_set_size(clean_btn, 120, 50);
@@ -29372,6 +35228,66 @@ static void show_compromised_file_page(compromised_file_kind_t kind)
     lv_label_set_text(status_label, "Loading...");
     lv_obj_set_style_text_font(status_label, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(status_label, ui_muted_color(), 0);
+
+    // Bulk selection, wardrive only. This page has no "Clean" on purpose - see
+    // wardrive_files_apply_selection() - so bulk deletion runs through here.
+    lv_obj_t *select_bar = NULL;
+    ctx->wardrive_files_delete_btn = NULL;
+    ctx->wardrive_files_delete_lbl = NULL;
+    if (kind == COMPROMISED_FILE_KIND_WARDRIVE) {
+        select_bar = lv_obj_create(*page_slot);
+        lv_obj_remove_style_all(select_bar);
+        lv_obj_set_size(select_bar, lv_pct(100), LV_SIZE_CONTENT);
+        lv_obj_set_flex_flow(select_bar, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(select_bar, LV_FLEX_ALIGN_START,
+                              LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_column(select_bar, 8, 0);
+        lv_obj_set_style_pad_bottom(select_bar, 4, 0);
+        lv_obj_clear_flag(select_bar, LV_OBJ_FLAG_SCROLLABLE);
+
+        static const struct {
+            const char *text;
+            lv_event_cb_t cb;
+        } select_buttons[] = {
+            { "Uploaded", wardrive_files_select_uploaded_cb },
+            { "All",      wardrive_files_select_all_cb },
+            { "None",     wardrive_files_select_none_cb },
+        };
+        for (size_t b = 0; b < sizeof(select_buttons) / sizeof(select_buttons[0]); b++) {
+            lv_obj_t *btn = lv_btn_create(select_bar);
+            lv_obj_set_size(btn, 110, 44);
+            lv_obj_set_style_bg_color(btn, lv_color_hex(0x455A64), 0);
+            lv_obj_set_style_bg_color(btn, lv_color_hex(0x555555), LV_STATE_DISABLED);
+            lv_obj_set_style_radius(btn, 8, 0);
+            lv_obj_add_event_cb(btn, select_buttons[b].cb, LV_EVENT_CLICKED, ctx);
+            if (!ctx->compromised_files_loaded) {
+                lv_obj_add_state(btn, LV_STATE_DISABLED);
+            }
+
+            lv_obj_t *lbl = lv_label_create(btn);
+            lv_label_set_text(lbl, select_buttons[b].text);
+            lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
+            lv_obj_set_style_text_color(lbl, lv_color_hex(0xFFFFFF), 0);
+            lv_obj_center(lbl);
+        }
+
+        ctx->wardrive_files_delete_btn = lv_btn_create(select_bar);
+        lv_obj_set_size(ctx->wardrive_files_delete_btn, 150, 44);
+        style_danger_button(ctx->wardrive_files_delete_btn);
+        lv_obj_set_style_bg_color(ctx->wardrive_files_delete_btn,
+                                  lv_color_hex(0x555555), LV_STATE_DISABLED);
+        lv_obj_add_event_cb(ctx->wardrive_files_delete_btn, wardrive_files_delete_selected_cb,
+                            LV_EVENT_CLICKED, ctx);
+        lv_obj_add_event_cb(ctx->wardrive_files_delete_btn, wardrive_files_delete_btn_delete_cb,
+                            LV_EVENT_DELETE, ctx);
+        lv_obj_add_state(ctx->wardrive_files_delete_btn, LV_STATE_DISABLED);
+
+        ctx->wardrive_files_delete_lbl = lv_label_create(ctx->wardrive_files_delete_btn);
+        lv_label_set_text(ctx->wardrive_files_delete_lbl, LV_SYMBOL_TRASH " Delete (0)");
+        lv_obj_set_style_text_font(ctx->wardrive_files_delete_lbl, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(ctx->wardrive_files_delete_lbl, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_center(ctx->wardrive_files_delete_lbl);
+    }
 
     lv_obj_t *list_container = lv_obj_create(*page_slot);
     lv_obj_set_size(list_container, lv_pct(100), LV_SIZE_CONTENT);
@@ -29422,6 +35338,13 @@ static void show_compromised_file_page(compromised_file_kind_t kind)
         lv_obj_set_style_text_font(loading_lbl, &lv_font_montserrat_16, 0);
         lv_obj_set_style_text_color(loading_lbl, ui_muted_color(), 0);
         lv_obj_align(loading_lbl, LV_ALIGN_CENTER, 0, 70);
+
+        // Hand the label to the loader so a wardrive listing - minutes long on
+        // firmware without the scan cache - counts files instead of showing a bare
+        // spinner. Nulled on delete; the page can be left mid-load.
+        ctx->compromised_files_loading_label = loading_lbl;
+        lv_obj_add_event_cb(loading_lbl, compromised_files_loading_label_delete_cb,
+                            LV_EVENT_DELETE, ctx);
 
         lv_obj_move_foreground(loading_box);
 
@@ -29475,7 +35398,10 @@ static void show_compromised_file_page(compromised_file_kind_t kind)
         lv_obj_set_style_text_color(empty, ui_muted_color(), 0);
         lv_obj_set_style_text_align(empty, LV_TEXT_ALIGN_CENTER, 0);
         lv_obj_set_width(empty, lv_pct(100));
-    } else if (kind == COMPROMISED_FILE_KIND_WARDRIVE && ctx->wardrive_file_summary.valid) {
+    } else if (kind == COMPROMISED_FILE_KIND_WARDRIVE &&
+               (ctx->wardrive_file_summary.valid || ctx->wardrive_file_summary.truncated)) {
+        // truncated also passes: that is the case with no SUMMARY line, where the
+        // formatter emits the "listing truncated" warning on its own.
         char summary[320];
         wardrive_format_summary_text(&ctx->wardrive_file_summary, summary, sizeof(summary));
         lv_label_set_text(status_label, summary);
@@ -29507,8 +35433,29 @@ static void show_compromised_file_page(compromised_file_kind_t kind)
         lv_obj_set_style_pad_all(row, 10, 0);
         lv_obj_set_style_pad_column(row, 10, 0);
         lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
-        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN,
+                              LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
         lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+        // Selection checkbox, wardrive only. The pointer is kept on the entry so
+        // the Uploaded/All/None buttons can tick boxes in place instead of forcing
+        // a page rebuild, which would re-issue the whole UART listing.
+        file->checkbox = NULL;
+        if (kind == COMPROMISED_FILE_KIND_WARDRIVE) {
+            lv_obj_t *cb = lv_checkbox_create(row);
+            lv_checkbox_set_text(cb, "");
+            lv_obj_set_size(cb, 44, 44);          // touch target, matches the upload popup
+            lv_obj_set_ext_click_area(cb, 12);
+            lv_obj_set_style_bg_color(cb, lv_color_hex(0x3D3D3D), LV_PART_INDICATOR);
+            lv_obj_set_style_border_color(cb, lv_color_hex(0x888888), LV_PART_INDICATOR);
+            lv_obj_set_style_bg_color(cb, COLOR_MATERIAL_TEAL,
+                                      LV_PART_INDICATOR | LV_STATE_CHECKED);
+            if (file->selected) {
+                lv_obj_add_state(cb, LV_STATE_CHECKED);
+            }
+            lv_obj_add_event_cb(cb, wardrive_files_checkbox_cb, LV_EVENT_VALUE_CHANGED, file);
+            file->checkbox = cb;
+        }
 
         lv_obj_t *info = lv_obj_create(row);
         lv_obj_remove_style_all(info);
@@ -29525,12 +35472,38 @@ static void show_compromised_file_page(compromised_file_kind_t kind)
         lv_obj_set_width(name_lbl, lv_pct(100));
         lv_label_set_long_mode(name_lbl, LV_LABEL_LONG_WRAP);
 
+        /* Sizes only exist for listings fetched with "list_dir -s". Other kinds
+         * leave size_bytes at 0, so stay silent rather than claiming the file is
+         * empty. A multi-megabyte capture is worth flagging, because the
+         * transfer has no resume and a drop costs the whole thing. */
+        bool oversized = file->size_bytes >= COMPROMISED_LARGE_FILE_WARN_BYTES;
         lv_obj_t *path_lbl = lv_label_create(info);
-        lv_label_set_text(path_lbl, file->path);
+        if (file->size_bytes > 0) {
+            char size_text[32];
+            wardrive_human_size(file->size_bytes, size_text, sizeof(size_text));
+            lv_label_set_text_fmt(path_lbl, "%s\n%s%s", file->path, size_text,
+                                  oversized ? "  -  large, transfer cannot resume" : "");
+        } else {
+            lv_label_set_text(path_lbl, file->path);
+        }
         lv_obj_set_style_text_font(path_lbl, &lv_font_montserrat_12, 0);
-        lv_obj_set_style_text_color(path_lbl, ui_muted_color(), 0);
+        lv_obj_set_style_text_color(path_lbl,
+                                    oversized ? COLOR_MATERIAL_AMBER : ui_muted_color(), 0);
         lv_obj_set_width(path_lbl, lv_pct(100));
         lv_label_set_long_mode(path_lbl, LV_LABEL_LONG_WRAP);
+
+        if (kind == COMPROMISED_FILE_KIND_PCAP_CAPTURE) {
+            lv_obj_t *sync_state_lbl = lv_label_create(info);
+            lv_label_set_recolor(sync_state_lbl, true);
+            lv_label_set_text(sync_state_lbl,
+                              file->tab5_synced
+                                  ? "#52B6FF MONSTER: AVAILABLE#  |  #5EDCA3 TAB5: SYNCED#"
+                                  : "#52B6FF MONSTER: AVAILABLE#  |  #F9A825 TAB5: NOT COPIED#");
+            lv_obj_set_width(sync_state_lbl, lv_pct(100));
+            lv_label_set_long_mode(sync_state_lbl, LV_LABEL_LONG_WRAP);
+            lv_obj_set_style_text_font(sync_state_lbl, &lv_font_montserrat_12, 0);
+            lv_obj_set_style_text_color(sync_state_lbl, ui_muted_color(), 0);
+        }
 
         if (kind == COMPROMISED_FILE_KIND_WARDRIVE) {
             char detail[224];
@@ -29559,10 +35532,16 @@ static void show_compromised_file_page(compromised_file_kind_t kind)
 
         lv_obj_t *actions = lv_obj_create(row);
         lv_obj_remove_style_all(actions);
-        lv_obj_set_size(actions, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+        if (is_copyable_pcap) {
+            // Explicit dimensions avoid LVGL resolving a percentage inside a
+            // content-sized flex parent to zero and hiding the copy action.
+            lv_obj_set_size(actions, 392, 62);
+        } else {
+            lv_obj_set_size(actions, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+        }
         lv_obj_set_flex_flow(actions, LV_FLEX_FLOW_ROW);
         lv_obj_set_flex_align(actions, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-        lv_obj_set_style_pad_column(actions, 8, 0);
+        lv_obj_set_style_pad_column(actions, 12, 0);
         lv_obj_clear_flag(actions, LV_OBJ_FLAG_SCROLLABLE);
 
         if (kind == COMPROMISED_FILE_KIND_WARDRIVE) {
@@ -29582,17 +35561,58 @@ static void show_compromised_file_page(compromised_file_kind_t kind)
             lv_obj_center(fix_lbl);
         }
 
+        if (is_copyable_pcap) {
+            lv_obj_t *copy_btn = lv_btn_create(actions);
+            lv_obj_set_size(copy_btn, 250, 62);
+            lv_obj_set_style_bg_color(copy_btn, lv_color_hex(0x087EA4), 0);
+            lv_obj_set_style_bg_color(copy_btn, lv_color_hex(0x05617F), LV_STATE_PRESSED);
+            lv_obj_set_style_border_width(copy_btn, 2, 0);
+            lv_obj_set_style_border_color(copy_btn, COLOR_MATERIAL_CYAN, 0);
+            lv_obj_set_style_border_opa(copy_btn, LV_OPA_100, 0);
+            lv_obj_set_style_radius(copy_btn, 10, 0);
+            lv_obj_set_style_shadow_width(copy_btn, 8, 0);
+            lv_obj_set_style_shadow_color(copy_btn, COLOR_MATERIAL_CYAN, 0);
+            lv_obj_set_style_shadow_opa(copy_btn, LV_OPA_30, 0);
+            lv_obj_set_flex_flow(copy_btn, LV_FLEX_FLOW_COLUMN);
+            lv_obj_set_flex_align(copy_btn, LV_FLEX_ALIGN_CENTER,
+                                  LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+            lv_obj_set_style_pad_row(copy_btn, 1, 0);
+            lv_obj_add_event_cb(copy_btn, compromised_file_copy_cb, LV_EVENT_CLICKED,
+                                compromised_make_user_data(kind, i));
+
+            lv_obj_t *copy_title = lv_label_create(copy_btn);
+            lv_label_set_text(copy_title, "COPY TO TAB5");
+            lv_obj_set_style_text_font(copy_title, &lv_font_montserrat_16, 0);
+            lv_obj_set_style_text_color(copy_title, lv_color_hex(0xFFFFFF), 0);
+
+            lv_obj_t *copy_hint = lv_label_create(copy_btn);
+            lv_label_set_text(copy_hint, "Monster SD  >  Tab5 SD");
+            lv_obj_set_style_text_font(copy_hint, &lv_font_montserrat_12, 0);
+            lv_obj_set_style_text_color(copy_hint, lv_color_hex(0xD7F7FF), 0);
+        }
+
         lv_obj_t *delete_btn = lv_btn_create(actions);
-        lv_obj_set_size(delete_btn, 110, 44);
+        lv_obj_set_size(delete_btn,
+                        is_copyable_pcap ? 130 : 110,
+                        is_copyable_pcap ? 62 : 44);
         style_danger_button(delete_btn);
         lv_obj_add_event_cb(delete_btn, compromised_file_delete_cb, LV_EVENT_CLICKED,
                             compromised_make_user_data(kind, i));
 
         lv_obj_t *delete_lbl = lv_label_create(delete_btn);
-        lv_label_set_text(delete_lbl, LV_SYMBOL_TRASH " Delete");
+        lv_label_set_text(delete_lbl,
+                          is_copyable_pcap
+                              ? "DELETE FILE"
+                              : LV_SYMBOL_TRASH " Delete");
         lv_obj_set_style_text_font(delete_lbl, &lv_font_montserrat_14, 0);
         lv_obj_set_style_text_color(delete_lbl, lv_color_hex(0xFFFFFF), 0);
         lv_obj_center(delete_lbl);
+    }
+
+    // Selection can survive a rebuild (a prune keeps the entries it did not drop),
+    // so bring the button's count in line with what the boxes now show.
+    if (kind == COMPROMISED_FILE_KIND_WARDRIVE) {
+        wardrive_files_refresh_delete_btn(ctx);
     }
 
     // Wardrive only: append the upload journal (upload_state). Files that were
@@ -29656,7 +35676,7 @@ static void show_compromised_file_page(compromised_file_kind_t kind)
 static void compromised_file_delete_cb(lv_event_t *e)
 {
     tab_context_t *ctx = get_current_ctx();
-    if (!ctx || ctx->compromised_cleanup_running) {
+    if (!ctx || ctx->compromised_cleanup_running || ctx->compromised_confirm_overlay) {
         return;
     }
 
@@ -29683,9 +35703,9 @@ static void compromised_file_delete_cb(lv_event_t *e)
     task_args->path_count = 1;
     snprintf(task_args->paths[0], sizeof(task_args->paths[0]), "%s", path);
 
-    if (!compromised_start_cleanup_operation(ctx, task_args)) {
-        free(task_args);
-    }
+    // Same confirm as Clean: one tap on a bin icon should not be enough to erase a
+    // capture off the card. The dialog owns task_args from here on.
+    show_compromised_delete_confirm(ctx, task_args);
 }
 
 static void wardrive_fix_file_cb(lv_event_t *e)
@@ -29743,10 +35763,217 @@ static void wardrive_fix_file_cb(lv_event_t *e)
     }
 }
 
+static void compromised_delete_confirm_close(tab_context_t *ctx)
+{
+    if (ctx && ctx->compromised_confirm_overlay) {
+        lv_obj_del(ctx->compromised_confirm_overlay);
+        ctx->compromised_confirm_overlay = NULL;
+    }
+}
+
+// The staged args outlive the dialog only if the user says Yes; every other way
+// out of the dialog - No, or the whole tab being torn down - lands here.
+static void compromised_delete_confirm_destroy_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx) {
+        return;
+    }
+    if (ctx->compromised_cleanup_pending) {
+        free(ctx->compromised_cleanup_pending);
+        ctx->compromised_cleanup_pending = NULL;
+    }
+    if (ctx->compromised_confirm_overlay == lv_event_get_target(e)) {
+        ctx->compromised_confirm_overlay = NULL;
+    }
+}
+
+static void compromised_delete_confirm_no_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx) {
+        ctx = get_current_ctx();
+    }
+    compromised_delete_confirm_close(ctx); // the delete handler frees the args
+}
+
+static void compromised_delete_confirm_yes_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
+    if (!ctx) {
+        ctx = get_current_ctx();
+    }
+    if (!ctx) {
+        return;
+    }
+
+    // Take ownership before closing, so the overlay's delete handler does not
+    // free the args out from under the worker task.
+    compromised_cleanup_task_args_t *task_args =
+        (compromised_cleanup_task_args_t *)ctx->compromised_cleanup_pending;
+    ctx->compromised_cleanup_pending = NULL;
+    compromised_delete_confirm_close(ctx);
+
+    if (!task_args) {
+        return;
+    }
+    if (ctx->compromised_cleanup_running || !compromised_start_cleanup_operation(ctx, task_args)) {
+        free(task_args);
+    }
+}
+
+// Guards both the per-file bin and Clean: either way a tap erases something from
+// the card for good, so name what is about to go and make the user aim at a red
+// button to confirm it. Takes ownership of task_args in every path.
+static void show_compromised_delete_confirm(tab_context_t *ctx,
+                                            compromised_cleanup_task_args_t *task_args)
+{
+    if (!ctx || !task_args) {
+        return;
+    }
+    if (ctx->compromised_confirm_overlay) {
+        free(task_args);
+        return;
+    }
+
+    lv_obj_t *container = get_container_for_tab(tab_id_for_ctx(ctx));
+    if (!container) {
+        free(task_args);
+        return;
+    }
+
+    ctx->compromised_cleanup_pending = (struct compromised_cleanup_task_args_s *)task_args;
+
+    ctx->compromised_confirm_overlay = lv_obj_create(container);
+    style_modal_overlay(ctx->compromised_confirm_overlay, LV_OPA_50);
+    lv_obj_add_flag(ctx->compromised_confirm_overlay, LV_OBJ_FLAG_FLOATING);
+    lv_obj_move_foreground(ctx->compromised_confirm_overlay);
+    lv_obj_add_event_cb(ctx->compromised_confirm_overlay, compromised_delete_confirm_destroy_cb,
+                        LV_EVENT_DELETE, ctx);
+
+    lv_obj_t *popup = lv_obj_create(ctx->compromised_confirm_overlay);
+    lv_obj_set_size(popup, 560, LV_SIZE_CONTENT);
+    lv_obj_center(popup);
+    lv_obj_set_style_bg_color(popup, lv_color_hex(0x1A1A2A), 0);
+    lv_obj_set_style_border_color(popup, COLOR_MATERIAL_RED, 0);
+    lv_obj_set_style_border_width(popup, 3, 0);
+    lv_obj_set_style_radius(popup, 16, 0);
+    lv_obj_set_style_shadow_width(popup, 30, 0);
+    lv_obj_set_style_shadow_color(popup, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_shadow_opa(popup, LV_OPA_50, 0);
+    lv_obj_set_style_pad_all(popup, 20, 0);
+    lv_obj_set_flex_flow(popup, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(popup, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(popup, 14, 0);
+    lv_obj_clear_flag(popup, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *icon = lv_label_create(popup);
+    lv_label_set_text(icon, LV_SYMBOL_WARNING);
+    lv_obj_set_style_text_font(icon, &lv_font_montserrat_44, 0);
+    lv_obj_set_style_text_color(icon, COLOR_MATERIAL_RED, 0);
+
+    // The per-file bin sends one path; Clean sends the directory. Evil twin and
+    // portal seed a single-file listing, so "all" would read oddly there too.
+    bool single = (task_args->path_count == 1);
+    lv_obj_t *title = lv_label_create(popup);
+    if (single) {
+        lv_label_set_text_fmt(title, "DELETE THIS %s FILE",
+                              compromised_tile_name_for_kind(task_args->kind));
+    } else {
+        lv_label_set_text_fmt(title, "DELETE ALL %d %s FILES",
+                              task_args->path_count,
+                              compromised_tile_name_for_kind(task_args->kind));
+    }
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_RED, 0);
+    lv_obj_set_width(title, lv_pct(100));
+    lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(title, LV_LABEL_LONG_WRAP);
+
+    // Name a few of them: a count alone does not tell the user whether this is the
+    // directory they think it is.
+    char preview[224] = "";
+    int written = 0;
+    int shown = 0;
+    for (int i = 0; i < task_args->path_count && shown < 3; i++) {
+        const char *name = strrchr(task_args->paths[i], '/');
+        name = name ? (name + 1) : task_args->paths[i];
+        int n = snprintf(preview + written, sizeof(preview) - (size_t)written,
+                         "%s%s", shown ? "\n" : "", name);
+        if (n < 0 || (size_t)n >= sizeof(preview) - (size_t)written) {
+            break;
+        }
+        written += n;
+        shown++;
+    }
+    if (shown < task_args->path_count) {
+        snprintf(preview + written, sizeof(preview) - (size_t)written,
+                 "\n...and %d more", task_args->path_count - shown);
+    }
+
+    lv_obj_t *list_lbl = lv_label_create(popup);
+    lv_label_set_text(list_lbl, preview);
+    lv_obj_set_style_text_font(list_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(list_lbl, lv_color_hex(0xCCCCCC), 0);
+    lv_obj_set_width(list_lbl, lv_pct(100));
+    lv_obj_set_style_text_align(list_lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(list_lbl, LV_LABEL_LONG_WRAP);
+
+    lv_obj_t *message = lv_label_create(popup);
+    if (task_args->kind == COMPROMISED_FILE_KIND_HANDSHAKE) {
+        lv_label_set_text(message,
+                          single
+                              ? "Erased from the module's SD card, together with its\n"
+                                ".hccapx companion. This cannot be undone."
+                              : "Erased from the module's SD card, together with their\n"
+                                ".hccapx companions. This cannot be undone.");
+    } else {
+        lv_label_set_text(message, "Erased from the module's SD card. This cannot be undone.");
+    }
+    lv_obj_set_style_text_font(message, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(message, lv_color_hex(0xAAAAAA), 0);
+    lv_obj_set_width(message, lv_pct(100));
+    lv_obj_set_style_text_align(message, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(message, LV_LABEL_LONG_WRAP);
+
+    lv_obj_t *btn_row = lv_obj_create(popup);
+    lv_obj_remove_style_all(btn_row);
+    lv_obj_set_size(btn_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(btn_row, 30, 0);
+    lv_obj_set_style_pad_top(btn_row, 6, 0);
+
+    // Cancel first and green: the safe option is the one the thumb lands on.
+    lv_obj_t *no_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(no_btn, 160, 52);
+    lv_obj_set_style_bg_color(no_btn, COLOR_MATERIAL_GREEN, 0);
+    lv_obj_set_style_radius(no_btn, 8, 0);
+    lv_obj_add_event_cb(no_btn, compromised_delete_confirm_no_cb, LV_EVENT_CLICKED, ctx);
+
+    lv_obj_t *no_lbl = lv_label_create(no_btn);
+    lv_label_set_text(no_lbl, "Cancel");
+    lv_obj_set_style_text_font(no_lbl, &lv_font_montserrat_18, 0);
+    lv_obj_center(no_lbl);
+
+    lv_obj_t *yes_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(yes_btn, 160, 52);
+    style_danger_button(yes_btn);
+    lv_obj_add_event_cb(yes_btn, compromised_delete_confirm_yes_cb, LV_EVENT_CLICKED, ctx);
+
+    lv_obj_t *yes_lbl = lv_label_create(yes_btn);
+    lv_label_set_text(yes_lbl, single ? LV_SYMBOL_TRASH " Delete file"
+                                      : LV_SYMBOL_TRASH " Delete all");
+    lv_obj_set_style_text_font(yes_lbl, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_color(yes_lbl, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_center(yes_lbl);
+}
+
 static void compromised_file_clean_cb(lv_event_t *e)
 {
     tab_context_t *ctx = get_current_ctx();
-    if (!ctx || ctx->wardrive_wigle_file_count <= 0 || ctx->compromised_cleanup_running) {
+    if (!ctx || ctx->wardrive_wigle_file_count <= 0 || ctx->compromised_cleanup_running ||
+        ctx->compromised_confirm_overlay) {
         return;
     }
 
@@ -29775,12 +36002,194 @@ static void compromised_file_clean_cb(lv_event_t *e)
         return;
     }
 
-    if (!compromised_start_cleanup_operation(ctx, task_args)) {
-        free(task_args);
-    }
+    // Staged, not started: the worker only runs if the confirm dialog says so.
+    show_compromised_delete_confirm(ctx, task_args);
 }
 
-// Show Compromised Data page with 4 tiles (inside current tab's container)
+static lv_obj_t *espshark_create_action_card(lv_obj_t *parent, const char *icon,
+                                              const char *title_text,
+                                              const char *description,
+                                              const char *status_text,
+                                              lv_color_t accent,
+                                              const char *action)
+{
+    lv_obj_t *card = lv_btn_create(parent);
+    lv_obj_set_width(card, lv_pct(49));
+    lv_obj_set_height(card, 190);
+    lv_obj_set_style_bg_color(card, ui_card_color(), 0);
+    lv_obj_set_style_bg_color(card, lv_color_hex(0x16364A), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(card, 2, 0);
+    lv_obj_set_style_border_color(card, accent, 0);
+    lv_obj_set_style_border_opa(card, LV_OPA_90, 0);
+    lv_obj_set_style_radius(card, 12, 0);
+    lv_obj_set_style_pad_all(card, 16, 0);
+    lv_obj_set_style_pad_row(card, 8, 0);
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(card, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    if (action) {
+        lv_obj_add_event_cb(card, espshark_action_btn_event_cb,
+                            LV_EVENT_CLICKED, (void *)action);
+    }
+
+    lv_obj_t *title = lv_label_create(card);
+    lv_label_set_text_fmt(title, "%s  %s", icon ? icon : "", title_text ? title_text : "");
+    lv_obj_set_width(title, lv_pct(100));
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, accent, 0);
+
+    lv_obj_t *desc = lv_label_create(card);
+    lv_label_set_text(desc, description ? description : "");
+    lv_obj_set_width(desc, lv_pct(100));
+    lv_label_set_long_mode(desc, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(desc, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(desc, ui_text_color(), 0);
+    lv_obj_set_flex_grow(desc, 1);
+
+    lv_obj_t *status = lv_label_create(card);
+    lv_label_set_text(status, status_text ? status_text : "");
+    lv_obj_set_width(status, lv_pct(100));
+    lv_label_set_long_mode(status, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(status, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(status, accent, 0);
+    return card;
+}
+
+static void show_espshark_page(void)
+{
+    tab_context_t *ctx = get_current_ctx();
+    lv_obj_t *container = get_current_tab_container();
+    if (!ctx || !container) {
+        return;
+    }
+
+    hide_all_pages(ctx);
+    if (ctx->espshark_page && lv_obj_is_valid(ctx->espshark_page)) {
+        lv_obj_del(ctx->espshark_page);
+    }
+
+    ctx->espshark_page = lv_obj_create(container);
+    lv_obj_t *page = ctx->espshark_page;
+    lv_obj_set_size(page, lv_pct(100), lv_pct(100));
+    lv_obj_align(page, LV_ALIGN_TOP_MID, 0, 0);
+    lv_obj_set_style_bg_color(page, ui_bg_color(), 0);
+    lv_obj_set_style_border_width(page, 0, 0);
+    lv_obj_set_style_pad_all(page, 10, 0);
+    lv_obj_set_style_pad_row(page, 10, 0);
+    lv_obj_set_flex_flow(page, LV_FLEX_FLOW_COLUMN);
+    ctx->current_visible_page = page;
+
+    lv_obj_t *header = lv_obj_create(page);
+    lv_obj_set_size(header, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(header, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(header, 0, 0);
+    lv_obj_set_style_pad_all(header, 0, 0);
+    lv_obj_set_style_pad_column(header, 12, 0);
+    lv_obj_set_flex_flow(header, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(header, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    lv_obj_t *back_btn = lv_btn_create(header);
+    lv_obj_set_size(back_btn, 72, 60);
+    style_back_nav_button(back_btn);
+    lv_obj_add_event_cb(back_btn, espshark_back_btn_event_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *back_icon = lv_label_create(back_btn);
+    lv_label_set_text(back_icon, LV_SYMBOL_LEFT);
+    lv_obj_set_style_text_color(back_icon, lv_color_white(), 0);
+    lv_obj_center(back_icon);
+
+    lv_obj_t *heading = lv_obj_create(header);
+    lv_obj_remove_style_all(heading);
+    lv_obj_set_height(heading, LV_SIZE_CONTENT);
+    lv_obj_set_flex_grow(heading, 1);
+    lv_obj_set_flex_flow(heading, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(heading, 2, 0);
+    lv_obj_clear_flag(heading, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *title = lv_label_create(heading);
+    lv_label_set_text(title, "ESPShark");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_color(title, COLOR_NEON_CYAN, 0);
+    lv_obj_t *subtitle = lv_label_create(heading);
+    lv_label_set_text(subtitle, "Capture  |  Inspect  |  Analyze");
+    lv_obj_set_style_text_font(subtitle, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(subtitle, ui_muted_color(), 0);
+
+    lv_obj_t *mode_badge = lv_label_create(header);
+    lv_label_set_text_fmt(mode_badge, "%s source", tab_transport_name(current_tab));
+    lv_obj_set_style_text_font(mode_badge, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(mode_badge, COLOR_NEON_GREEN, 0);
+
+    lv_obj_t *intro = lv_label_create(page);
+    lv_label_set_text(intro,
+                      "Choose where the capture comes from. Monster view shows what is on the module SD, "
+                      "marks files already copied to Tab5 and can synchronize everything missing.");
+    lv_obj_set_width(intro, lv_pct(100));
+    lv_label_set_long_mode(intro, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(intro, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(intro, ui_muted_color(), 0);
+
+    lv_obj_t *actions = lv_obj_create(page);
+    lv_obj_set_size(actions, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(actions, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(actions, 0, 0);
+    lv_obj_set_style_pad_all(actions, 0, 0);
+    lv_obj_set_style_pad_gap(actions, 12, 0);
+    lv_obj_set_flex_flow(actions, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_flex_align(actions, LV_FLEX_ALIGN_SPACE_BETWEEN,
+                          LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_clear_flag(actions, LV_OBJ_FLAG_SCROLLABLE);
+
+    bool monster_ready = !tab_is_internal(current_tab) && current_tab_has_sd_card();
+    char monster_status[128];
+    if (monster_ready) {
+        snprintf(monster_status, sizeof(monster_status),
+                 "%s SD ready  |  COPY ONE / SYNC ALL", tab_transport_name(current_tab));
+    } else if (tab_is_internal(current_tab)) {
+        snprintf(monster_status, sizeof(monster_status),
+                 "Select an MBus, Grove or USB JanOS tab first");
+    } else {
+        snprintf(monster_status, sizeof(monster_status),
+                 "%s: Monster SD not detected", tab_transport_name(current_tab));
+    }
+
+    lv_obj_t *monster_card = espshark_create_action_card(
+        actions, LV_SYMBOL_DOWNLOAD, "READ FROM MONSTER",
+        "Browse captures on the Monster SD. Each row shows whether its verified copy "
+        "already exists on Tab5.", monster_status, COLOR_MATERIAL_GREEN, "monster");
+    if (!monster_ready) {
+        lv_obj_add_state(monster_card, LV_STATE_DISABLED);
+    }
+
+    espshark_create_action_card(
+        actions, LV_SYMBOL_EYE_OPEN, "OPEN FROM TAB5",
+        "Open PCAP files already stored under /sdcard/lab/pcaps and inspect "
+        "packets, summaries, DNS and protocol filters.",
+        "TAB5 SD  |  LOCAL ANALYSIS", COLOR_NEON_CYAN, "tab5");
+
+    lv_obj_t *future = lv_obj_create(page);
+    lv_obj_set_size(future, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_color(future, ui_card_color(), 0);
+    lv_obj_set_style_border_width(future, 1, 0);
+    lv_obj_set_style_border_color(future, COLOR_MATERIAL_PURPLE, 0);
+    lv_obj_set_style_radius(future, 10, 0);
+    lv_obj_set_style_pad_all(future, 12, 0);
+    lv_obj_clear_flag(future, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *future_text = lv_label_create(future);
+    lv_label_set_text(future_text,
+                      LV_SYMBOL_WARNING "  NEXT: NETWORK HEALTH / THREAT ANALYSIS\n"
+                      "Baseline, suspicious DNS, scans, beaconing and worm-like lateral spread. "
+                      "Live stream requires a later JanOS capture protocol.");
+    lv_obj_set_width(future_text, lv_pct(100));
+    lv_label_set_long_mode(future_text, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(future_text, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(future_text, COLOR_MATERIAL_PURPLE, 0);
+
+    ESP_LOGI(TAG, "[ESPShark] Hub opened on %s (Monster SD=%s)",
+             tab_transport_name(current_tab), monster_ready ? "ready" : "unavailable");
+}
+
+// Show Compromised Data page with file-category tiles inside the current tab.
 static void show_compromised_data_page(void)
 {
     tab_context_t *ctx = get_current_ctx();
@@ -29856,10 +36265,12 @@ static void show_compromised_data_page(void)
     lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
     lv_obj_clear_flag(tiles, LV_OBJ_FLAG_SCROLLABLE);
 
-    // Create 4 tiles (same flow as main menu)
+    // Same responsive row-wrap flow as the main menu. Category tiles wrap
+    // into additional rows when the available width is smaller.
     create_tile(tiles, LV_SYMBOL_LIST, "Evil Twin\nPasswords", COLOR_MATERIAL_AMBER, compromised_data_tile_event_cb, "Evil Twin Passwords");
     create_tile(tiles, LV_SYMBOL_FILE, "Portal\nData", COLOR_MATERIAL_TEAL, compromised_data_tile_event_cb, "Portal Data");
     create_tile(tiles, LV_SYMBOL_DOWNLOAD, "Handshakes", COLOR_MATERIAL_PURPLE, compromised_data_tile_event_cb, "Handshakes");
+    create_tile(tiles, LV_SYMBOL_EYE_OPEN, "ESPShark", lv_color_hex(0x087EA4), compromised_data_tile_event_cb, "ESPShark");
     create_tile(tiles, LV_SYMBOL_GPS, "Wardrive\nFiles", COLOR_MATERIAL_CYAN, compromised_data_tile_event_cb, "Wardrive Files");
 
     // Set current visible page
@@ -30313,6 +36724,7 @@ static void rogue_ap_monitor_task(void *arg)
                             mac[j] = '\0';
                             snprintf(current_mac, sizeof(current_mac), "%s", mac);
                             client_count++;
+                            alert_chime_play(ALERT_TONE_JOIN);
 
                             bsp_display_lock(0);
                             if (ctx->rogue_ap_status_label) {
@@ -30335,6 +36747,7 @@ static void rogue_ap_monitor_task(void *arg)
                             count_ptr += 22;  // Skip "Portal: Client count = "
                             int parsed_count = atoi(count_ptr);
                             if (parsed_count != client_count) {
+                                if (parsed_count > client_count) alert_chime_play(ALERT_TONE_JOIN);
                                 client_count = parsed_count;
                                 bsp_display_lock(0);
                                 if (ctx->rogue_ap_status_label) {
@@ -30378,6 +36791,7 @@ static void rogue_ap_monitor_task(void *arg)
                             }
 
                             if (strlen(pass) > 0) {
+                                alert_chime_play(ALERT_TONE_WIN);
                                 bsp_display_lock(0);
                                 if (ctx->rogue_ap_status_label) {
                                     char status[512];
@@ -31332,6 +37746,7 @@ static void save_portal_data(const char *ssid, const char *form_data)
         fprintf(f, "SSID: %s\nData: %s\n---\n", ssid, form_data);
         fclose(f);
         ESP_LOGI(TAG, "Portal data saved for SSID: %s", ssid);
+        alert_chime_play(ALERT_TONE_WIN);
 
         // Increment new data counter and update portal icon
         portal_new_data_count++;
@@ -33792,6 +40207,6380 @@ static void show_wardrive_files_page(void)
     show_compromised_file_page(COMPROMISED_FILE_KIND_WARDRIVE);
 }
 
+static void show_pcap_captures_page(void)
+{
+    show_compromised_file_page(COMPROMISED_FILE_KIND_PCAP_CAPTURE);
+}
+
+//==================================================================================
+// ESPShark local PCAP analysis (Tab5 SD)
+//==================================================================================
+
+static void pcap_viewer_copy_text(char *destination, size_t destination_size,
+                                  const char *source)
+{
+    if (!destination || destination_size == 0U) return;
+    size_t length = source ? strnlen(source, destination_size - 1U) : 0U;
+    if (length > 0U) memcpy(destination, source, length);
+    destination[length] = '\0';
+}
+
+static pcap_viewer_state_t *pcap_viewer_get_state(tab_context_t *ctx, bool create)
+{
+    if (!ctx) {
+        return NULL;
+    }
+    if (!ctx->pcap_viewer && create) {
+        ctx->pcap_viewer = heap_caps_calloc(1, sizeof(pcap_viewer_state_t),
+                                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!ctx->pcap_viewer) {
+            ctx->pcap_viewer = calloc(1, sizeof(pcap_viewer_state_t));
+        }
+        if (ctx->pcap_viewer) {
+            ctx->pcap_viewer->ctx = ctx;
+        }
+    }
+    return ctx->pcap_viewer;
+}
+
+static void pcap_viewer_close_detail(pcap_viewer_state_t *state)
+{
+    if (!state) {
+        return;
+    }
+    if (state->detail_overlay && lv_obj_is_valid(state->detail_overlay)) {
+        lv_obj_del(state->detail_overlay);
+    }
+    state->detail_overlay = NULL;
+    state->map_stage = NULL;
+    state->map_detail_label = NULL;
+    state->map_node_overlay = NULL;
+    state->map_summary_btn = NULL;
+    state->map_filter_btn = NULL;
+    memset(state->map_mode_buttons, 0, sizeof(state->map_mode_buttons));
+    state->map_selected_node = -1;
+    if (state->map_graph) {
+        heap_caps_free(state->map_graph);
+        state->map_graph = NULL;
+    }
+}
+
+static void pcap_viewer_release_capture(pcap_viewer_state_t *state)
+{
+    if (!state || state->loading || state->artifact_running) {
+        return;
+    }
+    pcap_viewer_close_detail(state);
+    if (state->reader) {
+        pcap_reader_close(state->reader);
+        state->reader = NULL;
+    }
+    if (state->packet_index) {
+        heap_caps_free(state->packet_index);
+        state->packet_index = NULL;
+    }
+    if (state->packet_flags) {
+        heap_caps_free(state->packet_flags);
+        state->packet_flags = NULL;
+    }
+    if (state->summary) {
+        heap_caps_free(state->summary);
+        state->summary = NULL;
+    }
+    if (state->flow_analysis) {
+        heap_caps_free(state->flow_analysis);
+        state->flow_analysis = NULL;
+    }
+    if (state->investigation) {
+        heap_caps_free(state->investigation);
+        state->investigation = NULL;
+    }
+    if (state->extract_result) {
+        heap_caps_free(state->extract_result);
+        state->extract_result = NULL;
+    }
+    state->extract_status = PCAP_EXTRACT_OK;
+    state->extract_phase[0] = '\0';
+    state->extract_done = 0;
+    state->extract_total = 0;
+    memset(&state->baseline_diff, 0, sizeof(state->baseline_diff));
+    state->baseline_status = PCAP_INVESTIGATION_NOT_FOUND;
+    memset(&state->capture_info, 0, sizeof(state->capture_info));
+    memset(&state->scan_summary, 0, sizeof(state->scan_summary));
+    memset(&state->cache_info, 0, sizeof(state->cache_info));
+    state->cache_hit = false;
+    state->cache_available = false;
+    state->force_reanalyze = false;
+    state->packet_page = 0;
+    state->packet_filter = PCAP_FILTER_ALL;
+    state->show_fqdn = false;
+    state->fqdn_btn = NULL;
+    state->fqdn_label = NULL;
+    pcap_flow_filter_clear(&state->quick_filter);
+    state->selected_path[0] = '\0';
+    state->selected_name[0] = '\0';
+}
+
+static bool pcap_viewer_supported_extension(const char *name)
+{
+    return name && (str_ends_with_ext(name, ".pcap") || str_ends_with_ext(name, ".pcapng"));
+}
+
+static void pcap_viewer_scan_directory(pcap_viewer_state_t *state, const char *directory,
+                                       int depth)
+{
+    if (!state || !directory || depth > 4 ||
+        state->file_count >= PCAP_VIEWER_MAX_FILES) {
+        return;
+    }
+    DIR *dir = opendir(directory);
+    if (!dir) {
+        return;
+    }
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL && state->file_count < PCAP_VIEWER_MAX_FILES) {
+        if (entry->d_name[0] == '.') {
+            continue;
+        }
+        char path[PCAP_VIEWER_PATH_MAX];
+        int written = snprintf(path, sizeof(path), "%s/%s", directory, entry->d_name);
+        if (written <= 0 || (size_t)written >= sizeof(path)) {
+            continue;
+        }
+        struct stat item_stat;
+        if (stat(path, &item_stat) != 0) {
+            continue;
+        }
+        if (S_ISDIR(item_stat.st_mode)) {
+            pcap_viewer_scan_directory(state, path, depth + 1);
+            continue;
+        }
+        if (!S_ISREG(item_stat.st_mode) || !pcap_viewer_supported_extension(entry->d_name)) {
+            continue;
+        }
+        pcap_viewer_file_t *file = &state->files[state->file_count++];
+        pcap_viewer_copy_text(file->path, sizeof(file->path), path);
+        size_t name_length = strnlen(entry->d_name, sizeof(file->name) - 1U);
+        memcpy(file->name, entry->d_name, name_length);
+        file->name[name_length] = '\0';
+        file->size_bytes = item_stat.st_size > 0 ? (uint64_t)item_stat.st_size : 0;
+        pcap_analysis_cache_info_t cache_info;
+        if (pcap_analysis_cache_probe(file->path, PCAP_VIEWER_MAX_INDEXED_PACKETS,
+                                      &cache_info) == PCAP_ANALYSIS_STORE_OK) {
+            file->analyzed = true;
+            file->cached_packets = cache_info.indexed_packets;
+        }
+    }
+    closedir(dir);
+}
+
+static int pcap_viewer_file_compare(const void *left, const void *right)
+{
+    const pcap_viewer_file_t *a = (const pcap_viewer_file_t *)left;
+    const pcap_viewer_file_t *b = (const pcap_viewer_file_t *)right;
+    return strcasecmp(a->path, b->path);
+}
+
+static void pcap_viewer_format_size(uint64_t bytes, char *output, size_t output_size)
+{
+    if (!output || output_size == 0) {
+        return;
+    }
+    if (bytes >= 1024ULL * 1024ULL) {
+        snprintf(output, output_size, "%.2f MB", (double)bytes / (1024.0 * 1024.0));
+    } else if (bytes >= 1024ULL) {
+        snprintf(output, output_size, "%.1f KB", (double)bytes / 1024.0);
+    } else {
+        snprintf(output, output_size, "%llu B", (unsigned long long)bytes);
+    }
+}
+
+static lv_obj_t *pcap_viewer_create_page(pcap_viewer_state_t *state, lv_obj_t *parent)
+{
+    if (!state || !state->ctx || !parent) {
+        return NULL;
+    }
+    if (state->ctx->pcap_viewer_page && lv_obj_is_valid(state->ctx->pcap_viewer_page)) {
+        lv_obj_del(state->ctx->pcap_viewer_page);
+    }
+    state->status_label = NULL;
+    state->packet_list = NULL;
+    state->page_label = NULL;
+    state->prev_btn = NULL;
+    state->next_btn = NULL;
+    state->fqdn_btn = NULL;
+    state->fqdn_label = NULL;
+    memset(state->filter_buttons, 0, sizeof(state->filter_buttons));
+    state->ctx->pcap_viewer_page = lv_obj_create(parent);
+    lv_obj_t *page = state->ctx->pcap_viewer_page;
+    lv_obj_set_size(page, lv_pct(100), lv_pct(100));
+    lv_obj_align(page, LV_ALIGN_TOP_MID, 0, 0);
+    lv_obj_set_style_bg_color(page, ui_bg_color(), 0);
+    lv_obj_set_style_border_width(page, 0, 0);
+    lv_obj_set_style_pad_all(page, 10, 0);
+    lv_obj_set_style_pad_row(page, 8, 0);
+    lv_obj_set_flex_flow(page, LV_FLEX_FLOW_COLUMN);
+    state->ctx->current_visible_page = page;
+    return page;
+}
+
+static void pcap_viewer_back_cb(lv_event_t *e)
+{
+    pcap_viewer_state_t *state = (pcap_viewer_state_t *)lv_event_get_user_data(e);
+    if (!state) {
+        return;
+    }
+    if (state->loading) {
+        state->cancel_requested = true;
+        if (state->status_label && lv_obj_is_valid(state->status_label)) {
+            lv_label_set_text(state->status_label, "Cancelling PCAP analysis...");
+        }
+        return;
+    }
+    if (state->selected_path[0]) {
+        pcap_viewer_release_capture(state);
+        show_pcap_viewer_page();
+    } else {
+        show_espshark_page();
+    }
+}
+
+static lv_obj_t *pcap_viewer_add_header(pcap_viewer_state_t *state, lv_obj_t *page,
+                                        const char *title_text)
+{
+    lv_obj_t *header = lv_obj_create(page);
+    lv_obj_set_size(header, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(header, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(header, 0, 0);
+    lv_obj_set_style_pad_all(header, 0, 0);
+    lv_obj_set_style_pad_column(header, 12, 0);
+    lv_obj_set_flex_flow(header, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(header, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    lv_obj_t *back_btn = lv_btn_create(header);
+    lv_obj_set_size(back_btn, 72, 60);
+    style_back_nav_button(back_btn);
+    lv_obj_add_event_cb(back_btn, pcap_viewer_back_cb, LV_EVENT_CLICKED, state);
+    lv_obj_t *back_icon = lv_label_create(back_btn);
+    lv_label_set_text(back_icon, LV_SYMBOL_LEFT);
+    lv_obj_set_style_text_color(back_icon, lv_color_white(), 0);
+    lv_obj_center(back_icon);
+
+    lv_obj_t *title = lv_label_create(header);
+    lv_label_set_text(title, title_text ? title_text : "ESPShark");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, COLOR_NEON_CYAN, 0);
+    lv_obj_set_flex_grow(title, 1);
+    lv_label_set_long_mode(title, LV_LABEL_LONG_DOT);
+
+    lv_obj_t *badge = lv_label_create(header);
+    lv_label_set_text(badge, LV_SYMBOL_SD_CARD " TAB5 SD");
+    lv_obj_set_style_text_font(badge, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(badge, COLOR_NEON_GREEN, 0);
+    return header;
+}
+
+static void pcap_viewer_render_file_list(pcap_viewer_state_t *state)
+{
+    if (!state || !state->ctx) {
+        return;
+    }
+    lv_obj_t *parent = NULL;
+    if (state->ctx->pcap_viewer_page && lv_obj_is_valid(state->ctx->pcap_viewer_page)) {
+        parent = lv_obj_get_parent(state->ctx->pcap_viewer_page);
+    } else if (tab_id_for_ctx(state->ctx) == current_tab) {
+        parent = get_current_tab_container();
+    }
+    if (!parent) {
+        return;
+    }
+    hide_all_pages(state->ctx);
+    lv_obj_t *page = pcap_viewer_create_page(state, parent);
+    if (!page) {
+        return;
+    }
+    pcap_viewer_add_header(state, page, "ESPShark - TAB5 SD");
+
+    state->status_label = lv_label_create(page);
+    lv_obj_set_width(state->status_label, lv_pct(100));
+    lv_label_set_long_mode(state->status_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(state->status_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(state->status_label,
+                                state->notice[0] ? COLOR_MATERIAL_AMBER : ui_muted_color(), 0);
+    if (state->notice[0]) {
+        lv_label_set_text(state->status_label, state->notice);
+    } else {
+        lv_label_set_text_fmt(state->status_label,
+                              "Found %d local capture(s) under %s",
+                              state->file_count, PCAP_VIEWER_ROOT);
+    }
+
+    lv_obj_t *list = lv_obj_create(page);
+    lv_obj_set_size(list, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_flex_grow(list, 1);
+    style_surface_panel(list, 8);
+    lv_obj_set_style_pad_all(list, 10, 0);
+    lv_obj_set_style_pad_row(list, 8, 0);
+    lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
+
+    if (state->file_count == 0) {
+        lv_obj_t *empty = lv_label_create(list);
+        lv_label_set_text(empty,
+                          "No local PCAP files yet.\nUse READ FROM MONSTER, then COPY TO TAB5 or Sync all.");
+        lv_obj_set_width(empty, lv_pct(100));
+        lv_obj_set_style_text_align(empty, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_font(empty, &lv_font_montserrat_18, 0);
+        lv_obj_set_style_text_color(empty, ui_muted_color(), 0);
+        return;
+    }
+
+    for (int i = 0; i < state->file_count; i++) {
+        pcap_viewer_file_t *file = &state->files[i];
+        lv_obj_t *row = lv_obj_create(list);
+        lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_color(row, ui_card_color(), 0);
+        lv_obj_set_style_border_width(row, 1, 0);
+        lv_obj_set_style_border_color(row, ui_border_color(), 0);
+        lv_obj_set_style_radius(row, 8, 0);
+        lv_obj_set_style_pad_all(row, 10, 0);
+        lv_obj_set_style_pad_column(row, 10, 0);
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN,
+                              LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *info = lv_obj_create(row);
+        lv_obj_remove_style_all(info);
+        lv_obj_set_height(info, LV_SIZE_CONTENT);
+        lv_obj_set_flex_grow(info, 1);
+        lv_obj_set_flex_flow(info, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_style_pad_row(info, 3, 0);
+        lv_obj_clear_flag(info, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *name = lv_label_create(info);
+        lv_label_set_text(name, file->name);
+        lv_obj_set_width(name, lv_pct(100));
+        lv_label_set_long_mode(name, LV_LABEL_LONG_DOT);
+        lv_obj_set_style_text_font(name, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(name, COLOR_NEON_CYAN, 0);
+
+        char size_text[32];
+        pcap_viewer_format_size(file->size_bytes, size_text, sizeof(size_text));
+        lv_obj_t *path = lv_label_create(info);
+        lv_label_set_text_fmt(path, "%s  |  %s", file->path, size_text);
+        lv_obj_set_width(path, lv_pct(100));
+        lv_label_set_long_mode(path, LV_LABEL_LONG_DOT);
+        lv_obj_set_style_text_font(path, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(path, ui_muted_color(), 0);
+
+        lv_obj_t *analysis_state = lv_label_create(info);
+        if (file->analyzed) {
+            lv_label_set_text_fmt(analysis_state,
+                                  LV_SYMBOL_OK " ANALYZED  |  cache v%u  |  %lu indexed",
+                                  PCAP_ANALYSIS_CACHE_SCHEMA_VERSION,
+                                  (unsigned long)file->cached_packets);
+            lv_obj_set_style_text_color(analysis_state, COLOR_NEON_GREEN, 0);
+        } else {
+            lv_label_set_text(analysis_state, "NOT ANALYZED  |  cache will be created on open");
+            lv_obj_set_style_text_color(analysis_state, COLOR_MATERIAL_AMBER, 0);
+        }
+        lv_obj_set_width(analysis_state, lv_pct(100));
+        lv_label_set_long_mode(analysis_state, LV_LABEL_LONG_DOT);
+        lv_obj_set_style_text_font(analysis_state, &lv_font_montserrat_12, 0);
+
+        lv_obj_t *open_btn = lv_btn_create(row);
+        lv_obj_set_size(open_btn, 150, 52);
+        lv_obj_set_style_bg_color(open_btn, lv_color_hex(0x087EA4), 0);
+        lv_obj_set_style_bg_color(open_btn, lv_color_hex(0x05617F), LV_STATE_PRESSED);
+        lv_obj_set_style_border_width(open_btn, 2, 0);
+        lv_obj_set_style_border_color(open_btn, COLOR_NEON_CYAN, 0);
+        lv_obj_set_style_radius(open_btn, 8, 0);
+        lv_obj_add_event_cb(open_btn, pcap_viewer_file_open_cb, LV_EVENT_CLICKED, file);
+        lv_obj_t *open_label = lv_label_create(open_btn);
+        lv_label_set_text(open_label, LV_SYMBOL_EYE_OPEN " OPEN");
+        lv_obj_set_style_text_font(open_label, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(open_label, lv_color_white(), 0);
+        lv_obj_center(open_label);
+    }
+}
+
+static void show_pcap_viewer_page(void)
+{
+    tab_context_t *ctx = get_current_ctx();
+    pcap_viewer_state_t *state = pcap_viewer_get_state(ctx, true);
+    if (!state || state->loading || state->artifact_running) {
+        return;
+    }
+    pcap_viewer_release_capture(state);
+    state->file_count = 0;
+    pcap_viewer_scan_directory(state, PCAP_VIEWER_ROOT, 0);
+    if (state->file_count > 1) {
+        qsort(state->files, (size_t)state->file_count,
+              sizeof(state->files[0]), pcap_viewer_file_compare);
+    }
+    ESP_LOGI(TAG, "[ESPShark] Local library scan: root=%s files=%d",
+             PCAP_VIEWER_ROOT, state->file_count);
+    pcap_viewer_render_file_list(state);
+    state->notice[0] = '\0';
+}
+
+static void compromised_format_duration(uint64_t seconds, char *out, size_t out_size)
+{
+    if (seconds >= 3600U) {
+        snprintf(out, out_size, "%lluh %llum", (unsigned long long)(seconds / 3600U),
+                 (unsigned long long)((seconds % 3600U) / 60U));
+    } else if (seconds >= 60U) {
+        snprintf(out, out_size, "%llum %llus", (unsigned long long)(seconds / 60U),
+                 (unsigned long long)(seconds % 60U));
+    } else {
+        snprintf(out, out_size, "%llus", (unsigned long long)seconds);
+    }
+}
+
+/* Read rate and remaining time for the indexing phases. Indexing a large
+ * capture takes minutes, and a bare percentage says nothing about whether it is
+ * about to finish or has barely started. Same smoothing as the transfer popup:
+ * the raw per-callback delta is far too jumpy to drive an ETA. */
+static int64_t pcap_index_rate_start_us;
+static int64_t pcap_index_rate_last_us;
+static uint64_t pcap_index_rate_last_units;
+static double pcap_index_rate_ups;
+
+static void pcap_index_rate_reset(void)
+{
+    pcap_index_rate_start_us = 0;
+    pcap_index_rate_last_us = 0;
+    pcap_index_rate_last_units = 0;
+    pcap_index_rate_ups = 0.0;
+}
+
+/* Returns the smoothed rate in units per second, 0 until it is meaningful. */
+static double pcap_index_rate_update(uint64_t done_units)
+{
+    int64_t now_us = esp_timer_get_time();
+    if (pcap_index_rate_start_us == 0 || done_units < pcap_index_rate_last_units) {
+        pcap_index_rate_start_us = now_us;
+        pcap_index_rate_last_us = now_us;
+        pcap_index_rate_last_units = done_units;
+        pcap_index_rate_ups = 0.0;
+        return 0.0;
+    }
+    if (now_us - pcap_index_rate_last_us >= 250000 &&
+        done_units > pcap_index_rate_last_units) {
+        double sample = (double)(done_units - pcap_index_rate_last_units) * 1000000.0 /
+                        (double)(now_us - pcap_index_rate_last_us);
+        pcap_index_rate_ups = pcap_index_rate_ups > 0.0
+                                  ? (pcap_index_rate_ups * 0.7) + (sample * 0.3)
+                                  : sample;
+        pcap_index_rate_last_us = now_us;
+        pcap_index_rate_last_units = done_units;
+    }
+    return pcap_index_rate_ups;
+}
+
+static void pcap_viewer_progress_cb(uint64_t offset, uint64_t file_size,
+                                    uint64_t packet_count, void *user_ctx)
+{
+    pcap_viewer_state_t *state = (pcap_viewer_state_t *)user_ctx;
+    if (!state || !state->status_label) {
+        return;
+    }
+    double bps = pcap_index_rate_update(offset);
+    if (!bsp_display_lock(50)) {
+        return;
+    }
+    if (state->status_label && lv_obj_is_valid(state->status_label)) {
+        int percent = file_size > 0 ? (int)((offset * 100U) / file_size) : 0;
+        if (percent > 100) percent = 100;
+        if (bps >= 1.0 && file_size > offset) {
+            char eta_text[24];
+            compromised_format_duration((uint64_t)((double)(file_size - offset) / bps),
+                                        eta_text, sizeof(eta_text));
+            lv_label_set_text_fmt(state->status_label,
+                                  "Indexing packets... %d%%\n%llu packet(s)\n"
+                                  "%.0f KB/s  -  %s left",
+                                  percent, (unsigned long long)packet_count,
+                                  bps / 1024.0, eta_text);
+        } else {
+            lv_label_set_text_fmt(state->status_label,
+                                  "Indexing packets... %d%%\n%llu packet(s)",
+                                  percent, (unsigned long long)packet_count);
+        }
+    }
+    bsp_display_unlock();
+}
+
+static void pcap_viewer_summary_progress_cb(size_t processed_packets,
+                                            size_t total_packets, void *user_ctx)
+{
+    pcap_viewer_state_t *state = (pcap_viewer_state_t *)user_ctx;
+    if (!state || !state->status_label) {
+        return;
+    }
+    double pps = pcap_index_rate_update(processed_packets);
+    if (!bsp_display_lock(50)) {
+        return;
+    }
+    if (state->status_label && lv_obj_is_valid(state->status_label)) {
+        int percent = total_packets > 0
+                          ? (int)((processed_packets * 100U) / total_packets) : 100;
+        if (percent > 100) percent = 100;
+        if (pps >= 1.0 && total_packets > processed_packets) {
+            char eta_text[24];
+            compromised_format_duration(
+                (uint64_t)((double)(total_packets - processed_packets) / pps),
+                eta_text, sizeof(eta_text));
+            lv_label_set_text_fmt(state->status_label,
+                                  "Building Zeek-style summary... %d%%\n"
+                                  "%u/%u indexed packets\n%.0f pkt/s  -  %s left",
+                                  percent, (unsigned)processed_packets,
+                                  (unsigned)total_packets, pps, eta_text);
+        } else {
+            lv_label_set_text_fmt(state->status_label,
+                                  "Building Zeek-style summary... %d%%\n%u/%u indexed packets",
+                                  percent, (unsigned)processed_packets,
+                                  (unsigned)total_packets);
+        }
+    }
+    bsp_display_unlock();
+}
+
+static void pcap_viewer_render_load_result_async(void *user_data)
+{
+    pcap_viewer_state_t *state = (pcap_viewer_state_t *)user_data;
+    if (!state || !state->ctx) {
+        return;
+    }
+    state->loading = false;
+    bool usable = (state->load_status == PCAP_READER_OK ||
+                   state->load_status == PCAP_READER_LIMIT_REACHED ||
+                   state->load_status == PCAP_READER_TRUNCATED);
+    ESP_LOGI(TAG,
+             "[ESPShark] Analysis finished: scan=%s summary=%s packets=%llu indexed=%lu malformed=%lu dns=%llu",
+             pcap_reader_status_name(state->load_status),
+             pcap_reader_status_name(state->summary_status),
+             (unsigned long long)state->scan_summary.packet_count,
+             (unsigned long)state->scan_summary.indexed_packets,
+             (unsigned long)state->scan_summary.malformed_records,
+             state->summary ? (unsigned long long)state->summary->dns_packets : 0ULL);
+    if (usable) {
+        pcap_viewer_render_capture_page(state);
+        return;
+    }
+
+    if (state->load_status == PCAP_READER_UNSUPPORTED_FORMAT) {
+        snprintf(state->notice, sizeof(state->notice),
+                 "%s: PCAPNG is not supported yet. Use classic PCAP 2.4.",
+                 state->selected_name[0] ? state->selected_name : "PCAP");
+    } else {
+        snprintf(state->notice, sizeof(state->notice), "%s: %s",
+                 state->selected_name[0] ? state->selected_name : "PCAP",
+                 pcap_reader_status_name(state->load_status));
+    }
+    pcap_viewer_release_capture(state);
+    state->file_count = 0;
+    pcap_viewer_scan_directory(state, PCAP_VIEWER_ROOT, 0);
+    if (state->file_count > 1) {
+        qsort(state->files, (size_t)state->file_count,
+              sizeof(state->files[0]), pcap_viewer_file_compare);
+    }
+    pcap_viewer_render_file_list(state);
+    state->notice[0] = '\0';
+}
+
+static void pcap_viewer_load_task(void *arg)
+{
+    pcap_viewer_state_t *state = (pcap_viewer_state_t *)arg;
+    if (!state) {
+        vTaskDelete(NULL);
+        return;
+    }
+    ESP_LOGI(TAG, "[ESPShark] Opening %s (force_reanalyze=%s)",
+             state->selected_path, state->force_reanalyze ? "yes" : "no");
+    state->load_status = pcap_reader_open(state->selected_path, &state->reader,
+                                          &state->capture_info);
+    bool cache_loaded = false;
+    if (state->load_status == PCAP_READER_OK && !state->force_reanalyze) {
+        pcap_capture_info_t opened_capture_info = state->capture_info;
+        pcap_analysis_store_status_t cache_status = pcap_analysis_cache_load(
+            state->selected_path, PCAP_VIEWER_MAX_INDEXED_PACKETS,
+            &state->capture_info, &state->scan_summary,
+            state->packet_index, PCAP_VIEWER_MAX_INDEXED_PACKETS,
+            state->packet_flags, PCAP_VIEWER_MAX_INDEXED_PACKETS,
+            state->summary, state->flow_analysis, &state->cache_info);
+        if (cache_status == PCAP_ANALYSIS_STORE_OK) {
+            cache_loaded = true;
+            state->cache_hit = true;
+            state->cache_available = true;
+            state->summary_status = PCAP_READER_OK;
+            state->load_status = state->scan_summary.truncated_tail
+                                     ? PCAP_READER_TRUNCATED
+                                     : (state->scan_summary.index_limited
+                                            ? PCAP_READER_LIMIT_REACHED
+                                            : PCAP_READER_OK);
+            ESP_LOGI(TAG, "[ESPShark] Cache hit: %s (%lu indexed)",
+                     state->cache_info.cache_path,
+                     (unsigned long)state->scan_summary.indexed_packets);
+        } else {
+            state->capture_info = opened_capture_info;
+            ESP_LOGI(TAG, "[ESPShark] Cache miss: %s",
+                     pcap_analysis_store_status_name(cache_status));
+        }
+    }
+
+    if (state->load_status == PCAP_READER_OK && !cache_loaded) {
+        memset(&state->scan_summary, 0, sizeof(state->scan_summary));
+        memset(state->summary, 0, sizeof(*state->summary));
+        memset(state->packet_flags, 0,
+               PCAP_VIEWER_MAX_INDEXED_PACKETS * sizeof(*state->packet_flags));
+        pcap_index_rate_reset();
+        state->load_status = pcap_reader_scan(state->reader, state->packet_index,
+                                              PCAP_VIEWER_MAX_INDEXED_PACKETS,
+                                              &state->scan_summary,
+                                              &state->cancel_requested,
+                                              pcap_viewer_progress_cb, state);
+    }
+    if (!cache_loaded && (state->load_status == PCAP_READER_OK ||
+         state->load_status == PCAP_READER_LIMIT_REACHED ||
+         state->load_status == PCAP_READER_TRUNCATED) &&
+        state->summary && state->packet_flags) {
+        pcap_reader_status_t scan_status = state->load_status;
+        state->summary_status =
+            pcap_summary_build(state->reader, state->packet_index,
+                               state->scan_summary.indexed_packets,
+                               state->summary, state->packet_flags,
+                               PCAP_VIEWER_MAX_INDEXED_PACKETS,
+                               &state->cancel_requested,
+                               pcap_viewer_summary_progress_cb, state);
+        if (state->summary_status == PCAP_READER_OK) {
+            state->load_status = scan_status;
+        } else {
+            state->load_status = state->summary_status;
+        }
+    }
+    if (!cache_loaded && state->summary_status == PCAP_READER_OK &&
+        state->flow_analysis &&
+        (state->load_status == PCAP_READER_OK ||
+         state->load_status == PCAP_READER_LIMIT_REACHED ||
+         state->load_status == PCAP_READER_TRUNCATED)) {
+        if (state->status_label && bsp_display_lock(50)) {
+            if (state->status_label && lv_obj_is_valid(state->status_label)) {
+                lv_label_set_text(state->status_label,
+                                  "Building flows, devices and Network Health...\n"
+                                  "Analyzing bounded offline evidence");
+            }
+            bsp_display_unlock();
+        }
+        pcap_reader_status_t flow_status = pcap_flow_analysis_build(
+            state->reader, &state->capture_info, state->packet_index,
+            state->scan_summary.indexed_packets, state->flow_analysis,
+            &state->cancel_requested);
+        if (flow_status != PCAP_READER_OK) state->load_status = flow_status;
+    }
+    if (state->summary_status == PCAP_READER_OK && state->investigation &&
+        state->flow_analysis &&
+        (state->load_status == PCAP_READER_OK ||
+         state->load_status == PCAP_READER_LIMIT_REACHED ||
+         state->load_status == PCAP_READER_TRUNCATED) &&
+        !state->cancel_requested) {
+        if (state->status_label && bsp_display_lock(50)) {
+            if (state->status_label && lv_obj_is_valid(state->status_label)) {
+                lv_label_set_text(state->status_label,
+                                  "Building Offline Investigation...\n"
+                                  "Posture, IOC, timeline and baseline diff");
+            }
+            bsp_display_unlock();
+        }
+        pcap_investigation_build(state->summary, state->flow_analysis,
+                                 state->investigation);
+        state->baseline_status = pcap_investigation_baseline_compare(
+            state->summary, state->flow_analysis, &state->baseline_diff);
+        ESP_LOGI(TAG,
+                 "[ESPShark] Investigation: findings=%lu timeline=%lu IOC=%lu baseline=%s",
+                 (unsigned long)state->investigation->finding_count,
+                 (unsigned long)state->investigation->timeline_count,
+                 (unsigned long)state->investigation->ioc_matches,
+                 pcap_investigation_status_name(state->baseline_status));
+    }
+    if (!cache_loaded && state->summary_status == PCAP_READER_OK &&
+        (state->load_status == PCAP_READER_OK ||
+         state->load_status == PCAP_READER_LIMIT_REACHED ||
+         state->load_status == PCAP_READER_TRUNCATED) &&
+        !state->cancel_requested) {
+        pcap_analysis_store_status_t cache_status = pcap_analysis_cache_save(
+            state->selected_path, PCAP_VIEWER_MAX_INDEXED_PACKETS,
+            &state->capture_info, &state->scan_summary, state->packet_index,
+            state->packet_flags, state->summary, state->flow_analysis,
+            &state->cache_info);
+        state->cache_available = cache_status == PCAP_ANALYSIS_STORE_OK;
+        ESP_LOGI(TAG, "[ESPShark] Cache save: %s%s%s",
+                 pcap_analysis_store_status_name(cache_status),
+                 state->cache_available ? " -> " : "",
+                 state->cache_available ? state->cache_info.cache_path : "");
+    }
+    state->force_reanalyze = false;
+    state->task = NULL;
+    lv_async_call(pcap_viewer_render_load_result_async, state);
+    vTaskDelete(NULL);
+}
+
+static void pcap_viewer_render_loading_page(pcap_viewer_state_t *state)
+{
+    if (!state || !state->ctx) {
+        return;
+    }
+    lv_obj_t *parent = get_current_tab_container();
+    if (!parent) {
+        return;
+    }
+    hide_all_pages(state->ctx);
+    lv_obj_t *page = pcap_viewer_create_page(state, parent);
+    if (!page) {
+        return;
+    }
+    pcap_viewer_add_header(state, page, state->selected_name);
+
+    lv_obj_t *box = lv_obj_create(page);
+    lv_obj_set_size(box, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_flex_grow(box, 1);
+    style_surface_panel(box, 12);
+    lv_obj_set_flex_flow(box, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(box, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(box, 24, 0);
+
+    lv_obj_t *spinner = lv_spinner_create(box);
+    lv_obj_set_size(spinner, 96, 96);
+    lv_spinner_set_anim_params(spinner, 1000, 200);
+    lv_obj_set_style_arc_color(spinner, COLOR_NEON_CYAN, LV_PART_INDICATOR);
+
+    state->status_label = lv_label_create(box);
+    lv_label_set_text(state->status_label,
+                      state->force_reanalyze
+                          ? "Reanalyzing PCAP and rebuilding cache..."
+                          : "Checking analysis cache, then opening PCAP...");
+    lv_obj_set_width(state->status_label, lv_pct(90));
+    lv_obj_set_style_text_align(state->status_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(state->status_label, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_color(state->status_label, ui_text_color(), 0);
+}
+
+static void pcap_viewer_start_file_load(pcap_viewer_state_t *state, const char *path,
+                                        const char *name, bool force_reanalyze)
+{
+    if (!state || !path || !path[0] || state->loading || state->task ||
+        state->artifact_running) {
+        return;
+    }
+    char selected_path[PCAP_VIEWER_PATH_MAX];
+    char selected_name[96];
+    const char *fallback_name = strrchr(path, '/');
+    fallback_name = fallback_name ? fallback_name + 1 : path;
+    pcap_viewer_copy_text(selected_path, sizeof(selected_path), path);
+    pcap_viewer_copy_text(selected_name, sizeof(selected_name),
+                          name && name[0] ? name : fallback_name);
+    pcap_viewer_release_capture(state);
+    state->packet_index = heap_caps_calloc(PCAP_VIEWER_MAX_INDEXED_PACKETS,
+                                           sizeof(pcap_packet_index_t),
+                                           MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    state->packet_flags = heap_caps_calloc(PCAP_VIEWER_MAX_INDEXED_PACKETS,
+                                           sizeof(uint32_t),
+                                           MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    state->summary = heap_caps_calloc(1, sizeof(pcap_summary_t),
+                                      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    state->flow_analysis = heap_caps_calloc(1, sizeof(pcap_flow_analysis_t),
+                                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    state->investigation = heap_caps_calloc(1, sizeof(pcap_investigation_t),
+                                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!state->packet_index || !state->packet_flags || !state->summary ||
+        !state->flow_analysis || !state->investigation) {
+        snprintf(state->notice, sizeof(state->notice),
+                 "Not enough PSRAM for the packet index and offline investigation.");
+        pcap_viewer_release_capture(state);
+        pcap_viewer_render_file_list(state);
+        state->notice[0] = '\0';
+        return;
+    }
+
+    pcap_viewer_copy_text(state->selected_path, sizeof(state->selected_path), selected_path);
+    pcap_viewer_copy_text(state->selected_name, sizeof(state->selected_name), selected_name);
+    state->cancel_requested = false;
+    state->loading = true;
+    state->force_reanalyze = force_reanalyze;
+    state->load_status = PCAP_READER_OK;
+    state->summary_status = PCAP_READER_OK;
+    state->packet_filter = PCAP_FILTER_ALL;
+    state->show_fqdn = false;
+    pcap_flow_filter_clear(&state->quick_filter);
+    pcap_viewer_render_loading_page(state);
+    if (xTaskCreate(pcap_viewer_load_task, "pcap_index", 8192, state, 5,
+                    &state->task) != pdTRUE) {
+        state->loading = false;
+        state->task = NULL;
+        snprintf(state->notice, sizeof(state->notice), "Could not start PCAP index task.");
+        pcap_viewer_release_capture(state);
+        show_pcap_viewer_page();
+    }
+}
+
+static void pcap_viewer_file_open_cb(lv_event_t *e)
+{
+    pcap_viewer_file_t *file = (pcap_viewer_file_t *)lv_event_get_user_data(e);
+    tab_context_t *ctx = get_current_ctx();
+    pcap_viewer_state_t *state = pcap_viewer_get_state(ctx, false);
+    if (!state || !file) {
+        return;
+    }
+    pcap_viewer_start_file_load(state, file->path, file->name, false);
+}
+
+static void pcap_viewer_format_endpoint(const char *address, uint16_t port,
+                                        char *output, size_t output_size)
+{
+    if (!output || output_size == 0) {
+        return;
+    }
+    if (!address || !address[0]) {
+        snprintf(output, output_size, "-");
+    } else if (port > 0) {
+        snprintf(output, output_size, "%s:%u", address, port);
+    } else {
+        snprintf(output, output_size, "%s", address);
+    }
+}
+
+static const char *pcap_viewer_packet_hostname(const pcap_viewer_state_t *state,
+                                               uint32_t packet_number,
+                                               const char *address)
+{
+    if (!state || !state->show_fqdn || !state->flow_analysis ||
+        !address || !address[0]) return NULL;
+    const pcap_flow_analysis_t *analysis = state->flow_analysis;
+    if (packet_number < analysis->analyzed_packets) {
+        uint16_t flow_id = analysis->packet_flow_id[packet_number];
+        if (flow_id != PCAP_FLOW_ID_NONE && flow_id < analysis->flow_count) {
+            const pcap_flow_entry_t *flow = &analysis->flows[flow_id];
+            if (flow->server_name[0] &&
+                strcasecmp(flow->responder, address) == 0) {
+                return flow->server_name;
+            }
+        }
+    }
+    return pcap_flow_hostname_for_address(analysis, address);
+}
+
+static uint32_t pcap_viewer_fqdn_hint_count(const pcap_viewer_state_t *state)
+{
+    if (!state || !state->flow_analysis) return 0U;
+    const pcap_flow_analysis_t *analysis = state->flow_analysis;
+    uint32_t count = analysis->dns_name_count;
+    for (uint32_t i = 0; i < analysis->flow_count; i++) {
+        if (analysis->flows[i].server_name[0]) count++;
+    }
+    return count;
+}
+
+static void pcap_viewer_format_table_endpoint(const pcap_viewer_state_t *state,
+                                              uint32_t packet_number,
+                                              const char *address, uint16_t port,
+                                              char *output, size_t output_size)
+{
+    if (!output || output_size == 0) {
+        return;
+    }
+    if (!address || !address[0]) {
+        snprintf(output, output_size, "-");
+        return;
+    }
+
+    const char *hostname = pcap_viewer_packet_hostname(state, packet_number, address);
+    if (hostname && hostname[0] && strcasecmp(hostname, address) != 0) {
+        char endpoint[96];
+        pcap_viewer_format_endpoint(address, port, endpoint, sizeof(endpoint));
+        snprintf(output, output_size, "%s\n%s", hostname, endpoint);
+        return;
+    }
+
+    size_t address_length = strlen(address);
+    unsigned total_colons = 0;
+    for (const char *cursor = address; *cursor; cursor++) {
+        if (*cursor == ':') {
+            total_colons++;
+        }
+    }
+    if (address_length < 32U || total_colons != 7U) {
+        pcap_viewer_format_endpoint(address, port, output, output_size);
+        return;
+    }
+
+    const char *split = NULL;
+    unsigned colon_count = 0;
+    for (const char *cursor = address; *cursor; cursor++) {
+        if (*cursor == ':' && ++colon_count == 4U) {
+            split = cursor + 1;
+            break;
+        }
+    }
+    if (!split) {
+        pcap_viewer_format_endpoint(address, port, output, output_size);
+        return;
+    }
+
+    int first_line_length = (int)(split - address);
+    if (port > 0) {
+        snprintf(output, output_size, "%.*s\n%s:%u",
+                 first_line_length, address, split, port);
+    } else {
+        snprintf(output, output_size, "%.*s\n%s",
+                 first_line_length, address, split);
+    }
+}
+
+static void pcap_viewer_packet_detail_close_cb(lv_event_t *e)
+{
+    pcap_viewer_state_t *state = (pcap_viewer_state_t *)lv_event_get_user_data(e);
+    pcap_viewer_close_detail(state);
+}
+
+enum {
+    PCAP_DETAIL_FILTER_SOURCE_HOST = 1,
+    PCAP_DETAIL_FILTER_DESTINATION_HOST,
+    PCAP_DETAIL_FILTER_SOURCE_MAC,
+    PCAP_DETAIL_FILTER_DESTINATION_MAC,
+    PCAP_DETAIL_FILTER_PORT,
+    PCAP_DETAIL_FILTER_TIME,
+    PCAP_DETAIL_FOLLOW_FLOW,
+    PCAP_DETAIL_FOLLOW_HEX,
+};
+
+static void pcap_viewer_follow_flow_mode(pcap_viewer_state_t *state, uint16_t flow_id,
+                                         pcap_flow_stream_mode_t mode)
+{
+    if (!state || !state->reader || !state->packet_index || !state->flow_analysis ||
+        flow_id == PCAP_FLOW_ID_NONE || flow_id >= state->flow_analysis->flow_count) {
+        return;
+    }
+    char *stream = heap_caps_malloc(24576, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!stream) {
+        pcap_viewer_show_summary_popup(state, "Follow Stream", "Not enough PSRAM.");
+        return;
+    }
+    pcap_flow_stream_result_t result;
+    pcap_reader_status_t status = pcap_flow_build_stream_ex(
+        state->reader, state->packet_index, state->scan_summary.indexed_packets,
+        state->flow_analysis, flow_id, mode, stream, 24576, &result);
+    if (status == PCAP_READER_OK) {
+        pcap_viewer_show_summary_popup(
+            state, mode == PCAP_FLOW_STREAM_HEX
+                       ? LV_SYMBOL_LIST " Follow Stream HEX"
+                       : LV_SYMBOL_LIST " Follow Stream ASCII", stream);
+    } else {
+        snprintf(stream, 24576, "Could not build stream: %s",
+                 pcap_reader_status_name(status));
+        pcap_viewer_show_summary_popup(state, "Follow Stream", stream);
+    }
+    heap_caps_free(stream);
+}
+
+static void pcap_viewer_follow_flow(pcap_viewer_state_t *state, uint16_t flow_id)
+{
+    pcap_viewer_follow_flow_mode(state, flow_id, PCAP_FLOW_STREAM_ASCII);
+}
+
+static void pcap_viewer_detail_action_cb(lv_event_t *e)
+{
+    uintptr_t action = (uintptr_t)lv_event_get_user_data(e);
+    tab_context_t *ctx = get_current_ctx();
+    pcap_viewer_state_t *state = pcap_viewer_get_state(ctx, false);
+    if (!state || !state->reader || !state->packet_index || !state->flow_analysis ||
+        state->detail_packet_index >= state->scan_summary.indexed_packets) return;
+
+    uint32_t packet_number = state->detail_packet_index;
+    pcap_packet_details_t details;
+    pcap_reader_status_t status = pcap_reader_describe_packet(
+        state->reader, &state->packet_index[packet_number], &details);
+    if (status != PCAP_READER_OK && status != PCAP_READER_LIMIT_REACHED) return;
+    uint16_t flow_id = state->flow_analysis->packet_flow_id[packet_number];
+    pcap_viewer_close_detail(state);
+    if (action == PCAP_DETAIL_FOLLOW_FLOW) {
+        pcap_viewer_follow_flow(state, flow_id);
+        return;
+    }
+    if (action == PCAP_DETAIL_FOLLOW_HEX) {
+        pcap_viewer_follow_flow_mode(state, flow_id, PCAP_FLOW_STREAM_HEX);
+        return;
+    }
+
+    pcap_flow_filter_clear(&state->quick_filter);
+    state->quick_filter.enabled = true;
+    if (action == PCAP_DETAIL_FILTER_SOURCE_HOST && details.source[0]) {
+        state->quick_filter.has_any_address = true;
+        pcap_viewer_copy_text(state->quick_filter.any_address,
+                              sizeof(state->quick_filter.any_address), details.source);
+    } else if (action == PCAP_DETAIL_FILTER_DESTINATION_HOST && details.destination[0]) {
+        state->quick_filter.has_any_address = true;
+        pcap_viewer_copy_text(state->quick_filter.any_address,
+                              sizeof(state->quick_filter.any_address), details.destination);
+    } else if (action == PCAP_DETAIL_FILTER_SOURCE_MAC && details.source_mac[0]) {
+        state->quick_filter.has_any_mac = true;
+        pcap_viewer_copy_text(state->quick_filter.any_mac,
+                              sizeof(state->quick_filter.any_mac), details.source_mac);
+    } else if (action == PCAP_DETAIL_FILTER_DESTINATION_MAC &&
+               details.destination_mac[0]) {
+        state->quick_filter.has_any_mac = true;
+        pcap_viewer_copy_text(state->quick_filter.any_mac,
+                              sizeof(state->quick_filter.any_mac), details.destination_mac);
+    } else if (action == PCAP_DETAIL_FILTER_PORT &&
+               (details.destination_port || details.source_port)) {
+        state->quick_filter.has_port = true;
+        state->quick_filter.port = flow_id != PCAP_FLOW_ID_NONE &&
+                                   flow_id < state->flow_analysis->flow_count
+                                       ? state->flow_analysis->flows[flow_id].responder_port
+                                       : (details.destination_port
+                                              ? details.destination_port
+                                              : details.source_port);
+    } else if (action == PCAP_DETAIL_FILTER_TIME) {
+        uint64_t fraction = state->packet_index[packet_number].timestamp_fraction;
+        if (state->capture_info.timestamp_resolution == PCAP_TIMESTAMP_NANOSECONDS) {
+            fraction /= 1000U;
+        }
+        uint64_t center = (uint64_t)state->packet_index[packet_number].timestamp_seconds *
+                          1000000ULL + fraction;
+        state->quick_filter.has_time_window = true;
+        state->quick_filter.time_start_us = center > 5000000ULL ? center - 5000000ULL : 0;
+        state->quick_filter.time_end_us = center + 5000000ULL;
+    } else {
+        pcap_flow_filter_clear(&state->quick_filter);
+        return;
+    }
+    state->packet_page = 0;
+    pcap_viewer_render_capture_page(state);
+}
+
+static lv_obj_t *pcap_viewer_add_detail_action(lv_obj_t *parent, const char *text,
+                                               uintptr_t action, bool enabled)
+{
+    lv_obj_t *button = lv_btn_create(parent);
+    lv_obj_set_size(button, 138, 42);
+    lv_obj_set_style_bg_color(button, lv_color_hex(0x087EA4), 0);
+    lv_obj_set_style_radius(button, 8, 0);
+    lv_obj_add_event_cb(button, pcap_viewer_detail_action_cb, LV_EVENT_CLICKED,
+                        (void *)action);
+    if (!enabled) lv_obj_add_state(button, LV_STATE_DISABLED);
+    lv_obj_t *label = lv_label_create(button);
+    lv_label_set_text(label, text);
+    lv_obj_set_style_text_font(label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(label, lv_color_white(), 0);
+    lv_obj_center(label);
+    return button;
+}
+
+static void pcap_viewer_append_text(char *output, size_t output_size, size_t *position,
+                                    const char *format, ...)
+{
+    if (!output || !position || *position >= output_size) {
+        return;
+    }
+    va_list args;
+    va_start(args, format);
+    int written = vsnprintf(output + *position, output_size - *position, format, args);
+    va_end(args);
+    if (written < 0) {
+        return;
+    }
+    size_t added = (size_t)written;
+    if (added >= output_size - *position) {
+        *position = output_size - 1;
+    } else {
+        *position += added;
+    }
+}
+
+static void pcap_viewer_packet_detail_cb(lv_event_t *e)
+{
+    uintptr_t encoded = (uintptr_t)lv_event_get_user_data(e);
+    if (encoded == 0) {
+        return;
+    }
+    uint32_t packet_index = (uint32_t)(encoded - 1U);
+    tab_context_t *ctx = get_current_ctx();
+    pcap_viewer_state_t *state = pcap_viewer_get_state(ctx, false);
+    if (!state || !state->reader || !state->packet_index ||
+        packet_index >= state->scan_summary.indexed_packets) {
+        return;
+    }
+    pcap_viewer_close_detail(state);
+
+    pcap_packet_index_t *packet = &state->packet_index[packet_index];
+    pcap_packet_details_t details;
+    pcap_reader_status_t detail_status =
+        pcap_reader_describe_packet(state->reader, packet, &details);
+    uint8_t bytes[PCAP_VIEWER_HEX_BYTES];
+    size_t bytes_read = 0;
+    pcap_reader_status_t read_status =
+        pcap_reader_read_packet(state->reader, packet, bytes, sizeof(bytes), &bytes_read);
+    if ((detail_status != PCAP_READER_OK && detail_status != PCAP_READER_LIMIT_REACHED) ||
+        (read_status != PCAP_READER_OK && read_status != PCAP_READER_LIMIT_REACHED)) {
+        return;
+    }
+    state->detail_packet_index = packet_index;
+
+    char *text_buffer = heap_caps_malloc(4096, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!text_buffer) {
+        return;
+    }
+    text_buffer[0] = '\0';
+    size_t position = 0;
+    char source[96], destination[96];
+    pcap_viewer_format_endpoint(details.source, details.source_port,
+                                source, sizeof(source));
+    pcap_viewer_format_endpoint(details.destination, details.destination_port,
+                                destination, sizeof(destination));
+    const char *application_name = "Unknown";
+    const char *application_confidence = "UNKNOWN";
+    if (state->flow_analysis && packet_index < state->flow_analysis->analyzed_packets) {
+        pcap_application_t app = (pcap_application_t)
+            state->flow_analysis->packet_application[packet_index];
+        application_name = pcap_flow_application_name(app);
+        application_confidence = pcap_flow_confidence_name(
+            (pcap_app_confidence_t)
+                state->flow_analysis->packet_confidence[packet_index]);
+        uint16_t flow_id = state->flow_analysis->packet_flow_id[packet_index];
+        if (flow_id != PCAP_FLOW_ID_NONE && flow_id < state->flow_analysis->flow_count) {
+            application_confidence = pcap_flow_confidence_name(
+                (pcap_app_confidence_t)state->flow_analysis->flows[flow_id].app_confidence);
+        }
+    }
+    uint32_t fraction_width = state->capture_info.timestamp_resolution ==
+                                  PCAP_TIMESTAMP_NANOSECONDS ? 9U : 6U;
+    pcap_viewer_append_text(text_buffer, 4096, &position,
+                            "Packet #%lu\nTimestamp: %lu.%0*lu (%s)\n"
+                            "Captured: %lu B | Original: %lu B\n"
+                            "Protocol: %s\nApplication: %s (%s)\n"
+                            "Source: %s\nDestination: %s\nInfo: %s%s%s\n\n"
+                            "HEX / ASCII (first %u bytes)\n",
+                            (unsigned long)(packet_index + 1),
+                            (unsigned long)packet->timestamp_seconds,
+                            (int)fraction_width, (unsigned long)packet->timestamp_fraction,
+                            state->capture_info.timestamp_resolution == PCAP_TIMESTAMP_NANOSECONDS
+                                ? "nanoseconds" : "microseconds",
+                            (unsigned long)packet->captured_length,
+                            (unsigned long)packet->original_length,
+                            details.protocol[0] ? details.protocol : "Unknown",
+                            application_name, application_confidence,
+                            source, destination,
+                            details.info[0] ? details.info : "-",
+                            details.malformed ? " | MALFORMED" : "",
+                            details.payload_truncated ? " | SNAPSHOT TRUNCATED" : "",
+                            (unsigned)bytes_read);
+
+    for (size_t offset = 0; offset < bytes_read; offset += 16) {
+        pcap_viewer_append_text(text_buffer, 4096, &position, "%04X  ", (unsigned)offset);
+        for (size_t column = 0; column < 16; column++) {
+            if (offset + column < bytes_read) {
+                pcap_viewer_append_text(text_buffer, 4096, &position,
+                                        "%02X ", bytes[offset + column]);
+            } else {
+                pcap_viewer_append_text(text_buffer, 4096, &position, "   ");
+            }
+        }
+        pcap_viewer_append_text(text_buffer, 4096, &position, " ");
+        for (size_t column = 0; column < 16 && offset + column < bytes_read; column++) {
+            uint8_t c = bytes[offset + column];
+            pcap_viewer_append_text(text_buffer, 4096, &position, "%c",
+                                    c >= 32 && c <= 126 ? c : '.');
+        }
+        pcap_viewer_append_text(text_buffer, 4096, &position, "\n");
+    }
+
+    state->detail_overlay = lv_obj_create(lv_scr_act());
+    lv_obj_remove_style_all(state->detail_overlay);
+    lv_obj_set_size(state->detail_overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(state->detail_overlay, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(state->detail_overlay, LV_OPA_70, 0);
+    lv_obj_add_flag(state->detail_overlay, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(state->detail_overlay, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *popup = lv_obj_create(state->detail_overlay);
+    lv_obj_set_size(popup, lv_pct(88), lv_pct(88));
+    lv_obj_center(popup);
+    style_surface_panel(popup, 14);
+    lv_obj_set_style_border_width(popup, 2, 0);
+    lv_obj_set_style_border_color(popup, COLOR_NEON_CYAN, 0);
+    lv_obj_set_style_pad_all(popup, 14, 0);
+    lv_obj_set_style_pad_row(popup, 10, 0);
+    lv_obj_set_flex_flow(popup, LV_FLEX_FLOW_COLUMN);
+
+    lv_obj_t *title = lv_label_create(popup);
+    lv_label_set_text_fmt(title, LV_SYMBOL_EYE_OPEN " Packet #%lu details",
+                          (unsigned long)(packet_index + 1));
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, COLOR_NEON_CYAN, 0);
+
+    lv_obj_t *scroll = lv_obj_create(popup);
+    lv_obj_set_size(scroll, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_flex_grow(scroll, 1);
+    lv_obj_set_style_bg_color(scroll, lv_color_hex(0x050A14), 0);
+    lv_obj_set_style_border_width(scroll, 1, 0);
+    lv_obj_set_style_border_color(scroll, ui_border_color(), 0);
+    lv_obj_set_style_pad_all(scroll, 12, 0);
+
+    lv_obj_t *detail_label = lv_label_create(scroll);
+    lv_label_set_text(detail_label, text_buffer);
+    lv_obj_set_width(detail_label, lv_pct(100));
+    lv_label_set_long_mode(detail_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(detail_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(detail_label, ui_text_color(), 0);
+    heap_caps_free(text_buffer);
+
+    lv_obj_t *actions = lv_obj_create(popup);
+    lv_obj_set_size(actions, lv_pct(100), 48);
+    lv_obj_set_style_bg_opa(actions, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(actions, 0, 0);
+    lv_obj_set_style_pad_all(actions, 2, 0);
+    lv_obj_set_style_pad_column(actions, 6, 0);
+    lv_obj_set_flex_flow(actions, LV_FLEX_FLOW_ROW);
+    lv_obj_set_scroll_dir(actions, LV_DIR_HOR);
+    lv_obj_set_scrollbar_mode(actions, LV_SCROLLBAR_MODE_AUTO);
+    uint16_t packet_flow = state->flow_analysis &&
+                           packet_index < state->flow_analysis->analyzed_packets
+                               ? state->flow_analysis->packet_flow_id[packet_index]
+                               : PCAP_FLOW_ID_NONE;
+    pcap_viewer_add_detail_action(actions, "HOST SRC", PCAP_DETAIL_FILTER_SOURCE_HOST,
+                                  details.source[0] != '\0');
+    pcap_viewer_add_detail_action(actions, "HOST DST", PCAP_DETAIL_FILTER_DESTINATION_HOST,
+                                  details.destination[0] != '\0');
+    pcap_viewer_add_detail_action(actions, "MAC SRC", PCAP_DETAIL_FILTER_SOURCE_MAC,
+                                  details.source_mac[0] != '\0');
+    pcap_viewer_add_detail_action(actions, "MAC DST", PCAP_DETAIL_FILTER_DESTINATION_MAC,
+                                  details.destination_mac[0] != '\0');
+    pcap_viewer_add_detail_action(actions, "PORT", PCAP_DETAIL_FILTER_PORT,
+                                  details.source_port || details.destination_port);
+    pcap_viewer_add_detail_action(actions, "TIME +/-5s", PCAP_DETAIL_FILTER_TIME, true);
+    pcap_viewer_add_detail_action(actions, "FOLLOW", PCAP_DETAIL_FOLLOW_FLOW,
+                                  packet_flow != PCAP_FLOW_ID_NONE);
+    pcap_viewer_add_detail_action(actions, "FOLLOW HEX", PCAP_DETAIL_FOLLOW_HEX,
+                                  packet_flow != PCAP_FLOW_ID_NONE);
+
+    lv_obj_t *close_btn = lv_btn_create(popup);
+    lv_obj_set_size(close_btn, 160, 46);
+    lv_obj_set_style_bg_color(close_btn, COLOR_MATERIAL_BLUE, 0);
+    lv_obj_set_style_radius(close_btn, 8, 0);
+    lv_obj_add_event_cb(close_btn, pcap_viewer_packet_detail_close_cb,
+                        LV_EVENT_CLICKED, state);
+    lv_obj_t *close_label = lv_label_create(close_btn);
+    lv_label_set_text(close_label, "Close");
+    lv_obj_set_style_text_color(close_label, lv_color_white(), 0);
+    lv_obj_center(close_label);
+}
+
+static bool pcap_viewer_packet_is_visible(const pcap_viewer_state_t *state,
+                                          uint32_t packet_index)
+{
+    if (!state || packet_index >= state->scan_summary.indexed_packets) {
+        return false;
+    }
+    bool protocol_match = state->packet_filter == PCAP_FILTER_ALL ||
+        (state->packet_flags &&
+         pcap_reader_packet_matches_filter(state->packet_flags[packet_index],
+                                           state->packet_filter));
+    if (!protocol_match || !state->quick_filter.enabled) return protocol_match;
+    if (!state->reader || !state->flow_analysis) return false;
+    uint16_t flow_id = state->flow_analysis->packet_flow_id[packet_index];
+    bool has_flow = flow_id != PCAP_FLOW_ID_NONE &&
+                    flow_id < state->flow_analysis->flow_count;
+    bool needs_details = !has_flow &&
+        (state->quick_filter.has_any_address ||
+         state->quick_filter.has_source_address ||
+         state->quick_filter.has_destination_address ||
+         state->quick_filter.has_any_mac ||
+         state->quick_filter.has_port);
+    pcap_packet_details_t details;
+    pcap_packet_details_t *details_ptr = NULL;
+    if (needs_details) {
+        pcap_reader_status_t status = pcap_reader_describe_packet(
+            state->reader, &state->packet_index[packet_index], &details);
+        if (status != PCAP_READER_OK && status != PCAP_READER_LIMIT_REACHED) return false;
+        details_ptr = &details;
+    }
+    return pcap_flow_filter_matches(&state->quick_filter, state->flow_analysis,
+                                    packet_index, &state->packet_index[packet_index],
+                                    details_ptr, state->capture_info.timestamp_resolution);
+}
+
+static uint32_t pcap_viewer_filter_packet_count(const pcap_viewer_state_t *state,
+                                                pcap_packet_filter_t filter)
+{
+    if (!state) {
+        return 0;
+    }
+    if (filter == PCAP_FILTER_ALL) {
+        return state->scan_summary.indexed_packets;
+    }
+    uint32_t count = 0;
+    for (uint32_t i = 0; i < state->scan_summary.indexed_packets; i++) {
+        if (state->packet_flags &&
+            pcap_reader_packet_matches_filter(state->packet_flags[i], filter)) {
+            count++;
+        }
+    }
+    return count;
+}
+
+static uint32_t pcap_viewer_filtered_packet_count(const pcap_viewer_state_t *state)
+{
+    if (!state) return 0;
+    if (!state->quick_filter.enabled) {
+        return pcap_viewer_filter_packet_count(state, state->packet_filter);
+    }
+    uint32_t matches = 0;
+    for (uint32_t i = 0; i < state->scan_summary.indexed_packets; i++) {
+        if (pcap_viewer_packet_is_visible(state, i)) matches++;
+    }
+    return matches;
+}
+
+static void pcap_viewer_update_filter_styles(pcap_viewer_state_t *state)
+{
+    if (!state) {
+        return;
+    }
+    for (int filter = 0; filter < PCAP_FILTER_COUNT; filter++) {
+        lv_obj_t *button = state->filter_buttons[filter];
+        if (!button || !lv_obj_is_valid(button)) {
+            continue;
+        }
+        bool active = state->packet_filter == (pcap_packet_filter_t)filter;
+        lv_obj_set_style_bg_color(button,
+                                  active ? lv_color_hex(0x087EA4) : ui_card_color(), 0);
+        lv_obj_set_style_border_color(button,
+                                      active ? COLOR_NEON_CYAN : ui_border_color(), 0);
+    }
+}
+
+static void pcap_viewer_filter_cb(lv_event_t *e)
+{
+    uintptr_t encoded = (uintptr_t)lv_event_get_user_data(e);
+    if (encoded == 0 || encoded > PCAP_FILTER_COUNT) {
+        return;
+    }
+    tab_context_t *ctx = get_current_ctx();
+    pcap_viewer_state_t *state = pcap_viewer_get_state(ctx, false);
+    if (!state || state->loading) {
+        return;
+    }
+    state->packet_filter = (pcap_packet_filter_t)(encoded - 1U);
+    state->packet_page = 0;
+    ESP_LOGI(TAG, "[ESPShark] Filter %s selected: %lu indexed match(es)",
+             pcap_reader_filter_name(state->packet_filter),
+             (unsigned long)pcap_viewer_filtered_packet_count(state));
+    pcap_viewer_update_filter_styles(state);
+    pcap_viewer_render_packet_page(state);
+}
+
+static void pcap_viewer_update_fqdn_toggle(pcap_viewer_state_t *state)
+{
+    if (!state || !state->fqdn_btn || !lv_obj_is_valid(state->fqdn_btn) ||
+        !state->fqdn_label || !lv_obj_is_valid(state->fqdn_label)) {
+        return;
+    }
+    uint32_t hints = pcap_viewer_fqdn_hint_count(state);
+    lv_label_set_text_fmt(state->fqdn_label, "%s\n%lu name hint%s",
+                          state->show_fqdn ? "FQDN ON" : "SHOW FQDN",
+                          (unsigned long)hints, hints == 1U ? "" : "s");
+    lv_obj_set_style_bg_color(state->fqdn_btn,
+                              state->show_fqdn
+                                  ? (hints > 0U ? COLOR_MATERIAL_GREEN
+                                                : COLOR_MATERIAL_AMBER)
+                                  : lv_color_hex(0x37474F), 0);
+    lv_obj_set_style_border_color(state->fqdn_btn,
+                                  state->show_fqdn
+                                      ? (hints > 0U ? COLOR_NEON_GREEN
+                                                    : COLOR_MATERIAL_AMBER)
+                                      : ui_border_color(), 0);
+}
+
+static void pcap_viewer_fqdn_toggle_cb(lv_event_t *e)
+{
+    pcap_viewer_state_t *state =
+        (pcap_viewer_state_t *)lv_event_get_user_data(e);
+    if (!state || state->loading || !state->flow_analysis) return;
+    state->show_fqdn = !state->show_fqdn;
+    ESP_LOGI(TAG, "[ESPShark] Packet endpoint FQDN display %s (%lu mappings)",
+             state->show_fqdn ? "enabled" : "disabled",
+             (unsigned long)state->flow_analysis->dns_name_count);
+    pcap_viewer_update_fqdn_toggle(state);
+    pcap_viewer_render_packet_page(state);
+}
+
+static void pcap_viewer_render_packet_page(pcap_viewer_state_t *state)
+{
+    if (!state || !state->packet_list || !lv_obj_is_valid(state->packet_list) ||
+        !state->reader || !state->packet_index) {
+        return;
+    }
+    lv_obj_clean(state->packet_list);
+    uint32_t indexed = state->scan_summary.indexed_packets;
+    uint32_t filtered = pcap_viewer_filtered_packet_count(state);
+    int total_pages = filtered == 0 ? 1 :
+        (int)((filtered + PCAP_VIEWER_PACKET_PAGE_SIZE - 1) /
+              PCAP_VIEWER_PACKET_PAGE_SIZE);
+    if (state->packet_page < 0) state->packet_page = 0;
+    if (state->packet_page >= total_pages) state->packet_page = total_pages - 1;
+    uint32_t start_match = (uint32_t)state->packet_page * PCAP_VIEWER_PACKET_PAGE_SIZE;
+    uint32_t end_match = start_match + PCAP_VIEWER_PACKET_PAGE_SIZE;
+    if (end_match > filtered) end_match = filtered;
+
+    if (state->page_label && lv_obj_is_valid(state->page_label)) {
+        if (state->show_fqdn) {
+            lv_label_set_text_fmt(
+                state->page_label,
+                "Page %d/%d | %lu match | %llu total | FQDN %lu hints",
+                state->packet_page + 1, total_pages,
+                (unsigned long)filtered,
+                (unsigned long long)state->scan_summary.packet_count,
+                (unsigned long)pcap_viewer_fqdn_hint_count(state));
+        } else {
+            lv_label_set_text_fmt(state->page_label,
+                                  "Page %d/%d | %lu indexed match | %llu total",
+                                  state->packet_page + 1, total_pages,
+                                  (unsigned long)filtered,
+                                  (unsigned long long)state->scan_summary.packet_count);
+        }
+    }
+    if (state->prev_btn) {
+        if (state->packet_page <= 0) lv_obj_add_state(state->prev_btn, LV_STATE_DISABLED);
+        else lv_obj_clear_state(state->prev_btn, LV_STATE_DISABLED);
+    }
+    if (state->next_btn) {
+        if (state->packet_page + 1 >= total_pages) lv_obj_add_state(state->next_btn, LV_STATE_DISABLED);
+        else lv_obj_clear_state(state->next_btn, LV_STATE_DISABLED);
+    }
+
+    if (filtered == 0) {
+        lv_obj_t *empty = lv_label_create(state->packet_list);
+        lv_label_set_text_fmt(empty, "%s: no matching indexed packets.",
+                              pcap_reader_filter_name(state->packet_filter));
+        lv_obj_set_width(empty, lv_pct(100));
+        lv_obj_set_style_text_align(empty, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_color(empty, ui_muted_color(), 0);
+        return;
+    }
+
+    double fraction_scale = state->capture_info.timestamp_resolution ==
+                                PCAP_TIMESTAMP_NANOSECONDS ? 1000000000.0 : 1000000.0;
+    double first_time = (double)state->scan_summary.first_timestamp_seconds +
+                        ((double)state->scan_summary.first_timestamp_fraction / fraction_scale);
+    uint32_t match_index = 0;
+    for (uint32_t i = 0; i < indexed && match_index < end_match; i++) {
+        if (!pcap_viewer_packet_is_visible(state, i)) {
+            continue;
+        }
+        if (match_index++ < start_match) {
+            continue;
+        }
+        pcap_packet_index_t *packet = &state->packet_index[i];
+        pcap_packet_details_t details;
+        pcap_reader_status_t status =
+            pcap_reader_describe_packet(state->reader, packet, &details);
+        if (status != PCAP_READER_OK && status != PCAP_READER_LIMIT_REACHED) {
+            memset(&details, 0, sizeof(details));
+            snprintf(details.protocol, sizeof(details.protocol), "Read error");
+            snprintf(details.info, sizeof(details.info), "%s",
+                     pcap_reader_status_name(status));
+        }
+        double packet_time = (double)packet->timestamp_seconds +
+                             ((double)packet->timestamp_fraction / fraction_scale);
+        char source[192], destination[192];
+        pcap_viewer_format_table_endpoint(state, i, details.source, details.source_port,
+                                          source, sizeof(source));
+        pcap_viewer_format_table_endpoint(state, i, details.destination,
+                                          details.destination_port,
+                                          destination, sizeof(destination));
+
+        lv_obj_t *row = lv_obj_create(state->packet_list);
+        lv_obj_remove_style_all(row);
+        lv_obj_set_size(row, lv_pct(100), PCAP_VIEWER_ROW_HEIGHT);
+        lv_color_t row_color = (i & 1U)
+                                   ? lv_color_mix(ui_card_color(), ui_bg_color(), LV_OPA_70)
+                                   : ui_card_color();
+        lv_obj_set_style_bg_color(row, row_color, 0);
+        lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
+        lv_obj_set_style_bg_color(row, ui_card_pressed_color(), LV_STATE_PRESSED);
+        lv_obj_set_style_border_width(row, 1, 0);
+        lv_obj_set_style_border_color(row,
+                                      details.malformed ? COLOR_MATERIAL_RED : ui_border_color(), 0);
+        lv_obj_set_style_border_side(row, LV_BORDER_SIDE_BOTTOM, 0);
+        lv_obj_set_style_radius(row, 0, 0);
+        lv_obj_set_style_pad_left(row, 6, 0);
+        lv_obj_set_style_pad_right(row, 6, 0);
+        lv_obj_set_style_pad_top(row, 0, 0);
+        lv_obj_set_style_pad_bottom(row, 0, 0);
+        lv_obj_set_style_pad_column(row, 8, 0);
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START,
+                              LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_event_cb(row, pcap_viewer_packet_detail_cb, LV_EVENT_CLICKED,
+                            (void *)(uintptr_t)(i + 1U));
+
+        lv_obj_t *number = lv_label_create(row);
+        lv_label_set_text_fmt(number, "%lu   +%.4fs",
+                              (unsigned long)(i + 1), packet_time - first_time);
+        lv_obj_set_width(number, PCAP_VIEWER_COL_NO_TIME);
+        lv_label_set_long_mode(number, LV_LABEL_LONG_DOT);
+        lv_obj_set_style_text_font(number, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(number, ui_muted_color(), 0);
+
+        pcap_application_t detected_app = PCAP_APP_UNKNOWN;
+        pcap_app_confidence_t detected_confidence = PCAP_APP_CONFIDENCE_NONE;
+        if (state->flow_analysis && i < state->flow_analysis->analyzed_packets) {
+            detected_app = (pcap_application_t)state->flow_analysis->packet_application[i];
+            detected_confidence = (pcap_app_confidence_t)
+                state->flow_analysis->packet_confidence[i];
+            uint16_t flow_id = state->flow_analysis->packet_flow_id[i];
+            if (flow_id != PCAP_FLOW_ID_NONE && flow_id < state->flow_analysis->flow_count) {
+                detected_confidence = (pcap_app_confidence_t)
+                    state->flow_analysis->flows[flow_id].app_confidence;
+            }
+        }
+        bool show_detected_app = detected_app != PCAP_APP_UNKNOWN &&
+                                 detected_app != PCAP_APP_TCP &&
+                                 detected_app != PCAP_APP_UDP;
+        lv_obj_t *protocol = lv_label_create(row);
+        lv_label_set_text(protocol, show_detected_app
+                                      ? pcap_flow_application_name(detected_app)
+                                      : (details.protocol[0] ? details.protocol : "Unknown"));
+        lv_obj_set_width(protocol, PCAP_VIEWER_COL_PROTOCOL);
+        lv_label_set_long_mode(protocol, LV_LABEL_LONG_DOT);
+        lv_obj_set_style_text_font(protocol, &lv_font_montserrat_12, 0);
+        lv_color_t protocol_color = details.malformed ? COLOR_MATERIAL_RED :
+            (detected_confidence == PCAP_APP_CONFIDENCE_LIKELY
+                 ? COLOR_MATERIAL_AMBER : COLOR_NEON_GREEN);
+        lv_obj_set_style_text_color(protocol, protocol_color, 0);
+
+        lv_obj_t *source_label = lv_label_create(row);
+        lv_label_set_text(source_label, source);
+        lv_obj_set_width(source_label, PCAP_VIEWER_COL_SOURCE);
+        lv_obj_set_height(source_label, PCAP_VIEWER_ENDPOINT_HEIGHT);
+        lv_label_set_long_mode(source_label, LV_LABEL_LONG_CLIP);
+        lv_obj_set_style_text_font(source_label, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(source_label, ui_text_color(), 0);
+
+        lv_obj_t *destination_label = lv_label_create(row);
+        lv_label_set_text(destination_label, destination);
+        lv_obj_set_width(destination_label, PCAP_VIEWER_COL_DESTINATION);
+        lv_obj_set_height(destination_label, PCAP_VIEWER_ENDPOINT_HEIGHT);
+        lv_label_set_long_mode(destination_label, LV_LABEL_LONG_CLIP);
+        lv_obj_set_style_text_font(destination_label, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(destination_label, ui_text_color(), 0);
+
+        lv_obj_t *info = lv_label_create(row);
+        lv_label_set_text(info, details.info[0] ? details.info : "-");
+        lv_obj_set_flex_grow(info, 1);
+        lv_obj_set_width(info, 0);
+        lv_label_set_long_mode(info, LV_LABEL_LONG_DOT);
+        lv_obj_set_style_text_font(info, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(info, ui_muted_color(), 0);
+
+        lv_obj_t *length_label = lv_label_create(row);
+        lv_label_set_text_fmt(length_label, "%lu",
+                              (unsigned long)packet->captured_length);
+        lv_obj_set_width(length_label, PCAP_VIEWER_COL_LENGTH);
+        lv_obj_set_style_text_align(length_label, LV_TEXT_ALIGN_RIGHT, 0);
+        lv_obj_set_style_text_font(length_label, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(length_label, ui_muted_color(), 0);
+    }
+}
+
+static void pcap_viewer_page_change_cb(lv_event_t *e)
+{
+    pcap_viewer_state_t *state = (pcap_viewer_state_t *)lv_event_get_user_data(e);
+    if (!state) {
+        return;
+    }
+    lv_obj_t *target = lv_event_get_target(e);
+    if (target == state->prev_btn) {
+        state->packet_page--;
+    } else if (target == state->next_btn) {
+        state->packet_page++;
+    }
+    pcap_viewer_render_packet_page(state);
+}
+
+static void pcap_viewer_show_summary_popup(pcap_viewer_state_t *state,
+                                           const char *title_text,
+                                           const char *body_text)
+{
+    if (!state || !title_text || !body_text) {
+        return;
+    }
+    pcap_viewer_close_detail(state);
+    state->detail_overlay = lv_obj_create(lv_scr_act());
+    lv_obj_remove_style_all(state->detail_overlay);
+    lv_obj_set_size(state->detail_overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(state->detail_overlay, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(state->detail_overlay, LV_OPA_70, 0);
+    lv_obj_add_flag(state->detail_overlay, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(state->detail_overlay, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *popup = lv_obj_create(state->detail_overlay);
+    lv_obj_set_size(popup, lv_pct(86), lv_pct(88));
+    lv_obj_center(popup);
+    style_surface_panel(popup, 14);
+    lv_obj_set_style_border_width(popup, 2, 0);
+    lv_obj_set_style_border_color(popup, COLOR_NEON_CYAN, 0);
+    lv_obj_set_style_pad_all(popup, 14, 0);
+    lv_obj_set_style_pad_row(popup, 10, 0);
+    lv_obj_set_flex_flow(popup, LV_FLEX_FLOW_COLUMN);
+
+    lv_obj_t *title = lv_label_create(popup);
+    lv_label_set_text(title, title_text);
+    lv_obj_set_width(title, lv_pct(100));
+    lv_label_set_long_mode(title, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, COLOR_NEON_CYAN, 0);
+
+    lv_obj_t *scroll = lv_obj_create(popup);
+    lv_obj_set_size(scroll, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_flex_grow(scroll, 1);
+    lv_obj_set_style_bg_color(scroll, lv_color_hex(0x050A14), 0);
+    lv_obj_set_style_border_width(scroll, 1, 0);
+    lv_obj_set_style_border_color(scroll, ui_border_color(), 0);
+    lv_obj_set_style_pad_all(scroll, 12, 0);
+
+    lv_obj_t *body = lv_label_create(scroll);
+    lv_label_set_text(body, body_text);
+    lv_obj_set_width(body, lv_pct(100));
+    lv_label_set_long_mode(body, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(body, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(body, ui_text_color(), 0);
+
+    lv_obj_t *close_btn = lv_btn_create(popup);
+    lv_obj_set_size(close_btn, 160, 46);
+    lv_obj_set_style_bg_color(close_btn, COLOR_MATERIAL_BLUE, 0);
+    lv_obj_set_style_radius(close_btn, 8, 0);
+    lv_obj_add_event_cb(close_btn, pcap_viewer_packet_detail_close_cb,
+                        LV_EVENT_CLICKED, state);
+    lv_obj_t *close_label = lv_label_create(close_btn);
+    lv_label_set_text(close_label, "Close");
+    lv_obj_set_style_text_color(close_label, lv_color_white(), 0);
+    lv_obj_center(close_label);
+}
+
+static void pcap_viewer_append_top_text(char *buffer, size_t buffer_size,
+                                        size_t *position, const char *heading,
+                                        const pcap_summary_text_counter_t *entries,
+                                        uint16_t count, uint16_t limit,
+                                        bool approximate)
+{
+    pcap_viewer_append_text(buffer, buffer_size, position, "\n%s%s\n",
+                            heading, approximate ? " (approximate)" : "");
+    uint16_t shown = count < limit ? count : limit;
+    if (shown == 0) {
+        pcap_viewer_append_text(buffer, buffer_size, position, "  none\n");
+        return;
+    }
+    for (uint16_t i = 0; i < shown; i++) {
+        pcap_viewer_append_text(buffer, buffer_size, position,
+                                "  %u. %s - %llu\n", (unsigned)(i + 1),
+                                entries[i].label,
+                                (unsigned long long)entries[i].count);
+    }
+}
+
+static void pcap_viewer_summary_cb(lv_event_t *e)
+{
+    uintptr_t summary_kind = (uintptr_t)lv_event_get_user_data(e);
+    tab_context_t *ctx = get_current_ctx();
+    pcap_viewer_state_t *state = pcap_viewer_get_state(ctx, false);
+    if (!state || !state->summary || state->summary_status != PCAP_READER_OK) {
+        return;
+    }
+    if (summary_kind == 2U) {
+        pcap_viewer_show_dns_top(state);
+        return;
+    }
+
+    char *text_buffer = heap_caps_malloc(8192, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!text_buffer) {
+        return;
+    }
+    text_buffer[0] = '\0';
+    size_t position = 0;
+    const pcap_summary_t *summary = state->summary;
+    bool sampled = summary->analyzed_packets < state->scan_summary.packet_count;
+
+    {
+        double fraction_scale = state->capture_info.timestamp_resolution ==
+                                    PCAP_TIMESTAMP_NANOSECONDS ? 1000000000.0 : 1000000.0;
+        double duration = 0;
+        if (state->scan_summary.packet_count > 0) {
+            duration = (double)state->scan_summary.last_timestamp_seconds -
+                       (double)state->scan_summary.first_timestamp_seconds +
+                       ((double)state->scan_summary.last_timestamp_fraction -
+                        (double)state->scan_summary.first_timestamp_fraction) /
+                           fraction_scale;
+            if (duration < 0) duration = 0;
+        }
+        double packet_rate = duration > 0
+                                 ? (double)state->scan_summary.packet_count / duration : 0;
+        double bit_rate = duration > 0
+                              ? ((double)state->scan_summary.captured_bytes * 8.0) / duration : 0;
+        pcap_viewer_append_text(text_buffer, 8192, &position,
+                                "Capture: %llu packet(s), %llu captured bytes, %.3f s\n"
+                                "Rate: %.2f packets/s | %.2f kbit/s\n"
+                                "Analyzed: %llu indexed packet(s)%s\n"
+                                "TCP %llu | UDP %llu | ARP %llu | DNS %llu | HTTP %llu | TLS %llu\n"
+                                "EAPOL %llu | malformed %llu | snapshot truncated %llu | decode >512 B %llu\n"
+                                "802.11 management %llu | beacon %llu | probe req %llu | probe resp %llu | deauth %llu\n",
+                                (unsigned long long)state->scan_summary.packet_count,
+                                (unsigned long long)state->scan_summary.captured_bytes,
+                                duration, packet_rate, bit_rate / 1000.0,
+                                (unsigned long long)summary->analyzed_packets,
+                                sampled ? " (capture sample)" : "",
+                                (unsigned long long)summary->tcp_packets,
+                                (unsigned long long)summary->udp_packets,
+                                (unsigned long long)summary->arp_packets,
+                                (unsigned long long)summary->dns_packets,
+                                (unsigned long long)summary->http_packets,
+                                (unsigned long long)summary->tls_packets,
+                                (unsigned long long)summary->eapol_packets,
+                                (unsigned long long)summary->malformed_packets,
+                                (unsigned long long)summary->truncated_packets,
+                                (unsigned long long)summary->decode_limited_packets,
+                                (unsigned long long)summary->wifi_management_packets,
+                                (unsigned long long)summary->wifi_beacons,
+                                (unsigned long long)summary->wifi_probe_requests,
+                                (unsigned long long)summary->wifi_probe_responses,
+                                (unsigned long long)summary->wifi_deauthentications);
+        if (state->flow_analysis) {
+            pcap_viewer_append_text(
+                text_buffer, 8192, &position,
+                "Health: %s | alerts %lu | local devices %lu | remote endpoints %lu | flows %lu\n",
+                pcap_flow_health_name(
+                    (pcap_health_level_t)state->flow_analysis->health_level),
+                (unsigned long)state->flow_analysis->alert_count,
+                (unsigned long)pcap_flow_local_device_count(state->flow_analysis),
+                (unsigned long)pcap_flow_remote_endpoint_count(state->flow_analysis),
+                (unsigned long)state->flow_analysis->flow_count);
+        }
+        {
+            /* Distinct-key sketches and ratio reducers. Each ratio prints its
+             * own denominator, so an empty sample reads as "n/a" instead of a
+             * confident zero. */
+            char nxdomain_text[64];
+            char answered_text[64];
+            char pair_text[64];
+            char malformed_text[64];
+            pcap_ratio_format(&summary->dns_nxdomain_ratio, nxdomain_text,
+                              sizeof(nxdomain_text));
+            pcap_ratio_format(&summary->dns_answered_ratio, answered_text,
+                              sizeof(answered_text));
+            pcap_ratio_format(&summary->top_pair_share, pair_text, sizeof(pair_text));
+            pcap_ratio_format(&summary->malformed_ratio, malformed_text,
+                              sizeof(malformed_text));
+            pcap_viewer_append_text(
+                text_buffer, 8192, &position,
+                "Unique: %llu endpoint(s)%s | %llu host pair(s)%s | %llu DNS name(s)%s\n"
+                "DNS answered %s | NXDOMAIN %s\n"
+                "Top pair share %s | malformed %s\n",
+                (unsigned long long)summary->unique_endpoints.distinct,
+                summary->unique_endpoints.approximate ? " (approx)" : "",
+                (unsigned long long)summary->unique_host_pairs.distinct,
+                summary->unique_host_pairs.approximate ? " (approx)" : "",
+                (unsigned long long)summary->unique_domains.distinct,
+                summary->unique_domains.approximate ? " (approx)" : "",
+                answered_text, nxdomain_text, pair_text, malformed_text);
+            if (summary->packet_window.configured && summary->packet_window.total >= 20U) {
+                uint16_t peak_bucket = 0;
+                uint32_t peak = pcap_window_peak(&summary->packet_window, &peak_bucket);
+                pcap_viewer_append_text(
+                    text_buffer, 8192, &position,
+                    "Busiest %.3f s window: %lu packet(s), %.1fx the average\n",
+                    pcap_window_bucket_seconds(&summary->packet_window),
+                    (unsigned long)peak,
+                    pcap_window_burst_score(&summary->packet_window));
+            }
+            if (summary->dns_nxdomain_window.total >= 10U &&
+                pcap_window_burst_score(&summary->dns_nxdomain_window) >= 3.0) {
+                pcap_viewer_append_text(
+                    text_buffer, 8192, &position,
+                    "NXDOMAIN burst: %lu in one %.3f s window\n",
+                    (unsigned long)pcap_window_peak(&summary->dns_nxdomain_window, NULL),
+                    pcap_window_bucket_seconds(&summary->dns_nxdomain_window));
+            }
+        }
+        pcap_viewer_append_top_text(text_buffer, 8192, &position, "Protocols",
+                                    summary->protocols, summary->protocol_count, 10,
+                                    summary->protocol_table_approximate);
+        pcap_viewer_append_top_text(text_buffer, 8192, &position, "Top endpoints",
+                                    summary->endpoints, summary->endpoint_count, 12,
+                                    summary->endpoint_table_approximate);
+        pcap_viewer_append_text(text_buffer, 8192, &position, "\nTop ports%s\n",
+                                summary->port_table_approximate ? " (approximate)" : "");
+        uint16_t ports_shown = summary->port_count < 12 ? summary->port_count : 12;
+        if (ports_shown == 0) {
+            pcap_viewer_append_text(text_buffer, 8192, &position, "  none\n");
+        }
+        for (uint16_t i = 0; i < ports_shown; i++) {
+            pcap_viewer_append_text(text_buffer, 8192, &position,
+                                    "  %u. %s/%u - %llu\n", (unsigned)(i + 1),
+                                    summary->ports[i].ip_protocol == 6 ? "TCP" : "UDP",
+                                    summary->ports[i].port,
+                                    (unsigned long long)summary->ports[i].count);
+        }
+        pcap_viewer_append_top_text(text_buffer, 8192, &position, "Top services",
+                                    summary->services, summary->service_count, 8,
+                                    summary->service_table_approximate);
+        pcap_viewer_append_top_text(text_buffer, 8192, &position, "Top host pairs",
+                                    summary->host_pairs, summary->host_pair_count, 8,
+                                    summary->host_pair_table_approximate);
+        pcap_viewer_show_summary_popup(state, LV_SYMBOL_EYE_OPEN " PCAP Overview", text_buffer);
+    }
+    heap_caps_free(text_buffer);
+}
+
+static lv_obj_t *pcap_viewer_create_analysis_list(pcap_viewer_state_t *state,
+                                                  const char *title_text)
+{
+    if (!state) return NULL;
+    pcap_viewer_close_detail(state);
+    state->detail_overlay = lv_obj_create(lv_scr_act());
+    lv_obj_remove_style_all(state->detail_overlay);
+    lv_obj_set_size(state->detail_overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(state->detail_overlay, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(state->detail_overlay, LV_OPA_70, 0);
+    lv_obj_add_flag(state->detail_overlay, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(state->detail_overlay, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *popup = lv_obj_create(state->detail_overlay);
+    lv_obj_set_size(popup, lv_pct(92), lv_pct(90));
+    lv_obj_center(popup);
+    style_surface_panel(popup, 14);
+    lv_obj_set_style_border_width(popup, 2, 0);
+    lv_obj_set_style_border_color(popup, COLOR_NEON_CYAN, 0);
+    lv_obj_set_style_pad_all(popup, 12, 0);
+    lv_obj_set_style_pad_row(popup, 8, 0);
+    lv_obj_set_flex_flow(popup, LV_FLEX_FLOW_COLUMN);
+
+    lv_obj_t *title = lv_label_create(popup);
+    lv_label_set_text(title, title_text);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, COLOR_NEON_CYAN, 0);
+
+    lv_obj_t *list = lv_obj_create(popup);
+    lv_obj_set_size(list, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_flex_grow(list, 1);
+    lv_obj_set_style_bg_color(list, lv_color_hex(0x050A14), 0);
+    lv_obj_set_style_border_width(list, 1, 0);
+    lv_obj_set_style_border_color(list, ui_border_color(), 0);
+    lv_obj_set_style_pad_all(list, 6, 0);
+    lv_obj_set_style_pad_row(list, 4, 0);
+    lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
+
+    lv_obj_t *close_btn = lv_btn_create(popup);
+    lv_obj_set_size(close_btn, 150, 42);
+    lv_obj_set_style_bg_color(close_btn, COLOR_MATERIAL_BLUE, 0);
+    lv_obj_set_style_radius(close_btn, 8, 0);
+    lv_obj_add_event_cb(close_btn, pcap_viewer_packet_detail_close_cb,
+                        LV_EVENT_CLICKED, state);
+    lv_obj_t *close_label = lv_label_create(close_btn);
+    lv_label_set_text(close_label, "Close");
+    lv_obj_center(close_label);
+    return list;
+}
+
+static void pcap_viewer_connection_filter_cb(lv_event_t *e)
+{
+    uintptr_t encoded = (uintptr_t)lv_event_get_user_data(e);
+    tab_context_t *ctx = get_current_ctx();
+    pcap_viewer_state_t *state = pcap_viewer_get_state(ctx, false);
+    if (!state || !state->flow_analysis || encoded == 0) return;
+    uint16_t flow_id = (uint16_t)(encoded - 1U);
+    if (flow_id >= state->flow_analysis->flow_count) return;
+    pcap_flow_filter_clear(&state->quick_filter);
+    state->quick_filter.enabled = true;
+    state->quick_filter.has_flow = true;
+    state->quick_filter.flow_id = flow_id;
+    pcap_viewer_close_detail(state);
+    pcap_viewer_render_capture_page(state);
+}
+
+static void pcap_viewer_connection_follow_cb(lv_event_t *e)
+{
+    uintptr_t encoded = (uintptr_t)lv_event_get_user_data(e);
+    tab_context_t *ctx = get_current_ctx();
+    pcap_viewer_state_t *state = pcap_viewer_get_state(ctx, false);
+    if (!state || encoded == 0) return;
+    uint16_t flow_id = (uint16_t)(encoded - 1U);
+    pcap_viewer_close_detail(state);
+    pcap_viewer_follow_flow(state, flow_id);
+}
+
+static void pcap_viewer_connection_hex_cb(lv_event_t *e)
+{
+    uintptr_t encoded = (uintptr_t)lv_event_get_user_data(e);
+    tab_context_t *ctx = get_current_ctx();
+    pcap_viewer_state_t *state = pcap_viewer_get_state(ctx, false);
+    if (!state || encoded == 0U) return;
+    uint16_t flow_id = (uint16_t)(encoded - 1U);
+    pcap_viewer_close_detail(state);
+    pcap_viewer_follow_flow_mode(state, flow_id, PCAP_FLOW_STREAM_HEX);
+}
+
+static const char *pcap_viewer_tcp_state(const pcap_flow_entry_t *flow)
+{
+    if (!flow || flow->ip_protocol != 6) return "DATAGRAM";
+    uint8_t flags = flow->originator_tcp_flags | flow->responder_tcp_flags;
+    if (flags & 0x04U) return "RESET";
+    bool syn = (flow->originator_tcp_flags & 0x02U) != 0;
+    bool syn_ack = (flow->responder_tcp_flags & 0x12U) == 0x12U;
+    if (!syn || !syn_ack) return "INCOMPLETE";
+    if (flags & 0x01U) return "CLOSED";
+    return "ESTABLISHED";
+}
+
+static lv_obj_t *pcap_viewer_small_action(lv_obj_t *parent, const char *text,
+                                          lv_event_cb_t callback, uintptr_t encoded,
+                                          lv_color_t color)
+{
+    lv_obj_t *button = lv_btn_create(parent);
+    lv_obj_set_size(button, 94, 34);
+    lv_obj_set_style_bg_color(button, color, 0);
+    lv_obj_set_style_radius(button, 7, 0);
+    lv_obj_set_style_pad_all(button, 3, 0);
+    lv_obj_add_event_cb(button, callback, LV_EVENT_CLICKED, (void *)encoded);
+    lv_obj_t *label = lv_label_create(button);
+    lv_label_set_text(label, text);
+    lv_obj_set_style_text_font(label, &lv_font_montserrat_12, 0);
+    lv_obj_center(label);
+    return button;
+}
+
+static bool pcap_viewer_dns_name_equal(const char *left, const char *right)
+{
+    if (!left || !right) return false;
+    size_t left_len = strlen(left);
+    size_t right_len = strlen(right);
+    while (left_len > 0U && left[left_len - 1U] == '.') left_len--;
+    while (right_len > 0U && right[right_len - 1U] == '.') right_len--;
+    return left_len == right_len && left_len > 0U &&
+           strncasecmp(left, right, left_len) == 0;
+}
+
+static void pcap_viewer_dns_add_unique(char entries[][64], uint16_t *count,
+                                       uint16_t capacity, bool *limited,
+                                       const char *value)
+{
+    if (!entries || !count || !value || !value[0]) return;
+    for (uint16_t i = 0; i < *count; i++) {
+        if (strcasecmp(entries[i], value) == 0) return;
+    }
+    if (*count >= capacity) {
+        if (limited) *limited = true;
+        return;
+    }
+    pcap_viewer_copy_text(entries[*count], sizeof(entries[*count]), value);
+    (*count)++;
+}
+
+static bool pcap_viewer_dns_flow_uses_address(
+    const pcap_flow_entry_t *flow, const pcap_dns_domain_detail_t *detail)
+{
+    if (!flow || !detail) return false;
+    for (uint16_t i = 0; i < detail->address_count; i++) {
+        if (strcasecmp(flow->originator, detail->addresses[i]) == 0 ||
+            strcasecmp(flow->responder, detail->addresses[i]) == 0) return true;
+    }
+    return false;
+}
+
+static void pcap_viewer_dns_add_related_flow(pcap_dns_domain_detail_t *detail,
+                                             uint16_t flow_id, uint64_t bytes)
+{
+    if (!detail) return;
+    if (detail->flow_count < PCAP_DNS_DETAIL_MAX_FLOWS) {
+        detail->flows[detail->flow_count].flow_id = flow_id;
+        detail->flows[detail->flow_count].bytes = bytes;
+        detail->flow_count++;
+        return;
+    }
+    detail->flow_limited = true;
+    uint16_t smallest = 0;
+    for (uint16_t i = 1; i < detail->flow_count; i++) {
+        if (detail->flows[i].bytes < detail->flows[smallest].bytes) smallest = i;
+    }
+    if (bytes > detail->flows[smallest].bytes) {
+        detail->flows[smallest].flow_id = flow_id;
+        detail->flows[smallest].bytes = bytes;
+    }
+}
+
+static bool pcap_viewer_dns_build_domain_detail(
+    pcap_viewer_state_t *state, const char *domain, pcap_dns_domain_detail_t *detail)
+{
+    if (!state || !domain || !detail || !state->reader || !state->packet_index ||
+        !state->summary) return false;
+    uint32_t packet_count = (uint32_t)state->summary->analyzed_packets;
+    if (packet_count > state->scan_summary.indexed_packets) {
+        packet_count = state->scan_summary.indexed_packets;
+    }
+    if (packet_count > PCAP_VIEWER_MAX_INDEXED_PACKETS) {
+        packet_count = PCAP_VIEWER_MAX_INDEXED_PACKETS;
+    }
+    for (uint32_t i = 0; i < packet_count; i++) {
+        pcap_packet_details_t packet_details;
+        if (pcap_reader_describe_packet(state->reader, &state->packet_index[i],
+                                        &packet_details) != PCAP_READER_OK ||
+            !packet_details.dns_valid ||
+            !pcap_viewer_dns_name_equal(packet_details.dns_query, domain)) continue;
+        if (packet_details.dns_response) {
+            detail->response_packets++;
+            for (uint8_t address_index = 0;
+                 address_index < packet_details.dns_address_count;
+                 address_index++) {
+                pcap_viewer_dns_add_unique(
+                    detail->addresses, &detail->address_count,
+                    PCAP_DNS_DETAIL_MAX_ADDRESSES, &detail->address_limited,
+                    packet_details.dns_addresses[address_index]);
+            }
+            if (packet_details.dns_address_count == 0U) {
+                pcap_viewer_dns_add_unique(detail->addresses,
+                                           &detail->address_count,
+                                           PCAP_DNS_DETAIL_MAX_ADDRESSES,
+                                           &detail->address_limited,
+                                           packet_details.dns_first_address);
+            }
+            if (packet_details.dns_address_limited) {
+                detail->address_limited = true;
+            }
+        } else {
+            detail->query_packets++;
+            pcap_viewer_dns_add_unique(detail->clients, &detail->client_count,
+                                       PCAP_DNS_DETAIL_MAX_CLIENTS,
+                                       &detail->client_limited,
+                                       packet_details.source);
+        }
+    }
+    if (state->flow_analysis) {
+        const pcap_flow_analysis_t *analysis = state->flow_analysis;
+        for (uint32_t i = 0; i < analysis->dns_name_count; i++) {
+            const pcap_dns_name_entry_t *entry = &analysis->dns_names[i];
+            if (pcap_viewer_dns_name_equal(entry->hostname, domain)) {
+                pcap_viewer_dns_add_unique(detail->addresses, &detail->address_count,
+                                           PCAP_DNS_DETAIL_MAX_ADDRESSES,
+                                           &detail->address_limited, entry->address);
+            }
+        }
+        for (uint16_t flow_id = 0; flow_id < analysis->flow_count; flow_id++) {
+            const pcap_flow_entry_t *flow = &analysis->flows[flow_id];
+            if (!pcap_viewer_dns_name_equal(flow->server_name, domain) &&
+                !pcap_viewer_dns_flow_uses_address(flow, detail)) continue;
+            pcap_viewer_dns_add_related_flow(
+                detail, flow_id, flow->originator_bytes + flow->responder_bytes);
+        }
+    }
+    for (uint16_t i = 0; i < detail->flow_count; i++) {
+        uint16_t best = i;
+        for (uint16_t j = i + 1U; j < detail->flow_count; j++) {
+            if (detail->flows[j].bytes > detail->flows[best].bytes) best = j;
+        }
+        pcap_dns_related_flow_t swap = detail->flows[i];
+        detail->flows[i] = detail->flows[best];
+        detail->flows[best] = swap;
+    }
+    return true;
+}
+
+static lv_obj_t *pcap_viewer_dns_section_title(lv_obj_t *list, const char *text)
+{
+    lv_obj_t *label = lv_label_create(list);
+    lv_label_set_text(label, text);
+    lv_obj_set_width(label, lv_pct(100));
+    lv_obj_set_style_text_font(label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(label, COLOR_NEON_CYAN, 0);
+    lv_obj_set_style_pad_top(label, 7, 0);
+    return label;
+}
+
+static void pcap_viewer_dns_add_counter_section(
+    lv_obj_t *list, const char *heading,
+    const pcap_summary_text_counter_t *entries, uint16_t count,
+    uint16_t limit, bool approximate)
+{
+    if (!list || !heading || !entries) return;
+    char title[96];
+    snprintf(title, sizeof(title), "%s%s", heading,
+             approximate ? " (approximate)" : "");
+    pcap_viewer_dns_section_title(list, title);
+    uint16_t shown = count < limit ? count : limit;
+    if (shown == 0U) {
+        lv_obj_t *empty = lv_label_create(list);
+        lv_label_set_text(empty, "  none");
+        lv_obj_set_style_text_color(empty, ui_muted_color(), 0);
+        return;
+    }
+    for (uint16_t i = 0; i < shown; i++) {
+        lv_obj_t *entry = lv_label_create(list);
+        lv_label_set_text_fmt(entry, "  %u. %s  -  %llu", (unsigned)i + 1U,
+                              entries[i].label,
+                              (unsigned long long)entries[i].count);
+        lv_obj_set_width(entry, lv_pct(100));
+        lv_label_set_long_mode(entry, LV_LABEL_LONG_DOT);
+        lv_obj_set_style_text_font(entry, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(entry, ui_text_color(), 0);
+    }
+}
+
+static void pcap_viewer_dns_back_cb(lv_event_t *e)
+{
+    pcap_viewer_state_t *state = (pcap_viewer_state_t *)lv_event_get_user_data(e);
+    pcap_viewer_show_dns_top(state);
+}
+
+static void pcap_viewer_dns_domain_cb(lv_event_t *e)
+{
+    uintptr_t encoded = (uintptr_t)lv_event_get_user_data(e);
+    tab_context_t *ctx = get_current_ctx();
+    pcap_viewer_state_t *state = pcap_viewer_get_state(ctx, false);
+    if (!state || !state->summary || encoded == 0U) return;
+    uint16_t domain_index = (uint16_t)(encoded - 1U);
+    if (domain_index >= state->summary->dns_domain_count) return;
+    const char *domain = state->summary->dns_domains[domain_index].label;
+    pcap_dns_domain_detail_t *detail = heap_caps_calloc(
+        1, sizeof(*detail), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!detail) {
+        pcap_viewer_show_summary_popup(state, "DNS domain", "Not enough PSRAM.");
+        return;
+    }
+    if (!pcap_viewer_dns_build_domain_detail(state, domain, detail)) {
+        heap_caps_free(detail);
+        pcap_viewer_show_summary_popup(state, "DNS domain",
+                                       "Could not inspect indexed DNS packets.");
+        return;
+    }
+
+    char title[128];
+    snprintf(title, sizeof(title), LV_SYMBOL_LIST " DNS: %.96s", domain);
+    lv_obj_t *list = pcap_viewer_create_analysis_list(state, title);
+    if (!list) {
+        heap_caps_free(detail);
+        return;
+    }
+    lv_obj_t *back = lv_btn_create(list);
+    lv_obj_set_size(back, 190, 38);
+    lv_obj_set_style_bg_color(back, COLOR_MATERIAL_BLUE, 0);
+    lv_obj_set_style_radius(back, 7, 0);
+    lv_obj_add_event_cb(back, pcap_viewer_dns_back_cb, LV_EVENT_CLICKED, state);
+    lv_obj_t *back_label = lv_label_create(back);
+    lv_label_set_text(back_label, LV_SYMBOL_LEFT " BACK TO DNS");
+    lv_obj_center(back_label);
+
+    lv_obj_t *summary = lv_label_create(list);
+    lv_label_set_text_fmt(
+        summary,
+        "DNS queries %lu | responses %lu | clients %u%s | resolved IPs %u%s\n"
+        "Related flows are correlated by DNS address or exact TLS SNI / HTTP Host.",
+        (unsigned long)detail->query_packets,
+        (unsigned long)detail->response_packets,
+        (unsigned)detail->client_count, detail->client_limited ? "+" : "",
+        (unsigned)detail->address_count, detail->address_limited ? "+" : "");
+    lv_obj_set_width(summary, lv_pct(100));
+    lv_label_set_long_mode(summary, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(summary, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(summary, ui_muted_color(), 0);
+
+    pcap_viewer_dns_section_title(list, "WHO QUERIED IT");
+    if (detail->client_count == 0U) {
+        lv_obj_t *none = lv_label_create(list);
+        lv_label_set_text(none, "  No decoded query client in the indexed sample.");
+        lv_obj_set_style_text_color(none, ui_muted_color(), 0);
+    }
+    for (uint16_t i = 0; i < detail->client_count; i++) {
+        const char *hostname = state->flow_analysis
+                                   ? pcap_flow_hostname_for_address(
+                                         state->flow_analysis, detail->clients[i])
+                                   : NULL;
+        lv_obj_t *client = lv_label_create(list);
+        if (hostname && hostname[0] && strcasecmp(hostname, detail->clients[i]) != 0) {
+            lv_label_set_text_fmt(client, "  %s  (%s)", hostname, detail->clients[i]);
+        } else {
+            lv_label_set_text_fmt(client, "  %s", detail->clients[i]);
+        }
+        lv_obj_set_width(client, lv_pct(100));
+        lv_label_set_long_mode(client, LV_LABEL_LONG_DOT);
+        lv_obj_set_style_text_color(client, ui_text_color(), 0);
+    }
+
+    pcap_viewer_dns_section_title(list, "RESOLVED ADDRESSES");
+    if (detail->address_count == 0U) {
+        lv_obj_t *none = lv_label_create(list);
+        lv_label_set_text(none, "  No A/AAAA address decoded in the indexed sample.");
+        lv_obj_set_style_text_color(none, ui_muted_color(), 0);
+    }
+    for (uint16_t i = 0; i < detail->address_count; i++) {
+        lv_obj_t *address = lv_label_create(list);
+        lv_label_set_text_fmt(address, "  %s", detail->addresses[i]);
+        lv_obj_set_width(address, lv_pct(100));
+        lv_label_set_long_mode(address, LV_LABEL_LONG_DOT);
+        lv_obj_set_style_text_color(address, ui_text_color(), 0);
+    }
+
+    pcap_viewer_dns_section_title(list, "RELATED FLOWS  (largest first)");
+    if (detail->flow_count == 0U) {
+        lv_obj_t *none = lv_label_create(list);
+        lv_label_set_text(none,
+                          "  No matching TCP/UDP flow was found in the indexed sample.");
+        lv_obj_set_style_text_color(none, ui_muted_color(), 0);
+    }
+    for (uint16_t i = 0; i < detail->flow_count; i++) {
+        uint16_t flow_id = detail->flows[i].flow_id;
+        const pcap_flow_entry_t *flow = &state->flow_analysis->flows[flow_id];
+        lv_obj_t *row = lv_obj_create(list);
+        lv_obj_set_size(row, lv_pct(100), 76);
+        lv_obj_set_style_bg_color(row, (i & 1U) ? ui_card_pressed_color() : ui_card_color(), 0);
+        lv_obj_set_style_border_width(row, 1, 0);
+        lv_obj_set_style_border_color(row, ui_border_color(), 0);
+        lv_obj_set_style_pad_all(row, 5, 0);
+        lv_obj_set_style_pad_column(row, 7, 0);
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START,
+                              LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_t *label = lv_label_create(row);
+        lv_label_set_text_fmt(
+            label, "#%u  %s:%u  ->  %s:%u\n%s/%s | %lu packets | %llu bytes%s%s",
+            (unsigned)flow_id + 1U, flow->originator, flow->originator_port,
+            flow->responder, flow->responder_port,
+            pcap_flow_transport_name(flow->ip_protocol),
+            pcap_flow_application_name((pcap_application_t)flow->app_protocol),
+            (unsigned long)(flow->originator_packets + flow->responder_packets),
+            (unsigned long long)detail->flows[i].bytes,
+            flow->server_name[0] ? " | host: " : "",
+            flow->server_name[0] ? flow->server_name : "");
+        lv_obj_set_flex_grow(label, 1);
+        lv_obj_set_width(label, 0);
+        lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
+        lv_obj_set_style_text_font(label, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(label, ui_text_color(), 0);
+        pcap_viewer_small_action(row, "FILTER", pcap_viewer_connection_filter_cb,
+                                 (uintptr_t)flow_id + 1U, lv_color_hex(0x087EA4));
+        pcap_viewer_small_action(row, "FOLLOW", pcap_viewer_connection_follow_cb,
+                                 (uintptr_t)flow_id + 1U, COLOR_MATERIAL_PURPLE);
+        pcap_viewer_small_action(row, "HEX", pcap_viewer_connection_hex_cb,
+                                 (uintptr_t)flow_id + 1U, COLOR_MATERIAL_TEAL);
+    }
+    if (detail->flow_limited) {
+        lv_obj_t *limited = lv_label_create(list);
+        lv_label_set_text_fmt(limited,
+                              "Showing the %u largest related flows (bounded view).",
+                              (unsigned)PCAP_DNS_DETAIL_MAX_FLOWS);
+        lv_obj_set_style_text_color(limited, COLOR_MATERIAL_AMBER, 0);
+    }
+    heap_caps_free(detail);
+}
+
+static void pcap_viewer_show_dns_top(pcap_viewer_state_t *state)
+{
+    if (!state || !state->summary) return;
+    const pcap_summary_t *summary = state->summary;
+    bool sampled = summary->analyzed_packets < state->scan_summary.packet_count;
+    lv_obj_t *list = pcap_viewer_create_analysis_list(
+        state, LV_SYMBOL_LIST " DNS (tap a domain for hosts and flows)");
+    if (!list) return;
+
+    lv_obj_t *overview = lv_label_create(list);
+    lv_label_set_text_fmt(
+        overview,
+        "Scope: %llu indexed packet(s)%s\n"
+        "DNS packets %llu | queries %llu | responses %llu | unique domains %llu%s\n"
+        "RCODE: NOERROR %llu | NXDOMAIN %llu | SERVFAIL %llu | other %llu\n"
+        "Long names >=50 chars %llu | >=5 labels %llu",
+        (unsigned long long)summary->analyzed_packets,
+        sampled ? " (capture sample)" : "",
+        (unsigned long long)summary->dns_packets,
+        (unsigned long long)summary->dns_queries,
+        (unsigned long long)summary->dns_responses,
+        (unsigned long long)summary->dns_unique_domains_observed,
+        summary->dns_domain_table_approximate ? " (approximate)" : "",
+        (unsigned long long)summary->dns_noerror,
+        (unsigned long long)summary->dns_nxdomain,
+        (unsigned long long)summary->dns_servfail,
+        (unsigned long long)summary->dns_other_rcode,
+        (unsigned long long)summary->dns_long_names,
+        (unsigned long long)summary->dns_many_label_names);
+    lv_obj_set_width(overview, lv_pct(100));
+    lv_label_set_long_mode(overview, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(overview, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(overview, ui_text_color(), 0);
+
+    pcap_viewer_dns_section_title(
+        list, summary->dns_domain_table_approximate
+                  ? "TOP DOMAINS (approximate) - TAP TO INSPECT"
+                  : "TOP DOMAINS - TAP TO INSPECT");
+    uint16_t shown = summary->dns_domain_count < 24U
+                         ? summary->dns_domain_count : 24U;
+    if (shown == 0U) {
+        lv_obj_t *none = lv_label_create(list);
+        lv_label_set_text(none,
+                          "No decoded DNS names. Encrypted Wi-Fi payloads and "
+                          "handshake-only captures do not expose DNS.");
+        lv_obj_set_width(none, lv_pct(100));
+        lv_label_set_long_mode(none, LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_text_color(none, ui_muted_color(), 0);
+    }
+    for (uint16_t i = 0; i < shown; i++) {
+        lv_obj_t *row = lv_btn_create(list);
+        lv_obj_set_size(row, lv_pct(100), 54);
+        lv_obj_set_style_bg_color(row, (i & 1U) ? ui_card_pressed_color() : ui_card_color(), 0);
+        lv_obj_set_style_border_width(row, 1, 0);
+        lv_obj_set_style_border_color(row, ui_border_color(), 0);
+        lv_obj_set_style_radius(row, 7, 0);
+        lv_obj_add_event_cb(row, pcap_viewer_dns_domain_cb, LV_EVENT_CLICKED,
+                            (void *)(uintptr_t)(i + 1U));
+        lv_obj_t *label = lv_label_create(row);
+        lv_label_set_text_fmt(label, "%u. %s\n%llu DNS packet observation(s)  " LV_SYMBOL_RIGHT,
+                              (unsigned)i + 1U,
+                              summary->dns_domains[i].label,
+                              (unsigned long long)summary->dns_domains[i].count);
+        lv_obj_set_width(label, lv_pct(100));
+        lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
+        lv_obj_set_style_text_font(label, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(label, ui_text_color(), 0);
+        lv_obj_center(label);
+    }
+    if (shown < summary->dns_domain_count) {
+        lv_obj_t *limited = lv_label_create(list);
+        lv_label_set_text_fmt(limited, "Showing top %u of %u tracked domains.",
+                              (unsigned)shown,
+                              (unsigned)summary->dns_domain_count);
+        lv_obj_set_style_text_color(limited, COLOR_MATERIAL_AMBER, 0);
+    }
+
+    pcap_viewer_dns_add_counter_section(list, "QUERY TYPES", summary->dns_types,
+                                        summary->dns_type_count, 10U,
+                                        summary->dns_type_table_approximate);
+    pcap_viewer_dns_add_counter_section(list, "TOP ANSWERS", summary->dns_answers,
+                                        summary->dns_answer_count, 10U,
+                                        summary->dns_answer_table_approximate);
+    pcap_viewer_dns_add_counter_section(list, "DNS CLIENTS", summary->dns_clients,
+                                        summary->dns_client_count, 8U,
+                                        summary->dns_client_table_approximate);
+    pcap_viewer_dns_add_counter_section(list, "DNS SERVERS", summary->dns_servers,
+                                        summary->dns_server_count, 8U,
+                                        summary->dns_server_table_approximate);
+    lv_obj_t *note = lv_label_create(list);
+    lv_label_set_text(note,
+                      "Long-name counters and DNS-to-flow correlation are investigative "
+                      "hints, not a security verdict.");
+    lv_obj_set_width(note, lv_pct(100));
+    lv_label_set_long_mode(note, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(note, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(note, ui_muted_color(), 0);
+}
+
+static void pcap_viewer_connections_cb(lv_event_t *e)
+{
+    pcap_viewer_state_t *state = (pcap_viewer_state_t *)lv_event_get_user_data(e);
+    if (!state || !state->flow_analysis) return;
+    lv_obj_t *list = pcap_viewer_create_analysis_list(
+        state, LV_SYMBOL_LIST " Connections (tap FILTER or FOLLOW)");
+    if (!list) return;
+    if (state->flow_analysis->flow_limited) {
+        lv_obj_t *warning = lv_label_create(list);
+        lv_label_set_text_fmt(warning,
+                              "FLOW TABLE LIMITED: %lu packet(s) could not be assigned.",
+                              (unsigned long)state->flow_analysis->overflow_packets);
+        lv_obj_set_width(warning, lv_pct(100));
+        lv_label_set_long_mode(warning, LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_text_color(warning, COLOR_MATERIAL_AMBER, 0);
+    }
+    uint32_t count = state->flow_analysis->flow_count;
+    uint16_t order[PCAP_FLOW_MAX_FLOWS];
+    for (uint16_t i = 0; i < count; i++) order[i] = i;
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t best = i;
+        uint64_t best_bytes = 0;
+        for (uint32_t j = i; j < count; j++) {
+            const pcap_flow_entry_t *candidate =
+                &state->flow_analysis->flows[order[j]];
+            uint64_t bytes = candidate->originator_bytes + candidate->responder_bytes;
+            if (bytes > best_bytes) {
+                best = j;
+                best_bytes = bytes;
+            }
+        }
+        uint16_t swap = order[i];
+        order[i] = order[best];
+        order[best] = swap;
+    }
+    uint32_t shown = count < 100U ? count : 100U;
+    for (uint32_t i = 0; i < shown; i++) {
+        uint16_t flow_id = order[i];
+        const pcap_flow_entry_t *flow = &state->flow_analysis->flows[flow_id];
+        lv_obj_t *row = lv_btn_create(list);
+        lv_obj_set_size(row, lv_pct(100), 84);
+        lv_obj_set_style_bg_color(row, (i & 1U) ? ui_card_pressed_color() : ui_card_color(), 0);
+        lv_obj_set_style_border_width(row, 1, 0);
+        lv_obj_set_style_border_color(row, ui_border_color(), 0);
+        lv_obj_set_style_pad_all(row, 5, 0);
+        lv_obj_set_style_pad_column(row, 7, 0);
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START,
+                              LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        double duration = flow->last_time_us >= flow->first_time_us
+                              ? (double)(flow->last_time_us - flow->first_time_us) / 1000000.0
+                              : 0.0;
+        char tcp_diagnostics[112] = {0};
+        if (flow->ip_protocol == 6U) {
+            snprintf(tcp_diagnostics, sizeof(tcp_diagnostics),
+                     "RTT %s%.2f ms | retrans %lu/%lu | zero-window %lu",
+                     flow->handshake_rtt_us ? "" : "~",
+                     (double)flow->handshake_rtt_us / 1000.0,
+                     (unsigned long)flow->originator_retransmissions,
+                     (unsigned long)flow->responder_retransmissions,
+                     (unsigned long)flow->zero_window_packets);
+        }
+        lv_obj_t *label = lv_label_create(row);
+        lv_label_set_text_fmt(label,
+                              "#%u  %s:%u  ->  %s:%u\n%s | %s | %s | %.3fs | %lu/%lu pkt | %llu/%llu B\n%s%s%s%s%s%s",
+                              (unsigned)flow_id + 1U,
+                              flow->originator, flow->originator_port,
+                              flow->responder, flow->responder_port,
+                              pcap_flow_application_name(
+                                  (pcap_application_t)flow->app_protocol),
+                              pcap_flow_confidence_name(
+                                  (pcap_app_confidence_t)flow->app_confidence),
+                              pcap_viewer_tcp_state(flow), duration,
+                              (unsigned long)flow->originator_packets,
+                              (unsigned long)flow->responder_packets,
+                              (unsigned long long)flow->originator_bytes,
+                              (unsigned long long)flow->responder_bytes,
+                              flow->server_name[0] ? "server: " : "",
+                              flow->server_name[0] ? flow->server_name : "",
+                              flow->server_name[0] && flow->application_detail[0] ? " | " : "",
+                              flow->application_detail[0] ? flow->application_detail : "",
+                              tcp_diagnostics[0] ? "\n" : "", tcp_diagnostics);
+        lv_obj_set_flex_grow(label, 1);
+        lv_obj_set_width(label, 0);
+        lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
+        lv_obj_set_style_text_font(label, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(label, ui_text_color(), 0);
+        pcap_viewer_small_action(row, "FILTER", pcap_viewer_connection_filter_cb,
+                                 (uintptr_t)flow_id + 1U, lv_color_hex(0x087EA4));
+        pcap_viewer_small_action(row, "FOLLOW", pcap_viewer_connection_follow_cb,
+                                 (uintptr_t)flow_id + 1U, COLOR_MATERIAL_PURPLE);
+        pcap_viewer_small_action(row, "HEX", pcap_viewer_connection_hex_cb,
+                                 (uintptr_t)flow_id + 1U, COLOR_MATERIAL_TEAL);
+    }
+    if (shown < count) {
+        lv_obj_t *limited = lv_label_create(list);
+        lv_label_set_text_fmt(limited, "Showing top %lu of %lu flows by bytes.",
+                              (unsigned long)shown, (unsigned long)count);
+        lv_obj_set_style_text_color(limited, COLOR_MATERIAL_AMBER, 0);
+    }
+}
+
+static void pcap_viewer_application_filter_cb(lv_event_t *e)
+{
+    uintptr_t encoded = (uintptr_t)lv_event_get_user_data(e);
+    tab_context_t *ctx = get_current_ctx();
+    pcap_viewer_state_t *state = pcap_viewer_get_state(ctx, false);
+    if (!state || encoded == 0 || encoded > PCAP_APP_COUNT) return;
+    pcap_flow_filter_clear(&state->quick_filter);
+    state->quick_filter.enabled = true;
+    state->quick_filter.has_application = true;
+    state->quick_filter.application = (uint8_t)(encoded - 1U);
+    pcap_viewer_close_detail(state);
+    pcap_viewer_render_capture_page(state);
+}
+
+static void pcap_viewer_protocols_cb(lv_event_t *e)
+{
+    pcap_viewer_state_t *state = (pcap_viewer_state_t *)lv_event_get_user_data(e);
+    if (!state || !state->flow_analysis) return;
+    lv_obj_t *list = pcap_viewer_create_analysis_list(
+        state, LV_SYMBOL_LIST " Top Application Protocols");
+    if (!list) return;
+    if (state->flow_analysis->flow_limited) {
+        lv_obj_t *warning = lv_label_create(list);
+        lv_label_set_text(warning,
+                          "FLOW TABLE LIMITED - application flow counts are a bounded sample.");
+        lv_obj_set_width(warning, lv_pct(100));
+        lv_label_set_long_mode(warning, LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_text_color(warning, COLOR_MATERIAL_AMBER, 0);
+    }
+    uint8_t order[PCAP_APP_COUNT];
+    for (uint8_t i = 0; i < PCAP_APP_COUNT; i++) order[i] = i;
+    for (uint8_t i = 0; i < PCAP_APP_COUNT; i++) {
+        uint8_t best = i;
+        for (uint8_t j = i + 1U; j < PCAP_APP_COUNT; j++) {
+            if (state->flow_analysis->applications[order[j]].packets >
+                state->flow_analysis->applications[order[best]].packets) best = j;
+        }
+        uint8_t swap = order[i];
+        order[i] = order[best];
+        order[best] = swap;
+    }
+    for (uint8_t i = 0; i < PCAP_APP_COUNT; i++) {
+        uint8_t app = order[i];
+        const pcap_app_summary_t *summary = &state->flow_analysis->applications[app];
+        if (summary->packets == 0 && summary->flows == 0) continue;
+        lv_obj_t *row = lv_btn_create(list);
+        lv_obj_set_size(row, lv_pct(100), 54);
+        lv_obj_set_style_bg_color(row, (i & 1U) ? ui_card_pressed_color() : ui_card_color(), 0);
+        lv_obj_set_style_border_width(row, 1, 0);
+        lv_obj_set_style_border_color(row, ui_border_color(), 0);
+        lv_obj_set_style_radius(row, 7, 0);
+        lv_obj_add_event_cb(row, pcap_viewer_application_filter_cb, LV_EVENT_CLICKED,
+                            (void *)(uintptr_t)(app + 1U));
+        lv_obj_t *label = lv_label_create(row);
+        lv_label_set_text_fmt(label,
+                              "%s\n%llu packets | %llu bytes | %lu flows | confirmed %lu pkt | likely %lu pkt",
+                              pcap_flow_application_name((pcap_application_t)app),
+                              (unsigned long long)summary->packets,
+                              (unsigned long long)summary->bytes,
+                              (unsigned long)summary->flows,
+                              (unsigned long)summary->confirmed_packets,
+                              (unsigned long)summary->likely_packets);
+        lv_obj_set_width(label, lv_pct(100));
+        lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
+        lv_obj_set_style_text_font(label, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(label, ui_text_color(), 0);
+        lv_obj_center(label);
+    }
+}
+
+static void pcap_viewer_device_filter_cb(lv_event_t *e)
+{
+    uintptr_t encoded = (uintptr_t)lv_event_get_user_data(e);
+    tab_context_t *ctx = get_current_ctx();
+    pcap_viewer_state_t *state = pcap_viewer_get_state(ctx, false);
+    if (!state || !state->flow_analysis || encoded == 0U) return;
+    uint32_t device_index = (uint32_t)(encoded - 1U);
+    if (device_index >= state->flow_analysis->device_count) return;
+    const pcap_device_entry_t *device = &state->flow_analysis->devices[device_index];
+    pcap_flow_filter_clear(&state->quick_filter);
+    state->quick_filter.enabled = true;
+    if (device->internal && device->mac[0]) {
+        state->quick_filter.has_any_mac = true;
+        pcap_viewer_copy_text(state->quick_filter.any_mac,
+                              sizeof(state->quick_filter.any_mac), device->mac);
+    } else {
+        state->quick_filter.has_any_address = true;
+        pcap_viewer_copy_text(state->quick_filter.any_address,
+                              sizeof(state->quick_filter.any_address), device->address);
+    }
+    state->packet_page = 0;
+    pcap_viewer_close_detail(state);
+    pcap_viewer_render_capture_page(state);
+}
+
+static uint64_t pcap_viewer_inventory_bytes(const pcap_flow_analysis_t *analysis,
+                                            uint16_t device_index, bool local_group)
+{
+    if (!analysis || device_index >= analysis->device_count) return 0U;
+    const pcap_device_entry_t *representative = &analysis->devices[device_index];
+    uint64_t bytes = 0U;
+    for (uint32_t i = 0; i < analysis->device_count; i++) {
+        const pcap_device_entry_t *candidate = &analysis->devices[i];
+        if (i == device_index ||
+            (local_group && pcap_flow_same_local_device(representative, candidate))) {
+            bytes += candidate->sent_bytes + candidate->received_bytes;
+        }
+    }
+    return bytes;
+}
+
+static bool pcap_viewer_local_device_representative(
+    const pcap_flow_analysis_t *analysis, uint16_t device_index)
+{
+    if (!analysis || device_index >= analysis->device_count ||
+        !analysis->devices[device_index].internal) return false;
+    for (uint16_t previous = 0; previous < device_index; previous++) {
+        if (pcap_flow_same_local_device(&analysis->devices[device_index],
+                                        &analysis->devices[previous])) return false;
+    }
+    return true;
+}
+
+static void pcap_viewer_investigation_finding_filter_cb(lv_event_t *e);
+
+static bool pcap_viewer_local_group_has_address(const pcap_flow_analysis_t *analysis,
+                                                uint16_t representative_index,
+                                                const char *address)
+{
+    if (!analysis || representative_index >= analysis->device_count ||
+        !address || !address[0]) return false;
+    const pcap_device_entry_t *representative =
+        &analysis->devices[representative_index];
+    for (uint32_t i = 0; i < analysis->device_count; i++) {
+        if (pcap_flow_same_local_device(representative, &analysis->devices[i]) &&
+            strcasecmp(analysis->devices[i].address, address) == 0) return true;
+    }
+    return false;
+}
+
+static void pcap_viewer_show_device_profile(pcap_viewer_state_t *state,
+                                            uint16_t device_index)
+{
+    if (!state || !state->flow_analysis || !state->investigation) return;
+    pcap_device_dossier_t dossier;
+    if (!pcap_investigation_device_dossier(state->flow_analysis,
+                                            state->investigation,
+                                            device_index, &dossier)) return;
+    lv_obj_t *list = pcap_viewer_create_analysis_list(
+        state, LV_SYMBOL_HOME " Device Dossier");
+    if (!list) return;
+
+    lv_obj_t *identity = lv_label_create(list);
+    lv_label_set_text_fmt(
+        identity,
+        "%s | role %s | risk %u/100 | %u finding(s)\nMAC %s | vendor %s\n%s",
+        dossier.hostname[0] ? dossier.hostname : "Unnamed local device",
+        dossier.role, dossier.risk_score, dossier.finding_count,
+        dossier.mac[0] ? dossier.mac : "not observed",
+        dossier.vendor[0] ? dossier.vendor : "unknown/offline DB missing",
+        dossier.addresses);
+    lv_obj_set_width(identity, lv_pct(100));
+    lv_label_set_long_mode(identity, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(identity, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(
+        identity, dossier.risk_score >= 70U ? COLOR_MATERIAL_RED :
+                  (dossier.risk_score >= 30U ? COLOR_MATERIAL_AMBER : COLOR_NEON_GREEN), 0);
+
+    lv_obj_t *actions = lv_obj_create(list);
+    lv_obj_set_size(actions, lv_pct(100), 42);
+    lv_obj_set_style_bg_opa(actions, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(actions, 0, 0);
+    lv_obj_set_style_pad_all(actions, 0, 0);
+    lv_obj_set_style_pad_column(actions, 8, 0);
+    lv_obj_set_flex_flow(actions, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(actions, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(actions, LV_OBJ_FLAG_SCROLLABLE);
+    pcap_viewer_small_action(actions, "FILTER MAC", pcap_viewer_device_filter_cb,
+                             (uintptr_t)device_index + 1U, COLOR_MATERIAL_TEAL);
+
+    lv_obj_t *traffic = lv_label_create(list);
+    double active_seconds = dossier.last_time_us >= dossier.first_time_us
+                                ? (double)(dossier.last_time_us - dossier.first_time_us) /
+                                      1000000.0 : 0.0;
+    lv_label_set_text_fmt(
+        traffic,
+        "Observed activity\n%lu flow(s) | %lu peer(s) | %lu service(s) | %.3f s span\nTX %llu B | RX %llu B",
+        (unsigned long)dossier.flow_count,
+        (unsigned long)dossier.remote_peer_count,
+        (unsigned long)dossier.service_count, active_seconds,
+        (unsigned long long)dossier.sent_bytes,
+        (unsigned long long)dossier.received_bytes);
+    lv_obj_set_width(traffic, lv_pct(100));
+    lv_label_set_long_mode(traffic, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_color(traffic, ui_text_color(), 0);
+
+    lv_obj_t *services = lv_label_create(list);
+    lv_label_set_text_fmt(services, "Observed services\n%s",
+                          dossier.services[0] ? dossier.services : "none in indexed sample");
+    lv_obj_set_width(services, lv_pct(100));
+    lv_label_set_long_mode(services, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_color(services, COLOR_MATERIAL_CYAN, 0);
+
+    lv_obj_t *peers = lv_label_create(list);
+    lv_label_set_text_fmt(peers, "Top peers\n%s",
+                          dossier.top_peers[0] ? dossier.top_peers : "none");
+    lv_obj_set_width(peers, lv_pct(100));
+    lv_label_set_long_mode(peers, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_color(peers, COLOR_MATERIAL_PURPLE, 0);
+
+    lv_obj_t *domains = lv_label_create(list);
+    lv_label_set_text_fmt(domains, "Observed DNS/SNI names\n%s",
+                          dossier.top_domains[0] ? dossier.top_domains : "none associated with flows");
+    lv_obj_set_width(domains, lv_pct(100));
+    lv_label_set_long_mode(domains, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_color(domains, COLOR_MATERIAL_CYAN, 0);
+
+    lv_obj_t *finding_title = lv_label_create(list);
+    lv_label_set_text(finding_title, "Findings for this identity");
+    lv_obj_set_style_text_color(finding_title, COLOR_NEON_CYAN, 0);
+    uint32_t shown = 0U;
+    for (uint32_t i = 0; i < state->investigation->finding_count && shown < 20U; i++) {
+        const pcap_investigation_finding_t *finding =
+            &state->investigation->findings[i];
+        if (!pcap_viewer_local_group_has_address(state->flow_analysis, device_index,
+                                                  finding->source) &&
+            !pcap_viewer_local_group_has_address(state->flow_analysis, device_index,
+                                                  finding->target)) continue;
+        lv_obj_t *row = lv_obj_create(list);
+        lv_obj_set_size(row, lv_pct(100), 62);
+        lv_obj_set_style_bg_color(row, ui_card_color(), 0);
+        lv_obj_set_style_border_width(row, 1, 0);
+        lv_obj_set_style_border_color(
+            row, finding->severity >= PCAP_HEALTH_SUSPICIOUS
+                     ? COLOR_MATERIAL_RED : COLOR_MATERIAL_AMBER, 0);
+        lv_obj_set_style_radius(row, 7, 0);
+        lv_obj_set_style_pad_all(row, 6, 0);
+        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(row, pcap_viewer_investigation_finding_filter_cb,
+                            LV_EVENT_CLICKED, (void *)(uintptr_t)(i + 1U));
+        lv_obj_t *label = lv_label_create(row);
+        lv_label_set_text_fmt(
+            label, "%s | %s | %s\n%s",
+            pcap_investigation_finding_name(
+                (pcap_investigation_finding_type_t)finding->type),
+            pcap_flow_health_name((pcap_health_level_t)finding->severity),
+            pcap_flow_confidence_name((pcap_app_confidence_t)finding->confidence),
+            finding->detail);
+        lv_obj_set_width(label, lv_pct(100));
+        lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
+        lv_obj_set_style_text_font(label, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(label, ui_text_color(), 0);
+        lv_obj_center(label);
+        shown++;
+    }
+    if (shown == 0U) {
+        lv_obj_t *none = lv_label_create(list);
+        lv_label_set_text(none, "No finding references this local identity.");
+        lv_obj_set_style_text_color(none, ui_muted_color(), 0);
+    }
+}
+
+static void pcap_viewer_device_profile_cb(lv_event_t *e)
+{
+    uintptr_t encoded = (uintptr_t)lv_event_get_user_data(e);
+    pcap_viewer_state_t *state = pcap_viewer_get_state(get_current_ctx(), false);
+    if (!state || encoded == 0U) return;
+    pcap_viewer_show_device_profile(state, (uint16_t)(encoded - 1U));
+}
+
+static void pcap_viewer_inventory_services(const pcap_flow_analysis_t *analysis,
+                                           uint16_t device_index, bool local_group,
+                                           char *output, size_t output_size,
+                                           bool *limited_out)
+{
+    if (!output || output_size == 0U) return;
+    output[0] = '\0';
+    if (limited_out) *limited_out = false;
+    if (!analysis || device_index >= analysis->device_count) return;
+    const pcap_device_entry_t *representative = &analysis->devices[device_index];
+    struct {
+        uint16_t port;
+        uint8_t protocol;
+    } visible[5];
+    uint16_t visible_count = 0U;
+    bool more_services = false;
+    for (uint32_t i = 0; i < analysis->device_count; i++) {
+        const pcap_device_entry_t *candidate = &analysis->devices[i];
+        if (i != device_index &&
+            (!local_group || !pcap_flow_same_local_device(representative, candidate))) continue;
+        if (candidate->service_limited) more_services = true;
+        for (uint16_t service_index = 0; service_index < candidate->service_count;
+             service_index++) {
+            const pcap_device_service_t *service = &candidate->services[service_index];
+            bool duplicate = false;
+            for (uint16_t visible_index = 0; visible_index < visible_count; visible_index++) {
+                if (visible[visible_index].port == service->port &&
+                    visible[visible_index].protocol == service->ip_protocol) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (duplicate) continue;
+            if (visible_count >= 5U) {
+                more_services = true;
+                continue;
+            }
+            visible[visible_count].port = service->port;
+            visible[visible_count].protocol = service->ip_protocol;
+            visible_count++;
+        }
+    }
+    size_t position = 0U;
+    for (uint16_t i = 0; i < visible_count; i++) {
+        pcap_viewer_append_text(output, output_size, &position, "%s%s/%u",
+                                i ? ", " : "",
+                                pcap_flow_transport_name(visible[i].protocol),
+                                visible[i].port);
+    }
+    if (more_services) pcap_viewer_append_text(output, output_size, &position, " + more");
+    if (limited_out) *limited_out = more_services;
+}
+
+static void pcap_viewer_devices_cb(lv_event_t *e);
+static void pcap_viewer_remote_endpoints_cb(lv_event_t *e);
+
+static void pcap_viewer_inventory_mode_button(lv_obj_t *parent, const char *text,
+                                              bool active, lv_event_cb_t callback,
+                                              pcap_viewer_state_t *state)
+{
+    lv_obj_t *button = lv_btn_create(parent);
+    lv_obj_set_size(button, 0, 40);
+    lv_obj_set_flex_grow(button, 1);
+    lv_obj_set_style_bg_color(button,
+                              active ? COLOR_MATERIAL_GREEN : ui_card_pressed_color(), 0);
+    lv_obj_set_style_border_width(button, active ? 2 : 1, 0);
+    lv_obj_set_style_border_color(button,
+                                  active ? COLOR_NEON_CYAN : ui_border_color(), 0);
+    lv_obj_set_style_radius(button, 7, 0);
+    lv_obj_add_event_cb(button, callback, LV_EVENT_CLICKED, state);
+    lv_obj_t *label = lv_label_create(button);
+    lv_label_set_text(label, text);
+    lv_obj_set_style_text_font(label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(label, lv_color_white(), 0);
+    lv_obj_center(label);
+}
+
+static void pcap_viewer_render_inventory(pcap_viewer_state_t *state, bool remote_mode)
+{
+    if (!state || !state->flow_analysis) return;
+    const pcap_flow_analysis_t *analysis = state->flow_analysis;
+    uint32_t local_count = pcap_flow_local_device_count(analysis);
+    uint32_t remote_count = pcap_flow_remote_endpoint_count(analysis);
+    lv_obj_t *list = pcap_viewer_create_analysis_list(
+        state, remote_mode ? LV_SYMBOL_GPS " Remote Endpoints (tap to filter)"
+                           : LV_SYMBOL_HOME " Local Devices (tap to filter)");
+    if (!list) return;
+
+    lv_obj_t *mode_row = lv_obj_create(list);
+    lv_obj_set_size(mode_row, lv_pct(100), 44);
+    lv_obj_set_style_bg_opa(mode_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(mode_row, 0, 0);
+    lv_obj_set_style_pad_all(mode_row, 0, 0);
+    lv_obj_set_style_pad_column(mode_row, 8, 0);
+    lv_obj_set_flex_flow(mode_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(mode_row, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(mode_row, LV_OBJ_FLAG_SCROLLABLE);
+    char local_text[48];
+    char remote_text[48];
+    snprintf(local_text, sizeof(local_text), "LOCAL DEVICES (%lu)",
+             (unsigned long)local_count);
+    snprintf(remote_text, sizeof(remote_text), "REMOTE (%lu%s)",
+             (unsigned long)remote_count, analysis->device_limited ? "+" : "");
+    pcap_viewer_inventory_mode_button(mode_row, local_text, !remote_mode,
+                                      pcap_viewer_devices_cb, state);
+    pcap_viewer_inventory_mode_button(mode_row, remote_text, remote_mode,
+                                      pcap_viewer_remote_endpoints_cb, state);
+
+    lv_obj_t *explanation = lv_label_create(list);
+    lv_label_set_text(
+        explanation,
+        remote_mode
+            ? "Internet peers are kept as separate IP endpoints. Their MAC often belongs to the gateway."
+            : "Private/link-local IPv4 and IPv6 addresses sharing a MAC are one local device.");
+    lv_obj_set_width(explanation, lv_pct(100));
+    lv_label_set_long_mode(explanation, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(explanation, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(explanation, COLOR_MATERIAL_CYAN, 0);
+
+    if (analysis->device_limited) {
+        lv_obj_t *warning = lv_label_create(list);
+        lv_label_set_text(
+            warning,
+            remote_mode
+                ? "ENDPOINT TABLE LIMITED - remote results are a bounded sample."
+                : "ENDPOINT TABLE LIMITED - local entries are prioritized over WAN, but this remains a capture sample.");
+        lv_obj_set_width(warning, lv_pct(100));
+        lv_label_set_long_mode(warning, LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_text_color(warning, COLOR_MATERIAL_AMBER, 0);
+    }
+
+    uint16_t order[PCAP_FLOW_MAX_DEVICES];
+    uint32_t count = 0U;
+    for (uint16_t i = 0; i < analysis->device_count; i++) {
+        if ((remote_mode && !analysis->devices[i].internal) ||
+            (!remote_mode && pcap_viewer_local_device_representative(analysis, i))) {
+            order[count++] = i;
+        }
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t best = i;
+        for (uint32_t j = i + 1U; j < count; j++) {
+            uint64_t candidate_bytes =
+                pcap_viewer_inventory_bytes(analysis, order[j], !remote_mode);
+            uint64_t selected_bytes =
+                pcap_viewer_inventory_bytes(analysis, order[best], !remote_mode);
+            if (candidate_bytes > selected_bytes) best = j;
+        }
+        uint16_t swap = order[i];
+        order[i] = order[best];
+        order[best] = swap;
+    }
+    for (uint32_t row_index = 0; row_index < count; row_index++) {
+        uint16_t device_index = order[row_index];
+        const pcap_device_entry_t *device = &analysis->devices[device_index];
+        lv_obj_t *row = remote_mode ? lv_btn_create(list) : lv_obj_create(list);
+        lv_obj_set_size(row, lv_pct(100), remote_mode ? 66 : 88);
+        lv_obj_set_style_bg_color(row,
+                                  (row_index & 1U) ? ui_card_pressed_color() : ui_card_color(), 0);
+        lv_obj_set_style_border_width(row, 1, 0);
+        lv_obj_set_style_border_color(row, ui_border_color(), 0);
+        lv_obj_set_style_radius(row, 7, 0);
+        if (remote_mode) {
+            lv_obj_add_event_cb(row, pcap_viewer_device_filter_cb, LV_EVENT_CLICKED,
+                                (void *)(uintptr_t)(device_index + 1U));
+        } else {
+            lv_obj_set_style_pad_all(row, 6, 0);
+            lv_obj_set_style_pad_column(row, 7, 0);
+            lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+            lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START,
+                                  LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+            lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        }
+        char services[160] = {0};
+        bool services_limited = false;
+        pcap_viewer_inventory_services(analysis, device_index, !remote_mode,
+                                       services, sizeof(services), &services_limited);
+        lv_obj_t *label = lv_label_create(row);
+        if (remote_mode) {
+            lv_label_set_text_fmt(
+                label, "WAN  %s  |  %s\nTX %llu B/%lu pkt | RX %llu B/%lu pkt | services: %s%s",
+                device->address, device->hostname[0] ? device->hostname : "no name",
+                (unsigned long long)device->sent_bytes, (unsigned long)device->sent_packets,
+                (unsigned long long)device->received_bytes,
+                (unsigned long)device->received_packets,
+                services[0] ? services : "none", services_limited ? " [LIMITED]" : "");
+        } else {
+            char addresses[192] = {0};
+            size_t address_position = 0U;
+            uint32_t aliases = 0U;
+            uint64_t sent_bytes = 0U;
+            uint64_t received_bytes = 0U;
+            uint32_t sent_packets = 0U;
+            uint32_t received_packets = 0U;
+            const char *hostname = device->hostname;
+            for (uint32_t i = 0; i < analysis->device_count; i++) {
+                const pcap_device_entry_t *alias = &analysis->devices[i];
+                if (!pcap_flow_same_local_device(device, alias)) continue;
+                if (!hostname[0] && alias->hostname[0]) hostname = alias->hostname;
+                if (aliases < 3U) {
+                    pcap_viewer_append_text(addresses, sizeof(addresses), &address_position,
+                                            "%s%s", aliases ? " | " : "", alias->address);
+                }
+                aliases++;
+                sent_bytes += alias->sent_bytes;
+                received_bytes += alias->received_bytes;
+                sent_packets += alias->sent_packets;
+                received_packets += alias->received_packets;
+            }
+            if (aliases > 3U) {
+                pcap_viewer_append_text(addresses, sizeof(addresses), &address_position,
+                                        " | +%lu address(es)", (unsigned long)(aliases - 3U));
+            }
+            lv_label_set_text_fmt(
+                label, "LAN  %s  |  %s\nIP %s\nTX %llu B/%lu pkt | RX %llu B/%lu pkt | services: %s%s",
+                hostname[0] ? hostname : "no name", device->mac[0] ? device->mac : "no MAC",
+                addresses[0] ? addresses : device->address,
+                (unsigned long long)sent_bytes, (unsigned long)sent_packets,
+                (unsigned long long)received_bytes, (unsigned long)received_packets,
+                services[0] ? services : "none", services_limited ? " [LIMITED]" : "");
+        }
+        lv_obj_set_width(label, lv_pct(100));
+        if (!remote_mode) {
+            lv_obj_set_width(label, 0);
+            lv_obj_set_flex_grow(label, 1);
+        }
+        lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
+        lv_obj_set_style_text_font(label, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(label, ui_text_color(), 0);
+        if (remote_mode) {
+            lv_obj_center(label);
+        } else {
+            pcap_viewer_small_action(row, "PROFILE", pcap_viewer_device_profile_cb,
+                                     (uintptr_t)device_index + 1U, COLOR_MATERIAL_PURPLE);
+            pcap_viewer_small_action(row, "FILTER", pcap_viewer_device_filter_cb,
+                                     (uintptr_t)device_index + 1U, COLOR_MATERIAL_TEAL);
+        }
+    }
+    if (count == 0U) {
+        lv_obj_t *empty = lv_label_create(list);
+        lv_label_set_text(empty, remote_mode ? "No remote endpoints in the indexed sample."
+                                             : "No local devices in the indexed sample.");
+        lv_obj_set_style_text_color(empty, ui_muted_color(), 0);
+    }
+}
+
+static void pcap_viewer_devices_cb(lv_event_t *e)
+{
+    pcap_viewer_render_inventory(
+        (pcap_viewer_state_t *)lv_event_get_user_data(e), false);
+}
+
+static void pcap_viewer_remote_endpoints_cb(lv_event_t *e)
+{
+    pcap_viewer_render_inventory(
+        (pcap_viewer_state_t *)lv_event_get_user_data(e), true);
+}
+
+static void pcap_viewer_apply_investigation_finding(pcap_viewer_state_t *state,
+                                                     uint32_t finding_index)
+{
+    if (!state || !state->investigation || !state->flow_analysis ||
+        finding_index >= state->investigation->finding_count) return;
+    const pcap_investigation_finding_t *finding =
+        &state->investigation->findings[finding_index];
+    pcap_flow_filter_clear(&state->quick_filter);
+    state->quick_filter.enabled = true;
+    if (finding->type == PCAP_INV_FINDING_SUSPICIOUS_DNS_NAME ||
+        finding->type == PCAP_INV_FINDING_IOC_DOMAIN ||
+        finding->type == PCAP_INV_FINDING_ENCRYPTED_DNS) {
+        state->packet_filter = PCAP_FILTER_DNS;
+    }
+    if (finding->flow_id != PCAP_FLOW_ID_NONE &&
+        finding->flow_id < state->flow_analysis->flow_count) {
+        state->quick_filter.has_flow = true;
+        state->quick_filter.flow_id = finding->flow_id;
+    } else if (finding->source[0] && strchr(finding->source, ' ') == NULL &&
+               (strchr(finding->source, '.') || strchr(finding->source, ':'))) {
+        state->quick_filter.has_any_address = true;
+        pcap_viewer_copy_text(state->quick_filter.any_address,
+                              sizeof(state->quick_filter.any_address), finding->source);
+    } else if (finding->service_port > 0U) {
+        state->quick_filter.has_port = true;
+        state->quick_filter.port = finding->service_port;
+    }
+    if (finding->first_time_us > 0U &&
+        finding->last_time_us >= finding->first_time_us) {
+        state->quick_filter.has_time_window = true;
+        state->quick_filter.time_start_us = finding->first_time_us;
+        state->quick_filter.time_end_us = finding->last_time_us;
+    }
+    state->packet_page = 0;
+    pcap_viewer_close_detail(state);
+    pcap_viewer_render_capture_page(state);
+}
+
+static void pcap_viewer_investigation_finding_filter_cb(lv_event_t *e)
+{
+    uintptr_t encoded = (uintptr_t)lv_event_get_user_data(e);
+    tab_context_t *ctx = get_current_ctx();
+    pcap_viewer_state_t *state = pcap_viewer_get_state(ctx, false);
+    if (!state || encoded == 0U) return;
+    pcap_viewer_apply_investigation_finding(state, (uint32_t)(encoded - 1U));
+}
+
+typedef enum {
+    PCAP_INV_VIEW_FINDINGS = 0,
+    PCAP_INV_VIEW_TIMELINE,
+    PCAP_INV_VIEW_BASELINE,
+    PCAP_INV_VIEW_INTEL,
+} pcap_investigation_view_t;
+
+static void pcap_viewer_render_investigation(pcap_viewer_state_t *state,
+                                             pcap_investigation_view_t mode);
+
+static void pcap_viewer_investigation_mode_cb(lv_event_t *e)
+{
+    uintptr_t encoded = (uintptr_t)lv_event_get_user_data(e);
+    tab_context_t *ctx = get_current_ctx();
+    pcap_viewer_state_t *state = pcap_viewer_get_state(ctx, false);
+    if (!state || encoded == 0U || encoded > PCAP_INV_VIEW_INTEL + 1U) return;
+    pcap_viewer_render_investigation(
+        state, (pcap_investigation_view_t)(encoded - 1U));
+}
+
+static void pcap_viewer_investigation_mode_button(lv_obj_t *parent,
+                                                   const char *text,
+                                                   pcap_investigation_view_t button_mode,
+                                                   pcap_investigation_view_t active_mode)
+{
+    lv_obj_t *button = lv_btn_create(parent);
+    lv_obj_set_size(button, 0, 40);
+    lv_obj_set_flex_grow(button, 1);
+    lv_obj_set_style_bg_color(button,
+                              button_mode == active_mode ? COLOR_MATERIAL_PURPLE
+                                                         : ui_card_pressed_color(), 0);
+    lv_obj_set_style_border_width(button, button_mode == active_mode ? 2 : 1, 0);
+    lv_obj_set_style_border_color(button,
+                                  button_mode == active_mode ? COLOR_NEON_CYAN
+                                                             : ui_border_color(), 0);
+    lv_obj_set_style_radius(button, 7, 0);
+    lv_obj_add_event_cb(button, pcap_viewer_investigation_mode_cb,
+                        LV_EVENT_CLICKED, (void *)(uintptr_t)(button_mode + 1U));
+    lv_obj_t *label = lv_label_create(button);
+    lv_label_set_text(label, text);
+    lv_obj_set_style_text_font(label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(label, lv_color_white(), 0);
+    lv_obj_center(label);
+}
+
+static void pcap_viewer_render_investigation(pcap_viewer_state_t *state,
+                                             pcap_investigation_view_t mode)
+{
+    if (!state || !state->flow_analysis || !state->investigation) return;
+    const pcap_investigation_t *investigation = state->investigation;
+    lv_obj_t *list = pcap_viewer_create_analysis_list(
+        state, LV_SYMBOL_WARNING " ESPShark Offline Investigation");
+    if (!list) return;
+
+    lv_obj_t *tabs = lv_obj_create(list);
+    lv_obj_set_size(tabs, lv_pct(100), 44);
+    lv_obj_set_style_bg_opa(tabs, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(tabs, 0, 0);
+    lv_obj_set_style_pad_all(tabs, 0, 0);
+    lv_obj_set_style_pad_column(tabs, 8, 0);
+    lv_obj_set_flex_flow(tabs, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(tabs, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(tabs, LV_OBJ_FLAG_SCROLLABLE);
+    char findings_text[40];
+    snprintf(findings_text, sizeof(findings_text), "FINDINGS (%lu)",
+             (unsigned long)investigation->finding_count);
+    pcap_viewer_investigation_mode_button(tabs, findings_text,
+                                          PCAP_INV_VIEW_FINDINGS, mode);
+    pcap_viewer_investigation_mode_button(tabs, "TIMELINE",
+                                          PCAP_INV_VIEW_TIMELINE, mode);
+    pcap_viewer_investigation_mode_button(tabs, "BASELINE",
+                                          PCAP_INV_VIEW_BASELINE, mode);
+    pcap_viewer_investigation_mode_button(tabs, "INTEL",
+                                          PCAP_INV_VIEW_INTEL, mode);
+
+    lv_obj_t *scope = lv_label_create(list);
+    lv_label_set_text_fmt(
+        scope,
+        "Passive bounded evidence | WATCH %lu | SUSPICIOUS %lu | CRITICAL %lu | IOC %lu\n"
+        "Observed services are not proof of general port exposure or vulnerability.",
+        (unsigned long)investigation->watch_count,
+        (unsigned long)investigation->suspicious_count,
+        (unsigned long)investigation->critical_count,
+        (unsigned long)investigation->ioc_matches);
+    lv_obj_set_width(scope, lv_pct(100));
+    lv_label_set_long_mode(scope, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(scope, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(scope, COLOR_MATERIAL_CYAN, 0);
+
+    if (mode == PCAP_INV_VIEW_FINDINGS) {
+        for (uint32_t i = 0; i < investigation->finding_count; i++) {
+            const pcap_investigation_finding_t *finding = &investigation->findings[i];
+            lv_obj_t *row = lv_btn_create(list);
+            lv_obj_set_size(row, lv_pct(100), 76);
+            lv_obj_set_style_bg_color(row,
+                                      (i & 1U) ? ui_card_pressed_color() : ui_card_color(), 0);
+            lv_obj_set_style_border_width(row, 1, 0);
+            lv_obj_set_style_border_color(
+                row, finding->severity >= PCAP_HEALTH_SUSPICIOUS
+                         ? COLOR_MATERIAL_RED : COLOR_MATERIAL_AMBER, 0);
+            lv_obj_set_style_radius(row, 7, 0);
+            lv_obj_add_event_cb(row, pcap_viewer_investigation_finding_filter_cb,
+                                LV_EVENT_CLICKED, (void *)(uintptr_t)(i + 1U));
+            lv_obj_t *label = lv_label_create(row);
+            char port_text[16] = {0};
+            if (finding->service_port) {
+                snprintf(port_text, sizeof(port_text), ":%u", finding->service_port);
+            }
+            lv_label_set_text_fmt(
+                label, "%s | %s | %s | %s -> %s%s\n%s",
+                pcap_investigation_finding_name(
+                    (pcap_investigation_finding_type_t)finding->type),
+                pcap_flow_health_name((pcap_health_level_t)finding->severity),
+                pcap_flow_confidence_name((pcap_app_confidence_t)finding->confidence),
+                finding->source[0] ? finding->source : "-",
+                finding->target[0] ? finding->target : "-",
+                port_text, finding->detail);
+            lv_obj_set_width(label, lv_pct(100));
+            lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
+            lv_obj_set_style_text_font(label, &lv_font_montserrat_12, 0);
+            lv_obj_set_style_text_color(label, ui_text_color(), 0);
+            lv_obj_center(label);
+        }
+        if (investigation->finding_limited) {
+            lv_obj_t *warning = lv_label_create(list);
+            lv_label_set_text(warning, "FINDING TABLE LIMITED - additional evidence omitted.");
+            lv_obj_set_style_text_color(warning, COLOR_MATERIAL_AMBER, 0);
+        }
+    } else if (mode == PCAP_INV_VIEW_TIMELINE) {
+        uint64_t first_time = 0U;
+        for (uint32_t i = 0; i < investigation->timeline_count; i++) {
+            if (investigation->timeline[i].time_us > 0U &&
+                (first_time == 0U || investigation->timeline[i].time_us < first_time)) {
+                first_time = investigation->timeline[i].time_us;
+            }
+        }
+        for (uint32_t i = 0; i < investigation->timeline_count; i++) {
+            const pcap_investigation_event_t *event = &investigation->timeline[i];
+            lv_obj_t *row = lv_btn_create(list);
+            lv_obj_set_size(row, lv_pct(100), 58);
+            lv_obj_set_style_bg_color(row,
+                                      (i & 1U) ? ui_card_pressed_color() : ui_card_color(), 0);
+            lv_obj_set_style_border_width(row, 1, 0);
+            lv_obj_set_style_border_color(
+                row, event->severity >= PCAP_HEALTH_SUSPICIOUS
+                         ? COLOR_MATERIAL_RED : ui_border_color(), 0);
+            lv_obj_set_style_radius(row, 7, 0);
+            if (event->type == PCAP_INV_EVENT_FINDING &&
+                event->finding_index < investigation->finding_count) {
+                lv_obj_add_event_cb(
+                    row, pcap_viewer_investigation_finding_filter_cb,
+                    LV_EVENT_CLICKED,
+                    (void *)(uintptr_t)(event->finding_index + 1U));
+            } else if (event->type == PCAP_INV_EVENT_FLOW_FIRST_SEEN &&
+                       event->flow_id != PCAP_FLOW_ID_NONE &&
+                       event->flow_id < state->flow_analysis->flow_count) {
+                lv_obj_add_event_cb(row, pcap_viewer_connection_filter_cb,
+                                    LV_EVENT_CLICKED,
+                                    (void *)(uintptr_t)(event->flow_id + 1U));
+            }
+            lv_obj_t *label = lv_label_create(row);
+            double relative = event->time_us > 0U && event->time_us >= first_time
+                                  ? (double)(event->time_us - first_time) / 1000000.0 : 0.0;
+            lv_label_set_text_fmt(
+                label, "+%.3fs | %s | %s | %s\n%s",
+                relative,
+                pcap_investigation_event_name(
+                    (pcap_investigation_event_type_t)event->type),
+                pcap_flow_health_name((pcap_health_level_t)event->severity),
+                event->actor[0] ? event->actor : "capture", event->detail);
+            lv_obj_set_width(label, lv_pct(100));
+            lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
+            lv_obj_set_style_text_font(label, &lv_font_montserrat_12, 0);
+            lv_obj_set_style_text_color(label, ui_text_color(), 0);
+            lv_obj_center(label);
+        }
+    } else if (mode == PCAP_INV_VIEW_BASELINE) {
+        lv_obj_t *summary = lv_label_create(list);
+        if (state->baseline_status == PCAP_INVESTIGATION_OK &&
+            state->baseline_diff.baseline_available) {
+            lv_label_set_text_fmt(
+                summary,
+                "Compared with %s\nNEW LOCAL %lu | MISSING LOCAL %lu | NEW REMOTE %lu | NEW DOMAINS %lu | SERVICE CHANGES %lu",
+                state->baseline_diff.baseline_source,
+                (unsigned long)state->baseline_diff.new_local_devices,
+                (unsigned long)state->baseline_diff.missing_local_devices,
+                (unsigned long)state->baseline_diff.new_remote_endpoints,
+                (unsigned long)state->baseline_diff.new_domains,
+                (unsigned long)state->baseline_diff.new_services);
+            for (uint32_t i = 0; i < state->baseline_diff.item_count; i++) {
+                lv_obj_t *item = lv_label_create(list);
+                lv_label_set_text(item, state->baseline_diff.items[i]);
+                lv_obj_set_width(item, lv_pct(100));
+                lv_label_set_long_mode(item, LV_LABEL_LONG_DOT);
+                lv_obj_set_style_text_color(item, COLOR_MATERIAL_AMBER, 0);
+            }
+        } else {
+            lv_label_set_text(
+                summary,
+                "No compatible baseline yet. Use EXPORT -> SET AS BASELINE on a known-good home capture, then open another capture.");
+        }
+        lv_obj_set_width(summary, lv_pct(100));
+        lv_label_set_long_mode(summary, LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_text_color(summary, COLOR_NEON_GREEN, 0);
+    } else {
+        lv_obj_t *intel = lv_label_create(list);
+        lv_label_set_text_fmt(
+            intel,
+            "Offline intelligence: %s\nIP entries %lu | domain entries %lu | forbidden ports %lu | matches %lu\n\n"
+             "Place one indicator per line on TAB5 SD:\n"
+             "/sdcard/lab/espshark/intel/ips.txt\n"
+             "/sdcard/lab/espshark/intel/domains.txt\n"
+             "/sdcard/lab/espshark/intel/forbidden_ports.txt\n"
+             "/sdcard/lab/espshark/intel/oui.txt (AA:BB:CC Vendor name)\n\n"
+            "Lines beginning with # are comments. Reanalyze/reopen the PCAP after updating lists.",
+            investigation->intel_loaded ? "LOADED" : "NO LOCAL LISTS",
+            (unsigned long)investigation->ioc_ip_entries,
+            (unsigned long)investigation->ioc_domain_entries,
+            (unsigned long)investigation->rule_port_entries,
+            (unsigned long)investigation->ioc_matches);
+        lv_obj_set_width(intel, lv_pct(100));
+        lv_label_set_long_mode(intel, LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_text_color(intel,
+                                    investigation->intel_loaded
+                                        ? COLOR_NEON_GREEN : COLOR_MATERIAL_AMBER, 0);
+    }
+}
+
+static void pcap_viewer_health_cb(lv_event_t *e)
+{
+    pcap_viewer_render_investigation(
+        (pcap_viewer_state_t *)lv_event_get_user_data(e), PCAP_INV_VIEW_FINDINGS);
+}
+
+static bool pcap_map_mac_valid(const char *mac)
+{
+    return mac && mac[0] && strcasecmp(mac, "00:00:00:00:00:00") != 0 &&
+           strcasecmp(mac, "FF:FF:FF:FF:FF:FF") != 0;
+}
+
+static pcap_map_node_kind_t pcap_map_classify_node(const char *address,
+                                                   const char *mac,
+                                                   bool internal)
+{
+    if (mac && strcasecmp(mac, "FF:FF:FF:FF:FF:FF") == 0) {
+        return PCAP_MAP_NODE_BROADCAST;
+    }
+    if (address && address[0]) {
+        if (strncasecmp(address, "ff", 2) == 0 && strchr(address, ':')) {
+            return PCAP_MAP_NODE_MULTICAST;
+        }
+        unsigned int a = 0, b = 0, c = 0, d = 0;
+        if (sscanf(address, "%u.%u.%u.%u", &a, &b, &c, &d) == 4 &&
+            a <= 255U && b <= 255U && c <= 255U && d <= 255U) {
+            if (a >= 224U && a <= 239U) return PCAP_MAP_NODE_MULTICAST;
+            if (a == 255U || d == 255U) return PCAP_MAP_NODE_BROADCAST;
+        }
+    }
+    return internal ? PCAP_MAP_NODE_LOCAL : PCAP_MAP_NODE_EXTERNAL;
+}
+
+static int pcap_map_find_candidate(const pcap_map_node_t *candidates,
+                                   uint16_t count, const char *address,
+                                   const char *mac, pcap_map_node_kind_t kind)
+{
+    if (!candidates) return -1;
+    for (uint16_t i = 0; i < count; i++) {
+        const pcap_map_node_t *candidate = &candidates[i];
+        if (kind == PCAP_MAP_NODE_MULTICAST || kind == PCAP_MAP_NODE_BROADCAST) {
+            if (candidate->kind == (uint8_t)kind) return (int)i;
+            continue;
+        }
+        if (candidate->kind != (uint8_t)kind) continue;
+        if (kind == PCAP_MAP_NODE_LOCAL && pcap_map_mac_valid(mac) &&
+            pcap_map_mac_valid(candidate->mac) &&
+            strcasecmp(candidate->mac, mac) == 0) {
+            return (int)i;
+        }
+        if (address && address[0] && candidate->address[0] &&
+            strcasecmp(candidate->address, address) == 0) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+static int pcap_map_candidate_for_endpoint(const pcap_map_node_t *candidates,
+                                           uint16_t count, const char *address,
+                                           const char *mac)
+{
+    if (!candidates || !address) return -1;
+    for (uint16_t i = 0; i < count; i++) {
+        if (candidates[i].address[0] &&
+            strcasecmp(candidates[i].address, address) == 0) return (int)i;
+    }
+    if (pcap_map_mac_valid(mac)) {
+        for (uint16_t i = 0; i < count; i++) {
+            if (pcap_map_mac_valid(candidates[i].mac) &&
+                strcasecmp(candidates[i].mac, mac) == 0) return (int)i;
+        }
+    }
+    pcap_map_node_kind_t kind = pcap_map_classify_node(address, mac, false);
+    if (kind == PCAP_MAP_NODE_MULTICAST || kind == PCAP_MAP_NODE_BROADCAST) {
+        return pcap_map_find_candidate(candidates, count, address, mac, kind);
+    }
+    return -1;
+}
+
+static void pcap_map_note_alert(pcap_map_node_t *node,
+                                const pcap_security_alert_t *alert)
+{
+    if (!node || !alert) return;
+    if (node->alert_count < UINT8_MAX) node->alert_count++;
+    if (alert->severity > node->alert_severity) {
+        node->alert_severity = alert->severity;
+    }
+}
+
+static bool pcap_map_text_contains(const char *text, const char *needle)
+{
+    if (!text || !needle || !needle[0]) return false;
+    size_t needle_length = strlen(needle);
+    for (const char *cursor = text; *cursor; cursor++) {
+        if (strncasecmp(cursor, needle, needle_length) == 0) return true;
+    }
+    return false;
+}
+
+static bool pcap_map_device_has_port(const pcap_flow_analysis_t *analysis,
+                                     uint16_t device_index, uint16_t port)
+{
+    if (!analysis || device_index >= analysis->device_count) return false;
+    const pcap_device_entry_t *representative = &analysis->devices[device_index];
+    for (uint32_t i = 0; i < analysis->device_count; i++) {
+        const pcap_device_entry_t *device = &analysis->devices[i];
+        if (i != device_index &&
+            !pcap_flow_same_local_device(representative, device)) continue;
+        for (uint16_t service = 0; service < device->service_count; service++) {
+            if (device->services[service].port == port) return true;
+        }
+    }
+    return false;
+}
+
+static int pcap_map_assign_roles(const pcap_flow_analysis_t *analysis,
+                                 pcap_map_node_t *candidates,
+                                 uint16_t candidate_count)
+{
+    if (!analysis || !candidates) return -1;
+    int gateway_candidate = -1;
+    unsigned gateway_score = 0U;
+    for (uint16_t i = 0; i < candidate_count; i++) {
+        pcap_map_node_t *node = &candidates[i];
+        if (node->kind == PCAP_MAP_NODE_EXTERNAL) {
+            node->role = PCAP_MAP_ROLE_WAN_SERVICE;
+            continue;
+        }
+        if (node->kind != PCAP_MAP_NODE_LOCAL) {
+            node->role = PCAP_MAP_ROLE_GROUP;
+            continue;
+        }
+        bool dns = pcap_map_device_has_port(analysis, node->device_index, 53U);
+        bool dhcp = pcap_map_device_has_port(analysis, node->device_index, 67U);
+        bool gateway_name = pcap_map_text_contains(node->hostname, "router") ||
+                            pcap_map_text_contains(node->hostname, "gateway") ||
+                            pcap_map_text_contains(node->hostname, "pfsense") ||
+                            pcap_map_text_contains(node->hostname, "opnsense");
+        bool infrastructure_name = gateway_name ||
+                                   pcap_map_text_contains(node->hostname, "unifi") ||
+                                   pcap_map_text_contains(node->hostname, "switch") ||
+                                   pcap_map_text_contains(node->hostname, "access point");
+        unsigned score = gateway_name ? 6U : 0U;
+        if (dns) score += 2U;
+        if (dhcp) score += 4U;
+        if (pcap_map_mac_valid(node->mac)) {
+            for (uint16_t peer = 0; peer < candidate_count; peer++) {
+                if (candidates[peer].kind == PCAP_MAP_NODE_EXTERNAL &&
+                    pcap_map_mac_valid(candidates[peer].mac) &&
+                    strcasecmp(node->mac, candidates[peer].mac) == 0) score += 2U;
+            }
+        }
+        if (score > gateway_score) {
+            gateway_score = score;
+            gateway_candidate = i;
+        }
+        bool server = node->service_count >= 2U ||
+                      pcap_map_text_contains(node->hostname, "server") ||
+                      pcap_map_text_contains(node->hostname, "nas") ||
+                      pcap_map_text_contains(node->hostname, "synology") ||
+                      pcap_map_text_contains(node->hostname, "qnap");
+        bool iot = pcap_map_text_contains(node->hostname, "esp") ||
+                   pcap_map_text_contains(node->hostname, "shelly") ||
+                   pcap_map_text_contains(node->hostname, "tuya") ||
+                   pcap_map_text_contains(node->hostname, "camera") ||
+                   pcap_map_text_contains(node->hostname, "printer") ||
+                   pcap_map_text_contains(node->hostname, "sonos") ||
+                   pcap_map_text_contains(node->hostname, "iot");
+        node->role = infrastructure_name || dns || dhcp
+                         ? PCAP_MAP_ROLE_INFRASTRUCTURE
+                         : (server ? PCAP_MAP_ROLE_SERVER
+                                   : (iot ? PCAP_MAP_ROLE_IOT
+                                          : PCAP_MAP_ROLE_CLIENT));
+    }
+    if (gateway_candidate >= 0 && gateway_score >= 2U) {
+        candidates[gateway_candidate].role = PCAP_MAP_ROLE_GATEWAY;
+        return gateway_candidate;
+    }
+    return -1;
+}
+
+static const char *pcap_map_role_name(pcap_map_role_t role)
+{
+    switch (role) {
+        case PCAP_MAP_ROLE_GATEWAY: return "GATEWAY/ROUTER";
+        case PCAP_MAP_ROLE_INFRASTRUCTURE: return "INFRASTRUCTURE";
+        case PCAP_MAP_ROLE_SERVER: return "SERVER/NAS";
+        case PCAP_MAP_ROLE_IOT: return "IOT/DEVICE";
+        case PCAP_MAP_ROLE_WAN_SERVICE: return "WAN SERVICE";
+        case PCAP_MAP_ROLE_GROUP: return "GROUP";
+        case PCAP_MAP_ROLE_CLIENT:
+        default: return "CLIENT";
+    }
+}
+
+static const char *pcap_map_role_badge(pcap_map_role_t role)
+{
+    switch (role) {
+        case PCAP_MAP_ROLE_GATEWAY: return "GW";
+        case PCAP_MAP_ROLE_INFRASTRUCTURE: return "INFRA";
+        case PCAP_MAP_ROLE_SERVER: return "SRV";
+        case PCAP_MAP_ROLE_IOT: return "IOT";
+        case PCAP_MAP_ROLE_WAN_SERVICE: return "WAN";
+        case PCAP_MAP_ROLE_GROUP: return "+";
+        case PCAP_MAP_ROLE_CLIENT:
+        default: return "LAN";
+    }
+}
+
+static uint64_t pcap_map_node_score(const pcap_map_node_t *node)
+{
+    if (!node) return 0U;
+    uint64_t score = node->sent_bytes + node->received_bytes;
+    score += ((uint64_t)node->sent_packets + node->received_packets) * 32ULL;
+    score += (uint64_t)node->flow_count * 1024ULL;
+    if (node->kind == PCAP_MAP_NODE_MULTICAST ||
+        node->kind == PCAP_MAP_NODE_BROADCAST) score |= (3ULL << 62);
+    if (node->role == PCAP_MAP_ROLE_GATEWAY) score |= (3ULL << 60);
+    if (node->alert_count > 0U) score |= (1ULL << 63);
+    return score;
+}
+
+static int pcap_map_find_raw_edge(const pcap_map_edge_t *edges, uint16_t count,
+                                  uint16_t source, uint16_t target)
+{
+    for (uint16_t i = 0; i < count; i++) {
+        if ((edges[i].source == source && edges[i].target == target) ||
+            (edges[i].source == target && edges[i].target == source)) return (int)i;
+    }
+    return -1;
+}
+
+static bool pcap_map_is_service_application(uint8_t application)
+{
+    return application > PCAP_APP_WIFI_MGMT && application < PCAP_APP_COUNT;
+}
+
+static uint64_t pcap_map_edge_score(const pcap_map_edge_t *edge)
+{
+    if (!edge) return 0U;
+    uint64_t score = edge->forward_bytes + edge->reverse_bytes;
+    score += ((uint64_t)edge->forward_packets + edge->reverse_packets) * 32ULL;
+    if (pcap_map_is_service_application(edge->primary_app)) score |= (1ULL << 62);
+    if (edge->alert_count > 0U) score |= (1ULL << 63);
+    return score;
+}
+
+static void pcap_map_aggregate_group_node(pcap_map_node_t *group,
+                                          const pcap_map_node_t *candidate)
+{
+    if (!group || !candidate) return;
+    group->sent_bytes += candidate->sent_bytes;
+    group->received_bytes += candidate->received_bytes;
+    group->sent_packets += candidate->sent_packets;
+    group->received_packets += candidate->received_packets;
+    group->flow_count += candidate->flow_count;
+    if ((uint32_t)group->service_count + candidate->service_count > UINT16_MAX) {
+        group->service_count = UINT16_MAX;
+    } else {
+        group->service_count += candidate->service_count;
+    }
+    group->grouped_nodes++;
+    if ((uint16_t)group->alert_count + candidate->alert_count > UINT8_MAX) {
+        group->alert_count = UINT8_MAX;
+    } else {
+        group->alert_count += candidate->alert_count;
+    }
+    if (candidate->alert_severity > group->alert_severity) {
+        group->alert_severity = candidate->alert_severity;
+    }
+}
+
+static bool pcap_map_build_graph(const pcap_flow_analysis_t *analysis,
+                                 pcap_map_graph_t *graph)
+{
+    if (!analysis || !graph) return false;
+    memset(graph, 0, sizeof(*graph));
+    graph->gateway_node = -1;
+    pcap_map_node_t *candidates = heap_caps_calloc(
+        PCAP_MAP_MAX_CANDIDATES, sizeof(*candidates), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    pcap_map_edge_t *raw_edges = heap_caps_calloc(
+        PCAP_FLOW_MAX_FLOWS, sizeof(*raw_edges), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!candidates || !raw_edges) {
+        if (candidates) heap_caps_free(candidates);
+        if (raw_edges) heap_caps_free(raw_edges);
+        return false;
+    }
+
+    uint16_t candidate_count = 0U;
+    uint32_t device_count = analysis->device_count < PCAP_MAP_MAX_CANDIDATES
+                                ? analysis->device_count : PCAP_MAP_MAX_CANDIDATES;
+    for (uint16_t device_index = 0; device_index < device_count; device_index++) {
+        const pcap_device_entry_t *device = &analysis->devices[device_index];
+        pcap_map_node_kind_t kind = pcap_map_classify_node(
+            device->address, device->mac, device->internal);
+        int found = pcap_map_find_candidate(candidates, candidate_count,
+                                            device->address, device->mac, kind);
+        if (found < 0) {
+            if (candidate_count >= PCAP_MAP_MAX_CANDIDATES) break;
+            found = candidate_count++;
+            pcap_map_node_t *candidate = &candidates[found];
+            candidate->kind = (uint8_t)kind;
+            candidate->device_index = device_index;
+            candidate->grouped_nodes = 1U;
+            pcap_viewer_copy_text(candidate->address, sizeof(candidate->address),
+                                  kind == PCAP_MAP_NODE_MULTICAST ? "MULTICAST" :
+                                  (kind == PCAP_MAP_NODE_BROADCAST ? "BROADCAST" :
+                                                                   device->address));
+            pcap_viewer_copy_text(candidate->mac, sizeof(candidate->mac), device->mac);
+            pcap_viewer_copy_text(candidate->hostname, sizeof(candidate->hostname),
+                                  device->hostname);
+        } else if (candidates[found].grouped_nodes < UINT16_MAX) {
+            candidates[found].grouped_nodes++;
+            if (!candidates[found].hostname[0] && device->hostname[0]) {
+                pcap_viewer_copy_text(candidates[found].hostname,
+                                      sizeof(candidates[found].hostname), device->hostname);
+            }
+        }
+        pcap_map_node_t *candidate = &candidates[found];
+        candidate->sent_bytes += device->sent_bytes;
+        candidate->received_bytes += device->received_bytes;
+        candidate->sent_packets += device->sent_packets;
+        candidate->received_packets += device->received_packets;
+        if ((uint32_t)candidate->service_count + device->service_count > UINT16_MAX) {
+            candidate->service_count = UINT16_MAX;
+        } else {
+            candidate->service_count += device->service_count;
+        }
+    }
+
+    for (uint16_t flow_id = 0; flow_id < analysis->flow_count; flow_id++) {
+        const pcap_flow_entry_t *flow = &analysis->flows[flow_id];
+        int source = pcap_map_candidate_for_endpoint(
+            candidates, candidate_count, flow->originator, flow->originator_mac);
+        int target = pcap_map_candidate_for_endpoint(
+            candidates, candidate_count, flow->responder, flow->responder_mac);
+        if (source >= 0 && candidates[source].flow_count < UINT32_MAX) {
+            candidates[source].flow_count++;
+        }
+        if (target >= 0 && target != source && candidates[target].flow_count < UINT32_MAX) {
+            candidates[target].flow_count++;
+        }
+    }
+
+    for (uint16_t alert_index = 0; alert_index < analysis->alert_count; alert_index++) {
+        const pcap_security_alert_t *alert = &analysis->alerts[alert_index];
+        int source = pcap_map_candidate_for_endpoint(
+            candidates, candidate_count, alert->source, NULL);
+        int target = pcap_map_candidate_for_endpoint(
+            candidates, candidate_count, alert->target, NULL);
+        if (alert->flow_id != PCAP_FLOW_ID_NONE &&
+            alert->flow_id < analysis->flow_count) {
+            const pcap_flow_entry_t *flow = &analysis->flows[alert->flow_id];
+            source = pcap_map_candidate_for_endpoint(
+                candidates, candidate_count, flow->originator, flow->originator_mac);
+            target = pcap_map_candidate_for_endpoint(
+                candidates, candidate_count, flow->responder, flow->responder_mac);
+        }
+        if (source >= 0) pcap_map_note_alert(&candidates[source], alert);
+        if (target >= 0 && target != source) pcap_map_note_alert(&candidates[target], alert);
+    }
+
+    int gateway_candidate = pcap_map_assign_roles(analysis, candidates,
+                                                   candidate_count);
+
+    uint16_t candidate_order[PCAP_MAP_MAX_CANDIDATES];
+    for (uint16_t i = 0; i < candidate_count; i++) candidate_order[i] = i;
+    for (uint16_t i = 0; i < candidate_count; i++) {
+        uint16_t best = i;
+        for (uint16_t j = i + 1U; j < candidate_count; j++) {
+            if (pcap_map_node_score(&candidates[candidate_order[j]]) >
+                pcap_map_node_score(&candidates[candidate_order[best]])) best = j;
+        }
+        uint16_t swap = candidate_order[i];
+        candidate_order[i] = candidate_order[best];
+        candidate_order[best] = swap;
+    }
+
+    uint8_t candidate_to_node[PCAP_MAP_MAX_CANDIDATES];
+    memset(candidate_to_node, UINT8_MAX, sizeof(candidate_to_node));
+    uint16_t primary_count = candidate_count <= PCAP_MAP_MAX_NODES
+                                 ? candidate_count : PCAP_MAP_PRIMARY_NODES;
+    for (uint16_t i = 0; i < primary_count; i++) {
+        uint16_t candidate_index = candidate_order[i];
+        candidate_to_node[candidate_index] = (uint8_t)graph->node_count;
+        graph->nodes[graph->node_count++] = candidates[candidate_index];
+    }
+
+    uint16_t omitted_local = 0U;
+    uint16_t omitted_external = 0U;
+    for (uint16_t i = primary_count; i < candidate_count; i++) {
+        pcap_map_node_kind_t kind = (pcap_map_node_kind_t)candidates[candidate_order[i]].kind;
+        if (kind == PCAP_MAP_NODE_LOCAL) omitted_local++;
+        else omitted_external++;
+    }
+    int local_group = -1;
+    int external_group = -1;
+    if (omitted_local > 0U && graph->node_count < PCAP_MAP_MAX_NODES) {
+        local_group = graph->node_count++;
+        graph->nodes[local_group].kind = PCAP_MAP_NODE_OTHER_LOCAL;
+        graph->nodes[local_group].role = PCAP_MAP_ROLE_GROUP;
+        graph->nodes[local_group].device_index = UINT16_MAX;
+        pcap_viewer_copy_text(graph->nodes[local_group].address,
+                              sizeof(graph->nodes[local_group].address), "OTHER LAN");
+    }
+    if (omitted_external > 0U && graph->node_count < PCAP_MAP_MAX_NODES) {
+        external_group = graph->node_count++;
+        graph->nodes[external_group].kind = PCAP_MAP_NODE_OTHER_EXTERNAL;
+        graph->nodes[external_group].role = PCAP_MAP_ROLE_GROUP;
+        graph->nodes[external_group].device_index = UINT16_MAX;
+        pcap_viewer_copy_text(graph->nodes[external_group].address,
+                              sizeof(graph->nodes[external_group].address), "INTERNET");
+    }
+    for (uint16_t i = primary_count; i < candidate_count; i++) {
+        uint16_t candidate_index = candidate_order[i];
+        pcap_map_node_kind_t kind = (pcap_map_node_kind_t)candidates[candidate_index].kind;
+        int group = kind == PCAP_MAP_NODE_LOCAL ? local_group : external_group;
+        if (group < 0) continue;
+        candidate_to_node[candidate_index] = (uint8_t)group;
+        pcap_map_aggregate_group_node(&graph->nodes[group], &candidates[candidate_index]);
+    }
+    if (gateway_candidate >= 0 && gateway_candidate < candidate_count &&
+        candidate_to_node[gateway_candidate] != UINT8_MAX) {
+        graph->gateway_node = candidate_to_node[gateway_candidate];
+    }
+
+    for (uint16_t i = 0; i < candidate_count; i++) {
+        if (candidates[i].kind == PCAP_MAP_NODE_LOCAL) graph->local_nodes++;
+        else if (candidates[i].kind == PCAP_MAP_NODE_EXTERNAL) graph->external_nodes++;
+    }
+    graph->hidden_nodes = candidate_count > primary_count
+                              ? candidate_count - primary_count : 0U;
+
+    uint16_t raw_edge_count = 0U;
+    for (uint16_t flow_id = 0; flow_id < analysis->flow_count; flow_id++) {
+        const pcap_flow_entry_t *flow = &analysis->flows[flow_id];
+        int source_candidate = pcap_map_candidate_for_endpoint(
+            candidates, candidate_count, flow->originator, flow->originator_mac);
+        int target_candidate = pcap_map_candidate_for_endpoint(
+            candidates, candidate_count, flow->responder, flow->responder_mac);
+        if (source_candidate < 0 || target_candidate < 0) continue;
+        uint8_t source = candidate_to_node[source_candidate];
+        uint8_t target = candidate_to_node[target_candidate];
+        if (source == UINT8_MAX || target == UINT8_MAX || source == target) continue;
+        int edge_index = pcap_map_find_raw_edge(raw_edges, raw_edge_count, source, target);
+        if (edge_index < 0) {
+            if (raw_edge_count >= PCAP_FLOW_MAX_FLOWS) continue;
+            edge_index = raw_edge_count++;
+            raw_edges[edge_index].source = source;
+            raw_edges[edge_index].target = target;
+            raw_edges[edge_index].representative_flow_id = flow_id;
+        }
+        pcap_map_edge_t *edge = &raw_edges[edge_index];
+        bool forward = edge->source == source;
+        if (forward) {
+            edge->forward_bytes += flow->originator_bytes;
+            edge->reverse_bytes += flow->responder_bytes;
+            edge->forward_packets += flow->originator_packets;
+            edge->reverse_packets += flow->responder_packets;
+        } else {
+            edge->forward_bytes += flow->responder_bytes;
+            edge->reverse_bytes += flow->originator_bytes;
+            edge->forward_packets += flow->responder_packets;
+            edge->reverse_packets += flow->originator_packets;
+        }
+        if (edge->flow_count < UINT16_MAX) edge->flow_count++;
+        uint64_t flow_bytes = flow->originator_bytes + flow->responder_bytes;
+        if (flow_bytes >= edge->primary_app_bytes) {
+            edge->primary_app_bytes = flow_bytes;
+            edge->primary_app = flow->app_protocol;
+            edge->representative_flow_id = flow_id;
+        }
+    }
+
+    for (uint16_t alert_index = 0; alert_index < analysis->alert_count; alert_index++) {
+        const pcap_security_alert_t *alert = &analysis->alerts[alert_index];
+        int source_candidate = pcap_map_candidate_for_endpoint(
+            candidates, candidate_count, alert->source, NULL);
+        int target_candidate = pcap_map_candidate_for_endpoint(
+            candidates, candidate_count, alert->target, NULL);
+        if (alert->flow_id != PCAP_FLOW_ID_NONE && alert->flow_id < analysis->flow_count) {
+            const pcap_flow_entry_t *flow = &analysis->flows[alert->flow_id];
+            source_candidate = pcap_map_candidate_for_endpoint(
+                candidates, candidate_count, flow->originator, flow->originator_mac);
+            target_candidate = pcap_map_candidate_for_endpoint(
+                candidates, candidate_count, flow->responder, flow->responder_mac);
+        }
+        uint8_t source = source_candidate >= 0 ? candidate_to_node[source_candidate] : UINT8_MAX;
+        uint8_t target = target_candidate >= 0 ? candidate_to_node[target_candidate] : UINT8_MAX;
+        int edge_index = source != UINT8_MAX && target != UINT8_MAX
+                             ? pcap_map_find_raw_edge(raw_edges, raw_edge_count, source, target) : -1;
+        if (edge_index >= 0) {
+            pcap_map_edge_t *edge = &raw_edges[edge_index];
+            if (edge->alert_count < UINT8_MAX) edge->alert_count++;
+            if (alert->severity > edge->alert_severity) edge->alert_severity = alert->severity;
+        } else if (source != UINT8_MAX &&
+                   (alert->type == PCAP_ALERT_HOST_SWEEP ||
+                    alert->type == PCAP_ALERT_WORM_LIKE_SPREAD)) {
+            for (uint16_t edge_id = 0; edge_id < raw_edge_count; edge_id++) {
+                pcap_map_edge_t *edge = &raw_edges[edge_id];
+                if (edge->source != source && edge->target != source) continue;
+                if (edge->alert_count < UINT8_MAX) edge->alert_count++;
+                if (alert->severity > edge->alert_severity) {
+                    edge->alert_severity = alert->severity;
+                }
+            }
+        }
+    }
+
+    uint16_t edge_order[PCAP_FLOW_MAX_FLOWS];
+    for (uint16_t i = 0; i < raw_edge_count; i++) edge_order[i] = i;
+    for (uint16_t i = 0; i < raw_edge_count; i++) {
+        uint16_t best = i;
+        for (uint16_t j = i + 1U; j < raw_edge_count; j++) {
+            if (pcap_map_edge_score(&raw_edges[edge_order[j]]) >
+                pcap_map_edge_score(&raw_edges[edge_order[best]])) best = j;
+        }
+        uint16_t swap = edge_order[i];
+        edge_order[i] = edge_order[best];
+        edge_order[best] = swap;
+    }
+    graph->edge_count = raw_edge_count < PCAP_MAP_MAX_EDGES
+                            ? raw_edge_count : PCAP_MAP_MAX_EDGES;
+    for (uint16_t i = 0; i < graph->edge_count; i++) {
+        graph->edges[i] = raw_edges[edge_order[i]];
+    }
+    graph->hidden_edges = raw_edge_count > graph->edge_count
+                              ? raw_edge_count - graph->edge_count : 0U;
+    graph->global_alerts = analysis->alert_count;
+    graph->limited = analysis->flow_limited || analysis->device_limited ||
+                     graph->hidden_nodes > 0U || graph->hidden_edges > 0U;
+    heap_caps_free(raw_edges);
+    heap_caps_free(candidates);
+    return true;
+}
+
+static const char *pcap_map_kind_name(pcap_map_node_kind_t kind)
+{
+    switch (kind) {
+        case PCAP_MAP_NODE_LOCAL: return "LOCAL DEVICE";
+        case PCAP_MAP_NODE_EXTERNAL: return "EXTERNAL ENDPOINT";
+        case PCAP_MAP_NODE_MULTICAST: return "MULTICAST GROUP";
+        case PCAP_MAP_NODE_BROADCAST: return "BROADCAST GROUP";
+        case PCAP_MAP_NODE_OTHER_LOCAL: return "COLLAPSED LOCAL DEVICES";
+        case PCAP_MAP_NODE_OTHER_EXTERNAL: return "COLLAPSED INTERNET ENDPOINTS";
+        default: return "ENDPOINT";
+    }
+}
+
+static lv_color_t pcap_map_node_color(const pcap_map_node_t *node)
+{
+    if (!node) return ui_muted_color();
+    if (node->alert_severity >= PCAP_HEALTH_SUSPICIOUS) return COLOR_MATERIAL_RED;
+    if (node->alert_count > 0U) return COLOR_MATERIAL_AMBER;
+    switch ((pcap_map_node_kind_t)node->kind) {
+        case PCAP_MAP_NODE_LOCAL: return COLOR_MATERIAL_GREEN;
+        case PCAP_MAP_NODE_EXTERNAL: return COLOR_MATERIAL_PURPLE;
+        case PCAP_MAP_NODE_MULTICAST: return COLOR_MATERIAL_CYAN;
+        case PCAP_MAP_NODE_BROADCAST: return COLOR_MATERIAL_AMBER;
+        case PCAP_MAP_NODE_OTHER_LOCAL: return COLOR_MATERIAL_TEAL;
+        case PCAP_MAP_NODE_OTHER_EXTERNAL: return lv_color_hex(0x7E57C2);
+        default: return ui_muted_color();
+    }
+}
+
+static lv_color_t pcap_map_application_color(uint8_t application)
+{
+    switch ((pcap_application_t)application) {
+        case PCAP_APP_DNS:
+        case PCAP_APP_MDNS:
+        case PCAP_APP_LLMNR:
+        case PCAP_APP_NBNS: return COLOR_MATERIAL_PURPLE;
+        case PCAP_APP_HTTP:
+        case PCAP_APP_FTP:
+        case PCAP_APP_TELNET:
+        case PCAP_APP_RDP:
+        case PCAP_APP_VNC:
+        case PCAP_APP_RTSP: return COLOR_MATERIAL_AMBER;
+        case PCAP_APP_TLS:
+        case PCAP_APP_QUIC:
+        case PCAP_APP_SSH: return COLOR_MATERIAL_CYAN;
+        case PCAP_APP_SMB:
+        case PCAP_APP_MQTT:
+        case PCAP_APP_COAP:
+        case PCAP_APP_REDIS:
+        case PCAP_APP_DATABASE:
+        case PCAP_APP_BITTORRENT:
+        case PCAP_APP_BITTORRENT_DHT: return COLOR_MATERIAL_GREEN;
+        default: return lv_color_hex(0x607D8B);
+    }
+}
+
+static void pcap_map_node_center(const pcap_map_graph_t *graph, uint16_t node_index,
+                                 int width, int height, int *x, int *y)
+{
+    if (!graph || node_index >= graph->node_count || !x || !y) return;
+    (void)height;
+    const pcap_map_node_t *node = &graph->nodes[node_index];
+    bool local = node->kind == PCAP_MAP_NODE_LOCAL ||
+                 node->kind == PCAP_MAP_NODE_OTHER_LOCAL;
+    bool external = node->kind == PCAP_MAP_NODE_EXTERNAL ||
+                    node->kind == PCAP_MAP_NODE_OTHER_EXTERNAL;
+    uint16_t count = 0U;
+    uint16_t ordinal = 0U;
+    for (uint16_t i = 0; i < graph->node_count; i++) {
+        const pcap_map_node_t *candidate = &graph->nodes[i];
+        bool same_lane = local
+                             ? (candidate->kind == PCAP_MAP_NODE_LOCAL ||
+                                candidate->kind == PCAP_MAP_NODE_OTHER_LOCAL)
+                             : external
+                                   ? (candidate->kind == PCAP_MAP_NODE_EXTERNAL ||
+                                      candidate->kind == PCAP_MAP_NODE_OTHER_EXTERNAL)
+                                   : (candidate->kind == PCAP_MAP_NODE_MULTICAST ||
+                                      candidate->kind == PCAP_MAP_NODE_BROADCAST);
+        if (!same_lane) continue;
+        if (i < node_index) ordinal++;
+        count++;
+    }
+    (void)count;
+    *x = local ? width * 26 / 100
+               : (external ? width * 74 / 100 : width / 2);
+    *y = 58 + (int)ordinal * 72;
+    *x = iot_recon_clamp_int(*x, 78, width - 78);
+}
+
+static int pcap_map_node_size(const pcap_map_graph_t *graph,
+                              const pcap_map_node_t *node)
+{
+    if (!graph || !node) return 20;
+    uint64_t maximum = 1U;
+    for (uint16_t i = 0; i < graph->node_count; i++) {
+        uint64_t bytes = graph->nodes[i].sent_bytes + graph->nodes[i].received_bytes;
+        if (bytes > maximum) maximum = bytes;
+    }
+    uint64_t bytes = node->sent_bytes + node->received_bytes;
+    int size = bytes >= maximum / 4U ? 34 : (bytes >= maximum / 16U ? 28 : 22);
+    if (node->alert_count > 0U) size += 4;
+    return size;
+}
+
+static void pcap_map_node_click_cb(lv_event_t *e);
+
+static void pcap_map_add_line(lv_obj_t *stage, int x1, int y1, int x2, int y2,
+                              int source_radius, int target_radius,
+                              lv_color_t color, lv_opa_t opacity, int width)
+{
+    iot_recon_trim_line_to_nodes(&x1, &y1, &x2, &y2,
+                                 source_radius, target_radius);
+    lv_point_precise_t *points = lv_malloc(sizeof(*points) * 2U);
+    if (!points) return;
+    points[0].x = x1;
+    points[0].y = y1;
+    points[1].x = x2;
+    points[1].y = y2;
+    lv_obj_t *line = lv_line_create(stage);
+    lv_line_set_points_mutable(line, points, 2);
+    lv_obj_add_event_cb(line, iot_recon_line_points_delete_cb, LV_EVENT_DELETE, points);
+    lv_obj_set_style_line_color(line, color, 0);
+    lv_obj_set_style_line_opa(line, opacity, 0);
+    lv_obj_set_style_line_width(line, width, 0);
+}
+
+static lv_color_t pcap_map_role_color(const pcap_map_node_t *node)
+{
+    if (!node) return ui_muted_color();
+    if (node->alert_severity >= PCAP_HEALTH_SUSPICIOUS) return COLOR_MATERIAL_RED;
+    if (node->alert_count > 0U) return COLOR_MATERIAL_AMBER;
+    switch ((pcap_map_role_t)node->role) {
+        case PCAP_MAP_ROLE_GATEWAY: return lv_color_hex(0x2196F3);
+        case PCAP_MAP_ROLE_INFRASTRUCTURE: return COLOR_MATERIAL_CYAN;
+        case PCAP_MAP_ROLE_SERVER: return COLOR_MATERIAL_PURPLE;
+        case PCAP_MAP_ROLE_IOT: return COLOR_MATERIAL_AMBER;
+        case PCAP_MAP_ROLE_WAN_SERVICE: return lv_color_hex(0x7E57C2);
+        case PCAP_MAP_ROLE_GROUP: return COLOR_MATERIAL_TEAL;
+        case PCAP_MAP_ROLE_CLIENT:
+        default: return COLOR_MATERIAL_GREEN;
+    }
+}
+
+static lv_obj_t *pcap_map_add_topology_card(pcap_viewer_state_t *state,
+                                             int node_index, int center_x, int center_y,
+                                             int width, int height,
+                                             const char *badge, const char *name,
+                                             const char *subtitle, lv_color_t color)
+{
+    if (!state || !state->map_stage) return NULL;
+    lv_obj_t *card = lv_obj_create(state->map_stage);
+    lv_obj_set_size(card, width, height);
+    lv_obj_set_pos(card, center_x - width / 2, center_y - height / 2);
+    lv_obj_set_style_bg_color(card, ui_card_color(), 0);
+    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(
+        card, node_index >= 0 && state->map_selected_node == node_index ? 3 : 2, 0);
+    lv_obj_set_style_border_color(card, color, 0);
+    lv_obj_set_style_radius(card, 9, 0);
+    lv_obj_set_style_shadow_width(card, 8, 0);
+    lv_obj_set_style_shadow_color(card, color, 0);
+    lv_obj_set_style_pad_all(card, 5, 0);
+    lv_obj_set_style_pad_column(card, 6, 0);
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(card, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    if (node_index >= 0) {
+        lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(card, pcap_map_node_click_cb, LV_EVENT_CLICKED,
+                            (void *)(uintptr_t)(node_index + 1U));
+    }
+
+    lv_obj_t *badge_obj = lv_obj_create(card);
+    lv_obj_set_size(badge_obj, 34, 34);
+    lv_obj_set_style_radius(badge_obj, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(badge_obj, color, 0);
+    lv_obj_set_style_border_width(badge_obj, 0, 0);
+    lv_obj_set_style_pad_all(badge_obj, 0, 0);
+    lv_obj_clear_flag(badge_obj, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(badge_obj, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_t *badge_label = lv_label_create(badge_obj);
+    lv_label_set_text(badge_label, badge ? badge : "?");
+    lv_obj_set_style_text_font(badge_label, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_color(badge_label, lv_color_white(), 0);
+    lv_obj_center(badge_label);
+
+    lv_obj_t *text = lv_label_create(card);
+    lv_label_set_text_fmt(text, "%s\n%s", name && name[0] ? name : "Unknown",
+                          subtitle && subtitle[0] ? subtitle : "observed endpoint");
+    lv_obj_set_flex_grow(text, 1);
+    lv_obj_set_width(text, 0);
+    lv_label_set_long_mode(text, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_font(text, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_color(text, ui_text_color(), 0);
+    return card;
+}
+
+static void pcap_map_render_topology(pcap_viewer_state_t *state,
+                                     int width, int height)
+{
+    if (!state || !state->map_graph || !state->map_stage) return;
+    (void)height;
+    const pcap_map_graph_t *graph = state->map_graph;
+    uint16_t local_nodes[PCAP_MAP_TOPOLOGY_MAX_DEVICES];
+    uint16_t local_visible = 0U;
+    uint16_t local_total = 0U;
+    for (uint16_t i = 0; i < graph->node_count; i++) {
+        const pcap_map_node_t *node = &graph->nodes[i];
+        if (i == (uint16_t)graph->gateway_node ||
+            (node->kind != PCAP_MAP_NODE_LOCAL &&
+             node->kind != PCAP_MAP_NODE_OTHER_LOCAL)) continue;
+        local_total++;
+        if (local_visible < PCAP_MAP_TOPOLOGY_MAX_DEVICES) {
+            local_nodes[local_visible++] = i;
+        }
+    }
+
+    const int center_x = width / 2;
+    const int internet_y = 36;
+    const int gateway_y = 116;
+    const int segment_y = 198;
+    const int group_top = 246;
+    const int card_height = 62;
+    const int row_pitch = 82;
+    int columns = width >= 720 && local_visible > 1U ? 2 : 1;
+    int rows = local_visible > 0U
+                   ? ((int)local_visible + columns - 1) / columns : 0;
+    int group_height = rows > 0 ? 140 + (rows - 1) * row_pitch : 126;
+    int group_width = width - 24;
+    int first_device_y = group_top + 64;
+    int last_device_y = rows > 0
+                            ? first_device_y + (rows - 1) * row_pitch
+                            : group_top + 62;
+
+    lv_obj_t *device_frame = lv_obj_create(state->map_stage);
+    lv_obj_set_pos(device_frame, 12, group_top);
+    lv_obj_set_size(device_frame, group_width, group_height);
+    lv_obj_set_style_bg_color(device_frame, lv_color_hex(0x071525), 0);
+    lv_obj_set_style_bg_opa(device_frame, LV_OPA_70, 0);
+    lv_obj_set_style_border_width(device_frame, 1, 0);
+    lv_obj_set_style_border_color(device_frame, lv_color_hex(0x24527A), 0);
+    lv_obj_set_style_radius(device_frame, 12, 0);
+    lv_obj_set_style_pad_all(device_frame, 0, 0);
+    lv_obj_clear_flag(device_frame, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(device_frame, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t *frame_title = lv_label_create(device_frame);
+    lv_label_set_text(frame_title, "OBSERVED LOCAL DEVICES");
+    lv_obj_set_pos(frame_title, 14, 10);
+    lv_obj_set_style_text_font(frame_title, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(frame_title, COLOR_NEON_CYAN, 0);
+    lv_obj_t *frame_hint = lv_label_create(device_frame);
+    lv_label_set_text(frame_hint, "tap a device for summary or filter");
+    lv_obj_set_width(frame_hint, group_width / 2 - 20);
+    lv_obj_set_pos(frame_hint, group_width / 2, 10);
+    lv_obj_set_style_text_align(frame_hint, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_set_style_text_font(frame_hint, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_color(frame_hint, ui_muted_color(), 0);
+
+    pcap_map_add_line(state->map_stage, center_x, internet_y + 25,
+                      center_x, gateway_y - 29, 0, 0,
+                      lv_color_hex(0x3A86FF), LV_OPA_70, 3);
+    pcap_map_add_line(state->map_stage, center_x, gateway_y + 29,
+                      center_x, segment_y - 28, 0, 0,
+                      lv_color_hex(0x3A86FF), LV_OPA_70, 3);
+    if (local_visible > 0U) {
+        pcap_map_add_line(state->map_stage, center_x, segment_y + 28,
+                          center_x, last_device_y, 0, 0,
+                          lv_color_hex(0x2D6AA0), LV_OPA_60, 2);
+    }
+
+    char wan_subtitle[64];
+    snprintf(wan_subtitle, sizeof(wan_subtitle), "%u observed remote endpoint%s",
+             (unsigned)graph->external_nodes,
+             graph->external_nodes == 1U ? "" : "s");
+    pcap_map_add_topology_card(state, -1, center_x, internet_y, 210, 50,
+                               "WAN", "INTERNET", wan_subtitle,
+                               lv_color_hex(0x7E57C2));
+
+    if (graph->gateway_node >= 0 && graph->gateway_node < graph->node_count) {
+        const pcap_map_node_t *gateway = &graph->nodes[graph->gateway_node];
+        const char *name = gateway->hostname[0] ? gateway->hostname : gateway->address;
+        pcap_map_add_topology_card(state, graph->gateway_node, center_x, gateway_y,
+                                   250, 58, "GW", name, "inferred gateway/router",
+                                   pcap_map_role_color(gateway));
+    } else {
+        pcap_map_add_topology_card(state, -1, center_x, gateway_y, 270, 58,
+                                   "?", "NETWORK EDGE",
+                                   "gateway not visible in sample",
+                                   COLOR_MATERIAL_AMBER);
+    }
+
+    pcap_map_add_topology_card(state, -1, center_x, segment_y, 390, 56,
+                               "L2", "LAN / UNKNOWN L2 FABRIC",
+                               "logical segment | physical switch path not visible",
+                               COLOR_MATERIAL_CYAN);
+
+    if (local_visible == 0U) {
+        lv_obj_t *empty = lv_label_create(state->map_stage);
+        lv_label_set_text(empty, "No local client identity decoded in this sample.");
+        lv_obj_set_width(empty, group_width - 40);
+        lv_obj_set_style_text_align(empty, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_color(empty, COLOR_MATERIAL_AMBER, 0);
+        lv_obj_set_pos(empty, 16, group_top + 58);
+        return;
+    }
+
+    int card_width = columns == 2
+                         ? iot_recon_clamp_int((width - 170) / 2, 220, 470)
+                         : iot_recon_clamp_int(width - 100, 240, 540);
+    int column_gap = columns == 2
+                         ? iot_recon_clamp_int((width - card_width * 2) / 4, 32, 68)
+                         : 0;
+    int left_x = columns == 2 ? center_x - card_width / 2 - column_gap : center_x;
+    int right_x = columns == 2 ? center_x + card_width / 2 + column_gap : center_x;
+
+    for (int row = 0; row < rows; row++) {
+        uint16_t first = (uint16_t)(row * columns);
+        bool pair = columns == 2 && first + 1U < local_visible;
+        int y = first_device_y + row * row_pitch;
+        if (pair) {
+            pcap_map_add_line(state->map_stage, left_x, y, right_x, y,
+                              card_width / 2, card_width / 2,
+                              lv_color_hex(0x2D6AA0), LV_OPA_60, 2);
+            lv_obj_t *junction = lv_obj_create(state->map_stage);
+            lv_obj_set_size(junction, 8, 8);
+            lv_obj_set_pos(junction, center_x - 4, y - 4);
+            lv_obj_set_style_radius(junction, LV_RADIUS_CIRCLE, 0);
+            lv_obj_set_style_bg_color(junction, COLOR_MATERIAL_CYAN, 0);
+            lv_obj_set_style_border_width(junction, 0, 0);
+            lv_obj_set_style_pad_all(junction, 0, 0);
+            lv_obj_clear_flag(junction, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_clear_flag(junction, LV_OBJ_FLAG_CLICKABLE);
+        }
+    }
+
+    for (uint16_t ordinal = 0; ordinal < local_visible; ordinal++) {
+        int row = ordinal / (uint16_t)columns;
+        int column = ordinal % (uint16_t)columns;
+        bool unpaired = columns == 2 && column == 0 && ordinal + 1U == local_visible;
+        int x = unpaired ? center_x : (column == 0 ? left_x : right_x);
+        int y = first_device_y + row * row_pitch;
+        uint16_t node_index = local_nodes[ordinal];
+        const pcap_map_node_t *node = &graph->nodes[node_index];
+        char subtitle[96];
+        if (node->kind == PCAP_MAP_NODE_OTHER_LOCAL) {
+            snprintf(subtitle, sizeof(subtitle), "%u grouped devices",
+                     (unsigned)node->grouped_nodes);
+        } else {
+            snprintf(subtitle, sizeof(subtitle), "%s | %lu flow%s",
+                     pcap_map_role_name((pcap_map_role_t)node->role),
+                     (unsigned long)node->flow_count,
+                     node->flow_count == 1U ? "" : "s");
+        }
+        const char *name = node->hostname[0] ? node->hostname : node->address;
+        pcap_map_add_topology_card(
+            state, node_index, x, y, card_width, card_height,
+            pcap_map_role_badge((pcap_map_role_t)node->role), name, subtitle,
+            pcap_map_role_color(node));
+    }
+
+    lv_obj_t *notice = lv_label_create(state->map_stage);
+    if (local_total > local_visible) {
+        lv_label_set_text_fmt(
+            notice,
+            "INFERRED FROM PCAP - logical links, not physical cabling | +%u device%s in TRAFFIC",
+            (unsigned)(local_total - local_visible),
+            local_total - local_visible == 1U ? "" : "s");
+    } else {
+        lv_label_set_text(
+            notice,
+            "INFERRED FROM PCAP - logical links; L1/L2 switches may be invisible");
+    }
+    lv_obj_set_width(notice, group_width - 28);
+    lv_obj_set_style_text_align(notice, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(notice, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_color(notice, ui_muted_color(), 0);
+    lv_obj_set_pos(notice, 18, group_top + group_height - 25);
+}
+
+static void pcap_map_update_mode_buttons(pcap_viewer_state_t *state)
+{
+    if (!state) return;
+    for (int i = 0; i < PCAP_MAP_MODE_COUNT; i++) {
+        lv_obj_t *button = state->map_mode_buttons[i];
+        if (!button || !lv_obj_is_valid(button)) continue;
+        lv_obj_set_style_border_width(button, i == state->map_mode ? 3 : 1, 0);
+        lv_obj_set_style_border_color(button,
+                                      i == state->map_mode ? COLOR_NEON_CYAN
+                                                           : ui_border_color(), 0);
+        lv_obj_set_style_bg_opa(button, i == state->map_mode ? LV_OPA_COVER : LV_OPA_70, 0);
+    }
+}
+
+static void pcap_map_render_stage(pcap_viewer_state_t *state)
+{
+    if (!state || !state->map_graph || !state->map_stage ||
+        !lv_obj_is_valid(state->map_stage)) return;
+    lv_obj_clean(state->map_stage);
+    lv_obj_update_layout(state->map_stage);
+    int width = lv_obj_get_content_width(state->map_stage);
+    int height = lv_obj_get_content_height(state->map_stage);
+    if (width < 200 || height < 120) return;
+    lv_obj_add_flag(state->map_stage, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(state->map_stage, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(state->map_stage, LV_SCROLLBAR_MODE_AUTO);
+    lv_obj_scroll_to_y(state->map_stage, 0, LV_ANIM_OFF);
+    const pcap_map_graph_t *graph = state->map_graph;
+    if (graph->node_count == 0U) {
+        lv_obj_t *empty = lv_label_create(state->map_stage);
+        lv_label_set_text(empty,
+                          "No decoded IP endpoints in this capture.\n"
+                          "Handshake-only and encrypted 802.11 PCAPs cannot build a communication map.");
+        lv_obj_set_width(empty, lv_pct(90));
+        lv_label_set_long_mode(empty, LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_text_align(empty, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_color(empty, COLOR_MATERIAL_AMBER, 0);
+        lv_obj_center(empty);
+        pcap_map_update_mode_buttons(state);
+        return;
+    }
+    if (state->map_mode == PCAP_MAP_MODE_TOPOLOGY) {
+        pcap_map_render_topology(state, width, height);
+        pcap_map_update_mode_buttons(state);
+        return;
+    }
+
+    uint16_t local_lane_count = 0U;
+    uint16_t external_lane_count = 0U;
+    uint16_t middle_lane_count = 0U;
+    for (uint16_t i = 0; i < graph->node_count; i++) {
+        const pcap_map_node_t *node = &graph->nodes[i];
+        if (node->kind == PCAP_MAP_NODE_LOCAL ||
+            node->kind == PCAP_MAP_NODE_OTHER_LOCAL) {
+            local_lane_count++;
+        } else if (node->kind == PCAP_MAP_NODE_EXTERNAL ||
+                   node->kind == PCAP_MAP_NODE_OTHER_EXTERNAL) {
+            external_lane_count++;
+        } else {
+            middle_lane_count++;
+        }
+    }
+    uint16_t maximum_lane_count = local_lane_count;
+    if (external_lane_count > maximum_lane_count) maximum_lane_count = external_lane_count;
+    if (middle_lane_count > maximum_lane_count) maximum_lane_count = middle_lane_count;
+    int lane_bottom = maximum_lane_count > 0U
+                          ? 58 + ((int)maximum_lane_count - 1) * 72 : 58;
+    if (local_lane_count > 0U) {
+        pcap_map_add_line(state->map_stage, width * 26 / 100, 36,
+                          width * 26 / 100, lane_bottom,
+                          0, 0, lv_color_hex(0x1F5F78), LV_OPA_20, 1);
+    }
+    if (external_lane_count > 0U) {
+        pcap_map_add_line(state->map_stage, width * 74 / 100, 36,
+                          width * 74 / 100, lane_bottom,
+                          0, 0, lv_color_hex(0x5A3D82), LV_OPA_20, 1);
+    }
+    if (middle_lane_count > 0U) {
+        pcap_map_add_line(state->map_stage, width / 2, 36,
+                          width / 2, 58 + ((int)middle_lane_count - 1) * 72,
+                          0, 0, lv_color_hex(0x546E7A), LV_OPA_20, 1);
+    }
+
+    uint64_t maximum_edge_bytes = 1U;
+    for (uint16_t i = 0; i < graph->edge_count; i++) {
+        uint64_t bytes = graph->edges[i].forward_bytes + graph->edges[i].reverse_bytes;
+        if (bytes > maximum_edge_bytes) maximum_edge_bytes = bytes;
+    }
+    for (uint16_t i = 0; i < graph->edge_count; i++) {
+        const pcap_map_edge_t *edge = &graph->edges[i];
+        if (edge->source >= graph->node_count || edge->target >= graph->node_count) continue;
+        bool service_edge = pcap_map_is_service_application(edge->primary_app);
+        if (state->map_mode == PCAP_MAP_MODE_SERVICES && !service_edge) continue;
+        int x1 = 0, y1 = 0, x2 = 0, y2 = 0;
+        pcap_map_node_center(graph, edge->source, width, height, &x1, &y1);
+        pcap_map_node_center(graph, edge->target, width, height, &x2, &y2);
+        uint64_t bytes = edge->forward_bytes + edge->reverse_bytes;
+        int line_width = bytes >= maximum_edge_bytes / 4U
+                             ? 5 : (bytes >= maximum_edge_bytes / 16U ? 3 : 1);
+        lv_color_t color = pcap_map_application_color(edge->primary_app);
+        lv_opa_t opacity = LV_OPA_60;
+        if (state->map_mode == PCAP_MAP_MODE_THREATS) {
+            if (edge->alert_count > 0U) {
+                color = edge->alert_severity >= PCAP_HEALTH_SUSPICIOUS
+                            ? COLOR_MATERIAL_RED : COLOR_MATERIAL_AMBER;
+                opacity = LV_OPA_90;
+                line_width += 2;
+            } else {
+                opacity = LV_OPA_20;
+            }
+        }
+        pcap_map_add_line(state->map_stage, x1, y1, x2, y2,
+                          pcap_map_node_size(graph, &graph->nodes[edge->source]) / 2,
+                          pcap_map_node_size(graph, &graph->nodes[edge->target]) / 2,
+                          color, opacity, line_width);
+    }
+
+    for (uint16_t i = 0; i < graph->node_count; i++) {
+        const pcap_map_node_t *node = &graph->nodes[i];
+        int x = 0, y = 0;
+        pcap_map_node_center(graph, i, width, height, &x, &y);
+        int size = pcap_map_node_size(graph, node);
+        lv_color_t color = pcap_map_node_color(node);
+        bool muted = (state->map_mode == PCAP_MAP_MODE_THREATS && node->alert_count == 0U) ||
+                     (state->map_mode == PCAP_MAP_MODE_SERVICES &&
+                      node->service_count == 0U && node->alert_count == 0U);
+        lv_obj_t *dot = lv_obj_create(state->map_stage);
+        lv_obj_set_size(dot, size, size);
+        lv_obj_set_pos(dot, x - size / 2, y - size / 2);
+        lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_bg_color(dot, color, 0);
+        lv_obj_set_style_bg_opa(dot, muted ? LV_OPA_30 : LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(dot, node->alert_count > 0U ? 3 : 2, 0);
+        lv_obj_set_style_border_color(dot, lv_color_lighten(color, 35), 0);
+        lv_obj_set_style_shadow_width(dot, node->alert_count > 0U ? 16 : 8, 0);
+        lv_obj_set_style_shadow_color(dot, color, 0);
+        lv_obj_clear_flag(dot, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(dot, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(dot, pcap_map_node_click_cb, LV_EVENT_CLICKED,
+                            (void *)(uintptr_t)(i + 1U));
+
+        bool show_label = i < 22U || node->alert_count > 0U ||
+                          node->kind >= PCAP_MAP_NODE_MULTICAST;
+        if (!show_label) continue;
+        lv_obj_t *label = lv_label_create(state->map_stage);
+        if (node->kind == PCAP_MAP_NODE_OTHER_LOCAL ||
+            node->kind == PCAP_MAP_NODE_OTHER_EXTERNAL) {
+            lv_label_set_text_fmt(label, "%s +%u", node->address,
+                                  (unsigned)node->grouped_nodes);
+        } else if (node->hostname[0]) {
+            lv_label_set_text(label, node->hostname);
+        } else {
+            lv_label_set_text(label, node->address);
+        }
+        lv_obj_set_width(label, 124);
+        lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
+        lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_font(label, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(label, muted ? ui_muted_color() : ui_text_color(), 0);
+        lv_obj_set_style_bg_color(label, lv_color_hex(0x050A14), 0);
+        lv_obj_set_style_bg_opa(label, LV_OPA_80, 0);
+        lv_obj_set_style_radius(label, 4, 0);
+        lv_obj_set_pos(label, x - 62, y + size / 2 + 3);
+    }
+
+    lv_obj_t *local_lane = lv_label_create(state->map_stage);
+    lv_label_set_text(local_lane, "LOCAL / LAN");
+    lv_obj_set_width(local_lane, 180);
+    lv_obj_set_pos(local_lane, width * 26 / 100 - 90, 6);
+    lv_obj_set_style_text_align(local_lane, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(local_lane, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_color(local_lane, COLOR_MATERIAL_CYAN, 0);
+    lv_obj_t *remote_lane = lv_label_create(state->map_stage);
+    lv_label_set_text(remote_lane, "REMOTE / WAN");
+    lv_obj_set_width(remote_lane, 180);
+    lv_obj_set_pos(remote_lane, width * 74 / 100 - 90, 6);
+    lv_obj_set_style_text_align(remote_lane, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(remote_lane, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_color(remote_lane, COLOR_MATERIAL_PURPLE, 0);
+    pcap_map_update_mode_buttons(state);
+}
+
+static bool pcap_map_node_filterable(const pcap_map_node_t *node)
+{
+    if (!node) return false;
+    return node->kind == PCAP_MAP_NODE_LOCAL || node->kind == PCAP_MAP_NODE_EXTERNAL;
+}
+
+static bool pcap_map_node_profileable(const pcap_viewer_state_t *state,
+                                      const pcap_map_node_t *node)
+{
+    return state && state->flow_analysis && state->investigation && node &&
+           node->kind == PCAP_MAP_NODE_LOCAL &&
+           node->device_index != UINT16_MAX &&
+           node->device_index < state->flow_analysis->device_count;
+}
+
+static uintptr_t pcap_map_encode_filter_action(uint16_t node_index,
+                                                pcap_map_filter_action_t action,
+                                                uint16_t port)
+{
+    return ((uintptr_t)action << 24U) | ((uintptr_t)port << 8U) |
+           (uintptr_t)(node_index + 1U);
+}
+
+static bool pcap_map_apply_node_filter(pcap_viewer_state_t *state,
+                                       const pcap_map_node_t *node,
+                                       pcap_map_filter_action_t action,
+                                       uint16_t port)
+{
+    if (!state || !node || !pcap_map_node_filterable(node)) return false;
+    if ((action == PCAP_MAP_FILTER_SOURCE ||
+         action == PCAP_MAP_FILTER_DESTINATION) && !node->address[0]) return false;
+    if (action == PCAP_MAP_FILTER_SERVICE && port == 0U) return false;
+    bool use_mac = node->kind == PCAP_MAP_NODE_LOCAL && pcap_map_mac_valid(node->mac);
+    if ((action == PCAP_MAP_FILTER_ALL || action == PCAP_MAP_FILTER_SERVICE) &&
+        !use_mac && !node->address[0]) return false;
+    pcap_flow_filter_clear(&state->quick_filter);
+    state->quick_filter.enabled = true;
+    if (action == PCAP_MAP_FILTER_SOURCE) {
+        state->quick_filter.has_source_address = true;
+        pcap_viewer_copy_text(state->quick_filter.source_address,
+                              sizeof(state->quick_filter.source_address), node->address);
+    } else if (action == PCAP_MAP_FILTER_DESTINATION) {
+        state->quick_filter.has_destination_address = true;
+        pcap_viewer_copy_text(state->quick_filter.destination_address,
+                              sizeof(state->quick_filter.destination_address), node->address);
+    } else if (use_mac) {
+        state->quick_filter.has_any_mac = true;
+        pcap_viewer_copy_text(state->quick_filter.any_mac,
+                              sizeof(state->quick_filter.any_mac), node->mac);
+    } else {
+        state->quick_filter.has_any_address = true;
+        pcap_viewer_copy_text(state->quick_filter.any_address,
+                              sizeof(state->quick_filter.any_address), node->address);
+    }
+    if (action == PCAP_MAP_FILTER_SERVICE) {
+        state->quick_filter.has_port = true;
+        state->quick_filter.port = port;
+    }
+    state->packet_filter = PCAP_FILTER_ALL;
+    state->packet_page = 0;
+    pcap_viewer_close_detail(state);
+    pcap_viewer_render_capture_page(state);
+    return true;
+}
+
+static bool pcap_map_node_matches_flow_endpoint(const pcap_map_node_t *node,
+                                                 const char *address,
+                                                 const char *mac)
+{
+    if (!node) return false;
+    if (node->kind == PCAP_MAP_NODE_LOCAL && pcap_map_mac_valid(node->mac) &&
+        mac && mac[0]) return strcasecmp(node->mac, mac) == 0;
+    return node->address[0] && address && address[0] &&
+           strcasecmp(node->address, address) == 0;
+}
+
+static void pcap_map_node_quick_close_cb(lv_event_t *e)
+{
+    pcap_viewer_state_t *state = (pcap_viewer_state_t *)lv_event_get_user_data(e);
+    if (!state) return;
+    if (state->map_node_overlay && lv_obj_is_valid(state->map_node_overlay)) {
+        lv_obj_del(state->map_node_overlay);
+    }
+    state->map_node_overlay = NULL;
+}
+
+static void pcap_map_node_quick_dossier_cb(lv_event_t *e)
+{
+    uintptr_t encoded = (uintptr_t)lv_event_get_user_data(e);
+    pcap_viewer_state_t *state = pcap_viewer_get_state(get_current_ctx(), false);
+    if (!state || !state->map_graph || encoded == 0U) return;
+    uint16_t node_index = (uint16_t)(encoded - 1U);
+    if (node_index >= state->map_graph->node_count) return;
+    pcap_map_node_t selected = state->map_graph->nodes[node_index];
+    if (!pcap_map_node_profileable(state, &selected)) return;
+    pcap_viewer_show_device_profile(state, selected.device_index);
+}
+
+static void pcap_map_node_quick_filter_cb(lv_event_t *e)
+{
+    uintptr_t encoded = (uintptr_t)lv_event_get_user_data(e);
+    pcap_viewer_state_t *state = pcap_viewer_get_state(get_current_ctx(), false);
+    if (!state || !state->map_graph) return;
+    uint16_t node_encoded = (uint16_t)(encoded & 0xFFU);
+    uint16_t port = (uint16_t)((encoded >> 8U) & 0xFFFFU);
+    pcap_map_filter_action_t action =
+        (pcap_map_filter_action_t)((encoded >> 24U) & 0xFFU);
+    if (node_encoded == 0U) return;
+    uint16_t node_index = (uint16_t)(node_encoded - 1U);
+    if (node_index >= state->map_graph->node_count) return;
+    pcap_map_node_t selected = state->map_graph->nodes[node_index];
+    pcap_map_apply_node_filter(state, &selected, action, port);
+}
+
+static void pcap_map_show_node_quick_view(pcap_viewer_state_t *state,
+                                          uint16_t node_index)
+{
+    if (!state || !state->map_graph || !state->detail_overlay ||
+        !lv_obj_is_valid(state->detail_overlay) ||
+        node_index >= state->map_graph->node_count) return;
+    if (state->map_node_overlay && lv_obj_is_valid(state->map_node_overlay)) {
+        lv_obj_del(state->map_node_overlay);
+    }
+    state->map_node_overlay = lv_obj_create(state->detail_overlay);
+    lv_obj_remove_style_all(state->map_node_overlay);
+    lv_obj_set_size(state->map_node_overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(state->map_node_overlay, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(state->map_node_overlay, LV_OPA_70, 0);
+    lv_obj_add_flag(state->map_node_overlay, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(state->map_node_overlay, LV_OBJ_FLAG_SCROLLABLE);
+
+    const pcap_map_node_t *node = &state->map_graph->nodes[node_index];
+    lv_color_t accent = pcap_map_role_color(node);
+    lv_obj_t *popup = lv_obj_create(state->map_node_overlay);
+    lv_obj_set_size(popup, lv_pct(86), lv_pct(86));
+    lv_obj_center(popup);
+    style_surface_panel(popup, 12);
+    lv_obj_set_style_border_width(popup, 2, 0);
+    lv_obj_set_style_border_color(popup, accent, 0);
+    lv_obj_set_style_pad_all(popup, 10, 0);
+    lv_obj_set_style_pad_row(popup, 7, 0);
+    lv_obj_set_flex_flow(popup, LV_FLEX_FLOW_COLUMN);
+    lv_obj_clear_flag(popup, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *header = lv_obj_create(popup);
+    lv_obj_set_size(header, lv_pct(100), 46);
+    lv_obj_set_style_bg_opa(header, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(header, 0, 0);
+    lv_obj_set_style_pad_all(header, 0, 0);
+    lv_obj_set_style_pad_column(header, 8, 0);
+    lv_obj_set_flex_flow(header, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(header, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(header, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *badge = lv_obj_create(header);
+    lv_obj_set_size(badge, 38, 38);
+    lv_obj_set_style_radius(badge, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(badge, accent, 0);
+    lv_obj_set_style_border_width(badge, 0, 0);
+    lv_obj_set_style_pad_all(badge, 0, 0);
+    lv_obj_clear_flag(badge, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *badge_label = lv_label_create(badge);
+    lv_label_set_text(badge_label,
+                      pcap_map_role_badge((pcap_map_role_t)node->role));
+    lv_obj_set_style_text_font(badge_label, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_color(badge_label, lv_color_white(), 0);
+    lv_obj_center(badge_label);
+    lv_obj_t *title = lv_label_create(header);
+    lv_label_set_text_fmt(title, "%s\n%s",
+                          node->hostname[0] ? node->hostname : node->address,
+                          pcap_map_role_name((pcap_map_role_t)node->role));
+    lv_obj_set_flex_grow(title, 1);
+    lv_obj_set_width(title, 0);
+    lv_label_set_long_mode(title, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(title, accent, 0);
+    lv_obj_t *close = lv_btn_create(header);
+    lv_obj_set_size(close, 100, 38);
+    lv_obj_set_style_bg_color(close, COLOR_MATERIAL_BLUE, 0);
+    lv_obj_set_style_radius(close, 8, 0);
+    lv_obj_add_event_cb(close, pcap_map_node_quick_close_cb,
+                        LV_EVENT_CLICKED, state);
+    lv_obj_t *close_label = lv_label_create(close);
+    lv_label_set_text(close_label, "BACK TO MAP");
+    lv_obj_set_style_text_font(close_label, &lv_font_montserrat_10, 0);
+    lv_obj_center(close_label);
+
+    lv_obj_t *body = lv_obj_create(popup);
+    lv_obj_set_size(body, lv_pct(100), 0);
+    lv_obj_set_flex_grow(body, 1);
+    lv_obj_set_style_bg_color(body, lv_color_hex(0x050A14), 0);
+    lv_obj_set_style_border_width(body, 1, 0);
+    lv_obj_set_style_border_color(body, ui_border_color(), 0);
+    lv_obj_set_style_radius(body, 8, 0);
+    lv_obj_set_style_pad_all(body, 8, 0);
+    lv_obj_set_style_pad_row(body, 7, 0);
+    lv_obj_set_flex_flow(body, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_scroll_dir(body, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(body, LV_SCROLLBAR_MODE_AUTO);
+
+    lv_obj_t *identity = lv_label_create(body);
+    lv_label_set_text_fmt(
+        identity,
+        "%s | %s\nIP %s | MAC %s\n%lu flow(s) | services %u | alerts %u\n"
+        "TX %llu B / %lu pkt   RX %llu B / %lu pkt",
+        pcap_map_kind_name((pcap_map_node_kind_t)node->kind),
+        pcap_map_role_name((pcap_map_role_t)node->role), node->address,
+        node->mac[0] ? node->mac : "not observed",
+        (unsigned long)node->flow_count, (unsigned)node->service_count,
+        (unsigned)node->alert_count,
+        (unsigned long long)node->sent_bytes, (unsigned long)node->sent_packets,
+        (unsigned long long)node->received_bytes,
+        (unsigned long)node->received_packets);
+    lv_obj_set_width(identity, lv_pct(100));
+    lv_label_set_long_mode(identity, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(identity, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(identity, ui_text_color(), 0);
+
+    lv_obj_t *actions = lv_obj_create(body);
+    lv_obj_set_size(actions, lv_pct(100), 50);
+    lv_obj_set_style_bg_opa(actions, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(actions, 0, 0);
+    lv_obj_set_style_pad_all(actions, 0, 0);
+    lv_obj_set_style_pad_column(actions, 7, 0);
+    lv_obj_set_flex_flow(actions, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(actions, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_scroll_dir(actions, LV_DIR_HOR);
+    lv_obj_set_scrollbar_mode(actions, LV_SCROLLBAR_MODE_AUTO);
+    if (pcap_map_node_profileable(state, node)) {
+        pcap_viewer_small_action(actions, "DOSSIER", pcap_map_node_quick_dossier_cb,
+                                 (uintptr_t)node_index + 1U,
+                                 COLOR_MATERIAL_PURPLE);
+    }
+    if (pcap_map_node_filterable(node)) {
+        pcap_viewer_small_action(
+            actions, "ALL TRAFFIC", pcap_map_node_quick_filter_cb,
+            pcap_map_encode_filter_action(node_index, PCAP_MAP_FILTER_ALL, 0U),
+            COLOR_MATERIAL_TEAL);
+        pcap_viewer_small_action(
+            actions, "SENT / SRC", pcap_map_node_quick_filter_cb,
+            pcap_map_encode_filter_action(node_index, PCAP_MAP_FILTER_SOURCE, 0U),
+            lv_color_hex(0x087EA4));
+        pcap_viewer_small_action(
+            actions, "RECV / DST", pcap_map_node_quick_filter_cb,
+            pcap_map_encode_filter_action(node_index, PCAP_MAP_FILTER_DESTINATION, 0U),
+            lv_color_hex(0x1565C0));
+    }
+
+    pcap_device_dossier_t dossier;
+    bool has_dossier = pcap_map_node_profileable(state, node) &&
+                       pcap_investigation_device_dossier(
+                           state->flow_analysis, state->investigation,
+                           node->device_index, &dossier);
+    if (has_dossier) {
+        lv_obj_t *context = lv_label_create(body);
+        lv_label_set_text_fmt(
+            context,
+            "Risk %u/100 | findings %u | aliases %lu | peers %lu | names %lu\n"
+            "Services: %s\nTop peers: %s\nDNS/SNI: %s",
+            dossier.risk_score, dossier.finding_count,
+            (unsigned long)dossier.alias_count,
+            (unsigned long)dossier.remote_peer_count,
+            (unsigned long)dossier.domain_count,
+            dossier.services[0] ? dossier.services : "none",
+            dossier.top_peers[0] ? dossier.top_peers : "none",
+            dossier.top_domains[0] ? dossier.top_domains : "none");
+        lv_obj_set_width(context, lv_pct(100));
+        lv_label_set_long_mode(context, LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_text_font(context, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(
+            context, dossier.risk_score >= 70U ? COLOR_MATERIAL_RED :
+                     (dossier.risk_score >= 30U ? COLOR_MATERIAL_AMBER
+                                                : COLOR_NEON_GREEN), 0);
+    }
+
+    if (pcap_map_node_filterable(node) && node->device_index != UINT16_MAX &&
+        node->device_index < state->flow_analysis->device_count) {
+        const pcap_device_entry_t *representative =
+            &state->flow_analysis->devices[node->device_index];
+        uint32_t service_keys[4] = {0};
+        uint16_t service_count = 0U;
+        for (uint32_t i = 0; i < state->flow_analysis->device_count &&
+                             service_count < 4U; i++) {
+            const pcap_device_entry_t *candidate = &state->flow_analysis->devices[i];
+            bool same = i == node->device_index ||
+                        (node->kind == PCAP_MAP_NODE_LOCAL &&
+                         pcap_flow_same_local_device(representative, candidate));
+            if (!same) continue;
+            for (uint16_t s = 0; s < candidate->service_count && service_count < 4U; s++) {
+                uint32_t key = ((uint32_t)candidate->services[s].ip_protocol << 16U) |
+                               candidate->services[s].port;
+                bool duplicate = false;
+                for (uint16_t known = 0; known < service_count; known++) {
+                    if (service_keys[known] == key) duplicate = true;
+                }
+                if (!duplicate) service_keys[service_count++] = key;
+            }
+        }
+        for (uint16_t i = 0; i < service_count; i++) {
+            uint16_t port = (uint16_t)(service_keys[i] & 0xFFFFU);
+            uint8_t protocol = (uint8_t)(service_keys[i] >> 16U);
+            char action_name[20];
+            snprintf(action_name, sizeof(action_name), "%s/%u",
+                     pcap_flow_transport_name(protocol), port);
+            pcap_viewer_small_action(
+                actions, action_name, pcap_map_node_quick_filter_cb,
+                pcap_map_encode_filter_action(
+                    node_index, PCAP_MAP_FILTER_SERVICE, port),
+                COLOR_MATERIAL_AMBER);
+        }
+    }
+
+    lv_obj_t *flow_title = lv_label_create(body);
+    lv_label_set_text(flow_title, "Top related flows");
+    lv_obj_set_style_text_font(flow_title, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(flow_title, COLOR_NEON_CYAN, 0);
+    uint16_t top_flows[5];
+    uint64_t top_scores[5] = {0};
+    for (uint16_t i = 0; i < 5U; i++) top_flows[i] = PCAP_FLOW_ID_NONE;
+    for (uint16_t flow_id = 0; flow_id < state->flow_analysis->flow_count; flow_id++) {
+        const pcap_flow_entry_t *flow = &state->flow_analysis->flows[flow_id];
+        if (!pcap_map_node_matches_flow_endpoint(
+                node, flow->originator, flow->originator_mac) &&
+            !pcap_map_node_matches_flow_endpoint(
+                node, flow->responder, flow->responder_mac)) continue;
+        uint64_t score = flow->originator_bytes + flow->responder_bytes;
+        for (uint16_t position = 0; position < 5U; position++) {
+            if (top_flows[position] != PCAP_FLOW_ID_NONE &&
+                score <= top_scores[position]) continue;
+            for (uint16_t move = 4U; move > position; move--) {
+                top_flows[move] = top_flows[move - 1U];
+                top_scores[move] = top_scores[move - 1U];
+            }
+            top_flows[position] = flow_id;
+            top_scores[position] = score;
+            break;
+        }
+    }
+    uint16_t shown_flows = 0U;
+    for (uint16_t i = 0; i < 5U; i++) {
+        if (top_flows[i] == PCAP_FLOW_ID_NONE) continue;
+        uint16_t flow_id = top_flows[i];
+        const pcap_flow_entry_t *flow = &state->flow_analysis->flows[flow_id];
+        bool originator = pcap_map_node_matches_flow_endpoint(
+            node, flow->originator, flow->originator_mac);
+        const char *peer = originator ? flow->responder : flow->originator;
+        uint16_t peer_port = originator ? flow->responder_port : flow->originator_port;
+        lv_obj_t *row = lv_obj_create(body);
+        lv_obj_set_size(row, lv_pct(100), 58);
+        lv_obj_set_style_bg_color(row, ui_card_color(), 0);
+        lv_obj_set_style_border_width(row, 1, 0);
+        lv_obj_set_style_border_color(row, ui_border_color(), 0);
+        lv_obj_set_style_radius(row, 7, 0);
+        lv_obj_set_style_pad_all(row, 5, 0);
+        lv_obj_set_style_pad_column(row, 6, 0);
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START,
+                              LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_t *label = lv_label_create(row);
+        lv_label_set_text_fmt(
+            label, "#%u %s %s:%u\n%s | %llu B | %lu/%lu pkt%s%s",
+            (unsigned)flow_id + 1U, originator ? "->" : "<-", peer, peer_port,
+            pcap_flow_application_name((pcap_application_t)flow->app_protocol),
+            (unsigned long long)(flow->originator_bytes + flow->responder_bytes),
+            (unsigned long)flow->originator_packets,
+            (unsigned long)flow->responder_packets,
+            flow->server_name[0] ? " | " : "",
+            flow->server_name[0] ? flow->server_name : "");
+        lv_obj_set_flex_grow(label, 1);
+        lv_obj_set_width(label, 0);
+        lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
+        lv_obj_set_style_text_font(label, &lv_font_montserrat_10, 0);
+        lv_obj_set_style_text_color(label, ui_text_color(), 0);
+        pcap_viewer_small_action(row, "FILTER", pcap_viewer_connection_filter_cb,
+                                 (uintptr_t)flow_id + 1U,
+                                 lv_color_hex(0x087EA4));
+        pcap_viewer_small_action(row, "FOLLOW", pcap_viewer_connection_follow_cb,
+                                 (uintptr_t)flow_id + 1U,
+                                 COLOR_MATERIAL_PURPLE);
+        pcap_viewer_small_action(row, "HEX", pcap_viewer_connection_hex_cb,
+                                 (uintptr_t)flow_id + 1U,
+                                 COLOR_MATERIAL_TEAL);
+        shown_flows++;
+    }
+    if (shown_flows == 0U) {
+        lv_obj_t *none = lv_label_create(body);
+        lv_label_set_text(none, "No related flow retained in the bounded flow table.");
+        lv_obj_set_style_text_color(none, ui_muted_color(), 0);
+    }
+}
+
+static void pcap_map_node_click_cb(lv_event_t *e)
+{
+    uintptr_t encoded = (uintptr_t)lv_event_get_user_data(e);
+    pcap_viewer_state_t *state = pcap_viewer_get_state(get_current_ctx(), false);
+    if (!state || !state->map_graph || encoded == 0U) return;
+    uint16_t node_index = (uint16_t)(encoded - 1U);
+    if (node_index >= state->map_graph->node_count) return;
+    state->map_selected_node = node_index;
+    const pcap_map_node_t *node = &state->map_graph->nodes[node_index];
+    if (state->map_detail_label && lv_obj_is_valid(state->map_detail_label)) {
+        lv_label_set_text_fmt(
+            state->map_detail_label,
+            "%s | %s | %s%s%s | MAC %s | %lu flow(s) | services %u | alerts %u\n"
+            "TX %llu B / %lu pkt   RX %llu B / %lu pkt%s",
+            pcap_map_role_name((pcap_map_role_t)node->role),
+            pcap_map_kind_name((pcap_map_node_kind_t)node->kind), node->address,
+            node->hostname[0] ? " | " : "", node->hostname[0] ? node->hostname : "",
+            node->mac[0] ? node->mac : "n/a", (unsigned long)node->flow_count,
+            (unsigned)node->service_count, (unsigned)node->alert_count,
+            (unsigned long long)node->sent_bytes, (unsigned long)node->sent_packets,
+            (unsigned long long)node->received_bytes, (unsigned long)node->received_packets,
+            node->grouped_nodes > 1U ? " | merged/grouped endpoints" : "");
+    }
+    if (state->map_summary_btn && lv_obj_is_valid(state->map_summary_btn)) {
+        if (pcap_map_node_profileable(state, node)) {
+            lv_obj_clear_state(state->map_summary_btn, LV_STATE_DISABLED);
+        } else {
+            lv_obj_add_state(state->map_summary_btn, LV_STATE_DISABLED);
+        }
+    }
+    if (state->map_filter_btn && lv_obj_is_valid(state->map_filter_btn)) {
+        if (pcap_map_node_filterable(node)) lv_obj_clear_state(state->map_filter_btn,
+                                                                LV_STATE_DISABLED);
+        else lv_obj_add_state(state->map_filter_btn, LV_STATE_DISABLED);
+    }
+    pcap_map_show_node_quick_view(state, node_index);
+}
+
+static void pcap_map_summary_selected_cb(lv_event_t *e)
+{
+    pcap_viewer_state_t *state = (pcap_viewer_state_t *)lv_event_get_user_data(e);
+    if (!state || !state->map_graph || state->map_selected_node < 0 ||
+        state->map_selected_node >= state->map_graph->node_count) return;
+    pcap_map_node_t selected = state->map_graph->nodes[state->map_selected_node];
+    if (!pcap_map_node_profileable(state, &selected)) return;
+    pcap_viewer_show_device_profile(state, selected.device_index);
+}
+
+static void pcap_map_filter_selected_cb(lv_event_t *e)
+{
+    pcap_viewer_state_t *state = (pcap_viewer_state_t *)lv_event_get_user_data(e);
+    if (!state || !state->map_graph || state->map_selected_node < 0 ||
+        state->map_selected_node >= state->map_graph->node_count) return;
+    pcap_map_node_t selected = state->map_graph->nodes[state->map_selected_node];
+    pcap_map_apply_node_filter(state, &selected, PCAP_MAP_FILTER_ALL, 0U);
+}
+
+static void pcap_map_mode_cb(lv_event_t *e)
+{
+    uintptr_t encoded = (uintptr_t)lv_event_get_user_data(e);
+    pcap_viewer_state_t *state = pcap_viewer_get_state(get_current_ctx(), false);
+    if (!state || encoded == 0U || encoded > PCAP_MAP_MODE_COUNT) return;
+    state->map_mode = (pcap_map_mode_t)(encoded - 1U);
+    pcap_map_render_stage(state);
+}
+
+static lv_obj_t *pcap_map_add_mode_button(pcap_viewer_state_t *state,
+                                          lv_obj_t *parent, const char *text,
+                                          pcap_map_mode_t mode, lv_color_t color)
+{
+    lv_obj_t *button = lv_btn_create(parent);
+    lv_obj_set_size(button, 0, 40);
+    lv_obj_set_flex_grow(button, 1);
+    lv_obj_set_style_bg_color(button, color, 0);
+    lv_obj_set_style_radius(button, 8, 0);
+    lv_obj_add_event_cb(button, pcap_map_mode_cb, LV_EVENT_CLICKED,
+                        (void *)(uintptr_t)(mode + 1U));
+    lv_obj_t *label = lv_label_create(button);
+    lv_label_set_text(label, text);
+    lv_obj_set_style_text_font(label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(label, lv_color_white(), 0);
+    lv_obj_center(label);
+    state->map_mode_buttons[mode] = button;
+    return button;
+}
+
+static void pcap_viewer_map_cb(lv_event_t *e)
+{
+    pcap_viewer_state_t *state = (pcap_viewer_state_t *)lv_event_get_user_data(e);
+    if (!state || !state->flow_analysis) return;
+    pcap_viewer_close_detail(state);
+    state->map_graph = heap_caps_calloc(1, sizeof(*state->map_graph),
+                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!state->map_graph || !pcap_map_build_graph(state->flow_analysis,
+                                                   state->map_graph)) {
+        if (state->map_graph) {
+            heap_caps_free(state->map_graph);
+            state->map_graph = NULL;
+        }
+        pcap_viewer_show_summary_popup(state, "ESPShark Map", "Not enough PSRAM to build map.");
+        return;
+    }
+    state->map_mode = PCAP_MAP_MODE_TOPOLOGY;
+    state->map_selected_node = -1;
+    state->detail_overlay = lv_obj_create(lv_scr_act());
+    lv_obj_remove_style_all(state->detail_overlay);
+    lv_obj_set_size(state->detail_overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(state->detail_overlay, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(state->detail_overlay, LV_OPA_80, 0);
+    lv_obj_add_flag(state->detail_overlay, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(state->detail_overlay, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *popup = lv_obj_create(state->detail_overlay);
+    lv_obj_set_size(popup, lv_pct(96), lv_pct(94));
+    lv_obj_center(popup);
+    style_surface_panel(popup, 12);
+    lv_obj_set_style_border_width(popup, 2, 0);
+    lv_obj_set_style_border_color(popup, COLOR_NEON_CYAN, 0);
+    lv_obj_set_style_pad_all(popup, 9, 0);
+    lv_obj_set_style_pad_row(popup, 6, 0);
+    lv_obj_set_flex_flow(popup, LV_FLEX_FLOW_COLUMN);
+    lv_obj_clear_flag(popup, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *header = lv_obj_create(popup);
+    lv_obj_set_size(header, lv_pct(100), 42);
+    lv_obj_set_style_bg_opa(header, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(header, 0, 0);
+    lv_obj_set_style_pad_all(header, 0, 0);
+    lv_obj_set_style_pad_column(header, 10, 0);
+    lv_obj_set_flex_flow(header, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(header, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(header, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *title = lv_label_create(header);
+    lv_label_set_text(title, "ESPShark Network Topology");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, COLOR_NEON_CYAN, 0);
+    lv_obj_set_flex_grow(title, 1);
+    lv_obj_t *scope = lv_label_create(header);
+    lv_label_set_text_fmt(scope, "INFERRED FROM CAPTURE%s | %u nodes | %u links",
+                          state->scan_summary.indexed_packets < state->scan_summary.packet_count
+                              ? " / SAMPLE" : "",
+                          (unsigned)state->map_graph->node_count,
+                          (unsigned)state->map_graph->edge_count);
+    lv_obj_set_style_text_font(scope, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(scope, state->map_graph->limited
+                                          ? COLOR_MATERIAL_AMBER : COLOR_NEON_GREEN, 0);
+    lv_obj_t *close = lv_btn_create(header);
+    lv_obj_set_size(close, 90, 38);
+    lv_obj_set_style_bg_color(close, COLOR_MATERIAL_BLUE, 0);
+    lv_obj_set_style_radius(close, 8, 0);
+    lv_obj_add_event_cb(close, pcap_viewer_packet_detail_close_cb,
+                        LV_EVENT_CLICKED, state);
+    lv_obj_t *close_label = lv_label_create(close);
+    lv_label_set_text(close_label, "CLOSE");
+    lv_obj_center(close_label);
+
+    lv_obj_t *controls = lv_obj_create(popup);
+    lv_obj_set_size(controls, lv_pct(100), 42);
+    lv_obj_set_style_bg_opa(controls, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(controls, 0, 0);
+    lv_obj_set_style_pad_all(controls, 0, 0);
+    lv_obj_set_style_pad_column(controls, 8, 0);
+    lv_obj_set_flex_flow(controls, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(controls, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(controls, LV_OBJ_FLAG_SCROLLABLE);
+    pcap_map_add_mode_button(state, controls, "TOPOLOGY", PCAP_MAP_MODE_TOPOLOGY,
+                             lv_color_hex(0x1565C0));
+    pcap_map_add_mode_button(state, controls, "TRAFFIC", PCAP_MAP_MODE_TRAFFIC,
+                             lv_color_hex(0x087EA4));
+    pcap_map_add_mode_button(state, controls, "THREATS", PCAP_MAP_MODE_THREATS,
+                             COLOR_MATERIAL_RED);
+    pcap_map_add_mode_button(state, controls, "SERVICES", PCAP_MAP_MODE_SERVICES,
+                             COLOR_MATERIAL_PURPLE);
+    lv_obj_t *legend = lv_label_create(controls);
+    lv_label_set_text(legend, "GW blue | LAN green | WAN purple | alerts red/amber");
+    lv_obj_set_width(legend, 350);
+    lv_label_set_long_mode(legend, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_font(legend, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(legend, ui_muted_color(), 0);
+
+    state->map_stage = lv_obj_create(popup);
+    lv_obj_set_size(state->map_stage, lv_pct(100), 0);
+    lv_obj_set_flex_grow(state->map_stage, 1);
+    lv_obj_set_style_bg_color(state->map_stage, lv_color_hex(0x050A14), 0);
+    lv_obj_set_style_border_width(state->map_stage, 1, 0);
+    lv_obj_set_style_border_color(state->map_stage, ui_border_color(), 0);
+    lv_obj_set_style_radius(state->map_stage, 8, 0);
+    lv_obj_set_style_pad_all(state->map_stage, 8, 0);
+    lv_obj_clear_flag(state->map_stage, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *detail = lv_obj_create(popup);
+    lv_obj_set_size(detail, lv_pct(100), 68);
+    lv_obj_set_style_bg_color(detail, ui_card_color(), 0);
+    lv_obj_set_style_border_width(detail, 1, 0);
+    lv_obj_set_style_border_color(detail, ui_border_color(), 0);
+    lv_obj_set_style_radius(detail, 8, 0);
+    lv_obj_set_style_pad_all(detail, 6, 0);
+    lv_obj_set_style_pad_column(detail, 8, 0);
+    lv_obj_set_flex_flow(detail, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(detail, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(detail, LV_OBJ_FLAG_SCROLLABLE);
+    state->map_detail_label = lv_label_create(detail);
+    lv_label_set_text_fmt(
+        state->map_detail_label,
+        "Tap a node for evidence | observed devices LAN %u / WAN %u | alerts %u%s\n"
+        "Absence of a link does not prove absence of communication.",
+        (unsigned)state->map_graph->local_nodes,
+        (unsigned)state->map_graph->external_nodes,
+        (unsigned)state->map_graph->global_alerts,
+        state->map_graph->limited ? " | MAP LIMITED" : "");
+    lv_obj_set_width(state->map_detail_label, 0);
+    lv_obj_set_flex_grow(state->map_detail_label, 1);
+    lv_label_set_long_mode(state->map_detail_label, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_font(state->map_detail_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(state->map_detail_label, ui_text_color(), 0);
+    state->map_summary_btn = lv_btn_create(detail);
+    lv_obj_set_size(state->map_summary_btn, 150, 44);
+    lv_obj_set_style_bg_color(state->map_summary_btn, COLOR_MATERIAL_PURPLE, 0);
+    lv_obj_set_style_radius(state->map_summary_btn, 8, 0);
+    lv_obj_add_state(state->map_summary_btn, LV_STATE_DISABLED);
+    lv_obj_add_event_cb(state->map_summary_btn, pcap_map_summary_selected_cb,
+                        LV_EVENT_CLICKED, state);
+    lv_obj_t *summary_btn_label = lv_label_create(state->map_summary_btn);
+    lv_label_set_text(summary_btn_label, "DEVICE SUMMARY");
+    lv_obj_set_style_text_font(summary_btn_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(summary_btn_label, lv_color_white(), 0);
+    lv_obj_center(summary_btn_label);
+    state->map_filter_btn = lv_btn_create(detail);
+    lv_obj_set_size(state->map_filter_btn, 150, 44);
+    lv_obj_set_style_bg_color(state->map_filter_btn, COLOR_MATERIAL_TEAL, 0);
+    lv_obj_set_style_radius(state->map_filter_btn, 8, 0);
+    lv_obj_add_state(state->map_filter_btn, LV_STATE_DISABLED);
+    lv_obj_add_event_cb(state->map_filter_btn, pcap_map_filter_selected_cb,
+                        LV_EVENT_CLICKED, state);
+    lv_obj_t *filter_label = lv_label_create(state->map_filter_btn);
+    lv_label_set_text(filter_label, "FILTER NODE");
+    lv_obj_set_style_text_color(filter_label, lv_color_white(), 0);
+    lv_obj_center(filter_label);
+    lv_obj_update_layout(popup);
+    pcap_map_render_stage(state);
+    ESP_LOGI(TAG, "[ESPShark] Communication map: nodes=%u edges=%u hidden_nodes=%u hidden_edges=%u alerts=%u",
+             (unsigned)state->map_graph->node_count,
+             (unsigned)state->map_graph->edge_count,
+             (unsigned)state->map_graph->hidden_nodes,
+             (unsigned)state->map_graph->hidden_edges,
+             (unsigned)state->map_graph->global_alerts);
+}
+
+static void pcap_viewer_clear_quick_filter_cb(lv_event_t *e)
+{
+    pcap_viewer_state_t *state = (pcap_viewer_state_t *)lv_event_get_user_data(e);
+    if (!state) return;
+    pcap_flow_filter_clear(&state->quick_filter);
+    state->packet_page = 0;
+    pcap_viewer_render_capture_page(state);
+}
+
+enum {
+    PCAP_TOOL_EXPORT_REPORT = 1,
+    PCAP_TOOL_EXPORT_FILTERED,
+    PCAP_TOOL_EXPORT_HTML,
+    PCAP_TOOL_EXPORT_SUMMARY,
+    PCAP_TOOL_SET_BASELINE,
+    PCAP_TOOL_COMPARE_BASELINE,
+    PCAP_TOOL_SAVE_FILTER,
+    PCAP_TOOL_LOAD_FILTER,
+    PCAP_TOOL_DELETE_CACHE,
+    PCAP_TOOL_REANALYZE,
+    PCAP_TOOL_CLOSE,
+};
+
+static void pcap_viewer_close_tools_popup(pcap_viewer_state_t *state)
+{
+    if (!state || state->artifact_running) {
+        return;
+    }
+    if (state->artifact_overlay && lv_obj_is_valid(state->artifact_overlay)) {
+        lv_obj_del(state->artifact_overlay);
+    }
+    state->artifact_overlay = NULL;
+    state->artifact_popup = NULL;
+    state->artifact_spinner = NULL;
+    state->artifact_status_label = NULL;
+    state->artifact_actions = NULL;
+}
+
+static void pcap_viewer_show_objects(pcap_viewer_state_t *state);
+
+/* Runs on the extraction task, so it only stores counters. The LVGL timer in
+ * pcap_viewer_extract_progress_timer_cb() is what touches the widgets. */
+static void pcap_viewer_extract_progress_cb(const char *phase, uint32_t done,
+                                            uint32_t total, void *user_ctx)
+{
+    pcap_viewer_state_t *state = (pcap_viewer_state_t *)user_ctx;
+    if (!state) return;
+    snprintf(state->extract_phase, sizeof(state->extract_phase), "%.15s",
+             phase ? phase : "");
+    state->extract_done = done;
+    state->extract_total = total;
+}
+
+static void pcap_viewer_extract_progress_timer_cb(lv_timer_t *timer)
+{
+    pcap_viewer_state_t *state = (pcap_viewer_state_t *)lv_timer_get_user_data(timer);
+    if (!state) {
+        lv_timer_del(timer);
+        return;
+    }
+    if (!state->artifact_running) {
+        state->extract_progress_timer = NULL;
+        lv_timer_del(timer);
+        return;
+    }
+    if (!state->artifact_status_label || !lv_obj_is_valid(state->artifact_status_label)) {
+        return;
+    }
+    uint32_t done = state->extract_done;
+    uint32_t total = state->extract_total;
+    unsigned percent = total > 0 ? (unsigned)((uint64_t)done * 100ULL / total) : 0U;
+    if (percent > 100U) percent = 100U;
+    lv_label_set_text_fmt(state->artifact_status_label,
+                          "Rebuilding HTTP objects...\n%s %u%%\n"
+                          "Only plaintext HTTP can be carved.",
+                          strcmp(state->extract_phase, "carve") == 0
+                              ? "Carving streams" : "Scanning capture",
+                          percent);
+}
+
+static void pcap_viewer_artifact_finish_async(void *user_data)
+{
+    pcap_viewer_state_t *state = (pcap_viewer_state_t *)user_data;
+    if (state && state->extract_progress_timer) {
+        lv_timer_del(state->extract_progress_timer);
+        state->extract_progress_timer = NULL;
+    }
+    if (state && state->extract_show_on_finish) {
+        state->extract_show_on_finish = false;
+        if (state->artifact_success && state->extract_result &&
+            state->extract_result->object_count > 0) {
+            pcap_viewer_close_tools_popup(state);
+            pcap_viewer_show_objects(state);
+            return;
+        }
+    }
+    if (!state || !state->artifact_overlay ||
+        !lv_obj_is_valid(state->artifact_overlay)) {
+        return;
+    }
+    if (state->artifact_spinner && lv_obj_is_valid(state->artifact_spinner)) {
+        lv_obj_add_flag(state->artifact_spinner, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (state->artifact_status_label && lv_obj_is_valid(state->artifact_status_label)) {
+        lv_label_set_text(state->artifact_status_label, state->artifact_message);
+        lv_obj_set_style_text_color(state->artifact_status_label,
+                                    state->artifact_success
+                                        ? COLOR_MATERIAL_GREEN : COLOR_MATERIAL_RED, 0);
+    }
+    if (state->artifact_actions && lv_obj_is_valid(state->artifact_actions)) {
+        lv_obj_clear_flag(state->artifact_actions, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void pcap_viewer_artifact_task(void *arg)
+{
+    pcap_viewer_state_t *state = (pcap_viewer_state_t *)arg;
+    if (!state) {
+        vTaskDelete(NULL);
+        return;
+    }
+    char output_path[PCAP_ANALYSIS_STORE_PATH_MAX] = {0};
+    pcap_analysis_store_status_t result = PCAP_ANALYSIS_STORE_INVALID;
+    state->artifact_message[0] = '\0';
+    if (state->artifact_action == PCAP_ARTIFACT_EXPORT_REPORT) {
+        uint32_t selected_matches = pcap_viewer_filtered_packet_count(state);
+        result = pcap_analysis_export_report_json(
+            state->selected_path, &state->capture_info, &state->scan_summary,
+            state->summary, state->flow_analysis, state->investigation,
+            state->packet_flags,
+            state->scan_summary.indexed_packets,
+            state->packet_filter, &state->quick_filter, selected_matches,
+            state->cache_hit, output_path, sizeof(output_path));
+        if (result == PCAP_ANALYSIS_STORE_OK) {
+            snprintf(state->artifact_message, sizeof(state->artifact_message),
+                     "Analysis report saved:\n%s", output_path);
+        }
+    } else if (state->artifact_action == PCAP_ARTIFACT_EXPORT_FILTERED_PCAP) {
+        uint32_t exported = 0;
+        uint8_t *selection = NULL;
+        if (state->quick_filter.enabled) {
+            selection = heap_caps_calloc(state->scan_summary.indexed_packets,
+                                         sizeof(uint8_t),
+                                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            if (selection) {
+                for (uint32_t i = 0; i < state->scan_summary.indexed_packets; i++) {
+                    selection[i] = pcap_viewer_packet_is_visible(state, i) ? 1U : 0U;
+                }
+            }
+        }
+        if (state->quick_filter.enabled && !selection) {
+            result = PCAP_ANALYSIS_STORE_LIMIT;
+        } else {
+            result = pcap_analysis_export_filtered_pcap(
+                state->selected_path, state->packet_index, state->packet_flags,
+                state->scan_summary.indexed_packets, state->packet_filter,
+                selection, selection ? state->scan_summary.indexed_packets : 0,
+                output_path, sizeof(output_path), &exported);
+        }
+        if (selection) heap_caps_free(selection);
+        if (result == PCAP_ANALYSIS_STORE_OK) {
+            snprintf(state->artifact_message, sizeof(state->artifact_message),
+                     "Exported %lu indexed matching packet(s):\n%s%s",
+                     (unsigned long)exported, output_path,
+                     state->scan_summary.index_limited
+                         ? "\nNote: source analysis is index-limited; export contains the analyzed sample."
+                         : "");
+        }
+    } else if (state->artifact_action == PCAP_ARTIFACT_EXTRACT_OBJECTS) {
+        const pcap_extract_result_t *objects = state->extract_result;
+        state->extract_status = objects
+                                    ? pcap_extract_run(state->selected_path,
+                                                       state->extract_result,
+                                                       &state->cancel_requested,
+                                                       pcap_viewer_extract_progress_cb,
+                                                       state)
+                                    : PCAP_EXTRACT_NO_MEMORY;
+        if (!objects) {
+            result = PCAP_ANALYSIS_STORE_INVALID;
+            snprintf(state->artifact_message, sizeof(state->artifact_message),
+                     "Object extraction failed: %s",
+                     pcap_extract_status_name(PCAP_EXTRACT_NO_MEMORY));
+        } else if (state->extract_status == PCAP_EXTRACT_OK) {
+            result = PCAP_ANALYSIS_STORE_OK;
+            snprintf(state->artifact_message, sizeof(state->artifact_message),
+                     "Extracted %lu object(s), %llu B written.\n%.200s\n"
+                     "%lu HTTP response(s) in %lu session(s); "
+                     "%lu encrypted flow(s) could not be carved.%s%s%s%s",
+                     (unsigned long)objects->object_count,
+                     (unsigned long long)objects->written_bytes,
+                     objects->directory,
+                     (unsigned long)objects->http_responses,
+                     (unsigned long)objects->session_count,
+                     (unsigned long)objects->encrypted_flows,
+                     objects->object_limited ? "\nOBJECT LIMIT reached." : "",
+                     objects->session_limited ? "\nSESSION LIMIT reached." : "",
+                     objects->segment_limited ? "\nSEGMENT LIMIT reached." : "",
+                     objects->capture_truncated ? "\nCapture tail is truncated." : "");
+        } else {
+            result = PCAP_ANALYSIS_STORE_INVALID;
+            if (state->extract_status == PCAP_EXTRACT_NOTHING_FOUND) {
+                snprintf(state->artifact_message, sizeof(state->artifact_message),
+                         "No plaintext HTTP object could be reconstructed.\n"
+                         "%lu HTTP response(s), %lu encrypted flow(s).\n"
+                         "TLS, QUIC and VPN payloads stay encrypted without keys.",
+                         (unsigned long)objects->http_responses,
+                         (unsigned long)objects->encrypted_flows);
+            } else {
+                snprintf(state->artifact_message, sizeof(state->artifact_message),
+                         "Object extraction failed: %s",
+                         pcap_extract_status_name(state->extract_status));
+            }
+        }
+    } else if (state->artifact_action == PCAP_ARTIFACT_EXPORT_HTML) {
+        pcap_investigation_status_t html_status = pcap_investigation_export_html(
+            state->selected_path, state->summary, state->flow_analysis,
+            state->investigation,
+            state->baseline_status == PCAP_INVESTIGATION_OK
+                ? &state->baseline_diff : NULL,
+            output_path, sizeof(output_path));
+        result = html_status == PCAP_INVESTIGATION_OK
+                     ? PCAP_ANALYSIS_STORE_OK : PCAP_ANALYSIS_STORE_IO_ERROR;
+        if (html_status == PCAP_INVESTIGATION_OK) {
+            snprintf(state->artifact_message, sizeof(state->artifact_message),
+                     "Investigation HTML saved:\n%s", output_path);
+        } else {
+            snprintf(state->artifact_message, sizeof(state->artifact_message),
+                     "HTML export failed: %s",
+                     pcap_investigation_status_name(html_status));
+        }
+    } else if (state->artifact_action == PCAP_ARTIFACT_EXPORT_SUMMARY_TEXT) {
+        result = pcap_analysis_export_summary_text(
+            state->selected_path, &state->capture_info, &state->scan_summary,
+            state->summary, output_path, sizeof(output_path));
+        if (result == PCAP_ANALYSIS_STORE_OK) {
+            snprintf(state->artifact_message, sizeof(state->artifact_message),
+                     "Text summary saved:\n%s%s", output_path,
+                     state->scan_summary.index_limited
+                         ? "\nNote: the analysis is index-limited, so the summary "
+                           "describes the analyzed sample."
+                         : "");
+        }
+    }
+    if (result != PCAP_ANALYSIS_STORE_OK && state->artifact_message[0] == '\0') {
+        snprintf(state->artifact_message, sizeof(state->artifact_message),
+                 "Operation failed: %s",
+                 pcap_analysis_store_status_name(result));
+    }
+    state->artifact_success = result == PCAP_ANALYSIS_STORE_OK;
+    state->artifact_action = PCAP_ARTIFACT_NONE;
+    state->artifact_running = false;
+    state->artifact_task = NULL;
+    lv_async_call(pcap_viewer_artifact_finish_async, state);
+    vTaskDelete(NULL);
+}
+
+static void pcap_viewer_tool_action_cb(lv_event_t *e)
+{
+    unsigned action = (unsigned)(uintptr_t)lv_event_get_user_data(e);
+    tab_context_t *ctx = get_current_ctx();
+    pcap_viewer_state_t *state = pcap_viewer_get_state(ctx, false);
+    if (!state || state->artifact_running) {
+        return;
+    }
+    if (action == PCAP_TOOL_CLOSE) {
+        pcap_viewer_close_tools_popup(state);
+        return;
+    }
+    if (action == PCAP_TOOL_REANALYZE) {
+        char path[PCAP_VIEWER_PATH_MAX];
+        char name[96];
+        pcap_viewer_copy_text(path, sizeof(path), state->selected_path);
+        pcap_viewer_copy_text(name, sizeof(name), state->selected_name);
+        pcap_viewer_close_tools_popup(state);
+        pcap_viewer_start_file_load(state, path, name, true);
+        return;
+    }
+
+    if (action == PCAP_TOOL_SAVE_FILTER || action == PCAP_TOOL_LOAD_FILTER ||
+        action == PCAP_TOOL_DELETE_CACHE || action == PCAP_TOOL_SET_BASELINE ||
+        action == PCAP_TOOL_COMPARE_BASELINE) {
+        char artifact_path[PCAP_ANALYSIS_STORE_PATH_MAX] = {0};
+        pcap_analysis_store_status_t result = PCAP_ANALYSIS_STORE_INVALID;
+        if (action == PCAP_TOOL_SET_BASELINE) {
+            pcap_investigation_status_t baseline_status =
+                pcap_investigation_baseline_save(
+                    state->selected_path, state->summary, state->flow_analysis,
+                    artifact_path, sizeof(artifact_path));
+            result = baseline_status == PCAP_INVESTIGATION_OK
+                         ? PCAP_ANALYSIS_STORE_OK : PCAP_ANALYSIS_STORE_IO_ERROR;
+            if (baseline_status == PCAP_INVESTIGATION_OK) {
+                state->baseline_status = pcap_investigation_baseline_compare(
+                    state->summary, state->flow_analysis, &state->baseline_diff);
+                snprintf(state->artifact_message, sizeof(state->artifact_message),
+                         "Current capture saved as known-good baseline:\n%s",
+                         artifact_path);
+            } else {
+                snprintf(state->artifact_message, sizeof(state->artifact_message),
+                         "Could not save baseline: %s",
+                         pcap_investigation_status_name(baseline_status));
+            }
+        } else if (action == PCAP_TOOL_COMPARE_BASELINE) {
+            state->baseline_status = pcap_investigation_baseline_compare(
+                state->summary, state->flow_analysis, &state->baseline_diff);
+            result = state->baseline_status == PCAP_INVESTIGATION_OK
+                         ? PCAP_ANALYSIS_STORE_OK : PCAP_ANALYSIS_STORE_NOT_FOUND;
+            if (state->baseline_status == PCAP_INVESTIGATION_OK) {
+                snprintf(state->artifact_message, sizeof(state->artifact_message),
+                         "Compared with %s: new LAN %lu, missing LAN %lu, new domains %lu",
+                         state->baseline_diff.baseline_source,
+                         (unsigned long)state->baseline_diff.new_local_devices,
+                         (unsigned long)state->baseline_diff.missing_local_devices,
+                         (unsigned long)state->baseline_diff.new_domains);
+            } else {
+                snprintf(state->artifact_message, sizeof(state->artifact_message),
+                         "Baseline comparison unavailable: %s",
+                         pcap_investigation_status_name(state->baseline_status));
+            }
+        } else if (action == PCAP_TOOL_SAVE_FILTER) {
+            result = pcap_analysis_filter_profile_save(state->packet_filter,
+                                                       &state->quick_filter,
+                                                       artifact_path, sizeof(artifact_path));
+            snprintf(state->artifact_message, sizeof(state->artifact_message),
+                     result == PCAP_ANALYSIS_STORE_OK
+                         ? "Current filter profile saved:\n%s"
+                         : "Could not save filter profile: %s",
+                     result == PCAP_ANALYSIS_STORE_OK
+                         ? artifact_path : pcap_analysis_store_status_name(result));
+        } else if (action == PCAP_TOOL_LOAD_FILTER) {
+            pcap_packet_filter_t loaded_filter = PCAP_FILTER_ALL;
+            pcap_flow_filter_t loaded_quick_filter;
+            pcap_flow_filter_clear(&loaded_quick_filter);
+            result = pcap_analysis_filter_profile_load(&loaded_filter,
+                                                       &loaded_quick_filter,
+                                                       artifact_path, sizeof(artifact_path));
+            if (result == PCAP_ANALYSIS_STORE_OK) {
+                state->packet_filter = loaded_filter;
+                state->quick_filter = loaded_quick_filter;
+                if (state->quick_filter.has_flow &&
+                    (!state->flow_analysis ||
+                     state->quick_filter.flow_id >= state->flow_analysis->flow_count)) {
+                    state->quick_filter.has_flow = false;
+                }
+                state->packet_page = 0;
+                snprintf(state->artifact_message, sizeof(state->artifact_message),
+                         "Loaded filter %s from:\n%s",
+                         pcap_reader_filter_name(loaded_filter), artifact_path);
+            } else {
+                snprintf(state->artifact_message, sizeof(state->artifact_message),
+                         "Could not load filter profile: %s",
+                         pcap_analysis_store_status_name(result));
+            }
+        } else {
+            result = pcap_analysis_cache_delete(state->selected_path);
+            if (result == PCAP_ANALYSIS_STORE_OK ||
+                result == PCAP_ANALYSIS_STORE_NOT_FOUND) {
+                state->cache_hit = false;
+                state->cache_available = false;
+                memset(&state->cache_info, 0, sizeof(state->cache_info));
+                snprintf(state->artifact_message, sizeof(state->artifact_message),
+                         "Analysis cache deleted. Current in-memory analysis remains open.");
+                result = PCAP_ANALYSIS_STORE_OK;
+            } else {
+                snprintf(state->artifact_message, sizeof(state->artifact_message),
+                         "Could not delete cache: %s",
+                         pcap_analysis_store_status_name(result));
+            }
+        }
+        if (state->artifact_status_label && lv_obj_is_valid(state->artifact_status_label)) {
+            lv_label_set_text(state->artifact_status_label, state->artifact_message);
+            lv_obj_set_style_text_color(state->artifact_status_label,
+                                        result == PCAP_ANALYSIS_STORE_OK
+                                            ? COLOR_MATERIAL_GREEN : COLOR_MATERIAL_RED, 0);
+        }
+        if (action == PCAP_TOOL_LOAD_FILTER && result == PCAP_ANALYSIS_STORE_OK) {
+            pcap_viewer_close_tools_popup(state);
+            pcap_viewer_render_capture_page(state);
+        }
+        return;
+    }
+
+    const char *artifact_status_text = NULL;
+    switch (action) {
+        case PCAP_TOOL_EXPORT_REPORT:
+            state->artifact_action = PCAP_ARTIFACT_EXPORT_REPORT;
+            artifact_status_text = "Writing portable ESPShark JSON report...";
+            break;
+        case PCAP_TOOL_EXPORT_FILTERED:
+            state->artifact_action = PCAP_ARTIFACT_EXPORT_FILTERED_PCAP;
+            artifact_status_text = "Writing a Wireshark/Zeek-compatible filtered PCAP...";
+            break;
+        case PCAP_TOOL_EXPORT_HTML:
+            state->artifact_action = PCAP_ARTIFACT_EXPORT_HTML;
+            artifact_status_text = "Writing standalone ESPShark investigation HTML...";
+            break;
+        case PCAP_TOOL_EXPORT_SUMMARY:
+            state->artifact_action = PCAP_ARTIFACT_EXPORT_SUMMARY_TEXT;
+            artifact_status_text = "Writing the deterministic English summary...";
+            break;
+        default:
+            return;
+    }
+    state->artifact_running = true;
+    state->artifact_success = false;
+    snprintf(state->artifact_message, sizeof(state->artifact_message), "Working...");
+    if (state->artifact_actions && lv_obj_is_valid(state->artifact_actions)) {
+        lv_obj_add_flag(state->artifact_actions, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (state->artifact_spinner && lv_obj_is_valid(state->artifact_spinner)) {
+        lv_obj_clear_flag(state->artifact_spinner, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (state->artifact_status_label && lv_obj_is_valid(state->artifact_status_label)) {
+        lv_label_set_text(state->artifact_status_label, artifact_status_text);
+        lv_obj_set_style_text_color(state->artifact_status_label, COLOR_MATERIAL_AMBER, 0);
+    }
+    if (xTaskCreate(pcap_viewer_artifact_task, "pcap_export", 8192, state, 5,
+                    &state->artifact_task) != pdTRUE) {
+        state->artifact_running = false;
+        state->artifact_task = NULL;
+        state->artifact_action = PCAP_ARTIFACT_NONE;
+        state->artifact_success = false;
+        snprintf(state->artifact_message, sizeof(state->artifact_message),
+                 "Could not start export task.");
+        pcap_viewer_artifact_finish_async(state);
+    }
+}
+
+static lv_obj_t *pcap_viewer_add_tool_button(lv_obj_t *parent, const char *text,
+                                              lv_color_t color, unsigned action)
+{
+    lv_obj_t *button = lv_btn_create(parent);
+    lv_obj_set_size(button, 210, 52);
+    lv_obj_set_style_bg_color(button, color, 0);
+    lv_obj_set_style_radius(button, 8, 0);
+    lv_obj_add_event_cb(button, pcap_viewer_tool_action_cb, LV_EVENT_CLICKED,
+                        (void *)(uintptr_t)action);
+    lv_obj_t *label = lv_label_create(button);
+    lv_label_set_text(label, text);
+    lv_obj_set_style_text_font(label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(label, lv_color_white(), 0);
+    lv_obj_center(label);
+    return button;
+}
+
+static void pcap_viewer_tools_cb(lv_event_t *e)
+{
+    pcap_viewer_state_t *state = (pcap_viewer_state_t *)lv_event_get_user_data(e);
+    if (!state || state->loading || state->artifact_running ||
+        !state->reader || !state->summary) {
+        return;
+    }
+    pcap_viewer_close_tools_popup(state);
+    state->artifact_overlay = lv_obj_create(lv_scr_act());
+    lv_obj_remove_style_all(state->artifact_overlay);
+    lv_obj_set_size(state->artifact_overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(state->artifact_overlay, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(state->artifact_overlay, LV_OPA_70, 0);
+    lv_obj_add_flag(state->artifact_overlay, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(state->artifact_overlay, LV_OBJ_FLAG_SCROLLABLE);
+
+    state->artifact_popup = lv_obj_create(state->artifact_overlay);
+    lv_obj_set_size(state->artifact_popup, 900, 570);
+    lv_obj_center(state->artifact_popup);
+    style_surface_panel(state->artifact_popup, 14);
+    lv_obj_set_style_pad_all(state->artifact_popup, 20, 0);
+    lv_obj_set_style_pad_row(state->artifact_popup, 14, 0);
+    lv_obj_set_flex_flow(state->artifact_popup, LV_FLEX_FLOW_COLUMN);
+    lv_obj_clear_flag(state->artifact_popup, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(state->artifact_popup);
+    lv_label_set_text(title, LV_SYMBOL_SAVE " ESPShark Cache & Export");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, COLOR_NEON_CYAN, 0);
+
+    char quick_description[128];
+    pcap_flow_filter_describe(&state->quick_filter, quick_description,
+                              sizeof(quick_description));
+    state->artifact_status_label = lv_label_create(state->artifact_popup);
+    lv_label_set_text_fmt(state->artifact_status_label,
+                          "Protocol filter: %s | Quick: %s\n"
+                          "%lu indexed match | filtered PCAP honors both filters\n%s",
+                          pcap_reader_filter_name(state->packet_filter),
+                          quick_description,
+                          (unsigned long)pcap_viewer_filtered_packet_count(state),
+                          state->cache_available
+                              ? "Analysis cache is available on Tab5 SD."
+                              : "No persistent cache; the in-memory analysis is still usable.");
+    lv_obj_set_width(state->artifact_status_label, lv_pct(100));
+    lv_label_set_long_mode(state->artifact_status_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(state->artifact_status_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(state->artifact_status_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(state->artifact_status_label, ui_muted_color(), 0);
+
+    state->artifact_spinner = lv_spinner_create(state->artifact_popup);
+    lv_obj_set_size(state->artifact_spinner, 58, 58);
+    lv_spinner_set_anim_params(state->artifact_spinner, 1000, 200);
+    lv_obj_set_style_arc_color(state->artifact_spinner, COLOR_NEON_CYAN, LV_PART_INDICATOR);
+    lv_obj_add_flag(state->artifact_spinner, LV_OBJ_FLAG_HIDDEN);
+
+    state->artifact_actions = lv_obj_create(state->artifact_popup);
+    lv_obj_set_size(state->artifact_actions, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(state->artifact_actions, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(state->artifact_actions, 0, 0);
+    lv_obj_set_style_pad_all(state->artifact_actions, 0, 0);
+    lv_obj_set_style_pad_gap(state->artifact_actions, 10, 0);
+    lv_obj_set_flex_flow(state->artifact_actions, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_flex_align(state->artifact_actions, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(state->artifact_actions, LV_OBJ_FLAG_SCROLLABLE);
+
+    pcap_viewer_add_tool_button(state->artifact_actions, "EXPORT JSON REPORT",
+                                lv_color_hex(0x087EA4), PCAP_TOOL_EXPORT_REPORT);
+    pcap_viewer_add_tool_button(state->artifact_actions, "EXPORT FILTERED PCAP",
+                                COLOR_MATERIAL_PURPLE, PCAP_TOOL_EXPORT_FILTERED);
+    pcap_viewer_add_tool_button(state->artifact_actions, "EXPORT HTML REPORT",
+                                COLOR_MATERIAL_ORANGE, PCAP_TOOL_EXPORT_HTML);
+    pcap_viewer_add_tool_button(state->artifact_actions, "EXPORT TEXT SUMMARY",
+                                COLOR_MATERIAL_TEAL, PCAP_TOOL_EXPORT_SUMMARY);
+    pcap_viewer_add_tool_button(state->artifact_actions, "SET AS BASELINE",
+                                COLOR_MATERIAL_GREEN, PCAP_TOOL_SET_BASELINE);
+    pcap_viewer_add_tool_button(state->artifact_actions, "COMPARE BASELINE",
+                                COLOR_MATERIAL_CYAN, PCAP_TOOL_COMPARE_BASELINE);
+    pcap_viewer_add_tool_button(state->artifact_actions, "SAVE FILTER PROFILE",
+                                COLOR_MATERIAL_TEAL, PCAP_TOOL_SAVE_FILTER);
+    pcap_viewer_add_tool_button(state->artifact_actions, "LOAD LAST FILTER",
+                                COLOR_MATERIAL_BLUE, PCAP_TOOL_LOAD_FILTER);
+    pcap_viewer_add_tool_button(state->artifact_actions, "DELETE CACHE",
+                                COLOR_MATERIAL_RED, PCAP_TOOL_DELETE_CACHE);
+    pcap_viewer_add_tool_button(state->artifact_actions, "REANALYZE",
+                                COLOR_MATERIAL_AMBER, PCAP_TOOL_REANALYZE);
+    pcap_viewer_add_tool_button(state->artifact_actions, "CLOSE",
+                                lv_color_hex(0x555555), PCAP_TOOL_CLOSE);
+}
+
+/* ---------------------------------------------------------------------------
+ * Extracted objects
+ *
+ * Carving runs on demand and never during a normal capture open. Every artifact
+ * is a derived copy: the source PCAP is only ever read.
+ * ------------------------------------------------------------------------ */
+
+#define PCAP_VIEWER_PREVIEW_BYTES   2048
+#define PCAP_VIEWER_PREVIEW_TEXT    6144
+
+static void pcap_viewer_start_extraction(pcap_viewer_state_t *state)
+{
+    if (!state || state->loading || state->artifact_running || !state->reader) {
+        return;
+    }
+    if (!state->extract_result) {
+        state->extract_result = heap_caps_calloc(1, sizeof(pcap_extract_result_t),
+                                                 MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    }
+    if (!state->extract_result) {
+        pcap_viewer_show_summary_popup(state, "Extracted Objects",
+                                       "Not enough PSRAM to run object extraction.");
+        return;
+    }
+
+    pcap_viewer_close_detail(state);
+    pcap_viewer_close_tools_popup(state);
+    state->artifact_overlay = lv_obj_create(lv_scr_act());
+    lv_obj_remove_style_all(state->artifact_overlay);
+    lv_obj_set_size(state->artifact_overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(state->artifact_overlay, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(state->artifact_overlay, LV_OPA_70, 0);
+    lv_obj_add_flag(state->artifact_overlay, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(state->artifact_overlay, LV_OBJ_FLAG_SCROLLABLE);
+
+    state->artifact_popup = lv_obj_create(state->artifact_overlay);
+    lv_obj_set_size(state->artifact_popup, 860, 460);
+    lv_obj_center(state->artifact_popup);
+    style_surface_panel(state->artifact_popup, 14);
+    lv_obj_set_style_pad_all(state->artifact_popup, 20, 0);
+    lv_obj_set_style_pad_row(state->artifact_popup, 14, 0);
+    lv_obj_set_flex_flow(state->artifact_popup, LV_FLEX_FLOW_COLUMN);
+    lv_obj_clear_flag(state->artifact_popup, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(state->artifact_popup);
+    lv_label_set_text(title, LV_SYMBOL_DOWNLOAD " ESPShark Extracted Objects");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, COLOR_NEON_CYAN, 0);
+
+    state->artifact_status_label = lv_label_create(state->artifact_popup);
+    lv_label_set_text(state->artifact_status_label, "Rebuilding HTTP objects...");
+    lv_obj_set_width(state->artifact_status_label, lv_pct(100));
+    lv_label_set_long_mode(state->artifact_status_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(state->artifact_status_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(state->artifact_status_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(state->artifact_status_label, COLOR_MATERIAL_AMBER, 0);
+
+    state->artifact_spinner = lv_spinner_create(state->artifact_popup);
+    lv_obj_set_size(state->artifact_spinner, 58, 58);
+    lv_spinner_set_anim_params(state->artifact_spinner, 1000, 200);
+    lv_obj_set_style_arc_color(state->artifact_spinner, COLOR_NEON_CYAN, LV_PART_INDICATOR);
+
+    state->artifact_actions = lv_obj_create(state->artifact_popup);
+    lv_obj_set_size(state->artifact_actions, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(state->artifact_actions, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(state->artifact_actions, 0, 0);
+    lv_obj_set_style_pad_all(state->artifact_actions, 0, 0);
+    lv_obj_set_style_pad_gap(state->artifact_actions, 10, 0);
+    lv_obj_set_flex_flow(state->artifact_actions, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_flex_align(state->artifact_actions, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(state->artifact_actions, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(state->artifact_actions, LV_OBJ_FLAG_HIDDEN);
+    pcap_viewer_add_tool_button(state->artifact_actions, "CLOSE",
+                                lv_color_hex(0x555555), PCAP_TOOL_CLOSE);
+
+    state->cancel_requested = false;
+    state->artifact_action = PCAP_ARTIFACT_EXTRACT_OBJECTS;
+    state->artifact_running = true;
+    state->artifact_success = false;
+    state->extract_show_on_finish = true;
+    state->extract_phase[0] = '\0';
+    state->extract_done = 0;
+    state->extract_total = 0;
+    snprintf(state->artifact_message, sizeof(state->artifact_message), "Working...");
+
+    if (state->extract_progress_timer) {
+        lv_timer_del(state->extract_progress_timer);
+    }
+    state->extract_progress_timer =
+        lv_timer_create(pcap_viewer_extract_progress_timer_cb, 300, state);
+
+    if (xTaskCreate(pcap_viewer_artifact_task, "pcap_extract", 8192, state, 5,
+                    &state->artifact_task) != pdTRUE) {
+        if (state->extract_progress_timer) {
+            lv_timer_del(state->extract_progress_timer);
+            state->extract_progress_timer = NULL;
+        }
+        state->artifact_running = false;
+        state->artifact_task = NULL;
+        state->artifact_action = PCAP_ARTIFACT_NONE;
+        state->extract_show_on_finish = false;
+        snprintf(state->artifact_message, sizeof(state->artifact_message),
+                 "Could not start the extraction task.");
+        pcap_viewer_artifact_finish_async(state);
+    }
+}
+
+static void pcap_viewer_object_preview_cb(lv_event_t *e)
+{
+    uintptr_t encoded = (uintptr_t)lv_event_get_user_data(e);
+    pcap_viewer_state_t *state = pcap_viewer_get_state(get_current_ctx(), false);
+    if (!state || !state->extract_result || encoded == 0U) return;
+    uint32_t index = (uint32_t)(encoded - 1U);
+    if (index >= state->extract_result->object_count) return;
+    const pcap_extract_object_t *object = &state->extract_result->objects[index];
+
+    uint8_t *raw = heap_caps_malloc(PCAP_VIEWER_PREVIEW_BYTES,
+                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    char *text = heap_caps_malloc(PCAP_VIEWER_PREVIEW_TEXT,
+                                  MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!raw || !text) {
+        heap_caps_free(raw);
+        heap_caps_free(text);
+        return;
+    }
+    size_t bytes_read = 0;
+    pcap_extract_status_t status = pcap_extract_read_object(
+        state->extract_result, index, raw, PCAP_VIEWER_PREVIEW_BYTES, &bytes_read);
+
+    size_t position = 0;
+    pcap_viewer_append_text(text, PCAP_VIEWER_PREVIEW_TEXT, &position,
+                            "%s\n%s | %llu B | %s | confidence %s\n"
+                            "HTTP %u %s%s%s%s\n%s:%u -> %s:%u | packets %lu-%lu\n"
+                            "SHA-256 %s\n"
+                            "Untrusted artifact: never run or unpack it on the device.\n"
+                            "----------------------------------------\n",
+                            object->name, pcap_extract_type_name(object->type),
+                            (unsigned long long)object->bytes,
+                            pcap_extract_state_name(object->state),
+                            pcap_extract_confidence_name(object->confidence),
+                            object->http_status,
+                            object->host[0] ? object->host : "(no Host)",
+                            object->url[0] ? " " : "", object->url,
+                            object->encoded ? " | stored compressed" : "",
+                            object->server, object->server_port,
+                            object->client, object->client_port,
+                            (unsigned long)object->first_packet,
+                            (unsigned long)object->last_packet,
+                            object->sha256);
+
+    if (status != PCAP_EXTRACT_OK) {
+        pcap_viewer_append_text(text, PCAP_VIEWER_PREVIEW_TEXT, &position,
+                                "Preview unavailable: %s\n",
+                                pcap_extract_status_name(status));
+    } else if (object->encoded || !pcap_extract_type_is_text(object->type)) {
+        /* Binary and compressed artifacts are only ever shown as bytes. */
+        size_t shown = bytes_read < 512U ? bytes_read : 512U;
+        for (size_t offset = 0; offset < shown; offset += 16U) {
+            pcap_viewer_append_text(text, PCAP_VIEWER_PREVIEW_TEXT, &position,
+                                    "%04X  ", (unsigned)offset);
+            for (size_t i = 0; i < 16U; i++) {
+                if (offset + i < shown) {
+                    pcap_viewer_append_text(text, PCAP_VIEWER_PREVIEW_TEXT, &position,
+                                            "%02X ", raw[offset + i]);
+                } else {
+                    pcap_viewer_append_text(text, PCAP_VIEWER_PREVIEW_TEXT, &position,
+                                            "   ");
+                }
+            }
+            pcap_viewer_append_text(text, PCAP_VIEWER_PREVIEW_TEXT, &position, " ");
+            for (size_t i = 0; i < 16U && offset + i < shown; i++) {
+                unsigned char c = raw[offset + i];
+                pcap_viewer_append_text(text, PCAP_VIEWER_PREVIEW_TEXT, &position,
+                                        "%c", isprint(c) ? (char)c : '.');
+            }
+            pcap_viewer_append_text(text, PCAP_VIEWER_PREVIEW_TEXT, &position, "\n");
+        }
+    } else {
+        /* HTML is shown as source text, never rendered as a live page. */
+        for (size_t i = 0; i < bytes_read && position + 2U < PCAP_VIEWER_PREVIEW_TEXT; i++) {
+            unsigned char c = raw[i];
+            char shown = (c == '\n' || c == '\t') ? (char)c
+                                                  : (isprint(c) ? (char)c : '.');
+            if (c == '\r') continue;
+            text[position++] = shown;
+            text[position] = '\0';
+        }
+    }
+    if (bytes_read >= PCAP_VIEWER_PREVIEW_BYTES || position + 64U >= PCAP_VIEWER_PREVIEW_TEXT) {
+        pcap_viewer_append_text(text, PCAP_VIEWER_PREVIEW_TEXT, &position,
+                                "\n[PREVIEW TRUNCATED - the saved file is complete]\n");
+    }
+
+    char popup_title[96];
+    snprintf(popup_title, sizeof(popup_title), LV_SYMBOL_FILE " %.72s", object->name);
+    pcap_viewer_show_summary_popup(state, popup_title, text);
+    heap_caps_free(raw);
+    heap_caps_free(text);
+}
+
+static void pcap_viewer_object_filter_cb(lv_event_t *e)
+{
+    uintptr_t encoded = (uintptr_t)lv_event_get_user_data(e);
+    pcap_viewer_state_t *state = pcap_viewer_get_state(get_current_ctx(), false);
+    if (!state || !state->extract_result || encoded == 0U) return;
+    uint32_t index = (uint32_t)(encoded - 1U);
+    if (index >= state->extract_result->object_count) return;
+    const pcap_extract_object_t *object = &state->extract_result->objects[index];
+    pcap_flow_filter_clear(&state->quick_filter);
+    state->quick_filter.enabled = true;
+    state->quick_filter.has_any_address = true;
+    snprintf(state->quick_filter.any_address, sizeof(state->quick_filter.any_address),
+             "%s", object->server);
+    state->quick_filter.has_port = true;
+    state->quick_filter.port = object->server_port;
+    state->packet_page = 0;
+    pcap_viewer_close_detail(state);
+    pcap_viewer_render_capture_page(state);
+}
+
+/* The list is rebuilt from a button that lives inside it, so the rebuild is
+ * deferred instead of deleting the tree from within its own event. */
+static void pcap_viewer_show_objects_async(void *user_data)
+{
+    pcap_viewer_show_objects((pcap_viewer_state_t *)user_data);
+}
+
+static void pcap_viewer_start_extraction_async(void *user_data)
+{
+    pcap_viewer_state_t *state = (pcap_viewer_state_t *)user_data;
+    if (!state) return;
+    pcap_viewer_close_detail(state);
+    pcap_viewer_start_extraction(state);
+}
+
+static void pcap_viewer_object_delete_cb(lv_event_t *e)
+{
+    uintptr_t encoded = (uintptr_t)lv_event_get_user_data(e);
+    pcap_viewer_state_t *state = pcap_viewer_get_state(get_current_ctx(), false);
+    if (!state || !state->extract_result || encoded == 0U) return;
+    uint32_t index = (uint32_t)(encoded - 1U);
+    if (index >= state->extract_result->object_count) return;
+    pcap_extract_delete_object(state->extract_result, index);
+    lv_async_call(pcap_viewer_show_objects_async, state);
+}
+
+static void pcap_viewer_object_reextract_cb(lv_event_t *e)
+{
+    pcap_viewer_state_t *state = (pcap_viewer_state_t *)lv_event_get_user_data(e);
+    if (!state) return;
+    lv_async_call(pcap_viewer_start_extraction_async, state);
+}
+
+static void pcap_viewer_show_objects(pcap_viewer_state_t *state)
+{
+    if (!state || !state->extract_result) return;
+    const pcap_extract_result_t *objects = state->extract_result;
+    char title[96];
+    snprintf(title, sizeof(title), LV_SYMBOL_DOWNLOAD " Extracted Objects (%lu)",
+             (unsigned long)objects->object_count);
+    lv_obj_t *list = pcap_viewer_create_analysis_list(state, title);
+    if (!list) return;
+
+    lv_obj_t *notice = lv_label_create(list);
+    lv_label_set_text_fmt(notice,
+                          "%s\n"
+                          "%lu HTTP response(s) in %lu session(s) | %lu encrypted flow(s) "
+                          "cannot be carved without keys.%s%s%s%s\n"
+                          "Artifacts are untrusted derived copies. The capture is unchanged.",
+                          objects->directory,
+                          (unsigned long)objects->http_responses,
+                          (unsigned long)objects->session_count,
+                          (unsigned long)objects->encrypted_flows,
+                          objects->object_limited ? "\nOBJECT LIMIT reached." : "",
+                          objects->session_limited ? "\nSESSION LIMIT reached." : "",
+                          objects->segment_limited ? "\nSEGMENT LIMIT reached." : "",
+                          objects->budget_reached ? "\nSESSION BYTE BUDGET reached." : "");
+    lv_obj_set_width(notice, lv_pct(100));
+    lv_label_set_long_mode(notice, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(notice, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(notice, ui_muted_color(), 0);
+
+    for (uint32_t i = 0; i < objects->object_count; i++) {
+        const pcap_extract_object_t *object = &objects->objects[i];
+        lv_obj_t *row = lv_btn_create(list);
+        lv_obj_set_size(row, lv_pct(100), 84);
+        lv_obj_set_style_bg_color(row, (i & 1U) ? ui_card_pressed_color() : ui_card_color(), 0);
+        lv_obj_set_style_border_width(row, 1, 0);
+        lv_obj_set_style_border_color(row,
+                                      object->state == PCAP_EXTRACT_STATE_COMPLETE
+                                          ? COLOR_MATERIAL_GREEN
+                                          : (object->state == PCAP_EXTRACT_STATE_PARTIAL
+                                                 ? COLOR_MATERIAL_RED : COLOR_MATERIAL_AMBER),
+                                      0);
+        lv_obj_set_style_pad_all(row, 5, 0);
+        lv_obj_set_style_pad_column(row, 7, 0);
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START,
+                              LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+        char size_text[32];
+        pcap_viewer_format_size(object->bytes, size_text, sizeof(size_text));
+        lv_obj_t *label = lv_label_create(row);
+        lv_label_set_text_fmt(label,
+                              "%lu. %s  (%s, %s)\n"
+                              "%s | HTTP %u | %s%s%s | %s | conf %s%s\n"
+                              "%s:%u | packets %lu-%lu | sha %.16s",
+                              (unsigned long)i + 1UL, object->name,
+                              pcap_extract_type_name(object->type), size_text,
+                              object->host[0] ? object->host : "(no Host)",
+                              object->http_status,
+                              object->url[0] ? object->url : "/",
+                              object->chunked ? " | chunked" : "",
+                              object->encoded ? " | compressed" : "",
+                              pcap_extract_state_name(object->state),
+                              pcap_extract_confidence_name(object->confidence),
+                              object->saved ? "" : " | NOT SAVED",
+                              object->server, object->server_port,
+                              (unsigned long)object->first_packet,
+                              (unsigned long)object->last_packet,
+                              object->sha256);
+        lv_obj_set_flex_grow(label, 1);
+        lv_obj_set_width(label, 0);
+        lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
+        lv_obj_set_style_text_font(label, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(label, ui_text_color(), 0);
+        pcap_viewer_small_action(row, "PREVIEW", pcap_viewer_object_preview_cb,
+                                 (uintptr_t)i + 1U, COLOR_MATERIAL_PURPLE);
+        pcap_viewer_small_action(row, "PACKETS", pcap_viewer_object_filter_cb,
+                                 (uintptr_t)i + 1U, lv_color_hex(0x087EA4));
+        pcap_viewer_small_action(row, "DELETE", pcap_viewer_object_delete_cb,
+                                 (uintptr_t)i + 1U, COLOR_MATERIAL_RED);
+    }
+
+    if (objects->object_count == 0) {
+        lv_obj_t *empty = lv_label_create(list);
+        lv_label_set_text(empty,
+                          "No plaintext HTTP object was reconstructed.\n"
+                          "TLS, QUIC, SSH and VPN traffic stays encrypted, and a capture "
+                          "that starts mid-download has no response header to bound.");
+        lv_obj_set_width(empty, lv_pct(100));
+        lv_label_set_long_mode(empty, LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_text_color(empty, COLOR_MATERIAL_AMBER, 0);
+    }
+
+    lv_obj_t *again = lv_btn_create(list);
+    lv_obj_set_size(again, lv_pct(100), 44);
+    lv_obj_set_style_bg_color(again, COLOR_MATERIAL_AMBER, 0);
+    lv_obj_set_style_radius(again, 8, 0);
+    lv_obj_add_event_cb(again, pcap_viewer_object_reextract_cb, LV_EVENT_CLICKED, state);
+    lv_obj_t *again_label = lv_label_create(again);
+    lv_label_set_text(again_label, "RE-EXTRACT (replaces the copies for this capture)");
+    lv_obj_set_style_text_font(again_label, &lv_font_montserrat_12, 0);
+    lv_obj_center(again_label);
+}
+
+static void pcap_viewer_objects_cb(lv_event_t *e)
+{
+    pcap_viewer_state_t *state = (pcap_viewer_state_t *)lv_event_get_user_data(e);
+    if (!state || state->loading || state->artifact_running || !state->reader) {
+        return;
+    }
+    if (state->extract_result && state->extract_status == PCAP_EXTRACT_OK) {
+        pcap_viewer_show_objects(state);
+        return;
+    }
+    pcap_viewer_start_extraction(state);
+}
+
+static void pcap_viewer_render_capture_page(pcap_viewer_state_t *state)
+{
+    if (!state || !state->ctx || !state->ctx->pcap_viewer_page ||
+        !lv_obj_is_valid(state->ctx->pcap_viewer_page)) {
+        return;
+    }
+    lv_obj_t *parent = lv_obj_get_parent(state->ctx->pcap_viewer_page);
+    lv_obj_t *page = pcap_viewer_create_page(state, parent);
+    if (!page) {
+        return;
+    }
+    pcap_viewer_add_header(state, page, state->selected_name);
+
+    lv_obj_t *summary = lv_obj_create(page);
+    lv_obj_set_size(summary, lv_pct(100), LV_SIZE_CONTENT);
+    style_surface_panel(summary, 8);
+    lv_obj_set_style_pad_all(summary, 10, 0);
+    lv_obj_set_style_pad_column(summary, 18, 0);
+    lv_obj_set_flex_flow(summary, LV_FLEX_FLOW_ROW);
+    lv_obj_clear_flag(summary, LV_OBJ_FLAG_SCROLLABLE);
+
+    double fraction_scale = state->capture_info.timestamp_resolution ==
+                                PCAP_TIMESTAMP_NANOSECONDS ? 1000000000.0 : 1000000.0;
+    double duration = 0;
+    if (state->scan_summary.packet_count > 0) {
+        duration = (double)state->scan_summary.last_timestamp_seconds -
+                   (double)state->scan_summary.first_timestamp_seconds +
+                   ((double)state->scan_summary.last_timestamp_fraction -
+                    (double)state->scan_summary.first_timestamp_fraction) / fraction_scale;
+        if (duration < 0) duration = 0;
+    }
+    char file_size_text[32];
+    pcap_viewer_format_size(state->capture_info.file_size,
+                            file_size_text, sizeof(file_size_text));
+    lv_obj_t *summary_label = lv_label_create(summary);
+    lv_label_set_text_fmt(summary_label,
+                          "#52B6FF %s#  |  PCAP %u.%u %s-endian %s\n"
+                          "#5EDCA3 %llu packets#  |  indexed %lu  |  flows %lu  |  %.3f s  |  %s  |  snaplen %lu%s%s%s\n"
+                          "%s",
+                          pcap_reader_link_type_name(state->capture_info.link_type),
+                          state->capture_info.version_major, state->capture_info.version_minor,
+                          state->capture_info.big_endian ? "big" : "little",
+                          state->capture_info.timestamp_resolution == PCAP_TIMESTAMP_NANOSECONDS
+                              ? "ns" : "us",
+                          (unsigned long long)state->scan_summary.packet_count,
+                          (unsigned long)state->scan_summary.indexed_packets,
+                          state->flow_analysis
+                              ? (unsigned long)state->flow_analysis->flow_count : 0UL,
+                          duration, file_size_text,
+                          (unsigned long)state->capture_info.snaplen,
+                          state->scan_summary.index_limited ? "  |  INDEX LIMITED" : "",
+                          state->scan_summary.truncated_tail ? "  |  TRUNCATED TAIL" : "",
+                          state->flow_analysis && state->flow_analysis->flow_limited
+                              ? "  |  FLOWS LIMITED" : "",
+                          state->cache_hit
+                              ? "#5EDCA3 CACHE HIT - analysis loaded from SD#"
+                              : (state->cache_available
+                                     ? "#52B6FF ANALYZED - current cache saved#"
+                                     : "#F9A825 ANALYZED - cache unavailable#"));
+    lv_label_set_recolor(summary_label, true);
+    lv_obj_set_width(summary_label, lv_pct(100));
+    lv_label_set_long_mode(summary_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(summary_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(summary_label, ui_text_color(), 0);
+
+    lv_obj_t *analysis_actions = lv_obj_create(page);
+    lv_obj_set_size(analysis_actions, lv_pct(100), 138);
+    lv_obj_set_style_bg_opa(analysis_actions, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(analysis_actions, 0, 0);
+    lv_obj_set_style_pad_all(analysis_actions, 0, 0);
+    lv_obj_set_style_pad_row(analysis_actions, 6, 0);
+    lv_obj_set_flex_flow(analysis_actions, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(analysis_actions, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(analysis_actions, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *analysis_row_top = lv_obj_create(analysis_actions);
+    lv_obj_set_size(analysis_row_top, lv_pct(100), 42);
+    lv_obj_set_style_bg_opa(analysis_row_top, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(analysis_row_top, 0, 0);
+    lv_obj_set_style_pad_all(analysis_row_top, 0, 0);
+    lv_obj_set_style_pad_column(analysis_row_top, 8, 0);
+    lv_obj_set_flex_flow(analysis_row_top, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(analysis_row_top, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(analysis_row_top, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *analysis_row_bottom = lv_obj_create(analysis_actions);
+    lv_obj_set_size(analysis_row_bottom, lv_pct(100), 42);
+    lv_obj_set_style_bg_opa(analysis_row_bottom, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(analysis_row_bottom, 0, 0);
+    lv_obj_set_style_pad_all(analysis_row_bottom, 0, 0);
+    lv_obj_set_style_pad_column(analysis_row_bottom, 8, 0);
+    lv_obj_set_flex_flow(analysis_row_bottom, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(analysis_row_bottom, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(analysis_row_bottom, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *analysis_row_third = lv_obj_create(analysis_actions);
+    lv_obj_set_size(analysis_row_third, lv_pct(100), 42);
+    lv_obj_set_style_bg_opa(analysis_row_third, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(analysis_row_third, 0, 0);
+    lv_obj_set_style_pad_all(analysis_row_third, 0, 0);
+    lv_obj_set_style_pad_column(analysis_row_third, 8, 0);
+    lv_obj_set_flex_flow(analysis_row_third, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(analysis_row_third, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(analysis_row_third, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *overview_btn = lv_btn_create(analysis_row_top);
+    lv_obj_set_size(overview_btn, 0, 42);
+    lv_obj_set_flex_grow(overview_btn, 1);
+    lv_obj_set_style_bg_color(overview_btn, lv_color_hex(0x087EA4), 0);
+    lv_obj_set_style_radius(overview_btn, 8, 0);
+    lv_obj_add_event_cb(overview_btn, pcap_viewer_summary_cb,
+                        LV_EVENT_CLICKED, (void *)(uintptr_t)1U);
+    lv_obj_t *overview_label = lv_label_create(overview_btn);
+    lv_label_set_text(overview_label, LV_SYMBOL_EYE_OPEN " OVERVIEW");
+    lv_obj_set_style_text_font(overview_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(overview_label, lv_color_white(), 0);
+    lv_obj_center(overview_label);
+
+    lv_obj_t *dns_btn = lv_btn_create(analysis_row_top);
+    lv_obj_set_size(dns_btn, 0, 42);
+    lv_obj_set_flex_grow(dns_btn, 1);
+    lv_obj_set_style_bg_color(dns_btn, COLOR_MATERIAL_PURPLE, 0);
+    lv_obj_set_style_radius(dns_btn, 8, 0);
+    lv_obj_add_event_cb(dns_btn, pcap_viewer_summary_cb,
+                        LV_EVENT_CLICKED, (void *)(uintptr_t)2U);
+    lv_obj_t *dns_label = lv_label_create(dns_btn);
+    lv_label_set_text_fmt(dns_label, LV_SYMBOL_LIST " DNS (%llu)",
+                          state->summary
+                              ? (unsigned long long)state->summary->dns_packets : 0ULL);
+    lv_obj_set_style_text_font(dns_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(dns_label, lv_color_white(), 0);
+    lv_obj_center(dns_label);
+
+    lv_obj_t *connections_btn = lv_btn_create(analysis_row_top);
+    lv_obj_set_size(connections_btn, 0, 42);
+    lv_obj_set_flex_grow(connections_btn, 1);
+    lv_obj_set_style_bg_color(connections_btn, COLOR_MATERIAL_BLUE, 0);
+    lv_obj_set_style_radius(connections_btn, 8, 0);
+    lv_obj_add_event_cb(connections_btn, pcap_viewer_connections_cb,
+                        LV_EVENT_CLICKED, state);
+    lv_obj_t *connections_label = lv_label_create(connections_btn);
+    lv_label_set_text_fmt(connections_label, LV_SYMBOL_LIST " FLOWS (%lu)",
+                          state->flow_analysis
+                              ? (unsigned long)state->flow_analysis->flow_count : 0UL);
+    lv_obj_set_style_text_font(connections_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(connections_label, lv_color_white(), 0);
+    lv_obj_center(connections_label);
+
+    lv_obj_t *protocols_btn = lv_btn_create(analysis_row_top);
+    lv_obj_set_size(protocols_btn, 0, 42);
+    lv_obj_set_flex_grow(protocols_btn, 1);
+    lv_obj_set_style_bg_color(protocols_btn, COLOR_MATERIAL_AMBER, 0);
+    lv_obj_set_style_radius(protocols_btn, 8, 0);
+    lv_obj_add_event_cb(protocols_btn, pcap_viewer_protocols_cb,
+                        LV_EVENT_CLICKED, state);
+    lv_obj_t *protocols_label = lv_label_create(protocols_btn);
+    lv_label_set_text(protocols_label, LV_SYMBOL_LIST " APPS");
+    lv_obj_set_style_text_font(protocols_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(protocols_label, lv_color_white(), 0);
+    lv_obj_center(protocols_label);
+
+    lv_obj_t *devices_btn = lv_btn_create(analysis_row_bottom);
+    lv_obj_set_size(devices_btn, 0, 42);
+    lv_obj_set_flex_grow(devices_btn, 1);
+    lv_obj_set_style_bg_color(devices_btn, COLOR_MATERIAL_GREEN, 0);
+    lv_obj_set_style_radius(devices_btn, 8, 0);
+    lv_obj_add_event_cb(devices_btn, pcap_viewer_devices_cb,
+                        LV_EVENT_CLICKED, state);
+    lv_obj_t *devices_label = lv_label_create(devices_btn);
+    lv_label_set_text_fmt(devices_label, LV_SYMBOL_HOME " DEVICES (%lu)",
+                          state->flow_analysis
+                              ? (unsigned long)pcap_flow_local_device_count(
+                                    state->flow_analysis) : 0UL);
+    lv_obj_set_style_text_font(devices_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(devices_label, lv_color_white(), 0);
+    lv_obj_center(devices_label);
+
+    lv_obj_t *health_btn = lv_btn_create(analysis_row_bottom);
+    lv_obj_set_size(health_btn, 0, 42);
+    lv_obj_set_flex_grow(health_btn, 1);
+    lv_color_t health_color = !state->flow_analysis || !state->investigation
+                                  ? lv_color_hex(0x555555)
+                                  : (state->investigation->critical_count > 0U ||
+                                     state->investigation->suspicious_count > 0U ||
+                                     state->flow_analysis->health_level >= PCAP_HEALTH_SUSPICIOUS
+                                         ? COLOR_MATERIAL_RED
+                                         : (state->investigation->watch_count > 0U ||
+                                            state->flow_analysis->health_level == PCAP_HEALTH_WATCH
+                                                ? COLOR_MATERIAL_AMBER
+                                                : COLOR_MATERIAL_TEAL));
+    lv_obj_set_style_bg_color(health_btn, health_color, 0);
+    lv_obj_set_style_radius(health_btn, 8, 0);
+    lv_obj_add_event_cb(health_btn, pcap_viewer_health_cb,
+                        LV_EVENT_CLICKED, state);
+    lv_obj_t *health_label = lv_label_create(health_btn);
+    lv_label_set_text_fmt(health_label, LV_SYMBOL_WARNING " INVEST (%lu)",
+                          state->investigation
+                              ? (unsigned long)state->investigation->finding_count : 0UL);
+    lv_obj_set_style_text_font(health_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(health_label, lv_color_white(), 0);
+    lv_obj_center(health_label);
+
+    lv_obj_t *map_btn = lv_btn_create(analysis_row_bottom);
+    lv_obj_set_size(map_btn, 0, 42);
+    lv_obj_set_flex_grow(map_btn, 1);
+    lv_obj_set_style_bg_color(map_btn, lv_color_hex(0x1565C0), 0);
+    lv_obj_set_style_radius(map_btn, 8, 0);
+    lv_obj_add_event_cb(map_btn, pcap_viewer_map_cb,
+                        LV_EVENT_CLICKED, state);
+    lv_obj_t *map_label = lv_label_create(map_btn);
+    lv_label_set_text(map_label, "MAP");
+    lv_obj_set_style_text_font(map_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(map_label, lv_color_white(), 0);
+    lv_obj_center(map_label);
+
+    lv_obj_t *tools_btn = lv_btn_create(analysis_row_bottom);
+    lv_obj_set_size(tools_btn, 0, 42);
+    lv_obj_set_flex_grow(tools_btn, 1);
+    lv_obj_set_style_bg_color(tools_btn, COLOR_MATERIAL_TEAL, 0);
+    lv_obj_set_style_radius(tools_btn, 8, 0);
+    lv_obj_add_event_cb(tools_btn, pcap_viewer_tools_cb, LV_EVENT_CLICKED, state);
+    lv_obj_t *tools_label = lv_label_create(tools_btn);
+    lv_label_set_text(tools_label, LV_SYMBOL_SAVE " EXPORT");
+    lv_obj_set_style_text_font(tools_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(tools_label, lv_color_white(), 0);
+    lv_obj_center(tools_label);
+
+    lv_obj_t *objects_btn = lv_btn_create(analysis_row_third);
+    lv_obj_set_size(objects_btn, 0, 42);
+    lv_obj_set_flex_grow(objects_btn, 1);
+    lv_obj_set_style_bg_color(objects_btn, lv_color_hex(0x8E24AA), 0);
+    lv_obj_set_style_radius(objects_btn, 8, 0);
+    lv_obj_add_event_cb(objects_btn, pcap_viewer_objects_cb, LV_EVENT_CLICKED, state);
+    lv_obj_t *objects_label = lv_label_create(objects_btn);
+    if (state->extract_result && state->extract_status == PCAP_EXTRACT_OK) {
+        lv_label_set_text_fmt(objects_label, LV_SYMBOL_DOWNLOAD " OBJECTS (%lu)",
+                              (unsigned long)state->extract_result->object_count);
+    } else {
+        lv_label_set_text(objects_label,
+                          LV_SYMBOL_DOWNLOAD " EXTRACT FILES (HTTP objects)");
+    }
+    lv_obj_set_style_text_font(objects_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(objects_label, lv_color_white(), 0);
+    lv_obj_center(objects_label);
+
+    if (state->quick_filter.enabled) {
+        char filter_description[128];
+        pcap_flow_filter_describe(&state->quick_filter, filter_description,
+                                  sizeof(filter_description));
+        lv_obj_t *quick_filter = lv_obj_create(page);
+        lv_obj_set_size(quick_filter, lv_pct(100), 38);
+        lv_obj_set_style_bg_color(quick_filter,
+                                  lv_color_mix(COLOR_NEON_CYAN, ui_bg_color(), LV_OPA_20), 0);
+        lv_obj_set_style_border_width(quick_filter, 1, 0);
+        lv_obj_set_style_border_color(quick_filter, COLOR_NEON_CYAN, 0);
+        lv_obj_set_style_radius(quick_filter, 8, 0);
+        lv_obj_set_style_pad_all(quick_filter, 4, 0);
+        lv_obj_set_style_pad_column(quick_filter, 8, 0);
+        lv_obj_set_flex_flow(quick_filter, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(quick_filter, LV_FLEX_ALIGN_START,
+                              LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_clear_flag(quick_filter, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_t *quick_label = lv_label_create(quick_filter);
+        lv_label_set_text_fmt(quick_label, LV_SYMBOL_LIST " %s", filter_description);
+        lv_obj_set_flex_grow(quick_label, 1);
+        lv_obj_set_style_text_font(quick_label, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(quick_label, COLOR_NEON_CYAN, 0);
+        lv_obj_t *clear = lv_btn_create(quick_filter);
+        lv_obj_set_size(clear, 96, 28);
+        lv_obj_set_style_bg_color(clear, COLOR_MATERIAL_RED, 0);
+        lv_obj_set_style_radius(clear, 7, 0);
+        lv_obj_add_event_cb(clear, pcap_viewer_clear_quick_filter_cb,
+                            LV_EVENT_CLICKED, state);
+        lv_obj_t *clear_label = lv_label_create(clear);
+        lv_label_set_text(clear_label, "CLEAR");
+        lv_obj_set_style_text_font(clear_label, &lv_font_montserrat_12, 0);
+        lv_obj_center(clear_label);
+    }
+
+    lv_obj_t *filter_bar = lv_obj_create(page);
+    lv_obj_set_size(filter_bar, lv_pct(100), 62);
+    lv_obj_set_style_bg_color(filter_bar, lv_color_hex(0x050A14), 0);
+    lv_obj_set_style_border_width(filter_bar, 1, 0);
+    lv_obj_set_style_border_color(filter_bar, ui_border_color(), 0);
+    lv_obj_set_style_radius(filter_bar, 8, 0);
+    lv_obj_set_style_pad_all(filter_bar, 4, 0);
+    lv_obj_set_style_pad_column(filter_bar, 6, 0);
+    lv_obj_set_flex_flow(filter_bar, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(filter_bar, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_scroll_dir(filter_bar, LV_DIR_HOR);
+    lv_obj_set_scrollbar_mode(filter_bar, LV_SCROLLBAR_MODE_AUTO);
+    lv_obj_set_style_width(filter_bar, 4, LV_PART_SCROLLBAR);
+    lv_obj_set_style_bg_color(filter_bar, COLOR_NEON_CYAN, LV_PART_SCROLLBAR);
+    lv_obj_set_style_bg_opa(filter_bar, LV_OPA_70, LV_PART_SCROLLBAR);
+    lv_obj_set_style_radius(filter_bar, LV_RADIUS_CIRCLE, LV_PART_SCROLLBAR);
+
+    state->fqdn_btn = lv_btn_create(filter_bar);
+    lv_obj_set_size(state->fqdn_btn, 122, 38);
+    lv_obj_set_style_border_width(state->fqdn_btn, 1, 0);
+    lv_obj_set_style_radius(state->fqdn_btn, 7, 0);
+    lv_obj_set_style_pad_all(state->fqdn_btn, 4, 0);
+    lv_obj_add_event_cb(state->fqdn_btn, pcap_viewer_fqdn_toggle_cb,
+                        LV_EVENT_CLICKED, state);
+    state->fqdn_label = lv_label_create(state->fqdn_btn);
+    lv_obj_set_style_text_font(state->fqdn_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(state->fqdn_label, lv_color_white(), 0);
+    lv_obj_center(state->fqdn_label);
+    pcap_viewer_update_fqdn_toggle(state);
+
+    for (int filter = 0; filter < PCAP_FILTER_COUNT; filter++) {
+        const char *filter_name = pcap_reader_filter_name((pcap_packet_filter_t)filter);
+        uint32_t filter_count = pcap_viewer_filter_packet_count(
+            state, (pcap_packet_filter_t)filter);
+        int button_width = 88;
+        if (filter == PCAP_FILTER_WIFI_MGMT) button_width = 150;
+        else if (filter == PCAP_FILTER_MALFORMED) button_width = 132;
+        else if (filter == PCAP_FILTER_EAPOL) button_width = 100;
+        lv_obj_t *button = lv_btn_create(filter_bar);
+        state->filter_buttons[filter] = button;
+        lv_obj_set_size(button, button_width, 38);
+        lv_obj_set_style_border_width(button, 1, 0);
+        lv_obj_set_style_radius(button, 7, 0);
+        lv_obj_set_style_pad_all(button, 4, 0);
+        lv_obj_add_event_cb(button, pcap_viewer_filter_cb, LV_EVENT_CLICKED,
+                            (void *)(uintptr_t)(filter + 1U));
+        lv_obj_t *label = lv_label_create(button);
+        lv_label_set_text_fmt(label, "%s\n%lu", filter_name,
+                              (unsigned long)filter_count);
+        lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_font(label, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(label, lv_color_white(), 0);
+        lv_obj_center(label);
+    }
+    pcap_viewer_update_filter_styles(state);
+
+    lv_obj_t *pager = lv_obj_create(page);
+    lv_obj_set_size(pager, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(pager, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(pager, 0, 0);
+    lv_obj_set_style_pad_all(pager, 0, 0);
+    lv_obj_set_style_pad_column(pager, 10, 0);
+    lv_obj_set_flex_flow(pager, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(pager, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    state->prev_btn = lv_btn_create(pager);
+    lv_obj_set_size(state->prev_btn, 110, 42);
+    style_back_nav_button(state->prev_btn);
+    lv_obj_add_event_cb(state->prev_btn, pcap_viewer_page_change_cb,
+                        LV_EVENT_CLICKED, state);
+    lv_obj_t *prev_label = lv_label_create(state->prev_btn);
+    lv_label_set_text(prev_label, LV_SYMBOL_LEFT " Prev");
+    lv_obj_center(prev_label);
+
+    state->page_label = lv_label_create(pager);
+    lv_obj_set_width(state->page_label, 430);
+    lv_obj_set_style_text_align(state->page_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(state->page_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(state->page_label, ui_muted_color(), 0);
+
+    state->next_btn = lv_btn_create(pager);
+    lv_obj_set_size(state->next_btn, 110, 42);
+    lv_obj_set_style_bg_color(state->next_btn, lv_color_hex(0x087EA4), 0);
+    lv_obj_set_style_radius(state->next_btn, 8, 0);
+    lv_obj_add_event_cb(state->next_btn, pcap_viewer_page_change_cb,
+                        LV_EVENT_CLICKED, state);
+    lv_obj_t *next_label = lv_label_create(state->next_btn);
+    lv_label_set_text(next_label, "Next " LV_SYMBOL_RIGHT);
+    lv_obj_center(next_label);
+
+    lv_obj_t *table_header = lv_obj_create(page);
+    lv_obj_remove_style_all(table_header);
+    lv_obj_set_size(table_header, lv_pct(100), 30);
+    lv_obj_set_style_bg_color(table_header,
+                              lv_color_mix(COLOR_NEON_CYAN, ui_bg_color(), LV_OPA_20), 0);
+    lv_obj_set_style_bg_opa(table_header, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(table_header, 1, 0);
+    lv_obj_set_style_border_color(table_header, COLOR_NEON_CYAN, 0);
+    lv_obj_set_style_border_side(table_header, LV_BORDER_SIDE_BOTTOM, 0);
+    lv_obj_set_style_pad_left(table_header, 6, 0);
+    lv_obj_set_style_pad_right(table_header, 6, 0);
+    lv_obj_set_style_pad_column(table_header, 8, 0);
+    lv_obj_set_flex_flow(table_header, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(table_header, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(table_header, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *number_header = lv_label_create(table_header);
+    lv_label_set_text(number_header, "NO. / RELATIVE TIME");
+    lv_obj_set_width(number_header, PCAP_VIEWER_COL_NO_TIME);
+    lv_obj_set_style_text_font(number_header, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_color(number_header, COLOR_NEON_CYAN, 0);
+
+    lv_obj_t *protocol_header = lv_label_create(table_header);
+    lv_label_set_text(protocol_header, "PROTOCOL");
+    lv_obj_set_width(protocol_header, PCAP_VIEWER_COL_PROTOCOL);
+    lv_obj_set_style_text_font(protocol_header, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_color(protocol_header, COLOR_NEON_CYAN, 0);
+
+    lv_obj_t *source_header = lv_label_create(table_header);
+    lv_label_set_text(source_header, "SOURCE");
+    lv_obj_set_width(source_header, PCAP_VIEWER_COL_SOURCE);
+    lv_obj_set_style_text_font(source_header, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_color(source_header, COLOR_NEON_CYAN, 0);
+
+    lv_obj_t *destination_header = lv_label_create(table_header);
+    lv_label_set_text(destination_header, "DESTINATION");
+    lv_obj_set_width(destination_header, PCAP_VIEWER_COL_DESTINATION);
+    lv_obj_set_style_text_font(destination_header, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_color(destination_header, COLOR_NEON_CYAN, 0);
+
+    lv_obj_t *info_header = lv_label_create(table_header);
+    lv_label_set_text(info_header, "INFO");
+    lv_obj_set_width(info_header, 0);
+    lv_obj_set_flex_grow(info_header, 1);
+    lv_obj_set_style_text_font(info_header, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_color(info_header, COLOR_NEON_CYAN, 0);
+
+    lv_obj_t *length_header = lv_label_create(table_header);
+    lv_label_set_text(length_header, "LEN");
+    lv_obj_set_width(length_header, PCAP_VIEWER_COL_LENGTH);
+    lv_obj_set_style_text_align(length_header, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_set_style_text_font(length_header, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_color(length_header, COLOR_NEON_CYAN, 0);
+
+    state->packet_list = lv_obj_create(page);
+    lv_obj_set_size(state->packet_list, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_flex_grow(state->packet_list, 1);
+    style_surface_panel(state->packet_list, 8);
+    lv_obj_set_style_pad_all(state->packet_list, 2, 0);
+    lv_obj_set_style_pad_row(state->packet_list, 0, 0);
+    lv_obj_set_flex_flow(state->packet_list, LV_FLEX_FLOW_COLUMN);
+    state->packet_page = 0;
+    pcap_viewer_render_packet_page(state);
+}
+
 //==================================================================================
 // Deauth Detector Page
 //==================================================================================
@@ -33938,6 +46727,9 @@ static void deauth_detector_task(void *arg)
                         if (parse_deauth_line(line_buffer, &entry)) {
                             ESP_LOGI(TAG, "Deauth detected: CH%d %s (%s) RSSI=%d",
                                      entry.channel, entry.ap_name, entry.bssid, entry.rssi);
+                            // A flood is hundreds of frames a minute; the 15 s
+                            // cooldown on ALARM is what makes this survivable.
+                            alert_chime_play(ALERT_TONE_ALARM);
 
                             // Shift entries down (newest first)
                             if (deauth_entry_count < DEAUTH_DETECTOR_MAX_ENTRIES) {
@@ -36955,6 +49747,12 @@ static void global_attack_tile_event_cb(lv_event_t *e)
         show_beacon_spam_page();
         return;
     }
+
+    // Handle standalone Capture Gateway (GITM) - upstream typed in the popup
+    if (strcmp(attack_name, "Capture GW") == 0) {
+        show_gitm_page();
+        return;
+    }
 }
 
 // Show Global WiFi Attacks page
@@ -37059,6 +49857,11 @@ static void show_global_attacks_page(void)
         create_tile(tiles, LV_SYMBOL_WIFI, "Beacon Spam", COLOR_MATERIAL_CYAN, global_attack_tile_event_cb, "Beacon Spam");
     }
 
+    // Capture Gateway (GITM) - Blue - Red Team only (standalone, upstream typed in popup)
+    if (enable_red_team) {
+        create_tile(tiles, LV_SYMBOL_LOOP, "GITM", COLOR_MATERIAL_BLUE, global_attack_tile_event_cb, "Capture GW");
+    }
+
     // Set current visible page
     ctx->current_visible_page = ctx->global_attacks_page;
 }
@@ -37079,6 +49882,7 @@ static __attribute__((unused)) lv_obj_t *settings_popup_obj = NULL;
 #define NVS_KEY_DASHBOARD       "dashboard"
 #define NVS_KEY_DARK_MODE       "dark_mode"
 #define NVS_KEY_BOOT_SOUND      "boot_sound"
+#define NVS_KEY_ALERT_SOUND     "alert_sound"
 #define NVS_KEY_CLOCK_24H       "clock_24h"
 #define NVS_KEY_CLOCK_DST       "clock_dst"
 #define NVS_KEY_CLOCK_SHOW      "clock_show"
@@ -37245,6 +50049,16 @@ static void load_screen_settings_from_nvs(void)
             ESP_LOGI(TAG, "No Boot Sound setting in NVS, using default: %s", boot_sound_mode_name(boot_sound_mode));
         }
 
+        uint8_t alert_sound = 1;
+        err = nvs_get_u8(nvs, NVS_KEY_ALERT_SOUND, &alert_sound);
+        if (err == ESP_OK) {
+            alert_sound_enabled = (alert_sound != 0);
+            ESP_LOGI(TAG, "Loaded Alert Sound from NVS: %s", alert_sound_enabled ? "ON" : "OFF");
+        } else {
+            alert_sound_enabled = true;
+            ESP_LOGI(TAG, "No Alert Sound setting in NVS, using default: ON");
+        }
+
         nvs_close(nvs);
     } else {
         ESP_LOGI(TAG, "NVS not available, using default screen settings");
@@ -37401,6 +50215,20 @@ static void save_boot_sound_to_nvs(boot_sound_mode_t mode)
         ESP_LOGI(TAG, "Saved Boot Sound to NVS: %s", boot_sound_mode_name(mode));
     } else {
         ESP_LOGE(TAG, "Failed to open NVS for writing Boot Sound: %s", esp_err_to_name(err));
+    }
+}
+
+static void save_alert_sound_to_nvs(bool enabled)
+{
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs);
+    if (err == ESP_OK) {
+        nvs_set_u8(nvs, NVS_KEY_ALERT_SOUND, enabled ? 1 : 0);
+        nvs_commit(nvs);
+        nvs_close(nvs);
+        ESP_LOGI(TAG, "Saved Alert Sound to NVS: %s", enabled ? "ON" : "OFF");
+    } else {
+        ESP_LOGE(TAG, "Failed to open NVS for writing Alert Sound: %s", esp_err_to_name(err));
     }
 }
 
@@ -37682,8 +50510,10 @@ static void detect_boards(void)
              mbus_detected ? "YES" : "NO");
 }
 
-// Check SD card presence on a specific tab using 'sd_status' command
-// Returns true if SD card is present, false otherwise
+// Check SD card presence on a specific tab using 'sd_status' command.
+// Retries for ~1.5s (like SubGHz): early SD_NONE is treated as "not ready yet"
+// so dual-board boot (no empty-port ping delay) does not false-negative.
+// Returns true if SD card is present, false otherwise.
 static bool check_sd_card_for_tab(tab_id_t tab)
 {
     if (tab == TAB_INTERNAL) {
@@ -37699,8 +50529,10 @@ static bool check_sd_card_for_tab(tab_id_t tab)
     ESP_LOGI(TAG, "[%s] Checking SD card presence...", tab_name);
 
     const char *cmd = "sd_status\r\n";
-    static const int64_t timeout_us = 300000; // one 300 ms probe
+    static const int64_t timeout_us = 1500000; // 1.5s window
+    static const int64_t resend_us = 400000;   // resend every 400 ms
     bool usb_locked = false;
+    bool saw_sd_none = false;
 
     if (tab == TAB_USB) {
         usb_rx_exclusive = true;
@@ -37710,6 +50542,7 @@ static bool check_sd_card_for_tab(tab_id_t tab)
     char rx_buffer[128];
     int total_len = 0;
     int64_t start_time = esp_timer_get_time();
+    int64_t last_cmd_us = start_time - resend_us; // first send immediate
 
     rx_buffer[0] = '\0';
 
@@ -37719,13 +50552,24 @@ static bool check_sd_card_for_tab(tab_id_t tab)
         uart_flush_input(uart_port);
     }
 
-    transport_write_bytes_tab(tab, uart_port, cmd, strlen(cmd));
+    while ((esp_timer_get_time() - start_time) < timeout_us) {
+        if ((esp_timer_get_time() - last_cmd_us) >= resend_us) {
+            transport_write_bytes_tab(tab, uart_port, cmd, strlen(cmd));
+            last_cmd_us = esp_timer_get_time();
+            // Fresh response window after each resend
+            total_len = 0;
+            rx_buffer[0] = '\0';
+        }
 
-    while ((esp_timer_get_time() - start_time) < timeout_us &&
-           total_len < (int)sizeof(rx_buffer) - 1) {
+        int space = (int)sizeof(rx_buffer) - 1 - total_len;
+        if (space <= 0) {
+            total_len = 0;
+            rx_buffer[0] = '\0';
+            space = (int)sizeof(rx_buffer) - 1;
+        }
+
         int len = transport_read_bytes_tab(tab, uart_port, rx_buffer + total_len,
-                                           sizeof(rx_buffer) - 1 - total_len,
-                                           pdMS_TO_TICKS(50));
+                                           space, pdMS_TO_TICKS(50));
         if (len <= 0) {
             continue;
         }
@@ -37735,18 +50579,27 @@ static bool check_sd_card_for_tab(tab_id_t tab)
 
         if (strstr(rx_buffer, "SD_OK") != NULL) {
             if (usb_locked) usb_rx_exclusive = false;
-            ESP_LOGI(TAG, "[%s] SD card present", tab_name);
+            if (saw_sd_none) {
+                ESP_LOGI(TAG, "[%s] SD card present (recovered after SD_NONE)", tab_name);
+            } else {
+                ESP_LOGI(TAG, "[%s] SD card present", tab_name);
+            }
             return true;
         }
         if (strstr(rx_buffer, "SD_NONE") != NULL) {
-            if (usb_locked) usb_rx_exclusive = false;
-            ESP_LOGW(TAG, "[%s] SD card not ready/not present", tab_name);
-            return false;
+            // Not ready yet — keep probing until timeout (dual-board race).
+            saw_sd_none = true;
+            total_len = 0;
+            rx_buffer[0] = '\0';
         }
     }
 
     if (usb_locked) usb_rx_exclusive = false;
-    ESP_LOGW(TAG, "[%s] SD status unknown after one probe, response: '%s'", tab_name, rx_buffer);
+    if (saw_sd_none) {
+        ESP_LOGW(TAG, "[%s] SD card not ready/not present", tab_name);
+    } else {
+        ESP_LOGW(TAG, "[%s] SD status unknown after probe, response: '%s'", tab_name, rx_buffer);
+    }
     return false;
 }
 
@@ -38168,11 +51021,9 @@ static void board_detect_popup_close_cb(lv_event_t *e)
 {
     ESP_LOGI(TAG, "User closed 'No Board Detected' popup");
 
-    // Stop retry timer
-    if (board_detect_retry_timer) {
-        lv_timer_del(board_detect_retry_timer);
-        board_detect_retry_timer = NULL;
-    }
+    // Ask the retry task to stop. It exits within ~100ms; if it is mid-probe it
+    // finishes that probe first (ping only, no UI work) and then returns.
+    board_detect_retry_stop = true;
 
     // Close popup
     if (board_detect_overlay) {
@@ -38187,49 +51038,68 @@ static void board_detect_popup_close_cb(lv_event_t *e)
     show_main_tiles();
 }
 
-// Retry board detection callback (called every 1s while popup is open)
-static void board_detect_retry_cb(lv_timer_t *timer)
+// Runs on the LVGL thread (via lv_async_call) once the retry task found a board.
+static void board_detect_found_async(void *user_data)
 {
+    (void)user_data;
+
+    // The user may have pressed "Continue Anyway" while the probe was running.
     if (!board_detection_popup_open) {
-        // Popup was closed, stop timer
-        if (board_detect_retry_timer) {
-            lv_timer_del(board_detect_retry_timer);
-            board_detect_retry_timer = NULL;
-        }
         return;
     }
 
-    ESP_LOGI(TAG, "Retrying board detection...");
+    ESP_LOGI(TAG, "Board detected! Closing popup and showing main UI.");
 
-    // Try detection again
-    detect_boards();
-
-    // Re-probe Sub-GHz availability so the home tile reflects the new state.
-    check_all_subghz_status();
-
-    // If any board detected, close popup and show main tiles
-    if (uart1_detected || mbus_detected) {
-        ESP_LOGI(TAG, "Board detected! Closing popup and showing main UI.");
-
-        // Stop retry timer
-        if (board_detect_retry_timer) {
-            lv_timer_del(board_detect_retry_timer);
-            board_detect_retry_timer = NULL;
-        }
-
-        // Close popup
-        if (board_detect_overlay) {
-            lv_obj_del(board_detect_overlay);
-            board_detect_overlay = NULL;
-            board_detect_popup = NULL;
-        }
-
-        board_detection_popup_open = false;
-
-        // Reload GUI to reflect detected config and show main tiles
-        reload_gui_for_detection();
-        show_main_tiles();
+    if (board_detect_overlay) {
+        lv_obj_del(board_detect_overlay);
+        board_detect_overlay = NULL;
+        board_detect_popup = NULL;
     }
+
+    board_detection_popup_open = false;
+
+    // Reload GUI to reflect detected config and show main tiles
+    reload_gui_for_detection();
+    show_main_tiles();
+}
+
+// Retry board detection while the popup is open. Runs on its own task because
+// each detect_boards() pass blocks ~3s on ping timeouts - on the LVGL thread
+// that starved touch handling completely.
+static void board_detect_retry_task(void *arg)
+{
+    (void)arg;
+    ESP_LOGI(TAG, "Board detection retry task started (3s interval)");
+
+    while (!board_detect_retry_stop) {
+        // Sleep in slices so "Continue Anyway" tears the task down promptly.
+        for (int i = 0; i < 30 && !board_detect_retry_stop; i++) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+        if (board_detect_retry_stop) break;
+
+        // A hotplug redetect owns the UARTs right now - try again next round.
+        if (board_probe_in_progress) continue;
+
+        ESP_LOGI(TAG, "Retrying board detection...");
+        board_probe_in_progress = true;
+        detect_boards();
+        check_all_sd_cards();
+        // Re-probe Sub-GHz availability so the home tile reflects the new state.
+        check_all_subghz_status();
+        board_probe_in_progress = false;
+
+        if (board_detect_retry_stop) break;
+
+        if (uart1_detected || mbus_detected) {
+            lv_async_call(board_detect_found_async, NULL);
+            break;
+        }
+    }
+
+    ESP_LOGI(TAG, "Board detection retry task stopped");
+    board_detect_retry_task_handle = NULL;
+    vTaskDelete(NULL);
 }
 
 // Show "No Board Detected" popup with retry logic
@@ -38284,7 +51154,7 @@ static void show_no_board_popup(void)
 
     // Status label (shows retry status)
     lv_obj_t *status = lv_label_create(board_detect_popup);
-    lv_label_set_text(status, "Retrying every 1 second...");
+    lv_label_set_text(status, "Retrying every 3 seconds...");
     lv_obj_set_style_text_font(status, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(status, lv_color_hex(0x888888), 0);
 
@@ -38300,9 +51170,17 @@ static void show_no_board_popup(void)
     lv_obj_set_style_text_font(btn_label, &lv_font_montserrat_14, 0);
     lv_obj_center(btn_label);
 
-    // Start retry timer (1 second interval)
-    board_detect_retry_timer = lv_timer_create(board_detect_retry_cb, 3000, NULL);
-    ESP_LOGI(TAG, "Started board detection retry timer (3s interval)");
+    // Start the retry task (3s interval). It must not run on the LVGL thread:
+    // the ping timeouts would block touch input and the button below would be
+    // unclickable.
+    board_detect_retry_stop = false;
+    if (board_detect_retry_task_handle == NULL) {
+        if (xTaskCreate(board_detect_retry_task, "board_retry", 5120, NULL, 4,
+                        &board_detect_retry_task_handle) != pdPASS) {
+            board_detect_retry_task_handle = NULL;
+            ESP_LOGE(TAG, "Failed to start board detection retry task");
+        }
+    }
 }
 
 //==================================================================================
@@ -39546,6 +52424,19 @@ static void theme_boot_sound_dropdown_cb(lv_event_t *e)
     save_boot_sound_to_nvs(boot_sound_mode);
 }
 
+static void theme_alert_sound_switch_cb(lv_event_t *e)
+{
+    lv_obj_t *sw = lv_event_get_target(e);
+    bool enabled = lv_obj_has_state(sw, LV_STATE_CHECKED);
+    if (alert_sound_enabled == enabled) return;
+
+    alert_sound_enabled = enabled;
+    save_alert_sound_to_nvs(alert_sound_enabled);
+    // Play it once on the way in, so the volume is a decision and not a
+    // surprise the next time somebody walks into the capture AP.
+    if (enabled) alert_chime_play(ALERT_TONE_JOIN);
+}
+
 static void style_theme_switch(lv_obj_t *sw)
 {
     lv_obj_set_size(sw, 70, 36);
@@ -39897,7 +52788,7 @@ static void show_theme_popup(void)
     style_modal_overlay(theme_popup_overlay, dark_mode_enabled ? LV_OPA_50 : LV_OPA_30);
 
     theme_popup_obj = lv_obj_create(theme_popup_overlay);
-    lv_obj_set_size(theme_popup_obj, 430, 430);
+    lv_obj_set_size(theme_popup_obj, 430, 500);
     lv_obj_center(theme_popup_obj);
     style_popup_card(theme_popup_obj, 12, ui_tab_icon_color());
     lv_obj_set_style_pad_all(theme_popup_obj, 18, 0);
@@ -39982,11 +52873,33 @@ static void show_theme_popup(void)
     }
     lv_obj_add_event_cb(boot_sound_dropdown, theme_boot_sound_dropdown_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
+    lv_obj_t *alert_sound_row = lv_obj_create(theme_popup_obj);
+    lv_obj_set_size(alert_sound_row, lv_pct(100), 56);
+    lv_obj_set_style_bg_opa(alert_sound_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(alert_sound_row, 0, 0);
+    lv_obj_set_style_pad_all(alert_sound_row, 0, 0);
+    lv_obj_set_flex_flow(alert_sound_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(alert_sound_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(alert_sound_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *alert_sound_row_label = lv_label_create(alert_sound_row);
+    lv_label_set_text(alert_sound_row_label, "Alert sound");
+    lv_obj_set_style_text_font(alert_sound_row_label, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_color(alert_sound_row_label, ui_text_color(), 0);
+
+    lv_obj_t *alert_sound_switch = lv_switch_create(alert_sound_row);
+    style_theme_switch(alert_sound_switch);
+    if (alert_sound_enabled) {
+        lv_obj_add_state(alert_sound_switch, LV_STATE_CHECKED);
+    }
+    lv_obj_add_event_cb(alert_sound_switch, theme_alert_sound_switch_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
     lv_obj_t *desc = lv_label_create(theme_popup_obj);
     lv_label_set_text(desc,
         "Dark mode switches between dark and light palette.\n"
         "Dashboard ON/OFF toggles bottom telemetry cards on Home.\n"
-        "Boot sound selects startup melody at 69% volume.");
+        "Boot sound selects startup melody at 69% volume.\n"
+        "Alert sound: joins, captures, warnings and follower alarms.");
     lv_obj_set_style_text_font(desc, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(desc, ui_muted_color(), 0);
     lv_obj_set_width(desc, lv_pct(100));
@@ -40618,6 +53531,11 @@ static int ota_status_overall_from_download_pct(int download_pct)
 static void ota_status_from_ota_line(const char *line)
 {
     if (!line) return;
+    // Any new OTA line means the C5 is still alive. Allow the silence watchdog to
+    // show a fresh waiting message after the next quiet period, but never treat
+    // that silence itself as a successful installation.
+    if (!g_ota.terminal_status_seen) g_ota.reboot_wait_shown = false;
+
     if (ota_ci_contains(line, "asset size")) {
         g_ota.flash_progress_seen = true;
         ota_status_set_phase(LV_SYMBOL_DOWNLOAD " Package found",
@@ -40693,15 +53611,23 @@ static void ota_status_from_ota_line(const char *line)
         if (g_ota.release_list_waiting) ota_release_list_finish(true);
         if (g_ota.install_started) ota_monitor_finish_close_ok();
         ota_restore_screen_timeout();
-    } else if (ota_ci_contains(line, "update applied") ||
-               ota_ci_contains(line, "marked valid") ||
-               ota_ci_contains(line, "restart") ||
-               ota_ci_contains(line, "reboot")) {
+    } else if (ota_ci_contains(line, "update applied") &&
+               (ota_ci_contains(line, "restarting") ||
+                ota_ci_contains(line, "rebooting"))) {
         ota_status_set_phase(LV_SYMBOL_OK " Update applied",
                              "Firmware was written. The C5 should reboot into the new slot.",
                              COLOR_MATERIAL_GREEN, 4, 100);
         if (g_ota.install_started) ota_monitor_finish_close_ok();
         ota_restore_screen_timeout();
+    } else if (ota_ci_contains(line, "marked valid")) {
+        ota_status_set_phase(LV_SYMBOL_OK " Firmware verified",
+                             "JanOS marked the running firmware as valid.",
+                             COLOR_MATERIAL_GREEN, 4, 100);
+    } else if (ota_ci_contains(line, "restart") ||
+               ota_ci_contains(line, "reboot")) {
+        ota_status_set_phase(LV_SYMBOL_REFRESH " Waiting for apply confirmation",
+                             "JanOS announced a restart. Waiting for the explicit update-applied marker.",
+                             COLOR_MATERIAL_ORANGE, 3, 96);
     } else if (ota_ci_contains(line, "error") || ota_ci_contains(line, "fail") ||
                ota_ci_contains(line, "abort")) {
         ota_status_set_phase(LV_SYMBOL_WARNING " OTA failed",
@@ -40717,10 +53643,9 @@ static void ota_status_show_reboot_wait(void)
     if (g_ota.reboot_wait_shown) return;
     g_ota.reboot_wait_shown = true;
     if (g_ota.byte_progress_seen) {
-        ota_status_set_phase(LV_SYMBOL_REFRESH " C5 is busy / rebooting",
-                             "No UART output after byte progress. Wait for JanOS to come back, then open Info to confirm the active partition.",
-                             COLOR_MATERIAL_GREEN, 3, 96);
-        if (g_ota.install_started) ota_monitor_finish_close_ok();
+        ota_status_set_phase(LV_SYMBOL_REFRESH " C5 is still finalizing",
+                             "No UART output after byte progress. Waiting for: OTA: update applied, restarting",
+                             COLOR_MATERIAL_ORANGE, 3, 96);
     } else {
         ota_status_set_phase(LV_SYMBOL_REFRESH " Waiting for old JanOS",
                              "This JanOS does not report byte progress. OTA may still be downloading/flashing; wait for reboot or a final OTA line.",
@@ -40732,8 +53657,7 @@ static void ota_status_show_reboot_wait(void)
                               ? LV_SYMBOL_REFRESH " Waiting for JanOS after flash/reboot..."
                               : LV_SYMBOL_REFRESH " Old JanOS: no detailed progress, keep waiting...");
         lv_obj_set_style_text_color(g_ota.mon_ota,
-                                    g_ota.byte_progress_seen ? COLOR_MATERIAL_GREEN
-                                                             : COLOR_MATERIAL_ORANGE,
+                                    COLOR_MATERIAL_ORANGE,
                                     0);
     }
 }
@@ -43003,6 +55927,1830 @@ static void show_sd_admin_page(void)
     sd_admin_refresh_ui(ctx);
 }
 
+// ============================================================================
+// JanOS SD -> Tab5 SD transfer
+// ============================================================================
+
+#define JANOS_TRANSFER_WIFI_CONNECTED_BIT BIT0
+#define JANOS_TRANSFER_WIFI_FAILED_BIT    BIT1
+#define JANOS_TRANSFER_WIFI_TIMEOUT_MS    20000
+#define JANOS_TRANSFER_HTTP_TIMEOUT_MS    20000
+#define JANOS_TRANSFER_BASE_URL           "http://172.0.0.1"
+#define JANOS_TRANSFER_LOCAL_ROOT         "/sdcard/lab/pcaps/imported"
+
+typedef struct {
+    EventGroupHandle_t events;
+    const volatile bool *cancel_requested;
+    int retries;
+} janos_transfer_wifi_wait_t;
+
+typedef struct {
+    bool valid;
+    bool was_connected;
+    bool previous_config_valid;
+    wifi_mode_t previous_mode;
+    wifi_config_t previous_config;
+} janos_transfer_wifi_session_t;
+
+static void compromised_transfer_set_stage(const char *status, const char *detail, int percent)
+{
+    if (!bsp_display_lock(100)) {
+        return;
+    }
+    if (compromised_transfer_ui.status_label &&
+        lv_obj_is_valid(compromised_transfer_ui.status_label)) {
+        lv_label_set_text(compromised_transfer_ui.status_label, status ? status : "Working...");
+    }
+    if (compromised_transfer_ui.detail_label &&
+        lv_obj_is_valid(compromised_transfer_ui.detail_label)) {
+        lv_label_set_text(compromised_transfer_ui.detail_label, detail ? detail : "");
+    }
+    if (compromised_transfer_ui.progress_bar &&
+        lv_obj_is_valid(compromised_transfer_ui.progress_bar)) {
+        lv_bar_set_value(compromised_transfer_ui.progress_bar,
+                         percent < 0 ? 0 : (percent > 100 ? 100 : percent), LV_ANIM_ON);
+    }
+    bsp_display_unlock();
+}
+
+/* Rate and remaining time for the transfer popup.
+ *
+ * Only bytes moved during this attempt count: a resumed transfer starts from a
+ * non-zero offset, and treating that prefix as if it had just been received
+ * would report a wildly optimistic rate. The rate is smoothed because block
+ * ACKs make the raw per-sample value jump around. */
+static int64_t compromised_rate_start_us;
+static uint64_t compromised_rate_start_bytes;
+static int64_t compromised_rate_last_us;
+static uint64_t compromised_rate_last_bytes;
+static double compromised_rate_bps;
+
+static void compromised_rate_reset(void)
+{
+    compromised_rate_start_us = 0;
+    compromised_rate_start_bytes = 0;
+    compromised_rate_last_us = 0;
+    compromised_rate_last_bytes = 0;
+    compromised_rate_bps = 0.0;
+}
+
+static void compromised_transfer_progress_cb(const janos_file_transfer_progress_t *progress,
+                                             void *user_ctx)
+{
+    (void)user_ctx;
+    if (!progress) {
+        return;
+    }
+
+    int percent = 0;
+    if (progress->bytes_total > 0) {
+        uint64_t value = (progress->bytes_received * 100U) / progress->bytes_total;
+        percent = value > 100U ? 100 : (int)value;
+    }
+
+    if (progress->state == JANOS_FILE_TRANSFER_QUERYING) {
+        compromised_rate_reset();
+    }
+
+    char detail[256];
+    if (progress->state == JANOS_FILE_TRANSFER_DOWNLOADING && progress->bytes_total > 0) {
+        int64_t now_us = esp_timer_get_time();
+        if (compromised_rate_start_us == 0) {
+            compromised_rate_start_us = now_us;
+            compromised_rate_start_bytes = progress->bytes_received;
+            compromised_rate_last_us = now_us;
+            compromised_rate_last_bytes = progress->bytes_received;
+        } else if (now_us > compromised_rate_last_us &&
+                   progress->bytes_received > compromised_rate_last_bytes) {
+            double sample = (double)(progress->bytes_received - compromised_rate_last_bytes) *
+                            1000000.0 / (double)(now_us - compromised_rate_last_us);
+            compromised_rate_bps = compromised_rate_bps > 0.0
+                                       ? (compromised_rate_bps * 0.7) + (sample * 0.3)
+                                       : sample;
+            compromised_rate_last_us = now_us;
+            compromised_rate_last_bytes = progress->bytes_received;
+        }
+
+        char received_text[32];
+        char total_text[32];
+        wardrive_human_size((long)progress->bytes_received, received_text,
+                            sizeof(received_text));
+        wardrive_human_size((long)progress->bytes_total, total_text, sizeof(total_text));
+
+        if (compromised_rate_bps >= 1.0) {
+            uint64_t remaining = progress->bytes_total > progress->bytes_received
+                                     ? progress->bytes_total - progress->bytes_received : 0;
+            char eta_text[24];
+            compromised_format_duration((uint64_t)((double)remaining / compromised_rate_bps),
+                                        eta_text, sizeof(eta_text));
+            snprintf(detail, sizeof(detail), "%s / %s (%d%%)\n%.1f KB/s  -  %s left",
+                     received_text, total_text, percent,
+                     compromised_rate_bps / 1024.0, eta_text);
+        } else {
+            snprintf(detail, sizeof(detail), "%s / %s (%d%%)",
+                     received_text, total_text, percent);
+        }
+    } else if (progress->state == JANOS_FILE_TRANSFER_DONE) {
+        char size_text[32];
+        wardrive_human_size((long)progress->bytes_received, size_text, sizeof(size_text));
+        uint64_t moved = progress->bytes_received > compromised_rate_start_bytes
+                             ? progress->bytes_received - compromised_rate_start_bytes : 0;
+        int64_t elapsed_us = compromised_rate_start_us
+                                 ? esp_timer_get_time() - compromised_rate_start_us : 0;
+        if (elapsed_us > 1000000 && moved > 0) {
+            char elapsed_text[24];
+            compromised_format_duration((uint64_t)(elapsed_us / 1000000), elapsed_text,
+                                        sizeof(elapsed_text));
+            snprintf(detail, sizeof(detail), "%s, CRC32 %08lX\n%s at %.1f KB/s",
+                     size_text, (unsigned long)progress->crc32, elapsed_text,
+                     (double)moved * 1000000.0 / (double)elapsed_us / 1024.0);
+        } else {
+            snprintf(detail, sizeof(detail), "%s, CRC32 %08lX", size_text,
+                     (unsigned long)progress->crc32);
+        }
+        percent = 100;
+    } else if (progress->message) {
+        snprintf(detail, sizeof(detail), "%s", progress->message);
+    } else {
+        detail[0] = '\0';
+    }
+
+    /* Kept from the hunt for the Wi-Fi transfer failures: a collapsing pool is
+     * invisible without sampling it as the transfer runs. Sparse enough now not
+     * to bury the rest of the log during a multi-minute copy. */
+    static int64_t last_memory_log_us;
+    int64_t now_us = esp_timer_get_time();
+    if (progress->state != JANOS_FILE_TRANSFER_DOWNLOADING ||
+            now_us - last_memory_log_us > 10000000) {
+        last_memory_log_us = now_us;
+        char context[48];
+        snprintf(context, sizeof(context), "transfer %s %d%%",
+                 janos_file_transfer_state_name(progress->state), percent);
+        log_memory_stats(context);
+    }
+
+    compromised_transfer_set_stage(janos_file_transfer_state_name(progress->state),
+                                   detail, percent);
+}
+
+static void compromised_transfer_close_or_cancel_cb(lv_event_t *e)
+{
+    (void)e;
+    if (compromised_transfer_ui.active) {
+        compromised_transfer_ui.cancel_requested = true;
+        if (compromised_transfer_ui.action_btn &&
+            lv_obj_is_valid(compromised_transfer_ui.action_btn)) {
+            lv_obj_add_state(compromised_transfer_ui.action_btn, LV_STATE_DISABLED);
+        }
+        if (compromised_transfer_ui.action_label &&
+            lv_obj_is_valid(compromised_transfer_ui.action_label)) {
+            lv_label_set_text(compromised_transfer_ui.action_label, "Cancelling...");
+        }
+        return;
+    }
+
+    tab_context_t *ctx = get_current_ctx();
+    bool refresh_espshark_monster = ctx && ctx->pcap_captures_page &&
+                                    ctx->current_visible_page == ctx->pcap_captures_page;
+
+    if (compromised_transfer_ui.overlay && lv_obj_is_valid(compromised_transfer_ui.overlay)) {
+        lv_obj_del(compromised_transfer_ui.overlay);
+    }
+    compromised_transfer_ui.overlay = NULL;
+    compromised_transfer_ui.popup = NULL;
+    compromised_transfer_ui.status_label = NULL;
+    compromised_transfer_ui.detail_label = NULL;
+    compromised_transfer_ui.progress_bar = NULL;
+    compromised_transfer_ui.action_btn = NULL;
+    compromised_transfer_ui.action_label = NULL;
+    compromised_transfer_ui.cancel_requested = false;
+    compromised_transfer_ui.sync_mode = false;
+
+    if (refresh_espshark_monster) {
+        ctx->compromised_files_loaded = false;
+        show_pcap_captures_page();
+    }
+}
+
+static void compromised_transfer_show_popup(const char *file_name)
+{
+    compromised_transfer_ui.overlay = lv_obj_create(lv_scr_act());
+    lv_obj_remove_style_all(compromised_transfer_ui.overlay);
+    lv_obj_set_size(compromised_transfer_ui.overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(compromised_transfer_ui.overlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(compromised_transfer_ui.overlay, LV_OPA_60, 0);
+    lv_obj_add_flag(compromised_transfer_ui.overlay, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(compromised_transfer_ui.overlay, LV_OBJ_FLAG_SCROLLABLE);
+
+    compromised_transfer_ui.popup = lv_obj_create(compromised_transfer_ui.overlay);
+    lv_obj_set_size(compromised_transfer_ui.popup, 680, 340);
+    lv_obj_center(compromised_transfer_ui.popup);
+    style_surface_panel(compromised_transfer_ui.popup, 16);
+    lv_obj_set_style_pad_all(compromised_transfer_ui.popup, 24, 0);
+    lv_obj_set_flex_flow(compromised_transfer_ui.popup, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(compromised_transfer_ui.popup, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(compromised_transfer_ui.popup, 16, 0);
+    lv_obj_clear_flag(compromised_transfer_ui.popup, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(compromised_transfer_ui.popup);
+    lv_label_set_text(title, compromised_transfer_ui.sync_mode
+                                ? LV_SYMBOL_REFRESH " Sync Monster SD"
+                                : LV_SYMBOL_DOWNLOAD " Copy to Tab5");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_GREEN, 0);
+
+    lv_obj_t *name = lv_label_create(compromised_transfer_ui.popup);
+    lv_label_set_text(name, file_name ? file_name : "PCAP file");
+    lv_obj_set_width(name, lv_pct(100));
+    lv_label_set_long_mode(name, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_align(name, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(name, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(name, ui_text_color(), 0);
+
+    compromised_transfer_ui.status_label = lv_label_create(compromised_transfer_ui.popup);
+    lv_label_set_text(compromised_transfer_ui.status_label, "Preparing transfer...");
+    lv_obj_set_width(compromised_transfer_ui.status_label, lv_pct(100));
+    lv_obj_set_style_text_align(compromised_transfer_ui.status_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(compromised_transfer_ui.status_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(compromised_transfer_ui.status_label, COLOR_MATERIAL_AMBER, 0);
+
+    compromised_transfer_ui.progress_bar = lv_bar_create(compromised_transfer_ui.popup);
+    lv_obj_set_size(compromised_transfer_ui.progress_bar, 580, 24);
+    lv_bar_set_range(compromised_transfer_ui.progress_bar, 0, 100);
+    lv_bar_set_value(compromised_transfer_ui.progress_bar, 0, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(compromised_transfer_ui.progress_bar, ui_card_color(), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(compromised_transfer_ui.progress_bar, COLOR_MATERIAL_GREEN,
+                              LV_PART_INDICATOR);
+
+    compromised_transfer_ui.detail_label = lv_label_create(compromised_transfer_ui.popup);
+    lv_label_set_text(compromised_transfer_ui.detail_label,
+                      "The original file will remain on the Monster.");
+    lv_obj_set_width(compromised_transfer_ui.detail_label, lv_pct(100));
+    lv_label_set_long_mode(compromised_transfer_ui.detail_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(compromised_transfer_ui.detail_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(compromised_transfer_ui.detail_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(compromised_transfer_ui.detail_label, ui_muted_color(), 0);
+
+    compromised_transfer_ui.action_btn = lv_btn_create(compromised_transfer_ui.popup);
+    lv_obj_set_size(compromised_transfer_ui.action_btn, 180, 48);
+    style_danger_button(compromised_transfer_ui.action_btn);
+    lv_obj_add_event_cb(compromised_transfer_ui.action_btn,
+                        compromised_transfer_close_or_cancel_cb, LV_EVENT_CLICKED, NULL);
+
+    compromised_transfer_ui.action_label = lv_label_create(compromised_transfer_ui.action_btn);
+    lv_label_set_text(compromised_transfer_ui.action_label, "Cancel");
+    lv_obj_set_style_text_font(compromised_transfer_ui.action_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(compromised_transfer_ui.action_label, lv_color_white(), 0);
+    lv_obj_center(compromised_transfer_ui.action_label);
+}
+
+static void compromised_transfer_finish_ui_unlocked(bool success, const char *detail)
+{
+    compromised_transfer_ui.active = false;
+    // A cancel is the operator's own decision - they do not need to be told.
+    if (success) {
+        alert_chime_play(ALERT_TONE_WIN);
+    } else if (!compromised_transfer_ui.cancel_requested) {
+        alert_chime_play(ALERT_TONE_WARN);
+    }
+    if (compromised_transfer_ui.status_label &&
+        lv_obj_is_valid(compromised_transfer_ui.status_label)) {
+        lv_label_set_text(compromised_transfer_ui.status_label,
+                          success ? (compromised_transfer_ui.sync_mode
+                                         ? "Sync complete" : "Transfer complete") :
+                          (compromised_transfer_ui.cancel_requested
+                               ? (compromised_transfer_ui.sync_mode
+                                      ? "Sync cancelled" : "Transfer cancelled")
+                               : (compromised_transfer_ui.sync_mode
+                                      ? "Sync finished with errors" : "Transfer failed")));
+        lv_obj_set_style_text_color(compromised_transfer_ui.status_label,
+                                    success ? COLOR_MATERIAL_GREEN : COLOR_MATERIAL_RED, 0);
+    }
+    if (compromised_transfer_ui.detail_label &&
+        lv_obj_is_valid(compromised_transfer_ui.detail_label)) {
+        lv_label_set_text(compromised_transfer_ui.detail_label, detail ? detail : "");
+    }
+    if (compromised_transfer_ui.progress_bar &&
+        lv_obj_is_valid(compromised_transfer_ui.progress_bar) && success) {
+        lv_bar_set_value(compromised_transfer_ui.progress_bar, 100, LV_ANIM_ON);
+    }
+    if (compromised_transfer_ui.action_btn &&
+        lv_obj_is_valid(compromised_transfer_ui.action_btn)) {
+        lv_obj_clear_state(compromised_transfer_ui.action_btn, LV_STATE_DISABLED);
+        lv_obj_set_style_bg_color(compromised_transfer_ui.action_btn,
+                                  success ? COLOR_MATERIAL_GREEN : COLOR_MATERIAL_BLUE, 0);
+    }
+    if (compromised_transfer_ui.action_label &&
+        lv_obj_is_valid(compromised_transfer_ui.action_label)) {
+        lv_label_set_text(compromised_transfer_ui.action_label, "Close");
+    }
+}
+
+static void compromised_transfer_finish_ui(bool success, const char *detail)
+{
+    if (!bsp_display_lock(250)) {
+        return;
+    }
+    compromised_transfer_finish_ui_unlocked(success, detail);
+    bsp_display_unlock();
+}
+
+static void janos_transfer_wifi_event_handler(void *arg, esp_event_base_t event_base,
+                                              int32_t event_id, void *event_data)
+{
+    janos_transfer_wifi_wait_t *wait = (janos_transfer_wifi_wait_t *)arg;
+    if (!wait || !wait->events) {
+        return;
+    }
+
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        if ((!wait->cancel_requested || !*wait->cancel_requested) && wait->retries < 4) {
+            wait->retries++;
+            esp_wifi_connect();
+        } else {
+            xEventGroupSetBits(wait->events, JANOS_TRANSFER_WIFI_FAILED_BIT);
+        }
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        const ip_event_got_ip_t *got_ip = (const ip_event_got_ip_t *)event_data;
+        if (got_ip) {
+            ESP_LOGI(TAG, "[Monster transfer] JanOS-Admin connected, IP=" IPSTR,
+                     IP2STR(&got_ip->ip_info.ip));
+        }
+        xEventGroupSetBits(wait->events, JANOS_TRANSFER_WIFI_CONNECTED_BIT);
+    }
+}
+
+static esp_err_t janos_transfer_connect_wifi(const char *password,
+                                             const volatile bool *cancel_requested,
+                                             janos_transfer_wifi_session_t *session)
+{
+    if (!password || !session) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    memset(session, 0, sizeof(*session));
+
+    bool was_initialized = esp_modem_wifi_initialized;
+    esp_err_t err = esp_modem_wifi_init();
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    session->valid = true;
+    if (esp_wifi_get_mode(&session->previous_mode) != ESP_OK) {
+        session->previous_mode = WIFI_MODE_STA;
+    }
+    session->previous_config_valid =
+        esp_wifi_get_config(WIFI_IF_STA, &session->previous_config) == ESP_OK;
+    wifi_ap_record_t previous_ap;
+    session->was_connected = was_initialized && esp_wifi_sta_get_ap_info(&previous_ap) == ESP_OK;
+
+    esp_wifi_disconnect();
+    vTaskDelay(pdMS_TO_TICKS(150));
+
+    EventGroupHandle_t events = xEventGroupCreate();
+    if (!events) {
+        return ESP_ERR_NO_MEM;
+    }
+    janos_transfer_wifi_wait_t wait = {
+        .events = events,
+        .cancel_requested = cancel_requested,
+        .retries = 0,
+    };
+    esp_event_handler_instance_t wifi_instance = NULL;
+    esp_event_handler_instance_t ip_instance = NULL;
+    err = esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
+                                              janos_transfer_wifi_event_handler, &wait,
+                                              &wifi_instance);
+    if (err == ESP_OK) {
+        err = esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
+                                                  janos_transfer_wifi_event_handler, &wait,
+                                                  &ip_instance);
+    }
+
+    wifi_config_t config = {0};
+    snprintf((char *)config.sta.ssid, sizeof(config.sta.ssid), "%s", "JanOS-Admin");
+    snprintf((char *)config.sta.password, sizeof(config.sta.password), "%s", password);
+    config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    config.sta.pmf_cfg.capable = true;
+    config.sta.pmf_cfg.required = false;
+
+    if (err == ESP_OK) {
+        err = esp_wifi_set_mode(WIFI_MODE_STA);
+    }
+    if (err == ESP_OK) {
+        err = esp_wifi_set_config(WIFI_IF_STA, &config);
+    }
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "[Monster transfer] Connecting internal C6 to Monster AP JanOS-Admin");
+        err = esp_wifi_connect();
+    }
+
+    if (err == ESP_OK) {
+        TickType_t started = xTaskGetTickCount();
+        while ((xTaskGetTickCount() - started) < pdMS_TO_TICKS(JANOS_TRANSFER_WIFI_TIMEOUT_MS)) {
+            if (cancel_requested && *cancel_requested) {
+                err = ESP_ERR_INVALID_STATE;
+                break;
+            }
+            EventBits_t bits = xEventGroupWaitBits(events,
+                                                   JANOS_TRANSFER_WIFI_CONNECTED_BIT |
+                                                       JANOS_TRANSFER_WIFI_FAILED_BIT,
+                                                   pdFALSE, pdFALSE, pdMS_TO_TICKS(250));
+            if (bits & JANOS_TRANSFER_WIFI_CONNECTED_BIT) {
+                err = ESP_OK;
+                break;
+            }
+            if (bits & JANOS_TRANSFER_WIFI_FAILED_BIT) {
+                err = ESP_FAIL;
+                break;
+            }
+        }
+        if (!(xEventGroupGetBits(events) & JANOS_TRANSFER_WIFI_CONNECTED_BIT) && err == ESP_OK) {
+            err = ESP_ERR_TIMEOUT;
+        }
+    }
+
+    if (ip_instance) {
+        esp_event_handler_instance_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, ip_instance);
+    }
+    if (wifi_instance) {
+        esp_event_handler_instance_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_instance);
+    }
+    vEventGroupDelete(events);
+    if (err != ESP_OK) {
+        esp_wifi_disconnect();
+    }
+    return err;
+}
+
+static void janos_transfer_restore_wifi(const janos_transfer_wifi_session_t *session)
+{
+    if (!session || !session->valid) {
+        return;
+    }
+    esp_wifi_disconnect();
+    vTaskDelay(pdMS_TO_TICKS(100));
+    esp_wifi_set_mode(session->previous_mode);
+    if (session->previous_config_valid) {
+        wifi_config_t previous_config = session->previous_config;
+        esp_wifi_set_config(WIFI_IF_STA, &previous_config);
+    }
+    if (session->was_connected) {
+        esp_wifi_connect();
+    }
+}
+
+static bool janos_transfer_wait_for_portal(tab_id_t tab, uart_port_t uart_port,
+                                           const char *password, char *response,
+                                           size_t response_size)
+{
+    if (!password || !response || response_size < 2) {
+        return false;
+    }
+
+    char command[96];
+    snprintf(command, sizeof(command), "start_admin_portal %s", password);
+    compromised_transport_flush(tab, uart_port);
+    ESP_LOGI(TAG, "[%s] Sending start_admin_portal <session-password> to Monster",
+             tab_transport_name(tab));
+    size_t command_len = strlen(command);
+    int command_written = transport_write_bytes_tab(tab, uart_port, command, command_len);
+    int newline_written = transport_write_bytes_tab(tab, uart_port, "\r\n", 2);
+    memset(command, 0, sizeof(command));
+    if (command_written != (int)command_len || newline_written != 2) {
+        ESP_LOGE(TAG, "[%s] Failed to send complete start_admin_portal command (%d/%u + %d/2)",
+                 tab_transport_name(tab), command_written, (unsigned)command_len,
+                 newline_written);
+        return false;
+    }
+    ESP_LOGI(TAG, "[%s] start_admin_portal command sent; waiting for Monster confirmation",
+             tab_transport_name(tab));
+
+    response[0] = '\0';
+    size_t total = 0;
+    TickType_t started = xTaskGetTickCount();
+    while ((xTaskGetTickCount() - started) < pdMS_TO_TICKS(15000) &&
+           total < response_size - 1) {
+        if (compromised_transfer_ui.cancel_requested) {
+            return false;
+        }
+        int read = transport_read_bytes_tab(tab, uart_port, response + total,
+                                            response_size - total - 1,
+                                            pdMS_TO_TICKS(100));
+        if (read <= 0) {
+            continue;
+        }
+        total += (size_t)read;
+        response[total] = '\0';
+        if (strstr(response, "Admin portal started. Connect to 'JanOS-Admin'") ||
+            strstr(response, "Portal already running")) {
+            ESP_LOGI(TAG, "[%s] Monster confirmed JanOS-Admin AP is running",
+                     tab_transport_name(tab));
+            return true;
+        }
+        if (strstr(response, "Failed to initialize SD card") ||
+            strstr(response, "Password length must be") ||
+            strstr(response, "Failed to start HTTP server") ||
+            strstr(response, "Failed to enable AP mode")) {
+            return false;
+        }
+    }
+    return false;
+}
+
+static const char *janos_transfer_source_folder(tab_id_t tab)
+{
+    switch (tab) {
+        case TAB_GROVE: return "grove";
+        case TAB_USB: return "usb";
+        case TAB_MBUS: return "mbus";
+        default: return "unknown";
+    }
+}
+
+static void janos_transfer_sanitize_filename(const char *input, char *output, size_t output_size)
+{
+    if (!output || output_size == 0) {
+        return;
+    }
+    size_t pos = 0;
+    const char *name = input ? input : "capture.pcap";
+    for (; *name && pos + 1 < output_size; name++) {
+        unsigned char c = (unsigned char)*name;
+        if (isalnum(c) || c == '.' || c == '-' || c == '_') {
+            output[pos++] = (char)c;
+        } else {
+            output[pos++] = '_';
+        }
+    }
+    output[pos] = '\0';
+    if (pos == 0) {
+        snprintf(output, output_size, "%s", "capture.pcap");
+    }
+}
+
+static bool janos_transfer_build_unique_local_path(tab_id_t tab, const char *file_name,
+                                                   char *output, size_t output_size)
+{
+    char safe_name[96];
+    janos_transfer_sanitize_filename(file_name, safe_name, sizeof(safe_name));
+
+    char base[96];
+    char extension[20] = {0};
+    snprintf(base, sizeof(base), "%s", safe_name);
+    char *dot = strrchr(base, '.');
+    if (dot && dot != base) {
+        snprintf(extension, sizeof(extension), "%s", dot);
+        *dot = '\0';
+    }
+
+    for (int suffix = 0; suffix < 1000; suffix++) {
+        int written;
+        if (suffix == 0) {
+            written = snprintf(output, output_size, "%s/%s/%s%s",
+                               JANOS_TRANSFER_LOCAL_ROOT, janos_transfer_source_folder(tab),
+                               base, extension);
+        } else {
+            written = snprintf(output, output_size, "%s/%s/%s_%d%s",
+                               JANOS_TRANSFER_LOCAL_ROOT, janos_transfer_source_folder(tab),
+                               base, suffix, extension);
+        }
+        if (written < 0 || (size_t)written >= output_size) {
+            return false;
+        }
+
+        char part_path[288];
+        snprintf(part_path, sizeof(part_path), "%s.part", output);
+        if (access(output, F_OK) != 0 && access(part_path, F_OK) != 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+#define JANOS_SYNC_STATE_FILE ".monster_sync.tsv"
+#define JANOS_SYNC_LINE_MAX   768
+
+static bool janos_sync_build_state_path(tab_id_t tab, char *output, size_t output_size)
+{
+    if (!output || output_size == 0) {
+        return false;
+    }
+    int written = snprintf(output, output_size, "%s/%s/%s",
+                           JANOS_TRANSFER_LOCAL_ROOT, janos_transfer_source_folder(tab),
+                           JANOS_SYNC_STATE_FILE);
+    return written > 0 && (size_t)written < output_size;
+}
+
+static bool janos_sync_build_canonical_local_path(tab_id_t tab, const char *file_name,
+                                                  char *output, size_t output_size)
+{
+    if (!output || output_size == 0) {
+        return false;
+    }
+    char safe_name[96];
+    janos_transfer_sanitize_filename(file_name, safe_name, sizeof(safe_name));
+    int written = snprintf(output, output_size, "%s/%s/%s",
+                           JANOS_TRANSFER_LOCAL_ROOT, janos_transfer_source_folder(tab),
+                           safe_name);
+    return written > 0 && (size_t)written < output_size;
+}
+
+static bool janos_sync_local_file_matches(const char *local_path, uint64_t remote_size)
+{
+    struct stat file_stat;
+    if (!local_path || stat(local_path, &file_stat) != 0 || !S_ISREG(file_stat.st_mode)) {
+        return false;
+    }
+    return (uint64_t)file_stat.st_size == remote_size;
+}
+
+/*
+ * Fast UI-side status source: the sync journal records the path and size that
+ * were verified after a successful transfer.  This does not claim that the
+ * remote file is still byte-for-byte unchanged; Sync all performs the strict
+ * remote path + current size check before deciding whether to skip it.
+ */
+static bool janos_sync_state_has_local_copy(tab_id_t tab, const char *remote_path)
+{
+    char state_path[320];
+    if (!remote_path || !janos_sync_build_state_path(tab, state_path, sizeof(state_path))) {
+        return false;
+    }
+
+    FILE *state = fopen(state_path, "r");
+    if (!state) {
+        return false;
+    }
+
+    bool found = false;
+    char line[JANOS_SYNC_LINE_MAX];
+    while (fgets(line, sizeof(line), state)) {
+        char *save = NULL;
+        char *size_text = strtok_r(line, "\t", &save);
+        char *crc_text = strtok_r(NULL, "\t", &save);
+        char *saved_remote_path = strtok_r(NULL, "\t", &save);
+        char *saved_local_path = strtok_r(NULL, "\r\n", &save);
+        if (!size_text || !crc_text || !saved_remote_path || !saved_local_path ||
+            strcmp(saved_remote_path, remote_path) != 0) {
+            continue;
+        }
+
+        char *end = NULL;
+        errno = 0;
+        unsigned long long saved_size = strtoull(size_text, &end, 10);
+        if (errno != 0 || end == size_text || *end != '\0') {
+            continue;
+        }
+        (void)crc_text;
+
+        if (janos_sync_local_file_matches(saved_local_path, (uint64_t)saved_size)) {
+            found = true;
+            break;
+        }
+    }
+    fclose(state);
+    return found;
+}
+
+/*
+ * The Monster file API currently exposes name/type/size, but no modification time
+ * or hash.  Exact remote path + size is therefore the strongest identity available
+ * without changing JanOS.  The downloaded CRC is retained for auditing and for a
+ * future API that can expose the remote CRC before download.
+ */
+static bool janos_sync_state_contains(tab_id_t tab, const char *remote_path,
+                                      uint64_t remote_size, char *local_path_out,
+                                      size_t local_path_out_size)
+{
+    char state_path[320];
+    if (!remote_path || !janos_sync_build_state_path(tab, state_path, sizeof(state_path))) {
+        return false;
+    }
+
+    FILE *state = fopen(state_path, "r");
+    if (!state) {
+        return false;
+    }
+
+    bool found = false;
+    char line[JANOS_SYNC_LINE_MAX];
+    while (fgets(line, sizeof(line), state)) {
+        char *save = NULL;
+        char *size_text = strtok_r(line, "\t", &save);
+        char *crc_text = strtok_r(NULL, "\t", &save);
+        char *saved_remote_path = strtok_r(NULL, "\t", &save);
+        char *saved_local_path = strtok_r(NULL, "\r\n", &save);
+        if (!size_text || !crc_text || !saved_remote_path || !saved_local_path) {
+            continue;
+        }
+
+        char *end = NULL;
+        errno = 0;
+        unsigned long long saved_size = strtoull(size_text, &end, 10);
+        if (errno != 0 || end == size_text || *end != '\0') {
+            continue;
+        }
+        (void)crc_text;
+
+        if ((uint64_t)saved_size == remote_size &&
+            strcmp(saved_remote_path, remote_path) == 0 &&
+            janos_sync_local_file_matches(saved_local_path, remote_size)) {
+            if (local_path_out && local_path_out_size > 0) {
+                snprintf(local_path_out, local_path_out_size, "%s", saved_local_path);
+            }
+            found = true;
+            break;
+        }
+    }
+    fclose(state);
+    return found;
+}
+
+static esp_err_t janos_sync_state_append(tab_id_t tab, const char *remote_path,
+                                         uint64_t remote_size, const char *local_path,
+                                         uint32_t crc32)
+{
+    if (!remote_path || !local_path || strchr(remote_path, '\t') || strchr(remote_path, '\n') ||
+        strchr(local_path, '\t') || strchr(local_path, '\n')) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    char state_path[320];
+    if (!janos_sync_build_state_path(tab, state_path, sizeof(state_path))) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    FILE *state = fopen(state_path, "a");
+    if (!state) {
+        ESP_LOGE(TAG, "Could not open sync state %s: errno=%d", state_path, errno);
+        return ESP_FAIL;
+    }
+    int written = fprintf(state, "%llu\t%08lX\t%s\t%s\n",
+                          (unsigned long long)remote_size, (unsigned long)crc32,
+                          remote_path, local_path);
+    esp_err_t err = ESP_OK;
+    if (written < 0 || fflush(state) != 0) {
+        err = ESP_FAIL;
+    } else {
+        int fd = fileno(state);
+        if (fd >= 0 && fsync(fd) != 0) {
+            err = ESP_FAIL;
+        }
+    }
+    if (fclose(state) != 0) {
+        err = ESP_FAIL;
+    }
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Could not persist sync state %s: errno=%d", state_path, errno);
+    }
+    return err;
+}
+
+static bool janos_sync_bootstrap_existing(tab_id_t tab, const char *remote_path,
+                                          const char *file_name, uint64_t remote_size)
+{
+    char canonical_path[256];
+    if (!janos_sync_build_canonical_local_path(tab, file_name,
+                                               canonical_path, sizeof(canonical_path)) ||
+        !janos_sync_local_file_matches(canonical_path, remote_size)) {
+        return false;
+    }
+
+    esp_err_t err = janos_sync_state_append(tab, remote_path, remote_size,
+                                            canonical_path, 0);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "[%s] Sync indexed existing local file %s",
+                 tab_transport_name(tab), canonical_path);
+        return true;
+    }
+    return false;
+}
+
+static void compromised_sync_progress_cb(const janos_file_transfer_progress_t *progress,
+                                         void *user_ctx)
+{
+    compromised_sync_progress_ctx_t *sync = (compromised_sync_progress_ctx_t *)user_ctx;
+    if (!progress || !sync || sync->total <= 0) {
+        return;
+    }
+
+    int file_percent = 0;
+    if (progress->bytes_total > 0) {
+        uint64_t value = (progress->bytes_received * 100U) / progress->bytes_total;
+        file_percent = value > 100U ? 100 : (int)value;
+    }
+    int overall_percent = (((sync->current - 1) * 100) + file_percent) / sync->total;
+
+    char detail[320];
+    if (progress->state == JANOS_FILE_TRANSFER_DOWNLOADING && progress->bytes_total > 0) {
+        snprintf(detail, sizeof(detail),
+                 "File %d/%d: %s\n%llu / %llu bytes (%d%%)",
+                 sync->current, sync->total,
+                 sync->file_name ? sync->file_name : "capture",
+                 (unsigned long long)progress->bytes_received,
+                 (unsigned long long)progress->bytes_total, file_percent);
+    } else if (progress->message) {
+        snprintf(detail, sizeof(detail), "File %d/%d: %s\n%s",
+                 sync->current, sync->total,
+                 sync->file_name ? sync->file_name : "capture", progress->message);
+    } else {
+        snprintf(detail, sizeof(detail), "File %d/%d: %s",
+                 sync->current, sync->total,
+                 sync->file_name ? sync->file_name : "capture");
+    }
+    compromised_transfer_set_stage("Checking and syncing files...", detail, overall_percent);
+}
+
+static void compromised_transfer_delete_current_task(void)
+{
+#if defined(CONFIG_SPIRAM_XIP_FROM_PSRAM) && CONFIG_SPIRAM_XIP_FROM_PSRAM && \
+    defined(CONFIG_FREERTOS_TLSP_DELETION_CALLBACKS) && CONFIG_FREERTOS_TLSP_DELETION_CALLBACKS
+    pthread_internal_local_storage_destructor_callback(NULL);
+#endif
+    compromised_transfer_ui.task = NULL;
+    vTaskDelete(NULL);
+}
+
+/* ---------------------------------------------------------------------------
+ * JanOS file transfer over the M-BUS UART.
+ *
+ * The Wi-Fi path through the C6 co-processor cannot carry more than about a
+ * megabyte: its SDIO stream buffer has to grow mid-transfer out of a
+ * DMA-capable pool that is permanently fragmented below 2 KB, and the RX path
+ * then wedges for good. This console link, by contrast, has never failed. It
+ * is slower at the default 115200, so the baud rate is raised for the duration
+ * of the transfer and dropped back afterwards.
+ *
+ * Wire format is defined by send_file on the JanOS side: a text header, then
+ * fixed blocks of "FTB\x01" + index + length + CRC32 + payload, each answered
+ * with a single ACK/NAK/CAN byte. Block length is carried in the header, so no
+ * byte stuffing is needed.
+ * ------------------------------------------------------------------------ */
+
+#define JANOS_UART_FT_ACK           0x06
+#define JANOS_UART_FT_NAK           0x15
+#define JANOS_UART_FT_CAN           0x18
+#define JANOS_UART_FT_BLOCK_MAX     4096
+#define JANOS_UART_FT_HEADER_BYTES  16
+#define JANOS_UART_FT_RETRIES          3
+#define JANOS_UART_FT_DEFAULT_BAUD 115200
+
+/* The console is raised to this rate for the duration of a transfer, which
+ * takes 115200's ~10.8 KB/s to roughly 85 KB/s.
+ *
+ * Two things make that safe. JanOS reverts to 115200 by itself after 60 seconds
+ * without a command, so an abandoned transfer can no longer leave the Monster
+ * fast while the Tab5 drops back. And it suppresses that revert while a
+ * transfer is running, so a long send is not cut in half. Without both of
+ * those, set this back to JANOS_UART_FT_DEFAULT_BAUD. */
+/* 921600 carried about a megabyte and then the Monster stopped sending, so the
+ * line is marginal at that rate over the M-BUS connector. Stop-and-wait ACKs
+ * cap throughput at roughly a third of the line rate anyway - measured 36.7 KB/s
+ * at 921600 - so halving the signalling rate costs only about a quarter of the
+ * speed while giving the physical layer far more margin. */
+#define JANOS_UART_FT_FAST_BAUD    460800
+
+/* Below this the Wi-Fi path is both faster and reliable, so it stays in use. */
+#define JANOS_UART_TRANSFER_MIN_BYTES (1024L * 1024L)
+
+static uint32_t janos_uart_crc32(uint32_t crc, const uint8_t *data, size_t len)
+{
+    crc = ~crc;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (int bit = 0; bit < 8; bit++) {
+            uint32_t mask = (uint32_t)-(int32_t)(crc & 1U);
+            crc = (crc >> 1) ^ (0xEDB88320U & mask);
+        }
+    }
+    return ~crc;
+}
+
+/* Reads one line without over-reading into the binary stream that follows. */
+static bool janos_uart_read_line(tab_id_t tab, uart_port_t port, char *out,
+                                 size_t out_size, uint32_t timeout_ms)
+{
+    size_t len = 0;
+    int64_t deadline = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
+    out[0] = '\0';
+    while (esp_timer_get_time() < deadline) {
+        uint8_t c = 0;
+        if (transport_read_bytes_tab(tab, port, &c, 1, pdMS_TO_TICKS(50)) != 1) {
+            continue;
+        }
+        if (c == '\n') {
+            out[len] = '\0';
+            return true;
+        }
+        if (c == '\r') {
+            continue;
+        }
+        if (len + 1 < out_size) {
+            out[len++] = (char)c;
+        }
+    }
+    out[len] = '\0';
+    return false;
+}
+
+/* Collects lines until the terminating marker, keeping the first line that
+ * starts with `keep_prefix` so the caller can parse or report it. */
+static bool janos_uart_wait_marker(tab_id_t tab, uart_port_t port, const char *marker,
+                                   const char *keep_prefix, char *keep, size_t keep_size,
+                                   uint32_t timeout_ms)
+{
+    if (keep && keep_size) {
+        keep[0] = '\0';
+    }
+    char line[256];
+    int64_t deadline = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
+    while (esp_timer_get_time() < deadline) {
+        if (!janos_uart_read_line(tab, port, line, sizeof(line), 1500)) {
+            continue;
+        }
+        if (keep && keep_size && keep[0] == '\0' && keep_prefix &&
+            strstr(line, keep_prefix)) {
+            snprintf(keep, keep_size, "%s", line);
+        }
+        if (strstr(line, marker)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static uint64_t janos_uart_field_u64(const char *line, const char *key, int base)
+{
+    const char *found = strstr(line, key);
+    if (!found) {
+        return 0;
+    }
+    return strtoull(found + strlen(key), NULL, base);
+}
+
+/* Raises the console baud rate. JanOS answers at the old rate, switches, and
+ * reverts to 115200 by itself if the confirmation does not arrive - so a failed
+ * switch degrades to a slow link instead of a dead one. */
+static bool janos_uart_set_baud(tab_id_t tab, uart_port_t port, int rate)
+{
+    if (tab_is_internal(tab) || tab == TAB_USB) {
+        return false; /* USB CDC has no meaningful line rate to change. */
+    }
+    if (rate == JANOS_UART_FT_DEFAULT_BAUD) {
+        return false; /* Nothing to raise, and nothing to restore afterwards. */
+    }
+    char command[48];
+    snprintf(command, sizeof(command), "uart_baud %d\r\n", rate);
+    compromised_transport_flush(tab, port);
+    transport_write_bytes_tab(tab, port, command, strlen(command));
+    if (!janos_uart_wait_marker(tab, port, "[UARTB] END", NULL, NULL, 0, 3000)) {
+        ESP_LOGW(TAG, "[UART-FT] Monster did not acknowledge baud %d", rate);
+        return false;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(60));
+    if (uart_set_baudrate(port, rate) != ESP_OK) {
+        return false;
+    }
+    vTaskDelay(pdMS_TO_TICKS(60));
+    compromised_transport_flush(tab, port);
+
+    transport_write_bytes_tab(tab, port, "uart_baud_confirm\r\n", 19);
+    if (!janos_uart_wait_marker(tab, port, "[UARTB] END", NULL, NULL, 0, 3000)) {
+        /* Not confirmed: JanOS falls back on its own, so follow it back down. */
+        ESP_LOGW(TAG, "[UART-FT] Baud %d not confirmed; returning to %d",
+                 rate, JANOS_UART_FT_DEFAULT_BAUD);
+        uart_set_baudrate(port, JANOS_UART_FT_DEFAULT_BAUD);
+        vTaskDelay(pdMS_TO_TICKS(11000));
+        compromised_transport_flush(tab, port);
+        return false;
+    }
+    ESP_LOGI(TAG, "[UART-FT] Console running at %d baud", rate);
+    return true;
+}
+
+/* Is the Monster console answering at the rate the port is set to right now? */
+static bool janos_uart_console_alive(tab_id_t tab, uart_port_t port)
+{
+    compromised_transport_flush(tab, port);
+    transport_write_bytes_tab(tab, port, "uart_baud_status\r\n", 18);
+    return janos_uart_wait_marker(tab, port, "[UARTB] END", NULL, NULL, 0, 1500);
+}
+
+/* Brings both ends back to the default rate.
+ *
+ * A blind switch is not enough: if the transfer was abandoned while JanOS was
+ * still inside send_file, the REPL never saw the command telling it to slow
+ * down, and the Monster is still running fast. So probe the default first, and
+ * if nothing answers, go back up, command the change properly, and come down
+ * together. */
+static void janos_uart_restore_baud(tab_id_t tab, uart_port_t port, int fast_rate)
+{
+    char command[48];
+    snprintf(command, sizeof(command), "uart_baud %d\r\n", JANOS_UART_FT_DEFAULT_BAUD);
+
+    for (int attempt = 0; attempt < 2; attempt++) {
+        transport_write_bytes_tab(tab, port, command, strlen(command));
+        janos_uart_wait_marker(tab, port, "[UARTB] END", NULL, NULL, 0, 2000);
+        vTaskDelay(pdMS_TO_TICKS(60));
+        uart_set_baudrate(port, JANOS_UART_FT_DEFAULT_BAUD);
+        vTaskDelay(pdMS_TO_TICKS(60));
+        compromised_transport_flush(tab, port);
+        transport_write_bytes_tab(tab, port, "uart_baud_confirm\r\n", 19);
+        janos_uart_wait_marker(tab, port, "[UARTB] END", NULL, NULL, 0, 2000);
+
+        if (janos_uart_console_alive(tab, port)) {
+            ESP_LOGI(TAG, "[UART-FT] Console back at %d baud",
+                     JANOS_UART_FT_DEFAULT_BAUD);
+            return;
+        }
+        /* Silence at the default rate means the Monster is still running fast. */
+        ESP_LOGW(TAG, "[UART-FT] No console at %d baud; retrying from %d",
+                 JANOS_UART_FT_DEFAULT_BAUD, fast_rate);
+        uart_set_baudrate(port, fast_rate);
+        vTaskDelay(pdMS_TO_TICKS(60));
+        compromised_transport_flush(tab, port);
+    }
+
+    uart_set_baudrate(port, JANOS_UART_FT_DEFAULT_BAUD);
+    ESP_LOGE(TAG, "[UART-FT] Could not resynchronise the console. "
+                  "Reboot the Monster to recover M-BUS.");
+}
+
+static void janos_uart_emit_progress(janos_file_transfer_state_t state,
+                                     uint64_t received, uint64_t total,
+                                     uint32_t crc32, esp_err_t error,
+                                     const char *message)
+{
+    janos_file_transfer_progress_t progress = {
+        .state = state,
+        .bytes_received = received,
+        .bytes_total = total,
+        .crc32 = crc32,
+        .http_status = 0,
+        .error = error,
+        .message = message,
+    };
+    compromised_transfer_progress_cb(&progress, NULL);
+}
+
+/* Hunts for the block magic instead of assuming the binary stream starts on the
+ * byte right after the text header. JanOS writes a blank line between the two,
+ * and a NAK retry can leave stray bytes behind, so exact alignment is not
+ * something the receiver should depend on. */
+static bool janos_uart_sync_magic(tab_id_t tab, uart_port_t port, uint8_t *head,
+                                  uint32_t timeout_ms)
+{
+    static const uint8_t magic[4] = { 'F', 'T', 'B', 0x01 };
+    size_t matched = 0;
+    int64_t deadline = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
+    while (matched < sizeof(magic) && esp_timer_get_time() < deadline) {
+        uint8_t c = 0;
+        if (transport_read_bytes_tab(tab, port, &c, 1, pdMS_TO_TICKS(100)) != 1) {
+            continue;
+        }
+        if (c == magic[matched]) {
+            head[matched++] = c;
+        } else {
+            /* A byte that breaks the run may itself start the real magic. */
+            matched = (c == magic[0]) ? 1U : 0U;
+            head[0] = c;
+        }
+    }
+    return matched == sizeof(magic);
+}
+
+/* JanOS answers send_file only after checksumming the whole requested range, so
+ * the wait for the header scales with the file rather than being a flat value. */
+static uint32_t janos_uart_header_timeout_ms(uint64_t size_bytes)
+{
+    uint64_t timeout = 15000U + (size_bytes / 1024U) * 4U;
+    if (timeout > 180000U) {
+        timeout = 180000U;
+    }
+    return (uint32_t)timeout;
+}
+
+static esp_err_t janos_uart_download(tab_id_t tab, uart_port_t port,
+                                     const char *remote_path, const char *local_path,
+                                     uint64_t expected_size,
+                                     const volatile bool *cancel,
+                                     janos_file_transfer_result_t *result)
+{
+    if (!remote_path || !local_path || !result) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    memset(result, 0, sizeof(*result));
+    snprintf(result->final_path, sizeof(result->final_path), "%s", local_path);
+    snprintf(result->part_path, sizeof(result->part_path), "%s.part", local_path);
+    if (access(result->final_path, F_OK) == 0) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /* Resume where a previous attempt stopped, folding the existing prefix into
+     * the CRC so the check still covers the whole file. */
+    uint64_t resume_from = 0;
+    struct stat part_info;
+    if (stat(result->part_path, &part_info) == 0 && part_info.st_size > 0) {
+        FILE *prefix = fopen(result->part_path, "rb");
+        if (prefix) {
+            uint8_t chunk[512];
+            size_t got = 0;
+            while ((got = fread(chunk, 1, sizeof(chunk), prefix)) > 0) {
+                result->crc32 = janos_uart_crc32(result->crc32, chunk, got);
+                resume_from += got;
+            }
+            fclose(prefix);
+            ESP_LOGI(TAG, "[UART-FT] Resuming %s at %llu bytes",
+                     result->part_path, (unsigned long long)resume_from);
+        } else {
+            unlink(result->part_path);
+        }
+    }
+
+    janos_uart_emit_progress(JANOS_FILE_TRANSFER_QUERYING, resume_from, expected_size,
+                             result->crc32, ESP_OK,
+                             "Monster is checksumming the file before sending");
+
+    char command[320];
+    snprintf(command, sizeof(command), "send_file %s %llu\r\n", remote_path,
+             (unsigned long long)resume_from);
+    compromised_transport_flush(tab, port);
+    transport_write_bytes_tab(tab, port, command, strlen(command));
+
+    char header[256];
+    if (!janos_uart_wait_marker(tab, port, "[FT] END", "[FT] ", header, sizeof(header),
+                                janos_uart_header_timeout_ms(expected_size))) {
+        janos_uart_emit_progress(JANOS_FILE_TRANSFER_ERROR, resume_from, 0, result->crc32,
+                                 ESP_FAIL, "Monster did not answer send_file");
+        return ESP_FAIL;
+    }
+    if (!strstr(header, "begin")) {
+        ESP_LOGE(TAG, "[UART-FT] %s", header);
+        janos_uart_emit_progress(JANOS_FILE_TRANSFER_ERROR, resume_from, 0, result->crc32,
+                                 ESP_FAIL, "Monster refused the file");
+        return ESP_FAIL;
+    }
+
+    result->remote_size_before = janos_uart_field_u64(header, "size=", 10);
+    uint64_t expected_crc = janos_uart_field_u64(header, "crc32=", 16);
+    if (result->remote_size_before == 0 || resume_from > result->remote_size_before) {
+        janos_uart_emit_progress(JANOS_FILE_TRANSFER_ERROR, resume_from, 0, result->crc32,
+                                 ESP_ERR_INVALID_SIZE, "Reported file size is unusable");
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    FILE *file = fopen(result->part_path, resume_from > 0 ? "ab" : "wb");
+    uint8_t *block = malloc(JANOS_UART_FT_BLOCK_MAX);
+    if (!file || !block) {
+        if (file) fclose(file);
+        free(block);
+        janos_uart_emit_progress(JANOS_FILE_TRANSFER_ERROR, resume_from,
+                                 result->remote_size_before, result->crc32,
+                                 ESP_ERR_NO_MEM, "Could not open .part or allocate buffer");
+        return ESP_ERR_NO_MEM;
+    }
+
+    result->bytes_written = resume_from;
+    esp_err_t err = ESP_OK;
+    unsigned retries = 0;
+    unsigned long nak_total = 0;
+    int64_t last_progress_us = 0;
+
+    while (result->bytes_written < result->remote_size_before) {
+        if (cancel && *cancel) {
+            uint8_t can = JANOS_UART_FT_CAN;
+            transport_write_bytes_tab(tab, port, (const char *)&can, 1);
+            err = ESP_ERR_INVALID_STATE;
+            break;
+        }
+
+        uint8_t head[JANOS_UART_FT_HEADER_BYTES];
+        if (!janos_uart_sync_magic(tab, port, head, 6000)) {
+            /* Silence here almost always means the Monster gave up and printed a
+             * text reason, which the magic hunt skipped over. Grab it. */
+            char reason[192];
+            reason[0] = '\0';
+            janos_uart_read_line(tab, port, reason, sizeof(reason), 500);
+            ESP_LOGE(TAG, "[UART-FT] No block magic after %llu bytes "
+                     "(nak=%lu, last line: %s)",
+                     (unsigned long long)result->bytes_written,
+                     (unsigned long)nak_total, reason[0] ? reason : "none");
+            err = ESP_ERR_INVALID_RESPONSE;
+            break;
+        }
+        size_t got = 4;
+        int64_t deadline = esp_timer_get_time() + 6000000;
+        while (got < sizeof(head) && esp_timer_get_time() < deadline) {
+            int read = transport_read_bytes_tab(tab, port, head + got,
+                                                sizeof(head) - got, pdMS_TO_TICKS(200));
+            if (read > 0) got += (size_t)read;
+        }
+        if (got != sizeof(head)) {
+            ESP_LOGE(TAG, "[UART-FT] Truncated block header after %llu bytes",
+                     (unsigned long long)result->bytes_written);
+            err = ESP_ERR_INVALID_RESPONSE;
+            break;
+        }
+
+        uint32_t length = (uint32_t)head[8] | ((uint32_t)head[9] << 8) |
+                          ((uint32_t)head[10] << 16) | ((uint32_t)head[11] << 24);
+        uint32_t block_crc = (uint32_t)head[12] | ((uint32_t)head[13] << 8) |
+                             ((uint32_t)head[14] << 16) | ((uint32_t)head[15] << 24);
+        if (length == 0 || length > JANOS_UART_FT_BLOCK_MAX) {
+            err = ESP_ERR_INVALID_RESPONSE;
+            break;
+        }
+
+        got = 0;
+        deadline = esp_timer_get_time() + 6000000;
+        while (got < length && esp_timer_get_time() < deadline) {
+            int read = transport_read_bytes_tab(tab, port, block + got, length - got,
+                                                pdMS_TO_TICKS(200));
+            if (read > 0) got += (size_t)read;
+        }
+
+        uint8_t reply = JANOS_UART_FT_ACK;
+        if (got != length || janos_uart_crc32(0, block, length) != block_crc) {
+            nak_total++;
+            /* Worth seeing: a short read points at a dropped byte on the line,
+             * a full read with a bad CRC points at corruption. */
+            ESP_LOGW(TAG, "[UART-FT] Block at %llu B rejected (%s), retry %u/%u",
+                     (unsigned long long)result->bytes_written,
+                     got != length ? "short read" : "bad CRC",
+                     retries + 1U, JANOS_UART_FT_RETRIES);
+            if (++retries > JANOS_UART_FT_RETRIES) {
+                err = ESP_ERR_INVALID_CRC;
+                reply = JANOS_UART_FT_CAN;
+                transport_write_bytes_tab(tab, port, (const char *)&reply, 1);
+                break;
+            }
+            reply = JANOS_UART_FT_NAK;
+            transport_write_bytes_tab(tab, port, (const char *)&reply, 1);
+            continue;
+        }
+
+        if (fwrite(block, 1, length, file) != length) {
+            reply = JANOS_UART_FT_CAN;
+            transport_write_bytes_tab(tab, port, (const char *)&reply, 1);
+            err = ESP_FAIL;
+            break;
+        }
+        transport_write_bytes_tab(tab, port, (const char *)&reply, 1);
+
+        retries = 0;
+        result->crc32 = janos_uart_crc32(result->crc32, block, length);
+        result->bytes_written += length;
+
+        int64_t now = esp_timer_get_time();
+        if (now - last_progress_us >= 200000) {
+            janos_uart_emit_progress(JANOS_FILE_TRANSFER_DOWNLOADING, result->bytes_written,
+                                     result->remote_size_before, result->crc32, ESP_OK,
+                                     "Downloading over M-BUS");
+            last_progress_us = now;
+        }
+    }
+
+    fflush(file);
+    int fd = fileno(file);
+    if (fd >= 0) fsync(fd);
+    fclose(file);
+    free(block);
+
+    if (err != ESP_OK) {
+        janos_uart_emit_progress(JANOS_FILE_TRANSFER_ERROR, result->bytes_written,
+                                 result->remote_size_before, result->crc32, err,
+                                 "Transfer interrupted; .part was kept for resume");
+        return err;
+    }
+
+    /* The trailer reports what the Monster actually sent, so prefer it over the
+     * value announced up front. */
+    char trailer[192];
+    if (janos_uart_wait_marker(tab, port, "[FT] END", "[FT] done", trailer,
+                               sizeof(trailer), 5000) && strstr(trailer, "crc32=")) {
+        expected_crc = (uint32_t)janos_uart_field_u64(trailer, "crc32=", 16);
+    }
+
+    if (expected_crc != 0 && result->crc32 != expected_crc) {
+        ESP_LOGE(TAG, "[UART-FT] CRC mismatch: local %08lX vs Monster %08lX",
+                 (unsigned long)result->crc32, (unsigned long)expected_crc);
+        janos_uart_emit_progress(JANOS_FILE_TRANSFER_ERROR, result->bytes_written,
+                                 result->remote_size_before, result->crc32,
+                                 ESP_ERR_INVALID_CRC, "CRC32 does not match the Monster copy");
+        return ESP_ERR_INVALID_CRC;
+    }
+
+    janos_uart_emit_progress(JANOS_FILE_TRANSFER_COMMITTING, result->bytes_written,
+                             result->remote_size_before, result->crc32, ESP_OK,
+                             "Finalizing local file");
+    if (rename(result->part_path, result->final_path) != 0) {
+        janos_uart_emit_progress(JANOS_FILE_TRANSFER_ERROR, result->bytes_written,
+                                 result->remote_size_before, result->crc32, ESP_FAIL,
+                                 "Could not rename .part file");
+        return ESP_FAIL;
+    }
+
+    janos_uart_emit_progress(JANOS_FILE_TRANSFER_DONE, result->bytes_written,
+                             result->remote_size_before, result->crc32, ESP_OK,
+                             "Transfer complete");
+    ESP_LOGI(TAG, "[UART-FT] Saved %s (%llu bytes, CRC32 %08lX, %lu retried block(s))",
+             result->final_path, (unsigned long long)result->bytes_written,
+             (unsigned long)result->crc32, nak_total);
+    return ESP_OK;
+}
+
+static void compromised_transfer_task(void *arg)
+{
+    compromised_transfer_task_args_t *args = (compromised_transfer_task_args_t *)arg;
+    if (!args || !args->ctx) {
+        free(args);
+        compromised_transfer_ui.active = false;
+        compromised_transfer_delete_current_task();
+        return;
+    }
+
+    tab_id_t tab = (tab_id_t)args->tab;
+    uart_port_t uart_port = uart_port_for_tab(tab);
+    bool usb_lock_set = false;
+    bool portal_started = false;
+    janos_transfer_wifi_session_t wifi_session = {0};
+    esp_err_t result_err = ESP_FAIL;
+    janos_file_transfer_result_t result = {0};
+    char final_detail[384] = {0};
+
+    compromised_transport_lock_begin(tab, uart_port, &usb_lock_set);
+    compromised_transfer_set_stage("Stopping Monster operations...",
+                                   "Preparing a stable file for download", 0);
+    transport_write_bytes_tab(tab, uart_port, "stop\r\n", 6);
+    char stop_response[1024];
+    (void)home_collect_uart_response(tab, uart_port, stop_response, sizeof(stop_response), 4500);
+
+    if (compromised_transfer_ui.cancel_requested) {
+        result_err = ESP_ERR_INVALID_STATE;
+        goto cleanup;
+    }
+
+    /* Anything the Wi-Fi path cannot finish goes over M-BUS instead. That path
+     * needs neither the admin portal nor the C6, so it skips both. */
+    bool use_uart = args->size_bytes >= JANOS_UART_TRANSFER_MIN_BYTES &&
+                    !tab_is_internal(tab);
+    ESP_LOGI(TAG, "[Monster transfer] %s (%ld B) -> %s (threshold %ld B)",
+             args->file_name, args->size_bytes,
+             use_uart ? "M-BUS UART" : "Wi-Fi",
+             (long)JANOS_UART_TRANSFER_MIN_BYTES);
+
+    if (use_uart) {
+        char uart_local_path[256];
+        if (!janos_transfer_build_unique_local_path(tab, args->file_name,
+                                                    uart_local_path, sizeof(uart_local_path))) {
+            result_err = ESP_ERR_INVALID_SIZE;
+            snprintf(final_detail, sizeof(final_detail),
+                     "Could not create a unique local filename.");
+            goto cleanup;
+        }
+
+        compromised_transfer_set_stage("Switching M-BUS to high speed...",
+                                       "Wi-Fi cannot carry a file this size", 0);
+        bool fast = janos_uart_set_baud(tab, uart_port, JANOS_UART_FT_FAST_BAUD);
+
+        compromised_transfer_set_stage("Copying over M-BUS...",
+                                       fast ? "Console raised to 921600 baud"
+                                            : "Console stayed at 115200 baud", 0);
+        result_err = janos_uart_download(tab, uart_port, args->remote_path, uart_local_path,
+                                         (uint64_t)args->size_bytes,
+                                         &compromised_transfer_ui.cancel_requested, &result);
+
+        if (fast) {
+            janos_uart_restore_baud(tab, uart_port, JANOS_UART_FT_FAST_BAUD);
+        }
+
+        if (result_err == ESP_OK) {
+            snprintf(final_detail, sizeof(final_detail),
+                     "Copied over M-BUS.\n%s\n%llu bytes, CRC32 %08lX",
+                     result.final_path, (unsigned long long)result.bytes_written,
+                     (unsigned long)result.crc32);
+        } else {
+            snprintf(final_detail, sizeof(final_detail),
+                     "M-BUS copy failed: %s\n%llu of %llu bytes kept in .part for resume",
+                     esp_err_to_name(result_err),
+                     (unsigned long long)result.bytes_written,
+                     (unsigned long long)result.remote_size_before);
+        }
+        goto cleanup;
+    }
+
+    char password[24];
+    snprintf(password, sizeof(password), "T5%08lX%02lX",
+             (unsigned long)esp_random(), (unsigned long)(esp_random() & 0xFFU));
+    compromised_transfer_set_stage("Starting JanOS-Admin...",
+                                   "Waiting for the Monster file server", 0);
+    char portal_response[2048];
+    if (!janos_transfer_wait_for_portal(tab, uart_port, password,
+                                        portal_response, sizeof(portal_response))) {
+        snprintf(final_detail, sizeof(final_detail),
+                 "JanOS-Admin did not start.\n%.260s",
+                 portal_response[0] ? portal_response : "No confirmation received.");
+        result_err = ESP_FAIL;
+        memset(password, 0, sizeof(password));
+        goto cleanup;
+    }
+    portal_started = true;
+
+    compromised_transfer_set_stage("Connecting Tab5 Wi-Fi...",
+                                   "Joining JanOS-Admin with the internal C6", 0);
+    result_err = janos_transfer_connect_wifi(password,
+                                             &compromised_transfer_ui.cancel_requested,
+                                             &wifi_session);
+    memset(password, 0, sizeof(password));
+    if (result_err != ESP_OK) {
+        snprintf(final_detail, sizeof(final_detail), "Could not connect to JanOS-Admin: %s",
+                 esp_err_to_name(result_err));
+        goto cleanup;
+    }
+
+    char local_path[256];
+    if (!janos_transfer_build_unique_local_path(tab, args->file_name,
+                                                local_path, sizeof(local_path))) {
+        result_err = ESP_ERR_INVALID_SIZE;
+        snprintf(final_detail, sizeof(final_detail), "Could not create a unique local filename.");
+        goto cleanup;
+    }
+
+    janos_file_transfer_config_t config = {
+        .base_url = JANOS_TRANSFER_BASE_URL,
+        .remote_path = args->remote_path,
+        .local_path = local_path,
+        .storage_mount_point = "/sdcard",
+        .io_buffer_size = 8192,
+        .timeout_ms = JANOS_TRANSFER_HTTP_TIMEOUT_MS,
+        .cancel_requested = &compromised_transfer_ui.cancel_requested,
+        .progress_cb = compromised_transfer_progress_cb,
+        .progress_ctx = args->ctx,
+    };
+    result_err = janos_file_transfer_download(&config, &result);
+    if (result_err == ESP_OK) {
+        esp_err_t state_err = janos_sync_state_append(tab, args->remote_path,
+                                                      result.remote_size_after,
+                                                      result.final_path, result.crc32);
+        snprintf(final_detail, sizeof(final_detail),
+                 "%s\n%llu bytes | CRC32 %08lX\nOriginal kept on Monster.%s",
+                 result.final_path,
+                 (unsigned long long)result.bytes_written,
+                 (unsigned long)result.crc32,
+                 state_err == ESP_OK ? "\nAdded to the sync index."
+                                     : "\nWarning: sync index was not saved.");
+    } else if (!final_detail[0]) {
+        snprintf(final_detail, sizeof(final_detail),
+                 "%s\nPartial file, if any: %s",
+                 compromised_transfer_ui.cancel_requested ? "Cancelled by user."
+                                                         : esp_err_to_name(result_err),
+                 result.part_path[0] ? result.part_path : "not created");
+    }
+
+cleanup:
+    if (portal_started) {
+        compromised_transfer_set_stage("Closing JanOS-Admin...",
+                                       "The copied file remains on both SD cards", 100);
+        transport_write_bytes_tab(tab, uart_port, "stop\r\n", 6);
+        vTaskDelay(pdMS_TO_TICKS(350));
+    }
+    janos_transfer_restore_wifi(&wifi_session);
+    compromised_transport_lock_end(usb_lock_set);
+
+    ESP_LOGI(TAG, "[%s] Monster file transfer finished: %s",
+             tab_transport_name(tab), esp_err_to_name(result_err));
+    compromised_transfer_finish_ui(result_err == ESP_OK, final_detail);
+    free(args);
+    compromised_transfer_delete_current_task();
+}
+
+static bool compromised_transfer_preflight(tab_context_t *ctx, bool sync_mode)
+{
+    struct stat sd_stat;
+    const char *reason = NULL;
+    if (!ctx || stat("/sdcard", &sd_stat) != 0 || !S_ISDIR(sd_stat.st_mode)) {
+        reason = "Tab5 SD card is not mounted. Insert or remount the card and try again.";
+    } else if (portal_active) {
+        reason = "Stop the Tab5 captive portal before connecting to JanOS-Admin.";
+    } else if (internal_ctx.sd_admin_task || internal_ctx.sd_admin_state != SD_ADMIN_STOPPED) {
+        reason = "Stop the manual SD Admin session before starting an automatic copy.";
+    }
+
+    if (!reason) {
+        return true;
+    }
+
+    compromised_transfer_ui.cancel_requested = false;
+    compromised_transfer_ui.sync_mode = sync_mode;
+    compromised_transfer_show_popup("Operation unavailable");
+    compromised_transfer_finish_ui_unlocked(false, reason);
+    return false;
+}
+
+static void compromised_sync_task(void *arg)
+{
+    compromised_sync_task_args_t *args = (compromised_sync_task_args_t *)arg;
+    if (!args || !args->ctx || args->item_count <= 0) {
+        heap_caps_free(args);
+        compromised_transfer_ui.active = false;
+        compromised_transfer_delete_current_task();
+        return;
+    }
+
+    tab_id_t tab = (tab_id_t)args->tab;
+    uart_port_t uart_port = uart_port_for_tab(tab);
+    bool usb_lock_set = false;
+    bool portal_started = false;
+    janos_transfer_wifi_session_t wifi_session = {0};
+    esp_err_t session_err = ESP_FAIL;
+    int copied = 0;
+    int skipped = 0;
+    int failed = 0;
+    int index_warnings = 0;
+    char final_detail[512] = {0};
+
+    compromised_transport_lock_begin(tab, uart_port, &usb_lock_set);
+    compromised_transfer_set_stage("Stopping Monster operations...",
+                                   "Preparing one stable sync session", 0);
+    transport_write_bytes_tab(tab, uart_port, "stop\r\n", 6);
+    char stop_response[1024];
+    (void)home_collect_uart_response(tab, uart_port, stop_response, sizeof(stop_response), 4500);
+
+    if (compromised_transfer_ui.cancel_requested) {
+        session_err = ESP_ERR_INVALID_STATE;
+        goto cleanup;
+    }
+
+    char password[24];
+    snprintf(password, sizeof(password), "T5%08lX%02lX",
+             (unsigned long)esp_random(), (unsigned long)(esp_random() & 0xFFU));
+    compromised_transfer_set_stage("Starting JanOS-Admin...",
+                                   "One connection will serve the whole batch", 0);
+    char portal_response[2048];
+    if (!janos_transfer_wait_for_portal(tab, uart_port, password,
+                                        portal_response, sizeof(portal_response))) {
+        snprintf(final_detail, sizeof(final_detail),
+                 "JanOS-Admin did not start.\n%.360s",
+                 portal_response[0] ? portal_response : "No confirmation received.");
+        memset(password, 0, sizeof(password));
+        session_err = ESP_FAIL;
+        goto cleanup;
+    }
+    portal_started = true;
+
+    compromised_transfer_set_stage("Connecting Tab5 Wi-Fi...",
+                                   "Joining JanOS-Admin with the internal C6", 0);
+    session_err = janos_transfer_connect_wifi(password,
+                                              &compromised_transfer_ui.cancel_requested,
+                                              &wifi_session);
+    memset(password, 0, sizeof(password));
+    if (session_err != ESP_OK) {
+        snprintf(final_detail, sizeof(final_detail), "Could not connect to JanOS-Admin: %s",
+                 esp_err_to_name(session_err));
+        goto cleanup;
+    }
+
+    session_err = ESP_OK;
+    for (int i = 0; i < args->item_count; i++) {
+        if (compromised_transfer_ui.cancel_requested) {
+            session_err = ESP_ERR_INVALID_STATE;
+            break;
+        }
+
+        compromised_sync_item_t *item = &args->items[i];
+        int checked_percent = (i * 100) / args->item_count;
+        char checking[256];
+        snprintf(checking, sizeof(checking), "File %d/%d: %s",
+                 i + 1, args->item_count, item->file_name);
+        compromised_transfer_set_stage("Checking Monster file...", checking, checked_percent);
+
+        uint64_t remote_size = 0;
+        esp_err_t item_err = janos_file_transfer_query_size(JANOS_TRANSFER_BASE_URL,
+                                                            item->remote_path,
+                                                            JANOS_TRANSFER_HTTP_TIMEOUT_MS,
+                                                            &remote_size);
+        if (item_err != ESP_OK) {
+            ESP_LOGW(TAG, "[%s] Sync could not inspect %s: %s",
+                     tab_transport_name(tab), item->remote_path, esp_err_to_name(item_err));
+            failed++;
+            continue;
+        }
+
+        char indexed_local_path[256];
+        if (janos_sync_state_contains(tab, item->remote_path, remote_size,
+                                      indexed_local_path, sizeof(indexed_local_path)) ||
+            janos_sync_bootstrap_existing(tab, item->remote_path, item->file_name,
+                                          remote_size)) {
+            ESP_LOGI(TAG, "[%s] Sync skipped unchanged %s (%llu bytes)",
+                     tab_transport_name(tab), item->remote_path,
+                     (unsigned long long)remote_size);
+            skipped++;
+            continue;
+        }
+
+        char local_path[256];
+        if (!janos_transfer_build_unique_local_path(tab, item->file_name,
+                                                    local_path, sizeof(local_path))) {
+            ESP_LOGE(TAG, "[%s] Sync could not create a local path for %s",
+                     tab_transport_name(tab), item->remote_path);
+            failed++;
+            continue;
+        }
+
+        compromised_sync_progress_ctx_t progress_ctx = {
+            .current = i + 1,
+            .total = args->item_count,
+            .file_name = item->file_name,
+        };
+        janos_file_transfer_result_t result = {0};
+        janos_file_transfer_config_t config = {
+            .base_url = JANOS_TRANSFER_BASE_URL,
+            .remote_path = item->remote_path,
+            .local_path = local_path,
+            .storage_mount_point = "/sdcard",
+            .io_buffer_size = 8192,
+            .timeout_ms = JANOS_TRANSFER_HTTP_TIMEOUT_MS,
+            .cancel_requested = &compromised_transfer_ui.cancel_requested,
+            .progress_cb = compromised_sync_progress_cb,
+            .progress_ctx = &progress_ctx,
+        };
+        item_err = janos_file_transfer_download(&config, &result);
+        if (item_err != ESP_OK) {
+            ESP_LOGW(TAG, "[%s] Sync failed for %s: %s",
+                     tab_transport_name(tab), item->remote_path, esp_err_to_name(item_err));
+            failed++;
+            if (compromised_transfer_ui.cancel_requested) {
+                session_err = ESP_ERR_INVALID_STATE;
+                break;
+            }
+            continue;
+        }
+
+        esp_err_t state_err = janos_sync_state_append(tab, item->remote_path,
+                                                      result.remote_size_after,
+                                                      result.final_path, result.crc32);
+        if (state_err != ESP_OK) {
+            index_warnings++;
+        }
+        copied++;
+        ESP_LOGI(TAG, "[%s] Sync copied %s -> %s (%llu bytes, CRC32 %08lX)",
+                 tab_transport_name(tab), item->remote_path, result.final_path,
+                 (unsigned long long)result.bytes_written, (unsigned long)result.crc32);
+    }
+
+    if (!compromised_transfer_ui.cancel_requested) {
+        session_err = failed == 0 ? ESP_OK : ESP_FAIL;
+        compromised_transfer_set_stage("Finalizing sync...",
+                                       "Saving results and closing JanOS-Admin", 100);
+        snprintf(final_detail, sizeof(final_detail),
+                 "Copied: %d | Already synced: %d | Failed: %d\nSaved under %s/%s%s",
+                 copied, skipped, failed, JANOS_TRANSFER_LOCAL_ROOT,
+                 janos_transfer_source_folder(tab),
+                 index_warnings > 0
+                     ? "\nWarning: some sync-index entries could not be saved." : "");
+    }
+
+cleanup:
+    if (portal_started) {
+        compromised_transfer_set_stage("Closing JanOS-Admin...",
+                                       "Copied files remain on both SD cards", 100);
+        transport_write_bytes_tab(tab, uart_port, "stop\r\n", 6);
+        vTaskDelay(pdMS_TO_TICKS(350));
+    }
+    janos_transfer_restore_wifi(&wifi_session);
+    compromised_transport_lock_end(usb_lock_set);
+
+    if (!final_detail[0]) {
+        snprintf(final_detail, sizeof(final_detail),
+                 "%s\nCopied: %d | Already synced: %d | Failed: %d",
+                 compromised_transfer_ui.cancel_requested ? "Cancelled by user."
+                                                         : esp_err_to_name(session_err),
+                 copied, skipped, failed);
+    }
+    ESP_LOGI(TAG, "[%s] Monster SD sync finished: %s (copied=%d skipped=%d failed=%d)",
+             tab_transport_name(tab), esp_err_to_name(session_err), copied, skipped, failed);
+    compromised_transfer_finish_ui(session_err == ESP_OK, final_detail);
+    heap_caps_free(args);
+    compromised_transfer_delete_current_task();
+}
+
+static void compromised_files_sync_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx || compromised_transfer_ui.active || compromised_transfer_ui.task) {
+        return;
+    }
+
+    compromised_file_kind_t kind = compromised_kind_from_user_data(lv_event_get_user_data(e));
+    bool syncable_kind = (kind == COMPROMISED_FILE_KIND_HANDSHAKE ||
+                          kind == COMPROMISED_FILE_KIND_PCAP_CAPTURE);
+    if (!syncable_kind || ctx->wardrive_wigle_file_count <= 0 ||
+        tab_is_internal(current_tab) || !compromised_transfer_preflight(ctx, true)) {
+        return;
+    }
+
+    int item_count = ctx->wardrive_wigle_file_count;
+    if (item_count > WARDRIVE_WIGLE_MAX_FILES) {
+        item_count = WARDRIVE_WIGLE_MAX_FILES;
+    }
+    size_t args_size = sizeof(compromised_sync_task_args_t) +
+                       ((size_t)item_count * sizeof(compromised_sync_item_t));
+    compromised_sync_task_args_t *args = heap_caps_calloc(1, args_size,
+                                                          MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!args) {
+        compromised_transfer_ui.sync_mode = true;
+        compromised_transfer_show_popup(kind == COMPROMISED_FILE_KIND_PCAP_CAPTURE
+                                             ? "ESPShark Sync all"
+                                             : "Sync new files");
+        compromised_transfer_finish_ui_unlocked(false,
+            "Not enough PSRAM to create the sync file list.");
+        return;
+    }
+
+    args->ctx = ctx;
+    args->tab = current_tab;
+    args->kind = kind;
+    for (int i = 0; i < item_count; i++) {
+        wardrive_wigle_file_t *file = &ctx->wardrive_wigle_files[i];
+        if (!file->path[0] || !file->name[0]) {
+            continue;
+        }
+        compromised_sync_item_t *item = &args->items[args->item_count++];
+        snprintf(item->remote_path, sizeof(item->remote_path), "%s", file->path);
+        snprintf(item->file_name, sizeof(item->file_name), "%s", file->name);
+    }
+    if (args->item_count == 0) {
+        heap_caps_free(args);
+        return;
+    }
+
+    compromised_transfer_ui.active = true;
+    compromised_transfer_ui.cancel_requested = false;
+    compromised_transfer_ui.sync_mode = true;
+    char popup_name[128];
+    snprintf(popup_name, sizeof(popup_name), "%s: %d file(s)",
+             compromised_title_for_kind(kind), args->item_count);
+    compromised_transfer_show_popup(popup_name);
+    if (xTaskCreate(compromised_sync_task, "janos_sync", 14336, args, 6,
+                    &compromised_transfer_ui.task) != pdPASS) {
+        compromised_transfer_ui.active = false;
+        compromised_transfer_ui.task = NULL;
+        compromised_transfer_finish_ui_unlocked(false, "Could not start the sync task.");
+        heap_caps_free(args);
+    }
+}
+
+static void compromised_file_copy_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx || compromised_transfer_ui.active || compromised_transfer_ui.task) {
+        return;
+    }
+
+    compromised_file_kind_t kind = compromised_kind_from_user_data(lv_event_get_user_data(e));
+    int index = compromised_index_from_user_data(lv_event_get_user_data(e));
+    bool copyable_kind = (kind == COMPROMISED_FILE_KIND_HANDSHAKE ||
+                          kind == COMPROMISED_FILE_KIND_PCAP_CAPTURE);
+    if (!copyable_kind || index < 0 ||
+        index >= ctx->wardrive_wigle_file_count || tab_is_internal(current_tab)) {
+        return;
+    }
+
+    if (!compromised_transfer_preflight(ctx, false)) {
+        return;
+    }
+
+    wardrive_wigle_file_t *file = &ctx->wardrive_wigle_files[index];
+    if (!file->path[0] || !file->name[0]) {
+        return;
+    }
+
+    compromised_transfer_task_args_t *args = calloc(1, sizeof(*args));
+    if (!args) {
+        return;
+    }
+    args->ctx = ctx;
+    args->tab = current_tab;
+    snprintf(args->remote_path, sizeof(args->remote_path), "%s", file->path);
+    snprintf(args->file_name, sizeof(args->file_name), "%s", file->name);
+    args->size_bytes = file->size_bytes;
+
+    compromised_transfer_ui.active = true;
+    compromised_transfer_ui.cancel_requested = false;
+    compromised_transfer_ui.sync_mode = false;
+    compromised_transfer_show_popup(file->name);
+    if (xTaskCreate(compromised_transfer_task, "janos_copy", 12288, args, 6,
+                    &compromised_transfer_ui.task) != pdPASS) {
+        compromised_transfer_ui.active = false;
+        compromised_transfer_ui.task = NULL;
+        compromised_transfer_finish_ui_unlocked(false, "Could not start the transfer task.");
+        free(args);
+    }
+}
+
 void app_main(void)
 {
     ESP_LOGI(TAG, "M5Stack Tab5 WiFi Scanner");
@@ -43017,15 +57765,6 @@ void app_main(void)
 
     // Initialize all tab contexts with PSRAM allocations
     init_all_tab_contexts();
-
-    // Legacy observer buffers (shared between tabs for UART I/O)
-    observer_networks = heap_caps_calloc(MAX_OBSERVER_NETWORKS, sizeof(observer_network_t), MALLOC_CAP_SPIRAM);
-    observer_rx_buffer = heap_caps_malloc(UART_BUF_SIZE, MALLOC_CAP_SPIRAM);
-    observer_line_buffer = heap_caps_malloc(OBSERVER_LINE_BUFFER_SIZE, MALLOC_CAP_SPIRAM);
-
-    if (!observer_networks || !observer_rx_buffer || !observer_line_buffer) {
-        ESP_LOGE(TAG, "Failed to allocate legacy observer PSRAM buffers!");
-    }
 
     // Allocate buffer for ESP Modem WiFi scan results
     ESP_LOGI(TAG, "Allocating ESP Modem buffers in PSRAM...");
@@ -43050,6 +57789,13 @@ void app_main(void)
     // Initialize audio codec (ES8388 speaker + ES7210 mic)
     bsp_codec_init();
 
+    // Guards the speaker against two tunes at once. Created here, before the
+    // startup melody and long before any page can ask for a chime.
+    audio_tone_mutex = xSemaphoreCreateMutex();
+    if (!audio_tone_mutex) {
+        ESP_LOGE(TAG, "Failed to create the audio mutex, sounds stay silent");
+    }
+
     // Initialize SD card
     ESP_LOGI(TAG, "Initializing SD card...");
     ret = bsp_sdcard_init(CONFIG_BSP_SD_MOUNT_POINT, 5);
@@ -43072,6 +57818,17 @@ void app_main(void)
     load_dashboard_from_nvs();
     load_clock_settings_from_nvs();
     load_wd_autoupload_from_nvs();
+
+    // Kick the startup melody off here, the first moment both prerequisites are
+    // met: the codec is up and NVS has told us which melody to play. It used to
+    // start from show_splash_screen(), i.e. only after UART init, the USB host
+    // enumeration wait and the full display bring-up.
+    if (boot_sound_mode != BOOT_SOUND_MODE_OFF) {
+        // Priority 6 keeps it above the LVGL task (5): it spends almost all of
+        // its life blocked inside i2s_write, so it steals no real CPU, but it
+        // must not be starved between buffers or the DMA underruns.
+        xTaskCreate((TaskFunction_t)play_startup_beep, "melody", 4096, NULL, 6, NULL);
+    }
 
     // Initialize both UARTs for board detection
     // UART1: Grove (TX=53, RX=54) - always initialized

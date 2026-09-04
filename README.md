@@ -19,6 +19,11 @@ Project Zero (JanOS): https://github.com/C5Lab/projectZero
 
 ## Documentation
 
+An English, section-by-section introduction to the offline packet-analysis
+workflow is available here:
+
+- [ESPShark — Offline packet investigation for M5Stack Tab5](docs/ESPShark.md)
+
 Full documentation and usage details are available on the wiki:
 https://github.com/C5Lab/M5MonsterC5-Tab5/wiki
 
