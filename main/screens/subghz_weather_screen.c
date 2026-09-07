@@ -435,7 +435,7 @@ void show_subghz_weather_page(void)
     lv_obj_set_flex_flow(st->weather_tiles_grid, LV_FLEX_FLOW_ROW_WRAP);
     lv_obj_set_flex_align(st->weather_tiles_grid, LV_FLEX_ALIGN_SPACE_EVENLY,
                           LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
-    lv_obj_clear_flag(st->weather_tiles_grid, LV_OBJ_FLAG_SCROLLABLE);
+    subghz_grid_scrollable(st->weather_tiles_grid);
 
     for (int i = 0; i < MAX_SENSORS; i++) build_tile(st, st->weather_tiles_grid, i);
     refresh_tiles(st);

@@ -690,8 +690,12 @@ static void lvgl_port_flush_callback(lv_display_t* drv, const lv_area_t* area, u
             uint32_t w_stride    = lv_draw_buf_width_to_stride(ww, cf);
             uint32_t h_stride    = lv_draw_buf_width_to_stride(hh, cf);
             if (disp_ctx->current_rotation == LV_DISPLAY_ROTATION_180) {
-                lv_draw_sw_rotate(color_map, disp_ctx->draw_buffs[2], hh, ww, h_stride, h_stride,
-                                  LV_DISPLAY_ROTATION_180, cf);
+                /* Was calling lv_draw_sw_rotate(..., hh, ww, h_stride, h_stride, ...): the
+                 * source width/height were transposed and the stride belonged to the other
+                 * axis, so any non-square flush block came out corrupted. Route it through
+                 * the PPA like the 90 deg case instead -- same framing, and it costs no CPU. */
+                rotate_copy_pixel((uint16_t*)color_map, (uint16_t*)disp_ctx->draw_buffs[2], 0, 0, offsetx2 - offsetx1,
+                                  offsety2 - offsety1, offsetx2 - offsetx1 + 1, offsety2 - offsety1 + 1, 180);
             } else if (disp_ctx->current_rotation == LV_DISPLAY_ROTATION_90) {
                 // printf("%ld %ld\n", w_stride, h_stride);
                 // lv_draw_sw_rotate(color_map, disp_ctx->draw_buffs[2], ww, hh, w_stride, h_stride,

@@ -135,6 +135,14 @@ void subghz_style_popup_card(lv_obj_t *popup, lv_coord_t radius, lv_color_t acce
     lv_obj_set_style_shadow_opa(popup, LV_OPA_30, 0);
 }
 
+void subghz_grid_scrollable(lv_obj_t *grid)
+{
+    if (!grid) return;
+    lv_obj_add_flag(grid, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(grid, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(grid, LV_SCROLLBAR_MODE_AUTO);
+}
+
 /* ---------- CC1101 radio presence (shared) -------------------------- */
 
 bool subghz_note_radio_line(subghz_tab_state_t *st, const char *line)
@@ -356,7 +364,7 @@ void show_subghz_page(void)
     lv_obj_set_style_pad_gap(tiles, 10, 0);
     lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
     lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
-    lv_obj_clear_flag(tiles, LV_OBJ_FLAG_SCROLLABLE);
+    subghz_grid_scrollable(tiles);
 
     subghz_create_tile(tiles, LV_SYMBOL_REFRESH,  "Quick Scan", subghz_host_color_cyan(),   on_scanner);
     subghz_create_tile(tiles, LV_SYMBOL_GPS,      "Hunter",     subghz_host_color_pink(),   on_hunter);

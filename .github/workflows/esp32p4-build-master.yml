@@ -379,6 +379,9 @@ jobs:
     needs: [release, firmware, pages]
     runs-on: ubuntu-24.04
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Notify Discord
         if: success()
         env:
@@ -396,55 +399,12 @@ jobs:
           fi
 
           TAG="${RELEASE_TAG:-$FW_VERSION}"
-          BASE_URL="https://github.com/$REPO/releases/download/$TAG"
-          FW_ZIP="$BASE_URL/M5MonsterC5-Tab5-${FW_VERSION}.zip"
-          BUNDLE_ZIP="$BASE_URL/M5MonsterC5-Tab5-${FW_VERSION}-bundle.zip"
           RELEASE_PAGE="https://github.com/$REPO/releases/tag/$TAG"
           PAGES_LINK="${PAGES_URL:-https://${GITHUB_REPOSITORY%/*}.github.io/${GITHUB_REPOSITORY#*/}/}"
 
-          RELEASE_BODY=""
-          if [ "${GITHUB_EVENT_NAME:-}" = "release" ] && [ -n "${GITHUB_EVENT_PATH:-}" ] && [ -f "${GITHUB_EVENT_PATH:-}" ]; then
-            RELEASE_BODY="$(jq -r '.release.body // ""' "$GITHUB_EVENT_PATH")"
-          fi
-          if [ -z "$(printf '%s' "$RELEASE_BODY" | tr -d '\r\n[:space:]')" ] && [ "${GITHUB_EVENT_NAME:-}" = "push" ] && [ -n "${GITHUB_EVENT_PATH:-}" ] && [ -f "${GITHUB_EVENT_PATH:-}" ]; then
-            MERGE_MESSAGE="$(jq -r '.head_commit.message // ""' "$GITHUB_EVENT_PATH")"
-            MERGE_TITLE="$(printf '%s' "$MERGE_MESSAGE" | sed -n '1p')"
-            MERGE_BODY="$(printf '%s\n' "$MERGE_MESSAGE" | tail -n +2 | sed '/./,$!d')"
-            if [ -n "$(printf '%s' "$MERGE_BODY" | tr -d '\r\n[:space:]')" ]; then
-              if [ -n "$(printf '%s' "$MERGE_TITLE" | tr -d '\r\n[:space:]')" ]; then
-                RELEASE_BODY="$(printf '%s\n\n%s' "$MERGE_TITLE" "$MERGE_BODY")"
-              else
-                RELEASE_BODY="$MERGE_BODY"
-              fi
-            fi
-          fi
-          if [ -z "$(printf '%s' "$RELEASE_BODY" | tr -d '\r\n[:space:]')" ]; then
-            RELEASE_BODY="$(gh release view "$TAG" -R "$REPO" --json body --jq .body 2>/dev/null || true)"
-          fi
-
-          base_content=$(
-            printf '%s\n' \
-              "M5MonsterC5-Tab5" \
-              "Release ${TAG} published." \
-              "Release page:" \
-              "${RELEASE_PAGE}" \
-              "Web flasher:" \
-              "${PAGES_LINK}" \
-              "Firmware (${FW_VERSION}):" \
-              "${FW_ZIP}" \
-              "Bundle:" \
-              "${BUNDLE_ZIP}"
-          )
-
-          RELEASE_BODY="$(printf '%s' "$RELEASE_BODY" | tr -d '\r')"
-          base_len=$(printf '%s' "$base_content" | wc -c | tr -d ' ')
-          room=$((1990 - base_len))
-          if [ "$room" -gt 0 ] && [ -n "$(printf '%s' "$RELEASE_BODY" | tr -d '\n[:space:]')" ]; then
-            body_trimmed="$(printf '%s' "$RELEASE_BODY" | head -c "$room")"
-            content="$(printf '%s\n%s' "$base_content" "$body_trimmed")"
-          else
-            content="$base_content"
-          fi
-
-          payload=$(jq -n --arg content "$content" '{content:$content}')
-          curl -X POST -H "Content-Type: application/json" -d "$payload" "$DISCORD_WEBHOOK"
+          # Read the published notes after release and Pages have completed.
+          gh release view "$TAG" -R "$REPO" --json body --jq '.body // ""' > release_body.md
+          export RELEASE_PAGE PAGES_LINK
+          python3 .github/scripts/discord_payload.py < release_body.md > discord_payload.json
+          curl --fail-with-body -X POST -H "Content-Type: application/json" \
+            --data-binary @discord_payload.json "$DISCORD_WEBHOOK"

@@ -19,6 +19,14 @@ lv_obj_t *subghz_add_header_action(lv_obj_t *header, const char *symbol,
 /* Style a popup as a card with a coloured border + shadow.  */
 void subghz_style_popup_card(lv_obj_t *popup, lv_coord_t radius, lv_color_t accent);
 
+/* Let a wrapping tile grid scroll vertically instead of clipping its lower
+ * rows. These grids take their height from flex_grow, so the page fixes it
+ * while the number of wrapped rows follows the width: a layout tuned for the
+ * 1280 px portrait screen overflows in a 90/270 orientation, where the screen
+ * is only 720 px tall, and with scrolling off the tiles past the fold cannot
+ * be reached at all. Same fix as style_scrollable_tile_grid() in main.c. */
+void subghz_grid_scrollable(lv_obj_t *grid);
+
 /* ---- CC1101 radio presence (shared across all SubGHz radio tools) ----
  * cc1101_present in subghz_tab_state_t: 0=unknown 1=present 2=absent. */
 

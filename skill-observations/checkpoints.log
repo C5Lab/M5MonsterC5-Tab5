@@ -1,0 +1,1 @@
+2026-09-05 UART transfer fix: no reusable skill observations; regression tests and ESP-IDF app build passed.

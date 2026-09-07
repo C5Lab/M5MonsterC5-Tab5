@@ -104,9 +104,14 @@ void subghz_show_text_input_popup(const char *title,
     lv_obj_clear_flag(ctx->overlay, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(ctx->overlay, LV_OBJ_FLAG_CLICKABLE);
 
-    /* Card at the top half (keyboard occupies bottom 260 px) */
+    /* Card at the top half (keyboard occupies bottom 260 px).
+     * 720 px is the full width of the portrait panel, so the card's border and
+     * shadow used to sit exactly on the screen edge. Keep a 20 px margin a side
+     * and do not grow past the original width in a 90/270 orientation. */
+    lv_coord_t card_w = (lv_coord_t)lv_disp_get_hor_res(NULL) - 40;
+    if (card_w > 720) card_w = 720;
     ctx->card = lv_obj_create(ctx->overlay);
-    lv_obj_set_size(ctx->card, 720, 240);
+    lv_obj_set_size(ctx->card, card_w, 240);
     lv_obj_align(ctx->card, LV_ALIGN_TOP_MID, 0, 36);
     subghz_style_popup_card(ctx->card, 12, accent);
     lv_obj_set_flex_flow(ctx->card, LV_FLEX_FLOW_COLUMN);
