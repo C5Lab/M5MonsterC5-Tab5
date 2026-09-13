@@ -1,0 +1,12 @@
+
+TEST SUMMARY
+==============================================================================
+time
+  PASS            0.11s  test_emulator_persistence.mjs
+  PASS            9.95s  test_emulator_time.py
+  PASS            0.23s  test_emulator_phase4_audit.py
+------------------------------------------------------------------------------
+Result: PASS | scripts PASS: 3 | FAIL/ERROR: 0
+Total elapsed: 10.30s
+Section wrapper times include their children; do not add them together.
+Report: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\docs\ui-emulator\test-runs\20260912-180256-e0b1b8\summary.json

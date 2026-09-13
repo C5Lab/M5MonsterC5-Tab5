@@ -1,0 +1,81 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="1850" viewBox="0 0 1080 1850">
+<title>show_compromised_file_page</title>
+<rect width="100%" height="100%" fill="#111827"/>
+<text x="28" y="38" fill="#7dd3fc" font-family="monospace" font-size="21">show_compromised_file_page</text>
+<text x="28" y="69" fill="#fbbf24" font-family="sans-serif" font-size="17">SOURCE DIAGRAM - not a screenshot or screen render</text>
+<text x="28" y="110" fill="#7dd3fc" font-family="monospace" font-size="16">SOURCE</text>
+<text x="28" y="133" fill="#e5e7eb" font-family="monospace" font-size="16">main/main.c:35312</text>
+<text x="28" y="156" fill="#e5e7eb" font-family="monospace" font-size="16"></text>
+<text x="28" y="179" fill="#7dd3fc" font-family="monospace" font-size="16">DIRECT TEXT LITERALS IN THIS FUNCTION</text>
+<text x="28" y="202" fill="#e5e7eb" font-family="monospace" font-size="16"> Send to wpa-sec</text>
+<text x="28" y="225" fill="#e5e7eb" font-family="monospace" font-size="16">Copy latest</text>
+<text x="28" y="248" fill="#e5e7eb" font-family="monospace" font-size="16"> Sync all Sync new</text>
+<text x="28" y="271" fill="#e5e7eb" font-family="monospace" font-size="16"> Clean</text>
+<text x="28" y="294" fill="#e5e7eb" font-family="monospace" font-size="16">Loading...</text>
+<text x="28" y="317" fill="#e5e7eb" font-family="monospace" font-size="16"> Delete (0)</text>
+<text x="28" y="340" fill="#e5e7eb" font-family="monospace" font-size="16">No SD card detected on this tab.</text>
+<text x="28" y="363" fill="#e5e7eb" font-family="monospace" font-size="16">Manage files from a JanOS transport tab.</text>
+<text x="28" y="386" fill="#e5e7eb" font-family="monospace" font-size="16">Reading file list from module...</text>
+<text x="28" y="409" fill="#e5e7eb" font-family="monospace" font-size="16">Failed to start file loader task.</text>
+<text x="28" y="432" fill="#e5e7eb" font-family="monospace" font-size="16">No files waiting - already uploaded/archived.</text>
+<text x="28" y="455" fill="#e5e7eb" font-family="monospace" font-size="16">No wardrive files in the working folder.</text>
+<text x="28" y="478" fill="#e5e7eb" font-family="monospace" font-size="16">#52B6FF MONSTER: AVAILABLE#  |  #5EDCA3 TAB5: SYNCED##52B6FF MONSTER: AVAILABLE#  |  #F9A825 TAB5: NOT</text>
+<text x="28" y="501" fill="#e5e7eb" font-family="monospace" font-size="16">COPIED#</text>
+<text x="28" y="524" fill="#e5e7eb" font-family="monospace" font-size="16">Fix</text>
+<text x="28" y="547" fill="#e5e7eb" font-family="monospace" font-size="16">COPY TO TAB5</text>
+<text x="28" y="570" fill="#e5e7eb" font-family="monospace" font-size="16">Monster SD  &gt;  Tab5 SD</text>
+<text x="28" y="593" fill="#e5e7eb" font-family="monospace" font-size="16">DELETE FILE Delete</text>
+<text x="28" y="616" fill="#e5e7eb" font-family="monospace" font-size="16"></text>
+<text x="28" y="639" fill="#7dd3fc" font-family="monospace" font-size="16">SOURCE DIMENSIONS (UNEVALUATED EXPRESSIONS)</text>
+<text x="28" y="662" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_size(*page_slot, lv_pct(100), lv_pct(100));</text>
+<text x="28" y="685" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_size(header, lv_pct(100), LV_SIZE_CONTENT);</text>
+<text x="28" y="708" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_size(back_btn, 72, 60);</text>
+<text x="28" y="731" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_height(spacer, 1);</text>
+<text x="28" y="754" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_size(wpasec_btn, 190, 50);</text>
+<text x="28" y="777" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_size(copy_latest_btn, 180, 50);</text>
+<text x="28" y="800" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_size(sync_btn, 155, 50);</text>
+<text x="28" y="823" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_size(clean_btn, 120, 50);</text>
+<text x="28" y="846" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_size(select_bar, lv_pct(100), LV_SIZE_CONTENT);</text>
+<text x="28" y="869" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_size(btn, 110, 44);</text>
+<text x="28" y="892" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_size(ctx-&gt;wardrive_files_delete_btn, 150, 44);</text>
+<text x="28" y="915" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_size(list_container, lv_pct(100), LV_SIZE_CONTENT);</text>
+<text x="28" y="938" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_size(loading_box, lv_pct(100), lv_pct(100));</text>
+<text x="28" y="961" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_size(spinner, 80, 80);</text>
+<text x="28" y="984" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_width(empty, lv_pct(100));</text>
+<text x="28" y="1007" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_width(empty, lv_pct(100));</text>
+<text x="28" y="1030" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);</text>
+<text x="28" y="1053" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_size(cb, 44, 44);</text>
+<text x="28" y="1076" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_height(info, LV_SIZE_CONTENT);</text>
+<text x="28" y="1099" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_width(name_lbl, lv_pct(100));</text>
+<text x="28" y="1122" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_width(path_lbl, lv_pct(100));</text>
+<text x="28" y="1145" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_width(sync_state_lbl, lv_pct(100));</text>
+<text x="28" y="1168" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_width(detail_lbl, lv_pct(100));</text>
+<text x="28" y="1191" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_width(detail_lbl, lv_pct(100));</text>
+<text x="28" y="1214" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_size(actions, 392, 62);</text>
+<text x="28" y="1237" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_size(actions, LV_SIZE_CONTENT, LV_SIZE_CONTENT);</text>
+<text x="28" y="1260" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_size(fix_btn, 86, 44);</text>
+<text x="28" y="1283" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_size(copy_btn, 250, 62);</text>
+<text x="28" y="1306" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_size(delete_btn, is_copyable_pcap ? 130 : 110, is_copyable_pcap ? 62 : 44);</text>
+<text x="28" y="1329" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_width(state_title, lv_pct(100));</text>
+<text x="28" y="1352" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);</text>
+<text x="28" y="1375" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_width(name_lbl, lv_pct(100));</text>
+<text x="28" y="1398" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_width(detail_lbl, lv_pct(100));</text>
+<text x="28" y="1421" fill="#e5e7eb" font-family="monospace" font-size="16"></text>
+<text x="28" y="1444" fill="#7dd3fc" font-family="monospace" font-size="16">EVENTS -&gt; CALLBACKS</text>
+<text x="28" y="1467" fill="#e5e7eb" font-family="monospace" font-size="16">compromised_file_clean_cb</text>
+<text x="28" y="1490" fill="#e5e7eb" font-family="monospace" font-size="16">compromised_file_copy_cb</text>
+<text x="28" y="1513" fill="#e5e7eb" font-family="monospace" font-size="16">compromised_file_delete_cb</text>
+<text x="28" y="1536" fill="#e5e7eb" font-family="monospace" font-size="16">compromised_files_loading_label_delete_cb</text>
+<text x="28" y="1559" fill="#e5e7eb" font-family="monospace" font-size="16">compromised_files_sync_cb</text>
+<text x="28" y="1582" fill="#e5e7eb" font-family="monospace" font-size="16">kind</text>
+<text x="28" y="1605" fill="#e5e7eb" font-family="monospace" font-size="16">select_buttons</text>
+<text x="28" y="1628" fill="#e5e7eb" font-family="monospace" font-size="16">wardrive_files_checkbox_cb</text>
+<text x="28" y="1651" fill="#e5e7eb" font-family="monospace" font-size="16">wardrive_files_delete_btn_delete_cb</text>
+<text x="28" y="1674" fill="#e5e7eb" font-family="monospace" font-size="16">wardrive_files_delete_selected_cb</text>
+<text x="28" y="1697" fill="#e5e7eb" font-family="monospace" font-size="16">wardrive_fix_file_cb</text>
+<text x="28" y="1720" fill="#e5e7eb" font-family="monospace" font-size="16">wpasec_btn_event_cb</text>
+<text x="28" y="1743" fill="#e5e7eb" font-family="monospace" font-size="16"></text>
+<text x="28" y="1766" fill="#7dd3fc" font-family="monospace" font-size="16">DIRECT UI FUNCTION CALLS</text>
+<text x="28" y="1789" fill="#e5e7eb" font-family="monospace" font-size="16">—</text>
+<text x="28" y="1812" fill="#e5e7eb" font-family="monospace" font-size="16"></text>
+</svg>

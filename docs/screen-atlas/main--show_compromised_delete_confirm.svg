@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="746" viewBox="0 0 1080 746">
+<title>show_compromised_delete_confirm</title>
+<rect width="100%" height="100%" fill="#111827"/>
+<text x="28" y="38" fill="#7dd3fc" font-family="monospace" font-size="21">show_compromised_delete_confirm</text>
+<text x="28" y="69" fill="#fbbf24" font-family="sans-serif" font-size="17">SOURCE DIAGRAM - not a screenshot or screen render</text>
+<text x="28" y="110" fill="#7dd3fc" font-family="monospace" font-size="16">SOURCE</text>
+<text x="28" y="133" fill="#e5e7eb" font-family="monospace" font-size="16">main/main.c:36056</text>
+<text x="28" y="156" fill="#e5e7eb" font-family="monospace" font-size="16"></text>
+<text x="28" y="179" fill="#7dd3fc" font-family="monospace" font-size="16">DIRECT TEXT LITERALS IN THIS FUNCTION</text>
+<text x="28" y="202" fill="#e5e7eb" font-family="monospace" font-size="16">Erased from the module&#x27;s SD card, together with its / .hccapx companion. This cannot be undone.Erased</text>
+<text x="28" y="225" fill="#e5e7eb" font-family="monospace" font-size="16">from the module&#x27;s SD card, together with their / .hccapx companions. This cannot be undone.</text>
+<text x="28" y="248" fill="#e5e7eb" font-family="monospace" font-size="16">Erased from the module&#x27;s SD card. This cannot be undone.</text>
+<text x="28" y="271" fill="#e5e7eb" font-family="monospace" font-size="16">Cancel</text>
+<text x="28" y="294" fill="#e5e7eb" font-family="monospace" font-size="16"> Delete file Delete all</text>
+<text x="28" y="317" fill="#e5e7eb" font-family="monospace" font-size="16"></text>
+<text x="28" y="340" fill="#7dd3fc" font-family="monospace" font-size="16">SOURCE DIMENSIONS (UNEVALUATED EXPRESSIONS)</text>
+<text x="28" y="363" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_size(popup, 560, LV_SIZE_CONTENT);</text>
+<text x="28" y="386" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_width(title, lv_pct(100));</text>
+<text x="28" y="409" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_width(list_lbl, lv_pct(100));</text>
+<text x="28" y="432" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_width(message, lv_pct(100));</text>
+<text x="28" y="455" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_size(btn_row, lv_pct(100), LV_SIZE_CONTENT);</text>
+<text x="28" y="478" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_size(no_btn, 160, 52);</text>
+<text x="28" y="501" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_size(yes_btn, 160, 52);</text>
+<text x="28" y="524" fill="#e5e7eb" font-family="monospace" font-size="16"></text>
+<text x="28" y="547" fill="#7dd3fc" font-family="monospace" font-size="16">EVENTS -&gt; CALLBACKS</text>
+<text x="28" y="570" fill="#e5e7eb" font-family="monospace" font-size="16">compromised_delete_confirm_destroy_cb</text>
+<text x="28" y="593" fill="#e5e7eb" font-family="monospace" font-size="16">compromised_delete_confirm_no_cb</text>
+<text x="28" y="616" fill="#e5e7eb" font-family="monospace" font-size="16">compromised_delete_confirm_yes_cb</text>
+<text x="28" y="639" fill="#e5e7eb" font-family="monospace" font-size="16"></text>
+<text x="28" y="662" fill="#7dd3fc" font-family="monospace" font-size="16">DIRECT UI FUNCTION CALLS</text>
+<text x="28" y="685" fill="#e5e7eb" font-family="monospace" font-size="16">—</text>
+<text x="28" y="708" fill="#e5e7eb" font-family="monospace" font-size="16"></text>
+</svg>

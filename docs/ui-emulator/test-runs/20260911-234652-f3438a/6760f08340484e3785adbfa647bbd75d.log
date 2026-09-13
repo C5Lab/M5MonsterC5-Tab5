@@ -1,0 +1,14 @@
+✔ nmap returns deterministic host and service data without storing credentials (1.3519ms)
+✔ tool busy, cancellation, disconnect and reset cannot publish stale results (0.4395ms)
+✔ IoT result is detached and agrees with PAN/node inventory (0.2312ms)
+✔ GITM stop saves valid capture once; cancellation and SD failures save nothing (2.0755ms)
+✔ GITM deterministic timing and input validation do not strand radio (2.6584ms)
+✔ wpa-sec simulated outcomes expose no credentials and require SD (0.2927ms)
+ℹ tests 6
+ℹ suites 0
+ℹ pass 6
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 94.5119

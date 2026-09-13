@@ -1,0 +1,13 @@
+✔ deauth events cycle the scenario networks and drift RSSI within bounds (1.0662ms)
+✔ a disconnected module detects nothing (0.2737ms)
+✔ the bridge formats a firmware-shaped [DEAUTH] line and empty text when idle (0.8111ms)
+✔ anti-surv followers cycle the BT devices and stop when disconnected (0.4863ms)
+✔ the bridge formats a MAC|name follower line and picks a handshaker target (0.5138ms)
+ℹ tests 5
+ℹ suites 0
+ℹ pass 5
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 163.2268

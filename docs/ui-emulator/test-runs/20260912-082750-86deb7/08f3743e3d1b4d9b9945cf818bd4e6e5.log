@@ -1,0 +1,10 @@
+test_file_pages_back_after_switching_sources (__main__.PcapDeepBrowser.test_file_pages_back_after_switching_sources) ... ok
+test_full_storage_shows_error_without_partial_install (__main__.PcapDeepBrowser.test_full_storage_shows_error_without_partial_install) ... ok
+test_invalid_capture_shows_native_error (__main__.PcapDeepBrowser.test_invalid_capture_shows_native_error) ... ok
+test_native_deep_views (__main__.PcapDeepBrowser.test_native_deep_views) ... ok
+test_native_http_object_export_preserves_capture (__main__.PcapDeepBrowser.test_native_http_object_export_preserves_capture) ... ok
+
+----------------------------------------------------------------------
+Ran 5 tests in 6.407s
+
+OK

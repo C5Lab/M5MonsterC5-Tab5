@@ -1,0 +1,24 @@
+test_files_empty_delete_cancel_and_copy_four_rotations (__main__.Queue2WardriveBrowser.test_files_empty_delete_cancel_and_copy_four_rotations) ... ok
+test_gps_home_and_blacklist_four_rotations (__main__.Queue2WardriveBrowser.test_gps_home_and_blacklist_four_rotations) ... ok
+test_handshakes_demo_upload_cancel_retry_four_rotations (__main__.Queue2WardriveBrowser.test_handshakes_demo_upload_cancel_retry_four_rotations) ... ok
+test_missing_gps_and_sd_four_rotations (__main__.Queue2WardriveBrowser.test_missing_gps_and_sd_four_rotations) ... ok
+test_native_uploaded_all_none_selection_is_distinct (__main__.Queue2WardriveBrowser.test_native_uploaded_all_none_selection_is_distinct) ... FAIL
+test_record_providers_and_settings_four_rotations (__main__.Queue2WardriveBrowser.test_record_providers_and_settings_four_rotations) ... ok
+test_restart_wrong_module_cancel_and_disconnect_do_not_complete (__main__.Queue2WardriveBrowser.test_restart_wrong_module_cancel_and_disconnect_do_not_complete) ... ok
+
+======================================================================
+FAIL: test_native_uploaded_all_none_selection_is_distinct (__main__.Queue2WardriveBrowser.test_native_uploaded_all_none_selection_is_distinct)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tests\test_emulator_queue2_wardrive.py", line 218, in test_native_uploaded_all_none_selection_is_distinct
+    self.click('show_wardrive_upload_popup.ctx--wardrive_wigle_sync_btn')
+    ~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tests\test_emulator_phase4_wardrive.py", line 26, in click
+    self.assertEqual(len(rows),1,key)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+AssertionError: 0 != 1 : show_wardrive_upload_popup.ctx--wardrive_wigle_sync_btn
+
+----------------------------------------------------------------------
+Ran 7 tests in 205.529s
+
+FAILED (failures=1)

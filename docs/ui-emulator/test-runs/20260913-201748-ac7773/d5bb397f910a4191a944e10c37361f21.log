@@ -1,0 +1,18 @@
+✔ all seven simulated operations start, change and stop without another module changing (4.7004ms)
+✔ cancel, disconnect and reset never resurrect jobs or write captures (0.5649ms)
+✔ invalid inputs never reserve the module and credentials never enter model history (0.6036ms)
+✔ MITM creates target-specific PCAP only on stop and handles SD/quota failures atomically (0.7511ms)
+✔ clock slicing produces identical bounded simulated results (0.9203ms)
+✔ Observer preserves scenario identities, changes activity, freezes on stop and resets (0.5166ms)
+✔ Observer discovers independently and its targets work without a WiFi scan (2.3605ms)
+✔ C boundary scan rows preserve scenario identities and cancellation (0.5662ms)
+✔ radar tracks exactly one target with bounded changing RSSI and reserves its module (2.8992ms)
+✔ radar disconnect and reset cannot affect another module or restart old readings (1.0664ms)
+ℹ tests 10
+ℹ suites 0
+ℹ pass 10
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 80.547

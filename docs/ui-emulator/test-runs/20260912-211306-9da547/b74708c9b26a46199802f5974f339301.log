@@ -1,0 +1,10 @@
+test_home_confirmation_no_yes_and_reopen (__main__.NativeDialogs.test_home_confirmation_no_yes_and_reopen) ... ok
+test_missing_board_all_rotations (__main__.NativeDialogs.test_missing_board_all_rotations) ... ok
+test_ota_slot_activation_all_rotations (__main__.NativeDialogs.test_ota_slot_activation_all_rotations) ... ok
+test_sd_cancel_continue_all_rotations (__main__.NativeDialogs.test_sd_cancel_continue_all_rotations) ... ok
+test_version_actions_all_rotations (__main__.NativeDialogs.test_version_actions_all_rotations) ... ok
+
+----------------------------------------------------------------------
+Ran 5 tests in 38.810s
+
+OK

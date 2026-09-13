@@ -1,0 +1,50 @@
+flowchart LR
+    home["Transport dashboard"]
+    hub["Compromised Data"]
+    evil["Evil Twin Passwords"]
+    portal["Portal Data"]
+    hs["Handshake files"]
+    wardrive["Wardrive files"]
+    espshark["ESPShark hub"]
+    remote["Monster PCAP captures"]
+    transfer["Copy / sync progress popup"]
+    local["Tab5 PCAP browser"]
+    analysis["PCAP packet analysis"]
+    packet["Packet detail"]
+    summary["Capture / DNS summaries"]
+    flows["Connections / protocols"]
+    entities["Devices / remote endpoints"]
+    health["Investigation / capture health"]
+    map["Network map"]
+    tools["Tools popup"]
+    objects["Extracted objects"]
+    delete["Delete / cleanup confirm"]
+    home -- "tap Compromised Data" --> hub
+    hub -- "tap Evil Twin Passwords" --> evil
+    hub -- "tap Portal Data" --> portal
+    hub -- "tap Handshakes" --> hs
+    hub -- "tap Wardrive Files" --> wardrive
+    hub -- "tap ESPShark" --> espshark
+    espshark -- "tap Monster SD" --> remote
+    espshark -- "tap Tab5 SD" --> local
+    remote -- "tap Copy / Sync" --> transfer
+    remote -- "tap Delete / Clean" --> delete
+    local -- "tap PCAP file" --> analysis
+    analysis -- "Back releases capture" --> local
+    local -- "Back with no capture open" --> espshark
+    analysis -- "tap packet row" --> packet
+    analysis -- "tap summary / DNS" --> summary
+    analysis -- "tap Connections" --> flows
+    analysis -- "tap Protocols" --> flows
+    analysis -- "tap Devices" --> entities
+    analysis -- "tap Remote endpoints" --> entities
+    analysis -- "tap Health / Investigation" --> health
+    analysis -- "tap Map" --> map
+    analysis -- "tap Tools" --> tools
+    analysis -- "tap Objects" --> objects
+    classDef screen fill:#111827,color:#f9fafb,stroke:#7dd3fc,stroke-width:1.5px;
+    classDef popup fill:#2a2036,color:#f9fafb,stroke:#d8b4fe,stroke-width:1.5px;
+    classDef condition fill:#3a2d12,color:#fff7d6,stroke:#f2b84b,stroke-width:1.5px;
+    class boot,splash,shell,uart,mbus,internal,home,hub,scan,observer,global,data,bt,subghz,settings,analysis,local,remote screen;
+    class no_board,net_popup,client_popup,deauth,evil,sae,handshake,mitm,rogue_gitm,blackout,sniffer,global_hs,portal,transfer,packet,summary,flows,entities,health,map,tools,objects,delete,scan_cfg,red,timeout,brightness,rotation,theme,time,lock,ota,sdadmin,baud,listen_action,listen_leave,tx_warn,hunter_action,hunter_leave,manage_action,rename,repeat popup;
+    class sd condition;

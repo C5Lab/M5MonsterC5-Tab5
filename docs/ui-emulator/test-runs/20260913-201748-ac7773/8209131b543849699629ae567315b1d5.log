@@ -1,0 +1,9 @@
+test_baud_saved_all_rotations (__main__.SettingsS20Browser.test_baud_saved_all_rotations) ... ok
+test_clock_preferences_all_rotations (__main__.SettingsS20Browser.test_clock_preferences_all_rotations) ... ok
+test_restart_requires_reopen_and_fresh_change (__main__.SettingsS20Browser.test_restart_requires_reopen_and_fresh_change) ... ok
+test_set_invalid_and_cancel_all_rotations (__main__.SettingsS20Browser.test_set_invalid_and_cancel_all_rotations) ... ok
+
+----------------------------------------------------------------------
+Ran 4 tests in 39.897s
+
+OK

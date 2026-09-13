@@ -1,0 +1,8 @@
+test_busy_invalid_selection_disconnect_and_cancel (__main__.RadarBrowser.test_busy_invalid_selection_disconnect_and_cancel) ... ok
+test_target_rssi_animation_stop_back_and_reopen_all_rotations (__main__.RadarBrowser.test_target_rssi_animation_stop_back_and_reopen_all_rotations) ... ok
+test_two_modules_are_independent_and_reset_clears_jobs (__main__.RadarBrowser.test_two_modules_are_independent_and_reset_clears_jobs) ... ok
+
+----------------------------------------------------------------------
+Ran 3 tests in 18.448s
+
+OK

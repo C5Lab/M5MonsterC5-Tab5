@@ -1,0 +1,29 @@
+digraph ui_flow {
+  graph [rankdir=LR, bgcolor="#0b1020", pad="0.25", nodesep="0.35", ranksep="0.65", fontname="Arial"];
+  node [shape=box, style="rounded,filled", fillcolor="#182235", color="#7dd3fc", fontcolor="#f8fafc", fontname="Arial", fontsize=11, margin="0.14,0.09"];
+  edge [color="#9fb0c8", fontcolor="#dce7f5", fontname="Arial", fontsize=9, arrowsize=0.7];
+  label="UI navigation overview"; labelloc=t; fontsize=19; fontcolor="#ffffff";
+  boot [label="Firmware boot"];
+  splash [label="Boot intro"];
+  no_board [label="No-board modal"];
+  shell [label="Persistent tab shell"];
+  uart [label="Grove / USB dashboard"];
+  mbus [label="M-BUS dashboard"];
+  internal [label="Internal tools"];
+  wifi [label="Wi-Fi operations"];
+  data [label="Compromised data / PCAP"];
+  bt [label="Bluetooth"];
+  subghz [label="Sub-GHz"];
+  settings [label="Device settings"];
+  boot -> splash [label="automatic: initialize LVGL", color="#238636", style="solid"];
+  splash -> no_board [label="conditional: no Monster detected", color="#b26a00", style="dashed"];
+  splash -> shell [label="automatic: board detected", color="#238636", style="solid"];
+  shell -> uart [label="tap Grove / USB tab", color="#1677c8", style="solid"];
+  shell -> mbus [label="tap M-BUS tab", color="#1677c8", style="solid"];
+  shell -> internal [label="tap Internal tab", color="#1677c8", style="solid"];
+  uart -> wifi [label="tap WiFi / attacks / observer", color="#1677c8", style="solid"];
+  uart -> data [label="tap Compromised Data", color="#1677c8", style="solid"];
+  uart -> bt [label="tap Bluetooth", color="#1677c8", style="solid"];
+  uart -> subghz [label="tap Sub-GHz", color="#1677c8", style="solid"];
+  internal -> settings [label="tap Settings", color="#1677c8", style="solid"];
+}

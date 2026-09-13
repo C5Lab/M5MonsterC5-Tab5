@@ -1,0 +1,55 @@
+EXEC node --test tests/test_emulator_radar.mjs tests/test_emulator_attacks.mjs tests/test_emulator_bridge.mjs
+✔ all seven simulated operations start, change and stop without another module changing (4.3315ms)
+✔ cancel, disconnect and reset never resurrect jobs or write captures (0.3671ms)
+✔ invalid inputs never reserve the module and credentials never enter model history (0.6526ms)
+✔ MITM creates target-specific PCAP only on stop and handles SD/quota failures atomically (0.6173ms)
+✔ clock slicing produces identical bounded simulated results (0.9293ms)
+✔ Observer preserves scenario identities, changes activity, freezes on stop and resets (0.4801ms)
+✔ C boundary scan rows preserve scenario identities and cancellation (1.3863ms)
+✔ radar tracks exactly one target with bounded changing RSSI and reserves its module (3.0856ms)
+✔ radar disconnect and reset cannot affect another module or restart old readings (1.0955ms)
+ℹ tests 9
+ℹ suites 0
+ℹ pass 9
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 99.111
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_radar.py
+test_busy_invalid_selection_disconnect_and_cancel (__main__.RadarBrowser.test_busy_invalid_selection_disconnect_and_cancel) ... ok
+test_target_rssi_animation_stop_back_and_reopen_all_rotations (__main__.RadarBrowser.test_target_rssi_animation_stop_back_and_reopen_all_rotations) ... ok
+test_two_modules_are_independent_and_reset_clears_jobs (__main__.RadarBrowser.test_two_modules_are_independent_and_reset_clears_jobs) ... ok
+
+----------------------------------------------------------------------
+Ran 3 tests in 18.448s
+
+OK
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_phase4_audit.py
+test_all_back_routes_covered_or_deferred (__main__.CoverageAudit.test_all_back_routes_covered_or_deferred)
+Every back route works, unless it is an explicitly deferred screen. ... ok
+test_every_ledger_control_is_categorized (__main__.CoverageAudit.test_every_ledger_control_is_categorized)
+No dead control may ship without a documented reason. ... ok
+test_ledger_control_total_conserved (__main__.CoverageAudit.test_ledger_control_total_conserved) ... ok
+test_matches_committed_baseline (__main__.CoverageAudit.test_matches_committed_baseline)
+Guard against silent coverage regressions or stale baselines. ... ok
+test_open_items_are_identified (__main__.CoverageAudit.test_open_items_are_identified)
+Each open item carries a category and a human-readable reason. ... ok
+
+----------------------------------------------------------------------
+Ran 5 tests in 0.120s
+
+OK
+
+TEST SUMMARY
+==============================================================================
+radar
+  PASS            0.19s  test_emulator_radar.mjs test_emulator_attacks.mjs test_emulator_bridge.mjs
+  PASS           18.63s  test_emulator_radar.py
+  PASS            0.30s  test_emulator_phase4_audit.py
+------------------------------------------------------------------------------
+Result: PASS | scripts PASS: 3 | FAIL/ERROR: 0
+Total elapsed: 19.14s
+Section wrapper times include their children; do not add them together.
+Report: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\docs\ui-emulator\test-runs\20260912-184845-e05daa\summary.json
+

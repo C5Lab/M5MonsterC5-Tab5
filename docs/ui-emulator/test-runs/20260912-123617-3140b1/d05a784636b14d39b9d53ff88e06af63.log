@@ -1,0 +1,10 @@
+test_sd_admin_start_back_and_sd_failure (__main__.SettingsSystemBrowser.test_sd_admin_start_back_and_sd_failure) ... ok
+test_status_disconnect_rejects_reboot (__main__.SettingsSystemBrowser.test_status_disconnect_rejects_reboot) ... ok
+test_status_reboot_preserves_sd_and_settings (__main__.SettingsSystemBrowser.test_status_reboot_preserves_sd_and_settings) ... ok
+test_update_failure_and_cancel_leave_version (__main__.SettingsSystemBrowser.test_update_failure_and_cancel_leave_version) ... ok
+test_update_success_and_reopen_info (__main__.SettingsSystemBrowser.test_update_success_and_reopen_info) ... ok
+
+----------------------------------------------------------------------
+Ran 5 tests in 11.382s
+
+OK

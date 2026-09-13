@@ -1,0 +1,9 @@
+test_busy_refusal_preserves_existing_operation (__main__.GlobalAttacksBrowser.test_busy_refusal_preserves_existing_operation) ... ok
+test_confirm_no_yes_stop_all_operations_and_rotations (__main__.GlobalAttacksBrowser.test_confirm_no_yes_stop_all_operations_and_rotations) ... ok
+test_disconnect_rejects_start_cancel_reset_and_reopen (__main__.GlobalAttacksBrowser.test_disconnect_rejects_start_cancel_reset_and_reopen) ... ok
+test_two_modules_have_independent_global_handshake_results_and_stop (__main__.GlobalAttacksBrowser.test_two_modules_have_independent_global_handshake_results_and_stop) ... ok
+
+----------------------------------------------------------------------
+Ran 4 tests in 14.024s
+
+OK

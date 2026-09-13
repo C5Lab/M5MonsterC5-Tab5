@@ -1,0 +1,208 @@
+{
+  "status": "passed",
+  "cases": [
+    {
+      "rotation": 0,
+      "viewport": {
+        "width": 1440,
+        "height": 1000
+      },
+      "status": "passed",
+      "metrics": {
+        "startupMs": 51.399999998509884,
+        "frames": 153,
+        "totalFrameMs": 467.99999998509884,
+        "maxFrameMs": 6.5,
+        "memoryBytes": 67108864
+      }
+    },
+    {
+      "rotation": 1,
+      "viewport": {
+        "width": 1440,
+        "height": 1000
+      },
+      "status": "passed",
+      "metrics": {
+        "startupMs": 58.899999998509884,
+        "frames": 159,
+        "totalFrameMs": 484.9999999180436,
+        "maxFrameMs": 10.5,
+        "memoryBytes": 67108864
+      }
+    },
+    {
+      "rotation": 2,
+      "viewport": {
+        "width": 1440,
+        "height": 1000
+      },
+      "status": "passed",
+      "metrics": {
+        "startupMs": 49.900000005960464,
+        "frames": 146,
+        "totalFrameMs": 420.1999999806285,
+        "maxFrameMs": 5.9000000059604645,
+        "memoryBytes": 67108864
+      }
+    },
+    {
+      "rotation": 3,
+      "viewport": {
+        "width": 1440,
+        "height": 1000
+      },
+      "status": "passed",
+      "metrics": {
+        "startupMs": 52.20000000298023,
+        "frames": 144,
+        "totalFrameMs": 379.6000000461936,
+        "maxFrameMs": 6.200000002980232,
+        "memoryBytes": 67108864
+      }
+    },
+    {
+      "rotation": 0,
+      "viewport": {
+        "width": 390,
+        "height": 844
+      },
+      "status": "passed",
+      "metrics": {
+        "startupMs": 48.19999999552965,
+        "frames": 142,
+        "totalFrameMs": 391.7999999150634,
+        "maxFrameMs": 5.699999995529652,
+        "memoryBytes": 67108864
+      }
+    },
+    {
+      "rotation": 1,
+      "viewport": {
+        "width": 390,
+        "height": 844
+      },
+      "status": "passed",
+      "metrics": {
+        "startupMs": 52.899999998509884,
+        "frames": 143,
+        "totalFrameMs": 402.200000025332,
+        "maxFrameMs": 6.5,
+        "memoryBytes": 67108864
+      }
+    },
+    {
+      "rotation": 2,
+      "viewport": {
+        "width": 390,
+        "height": 844
+      },
+      "status": "passed",
+      "metrics": {
+        "startupMs": 50.899999998509884,
+        "frames": 151,
+        "totalFrameMs": 464.99999994784594,
+        "maxFrameMs": 15.100000001490116,
+        "memoryBytes": 67108864
+      }
+    },
+    {
+      "rotation": 3,
+      "viewport": {
+        "width": 390,
+        "height": 844
+      },
+      "status": "passed",
+      "metrics": {
+        "startupMs": 61.30000000447035,
+        "frames": 144,
+        "totalFrameMs": 374.49999997764826,
+        "maxFrameMs": 6.299999997019768,
+        "memoryBytes": 67108864
+      }
+    }
+  ],
+  "scope": "Phase 2 navigation/scan/Scan Setup subset; not the complete acceptance gate",
+  "recorded_at": "2026-09-13T18:18:04.949522+00:00",
+  "checks": [
+    "Canvas navigation",
+    "cancellation and late-event suppression",
+    "rescan clears selection",
+    "stable network binding IDs",
+    "Grove/MBus result isolation",
+    "landscape wheel scrolling",
+    "Scan Setup save and reopen",
+    "page errors and unsupported boundaries"
+  ],
+  "limitations": [
+    "No physical mobile device or touch validation",
+    "No text input or complete Settings coverage",
+    "No cross-browser or performance-budget acceptance"
+  ],
+  "browser": {
+    "engine": "chromium",
+    "version": "145.0.7632.6"
+  },
+  "download_bytes": {
+    "app.mjs": 13669,
+    "display.mjs": 1288,
+    "emulator.js": 126350,
+    "emulator.wasm": 1681096,
+    "index.html": 4875,
+    "model/attacks.mjs": 5303,
+    "model/bridge.mjs": 2594,
+    "model/device.mjs": 28803,
+    "model/nettools.mjs": 4946,
+    "model/pcap-deep.mjs": 4606,
+    "model/pcap.mjs": 1563,
+    "pcap-story.mjs": 4366,
+    "persistence.mjs": 2944,
+    "portal-story.mjs": 4012,
+    "queue2-attacks.mjs": 7662,
+    "queue2-common.mjs": 1279,
+    "queue2-nettools.mjs": 7046,
+    "queue2-system.mjs": 7636,
+    "queue2-wardrive.mjs": 13953,
+    "recon-stories.mjs": 5692,
+    "scenario.json": 13404,
+    "settings-s18.mjs": 4491,
+    "settings-s19.mjs": 6763,
+    "settings-s20.mjs": 4018,
+    "startup-story.mjs": 4295,
+    "stories.mjs": 9763,
+    "story-restart.mjs": 786,
+    "style.css": 3458,
+    "wifi-stories.mjs": 7300
+  },
+  "artifact_sha256": {
+    "app.mjs": "3adbe65a23412369dcbae95e240983e97e2110f6e4636b03133a15b0e9584497",
+    "display.mjs": "8fd915df5b8dd7f38d2e29fc80bf9cf9c2afd54f8466ba99e4928b6490f865d3",
+    "emulator.js": "d1d54e619310d27506098eaa205bbef4425fd6448374e552e461e366b81c2155",
+    "emulator.wasm": "8937f36e124efecfdc43f0fd38a4ff1d1b91eb1b1ba2897136b3a930c2e35b65",
+    "index.html": "356a789516a2678373912ed2ef6ffebda72a21b42e1ff7e0eba03b261f74e5ae",
+    "model/attacks.mjs": "5814cffece99efe9076e8bbe6e2f63a6e1317ef84214bbc5f9bd12718694938f",
+    "model/bridge.mjs": "7ce7d94c5d5960f57ec439e6243012ed78471496bcbf273fb3f95a782932b02f",
+    "model/device.mjs": "7b471b5e69e3ab2d0d54aa7a469f3fe7c6abbb3d1337326fa2af3c60193b16ec",
+    "model/nettools.mjs": "61538946098a0da2910caecdeff98b325c94ef1c9a7bc4d8c21345899cd84623",
+    "model/pcap-deep.mjs": "99e3d25cfb5ed768ccdd03b4447ae0cfe4f0804abe192ec5011ce786341b783a",
+    "model/pcap.mjs": "bb754971c4e534a38c974c07ea815046a260c284aabdac051e7abc0581c3d591",
+    "pcap-story.mjs": "6d74f275bf1333f6866427a2302305fcfe609e5bb9dbdba6cc8642ce314f8db6",
+    "persistence.mjs": "cea73f05fb8e10e58ad09dfef993551e9f5f6769c5c390aa12e6618b8bf0a5fc",
+    "portal-story.mjs": "4bfb39c13d90724e4781ae1aa8dd886b24f74dfb15b4c552b0a13a53025b89dc",
+    "queue2-attacks.mjs": "2dfedddbbc4493f4075f1a10dc03cbcaff55f18897e9a7827c2fde8215ec3031",
+    "queue2-common.mjs": "97c7cc3d6261b37282cf3247ef92d3cad926519684eb7dd03e3530790478cb52",
+    "queue2-nettools.mjs": "f512cbe0157e141d80f099ce3ee1db487c90abe4c73f476e230a50ba060ca2f2",
+    "queue2-system.mjs": "c9ef995af625ed5478cb7859ccfbd3f836c4126b1ae68b083a1df3c5523df4fb",
+    "queue2-wardrive.mjs": "6825eaf49ccc2fcf92fde534798207e0ab03d2f360b91306fe99818ecdcc1412",
+    "recon-stories.mjs": "32f597b6f8d36ddb7b2b556e48f61c80a38f98d48cbbea6a803939d60205da9b",
+    "scenario.json": "a2862050d87adb855250d96906bf6404138fe04dfbc772e107d2358721342711",
+    "settings-s18.mjs": "e638d60639e2c4e1fc1a0aaa60a9126b286d917af95a66412c21931827ee5300",
+    "settings-s19.mjs": "1bde9025e3c0c19015c27a50790a2e4e753fe61088c20d9902f8c5fe9cf51ded",
+    "settings-s20.mjs": "82541c1c978c8d12215f45c65d04ba547620bef4eb3cedc48c9787117b869295",
+    "startup-story.mjs": "5ece1a8c4f4aff934f0594d25e27c1d4be16a2eceed79c21ce19ce138c48fc96",
+    "stories.mjs": "1e7d071ec56b862ddd4ae66e5c28936c0ddce920cc4beb484422cd32292c5d90",
+    "story-restart.mjs": "c6fd126ca9e76de0270c9c0581eca9b65bc1b8ef43afbf0289dbcc41f34852a1",
+    "style.css": "abaf75223da73bd49b15820670162dd5414513607e660788b3f5c38bd79c1da5",
+    "wifi-stories.mjs": "e5e87419b2d18501dccdecf0b0b92500309946a4379bb48631bac5176a95b219"
+  }
+}

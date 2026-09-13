@@ -1,0 +1,8 @@
+test_all_three_demos_across_rotations (__main__.PortalStoryBrowser.test_all_three_demos_across_rotations) ... ok
+test_cancel_before_submission_does_not_complete (__main__.PortalStoryBrowser.test_cancel_before_submission_does_not_complete) ... ok
+test_stories_are_independent_of_the_previous_session (__main__.PortalStoryBrowser.test_stories_are_independent_of_the_previous_session) ... ok
+
+----------------------------------------------------------------------
+Ran 3 tests in 24.170s
+
+OK

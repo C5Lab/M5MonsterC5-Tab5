@@ -1,0 +1,56 @@
+{
+  "status": "FAIL",
+  "seconds": 13.345886099996278,
+  "checks": [
+    {
+      "section": "observer",
+      "name": "test_emulator_bridge.mjs test_emulator_attacks.mjs test_emulator_device.mjs",
+      "started": 1789238546.69608,
+      "seconds": 0.13490550001733936,
+      "status": "PASS",
+      "exit_code": 0,
+      "log": "C:\\Users\\mati\\Documents\\GitHub\\M5MonsterC5-Tab5\\docs\\ui-emulator\\test-runs\\20260912-204226-fc2e61\\e7fb779dfe0c41088ed93d5badfc5b8b.log",
+      "aggregate": false
+    },
+    {
+      "section": "observer",
+      "name": "test_emulator_observer_exit.py",
+      "started": 1789238546.8317473,
+      "seconds": 3.3302690999989863,
+      "status": "PASS",
+      "exit_code": 0,
+      "log": "C:\\Users\\mati\\Documents\\GitHub\\M5MonsterC5-Tab5\\docs\\ui-emulator\\test-runs\\20260912-204226-fc2e61\\26dd7df460fd43fe8efa39c4f67a8596.log",
+      "aggregate": false
+    },
+    {
+      "section": "observer",
+      "name": "test_emulator_lifecycle.py",
+      "started": 1789238550.1635668,
+      "seconds": 6.310651800013147,
+      "status": "PASS",
+      "exit_code": 0,
+      "log": "C:\\Users\\mati\\Documents\\GitHub\\M5MonsterC5-Tab5\\docs\\ui-emulator\\test-runs\\20260912-204226-fc2e61\\6fd2c49a3f3d41cf84410e64a68124c3.log",
+      "aggregate": false
+    },
+    {
+      "section": "observer",
+      "name": "test_emulator_observer_activity.py",
+      "started": 1789238556.475192,
+      "seconds": 1.8109324999968521,
+      "status": "PASS",
+      "exit_code": 0,
+      "log": "C:\\Users\\mati\\Documents\\GitHub\\M5MonsterC5-Tab5\\docs\\ui-emulator\\test-runs\\20260912-204226-fc2e61\\053349d29e2344169f51d1094c8cec97.log",
+      "aggregate": false
+    },
+    {
+      "section": "observer",
+      "name": "test_emulator_phase3.py",
+      "started": 1789238558.286702,
+      "seconds": 1.7417568000091705,
+      "status": "FAIL",
+      "exit_code": 1,
+      "log": "C:\\Users\\mati\\Documents\\GitHub\\M5MonsterC5-Tab5\\docs\\ui-emulator\\test-runs\\20260912-204226-fc2e61\\2077b884d8cc428aa1c0cfed924e82a9.log",
+      "aggregate": false
+    }
+  ]
+}

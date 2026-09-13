@@ -1,0 +1,9 @@
+{
+  "attack_tile_event_cb": "adapter",
+  "handle_selected_attack": "adapter",
+  "observer_station_attack_tile_event_cb": "adapter",
+  "pause_observer_for_attack": "adapter",
+  "ssid_utf8_font": "retain",
+  "trim_trailing_whitespace": "retain",
+  "save_globals_to_tab_context": "adapter"
+}

@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Tab5 · Live emulator</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header><h1>Tab5 <span>Live emulator</span></h1><strong class="demo">Demo</strong></header>
+  <main>
+    <aside aria-label="Simulator controls">
+      <h2>Explore the device</h2>
+      <p>Explore the Tab5 interface with simulated modules, GPS, Bluetooth and local files. No real radio traffic or uploads.</p>
+      <section class="guide" aria-label="Guided stories">
+        <button id="guide-start" disabled>Start Bluetooth story</button>
+        <button id="guide-startup" disabled>Start module tour</button>
+        <button id="guide-scan" disabled>Start Wi-Fi scan story</button>
+        <button id="guide-radar" disabled>Start Radar story</button>
+        <button id="guide-observer" disabled>Start Observer story</button>
+        <button id="guide-mesh" disabled>Start Mesh story</button>
+        <div id="queue2-menu">
+          <label for="queue2-story">More guided stories</label>
+          <select id="queue2-story" disabled></select>
+          <button id="guide-queue2" disabled>Start selected story</button>
+        </div>
+        <div id="guide-panel" hidden>
+          <p id="guide-progress" class="guide-progress"></p>
+          <h3 id="guide-title" tabindex="-1"></h3>
+          <p id="guide-instruction" role="status" aria-live="polite"></p>
+          <button id="guide-leave">Free exploration</button>
+          <button id="guide-restart">Restart story</button>
+          <ol id="guide-steps" aria-label="Story steps"></ol>
+        </div>
+      </section>
+      <label for="rotation">Orientation</label>
+      <select id="rotation"><option value="0">Portrait · 0°</option><option value="1">Landscape · 90°</option><option value="2">Portrait · 180°</option><option value="3">Landscape · 270°</option></select>
+      <label for="timing">Simulation speed</label>
+      <select id="timing" disabled><option value="0">Demo · 10×</option><option value="1">Realistic · 1×</option></select>
+      <button id="cancel" disabled>Cancel simulated operation</button>
+      <button id="pcap-examples">Load PCAP examples</button>
+      <button id="reset">Reset demo</button>
+      <button id="fullscreen">Full screen</button>
+      <details class="demo-conditions">
+        <summary>Demo module conditions</summary>
+        <label for="module-condition">Module condition</label>
+        <select id="module-condition">
+          <option value="normal">Connected · SD available</option>
+          <option value="missing-board">No external boards</option>
+          <option value="missing-sd">Connected · SD missing</option>
+          <option value="version-mismatch">JanOS version mismatch</option>
+        </select>
+        <label for="wifi-condition">Wi-Fi demo results</label>
+        <select id="wifi-condition">
+          <option value="normal">Normal networks</option>
+          <option value="hidden">Hidden SSID example</option>
+          <option value="empty">Empty results</option>
+          <option value="cancel">Cancellation · 30-second scan</option>
+        </select>
+        <p>Changing this restarts the demo. Files and story progress are cleared.</p>
+        <label for="live-gps">Live GROVE GPS</label>
+        <select id="live-gps" disabled><option value="available">GPS available</option><option value="missing">No GPS fix</option></select>
+        <label for="live-sd">Live GROVE SD</label>
+        <select id="live-sd" disabled><option value="available">SD available</option><option value="missing">SD missing</option></select>
+        <p>Live conditions change the current GROVE simulation without restarting the story.</p>
+      </details>
+      <p class="hint">Click or tap the screen. Drag or use the wheel to scroll. Orientation changes restart this prototype.</p>
+      <p id="status" role="status" aria-live="polite">Loading emulator…</p>
+      <p id="notice" role="status" aria-live="polite"></p>
+      <p id="storage-status" role="status" aria-live="polite"></p>
+      <details><summary>Runtime measurements</summary><output id="metrics">Waiting for first frame.</output></details>
+    </aside>
+    <section class="stage" aria-label="Virtual Tab5">
+      <canvas id="display" width="720" height="1280" tabindex="0" aria-label="Tab5 touchscreen emulator. Click or tap device controls."></canvas>
+      <label class="text-entry" for="text-input">Text for the selected device field
+        <input id="text-input" type="text" autocomplete="off" spellcheck="false" placeholder="Type here after selecting a device field">
+      </label>
+    </section>
+  </main>
+  <script src="emulator.js"></script>
+  <script type="module" src="app.mjs"></script>
+</body>
+</html>

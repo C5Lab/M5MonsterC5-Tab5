@@ -1,0 +1,6 @@
+test_keep_running_then_stop_and_exit_all_rotations (__main__.ObserverExitBrowser.test_keep_running_then_stop_and_exit_all_rotations) ... ok
+
+----------------------------------------------------------------------
+Ran 1 test in 3.012s
+
+OK

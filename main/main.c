@@ -22,6 +22,7 @@
 #include "freertos/timers.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
+#include "esp_private/esp_clk.h"
 #include "esp_rom_crc.h"
 #include "nvs_flash.h"
 #include "nvs.h"
@@ -57,6 +58,14 @@
 #include "pcap_analysis_store.h"
 #include "pcap_investigation.h"
 #include "pcap_extract.h"
+
+// WPA handshake dictionary cracker (on-device, trivial-password check)
+#include "mbedtls/pkcs5.h"
+#include "mbedtls/md.h"
+#include "mbedtls/platform_util.h"
+#include "hs_crack_crypto.h"
+#include <stdatomic.h>
+#include "freertos/queue.h"
 
 // Captive portal includes
 #include "esp_http_server.h"
@@ -758,6 +767,8 @@ typedef struct {
     lv_obj_t *handshaker_stop_btn;       // STOP/DONE button
     lv_obj_t *handshaker_stop_label;     // STOP/DONE label
     lv_obj_t *handshaker_wpasec_btn;     // "Send to wpa-sec" button (shown on success)
+    lv_obj_t *handshaker_result_actions;
+    char handshaker_saved_pcap[WARDRIVE_WIGLE_PATH_MAX];
     char handshaker_log_buffer[2048];    // Accumulated log messages
     bool handshaker_capture_success;      // True when capture/already-captured was detected
     volatile bool handshaker_monitoring;
@@ -2927,6 +2938,7 @@ static void show_sae_popup(int network_idx);
 static void sae_popup_close_cb(lv_event_t *e);
 static void show_handshaker_popup(void);
 static void handshaker_popup_close_cb(lv_event_t *e);
+static void handshaker_crack_cb(lv_event_t *e);
 static void handshaker_monitor_task(void *arg);
 static void show_mitm_popup(void);
 static void mitm_connect_and_start_cb(lv_event_t *e);
@@ -3247,6 +3259,7 @@ static bool compromised_start_cleanup_operation(tab_context_t *ctx,
 static void compromised_cleanup_task(void *arg);
 static void compromised_cleanup_async_refresh(void *user_data);
 static void wpasec_btn_event_cb(lv_event_t *e);
+static void hs_crack_file_cb(lv_event_t *e);
 static void show_deauth_detector_page(void);
 static void deauth_detector_back_btn_event_cb(lv_event_t *e);
 static void deauth_detector_start_cb(lv_event_t *e);
@@ -4489,6 +4502,10 @@ static bool usb_host_started_by_us = false;
 static uint32_t usb_next_retry_ms = 0;
 static bool usb_log_tuned = false;
 static bool board_redetect_pending = false;
+// True only once bsp_display_start() has run lv_init(). Guards any lv_async_call
+// (and other LVGL calls) made from USB callbacks that can fire during the early
+// boot USB open, before LVGL exists - calling into LVGL then corrupts the heap.
+static volatile bool lvgl_ready = false;
 static bool usb_debug_logs = true;
 static bool usb_cdc_preferred_valid = false;
 static bool usb_cdc_driver_installed = false;
@@ -4717,7 +4734,9 @@ static void usb_log_cdc_state(const char *where)
 
 static void schedule_board_redetect(void);
 
-static void board_redetect_cb(void *user_data)
+// Retained for a possible future runtime-redetect path, but currently unused:
+// USB detection is boot-only, so nothing schedules this anymore.
+static __attribute__((unused)) void board_redetect_cb(void *user_data)
 {
     (void)user_data;
     ESP_LOGI(TAG, "board_redetect_cb called");
@@ -4771,8 +4790,15 @@ static void board_redetect_cb(void *user_data)
     }
 }
 
-static void schedule_board_redetect(void)
+static __attribute__((unused)) void schedule_board_redetect(void)
 {
+    // A USB device can be opened before LVGL is up (usb_boot_open_early runs
+    // ahead of bsp_display_start). The redetect drives the GUI, so there is
+    // nothing to do yet and lv_async_call() into an uninitialized LVGL would
+    // corrupt the heap - the normal boot detection will pick the device up.
+    if (!lvgl_ready) {
+        return;
+    }
     if (board_redetect_pending) {
         return;
     }
@@ -4834,7 +4860,10 @@ static void usb_cdc_connect_cb(usbh_cdc_handle_t cdc_handle, void *user_data)
     }
 
     start_usb_gps_drain_task();
-    schedule_board_redetect();
+    // Board detection is boot-only (see usb_boot_open_early): the boot probe
+    // classifies whatever is already open. Do NOT kick a runtime redetect from
+    // the connect callback - a device that shows up after boot is intentionally
+    // not brought into the UI live.
 }
 
 static void usb_cdc_disconnect_cb(usbh_cdc_handle_t cdc_handle, void *user_data)
@@ -4864,7 +4893,8 @@ static void usb_cdc_disconnect_cb(usbh_cdc_handle_t cdc_handle, void *user_data)
     if (usb_debug_logs) {
         usb_log_cdc_state("disconnect");
     }
-    schedule_board_redetect();
+    // Boot-only detection: don't run a runtime redetect when a device is
+    // unplugged. The tab layout is fixed at boot.
 }
 
 static void usb_cdc_recv_cb(usbh_cdc_handle_t cdc_handle, void *user_data)
@@ -4909,12 +4939,16 @@ static void usb_transport_init(void)
     }
 
     if (!usb_log_tuned) {
+        // USBH_CDC logs "cdc read failed" (ESP_LOGE) on every empty poll while
+        // we ping a still-booting Monster - pure noise, and our own [USB] logs
+        // already say what matters. Silence that tag regardless of debug mode;
+        // esp_log_level_set is per-tag and can only be done here in code, not in
+        // sdkconfig (which carries only the global default/max level).
+        esp_log_level_set("USBH_CDC", ESP_LOG_NONE);
         if (usb_debug_logs) {
-            esp_log_level_set("USBH_CDC", ESP_LOG_INFO);
             esp_log_level_set("USBH", ESP_LOG_INFO);
             esp_log_level_set("USB HOST", ESP_LOG_INFO);
         } else {
-            esp_log_level_set("USBH_CDC", ESP_LOG_NONE);
             esp_log_level_set("USBH", ESP_LOG_NONE);
             esp_log_level_set("USB HOST", ESP_LOG_NONE);
         }
@@ -5009,6 +5043,38 @@ static void usb_transport_init(void)
     usb_transport_ready = true;
     usb_transport_warned = false;
     ESP_LOGI(TAG, "[USB] USB CDC host ready, waiting for device...");
+}
+
+// Open the Monster-over-USB-A link *before* the audio codec, SD card and
+// MIPI-DSI panel each claim their slice of the board's tiny internal
+// DMA-capable pool (only ~128 KiB total, RTCRAM and TCM excluded). usbh_cdc
+// needs several 512-byte-aligned DMA blocks for the endpoint transfer-descriptor
+// lists; once those peripherals are up the pool is fragmented down to a few KiB
+// and the create fails for good with "EP Alloc error: ESP_ERR_NO_MEM" - and
+// every failed attempt leaks DMA, so retrying only drives it lower. Run once,
+// early in app_main, this enumerates and opens the CH340 while DMA is still
+// plentiful; the boot board detection later just reuses the handle. Detection
+// itself stays boot-only - nothing retries the open afterwards.
+static void usb_boot_open_early(void)
+{
+    ESP_LOGI(TAG, "[USB] Early open (before codec/SD/display grab DMA)...");
+    usb_transport_init();   // install host + CDC driver, arm new_dev_cb
+
+    // Wait for the CH340 to enumerate, then open it. Bounded so a USB-less boot
+    // pays only a small fixed cost. Enumeration on this board takes ~400 ms.
+    for (int i = 0; i < 35 && !usb_cdc_handle; i++) {
+        vTaskDelay(pdMS_TO_TICKS(20));
+        if (usb_cdc_preferred_valid && !usb_cdc_handle) {
+            usb_next_retry_ms = 0;   // clear the 1 s backoff a failed probe set
+            usb_transport_init();
+        }
+    }
+
+    if (usb_cdc_handle) {
+        ESP_LOGI(TAG, "[USB] Monster opened early over USB-A");
+    } else {
+        ESP_LOGI(TAG, "[USB] No USB-A device opened early (none present or not ready)");
+    }
 }
 
 static __attribute__((unused)) void usb_transport_deinit(void)
@@ -12821,10 +12887,12 @@ static void handshaker_popup_close_cb(lv_event_t *e)
         ctx->handshaker_stop_btn = NULL;
         ctx->handshaker_stop_label = NULL;
         ctx->handshaker_wpasec_btn = NULL;
+        ctx->handshaker_result_actions = NULL;
     }
     ctx->observer_attack_return_to_observer = false;
     clear_observer_attack_override(ctx);
     ctx->handshaker_capture_success = false;
+    ctx->handshaker_saved_pcap[0] = '\0';
 
     // Clear global pointers
     handshaker_log_container = NULL;
@@ -12865,8 +12933,38 @@ static void handshaker_set_done_state(tab_context_t *ctx, bool show_wpasec_butto
             lv_obj_add_flag(ctx->handshaker_wpasec_btn, LV_OBJ_FLAG_HIDDEN);
         }
     }
+    if (ctx->handshaker_result_actions) {
+        if (show_wpasec_button) lv_obj_clear_flag(ctx->handshaker_result_actions, LV_OBJ_FLAG_HIDDEN);
+        else lv_obj_add_flag(ctx->handshaker_result_actions, LV_OBJ_FLAG_HIDDEN);
+    }
 
     bsp_display_unlock();
+}
+
+// Capture the path from JanOS's saved-file notification, never guess from SSID.
+// Store its PCAP spelling because the shared checker resolves the companion.
+static bool handshaker_saved_path(const char *line, char *out, size_t out_size)
+{
+    const char *marker = strstr(line, "PCAP saved:");
+    bool hccapx = false;
+    if (!marker) {
+        marker = strstr(line, "HCCAPX saved:");
+        hccapx = true;
+    }
+    if (!marker) return false;
+    if (!out || !out_size) return false;
+    out[0] = '\0';
+    const char *path = strstr(marker, "/sdcard/");
+    if (!path) return false;
+    const char *extension = strstr(path, hccapx ? ".hccapx" : ".pcap");
+    if (!extension) return false;
+    const char *end = extension + (hccapx ? 7 : 5);
+    if (*end && !isspace((unsigned char)*end) && *end != '\'' && *end != '"' && *end != '\x1b') return false;
+    size_t stem_len = (size_t)(extension - path);
+    if (stem_len + sizeof(".pcap") > out_size) return false;
+    memcpy(out, path, stem_len);
+    memcpy(out + stem_len, ".pcap", sizeof(".pcap"));
+    return true;
 }
 
 // Append message to handshaker log with color coding
@@ -13018,6 +13116,8 @@ static void handshaker_monitor_task(void *arg)
                         }
                         else if (strstr(line_buffer, "PCAP saved:") != NULL ||
                                  strstr(line_buffer, "HCCAPX saved:") != NULL) {
+                            handshaker_saved_path(line_buffer, ctx->handshaker_saved_pcap,
+                                                  sizeof(ctx->handshaker_saved_pcap));
                             // Extract filename from path
                             char *path = strstr(line_buffer, "/sdcard/");
                             if (path) {
@@ -13373,8 +13473,15 @@ static void show_handshaker_popup(void)
     lv_obj_center(ctx->handshaker_stop_label);
 
     // Hidden by default, shown only when attack is done and handshake exists
-    ctx->handshaker_wpasec_btn = lv_btn_create(ctx->handshaker_popup);
-    lv_obj_set_size(ctx->handshaker_wpasec_btn, lv_pct(100), 50);
+    ctx->handshaker_result_actions = lv_obj_create(ctx->handshaker_popup);
+    lv_obj_remove_style_all(ctx->handshaker_result_actions);
+    lv_obj_set_size(ctx->handshaker_result_actions, lv_pct(100), 50);
+    lv_obj_set_flex_flow(ctx->handshaker_result_actions, LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_column(ctx->handshaker_result_actions, 10, 0);
+    lv_obj_add_flag(ctx->handshaker_result_actions, LV_OBJ_FLAG_HIDDEN);
+    ctx->handshaker_wpasec_btn = lv_btn_create(ctx->handshaker_result_actions);
+    lv_obj_set_size(ctx->handshaker_wpasec_btn, 0, 50);
+    lv_obj_set_flex_grow(ctx->handshaker_wpasec_btn, 1);
     lv_obj_set_style_bg_color(ctx->handshaker_wpasec_btn, COLOR_MATERIAL_PURPLE, 0);
     lv_obj_set_style_bg_color(ctx->handshaker_wpasec_btn, lv_color_hex(0x9C27B0), LV_STATE_PRESSED);
     lv_obj_set_style_radius(ctx->handshaker_wpasec_btn, 8, 0);
@@ -13386,7 +13493,19 @@ static void show_handshaker_popup(void)
     lv_obj_set_style_text_font(wpasec_btn_lbl, &lv_font_montserrat_18, 0);
     lv_obj_set_style_text_color(wpasec_btn_lbl, lv_color_hex(0xFFFFFF), 0);
     lv_obj_center(wpasec_btn_lbl);
+    lv_obj_t *crack_btn = lv_btn_create(ctx->handshaker_result_actions);
+    lv_obj_set_size(crack_btn, 0, 50);
+    lv_obj_set_flex_grow(crack_btn, 1);
+    lv_obj_set_style_bg_color(crack_btn, COLOR_MATERIAL_PURPLE, 0);
+    lv_obj_set_style_radius(crack_btn, 8, 0);
+    lv_obj_add_event_cb(crack_btn, handshaker_crack_cb, LV_EVENT_CLICKED, ctx);
+    lv_obj_t *crack_label = lv_label_create(crack_btn);
+    lv_label_set_text(crack_label, "Crack latest");
+    lv_obj_set_style_text_font(crack_label, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_color(crack_label, lv_color_white(), 0);
+    lv_obj_center(crack_label);
     ctx->handshaker_capture_success = false;
+    ctx->handshaker_saved_pcap[0] = '\0';
 
     // Now send UART commands and start monitoring
 
@@ -22831,22 +22950,25 @@ static void show_wardrive_gps_overlay(tab_context_t *ctx)
 static void update_wardrive_count_label(tab_context_t *ctx)
 {
     if (!ctx || !ctx->wardrive_net_count_label) return;
+    // LVGL's builtin formatter has floating-point conversions disabled.
+    char distance_text[32];
+    snprintf(distance_text, sizeof(distance_text), "%.2f", ctx->wardrive_distance_m / 1000.0);
     if (ctx->wardrive_relogs > 0 || ctx->wardrive_best_ch > 0) {
         lv_label_set_text_fmt(ctx->wardrive_net_count_label,
-                              "WiFi: %d  BT: %d  relog: %d  ch: %d  SAT: %d  %.2f km",
+                              "WiFi: %d  BT: %d  relog: %d  ch: %d  SAT: %d  %s km",
                               ctx->wardrive_wifi_count,
                               ctx->wardrive_bt_count,
                               ctx->wardrive_relogs,
                               ctx->wardrive_best_ch,
                               ctx->wardrive_sat_count,
-                              ctx->wardrive_distance_m / 1000.0);
+                              distance_text);
     } else {
         lv_label_set_text_fmt(ctx->wardrive_net_count_label,
-                              "WiFi: %d  BT: %d  SAT: %d  %.2f km",
+                              "WiFi: %d  BT: %d  SAT: %d  %s km",
                               ctx->wardrive_wifi_count,
                               ctx->wardrive_bt_count,
                               ctx->wardrive_sat_count,
-                              ctx->wardrive_distance_m / 1000.0);
+                              distance_text);
     }
 }
 
@@ -30331,8 +30453,11 @@ static void wardrive_gps_debug_parse_nmea(tab_context_t *ctx, const char *line)
         }
         if (ctx->wardrive_gps_debug_coord_label) {
             if (have_coords) {
+                char latitude_text[24], longitude_text[24];
+                snprintf(latitude_text, sizeof(latitude_text), "%.6f", latitude);
+                snprintf(longitude_text, sizeof(longitude_text), "%.6f", longitude);
                 lv_label_set_text_fmt(ctx->wardrive_gps_debug_coord_label,
-                                      "Coordinates: %.6f, %.6f", latitude, longitude);
+                                      "Coordinates: %s, %s", latitude_text, longitude_text);
                 lv_obj_set_style_text_color(ctx->wardrive_gps_debug_coord_label,
                                             COLOR_MATERIAL_GREEN, 0);
             } else {
@@ -35767,7 +35892,9 @@ static void show_compromised_file_page(compromised_file_kind_t kind)
         if (is_copyable_pcap) {
             // Explicit dimensions avoid LVGL resolving a percentage inside a
             // content-sized flex parent to zero and hiding the copy action.
-            lv_obj_set_size(actions, 392, 62);
+            // Handshakes carry an extra "Crack" button, so widen the row for them.
+            lv_obj_set_size(actions,
+                            kind == COMPROMISED_FILE_KIND_HANDSHAKE ? 526 : 392, 62);
         } else {
             lv_obj_set_size(actions, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
         }
@@ -35791,6 +35918,31 @@ static void show_compromised_file_page(compromised_file_kind_t kind)
             lv_obj_set_style_text_font(fix_lbl, &lv_font_montserrat_14, 0);
             lv_obj_set_style_text_color(fix_lbl, lv_color_hex(0xFFFFFF), 0);
             lv_obj_center(fix_lbl);
+        }
+
+        if (kind == COMPROMISED_FILE_KIND_HANDSHAKE) {
+            lv_obj_t *crack_btn = lv_btn_create(actions);
+            lv_obj_set_size(crack_btn, 122, 62);
+            lv_obj_set_style_bg_color(crack_btn, COLOR_MATERIAL_PURPLE, 0);
+            lv_obj_set_style_bg_color(crack_btn, lv_color_hex(0x9C27B0), LV_STATE_PRESSED);
+            lv_obj_set_style_radius(crack_btn, 10, 0);
+            lv_obj_set_style_shadow_width(crack_btn, 0, 0);
+            lv_obj_set_flex_flow(crack_btn, LV_FLEX_FLOW_COLUMN);
+            lv_obj_set_flex_align(crack_btn, LV_FLEX_ALIGN_CENTER,
+                                  LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+            lv_obj_set_style_pad_row(crack_btn, 1, 0);
+            lv_obj_add_event_cb(crack_btn, hs_crack_file_cb, LV_EVENT_CLICKED,
+                                compromised_make_user_data(kind, i));
+
+            lv_obj_t *crack_title = lv_label_create(crack_btn);
+            lv_label_set_text(crack_title, "CRACK");
+            lv_obj_set_style_text_font(crack_title, &lv_font_montserrat_16, 0);
+            lv_obj_set_style_text_color(crack_title, lv_color_hex(0xFFFFFF), 0);
+
+            lv_obj_t *crack_hint = lv_label_create(crack_btn);
+            lv_label_set_text(crack_hint, "dictionary");
+            lv_obj_set_style_text_font(crack_hint, &lv_font_montserrat_12, 0);
+            lv_obj_set_style_text_color(crack_hint, lv_color_hex(0xEAD6F5), 0);
         }
 
         if (is_copyable_pcap) {
@@ -39811,10 +39963,12 @@ static void wpasec_upload_task(void *arg)
     if (!ctx->wpasec_task_running) goto done;
 
     if (strstr(rx_buf, "not set") != NULL) {
+        bsp_display_lock(0);
         if (ctx->wpasec_status_label) {
             lv_label_set_text(ctx->wpasec_status_label,
                 "Add your key to /lab/wpa-sec.txt\nin C5Monster and reboot.");
         }
+        bsp_display_unlock();
         goto done;
     }
 
@@ -40938,13 +41092,15 @@ static void pcap_viewer_progress_cb(uint64_t offset, uint64_t file_size,
         if (percent > 100) percent = 100;
         if (bps >= 1.0 && file_size > offset) {
             char eta_text[24];
+            char rate_text[32];
+            snprintf(rate_text, sizeof(rate_text), "%.0f", bps / 1024.0);
             compromised_format_duration((uint64_t)((double)(file_size - offset) / bps),
                                         eta_text, sizeof(eta_text));
             lv_label_set_text_fmt(state->status_label,
                                   "Indexing packets... %d%%\n%llu packet(s)\n"
-                                  "%.0f KB/s  -  %s left",
+                                  "%s KB/s  -  %s left",
                                   percent, (unsigned long long)packet_count,
-                                  bps / 1024.0, eta_text);
+                                  rate_text, eta_text);
         } else {
             lv_label_set_text_fmt(state->status_label,
                                   "Indexing packets... %d%%\n%llu packet(s)",
@@ -40971,14 +41127,16 @@ static void pcap_viewer_summary_progress_cb(size_t processed_packets,
         if (percent > 100) percent = 100;
         if (pps >= 1.0 && total_packets > processed_packets) {
             char eta_text[24];
+            char rate_text[32];
+            snprintf(rate_text, sizeof(rate_text), "%.0f", pps);
             compromised_format_duration(
                 (uint64_t)((double)(total_packets - processed_packets) / pps),
                 eta_text, sizeof(eta_text));
             lv_label_set_text_fmt(state->status_label,
                                   "Building Zeek-style summary... %d%%\n"
-                                  "%u/%u indexed packets\n%.0f pkt/s  -  %s left",
+                                  "%u/%u indexed packets\n%s pkt/s  -  %s left",
                                   percent, (unsigned)processed_packets,
-                                  (unsigned)total_packets, pps, eta_text);
+                                  (unsigned)total_packets, rate_text, eta_text);
         } else {
             lv_label_set_text_fmt(state->status_label,
                                   "Building Zeek-style summary... %d%%\n%u/%u indexed packets",
@@ -40996,7 +41154,7 @@ static void pcap_viewer_render_load_result_async(void *user_data)
         return;
     }
     state->loading = false;
-    bool usable = (state->load_status == PCAP_READER_OK ||
+    bool usable = state->reader && (state->load_status == PCAP_READER_OK ||
                    state->load_status == PCAP_READER_LIMIT_REACHED ||
                    state->load_status == PCAP_READER_TRUNCATED);
     ESP_LOGI(TAG,
@@ -41043,6 +41201,16 @@ static void pcap_viewer_load_task(void *arg)
              state->selected_path, state->force_reanalyze ? "yes" : "no");
     state->load_status = pcap_reader_open(state->selected_path, &state->reader,
                                           &state->capture_info);
+    /* A truncated global header has no reader. Preserve the open error;
+     * only a truncated packet tail can proceed to summary construction. */
+    if (state->load_status != PCAP_READER_OK) {
+        state->summary_status = state->load_status;
+        state->force_reanalyze = false;
+        state->task = NULL;
+        lv_async_call(pcap_viewer_render_load_result_async, state);
+        vTaskDelete(NULL);
+        return;
+    }
     bool cache_loaded = false;
     if (state->load_status == PCAP_READER_OK && !state->force_reanalyze) {
         pcap_capture_info_t opened_capture_info = state->capture_info;
@@ -43126,12 +43294,14 @@ static void pcap_viewer_show_device_profile(pcap_viewer_state_t *state,
     double active_seconds = dossier.last_time_us >= dossier.first_time_us
                                 ? (double)(dossier.last_time_us - dossier.first_time_us) /
                                       1000000.0 : 0.0;
+    char active_seconds_text[32];
+    snprintf(active_seconds_text, sizeof(active_seconds_text), "%.3f", active_seconds);
     lv_label_set_text_fmt(
         traffic,
-        "Observed activity\n%lu flow(s) | %lu peer(s) | %lu service(s) | %.3f s span\nTX %llu B | RX %llu B",
+        "Observed activity\n%lu flow(s) | %lu peer(s) | %lu service(s) | %s s span\nTX %llu B | RX %llu B",
         (unsigned long)dossier.flow_count,
         (unsigned long)dossier.remote_peer_count,
-        (unsigned long)dossier.service_count, active_seconds,
+        (unsigned long)dossier.service_count, active_seconds_text,
         (unsigned long long)dossier.sent_bytes,
         (unsigned long long)dossier.received_bytes);
     lv_obj_set_width(traffic, lv_pct(100));
@@ -43682,9 +43852,11 @@ static void pcap_viewer_render_investigation(pcap_viewer_state_t *state,
             lv_obj_t *label = lv_label_create(row);
             double relative = event->time_us > 0U && event->time_us >= first_time
                                   ? (double)(event->time_us - first_time) / 1000000.0 : 0.0;
+            char relative_text[40];
+            snprintf(relative_text, sizeof(relative_text), "%.3f", relative);
             lv_label_set_text_fmt(
-                label, "+%.3fs | %s | %s | %s\n%s",
-                relative,
+                label, "+%ss | %s | %s | %s\n%s",
+                relative_text,
                 pcap_investigation_event_name(
                     (pcap_investigation_event_type_t)event->type),
                 pcap_flow_health_name((pcap_health_level_t)event->severity),
@@ -46444,9 +46616,11 @@ static void pcap_viewer_render_capture_page(pcap_viewer_state_t *state)
     pcap_viewer_format_size(state->capture_info.file_size,
                             file_size_text, sizeof(file_size_text));
     lv_obj_t *summary_label = lv_label_create(summary);
+    char duration_text[32];
+    snprintf(duration_text, sizeof(duration_text), "%.3f", duration);
     lv_label_set_text_fmt(summary_label,
                           "#52B6FF %s#  |  PCAP %u.%u %s-endian %s\n"
-                          "#5EDCA3 %llu packets#  |  indexed %lu  |  flows %lu  |  %.3f s  |  %s  |  snaplen %lu%s%s%s\n"
+                          "#5EDCA3 %llu packets#  |  indexed %lu  |  flows %lu  |  %s s  |  %s  |  snaplen %lu%s%s%s\n"
                           "%s",
                           pcap_reader_link_type_name(state->capture_info.link_type),
                           state->capture_info.version_major, state->capture_info.version_minor,
@@ -46457,7 +46631,7 @@ static void pcap_viewer_render_capture_page(pcap_viewer_state_t *state)
                           (unsigned long)state->scan_summary.indexed_packets,
                           state->flow_analysis
                               ? (unsigned long)state->flow_analysis->flow_count : 0UL,
-                          duration, file_size_text,
+                          duration_text, file_size_text,
                           (unsigned long)state->capture_info.snaplen,
                           state->scan_summary.index_limited ? "  |  INDEX LIMITED" : "",
                           state->scan_summary.truncated_tail ? "  |  TRUNCATED TAIL" : "",
@@ -50844,7 +51018,36 @@ static void detect_boards(void)
 
     // Detect each device independently using ping/pong (also snoops JanOS boot banner)
     grove_detected = ping_uart_direct(UART_NUM, "Grove", &grove_ctx);
-    usb_detected = usb_cdc_connected ? ping_usb() : false;  // Must respond to ping, not just be connected
+
+    // A Monster on USB-A powers up together with the Tab5 and can still be in
+    // its own boot/OTA phase when this first probe runs - the port is open and
+    // streaming its boot banner, but it will not answer "ping" with "pong" yet.
+    // Retry a few times inside this one boot probe (detection stays boot-only)
+    // so a slow-booting Monster is still caught. Stop early once it is a GPS
+    // (NMEA stream), which is not a board and never pongs.
+    usb_detected = false;
+    if (usb_cdc_connected) {
+        for (int attempt = 0; attempt < 6 && !usb_detected; attempt++) {
+            if (attempt > 0) {
+                vTaskDelay(pdMS_TO_TICKS(600));
+            }
+            usb_detected = ping_usb();
+            // The USB-A port is JanOS's interactive console, not the machine
+            // port: it prints its boot banner ("JanOS version: X") but does not
+            // answer "ping" with "pong". ping_usb() snoops that banner into
+            // usb_ctx, so a captured version is proof a Monster is on USB-A -
+            // accept it as detection even without a pong.
+            if (!usb_detected && usb_ctx.janos_version[0] != '\0') {
+                usb_detected = true;
+                ESP_LOGI(TAG, "[USB] Monster detected via boot-snoop version %s (console port, no pong)",
+                         usb_ctx.janos_version);
+                break;
+            }
+            if (!usb_detected && (usb_nmea_device_seen || usb_is_known_gps)) {
+                break;  // GPS accessory, not a Monster - no point pinging again
+            }
+        }
+    }
     if (usb_cdc_connected && !usb_detected && usb_debug_logs && !usb_nmea_device_seen && !usb_is_known_gps) {
         usb_log_cdc_state("detect_boards_usb_ping_failed");
     }
@@ -58693,6 +58896,1009 @@ static void compromised_files_sync_cb(lv_event_t *e)
     }
 }
 
+//==================================================================================
+// WPA Handshake Dictionary Cracker (on-device trivial-password check)
+//
+// Pulls the Monster's .hccapx companion for a captured handshake over M-BUS,
+// then tries a small dictionary (SD /lab/wordlist.txt + a built-in common list +
+// a few SSID-derived guesses) against the 4-way handshake MIC using mbedtls.
+//
+// Throughput depends on the device and capture count; display the measured rate.
+//==================================================================================
+
+#define HCCAPX_SIGNATURE      0x58504348u  /* "HCPX", little-endian on disk */
+#define HCCAPX_RECORD_SIZE    393
+#define HS_CRACK_MAX_RECORDS  16
+#define HS_CRACK_LOCAL_HCCAPX "/sdcard/lab/handshakes/_crack_tmp.hccapx"
+#define HS_CRACK_WORDLIST     "/sdcard/lab/wordlist.txt"
+
+typedef struct __attribute__((packed)) {
+    uint32_t signature;
+    uint32_t version;
+    uint8_t  message_pair;
+    uint8_t  essid_len;
+    uint8_t  essid[32];
+    uint8_t  keyver;
+    uint8_t  keymic[16];
+    uint8_t  mac_ap[6];
+    uint8_t  nonce_ap[32];
+    uint8_t  mac_sta[6];
+    uint8_t  nonce_sta[32];
+    uint16_t eapol_len;
+    uint8_t  eapol[256];
+} hccapx_record_t;
+
+_Static_assert(sizeof(hccapx_record_t) == HCCAPX_RECORD_SIZE,
+               "hccapx record must be exactly 393 packed bytes");
+
+typedef struct hs_crack_run hs_crack_run_t;
+
+typedef struct {
+    volatile bool active;
+    volatile bool cancel_requested;
+    TaskHandle_t task;
+    int tab;
+    int64_t last_update_us;
+    bool counting_candidates;
+    uint64_t total_candidates;
+    bool started;
+    bool dual_mode;
+    lv_obj_t *mode_dropdown;
+    hs_crack_run_t *run;
+    const char *candidate_source;
+    char candidate_status[96];
+    lv_timer_t *metrics_timer;
+    lv_obj_t *metrics_label;
+    int64_t metrics_sample_us;
+    uint64_t idle_runtime[2];
+    char remote_pcap_path[WARDRIVE_WIGLE_PATH_MAX];
+    char file_name[96];
+    lv_obj_t *overlay;
+    lv_obj_t *popup;
+    lv_obj_t *status_label;
+    lv_obj_t *detail_label;
+    lv_obj_t *progress_bar;
+    lv_obj_t *action_btn;
+    lv_obj_t *action_label;
+} hs_crack_ui_t;
+
+static hs_crack_ui_t hs_crack_ui;
+static void hs_crack_task(void *arg);
+
+// A short built-in list of common/obvious WPA passphrases (all 8..63 chars, so
+// they clear the PSK length gate). The SD wordlist and SSID guesses extend this.
+static const char *const hs_crack_builtin[] = {
+    "12345678", "123456789", "1234567890", "0123456789", "87654321",
+    "11111111", "00000000", "password", "password1", "password123",
+    "passw0rd", "P@ssw0rd", "qwertyui", "qwerty123", "qwertyuiop",
+    "1qaz2wsx", "zaq12wsx", "1q2w3e4r", "q1w2e3r4", "asdfghjkl",
+    "abcd1234", "a1b2c3d4", "1a2b3c4d", "changeme", "welcome1",
+    "welcome123", "letmein1", "iloveyou", "superman", "football",
+    "baseball", "sunshine", "princess", "dragon12", "monkey12",
+    "computer", "internet", "wireless", "adminadmin", "admin123",
+    "administrator", "linksys123", "netgear123", "guestguest", "homewifi1",
+    "test1234", "root1234", "pass1234", "secret12", "master12",
+};
+
+// PRF-512 block 0 -> the first 16 bytes are the KCK we sign the EAPOL frame with.
+static bool hs_crack_compute_kck(const uint8_t pmk[32], const hccapx_record_t *r, uint8_t kck[16])
+{
+    static const char label[] = "Pairwise key expansion"; // 22 bytes, no NUL in the PRF input
+    const uint8_t *mmin, *mmax, *nmin, *nmax;
+    if (memcmp(r->mac_ap, r->mac_sta, 6) < 0) { mmin = r->mac_ap; mmax = r->mac_sta; }
+    else                                       { mmin = r->mac_sta; mmax = r->mac_ap; }
+    if (memcmp(r->nonce_ap, r->nonce_sta, 32) < 0) { nmin = r->nonce_ap; nmax = r->nonce_sta; }
+    else                                            { nmin = r->nonce_sta; nmax = r->nonce_ap; }
+
+    uint8_t data[100];
+    size_t o = 0;
+    memcpy(data + o, label, 22); o += 22;
+    data[o++] = 0x00;
+    memcpy(data + o, mmin, 6);  o += 6;
+    memcpy(data + o, mmax, 6);  o += 6;
+    memcpy(data + o, nmin, 32); o += 32;
+    memcpy(data + o, nmax, 32); o += 32;
+    data[o++] = 0x00;  // PRF counter i = 0
+    // o == 100
+
+    uint8_t out[20];
+    if (hs_crack_hmac_sha1(pmk, 32, data, o, out) != 0) {
+        return false;
+    }
+    memcpy(kck, out, 16);
+    return true;
+}
+
+static bool hs_crack_record_valid(const hccapx_record_t *r)
+{
+    return r->signature == HCCAPX_SIGNATURE && r->version == 4 &&
+           (r->message_pair & 0x7f) <= 5 && r->essid_len <= 32 &&
+           (r->keyver == 1 || r->keyver == 2) &&
+           r->eapol_len >= 99 && r->eapol_len <= sizeof(r->eapol) &&
+           r->eapol[1] == 3 &&
+           (((unsigned)r->eapol[2] << 8) | r->eapol[3]) + 4 == r->eapol_len &&
+           (r->eapol[6] & 7) == r->keyver;
+}
+
+// 1 match, 0 mismatch, -2 crypto failure. PMK is reused across records
+// sharing an SSID for this candidate only; it is never shared across workers.
+static int hs_crack_test_pmk(const uint8_t pmk[32], const hccapx_record_t *r)
+{
+    uint8_t kck[16] = {0}, mic[20] = {0}, eapol[256];
+    int rc = -2;
+    if (!hs_crack_record_valid(r) || !hs_crack_compute_kck(pmk, r, kck)) goto done;
+    memcpy(eapol, r->eapol, r->eapol_len);
+    memset(eapol + 81, 0, 16);
+    int err = r->keyver == 1 ?
+        mbedtls_md_hmac(mbedtls_md_info_from_type(MBEDTLS_MD_MD5), kck, 16,
+                        eapol, r->eapol_len, mic) :
+        hs_crack_hmac_sha1(kck, 16, eapol, r->eapol_len, mic);
+    if (!err) rc = memcmp(mic, r->keymic, 16) == 0;
+done:
+    mbedtls_platform_zeroize(kck, sizeof(kck));
+    mbedtls_platform_zeroize(mic, sizeof(mic));
+    return rc;
+}
+
+// Returns record index, -1 no match, -2 error, -3 cancellation.
+static int hs_crack_verify_candidate(const char *pw, const hccapx_record_t *recs,
+                                     int nrecs, hs_crack_checkpoint_fn checkpoint, void *arg)
+{
+    uint8_t pmks[HS_CRACK_MAX_RECORDS][32] = {{0}};
+    int result = -1;
+    if (nrecs < 1 || nrecs > HS_CRACK_MAX_RECORDS) return -2;
+    for (int i = 0; i < nrecs; i++) {
+        if (checkpoint && !checkpoint(arg)) { result = -3; break; }
+        if (!hs_crack_record_valid(&recs[i])) { result = -2; break; }
+        int same = -1;
+        for (int j = 0; j < i; j++) {
+            if (recs[j].essid_len == recs[i].essid_len &&
+                !memcmp(recs[j].essid, recs[i].essid, recs[i].essid_len)) {
+                same = j;
+                break;
+            }
+        }
+        if (same >= 0) memcpy(pmks[i], pmks[same], 32);
+        else {
+            int rc = hs_crack_derive_pmk(pw, recs[i].essid, recs[i].essid_len,
+                                        pmks[i], checkpoint, arg);
+            if (rc) { result = rc == -1 ? -3 : -2; break; }
+        }
+        int match = hs_crack_test_pmk(pmks[i], &recs[i]);
+        if (match < 0) { result = -2; break; }
+        if (match) { result = i; break; }
+    }
+    mbedtls_platform_zeroize(pmks, sizeof(pmks));
+    return result;
+}
+
+#ifndef ESP_PLATFORM
+// Direct entry points retained for synthetic host regression vectors.
+static bool hs_crack_test_password(const char *pw, const hccapx_record_t *r)
+{
+    return hs_crack_verify_candidate(pw, r, 1, NULL, NULL) == 0;
+}
+#endif
+
+static int hs_crack_load_records(const char *path, hccapx_record_t *recs, int max_recs)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    int n = 0;
+    while (n < max_recs) {
+        size_t got = fread(&recs[n], 1, sizeof(hccapx_record_t), f);
+        if (got == 0 && !ferror(f)) break;
+        if (got != sizeof(hccapx_record_t) || !hs_crack_record_valid(&recs[n])) {
+            n = -1;
+            break;
+        }
+        n++;
+    }
+    // Do not silently ignore captures beyond the fixed memory budget.
+    if (n == max_recs && fgetc(f) != EOF) n = -1;
+    if (ferror(f)) n = -1;
+    fclose(f);
+    return n;
+}
+
+// Read one whole line, preserving spaces and discarding oversized/binary lines.
+// 1 = candidate, 0 = skipped line, -1 = EOF/cancel, -2 = read error.
+static int hs_crack_read_word(FILE *f, char word[65], const volatile bool *cancel)
+{
+    size_t len = 0;
+#ifdef ESP_PLATFORM
+    unsigned bytes_since_yield = 0;
+#endif
+    bool binary = false;
+    int c = EOF;
+    while (!*cancel && (c = fgetc(f)) != EOF && c != '\n') {
+#ifdef ESP_PLATFORM
+        // Also service idle while discarding an arbitrarily long malformed line.
+        if (++bytes_since_yield == 4096) {
+            bytes_since_yield = 0;
+            vTaskDelay(1);
+        }
+#endif
+        if (c == 0) binary = true;
+        if (len < 64) word[len] = (char)c;
+        if (len < 65) len++;
+    }
+    if (*cancel) return -1;
+    if (ferror(f)) return -2;
+    if (c == EOF && len == 0) return -1;
+    if (len <= 64 && len && word[len - 1] == '\r') len--;
+    if (binary || len < 8 || len > 63) return 0;
+    word[len] = '\0';
+    return 1;
+}
+
+#ifndef ESP_PLATFORM
+static int hs_crack_try_candidate(const char *pw, const hccapx_record_t *recs, int nrecs)
+{
+    int rc = hs_crack_verify_candidate(pw, recs, nrecs, NULL, NULL);
+    return rc >= 0 ? rc : -1;
+}
+#endif
+
+// UINT64_MAX means that no measured estimate is available yet.
+static uint64_t hs_crack_eta_seconds(uint64_t total, uint32_t tried, int64_t elapsed_us)
+{
+    if (total <= tried) return 0;
+    if (!tried || elapsed_us <= 0) return UINT64_MAX;
+    double seconds = (double)(total - tried) * (double)elapsed_us / (1000000.0 * tried);
+    if (seconds >= (double)UINT64_MAX) return UINT64_MAX;
+    uint64_t rounded = (uint64_t)seconds;
+    return rounded + (seconds > (double)rounded);
+}
+
+static void hs_crack_set_stage(const char *status, const char *detail, int bar_value)
+{
+    if (!bsp_display_lock(200)) return;
+    if (hs_crack_ui.status_label && lv_obj_is_valid(hs_crack_ui.status_label) && status) {
+        lv_label_set_text(hs_crack_ui.status_label, status);
+    }
+    if (hs_crack_ui.detail_label && lv_obj_is_valid(hs_crack_ui.detail_label) && detail) {
+        lv_label_set_text(hs_crack_ui.detail_label, detail);
+    }
+    if (hs_crack_ui.progress_bar && lv_obj_is_valid(hs_crack_ui.progress_bar) && bar_value >= 0) {
+        lv_obj_clear_flag(hs_crack_ui.progress_bar, LV_OBJ_FLAG_HIDDEN);
+        lv_bar_set_value(hs_crack_ui.progress_bar, bar_value, LV_ANIM_OFF);
+    }
+    if (hs_crack_ui.progress_bar && bar_value < 0) {
+        // Total dictionary size is unknown; the tried count and measured rate
+        // are progress, not a percentage that wraps back to zero.
+        lv_obj_add_flag(hs_crack_ui.progress_bar, LV_OBJ_FLAG_HIDDEN);
+    }
+    bsp_display_unlock();
+}
+
+// Called by the LVGL timer, independently of the password worker. All fields
+// below belong to the display thread; no extra task or heap snapshot is needed.
+static void hs_crack_metrics_update(lv_timer_t *timer)
+{
+    (void)timer;
+    if (!hs_crack_ui.metrics_label) return;
+    char cpu[64] = "CPU0 --  CPU1 --";
+#if configUSE_TRACE_FACILITY && configGENERATE_RUN_TIME_STATS && \
+    CONFIG_FREERTOS_RUN_TIME_STATS_USING_ESP_TIMER && !CONFIG_FREERTOS_SMP && !CONFIG_FREERTOS_UNICORE
+    int64_t now = esp_timer_get_time();
+    int64_t elapsed = now - hs_crack_ui.metrics_sample_us;
+    unsigned busy[2] = {0, 0};
+    for (int core = 0; core < 2; core++) {
+        TaskStatus_t idle;
+        vTaskGetInfo(xTaskGetIdleTaskHandleForCore(core), &idle, pdFALSE, eInvalid);
+        // Subtract in the configured counter width to handle a single wrap.
+        configRUN_TIME_COUNTER_TYPE idle_delta = idle.ulRunTimeCounter -
+            (configRUN_TIME_COUNTER_TYPE)hs_crack_ui.idle_runtime[core];
+        hs_crack_ui.idle_runtime[core] = idle.ulRunTimeCounter;
+        if (elapsed > 0 && elapsed <= UINT32_MAX) {
+            double idle_percent = 100.0 * (double)idle_delta / (double)elapsed;
+            busy[core] = idle_percent >= 100.0 ? 0 : (unsigned)(100.0 - idle_percent + 0.5);
+        }
+    }
+    if (hs_crack_ui.metrics_sample_us && elapsed > 0 && elapsed <= UINT32_MAX) {
+        snprintf(cpu, sizeof(cpu), "CPU0 %u%%  CPU1 %u%%", busy[0], busy[1]);
+    }
+    hs_crack_ui.metrics_sample_us = now;
+#endif
+    const uint32_t ram_caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
+    const uint32_t psram_caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
+    size_t ram_total = heap_caps_get_total_size(ram_caps);
+    size_t ram_free = heap_caps_get_free_size(ram_caps);
+    size_t psram_total = heap_caps_get_total_size(psram_caps);
+    size_t psram_free = heap_caps_get_free_size(psram_caps);
+    size_t ram_used = ram_total > ram_free ? ram_total - ram_free : 0;
+    size_t psram_used = psram_total > psram_free ? psram_total - psram_free : 0;
+    char text[256];
+    snprintf(text, sizeof(text),
+             "%s | %d MHz\nRAM %lu/%lu KiB | PSRAM %.1f/%.1f MiB\n"
+             "DMA free %lu KiB | Largest RAM block %lu KiB",
+             cpu, esp_clk_cpu_freq() / 1000000,
+             (unsigned long)(ram_used / 1024), (unsigned long)(ram_total / 1024),
+             (double)psram_used / 1048576.0, (double)psram_total / 1048576.0,
+             (unsigned long)(heap_caps_get_free_size(MALLOC_CAP_DMA) / 1024),
+             (unsigned long)(heap_caps_get_largest_free_block(ram_caps) / 1024));
+    lv_label_set_text(hs_crack_ui.metrics_label, text);
+}
+
+static void hs_crack_metrics_stop(void)
+{
+    if (hs_crack_ui.metrics_timer) {
+        lv_timer_delete(hs_crack_ui.metrics_timer);
+        hs_crack_ui.metrics_timer = NULL;
+    }
+}
+
+// Caller owns the LVGL lock (including the task-start failure callback).
+static void hs_crack_finish_ui_unlocked(bool found, const char *status, const char *detail)
+{
+    hs_crack_metrics_stop();
+    hs_crack_ui.active = false;
+    alert_chime_play(found ? ALERT_TONE_WIN : ALERT_TONE_WARN);
+    if (hs_crack_ui.status_label && lv_obj_is_valid(hs_crack_ui.status_label)) {
+        lv_label_set_text(hs_crack_ui.status_label,
+                          status);
+        lv_obj_set_style_text_color(hs_crack_ui.status_label,
+                                    found ? COLOR_MATERIAL_GREEN : COLOR_MATERIAL_AMBER, 0);
+    }
+    if (hs_crack_ui.detail_label && lv_obj_is_valid(hs_crack_ui.detail_label)) {
+        lv_label_set_text(hs_crack_ui.detail_label, detail ? detail : "");
+    }
+    if (hs_crack_ui.progress_bar && lv_obj_is_valid(hs_crack_ui.progress_bar)) {
+        lv_bar_set_value(hs_crack_ui.progress_bar, 100, LV_ANIM_OFF);
+    }
+    if (hs_crack_ui.action_btn && lv_obj_is_valid(hs_crack_ui.action_btn)) {
+        lv_obj_clear_state(hs_crack_ui.action_btn, LV_STATE_DISABLED);
+        lv_obj_set_style_bg_color(hs_crack_ui.action_btn,
+                                  found ? COLOR_MATERIAL_GREEN : COLOR_MATERIAL_BLUE, 0);
+    }
+    if (hs_crack_ui.action_label && lv_obj_is_valid(hs_crack_ui.action_label)) {
+        lv_label_set_text(hs_crack_ui.action_label, "Close");
+    }
+}
+
+static void hs_crack_overlay_deleted_cb(lv_event_t *e)
+{
+    if (lv_event_get_target(e) != hs_crack_ui.overlay) return;
+    hs_crack_metrics_stop();
+    hs_crack_ui.metrics_label = NULL;
+    hs_crack_ui.mode_dropdown = NULL;
+    hs_crack_ui.cancel_requested = true;
+    hs_crack_ui.overlay = NULL;
+    hs_crack_ui.popup = NULL;
+    hs_crack_ui.status_label = NULL;
+    hs_crack_ui.detail_label = NULL;
+    hs_crack_ui.progress_bar = NULL;
+    hs_crack_ui.action_btn = NULL;
+    hs_crack_ui.action_label = NULL;
+}
+
+static void hs_crack_close_or_cancel_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!hs_crack_ui.started) {
+        hs_crack_ui.dual_mode = lv_dropdown_get_selected(hs_crack_ui.mode_dropdown) == 1;
+        hs_crack_ui.started = true;
+        hs_crack_ui.active = true;
+        lv_obj_add_state(hs_crack_ui.mode_dropdown, LV_STATE_DISABLED);
+        lv_label_set_text(hs_crack_ui.action_label, "Cancel");
+        if (xTaskCreate(hs_crack_task, "hs_crack", 12288, NULL, 4, &hs_crack_ui.task) != pdPASS) {
+            hs_crack_ui.task = NULL;
+            hs_crack_finish_ui_unlocked(false, "Check failed", "Could not start coordinator.");
+        }
+        return;
+    }
+    if (hs_crack_ui.active) {
+        hs_crack_ui.cancel_requested = true;
+        if (hs_crack_ui.action_btn && lv_obj_is_valid(hs_crack_ui.action_btn)) {
+            lv_obj_add_state(hs_crack_ui.action_btn, LV_STATE_DISABLED);
+        }
+        if (hs_crack_ui.action_label && lv_obj_is_valid(hs_crack_ui.action_label)) {
+            lv_label_set_text(hs_crack_ui.action_label, "Cancelling...");
+        }
+        return;
+    }
+    if (hs_crack_ui.overlay && lv_obj_is_valid(hs_crack_ui.overlay)) {
+        lv_obj_del(hs_crack_ui.overlay);
+    }
+    hs_crack_ui.overlay = NULL;
+    hs_crack_ui.popup = NULL;
+    hs_crack_ui.status_label = NULL;
+    hs_crack_ui.detail_label = NULL;
+    hs_crack_ui.progress_bar = NULL;
+    hs_crack_ui.action_btn = NULL;
+    hs_crack_ui.action_label = NULL;
+}
+
+static void hs_crack_dismiss_cb(lv_event_t *e)
+{
+    (void)e;
+    if (hs_crack_ui.overlay) lv_obj_del(hs_crack_ui.overlay);
+}
+
+static void hs_crack_show_popup(const char *file_name)
+{
+    hs_crack_ui.overlay = lv_obj_create(lv_scr_act());
+    lv_obj_add_event_cb(hs_crack_ui.overlay, hs_crack_overlay_deleted_cb, LV_EVENT_DELETE, NULL);
+    lv_obj_remove_style_all(hs_crack_ui.overlay);
+    lv_obj_set_size(hs_crack_ui.overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(hs_crack_ui.overlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(hs_crack_ui.overlay, LV_OPA_60, 0);
+    lv_obj_add_flag(hs_crack_ui.overlay, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(hs_crack_ui.overlay, LV_OBJ_FLAG_SCROLLABLE);
+
+    hs_crack_ui.popup = lv_obj_create(hs_crack_ui.overlay);
+    lv_obj_set_size(hs_crack_ui.popup, popup_clamp_w(680), popup_clamp_h(640));
+    lv_obj_center(hs_crack_ui.popup);
+    style_surface_panel(hs_crack_ui.popup, 16);
+    lv_obj_set_style_pad_all(hs_crack_ui.popup, 24, 0);
+    lv_obj_set_flex_flow(hs_crack_ui.popup, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(hs_crack_ui.popup, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(hs_crack_ui.popup, 16, 0);
+    lv_obj_add_flag(hs_crack_ui.popup, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(hs_crack_ui.popup);
+    lv_label_set_text(title, LV_SYMBOL_KEYBOARD " Crack handshake (dictionary)");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_PURPLE, 0);
+
+    lv_obj_t *name = lv_label_create(hs_crack_ui.popup);
+    lv_label_set_text(name, file_name ? file_name : "handshake");
+    lv_obj_set_width(name, lv_pct(100));
+    lv_label_set_long_mode(name, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_align(name, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(name, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(name, ui_text_color(), 0);
+
+    hs_crack_ui.mode_dropdown = lv_dropdown_create(hs_crack_ui.popup);
+    lv_dropdown_set_options(hs_crack_ui.mode_dropdown, "Single (CPU1)\nDual (CPU0 + CPU1)");
+    lv_dropdown_set_selected(hs_crack_ui.mode_dropdown, hs_crack_ui.dual_mode ? 1 : 0);
+    lv_obj_set_width(hs_crack_ui.mode_dropdown, lv_pct(100));
+#if CONFIG_FREERTOS_UNICORE
+    lv_dropdown_set_selected(hs_crack_ui.mode_dropdown, 0);
+    lv_obj_add_state(hs_crack_ui.mode_dropdown, LV_STATE_DISABLED);
+#endif
+    hs_crack_ui.status_label = lv_label_create(hs_crack_ui.popup);
+    lv_label_set_text(hs_crack_ui.status_label, "Choose mode and press Start");
+    lv_obj_set_width(hs_crack_ui.status_label, lv_pct(100));
+    lv_label_set_long_mode(hs_crack_ui.status_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(hs_crack_ui.status_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(hs_crack_ui.status_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(hs_crack_ui.status_label, COLOR_MATERIAL_AMBER, 0);
+
+    hs_crack_ui.progress_bar = lv_bar_create(hs_crack_ui.popup);
+    lv_obj_set_size(hs_crack_ui.progress_bar, lv_pct(100), 20);
+    lv_bar_set_range(hs_crack_ui.progress_bar, 0, 100);
+    lv_bar_set_value(hs_crack_ui.progress_bar, 0, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(hs_crack_ui.progress_bar, ui_card_color(), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(hs_crack_ui.progress_bar, COLOR_MATERIAL_PURPLE, LV_PART_INDICATOR);
+
+    hs_crack_ui.detail_label = lv_label_create(hs_crack_ui.popup);
+    lv_label_set_text(hs_crack_ui.detail_label,
+                      "Trivial-password check only. Serious cracking: wpa-sec / hashcat.");
+    lv_obj_set_width(hs_crack_ui.detail_label, lv_pct(100));
+    lv_label_set_long_mode(hs_crack_ui.detail_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(hs_crack_ui.detail_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(hs_crack_ui.detail_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(hs_crack_ui.detail_label, ui_muted_color(), 0);
+
+    hs_crack_ui.metrics_label = lv_label_create(hs_crack_ui.popup);
+    lv_obj_set_width(hs_crack_ui.metrics_label, lv_pct(100));
+    lv_label_set_long_mode(hs_crack_ui.metrics_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(hs_crack_ui.metrics_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(hs_crack_ui.metrics_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(hs_crack_ui.metrics_label, ui_muted_color(), 0);
+    hs_crack_ui.metrics_sample_us = 0;
+    hs_crack_metrics_update(NULL);
+    hs_crack_ui.metrics_timer = lv_timer_create(hs_crack_metrics_update, 1000, NULL);
+
+    hs_crack_ui.action_btn = lv_btn_create(hs_crack_ui.popup);
+    lv_obj_set_size(hs_crack_ui.action_btn, 180, 48);
+    style_danger_button(hs_crack_ui.action_btn);
+    lv_obj_add_event_cb(hs_crack_ui.action_btn, hs_crack_close_or_cancel_cb, LV_EVENT_CLICKED, NULL);
+
+    hs_crack_ui.action_label = lv_label_create(hs_crack_ui.action_btn);
+    lv_label_set_text(hs_crack_ui.action_label, "Start");
+    lv_obj_set_style_text_font(hs_crack_ui.action_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(hs_crack_ui.action_label, lv_color_white(), 0);
+    lv_obj_center(hs_crack_ui.action_label);
+    lv_obj_t *dismiss = lv_btn_create(hs_crack_ui.popup);
+    lv_obj_set_size(dismiss, 180, 40);
+    lv_obj_add_event_cb(dismiss, hs_crack_dismiss_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *dismiss_label = lv_label_create(dismiss);
+    lv_label_set_text(dismiss_label, "Dismiss / stop");
+    lv_obj_center(dismiss_label);
+}
+
+static void hs_crack_set_source(const char *source, uint32_t tried)
+{
+    hs_crack_ui.candidate_source = source;
+    snprintf(hs_crack_ui.candidate_status, sizeof(hs_crack_ui.candidate_status),
+             "%s: %s", hs_crack_ui.counting_candidates ? "Counting" : "Checking", source);
+    int percent = hs_crack_ui.total_candidates ?
+                  (int)(100.0 * (double)tried / (double)hs_crack_ui.total_candidates) : 0;
+    hs_crack_set_stage(hs_crack_ui.candidate_status, NULL,
+                       hs_crack_ui.counting_candidates ? -1 : (percent > 100 ? 100 : percent));
+}
+
+// Runs one candidate, updates the tried counter and periodic progress, and
+// reports a hit. Returns true when the caller should stop (found or cancelled).
+typedef struct {
+    char password[64];
+    const char *source;
+    int match;
+    int core;
+    int64_t elapsed_us;
+} hs_crack_job_t;
+
+typedef struct {
+    hs_crack_run_t *run;
+    int core;
+    int64_t slice_started;
+} hs_crack_worker_t;
+
+struct hs_crack_run {
+    QueueHandle_t jobs, results;
+    TaskHandle_t coordinator;
+    atomic_bool stop;
+    const hccapx_record_t *records;
+    int record_count;
+    unsigned workers, pending;
+    bool error;
+    hs_crack_worker_t worker[2];
+};
+
+static bool hs_crack_checkpoint(void *arg)
+{
+    hs_crack_worker_t *worker = arg;
+    if (atomic_load(&worker->run->stop)) return false;
+    int64_t now = esp_timer_get_time();
+    int64_t slice_us = worker->core == 0 ? 19000 : 49000;
+    if (now - worker->slice_started >= slice_us) {
+        // A real blocking interval lets IDLE run; taskYIELD alone cannot do so.
+        int64_t resume_after = now + 1000;
+        do { vTaskDelay(1); } while (esp_timer_get_time() < resume_after);
+        worker->slice_started = esp_timer_get_time();
+    }
+    return !atomic_load(&worker->run->stop);
+}
+
+static void hs_crack_worker_task(void *arg)
+{
+    hs_crack_worker_t *worker = arg;
+    hs_crack_run_t *run = worker->run;
+    hs_crack_job_t job = {0};
+    while (!atomic_load(&run->stop)) {
+        if (xQueueReceive(run->jobs, &job, pdMS_TO_TICKS(20)) != pdTRUE) continue;
+        worker->slice_started = esp_timer_get_time();
+        int64_t start = worker->slice_started;
+        job.match = hs_crack_verify_candidate(job.password, run->records,
+                                              run->record_count, hs_crack_checkpoint, worker);
+        job.elapsed_us = esp_timer_get_time() - start;
+        job.core = worker->core;
+        if (job.match == -3) break;
+        while (!atomic_load(&run->stop) &&
+               xQueueSend(run->results, &job, pdMS_TO_TICKS(20)) != pdTRUE) {}
+        mbedtls_platform_zeroize(&job, sizeof(job));
+        // Also service idle when a whole candidate finishes inside one slice.
+        vTaskDelay(1);
+    }
+    mbedtls_platform_zeroize(&job, sizeof(job));
+    TaskHandle_t coordinator = run->coordinator;
+    // No accesses to run/worker after this notification: coordinator may free them.
+    xTaskNotifyGive(coordinator);
+    vTaskDelete(NULL);
+}
+
+static void hs_crack_workers_stop(void)
+{
+    hs_crack_run_t *run = hs_crack_ui.run;
+    if (!run) return;
+    atomic_store(&run->stop, true);
+    for (unsigned i = 0; i < run->workers; i++) {
+        while (!ulTaskNotifyTake(pdFALSE, pdMS_TO_TICKS(50))) {}
+    }
+    hs_crack_job_t discarded;
+    if (run->jobs) {
+        while (xQueueReceive(run->jobs, &discarded, 0) == pdTRUE) {}
+        vQueueDelete(run->jobs);
+    }
+    if (run->results) {
+        while (xQueueReceive(run->results, &discarded, 0) == pdTRUE) {}
+        vQueueDelete(run->results);
+    }
+    mbedtls_platform_zeroize(&discarded, sizeof(discarded));
+    free(run);
+    hs_crack_ui.run = NULL;
+}
+
+static bool hs_crack_workers_start(const hccapx_record_t *recs, int nrecs)
+{
+    hs_crack_run_t *run = calloc(1, sizeof(*run));
+    if (!run) return false;
+    hs_crack_ui.run = run;
+    atomic_init(&run->stop, false);
+    run->coordinator = xTaskGetCurrentTaskHandle();
+    (void)ulTaskNotifyTake(pdTRUE, 0);
+    run->records = recs;
+    run->record_count = nrecs;
+    run->jobs = xQueueCreate(4, sizeof(hs_crack_job_t));
+    run->results = xQueueCreate(4, sizeof(hs_crack_job_t));
+    if (!run->jobs || !run->results) goto fail;
+    unsigned count = hs_crack_ui.dual_mode ? 2 : 1;
+    for (unsigned i = 0; i < count; i++) {
+        run->worker[i].run = run;
+        run->worker[i].core = i == 0 ? 1 : 0;
+#if CONFIG_FREERTOS_UNICORE
+        run->worker[i].core = 0;
+#endif
+        if (xTaskCreatePinnedToCore(hs_crack_worker_task, i == 0 ? "hs_cpu1" : "hs_cpu0",
+                                   8192, &run->worker[i], 3, NULL,
+                                   run->worker[i].core) != pdPASS) goto fail;
+        run->workers++;
+    }
+    ESP_LOGI(TAG, "[HS-CRACK] mode=%s workers=%u software SHA1; CPU0 19ms/1ms, CPU1 49ms/1ms",
+             hs_crack_ui.dual_mode ? "Dual" : "Single", run->workers);
+    return true;
+fail:
+    hs_crack_workers_stop();
+    return false;
+}
+
+static void hs_crack_progress(const char *pw, uint32_t tried, int64_t t0)
+{
+    int64_t now = esp_timer_get_time();
+    if (now - hs_crack_ui.last_update_us < 250000) return;
+    hs_crack_ui.last_update_us = now;
+    int64_t elapsed = now - t0;
+    double rate = elapsed > 0 ? tried * 1000000.0 / elapsed : 0;
+    char detail[192], eta_text[48];
+    uint64_t eta = hs_crack_eta_seconds(hs_crack_ui.total_candidates, tried, elapsed);
+    if (eta == UINT64_MAX) snprintf(eta_text, sizeof(eta_text), "calculating...");
+    else compromised_format_duration(eta, eta_text, sizeof(eta_text));
+    snprintf(detail, sizeof(detail), "Tried %lu / %llu - %.2f/s (%.1f s/try)\nETA: %s\nLast: %.20s",
+             (unsigned long)tried, (unsigned long long)hs_crack_ui.total_candidates,
+             rate, tried ? elapsed / (1000000.0 * tried) : 0, eta_text, pw);
+    int percent = hs_crack_ui.total_candidates ?
+        (int)(100.0 * tried / hs_crack_ui.total_candidates) : 0;
+    hs_crack_set_stage(hs_crack_ui.candidate_status, detail, percent > 100 ? 100 : percent);
+}
+
+// Only the coordinator publishes results, counts completions and changes sources.
+static bool hs_crack_collect(uint32_t *tried, int64_t t0, int *found_idx,
+                              char *found_pw, size_t size, bool drain)
+{
+    hs_crack_run_t *run = hs_crack_ui.run;
+    if (!run) return hs_crack_ui.cancel_requested;
+    hs_crack_job_t result;
+    while (run->pending) {
+        if (hs_crack_ui.cancel_requested) { atomic_store(&run->stop, true); return true; }
+        if (xQueueReceive(run->results, &result, drain ? pdMS_TO_TICKS(20) : 0) != pdTRUE) {
+            if (drain) continue;
+            break;
+        }
+        run->pending--;
+        if (result.match == -2) run->error = true;
+        else (*tried)++;
+        if (*tried <= 3 || (*tried % 32u) == 0) {
+            ESP_LOGI(TAG, "[HS-CRACK] completed=%lu core=%d candidate=%lldus",
+                     (unsigned long)*tried, result.core, (long long)result.elapsed_us);
+        }
+        if (result.match >= 0) {
+            *found_idx = result.match;
+            snprintf(found_pw, size, "%s", result.password);
+            hs_crack_ui.candidate_source = result.source;
+        }
+        bool stop = run->error || result.match >= 0;
+        if (!stop) hs_crack_progress(result.password, *tried, t0);
+        mbedtls_platform_zeroize(&result, sizeof(result));
+        if (stop) { atomic_store(&run->stop, true); return true; }
+    }
+    return hs_crack_ui.cancel_requested;
+}
+
+static bool hs_crack_step(const char *pw, const hccapx_record_t *recs, int nrecs,
+                          uint32_t *tried, int64_t t0, int *found_idx, char *found_pw,
+                          size_t found_pw_sz)
+{
+    if (hs_crack_ui.cancel_requested) return true;
+    size_t pwlen = strlen(pw);
+    if (pwlen < 8 || pwlen > 63) return false;
+    if (hs_crack_ui.counting_candidates) {
+        hs_crack_ui.total_candidates++;
+        if ((hs_crack_ui.total_candidates % 1024u) == 0) {
+            char detail[96];
+            snprintf(detail, sizeof(detail), "%llu valid candidates counted; no password checks yet.",
+                     (unsigned long long)hs_crack_ui.total_candidates);
+            hs_crack_set_stage(hs_crack_ui.candidate_status, detail, -1);
+            vTaskDelay(1);
+        }
+        return false;
+    }
+    (void)recs; (void)nrecs;
+    hs_crack_run_t *run = hs_crack_ui.run;
+    hs_crack_job_t job = {0};
+    snprintf(job.password, sizeof(job.password), "%s", pw);
+    job.source = hs_crack_ui.candidate_source;
+    bool stop = false;
+    while (!(stop = hs_crack_collect(tried, t0, found_idx, found_pw, found_pw_sz, false))) {
+        if (xQueueSend(run->jobs, &job, pdMS_TO_TICKS(10)) == pdTRUE) {
+            run->pending++;
+            break;
+        }
+    }
+    mbedtls_platform_zeroize(&job, sizeof(job));
+    return stop;
+}
+
+static void hs_crack_task(void *arg)
+{
+    (void)arg;
+    tab_id_t tab = (tab_id_t)hs_crack_ui.tab;
+    uart_port_t uart_port = uart_port_for_tab(tab);
+    bool usb_lock_set = false;
+    hccapx_record_t *recs = NULL;
+    int nrecs = 0;
+    int found_idx = -1;
+    char found_pw[64] = {0};
+    char final_detail[256] = {0};
+    const char *final_status = "Check failed";
+    char ssid[33] = {0};
+    uint32_t tried = 0;
+    int64_t t0 = 0;
+    bool sd_wordlist_used = false;
+
+    // Build the remote .hccapx path from the .pcap path.
+    char remote_hccapx[WARDRIVE_WIGLE_PATH_MAX];
+    snprintf(remote_hccapx, sizeof(remote_hccapx), "%s", hs_crack_ui.remote_pcap_path);
+    char *dot = strrchr(remote_hccapx, '.');
+    if (!dot || !str_ends_with_ext(remote_hccapx, ".pcap") ||
+        (size_t)(dot - remote_hccapx) + sizeof(".hccapx") > sizeof(remote_hccapx)) {
+        snprintf(final_detail, sizeof(final_detail), "Not a .pcap handshake file.");
+        goto finish;
+    }
+    snprintf(dot, sizeof(remote_hccapx) - (size_t)(dot - remote_hccapx), ".hccapx");
+
+    // Fetch the companion over M-BUS (tiny file, so Wi-Fi/portal is not needed).
+    unlink(HS_CRACK_LOCAL_HCCAPX);
+    unlink(HS_CRACK_LOCAL_HCCAPX ".part");
+    compromised_transport_lock_begin(tab, uart_port, &usb_lock_set);
+    hs_crack_set_stage("Fetching handshake...", "Copying .hccapx from Monster over M-BUS", 0);
+    transport_write_bytes_tab(tab, uart_port, "stop\r\n", 6);
+    char stop_response[512];
+    (void)home_collect_uart_response(tab, uart_port, stop_response, sizeof(stop_response), 2500);
+
+    janos_file_transfer_result_t result = {0};
+    esp_err_t err = janos_uart_download(tab, uart_port, remote_hccapx, HS_CRACK_LOCAL_HCCAPX,
+                                        0, &hs_crack_ui.cancel_requested, &result);
+    compromised_transport_lock_end(usb_lock_set);
+    usb_lock_set = false;
+
+    if (hs_crack_ui.cancel_requested) {
+        snprintf(final_detail, sizeof(final_detail), "Cancelled.");
+        goto finish;
+    }
+    if (err != ESP_OK) {
+        snprintf(final_detail, sizeof(final_detail),
+                 "Could not fetch .hccapx (%s).\nNeed a complete 4-way capture on the Monster.",
+                 esp_err_to_name(err));
+        goto finish;
+    }
+
+    recs = heap_caps_calloc(HS_CRACK_MAX_RECORDS, sizeof(hccapx_record_t), MALLOC_CAP_SPIRAM);
+    if (!recs) {
+        recs = calloc(HS_CRACK_MAX_RECORDS, sizeof(hccapx_record_t));
+    }
+    if (!recs) {
+        snprintf(final_detail, sizeof(final_detail), "Out of memory.");
+        goto finish;
+    }
+    nrecs = hs_crack_load_records(HS_CRACK_LOCAL_HCCAPX, recs, HS_CRACK_MAX_RECORDS);
+    if (nrecs <= 0) {
+        snprintf(final_detail, sizeof(final_detail),
+                 "Need 1-16 valid hccapx v4 records (WPA/WPA2 keyver 1 or 2).\nPMKID and keyver 3 are not supported.");
+        goto finish;
+    }
+
+    uint8_t ssid_len = recs[0].essid_len > 32 ? 32 : recs[0].essid_len;
+    memcpy(ssid, recs[0].essid, ssid_len);
+
+run_candidates:
+    // Both passes use the exact same enumeration and length/line filters.
+    // The first only counts; transfer and counting time are excluded from ETA.
+    t0 = esp_timer_get_time();
+    hs_crack_set_stage(hs_crack_ui.counting_candidates ? "Counting candidates..." : "Trying passwords...",
+                       hs_crack_ui.counting_candidates ? "Reading lists; ETA will follow the first completed attempt."
+                                                       : "SSID variants first; ETA calculating...", 0);
+
+    // 1) SSID-derived guesses for each distinct, printable SSID.
+    hs_crack_set_source("SSID variants", tried);
+    for (int record_index = 0; record_index < nrecs; record_index++) {
+        const hccapx_record_t *record = &recs[record_index];
+        if (!record->essid_len || memchr(record->essid, 0, record->essid_len)) continue;
+        bool duplicate = false;
+        for (int previous = 0; previous < record_index; previous++) {
+            if (recs[previous].essid_len == record->essid_len &&
+                memcmp(recs[previous].essid, record->essid, record->essid_len) == 0) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) continue;
+        char guess_ssid[33] = {0};
+        memcpy(guess_ssid, record->essid, record->essid_len);
+        static const char *const suffixes[] = {
+            "", "1", "12", "123", "1234", "12345", "123456", "1234567", "12345678",
+            "2020", "2021", "2022", "2023", "2024", "2025", "2026",
+            "!", "@123", "wifi", "admin",
+            "1234@", "1234%", "1234#", "1234!", "1234^", "1234&", "1234*",
+            "1234(", "1234)", "1234_", "1234-", "1234+", "1234=",
+        };
+        for (size_t i = 0; i < sizeof(suffixes) / sizeof(suffixes[0]); i++) {
+            char cand[64];
+            snprintf(cand, sizeof(cand), "%s%s", guess_ssid, suffixes[i]);
+            if (hs_crack_step(cand, recs, nrecs, &tried, t0,
+                              &found_idx, found_pw, sizeof(found_pw))) {
+                goto done;
+            }
+        }
+    }
+
+    // 2) Built-in common list.
+    if (hs_crack_collect(&tried, t0, &found_idx, found_pw, sizeof(found_pw), true)) goto done;
+    hs_crack_set_source("Generic (built-in)", tried);
+    for (size_t i = 0; i < sizeof(hs_crack_builtin) / sizeof(hs_crack_builtin[0]); i++) {
+        if (hs_crack_step(hs_crack_builtin[i], recs, nrecs, &tried, t0,
+                          &found_idx, found_pw, sizeof(found_pw))) {
+            goto done;
+        }
+    }
+
+    // 3) SD wordlist, one passphrase per line.
+    if (hs_crack_collect(&tried, t0, &found_idx, found_pw, sizeof(found_pw), true)) goto done;
+    hs_crack_set_source("SD: /lab/wordlist.txt", tried);
+    FILE *wl = fopen(HS_CRACK_WORDLIST, "r");
+    if (wl) {
+        sd_wordlist_used = true;
+        char line[65];
+        int read_status;
+        uint32_t lines_read = 0;
+        while ((read_status = hs_crack_read_word(wl, line, &hs_crack_ui.cancel_requested)) >= 0) {
+            if ((++lines_read % 128u) == 0) vTaskDelay(1);
+            if (read_status == 0) continue;
+            if (hs_crack_step(line, recs, nrecs, &tried, t0,
+                              &found_idx, found_pw, sizeof(found_pw))) {
+                break;
+            }
+        }
+        if (read_status == -2) {
+            snprintf(final_detail, sizeof(final_detail), "Could not read /lab/wordlist.txt.");
+        }
+        fclose(wl);
+    } else if (errno != ENOENT) {
+        snprintf(final_detail, sizeof(final_detail), "Could not open /lab/wordlist.txt.");
+    }
+
+done:
+    if (final_detail[0]) goto finish;
+    if (hs_crack_ui.counting_candidates && !hs_crack_ui.cancel_requested) {
+        if (!hs_crack_workers_start(recs, nrecs)) {
+            snprintf(final_detail, sizeof(final_detail), "Insufficient RAM for workers. Close this dialog and retry Single mode.");
+            goto finish;
+        }
+        hs_crack_ui.counting_candidates = false;
+        hs_crack_ui.last_update_us = 0;
+        goto run_candidates;
+    }
+    if (found_idx < 0 && hs_crack_ui.run && !hs_crack_ui.run->error)
+        (void)hs_crack_collect(&tried, t0, &found_idx, found_pw, sizeof(found_pw), true);
+    if (hs_crack_ui.run && hs_crack_ui.run->error) {
+        snprintf(final_detail, sizeof(final_detail), "Cryptographic verification failed; result is incomplete.");
+        goto finish;
+    }
+    if (found_idx >= 0) {
+        final_status = "Password found!";
+        memset(ssid, 0, sizeof(ssid));
+        memcpy(ssid, recs[found_idx].essid, recs[found_idx].essid_len);
+        snprintf(final_detail, sizeof(final_detail),
+                 "SSID: %s\nPassword: %s\nSource: %s\n(%lu tried)",
+                 ssid, found_pw, hs_crack_ui.candidate_source, (unsigned long)tried);
+    } else if (hs_crack_ui.cancel_requested) {
+        final_status = "Cancelled";
+        snprintf(final_detail, sizeof(final_detail),
+                 "Cancelled after %lu passwords.", (unsigned long)tried);
+    } else {
+        final_status = "Not in dictionary";
+        snprintf(final_detail, sizeof(final_detail),
+                 "SSID: %s\n%lu passwords tried, no match.\n%s",
+                 ssid, (unsigned long)tried,
+                 sd_wordlist_used ? "SD dictionary exhausted." : "No /lab/wordlist.txt; built-in + SSID guesses only.");
+    }
+
+finish:
+    if (usb_lock_set) {
+        compromised_transport_lock_end(usb_lock_set);
+    }
+    hs_crack_workers_stop();
+    free(recs);
+    unlink(HS_CRACK_LOCAL_HCCAPX);
+    unlink(HS_CRACK_LOCAL_HCCAPX ".part");
+    // Publish completion atomically with the Close button, even if LVGL was busy.
+    while (!bsp_display_lock(200)) vTaskDelay(1);
+    if (hs_crack_ui.cancel_requested && found_idx < 0) final_status = "Cancelled";
+    hs_crack_ui.task = NULL;
+    hs_crack_finish_ui_unlocked(found_idx >= 0, final_status, final_detail);
+    bsp_display_unlock();
+    vTaskDelete(NULL);
+}
+
+static void hs_crack_start_file(tab_context_t *ctx, const char *remote_path, const char *file_name)
+{
+    if (!ctx || hs_crack_ui.overlay || hs_crack_ui.active || hs_crack_ui.task ||
+        compromised_transfer_ui.active || compromised_transfer_ui.task ||
+        tab_is_internal(current_tab) || !remote_path || !remote_path[0] || !file_name) return;
+    if (!compromised_transfer_preflight(ctx, false)) return;
+    hs_crack_ui.tab = current_tab;
+    hs_crack_ui.cancel_requested = false;
+    hs_crack_ui.last_update_us = 0;
+    hs_crack_ui.counting_candidates = true;
+    hs_crack_ui.total_candidates = 0;
+    hs_crack_ui.started = false;
+    hs_crack_ui.run = NULL;
+    snprintf(hs_crack_ui.remote_pcap_path, sizeof(hs_crack_ui.remote_pcap_path), "%s", remote_path);
+    snprintf(hs_crack_ui.file_name, sizeof(hs_crack_ui.file_name), "%s", file_name);
+
+    hs_crack_ui.active = false;
+    hs_crack_show_popup(file_name);
+}
+
+static void hs_crack_file_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx || hs_crack_ui.active || hs_crack_ui.task) {
+        return;
+    }
+    // Both flows share the M-BUS transport; do not overlap them.
+    if (compromised_transfer_ui.active || compromised_transfer_ui.task) {
+        return;
+    }
+
+    compromised_file_kind_t kind = compromised_kind_from_user_data(lv_event_get_user_data(e));
+    int index = compromised_index_from_user_data(lv_event_get_user_data(e));
+    if (kind != COMPROMISED_FILE_KIND_HANDSHAKE || index < 0 ||
+        index >= ctx->wardrive_wigle_file_count || tab_is_internal(current_tab)) {
+        return;
+    }
+
+    wardrive_wigle_file_t *file = &ctx->wardrive_wigle_files[index];
+    if (!file->path[0] || !file->name[0]) {
+        return;
+    }
+
+    hs_crack_start_file(ctx, file->path, file->name);
+}
+
+static void handshaker_crack_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = lv_event_get_user_data(e);
+    if (!ctx || ctx != get_current_ctx() || !ctx->handshaker_capture_success ||
+        ctx->handshaker_monitoring || hs_crack_ui.active || hs_crack_ui.task ||
+        compromised_transfer_ui.active || compromised_transfer_ui.task) return;
+
+    // Closing stops/joins the UART reader and clears its state; preserve the path first.
+    char remote_path[WARDRIVE_WIGLE_PATH_MAX];
+    snprintf(remote_path, sizeof(remote_path), "%s", ctx->handshaker_saved_pcap);
+    handshaker_popup_close_cb(NULL);
+    if (!remote_path[0]) {
+        // Older firmware may report success without a file path. Let the user choose.
+        show_handshakes_page();
+        return;
+    }
+    const char *name = strrchr(remote_path, '/');
+    hs_crack_start_file(ctx, remote_path, name ? name + 1 : remote_path);
+}
+
 static void compromised_file_copy_cb(lv_event_t *e)
 {
     tab_context_t *ctx = get_current_ctx();
@@ -58771,6 +59977,13 @@ void app_main(void)
     // Initialize IO expander
     bsp_io_expander_pi4ioe_init(bsp_i2c_get_handle());
 
+    // Open the Monster over USB-A now, while the internal DMA pool is still
+    // almost entirely free. usbh_cdc_create() cannot find its 512-byte-aligned
+    // DMA blocks once the codec, SD card and MIPI-DSI panel below have taken
+    // their share, so this has to run before them. Boot-only: detection reuses
+    // the handle and nothing retries afterwards.
+    usb_boot_open_early();
+
     // Initialize RX8130CE RTC and seed the system clock from it
     if (rx8130_init() == ESP_OK) {
         rx8130_sync_system_from_rtc();
@@ -58845,6 +60058,8 @@ void app_main(void)
         ESP_LOGE(TAG, "Failed to initialize display");
         return;
     }
+    // LVGL exists now: USB callbacks may schedule GUI redetects from here on.
+    lvgl_ready = true;
 
     // Apply the saved orientation before a single widget exists, so everything
     // below is built against the final resolution. The rotation itself is done

@@ -1,0 +1,11 @@
+
+TEST SUMMARY
+==============================================================================
+sae
+  PASS            0.20s  test_emulator_sae.mjs test_emulator_attacks.mjs
+  PASS           11.66s  test_emulator_sae.py
+------------------------------------------------------------------------------
+Result: PASS | scripts PASS: 2 | FAIL/ERROR: 0
+Total elapsed: 11.87s
+Section wrapper times include their children; do not add them together.
+Report: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\docs\ui-emulator\test-runs\20260912-145145-fe6dcd\summary.json

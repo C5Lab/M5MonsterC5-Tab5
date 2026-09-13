@@ -1,0 +1,2795 @@
+[
+  {
+    "name": "show_scan_overlay",
+    "file": "main/main.c",
+    "line": 6388,
+    "diagram": "main--show_scan_overlay.svg",
+    "callbacks": [],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "Scanning..."
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(scan_overlay, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(spin, 100, 100);"
+    ]
+  },
+  {
+    "name": "show_evil_twin_loading_overlay",
+    "file": "main/main.c",
+    "line": 6421,
+    "diagram": "main--show_evil_twin_loading_overlay.svg",
+    "callbacks": [],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "Loading portals..."
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(evil_twin_loading_overlay, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(spin, 100, 100);"
+    ]
+  },
+  {
+    "name": "show_splash_screen",
+    "file": "main/main.c",
+    "line": 7255,
+    "diagram": "main--show_splash_screen.svg",
+    "callbacks": [
+      "intro_skip_cb"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [],
+    "dimension_calls": [
+      "lv_obj_set_size(splash_screen, w, h);"
+    ]
+  },
+  {
+    "name": "show_hidden_ssid_popup",
+    "file": "main/main.c",
+    "line": 8839,
+    "diagram": "main--show_hidden_ssid_popup.svg",
+    "callbacks": [
+      "hidden_ssid_cancel_btn_cb",
+      "hidden_ssid_confirm_btn_cb",
+      "hidden_ssid_dropdown_changed_cb",
+      "hidden_ssid_keyboard_ready_cb",
+      "hidden_ssid_textarea_focus_cb"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      " Hidden Network",
+      "Enter or select SSID:",
+      "Cancel",
+      "Confirm"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(hidden_ssid_popup_overlay, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(hidden_ssid_popup, 500, LV_SIZE_CONTENT);",
+      "lv_obj_set_width(hidden_ssid_dropdown, lv_pct(100));",
+      "lv_obj_set_size(hidden_ssid_textarea, lv_pct(100), 44);",
+      "lv_obj_set_size(btn_row, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(cancel_btn, 120, 44);",
+      "lv_obj_set_size(confirm_btn, 120, 44);",
+      "lv_obj_set_size(hidden_ssid_keyboard, lv_pct(100), 260);"
+    ]
+  },
+  {
+    "name": "show_scan_deauth_popup",
+    "file": "main/main.c",
+    "line": 9441,
+    "diagram": "main--show_scan_deauth_popup.svg",
+    "callbacks": [
+      "scan_deauth_popup_close_cb"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "Attacking networks:",
+      "STOP ATTACK"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(ctx->scan_deauth_overlay, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(ctx->scan_deauth_popup, 550, 450);",
+      "lv_obj_set_size(list_cont, lv_pct(100), 280);",
+      "lv_obj_set_size(item, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(stop_btn, lv_pct(100), 50);"
+    ]
+  },
+  {
+    "name": "show_sae_popup",
+    "file": "main/main.c",
+    "line": 9563,
+    "diagram": "main--show_sae_popup.svg",
+    "callbacks": [
+      "sae_popup_close_cb"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "SAE Overflow Active",
+      "STOP"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(ctx->sae_popup_overlay, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(ctx->sae_popup, 500, 300);",
+      "lv_obj_set_size(spacer, 1, 20);",
+      "lv_obj_set_size(stop_btn, lv_pct(100), 50);"
+    ]
+  },
+  {
+    "name": "show_mitm_popup",
+    "file": "main/main.c",
+    "line": 9889,
+    "diagram": "main--show_mitm_popup.svg",
+    "callbacks": [
+      "mitm_connect_and_start_cb",
+      "mitm_keyboard_cb",
+      "mitm_password_input_cb",
+      "mitm_popup_close_cb"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "Password:",
+      "Known password found. Press Connect & Start.",
+      "JanOS saved passwords will be tried automatically. / If none matches, manual input will be enabled.",
+      "Open network. Press Connect & Start.",
+      "Connect & Start",
+      "Cancel",
+      "STOP CAPTURE"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(ctx->mitm_popup_overlay, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(ctx->mitm_popup, 550, 380);",
+      "lv_obj_set_size(ctx->mitm_pass_row, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(ctx->mitm_password_input, 320, 40);",
+      "lv_obj_set_width(ctx->mitm_status_label, lv_pct(100));",
+      "lv_obj_set_size(ctx->mitm_btn_row, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(ctx->mitm_connect_btn, lv_pct(100), 50);",
+      "lv_obj_set_size(mitm_cancel_btn, lv_pct(100), 50);",
+      "lv_obj_set_size(ctx->mitm_stop_btn, lv_pct(100), 50);",
+      "lv_obj_set_size(ctx->mitm_keyboard, lv_pct(100), 260);"
+    ]
+  },
+  {
+    "name": "show_gitm_exit_confirm",
+    "file": "main/main.c",
+    "line": 11601,
+    "diagram": "main--show_gitm_exit_confirm.svg",
+    "callbacks": [
+      "gitm_exit_cancel_cb",
+      "gitm_exit_confirm_cb"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "GITM IS RUNNING",
+      "Leaving sends stop to JanOS: it closes any / open capture and takes the gateway down. / Clients on the AP lose their connection.",
+      "Keep capturing",
+      " Stop and exit"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(gitm_exit_overlay, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(popup, 560, 380);",
+      "lv_obj_set_size(gitm_exit_btn_row, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(stay_btn, 170, 54);",
+      "lv_obj_set_size(quit_btn, 210, 54);"
+    ]
+  },
+  {
+    "name": "show_gitm_page",
+    "file": "main/main.c",
+    "line": 11961,
+    "diagram": "main--show_gitm_page.svg",
+    "callbacks": [
+      "gitm_back_cb",
+      "gitm_keyboard_cb",
+      "gitm_prefix_changed_cb",
+      "gitm_security_changed_cb"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "GITM",
+      "Gate-in-the-Middle",
+      "IDLE",
+      "Asking JanOS for its current state...",
+      "Security:",
+      "Open / WPA2",
+      " Open AP - anyone in range can join and will be recorded.",
+      "Clients (0)",
+      "Capture"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(ctx->gitm->page, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(header, lv_pct(100), 56);",
+      "lv_obj_set_size(back_btn, 72, 44);",
+      "lv_obj_set_width(ctx->gitm->status_label, lv_pct(100));",
+      "lv_obj_set_width(ctx->gitm->body, lv_pct(100));",
+      "lv_obj_set_size(ctx->gitm->net_list, lv_pct(100), net_list_h);",
+      "lv_obj_set_size(s1_btns, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(sec_row, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_width(sec_lbl, 160);",
+      "lv_obj_set_size(ctx->gitm->sec_dd, 220, 44);",
+      "lv_obj_set_width(ctx->gitm->open_warn, lv_pct(100));",
+      "lv_obj_set_width(ctx->gitm->live_hdr, lv_pct(100));",
+      "lv_obj_set_width(ctx->gitm->live_warn, lv_pct(100));",
+      "lv_obj_set_size(ctx->gitm->clients_list, lv_pct(100), client_list_h);",
+      "lv_obj_set_width(ctx->gitm->cap_label, lv_pct(100));",
+      "lv_obj_set_width(ctx->gitm->rec_label, lv_pct(100));",
+      "lv_obj_set_width(ctx->gitm->shaper_label, lv_pct(100));",
+      "lv_obj_set_size(ctx->gitm->keyboard, lv_pct(100), 260);"
+    ]
+  },
+  {
+    "name": "show_gitm_page_from_scan",
+    "file": "main/main.c",
+    "line": 12279,
+    "diagram": "main--show_gitm_page_from_scan.svg",
+    "callbacks": [],
+    "direct_ui_calls": [
+      "show_gitm_page"
+    ],
+    "literal_labels": [],
+    "dimension_calls": []
+  },
+  {
+    "name": "show_rogue_gitm_popup",
+    "file": "main/main.c",
+    "line": 12622,
+    "diagram": "main--show_rogue_gitm_popup.svg",
+    "callbacks": [
+      "rogue_gitm_cancel_cb",
+      "rogue_gitm_keyboard_cb",
+      "rogue_gitm_start_cb",
+      "rogue_gitm_uplink_changed_cb"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "Rogue GITM: open it from WiFi Scan & Attack (needs the full scan).",
+      "Uplink and victim share a channel. The mirror uses the victim's real password.",
+      "  Cancel",
+      "  Start"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(rogue_gitm_overlay, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(rogue_gitm_popup, 600, 540);",
+      "lv_obj_set_width(victim_info, lv_pct(100));",
+      "lv_obj_set_width(rogue_gitm_uplink_dd, lv_pct(100));",
+      "lv_obj_set_width(rogue_gitm_status_label, lv_pct(100));",
+      "lv_obj_set_size(btn_row, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(cancel_btn, 240, 56);",
+      "lv_obj_set_size(start_btn, 260, 56);",
+      "lv_obj_set_size(rogue_gitm_keyboard, lv_pct(100), 300);"
+    ]
+  },
+  {
+    "name": "show_handshaker_popup",
+    "file": "main/main.c",
+    "line": 13202,
+    "diagram": "main--show_handshaker_popup.svg",
+    "callbacks": [
+      "handshaker_popup_close_cb",
+      "wpasec_btn_event_cb"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "Target selection failed - restart Observer",
+      "Handshaker Attack Active",
+      "on networks:",
+      "Waiting for handshake...",
+      "Stop",
+      "Send to wpa-sec"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(ctx->handshaker_popup_overlay, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(ctx->handshaker_popup, 550, 560);",
+      "lv_obj_set_size(network_scroll, lv_pct(100), 100);",
+      "lv_obj_set_size(ctx->handshaker_log_container, lv_pct(100), 120);",
+      "lv_obj_set_width(ctx->handshaker_status_label, lv_pct(100));",
+      "lv_obj_set_size(ctx->handshaker_stop_btn, lv_pct(100), 50);",
+      "lv_obj_set_size(ctx->handshaker_wpasec_btn, lv_pct(100), 50);"
+    ]
+  },
+  {
+    "name": "nmap_show_scan_type_popup",
+    "file": "main/main.c",
+    "line": 14374,
+    "diagram": "main--nmap_show_scan_type_popup.svg",
+    "callbacks": [
+      "nmap_scan_type_cb",
+      "nmap_scan_type_popup_close_cb"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "  Nmap Scan - All Hosts",
+      "Select scan depth:",
+      "Quick (20 ports)",
+      "FTP, SSH, HTTP, SMB, RDP",
+      "Medium (50 ports)",
+      "LDAP, MQTT, Docker, Redis",
+      "Heavy (100 ports)",
+      "TFTP, BGP, Modbus, MongoDB, Minecraft",
+      "Cancel"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(ctx->nmap_scan_popup_overlay, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(ctx->nmap_scan_popup, 500, 360);",
+      "lv_obj_set_size(quick_btn, lv_pct(90), 60);",
+      "lv_obj_set_size(med_btn, lv_pct(90), 60);",
+      "lv_obj_set_size(heavy_btn, lv_pct(90), 60);",
+      "lv_obj_set_size(close_btn, 100, 36);"
+    ]
+  },
+  {
+    "name": "show_nmap_page",
+    "file": "main/main.c",
+    "line": 14892,
+    "diagram": "main--show_nmap_page.svg",
+    "callbacks": [
+      "nmap_back_cb",
+      "nmap_connect_cb",
+      "nmap_keyboard_cb",
+      "nmap_list_hosts_cb",
+      "nmap_password_input_cb"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "  Nmap Port Scanner",
+      "  Open Network (no password required)",
+      "Password:",
+      "Connect",
+      "List Hosts",
+      "Saved password available",
+      "Firmware will use --saved",
+      "Press Connect to try open, or enter password",
+      "Press Connect to join network",
+      "Enter WiFi password to connect",
+      "Connect to network, then List Hosts to scan for targets"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(nmap_page, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(header, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(back_btn, 72, 60);",
+      "lv_obj_set_size(pass_section, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(pass_left, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(nmap_password_input, 300, 40);",
+      "lv_obj_set_size(btn_row, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(nmap_connect_btn, 120, 40);",
+      "lv_obj_set_size(nmap_list_hosts_btn, 120, 40);",
+      "lv_obj_set_size(btn_row, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(nmap_connect_btn, 120, 40);",
+      "lv_obj_set_size(nmap_list_hosts_btn, 120, 40);",
+      "lv_obj_set_size(pass_left, LV_SIZE_CONTENT, LV_SIZE_CONTENT);",
+      "lv_obj_set_size(nmap_password_input, 300, 40);",
+      "lv_obj_set_size(nmap_connect_btn, 120, 40);",
+      "lv_obj_set_size(nmap_list_hosts_btn, 120, 40);",
+      "lv_obj_set_size(nmap_hosts_container, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(nmap_keyboard, lv_pct(100), 200);"
+    ]
+  },
+  {
+    "name": "show_arp_poison_page",
+    "file": "main/main.c",
+    "line": 15237,
+    "diagram": "main--show_arp_poison_page.svg",
+    "callbacks": [
+      "arp_connect_cb",
+      "arp_keyboard_cb",
+      "arp_list_hosts_cb",
+      "arp_password_input_cb",
+      "arp_poison_back_cb"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "Internal WiFi AttacksInternal WiFi Tests",
+      "  Open Network (no password required)",
+      "Connect",
+      "List Hosts",
+      "Saved password available",
+      "Firmware will use --saved",
+      "Password:",
+      " List Hosts",
+      "Press Connect to join open network",
+      "Enter WiFi password to connect",
+      "Connecting to network...",
+      "Connect to WiFi and click 'List Hosts' to scan network"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(arp_poison_page, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(header, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(back_btn, 72, 60);",
+      "lv_obj_set_size(pass_section, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(btn_row, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(arp_connect_btn, 120, 40);",
+      "lv_obj_set_size(arp_list_hosts_btn, 120, 40);",
+      "lv_obj_set_size(btn_row, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(arp_connect_btn, 120, 40);",
+      "lv_obj_set_size(arp_list_hosts_btn, 120, 40);",
+      "lv_obj_set_size(pass_left, LV_SIZE_CONTENT, LV_SIZE_CONTENT);",
+      "lv_obj_set_size(arp_password_input, 300, 40);",
+      "lv_obj_set_size(arp_connect_btn, 120, 40);",
+      "lv_obj_set_size(arp_list_hosts_btn, 120, 40);",
+      "lv_obj_set_size(btn_container, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(arp_list_hosts_btn, 150, 45);",
+      "lv_obj_set_size(arp_hosts_container, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(arp_keyboard, lv_pct(100), 260);"
+    ]
+  },
+  {
+    "name": "show_karma_page",
+    "file": "main/main.c",
+    "line": 16310,
+    "diagram": "main--show_karma_page.svg",
+    "callbacks": [
+      "karma_back_cb",
+      "karma_start_sniffer_cb",
+      "karma_stop_sniffer_cb"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "Karma Attack",
+      "Start Sniffer",
+      "Stop Sniffer",
+      "Start sniffer to collect probe requests",
+      "Wait a moment - the longer the better. Click Stop to see collected Probes."
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(karma_page, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(header, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(back_btn, 72, 60);",
+      "lv_obj_set_size(btn_bar, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(karma_start_sniffer_btn, 130, 45);",
+      "lv_obj_set_size(karma_stop_sniffer_btn, 130, 45);",
+      "lv_obj_set_size(karma_probes_container, lv_pct(100), LV_SIZE_CONTENT);"
+    ]
+  },
+  {
+    "name": "show_evil_twin_popup",
+    "file": "main/main.c",
+    "line": 16792,
+    "diagram": "main--show_evil_twin_popup.svg",
+    "callbacks": [
+      "evil_twin_close_cb",
+      "evil_twin_start_cb"
+    ],
+    "direct_ui_calls": [
+      "show_evil_twin_loading_overlay"
+    ],
+    "literal_labels": [
+      "Evil Twin Attack",
+      "Evil Twin Network:",
+      "Portal HTML:",
+      "START ATTACK",
+      "Select network and portal, then click START ATTACK",
+      "CLOSE",
+      "STOP"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(ctx->evil_twin_overlay, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(ctx->evil_twin_popup, 600, 550);",
+      "lv_obj_set_size(net_cont, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_width(net_label, 180);",
+      "lv_obj_set_width(ctx->evil_twin_network_dropdown, 350);",
+      "lv_obj_set_size(html_cont, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_width(html_label, 180);",
+      "lv_obj_set_width(ctx->evil_twin_html_dropdown, 350);",
+      "lv_obj_set_size(start_btn, lv_pct(100), 50);",
+      "lv_obj_set_size(status_cont, lv_pct(100), 200);",
+      "lv_obj_set_width(ctx->evil_twin_status_label, lv_pct(100));",
+      "lv_obj_set_size(close_btn, lv_pct(100), 50);",
+      "lv_obj_set_size(stop_btn, lv_pct(100), 50);"
+    ]
+  },
+  {
+    "name": "show_uart1_tiles",
+    "file": "main/main.c",
+    "line": 17460,
+    "diagram": "main--show_uart1_tiles.svg",
+    "callbacks": [],
+    "direct_ui_calls": [],
+    "literal_labels": [],
+    "dimension_calls": []
+  },
+  {
+    "name": "show_mbus_tiles",
+    "file": "main/main.c",
+    "line": 17488,
+    "diagram": "main--show_mbus_tiles.svg",
+    "callbacks": [],
+    "direct_ui_calls": [],
+    "literal_labels": [],
+    "dimension_calls": []
+  },
+  {
+    "name": "show_internal_tiles",
+    "file": "main/main.c",
+    "line": 17529,
+    "diagram": "main--show_internal_tiles.svg",
+    "callbacks": [],
+    "direct_ui_calls": [],
+    "literal_labels": [],
+    "dimension_calls": [
+      "lv_obj_set_size(internal_tiles, lv_pct(100), lv_pct(100));"
+    ]
+  },
+  {
+    "name": "show_main_tiles",
+    "file": "main/main.c",
+    "line": 17569,
+    "diagram": "main--show_main_tiles.svg",
+    "callbacks": [],
+    "direct_ui_calls": [
+      "show_internal_tiles",
+      "show_mbus_tiles",
+      "show_uart1_tiles"
+    ],
+    "literal_labels": [],
+    "dimension_calls": [
+      "lv_obj_set_size(grove_container, lv_pct(100), height);",
+      "lv_obj_set_size(usb_container, lv_pct(100), height);",
+      "lv_obj_set_size(mbus_container, lv_pct(100), height);"
+    ]
+  },
+  {
+    "name": "show_scan_page",
+    "file": "main/main.c",
+    "line": 17647,
+    "diagram": "main--show_scan_page.svg",
+    "callbacks": [
+      "back_btn_event_cb",
+      "scan_btn_click_cb"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "Scan & AttackScan & Test",
+      "RESCAN",
+      "Press RESCAN to search for networks"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(ctx->scan_page, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(header, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(left_cont, LV_SIZE_CONTENT, LV_SIZE_CONTENT);",
+      "lv_obj_set_size(back_btn, 72, 60);",
+      "lv_obj_set_size(btn_cont, LV_SIZE_CONTENT, LV_SIZE_CONTENT);",
+      "lv_obj_set_size(ctx->spinner, 32, 32);",
+      "lv_obj_set_size(ctx->scan_btn, 120, 40);",
+      "lv_obj_set_width(ctx->network_list, lv_pct(100));"
+    ]
+  },
+  {
+    "name": "show_network_popup",
+    "file": "main/main.c",
+    "line": 18463,
+    "diagram": "main--show_network_popup.svg",
+    "callbacks": [
+      "popup_close_btn_cb"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "Failed to start target task"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(ctx->network_popup, 640, net_popup_h);",
+      "lv_obj_set_size(header, lv_pct(100), 40);",
+      "lv_obj_set_size(close_btn, 40, 40);",
+      "lv_obj_set_size(info_container, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(ctx->popup_clients_container, lv_pct(100), 170);"
+    ]
+  },
+  {
+    "name": "show_deauth_popup",
+    "file": "main/main.c",
+    "line": 18960,
+    "diagram": "main--show_deauth_popup.svg",
+    "callbacks": [
+      "deauth_btn_click_cb"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "Deauth requires Red Team mode",
+      "Deauth Station"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(deauth_popup_obj, 620, LV_SIZE_CONTENT);",
+      "lv_obj_set_size(header, lv_pct(100), 40);",
+      "lv_obj_set_size(close_btn, 40, 40);",
+      "lv_obj_set_size(info_container, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(deauth_btn, lv_pct(100), 60);"
+    ]
+  },
+  {
+    "name": "show_observer_exit_confirm",
+    "file": "main/main.c",
+    "line": 19915,
+    "diagram": "main--show_observer_exit_confirm.svg",
+    "callbacks": [
+      "observer_exit_cancel_cb",
+      "observer_exit_confirm_cb"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "OBSERVER IS RUNNING",
+      "Leaving will send stop to the Monster. / Without it the sniffer keeps running and / later commands get no answer.",
+      "Keep running",
+      " Stop and exit"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(observer_exit_overlay, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(popup, 540, 360);",
+      "lv_obj_set_size(observer_exit_btn_row, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(stay_btn, 160, 54);",
+      "lv_obj_set_size(quit_btn, 200, 54);"
+    ]
+  },
+  {
+    "name": "show_observer_page",
+    "file": "main/main.c",
+    "line": 20269,
+    "diagram": "main--show_observer_page.svg",
+    "callbacks": [
+      "observer_back_btn_event_cb",
+      "observer_export_btn_cb",
+      "observer_start_btn_cb",
+      "observer_stop_btn_cb"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "Network Observer",
+      "Stop",
+      "Start",
+      " Export",
+      "Press Start to begin observing"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(observer_page, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(header, lv_pct(100), 56);",
+      "lv_obj_set_size(back_btn, 72, 44);",
+      "lv_obj_set_size(ctx->observer_stop_btn, 100, 44);",
+      "lv_obj_set_size(ctx->observer_start_btn, 100, 44);",
+      "lv_obj_set_size(ctx->observer_export_btn, 120, 44);",
+      "lv_obj_set_size(ctx->observer_table, lv_pct(100), lv_pct(100));"
+    ]
+  },
+  {
+    "name": "show_esp_modem_page",
+    "file": "main/main.c",
+    "line": 20758,
+    "diagram": "main--show_esp_modem_page.svg",
+    "callbacks": [
+      "esp_modem_back_btn_event_cb",
+      "esp_modem_scan_btn_click_cb"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "Internal C6 WiFi",
+      "SCAN",
+      "Press SCAN to search for networks (via ESP32C6)"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(esp_modem_page, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(header, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(left_cont, LV_SIZE_CONTENT, LV_SIZE_CONTENT);",
+      "lv_obj_set_size(back_btn, 72, 60);",
+      "lv_obj_set_size(btn_cont, LV_SIZE_CONTENT, LV_SIZE_CONTENT);",
+      "lv_obj_set_size(esp_modem_spinner, 32, 32);",
+      "lv_obj_set_size(esp_modem_scan_btn, 120, 40);",
+      "lv_obj_set_size(esp_modem_network_list, lv_pct(100), lv_pct(100));"
+    ]
+  },
+  {
+    "name": "show_blackout_confirm_popup",
+    "file": "main/main.c",
+    "line": 20980,
+    "diagram": "main--show_blackout_confirm_popup.svg",
+    "callbacks": [
+      "blackout_confirm_no_cb",
+      "blackout_confirm_yes_cb"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "BLACKOUT",
+      "This will deauth all networks / around you. Are you sure?",
+      "No",
+      "Yes"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(ctx->blackout_popup_overlay, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(ctx->blackout_popup, 500, 350);",
+      "lv_obj_set_size(btn_container, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(no_btn, 120, 50);",
+      "lv_obj_set_size(yes_btn, 120, 50);"
+    ]
+  },
+  {
+    "name": "show_blackout_active_popup",
+    "file": "main/main.c",
+    "line": 21069,
+    "diagram": "main--show_blackout_active_popup.svg",
+    "callbacks": [
+      "blackout_stop_cb"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "Attack in Progress",
+      "Deauthing all networks...",
+      " Stop"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(ctx->blackout_popup_overlay, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(ctx->blackout_popup, 450, 300);",
+      "lv_obj_set_size(stop_btn, 180, 55);"
+    ]
+  },
+  {
+    "name": "show_sd_warning_popup",
+    "file": "main/main.c",
+    "line": 21258,
+    "diagram": "main--show_sd_warning_popup.svg",
+    "callbacks": [
+      "sd_warning_cancel_cb",
+      "sd_warning_continue_cb"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "NO SD CARD DETECTED",
+      "This feature requires SD card / for HTML portal files. / Continue anyway?",
+      "Cancel",
+      "Continue"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(sd_warning_popup_overlay, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(sd_warning_popup_obj, 500, 320);",
+      "lv_obj_set_size(btn_container, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(cancel_btn, 120, 50);",
+      "lv_obj_set_size(continue_btn, 150, 50);"
+    ]
+  },
+  {
+    "name": "show_snifferdog_confirm_popup",
+    "file": "main/main.c",
+    "line": 21371,
+    "diagram": "main--show_snifferdog_confirm_popup.svg",
+    "callbacks": [
+      "snifferdog_confirm_no_cb",
+      "snifferdog_confirm_yes_cb"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "SNIFFER DOG",
+      "This will deauth all clients / around you. Are you sure?",
+      "No",
+      "Yes"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(ctx->snifferdog_popup_overlay, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(ctx->snifferdog_popup, 500, 350);",
+      "lv_obj_set_size(btn_container, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(no_btn, 120, 50);",
+      "lv_obj_set_size(yes_btn, 120, 50);"
+    ]
+  },
+  {
+    "name": "show_snifferdog_active_popup",
+    "file": "main/main.c",
+    "line": 21460,
+    "diagram": "main--show_snifferdog_active_popup.svg",
+    "callbacks": [
+      "snifferdog_stop_cb"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "Attack in Progress",
+      "Deauthing all clients...",
+      " Stop"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(ctx->snifferdog_popup_overlay, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(ctx->snifferdog_popup, 450, 300);",
+      "lv_obj_set_size(stop_btn, 180, 55);"
+    ]
+  },
+  {
+    "name": "show_global_handshaker_confirm_popup",
+    "file": "main/main.c",
+    "line": 21958,
+    "diagram": "main--show_global_handshaker_confirm_popup.svg",
+    "callbacks": [
+      "global_handshaker_confirm_no_cb",
+      "global_handshaker_confirm_yes_cb"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "HANDSHAKER",
+      "This will deauth all networks around / you in order to grab handshakes. / Are you sure?",
+      "No",
+      "Yes"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(ctx->global_handshaker_popup_overlay, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(ctx->global_handshaker_popup, 520, 380);",
+      "lv_obj_set_size(btn_container, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(no_btn, 120, 50);",
+      "lv_obj_set_size(yes_btn, 120, 50);"
+    ]
+  },
+  {
+    "name": "show_global_handshaker_active_popup",
+    "file": "main/main.c",
+    "line": 22047,
+    "diagram": "main--show_global_handshaker_active_popup.svg",
+    "callbacks": [
+      "global_handshaker_stop_cb"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "Attack in Progress",
+      "Waiting for handshakes...",
+      "Last Handshake: - / Total: 0",
+      " Stop"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(ctx->global_handshaker_popup_overlay, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(ctx->global_handshaker_popup, 520, 470);",
+      "lv_obj_set_size(ctx->global_handshaker_log_container, lv_pct(100), 150);",
+      "lv_obj_set_width(ctx->global_handshaker_status_label, lv_pct(100));",
+      "lv_obj_set_size(stats_container, lv_pct(100), 72);",
+      "lv_obj_set_width(ctx->global_handshaker_stats_label, lv_pct(100));",
+      "lv_obj_set_size(stop_btn, 180, 55);"
+    ]
+  },
+  {
+    "name": "show_phishing_portal_active_popup",
+    "file": "main/main.c",
+    "line": 22446,
+    "diagram": "main--show_phishing_portal_active_popup.svg",
+    "callbacks": [
+      "phishing_portal_stop_cb"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "Submitted forms: 0",
+      "Last captured: --",
+      " Stop"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(ctx->phishing_portal_popup_overlay, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(ctx->phishing_portal_popup, 500, 380);",
+      "lv_obj_set_width(ctx->phishing_portal_data_label, lv_pct(90));",
+      "lv_obj_set_size(stop_btn, 180, 55);"
+    ]
+  },
+  {
+    "name": "show_phishing_portal_popup",
+    "file": "main/main.c",
+    "line": 22615,
+    "diagram": "main--show_phishing_portal_popup.svg",
+    "callbacks": [
+      "phishing_portal_close_cb",
+      "phishing_portal_keyboard_cb",
+      "phishing_portal_start_cb",
+      "phishing_portal_textarea_focus_cb"
+    ],
+    "direct_ui_calls": [
+      "show_evil_twin_loading_overlay"
+    ],
+    "literal_labels": [
+      " Phishing Portal",
+      "Enter SSID:",
+      "Select Portal HTML:",
+      "Cancel",
+      "Start"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(ctx->phishing_portal_popup_overlay, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(ctx->phishing_portal_popup, 600, 480);",
+      "lv_obj_set_size(ctx->phishing_portal_ssid_textarea, lv_pct(90), 45);",
+      "lv_obj_set_size(ctx->phishing_portal_html_dropdown, lv_pct(90), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(btn_container, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(cancel_btn, 120, 45);",
+      "lv_obj_set_size(ok_btn, 120, 45);",
+      "lv_obj_set_size(ctx->phishing_portal_keyboard, lv_pct(100), 260);"
+    ]
+  },
+  {
+    "name": "show_wardrive_gps_overlay",
+    "file": "main/main.c",
+    "line": 22769,
+    "diagram": "main--show_wardrive_gps_overlay.svg",
+    "callbacks": [],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "Acquiring GPS Fix...",
+      "Need clear view of the sky"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(ctx->wardrive_gps_overlay, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(ctx->wardrive_gps_popup, 420, 220);"
+    ]
+  },
+  {
+    "name": "show_wardrive_upload_menu",
+    "file": "main/main.c",
+    "line": 23261,
+    "diagram": "main--show_wardrive_upload_menu.svg",
+    "callbacks": [
+      "wardrive_cleanup_dry_run_cb",
+      "wardrive_fix_file_cb",
+      "wardrive_upload_menu_close_cb",
+      "wardrive_upload_menu_subtitle_delete_cb",
+      "wardrive_upload_wdgwars_btn_cb",
+      "wardrive_upload_wigle_btn_cb"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      " Wardrive Upload",
+      "Loading wardrive status...",
+      " To Upload",
+      " Uploaded",
+      "No SD card detected on this tab.",
+      "Reading wardrive files from module...",
+      "Failed to start file loader task.",
+      "No Wardrive LOG/TXT/CSV files found.",
+      "All files uploaded",
+      "No files to upload",
+      "Nothing to send - see Uploaded below.",
+      " Fix",
+      "No upload history yet.",
+      "WiGLE",
+      "WDGWars",
+      " Archive done",
+      "Close"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(ctx->wardrive_upload_menu_popup, lv_pct(85), lv_pct(85));",
+      "lv_obj_set_width(subtitle, lv_pct(95));",
+      "lv_obj_set_width(upload_hdr, lv_pct(100));",
+      "lv_obj_set_size(file_list, lv_pct(100), 0);",
+      "lv_obj_set_width(uploaded_hdr, lv_pct(100));",
+      "lv_obj_set_size(state_list, lv_pct(100), 0);",
+      "lv_obj_set_size(spin_box, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(spinner, 80, 80);",
+      "lv_obj_set_width(files_title, lv_pct(100));",
+      "lv_obj_set_width(bad_note, lv_pct(100));",
+      "lv_obj_set_width(none_lbl, lv_pct(100));",
+      "lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_width(name_lbl, lv_pct(100));",
+      "lv_obj_set_width(detail_lbl, lv_pct(100));",
+      "lv_obj_set_size(fix_btn, 120, 38);",
+      "lv_obj_set_width(more_lbl, lv_pct(100));",
+      "lv_obj_set_width(state_title, lv_pct(100));",
+      "lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_width(name_lbl, lv_pct(100));",
+      "lv_obj_set_width(detail_lbl, lv_pct(100));",
+      "lv_obj_set_width(more_state, lv_pct(100));",
+      "lv_obj_set_width(no_state, lv_pct(100));",
+      "lv_obj_set_size(button_row, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_height(wigle_btn, 48);",
+      "lv_obj_set_height(wdgwars_btn, 48);",
+      "lv_obj_set_height(archive_btn, 48);",
+      "lv_obj_set_height(close_btn, 48);"
+    ]
+  },
+  {
+    "name": "show_wardrive_upload_popup",
+    "file": "main/main.c",
+    "line": 27031,
+    "diagram": "main--show_wardrive_upload_popup.svg",
+    "callbacks": [
+      "wardrive_wigle_close_cb",
+      "wardrive_wigle_force_all_btn_cb",
+      "wardrive_wigle_next_page_cb",
+      "wardrive_wigle_prev_page_cb",
+      "wardrive_wigle_send_btn_cb",
+      "wardrive_wigle_stop_btn_cb",
+      "wardrive_wigle_sync_pending_btn_cb"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "Loading Wardrive files...",
+      "< Prev",
+      "Next >",
+      "Sync pending",
+      "Force all",
+      "Send",
+      "Stop",
+      "Close",
+      "No SD card detected on this tab.",
+      "No Wardrive LOG/TXT/CSV files found."
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(ctx->wardrive_wigle_popup_overlay, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(ctx->wardrive_wigle_popup, lv_pct(85), lv_pct(85));",
+      "lv_obj_set_width(ctx->wardrive_wigle_status_label, lv_pct(90));",
+      "lv_obj_set_size(ctx->wardrive_wigle_progress_bar, lv_pct(100), 14);",
+      "lv_obj_set_size(ctx->wardrive_wigle_list, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(page_nav, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(ctx->wardrive_wigle_prev_btn, 80, 38);",
+      "lv_obj_set_size(ctx->wardrive_wigle_next_btn, 80, 38);",
+      "lv_obj_set_size(batch_row, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(ctx->wardrive_wigle_sync_btn, 170, 42);",
+      "lv_obj_set_size(ctx->wardrive_wigle_all_btn, 150, 42);",
+      "lv_obj_set_size(btn_row, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(ctx->wardrive_wigle_send_btn, 140, 44);",
+      "lv_obj_set_size(ctx->wardrive_wigle_stop_btn, 140, 44);",
+      "lv_obj_set_size(ctx->wardrive_wigle_spinner, 36, 36);",
+      "lv_obj_set_size(close_btn, 120, 44);"
+    ]
+  },
+  {
+    "name": "show_home_mgmt_overlay",
+    "file": "main/main.c",
+    "line": 27951,
+    "diagram": "main--show_home_mgmt_overlay.svg",
+    "callbacks": [
+      "home_mgmt_add_cb",
+      "home_mgmt_close_cb",
+      "home_mgmt_scan_cb",
+      "home_mgmt_ta_focus_cb"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      " Home networks",
+      "Recognised while wardriving -> offers auto-upload.",
+      " Scan",
+      " Add",
+      " Close"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(ctx->home_mgmt_overlay, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(popup, 600, 560);",
+      "lv_obj_set_width(ctx->home_mgmt_list, lv_pct(100));",
+      "lv_obj_set_width(ctx->home_mgmt_ssid_input, lv_pct(100));",
+      "lv_obj_set_width(ctx->home_mgmt_pass_input, lv_pct(100));",
+      "lv_obj_set_width(ctx->home_mgmt_bssid_input, lv_pct(100));",
+      "lv_obj_set_width(ctx->home_mgmt_status_label, lv_pct(100));",
+      "lv_obj_set_size(act_row, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(scan_btn, 178, 48);",
+      "lv_obj_set_size(add_btn, 178, 48);",
+      "lv_obj_set_size(close_btn, 178, 48);",
+      "lv_obj_set_size(ctx->home_mgmt_keyboard, lv_pct(100), 240);"
+    ]
+  },
+  {
+    "name": "show_wardrive_home_confirm",
+    "file": "main/main.c",
+    "line": 28569,
+    "diagram": "main--show_wardrive_home_confirm.svg",
+    "callbacks": [
+      "wardrive_home_confirm_no_cb",
+      "wardrive_home_confirm_yes_cb"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      " Home network detected",
+      " Yes, upload",
+      " No"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(ov, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(box, 540, LV_SIZE_CONTENT);",
+      "lv_obj_set_width(msg, lv_pct(100));",
+      "lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(yes, 210, 54);",
+      "lv_obj_set_size(no, 210, 54);"
+    ]
+  },
+  {
+    "name": "show_wardrive_page",
+    "file": "main/main.c",
+    "line": 31151,
+    "diagram": "main--show_wardrive_page.svg",
+    "callbacks": [
+      "wardrive_back_cb",
+      "wardrive_setup_btn_cb",
+      "wardrive_start_cb",
+      "wardrive_stop_cb",
+      "wardrive_upload_btn_cb"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "Wardrive",
+      " Start",
+      " Stop",
+      " Upload",
+      " Setup",
+      "Press Start to begin wardrive",
+      "WiFi: 0  BT: 0  SAT: 0  0.00 km"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(ctx->wardrive_page, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(header, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(left_cont, LV_SIZE_CONTENT, LV_SIZE_CONTENT);",
+      "lv_obj_set_size(back_btn, 72, 60);",
+      "lv_obj_set_size(btn_cont, LV_SIZE_CONTENT, LV_SIZE_CONTENT);",
+      "lv_obj_set_size(ctx->wardrive_start_btn, 86, 40);",
+      "lv_obj_set_size(ctx->wardrive_stop_btn, 86, 40);",
+      "lv_obj_set_size(ctx->wardrive_upload_btn, 110, 40);",
+      "lv_obj_set_size(ctx->wardrive_setup_btn, 96, 40);",
+      "lv_obj_set_size(status_row, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(ctx->wardrive_table, lv_pct(100), LV_SIZE_CONTENT);"
+    ]
+  },
+  {
+    "name": "show_antisurv_page",
+    "file": "main/main.c",
+    "line": 31589,
+    "diagram": "main--show_antisurv_page.svg",
+    "callbacks": [
+      "antisurv_back_cb",
+      "antisurv_sens_btn_cb",
+      "antisurv_start_cb",
+      "antisurv_stop_cb"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      " Anti-Surveillance",
+      " Start",
+      " Stop",
+      " med",
+      "Detects a BLE device that moves with you",
+      "Followers: 0"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(ctx->antisurv_page, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(header, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(left_cont, LV_SIZE_CONTENT, LV_SIZE_CONTENT);",
+      "lv_obj_set_size(back_btn, 72, 60);",
+      "lv_obj_set_size(btn_cont, LV_SIZE_CONTENT, LV_SIZE_CONTENT);",
+      "lv_obj_set_size(ctx->antisurv_start_btn, 90, 40);",
+      "lv_obj_set_size(ctx->antisurv_stop_btn, 90, 40);",
+      "lv_obj_set_size(ctx->antisurv_sens_btn, 110, 40);",
+      "lv_obj_set_size(status_row, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(ctx->antisurv_list, lv_pct(100), LV_SIZE_CONTENT);"
+    ]
+  },
+  {
+    "name": "show_zig_recon_page",
+    "file": "main/main.c",
+    "line": 32967,
+    "diagram": "main--show_zig_recon_page.svg",
+    "callbacks": [
+      "iot_recon_back_cb",
+      "iot_recon_clear_cb",
+      "iot_recon_start_cb",
+      "iot_recon_stop_cb"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      " Mesh Recon",
+      "802.15.4 / Zigbee / Thread",
+      " Start",
+      " Stop",
+      "Clear",
+      "Skeleton ready - parser/polling comes next",
+      "No Mesh networks yet"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(ctx->iot_page, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(header, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(left_cont, LV_SIZE_CONTENT, LV_SIZE_CONTENT);",
+      "lv_obj_set_size(back_btn, 72, 60);",
+      "lv_obj_set_size(title_col, LV_SIZE_CONTENT, LV_SIZE_CONTENT);",
+      "lv_obj_set_size(btn_cont, LV_SIZE_CONTENT, LV_SIZE_CONTENT);",
+      "lv_obj_set_size(ctx->iot_start_btn, 88, 42);",
+      "lv_obj_set_size(ctx->iot_stop_btn, 84, 42);",
+      "lv_obj_set_size(ctx->iot_clear_btn, 82, 42);",
+      "lv_obj_set_width(ctx->iot_status_label, lv_pct(100));",
+      "lv_obj_set_size(metrics, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(ctx->iot_pan_list, lv_pct(100), LV_SIZE_CONTENT);"
+    ]
+  },
+  {
+    "name": "show_compromised_cleanup_popup",
+    "file": "main/main.c",
+    "line": 34113,
+    "diagram": "main--show_compromised_cleanup_popup.svg",
+    "callbacks": [
+      "wardrive_cleanup_close_cb",
+      "wardrive_cleanup_move_confirm_cb"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "Move matched",
+      "Close"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(ctx->compromised_cleanup_popup, 520, 360);",
+      "lv_obj_set_width(status_row, lv_pct(100));",
+      "lv_obj_set_height(status_row, LV_SIZE_CONTENT);",
+      "lv_obj_set_size(ctx->compromised_cleanup_spinner, 34, 34);",
+      "lv_obj_set_width(ctx->compromised_cleanup_status_label, lv_pct(100));",
+      "lv_obj_set_size(ctx->compromised_cleanup_log_container, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_width(ctx->compromised_cleanup_log_label, lv_pct(100));",
+      "lv_obj_set_size(btn_row, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(ctx->compromised_cleanup_move_btn, 160, 42);",
+      "lv_obj_set_size(ctx->compromised_cleanup_close_btn, 120, 42);"
+    ]
+  },
+  {
+    "name": "show_compromised_file_page",
+    "file": "main/main.c",
+    "line": 35312,
+    "diagram": "main--show_compromised_file_page.svg",
+    "callbacks": [
+      "compromised_file_clean_cb",
+      "compromised_file_copy_cb",
+      "compromised_file_delete_cb",
+      "compromised_files_loading_label_delete_cb",
+      "compromised_files_sync_cb",
+      "kind",
+      "select_buttons",
+      "wardrive_files_checkbox_cb",
+      "wardrive_files_delete_btn_delete_cb",
+      "wardrive_files_delete_selected_cb",
+      "wardrive_fix_file_cb",
+      "wpasec_btn_event_cb"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      " Send to wpa-sec",
+      "Copy latest",
+      " Sync all Sync new",
+      " Clean",
+      "Loading...",
+      " Delete (0)",
+      "No SD card detected on this tab.",
+      "Manage files from a JanOS transport tab.",
+      "Reading file list from module...",
+      "Failed to start file loader task.",
+      "No files waiting - already uploaded/archived.",
+      "No wardrive files in the working folder.",
+      "#52B6FF MONSTER: AVAILABLE#  |  #5EDCA3 TAB5: SYNCED##52B6FF MONSTER: AVAILABLE#  |  #F9A825 TAB5: NOT COPIED#",
+      "Fix",
+      "COPY TO TAB5",
+      "Monster SD  >  Tab5 SD",
+      "DELETE FILE Delete"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(*page_slot, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(header, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(back_btn, 72, 60);",
+      "lv_obj_set_height(spacer, 1);",
+      "lv_obj_set_size(wpasec_btn, 190, 50);",
+      "lv_obj_set_size(copy_latest_btn, 180, 50);",
+      "lv_obj_set_size(sync_btn, 155, 50);",
+      "lv_obj_set_size(clean_btn, 120, 50);",
+      "lv_obj_set_size(select_bar, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(btn, 110, 44);",
+      "lv_obj_set_size(ctx->wardrive_files_delete_btn, 150, 44);",
+      "lv_obj_set_size(list_container, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(loading_box, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(spinner, 80, 80);",
+      "lv_obj_set_width(empty, lv_pct(100));",
+      "lv_obj_set_width(empty, lv_pct(100));",
+      "lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(cb, 44, 44);",
+      "lv_obj_set_height(info, LV_SIZE_CONTENT);",
+      "lv_obj_set_width(name_lbl, lv_pct(100));",
+      "lv_obj_set_width(path_lbl, lv_pct(100));",
+      "lv_obj_set_width(sync_state_lbl, lv_pct(100));",
+      "lv_obj_set_width(detail_lbl, lv_pct(100));",
+      "lv_obj_set_width(detail_lbl, lv_pct(100));",
+      "lv_obj_set_size(actions, 392, 62);",
+      "lv_obj_set_size(actions, LV_SIZE_CONTENT, LV_SIZE_CONTENT);",
+      "lv_obj_set_size(fix_btn, 86, 44);",
+      "lv_obj_set_size(copy_btn, 250, 62);",
+      "lv_obj_set_size(delete_btn, is_copyable_pcap ? 130 : 110, is_copyable_pcap ? 62 : 44);",
+      "lv_obj_set_width(state_title, lv_pct(100));",
+      "lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_width(name_lbl, lv_pct(100));",
+      "lv_obj_set_width(detail_lbl, lv_pct(100));"
+    ]
+  },
+  {
+    "name": "show_compromised_delete_confirm",
+    "file": "main/main.c",
+    "line": 36056,
+    "diagram": "main--show_compromised_delete_confirm.svg",
+    "callbacks": [
+      "compromised_delete_confirm_destroy_cb",
+      "compromised_delete_confirm_no_cb",
+      "compromised_delete_confirm_yes_cb"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "Erased from the module's SD card, together with its / .hccapx companion. This cannot be undone.Erased from the module's SD card, together with their / .hccapx companions. This cannot be undone.",
+      "Erased from the module's SD card. This cannot be undone.",
+      "Cancel",
+      " Delete file Delete all"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(popup, 560, LV_SIZE_CONTENT);",
+      "lv_obj_set_width(title, lv_pct(100));",
+      "lv_obj_set_width(list_lbl, lv_pct(100));",
+      "lv_obj_set_width(message, lv_pct(100));",
+      "lv_obj_set_size(btn_row, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(no_btn, 160, 52);",
+      "lv_obj_set_size(yes_btn, 160, 52);"
+    ]
+  },
+  {
+    "name": "show_espshark_page",
+    "file": "main/main.c",
+    "line": 36293,
+    "diagram": "main--show_espshark_page.svg",
+    "callbacks": [
+      "espshark_back_btn_event_cb"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "ESPShark",
+      "Capture  |  Inspect  |  Analyze",
+      "Choose where the capture comes from. Monster view shows what is on the module SD, marks files already copied to Tab5 and can synchronize everything missing.",
+      "  NEXT: NETWORK HEALTH / THREAT ANALYSIS / Baseline, suspicious DNS, scans, beaconing and worm-like lateral spread. Live stream requires a later JanOS capture protocol."
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(page, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(header, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(back_btn, 72, 60);",
+      "lv_obj_set_height(heading, LV_SIZE_CONTENT);",
+      "lv_obj_set_width(intro, lv_pct(100));",
+      "lv_obj_set_size(actions, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(future, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_width(future_text, lv_pct(100));"
+    ]
+  },
+  {
+    "name": "show_compromised_data_page",
+    "file": "main/main.c",
+    "line": 36434,
+    "diagram": "main--show_compromised_data_page.svg",
+    "callbacks": [
+      "compromised_data_main_back_btn_event_cb"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "Compromised Data"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(compromised_data_page, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(header, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(back_btn, 72, 60);",
+      "lv_obj_set_size(tiles, lv_pct(100), LV_SIZE_CONTENT);"
+    ]
+  },
+  {
+    "name": "show_evil_twin_passwords_page",
+    "file": "main/main.c",
+    "line": 36522,
+    "diagram": "main--show_evil_twin_passwords_page.svg",
+    "callbacks": [
+      "compromised_data_back_btn_event_cb",
+      "evil_twin_row_click_cb"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "Evil Twin Passwords",
+      "Loading..."
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(ctx->evil_twin_passwords_page, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(header, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(back_btn, 72, 60);",
+      "lv_obj_set_height(spacer, 1);",
+      "lv_obj_set_size(list_container, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);"
+    ]
+  },
+  {
+    "name": "show_evil_twin_connect_popup",
+    "file": "main/main.c",
+    "line": 36729,
+    "diagram": "main--show_evil_twin_connect_popup.svg",
+    "callbacks": [
+      "evil_twin_connect_popup_cancel_cb",
+      "evil_twin_connect_popup_yes_cb"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      " Connect to Network?",
+      "Connect and scan for hosts to perform ARP poisoning attack",
+      "Cancel",
+      "Connect"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(evil_twin_connect_popup_overlay, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(evil_twin_connect_popup_obj, 320, LV_SIZE_CONTENT);",
+      "lv_obj_set_width(ssid_label, lv_pct(100));",
+      "lv_obj_set_width(pass_label, lv_pct(100));",
+      "lv_obj_set_width(desc, lv_pct(100));",
+      "lv_obj_set_size(btn_row, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(cancel_btn, 100, 45);",
+      "lv_obj_set_size(yes_btn, 120, 45);"
+    ]
+  },
+  {
+    "name": "show_rogue_ap_popup",
+    "file": "main/main.c",
+    "line": 37164,
+    "diagram": "main--show_rogue_ap_popup.svg",
+    "callbacks": [
+      "rogue_ap_popup_close_cb"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "Rogue AP Running",
+      "Starting Rogue AP...",
+      "Stop Rogue AP"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(ctx->rogue_ap_popup_overlay, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(ctx->rogue_ap_popup, 550, 450);",
+      "lv_obj_set_width(ctx->rogue_ap_status_label, lv_pct(100));",
+      "lv_obj_set_size(close_btn, lv_pct(100), 50);"
+    ]
+  },
+  {
+    "name": "show_rogue_ap_page",
+    "file": "main/main.c",
+    "line": 37231,
+    "diagram": "main--show_rogue_ap_page.svg",
+    "callbacks": [
+      "rogue_ap_back_cb",
+      "rogue_ap_password_focus_cb",
+      "rogue_ap_start_cb"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "Rogue AP Attack",
+      "Known Password:",
+      "Enter WiFi Password:",
+      "Select Portal HTML:",
+      " Start Rogue AP"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(ctx->rogue_ap_page, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(header, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(back_btn, 72, 60);",
+      "lv_obj_set_size(pass_section, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(ctx->rogue_ap_password_input, lv_pct(100), 45);",
+      "lv_obj_set_size(ctx->rogue_ap_keyboard, lv_pct(100), 260);",
+      "lv_obj_set_width(ctx->rogue_ap_html_dropdown, lv_pct(100));",
+      "lv_obj_set_height(ctx->rogue_ap_html_dropdown, 45);",
+      "lv_obj_set_size(ctx->rogue_ap_start_btn, lv_pct(100), 50);"
+    ]
+  },
+  {
+    "name": "show_karma2_html_popup",
+    "file": "main/main.c",
+    "line": 37816,
+    "diagram": "main--show_karma2_html_popup.svg",
+    "callbacks": [
+      "karma2_html_popup_close_cb",
+      "karma2_html_select_cb"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "Select Portal HTML",
+      "(Default portal)",
+      "Cancel",
+      "Start Portal"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(karma2_html_popup_obj, 350, LV_SIZE_CONTENT);",
+      "lv_obj_set_width(karma2_html_dropdown, lv_pct(100));",
+      "lv_obj_set_size(btn_row, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(cancel_btn, 100, 40);",
+      "lv_obj_set_size(start_btn, 130, 40);"
+    ]
+  },
+  {
+    "name": "show_karma2_attack_popup",
+    "file": "main/main.c",
+    "line": 38574,
+    "diagram": "main--show_karma2_attack_popup.svg",
+    "callbacks": [
+      "karma2_attack_background_cb",
+      "karma2_attack_stop_cb"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      " Karma Attack Active",
+      " Background",
+      " Stop Portal"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(karma2_attack_popup_overlay, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(karma2_attack_popup_obj, 400, LV_SIZE_CONTENT);",
+      "lv_obj_set_width(karma2_attack_status_label, lv_pct(100));",
+      "lv_obj_set_size(btn_cont, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(bg_btn, 150, 50);",
+      "lv_obj_set_size(stop_btn, 150, 50);"
+    ]
+  },
+  {
+    "name": "show_adhoc_portal_page",
+    "file": "main/main.c",
+    "line": 39151,
+    "diagram": "main--show_adhoc_portal_page.svg",
+    "callbacks": [
+      "adhoc_portal_back_cb",
+      "adhoc_portal_stop_cb",
+      "adhoc_show_probes_cb"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "Ad Hoc Portal & Karma",
+      " Portal Active",
+      "Waiting for client connections... /  / Passwords will appear here.",
+      " STOP PORTAL",
+      "Start a Karma captive portal using probe requests / collected by Network Observer. /  / Probes from all connected devices will be / combined (duplicates removed).",
+      "Start a Karma captive portal using probe requests / collected by Network Observer.",
+      " Show Probes",
+      "Select a probe request to start captive portal"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(adhoc_portal_page, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(header, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(back_btn, 72, 60);",
+      "lv_obj_set_size(status_box, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(data_box, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_width(adhoc_portal_data_label, lv_pct(100));",
+      "lv_obj_set_size(stop_btn, lv_pct(100), 55);",
+      "lv_obj_set_size(info_box, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_width(info_label, lv_pct(100));",
+      "lv_obj_set_size(probes_btn, lv_pct(100), 55);"
+    ]
+  },
+  {
+    "name": "show_portal_data_page",
+    "file": "main/main.c",
+    "line": 39337,
+    "diagram": "main--show_portal_data_page.svg",
+    "callbacks": [
+      "compromised_data_back_btn_event_cb"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "Portal Data",
+      "Loading..."
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(ctx->portal_data_page, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(header, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(back_btn, 72, 60);",
+      "lv_obj_set_height(spacer, 1);",
+      "lv_obj_set_size(list_container, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_width(fields_lbl, lv_pct(100));"
+    ]
+  },
+  {
+    "name": "show_wpasec_popup",
+    "file": "main/main.c",
+    "line": 40354,
+    "diagram": "main--show_wpasec_popup.svg",
+    "callbacks": [
+      "close_wpasec_popup"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      " WPA-SEC Upload",
+      "Checking key...",
+      "Close"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(ctx->wpasec_popup_overlay, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(ctx->wpasec_popup, lv_pct(85), lv_pct(85));",
+      "lv_obj_set_width(ctx->wpasec_status_label, lv_pct(90));",
+      "lv_obj_set_size(close_btn, 120, 44);"
+    ]
+  },
+  {
+    "name": "show_handshakes_page",
+    "file": "main/main.c",
+    "line": 40442,
+    "diagram": "main--show_handshakes_page.svg",
+    "callbacks": [],
+    "direct_ui_calls": [
+      "show_compromised_file_page"
+    ],
+    "literal_labels": [],
+    "dimension_calls": []
+  },
+  {
+    "name": "show_wardrive_files_page",
+    "file": "main/main.c",
+    "line": 40447,
+    "diagram": "main--show_wardrive_files_page.svg",
+    "callbacks": [],
+    "direct_ui_calls": [
+      "show_compromised_file_page"
+    ],
+    "literal_labels": [],
+    "dimension_calls": []
+  },
+  {
+    "name": "show_pcap_captures_page",
+    "file": "main/main.c",
+    "line": 40452,
+    "diagram": "main--show_pcap_captures_page.svg",
+    "callbacks": [],
+    "direct_ui_calls": [
+      "show_compromised_file_page"
+    ],
+    "literal_labels": [],
+    "dimension_calls": []
+  },
+  {
+    "name": "show_pcap_viewer_page",
+    "file": "main/main.c",
+    "line": 40850,
+    "diagram": "main--show_pcap_viewer_page.svg",
+    "callbacks": [],
+    "direct_ui_calls": [],
+    "literal_labels": [],
+    "dimension_calls": []
+  },
+  {
+    "name": "pcap_viewer_show_summary_popup",
+    "file": "main/main.c",
+    "line": 42068,
+    "diagram": "main--pcap_viewer_show_summary_popup.svg",
+    "callbacks": [
+      "pcap_viewer_packet_detail_close_cb"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "Close"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(state->detail_overlay, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(popup, lv_pct(86), lv_pct(88));",
+      "lv_obj_set_width(title, lv_pct(100));",
+      "lv_obj_set_size(scroll, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_width(body, lv_pct(100));",
+      "lv_obj_set_size(close_btn, 160, 46);"
+    ]
+  },
+  {
+    "name": "show_deauth_detector_page",
+    "file": "main/main.c",
+    "line": 47132,
+    "diagram": "main--show_deauth_detector_page.svg",
+    "callbacks": [
+      "deauth_detector_back_btn_event_cb",
+      "deauth_detector_start_cb",
+      "deauth_detector_stop_cb"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "Deauth Detector",
+      " Start",
+      " Stop"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(deauth_detector_page, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(header, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(left_cont, LV_SIZE_CONTENT, LV_SIZE_CONTENT);",
+      "lv_obj_set_size(back_btn, 72, 60);",
+      "lv_obj_set_size(btn_cont, LV_SIZE_CONTENT, LV_SIZE_CONTENT);",
+      "lv_obj_set_size(deauth_start_btn, 90, 40);",
+      "lv_obj_set_size(deauth_stop_btn, 90, 40);",
+      "lv_obj_set_size(deauth_table, lv_pct(100), LV_SIZE_CONTENT);"
+    ]
+  },
+  {
+    "name": "show_bluetooth_menu_page",
+    "file": "main/main.c",
+    "line": 47316,
+    "diagram": "main--show_bluetooth_menu_page.svg",
+    "callbacks": [
+      "bt_menu_back_btn_event_cb"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "Bluetooth"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(bt_menu_page, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(header, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(back_btn, 72, 60);",
+      "lv_obj_set_size(tiles, lv_pct(100), LV_SIZE_CONTENT);"
+    ]
+  },
+  {
+    "name": "show_airtag_scan_page",
+    "file": "main/main.c",
+    "line": 47534,
+    "diagram": "main--show_airtag_scan_page.svg",
+    "callbacks": [
+      "airtag_scan_back_btn_event_cb"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "AirTag Scan",
+      "0",
+      "AirTags",
+      "SmartTags"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(bt_airtag_page, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(header, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(back_btn, 72, 60);",
+      "lv_obj_set_size(content, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(airtag_box, 200, 180);",
+      "lv_obj_set_size(smarttag_box, 200, 180);"
+    ]
+  },
+  {
+    "name": "show_jammer_page",
+    "file": "main/main.c",
+    "line": 47959,
+    "diagram": "main--show_jammer_page.svg",
+    "callbacks": [
+      "jammer_back_btn_event_cb",
+      "jammer_band_event_cb",
+      "jammer_big_btn_event_cb"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "Jammer",
+      "  Start Jammer",
+      "Idle"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(bt_jammer_page, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(header, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(back_btn, 72, 60);",
+      "lv_obj_set_size(content, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(band_row, LV_SIZE_CONTENT, LV_SIZE_CONTENT);",
+      "lv_obj_set_size(btn, 110, 56);",
+      "lv_obj_set_size(bt_jammer_big_btn, 320, 80);"
+    ]
+  },
+  {
+    "name": "show_bt_scan_page",
+    "file": "main/main.c",
+    "line": 48191,
+    "diagram": "main--show_bt_scan_page.svg",
+    "callbacks": [
+      "bt_scan_back_btn_event_cb",
+      "bt_scan_device_click_cb",
+      "bt_scan_rescan_cb"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "BT Scan & Locate",
+      " Rescan",
+      "Scanning for BT devices..."
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(bt_scan_page, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(header, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(left_cont, LV_SIZE_CONTENT, LV_SIZE_CONTENT);",
+      "lv_obj_set_size(back_btn, 72, 60);",
+      "lv_obj_set_size(rescan_btn, 100, 40);",
+      "lv_obj_set_size(loading_container, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(spinner, 60, 60);",
+      "lv_obj_set_size(list_container, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_width(name_lbl, 155);",
+      "lv_obj_set_width(mac_lbl, 155);",
+      "lv_obj_set_width(rssi_lbl, 70);"
+    ]
+  },
+  {
+    "name": "show_ap_radar_page",
+    "file": "main/main.c",
+    "line": 48672,
+    "diagram": "main--show_ap_radar_page.svg",
+    "callbacks": [
+      "ap_radar_back_btn_event_cb",
+      "ap_radar_panel_draw_cb",
+      "ap_radar_stop_btn_event_cb"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "  AP Radar",
+      "  STOP"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(ap_radar_page, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(header, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(back_btn, 72, 60);",
+      "lv_obj_set_size(title_col, LV_SIZE_CONTENT, LV_SIZE_CONTENT);",
+      "lv_obj_set_width(ap_radar_panel, lv_pct(100));",
+      "lv_obj_set_width(ap_radar_rssi_label, lv_pct(100));",
+      "lv_obj_set_size(stop_btn, lv_pct(100), 56);"
+    ]
+  },
+  {
+    "name": "show_bt_locator_page",
+    "file": "main/main.c",
+    "line": 48938,
+    "diagram": "main--show_bt_locator_page.svg",
+    "callbacks": [
+      "bt_locator_tracking_back_btn_event_cb"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "BT Locator - Tracking",
+      "Signal Strength"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(bt_locator_page, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(header, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(back_btn, 72, 60);",
+      "lv_obj_set_size(content, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(rssi_box, 250, 150);"
+    ]
+  },
+  {
+    "name": "show_beacon_ssids_page",
+    "file": "main/main.c",
+    "line": 49778,
+    "diagram": "main--show_beacon_ssids_page.svg",
+    "callbacks": [
+      "beacon_ssids_add_new_cb",
+      "beacon_ssids_back_btn_event_cb"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "List SSIDs",
+      " Add New",
+      "Loading..."
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(ctx->beacon_ssids_page, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(header, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(back_btn, 72, 60);",
+      "lv_obj_set_height(spacer, 1);",
+      "lv_obj_set_size(add_btn, 150, 48);",
+      "lv_obj_set_size(body, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(list_panel, LV_SIZE_CONTENT, lv_pct(100));",
+      "lv_obj_set_size(ctx->beacon_ssids_grid, lv_pct(100), LV_SIZE_CONTENT);"
+    ]
+  },
+  {
+    "name": "show_beacon_spam_page",
+    "file": "main/main.c",
+    "line": 49912,
+    "diagram": "main--show_beacon_spam_page.svg",
+    "callbacks": [
+      "beacon_spam_back_btn_event_cb"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "Beacon Spam"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(ctx->beacon_spam_page, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(header, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(back_btn, 72, 60);",
+      "lv_obj_set_size(tiles, lv_pct(100), LV_SIZE_CONTENT);"
+    ]
+  },
+  {
+    "name": "show_global_attacks_page",
+    "file": "main/main.c",
+    "line": 50035,
+    "diagram": "main--show_global_attacks_page.svg",
+    "callbacks": [
+      "back_btn_event_cb"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "Global WiFi AttacksGlobal WiFi Tests"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(global_attacks_page, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(header, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(back_btn, 72, 60);",
+      "lv_obj_set_size(tiles, lv_pct(100), LV_SIZE_CONTENT);"
+    ]
+  },
+  {
+    "name": "show_version_mismatch_popup",
+    "file": "main/main.c",
+    "line": 51282,
+    "diagram": "main--show_version_mismatch_popup.svg",
+    "callbacks": [
+      "version_popup_close_cb",
+      "version_popup_ota_cb"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "JanOS Version Mismatch",
+      " Monster OTA",
+      "OK"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(overlay, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(popup, 560, 370);",
+      "lv_obj_set_width(message, 500);",
+      "lv_obj_set_size(ota_btn, 220, 48);",
+      "lv_obj_set_size(ok_btn, 140, 46);"
+    ]
+  },
+  {
+    "name": "show_no_board_popup",
+    "file": "main/main.c",
+    "line": 51465,
+    "diagram": "main--show_no_board_popup.svg",
+    "callbacks": [
+      "board_detect_popup_close_cb"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "No Board Detected",
+      "Connect ESP32-C5 board via UART",
+      "Retrying every 3 seconds...",
+      "Continue Anyway"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(board_detect_overlay, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(board_detect_popup, 400, 280);",
+      "lv_obj_set_size(close_btn, 160, 50);"
+    ]
+  },
+  {
+    "name": "show_scan_time_popup",
+    "file": "main/main.c",
+    "line": 52003,
+    "diagram": "main--show_scan_time_popup.svg",
+    "callbacks": [
+      "scan_setup_vendor_switch_cb",
+      "scan_time_popup_close_cb",
+      "scan_time_save_cb"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "Scan Setup",
+      "Show Vendors",
+      "Channel Scan Time (ms)",
+      "Grove",
+      "USB",
+      "MBus",
+      "Vendor read unavailable",
+      "Cancel",
+      "Save"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(scan_time_popup_obj, 420, popup_height);",
+      "lv_obj_set_size(vendor_row, lv_pct(100), 50);",
+      "lv_obj_set_size(btn_row, lv_pct(100), 50);",
+      "lv_obj_set_size(cancel_btn, 100, 40);",
+      "lv_obj_set_size(save_btn, 100, 40);"
+    ]
+  },
+  {
+    "name": "show_red_team_disclaimer_popup",
+    "file": "main/main.c",
+    "line": 52265,
+    "diagram": "main--show_red_team_disclaimer_popup.svg",
+    "callbacks": [
+      "red_team_disclaimer_cancel_cb",
+      "red_team_disclaimer_confirm_cb"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "WARNING - Red Team Mode",
+      "Red Team features include offensive WiFi / testing capabilities such as deauthentication, / evil twin attacks, and ARP poisoning. /  / Only use these features on networks you own / or have explicit written permission to test. /  / Unauthorized use may be illegal.",
+      "Cancel",
+      "I Understand"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(red_team_disclaimer_overlay, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(red_team_disclaimer_popup, 550, 400);",
+      "lv_obj_set_width(message, lv_pct(90));",
+      "lv_obj_set_size(btn_container, lv_pct(100), 50);",
+      "lv_obj_set_size(cancel_btn, 120, 45);",
+      "lv_obj_set_size(confirm_btn, 150, 45);"
+    ]
+  },
+  {
+    "name": "show_red_team_settings_page",
+    "file": "main/main.c",
+    "line": 52402,
+    "diagram": "main--show_red_team_settings_page.svg",
+    "callbacks": [
+      "red_team_back_cb",
+      "red_team_switch_event_cb"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      " Back",
+      "Red Team Settings",
+      "Enable Red team features",
+      "When enabled, offensive testing features become / available including deauthentication attacks, / evil twin, ARP poisoning, and more. /  / When disabled, these features are hidden and / 'Attack' labels become 'Test'.",
+      "Status: ENABLED - All features available",
+      "Status: DISABLED - Safe mode active"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(red_team_page, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(header, lv_pct(100), 50);",
+      "lv_obj_set_size(back_btn, 80, 40);",
+      "lv_obj_set_size(content, lv_pct(90), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(switch_row, lv_pct(100), 60);",
+      "lv_obj_set_size(red_team_switch, 60, 30);",
+      "lv_obj_set_width(desc, lv_pct(100));"
+    ]
+  },
+  {
+    "name": "show_screen_timeout_popup",
+    "file": "main/main.c",
+    "line": 52583,
+    "diagram": "main--show_screen_timeout_popup.svg",
+    "callbacks": [
+      "screen_timeout_close_cb",
+      "screen_timeout_dropdown_cb"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "Screen Timeout",
+      "10 seconds / 30 seconds / 1 minute / 5 minutes / Stays On",
+      "Close"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(screen_timeout_popup_obj, 350, 220);",
+      "lv_obj_set_width(dropdown, 200);",
+      "lv_obj_set_size(close_btn, 100, 40);"
+    ]
+  },
+  {
+    "name": "show_screen_rotation_popup",
+    "file": "main/main.c",
+    "line": 52721,
+    "diagram": "main--show_screen_rotation_popup.svg",
+    "callbacks": [
+      "screen_rotation_close_cb",
+      "screen_rotation_dropdown_cb",
+      "screen_rotation_restart_cb"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "Screen Rotation",
+      "Portrait (0) / Landscape (90) / Portrait flipped (180) / Landscape flipped (270)",
+      "Close",
+      " Restart"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(screen_rotation_popup_obj, 380, 290);",
+      "lv_obj_set_width(dropdown, 260);",
+      "lv_obj_set_size(btn_row, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(close_btn, 100, 40);",
+      "lv_obj_set_size(restart_btn, 130, 40);"
+    ]
+  },
+  {
+    "name": "show_screen_brightness_popup",
+    "file": "main/main.c",
+    "line": 52863,
+    "diagram": "main--show_screen_brightness_popup.svg",
+    "callbacks": [
+      "screen_brightness_close_cb",
+      "screen_brightness_slider_cb",
+      "screen_brightness_slider_release_cb"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "Screen Brightness",
+      "Close"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(screen_brightness_popup_overlay, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(screen_brightness_popup_obj, 400, 250);",
+      "lv_obj_set_width(screen_brightness_slider, 300);",
+      "lv_obj_set_size(close_btn, 100, 40);"
+    ]
+  },
+  {
+    "name": "show_time_popup",
+    "file": "main/main.c",
+    "line": 53205,
+    "diagram": "main--show_time_popup.svg",
+    "callbacks": [
+      "time_popup_close_cb",
+      "time_popup_set_cb"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      " Time (RTC)",
+      "RX8130CE RTC not detected on I2C 0x32.",
+      " Set",
+      "Close"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(card, 600, time_card_h);",
+      "lv_obj_set_width(time_popup_status, lv_pct(100));",
+      "lv_obj_set_size(rollers, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_width(time_year_roller, 104);",
+      "lv_obj_set_size(btn_row, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(set_btn, 160, 48);",
+      "lv_obj_set_size(close_btn, 140, 48);"
+    ]
+  },
+  {
+    "name": "show_theme_popup",
+    "file": "main/main.c",
+    "line": 53329,
+    "diagram": "main--show_theme_popup.svg",
+    "callbacks": [
+      "theme_alert_sound_switch_cb",
+      "theme_boot_sound_dropdown_cb",
+      "theme_dark_mode_switch_cb",
+      "theme_dashboard_switch_cb",
+      "theme_popup_close_cb"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "Theme",
+      "Dark mode",
+      "Dashboard",
+      "Boot sound",
+      "OFF / Nokia / Intel / Star Wars",
+      "Alert sound",
+      "Dark mode switches between dark and light palette. / Dashboard ON/OFF toggles bottom telemetry cards on Home. / Boot sound selects startup melody at 69% volume. / Alert sound: joins, captures, warnings and follower alarms.",
+      "Close"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(theme_popup_obj, 430, 500);",
+      "lv_obj_set_size(dark_row, lv_pct(100), 56);",
+      "lv_obj_set_size(dashboard_row, lv_pct(100), 56);",
+      "lv_obj_set_size(boot_sound_row, lv_pct(100), 64);",
+      "lv_obj_set_width(boot_sound_dropdown, 170);",
+      "lv_obj_set_size(alert_sound_row, lv_pct(100), 56);",
+      "lv_obj_set_width(desc, lv_pct(100));",
+      "lv_obj_set_size(close_btn, 120, 40);"
+    ]
+  },
+  {
+    "name": "show_screen_lock_popup",
+    "file": "main/main.c",
+    "line": 53523,
+    "diagram": "main--show_screen_lock_popup.svg",
+    "callbacks": [
+      "auto_lock_switch_cb",
+      "screen_lock_now_cb",
+      "screen_lock_popup_close_cb",
+      "screen_lock_switch_cb"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "Screen Lock",
+      "Show lock button",
+      "Auto-lock on screen off",
+      "Adds a lock button to the top status bar. / When locked, the screen ignores all taps until / you slide to unlock - prevents accidental clicks. / Auto-lock engages the lock when the screen dims.",
+      " Lock now",
+      "Close"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(card, 430, 390);",
+      "lv_obj_set_size(row, lv_pct(100), 56);",
+      "lv_obj_set_size(auto_row, lv_pct(100), 56);",
+      "lv_obj_set_width(desc, lv_pct(100));",
+      "lv_obj_set_size(btn_row, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(lock_btn, 140, 44);",
+      "lv_obj_set_size(close_btn, 120, 44);"
+    ]
+  },
+  {
+    "name": "show_ft_baud_popup",
+    "file": "main/main.c",
+    "line": 53653,
+    "diagram": "main--show_ft_baud_popup.svg",
+    "callbacks": [
+      "ft_baud_dropdown_cb",
+      "ft_baud_popup_close_cb"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "Transfer Speed",
+      "Console baud",
+      "Rate the Monster console is switched to while a file / is copied over Grove or M-BUS. Higher is faster but / depends on the cable: if the switch is not confirmed, / the copy still runs at 115200. / The transfer popup reports the KB/s it achieved.",
+      "Close"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(card, 430, 340);",
+      "lv_obj_set_size(row, lv_pct(100), 64);",
+      "lv_obj_set_width(dropdown, 190);",
+      "lv_obj_set_width(desc, lv_pct(100));",
+      "lv_obj_set_size(close_btn, 120, 40);"
+    ]
+  },
+  {
+    "name": "show_ota_page",
+    "file": "main/main.c",
+    "line": 55650,
+    "diagram": "main--show_ota_page.svg",
+    "callbacks": [
+      "ota_back_cb",
+      "ota_channel_changed_cb",
+      "ota_check_btn_cb",
+      "ota_credentials_changed_cb",
+      "ota_info_btn_cb",
+      "ota_kb_ready_cb",
+      "ota_list_btn_cb",
+      "ota_mode_changed_cb",
+      "ota_pass_toggle_cb",
+      "ota_scan_btn_cb"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      " Back",
+      " Monster OTA",
+      " No C5 module detected - connect it and reopen",
+      " Scan",
+      "DHCP / Manual",
+      "main / dev",
+      " Download & Flash",
+      "List",
+      "Info"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(g_ota.page, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(header, lv_pct(100), 50);",
+      "lv_obj_set_size(back_btn, 90, 40);",
+      "lv_obj_set_width(form, lv_pct(100));",
+      "lv_obj_set_width(tgt, lv_pct(100));",
+      "lv_obj_set_width(ssid_row, lv_pct(100));",
+      "lv_obj_set_height(ssid_row, LV_SIZE_CONTENT);",
+      "lv_obj_set_size(scan_btn, 110, 44);",
+      "lv_obj_set_width(pass_row, lv_pct(100));",
+      "lv_obj_set_height(pass_row, LV_SIZE_CONTENT);",
+      "lv_obj_set_size(eye_btn, 52, 44);",
+      "lv_obj_set_width(g_ota.mode_dd, lv_pct(100));",
+      "lv_obj_set_width(g_ota.manual_box, lv_pct(100));",
+      "lv_obj_set_height(g_ota.manual_box, LV_SIZE_CONTENT);",
+      "lv_obj_set_width(g_ota.channel_dd, lv_pct(100));",
+      "lv_obj_set_size(actions, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_height(check_btn, 52);",
+      "lv_obj_set_size(list_btn, 90, 52);",
+      "lv_obj_set_size(info_btn, 90, 52);",
+      "lv_obj_set_width(g_ota.page_status, lv_pct(100));",
+      "lv_obj_set_size(g_ota.keyboard, lv_pct(100), 260);"
+    ]
+  },
+  {
+    "name": "show_settings_page",
+    "file": "main/main.c",
+    "line": 55917,
+    "diagram": "main--show_settings_page.svg",
+    "callbacks": [
+      "settings_back_btn_event_cb"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      " Back",
+      "Settings"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(settings_page, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(header, lv_pct(100), 50);",
+      "lv_obj_set_size(back_btn, 80, 40);",
+      "lv_obj_set_size(tiles, lv_pct(100), LV_SIZE_CONTENT);"
+    ]
+  },
+  {
+    "name": "show_sd_admin_page",
+    "file": "main/main.c",
+    "line": 56427,
+    "diagram": "main--show_sd_admin_page.svg",
+    "callbacks": [
+      "sd_admin_back_cb",
+      "sd_admin_keyboard_cb",
+      "sd_admin_password_focus_cb",
+      "sd_admin_password_insert_cb",
+      "sd_admin_quick_start_cb",
+      "sd_admin_show_password_toggle_cb",
+      "sd_admin_start_cb",
+      "sd_admin_stop_cb"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "SD Card Admin / File Manager",
+      "Secure SD file manager. Only devices connected to JanOS-Admin can access /sdcard/lab. / 1. Enter a WPA2 password and tap Start, or use Quick Start. / 2. When status shows Running, scan the QR code or join Wi-Fi: JanOS-Admin / ",
+      "Start Admin Portal",
+      "Quick Start",
+      "Stop Portal",
+      "Quick Start password: 12345678",
+      "Phone connection",
+      "Scan QR to join JanOS-Admin"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(ctx->sd_admin_page, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(header, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(back, 72, 60);",
+      "lv_obj_set_size(info, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_width(info_text, lv_pct(100));",
+      "lv_obj_set_size(form, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_size(ctx->sd_admin_password_input, 520, 48);",
+      "lv_obj_set_size(actions, lv_pct(100), 56);",
+      "lv_obj_set_size(ctx->sd_admin_start_btn, 220, 52);",
+      "lv_obj_set_size(ctx->sd_admin_quick_start_btn, 150, 52);",
+      "lv_obj_set_size(ctx->sd_admin_stop_btn, 160, 52);",
+      "lv_obj_set_size(status_panel, lv_pct(100), LV_SIZE_CONTENT);",
+      "lv_obj_set_width(ctx->sd_admin_status_label, lv_pct(100));",
+      "lv_obj_set_width(ctx->sd_admin_command_label, lv_pct(100));",
+      "lv_obj_set_size(ctx->sd_admin_qr_section, lv_pct(100), 264);",
+      "lv_obj_set_size(ctx->sd_admin_keyboard, lv_pct(100), 240);"
+    ]
+  },
+  {
+    "name": "compromised_transfer_show_popup",
+    "file": "main/main.c",
+    "line": 56809,
+    "diagram": "main--compromised_transfer_show_popup.svg",
+    "callbacks": [
+      "compromised_transfer_close_or_cancel_cb"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      " Sync Monster SD Copy to Tab5",
+      "PCAP file",
+      "Preparing transfer...",
+      "The original file will remain on the Monster.",
+      "Cancel"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(compromised_transfer_ui.overlay, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(compromised_transfer_ui.popup, popup_clamp_w(680), 340);",
+      "lv_obj_set_width(name, lv_pct(100));",
+      "lv_obj_set_width(compromised_transfer_ui.status_label, lv_pct(100));",
+      "lv_obj_set_size(compromised_transfer_ui.progress_bar, 580, 24);",
+      "lv_obj_set_width(compromised_transfer_ui.detail_label, lv_pct(100));",
+      "lv_obj_set_size(compromised_transfer_ui.action_btn, 180, 48);"
+    ]
+  },
+  {
+    "name": "show_action_popup",
+    "file": "main/screens/subghz_hunter_screen.c",
+    "line": 506,
+    "diagram": "subghz_hunter_screen--show_action_popup.svg",
+    "callbacks": [
+      "bs"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [],
+    "dimension_calls": [
+      "lv_obj_set_size(overlay, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(popup, 540, 260);",
+      "lv_obj_set_size(brow, lv_pct(100), 60);",
+      "lv_obj_set_size(b, 150, 50);"
+    ]
+  },
+  {
+    "name": "show_leave_popup",
+    "file": "main/screens/subghz_hunter_screen.c",
+    "line": 593,
+    "diagram": "subghz_hunter_screen--show_leave_popup.svg",
+    "callbacks": [
+      "on_leave_cancel",
+      "on_leave_confirm"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "Leave Hunter?",
+      "Leave",
+      "Stay"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(overlay, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(popup, 540, 240);",
+      "lv_obj_set_width(body, lv_pct(100));",
+      "lv_obj_set_size(brow, lv_pct(100), 60);",
+      "lv_obj_set_size(leave, 200, 50);",
+      "lv_obj_set_size(stay, 200, 50);"
+    ]
+  },
+  {
+    "name": "show_subghz_hunter_page",
+    "file": "main/screens/subghz_hunter_screen.c",
+    "line": 813,
+    "diagram": "subghz_hunter_screen--show_subghz_hunter_page.svg",
+    "callbacks": [],
+    "direct_ui_calls": [],
+    "literal_labels": [],
+    "dimension_calls": []
+  },
+  {
+    "name": "show_subghz_hunter_page_resume",
+    "file": "main/screens/subghz_hunter_screen.c",
+    "line": 815,
+    "diagram": "subghz_hunter_screen--show_subghz_hunter_page_resume.svg",
+    "callbacks": [],
+    "direct_ui_calls": [],
+    "literal_labels": [],
+    "dimension_calls": []
+  },
+  {
+    "name": "show_subghz_hunter_settings_page",
+    "file": "main/screens/subghz_hunter_settings_screen.c",
+    "line": 143,
+    "diagram": "subghz_hunter_settings_screen--show_subghz_hunter_settings_page.svg",
+    "callbacks": [
+      "on_fast_changed",
+      "on_mode_changed",
+      "on_single_changed",
+      "on_timeout_changed",
+      "on_trigger_changed"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "-85 / -80 / -75 / -70 / -65 / -60",
+      "1 s / 2 s / 3 s / 5 s",
+      "Decode / Raw"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(st->hunter_settings_page, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(cont, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(sw, 80, 40);",
+      "lv_obj_set_size(sw, 80, 40);"
+    ]
+  },
+  {
+    "name": "show_subghz_jammer_page",
+    "file": "main/screens/subghz_jammer_screen.c",
+    "line": 310,
+    "diagram": "subghz_jammer_screen--show_subghz_jammer_page.svg",
+    "callbacks": [
+      "on_big_btn",
+      "on_freq_tap"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      " START JAM",
+      "Idle"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(st->jammer_page, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_height(hspacer, 1);",
+      "lv_obj_set_size(st->jammer_big_btn, 380, 100);"
+    ]
+  },
+  {
+    "name": "show_action_popup",
+    "file": "main/screens/subghz_listen_screen.c",
+    "line": 1283,
+    "diagram": "subghz_listen_screen--show_action_popup.svg",
+    "callbacks": [
+      "btns"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [],
+    "dimension_calls": [
+      "lv_obj_set_size(overlay, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(popup, 540, 280);",
+      "lv_obj_set_width(name_lbl, lv_pct(100));",
+      "lv_obj_set_size(brow, lv_pct(100), 60);",
+      "lv_obj_set_size(b, 160, 50);"
+    ]
+  },
+  {
+    "name": "show_leave_popup",
+    "file": "main/screens/subghz_listen_screen.c",
+    "line": 1384,
+    "diagram": "subghz_listen_screen--show_leave_popup.svg",
+    "callbacks": [
+      "on_leave_cancel",
+      "on_leave_confirm"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "Leave Listen?",
+      "Leave",
+      "Stay"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(overlay, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(popup, 560, 260);",
+      "lv_obj_set_width(body, lv_pct(100));",
+      "lv_obj_set_size(brow, lv_pct(100), 60);",
+      "lv_obj_set_size(leave_btn, 200, 50);",
+      "lv_obj_set_size(stay_btn, 200, 50);"
+    ]
+  },
+  {
+    "name": "show_tx_warn_popup",
+    "file": "main/screens/subghz_listen_screen.c",
+    "line": 1471,
+    "diagram": "subghz_listen_screen--show_tx_warn_popup.svg",
+    "callbacks": [
+      "on_tx_warn_ok"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "Stop Listening First",
+      "Pause listening before transmitting a signal, then try again.",
+      "OK"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(overlay, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(popup, 560, 260);",
+      "lv_obj_set_width(body, lv_pct(100));",
+      "lv_obj_set_size(ok_btn, 200, 50);"
+    ]
+  },
+  {
+    "name": "show_subghz_listen_page",
+    "file": "main/screens/subghz_listen_screen.c",
+    "line": 1521,
+    "diagram": "subghz_listen_screen--show_subghz_listen_page.svg",
+    "callbacks": [
+      "on_freq_tap",
+      "on_raw_toggle",
+      "on_signal_list_scroll",
+      "on_start_stop"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "--",
+      " Start",
+      "Decode",
+      "Raw",
+      "Sig: 0",
+      "No signals captured"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(st->listen_page, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_height(spacer, 1);",
+      "lv_obj_set_size(rssi_box, 56, 48);",
+      "lv_obj_set_size(st->listen_rssi_arc, 48, 48);",
+      "lv_obj_set_size(freq_btn, LV_SIZE_CONTENT, 48);",
+      "lv_obj_set_size(ctrl, lv_pct(100), 60);",
+      "lv_obj_set_size(st->btn_start_stop, 160, 50);",
+      "lv_obj_set_size(mode_box, 240, 50);",
+      "lv_obj_set_size(st->btn_raw, 60, 32);",
+      "lv_obj_set_size(st->canvas, WATERFALL_W, WATERFALL_H);",
+      "lv_obj_set_size(hdr, lv_pct(100), 28);",
+      "lv_obj_set_width(l, cols[i].w);",
+      "lv_obj_set_size(st->sig_list, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(st->sig_spacer, 1, 1);"
+    ]
+  },
+  {
+    "name": "show_subghz_listen_page_at",
+    "file": "main/screens/subghz_listen_screen.c",
+    "line": 1773,
+    "diagram": "subghz_listen_screen--show_subghz_listen_page_at.svg",
+    "callbacks": [],
+    "direct_ui_calls": [
+      "show_subghz_listen_page"
+    ],
+    "literal_labels": [],
+    "dimension_calls": []
+  },
+  {
+    "name": "show_subghz_listen_settings_page",
+    "file": "main/screens/subghz_listen_settings_screen.c",
+    "line": 35,
+    "diagram": "subghz_listen_settings_screen--show_subghz_listen_settings_page.svg",
+    "callbacks": [
+      "on_rssi_changed"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "RSSI floor (dBm)",
+      "-85 / -80 / -75 / -70 / -65 / -60",
+      "Signals weaker than this are not reported in Listen."
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(st->listen_settings_page, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(card, lv_pct(80), 240);",
+      "lv_obj_set_width(dd, 240);",
+      "lv_obj_set_height(dd, 60);",
+      "lv_obj_set_width(desc, lv_pct(100));"
+    ]
+  },
+  {
+    "name": "show_delete_confirm",
+    "file": "main/screens/subghz_manage_screen.c",
+    "line": 480,
+    "diagram": "subghz_manage_screen--show_delete_confirm.svg",
+    "callbacks": [
+      "on_delete_cancel",
+      "on_delete_confirmed"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "Delete",
+      "Cancel"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(overlay, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(popup, 540, 240);",
+      "lv_obj_set_width(body, lv_pct(100));",
+      "lv_obj_set_size(brow, lv_pct(100), 60);",
+      "lv_obj_set_size(del, 200, 50);",
+      "lv_obj_set_size(can, 200, 50);"
+    ]
+  },
+  {
+    "name": "show_tx_count_popup",
+    "file": "main/screens/subghz_manage_screen.c",
+    "line": 642,
+    "diagram": "subghz_manage_screen--show_tx_count_popup.svg",
+    "callbacks": [
+      "on_tx_count_cancel",
+      "on_tx_count_confirm"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "Transmit",
+      "Cancel"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(overlay, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(popup, 540, 360);",
+      "lv_obj_set_size(roller_row, lv_pct(100), 150);",
+      "lv_obj_set_size(brow, lv_pct(100), 56);",
+      "lv_obj_set_size(tx, 220, 50);",
+      "lv_obj_set_size(cn, 220, 50);"
+    ]
+  },
+  {
+    "name": "show_action_popup",
+    "file": "main/screens/subghz_manage_screen.c",
+    "line": 724,
+    "diagram": "subghz_manage_screen--show_action_popup.svg",
+    "callbacks": [
+      "btns"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [],
+    "dimension_calls": [
+      "lv_obj_set_size(overlay, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(popup, 580, 320);",
+      "lv_obj_set_width(name_lbl, lv_pct(100));",
+      "lv_obj_set_size(brow, lv_pct(100), 120);",
+      "lv_obj_set_size(row1, lv_pct(100), 50);",
+      "lv_obj_set_size(row2, lv_pct(100), 50);",
+      "lv_obj_set_size(b, 200, 46);"
+    ]
+  },
+  {
+    "name": "show_subghz_manage_page",
+    "file": "main/screens/subghz_manage_screen.c",
+    "line": 894,
+    "diagram": "subghz_manage_screen--show_subghz_manage_page.svg",
+    "callbacks": [],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "Loading SD signals..."
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(st->manage_page, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_width(st->status_lbl, lv_pct(100));",
+      "lv_obj_set_size(st->sig_list_obj, lv_pct(100), lv_pct(100));"
+    ]
+  },
+  {
+    "name": "show_subghz_scanner_page",
+    "file": "main/screens/subghz_scanner_screen.c",
+    "line": 297,
+    "diagram": "subghz_scanner_screen--show_subghz_scanner_page.svg",
+    "callbacks": [],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "Scanning"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(st->scanner_page, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_height(spacer, 1);",
+      "lv_obj_set_size(st->scanner_pulse_dot, 18, 18);",
+      "lv_obj_set_size(grid, lv_pct(100), lv_pct(100));"
+    ]
+  },
+  {
+    "name": "show_subghz_scanner_settings_page",
+    "file": "main/screens/subghz_scanner_settings_screen.c",
+    "line": 120,
+    "diagram": "subghz_scanner_settings_screen--show_subghz_scanner_settings_page.svg",
+    "callbacks": [
+      "on_dwell_changed",
+      "on_edges_changed",
+      "on_fast_changed",
+      "on_rssi_changed"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "-85 / -80 / -75 / -70 / -65 / -60",
+      "40 / 80 / 120 / 200",
+      "2 / 4 / 8 / 12"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(st->scanner_settings_page, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(cont, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(sw, 80, 40);"
+    ]
+  },
+  {
+    "name": "show_subghz_page",
+    "file": "main/screens/subghz_screen.c",
+    "line": 325,
+    "diagram": "subghz_screen--show_subghz_page.svg",
+    "callbacks": [],
+    "direct_ui_calls": [],
+    "literal_labels": [],
+    "dimension_calls": [
+      "lv_obj_set_size(st->page, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(tiles, lv_pct(100), LV_SIZE_CONTENT);"
+    ]
+  },
+  {
+    "name": "show_subghz_settings_page",
+    "file": "main/screens/subghz_settings_screen.c",
+    "line": 183,
+    "diagram": "subghz_settings_screen--show_subghz_settings_page.svg",
+    "callbacks": [
+      "on_set"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "Frequency Correction (MHz)",
+      ".",
+      "Set",
+      "Loading..."
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(st->settings_page, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(card, lv_pct(80), 360);",
+      "lv_obj_set_size(row, lv_pct(100), 160);",
+      "lv_obj_set_size(st->settings_set_btn, 200, 50);"
+    ]
+  },
+  {
+    "name": "show_subghz_tesla_page",
+    "file": "main/screens/subghz_tesla_screen.c",
+    "line": 34,
+    "diagram": "subghz_tesla_screen--show_subghz_tesla_page.svg",
+    "callbacks": [
+      "on_open_port"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "Charge Port Opener",
+      "315.00 MHz OOK",
+      " Open Port",
+      "Ready"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(st->tesla_page, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(btn, 380, 100);"
+    ]
+  },
+  {
+    "name": "subghz_show_text_input_popup",
+    "file": "main/screens/subghz_text_input_popup.c",
+    "line": 79,
+    "diagram": "subghz_text_input_popup--subghz_show_text_input_popup.svg",
+    "callbacks": [
+      "on_cancel_clicked",
+      "on_confirm_clicked",
+      "on_kb_event"
+    ],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "Input",
+      "Save",
+      "Cancel"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(ctx->overlay, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_size(ctx->card, card_w, 240);",
+      "lv_obj_set_size(ctx->textarea, lv_pct(100), 64);",
+      "lv_obj_set_size(brow, lv_pct(100), 56);",
+      "lv_obj_set_size(ok, 180, 48);",
+      "lv_obj_set_size(cancel, 180, 48);",
+      "lv_obj_set_size(ctx->keyboard, lv_pct(100), 320);"
+    ]
+  },
+  {
+    "name": "show_subghz_weather_page",
+    "file": "main/screens/subghz_weather_screen.c",
+    "line": 377,
+    "diagram": "subghz_weather_screen--show_subghz_weather_page.svg",
+    "callbacks": [],
+    "direct_ui_calls": [],
+    "literal_labels": [
+      "Listening...  -  0 sensors"
+    ],
+    "dimension_calls": [
+      "lv_obj_set_size(st->weather_page, lv_pct(100), lv_pct(100));",
+      "lv_obj_set_height(spacer, 1);",
+      "lv_obj_set_size(st->weather_pulse_dot, 18, 18);",
+      "lv_obj_set_size(st->weather_tiles_grid, lv_pct(100), lv_pct(100));"
+    ]
+  }
+]

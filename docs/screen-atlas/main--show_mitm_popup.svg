@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="884" viewBox="0 0 1080 884">
+<title>show_mitm_popup</title>
+<rect width="100%" height="100%" fill="#111827"/>
+<text x="28" y="38" fill="#7dd3fc" font-family="monospace" font-size="21">show_mitm_popup</text>
+<text x="28" y="69" fill="#fbbf24" font-family="sans-serif" font-size="17">SOURCE DIAGRAM - not a screenshot or screen render</text>
+<text x="28" y="110" fill="#7dd3fc" font-family="monospace" font-size="16">SOURCE</text>
+<text x="28" y="133" fill="#e5e7eb" font-family="monospace" font-size="16">main/main.c:9889</text>
+<text x="28" y="156" fill="#e5e7eb" font-family="monospace" font-size="16"></text>
+<text x="28" y="179" fill="#7dd3fc" font-family="monospace" font-size="16">DIRECT TEXT LITERALS IN THIS FUNCTION</text>
+<text x="28" y="202" fill="#e5e7eb" font-family="monospace" font-size="16">Password:</text>
+<text x="28" y="225" fill="#e5e7eb" font-family="monospace" font-size="16">Known password found. Press Connect &amp; Start.</text>
+<text x="28" y="248" fill="#e5e7eb" font-family="monospace" font-size="16">JanOS saved passwords will be tried automatically. / If none matches, manual input will be enabled.</text>
+<text x="28" y="271" fill="#e5e7eb" font-family="monospace" font-size="16">Open network. Press Connect &amp; Start.</text>
+<text x="28" y="294" fill="#e5e7eb" font-family="monospace" font-size="16">Connect &amp; Start</text>
+<text x="28" y="317" fill="#e5e7eb" font-family="monospace" font-size="16">Cancel</text>
+<text x="28" y="340" fill="#e5e7eb" font-family="monospace" font-size="16">STOP CAPTURE</text>
+<text x="28" y="363" fill="#e5e7eb" font-family="monospace" font-size="16"></text>
+<text x="28" y="386" fill="#7dd3fc" font-family="monospace" font-size="16">SOURCE DIMENSIONS (UNEVALUATED EXPRESSIONS)</text>
+<text x="28" y="409" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_size(ctx-&gt;mitm_popup_overlay, lv_pct(100), lv_pct(100));</text>
+<text x="28" y="432" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_size(ctx-&gt;mitm_popup, 550, 380);</text>
+<text x="28" y="455" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_size(ctx-&gt;mitm_pass_row, lv_pct(100), LV_SIZE_CONTENT);</text>
+<text x="28" y="478" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_size(ctx-&gt;mitm_password_input, 320, 40);</text>
+<text x="28" y="501" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_width(ctx-&gt;mitm_status_label, lv_pct(100));</text>
+<text x="28" y="524" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_size(ctx-&gt;mitm_btn_row, lv_pct(100), LV_SIZE_CONTENT);</text>
+<text x="28" y="547" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_size(ctx-&gt;mitm_connect_btn, lv_pct(100), 50);</text>
+<text x="28" y="570" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_size(mitm_cancel_btn, lv_pct(100), 50);</text>
+<text x="28" y="593" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_size(ctx-&gt;mitm_stop_btn, lv_pct(100), 50);</text>
+<text x="28" y="616" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_size(ctx-&gt;mitm_keyboard, lv_pct(100), 260);</text>
+<text x="28" y="639" fill="#e5e7eb" font-family="monospace" font-size="16"></text>
+<text x="28" y="662" fill="#7dd3fc" font-family="monospace" font-size="16">EVENTS -&gt; CALLBACKS</text>
+<text x="28" y="685" fill="#e5e7eb" font-family="monospace" font-size="16">mitm_connect_and_start_cb</text>
+<text x="28" y="708" fill="#e5e7eb" font-family="monospace" font-size="16">mitm_keyboard_cb</text>
+<text x="28" y="731" fill="#e5e7eb" font-family="monospace" font-size="16">mitm_password_input_cb</text>
+<text x="28" y="754" fill="#e5e7eb" font-family="monospace" font-size="16">mitm_popup_close_cb</text>
+<text x="28" y="777" fill="#e5e7eb" font-family="monospace" font-size="16"></text>
+<text x="28" y="800" fill="#7dd3fc" font-family="monospace" font-size="16">DIRECT UI FUNCTION CALLS</text>
+<text x="28" y="823" fill="#e5e7eb" font-family="monospace" font-size="16">—</text>
+<text x="28" y="846" fill="#e5e7eb" font-family="monospace" font-size="16"></text>
+</svg>

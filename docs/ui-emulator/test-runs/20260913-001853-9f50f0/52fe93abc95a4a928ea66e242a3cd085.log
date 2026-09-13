@@ -1,0 +1,10 @@
+test_preset_reload_reset_and_stale_scan (__main__.WiFiStoriesBrowser.test_preset_reload_reset_and_stale_scan) ... ok
+test_radar_background_cancel_reopen_and_restart (__main__.WiFiStoriesBrowser.test_radar_background_cancel_reopen_and_restart) ... ok
+test_radar_signal_stop_and_back_all_rotations (__main__.WiFiStoriesBrowser.test_radar_signal_stop_and_back_all_rotations) ... ok
+test_rejection_must_match_selection_at_the_time_of_the_action (__main__.WiFiStoriesBrowser.test_rejection_must_match_selection_at_the_time_of_the_action) ... ok
+test_scan_variants_all_rotations (__main__.WiFiStoriesBrowser.test_scan_variants_all_rotations) ... ok
+
+----------------------------------------------------------------------
+Ran 5 tests in 45.479s
+
+OK

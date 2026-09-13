@@ -1,0 +1,11 @@
+test_disconnected_flags_nothing (__main__.AntiSurvBrowser.test_disconnected_flags_nothing) ... ok
+test_start_flags_followers_then_stop_summary (__main__.AntiSurvBrowser.test_start_flags_followers_then_stop_summary) ... ok
+test_back_while_running_stops_detection (__main__.DeauthDetectorBrowser.test_back_while_running_stops_detection) ... ok
+test_disconnected_module_detects_nothing (__main__.DeauthDetectorBrowser.test_disconnected_module_detects_nothing) ... ok
+test_start_detects_and_stop_freezes (__main__.DeauthDetectorBrowser.test_start_detects_and_stop_freezes) ... ok
+test_handshaker_captures_and_closes (__main__.HandshakerBrowser.test_handshaker_captures_and_closes) ... ok
+
+----------------------------------------------------------------------
+Ran 6 tests in 12.881s
+
+OK

@@ -1,0 +1,200 @@
+....----------------------------------------
+Exception occurred during processing of request from ('127.0.0.1', 58807)
+Traceback (most recent call last):
+  File "C:\Users\mati\AppData\Local\Programs\Python\Python313\Lib\socketserver.py", line 697, in process_request_thread
+    self.finish_request(request, client_address)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\mati\AppData\Local\Programs\Python\Python313\Lib\socketserver.py", line 362, in finish_request
+    self.RequestHandlerClass(request, client_address, self)
+    ~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\mati\AppData\Local\Programs\Python\Python313\Lib\http\server.py", line 672, in __init__
+    super().__init__(*args, **kwargs)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "C:\Users\mati\AppData\Local\Programs\Python\Python313\Lib\socketserver.py", line 766, in __init__
+    self.handle()
+    ~~~~~~~~~~~^^
+  File "C:\Users\mati\AppData\Local\Programs\Python\Python313\Lib\http\server.py", line 438, in handle
+    self.handle_one_request()
+    ~~~~~~~~~~~~~~~~~~~~~~~^^
+  File "C:\Users\mati\AppData\Local\Programs\Python\Python313\Lib\http\server.py", line 404, in handle_one_request
+    self.raw_requestline = self.rfile.readline(65537)
+                           ~~~~~~~~~~~~~~~~~~~^^^^^^^
+  File "C:\Users\mati\AppData\Local\Programs\Python\Python313\Lib\socket.py", line 719, in readinto
+    return self._sock.recv_into(b)
+           ~~~~~~~~~~~~~~~~~~~~^^^
+ConnectionResetError: [WinError 10054] Istniejące połączenie zostało gwałtownie zamknięte przez zdalnego hosta
+----------------------------------------
+----------------------------------------
+Exception occurred during processing of request from ('127.0.0.1', 53495)
+Traceback (most recent call last):
+  File "C:\Users\mati\AppData\Local\Programs\Python\Python313\Lib\socketserver.py", line 697, in process_request_thread
+    self.finish_request(request, client_address)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^
+----------------------------------------
+  File "C:\Users\mati\AppData\Local\Programs\Python\Python313\Lib\socketserver.py", line 362, in finish_request
+    self.RequestHandlerClass(request, client_address, self)
+    ~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+Exception occurred during processing of request from ('127.0.0.1', 65466)
+----------------------------------------
+Exception occurred during processing of request from ('127.0.0.1', 63871)
+  File "C:\Users\mati\AppData\Local\Programs\Python\Python313\Lib\http\server.py", line 672, in __init__
+    super().__init__(*args, **kwargs)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "C:\Users\mati\AppData\Local\Programs\Python\Python313\Lib\socketserver.py", line 766, in __init__
+    self.handle()
+    ~~~~~~~~~~~^^
+Traceback (most recent call last):
+  File "C:\Users\mati\AppData\Local\Programs\Python\Python313\Lib\http\server.py", line 438, in handle
+    self.handle_one_request()
+    ~~~~~~~~~~~~~~~~~~~~~~~^^
+Traceback (most recent call last):
+  File "C:\Users\mati\AppData\Local\Programs\Python\Python313\Lib\http\server.py", line 404, in handle_one_request
+    self.raw_requestline = self.rfile.readline(65537)
+                           ~~~~~~~~~~~~~~~~~~~^^^^^^^
+  File "C:\Users\mati\AppData\Local\Programs\Python\Python313\Lib\socketserver.py", line 697, in process_request_thread
+    self.finish_request(request, client_address)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\mati\AppData\Local\Programs\Python\Python313\Lib\socket.py", line 719, in readinto
+    return self._sock.recv_into(b)
+           ~~~~~~~~~~~~~~~~~~~~^^^
+  File "C:\Users\mati\AppData\Local\Programs\Python\Python313\Lib\socketserver.py", line 362, in finish_request
+    self.RequestHandlerClass(request, client_address, self)
+    ~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ConnectionResetError: [WinError 10054] Istniejące połączenie zostało gwałtownie zamknięte przez zdalnego hosta
+  File "C:\Users\mati\AppData\Local\Programs\Python\Python313\Lib\http\server.py", line 672, in __init__
+    super().__init__(*args, **kwargs)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+----------------------------------------
+  File "C:\Users\mati\AppData\Local\Programs\Python\Python313\Lib\socketserver.py", line 766, in __init__
+    self.handle()
+    ~~~~~~~~~~~^^
+  File "C:\Users\mati\AppData\Local\Programs\Python\Python313\Lib\socketserver.py", line 697, in process_request_thread
+    self.finish_request(request, client_address)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\mati\AppData\Local\Programs\Python\Python313\Lib\socketserver.py", line 362, in finish_request
+    self.RequestHandlerClass(request, client_address, self)
+    ~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\mati\AppData\Local\Programs\Python\Python313\Lib\http\server.py", line 438, in handle
+    self.handle_one_request()
+    ~~~~~~~~~~~~~~~~~~~~~~~^^
+  File "C:\Users\mati\AppData\Local\Programs\Python\Python313\Lib\http\server.py", line 404, in handle_one_request
+    self.raw_requestline = self.rfile.readline(65537)
+                           ~~~~~~~~~~~~~~~~~~~^^^^^^^
+----------------------------------------
+  File "C:\Users\mati\AppData\Local\Programs\Python\Python313\Lib\socket.py", line 719, in readinto
+    return self._sock.recv_into(b)
+           ~~~~~~~~~~~~~~~~~~~~^^^
+  File "C:\Users\mati\AppData\Local\Programs\Python\Python313\Lib\http\server.py", line 672, in __init__
+    super().__init__(*args, **kwargs)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "C:\Users\mati\AppData\Local\Programs\Python\Python313\Lib\socketserver.py", line 766, in __init__
+    self.handle()
+    ~~~~~~~~~~~^^
+Exception occurred during processing of request from ('127.0.0.1', 58833)
+  File "C:\Users\mati\AppData\Local\Programs\Python\Python313\Lib\http\server.py", line 438, in handle
+    self.handle_one_request()
+    ~~~~~~~~~~~~~~~~~~~~~~~^^
+  File "C:\Users\mati\AppData\Local\Programs\Python\Python313\Lib\http\server.py", line 404, in handle_one_request
+    self.raw_requestline = self.rfile.readline(65537)
+                           ~~~~~~~~~~~~~~~~~~~^^^^^^^
+ConnectionResetError: [WinError 10054] Istniejące połączenie zostało gwałtownie zamknięte przez zdalnego hosta
+  File "C:\Users\mati\AppData\Local\Programs\Python\Python313\Lib\socket.py", line 719, in readinto
+    return self._sock.recv_into(b)
+           ~~~~~~~~~~~~~~~~~~~~^^^
+ConnectionResetError: [WinError 10054] Istniejące połączenie zostało gwałtownie zamknięte przez zdalnego hosta
+----------------------------------------
+----------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\mati\AppData\Local\Programs\Python\Python313\Lib\socketserver.py", line 697, in process_request_thread
+    self.finish_request(request, client_address)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\mati\AppData\Local\Programs\Python\Python313\Lib\socketserver.py", line 362, in finish_request
+    self.RequestHandlerClass(request, client_address, self)
+    ~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\mati\AppData\Local\Programs\Python\Python313\Lib\http\server.py", line 672, in __init__
+    super().__init__(*args, **kwargs)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "C:\Users\mati\AppData\Local\Programs\Python\Python313\Lib\socketserver.py", line 766, in __init__
+    self.handle()
+    ~~~~~~~~~~~^^
+  File "C:\Users\mati\AppData\Local\Programs\Python\Python313\Lib\http\server.py", line 436, in handle
+    self.handle_one_request()
+    ~~~~~~~~~~~~~~~~~~~~~~~^^
+  File "C:\Users\mati\AppData\Local\Programs\Python\Python313\Lib\http\server.py", line 404, in handle_one_request
+    self.raw_requestline = self.rfile.readline(65537)
+                           ~~~~~~~~~~~~~~~~~~~^^^^^^^
+  File "C:\Users\mati\AppData\Local\Programs\Python\Python313\Lib\socket.py", line 719, in readinto
+    return self._sock.recv_into(b)
+           ~~~~~~~~~~~~~~~~~~~~^^^
+ConnectionResetError: [WinError 10054] Istniejące połączenie zostało gwałtownie zamknięte przez zdalnego hosta
+----------------------------------------
+----------------------------------------
+Exception occurred during processing of request from ('127.0.0.1', 58891)
+Traceback (most recent call last):
+  File "C:\Users\mati\AppData\Local\Programs\Python\Python313\Lib\socketserver.py", line 697, in process_request_thread
+    self.finish_request(request, client_address)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\mati\AppData\Local\Programs\Python\Python313\Lib\socketserver.py", line 362, in finish_request
+    self.RequestHandlerClass(request, client_address, self)
+    ~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\mati\AppData\Local\Programs\Python\Python313\Lib\http\server.py", line 672, in __init__
+    super().__init__(*args, **kwargs)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "C:\Users\mati\AppData\Local\Programs\Python\Python313\Lib\socketserver.py", line 766, in __init__
+    self.handle()
+    ~~~~~~~~~~~^^
+  File "C:\Users\mati\AppData\Local\Programs\Python\Python313\Lib\http\server.py", line 436, in handle
+    self.handle_one_request()
+    ~~~~~~~~~~~~~~~~~~~~~~~^^
+  File "C:\Users\mati\AppData\Local\Programs\Python\Python313\Lib\http\server.py", line 404, in handle_one_request
+    self.raw_requestline = self.rfile.readline(65537)
+                           ~~~~~~~~~~~~~~~~~~~^^^^^^^
+  File "C:\Users\mati\AppData\Local\Programs\Python\Python313\Lib\socket.py", line 719, in readinto
+    return self._sock.recv_into(b)
+           ~~~~~~~~~~~~~~~~~~~~^^^
+ConnectionResetError: [WinError 10054] Istniejące połączenie zostało gwałtownie zamknięte przez zdalnego hosta
+----------------------------------------
+E.
+======================================================================
+ERROR: test_reset_with_readable_but_unwritable_storage (__main__.PersistenceTests.test_reset_with_readable_but_unwritable_storage)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tests\test_emulator_phase5_settings.py", line 85, in test_reset_with_readable_but_unwritable_storage
+    p.goto(self.url); self.ready()
+                      ~~~~~~~~~~^^
+  File "C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tests\test_emulator_phase5_settings.py", line 17, in ready
+    self.page.wait_for_function('globalThis.emulator?.measurements.frames > 2')
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Lib\site-packages\playwright\sync_api\_generated.py", line 11599, in wait_for_function
+    self._sync(
+    ~~~~~~~~~~^
+        self._impl_obj.wait_for_function(
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    ...<4 lines>...
+        )
+        ^
+    )
+    ^
+  File "C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Lib\site-packages\playwright\_impl\_sync_base.py", line 115, in _sync
+    return task.result()
+           ~~~~~~~~~~~^^
+  File "C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Lib\site-packages\playwright\_impl\_page.py", line 1110, in wait_for_function
+    return await self._main_frame.wait_for_function(**locals_to_params(locals()))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Lib\site-packages\playwright\_impl\_frame.py", line 878, in wait_for_function
+    await self._channel.send("waitForFunction", self._timeout, params)
+  File "C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Lib\site-packages\playwright\_impl\_connection.py", line 69, in send
+    return await self._connection.wrap_api_call(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    ...<3 lines>...
+    )
+    ^
+  File "C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Lib\site-packages\playwright\_impl\_connection.py", line 559, in wrap_api_call
+    raise rewrite_error(error, f"{parsed_st['apiName']}: {error}") from None
+playwright._impl._errors.TimeoutError: Page.wait_for_function: Timeout 30000ms exceeded.
+
+----------------------------------------------------------------------
+Ran 6 tests in 37.457s
+
+FAILED (errors=1)
+{'status': 'Could not load the emulator: Failed to fetch. Serve the built folder over HTTP and reset to retry.', 'frames': None, 'visibility': 'visible', 'resources': [{'name': 'http://127.0.0.1:56637/style.css', 'duration': 4.100000008940697}, {'name': 'http://127.0.0.1:56637/app.mjs', 'duration': 5.700000002980232}, {'name': 'http://127.0.0.1:56637/emulator.js', 'duration': 9}, {'name': 'http://127.0.0.1:56637/model/bridge.mjs', 'duration': 3.800000011920929}, {'name': 'http://127.0.0.1:56637/display.mjs', 'duration': 3.800000011920929}, {'name': 'http://127.0.0.1:56637/persistence.mjs', 'duration': 3.9000000059604645}, {'name': 'http://127.0.0.1:56637/model/device.mjs', 'duration': 4.200000002980232}, {'name': 'http://127.0.0.1:56637/model/pcap.mjs', 'duration': 3.3999999910593033}, {'name': 'http://127.0.0.1:56637/model/nettools.mjs', 'duration': 4.600000008940697}, {'name': 'http://127.0.0.1:56637/model/pcap-deep.mjs', 'duration': 4.799999997019768}, {'name': 'http://127.0.0.1:56637/model/attacks.mjs', 'duration': 5}, {'name': 'http://127.0.0.1:56637/scenario.json', 'duration': 3.7999999970197678}, {'name': 'http://127.0.0.1:56637/emulator.wasm', 'duration': 678.7999999970198}, {'name': 'http://127.0.0.1:56637/emulator.wasm', 'duration': 2.9000000059604645}, {'name': 'http://127.0.0.1:56637/emulator.wasm', 'duration': 1.9000000059604645}]}

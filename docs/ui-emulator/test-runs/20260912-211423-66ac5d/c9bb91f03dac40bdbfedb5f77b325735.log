@@ -1,0 +1,49 @@
+EXEC node --test tests/test_emulator_stories.mjs tests/test_emulator_dialogs.mjs
+✔ slot activates only after successful reboot; cancellation and disconnect retain running image (1.3147ms)
+✔ firmware update refreshes the running slot image (0.2263ms)
+✔ guide advances only from ordered native events for the right module and target (0.5392ms)
+✔ disconnect, premature back, restart and leaving cannot manufacture completion (0.1141ms)
+ℹ tests 4
+ℹ suites 0
+ℹ pass 4
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 61.8892
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_stories.py
+test_complete_native_story_all_rotations (__main__.BluetoothStoryBrowser.test_complete_native_story_all_rotations) ... ok
+test_hidden_locator_does_not_advance_and_fullscreen_keeps_guide (__main__.BluetoothStoryBrowser.test_hidden_locator_does_not_advance_and_fullscreen_keeps_guide) ... ok
+test_no_signal_cannot_complete_and_conditions_reset_to_normal (__main__.BluetoothStoryBrowser.test_no_signal_cannot_complete_and_conditions_reset_to_normal) ... ok
+test_wrong_device_module_restart_and_reload_do_not_complete (__main__.BluetoothStoryBrowser.test_wrong_device_module_restart_and_reload_do_not_complete) ... ok
+
+----------------------------------------------------------------------
+Ran 4 tests in 20.032s
+
+OK
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_dialogs.py
+test_home_confirmation_no_yes_and_reopen (__main__.NativeDialogs.test_home_confirmation_no_yes_and_reopen) ... ok
+test_missing_board_all_rotations (__main__.NativeDialogs.test_missing_board_all_rotations) ... ok
+test_ota_slot_activation_all_rotations (__main__.NativeDialogs.test_ota_slot_activation_all_rotations) ... ok
+test_sd_cancel_continue_all_rotations (__main__.NativeDialogs.test_sd_cancel_continue_all_rotations) ... ok
+test_version_actions_all_rotations (__main__.NativeDialogs.test_version_actions_all_rotations) ... ok
+
+----------------------------------------------------------------------
+Ran 5 tests in 18.635s
+
+OK
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_phase4_audit.py
+test_all_back_routes_covered_or_deferred (__main__.CoverageAudit.test_all_back_routes_covered_or_deferred)
+Every back route works, unless it is an explicitly deferred screen. ... ok
+test_every_ledger_control_is_categorized (__main__.CoverageAudit.test_every_ledger_control_is_categorized)
+No dead control may ship without a documented reason. ... ok
+test_ledger_control_total_conserved (__main__.CoverageAudit.test_ledger_control_total_conserved) ... ok
+test_matches_committed_baseline (__main__.CoverageAudit.test_matches_committed_baseline)
+Guard against silent coverage regressions or stale baselines. ... ok
+test_open_items_are_identified (__main__.CoverageAudit.test_open_items_are_identified)
+Each open item carries a category and a human-readable reason. ... ok
+
+----------------------------------------------------------------------
+Ran 5 tests in 0.080s
+
+OK

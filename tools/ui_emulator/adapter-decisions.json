@@ -1,0 +1,2151 @@
+{
+  "source_hashes": {
+    "main/main.c": "900e1adfedca93ce66e72fcee7764b807076badab14600c5c57380ed26a5a014",
+    "main/screens/cgw_parser.c": "65309137e1b643147a16286bd946e3b10ab61ae1b8a3135f9f522b10c048655d",
+    "main/screens/psram_dynarr.c": "f107d20831202bbb198e54fed0ae925b68d6c343de71ab5b3cccc3825e622bc6",
+    "main/screens/subghz_hunter_screen.c": "74e7831acc02c609a8b658a9cf5645ae992192da96ddc3f5f54cfc4337d6e197",
+    "main/screens/subghz_hunter_settings_screen.c": "f482581abaec08d66d2214f7d0b8ea06136a234d608efab07987c54206f9fd0d",
+    "main/screens/subghz_jammer_screen.c": "db69e347feb02cbd8ddf151735045c4e736bf31572befbc8aa6aaf4c6c35b88d",
+    "main/screens/subghz_listen_screen.c": "3bd6e3ef129c980001eba386c0dbac6d7a4b8a8fc3f74f73be6fe719af24e5da",
+    "main/screens/subghz_listen_settings_screen.c": "4660d9545b7aa182efbe319b826804a0598bd42cdff5cc23ee7e6fac011c4e26",
+    "main/screens/subghz_manage_screen.c": "96e8f65f20565675e7a9b7d39f97ea32f9f054c1ccb88b8bbf8e53df60b54a59",
+    "main/screens/subghz_parser.c": "d0f7781ba6dd16db8a8e9f811ae91a3ab0c4a9f8d06337ebaded0f705b31e677",
+    "main/screens/subghz_rf_settings.c": "0e29a4beea227f154cf8cc7f2e3901cd47cdd7d7699f5729c02a3aa2e2ff03ff",
+    "main/screens/subghz_scanner_screen.c": "7c98f7ac9887c6a3fcb64b77c81f538d129f4be68af89aa426bf86fb63e85e6c",
+    "main/screens/subghz_scanner_settings_screen.c": "71cfbc78d4137c051949e5ce8ddfb8e22ab03d4b07e05897cc1b7e51913a73e2",
+    "main/screens/subghz_screen.c": "ce43a283b781a9b3080bedf08cd50efac7f761ab3bed83785c02919c3491d634",
+    "main/screens/subghz_settings_screen.c": "f46e6c84d565c7aead9756fb8137801b205046228985a1e9bb7a2125f1079201",
+    "main/screens/subghz_signal_list.c": "e62217f7953233ca75c174edbdef5e1dd55600309a5cc79e87381a90259c7056",
+    "main/screens/subghz_tesla_screen.c": "b264a6455f80a1240608d733eee9707168d3e74c17b422546650c81b234fa863",
+    "main/screens/subghz_text_input_popup.c": "338399e27626d67c2c9050d3c1f3427f00d41dc3c36746868472f68c23fb67a5",
+    "main/screens/subghz_weather_screen.c": "9dbc5096d4a63d2445318965fae497bc824598dfafdbdcec54110f7635cccfeb",
+    "components/janos_file_transfer/janos_file_transfer.c": "b3bfbe5866dfc354000a800838c11ccba2442ff07d7f3b97a5f1dd6f09203d3e",
+    "components/janos_file_transfer/include/janos_file_transfer.h": "1f2493e4a84fbd83be8bac5ce096972477bc37430eab8e0f485c8211ed03a17f"
+  },
+  "symbols": {
+    "(compromised_file_kind_t)": {
+      "policy": "retain_macro_or_expression",
+      "contract": "Preprocessor/cast expression; validate against actual compiler, not a callable adapter."
+    },
+    "(lv_coord_t)": {
+      "policy": "retain_macro_or_expression",
+      "contract": "Preprocessor/cast expression; validate against actual compiler, not a callable adapter."
+    },
+    "(lv_opa_t)": {
+      "policy": "retain_macro_or_expression",
+      "contract": "Preprocessor/cast expression; validate against actual compiler, not a callable adapter."
+    },
+    "(pcap_investigation_view_t)": {
+      "policy": "retain_macro_or_expression",
+      "contract": "Preprocessor/cast expression; validate against actual compiler, not a callable adapter."
+    },
+    "(pcap_map_filter_action_t)": {
+      "policy": "retain_macro_or_expression",
+      "contract": "Preprocessor/cast expression; validate against actual compiler, not a callable adapter."
+    },
+    "(pcap_map_mode_t)": {
+      "policy": "retain_macro_or_expression",
+      "contract": "Preprocessor/cast expression; validate against actual compiler, not a callable adapter."
+    },
+    "(pcap_packet_filter_t)": {
+      "policy": "retain_macro_or_expression",
+      "contract": "Preprocessor/cast expression; validate against actual compiler, not a callable adapter."
+    },
+    "(wardrive_antisurv_sens_t)": {
+      "policy": "retain_macro_or_expression",
+      "contract": "Preprocessor/cast expression; validate against actual compiler, not a callable adapter."
+    },
+    "ESP_ERROR_CHECK": {
+      "policy": "retain_macro_or_expression",
+      "contract": "Preprocessor/cast expression; validate against actual compiler, not a callable adapter."
+    },
+    "ESP_LOGD": {
+      "policy": "retain_macro_or_expression",
+      "contract": "Preprocessor/cast expression; validate against actual compiler, not a callable adapter."
+    },
+    "ESP_LOGE": {
+      "policy": "retain_macro_or_expression",
+      "contract": "Preprocessor/cast expression; validate against actual compiler, not a callable adapter."
+    },
+    "ESP_LOGI": {
+      "policy": "retain_macro_or_expression",
+      "contract": "Preprocessor/cast expression; validate against actual compiler, not a callable adapter."
+    },
+    "ESP_LOGW": {
+      "policy": "retain_macro_or_expression",
+      "contract": "Preprocessor/cast expression; validate against actual compiler, not a callable adapter."
+    },
+    "ESP_NETIF_INHERENT_DEFAULT_WIFI_AP": {
+      "policy": "retain_macro_or_expression",
+      "contract": "Preprocessor/cast expression; validate against actual compiler, not a callable adapter."
+    },
+    "GITM_LOG_RX": {
+      "policy": "retain_macro_or_expression",
+      "contract": "Preprocessor/cast expression; validate against actual compiler, not a callable adapter."
+    },
+    "HTTPD_DEFAULT_CONFIG": {
+      "policy": "retain_macro_or_expression",
+      "contract": "Preprocessor/cast expression; validate against actual compiler, not a callable adapter."
+    },
+    "IP2STR": {
+      "policy": "retain_macro_or_expression",
+      "contract": "Preprocessor/cast expression; validate against actual compiler, not a callable adapter."
+    },
+    "LV_PCT": {
+      "policy": "retain_macro_or_expression",
+      "contract": "Preprocessor/cast expression; validate against actual compiler, not a callable adapter."
+    },
+    "S_ISDIR": {
+      "policy": "retain_macro_or_expression",
+      "contract": "Preprocessor/cast expression; validate against actual compiler, not a callable adapter."
+    },
+    "S_ISREG": {
+      "policy": "retain_macro_or_expression",
+      "contract": "Preprocessor/cast expression; validate against actual compiler, not a callable adapter."
+    },
+    "USB_EP_DESC_GET_EP_DIR": {
+      "policy": "retain_macro_or_expression",
+      "contract": "Preprocessor/cast expression; validate against actual compiler, not a callable adapter."
+    },
+    "USB_EP_DESC_GET_XFERTYPE": {
+      "policy": "retain_macro_or_expression",
+      "contract": "Preprocessor/cast expression; validate against actual compiler, not a callable adapter."
+    },
+    "WIFI_INIT_CONFIG_DEFAULT": {
+      "policy": "retain_macro_or_expression",
+      "contract": "Preprocessor/cast expression; validate against actual compiler, not a callable adapter."
+    },
+    "abs": {
+      "policy": "retain_libc",
+      "contract": "Use equivalent standard-library behavior in Emscripten."
+    },
+    "access": {
+      "policy": "adapt_filesystem",
+      "contract": "Virtual filesystem; preserve partial IO, size, seek and missing-file errors."
+    },
+    "action": {
+      "policy": "retain_bound_callback",
+      "contract": "sd_warning_continue_cb captures sd_warning_pending_action before popup cleanup, invokes it only if non-null, then resets the acknowledgement flag. Preserve this ordering."
+    },
+    "atof": {
+      "policy": "retain_libc",
+      "contract": "Use equivalent standard-library behavior in Emscripten."
+    },
+    "atoi": {
+      "policy": "retain_libc",
+      "contract": "Use equivalent standard-library behavior in Emscripten."
+    },
+    "bind": {
+      "policy": "adapt_network",
+      "contract": "Local scenario events and simulated server outcomes; no real radio/backend request."
+    },
+    "bsp_codec_init": {
+      "policy": "adapt_hardware",
+      "contract": "Per-device adapter; preserve expected read/write/availability behavior."
+    },
+    "bsp_display_brightness_set": {
+      "policy": "adapt_hardware",
+      "contract": "Per-device adapter; preserve expected read/write/availability behavior."
+    },
+    "bsp_display_get_input_dev": {
+      "policy": "adapt_hardware",
+      "contract": "Per-device adapter; preserve expected read/write/availability behavior."
+    },
+    "bsp_display_lock": {
+      "policy": "adapt_hardware",
+      "contract": "Per-device adapter; preserve expected read/write/availability behavior."
+    },
+    "bsp_display_rotate": {
+      "policy": "adapt_hardware",
+      "contract": "Per-device adapter; preserve expected read/write/availability behavior."
+    },
+    "bsp_display_start": {
+      "policy": "adapt_hardware",
+      "contract": "Per-device adapter; preserve expected read/write/availability behavior."
+    },
+    "bsp_display_unlock": {
+      "policy": "adapt_hardware",
+      "contract": "Per-device adapter; preserve expected read/write/availability behavior."
+    },
+    "bsp_generate_poweroff_signal": {
+      "policy": "adapt_hardware",
+      "contract": "Per-device adapter; preserve expected read/write/availability behavior."
+    },
+    "bsp_get_codec_handle": {
+      "policy": "adapt_hardware",
+      "contract": "Per-device adapter; preserve expected read/write/availability behavior."
+    },
+    "bsp_i2c_get_handle": {
+      "policy": "adapt_hardware",
+      "contract": "Per-device adapter; preserve expected read/write/availability behavior."
+    },
+    "bsp_i2c_init": {
+      "policy": "adapt_hardware",
+      "contract": "Per-device adapter; preserve expected read/write/availability behavior."
+    },
+    "bsp_io_expander_pi4ioe_init": {
+      "policy": "adapt_hardware",
+      "contract": "Per-device adapter; preserve expected read/write/availability behavior."
+    },
+    "bsp_sdcard_init": {
+      "policy": "adapt_hardware",
+      "contract": "Per-device adapter; preserve expected read/write/availability behavior."
+    },
+    "bsp_set_charge_en": {
+      "policy": "adapt_hardware",
+      "contract": "Per-device adapter; preserve expected read/write/availability behavior."
+    },
+    "bsp_set_charge_qc_en": {
+      "policy": "adapt_hardware",
+      "contract": "Per-device adapter; preserve expected read/write/availability behavior."
+    },
+    "bsp_set_wifi_power_enable": {
+      "policy": "adapt_hardware",
+      "contract": "Per-device adapter; preserve expected read/write/availability behavior."
+    },
+    "bsp_usb_c_detect": {
+      "policy": "adapt_hardware",
+      "contract": "Per-device adapter; preserve expected read/write/availability behavior."
+    },
+    "bsp_usb_host_start": {
+      "policy": "adapt_hardware",
+      "contract": "Per-device adapter; preserve expected read/write/availability behavior."
+    },
+    "bsp_usb_host_stop": {
+      "policy": "adapt_hardware",
+      "contract": "Per-device adapter; preserve expected read/write/availability behavior."
+    },
+    "calloc": {
+      "policy": "retain_libc",
+      "contract": "Use equivalent standard-library behavior in Emscripten."
+    },
+    "cb": {
+      "policy": "retain_bound_callback",
+      "contract": "Keep the callback selected by original popup construction; hidden SSID copies the text and callback before clearing/closing the popup. SubGHz popup callers are deferred."
+    },
+    "close": {
+      "policy": "adapt_filesystem",
+      "contract": "Virtual filesystem; preserve partial IO, size, seek and missing-file errors."
+    },
+    "closedir": {
+      "policy": "adapt_filesystem",
+      "contract": "Virtual filesystem; preserve partial IO, size, seek and missing-file errors."
+    },
+    "codec->get_volume": {
+      "policy": "adapt_hardware",
+      "contract": "Per-device adapter; preserve expected read/write/availability behavior."
+    },
+    "codec->i2s_reconfig_clk_fn": {
+      "policy": "adapt_hardware",
+      "contract": "Per-device adapter; preserve expected read/write/availability behavior."
+    },
+    "codec->i2s_write": {
+      "policy": "adapt_hardware",
+      "contract": "Per-device adapter; preserve expected read/write/availability behavior."
+    },
+    "codec->set_mute": {
+      "policy": "adapt_hardware",
+      "contract": "Per-device adapter; preserve expected read/write/availability behavior."
+    },
+    "codec->set_volume": {
+      "policy": "adapt_hardware",
+      "contract": "Per-device adapter; preserve expected read/write/availability behavior."
+    },
+    "cos": {
+      "policy": "retain_libc",
+      "contract": "Use equivalent standard-library behavior in Emscripten."
+    },
+    "esp_err_to_name": {
+      "policy": "adapt_error_names",
+      "contract": "Map ESP error values used by retained code to their SDK names; preserve Unknown for unrecognized values."
+    },
+    "esp_event_handler_instance_register": {
+      "policy": "adapt_network",
+      "contract": "Local scenario events and simulated server outcomes; no real radio/backend request."
+    },
+    "esp_event_handler_instance_unregister": {
+      "policy": "adapt_network",
+      "contract": "Local scenario events and simulated server outcomes; no real radio/backend request."
+    },
+    "esp_event_loop_create_default": {
+      "policy": "adapt_network",
+      "contract": "Local scenario events and simulated server outcomes; no real radio/backend request."
+    },
+    "esp_hosted_init": {
+      "policy": "adapt_network",
+      "contract": "Local scenario events and simulated server outcomes; no real radio/backend request."
+    },
+    "esp_ip4addr_aton": {
+      "policy": "retain_ipv4_parser",
+      "contract": "Retain IPv4 parsing semantics and return success/failure; this helper does not access a network."
+    },
+    "esp_log_level_set": {
+      "policy": "adapt_logging",
+      "contract": "Set the virtual logger filter without changing scenario state."
+    },
+    "esp_netif_attach_wifi_ap": {
+      "policy": "adapt_network",
+      "contract": "Local scenario events and simulated server outcomes; no real radio/backend request."
+    },
+    "esp_netif_create_default_wifi_sta": {
+      "policy": "adapt_network",
+      "contract": "Local scenario events and simulated server outcomes; no real radio/backend request."
+    },
+    "esp_netif_dhcps_start": {
+      "policy": "adapt_network",
+      "contract": "Local scenario events and simulated server outcomes; no real radio/backend request."
+    },
+    "esp_netif_dhcps_stop": {
+      "policy": "adapt_network",
+      "contract": "Local scenario events and simulated server outcomes; no real radio/backend request."
+    },
+    "esp_netif_get_handle_from_ifkey": {
+      "policy": "adapt_network",
+      "contract": "Local scenario events and simulated server outcomes; no real radio/backend request."
+    },
+    "esp_netif_init": {
+      "policy": "adapt_network",
+      "contract": "Local scenario events and simulated server outcomes; no real radio/backend request."
+    },
+    "esp_netif_new": {
+      "policy": "adapt_network",
+      "contract": "Local scenario events and simulated server outcomes; no real radio/backend request."
+    },
+    "esp_netif_set_ip_info": {
+      "policy": "adapt_network",
+      "contract": "Local scenario events and simulated server outcomes; no real radio/backend request."
+    },
+    "esp_random": {
+      "policy": "adapt_lifecycle",
+      "contract": "Deterministic scenario time/randomness or simulated reset; never host reboot."
+    },
+    "esp_reset_reason": {
+      "policy": "adapt_lifecycle",
+      "contract": "Deterministic scenario time/randomness or simulated reset; never host reboot."
+    },
+    "esp_restart": {
+      "policy": "adapt_lifecycle",
+      "contract": "Deterministic scenario time/randomness or simulated reset; never host reboot."
+    },
+    "esp_rom_crc32_le": {
+      "policy": "retain_crc32",
+      "contract": "Use the SDK-compatible seeded little-endian CRC32 algorithm; never substitute a constant checksum."
+    },
+    "esp_timer_get_time": {
+      "policy": "adapt_scheduler",
+      "contract": "Explicit bounded jobs, clock and synchronization semantics; no dummy successful task creation."
+    },
+    "esp_vfs_fat_info": {
+      "policy": "adapt_filesystem",
+      "contract": "Virtual filesystem; preserve partial IO, size, seek and missing-file errors."
+    },
+    "esp_wifi_connect": {
+      "policy": "adapt_network",
+      "contract": "Local scenario events and simulated server outcomes; no real radio/backend request."
+    },
+    "esp_wifi_disconnect": {
+      "policy": "adapt_network",
+      "contract": "Local scenario events and simulated server outcomes; no real radio/backend request."
+    },
+    "esp_wifi_get_config": {
+      "policy": "adapt_network",
+      "contract": "Local scenario events and simulated server outcomes; no real radio/backend request."
+    },
+    "esp_wifi_get_mode": {
+      "policy": "adapt_network",
+      "contract": "Local scenario events and simulated server outcomes; no real radio/backend request."
+    },
+    "esp_wifi_init": {
+      "policy": "adapt_network",
+      "contract": "Local scenario events and simulated server outcomes; no real radio/backend request."
+    },
+    "esp_wifi_scan_get_ap_num": {
+      "policy": "adapt_network",
+      "contract": "Local scenario events and simulated server outcomes; no real radio/backend request."
+    },
+    "esp_wifi_scan_get_ap_records": {
+      "policy": "adapt_network",
+      "contract": "Local scenario events and simulated server outcomes; no real radio/backend request."
+    },
+    "esp_wifi_scan_start": {
+      "policy": "adapt_network",
+      "contract": "Local scenario events and simulated server outcomes; no real radio/backend request."
+    },
+    "esp_wifi_set_config": {
+      "policy": "adapt_network",
+      "contract": "Local scenario events and simulated server outcomes; no real radio/backend request."
+    },
+    "esp_wifi_set_default_wifi_ap_handlers": {
+      "policy": "adapt_network",
+      "contract": "Local scenario events and simulated server outcomes; no real radio/backend request."
+    },
+    "esp_wifi_set_mode": {
+      "policy": "adapt_network",
+      "contract": "Local scenario events and simulated server outcomes; no real radio/backend request."
+    },
+    "esp_wifi_sta_get_ap_info": {
+      "policy": "adapt_network",
+      "contract": "Local scenario events and simulated server outcomes; no real radio/backend request."
+    },
+    "esp_wifi_start": {
+      "policy": "adapt_network",
+      "contract": "Local scenario events and simulated server outcomes; no real radio/backend request."
+    },
+    "fabs": {
+      "policy": "retain_libc",
+      "contract": "Use equivalent standard-library behavior in Emscripten."
+    },
+    "fabsf": {
+      "policy": "retain_libc",
+      "contract": "Use equivalent standard-library behavior in Emscripten."
+    },
+    "fclose": {
+      "policy": "adapt_filesystem",
+      "contract": "Virtual filesystem; preserve partial IO, size, seek and missing-file errors."
+    },
+    "ferror": {
+      "policy": "adapt_filesystem",
+      "contract": "Virtual filesystem; preserve partial IO, size, seek and missing-file errors."
+    },
+    "fflush": {
+      "policy": "adapt_filesystem",
+      "contract": "Virtual filesystem; preserve partial IO, size, seek and missing-file errors."
+    },
+    "fgets": {
+      "policy": "adapt_filesystem",
+      "contract": "Virtual filesystem; preserve partial IO, size, seek and missing-file errors."
+    },
+    "fileno": {
+      "policy": "adapt_filesystem",
+      "contract": "Virtual filesystem; preserve partial IO, size, seek and missing-file errors."
+    },
+    "fopen": {
+      "policy": "adapt_filesystem",
+      "contract": "Virtual filesystem; preserve partial IO, size, seek and missing-file errors."
+    },
+    "fprintf": {
+      "policy": "retain_libc",
+      "contract": "Use equivalent standard-library behavior in Emscripten."
+    },
+    "fread": {
+      "policy": "adapt_filesystem",
+      "contract": "Virtual filesystem; preserve partial IO, size, seek and missing-file errors."
+    },
+    "free": {
+      "policy": "retain_libc",
+      "contract": "Use equivalent standard-library behavior in Emscripten."
+    },
+    "fseek": {
+      "policy": "adapt_filesystem",
+      "contract": "Virtual filesystem; preserve partial IO, size, seek and missing-file errors."
+    },
+    "fsync": {
+      "policy": "adapt_filesystem",
+      "contract": "Virtual filesystem; preserve partial IO, size, seek and missing-file errors."
+    },
+    "ftell": {
+      "policy": "adapt_filesystem",
+      "contract": "Virtual filesystem; preserve partial IO, size, seek and missing-file errors."
+    },
+    "fwrite": {
+      "policy": "adapt_filesystem",
+      "contract": "Virtual filesystem; preserve partial IO, size, seek and missing-file errors."
+    },
+    "heap_caps_calloc": {
+      "policy": "adapt_allocator",
+      "contract": "Map allocations to host memory; retain allocation-failure semantics."
+    },
+    "heap_caps_free": {
+      "policy": "adapt_allocator",
+      "contract": "Map allocations to host memory; retain allocation-failure semantics."
+    },
+    "heap_caps_get_free_size": {
+      "policy": "adapt_allocator",
+      "contract": "Map allocations to host memory; retain allocation-failure semantics."
+    },
+    "heap_caps_get_minimum_free_size": {
+      "policy": "adapt_allocator",
+      "contract": "Map allocations to host memory; retain allocation-failure semantics."
+    },
+    "heap_caps_malloc": {
+      "policy": "adapt_allocator",
+      "contract": "Map allocations to host memory; retain allocation-failure semantics."
+    },
+    "heap_caps_realloc": {
+      "policy": "adapt_allocator",
+      "contract": "Map allocations to host memory; retain allocation-failure semantics."
+    },
+    "htons": {
+      "policy": "retain_libc",
+      "contract": "Use equivalent standard-library behavior in Emscripten."
+    },
+    "httpd_query_key_value": {
+      "policy": "adapt_network",
+      "contract": "Local scenario events and simulated server outcomes; no real radio/backend request."
+    },
+    "httpd_register_uri_handler": {
+      "policy": "adapt_network",
+      "contract": "Local scenario events and simulated server outcomes; no real radio/backend request."
+    },
+    "httpd_req_get_url_query_len": {
+      "policy": "adapt_network",
+      "contract": "Local scenario events and simulated server outcomes; no real radio/backend request."
+    },
+    "httpd_req_get_url_query_str": {
+      "policy": "adapt_network",
+      "contract": "Local scenario events and simulated server outcomes; no real radio/backend request."
+    },
+    "httpd_req_recv": {
+      "policy": "adapt_network",
+      "contract": "Local scenario events and simulated server outcomes; no real radio/backend request."
+    },
+    "httpd_resp_send": {
+      "policy": "adapt_network",
+      "contract": "Local scenario events and simulated server outcomes; no real radio/backend request."
+    },
+    "httpd_resp_set_hdr": {
+      "policy": "adapt_network",
+      "contract": "Local scenario events and simulated server outcomes; no real radio/backend request."
+    },
+    "httpd_resp_set_status": {
+      "policy": "adapt_network",
+      "contract": "Local scenario events and simulated server outcomes; no real radio/backend request."
+    },
+    "httpd_resp_set_type": {
+      "policy": "adapt_network",
+      "contract": "Local scenario events and simulated server outcomes; no real radio/backend request."
+    },
+    "httpd_start": {
+      "policy": "adapt_network",
+      "contract": "Local scenario events and simulated server outcomes; no real radio/backend request."
+    },
+    "i2c_master_bus_add_device": {
+      "policy": "adapt_hardware",
+      "contract": "Per-device adapter; preserve expected read/write/availability behavior."
+    },
+    "i2c_master_bus_rm_device": {
+      "policy": "adapt_hardware",
+      "contract": "Per-device adapter; preserve expected read/write/availability behavior."
+    },
+    "i2c_master_probe": {
+      "policy": "adapt_hardware",
+      "contract": "Per-device adapter; preserve expected read/write/availability behavior."
+    },
+    "i2c_master_transmit": {
+      "policy": "adapt_hardware",
+      "contract": "Per-device adapter; preserve expected read/write/availability behavior."
+    },
+    "i2c_master_transmit_receive": {
+      "policy": "adapt_hardware",
+      "contract": "Per-device adapter; preserve expected read/write/availability behavior."
+    },
+    "isalnum": {
+      "policy": "retain_libc",
+      "contract": "Use equivalent standard-library behavior in Emscripten."
+    },
+    "isdigit": {
+      "policy": "retain_libc",
+      "contract": "Use equivalent standard-library behavior in Emscripten."
+    },
+    "isfinite": {
+      "policy": "retain_libc",
+      "contract": "Use equivalent standard-library behavior in Emscripten."
+    },
+    "isprint": {
+      "policy": "retain_libc",
+      "contract": "Use equivalent standard-library behavior in Emscripten."
+    },
+    "isspace": {
+      "policy": "retain_libc",
+      "contract": "Use equivalent standard-library behavior in Emscripten."
+    },
+    "isxdigit": {
+      "policy": "retain_libc",
+      "contract": "Use equivalent standard-library behavior in Emscripten."
+    },
+    "janos_file_transfer_download": {
+      "policy": "adapt_http_file_download",
+      "contract": "A resumable job implements the existing config/result/progress contract: QUERYING, DOWNLOADING, VERIFYING, COMMITTING then DONE/CANCELLED/ERROR; validate bytes and CRC; atomic .part rename only on success; respect cancel_requested and callback context."
+    },
+    "janos_file_transfer_query_size": {
+      "policy": "adapt_http_file_query",
+      "contract": "Query virtual JanOS file metadata; preserve not-found, invalid path, timeout and HTTP error outcomes; write size_out only on success."
+    },
+    "janos_file_transfer_state_name": {
+      "policy": "retain_transfer_labels",
+      "contract": "Compile the existing pure enum-to-label function from janos_file_transfer.c."
+    },
+    "ledc_set_duty": {
+      "policy": "adapt_hardware",
+      "contract": "Per-device adapter; preserve expected read/write/availability behavior."
+    },
+    "ledc_update_duty": {
+      "policy": "adapt_hardware",
+      "contract": "Per-device adapter; preserve expected read/write/availability behavior."
+    },
+    "localtime_r": {
+      "policy": "adapt_lifecycle",
+      "contract": "Deterministic scenario time/randomness or simulated reset; never host reboot."
+    },
+    "lroundf": {
+      "policy": "retain_libc",
+      "contract": "Use equivalent standard-library behavior in Emscripten."
+    },
+    "lv_anim_init": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_anim_set_exec_cb": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_anim_set_path_cb": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_anim_set_ready_cb": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_anim_set_time": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_anim_set_values": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_anim_set_var": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_anim_start": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_arc_create": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_arc_set_bg_angles": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_arc_set_range": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_arc_set_rotation": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_arc_set_value": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_area_get_height": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_area_get_width": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_async_call": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_bar_create": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_bar_set_range": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_bar_set_value": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_btn_create": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_canvas_create": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_canvas_set_buffer": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_checkbox_create": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_checkbox_set_text": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_color_black": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_color_darken": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_color_hex": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_color_lighten": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_color_make": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_color_mix": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_color_to_u16": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_color_white": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_disp_get_hor_res": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_disp_get_ver_res": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_display_get_default": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_display_get_horizontal_resolution": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_display_get_rotation": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_display_get_vertical_resolution": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_draw_arc": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_draw_arc_dsc_init": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_draw_buf_destroy": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_draw_line": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_draw_line_dsc_init": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_draw_rect": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_draw_rect_dsc_init": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_dropdown_create": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_dropdown_get_list": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_dropdown_get_selected": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_dropdown_get_selected_str": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_dropdown_set_options": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_dropdown_set_selected": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_event_get_code": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_event_get_current_target": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_event_get_layer": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_event_get_param": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_event_get_target": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_event_get_target_obj": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_event_get_user_data": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_event_stop_bubbling": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_free": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_indev_add_event_cb": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_keyboard_create": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_keyboard_set_mode": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_keyboard_set_textarea": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_label_create": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_label_set_long_mode": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_label_set_recolor": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_label_set_text": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_label_set_text_fmt": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_label_set_text_static": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_layer_top": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_line_create": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_line_set_points_mutable": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_malloc": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_add_event_cb": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_add_flag": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_add_state": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_align": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_align_to": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_center": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_clean": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_clear_flag": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_clear_state": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_create": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_del": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_delete": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_get_child": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_get_child_cnt": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_get_content_height": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_get_content_width": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_get_coords": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_get_height": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_get_parent": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_get_scroll_y": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_get_user_data": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_has_flag": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_has_state": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_invalidate": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_is_valid": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_move_background": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_move_foreground": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_move_to_index": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_remove_state": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_remove_style": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_remove_style_all": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_scroll_to_view": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_scroll_to_y": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_send_event": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_set_ext_click_area": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_set_flex_align": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_set_flex_flow": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_set_flex_grow": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_set_height": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_set_pos": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_set_scroll_dir": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_set_scrollbar_mode": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_set_size": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_set_style_align": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_set_style_arc_color": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_set_style_arc_width": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_set_style_bg_color": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_set_style_bg_grad_color": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_set_style_bg_grad_dir": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_set_style_bg_image_src": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_set_style_bg_image_tiled": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_set_style_bg_opa": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_set_style_border_color": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_set_style_border_opa": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_set_style_border_side": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_set_style_border_width": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_set_style_line_color": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_set_style_line_dash_gap": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_set_style_line_dash_width": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_set_style_line_opa": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_set_style_line_width": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_set_style_margin_left": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_set_style_margin_right": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_set_style_min_height": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_set_style_opa": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_set_style_outline_width": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_set_style_pad_all": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_set_style_pad_bottom": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_set_style_pad_column": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_set_style_pad_gap": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_set_style_pad_hor": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_set_style_pad_left": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_set_style_pad_right": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_set_style_pad_row": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_set_style_pad_top": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_set_style_pad_ver": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_set_style_radius": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_set_style_shadow_color": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_set_style_shadow_opa": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_set_style_shadow_width": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_set_style_text_align": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_set_style_text_color": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_set_style_text_font": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_set_style_text_letter_space": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_set_style_text_opa": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_set_style_width": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_set_user_data": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_set_width": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_obj_update_layout": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_pct": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_qrcode_create": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_qrcode_set_dark_color": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_qrcode_set_data": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_qrcode_set_light_color": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_qrcode_set_quiet_zone": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_qrcode_set_size": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_refr_now": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_roller_create": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_roller_get_selected": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_roller_set_options": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_roller_set_selected": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_roller_set_visible_row_count": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_scr_act": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_slider_create": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_slider_get_value": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_slider_set_range": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_slider_set_value": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_snapshot_take": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_spinbox_create": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_spinbox_decrement": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_spinbox_get_value": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_spinbox_increment": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_spinbox_set_digit_format": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_spinbox_set_range": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_spinbox_set_step": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_spinbox_set_value": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_spinner_create": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_spinner_set_anim_params": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_switch_create": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_textarea_create": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_textarea_get_password_mode": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_textarea_get_text": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_textarea_set_insert_replace": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_textarea_set_max_length": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_textarea_set_one_line": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_textarea_set_password_mode": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_textarea_set_password_show_time": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_textarea_set_placeholder_text": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_textarea_set_text": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_tick_elaps": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_tick_get": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_timer_create": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_timer_del": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_timer_delete": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_timer_get_user_data": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_timer_set_period": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_timer_set_repeat_count": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_tiny_ttf_create_data": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_trigo_cos": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "lv_trigo_sin": {
+      "policy": "retain_lvgl",
+      "contract": "Compile repository LVGL; keep event/timer behavior."
+    },
+    "malloc": {
+      "policy": "retain_libc",
+      "contract": "Use equivalent standard-library behavior in Emscripten."
+    },
+    "memchr": {
+      "policy": "retain_libc",
+      "contract": "Use equivalent standard-library behavior in Emscripten."
+    },
+    "memcpy": {
+      "policy": "retain_libc",
+      "contract": "Use equivalent standard-library behavior in Emscripten."
+    },
+    "memmove": {
+      "policy": "retain_libc",
+      "contract": "Use equivalent standard-library behavior in Emscripten."
+    },
+    "memset": {
+      "policy": "retain_libc",
+      "contract": "Use equivalent standard-library behavior in Emscripten."
+    },
+    "mkdir": {
+      "policy": "adapt_filesystem",
+      "contract": "Virtual filesystem; preserve partial IO, size, seek and missing-file errors."
+    },
+    "mktime": {
+      "policy": "adapt_lifecycle",
+      "contract": "Deterministic scenario time/randomness or simulated reset; never host reboot."
+    },
+    "nvs_close": {
+      "policy": "adapt_settings",
+      "contract": "Versioned virtual settings; return real simulated errors."
+    },
+    "nvs_commit": {
+      "policy": "adapt_settings",
+      "contract": "Versioned virtual settings; return real simulated errors."
+    },
+    "nvs_flash_erase": {
+      "policy": "adapt_settings",
+      "contract": "Versioned virtual settings; return real simulated errors."
+    },
+    "nvs_flash_init": {
+      "policy": "adapt_settings",
+      "contract": "Versioned virtual settings; return real simulated errors."
+    },
+    "nvs_get_i8": {
+      "policy": "adapt_settings",
+      "contract": "Versioned virtual settings; return real simulated errors."
+    },
+    "nvs_get_str": {
+      "policy": "adapt_settings",
+      "contract": "Versioned virtual settings; return real simulated errors."
+    },
+    "nvs_get_u16": {
+      "policy": "adapt_settings",
+      "contract": "Versioned virtual settings; return real simulated errors."
+    },
+    "nvs_get_u32": {
+      "policy": "adapt_settings",
+      "contract": "Versioned virtual settings; return real simulated errors."
+    },
+    "nvs_get_u8": {
+      "policy": "adapt_settings",
+      "contract": "Versioned virtual settings; return real simulated errors."
+    },
+    "nvs_open": {
+      "policy": "adapt_settings",
+      "contract": "Versioned virtual settings; return real simulated errors."
+    },
+    "nvs_set_i8": {
+      "policy": "adapt_settings",
+      "contract": "Versioned virtual settings; return real simulated errors."
+    },
+    "nvs_set_str": {
+      "policy": "adapt_settings",
+      "contract": "Versioned virtual settings; return real simulated errors."
+    },
+    "nvs_set_u16": {
+      "policy": "adapt_settings",
+      "contract": "Versioned virtual settings; return real simulated errors."
+    },
+    "nvs_set_u32": {
+      "policy": "adapt_settings",
+      "contract": "Versioned virtual settings; return real simulated errors."
+    },
+    "nvs_set_u8": {
+      "policy": "adapt_settings",
+      "contract": "Versioned virtual settings; return real simulated errors."
+    },
+    "on_cancel": {
+      "policy": "deferred_subghz_callback",
+      "contract": "Only recorded SubGHz popup callers use this symbol; do not include these constructors in the current profile."
+    },
+    "on_line": {
+      "policy": "retain_bound_callback",
+      "contract": "gitm_read_lines dispatches complete lines to its supplied status/event/start/connect/stop parser and stops when that parser returns true; preserve user context and partial-line buffering."
+    },
+    "opendir": {
+      "policy": "adapt_filesystem",
+      "contract": "Virtual filesystem; preserve partial IO, size, seek and missing-file errors."
+    },
+    "pcap_analysis_cache_delete": {
+      "policy": "retain_component",
+      "contract": "Compile production PCAP component over virtual files; inspect platform dependencies."
+    },
+    "pcap_analysis_cache_load": {
+      "policy": "retain_component",
+      "contract": "Compile production PCAP component over virtual files; inspect platform dependencies."
+    },
+    "pcap_analysis_cache_probe": {
+      "policy": "retain_component",
+      "contract": "Compile production PCAP component over virtual files; inspect platform dependencies."
+    },
+    "pcap_analysis_cache_save": {
+      "policy": "retain_component",
+      "contract": "Compile production PCAP component over virtual files; inspect platform dependencies."
+    },
+    "pcap_analysis_export_filtered_pcap": {
+      "policy": "retain_component",
+      "contract": "Compile production PCAP component over virtual files; inspect platform dependencies."
+    },
+    "pcap_analysis_export_report_json": {
+      "policy": "retain_component",
+      "contract": "Compile production PCAP component over virtual files; inspect platform dependencies."
+    },
+    "pcap_analysis_export_summary_text": {
+      "policy": "retain_component",
+      "contract": "Compile production PCAP component over virtual files; inspect platform dependencies."
+    },
+    "pcap_analysis_filter_profile_load": {
+      "policy": "retain_component",
+      "contract": "Compile production PCAP component over virtual files; inspect platform dependencies."
+    },
+    "pcap_analysis_filter_profile_save": {
+      "policy": "retain_component",
+      "contract": "Compile production PCAP component over virtual files; inspect platform dependencies."
+    },
+    "pcap_analysis_store_status_name": {
+      "policy": "retain_component",
+      "contract": "Compile production PCAP component over virtual files; inspect platform dependencies."
+    },
+    "pcap_extract_confidence_name": {
+      "policy": "retain_component",
+      "contract": "Compile production PCAP component over virtual files; inspect platform dependencies."
+    },
+    "pcap_extract_delete_object": {
+      "policy": "retain_component",
+      "contract": "Compile production PCAP component over virtual files; inspect platform dependencies."
+    },
+    "pcap_extract_read_object": {
+      "policy": "retain_component",
+      "contract": "Compile production PCAP component over virtual files; inspect platform dependencies."
+    },
+    "pcap_extract_run": {
+      "policy": "retain_component",
+      "contract": "Compile production PCAP component over virtual files; inspect platform dependencies."
+    },
+    "pcap_extract_state_name": {
+      "policy": "retain_component",
+      "contract": "Compile production PCAP component over virtual files; inspect platform dependencies."
+    },
+    "pcap_extract_status_name": {
+      "policy": "retain_component",
+      "contract": "Compile production PCAP component over virtual files; inspect platform dependencies."
+    },
+    "pcap_extract_type_is_text": {
+      "policy": "retain_component",
+      "contract": "Compile production PCAP component over virtual files; inspect platform dependencies."
+    },
+    "pcap_extract_type_name": {
+      "policy": "retain_component",
+      "contract": "Compile production PCAP component over virtual files; inspect platform dependencies."
+    },
+    "pcap_flow_analysis_build": {
+      "policy": "retain_component",
+      "contract": "Compile production PCAP component over virtual files; inspect platform dependencies."
+    },
+    "pcap_flow_application_name": {
+      "policy": "retain_component",
+      "contract": "Compile production PCAP component over virtual files; inspect platform dependencies."
+    },
+    "pcap_flow_build_stream_ex": {
+      "policy": "retain_component",
+      "contract": "Compile production PCAP component over virtual files; inspect platform dependencies."
+    },
+    "pcap_flow_confidence_name": {
+      "policy": "retain_component",
+      "contract": "Compile production PCAP component over virtual files; inspect platform dependencies."
+    },
+    "pcap_flow_filter_clear": {
+      "policy": "retain_component",
+      "contract": "Compile production PCAP component over virtual files; inspect platform dependencies."
+    },
+    "pcap_flow_filter_describe": {
+      "policy": "retain_component",
+      "contract": "Compile production PCAP component over virtual files; inspect platform dependencies."
+    },
+    "pcap_flow_filter_matches": {
+      "policy": "retain_component",
+      "contract": "Compile production PCAP component over virtual files; inspect platform dependencies."
+    },
+    "pcap_flow_health_name": {
+      "policy": "retain_component",
+      "contract": "Compile production PCAP component over virtual files; inspect platform dependencies."
+    },
+    "pcap_flow_hostname_for_address": {
+      "policy": "retain_component",
+      "contract": "Compile production PCAP component over virtual files; inspect platform dependencies."
+    },
+    "pcap_flow_local_device_count": {
+      "policy": "retain_component",
+      "contract": "Compile production PCAP component over virtual files; inspect platform dependencies."
+    },
+    "pcap_flow_remote_endpoint_count": {
+      "policy": "retain_component",
+      "contract": "Compile production PCAP component over virtual files; inspect platform dependencies."
+    },
+    "pcap_flow_same_local_device": {
+      "policy": "retain_component",
+      "contract": "Compile production PCAP component over virtual files; inspect platform dependencies."
+    },
+    "pcap_flow_transport_name": {
+      "policy": "retain_component",
+      "contract": "Compile production PCAP component over virtual files; inspect platform dependencies."
+    },
+    "pcap_investigation_baseline_compare": {
+      "policy": "retain_component",
+      "contract": "Compile production PCAP component over virtual files; inspect platform dependencies."
+    },
+    "pcap_investigation_baseline_save": {
+      "policy": "retain_component",
+      "contract": "Compile production PCAP component over virtual files; inspect platform dependencies."
+    },
+    "pcap_investigation_build": {
+      "policy": "retain_component",
+      "contract": "Compile production PCAP component over virtual files; inspect platform dependencies."
+    },
+    "pcap_investigation_device_dossier": {
+      "policy": "retain_component",
+      "contract": "Compile production PCAP component over virtual files; inspect platform dependencies."
+    },
+    "pcap_investigation_event_name": {
+      "policy": "retain_component",
+      "contract": "Compile production PCAP component over virtual files; inspect platform dependencies."
+    },
+    "pcap_investigation_export_html": {
+      "policy": "retain_component",
+      "contract": "Compile production PCAP component over virtual files; inspect platform dependencies."
+    },
+    "pcap_investigation_finding_name": {
+      "policy": "retain_component",
+      "contract": "Compile production PCAP component over virtual files; inspect platform dependencies."
+    },
+    "pcap_investigation_status_name": {
+      "policy": "retain_component",
+      "contract": "Compile production PCAP component over virtual files; inspect platform dependencies."
+    },
+    "pcap_ratio_format": {
+      "policy": "retain_component",
+      "contract": "Compile production PCAP component over virtual files; inspect platform dependencies."
+    },
+    "pcap_reader_close": {
+      "policy": "retain_component",
+      "contract": "Compile production PCAP component over virtual files; inspect platform dependencies."
+    },
+    "pcap_reader_describe_packet": {
+      "policy": "retain_component",
+      "contract": "Compile production PCAP component over virtual files; inspect platform dependencies."
+    },
+    "pcap_reader_filter_name": {
+      "policy": "retain_component",
+      "contract": "Compile production PCAP component over virtual files; inspect platform dependencies."
+    },
+    "pcap_reader_link_type_name": {
+      "policy": "retain_component",
+      "contract": "Compile production PCAP component over virtual files; inspect platform dependencies."
+    },
+    "pcap_reader_open": {
+      "policy": "retain_component",
+      "contract": "Compile production PCAP component over virtual files; inspect platform dependencies."
+    },
+    "pcap_reader_packet_matches_filter": {
+      "policy": "retain_component",
+      "contract": "Compile production PCAP component over virtual files; inspect platform dependencies."
+    },
+    "pcap_reader_read_packet": {
+      "policy": "retain_component",
+      "contract": "Compile production PCAP component over virtual files; inspect platform dependencies."
+    },
+    "pcap_reader_scan": {
+      "policy": "retain_component",
+      "contract": "Compile production PCAP component over virtual files; inspect platform dependencies."
+    },
+    "pcap_reader_status_name": {
+      "policy": "retain_component",
+      "contract": "Compile production PCAP component over virtual files; inspect platform dependencies."
+    },
+    "pcap_summary_build": {
+      "policy": "retain_component",
+      "contract": "Compile production PCAP component over virtual files; inspect platform dependencies."
+    },
+    "pcap_window_bucket_seconds": {
+      "policy": "retain_component",
+      "contract": "Compile production PCAP component over virtual files; inspect platform dependencies."
+    },
+    "pcap_window_burst_score": {
+      "policy": "retain_component",
+      "contract": "Compile production PCAP component over virtual files; inspect platform dependencies."
+    },
+    "pcap_window_peak": {
+      "policy": "retain_component",
+      "contract": "Compile production PCAP component over virtual files; inspect platform dependencies."
+    },
+    "pdMS_TO_TICKS": {
+      "policy": "adapt_scheduler",
+      "contract": "Explicit bounded jobs, clock and synchronization semantics; no dummy successful task creation."
+    },
+    "portENTER_CRITICAL": {
+      "policy": "adapt_scheduler",
+      "contract": "Explicit bounded jobs, clock and synchronization semantics; no dummy successful task creation."
+    },
+    "portEXIT_CRITICAL": {
+      "policy": "adapt_scheduler",
+      "contract": "Explicit bounded jobs, clock and synchronization semantics; no dummy successful task creation."
+    },
+    "powf": {
+      "policy": "retain_libc",
+      "contract": "Use equivalent standard-library behavior in Emscripten."
+    },
+    "pthread_internal_local_storage_destructor_callback": {
+      "policy": "exclude_esp_tls_branch",
+      "contract": "Disable the guarded ESP PSRAM/TLS deletion branch in the browser target; scheduler job cleanup must still run exactly once before clearing the task handle."
+    },
+    "pvTimerGetTimerID": {
+      "policy": "adapt_scheduler",
+      "contract": "Explicit bounded jobs, clock and synchronization semantics; no dummy successful task creation."
+    },
+    "qsort": {
+      "policy": "retain_libc",
+      "contract": "Use equivalent standard-library behavior in Emscripten."
+    },
+    "readdir": {
+      "policy": "adapt_filesystem",
+      "contract": "Virtual filesystem; preserve partial IO, size, seek and missing-file errors."
+    },
+    "recvfrom": {
+      "policy": "adapt_network",
+      "contract": "Local scenario events and simulated server outcomes; no real radio/backend request."
+    },
+    "rename": {
+      "policy": "adapt_filesystem",
+      "contract": "Virtual filesystem; preserve partial IO, size, seek and missing-file errors."
+    },
+    "roundf": {
+      "policy": "retain_libc",
+      "contract": "Use equivalent standard-library behavior in Emscripten."
+    },
+    "sendto": {
+      "policy": "adapt_network",
+      "contract": "Local scenario events and simulated server outcomes; no real radio/backend request."
+    },
+    "setsockopt": {
+      "policy": "adapt_network",
+      "contract": "Local scenario events and simulated server outcomes; no real radio/backend request."
+    },
+    "settimeofday": {
+      "policy": "adapt_lifecycle",
+      "contract": "Deterministic scenario time/randomness or simulated reset; never host reboot."
+    },
+    "setvbuf": {
+      "policy": "adapt_filesystem",
+      "contract": "Virtual filesystem; preserve partial IO, size, seek and missing-file errors."
+    },
+    "sin": {
+      "policy": "retain_libc",
+      "contract": "Use equivalent standard-library behavior in Emscripten."
+    },
+    "sinf": {
+      "policy": "retain_libc",
+      "contract": "Use equivalent standard-library behavior in Emscripten."
+    },
+    "snprintf": {
+      "policy": "retain_libc",
+      "contract": "Use equivalent standard-library behavior in Emscripten."
+    },
+    "socket": {
+      "policy": "adapt_network",
+      "contract": "Local scenario events and simulated server outcomes; no real radio/backend request."
+    },
+    "sqrt": {
+      "policy": "retain_libc",
+      "contract": "Use equivalent standard-library behavior in Emscripten."
+    },
+    "sscanf": {
+      "policy": "retain_libc",
+      "contract": "Use equivalent standard-library behavior in Emscripten."
+    },
+    "stat": {
+      "policy": "adapt_filesystem",
+      "contract": "Virtual filesystem; preserve partial IO, size, seek and missing-file errors."
+    },
+    "strcasecmp": {
+      "policy": "retain_libc",
+      "contract": "Use equivalent standard-library behavior in Emscripten."
+    },
+    "strcat": {
+      "policy": "retain_libc",
+      "contract": "Use equivalent standard-library behavior in Emscripten."
+    },
+    "strchr": {
+      "policy": "retain_libc",
+      "contract": "Use equivalent standard-library behavior in Emscripten."
+    },
+    "strcmp": {
+      "policy": "retain_libc",
+      "contract": "Use equivalent standard-library behavior in Emscripten."
+    },
+    "strcpy": {
+      "policy": "retain_libc",
+      "contract": "Use equivalent standard-library behavior in Emscripten."
+    },
+    "strcspn": {
+      "policy": "retain_libc",
+      "contract": "Use equivalent standard-library behavior in Emscripten."
+    },
+    "strdup": {
+      "policy": "retain_libc",
+      "contract": "Use equivalent standard-library behavior in Emscripten."
+    },
+    "strerror": {
+      "policy": "retain_libc",
+      "contract": "Use equivalent standard-library behavior in Emscripten."
+    },
+    "strlen": {
+      "policy": "retain_libc",
+      "contract": "Use equivalent standard-library behavior in Emscripten."
+    },
+    "strncasecmp": {
+      "policy": "retain_libc",
+      "contract": "Use equivalent standard-library behavior in Emscripten."
+    },
+    "strncat": {
+      "policy": "retain_libc",
+      "contract": "Use equivalent standard-library behavior in Emscripten."
+    },
+    "strncmp": {
+      "policy": "retain_libc",
+      "contract": "Use equivalent standard-library behavior in Emscripten."
+    },
+    "strncpy": {
+      "policy": "retain_libc",
+      "contract": "Use equivalent standard-library behavior in Emscripten."
+    },
+    "strnlen": {
+      "policy": "retain_libc",
+      "contract": "Use equivalent standard-library behavior in Emscripten."
+    },
+    "strpbrk": {
+      "policy": "retain_libc",
+      "contract": "Use equivalent standard-library behavior in Emscripten."
+    },
+    "strrchr": {
+      "policy": "retain_libc",
+      "contract": "Use equivalent standard-library behavior in Emscripten."
+    },
+    "strstr": {
+      "policy": "retain_libc",
+      "contract": "Use equivalent standard-library behavior in Emscripten."
+    },
+    "strtod": {
+      "policy": "retain_libc",
+      "contract": "Use equivalent standard-library behavior in Emscripten."
+    },
+    "strtof": {
+      "policy": "retain_libc",
+      "contract": "Use equivalent standard-library behavior in Emscripten."
+    },
+    "strtok": {
+      "policy": "retain_libc",
+      "contract": "Use equivalent standard-library behavior in Emscripten."
+    },
+    "strtok_r": {
+      "policy": "retain_libc",
+      "contract": "Use equivalent standard-library behavior in Emscripten."
+    },
+    "strtol": {
+      "policy": "retain_libc",
+      "contract": "Use equivalent standard-library behavior in Emscripten."
+    },
+    "strtoul": {
+      "policy": "retain_libc",
+      "contract": "Use equivalent standard-library behavior in Emscripten."
+    },
+    "strtoull": {
+      "policy": "retain_libc",
+      "contract": "Use equivalent standard-library behavior in Emscripten."
+    },
+    "time": {
+      "policy": "adapt_lifecycle",
+      "contract": "Deterministic scenario time/randomness or simulated reset; never host reboot."
+    },
+    "tolower": {
+      "policy": "retain_libc",
+      "contract": "Use equivalent standard-library behavior in Emscripten."
+    },
+    "toupper": {
+      "policy": "retain_libc",
+      "contract": "Use equivalent standard-library behavior in Emscripten."
+    },
+    "uart_driver_delete": {
+      "policy": "adapt_hardware",
+      "contract": "Per-device adapter; preserve expected read/write/availability behavior."
+    },
+    "uart_driver_install": {
+      "policy": "adapt_hardware",
+      "contract": "Per-device adapter; preserve expected read/write/availability behavior."
+    },
+    "uart_flush": {
+      "policy": "adapt_hardware",
+      "contract": "Per-device adapter; preserve expected read/write/availability behavior."
+    },
+    "uart_flush_input": {
+      "policy": "adapt_hardware",
+      "contract": "Per-device adapter; preserve expected read/write/availability behavior."
+    },
+    "uart_get_baudrate": {
+      "policy": "adapt_hardware",
+      "contract": "Per-device adapter; preserve expected read/write/availability behavior."
+    },
+    "uart_param_config": {
+      "policy": "adapt_hardware",
+      "contract": "Per-device adapter; preserve expected read/write/availability behavior."
+    },
+    "uart_read_bytes": {
+      "policy": "adapt_hardware",
+      "contract": "Per-device adapter; preserve expected read/write/availability behavior."
+    },
+    "uart_set_baudrate": {
+      "policy": "adapt_hardware",
+      "contract": "Per-device adapter; preserve expected read/write/availability behavior."
+    },
+    "uart_set_pin": {
+      "policy": "adapt_hardware",
+      "contract": "Per-device adapter; preserve expected read/write/availability behavior."
+    },
+    "uart_write_bytes": {
+      "policy": "adapt_hardware",
+      "contract": "Per-device adapter; preserve expected read/write/availability behavior."
+    },
+    "unlink": {
+      "policy": "adapt_filesystem",
+      "contract": "Virtual filesystem; preserve partial IO, size, seek and missing-file errors."
+    },
+    "usb_host_get_active_config_descriptor": {
+      "policy": "adapt_hardware",
+      "contract": "Per-device adapter; preserve expected read/write/availability behavior."
+    },
+    "usb_host_get_device_descriptor": {
+      "policy": "adapt_hardware",
+      "contract": "Per-device adapter; preserve expected read/write/availability behavior."
+    },
+    "usb_host_lib_info": {
+      "policy": "adapt_hardware",
+      "contract": "Per-device adapter; preserve expected read/write/availability behavior."
+    },
+    "usb_parse_endpoint_descriptor_by_index": {
+      "policy": "adapt_hardware",
+      "contract": "Per-device adapter; preserve expected read/write/availability behavior."
+    },
+    "usb_parse_next_descriptor_of_type": {
+      "policy": "adapt_hardware",
+      "contract": "Per-device adapter; preserve expected read/write/availability behavior."
+    },
+    "usbh_cdc_create": {
+      "policy": "adapt_hardware",
+      "contract": "Per-device adapter; preserve expected read/write/availability behavior."
+    },
+    "usbh_cdc_delete": {
+      "policy": "adapt_hardware",
+      "contract": "Per-device adapter; preserve expected read/write/availability behavior."
+    },
+    "usbh_cdc_desc_print": {
+      "policy": "adapt_hardware",
+      "contract": "Per-device adapter; preserve expected read/write/availability behavior."
+    },
+    "usbh_cdc_driver_install": {
+      "policy": "adapt_hardware",
+      "contract": "Per-device adapter; preserve expected read/write/availability behavior."
+    },
+    "usbh_cdc_driver_uninstall": {
+      "policy": "adapt_hardware",
+      "contract": "Per-device adapter; preserve expected read/write/availability behavior."
+    },
+    "usbh_cdc_flush_rx_buffer": {
+      "policy": "adapt_hardware",
+      "contract": "Per-device adapter; preserve expected read/write/availability behavior."
+    },
+    "usbh_cdc_get_rx_buffer_size": {
+      "policy": "adapt_hardware",
+      "contract": "Per-device adapter; preserve expected read/write/availability behavior."
+    },
+    "usbh_cdc_get_state": {
+      "policy": "adapt_hardware",
+      "contract": "Per-device adapter; preserve expected read/write/availability behavior."
+    },
+    "usbh_cdc_read_bytes": {
+      "policy": "adapt_hardware",
+      "contract": "Per-device adapter; preserve expected read/write/availability behavior."
+    },
+    "usbh_cdc_send_custom_request": {
+      "policy": "adapt_hardware",
+      "contract": "Per-device adapter; preserve expected read/write/availability behavior."
+    },
+    "usbh_cdc_write_bytes": {
+      "policy": "adapt_hardware",
+      "contract": "Per-device adapter; preserve expected read/write/availability behavior."
+    },
+    "vEventGroupDelete": {
+      "policy": "adapt_scheduler",
+      "contract": "Explicit bounded jobs, clock and synchronization semantics; no dummy successful task creation."
+    },
+    "vTaskDelay": {
+      "policy": "adapt_scheduler",
+      "contract": "Explicit bounded jobs, clock and synchronization semantics; no dummy successful task creation."
+    },
+    "vTaskDelete": {
+      "policy": "adapt_scheduler",
+      "contract": "Explicit bounded jobs, clock and synchronization semantics; no dummy successful task creation."
+    },
+    "vTaskDeleteWithCaps": {
+      "policy": "adapt_scheduler",
+      "contract": "Explicit bounded jobs, clock and synchronization semantics; no dummy successful task creation."
+    },
+    "vTimerSetTimerID": {
+      "policy": "adapt_scheduler",
+      "contract": "Explicit bounded jobs, clock and synchronization semantics; no dummy successful task creation."
+    },
+    "va_end": {
+      "policy": "retain_macro_or_expression",
+      "contract": "Preprocessor/cast expression; validate against actual compiler, not a callable adapter."
+    },
+    "va_start": {
+      "policy": "retain_macro_or_expression",
+      "contract": "Preprocessor/cast expression; validate against actual compiler, not a callable adapter."
+    },
+    "vsnprintf": {
+      "policy": "retain_libc",
+      "contract": "Use equivalent standard-library behavior in Emscripten."
+    },
+    "xEventGroupCreate": {
+      "policy": "adapt_scheduler",
+      "contract": "Explicit bounded jobs, clock and synchronization semantics; no dummy successful task creation."
+    },
+    "xEventGroupGetBits": {
+      "policy": "adapt_scheduler",
+      "contract": "Explicit bounded jobs, clock and synchronization semantics; no dummy successful task creation."
+    },
+    "xEventGroupSetBits": {
+      "policy": "adapt_scheduler",
+      "contract": "Explicit bounded jobs, clock and synchronization semantics; no dummy successful task creation."
+    },
+    "xEventGroupWaitBits": {
+      "policy": "adapt_scheduler",
+      "contract": "Explicit bounded jobs, clock and synchronization semantics; no dummy successful task creation."
+    },
+    "xSemaphoreCreateMutex": {
+      "policy": "adapt_scheduler",
+      "contract": "Explicit bounded jobs, clock and synchronization semantics; no dummy successful task creation."
+    },
+    "xSemaphoreGive": {
+      "policy": "adapt_scheduler",
+      "contract": "Explicit bounded jobs, clock and synchronization semantics; no dummy successful task creation."
+    },
+    "xSemaphoreTake": {
+      "policy": "adapt_scheduler",
+      "contract": "Explicit bounded jobs, clock and synchronization semantics; no dummy successful task creation."
+    },
+    "xTaskCreate": {
+      "policy": "adapt_scheduler",
+      "contract": "Explicit bounded jobs, clock and synchronization semantics; no dummy successful task creation."
+    },
+    "xTaskCreateWithCaps": {
+      "policy": "adapt_scheduler",
+      "contract": "Explicit bounded jobs, clock and synchronization semantics; no dummy successful task creation."
+    },
+    "xTaskGetTickCount": {
+      "policy": "adapt_scheduler",
+      "contract": "Explicit bounded jobs, clock and synchronization semantics; no dummy successful task creation."
+    },
+    "xTimerCreate": {
+      "policy": "adapt_scheduler",
+      "contract": "Explicit bounded jobs, clock and synchronization semantics; no dummy successful task creation."
+    },
+    "xTimerStart": {
+      "policy": "adapt_scheduler",
+      "contract": "Explicit bounded jobs, clock and synchronization semantics; no dummy successful task creation."
+    },
+    "xTimerStop": {
+      "policy": "adapt_scheduler",
+      "contract": "Explicit bounded jobs, clock and synchronization semantics; no dummy successful task creation."
+    }
+  }
+}

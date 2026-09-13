@@ -1,0 +1,56 @@
+{
+  "status": "PASS",
+  "seconds": 58.51272000002791,
+  "checks": [
+    {
+      "section": "guided_dialogs",
+      "name": "test_emulator_stories.mjs test_emulator_dialogs.mjs",
+      "started": 1789245358.5613885,
+      "seconds": 0.10836509999353439,
+      "status": "PASS",
+      "exit_code": 0,
+      "log": "C:\\Users\\mati\\Documents\\GitHub\\M5MonsterC5-Tab5\\docs\\ui-emulator\\test-runs\\20260912-223558-ad381f\\acddd15f4ce94ac2afbbdc7af01c0495.log",
+      "aggregate": false
+    },
+    {
+      "section": "guided_dialogs",
+      "name": "test_emulator_stories.py",
+      "started": 1789245358.6799653,
+      "seconds": 27.939566099987132,
+      "status": "PASS",
+      "exit_code": 0,
+      "log": "C:\\Users\\mati\\Documents\\GitHub\\M5MonsterC5-Tab5\\docs\\ui-emulator\\test-runs\\20260912-223558-ad381f\\34a1e1f17d0a4b34bd33369caaa1be28.log",
+      "aggregate": false
+    },
+    {
+      "section": "guided_dialogs",
+      "name": "test_emulator_story_lifecycle.py",
+      "started": 1789245386.6203325,
+      "seconds": 11.268458100006683,
+      "status": "PASS",
+      "exit_code": 0,
+      "log": "C:\\Users\\mati\\Documents\\GitHub\\M5MonsterC5-Tab5\\docs\\ui-emulator\\test-runs\\20260912-223558-ad381f\\6d8a138ae6c4429c8d15fe97dd8db082.log",
+      "aggregate": false
+    },
+    {
+      "section": "guided_dialogs",
+      "name": "test_emulator_dialogs.py",
+      "started": 1789245397.889324,
+      "seconds": 18.926591700001154,
+      "status": "PASS",
+      "exit_code": 0,
+      "log": "C:\\Users\\mati\\Documents\\GitHub\\M5MonsterC5-Tab5\\docs\\ui-emulator\\test-runs\\20260912-223558-ad381f\\4f17d169424844fb92bfdbe20b1aa42a.log",
+      "aggregate": false
+    },
+    {
+      "section": "guided_dialogs",
+      "name": "test_emulator_phase4_audit.py",
+      "started": 1789245416.8167777,
+      "seconds": 0.24994660000083968,
+      "status": "PASS",
+      "exit_code": 0,
+      "log": "C:\\Users\\mati\\Documents\\GitHub\\M5MonsterC5-Tab5\\docs\\ui-emulator\\test-runs\\20260912-223558-ad381f\\1d95c7a824534ff3aa452cb3b23500ab.log",
+      "aggregate": false
+    }
+  ]
+}

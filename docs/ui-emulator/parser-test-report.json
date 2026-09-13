@@ -1,0 +1,36 @@
+{
+  "status": "passed",
+  "source_sha256": "900e1adfedca93ce66e72fcee7764b807076badab14600c5c57380ed26a5a014",
+  "fixture_sha256": {
+    "neon-district.seed.json": "a2862050d87adb855250d96906bf6404138fe04dfbc772e107d2358721342711",
+    "neon-district.responses.json": "62407a97a149674d4cf289dd1a6915c5de6c0fcf0ed5e0b2d893402e90e90643"
+  },
+  "functions": [
+    "trim_ascii_whitespace",
+    "parse_csv_mixed_fields",
+    "parse_network_line",
+    "parse_bt_device_line",
+    "parse_probes_from_buffer",
+    "fetch_html_files_from_sd"
+  ],
+  "extracted_block": "ARP host parsing block",
+  "chunk_sizes": [
+    1,
+    2,
+    7,
+    31,
+    512,
+    4096
+  ],
+  "sanitizers": [
+    "address",
+    "undefined"
+  ],
+  "limitations": [
+    "Wi-Fi/BLE framing uses a test adapter, not full production receive tasks.",
+    "HTML executes the full production fetch function with simulated transport and time.",
+    "No live UI, scheduler, hardware or all-command coverage."
+  ],
+  "output": "PASS: five response families, six chunk sizes, fields, duplicate probes, ICMP exclusion, CSV escaping, empty/error/timeout cases\n",
+  "errors": ""
+}

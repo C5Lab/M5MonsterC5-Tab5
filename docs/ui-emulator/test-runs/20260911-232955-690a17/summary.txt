@@ -1,0 +1,46 @@
+
+TEST SUMMARY
+==============================================================================
+phase4_attacks
+  FAIL          141.41s  verify_emulator_phase4_nettools.py
+phase4_nettools
+  PASS          126.29s  verify_emulator_phase4_pcap_deep.py
+  PASS            0.16s  test_emulator_nettools.mjs
+  PASS            0.10s  test_emulator_slice_tokens.py
+  FAIL           14.70s  test_emulator_phase4_nettools.py
+phase4_pcap_deep
+  PASS          115.42s  verify_emulator_phase4_wardrive.py
+  PASS            0.17s  test_emulator_pcap_deep.mjs test_emulator_files.mjs
+  PASS            3.29s  test_emulator_sha256.py
+  PASS            7.25s  test_emulator_phase4_pcap_deep.py
+phase4_wardrive
+  PASS          106.86s  verify_emulator_phase4_bluetooth.py
+  PASS            0.24s  test_emulator_wardrive.mjs
+  PASS            8.15s  test_emulator_phase4_wardrive.py
+phase4_bluetooth
+  PASS           97.93s  verify_emulator_phase3.py
+  PASS            2.15s  test_emulator_phase4_bluetooth.py
+  PASS            6.56s  test_emulator_bluetooth_lifecycle.py
+phase3
+  PASS           81.27s  verify_emulator_phase2.py
+  PASS            0.30s  test_emulator_device.mjs
+  PASS            0.20s  test_emulator_bridge.mjs
+  PASS            2.51s  run_emulator_capture_tests.py
+  PASS            2.92s  test_emulator_phase3.py
+  PASS           10.56s  test_emulator_lifecycle.py
+phase2
+  PASS            1.91s  test_emulator_slice.py
+  PASS            0.09s  test_emulator_contracts.py
+  PASS            0.11s  test_emulator_input.mjs
+  PASS           23.28s  test_emulator_browser.py
+  PASS           29.47s  test_emulator_phase2.py
+  PASS           10.20s  test_emulator_settings.py
+  PASS           16.01s  test_emulator_performance.py
+------------------------------------------------------------------------------
+Result: FAIL | scripts PASS: 21 | FAIL/ERROR: 1
+Total elapsed: 141.51s
+Section wrapper times include their children; do not add them together.
+Run incomplete: checks after the failure may NOT HAVE RUN. Missing entries are not passes.
+Failure log: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\docs\ui-emulator\test-runs\20260911-232955-690a17\1eab77298a504ce3aa6303583502aa2e.log
+Failure log: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\docs\ui-emulator\test-runs\20260911-232955-690a17\e9f8c2b0d29a4e40bfbb5a2762d78600.log
+Report: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\docs\ui-emulator\test-runs\20260911-232955-690a17\summary.json

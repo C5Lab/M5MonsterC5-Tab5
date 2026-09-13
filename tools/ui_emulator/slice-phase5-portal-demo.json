@@ -1,0 +1,12 @@
+{
+  "uart1_preferred_tab": "retain",
+  "show_adhoc_portal_page": "retain",
+  "adhoc_portal_back_cb": "retain",
+  "adhoc_portal_stop_cb": "adapter",
+  "adhoc_show_probes_cb": "retain",
+  "adhoc_probe_click_cb": "retain",
+  "adhoc_html_popup_close_cb": "retain",
+  "adhoc_html_select_cb": "adapter",
+  "adhoc_fetch_probes_from_all_uarts": "adapter",
+  "karma2_fetch_html_files": "adapter"
+}

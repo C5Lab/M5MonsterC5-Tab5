@@ -1,0 +1,9 @@
+test_complete_native_story_all_rotations (__main__.BluetoothStoryBrowser.test_complete_native_story_all_rotations) ... ok
+test_hidden_locator_does_not_advance_and_fullscreen_keeps_guide (__main__.BluetoothStoryBrowser.test_hidden_locator_does_not_advance_and_fullscreen_keeps_guide) ... ok
+test_no_signal_cannot_complete_and_conditions_reset_to_normal (__main__.BluetoothStoryBrowser.test_no_signal_cannot_complete_and_conditions_reset_to_normal) ... ok
+test_wrong_device_module_restart_and_reload_do_not_complete (__main__.BluetoothStoryBrowser.test_wrong_device_module_restart_and_reload_do_not_complete) ... ok
+
+----------------------------------------------------------------------
+Ran 4 tests in 19.953s
+
+OK

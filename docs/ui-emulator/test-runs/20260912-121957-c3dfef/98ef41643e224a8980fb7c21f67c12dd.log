@@ -1,0 +1,12 @@
+✔ one pointer owns a gesture; cancellation releases its last position exactly once (1.0695ms)
+✔ CSS scaling maps to logical pixels without applying rotation twice (0.1411ms)
+✔ captured pointer outside Canvas clamps to valid display pixels (0.2464ms)
+✔ RGB565 framebuffer preserves primary colors and opaque alpha (0.1262ms)
+ℹ tests 4
+ℹ suites 0
+ℹ pass 4
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 112.1206

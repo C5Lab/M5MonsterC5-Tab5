@@ -1,0 +1,59 @@
+flowchart LR
+    home["Transport dashboard"]
+    scan["WiFi Scan & Attack"]
+    observer["Network Observer"]
+    net_popup["Network action popup"]
+    client_popup["Client deauth popup"]
+    global["Global WiFi Attacks"]
+    deauth["Deauth active popup"]
+    evil["Evil Twin setup / active"]
+    sae["SAE Overflow active"]
+    handshake["Handshaker popup"]
+    arp["ARP Poison page"]
+    mitm["MITM setup / active"]
+    gitm["Capture Gateway page"]
+    rogue_gitm["Rogue GITM popup"]
+    nmap["Nmap page / result popups"]
+    rogue_ap["Rogue AP page / popup"]
+    radar["AP Radar"]
+    sd["SD-card warning"]
+    blackout["Blackout confirm / active"]
+    sniffer["SnifferDog confirm / active"]
+    global_hs["Global Handshaker confirm / active"]
+    portal["Phishing Portal setup / active"]
+    beacon["Beacon Spam menu"]
+    ssids["Beacon SSID list / editor"]
+    wardrive["Wardrive page / overlays"]
+    home -- "tap WiFi Scan & Attack" --> scan
+    home -- "tap Network Observer" --> observer
+    home -- "tap Global WiFi Attacks" --> global
+    observer -- "tap network row" --> net_popup
+    observer -. "tap client row; Red Team required" .-> client_popup
+    scan -. "tap Deauth; one or more selected" .-> deauth
+    scan -. "Evil Twin without SD" .-> sd
+    scan -- "tap Evil Twin" --> evil
+    scan -. "tap SAE Overflow; exactly one AP" .-> sae
+    scan -- "tap Handshaker" --> handshake
+    scan -. "tap ARP Poison; exactly one AP" .-> arp
+    scan -. "tap MITM; exactly one AP" .-> mitm
+    scan -- "tap Capture GW" --> gitm
+    scan -. "tap Rogue GITM; exactly one AP" .-> rogue_gitm
+    scan -. "tap Nmap; exactly one AP" .-> nmap
+    scan -. "tap Rogue AP; exactly one AP" .-> rogue_ap
+    scan -. "tap AP Radar; exactly one AP" .-> radar
+    global -- "tap Blackout" --> blackout
+    global -- "tap SnifferDog" --> sniffer
+    global -- "tap Handshaker" --> global_hs
+    global -. "Portal / Wardrive without SD" .-> sd
+    global -- "tap Portal" --> portal
+    global -- "tap Wardrive" --> wardrive
+    global -- "tap Beacon Spam" --> beacon
+    global -- "tap GITM" --> gitm
+    beacon -- "tap List SSIDs" --> ssids
+    beacon -- "Back" --> global
+    classDef screen fill:#111827,color:#f9fafb,stroke:#7dd3fc,stroke-width:1.5px;
+    classDef popup fill:#2a2036,color:#f9fafb,stroke:#d8b4fe,stroke-width:1.5px;
+    classDef condition fill:#3a2d12,color:#fff7d6,stroke:#f2b84b,stroke-width:1.5px;
+    class boot,splash,shell,uart,mbus,internal,home,hub,scan,observer,global,data,bt,subghz,settings,analysis,local,remote screen;
+    class no_board,net_popup,client_popup,deauth,evil,sae,handshake,mitm,rogue_gitm,blackout,sniffer,global_hs,portal,transfer,packet,summary,flows,entities,health,map,tools,objects,delete,scan_cfg,red,timeout,brightness,rotation,theme,time,lock,ota,sdadmin,baud,listen_action,listen_leave,tx_warn,hunter_action,hunter_leave,manage_action,rename,repeat popup;
+    class sd condition;

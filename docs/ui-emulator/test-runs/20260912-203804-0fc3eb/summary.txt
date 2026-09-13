@@ -1,0 +1,12 @@
+
+TEST SUMMARY
+==============================================================================
+mesh
+  PASS            0.16s  test_emulator_device.mjs test_emulator_nettools.mjs
+  PASS           10.20s  test_emulator_mesh_monitor.py
+  PASS            0.25s  test_emulator_phase4_audit.py
+------------------------------------------------------------------------------
+Result: PASS | scripts PASS: 3 | FAIL/ERROR: 0
+Total elapsed: 10.63s
+Section wrapper times include their children; do not add them together.
+Report: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\docs\ui-emulator\test-runs\20260912-203804-0fc3eb\summary.json

@@ -1,0 +1,10 @@
+test_empty_observer_and_cancelled_capture_cannot_supply_result (__main__.ReconStoriesBrowser.test_empty_observer_and_cancelled_capture_cannot_supply_result) ... ok
+test_mesh_stop_clear_and_home_all_rotations (__main__.ReconStoriesBrowser.test_mesh_stop_clear_and_home_all_rotations) ... ok
+test_observer_capture_and_both_exit_choices_all_rotations (__main__.ReconStoriesBrowser.test_observer_capture_and_both_exit_choices_all_rotations) ... ok
+test_observer_restart_and_disconnect_do_not_complete (__main__.ReconStoriesBrowser.test_observer_restart_and_disconnect_do_not_complete) ... ok
+test_restart_hidden_module_and_cancel_require_fresh_session (__main__.ReconStoriesBrowser.test_restart_hidden_module_and_cancel_require_fresh_session) ... ok
+
+----------------------------------------------------------------------
+Ran 5 tests in 55.717s
+
+OK

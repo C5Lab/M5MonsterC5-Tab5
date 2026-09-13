@@ -1,0 +1,103 @@
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/verify_emulator_phase2.py
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_slice.py
+.641 retained production functions; 189 explicit boundaries
+..
+----------------------------------------------------------------------
+Ran 3 tests in 1.923s
+
+OK
+PASS tests/test_emulator_slice.py
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_contracts.py
+......
+----------------------------------------------------------------------
+Ran 6 tests in 0.001s
+
+OK
+PASS tests/test_emulator_contracts.py
+EXEC node --test tests/test_emulator_input.mjs
+✔ one pointer owns a gesture; cancellation releases its last position exactly once (0.9732ms)
+✔ CSS scaling maps to logical pixels without applying rotation twice (0.124ms)
+✔ captured pointer outside Canvas clamps to valid display pixels (0.2229ms)
+✔ RGB565 framebuffer preserves primary colors and opaque alpha (0.1137ms)
+ℹ tests 4
+ℹ suites 0
+ℹ pass 4
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 69.0995
+PASS tests/test_emulator_input.mjs
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_browser.py
+Navigation, scan and Settings passed: 0 1440
+Navigation, scan and Settings passed: 1 1440
+Navigation, scan and Settings passed: 2 1440
+Navigation, scan and Settings passed: 3 1440
+Navigation, scan and Settings passed: 0 390
+Navigation, scan and Settings passed: 1 390
+Navigation, scan and Settings passed: 2 390
+Navigation, scan and Settings passed: 3 390
+PASS tests/test_emulator_browser.py
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_phase2.py
+WAIT 30s: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/verify_emulator_phase2.py
+......
+----------------------------------------------------------------------
+Ran 6 tests in 21.121s
+
+OK
+PASS tests/test_emulator_phase2.py
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_settings.py
+.....
+----------------------------------------------------------------------
+Ran 5 tests in 7.481s
+
+OK
+PASS tests/test_emulator_settings.py
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_performance.py
+desktop profile measured
+WAIT 60s: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/verify_emulator_phase2.py
+mobile profile measured
+PASS tests/test_emulator_performance.py
+PASS tests/verify_emulator_phase2.py
+EXEC node --test tests/test_emulator_device.mjs
+✔ module captures have distinct paths when copied to the shared analysis filesystem (1.3717ms)
+✔ PCAP packet timestamps carry into seconds rather than overflowing microseconds (1.5407ms)
+✔ scan selection and clients use the seed identities, independently for each module (0.7461ms)
+✔ cancelled captures cannot create files; reset makes all previous job IDs stale (0.2913ms)
+✔ completed capture stores valid PCAP bytes for the selected network and clients (0.3169ms)
+✔ missing/full SD and missing clients fail explicitly without committing a file (0.2842ms)
+✔ Bluetooth respects connection state, explicit time zero and immutable discovery snapshots (0.2155ms)
+✔ disconnect cancels work, snapshots cannot mutate the model, invalid clocks are rejected (0.188ms)
+ℹ tests 8
+ℹ suites 0
+ℹ pass 8
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 80.7852
+PASS tests/test_emulator_device.mjs
+EXEC node --test tests/test_emulator_bridge.mjs
+✔ Observer discovers independently and its targets work without a WiFi scan (1.699ms)
+✔ C boundary scan rows preserve scenario identities and cancellation (0.3973ms)
+ℹ tests 2
+ℹ suites 0
+ℹ pass 2
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 81.5719
+PASS tests/test_emulator_bridge.mjs
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/run_emulator_capture_tests.py
+PASS: production PCAP reader parsed three synthetic ARP frames, selected AP and all three clients
+PASS tests/run_emulator_capture_tests.py
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_phase3.py
+PASS tests/test_emulator_phase3.py
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_lifecycle.py
+....
+----------------------------------------------------------------------
+Ran 4 tests in 5.693s
+
+OK
+PASS tests/test_emulator_lifecycle.py

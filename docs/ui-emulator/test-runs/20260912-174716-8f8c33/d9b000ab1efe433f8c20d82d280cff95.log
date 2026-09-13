@@ -1,0 +1,39 @@
+EXEC node --test tests/test_emulator_global_attacks.mjs tests/test_emulator_sae.mjs tests/test_emulator_attacks.mjs
+✔ all seven simulated operations start, change and stop without another module changing (3.4028ms)
+✔ cancel, disconnect and reset never resurrect jobs or write captures (0.3211ms)
+✔ invalid inputs never reserve the module and credentials never enter model history (0.3147ms)
+✔ MITM creates target-specific PCAP only on stop and handles SD/quota failures atomically (0.4463ms)
+✔ clock slicing produces identical bounded simulated results (0.5782ms)
+✔ Observer preserves scenario identities, changes activity, freezes on stop and resets (0.3949ms)
+✔ global operations need no selection, own one module, advance and freeze on stop (2.4395ms)
+✔ global Handshaker emits deterministic bounded scenario results, including an empty scenario (1.1327ms)
+✔ global jobs cancel on disconnect/reset and do not stop another module (0.6304ms)
+✔ SAE requires exactly one scenario target and rejects invalid selection without reserving radio (1.8837ms)
+✔ SAE cancellation, module disconnect and reset cannot resume old activity (0.4066ms)
+ℹ tests 11
+ℹ suites 0
+ℹ pass 11
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 96.209
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_global_attacks.py
+test_busy_refusal_preserves_existing_operation (__main__.GlobalAttacksBrowser.test_busy_refusal_preserves_existing_operation) ... ok
+test_confirm_no_yes_stop_all_operations_and_rotations (__main__.GlobalAttacksBrowser.test_confirm_no_yes_stop_all_operations_and_rotations) ... ok
+test_disconnect_rejects_start_cancel_reset_and_reopen (__main__.GlobalAttacksBrowser.test_disconnect_rejects_start_cancel_reset_and_reopen) ... ok
+test_two_modules_have_independent_global_handshake_results_and_stop (__main__.GlobalAttacksBrowser.test_two_modules_have_independent_global_handshake_results_and_stop) ... ok
+
+----------------------------------------------------------------------
+Ran 4 tests in 13.770s
+
+OK
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_sae.py
+test_invalid_selection_disconnect_and_reset (__main__.SaeBrowser.test_invalid_selection_disconnect_and_reset) ... ok
+test_native_popup_target_stop_and_reopen_in_four_rotations (__main__.SaeBrowser.test_native_popup_target_stop_and_reopen_in_four_rotations) ... ok
+test_two_modules_stop_and_shell_cancel_are_isolated (__main__.SaeBrowser.test_two_modules_stop_and_shell_cancel_are_isolated) ... ok
+
+----------------------------------------------------------------------
+Ran 3 tests in 9.300s
+
+OK

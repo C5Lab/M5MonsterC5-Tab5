@@ -1,0 +1,7 @@
+{
+  "show_ft_baud_popup": "retain",
+  "ft_baud_popup_close_cb": "retain",
+  "ft_baud_dropdown_cb": "retain",
+  "janos_ft_baud_index": "retain",
+  "save_janos_ft_baud_to_nvs": "adapter"
+}

@@ -1,0 +1,31 @@
+✔ slot activates only after successful reboot; cancellation and disconnect retain running image (1.753ms)
+✔ firmware update refreshes the running slot image (0.3515ms)
+✔ ordered startup tour: normal (0.7379ms)
+✔ ordered startup tour: missing-board (0.1099ms)
+✔ ordered startup tour: missing-sd (0.6797ms)
+✔ ordered startup tour: version-mismatch (0.0821ms)
+✔ wrong screen, unseen warning, stale session and hidden document cannot advance (0.1569ms)
+✔ partial card viewing resets when the card is clipped or another tab is selected (0.1078ms)
+✔ SD warning must belong to the requested Grove Wardrive route (0.0802ms)
+✔ guide advances only from ordered native events for the right module and target (0.6961ms)
+✔ disconnect, premature back, restart and leaving cannot manufacture completion (0.7559ms)
+✔ events from a previous guide session cannot enter a restarted story (0.1071ms)
+✔ visibility and module transitions reset an unfinished observation window (0.1307ms)
+✔ scan story normal (0.9285ms)
+✔ scan story hidden (0.1514ms)
+✔ scan story empty (0.0759ms)
+✔ scan story cancel (0.0821ms)
+✔ radar requires rejected invalid selections, correct target, live samples and native stop (0.2091ms)
+✔ stale scans, wrong module, stale epoch, cancelled scans and restart cannot supply evidence (0.1013ms)
+✔ demo variants do not mutate the original seed (0.1775ms)
+✔ Radar completes only after an observed live signal and completed native return (0.1279ms)
+✔ Radar does not credit hidden time, wrong targets, loss of signal or previous jobs (0.212ms)
+✔ selection changes cannot reuse a rejection from another selection (0.2337ms)
+ℹ tests 23
+ℹ suites 0
+ℹ pass 23
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 109.1897

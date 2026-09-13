@@ -1,0 +1,20 @@
+{
+  "wpasec_btn_event_cb": "retain",
+  "show_wpasec_popup": "retain",
+  "close_wpasec_popup": "retain",
+  "wpasec_create_credentials_prompt": "retain",
+  "wpasec_text_input_cb": "retain",
+  "wpasec_keyboard_cb": "retain",
+  "wpasec_connect_btn_cb": "retain",
+  "wpasec_show_password_toggle_cb": "retain",
+  "wpasec_upload_task": "adapter",
+  "wpasec_network_row_click_cb": "retain",
+  "hidden_ssid_wpasec_confirm_cb": "retain",
+  "show_hidden_ssid_popup": "adapter",
+  "close_hidden_ssid_popup": "retain",
+  "hidden_ssid_dropdown_changed_cb": "retain",
+  "hidden_ssid_textarea_focus_cb": "retain",
+  "hidden_ssid_keyboard_ready_cb": "retain",
+  "hidden_ssid_confirm_btn_cb": "retain",
+  "hidden_ssid_cancel_btn_cb": "retain"
+}

@@ -1,0 +1,496 @@
+{
+  "schema_version": 1,
+  "id": "neon-district",
+  "status": "phase3-browser-integration",
+  "seed": 2077,
+  "source": {
+    "repository": "projectZero/ESP32C5",
+    "head": "36911a31dea327800d82ed71d9b24a2e80ff9d20",
+    "main_sha256": "bb25a03ab11a474b7c41322a584ef010850226ffe505622955ee89347bd55a1f"
+  },
+  "networks": [
+    {
+      "id": "net-1",
+      "index": 1,
+      "ssid": "NEON-BAZAAR",
+      "bssid": "02:20:77:00:00:01",
+      "vendor": "",
+      "channel": 1,
+      "security": "WPA2",
+      "rssi": -38,
+      "band": "2.4GHz"
+    },
+    {
+      "id": "net-2",
+      "index": 2,
+      "ssid": "GHOST-LINE",
+      "bssid": "02:20:77:00:00:02",
+      "vendor": "",
+      "channel": 1,
+      "security": "WPA2",
+      "rssi": -47,
+      "band": "2.4GHz"
+    },
+    {
+      "id": "net-3",
+      "index": 3,
+      "ssid": "CHROME-CLINIC",
+      "bssid": "02:20:77:00:00:03",
+      "vendor": "",
+      "channel": 6,
+      "security": "WPA2/WPA3 Mixed",
+      "rssi": -56,
+      "band": "2.4GHz"
+    },
+    {
+      "id": "net-4",
+      "index": 4,
+      "ssid": "BLACK-ICE",
+      "bssid": "02:20:77:00:00:04",
+      "vendor": "",
+      "channel": 36,
+      "security": "WPA3",
+      "rssi": -65,
+      "band": "5GHz"
+    },
+    {
+      "id": "net-5",
+      "index": 5,
+      "ssid": "AFTERLIFE-GUEST",
+      "bssid": "02:20:77:00:00:05",
+      "vendor": "",
+      "channel": 11,
+      "security": "Open",
+      "rssi": -74,
+      "band": "2.4GHz"
+    },
+    {
+      "id": "net-6",
+      "index": 6,
+      "ssid": "SYNAPSE-RELAY",
+      "bssid": "02:20:77:00:00:06",
+      "vendor": "",
+      "channel": 44,
+      "security": "WPA2",
+      "rssi": -83,
+      "band": "5GHz"
+    },
+    {
+      "id": "net-7",
+      "index": 7,
+      "ssid": "NIGHT-CITY",
+      "bssid": "02:20:77:00:00:07",
+      "vendor": "",
+      "channel": 8,
+      "security": "WPA2",
+      "rssi": -61,
+      "band": "2.4GHz"
+    },
+    {
+      "id": "net-8",
+      "index": 8,
+      "ssid": "VOODOO-BOYS",
+      "bssid": "02:20:77:00:00:08",
+      "vendor": "",
+      "channel": 9,
+      "security": "WPA2",
+      "rssi": -64,
+      "band": "2.4GHz"
+    },
+    {
+      "id": "net-9",
+      "index": 9,
+      "ssid": "SAMURAI",
+      "bssid": "02:20:77:00:00:09",
+      "vendor": "",
+      "channel": 10,
+      "security": "WPA2",
+      "rssi": -67,
+      "band": "2.4GHz"
+    },
+    {
+      "id": "net-10",
+      "index": 10,
+      "ssid": "BRAINDANCE",
+      "bssid": "02:20:77:00:00:0A",
+      "vendor": "",
+      "channel": 11,
+      "security": "WPA2",
+      "rssi": -70,
+      "band": "2.4GHz"
+    },
+    {
+      "id": "net-11",
+      "index": 11,
+      "ssid": "NETRUNNER",
+      "bssid": "02:20:77:00:00:0B",
+      "vendor": "",
+      "channel": 1,
+      "security": "WPA2",
+      "rssi": -73,
+      "band": "2.4GHz"
+    },
+    {
+      "id": "net-12",
+      "index": 12,
+      "ssid": "AFTERLIFE",
+      "bssid": "02:20:77:00:00:0C",
+      "vendor": "",
+      "channel": 2,
+      "security": "WPA2",
+      "rssi": -76,
+      "band": "2.4GHz"
+    }
+  ],
+  "clients": [
+    {
+      "id": "client-1",
+      "label": "DECK-RUNNER",
+      "mac": "02:20:77:01:00:01",
+      "network_id": "net-1",
+      "ip": "192.0.2.20"
+    },
+    {
+      "id": "client-2",
+      "label": "NEURAL-LINK",
+      "mac": "02:20:77:01:00:02",
+      "network_id": "net-1",
+      "ip": "192.0.2.21"
+    },
+    {
+      "id": "client-3",
+      "label": "CHROME-OPTICS",
+      "mac": "02:20:77:01:00:03",
+      "network_id": "net-1",
+      "ip": "192.0.2.22"
+    }
+  ],
+  "bluetooth": [
+    {
+      "id": "ble-1",
+      "name": "NEURODECK-07",
+      "mac": "02:20:77:02:00:01",
+      "rssi": -44
+    },
+    {
+      "id": "ble-2",
+      "name": "GHOST-EARPIECE",
+      "mac": "02:20:77:02:00:02",
+      "rssi": -51
+    },
+    {
+      "id": "ble-3",
+      "name": "CHROME-PULSE",
+      "mac": "02:20:77:02:00:03",
+      "rssi": -58
+    },
+    {
+      "id": "ble-4",
+      "name": "SYNAPSE-BAND",
+      "mac": "02:20:77:02:00:04",
+      "rssi": -65
+    },
+    {
+      "id": "ble-5",
+      "name": "NIGHT-COURIER",
+      "mac": "02:20:77:02:00:05",
+      "rssi": -72
+    },
+    {
+      "id": "ble-6",
+      "name": "",
+      "mac": "02:20:77:02:00:06",
+      "rssi": -79
+    }
+  ],
+  "probe_network_ids": [
+    "net-1",
+    "net-2",
+    "net-5"
+  ],
+  "portal_filenames": [
+    "neon-bazaar.html",
+    "afterlife-guest.html"
+  ],
+  "notes": [
+    "All identities are synthetic. Vendor fields intentionally empty for locally administered addresses.",
+    "Client labels are scenario metadata, not additional fields in JanOS host output.",
+    "Timing and remaining domains require further protocol mapping.",
+    "Variant entries are behavior requirements, not executable scenario overrides.",
+    "SubGHz is excluded by user decision; its empty schema slot is reserved for a later stage.",
+    "Demo mode proposes 10x device-job time with deadlines on the same virtual clock; realistic mode uses 1x. UI animation time stays independent.",
+    "Grove, MBus and Internal are the default available profiles. USB transport support does not require an additional visible duplicate device in the default seed."
+  ],
+  "modules": [
+    {
+      "id": "grove",
+      "transport": "grove",
+      "connected": true,
+      "sd_present": true,
+      "radio_mode": "wifi",
+      "producer": "janos",
+      "capabilities": [
+        "wifi",
+        "ble",
+        "gps",
+        "sd"
+      ]
+    },
+    {
+      "id": "mbus",
+      "transport": "mbus",
+      "connected": true,
+      "sd_present": true,
+      "radio_mode": "wifi",
+      "producer": "janos",
+      "capabilities": [
+        "wifi",
+        "ble",
+        "sd"
+      ]
+    },
+    {
+      "id": "internal",
+      "transport": "internal",
+      "connected": true,
+      "sd_present": true,
+      "radio_mode": "idle",
+      "producer": "tab5-internal",
+      "capabilities": [
+        "settings",
+        "local-files",
+        "internal-portal"
+      ]
+    }
+  ],
+  "settings": {
+    "rotation": 0,
+    "red_team": true,
+    "theme": "default",
+    "scan_time_ms": 4500
+  },
+  "gps": {
+    "fix": false,
+    "latitude": 0,
+    "longitude": 0,
+    "speed_kmh": 0,
+    "route": []
+  },
+  "subghz_signals": [],
+  "files": [
+    {
+      "id": "portal-1",
+      "path": "/sdcard/neon-bazaar.html",
+      "kind": "html",
+      "content_status": "planned",
+      "network_id": "net-1",
+      "size_bytes": null
+    },
+    {
+      "id": "portal-2",
+      "path": "/sdcard/afterlife-guest.html",
+      "kind": "html",
+      "content_status": "planned",
+      "network_id": "net-5",
+      "size_bytes": null
+    }
+  ],
+  "jobs": [],
+  "variants": [
+    {
+      "id": "wifi-populated",
+      "domain": "wifi",
+      "condition": "populated",
+      "expected_outcome": "Return linked fixture entities and command-specific completion."
+    },
+    {
+      "id": "wifi-empty",
+      "domain": "wifi",
+      "condition": "empty",
+      "expected_outcome": "Return zero entities with the real empty/completion response."
+    },
+    {
+      "id": "wifi-disconnected",
+      "domain": "wifi",
+      "condition": "disconnected",
+      "expected_outcome": "Reject new jobs for the module and cancel its active generation."
+    },
+    {
+      "id": "wifi-timeout",
+      "domain": "wifi",
+      "condition": "timeout",
+      "expected_outcome": "Deliver no completion before the consumer deadline; release job ownership."
+    },
+    {
+      "id": "wifi-failure",
+      "domain": "wifi",
+      "condition": "failure",
+      "expected_outcome": "Emit the mapped producer error and keep result files absent."
+    },
+    {
+      "id": "observer-populated",
+      "domain": "observer",
+      "condition": "populated",
+      "expected_outcome": "Return linked fixture entities and command-specific completion."
+    },
+    {
+      "id": "observer-empty",
+      "domain": "observer",
+      "condition": "empty",
+      "expected_outcome": "Return zero entities with the real empty/completion response."
+    },
+    {
+      "id": "observer-disconnected",
+      "domain": "observer",
+      "condition": "disconnected",
+      "expected_outcome": "Reject new jobs for the module and cancel its active generation."
+    },
+    {
+      "id": "observer-timeout",
+      "domain": "observer",
+      "condition": "timeout",
+      "expected_outcome": "Deliver no completion before the consumer deadline; release job ownership."
+    },
+    {
+      "id": "observer-failure",
+      "domain": "observer",
+      "condition": "failure",
+      "expected_outcome": "Emit the mapped producer error and keep result files absent."
+    },
+    {
+      "id": "bluetooth-populated",
+      "domain": "bluetooth",
+      "condition": "populated",
+      "expected_outcome": "Return linked fixture entities and command-specific completion."
+    },
+    {
+      "id": "bluetooth-empty",
+      "domain": "bluetooth",
+      "condition": "empty",
+      "expected_outcome": "Return zero entities with the real empty/completion response."
+    },
+    {
+      "id": "bluetooth-disconnected",
+      "domain": "bluetooth",
+      "condition": "disconnected",
+      "expected_outcome": "Reject new jobs for the module and cancel its active generation."
+    },
+    {
+      "id": "bluetooth-timeout",
+      "domain": "bluetooth",
+      "condition": "timeout",
+      "expected_outcome": "Deliver no completion before the consumer deadline; release job ownership."
+    },
+    {
+      "id": "bluetooth-failure",
+      "domain": "bluetooth",
+      "condition": "failure",
+      "expected_outcome": "Emit the mapped producer error and keep result files absent."
+    },
+    {
+      "id": "files-populated",
+      "domain": "files",
+      "condition": "populated",
+      "expected_outcome": "Return linked fixture entities and command-specific completion."
+    },
+    {
+      "id": "files-empty",
+      "domain": "files",
+      "condition": "empty",
+      "expected_outcome": "Return zero entities with the real empty/completion response."
+    },
+    {
+      "id": "files-disconnected",
+      "domain": "files",
+      "condition": "disconnected",
+      "expected_outcome": "Reject new jobs for the module and cancel its active generation."
+    },
+    {
+      "id": "files-timeout",
+      "domain": "files",
+      "condition": "timeout",
+      "expected_outcome": "Deliver no completion before the consumer deadline; release job ownership."
+    },
+    {
+      "id": "files-failure",
+      "domain": "files",
+      "condition": "failure",
+      "expected_outcome": "Emit the mapped producer error and keep result files absent."
+    },
+    {
+      "id": "operations-populated",
+      "domain": "operations",
+      "condition": "populated",
+      "expected_outcome": "Return linked fixture entities and command-specific completion."
+    },
+    {
+      "id": "operations-empty",
+      "domain": "operations",
+      "condition": "empty",
+      "expected_outcome": "Return zero entities with the real empty/completion response."
+    },
+    {
+      "id": "operations-disconnected",
+      "domain": "operations",
+      "condition": "disconnected",
+      "expected_outcome": "Reject new jobs for the module and cancel its active generation."
+    },
+    {
+      "id": "operations-timeout",
+      "domain": "operations",
+      "condition": "timeout",
+      "expected_outcome": "Deliver no completion before the consumer deadline; release job ownership."
+    },
+    {
+      "id": "operations-failure",
+      "domain": "operations",
+      "condition": "failure",
+      "expected_outcome": "Emit the mapped producer error and keep result files absent."
+    },
+    {
+      "id": "wardrive-populated",
+      "domain": "wardrive",
+      "condition": "populated",
+      "expected_outcome": "Return linked fixture entities and command-specific completion."
+    },
+    {
+      "id": "wardrive-empty",
+      "domain": "wardrive",
+      "condition": "empty",
+      "expected_outcome": "Return zero entities with the real empty/completion response."
+    },
+    {
+      "id": "wardrive-disconnected",
+      "domain": "wardrive",
+      "condition": "disconnected",
+      "expected_outcome": "Reject new jobs for the module and cancel its active generation."
+    },
+    {
+      "id": "wardrive-timeout",
+      "domain": "wardrive",
+      "condition": "timeout",
+      "expected_outcome": "Deliver no completion before the consumer deadline; release job ownership."
+    },
+    {
+      "id": "wardrive-failure",
+      "domain": "wardrive",
+      "condition": "failure",
+      "expected_outcome": "Emit the mapped producer error and keep result files absent."
+    }
+  ],
+  "lan": {
+    "network_id": "net-1",
+    "module_id": "grove",
+    "own_ip": "192.0.2.10",
+    "netmask": "255.255.255.0"
+  },
+  "experience": {
+    "default_timing": "demo",
+    "demo_clock_scale": 10,
+    "realistic_clock_scale": 1,
+    "default_module_profile": "available-virtual-modules",
+    "excluded_features": [
+      "subghz"
+    ]
+  }
+}

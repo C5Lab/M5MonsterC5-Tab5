@@ -1,0 +1,11 @@
+
+TEST SUMMARY
+==============================================================================
+pcap_story
+  PASS            0.10s  test_emulator_pcap_story.mjs
+  PASS            6.16s  test_emulator_pcap_story.py
+------------------------------------------------------------------------------
+Result: PASS | scripts PASS: 2 | FAIL/ERROR: 0
+Total elapsed: 6.28s
+Section wrapper times include their children; do not add them together.
+Report: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\docs\ui-emulator\test-runs\20260913-110313-ae47f8\summary.json

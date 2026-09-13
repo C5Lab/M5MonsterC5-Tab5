@@ -1,0 +1,11 @@
+test_detector_full_history_still_accepts_new_session_events (__main__.Queue2SystemBrowser.test_detector_full_history_still_accepts_new_session_events) ... ok
+test_detectors_stop_restart_and_back_all_rotations (__main__.Queue2SystemBrowser.test_detectors_stop_restart_and_back_all_rotations) ... ok
+test_each_module_reboot_all_rotations (__main__.Queue2SystemBrowser.test_each_module_reboot_all_rotations) ... ok
+test_ota_info_releases_update_and_cancel_all_rotations (__main__.Queue2SystemBrowser.test_ota_info_releases_update_and_cancel_all_rotations) ... ok
+test_ota_slot_activate_and_cancel_all_rotations (__main__.Queue2SystemBrowser.test_ota_slot_activate_and_cancel_all_rotations) ... ok
+test_sd_admin_both_exit_choices_all_rotations (__main__.Queue2SystemBrowser.test_sd_admin_both_exit_choices_all_rotations) ... ok
+
+----------------------------------------------------------------------
+Ran 6 tests in 66.286s
+
+OK

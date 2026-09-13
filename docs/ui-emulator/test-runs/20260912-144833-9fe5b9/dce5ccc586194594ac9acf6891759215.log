@@ -1,0 +1,7 @@
+test_invalid_selection_disconnect_and_reset (__main__.SaeBrowser.test_invalid_selection_disconnect_and_reset) ... ok
+test_native_popup_target_stop_and_reopen_in_four_rotations (__main__.SaeBrowser.test_native_popup_target_stop_and_reopen_in_four_rotations) ... ok
+
+----------------------------------------------------------------------
+Ran 2 tests in 8.060s
+
+OK

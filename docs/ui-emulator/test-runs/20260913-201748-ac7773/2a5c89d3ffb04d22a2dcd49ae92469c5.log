@@ -1,0 +1,227 @@
+RUN tests/verify_emulator_phase4_pcap_deep.py
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/verify_emulator_phase4_pcap_deep.py
+RUN tests/verify_emulator_phase4_wardrive.py
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/verify_emulator_phase4_wardrive.py
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/verify_emulator_phase4_bluetooth.py
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/verify_emulator_phase3.py
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/verify_emulator_phase2.py
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_slice.py
+.653 retained production functions; 191 explicit boundaries
+..
+----------------------------------------------------------------------
+Ran 3 tests in 2.610s
+
+OK
+PASS tests/test_emulator_slice.py
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_contracts.py
+......
+----------------------------------------------------------------------
+Ran 6 tests in 0.001s
+
+OK
+PASS tests/test_emulator_contracts.py
+EXEC node --test tests/test_emulator_input.mjs
+✔ one pointer owns a gesture; cancellation releases its last position exactly once (0.8524ms)
+✔ CSS scaling maps to logical pixels without applying rotation twice (0.1209ms)
+✔ captured pointer outside Canvas clamps to valid display pixels (0.2183ms)
+✔ RGB565 framebuffer preserves primary colors and opaque alpha (0.1079ms)
+ℹ tests 4
+ℹ suites 0
+ℹ pass 4
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 58.4254
+PASS tests/test_emulator_input.mjs
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_browser.py
+Navigation, scan and Settings passed: 0 1440
+Navigation, scan and Settings passed: 1 1440
+Navigation, scan and Settings passed: 2 1440
+Navigation, scan and Settings passed: 3 1440
+Navigation, scan and Settings passed: 0 390
+Navigation, scan and Settings passed: 1 390
+Navigation, scan and Settings passed: 2 390
+Navigation, scan and Settings passed: 3 390
+PASS tests/test_emulator_browser.py
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_phase2.py
+WAIT 30s: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/verify_emulator_phase4_pcap_deep.py
+WAIT 30s: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/verify_emulator_phase4_wardrive.py
+WAIT 30s: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/verify_emulator_phase4_bluetooth.py
+WAIT 30s: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/verify_emulator_phase3.py
+WAIT 30s: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/verify_emulator_phase2.py
+......
+----------------------------------------------------------------------
+Ran 6 tests in 21.331s
+
+OK
+PASS tests/test_emulator_phase2.py
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_settings.py
+.....
+----------------------------------------------------------------------
+Ran 5 tests in 7.007s
+
+OK
+PASS tests/test_emulator_settings.py
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_performance.py
+desktop profile measured
+WAIT 60s: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/verify_emulator_phase4_pcap_deep.py
+WAIT 60s: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/verify_emulator_phase4_wardrive.py
+WAIT 60s: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/verify_emulator_phase4_bluetooth.py
+WAIT 60s: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/verify_emulator_phase3.py
+WAIT 60s: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/verify_emulator_phase2.py
+mobile profile measured
+PASS tests/test_emulator_performance.py
+PASS tests/verify_emulator_phase2.py
+EXEC node --test tests/test_emulator_device.mjs
+✔ module captures have distinct paths when copied to the shared analysis filesystem (3.7101ms)
+✔ PCAP packet timestamps carry into seconds rather than overflowing microseconds (3.6174ms)
+✔ scan selection and clients use the seed identities, independently for each module (2.1202ms)
+✔ cancelled captures cannot create files; reset makes all previous job IDs stale (1.0964ms)
+✔ completed capture stores valid PCAP bytes for the selected network and clients (0.9494ms)
+✔ missing/full SD and missing clients fail explicitly without committing a file (0.9527ms)
+✔ Bluetooth respects connection state, explicit time zero and immutable discovery snapshots (0.5149ms)
+✔ disconnect cancels work, snapshots cannot mutate the model, invalid clocks are rejected (0.424ms)
+ℹ tests 8
+ℹ suites 0
+ℹ pass 8
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 141.3947
+PASS tests/test_emulator_device.mjs
+EXEC node --test tests/test_emulator_bridge.mjs
+✔ Observer discovers independently and its targets work without a WiFi scan (3.6019ms)
+✔ C boundary scan rows preserve scenario identities and cancellation (0.8823ms)
+ℹ tests 2
+ℹ suites 0
+ℹ pass 2
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 87.2133
+PASS tests/test_emulator_bridge.mjs
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/run_emulator_capture_tests.py
+PASS: production PCAP reader parsed three synthetic ARP frames, selected AP and all three clients
+PASS tests/run_emulator_capture_tests.py
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_phase3.py
+PASS tests/test_emulator_phase3.py
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_lifecycle.py
+....
+----------------------------------------------------------------------
+Ran 4 tests in 6.211s
+
+OK
+PASS tests/test_emulator_lifecycle.py
+PASS tests/verify_emulator_phase3.py
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_phase4_bluetooth.py
+PASS tests/test_emulator_phase4_bluetooth.py
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_bluetooth_lifecycle.py
+....
+----------------------------------------------------------------------
+Ran 4 tests in 3.551s
+
+OK
+PASS tests/test_emulator_bluetooth_lifecycle.py
+PASS tests/verify_emulator_phase4_bluetooth.py
+EXEC node --test tests/test_emulator_wardrive.mjs
+✔ Bluetooth blacklist affects only its module and WiFi picker returns immutable seed snapshots (2.0765ms)
+✔ native upload selection, pending and force-all modes preserve provider and module isolation (1.6979ms)
+✔ Wardrive acquires GPS and discovers seed identities deterministically regardless of tick size (0.7628ms)
+✔ Stop commits a session once, frees radio, upload outcomes are simulated and retry only pending sessions (0.6023ms)
+✔ Disconnect and cancellation cannot later save stale sessions; reset clears all state (0.4287ms)
+✔ SD errors never commit partial session metadata and do not leave the radio busy (0.2934ms)
+✔ GPS loss freezes track until restored, isolated by module; empty scenarios stay empty (0.3245ms)
+✔ Configured GPS coordinates are used and long sessions retain a bounded recent track (0.9237ms)
+ℹ tests 8
+ℹ suites 0
+ℹ pass 8
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 69.9433
+PASS tests/test_emulator_wardrive.mjs
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_phase4_wardrive.py
+WAIT 90s: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/verify_emulator_phase4_pcap_deep.py
+WAIT 90s: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/verify_emulator_phase4_wardrive.py
+.....
+----------------------------------------------------------------------
+Ran 5 tests in 7.184s
+
+OK
+PASS tests/test_emulator_phase4_wardrive.py
+PASS tests/verify_emulator_phase4_wardrive.py
+RUN --test tests/test_emulator_pcap_deep.mjs tests/test_emulator_files.mjs
+EXEC node --test tests/test_emulator_pcap_deep.mjs tests/test_emulator_files.mjs
+✔ virtual artifact transactions validate paths and roll back quota failures (1.4533ms)
+✔ wardrive cleanup previews, then archives only sessions done on both services (1.1416ms)
+✔ artifact writes are detached and module isolated (0.2215ms)
+✔ unavailable or busy module rejects an entire artifact mutation (0.3086ms)
+✔ example installation is explicit, deterministic, isolated and idempotent (2.0707ms)
+✔ fixture storage guards never partially install files (0.7043ms)
+✔ fixture capacity includes existing captures and exact capacity permits repeat installation (1.583ms)
+✔ example frames have valid IPv4 and transport lengths and checksums (0.6704ms)
+ℹ tests 8
+ℹ suites 0
+ℹ pass 8
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 69.915
+PASS tests/test_emulator_files.mjs
+RUN tests/test_emulator_sha256.py
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_sha256.py
+PASS: 8 SHA-256 vectors, streaming chunks and padding boundaries, ASan/UBSan
+PASS tests/test_emulator_sha256.py
+RUN tests/test_emulator_phase4_pcap_deep.py
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_phase4_pcap_deep.py
+test_file_pages_back_after_switching_sources (__main__.PcapDeepBrowser.test_file_pages_back_after_switching_sources) ... ok
+test_full_storage_shows_error_without_partial_install (__main__.PcapDeepBrowser.test_full_storage_shows_error_without_partial_install) ... ok
+test_invalid_capture_shows_native_error (__main__.PcapDeepBrowser.test_invalid_capture_shows_native_error) ... ok
+test_native_deep_views (__main__.PcapDeepBrowser.test_native_deep_views) ... ok
+test_native_http_object_export_preserves_capture (__main__.PcapDeepBrowser.test_native_http_object_export_preserves_capture) ... ok
+
+----------------------------------------------------------------------
+Ran 5 tests in 6.492s
+
+OK
+PASS tests/test_emulator_phase4_pcap_deep.py
+PASS tests/verify_emulator_phase4_pcap_deep.py
+RUN --test tests/test_emulator_nettools.mjs
+EXEC node --test tests/test_emulator_nettools.mjs
+✔ nmap returns deterministic host and service data without storing credentials (1.3413ms)
+✔ tool busy, cancellation, disconnect and reset cannot publish stale results (0.4073ms)
+✔ IoT result is detached and agrees with PAN/node inventory (0.2726ms)
+✔ Mesh monitors until stopped, discovers gradually and freezes on cancellation (1.0919ms)
+✔ GITM stop saves valid capture once; cancellation and SD failures save nothing (1.4053ms)
+✔ GITM deterministic timing and input validation do not strand radio (1.9573ms)
+✔ wpa-sec simulated outcomes expose no credentials and require SD (0.2829ms)
+ℹ tests 7
+ℹ suites 0
+ℹ pass 7
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 64.9563
+PASS tests/test_emulator_nettools.mjs
+RUN tests/test_emulator_slice_tokens.py
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_slice_tokens.py
+.
+----------------------------------------------------------------------
+Ran 1 test in 0.000s
+
+OK
+PASS tests/test_emulator_slice_tokens.py
+RUN tests/test_emulator_phase4_nettools.py
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_phase4_nettools.py
+............
+----------------------------------------------------------------------
+Ran 12 tests in 19.720s
+
+OK
+PASS tests/test_emulator_phase4_nettools.py

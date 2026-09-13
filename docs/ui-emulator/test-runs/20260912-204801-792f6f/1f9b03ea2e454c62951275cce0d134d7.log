@@ -1,0 +1,14 @@
+test_all_back_routes_covered_or_deferred (__main__.CoverageAudit.test_all_back_routes_covered_or_deferred)
+Every back route works, unless it is an explicitly deferred screen. ... ok
+test_every_ledger_control_is_categorized (__main__.CoverageAudit.test_every_ledger_control_is_categorized)
+No dead control may ship without a documented reason. ... ok
+test_ledger_control_total_conserved (__main__.CoverageAudit.test_ledger_control_total_conserved) ... ok
+test_matches_committed_baseline (__main__.CoverageAudit.test_matches_committed_baseline)
+Guard against silent coverage regressions or stale baselines. ... ok
+test_open_items_are_identified (__main__.CoverageAudit.test_open_items_are_identified)
+Each open item carries a category and a human-readable reason. ... ok
+
+----------------------------------------------------------------------
+Ran 5 tests in 0.109s
+
+OK

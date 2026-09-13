@@ -1,0 +1,20 @@
+import {StepGuide,readUI} from './queue2-common.mjs';
+function read(module){module._emu_settings_s20_state();return {...globalThis.emulatorSettingsS20,...readUI(module)};}
+const step=(title,instruction,accept)=>({title,instruction,accept});
+const opened=(baud=false)=>step('Open '+(baud?'Transfer Speed':'Time'),'Open INTERNAL → Settings → '+(baud?'Transfer Speed. This is a saved console baud preference, not a physical bandwidth measurement.':'Time. If already open, Close it and open it again.'),(s,g)=>{if(!s[baud?'baudOpen':'timeOpen']||g.baseline[baud?'baudOpen':'timeOpen']){if(!s[baud?'baudOpen':'timeOpen'])g.baseline[baud?'baudOpen':'timeOpen']=false;return false;}g.memory.open={...s};return true;});
+const close=(baud=false)=>step('Return to Settings','Press the native Close button.',s=>!s[baud?'baudOpen':'timeOpen']&&s.has('Time'));
+const changed=(s,g)=>s.timeOpen&&s.rollers!==g.memory.open.rollers;
+const set=(title='Set a different date or time')=>step(title,'Change a date or time roller, then press Set. The RTC must report a valid new value.',(s,g)=>{if(!changed(s,g)||!s.status.startsWith('RTC set:')||s.offset===g.memory.open.offset)return false;g.memory.written=s.now;return true;});
+function entry(id,label,steps){return{id,label,read,create:()=>new StepGuide({id,label,tab:3,steps,completionTitle:label+' complete',completion:'The local settings workflow is complete. Use Back to stories to choose another demo.'})};}
+function preference(id,label,key,instruction,verify){return entry(id,'S20 · '+label,[opened(),step('Change '+label,instruction,(s,g)=>s.timeOpen&&s[key]!==g.memory.open[key]&&verify(s,g)),close(),step('Verify the saved preference','Open Time again and inspect the changed setting.',(s,g)=>s.timeOpen&&s[key]!==g.memory.open[key]&&verify(s,g)),close()]);}
+function correctClock(s){const d=new Date(s.now*1000),h=d.getUTCHours();return s.clockVisible&&s.clock===String(s.h24?h:(h%12||12)).padStart(2,'0')+':'+String(d.getUTCMinutes()).padStart(2,'0');}
+export const settingsS20=[
+ entry('s20-time','S20 · Date and time',[opened(),set(),step('Watch the clock advance','Keep Time open for a moment. The virtual RTC continues ticking.',(s,g)=>s.timeOpen&&s.now>g.memory.written),close()]),
+ entry('s20-invalid','S20 · Calendar validation',[opened(),step('Try an invalid calendar date','Select February 31 and press Set. The native error must appear without changing the RTC.',(s,g)=>changed(s,g)&&s.rollers.split(',')[1]==='2'&&s.rollers.split(',')[2]==='31'&&s.status==='Failed to write RTC.'&&s.offset===g.memory.open.offset),set('Correct the date and save'),close()]),
+ entry('s20-cancel','S20 · Close without saving',[opened(),step('Edit without pressing Set','Change a date or time roller. Leave the edit unsaved.',(s,g)=>changed(s,g)&&s.offset===g.memory.open.offset),close(),step('Check the original clock','Open Time again. The unsaved roller edit must be discarded.',(s,g)=>s.timeOpen&&s.offset===g.memory.open.offset&&s.status.startsWith('RTC now:')),close()]),
+ preference('s20-format','Clock format','h24','Toggle 24-hour format. Enable Show clock on top bar if needed, then inspect the native clock.',correctClock),
+ preference('s20-dst','Summer time (DST)','dst','Toggle Summer time (DST +1h). The virtual clock shifts by one hour; switching it off subtracts one hour.',(s,g)=>Math.abs((s.offset-g.memory.open.offset)-(s.dst?3600000:-3600000))<1000),
+ preference('s20-visibility','Clock visibility','show','Toggle Show clock on top bar and inspect the native top bar.',s=>s.clockVisible===s.show),
+ entry('s20-baud','S20 · Transfer Speed',[opened(true),step('Choose a different console baud','Select a different baud value from the native dropdown. The demo stores this preference; it does not measure cable throughput.',(s,g)=>s.baudOpen&&s.baud!==g.memory.open.baud),close(true),step('Verify saved console baud','Open Transfer Speed again. The selected preference must remain changed.',(s,g)=>s.baudOpen&&s.baud!==g.memory.open.baud),close(true)]),
+];
+

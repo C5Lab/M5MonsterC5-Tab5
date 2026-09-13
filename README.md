@@ -23,9 +23,35 @@ An English, section-by-section introduction to the offline packet-analysis
 workflow is available here:
 
 - [ESPShark — Offline packet investigation for M5Stack Tab5](docs/ESPShark.md)
+- [On-device handshake dictionary check — SD setup and usage](docs/Handshake_Dictionary_Check.md)
 
 Full documentation and usage details are available on the wiki:
 https://github.com/C5Lab/M5MonsterC5-Tab5/wiki
+
+## Local browser emulator
+
+Run these commands from the repository root in **Windows Command Prompt**.
+With Docker Desktop running, build the emulator after changing its sources:
+
+```bat
+powershell -ExecutionPolicy Bypass -File tools\ui_emulator\build.ps1 -Jobs 8
+```
+
+Start the local preview and leave this terminal open:
+
+```bat
+tools\ui_emulator\.venv\Scripts\python.exe -m http.server 8765 --bind 127.0.0.1 --protocol HTTP/1.1 --directory tools/ui_emulator/dist
+```
+
+Open **http://127.0.0.1:8765/**. Stop the server with **Ctrl+C**. If the virtual
+environment does not exist, `py -m http.server` can serve the already built folder
+with the same arguments. Do not put `py` before the virtual environment's
+`python.exe` path. If the browser refuses the connection, check that the server
+terminal is still running; if port 8765 is occupied, use 8766 in the command and URL.
+
+The emulator uses synthetic data. For setup, tests and a scan-to-PCAP walkthrough,
+see [the emulator README](tools/ui_emulator/README.md). Current scope and remaining
+work are tracked in [Live Emulator TODO](docs/Live_Emulator_TODO.md).
 
 ## Availability
 

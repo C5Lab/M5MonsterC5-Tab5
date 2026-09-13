@@ -1,0 +1,8 @@
+{
+  "status": "passed",
+  "scope": "Phase 3 standalone model capture; browser integration pending",
+  "capture_sha256": "f0b840bde47ed8f64e6305016d49b2e248c323e2b44c1c88f88e6dfe3d485e36",
+  "reader_sha256": "67949eb8c11e08ecd05237400639b1c9654147c278edc63dfd3d4da273f05688",
+  "output": "PASS: production PCAP reader parsed three synthetic ARP frames, selected AP and all three clients\n",
+  "errors": ""
+}

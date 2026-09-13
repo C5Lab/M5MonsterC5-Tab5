@@ -1,0 +1,99 @@
+{
+  "status": "passed",
+  "recorded_at": "2026-09-13T18:20:42.511689+00:00",
+  "checks": [
+    {
+      "command": [
+        "node",
+        "--test",
+        "tests/test_emulator_global_attacks.mjs",
+        "tests/test_emulator_sae.mjs",
+        "tests/test_emulator_attacks.mjs"
+      ],
+      "exit_code": 0,
+      "output": "\u2714 all seven simulated operations start, change and stop without another module changing (3.969ms)\n\u2714 cancel, disconnect and reset never resurrect jobs or write captures (0.3554ms)\n\u2714 invalid inputs never reserve the module and credentials never enter model history (0.3789ms)\n\u2714 MITM creates target-specific PCAP only on stop and handles SD/quota failures atomically (0.5189ms)\n\u2714 clock slicing produces identical bounded simulated results (0.6402ms)\n\u2714 Observer preserves scenario identities, changes activity, freezes on stop and resets (0.4523ms)\n\u2714 global operations need no selection, own one module, advance and freeze on stop (2.7106ms)\n\u2714 global Handshaker emits deterministic bounded scenario results, including an empty scenario (1.1888ms)\n\u2714 global jobs cancel on disconnect/reset and do not stop another module (0.7095ms)\n\u2714 SAE requires exactly one scenario target and rejects invalid selection without reserving radio (2.2096ms)\n\u2714 SAE cancellation, module disconnect and reset cannot resume old activity (0.454ms)\n\u2139 tests 11\n\u2139 suites 0\n\u2139 pass 11\n\u2139 fail 0\n\u2139 cancelled 0\n\u2139 skipped 0\n\u2139 todo 0\n\u2139 duration_ms 71.4099\n"
+    },
+    {
+      "command": [
+        "C:\\Users\\mati\\Documents\\GitHub\\M5MonsterC5-Tab5\\tools\\ui_emulator\\.venv\\Scripts\\python.exe",
+        "tests/test_emulator_global_attacks.py"
+      ],
+      "exit_code": 0,
+      "output": "test_busy_refusal_preserves_existing_operation (__main__.GlobalAttacksBrowser.test_busy_refusal_preserves_existing_operation) ... ok\ntest_confirm_no_yes_stop_all_operations_and_rotations (__main__.GlobalAttacksBrowser.test_confirm_no_yes_stop_all_operations_and_rotations) ... ok\ntest_disconnect_rejects_start_cancel_reset_and_reopen (__main__.GlobalAttacksBrowser.test_disconnect_rejects_start_cancel_reset_and_reopen) ... ok\ntest_two_modules_have_independent_global_handshake_results_and_stop (__main__.GlobalAttacksBrowser.test_two_modules_have_independent_global_handshake_results_and_stop) ... ok\n\n----------------------------------------------------------------------\nRan 4 tests in 13.847s\n\nOK\n"
+    },
+    {
+      "command": [
+        "C:\\Users\\mati\\Documents\\GitHub\\M5MonsterC5-Tab5\\tools\\ui_emulator\\.venv\\Scripts\\python.exe",
+        "tests/test_emulator_sae.py"
+      ],
+      "exit_code": 0,
+      "output": "test_invalid_selection_disconnect_and_reset (__main__.SaeBrowser.test_invalid_selection_disconnect_and_reset) ... ok\ntest_native_popup_target_stop_and_reopen_in_four_rotations (__main__.SaeBrowser.test_native_popup_target_stop_and_reopen_in_four_rotations) ... ok\ntest_two_modules_stop_and_shell_cancel_are_isolated (__main__.SaeBrowser.test_two_modules_stop_and_shell_cancel_are_isolated) ... ok\n\n----------------------------------------------------------------------\nRan 3 tests in 9.053s\n\nOK\n"
+    }
+  ],
+  "limitations": [
+    "Offline jobs and synthetic handshake counters only; no radio effects or handshake files",
+    "Focused Chromium acceptance; full cumulative and hardware gates remain separate"
+  ],
+  "download_bytes": {
+    "app.mjs": 13669,
+    "display.mjs": 1288,
+    "emulator.js": 126350,
+    "emulator.wasm": 1681096,
+    "index.html": 4875,
+    "model/attacks.mjs": 5303,
+    "model/bridge.mjs": 2594,
+    "model/device.mjs": 28803,
+    "model/nettools.mjs": 4946,
+    "model/pcap-deep.mjs": 4606,
+    "model/pcap.mjs": 1563,
+    "pcap-story.mjs": 4366,
+    "persistence.mjs": 2944,
+    "portal-story.mjs": 4012,
+    "queue2-attacks.mjs": 7662,
+    "queue2-common.mjs": 1279,
+    "queue2-nettools.mjs": 7046,
+    "queue2-system.mjs": 7636,
+    "queue2-wardrive.mjs": 13953,
+    "recon-stories.mjs": 5692,
+    "scenario.json": 13404,
+    "settings-s18.mjs": 4491,
+    "settings-s19.mjs": 6763,
+    "settings-s20.mjs": 4018,
+    "startup-story.mjs": 4295,
+    "stories.mjs": 9763,
+    "story-restart.mjs": 786,
+    "style.css": 3458,
+    "wifi-stories.mjs": 7300
+  },
+  "artifact_sha256": {
+    "app.mjs": "3adbe65a23412369dcbae95e240983e97e2110f6e4636b03133a15b0e9584497",
+    "display.mjs": "8fd915df5b8dd7f38d2e29fc80bf9cf9c2afd54f8466ba99e4928b6490f865d3",
+    "emulator.js": "d1d54e619310d27506098eaa205bbef4425fd6448374e552e461e366b81c2155",
+    "emulator.wasm": "8937f36e124efecfdc43f0fd38a4ff1d1b91eb1b1ba2897136b3a930c2e35b65",
+    "index.html": "356a789516a2678373912ed2ef6ffebda72a21b42e1ff7e0eba03b261f74e5ae",
+    "model/attacks.mjs": "5814cffece99efe9076e8bbe6e2f63a6e1317ef84214bbc5f9bd12718694938f",
+    "model/bridge.mjs": "7ce7d94c5d5960f57ec439e6243012ed78471496bcbf273fb3f95a782932b02f",
+    "model/device.mjs": "7b471b5e69e3ab2d0d54aa7a469f3fe7c6abbb3d1337326fa2af3c60193b16ec",
+    "model/nettools.mjs": "61538946098a0da2910caecdeff98b325c94ef1c9a7bc4d8c21345899cd84623",
+    "model/pcap-deep.mjs": "99e3d25cfb5ed768ccdd03b4447ae0cfe4f0804abe192ec5011ce786341b783a",
+    "model/pcap.mjs": "bb754971c4e534a38c974c07ea815046a260c284aabdac051e7abc0581c3d591",
+    "pcap-story.mjs": "6d74f275bf1333f6866427a2302305fcfe609e5bb9dbdba6cc8642ce314f8db6",
+    "persistence.mjs": "cea73f05fb8e10e58ad09dfef993551e9f5f6769c5c390aa12e6618b8bf0a5fc",
+    "portal-story.mjs": "4bfb39c13d90724e4781ae1aa8dd886b24f74dfb15b4c552b0a13a53025b89dc",
+    "queue2-attacks.mjs": "2dfedddbbc4493f4075f1a10dc03cbcaff55f18897e9a7827c2fde8215ec3031",
+    "queue2-common.mjs": "97c7cc3d6261b37282cf3247ef92d3cad926519684eb7dd03e3530790478cb52",
+    "queue2-nettools.mjs": "f512cbe0157e141d80f099ce3ee1db487c90abe4c73f476e230a50ba060ca2f2",
+    "queue2-system.mjs": "c9ef995af625ed5478cb7859ccfbd3f836c4126b1ae68b083a1df3c5523df4fb",
+    "queue2-wardrive.mjs": "6825eaf49ccc2fcf92fde534798207e0ab03d2f360b91306fe99818ecdcc1412",
+    "recon-stories.mjs": "32f597b6f8d36ddb7b2b556e48f61c80a38f98d48cbbea6a803939d60205da9b",
+    "scenario.json": "a2862050d87adb855250d96906bf6404138fe04dfbc772e107d2358721342711",
+    "settings-s18.mjs": "e638d60639e2c4e1fc1a0aaa60a9126b286d917af95a66412c21931827ee5300",
+    "settings-s19.mjs": "1bde9025e3c0c19015c27a50790a2e4e753fe61088c20d9902f8c5fe9cf51ded",
+    "settings-s20.mjs": "82541c1c978c8d12215f45c65d04ba547620bef4eb3cedc48c9787117b869295",
+    "startup-story.mjs": "5ece1a8c4f4aff934f0594d25e27c1d4be16a2eceed79c21ce19ce138c48fc96",
+    "stories.mjs": "1e7d071ec56b862ddd4ae66e5c28936c0ddce920cc4beb484422cd32292c5d90",
+    "story-restart.mjs": "c6fd126ca9e76de0270c9c0581eca9b65bc1b8ef43afbf0289dbcc41f34852a1",
+    "style.css": "abaf75223da73bd49b15820670162dd5414513607e660788b3f5c38bd79c1da5",
+    "wifi-stories.mjs": "e5e87419b2d18501dccdecf0b0b92500309946a4379bb48631bac5176a95b219"
+  }
+}

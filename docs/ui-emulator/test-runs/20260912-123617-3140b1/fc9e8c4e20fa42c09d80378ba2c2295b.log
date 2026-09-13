@@ -1,0 +1,16 @@
+✔ virtual artifact transactions validate paths and roll back quota failures (2.5172ms)
+✔ wardrive cleanup previews, then archives only sessions done on both services (1.7698ms)
+✔ artifact writes are detached and module isolated (0.2983ms)
+✔ unavailable or busy module rejects an entire artifact mutation (0.4033ms)
+✔ example installation is explicit, deterministic, isolated and idempotent (3.4306ms)
+✔ fixture storage guards never partially install files (1.0228ms)
+✔ fixture capacity includes existing captures and exact capacity permits repeat installation (2.6494ms)
+✔ example frames have valid IPv4 and transport lengths and checksums (0.9124ms)
+ℹ tests 8
+ℹ suites 0
+ℹ pass 8
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 146.0877

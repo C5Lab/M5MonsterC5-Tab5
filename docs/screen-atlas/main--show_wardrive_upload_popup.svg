@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="1160" viewBox="0 0 1080 1160">
+<title>show_wardrive_upload_popup</title>
+<rect width="100%" height="100%" fill="#111827"/>
+<text x="28" y="38" fill="#7dd3fc" font-family="monospace" font-size="21">show_wardrive_upload_popup</text>
+<text x="28" y="69" fill="#fbbf24" font-family="sans-serif" font-size="17">SOURCE DIAGRAM - not a screenshot or screen render</text>
+<text x="28" y="110" fill="#7dd3fc" font-family="monospace" font-size="16">SOURCE</text>
+<text x="28" y="133" fill="#e5e7eb" font-family="monospace" font-size="16">main/main.c:27031</text>
+<text x="28" y="156" fill="#e5e7eb" font-family="monospace" font-size="16"></text>
+<text x="28" y="179" fill="#7dd3fc" font-family="monospace" font-size="16">DIRECT TEXT LITERALS IN THIS FUNCTION</text>
+<text x="28" y="202" fill="#e5e7eb" font-family="monospace" font-size="16">Loading Wardrive files...</text>
+<text x="28" y="225" fill="#e5e7eb" font-family="monospace" font-size="16">&lt; Prev</text>
+<text x="28" y="248" fill="#e5e7eb" font-family="monospace" font-size="16">Next &gt;</text>
+<text x="28" y="271" fill="#e5e7eb" font-family="monospace" font-size="16">Sync pending</text>
+<text x="28" y="294" fill="#e5e7eb" font-family="monospace" font-size="16">Force all</text>
+<text x="28" y="317" fill="#e5e7eb" font-family="monospace" font-size="16">Send</text>
+<text x="28" y="340" fill="#e5e7eb" font-family="monospace" font-size="16">Stop</text>
+<text x="28" y="363" fill="#e5e7eb" font-family="monospace" font-size="16">Close</text>
+<text x="28" y="386" fill="#e5e7eb" font-family="monospace" font-size="16">No SD card detected on this tab.</text>
+<text x="28" y="409" fill="#e5e7eb" font-family="monospace" font-size="16">No Wardrive LOG/TXT/CSV files found.</text>
+<text x="28" y="432" fill="#e5e7eb" font-family="monospace" font-size="16"></text>
+<text x="28" y="455" fill="#7dd3fc" font-family="monospace" font-size="16">SOURCE DIMENSIONS (UNEVALUATED EXPRESSIONS)</text>
+<text x="28" y="478" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_size(ctx-&gt;wardrive_wigle_popup_overlay, lv_pct(100), lv_pct(100));</text>
+<text x="28" y="501" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_size(ctx-&gt;wardrive_wigle_popup, lv_pct(85), lv_pct(85));</text>
+<text x="28" y="524" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_width(ctx-&gt;wardrive_wigle_status_label, lv_pct(90));</text>
+<text x="28" y="547" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_size(ctx-&gt;wardrive_wigle_progress_bar, lv_pct(100), 14);</text>
+<text x="28" y="570" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_size(ctx-&gt;wardrive_wigle_list, lv_pct(100), LV_SIZE_CONTENT);</text>
+<text x="28" y="593" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_size(page_nav, lv_pct(100), LV_SIZE_CONTENT);</text>
+<text x="28" y="616" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_size(ctx-&gt;wardrive_wigle_prev_btn, 80, 38);</text>
+<text x="28" y="639" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_size(ctx-&gt;wardrive_wigle_next_btn, 80, 38);</text>
+<text x="28" y="662" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_size(batch_row, lv_pct(100), LV_SIZE_CONTENT);</text>
+<text x="28" y="685" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_size(ctx-&gt;wardrive_wigle_sync_btn, 170, 42);</text>
+<text x="28" y="708" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_size(ctx-&gt;wardrive_wigle_all_btn, 150, 42);</text>
+<text x="28" y="731" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_size(btn_row, lv_pct(100), LV_SIZE_CONTENT);</text>
+<text x="28" y="754" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_size(ctx-&gt;wardrive_wigle_send_btn, 140, 44);</text>
+<text x="28" y="777" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_size(ctx-&gt;wardrive_wigle_stop_btn, 140, 44);</text>
+<text x="28" y="800" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_size(ctx-&gt;wardrive_wigle_spinner, 36, 36);</text>
+<text x="28" y="823" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_size(close_btn, 120, 44);</text>
+<text x="28" y="846" fill="#e5e7eb" font-family="monospace" font-size="16"></text>
+<text x="28" y="869" fill="#7dd3fc" font-family="monospace" font-size="16">EVENTS -&gt; CALLBACKS</text>
+<text x="28" y="892" fill="#e5e7eb" font-family="monospace" font-size="16">wardrive_wigle_close_cb</text>
+<text x="28" y="915" fill="#e5e7eb" font-family="monospace" font-size="16">wardrive_wigle_force_all_btn_cb</text>
+<text x="28" y="938" fill="#e5e7eb" font-family="monospace" font-size="16">wardrive_wigle_next_page_cb</text>
+<text x="28" y="961" fill="#e5e7eb" font-family="monospace" font-size="16">wardrive_wigle_prev_page_cb</text>
+<text x="28" y="984" fill="#e5e7eb" font-family="monospace" font-size="16">wardrive_wigle_send_btn_cb</text>
+<text x="28" y="1007" fill="#e5e7eb" font-family="monospace" font-size="16">wardrive_wigle_stop_btn_cb</text>
+<text x="28" y="1030" fill="#e5e7eb" font-family="monospace" font-size="16">wardrive_wigle_sync_pending_btn_cb</text>
+<text x="28" y="1053" fill="#e5e7eb" font-family="monospace" font-size="16"></text>
+<text x="28" y="1076" fill="#7dd3fc" font-family="monospace" font-size="16">DIRECT UI FUNCTION CALLS</text>
+<text x="28" y="1099" fill="#e5e7eb" font-family="monospace" font-size="16">—</text>
+<text x="28" y="1122" fill="#e5e7eb" font-family="monospace" font-size="16"></text>
+</svg>

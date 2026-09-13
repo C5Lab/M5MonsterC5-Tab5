@@ -1,0 +1,15 @@
+✔ system status is detached and module-local (2.3152ms)
+✔ system progress and completion are invariant under timestep sizes (2.0944ms)
+✔ failed update leaves version and boot time unchanged (0.2509ms)
+✔ cancel disconnect and reset invalidate pending completions (1.2709ms)
+✔ reboot preserves SD bytes and clears discovery and observer state (1.0456ms)
+✔ system inputs use a strict whitelist and never retain credentials (0.6555ms)
+✔ SD admin reserves a module until stopped and fails immediately on SD removal (0.4631ms)
+ℹ tests 7
+ℹ suites 0
+ℹ pass 7
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 132.0306

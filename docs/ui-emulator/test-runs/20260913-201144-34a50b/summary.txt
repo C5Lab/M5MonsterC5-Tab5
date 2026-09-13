@@ -1,0 +1,23 @@
+
+TEST SUMMARY
+==============================================================================
+phase5_settings
+  PASS            0.11s  test_emulator_persistence.mjs
+  PASS           10.19s  test_emulator_phase5_settings.py
+  PASS           10.24s  verify_emulator_time.py
+  FAIL           16.77s  verify_emulator_portal_demo.py
+time
+  PASS            0.10s  test_emulator_persistence.mjs
+  PASS            9.74s  test_emulator_time.py
+  PASS            0.24s  test_emulator_phase4_audit.py
+portal_demo
+  PASS            0.12s  test_emulator_portal_demo.mjs test_emulator_attacks.mjs test_emulator_bridge.mjs
+  FAIL           16.50s  test_emulator_portal_demo.py
+------------------------------------------------------------------------------
+Result: FAIL | scripts PASS: 6 | FAIL/ERROR: 1
+Total elapsed: 37.48s
+Section wrapper times include their children; do not add them together.
+Run incomplete: checks after the failure may NOT HAVE RUN. Missing entries are not passes.
+Failure log: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\docs\ui-emulator\test-runs\20260913-201144-34a50b\035efd80afc1445dbd3f87d04bf70529.log
+Failure log: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\docs\ui-emulator\test-runs\20260913-201144-34a50b\28d2f120a4ba417cb71a27f246edcb8c.log
+Report: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\docs\ui-emulator\test-runs\20260913-201144-34a50b\summary.json

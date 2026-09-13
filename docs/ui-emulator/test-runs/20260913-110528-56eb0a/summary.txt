@@ -1,0 +1,11 @@
+
+TEST SUMMARY
+==============================================================================
+portal_story
+  PASS            0.12s  test_emulator_portal_story.mjs
+  PASS           24.33s  test_emulator_portal_story.py
+------------------------------------------------------------------------------
+Result: PASS | scripts PASS: 2 | FAIL/ERROR: 0
+Total elapsed: 24.47s
+Section wrapper times include their children; do not add them together.
+Report: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\docs\ui-emulator\test-runs\20260913-110528-56eb0a\summary.json

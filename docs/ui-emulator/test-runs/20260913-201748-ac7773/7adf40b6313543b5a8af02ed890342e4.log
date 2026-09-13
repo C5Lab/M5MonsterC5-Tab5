@@ -1,0 +1,45 @@
+EXEC node --test tests/test_emulator_portal_demo.mjs tests/test_emulator_attacks.mjs tests/test_emulator_bridge.mjs
+✔ all seven simulated operations start, change and stop without another module changing (4.5072ms)
+✔ cancel, disconnect and reset never resurrect jobs or write captures (0.3928ms)
+✔ invalid inputs never reserve the module and credentials never enter model history (0.38ms)
+✔ MITM creates target-specific PCAP only on stop and handles SD/quota failures atomically (0.5509ms)
+✔ clock slicing produces identical bounded simulated results (0.6823ms)
+✔ Observer preserves scenario identities, changes activity, freezes on stop and resets (0.4704ms)
+✔ Observer discovers independently and its targets work without a WiFi scan (2.0421ms)
+✔ C boundary scan rows preserve scenario identities and cancellation (0.5151ms)
+✔ portal story reveals connection, page visit and synthetic submission in order (2.6184ms)
+✔ stop or disconnect before submission freezes the story; other module stays independent (1.3412ms)
+✔ every selectable network completes the demo even without a seeded client (2.9389ms)
+ℹ tests 11
+ℹ suites 0
+ℹ pass 11
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 89.0733
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_portal_demo.py
+test_cancel_before_submission_and_reset (__main__.PortalDemoBrowser.test_cancel_before_submission_and_reset) ... ok
+test_chrome_clinic_without_seeded_client_completes (__main__.PortalDemoBrowser.test_chrome_clinic_without_seeded_client_completes) ... ok
+test_evil_and_rogue_sequence_all_rotations (__main__.PortalDemoBrowser.test_evil_and_rogue_sequence_all_rotations) ... ok
+test_internal_portal_sequence_stop_and_reopen (__main__.PortalDemoBrowser.test_internal_portal_sequence_stop_and_reopen) ... ok
+
+----------------------------------------------------------------------
+Ran 4 tests in 18.690s
+
+OK
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_phase4_audit.py
+test_all_back_routes_covered_or_deferred (__main__.CoverageAudit.test_all_back_routes_covered_or_deferred)
+Every back route works, unless it is an explicitly deferred screen. ... ok
+test_every_ledger_control_is_categorized (__main__.CoverageAudit.test_every_ledger_control_is_categorized)
+No dead control may ship without a documented reason. ... ok
+test_ledger_control_total_conserved (__main__.CoverageAudit.test_ledger_control_total_conserved) ... ok
+test_matches_committed_baseline (__main__.CoverageAudit.test_matches_committed_baseline)
+Guard against silent coverage regressions or stale baselines. ... ok
+test_open_items_are_identified (__main__.CoverageAudit.test_open_items_are_identified)
+Each open item carries a category and a human-readable reason. ... ok
+
+----------------------------------------------------------------------
+Ran 5 tests in 0.080s
+
+OK

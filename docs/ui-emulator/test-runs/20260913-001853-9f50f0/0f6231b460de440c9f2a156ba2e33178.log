@@ -1,0 +1,47 @@
+EXEC node --test tests/test_emulator_persistence.mjs
+✔ transfer baud accepts only firmware choices, survives reload and resets (0.7998ms)
+✔ settings survive reconstruction; reset restores defaults without clearing unrelated storage (0.6233ms)
+✔ legacy settings migrate once and do not return after reset (0.1289ms)
+✔ corrupt, future and invalid settings recover to safe defaults (0.1198ms)
+✔ denied storage and quota exhaustion keep settings usable for this session (0.2793ms)
+✔ invalid writes cannot replace a valid value (0.1142ms)
+✔ existing Wardrive adapter settings remain writable and migrate (0.0904ms)
+✔ session fallback survives reboot and overrides stale disk after a failed reset write (0.1041ms)
+ℹ tests 8
+ℹ suites 0
+ℹ pass 8
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 69.1921
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_transfer_speed.py
+test_denied_disk_uses_session_storage (__main__.TransferSpeedBrowser.test_denied_disk_uses_session_storage) ... ok
+test_selection_reload_and_reset_all_rotations (__main__.TransferSpeedBrowser.test_selection_reload_and_reset_all_rotations) ... ok
+
+----------------------------------------------------------------------
+Ran 2 tests in 8.396s
+
+OK
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_observer_exit.py
+test_keep_running_then_stop_and_exit_all_rotations (__main__.ObserverExitBrowser.test_keep_running_then_stop_and_exit_all_rotations) ... ok
+
+----------------------------------------------------------------------
+Ran 1 test in 3.172s
+
+OK
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_phase4_audit.py
+test_all_back_routes_covered_or_deferred (__main__.CoverageAudit.test_all_back_routes_covered_or_deferred)
+Every back route works, unless it is an explicitly deferred screen. ... ok
+test_every_ledger_control_is_categorized (__main__.CoverageAudit.test_every_ledger_control_is_categorized)
+No dead control may ship without a documented reason. ... ok
+test_ledger_control_total_conserved (__main__.CoverageAudit.test_ledger_control_total_conserved) ... ok
+test_matches_committed_baseline (__main__.CoverageAudit.test_matches_committed_baseline)
+Guard against silent coverage regressions or stale baselines. ... ok
+test_open_items_are_identified (__main__.CoverageAudit.test_open_items_are_identified)
+Each open item carries a category and a human-readable reason. ... ok
+
+----------------------------------------------------------------------
+Ran 5 tests in 0.078s
+
+OK

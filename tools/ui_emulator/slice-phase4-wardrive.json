@@ -1,0 +1,12 @@
+{
+  "show_wardrive_page": "retain",
+  "update_wardrive_count_label": "retain",
+  "update_wardrive_trace_button": "retain",
+  "update_wardrive_table": "retain",
+  "parse_wardrive_network_line": "retain",
+  "wardrive_config_set_defaults": "retain",
+  "wardrive_start_cb": "adapter",
+  "wardrive_stop_cb": "adapter",
+  "wardrive_back_cb": "adapter",
+  "wifi_network_security_is_open": "retain"
+}

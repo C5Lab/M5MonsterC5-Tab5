@@ -1,0 +1,43 @@
+EXEC node --test tests/test_emulator_radar.mjs tests/test_emulator_attacks.mjs tests/test_emulator_bridge.mjs
+✔ all seven simulated operations start, change and stop without another module changing (3.906ms)
+✔ cancel, disconnect and reset never resurrect jobs or write captures (0.3317ms)
+✔ invalid inputs never reserve the module and credentials never enter model history (0.3454ms)
+✔ MITM creates target-specific PCAP only on stop and handles SD/quota failures atomically (0.4698ms)
+✔ clock slicing produces identical bounded simulated results (0.5891ms)
+✔ Observer preserves scenario identities, changes activity, freezes on stop and resets (0.3981ms)
+✔ Observer discovers independently and its targets work without a WiFi scan (1.8014ms)
+✔ C boundary scan rows preserve scenario identities and cancellation (0.4202ms)
+✔ radar tracks exactly one target with bounded changing RSSI and reserves its module (2.3517ms)
+✔ radar disconnect and reset cannot affect another module or restart old readings (0.7312ms)
+ℹ tests 10
+ℹ suites 0
+ℹ pass 10
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 69.9601
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_radar.py
+test_busy_invalid_selection_disconnect_and_cancel (__main__.RadarBrowser.test_busy_invalid_selection_disconnect_and_cancel) ... ok
+test_target_rssi_animation_stop_back_and_reopen_all_rotations (__main__.RadarBrowser.test_target_rssi_animation_stop_back_and_reopen_all_rotations) ... ok
+test_two_modules_are_independent_and_reset_clears_jobs (__main__.RadarBrowser.test_two_modules_are_independent_and_reset_clears_jobs) ... ok
+
+----------------------------------------------------------------------
+Ran 3 tests in 17.040s
+
+OK
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_phase4_audit.py
+test_all_back_routes_covered_or_deferred (__main__.CoverageAudit.test_all_back_routes_covered_or_deferred)
+Every back route works, unless it is an explicitly deferred screen. ... ok
+test_every_ledger_control_is_categorized (__main__.CoverageAudit.test_every_ledger_control_is_categorized)
+No dead control may ship without a documented reason. ... ok
+test_ledger_control_total_conserved (__main__.CoverageAudit.test_ledger_control_total_conserved) ... ok
+test_matches_committed_baseline (__main__.CoverageAudit.test_matches_committed_baseline)
+Guard against silent coverage regressions or stale baselines. ... ok
+test_open_items_are_identified (__main__.CoverageAudit.test_open_items_are_identified)
+Each open item carries a category and a human-readable reason. ... ok
+
+----------------------------------------------------------------------
+Ran 5 tests in 0.070s
+
+OK

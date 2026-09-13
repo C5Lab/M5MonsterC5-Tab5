@@ -1,0 +1,5 @@
+Traceback (most recent call last):
+  File "C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tests\test_emulator_phase3.py", line 64, in <module>
+    assert clients, 'The seed must give the selected network clients'
+           ^^^^^^^
+AssertionError: The seed must give the selected network clients

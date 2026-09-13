@@ -1,0 +1,10 @@
+test_brightness_effect_reopened_restored_all_rotations (__main__.SettingsS19Browser.test_brightness_effect_reopened_restored_all_rotations) ... ok
+test_close_without_change_restart_guide_and_wrong_tab (__main__.SettingsS19Browser.test_close_without_change_restart_guide_and_wrong_tab) ... ok
+test_rotation_native_restart_resumes_once_all_rotations (__main__.SettingsS19Browser.test_rotation_native_restart_resumes_once_all_rotations) ... ok
+test_theme_rebuild_reopen_restore_all_rotations (__main__.SettingsS19Browser.test_theme_rebuild_reopen_restore_all_rotations) ... ok
+test_timeout_saved_reopened_restored_all_rotations (__main__.SettingsS19Browser.test_timeout_saved_reopened_restored_all_rotations) ... ok
+
+----------------------------------------------------------------------
+Ran 5 tests in 31.208s
+
+OK

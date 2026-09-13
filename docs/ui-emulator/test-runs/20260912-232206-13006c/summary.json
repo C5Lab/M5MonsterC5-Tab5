@@ -1,0 +1,76 @@
+{
+  "status": "PASS",
+  "seconds": 168.21205540001392,
+  "checks": [
+    {
+      "section": "guided_dialogs",
+      "name": "test_emulator_stories.mjs test_emulator_startup_story.mjs test_emulator_wifi_stories.mjs test_emulator_dialogs.mjs",
+      "started": 1789248126.491474,
+      "seconds": 0.20353810000233352,
+      "status": "PASS",
+      "exit_code": 0,
+      "log": "C:\\Users\\mati\\Documents\\GitHub\\M5MonsterC5-Tab5\\docs\\ui-emulator\\test-runs\\20260912-232206-13006c\\e4d6a2e9144f4a5789595b9742595566.log",
+      "aggregate": false
+    },
+    {
+      "section": "guided_dialogs",
+      "name": "test_emulator_stories.py",
+      "started": 1789248126.6963801,
+      "seconds": 30.752545199997257,
+      "status": "PASS",
+      "exit_code": 0,
+      "log": "C:\\Users\\mati\\Documents\\GitHub\\M5MonsterC5-Tab5\\docs\\ui-emulator\\test-runs\\20260912-232206-13006c\\bc51245f018443c1ab2beb377b43a874.log",
+      "aggregate": false
+    },
+    {
+      "section": "guided_dialogs",
+      "name": "test_emulator_story_lifecycle.py",
+      "started": 1789248157.449499,
+      "seconds": 22.42596510000294,
+      "status": "PASS",
+      "exit_code": 0,
+      "log": "C:\\Users\\mati\\Documents\\GitHub\\M5MonsterC5-Tab5\\docs\\ui-emulator\\test-runs\\20260912-232206-13006c\\f94a24147b3849178ff8c5130a6d4b2d.log",
+      "aggregate": false
+    },
+    {
+      "section": "guided_dialogs",
+      "name": "test_emulator_startup_story.py",
+      "started": 1789248179.8759458,
+      "seconds": 48.84364639999694,
+      "status": "PASS",
+      "exit_code": 0,
+      "log": "C:\\Users\\mati\\Documents\\GitHub\\M5MonsterC5-Tab5\\docs\\ui-emulator\\test-runs\\20260912-232206-13006c\\a89f8cc7700e495a98b117c7c90360b7.log",
+      "aggregate": false
+    },
+    {
+      "section": "guided_dialogs",
+      "name": "test_emulator_wifi_stories.py",
+      "started": 1789248228.720213,
+      "seconds": 46.322104499995476,
+      "status": "PASS",
+      "exit_code": 0,
+      "log": "C:\\Users\\mati\\Documents\\GitHub\\M5MonsterC5-Tab5\\docs\\ui-emulator\\test-runs\\20260912-232206-13006c\\6b9bed82b510453eb3989404e98c0ad3.log",
+      "aggregate": false
+    },
+    {
+      "section": "guided_dialogs",
+      "name": "test_emulator_dialogs.py",
+      "started": 1789248275.0430193,
+      "seconds": 19.361379299982218,
+      "status": "PASS",
+      "exit_code": 0,
+      "log": "C:\\Users\\mati\\Documents\\GitHub\\M5MonsterC5-Tab5\\docs\\ui-emulator\\test-runs\\20260912-232206-13006c\\421408ea0da54cc2baf00656ab1909a2.log",
+      "aggregate": false
+    },
+    {
+      "section": "guided_dialogs",
+      "name": "test_emulator_phase4_audit.py",
+      "started": 1789248294.405081,
+      "seconds": 0.2915997999953106,
+      "status": "PASS",
+      "exit_code": 0,
+      "log": "C:\\Users\\mati\\Documents\\GitHub\\M5MonsterC5-Tab5\\docs\\ui-emulator\\test-runs\\20260912-232206-13006c\\a1cf7091519941c9a38c1195bf25f01d.log",
+      "aggregate": false
+    }
+  ]
+}

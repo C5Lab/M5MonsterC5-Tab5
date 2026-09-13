@@ -1,0 +1,5098 @@
+[
+  {
+    "screen": "show_adhoc_portal_page",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 88,
+    "status": "rendered",
+    "sha256": "9443f7daf737d89ce954d5620e25ec178f8e4b90538851d357fa066bd35e9fb4"
+  },
+  {
+    "screen": "show_adhoc_portal_page",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 88,
+    "status": "rendered",
+    "sha256": "331274e91fb43a2445668f5d0d7921e9d58f8cb9033d483b42417b09a4d2e46b"
+  },
+  {
+    "screen": "show_adhoc_portal_page",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 88,
+    "status": "rendered",
+    "sha256": "9443f7daf737d89ce954d5620e25ec178f8e4b90538851d357fa066bd35e9fb4"
+  },
+  {
+    "screen": "show_adhoc_portal_page",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 88,
+    "status": "rendered",
+    "sha256": "331274e91fb43a2445668f5d0d7921e9d58f8cb9033d483b42417b09a4d2e46b"
+  },
+  {
+    "screen": "show_airtag_scan_page",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 70,
+    "status": "rendered",
+    "sha256": "7303cf18d63feacd36811d72fc45666a7049ff6e23377f8752a91db5c8db6183"
+  },
+  {
+    "screen": "show_airtag_scan_page",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 70,
+    "status": "rendered",
+    "sha256": "f2bd40e1231dcf59d958046650e49dd26fd02d7774a077a8b233505b77ca0714"
+  },
+  {
+    "screen": "show_airtag_scan_page",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 70,
+    "status": "rendered",
+    "sha256": "7303cf18d63feacd36811d72fc45666a7049ff6e23377f8752a91db5c8db6183"
+  },
+  {
+    "screen": "show_airtag_scan_page",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 70,
+    "status": "rendered",
+    "sha256": "f2bd40e1231dcf59d958046650e49dd26fd02d7774a077a8b233505b77ca0714"
+  },
+  {
+    "screen": "show_antisurv_page",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 125,
+    "status": "rendered",
+    "sha256": "eb49536ae84567d5320be0c51e564b4e3290f9bdbffb2887d71594bd4a32e51f"
+  },
+  {
+    "screen": "show_antisurv_page",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 125,
+    "status": "rendered",
+    "sha256": "e39a3f4e4b3d696409536994699683e1db173482e8ce2f98136a8b0b295e4ca2"
+  },
+  {
+    "screen": "show_antisurv_page",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 125,
+    "status": "rendered",
+    "sha256": "eb49536ae84567d5320be0c51e564b4e3290f9bdbffb2887d71594bd4a32e51f"
+  },
+  {
+    "screen": "show_antisurv_page",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 125,
+    "status": "rendered",
+    "sha256": "e39a3f4e4b3d696409536994699683e1db173482e8ce2f98136a8b0b295e4ca2"
+  },
+  {
+    "screen": "show_ap_radar_page",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 90,
+    "status": "rendered",
+    "sha256": "479cb13fd72333d451e2e8247d58a4bad4392be5ce2822626e6770a5e69ebec2"
+  },
+  {
+    "screen": "show_ap_radar_page",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 90,
+    "status": "rendered",
+    "sha256": "29fd6475e093a89621ae6eb6d6a20f53fa4da14bec1f04e3242000f28d09d973"
+  },
+  {
+    "screen": "show_ap_radar_page",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 90,
+    "status": "rendered",
+    "sha256": "479cb13fd72333d451e2e8247d58a4bad4392be5ce2822626e6770a5e69ebec2"
+  },
+  {
+    "screen": "show_ap_radar_page",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 90,
+    "status": "rendered",
+    "sha256": "29fd6475e093a89621ae6eb6d6a20f53fa4da14bec1f04e3242000f28d09d973"
+  },
+  {
+    "screen": "show_arp_poison_page",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 98,
+    "status": "rendered",
+    "sha256": "29c115a498a337c48d7dbdff4f1e9ea9e4a45f88c98afaad4f98e4cf65abdce1"
+  },
+  {
+    "screen": "show_arp_poison_page",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 98,
+    "status": "rendered",
+    "sha256": "08a0f4657bc198540274b9f3cee6af14e1606cb6e2b545e234926290146d27a3"
+  },
+  {
+    "screen": "show_arp_poison_page",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 98,
+    "status": "rendered",
+    "sha256": "29c115a498a337c48d7dbdff4f1e9ea9e4a45f88c98afaad4f98e4cf65abdce1"
+  },
+  {
+    "screen": "show_arp_poison_page",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 98,
+    "status": "rendered",
+    "sha256": "08a0f4657bc198540274b9f3cee6af14e1606cb6e2b545e234926290146d27a3"
+  },
+  {
+    "screen": "show_beacon_spam_page",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 105,
+    "status": "rendered",
+    "sha256": "c84d99aa361f4bead8e3056fc78d9cedbff43ba509425655a32263eb6ce10097"
+  },
+  {
+    "screen": "show_beacon_spam_page",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 105,
+    "status": "rendered",
+    "sha256": "2ccdce592637a2469e64a52cfe99fd6db2a307384991539dd38dc34a3a6d49a4"
+  },
+  {
+    "screen": "show_beacon_spam_page",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 105,
+    "status": "rendered",
+    "sha256": "c84d99aa361f4bead8e3056fc78d9cedbff43ba509425655a32263eb6ce10097"
+  },
+  {
+    "screen": "show_beacon_spam_page",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 105,
+    "status": "rendered",
+    "sha256": "2ccdce592637a2469e64a52cfe99fd6db2a307384991539dd38dc34a3a6d49a4"
+  },
+  {
+    "screen": "show_beacon_ssids_page",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 92,
+    "status": "rendered",
+    "sha256": "ab576ad12881938f471e4034ef3551b4d65afc2ec5ae7097c4dd20c69a7b1075"
+  },
+  {
+    "screen": "show_beacon_ssids_page",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 92,
+    "status": "rendered",
+    "sha256": "383863445e11145f124404f214c0123f7f0e5fb0fef3f18f2d86e79bbaba3b05"
+  },
+  {
+    "screen": "show_beacon_ssids_page",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 92,
+    "status": "rendered",
+    "sha256": "ab576ad12881938f471e4034ef3551b4d65afc2ec5ae7097c4dd20c69a7b1075"
+  },
+  {
+    "screen": "show_beacon_ssids_page",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 92,
+    "status": "rendered",
+    "sha256": "383863445e11145f124404f214c0123f7f0e5fb0fef3f18f2d86e79bbaba3b05"
+  },
+  {
+    "screen": "show_blackout_active_popup",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 59,
+    "status": "rendered",
+    "sha256": "a35a6931ca4e49a1de86a690b8776e2a9d5ac2fca212310e3bf1e0874006616e"
+  },
+  {
+    "screen": "show_blackout_active_popup",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 59,
+    "status": "rendered",
+    "sha256": "c6e29aa4305e56934b3a8c9f19500d3f9169da74fa4919763d1915e7f4e0550b"
+  },
+  {
+    "screen": "show_blackout_active_popup",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 59,
+    "status": "rendered",
+    "sha256": "a35a6931ca4e49a1de86a690b8776e2a9d5ac2fca212310e3bf1e0874006616e"
+  },
+  {
+    "screen": "show_blackout_active_popup",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 59,
+    "status": "rendered",
+    "sha256": "c6e29aa4305e56934b3a8c9f19500d3f9169da74fa4919763d1915e7f4e0550b"
+  },
+  {
+    "screen": "show_blackout_confirm_popup",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 80,
+    "status": "rendered",
+    "sha256": "4ee1ae06d97eb17cdd4b029f80f0bfea83e46688d7d55c31910123f987cb8afc"
+  },
+  {
+    "screen": "show_blackout_confirm_popup",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 80,
+    "status": "rendered",
+    "sha256": "51cd38ab6ed4190e495cc7dc5d6104ce8312c9d7fed515af453e328a20a75ec8"
+  },
+  {
+    "screen": "show_blackout_confirm_popup",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 80,
+    "status": "rendered",
+    "sha256": "4ee1ae06d97eb17cdd4b029f80f0bfea83e46688d7d55c31910123f987cb8afc"
+  },
+  {
+    "screen": "show_blackout_confirm_popup",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 80,
+    "status": "rendered",
+    "sha256": "51cd38ab6ed4190e495cc7dc5d6104ce8312c9d7fed515af453e328a20a75ec8"
+  },
+  {
+    "screen": "show_bluetooth_menu_page",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 117,
+    "status": "rendered",
+    "sha256": "d7f1698b648820105d72687eeec7a7d8822b62f1014de21f7c3899d1b67801bd"
+  },
+  {
+    "screen": "show_bluetooth_menu_page",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 117,
+    "status": "rendered",
+    "sha256": "b2cf7d95faa5332017b0fe6790266f1271e109f693d74be4e0231bcada6a068f"
+  },
+  {
+    "screen": "show_bluetooth_menu_page",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 117,
+    "status": "rendered",
+    "sha256": "d7f1698b648820105d72687eeec7a7d8822b62f1014de21f7c3899d1b67801bd"
+  },
+  {
+    "screen": "show_bluetooth_menu_page",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 117,
+    "status": "rendered",
+    "sha256": "b2cf7d95faa5332017b0fe6790266f1271e109f693d74be4e0231bcada6a068f"
+  },
+  {
+    "screen": "show_bt_locator_page",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 103,
+    "status": "rendered",
+    "sha256": "416b242f52f5d45b725ea7dcf45dc57ce32eb04377527dcfd73862d8ec094ebc"
+  },
+  {
+    "screen": "show_bt_locator_page",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 103,
+    "status": "rendered",
+    "sha256": "03bfb8a0f0725cc51d9bd8eed1be5e641e743281f9b903cf010c75d10823027b"
+  },
+  {
+    "screen": "show_bt_locator_page",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 103,
+    "status": "rendered",
+    "sha256": "416b242f52f5d45b725ea7dcf45dc57ce32eb04377527dcfd73862d8ec094ebc"
+  },
+  {
+    "screen": "show_bt_locator_page",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 103,
+    "status": "rendered",
+    "sha256": "03bfb8a0f0725cc51d9bd8eed1be5e641e743281f9b903cf010c75d10823027b"
+  },
+  {
+    "screen": "show_bt_scan_page",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 76,
+    "status": "rendered",
+    "sha256": "eae9df10e7aed2556a967a1ff117cebee5556e40138577520e109595bbcf85f5"
+  },
+  {
+    "screen": "show_bt_scan_page",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 76,
+    "status": "rendered",
+    "sha256": "1a95c8f9cabadd0866ee030d9acb5d4e1fac8f8775765cb58edb63876f5b3194"
+  },
+  {
+    "screen": "show_bt_scan_page",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 76,
+    "status": "rendered",
+    "sha256": "eae9df10e7aed2556a967a1ff117cebee5556e40138577520e109595bbcf85f5"
+  },
+  {
+    "screen": "show_bt_scan_page",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 76,
+    "status": "rendered",
+    "sha256": "1a95c8f9cabadd0866ee030d9acb5d4e1fac8f8775765cb58edb63876f5b3194"
+  },
+  {
+    "screen": "show_compromised_cleanup_popup",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 106,
+    "status": "rendered",
+    "sha256": "c78bcd185d93622ece154180e5e9d51990cd1fb4ebd0b7c30623bd16ff2761fb"
+  },
+  {
+    "screen": "show_compromised_cleanup_popup",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 106,
+    "status": "rendered",
+    "sha256": "cb4d43dba8e27ae46c03b1cf6732536d5108dde82cc20e9ff7286802b249fdf0"
+  },
+  {
+    "screen": "show_compromised_cleanup_popup",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 106,
+    "status": "rendered",
+    "sha256": "c78bcd185d93622ece154180e5e9d51990cd1fb4ebd0b7c30623bd16ff2761fb"
+  },
+  {
+    "screen": "show_compromised_cleanup_popup",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 106,
+    "status": "rendered",
+    "sha256": "cb4d43dba8e27ae46c03b1cf6732536d5108dde82cc20e9ff7286802b249fdf0"
+  },
+  {
+    "screen": "show_compromised_data_page",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 147,
+    "status": "rendered",
+    "sha256": "46dd0698998576421307f4e7fe4908d8e31c9180a35e5e1e3483d9bdd138ba2f"
+  },
+  {
+    "screen": "show_compromised_data_page",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 147,
+    "status": "rendered",
+    "sha256": "00ddb6b1507ae85afbb490931d3ffca4086f97377d1fb83ce09bcf1c19b5db78"
+  },
+  {
+    "screen": "show_compromised_data_page",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 147,
+    "status": "rendered",
+    "sha256": "46dd0698998576421307f4e7fe4908d8e31c9180a35e5e1e3483d9bdd138ba2f"
+  },
+  {
+    "screen": "show_compromised_data_page",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 147,
+    "status": "rendered",
+    "sha256": "00ddb6b1507ae85afbb490931d3ffca4086f97377d1fb83ce09bcf1c19b5db78"
+  },
+  {
+    "screen": "show_compromised_file_page",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 138,
+    "status": "rendered",
+    "sha256": "653450a2edc9dc51697b49775025f8acbb2e3285c197b2d5d3068c52d2265e61"
+  },
+  {
+    "screen": "show_compromised_file_page",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 138,
+    "status": "rendered",
+    "sha256": "c219c069be14c64e99336eb21de031e095b608d7828431c0053572150a29a105"
+  },
+  {
+    "screen": "show_compromised_file_page",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 138,
+    "status": "rendered",
+    "sha256": "653450a2edc9dc51697b49775025f8acbb2e3285c197b2d5d3068c52d2265e61"
+  },
+  {
+    "screen": "show_compromised_file_page",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 138,
+    "status": "rendered",
+    "sha256": "c219c069be14c64e99336eb21de031e095b608d7828431c0053572150a29a105"
+  },
+  {
+    "screen": "show_deauth_detector_page",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 85,
+    "status": "rendered",
+    "sha256": "ddf40100b5a766f9bf293fb3c528b672b94eda4480d3198f686135542dacf525"
+  },
+  {
+    "screen": "show_deauth_detector_page",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 85,
+    "status": "rendered",
+    "sha256": "8f65842bd81d458f1723f55a7c925f4e62fbd3fb459ddc39527e1424f044c1b4"
+  },
+  {
+    "screen": "show_deauth_detector_page",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 85,
+    "status": "rendered",
+    "sha256": "ddf40100b5a766f9bf293fb3c528b672b94eda4480d3198f686135542dacf525"
+  },
+  {
+    "screen": "show_deauth_detector_page",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 85,
+    "status": "rendered",
+    "sha256": "8f65842bd81d458f1723f55a7c925f4e62fbd3fb459ddc39527e1424f044c1b4"
+  },
+  {
+    "screen": "show_deauth_popup",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 200,
+    "status": "rendered",
+    "sha256": "88ec6702726121b82bc0ebae36597615c0a63d43ab58e273227dbf1b559d3b47"
+  },
+  {
+    "screen": "show_deauth_popup",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 213,
+    "status": "rendered",
+    "sha256": "1c748641a2b984c2a08bf5458397b4b67097723e731d2a300e070ded5fcb027b"
+  },
+  {
+    "screen": "show_deauth_popup",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 200,
+    "status": "rendered",
+    "sha256": "88ec6702726121b82bc0ebae36597615c0a63d43ab58e273227dbf1b559d3b47"
+  },
+  {
+    "screen": "show_deauth_popup",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 213,
+    "status": "rendered",
+    "sha256": "1c748641a2b984c2a08bf5458397b4b67097723e731d2a300e070ded5fcb027b"
+  },
+  {
+    "screen": "show_esp_modem_page",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 68,
+    "status": "rendered",
+    "sha256": "b3a263cbc48a5ffd29adbba5fdc179fde809ea0930b45f7405c3f3eafa047848"
+  },
+  {
+    "screen": "show_esp_modem_page",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 68,
+    "status": "rendered",
+    "sha256": "58510565d4ed92d80a96a726fa75531eea7892d2b4e0d4a6e543c58a732ae7a9"
+  },
+  {
+    "screen": "show_esp_modem_page",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 68,
+    "status": "rendered",
+    "sha256": "b3a263cbc48a5ffd29adbba5fdc179fde809ea0930b45f7405c3f3eafa047848"
+  },
+  {
+    "screen": "show_esp_modem_page",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 68,
+    "status": "rendered",
+    "sha256": "58510565d4ed92d80a96a726fa75531eea7892d2b4e0d4a6e543c58a732ae7a9"
+  },
+  {
+    "screen": "show_espshark_page",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 152,
+    "status": "rendered",
+    "sha256": "0e2fb459cc1574b986586a5b0992e4ede8d41ba2f1a85b3a4b755ab4f252d29c"
+  },
+  {
+    "screen": "show_espshark_page",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 152,
+    "status": "rendered",
+    "sha256": "739116ea8d7d3f63341bd15ba0ab4cd629eeeb3eb22a48ae932b5c5b139a569a"
+  },
+  {
+    "screen": "show_espshark_page",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 152,
+    "status": "rendered",
+    "sha256": "0e2fb459cc1574b986586a5b0992e4ede8d41ba2f1a85b3a4b755ab4f252d29c"
+  },
+  {
+    "screen": "show_espshark_page",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 152,
+    "status": "rendered",
+    "sha256": "739116ea8d7d3f63341bd15ba0ab4cd629eeeb3eb22a48ae932b5c5b139a569a"
+  },
+  {
+    "screen": "show_evil_twin_connect_popup",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 82,
+    "status": "rendered",
+    "sha256": "5d38195e3d8239971dee28b1fb6b87463b585e0cffd6cc2c6e5731b362204b9d"
+  },
+  {
+    "screen": "show_evil_twin_connect_popup",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 82,
+    "status": "rendered",
+    "sha256": "575344f6d32b76fd141114ab4cc3a7539470e4cbbb99b3eb77a262423b0a7dcb"
+  },
+  {
+    "screen": "show_evil_twin_connect_popup",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 82,
+    "status": "rendered",
+    "sha256": "5d38195e3d8239971dee28b1fb6b87463b585e0cffd6cc2c6e5731b362204b9d"
+  },
+  {
+    "screen": "show_evil_twin_connect_popup",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 82,
+    "status": "rendered",
+    "sha256": "575344f6d32b76fd141114ab4cc3a7539470e4cbbb99b3eb77a262423b0a7dcb"
+  },
+  {
+    "screen": "show_evil_twin_loading_overlay",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 50,
+    "status": "rendered",
+    "sha256": "594e095d8d6c528b287d5f4975f2759ea6fc8734801a1a18772439fd3911d3d4"
+  },
+  {
+    "screen": "show_evil_twin_loading_overlay",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 50,
+    "status": "rendered",
+    "sha256": "3fd1ef0c4e02b6485ba2e208fcaf1b64125703a21b0279ef956fb65d157c43ae"
+  },
+  {
+    "screen": "show_evil_twin_loading_overlay",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 50,
+    "status": "rendered",
+    "sha256": "594e095d8d6c528b287d5f4975f2759ea6fc8734801a1a18772439fd3911d3d4"
+  },
+  {
+    "screen": "show_evil_twin_loading_overlay",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 50,
+    "status": "rendered",
+    "sha256": "3fd1ef0c4e02b6485ba2e208fcaf1b64125703a21b0279ef956fb65d157c43ae"
+  },
+  {
+    "screen": "show_evil_twin_passwords_page",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 113,
+    "status": "rendered",
+    "sha256": "06ad338a874d72b136597a72ed0ac806572a8da887dcea7281ac6d0c2afe5402"
+  },
+  {
+    "screen": "show_evil_twin_passwords_page",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 113,
+    "status": "rendered",
+    "sha256": "3c792ed6208908cde4cdee21d1be80f3cabf9a190516ac9dd0b2cb2f18e00981"
+  },
+  {
+    "screen": "show_evil_twin_passwords_page",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 113,
+    "status": "rendered",
+    "sha256": "06ad338a874d72b136597a72ed0ac806572a8da887dcea7281ac6d0c2afe5402"
+  },
+  {
+    "screen": "show_evil_twin_passwords_page",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 113,
+    "status": "rendered",
+    "sha256": "3c792ed6208908cde4cdee21d1be80f3cabf9a190516ac9dd0b2cb2f18e00981"
+  },
+  {
+    "screen": "show_evil_twin_popup",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 123,
+    "status": "rendered",
+    "sha256": "e6f5b777cc087e44a242475583136e215e13281c7f305d8294e8a67f0475ee12"
+  },
+  {
+    "screen": "show_evil_twin_popup",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 123,
+    "status": "rendered",
+    "sha256": "578ba327a0787c904ed2c5167ba4988d3b5f5b74e1df81aa3f50ba1fadedf2bd"
+  },
+  {
+    "screen": "show_evil_twin_popup",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 123,
+    "status": "rendered",
+    "sha256": "e6f5b777cc087e44a242475583136e215e13281c7f305d8294e8a67f0475ee12"
+  },
+  {
+    "screen": "show_evil_twin_popup",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 123,
+    "status": "rendered",
+    "sha256": "578ba327a0787c904ed2c5167ba4988d3b5f5b74e1df81aa3f50ba1fadedf2bd"
+  },
+  {
+    "screen": "show_ft_baud_popup",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 248,
+    "status": "rendered",
+    "sha256": "32fe5a2ebacd744cc7000a565674d42e95b7da966f76776dfe150f04a0fd685f"
+  },
+  {
+    "screen": "show_ft_baud_popup",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 282,
+    "status": "rendered",
+    "sha256": "f6a5fbf98d9b08f758e09e9f08252e802c31c98da0355531b4c6c77b3cb65e86"
+  },
+  {
+    "screen": "show_ft_baud_popup",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 248,
+    "status": "rendered",
+    "sha256": "32fe5a2ebacd744cc7000a565674d42e95b7da966f76776dfe150f04a0fd685f"
+  },
+  {
+    "screen": "show_ft_baud_popup",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 282,
+    "status": "rendered",
+    "sha256": "f6a5fbf98d9b08f758e09e9f08252e802c31c98da0355531b4c6c77b3cb65e86"
+  },
+  {
+    "screen": "show_gitm_exit_confirm",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 81,
+    "status": "rendered",
+    "sha256": "97fa9806687ad2fb9e6a9bce52c8eaa2f13198452d2dc2ba4964a3acc1a3c742"
+  },
+  {
+    "screen": "show_gitm_exit_confirm",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 81,
+    "status": "rendered",
+    "sha256": "62a97242d6c34bcab1ca4f4cc3faad36a38b388ba93743dc564f0ab3c0cb8979"
+  },
+  {
+    "screen": "show_gitm_exit_confirm",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 81,
+    "status": "rendered",
+    "sha256": "97fa9806687ad2fb9e6a9bce52c8eaa2f13198452d2dc2ba4964a3acc1a3c742"
+  },
+  {
+    "screen": "show_gitm_exit_confirm",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 81,
+    "status": "rendered",
+    "sha256": "62a97242d6c34bcab1ca4f4cc3faad36a38b388ba93743dc564f0ab3c0cb8979"
+  },
+  {
+    "screen": "show_gitm_page",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 132,
+    "status": "rendered",
+    "sha256": "6b621c04f454a11b5897e4bb52a9cb9fb10d5e7a067d988b072136eac47f64bd"
+  },
+  {
+    "screen": "show_gitm_page",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 132,
+    "status": "rendered",
+    "sha256": "a5b9e8dfec0e7ec8528d5f171c0aa0b9019f12a40ae7b2bcca34a1aa7a11a8bd"
+  },
+  {
+    "screen": "show_gitm_page",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 132,
+    "status": "rendered",
+    "sha256": "6b621c04f454a11b5897e4bb52a9cb9fb10d5e7a067d988b072136eac47f64bd"
+  },
+  {
+    "screen": "show_gitm_page",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 132,
+    "status": "rendered",
+    "sha256": "a5b9e8dfec0e7ec8528d5f171c0aa0b9019f12a40ae7b2bcca34a1aa7a11a8bd"
+  },
+  {
+    "screen": "show_gitm_page_from_scan",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 132,
+    "status": "rendered",
+    "sha256": "6b621c04f454a11b5897e4bb52a9cb9fb10d5e7a067d988b072136eac47f64bd"
+  },
+  {
+    "screen": "show_gitm_page_from_scan",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 132,
+    "status": "rendered",
+    "sha256": "a5b9e8dfec0e7ec8528d5f171c0aa0b9019f12a40ae7b2bcca34a1aa7a11a8bd"
+  },
+  {
+    "screen": "show_gitm_page_from_scan",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 132,
+    "status": "rendered",
+    "sha256": "6b621c04f454a11b5897e4bb52a9cb9fb10d5e7a067d988b072136eac47f64bd"
+  },
+  {
+    "screen": "show_gitm_page_from_scan",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 132,
+    "status": "rendered",
+    "sha256": "a5b9e8dfec0e7ec8528d5f171c0aa0b9019f12a40ae7b2bcca34a1aa7a11a8bd"
+  },
+  {
+    "screen": "show_global_attacks_page",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 167,
+    "status": "rendered",
+    "sha256": "787b9cf7f86d1bb6025aa755623458e1ab095022b0570aa57cc6ea1ee5fd8701"
+  },
+  {
+    "screen": "show_global_attacks_page",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 167,
+    "status": "rendered",
+    "sha256": "523248729421240ba816c89ba5ceba301c86a86ec0e2f7c635f4a87007564d33"
+  },
+  {
+    "screen": "show_global_attacks_page",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 167,
+    "status": "rendered",
+    "sha256": "787b9cf7f86d1bb6025aa755623458e1ab095022b0570aa57cc6ea1ee5fd8701"
+  },
+  {
+    "screen": "show_global_attacks_page",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 167,
+    "status": "rendered",
+    "sha256": "523248729421240ba816c89ba5ceba301c86a86ec0e2f7c635f4a87007564d33"
+  },
+  {
+    "screen": "show_global_handshaker_active_popup",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 77,
+    "status": "rendered",
+    "sha256": "043cbcdcddf145cdb84adc44573277617959b022c1f216e85b7c7f2077589bff"
+  },
+  {
+    "screen": "show_global_handshaker_active_popup",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 77,
+    "status": "rendered",
+    "sha256": "63af06154a334f0224ecc8cd65e5258402bb2a786a162f1107267ed6418f01b1"
+  },
+  {
+    "screen": "show_global_handshaker_active_popup",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 77,
+    "status": "rendered",
+    "sha256": "043cbcdcddf145cdb84adc44573277617959b022c1f216e85b7c7f2077589bff"
+  },
+  {
+    "screen": "show_global_handshaker_active_popup",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 77,
+    "status": "rendered",
+    "sha256": "63af06154a334f0224ecc8cd65e5258402bb2a786a162f1107267ed6418f01b1"
+  },
+  {
+    "screen": "show_global_handshaker_confirm_popup",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 80,
+    "status": "rendered",
+    "sha256": "378ccadfa1d52e6bcb42819b67c2f9cc189ed38e9f9333831475d7cf919effef"
+  },
+  {
+    "screen": "show_global_handshaker_confirm_popup",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 80,
+    "status": "rendered",
+    "sha256": "49e4888d732a4eb63c85ff29162bd50ea1a2ea9922a2dfba295cc781fb559aae"
+  },
+  {
+    "screen": "show_global_handshaker_confirm_popup",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 80,
+    "status": "rendered",
+    "sha256": "378ccadfa1d52e6bcb42819b67c2f9cc189ed38e9f9333831475d7cf919effef"
+  },
+  {
+    "screen": "show_global_handshaker_confirm_popup",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 80,
+    "status": "rendered",
+    "sha256": "49e4888d732a4eb63c85ff29162bd50ea1a2ea9922a2dfba295cc781fb559aae"
+  },
+  {
+    "screen": "show_handshaker_popup",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 95,
+    "status": "rendered",
+    "sha256": "b91a89e04f5dc98e04bd8b266fad4222a1f6c34092ec0ec655259b815a77c952"
+  },
+  {
+    "screen": "show_handshaker_popup",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 95,
+    "status": "rendered",
+    "sha256": "b40491fc0279257c75d3fc4667678072be3586da7c321c9f5d592cbf3c9fc96b"
+  },
+  {
+    "screen": "show_handshaker_popup",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 95,
+    "status": "rendered",
+    "sha256": "b91a89e04f5dc98e04bd8b266fad4222a1f6c34092ec0ec655259b815a77c952"
+  },
+  {
+    "screen": "show_handshaker_popup",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 95,
+    "status": "rendered",
+    "sha256": "b40491fc0279257c75d3fc4667678072be3586da7c321c9f5d592cbf3c9fc96b"
+  },
+  {
+    "screen": "show_handshakes_page",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 138,
+    "status": "rendered",
+    "sha256": "653450a2edc9dc51697b49775025f8acbb2e3285c197b2d5d3068c52d2265e61"
+  },
+  {
+    "screen": "show_handshakes_page",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 138,
+    "status": "rendered",
+    "sha256": "c219c069be14c64e99336eb21de031e095b608d7828431c0053572150a29a105"
+  },
+  {
+    "screen": "show_handshakes_page",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 138,
+    "status": "rendered",
+    "sha256": "653450a2edc9dc51697b49775025f8acbb2e3285c197b2d5d3068c52d2265e61"
+  },
+  {
+    "screen": "show_handshakes_page",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 138,
+    "status": "rendered",
+    "sha256": "c219c069be14c64e99336eb21de031e095b608d7828431c0053572150a29a105"
+  },
+  {
+    "screen": "show_hidden_ssid_popup",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 107,
+    "status": "rendered",
+    "sha256": "df3deab4f951be183c6d177788e1e617228590b51c2f058e99de1711ed4963e7"
+  },
+  {
+    "screen": "show_hidden_ssid_popup",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 107,
+    "status": "rendered",
+    "sha256": "4d506f10c2eaee0a8cafc13003d7b4d66c0a5647bd15b6ef8647f2ca77588581"
+  },
+  {
+    "screen": "show_hidden_ssid_popup",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 107,
+    "status": "rendered",
+    "sha256": "df3deab4f951be183c6d177788e1e617228590b51c2f058e99de1711ed4963e7"
+  },
+  {
+    "screen": "show_hidden_ssid_popup",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 107,
+    "status": "rendered",
+    "sha256": "4d506f10c2eaee0a8cafc13003d7b4d66c0a5647bd15b6ef8647f2ca77588581"
+  },
+  {
+    "screen": "show_home_mgmt_overlay",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 211,
+    "status": "rendered",
+    "sha256": "5ca8ef1d15d1b44fdd27c6ba7070fdd79fcdd4e0db5fc269fdd50c98d4c0c974"
+  },
+  {
+    "screen": "show_home_mgmt_overlay",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 193,
+    "status": "rendered",
+    "sha256": "7646401ce7610de363b2bf8c691cea409a7ddc97184622583bd7e1f0fc518f83"
+  },
+  {
+    "screen": "show_home_mgmt_overlay",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 211,
+    "status": "rendered",
+    "sha256": "5ca8ef1d15d1b44fdd27c6ba7070fdd79fcdd4e0db5fc269fdd50c98d4c0c974"
+  },
+  {
+    "screen": "show_home_mgmt_overlay",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 193,
+    "status": "rendered",
+    "sha256": "7646401ce7610de363b2bf8c691cea409a7ddc97184622583bd7e1f0fc518f83"
+  },
+  {
+    "screen": "show_internal_tiles",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 80,
+    "status": "rendered",
+    "sha256": "6bd97119cba14b391170ec43ca6412dd30c624425ae9384a8d569a50e8fca172"
+  },
+  {
+    "screen": "show_internal_tiles",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 80,
+    "status": "rendered",
+    "sha256": "a1185c40ba59a70d0b02ea474160c8dedd11a4cedfe211b78b8b375169237f03"
+  },
+  {
+    "screen": "show_internal_tiles",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 80,
+    "status": "rendered",
+    "sha256": "6bd97119cba14b391170ec43ca6412dd30c624425ae9384a8d569a50e8fca172"
+  },
+  {
+    "screen": "show_internal_tiles",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 80,
+    "status": "rendered",
+    "sha256": "a1185c40ba59a70d0b02ea474160c8dedd11a4cedfe211b78b8b375169237f03"
+  },
+  {
+    "screen": "show_jammer_page",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 90,
+    "status": "rendered",
+    "sha256": "751fb18a2ae8d9922bd823fcf6331b25c4d98cab6230ed109509ea790be44808"
+  },
+  {
+    "screen": "show_jammer_page",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 90,
+    "status": "rendered",
+    "sha256": "edcc15c13cd5a19445b0e3d32d39789632c294a416baa9549fdbe9b495c7d9fe"
+  },
+  {
+    "screen": "show_jammer_page",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 90,
+    "status": "rendered",
+    "sha256": "751fb18a2ae8d9922bd823fcf6331b25c4d98cab6230ed109509ea790be44808"
+  },
+  {
+    "screen": "show_jammer_page",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 90,
+    "status": "rendered",
+    "sha256": "edcc15c13cd5a19445b0e3d32d39789632c294a416baa9549fdbe9b495c7d9fe"
+  },
+  {
+    "screen": "show_karma2_attack_popup",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 85,
+    "status": "rendered",
+    "sha256": "c41580a6ddd1fb0847d53dece9f50f55d593f0e3ecb9493647587ac8211db8b2"
+  },
+  {
+    "screen": "show_karma2_attack_popup",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 85,
+    "status": "rendered",
+    "sha256": "0f8206f473625ff8fb2ba7270f0bcc96d2f1a3e493afe6c2ef20e52ac6fac232"
+  },
+  {
+    "screen": "show_karma2_attack_popup",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 85,
+    "status": "rendered",
+    "sha256": "c41580a6ddd1fb0847d53dece9f50f55d593f0e3ecb9493647587ac8211db8b2"
+  },
+  {
+    "screen": "show_karma2_attack_popup",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 85,
+    "status": "rendered",
+    "sha256": "0f8206f473625ff8fb2ba7270f0bcc96d2f1a3e493afe6c2ef20e52ac6fac232"
+  },
+  {
+    "screen": "show_karma2_html_popup",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 100,
+    "status": "rendered",
+    "sha256": "b83ec0539347f1ee208ab26b768eaf7c141220776eabdeafef2f2241830462a6"
+  },
+  {
+    "screen": "show_karma2_html_popup",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 100,
+    "status": "rendered",
+    "sha256": "e09f970fd40ff6246f74179ce4ceff821931577ce83bc1b705a664e6f159b415"
+  },
+  {
+    "screen": "show_karma2_html_popup",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 100,
+    "status": "rendered",
+    "sha256": "b83ec0539347f1ee208ab26b768eaf7c141220776eabdeafef2f2241830462a6"
+  },
+  {
+    "screen": "show_karma2_html_popup",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 100,
+    "status": "rendered",
+    "sha256": "e09f970fd40ff6246f74179ce4ceff821931577ce83bc1b705a664e6f159b415"
+  },
+  {
+    "screen": "show_karma_page",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 107,
+    "status": "rendered",
+    "sha256": "d1e1cfce8e742a2fe1b54b59fd156e861c74442570e90cb19fd0e1e1fb1bcb6a"
+  },
+  {
+    "screen": "show_karma_page",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 107,
+    "status": "rendered",
+    "sha256": "b90d897b1644127bc6f07377a20dc1f57c97570ceeb3c691dc5b96c642b7b531"
+  },
+  {
+    "screen": "show_karma_page",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 107,
+    "status": "rendered",
+    "sha256": "d1e1cfce8e742a2fe1b54b59fd156e861c74442570e90cb19fd0e1e1fb1bcb6a"
+  },
+  {
+    "screen": "show_karma_page",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 107,
+    "status": "rendered",
+    "sha256": "b90d897b1644127bc6f07377a20dc1f57c97570ceeb3c691dc5b96c642b7b531"
+  },
+  {
+    "screen": "show_main_tiles",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 268,
+    "status": "rendered",
+    "sha256": "51c045395c7df3d02568bd1fd33c605803ed064553246437053dd832362726eb"
+  },
+  {
+    "screen": "show_main_tiles",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 250,
+    "status": "rendered",
+    "sha256": "c4540447cb2591a2ef4e862091abac286508732d891a88abcdf5e3cc87ed42d1"
+  },
+  {
+    "screen": "show_main_tiles",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 268,
+    "status": "rendered",
+    "sha256": "51c045395c7df3d02568bd1fd33c605803ed064553246437053dd832362726eb"
+  },
+  {
+    "screen": "show_main_tiles",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 250,
+    "status": "rendered",
+    "sha256": "c4540447cb2591a2ef4e862091abac286508732d891a88abcdf5e3cc87ed42d1"
+  },
+  {
+    "screen": "show_mbus_tiles",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 259,
+    "status": "rendered",
+    "sha256": "ee98dd2222c9e57d9bbd76dfddabbf44760d0bec7fec18fa0f4e9627ccd212a7"
+  },
+  {
+    "screen": "show_mbus_tiles",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 249,
+    "status": "rendered",
+    "sha256": "449be5910de0f5becac8de3af210a9bed1d4649efebe7692a419905b77ba2412"
+  },
+  {
+    "screen": "show_mbus_tiles",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 259,
+    "status": "rendered",
+    "sha256": "ee98dd2222c9e57d9bbd76dfddabbf44760d0bec7fec18fa0f4e9627ccd212a7"
+  },
+  {
+    "screen": "show_mbus_tiles",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 249,
+    "status": "rendered",
+    "sha256": "449be5910de0f5becac8de3af210a9bed1d4649efebe7692a419905b77ba2412"
+  },
+  {
+    "screen": "show_mitm_popup",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 130,
+    "status": "rendered",
+    "sha256": "fdc090e4bd2cda76ff55fbfc15fa3338209957fe7f1e605cbfdc80ced9bffc7c"
+  },
+  {
+    "screen": "show_mitm_popup",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 130,
+    "status": "rendered",
+    "sha256": "536e013ab6eb417fdb2048fe1fa6ed3ff194487e95563cfc6cbdb1266626c9e2"
+  },
+  {
+    "screen": "show_mitm_popup",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 130,
+    "status": "rendered",
+    "sha256": "fdc090e4bd2cda76ff55fbfc15fa3338209957fe7f1e605cbfdc80ced9bffc7c"
+  },
+  {
+    "screen": "show_mitm_popup",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 130,
+    "status": "rendered",
+    "sha256": "536e013ab6eb417fdb2048fe1fa6ed3ff194487e95563cfc6cbdb1266626c9e2"
+  },
+  {
+    "screen": "show_network_popup",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 205,
+    "status": "rendered",
+    "sha256": "cf3db4adca43572621ada4ccec82eac68ca69705d65509bd0f2a80ca3aeb561a"
+  },
+  {
+    "screen": "show_network_popup",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 209,
+    "status": "rendered",
+    "sha256": "17ab79df9c5372fcb0ee78d38c437a906c55c7249044d1e2823ad5e371cb0e7b"
+  },
+  {
+    "screen": "show_network_popup",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 205,
+    "status": "rendered",
+    "sha256": "cf3db4adca43572621ada4ccec82eac68ca69705d65509bd0f2a80ca3aeb561a"
+  },
+  {
+    "screen": "show_network_popup",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 209,
+    "status": "rendered",
+    "sha256": "17ab79df9c5372fcb0ee78d38c437a906c55c7249044d1e2823ad5e371cb0e7b"
+  },
+  {
+    "screen": "show_nmap_page",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 92,
+    "status": "rendered",
+    "sha256": "44951091ec8fb35de75fd522de82406b81b876b6598a25443be337993d61b108"
+  },
+  {
+    "screen": "show_nmap_page",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 92,
+    "status": "rendered",
+    "sha256": "04ac9a5b81d0cc7e29486b98f4b9508360723acb7cfafe1f262f3ed2a47e8aa3"
+  },
+  {
+    "screen": "show_nmap_page",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 92,
+    "status": "rendered",
+    "sha256": "44951091ec8fb35de75fd522de82406b81b876b6598a25443be337993d61b108"
+  },
+  {
+    "screen": "show_nmap_page",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 92,
+    "status": "rendered",
+    "sha256": "04ac9a5b81d0cc7e29486b98f4b9508360723acb7cfafe1f262f3ed2a47e8aa3"
+  },
+  {
+    "screen": "show_no_board_popup",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 85,
+    "status": "rendered",
+    "sha256": "0252807574690230baf4d48aadaffee2eef5ff895e1a121a34bbb664b1bf50e4"
+  },
+  {
+    "screen": "show_no_board_popup",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 85,
+    "status": "rendered",
+    "sha256": "852b2c98c6a5790899c7b720d6f58a492d0820c0e8c60e811e40329e5d3933a0"
+  },
+  {
+    "screen": "show_no_board_popup",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 85,
+    "status": "rendered",
+    "sha256": "0252807574690230baf4d48aadaffee2eef5ff895e1a121a34bbb664b1bf50e4"
+  },
+  {
+    "screen": "show_no_board_popup",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 85,
+    "status": "rendered",
+    "sha256": "852b2c98c6a5790899c7b720d6f58a492d0820c0e8c60e811e40329e5d3933a0"
+  },
+  {
+    "screen": "show_observer_exit_confirm",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 78,
+    "status": "rendered",
+    "sha256": "dc2e7121bec1ebee9788ed7aa93c82340884989d58a4888ec3cdb88b9a8a5748"
+  },
+  {
+    "screen": "show_observer_exit_confirm",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 78,
+    "status": "rendered",
+    "sha256": "ca3edb137721fce4e7acdffaeb63b74ae5f86d49f96a69b70ae920249bb9068c"
+  },
+  {
+    "screen": "show_observer_exit_confirm",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 78,
+    "status": "rendered",
+    "sha256": "dc2e7121bec1ebee9788ed7aa93c82340884989d58a4888ec3cdb88b9a8a5748"
+  },
+  {
+    "screen": "show_observer_exit_confirm",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 78,
+    "status": "rendered",
+    "sha256": "ca3edb137721fce4e7acdffaeb63b74ae5f86d49f96a69b70ae920249bb9068c"
+  },
+  {
+    "screen": "show_observer_page",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 195,
+    "status": "rendered",
+    "sha256": "bc325824bc1f901052e624e29632019559e989087422c6e48177fe3665cbcb98"
+  },
+  {
+    "screen": "show_observer_page",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 195,
+    "status": "rendered",
+    "sha256": "a86dfe2e7897a5be4abd2fa6519d26bc78b008ce57d591fe78d03ca42825f525"
+  },
+  {
+    "screen": "show_observer_page",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 195,
+    "status": "rendered",
+    "sha256": "bc325824bc1f901052e624e29632019559e989087422c6e48177fe3665cbcb98"
+  },
+  {
+    "screen": "show_observer_page",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 195,
+    "status": "rendered",
+    "sha256": "a86dfe2e7897a5be4abd2fa6519d26bc78b008ce57d591fe78d03ca42825f525"
+  },
+  {
+    "screen": "show_ota_page",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 192,
+    "status": "rendered",
+    "sha256": "785b0d1cdf04da46fb87a9c19d017cc3539603b858ac41f6a9b97746a691b72e"
+  },
+  {
+    "screen": "show_ota_page",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 192,
+    "status": "rendered",
+    "sha256": "aa7107f83188631b399706439488d0d464af0c707333e3ef324fe08c8b12c6c9"
+  },
+  {
+    "screen": "show_ota_page",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 192,
+    "status": "rendered",
+    "sha256": "785b0d1cdf04da46fb87a9c19d017cc3539603b858ac41f6a9b97746a691b72e"
+  },
+  {
+    "screen": "show_ota_page",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 192,
+    "status": "rendered",
+    "sha256": "aa7107f83188631b399706439488d0d464af0c707333e3ef324fe08c8b12c6c9"
+  },
+  {
+    "screen": "show_pcap_captures_page",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 121,
+    "status": "rendered",
+    "sha256": "eaaa04643722b691970ee6d3f39afee97b9a84f8c46a5d78817d9627c4131dc6"
+  },
+  {
+    "screen": "show_pcap_captures_page",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 121,
+    "status": "rendered",
+    "sha256": "a0b0cb90988c0fdbda7da6a6cbc03600d408f8d27ea1c5eefb13d3ad4ad03727"
+  },
+  {
+    "screen": "show_pcap_captures_page",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 121,
+    "status": "rendered",
+    "sha256": "eaaa04643722b691970ee6d3f39afee97b9a84f8c46a5d78817d9627c4131dc6"
+  },
+  {
+    "screen": "show_pcap_captures_page",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 121,
+    "status": "rendered",
+    "sha256": "a0b0cb90988c0fdbda7da6a6cbc03600d408f8d27ea1c5eefb13d3ad4ad03727"
+  },
+  {
+    "screen": "show_pcap_viewer_page",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 84,
+    "status": "rendered",
+    "sha256": "015befa69861057f8f456795f02b68f4775af02f1057ae7aa649070899bcd40c"
+  },
+  {
+    "screen": "show_pcap_viewer_page",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 84,
+    "status": "rendered",
+    "sha256": "d30e22076f733f76ba4dbb19f8a636ce0316f247aa62780a9b89582967f5ee48"
+  },
+  {
+    "screen": "show_pcap_viewer_page",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 84,
+    "status": "rendered",
+    "sha256": "015befa69861057f8f456795f02b68f4775af02f1057ae7aa649070899bcd40c"
+  },
+  {
+    "screen": "show_pcap_viewer_page",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 84,
+    "status": "rendered",
+    "sha256": "d30e22076f733f76ba4dbb19f8a636ce0316f247aa62780a9b89582967f5ee48"
+  },
+  {
+    "screen": "show_phishing_portal_active_popup",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 73,
+    "status": "rendered",
+    "sha256": "fd86ef1603832a97447d53956f8ed52b41272e35545af4bb2ca3b84085ed4a68"
+  },
+  {
+    "screen": "show_phishing_portal_active_popup",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 73,
+    "status": "rendered",
+    "sha256": "c686afe1783426922864d0def2194e00d774253b12fd3066d6642960e62ccbef"
+  },
+  {
+    "screen": "show_phishing_portal_active_popup",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 73,
+    "status": "rendered",
+    "sha256": "fd86ef1603832a97447d53956f8ed52b41272e35545af4bb2ca3b84085ed4a68"
+  },
+  {
+    "screen": "show_phishing_portal_active_popup",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 73,
+    "status": "rendered",
+    "sha256": "c686afe1783426922864d0def2194e00d774253b12fd3066d6642960e62ccbef"
+  },
+  {
+    "screen": "show_phishing_portal_popup",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 113,
+    "status": "rendered",
+    "sha256": "ecebd9848b57a3441e2e2a41112cf80f40e70b6fa26e73f6fa531ed8f0bfb1a3"
+  },
+  {
+    "screen": "show_phishing_portal_popup",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 113,
+    "status": "rendered",
+    "sha256": "76405ed5a4fbb2a35d647adc59bee8bffade4062c251e113cd8b1af7f7e0875c"
+  },
+  {
+    "screen": "show_phishing_portal_popup",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 113,
+    "status": "rendered",
+    "sha256": "ecebd9848b57a3441e2e2a41112cf80f40e70b6fa26e73f6fa531ed8f0bfb1a3"
+  },
+  {
+    "screen": "show_phishing_portal_popup",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 113,
+    "status": "rendered",
+    "sha256": "76405ed5a4fbb2a35d647adc59bee8bffade4062c251e113cd8b1af7f7e0875c"
+  },
+  {
+    "screen": "show_portal_data_page",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 112,
+    "status": "rendered",
+    "sha256": "50288ef143d7aae051fc0882e7de735e6390d94e012c4e7c0c4f83174cf23d45"
+  },
+  {
+    "screen": "show_portal_data_page",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 112,
+    "status": "rendered",
+    "sha256": "47881fa0daacb305583b865890f5f022dda26e7ddd69d0ac181f04c0d93e43e4"
+  },
+  {
+    "screen": "show_portal_data_page",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 112,
+    "status": "rendered",
+    "sha256": "50288ef143d7aae051fc0882e7de735e6390d94e012c4e7c0c4f83174cf23d45"
+  },
+  {
+    "screen": "show_portal_data_page",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 112,
+    "status": "rendered",
+    "sha256": "47881fa0daacb305583b865890f5f022dda26e7ddd69d0ac181f04c0d93e43e4"
+  },
+  {
+    "screen": "show_red_team_disclaimer_popup",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 76,
+    "status": "rendered",
+    "sha256": "74228795e6dfa7cd812863a926f5f06589769fd64a5b90bdd0f0eb90405e76f7"
+  },
+  {
+    "screen": "show_red_team_disclaimer_popup",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 76,
+    "status": "rendered",
+    "sha256": "e376c8fdaaeddea6d13a45e8bf0b39c4fa4446c7d9ce04fb8f5e348210031c83"
+  },
+  {
+    "screen": "show_red_team_disclaimer_popup",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 76,
+    "status": "rendered",
+    "sha256": "74228795e6dfa7cd812863a926f5f06589769fd64a5b90bdd0f0eb90405e76f7"
+  },
+  {
+    "screen": "show_red_team_disclaimer_popup",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 76,
+    "status": "rendered",
+    "sha256": "e376c8fdaaeddea6d13a45e8bf0b39c4fa4446c7d9ce04fb8f5e348210031c83"
+  },
+  {
+    "screen": "show_red_team_settings_page",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 87,
+    "status": "rendered",
+    "sha256": "12122db7a6d3f2b20315b553f345b9e499c9e0d1afb2da60065aa83447f39b6f"
+  },
+  {
+    "screen": "show_red_team_settings_page",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 87,
+    "status": "rendered",
+    "sha256": "1749066ea858e6b58ba4f7905210c8db3c77b728e6b822ba9fc725765f6924d8"
+  },
+  {
+    "screen": "show_red_team_settings_page",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 87,
+    "status": "rendered",
+    "sha256": "12122db7a6d3f2b20315b553f345b9e499c9e0d1afb2da60065aa83447f39b6f"
+  },
+  {
+    "screen": "show_red_team_settings_page",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 87,
+    "status": "rendered",
+    "sha256": "1749066ea858e6b58ba4f7905210c8db3c77b728e6b822ba9fc725765f6924d8"
+  },
+  {
+    "screen": "show_rogue_ap_page",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 96,
+    "status": "rendered",
+    "sha256": "610b8164deb5ac58db2b0b387ce0c118ff8345d827efc1efb71b62df8d1d540c"
+  },
+  {
+    "screen": "show_rogue_ap_page",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 96,
+    "status": "rendered",
+    "sha256": "eff8e28756e0b5e1553f05be0c0bf37c3e7696d04a788a32f13ad9e64d9e8406"
+  },
+  {
+    "screen": "show_rogue_ap_page",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 96,
+    "status": "rendered",
+    "sha256": "610b8164deb5ac58db2b0b387ce0c118ff8345d827efc1efb71b62df8d1d540c"
+  },
+  {
+    "screen": "show_rogue_ap_page",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 96,
+    "status": "rendered",
+    "sha256": "eff8e28756e0b5e1553f05be0c0bf37c3e7696d04a788a32f13ad9e64d9e8406"
+  },
+  {
+    "screen": "show_rogue_ap_popup",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 65,
+    "status": "rendered",
+    "sha256": "9910189b5e3800b19ba32f5fad1c8dd0a3c6de3155f94c2dc04770b14d1c12d3"
+  },
+  {
+    "screen": "show_rogue_ap_popup",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 65,
+    "status": "rendered",
+    "sha256": "ac0ac969e815480fc04dcc7c747283344783cc8a0b80ef9991c0f8b772dfbbd8"
+  },
+  {
+    "screen": "show_rogue_ap_popup",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 65,
+    "status": "rendered",
+    "sha256": "9910189b5e3800b19ba32f5fad1c8dd0a3c6de3155f94c2dc04770b14d1c12d3"
+  },
+  {
+    "screen": "show_rogue_ap_popup",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 65,
+    "status": "rendered",
+    "sha256": "ac0ac969e815480fc04dcc7c747283344783cc8a0b80ef9991c0f8b772dfbbd8"
+  },
+  {
+    "screen": "show_rogue_gitm_popup",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 131,
+    "status": "rendered",
+    "sha256": "a448f70652efe4b99003b994ba2d28981284884aa1a42cec16d06acfd0b74ff0"
+  },
+  {
+    "screen": "show_rogue_gitm_popup",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 131,
+    "status": "rendered",
+    "sha256": "8d69f6c00888da44f5ccdac0c2d1049b660cb66c107ad2152936711411109059"
+  },
+  {
+    "screen": "show_rogue_gitm_popup",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 131,
+    "status": "rendered",
+    "sha256": "a448f70652efe4b99003b994ba2d28981284884aa1a42cec16d06acfd0b74ff0"
+  },
+  {
+    "screen": "show_rogue_gitm_popup",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 131,
+    "status": "rendered",
+    "sha256": "8d69f6c00888da44f5ccdac0c2d1049b660cb66c107ad2152936711411109059"
+  },
+  {
+    "screen": "show_sae_popup",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 63,
+    "status": "rendered",
+    "sha256": "5da8cb632ade387bdb9754dbe423dad5c5fe75c5708aca957e822eb4df8b813b"
+  },
+  {
+    "screen": "show_sae_popup",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 63,
+    "status": "rendered",
+    "sha256": "941262d4e3526a8696ec7c3488ead5a169568804c7d43dc53880d93055304d47"
+  },
+  {
+    "screen": "show_sae_popup",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 63,
+    "status": "rendered",
+    "sha256": "5da8cb632ade387bdb9754dbe423dad5c5fe75c5708aca957e822eb4df8b813b"
+  },
+  {
+    "screen": "show_sae_popup",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 63,
+    "status": "rendered",
+    "sha256": "941262d4e3526a8696ec7c3488ead5a169568804c7d43dc53880d93055304d47"
+  },
+  {
+    "screen": "show_scan_deauth_popup",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 82,
+    "status": "rendered",
+    "sha256": "524be86b67bf099dbdf63884a06555f24970e811cb915a0877fd43a64a06627d"
+  },
+  {
+    "screen": "show_scan_deauth_popup",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 82,
+    "status": "rendered",
+    "sha256": "00499417f88cfc4f065245acbb5dc7d3a521ffe194a4cc207711f210e5442e52"
+  },
+  {
+    "screen": "show_scan_deauth_popup",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 82,
+    "status": "rendered",
+    "sha256": "524be86b67bf099dbdf63884a06555f24970e811cb915a0877fd43a64a06627d"
+  },
+  {
+    "screen": "show_scan_deauth_popup",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 82,
+    "status": "rendered",
+    "sha256": "00499417f88cfc4f065245acbb5dc7d3a521ffe194a4cc207711f210e5442e52"
+  },
+  {
+    "screen": "show_scan_overlay",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 50,
+    "status": "rendered",
+    "sha256": "2b9698cc6aebadfc1d4a3921e123cb500e75d4052172e461a5419430dc2e0696"
+  },
+  {
+    "screen": "show_scan_overlay",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 50,
+    "status": "rendered",
+    "sha256": "f3e11265878a502faa417f1e8f03bab66cfbb3628f9913f4fcf744c663cd6ae9"
+  },
+  {
+    "screen": "show_scan_overlay",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 50,
+    "status": "rendered",
+    "sha256": "2b9698cc6aebadfc1d4a3921e123cb500e75d4052172e461a5419430dc2e0696"
+  },
+  {
+    "screen": "show_scan_overlay",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 50,
+    "status": "rendered",
+    "sha256": "f3e11265878a502faa417f1e8f03bab66cfbb3628f9913f4fcf744c663cd6ae9"
+  },
+  {
+    "screen": "show_scan_page",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 300,
+    "status": "rendered",
+    "sha256": "485951ba93151b853457b5e562372a756cf708b7af9928080fe5ac6d0c2b5616"
+  },
+  {
+    "screen": "show_scan_page",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 350,
+    "status": "rendered",
+    "sha256": "ba982b806ff62b54c081602b551e3e7b2de7d7c77f159a5f005e15a02200c91f"
+  },
+  {
+    "screen": "show_scan_page",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 300,
+    "status": "rendered",
+    "sha256": "485951ba93151b853457b5e562372a756cf708b7af9928080fe5ac6d0c2b5616"
+  },
+  {
+    "screen": "show_scan_page",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 350,
+    "status": "rendered",
+    "sha256": "ba982b806ff62b54c081602b551e3e7b2de7d7c77f159a5f005e15a02200c91f"
+  },
+  {
+    "screen": "show_scan_time_popup",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 304,
+    "status": "rendered",
+    "sha256": "57e4b6b88d09bee3e6757726c8318eeae1ea52fa8c50cc8a79220e66f1db1c08"
+  },
+  {
+    "screen": "show_scan_time_popup",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 340,
+    "status": "rendered",
+    "sha256": "fbd47fdb6492f2f97fb5748d92ae0c27bd344c52ba4854942f48ec4d55b522c1"
+  },
+  {
+    "screen": "show_scan_time_popup",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 304,
+    "status": "rendered",
+    "sha256": "57e4b6b88d09bee3e6757726c8318eeae1ea52fa8c50cc8a79220e66f1db1c08"
+  },
+  {
+    "screen": "show_scan_time_popup",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 340,
+    "status": "rendered",
+    "sha256": "fbd47fdb6492f2f97fb5748d92ae0c27bd344c52ba4854942f48ec4d55b522c1"
+  },
+  {
+    "screen": "show_screen_brightness_popup",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 254,
+    "status": "rendered",
+    "sha256": "88acf101e7fbc5e3d5ef682f1f0c0805c9d4db06abcd77b7ec26a17150928cf8"
+  },
+  {
+    "screen": "show_screen_brightness_popup",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 314,
+    "status": "rendered",
+    "sha256": "113a96f58bb52bb1027f9ce6ac49f184be1e15e5a1a9cd1ccb9ebd820b3f7bf6"
+  },
+  {
+    "screen": "show_screen_brightness_popup",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 254,
+    "status": "rendered",
+    "sha256": "88acf101e7fbc5e3d5ef682f1f0c0805c9d4db06abcd77b7ec26a17150928cf8"
+  },
+  {
+    "screen": "show_screen_brightness_popup",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 314,
+    "status": "rendered",
+    "sha256": "113a96f58bb52bb1027f9ce6ac49f184be1e15e5a1a9cd1ccb9ebd820b3f7bf6"
+  },
+  {
+    "screen": "show_screen_lock_popup",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 258,
+    "status": "rendered",
+    "sha256": "9780bf42ca52f74d849bce323718ef78d1e21a535289855d0e4628d5b8417c38"
+  },
+  {
+    "screen": "show_screen_lock_popup",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 292,
+    "status": "rendered",
+    "sha256": "1cbc2aa2f27bbf2d70278df2a870c19c974a0b924b5cd9579284a00defb87f0c"
+  },
+  {
+    "screen": "show_screen_lock_popup",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 258,
+    "status": "rendered",
+    "sha256": "9780bf42ca52f74d849bce323718ef78d1e21a535289855d0e4628d5b8417c38"
+  },
+  {
+    "screen": "show_screen_lock_popup",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 292,
+    "status": "rendered",
+    "sha256": "1cbc2aa2f27bbf2d70278df2a870c19c974a0b924b5cd9579284a00defb87f0c"
+  },
+  {
+    "screen": "show_screen_rotation_popup",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 275,
+    "status": "rendered",
+    "sha256": "6aea2ba73ebc27423dc808d353ac701bd4de9575f7b2198bfd25feadc43cd7a7"
+  },
+  {
+    "screen": "show_screen_rotation_popup",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 300,
+    "status": "rendered",
+    "sha256": "9ceff0a8f559e9d590f96a4bd7bd59ea3dd9d41373a37e91fd2d84dd90255ea2"
+  },
+  {
+    "screen": "show_screen_rotation_popup",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 275,
+    "status": "rendered",
+    "sha256": "81054e58c40e4cd5c354e10dc3ab369a8f7d26a6f26d93ffb5c1d3c806b3a7d3"
+  },
+  {
+    "screen": "show_screen_rotation_popup",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 300,
+    "status": "rendered",
+    "sha256": "0b3529de1e65b84ba3c17061308ee13cbe97cf6d01297a0331a3295f624f48ab"
+  },
+  {
+    "screen": "show_screen_timeout_popup",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 256,
+    "status": "rendered",
+    "sha256": "3f69163e7c78cd3fce660c9f9eda201acc68b8d8a5b2a612926290beb42d0051"
+  },
+  {
+    "screen": "show_screen_timeout_popup",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 247,
+    "status": "rendered",
+    "sha256": "8ace946d2738d38fc3d139d25f5244e8b034c710c04eee61e450604ad5e646e5"
+  },
+  {
+    "screen": "show_screen_timeout_popup",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 256,
+    "status": "rendered",
+    "sha256": "3f69163e7c78cd3fce660c9f9eda201acc68b8d8a5b2a612926290beb42d0051"
+  },
+  {
+    "screen": "show_screen_timeout_popup",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 247,
+    "status": "rendered",
+    "sha256": "8ace946d2738d38fc3d139d25f5244e8b034c710c04eee61e450604ad5e646e5"
+  },
+  {
+    "screen": "show_sd_admin_page",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 177,
+    "status": "rendered",
+    "sha256": "b32388170af0cf24d391df0313b97b330cd8db7df9c3af887f4f7df62f5e7940"
+  },
+  {
+    "screen": "show_sd_admin_page",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 177,
+    "status": "rendered",
+    "sha256": "8b37053b28c9ab063e8418b1ebb88e87a5b1af9e6b49f76af6aeb75b1f5e5c97"
+  },
+  {
+    "screen": "show_sd_admin_page",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 177,
+    "status": "rendered",
+    "sha256": "b32388170af0cf24d391df0313b97b330cd8db7df9c3af887f4f7df62f5e7940"
+  },
+  {
+    "screen": "show_sd_admin_page",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 177,
+    "status": "rendered",
+    "sha256": "8b37053b28c9ab063e8418b1ebb88e87a5b1af9e6b49f76af6aeb75b1f5e5c97"
+  },
+  {
+    "screen": "show_sd_warning_popup",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 80,
+    "status": "rendered",
+    "sha256": "e22adb5bdbdc5c7ceb15f0bfdde49eac996c34c9e80900f68c3b139aaffab7d5"
+  },
+  {
+    "screen": "show_sd_warning_popup",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 80,
+    "status": "rendered",
+    "sha256": "d6af2238c6b551b97f0b9ef8deaef6ca512b351ed29f80002542d59f5cb095c5"
+  },
+  {
+    "screen": "show_sd_warning_popup",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 80,
+    "status": "rendered",
+    "sha256": "e22adb5bdbdc5c7ceb15f0bfdde49eac996c34c9e80900f68c3b139aaffab7d5"
+  },
+  {
+    "screen": "show_sd_warning_popup",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 80,
+    "status": "rendered",
+    "sha256": "d6af2238c6b551b97f0b9ef8deaef6ca512b351ed29f80002542d59f5cb095c5"
+  },
+  {
+    "screen": "show_settings_page",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 223,
+    "status": "rendered",
+    "sha256": "07e2130d0b23680d770fd499338c70ae34359711e096cd65b76e43c2481407ad"
+  },
+  {
+    "screen": "show_settings_page",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 223,
+    "status": "rendered",
+    "sha256": "75fbaecf1772b6ecbc554b66eb7ecbfe219082a0ee5d10bd5c01ce30adcb2bb4"
+  },
+  {
+    "screen": "show_settings_page",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 223,
+    "status": "rendered",
+    "sha256": "07e2130d0b23680d770fd499338c70ae34359711e096cd65b76e43c2481407ad"
+  },
+  {
+    "screen": "show_settings_page",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 223,
+    "status": "rendered",
+    "sha256": "75fbaecf1772b6ecbc554b66eb7ecbfe219082a0ee5d10bd5c01ce30adcb2bb4"
+  },
+  {
+    "screen": "show_snifferdog_active_popup",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 59,
+    "status": "rendered",
+    "sha256": "09bd257b302e413dcc92bbe936143b673dc8600fcf58c1660ac0e5f2e141b12a"
+  },
+  {
+    "screen": "show_snifferdog_active_popup",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 59,
+    "status": "rendered",
+    "sha256": "4ff3090847cc39e7629c985c6211c391e3cdd72629f10a7763df9b4a8f2063c7"
+  },
+  {
+    "screen": "show_snifferdog_active_popup",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 59,
+    "status": "rendered",
+    "sha256": "09bd257b302e413dcc92bbe936143b673dc8600fcf58c1660ac0e5f2e141b12a"
+  },
+  {
+    "screen": "show_snifferdog_active_popup",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 59,
+    "status": "rendered",
+    "sha256": "4ff3090847cc39e7629c985c6211c391e3cdd72629f10a7763df9b4a8f2063c7"
+  },
+  {
+    "screen": "show_snifferdog_confirm_popup",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 80,
+    "status": "rendered",
+    "sha256": "37d32d8a1ae227d4ca38c95b5d76450548e3fde105aeddfcda817e6e4d8f3837"
+  },
+  {
+    "screen": "show_snifferdog_confirm_popup",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 80,
+    "status": "rendered",
+    "sha256": "ac042c7a4cb7f0bacae356b58a0f9921fd7d5943555268e6f5d6ff1975a8fb5f"
+  },
+  {
+    "screen": "show_snifferdog_confirm_popup",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 80,
+    "status": "rendered",
+    "sha256": "37d32d8a1ae227d4ca38c95b5d76450548e3fde105aeddfcda817e6e4d8f3837"
+  },
+  {
+    "screen": "show_snifferdog_confirm_popup",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 80,
+    "status": "rendered",
+    "sha256": "ac042c7a4cb7f0bacae356b58a0f9921fd7d5943555268e6f5d6ff1975a8fb5f"
+  },
+  {
+    "screen": "show_splash_screen",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 2,
+    "status": "rendered",
+    "sha256": "44d5a2f2d6c1e88720be26c5816f450c3f575736dd25fc2b690c03cacdffb2aa"
+  },
+  {
+    "screen": "show_splash_screen",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 2,
+    "status": "rendered",
+    "sha256": "9aa0f08064cd8ed46843e35919932047ecd9395e935f517d10afb360c9a432bd"
+  },
+  {
+    "screen": "show_splash_screen",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 2,
+    "status": "rendered",
+    "sha256": "44d5a2f2d6c1e88720be26c5816f450c3f575736dd25fc2b690c03cacdffb2aa"
+  },
+  {
+    "screen": "show_splash_screen",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 2,
+    "status": "rendered",
+    "sha256": "9aa0f08064cd8ed46843e35919932047ecd9395e935f517d10afb360c9a432bd"
+  },
+  {
+    "screen": "show_theme_popup",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 278,
+    "status": "rendered",
+    "sha256": "05896b6bd51f2bf5618a1e36b11b59f26cb1ad85c5b16efd573497dcda668b34"
+  },
+  {
+    "screen": "show_theme_popup",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 300,
+    "status": "rendered",
+    "sha256": "cbd762c8b2fa16ea283ca6400e681fd7174e4d38ca52c537dc400174cd4c7e2b"
+  },
+  {
+    "screen": "show_theme_popup",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 278,
+    "status": "rendered",
+    "sha256": "05896b6bd51f2bf5618a1e36b11b59f26cb1ad85c5b16efd573497dcda668b34"
+  },
+  {
+    "screen": "show_theme_popup",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 300,
+    "status": "rendered",
+    "sha256": "cbd762c8b2fa16ea283ca6400e681fd7174e4d38ca52c537dc400174cd4c7e2b"
+  },
+  {
+    "screen": "show_time_popup",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 252,
+    "status": "rendered",
+    "sha256": "dd66d3b3b6ca83e1a98f6e571d7bfb49a86938d20e696626d082c1e29578e926"
+  },
+  {
+    "screen": "show_time_popup",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 249,
+    "status": "rendered",
+    "sha256": "0f3f61f6ea03f84509f27b2ab5102bc202135fca5f4d579ef8db55c34103161b"
+  },
+  {
+    "screen": "show_time_popup",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 252,
+    "status": "rendered",
+    "sha256": "dd66d3b3b6ca83e1a98f6e571d7bfb49a86938d20e696626d082c1e29578e926"
+  },
+  {
+    "screen": "show_time_popup",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 249,
+    "status": "rendered",
+    "sha256": "0f3f61f6ea03f84509f27b2ab5102bc202135fca5f4d579ef8db55c34103161b"
+  },
+  {
+    "screen": "show_uart1_tiles",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 268,
+    "status": "rendered",
+    "sha256": "51c045395c7df3d02568bd1fd33c605803ed064553246437053dd832362726eb"
+  },
+  {
+    "screen": "show_uart1_tiles",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 250,
+    "status": "rendered",
+    "sha256": "c4540447cb2591a2ef4e862091abac286508732d891a88abcdf5e3cc87ed42d1"
+  },
+  {
+    "screen": "show_uart1_tiles",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 268,
+    "status": "rendered",
+    "sha256": "51c045395c7df3d02568bd1fd33c605803ed064553246437053dd832362726eb"
+  },
+  {
+    "screen": "show_uart1_tiles",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 250,
+    "status": "rendered",
+    "sha256": "c4540447cb2591a2ef4e862091abac286508732d891a88abcdf5e3cc87ed42d1"
+  },
+  {
+    "screen": "show_version_mismatch_popup",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 94,
+    "status": "rendered",
+    "sha256": "424fa9e09bd144dd6049894c5a153aa0fa6af8e5bbb568cd7f62e8cd93c7aeed"
+  },
+  {
+    "screen": "show_version_mismatch_popup",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 94,
+    "status": "rendered",
+    "sha256": "e7d6a0189dfc4e8d0de2d394760abb7579ea0fcfe590aec3d06a4a3e1132121b"
+  },
+  {
+    "screen": "show_version_mismatch_popup",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 94,
+    "status": "rendered",
+    "sha256": "424fa9e09bd144dd6049894c5a153aa0fa6af8e5bbb568cd7f62e8cd93c7aeed"
+  },
+  {
+    "screen": "show_version_mismatch_popup",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 94,
+    "status": "rendered",
+    "sha256": "e7d6a0189dfc4e8d0de2d394760abb7579ea0fcfe590aec3d06a4a3e1132121b"
+  },
+  {
+    "screen": "show_wardrive_files_page",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 139,
+    "status": "rendered",
+    "sha256": "2bccc3e23d86cc920c2c49707c35b2a242ff5d73e842f2d046dcce5179aa8fb8"
+  },
+  {
+    "screen": "show_wardrive_files_page",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 139,
+    "status": "rendered",
+    "sha256": "e1b0ee86d8627a8d7c57e02b81b68e473e7f82a3d9035835eef51c54b37da458"
+  },
+  {
+    "screen": "show_wardrive_files_page",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 139,
+    "status": "rendered",
+    "sha256": "2bccc3e23d86cc920c2c49707c35b2a242ff5d73e842f2d046dcce5179aa8fb8"
+  },
+  {
+    "screen": "show_wardrive_files_page",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 139,
+    "status": "rendered",
+    "sha256": "e1b0ee86d8627a8d7c57e02b81b68e473e7f82a3d9035835eef51c54b37da458"
+  },
+  {
+    "screen": "show_wardrive_gps_overlay",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 153,
+    "status": "rendered",
+    "sha256": "9167c04d6896bce365540fb4ffd9399dc1e0530c291c0cedc83475d337e47745"
+  },
+  {
+    "screen": "show_wardrive_gps_overlay",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 153,
+    "status": "rendered",
+    "sha256": "f79686bbb3bc798526244bf2d5a077114e5e7b3a5856218f0464a8c4572eac90"
+  },
+  {
+    "screen": "show_wardrive_gps_overlay",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 153,
+    "status": "rendered",
+    "sha256": "9167c04d6896bce365540fb4ffd9399dc1e0530c291c0cedc83475d337e47745"
+  },
+  {
+    "screen": "show_wardrive_gps_overlay",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 153,
+    "status": "rendered",
+    "sha256": "f79686bbb3bc798526244bf2d5a077114e5e7b3a5856218f0464a8c4572eac90"
+  },
+  {
+    "screen": "show_wardrive_home_confirm",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 191,
+    "status": "rendered",
+    "sha256": "9a29cff41f5be1488310203e7590b261f9bc1d788921d0e7150bab434883d3d8"
+  },
+  {
+    "screen": "show_wardrive_home_confirm",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 191,
+    "status": "rendered",
+    "sha256": "8a410c0545ccbe761ff054c00b0ef3e643d6732d9599017a72a03204b2bf01a8"
+  },
+  {
+    "screen": "show_wardrive_home_confirm",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 191,
+    "status": "rendered",
+    "sha256": "9a29cff41f5be1488310203e7590b261f9bc1d788921d0e7150bab434883d3d8"
+  },
+  {
+    "screen": "show_wardrive_home_confirm",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 191,
+    "status": "rendered",
+    "sha256": "8a410c0545ccbe761ff054c00b0ef3e643d6732d9599017a72a03204b2bf01a8"
+  },
+  {
+    "screen": "show_wardrive_page",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 129,
+    "status": "rendered",
+    "sha256": "b54339c7f9c27de3ba97d9546b66fcfca7c090bc2d26a594ddaca231745b4b34"
+  },
+  {
+    "screen": "show_wardrive_page",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 129,
+    "status": "rendered",
+    "sha256": "f2d794662c4093eb37d8170545a0d3ad462cba535bbbc8def895a2670649f6c4"
+  },
+  {
+    "screen": "show_wardrive_page",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 129,
+    "status": "rendered",
+    "sha256": "b54339c7f9c27de3ba97d9546b66fcfca7c090bc2d26a594ddaca231745b4b34"
+  },
+  {
+    "screen": "show_wardrive_page",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 129,
+    "status": "rendered",
+    "sha256": "f2d794662c4093eb37d8170545a0d3ad462cba535bbbc8def895a2670649f6c4"
+  },
+  {
+    "screen": "show_wardrive_upload_menu",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 227,
+    "status": "rendered",
+    "sha256": "8597243bb0e10f05985fe7962b633976f71c87faecb84d9ef5bb79f9716b0528"
+  },
+  {
+    "screen": "show_wardrive_upload_menu",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 397,
+    "status": "rendered",
+    "sha256": "95fd2a6064c95e84189bd903a3be01df1b70ba34ce85a356e966d28936fc2d1a"
+  },
+  {
+    "screen": "show_wardrive_upload_menu",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 227,
+    "status": "rendered",
+    "sha256": "8597243bb0e10f05985fe7962b633976f71c87faecb84d9ef5bb79f9716b0528"
+  },
+  {
+    "screen": "show_wardrive_upload_menu",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 397,
+    "status": "rendered",
+    "sha256": "95fd2a6064c95e84189bd903a3be01df1b70ba34ce85a356e966d28936fc2d1a"
+  },
+  {
+    "screen": "show_wardrive_upload_popup",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 229,
+    "status": "rendered",
+    "sha256": "dcbfcdaedd0f9cc960fd0e52fc69d0eb945fc0e59b3959910ea0b0ffd3821066"
+  },
+  {
+    "screen": "show_wardrive_upload_popup",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 199,
+    "status": "rendered",
+    "sha256": "0d9280621920e0a196fa180a7ee8dfc2819840a3665e8d3da87a964cf36c2d2e"
+  },
+  {
+    "screen": "show_wardrive_upload_popup",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 229,
+    "status": "rendered",
+    "sha256": "dcbfcdaedd0f9cc960fd0e52fc69d0eb945fc0e59b3959910ea0b0ffd3821066"
+  },
+  {
+    "screen": "show_wardrive_upload_popup",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 199,
+    "status": "rendered",
+    "sha256": "0d9280621920e0a196fa180a7ee8dfc2819840a3665e8d3da87a964cf36c2d2e"
+  },
+  {
+    "screen": "show_wpasec_popup",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 65,
+    "status": "rendered",
+    "sha256": "2b54ec1168812955ac0b8f584f89ff8a79279337083f852b4bb772ddeda0ccf8"
+  },
+  {
+    "screen": "show_wpasec_popup",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 65,
+    "status": "rendered",
+    "sha256": "c4cdc05a50b96187ed8e4f7efdc6c7c9aff8ed7ca023a3cc20e0d4fb2063637c"
+  },
+  {
+    "screen": "show_wpasec_popup",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 65,
+    "status": "rendered",
+    "sha256": "2b54ec1168812955ac0b8f584f89ff8a79279337083f852b4bb772ddeda0ccf8"
+  },
+  {
+    "screen": "show_wpasec_popup",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 65,
+    "status": "rendered",
+    "sha256": "c4cdc05a50b96187ed8e4f7efdc6c7c9aff8ed7ca023a3cc20e0d4fb2063637c"
+  },
+  {
+    "screen": "show_zig_recon_page",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 197,
+    "status": "rendered",
+    "sha256": "37d5ac39a0fa53e7da9d228acc3c65f98862006ff1093f6627ac4c34f9c8ca79"
+  },
+  {
+    "screen": "show_zig_recon_page",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 197,
+    "status": "rendered",
+    "sha256": "a75b4d75dc367d248ee5a33a35aad0e71778c3a1402efccbe7ef1f4a37afc147"
+  },
+  {
+    "screen": "show_zig_recon_page",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 197,
+    "status": "rendered",
+    "sha256": "37d5ac39a0fa53e7da9d228acc3c65f98862006ff1093f6627ac4c34f9c8ca79"
+  },
+  {
+    "screen": "show_zig_recon_page",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 197,
+    "status": "rendered",
+    "sha256": "a75b4d75dc367d248ee5a33a35aad0e71778c3a1402efccbe7ef1f4a37afc147"
+  },
+  {
+    "screen": "show_subghz_page",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 145,
+    "status": "rendered",
+    "sha256": "f2d9b8b0e30cb19d3eac165d18e871f9b9250c9fd84fa31d44381fc19d087243"
+  },
+  {
+    "screen": "show_subghz_page",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 145,
+    "status": "rendered",
+    "sha256": "ab2df08cc6fc87b5b96e5c6c8e815a4793306af563e74b2ddfb25a61a8872b7e"
+  },
+  {
+    "screen": "show_subghz_page",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 145,
+    "status": "rendered",
+    "sha256": "f2d9b8b0e30cb19d3eac165d18e871f9b9250c9fd84fa31d44381fc19d087243"
+  },
+  {
+    "screen": "show_subghz_page",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 145,
+    "status": "rendered",
+    "sha256": "ab2df08cc6fc87b5b96e5c6c8e815a4793306af563e74b2ddfb25a61a8872b7e"
+  },
+  {
+    "screen": "show_subghz_listen_page",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 113,
+    "status": "rendered",
+    "sha256": "ee87506bd076349ae3c34621a927302accf7a86b5b365955f981e98eea2a2baa"
+  },
+  {
+    "screen": "show_subghz_listen_page",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 113,
+    "status": "rendered",
+    "sha256": "510dfafa9a119574b9c9b917f58211befd935cde03807d91a8e4198645e8fcb4"
+  },
+  {
+    "screen": "show_subghz_listen_page",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 113,
+    "status": "rendered",
+    "sha256": "ee87506bd076349ae3c34621a927302accf7a86b5b365955f981e98eea2a2baa"
+  },
+  {
+    "screen": "show_subghz_listen_page",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 113,
+    "status": "rendered",
+    "sha256": "510dfafa9a119574b9c9b917f58211befd935cde03807d91a8e4198645e8fcb4"
+  },
+  {
+    "screen": "show_subghz_manage_page",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 45,
+    "status": "rendered",
+    "sha256": "ad399ee1f051e926468eb2589cdea687c215c35308a7edfc6829a228cd669cc8"
+  },
+  {
+    "screen": "show_subghz_manage_page",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 45,
+    "status": "rendered",
+    "sha256": "80dbb848ff323cb5993ca62eed2b066b69b821e3ac208d14b5f1330c3e15e3f9"
+  },
+  {
+    "screen": "show_subghz_manage_page",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 45,
+    "status": "rendered",
+    "sha256": "ad399ee1f051e926468eb2589cdea687c215c35308a7edfc6829a228cd669cc8"
+  },
+  {
+    "screen": "show_subghz_manage_page",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 45,
+    "status": "rendered",
+    "sha256": "80dbb848ff323cb5993ca62eed2b066b69b821e3ac208d14b5f1330c3e15e3f9"
+  },
+  {
+    "screen": "show_subghz_jammer_page",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 62,
+    "status": "rendered",
+    "sha256": "d4d9495b72d2349d249c0e44ba44fcb3cdd8dc6adc77b57c07bd2193568d1f4b"
+  },
+  {
+    "screen": "show_subghz_jammer_page",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 62,
+    "status": "rendered",
+    "sha256": "04bc12e82dbefc01f8952279dbd786989afdbe24de3389b60c69e5b3e29590dc"
+  },
+  {
+    "screen": "show_subghz_jammer_page",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 62,
+    "status": "rendered",
+    "sha256": "d4d9495b72d2349d249c0e44ba44fcb3cdd8dc6adc77b57c07bd2193568d1f4b"
+  },
+  {
+    "screen": "show_subghz_jammer_page",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 62,
+    "status": "rendered",
+    "sha256": "04bc12e82dbefc01f8952279dbd786989afdbe24de3389b60c69e5b3e29590dc"
+  },
+  {
+    "screen": "show_subghz_tesla_page",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 76,
+    "status": "rendered",
+    "sha256": "aa7db3e4efcd042dbeb7841764c2c6d1424a923333b7f9d9c41336b94a3a99ae"
+  },
+  {
+    "screen": "show_subghz_tesla_page",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 76,
+    "status": "rendered",
+    "sha256": "fd28f6e174bd452f2ec4b93cc6e846763d355cee7fab5034acd32d50d962f967"
+  },
+  {
+    "screen": "show_subghz_tesla_page",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 76,
+    "status": "rendered",
+    "sha256": "aa7db3e4efcd042dbeb7841764c2c6d1424a923333b7f9d9c41336b94a3a99ae"
+  },
+  {
+    "screen": "show_subghz_tesla_page",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 76,
+    "status": "rendered",
+    "sha256": "fd28f6e174bd452f2ec4b93cc6e846763d355cee7fab5034acd32d50d962f967"
+  },
+  {
+    "screen": "show_subghz_hunter_page",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 131,
+    "status": "rendered",
+    "sha256": "0e8db1154ecd8bd0d495c88a409cbc2af3effb42b9dfda9b070ec07cd30d8227"
+  },
+  {
+    "screen": "show_subghz_hunter_page",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 131,
+    "status": "rendered",
+    "sha256": "360490647c6492555566ae8c94ee50342e0f7c28a8787a5ff6f68f9c0a8f8a52"
+  },
+  {
+    "screen": "show_subghz_hunter_page",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 131,
+    "status": "rendered",
+    "sha256": "0e8db1154ecd8bd0d495c88a409cbc2af3effb42b9dfda9b070ec07cd30d8227"
+  },
+  {
+    "screen": "show_subghz_hunter_page",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 131,
+    "status": "rendered",
+    "sha256": "360490647c6492555566ae8c94ee50342e0f7c28a8787a5ff6f68f9c0a8f8a52"
+  },
+  {
+    "screen": "show_subghz_hunter_page_resume",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 131,
+    "status": "rendered",
+    "sha256": "0e8db1154ecd8bd0d495c88a409cbc2af3effb42b9dfda9b070ec07cd30d8227"
+  },
+  {
+    "screen": "show_subghz_hunter_page_resume",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 131,
+    "status": "rendered",
+    "sha256": "360490647c6492555566ae8c94ee50342e0f7c28a8787a5ff6f68f9c0a8f8a52"
+  },
+  {
+    "screen": "show_subghz_hunter_page_resume",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 131,
+    "status": "rendered",
+    "sha256": "0e8db1154ecd8bd0d495c88a409cbc2af3effb42b9dfda9b070ec07cd30d8227"
+  },
+  {
+    "screen": "show_subghz_hunter_page_resume",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 131,
+    "status": "rendered",
+    "sha256": "360490647c6492555566ae8c94ee50342e0f7c28a8787a5ff6f68f9c0a8f8a52"
+  },
+  {
+    "screen": "show_subghz_scanner_page",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 76,
+    "status": "rendered",
+    "sha256": "1af6d95cc459d91fac5741c463e15772175353a070e1689887b93b8f1e8183d7"
+  },
+  {
+    "screen": "show_subghz_scanner_page",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 76,
+    "status": "rendered",
+    "sha256": "fb09d43ff41edf41727bf78da9b5f0229c15fb3c9cd0d8bc02e2117fbf3b70d5"
+  },
+  {
+    "screen": "show_subghz_scanner_page",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 76,
+    "status": "rendered",
+    "sha256": "1af6d95cc459d91fac5741c463e15772175353a070e1689887b93b8f1e8183d7"
+  },
+  {
+    "screen": "show_subghz_scanner_page",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 76,
+    "status": "rendered",
+    "sha256": "fb09d43ff41edf41727bf78da9b5f0229c15fb3c9cd0d8bc02e2117fbf3b70d5"
+  },
+  {
+    "screen": "show_subghz_weather_page",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 71,
+    "status": "rendered",
+    "sha256": "1454902aac0459a500943ccb002f603def14a3060f699f076c0b98f2519db9c4"
+  },
+  {
+    "screen": "show_subghz_weather_page",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 71,
+    "status": "rendered",
+    "sha256": "c06dc84c2405e4fb7be9ab280796892ab188c17ed9f65d6fc64087047202b7a6"
+  },
+  {
+    "screen": "show_subghz_weather_page",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 71,
+    "status": "rendered",
+    "sha256": "1454902aac0459a500943ccb002f603def14a3060f699f076c0b98f2519db9c4"
+  },
+  {
+    "screen": "show_subghz_weather_page",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 71,
+    "status": "rendered",
+    "sha256": "c06dc84c2405e4fb7be9ab280796892ab188c17ed9f65d6fc64087047202b7a6"
+  },
+  {
+    "screen": "show_subghz_settings_page",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 99,
+    "status": "rendered",
+    "sha256": "cb049dbc93554ab7af88bf9b80b52fd02c5b60e0d7435f2d75a40633a97c4242"
+  },
+  {
+    "screen": "show_subghz_settings_page",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 99,
+    "status": "rendered",
+    "sha256": "c2c256fa065ddb7460743daca0f512600265cf0525ff9f043060ae4c23de3554"
+  },
+  {
+    "screen": "show_subghz_settings_page",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 99,
+    "status": "rendered",
+    "sha256": "cb049dbc93554ab7af88bf9b80b52fd02c5b60e0d7435f2d75a40633a97c4242"
+  },
+  {
+    "screen": "show_subghz_settings_page",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 99,
+    "status": "rendered",
+    "sha256": "c2c256fa065ddb7460743daca0f512600265cf0525ff9f043060ae4c23de3554"
+  },
+  {
+    "screen": "show_subghz_listen_settings_page",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 83,
+    "status": "rendered",
+    "sha256": "42fc9212f50e9aa3d16e97f0053157a2607501158c5a6946e27ad14285e04cf5"
+  },
+  {
+    "screen": "show_subghz_listen_settings_page",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 83,
+    "status": "rendered",
+    "sha256": "653e2b7d26419bad164b1aac949f5260d14ff2d03a4f91b19e7376790603b2df"
+  },
+  {
+    "screen": "show_subghz_listen_settings_page",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 83,
+    "status": "rendered",
+    "sha256": "42fc9212f50e9aa3d16e97f0053157a2607501158c5a6946e27ad14285e04cf5"
+  },
+  {
+    "screen": "show_subghz_listen_settings_page",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 83,
+    "status": "rendered",
+    "sha256": "653e2b7d26419bad164b1aac949f5260d14ff2d03a4f91b19e7376790603b2df"
+  },
+  {
+    "screen": "show_subghz_hunter_settings_page",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 81,
+    "status": "rendered",
+    "sha256": "cc3344c004e2a8e39ae69c88559d3cc7096bd21340c8fbf87af72ea7a68e9441"
+  },
+  {
+    "screen": "show_subghz_hunter_settings_page",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 83,
+    "status": "rendered",
+    "sha256": "6f928e47acc96f9a95e9d62b6f72d44d6f93d2ee548235a1cd6a417708d77a27"
+  },
+  {
+    "screen": "show_subghz_hunter_settings_page",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 81,
+    "status": "rendered",
+    "sha256": "cc3344c004e2a8e39ae69c88559d3cc7096bd21340c8fbf87af72ea7a68e9441"
+  },
+  {
+    "screen": "show_subghz_hunter_settings_page",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 83,
+    "status": "rendered",
+    "sha256": "6f928e47acc96f9a95e9d62b6f72d44d6f93d2ee548235a1cd6a417708d77a27"
+  },
+  {
+    "screen": "show_subghz_scanner_settings_page",
+    "rotation": 0,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 81,
+    "status": "rendered",
+    "sha256": "766d5dd5cc2ddfabf1bf2f451f4dac954428e432ab60a5226cea058aa55a65c6"
+  },
+  {
+    "screen": "show_subghz_scanner_settings_page",
+    "rotation": 90,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 81,
+    "status": "rendered",
+    "sha256": "a6b119d71156134421dbee8c4d7fad1b198682f91e5a18805f662514ea48546d"
+  },
+  {
+    "screen": "show_subghz_scanner_settings_page",
+    "rotation": 180,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      720,
+      1280
+    ],
+    "content_colors": 81,
+    "status": "rendered",
+    "sha256": "766d5dd5cc2ddfabf1bf2f451f4dac954428e432ab60a5226cea058aa55a65c6"
+  },
+  {
+    "screen": "show_subghz_scanner_settings_page",
+    "rotation": 270,
+    "fixture": "host defaults; hardware I/O inert",
+    "exit_code": 0,
+    "size": [
+      1280,
+      720
+    ],
+    "content_colors": 81,
+    "status": "rendered",
+    "sha256": "a6b119d71156134421dbee8c4d7fad1b198682f91e5a18805f662514ea48546d"
+  }
+]

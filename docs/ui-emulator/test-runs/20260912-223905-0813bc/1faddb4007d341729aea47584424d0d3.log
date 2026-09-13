@@ -1,0 +1,14 @@
+✔ slot activates only after successful reboot; cancellation and disconnect retain running image (1.3898ms)
+✔ firmware update refreshes the running slot image (0.24ms)
+✔ guide advances only from ordered native events for the right module and target (0.6758ms)
+✔ disconnect, premature back, restart and leaving cannot manufacture completion (0.1287ms)
+✔ events from a previous guide session cannot enter a restarted story (0.0782ms)
+✔ visibility and module transitions reset an unfinished observation window (0.629ms)
+ℹ tests 6
+ℹ suites 0
+ℹ pass 6
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 72.8426

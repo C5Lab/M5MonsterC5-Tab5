@@ -1,0 +1,10 @@
+test_invalid_range_and_cancel_all_rotations (__main__.SettingsS18Browser.test_invalid_range_and_cancel_all_rotations) ... ok
+test_red_team_both_choices_all_rotations (__main__.SettingsS18Browser.test_red_team_both_choices_all_rotations) ... ok
+test_restart_rejects_old_validation_error_and_cancel_as_save (__main__.SettingsS18Browser.test_restart_rejects_old_validation_error_and_cancel_as_save) ... ok
+test_scan_save_all_rotations (__main__.SettingsS18Browser.test_scan_save_all_rotations) ... ok
+test_wrong_module_and_restart_do_not_credit_existing_dialog (__main__.SettingsS18Browser.test_wrong_module_and_restart_do_not_credit_existing_dialog) ... ok
+
+----------------------------------------------------------------------
+Ran 5 tests in 30.604s
+
+OK

@@ -1,0 +1,14 @@
+
+TEST SUMMARY
+==============================================================================
+sae
+  PASS            0.16s  test_emulator_sae.mjs test_emulator_attacks.mjs
+  PASS            8.24s  test_emulator_sae.py
+  FAIL          132.22s  test_emulator_phase4_attacks.py
+------------------------------------------------------------------------------
+Result: FAIL | scripts PASS: 2 | FAIL/ERROR: 1
+Total elapsed: 140.64s
+Section wrapper times include their children; do not add them together.
+Run incomplete: checks after the failure may NOT HAVE RUN. Missing entries are not passes.
+Failure log: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\docs\ui-emulator\test-runs\20260912-144833-9fe5b9\efb7fa64b7f24f23ba59b0d6fad22133.log
+Report: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\docs\ui-emulator\test-runs\20260912-144833-9fe5b9\summary.json

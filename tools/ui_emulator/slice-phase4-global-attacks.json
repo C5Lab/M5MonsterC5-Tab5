@@ -1,0 +1,22 @@
+{
+  "show_blackout_confirm_popup": "retain",
+  "show_blackout_active_popup": "retain",
+  "blackout_confirm_no_cb": "retain",
+  "blackout_confirm_yes_cb": "adapter",
+  "blackout_stop_cb": "retain",
+  "close_blackout_popup_ctx": "retain",
+  "show_snifferdog_confirm_popup": "retain",
+  "show_snifferdog_active_popup": "retain",
+  "snifferdog_confirm_no_cb": "retain",
+  "snifferdog_confirm_yes_cb": "adapter",
+  "snifferdog_stop_cb": "retain",
+  "close_snifferdog_popup_ctx": "retain",
+  "show_global_handshaker_confirm_popup": "retain",
+  "show_global_handshaker_active_popup": "retain",
+  "global_handshaker_confirm_no_cb": "retain",
+  "global_handshaker_confirm_yes_cb": "adapter",
+  "global_handshaker_stop_cb": "retain",
+  "close_global_handshaker_popup_ctx": "retain",
+  "global_handshaker_monitor_task": "adapter",
+  "update_global_handshaker_stats_ctx": "retain"
+}

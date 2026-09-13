@@ -1,0 +1,125 @@
+test_cancel_before_submission_and_reset (__main__.PortalDemoBrowser.test_cancel_before_submission_and_reset) ... ok
+test_chrome_clinic_without_seeded_client_completes (__main__.PortalDemoBrowser.test_chrome_clinic_without_seeded_client_completes) ... FAIL
+test_evil_and_rogue_sequence_all_rotations (__main__.PortalDemoBrowser.test_evil_and_rogue_sequence_all_rotations) ... 
+  test_evil_and_rogue_sequence_all_rotations (__main__.PortalDemoBrowser.test_evil_and_rogue_sequence_all_rotations) (rotation=0, label='Evil Twin') ... FAIL
+  test_evil_and_rogue_sequence_all_rotations (__main__.PortalDemoBrowser.test_evil_and_rogue_sequence_all_rotations) (rotation=0, label='RogueAP') ... FAIL
+  test_evil_and_rogue_sequence_all_rotations (__main__.PortalDemoBrowser.test_evil_and_rogue_sequence_all_rotations) (rotation=1, label='Evil Twin') ... FAIL
+  test_evil_and_rogue_sequence_all_rotations (__main__.PortalDemoBrowser.test_evil_and_rogue_sequence_all_rotations) (rotation=1, label='RogueAP') ... FAIL
+  test_evil_and_rogue_sequence_all_rotations (__main__.PortalDemoBrowser.test_evil_and_rogue_sequence_all_rotations) (rotation=2, label='Evil Twin') ... FAIL
+  test_evil_and_rogue_sequence_all_rotations (__main__.PortalDemoBrowser.test_evil_and_rogue_sequence_all_rotations) (rotation=2, label='RogueAP') ... FAIL
+  test_evil_and_rogue_sequence_all_rotations (__main__.PortalDemoBrowser.test_evil_and_rogue_sequence_all_rotations) (rotation=3, label='Evil Twin') ... FAIL
+  test_evil_and_rogue_sequence_all_rotations (__main__.PortalDemoBrowser.test_evil_and_rogue_sequence_all_rotations) (rotation=3, label='RogueAP') ... FAIL
+test_internal_portal_sequence_stop_and_reopen (__main__.PortalDemoBrowser.test_internal_portal_sequence_stop_and_reopen) ... ok
+
+======================================================================
+FAIL: test_chrome_clinic_without_seeded_client_completes (__main__.PortalDemoBrowser.test_chrome_clinic_without_seeded_client_completes)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tests\test_emulator_portal_demo.py", line 53, in test_chrome_clinic_without_seeded_client_completes
+    self.sequence();self.assertIn('SSID: CHROME-CLINIC',self.text());self.clean()
+    ~~~~~~~~~~~~~^^
+  File "C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tests\test_emulator_portal_demo.py", line 23, in sequence
+    self.assertIn('Waiting for a demo client',self.text())
+    ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 'Waiting for a demo client' not found in '\n\n\n\n\n\n\uf053\nScan & Attack\n\n\nRESCAN\nFound 12 networks\n\n\n\n\nNEON-BAZAAR\n#5599FF 02:20:77:00:00:01#  |  #5599FF CH1#  |  #FFAA33 2.4GHz#  |  #00CCCC WPA2#  |  #55DD55 -38 dBm#\nVendor: -\n\n\n\nGHOST-LINE\n#5599FF 02:20:77:00:00:02#  |  #5599FF CH1#  |  #FFAA33 2.4GHz#  |  #00CCCC WPA2#  |  #55DD55 -47 dBm#\nVendor: -\n\n\n\nCHROME-CLINIC\n#5599FF 02:20:77:00:00:03#  |  #5599FF CH6#  |  #FFAA33 2.4GHz#  |  #55DD55 WPA2/WPA3 Mixed#  |  #FFAA00 -56 dBm#\nVendor: -\n\n\n\nBLACK-ICE\n#5599FF 02:20:77:00:00:04#  |  #5599FF CH36#  |  #CC66FF 5GHz#  |  #55DD55 WPA3#  |  #FFAA00 -65 dBm#\nVendor: -\n\n\n\nAFTERLIFE-GUEST\n#5599FF 02:20:77:00:00:05#  |  #5599FF CH11#  |  #FFAA33 2.4GHz#  |  #FF6666 Open#  |  #FF5555 -74 dBm#\nVendor: -\n\n\n\nSYNAPSE-RELAY\n#5599FF 02:20:77:00:00:06#  |  #5599FF CH44#  |  #CC66FF 5GHz#  |  #00CCCC WPA2#  |  #FF5555 -83 dBm#\nVendor: -\n\n\n\nNIGHT-CITY\n#5599FF 02:20:77:00:00:07#  |  #5599FF CH8#  |  #FFAA33 2.4GHz#  |  #00CCCC WPA2#  |  #FFAA00 -61 dBm#\nVendor: -\n\n\n\nVOODOO-BOYS\n#5599FF 02:20:77:00:00:08#  |  #5599FF CH9#  |  #FFAA33 2.4GHz#  |  #00CCCC WPA2#  |  #FFAA00 -64 dBm#\nVendor: -\n\n\n\nSAMURAI\n#5599FF 02:20:77:00:00:09#  |  #5599FF CH10#  |  #FFAA33 2.4GHz#  |  #00CCCC WPA2#  |  #FFAA00 -67 dBm#\nVendor: -\n\n\n\nBRAINDANCE\n#5599FF 02:20:77:00:00:0A#  |  #5599FF CH11#  |  #FFAA33 2.4GHz#  |  #00CCCC WPA2#  |  #FF5555 -70 dBm#\nVendor: -\n\n\n\nNETRUNNER\n#5599FF 02:20:77:00:00:0B#  |  #5599FF CH1#  |  #FFAA33 2.4GHz#  |  #00CCCC WPA2#  |  #FF5555 -73 dBm#\nVendor: -\n\n\n\nAFTERLIFE\n#5599FF 02:20:77:00:00:0C#  |  #5599FF CH2#  |  #FFAA33 2.4GHz#  |  #00CCCC WPA2#  |  #FF5555 -76 dBm#\nVendor: -\n\n\n\n\n\n\n\n\uf0e7\nDeauth\n\n\n\n\n\n\uf071\nEvil Twin\n\n\n\n\n\n\uf011\nSAE Overflow\n\n\n\n\n\n\uf019\nHandshake\n\n\n\n\n\n\uf074\nARP\n\n\n\n\n\n\uf06e\nRogueAP\n\n\n\n\n\n\uf0c5\nMITM\n\n\n\n\n\n\uf00b\nNmap\n\n\n\n\n\n\uf124\nRadar\n\n\n\n\n\n\uf079\nGITM\n\n\n\n\n\n\uf079\nRogue GITM\n\n\nEvil Twin Attack\n\nEvil Twin Network:\n\n\nPortal HTML:\n\n\nSTART ATTACK\n\nSelect network and portal, then click START ATTACK\n\nSTOP\n\n\n#FF2FA3 LAB5# | control the chaos\n20:12\n\n\n\n4.00V (SIM)\n\n\n\uf070\n\n\uf013\n\n\n\n\uf1eb\nGROVE\n\n\n\uf124\nMBUS\n\n\n\uf013\nINTERNAL\n'
+
+======================================================================
+FAIL: test_evil_and_rogue_sequence_all_rotations (__main__.PortalDemoBrowser.test_evil_and_rogue_sequence_all_rotations) (rotation=0, label='Evil Twin')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tests\test_emulator_portal_demo.py", line 47, in test_evil_and_rogue_sequence_all_rotations
+    self.sequence();job=self.page.evaluate('emulator.device.snapshot(0).active')
+    ~~~~~~~~~~~~~^^
+  File "C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tests\test_emulator_portal_demo.py", line 23, in sequence
+    self.assertIn('Waiting for a demo client',self.text())
+    ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 'Waiting for a demo client' not found in '\n\n\n\n\n\n\uf053\nScan & Attack\n\n\nRESCAN\nFound 12 networks\n\n\n\n\nNEON-BAZAAR\n#5599FF 02:20:77:00:00:01#  |  #5599FF CH1#  |  #FFAA33 2.4GHz#  |  #00CCCC WPA2#  |  #55DD55 -38 dBm#\nVendor: -\n\n\n\nGHOST-LINE\n#5599FF 02:20:77:00:00:02#  |  #5599FF CH1#  |  #FFAA33 2.4GHz#  |  #00CCCC WPA2#  |  #55DD55 -47 dBm#\nVendor: -\n\n\n\nCHROME-CLINIC\n#5599FF 02:20:77:00:00:03#  |  #5599FF CH6#  |  #FFAA33 2.4GHz#  |  #55DD55 WPA2/WPA3 Mixed#  |  #FFAA00 -56 dBm#\nVendor: -\n\n\n\nBLACK-ICE\n#5599FF 02:20:77:00:00:04#  |  #5599FF CH36#  |  #CC66FF 5GHz#  |  #55DD55 WPA3#  |  #FFAA00 -65 dBm#\nVendor: -\n\n\n\nAFTERLIFE-GUEST\n#5599FF 02:20:77:00:00:05#  |  #5599FF CH11#  |  #FFAA33 2.4GHz#  |  #FF6666 Open#  |  #FF5555 -74 dBm#\nVendor: -\n\n\n\nSYNAPSE-RELAY\n#5599FF 02:20:77:00:00:06#  |  #5599FF CH44#  |  #CC66FF 5GHz#  |  #00CCCC WPA2#  |  #FF5555 -83 dBm#\nVendor: -\n\n\n\nNIGHT-CITY\n#5599FF 02:20:77:00:00:07#  |  #5599FF CH8#  |  #FFAA33 2.4GHz#  |  #00CCCC WPA2#  |  #FFAA00 -61 dBm#\nVendor: -\n\n\n\nVOODOO-BOYS\n#5599FF 02:20:77:00:00:08#  |  #5599FF CH9#  |  #FFAA33 2.4GHz#  |  #00CCCC WPA2#  |  #FFAA00 -64 dBm#\nVendor: -\n\n\n\nSAMURAI\n#5599FF 02:20:77:00:00:09#  |  #5599FF CH10#  |  #FFAA33 2.4GHz#  |  #00CCCC WPA2#  |  #FFAA00 -67 dBm#\nVendor: -\n\n\n\nBRAINDANCE\n#5599FF 02:20:77:00:00:0A#  |  #5599FF CH11#  |  #FFAA33 2.4GHz#  |  #00CCCC WPA2#  |  #FF5555 -70 dBm#\nVendor: -\n\n\n\nNETRUNNER\n#5599FF 02:20:77:00:00:0B#  |  #5599FF CH1#  |  #FFAA33 2.4GHz#  |  #00CCCC WPA2#  |  #FF5555 -73 dBm#\nVendor: -\n\n\n\nAFTERLIFE\n#5599FF 02:20:77:00:00:0C#  |  #5599FF CH2#  |  #FFAA33 2.4GHz#  |  #00CCCC WPA2#  |  #FF5555 -76 dBm#\nVendor: -\n\n\n\n\n\n\n\n\uf0e7\nDeauth\n\n\n\n\n\n\uf071\nEvil Twin\n\n\n\n\n\n\uf011\nSAE Overflow\n\n\n\n\n\n\uf019\nHandshake\n\n\n\n\n\n\uf074\nARP\n\n\n\n\n\n\uf06e\nRogueAP\n\n\n\n\n\n\uf0c5\nMITM\n\n\n\n\n\n\uf00b\nNmap\n\n\n\n\n\n\uf124\nRadar\n\n\n\n\n\n\uf079\nGITM\n\n\n\n\n\n\uf079\nRogue GITM\n\n\nEvil Twin Attack\n\nEvil Twin Network:\n\n\nPortal HTML:\n\n\nSTART ATTACK\n\nSelect network and portal, then click START ATTACK\n\nSTOP\n\n\n#FF2FA3 LAB5# | control the chaos\n20:12\n\n\n\n4.00V (SIM)\n\n\n\uf070\n\n\uf013\n\n\n\n\uf1eb\nGROVE\n\n\n\uf124\nMBUS\n\n\n\uf013\nINTERNAL\n'
+
+======================================================================
+FAIL: test_evil_and_rogue_sequence_all_rotations (__main__.PortalDemoBrowser.test_evil_and_rogue_sequence_all_rotations) (rotation=0, label='RogueAP')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tests\test_emulator_portal_demo.py", line 47, in test_evil_and_rogue_sequence_all_rotations
+    self.sequence();job=self.page.evaluate('emulator.device.snapshot(0).active')
+    ~~~~~~~~~~~~~^^
+  File "C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tests\test_emulator_portal_demo.py", line 23, in sequence
+    self.assertIn('Waiting for a demo client',self.text())
+    ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 'Waiting for a demo client' not found in '\n\n\n\n\n\uf053\nRogue AP Attack\nTarget SSID: NEON-BAZAAR\n\nEnter WiFi Password:\n\n\nSelect Portal HTML:\n\n\n\uf011 Start Rogue AP\n\n\n#FF2FA3 LAB5# | control the chaos\n20:12\n\n\n\n4.00V (SIM)\n\n\n\uf070\n\n\uf013\n\n\n\n\uf1eb\nGROVE\n\n\n\uf124\nMBUS\n\n\n\uf013\nINTERNAL\n'
+
+======================================================================
+FAIL: test_evil_and_rogue_sequence_all_rotations (__main__.PortalDemoBrowser.test_evil_and_rogue_sequence_all_rotations) (rotation=1, label='Evil Twin')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tests\test_emulator_portal_demo.py", line 47, in test_evil_and_rogue_sequence_all_rotations
+    self.sequence();job=self.page.evaluate('emulator.device.snapshot(0).active')
+    ~~~~~~~~~~~~~^^
+  File "C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tests\test_emulator_portal_demo.py", line 23, in sequence
+    self.assertIn('Waiting for a demo client',self.text())
+    ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 'Waiting for a demo client' not found in '\n\n\n\n\n\n\uf053\nScan & Attack\n\n\nRESCAN\nFound 12 networks\n\n\n\n\nNEON-BAZAAR\n#5599FF 02:20:77:00:00:01#  |  #5599FF CH1#  |  #FFAA33 2.4GHz#  |  #00CCCC WPA2#  |  #55DD55 -38 dBm#  |  Vendor: -\n\n\n\nGHOST-LINE\n#5599FF 02:20:77:00:00:02#  |  #5599FF CH1#  |  #FFAA33 2.4GHz#  |  #00CCCC WPA2#  |  #55DD55 -47 dBm#  |  Vendor: -\n\n\n\nCHROME-CLINIC\n#5599FF 02:20:77:00:00:03#  |  #5599FF CH6#  |  #FFAA33 2.4GHz#  |  #55DD55 WPA2/WPA3 Mixed#  |  #FFAA00 -56 dBm#  |  Vendor: -\n\n\n\nBLACK-ICE\n#5599FF 02:20:77:00:00:04#  |  #5599FF CH36#  |  #CC66FF 5GHz#  |  #55DD55 WPA3#  |  #FFAA00 -65 dBm#  |  Vendor: -\n\n\n\nAFTERLIFE-GUEST\n#5599FF 02:20:77:00:00:05#  |  #5599FF CH11#  |  #FFAA33 2.4GHz#  |  #FF6666 Open#  |  #FF5555 -74 dBm#  |  Vendor: -\n\n\n\nSYNAPSE-RELAY\n#5599FF 02:20:77:00:00:06#  |  #5599FF CH44#  |  #CC66FF 5GHz#  |  #00CCCC WPA2#  |  #FF5555 -83 dBm#  |  Vendor: -\n\n\n\nNIGHT-CITY\n#5599FF 02:20:77:00:00:07#  |  #5599FF CH8#  |  #FFAA33 2.4GHz#  |  #00CCCC WPA2#  |  #FFAA00 -61 dBm#  |  Vendor: -\n\n\n\nVOODOO-BOYS\n#5599FF 02:20:77:00:00:08#  |  #5599FF CH9#  |  #FFAA33 2.4GHz#  |  #00CCCC WPA2#  |  #FFAA00 -64 dBm#  |  Vendor: -\n\n\n\nSAMURAI\n#5599FF 02:20:77:00:00:09#  |  #5599FF CH10#  |  #FFAA33 2.4GHz#  |  #00CCCC WPA2#  |  #FFAA00 -67 dBm#  |  Vendor: -\n\n\n\nBRAINDANCE\n#5599FF 02:20:77:00:00:0A#  |  #5599FF CH11#  |  #FFAA33 2.4GHz#  |  #00CCCC WPA2#  |  #FF5555 -70 dBm#  |  Vendor: -\n\n\n\nNETRUNNER\n#5599FF 02:20:77:00:00:0B#  |  #5599FF CH1#  |  #FFAA33 2.4GHz#  |  #00CCCC WPA2#  |  #FF5555 -73 dBm#  |  Vendor: -\n\n\n\nAFTERLIFE\n#5599FF 02:20:77:00:00:0C#  |  #5599FF CH2#  |  #FFAA33 2.4GHz#  |  #00CCCC WPA2#  |  #FF5555 -76 dBm#  |  Vendor: -\n\n\n\n\n\n\n\n\uf0e7\nDeauth\n\n\n\n\n\n\uf071\nEvil Twin\n\n\n\n\n\n\uf011\nSAE Overflow\n\n\n\n\n\n\uf019\nHandshake\n\n\n\n\n\n\uf074\nARP\n\n\n\n\n\n\uf06e\nRogueAP\n\n\n\n\n\n\uf0c5\nMITM\n\n\n\n\n\n\uf00b\nNmap\n\n\n\n\n\n\uf124\nRadar\n\n\n\n\n\n\uf079\nGITM\n\n\n\n\n\n\uf079\nRogue GITM\n\n\nEvil Twin Attack\n\nEvil Twin Network:\n\n\nPortal HTML:\n\n\nSTART ATTACK\n\nSelect network and portal, then click START ATTACK\n\nSTOP\n\n\n#FF2FA3 LAB5# | control the chaos\n20:12\n\n\n\n4.00V (SIM)\n\n\n\uf070\n\n\uf013\n\n\n\n\uf1eb\nGROVE\n\n\n\uf124\nMBUS\n\n\n\uf013\nINTERNAL\n'
+
+======================================================================
+FAIL: test_evil_and_rogue_sequence_all_rotations (__main__.PortalDemoBrowser.test_evil_and_rogue_sequence_all_rotations) (rotation=1, label='RogueAP')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tests\test_emulator_portal_demo.py", line 47, in test_evil_and_rogue_sequence_all_rotations
+    self.sequence();job=self.page.evaluate('emulator.device.snapshot(0).active')
+    ~~~~~~~~~~~~~^^
+  File "C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tests\test_emulator_portal_demo.py", line 23, in sequence
+    self.assertIn('Waiting for a demo client',self.text())
+    ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 'Waiting for a demo client' not found in '\n\n\n\n\n\uf053\nRogue AP Attack\nTarget SSID: NEON-BAZAAR\n\nEnter WiFi Password:\n\n\nSelect Portal HTML:\n\n\n\uf011 Start Rogue AP\n\n\n#FF2FA3 LAB5# | control the chaos\n20:12\n\n\n\n4.00V (SIM)\n\n\n\uf070\n\n\uf013\n\n\n\n\uf1eb\nGROVE\n\n\n\uf124\nMBUS\n\n\n\uf013\nINTERNAL\n'
+
+======================================================================
+FAIL: test_evil_and_rogue_sequence_all_rotations (__main__.PortalDemoBrowser.test_evil_and_rogue_sequence_all_rotations) (rotation=2, label='Evil Twin')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tests\test_emulator_portal_demo.py", line 47, in test_evil_and_rogue_sequence_all_rotations
+    self.sequence();job=self.page.evaluate('emulator.device.snapshot(0).active')
+    ~~~~~~~~~~~~~^^
+  File "C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tests\test_emulator_portal_demo.py", line 23, in sequence
+    self.assertIn('Waiting for a demo client',self.text())
+    ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 'Waiting for a demo client' not found in '\n\n\n\n\n\n\uf053\nScan & Attack\n\n\nRESCAN\nFound 12 networks\n\n\n\n\nNEON-BAZAAR\n#5599FF 02:20:77:00:00:01#  |  #5599FF CH1#  |  #FFAA33 2.4GHz#  |  #00CCCC WPA2#  |  #55DD55 -38 dBm#\nVendor: -\n\n\n\nGHOST-LINE\n#5599FF 02:20:77:00:00:02#  |  #5599FF CH1#  |  #FFAA33 2.4GHz#  |  #00CCCC WPA2#  |  #55DD55 -47 dBm#\nVendor: -\n\n\n\nCHROME-CLINIC\n#5599FF 02:20:77:00:00:03#  |  #5599FF CH6#  |  #FFAA33 2.4GHz#  |  #55DD55 WPA2/WPA3 Mixed#  |  #FFAA00 -56 dBm#\nVendor: -\n\n\n\nBLACK-ICE\n#5599FF 02:20:77:00:00:04#  |  #5599FF CH36#  |  #CC66FF 5GHz#  |  #55DD55 WPA3#  |  #FFAA00 -65 dBm#\nVendor: -\n\n\n\nAFTERLIFE-GUEST\n#5599FF 02:20:77:00:00:05#  |  #5599FF CH11#  |  #FFAA33 2.4GHz#  |  #FF6666 Open#  |  #FF5555 -74 dBm#\nVendor: -\n\n\n\nSYNAPSE-RELAY\n#5599FF 02:20:77:00:00:06#  |  #5599FF CH44#  |  #CC66FF 5GHz#  |  #00CCCC WPA2#  |  #FF5555 -83 dBm#\nVendor: -\n\n\n\nNIGHT-CITY\n#5599FF 02:20:77:00:00:07#  |  #5599FF CH8#  |  #FFAA33 2.4GHz#  |  #00CCCC WPA2#  |  #FFAA00 -61 dBm#\nVendor: -\n\n\n\nVOODOO-BOYS\n#5599FF 02:20:77:00:00:08#  |  #5599FF CH9#  |  #FFAA33 2.4GHz#  |  #00CCCC WPA2#  |  #FFAA00 -64 dBm#\nVendor: -\n\n\n\nSAMURAI\n#5599FF 02:20:77:00:00:09#  |  #5599FF CH10#  |  #FFAA33 2.4GHz#  |  #00CCCC WPA2#  |  #FFAA00 -67 dBm#\nVendor: -\n\n\n\nBRAINDANCE\n#5599FF 02:20:77:00:00:0A#  |  #5599FF CH11#  |  #FFAA33 2.4GHz#  |  #00CCCC WPA2#  |  #FF5555 -70 dBm#\nVendor: -\n\n\n\nNETRUNNER\n#5599FF 02:20:77:00:00:0B#  |  #5599FF CH1#  |  #FFAA33 2.4GHz#  |  #00CCCC WPA2#  |  #FF5555 -73 dBm#\nVendor: -\n\n\n\nAFTERLIFE\n#5599FF 02:20:77:00:00:0C#  |  #5599FF CH2#  |  #FFAA33 2.4GHz#  |  #00CCCC WPA2#  |  #FF5555 -76 dBm#\nVendor: -\n\n\n\n\n\n\n\n\uf0e7\nDeauth\n\n\n\n\n\n\uf071\nEvil Twin\n\n\n\n\n\n\uf011\nSAE Overflow\n\n\n\n\n\n\uf019\nHandshake\n\n\n\n\n\n\uf074\nARP\n\n\n\n\n\n\uf06e\nRogueAP\n\n\n\n\n\n\uf0c5\nMITM\n\n\n\n\n\n\uf00b\nNmap\n\n\n\n\n\n\uf124\nRadar\n\n\n\n\n\n\uf079\nGITM\n\n\n\n\n\n\uf079\nRogue GITM\n\n\nEvil Twin Attack\n\nEvil Twin Network:\n\n\nPortal HTML:\n\n\nSTART ATTACK\n\nSelect network and portal, then click START ATTACK\n\nSTOP\n\n\n#FF2FA3 LAB5# | control the chaos\n20:12\n\n\n\n4.00V (SIM)\n\n\n\uf070\n\n\uf013\n\n\n\n\uf1eb\nGROVE\n\n\n\uf124\nMBUS\n\n\n\uf013\nINTERNAL\n'
+
+======================================================================
+FAIL: test_evil_and_rogue_sequence_all_rotations (__main__.PortalDemoBrowser.test_evil_and_rogue_sequence_all_rotations) (rotation=2, label='RogueAP')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tests\test_emulator_portal_demo.py", line 47, in test_evil_and_rogue_sequence_all_rotations
+    self.sequence();job=self.page.evaluate('emulator.device.snapshot(0).active')
+    ~~~~~~~~~~~~~^^
+  File "C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tests\test_emulator_portal_demo.py", line 23, in sequence
+    self.assertIn('Waiting for a demo client',self.text())
+    ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 'Waiting for a demo client' not found in '\n\n\n\n\n\uf053\nRogue AP Attack\nTarget SSID: NEON-BAZAAR\n\nEnter WiFi Password:\n\n\nSelect Portal HTML:\n\n\n\uf011 Start Rogue AP\n\n\n#FF2FA3 LAB5# | control the chaos\n20:12\n\n\n\n4.00V (SIM)\n\n\n\uf070\n\n\uf013\n\n\n\n\uf1eb\nGROVE\n\n\n\uf124\nMBUS\n\n\n\uf013\nINTERNAL\n'
+
+======================================================================
+FAIL: test_evil_and_rogue_sequence_all_rotations (__main__.PortalDemoBrowser.test_evil_and_rogue_sequence_all_rotations) (rotation=3, label='Evil Twin')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tests\test_emulator_portal_demo.py", line 47, in test_evil_and_rogue_sequence_all_rotations
+    self.sequence();job=self.page.evaluate('emulator.device.snapshot(0).active')
+    ~~~~~~~~~~~~~^^
+  File "C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tests\test_emulator_portal_demo.py", line 23, in sequence
+    self.assertIn('Waiting for a demo client',self.text())
+    ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 'Waiting for a demo client' not found in '\n\n\n\n\n\n\uf053\nScan & Attack\n\n\nRESCAN\nFound 12 networks\n\n\n\n\nNEON-BAZAAR\n#5599FF 02:20:77:00:00:01#  |  #5599FF CH1#  |  #FFAA33 2.4GHz#  |  #00CCCC WPA2#  |  #55DD55 -38 dBm#  |  Vendor: -\n\n\n\nGHOST-LINE\n#5599FF 02:20:77:00:00:02#  |  #5599FF CH1#  |  #FFAA33 2.4GHz#  |  #00CCCC WPA2#  |  #55DD55 -47 dBm#  |  Vendor: -\n\n\n\nCHROME-CLINIC\n#5599FF 02:20:77:00:00:03#  |  #5599FF CH6#  |  #FFAA33 2.4GHz#  |  #55DD55 WPA2/WPA3 Mixed#  |  #FFAA00 -56 dBm#  |  Vendor: -\n\n\n\nBLACK-ICE\n#5599FF 02:20:77:00:00:04#  |  #5599FF CH36#  |  #CC66FF 5GHz#  |  #55DD55 WPA3#  |  #FFAA00 -65 dBm#  |  Vendor: -\n\n\n\nAFTERLIFE-GUEST\n#5599FF 02:20:77:00:00:05#  |  #5599FF CH11#  |  #FFAA33 2.4GHz#  |  #FF6666 Open#  |  #FF5555 -74 dBm#  |  Vendor: -\n\n\n\nSYNAPSE-RELAY\n#5599FF 02:20:77:00:00:06#  |  #5599FF CH44#  |  #CC66FF 5GHz#  |  #00CCCC WPA2#  |  #FF5555 -83 dBm#  |  Vendor: -\n\n\n\nNIGHT-CITY\n#5599FF 02:20:77:00:00:07#  |  #5599FF CH8#  |  #FFAA33 2.4GHz#  |  #00CCCC WPA2#  |  #FFAA00 -61 dBm#  |  Vendor: -\n\n\n\nVOODOO-BOYS\n#5599FF 02:20:77:00:00:08#  |  #5599FF CH9#  |  #FFAA33 2.4GHz#  |  #00CCCC WPA2#  |  #FFAA00 -64 dBm#  |  Vendor: -\n\n\n\nSAMURAI\n#5599FF 02:20:77:00:00:09#  |  #5599FF CH10#  |  #FFAA33 2.4GHz#  |  #00CCCC WPA2#  |  #FFAA00 -67 dBm#  |  Vendor: -\n\n\n\nBRAINDANCE\n#5599FF 02:20:77:00:00:0A#  |  #5599FF CH11#  |  #FFAA33 2.4GHz#  |  #00CCCC WPA2#  |  #FF5555 -70 dBm#  |  Vendor: -\n\n\n\nNETRUNNER\n#5599FF 02:20:77:00:00:0B#  |  #5599FF CH1#  |  #FFAA33 2.4GHz#  |  #00CCCC WPA2#  |  #FF5555 -73 dBm#  |  Vendor: -\n\n\n\nAFTERLIFE\n#5599FF 02:20:77:00:00:0C#  |  #5599FF CH2#  |  #FFAA33 2.4GHz#  |  #00CCCC WPA2#  |  #FF5555 -76 dBm#  |  Vendor: -\n\n\n\n\n\n\n\n\uf0e7\nDeauth\n\n\n\n\n\n\uf071\nEvil Twin\n\n\n\n\n\n\uf011\nSAE Overflow\n\n\n\n\n\n\uf019\nHandshake\n\n\n\n\n\n\uf074\nARP\n\n\n\n\n\n\uf06e\nRogueAP\n\n\n\n\n\n\uf0c5\nMITM\n\n\n\n\n\n\uf00b\nNmap\n\n\n\n\n\n\uf124\nRadar\n\n\n\n\n\n\uf079\nGITM\n\n\n\n\n\n\uf079\nRogue GITM\n\n\nEvil Twin Attack\n\nEvil Twin Network:\n\n\nPortal HTML:\n\n\nSTART ATTACK\n\nSelect network and portal, then click START ATTACK\n\nSTOP\n\n\n#FF2FA3 LAB5# | control the chaos\n20:12\n\n\n\n4.00V (SIM)\n\n\n\uf070\n\n\uf013\n\n\n\n\uf1eb\nGROVE\n\n\n\uf124\nMBUS\n\n\n\uf013\nINTERNAL\n'
+
+======================================================================
+FAIL: test_evil_and_rogue_sequence_all_rotations (__main__.PortalDemoBrowser.test_evil_and_rogue_sequence_all_rotations) (rotation=3, label='RogueAP')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tests\test_emulator_portal_demo.py", line 47, in test_evil_and_rogue_sequence_all_rotations
+    self.sequence();job=self.page.evaluate('emulator.device.snapshot(0).active')
+    ~~~~~~~~~~~~~^^
+  File "C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tests\test_emulator_portal_demo.py", line 23, in sequence
+    self.assertIn('Waiting for a demo client',self.text())
+    ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 'Waiting for a demo client' not found in '\n\n\n\n\n\uf053\nRogue AP Attack\nTarget SSID: NEON-BAZAAR\n\nEnter WiFi Password:\n\n\nSelect Portal HTML:\n\n\n\uf011 Start Rogue AP\n\n\n#FF2FA3 LAB5# | control the chaos\n20:12\n\n\n\n4.00V (SIM)\n\n\n\uf070\n\n\uf013\n\n\n\n\uf1eb\nGROVE\n\n\n\uf124\nMBUS\n\n\n\uf013\nINTERNAL\n'
+
+----------------------------------------------------------------------
+Ran 4 tests in 16.326s
+
+FAILED (failures=9)

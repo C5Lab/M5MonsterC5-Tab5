@@ -1,0 +1,6 @@
+{
+  "show_observer_exit_confirm": "retain",
+  "close_observer_exit_confirm": "retain",
+  "observer_exit_cancel_cb": "retain",
+  "observer_exit_confirm_cb": "adapter"
+}

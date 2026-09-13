@@ -1,0 +1,30 @@
+flowchart LR
+    boot["Firmware boot"]
+    splash["Boot intro"]
+    no_board["No-board modal"]
+    shell["Persistent tab shell"]
+    uart["Grove / USB dashboard"]
+    mbus["M-BUS dashboard"]
+    internal["Internal tools"]
+    wifi["Wi-Fi operations"]
+    data["Compromised data / PCAP"]
+    bt["Bluetooth"]
+    subghz["Sub-GHz"]
+    settings["Device settings"]
+    boot -- "automatic: initialize LVGL" --> splash
+    splash -. "conditional: no Monster detected" .-> no_board
+    splash -- "automatic: board detected" --> shell
+    shell -- "tap Grove / USB tab" --> uart
+    shell -- "tap M-BUS tab" --> mbus
+    shell -- "tap Internal tab" --> internal
+    uart -- "tap WiFi / attacks / observer" --> wifi
+    uart -- "tap Compromised Data" --> data
+    uart -- "tap Bluetooth" --> bt
+    uart -- "tap Sub-GHz" --> subghz
+    internal -- "tap Settings" --> settings
+    classDef screen fill:#111827,color:#f9fafb,stroke:#7dd3fc,stroke-width:1.5px;
+    classDef popup fill:#2a2036,color:#f9fafb,stroke:#d8b4fe,stroke-width:1.5px;
+    classDef condition fill:#3a2d12,color:#fff7d6,stroke:#f2b84b,stroke-width:1.5px;
+    class boot,splash,shell,uart,mbus,internal,home,hub,scan,observer,global,data,bt,subghz,settings,analysis,local,remote screen;
+    class no_board,net_popup,client_popup,deauth,evil,sae,handshake,mitm,rogue_gitm,blackout,sniffer,global_hs,portal,transfer,packet,summary,flows,entities,health,map,tools,objects,delete,scan_cfg,red,timeout,brightness,rotation,theme,time,lock,ota,sdadmin,baud,listen_action,listen_leave,tx_warn,hunter_action,hunter_leave,manage_action,rename,repeat popup;
+    class sd condition;

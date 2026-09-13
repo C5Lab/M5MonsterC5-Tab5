@@ -1,0 +1,20 @@
+{
+  "sd_admin_state_name": "retain",
+  "sd_admin_set_status": "retain",
+  "sd_admin_hide_qr": "retain",
+  "sd_admin_refresh_ui": "retain",
+  "sd_admin_return_to_settings": "retain",
+  "sd_admin_keyboard_cb": "retain",
+  "sd_admin_password_focus_cb": "retain",
+  "sd_admin_show_password_toggle_cb": "retain",
+  "sd_admin_password_insert_cb": "retain",
+  "sd_admin_start_cb": "retain",
+  "sd_admin_quick_start_cb": "retain",
+  "show_sd_admin_page": "adapter",
+  "sd_admin_back_cb": "adapter",
+  "sd_admin_start_with_password": "adapter",
+  "sd_admin_stop_cb": "adapter",
+  "sd_admin_leave_keep_cb": "adapter",
+  "sd_admin_leave_stop_cb": "adapter",
+  "sd_admin_resolve_target_tab": "adapter"
+}

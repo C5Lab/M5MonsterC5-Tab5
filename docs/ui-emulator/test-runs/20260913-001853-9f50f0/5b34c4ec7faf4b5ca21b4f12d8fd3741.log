@@ -1,0 +1,9 @@
+test_cancel_before_submission_and_reset (__main__.PortalDemoBrowser.test_cancel_before_submission_and_reset) ... ok
+test_chrome_clinic_without_seeded_client_completes (__main__.PortalDemoBrowser.test_chrome_clinic_without_seeded_client_completes) ... ok
+test_evil_and_rogue_sequence_all_rotations (__main__.PortalDemoBrowser.test_evil_and_rogue_sequence_all_rotations) ... ok
+test_internal_portal_sequence_stop_and_reopen (__main__.PortalDemoBrowser.test_internal_portal_sequence_stop_and_reopen) ... ok
+
+----------------------------------------------------------------------
+Ran 4 tests in 18.704s
+
+OK

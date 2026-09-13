@@ -1,0 +1,107 @@
+{
+  "status": "passed",
+  "recorded_at": "2026-09-13T18:18:00.998057+00:00",
+  "checks": [
+    {
+      "command": [
+        "C:\\Users\\mati\\Documents\\GitHub\\M5MonsterC5-Tab5\\tools\\ui_emulator\\.venv\\Scripts\\python.exe",
+        "tests/verify_emulator_phase4_wardrive.py"
+      ],
+      "exit_code": 0,
+      "output": "EXEC C:\\Users\\mati\\Documents\\GitHub\\M5MonsterC5-Tab5\\tools\\ui_emulator\\.venv\\Scripts\\python.exe tests/verify_emulator_phase4_bluetooth.py\nEXEC C:\\Users\\mati\\Documents\\GitHub\\M5MonsterC5-Tab5\\tools\\ui_emulator\\.venv\\Scripts\\python.exe tests/verify_emulator_phase3.py\nEXEC C:\\Users\\mati\\Documents\\GitHub\\M5MonsterC5-Tab5\\tools\\ui_emulator\\.venv\\Scripts\\python.exe tests/verify_emulator_phase2.py\nEXEC C:\\Users\\mati\\Documents\\GitHub\\M5MonsterC5-Tab5\\tools\\ui_emulator\\.venv\\Scripts\\python.exe tests/test_emulator_slice.py\n.653 retained production functions; 191 explicit boundaries\n..\n----------------------------------------------------------------------\nRan 3 tests in 2.610s\n\nOK\nPASS tests/test_emulator_slice.py\nEXEC C:\\Users\\mati\\Documents\\GitHub\\M5MonsterC5-Tab5\\tools\\ui_emulator\\.venv\\Scripts\\python.exe tests/test_emulator_contracts.py\n......\n----------------------------------------------------------------------\nRan 6 tests in 0.001s\n\nOK\nPASS tests/test_emulator_contracts.py\nEXEC node --test tests/test_emulator_input.mjs\n\u2714 one pointer owns a gesture; cancellation releases its last position exactly once (0.8524ms)\n\u2714 CSS scaling maps to logical pixels without applying rotation twice (0.1209ms)\n\u2714 captured pointer outside Canvas clamps to valid display pixels (0.2183ms)\n\u2714 RGB565 framebuffer preserves primary colors and opaque alpha (0.1079ms)\n\u2139 tests 4\n\u2139 suites 0\n\u2139 pass 4\n\u2139 fail 0\n\u2139 cancelled 0\n\u2139 skipped 0\n\u2139 todo 0\n\u2139 duration_ms 58.4254\nPASS tests/test_emulator_input.mjs\nEXEC C:\\Users\\mati\\Documents\\GitHub\\M5MonsterC5-Tab5\\tools\\ui_emulator\\.venv\\Scripts\\python.exe tests/test_emulator_browser.py\nNavigation, scan and Settings passed: 0 1440\nNavigation, scan and Settings passed: 1 1440\nNavigation, scan and Settings passed: 2 1440\nNavigation, scan and Settings passed: 3 1440\nNavigation, scan and Settings passed: 0 390\nNavigation, scan and Settings passed: 1 390\nNavigation, scan and Settings passed: 2 390\nNavigation, scan and Settings passed: 3 390\nPASS tests/test_emulator_browser.py\nEXEC C:\\Users\\mati\\Documents\\GitHub\\M5MonsterC5-Tab5\\tools\\ui_emulator\\.venv\\Scripts\\python.exe tests/test_emulator_phase2.py\nWAIT 30s: C:\\Users\\mati\\Documents\\GitHub\\M5MonsterC5-Tab5\\tools\\ui_emulator\\.venv\\Scripts\\python.exe tests/verify_emulator_phase4_bluetooth.py\nWAIT 30s: C:\\Users\\mati\\Documents\\GitHub\\M5MonsterC5-Tab5\\tools\\ui_emulator\\.venv\\Scripts\\python.exe tests/verify_emulator_phase3.py\nWAIT 30s: C:\\Users\\mati\\Documents\\GitHub\\M5MonsterC5-Tab5\\tools\\ui_emulator\\.venv\\Scripts\\python.exe tests/verify_emulator_phase2.py\n......\n----------------------------------------------------------------------\nRan 6 tests in 21.331s\n\nOK\nPASS tests/test_emulator_phase2.py\nEXEC C:\\Users\\mati\\Documents\\GitHub\\M5MonsterC5-Tab5\\tools\\ui_emulator\\.venv\\Scripts\\python.exe tests/test_emulator_settings.py\n.....\n----------------------------------------------------------------------\nRan 5 tests in 7.007s\n\nOK\nPASS tests/test_emulator_settings.py\nEXEC C:\\Users\\mati\\Documents\\GitHub\\M5MonsterC5-Tab5\\tools\\ui_emulator\\.venv\\Scripts\\python.exe tests/test_emulator_performance.py\ndesktop profile measured\nWAIT 60s: C:\\Users\\mati\\Documents\\GitHub\\M5MonsterC5-Tab5\\tools\\ui_emulator\\.venv\\Scripts\\python.exe tests/verify_emulator_phase4_bluetooth.py\nWAIT 60s: C:\\Users\\mati\\Documents\\GitHub\\M5MonsterC5-Tab5\\tools\\ui_emulator\\.venv\\Scripts\\python.exe tests/verify_emulator_phase3.py\nWAIT 60s: C:\\Users\\mati\\Documents\\GitHub\\M5MonsterC5-Tab5\\tools\\ui_emulator\\.venv\\Scripts\\python.exe tests/verify_emulator_phase2.py\nmobile profile measured\nPASS tests/test_emulator_performance.py\nPASS tests/verify_emulator_phase2.py\nEXEC node --test tests/test_emulator_device.mjs\n\u2714 module captures have distinct paths when copied to the shared analysis filesystem (3.7101ms)\n\u2714 PCAP packet timestamps carry into seconds rather than overflowing microseconds (3.6174ms)\n\u2714 scan selection and clients use the seed identities, independently for each module (2.1202ms)\n\u2714 cancelled captures cannot create files; reset makes all previous job IDs stale (1.0964ms)\n\u2714 completed capture stores valid PCAP bytes for the selected network and clients (0.9494ms)\n\u2714 missing/full SD and missing clients fail explicitly without committing a file (0.9527ms)\n\u2714 Bluetooth respects connection state, explicit time zero and immutable discovery snapshots (0.5149ms)\n\u2714 disconnect cancels work, snapshots cannot mutate the model, invalid clocks are rejected (0.424ms)\n\u2139 tests 8\n\u2139 suites 0\n\u2139 pass 8\n\u2139 fail 0\n\u2139 cancelled 0\n\u2139 skipped 0\n\u2139 todo 0\n\u2139 duration_ms 141.3947\nPASS tests/test_emulator_device.mjs\nEXEC node --test tests/test_emulator_bridge.mjs\n\u2714 Observer discovers independently and its targets work without a WiFi scan (3.6019ms)\n\u2714 C boundary scan rows preserve scenario identities and cancellation (0.8823ms)\n\u2139 tests 2\n\u2139 suites 0\n\u2139 pass 2\n\u2139 fail 0\n\u2139 cancelled 0\n\u2139 skipped 0\n\u2139 todo 0\n\u2139 duration_ms 87.2133\nPASS tests/test_emulator_bridge.mjs\nEXEC C:\\Users\\mati\\Documents\\GitHub\\M5MonsterC5-Tab5\\tools\\ui_emulator\\.venv\\Scripts\\python.exe tests/run_emulator_capture_tests.py\nPASS: production PCAP reader parsed three synthetic ARP frames, selected AP and all three clients\nPASS tests/run_emulator_capture_tests.py\nEXEC C:\\Users\\mati\\Documents\\GitHub\\M5MonsterC5-Tab5\\tools\\ui_emulator\\.venv\\Scripts\\python.exe tests/test_emulator_phase3.py\nPASS tests/test_emulator_phase3.py\nEXEC C:\\Users\\mati\\Documents\\GitHub\\M5MonsterC5-Tab5\\tools\\ui_emulator\\.venv\\Scripts\\python.exe tests/test_emulator_lifecycle.py\n....\n----------------------------------------------------------------------\nRan 4 tests in 6.211s\n\nOK\nPASS tests/test_emulator_lifecycle.py\nPASS tests/verify_emulator_phase3.py\nEXEC C:\\Users\\mati\\Documents\\GitHub\\M5MonsterC5-Tab5\\tools\\ui_emulator\\.venv\\Scripts\\python.exe tests/test_emulator_phase4_bluetooth.py\nPASS tests/test_emulator_phase4_bluetooth.py\nEXEC C:\\Users\\mati\\Documents\\GitHub\\M5MonsterC5-Tab5\\tools\\ui_emulator\\.venv\\Scripts\\python.exe tests/test_emulator_bluetooth_lifecycle.py\n....\n----------------------------------------------------------------------\nRan 4 tests in 3.551s\n\nOK\nPASS tests/test_emulator_bluetooth_lifecycle.py\nPASS tests/verify_emulator_phase4_bluetooth.py\nEXEC node --test tests/test_emulator_wardrive.mjs\n\u2714 Bluetooth blacklist affects only its module and WiFi picker returns immutable seed snapshots (2.0765ms)\n\u2714 native upload selection, pending and force-all modes preserve provider and module isolation (1.6979ms)\n\u2714 Wardrive acquires GPS and discovers seed identities deterministically regardless of tick size (0.7628ms)\n\u2714 Stop commits a session once, frees radio, upload outcomes are simulated and retry only pending sessions (0.6023ms)\n\u2714 Disconnect and cancellation cannot later save stale sessions; reset clears all state (0.4287ms)\n\u2714 SD errors never commit partial session metadata and do not leave the radio busy (0.2934ms)\n\u2714 GPS loss freezes track until restored, isolated by module; empty scenarios stay empty (0.3245ms)\n\u2714 Configured GPS coordinates are used and long sessions retain a bounded recent track (0.9237ms)\n\u2139 tests 8\n\u2139 suites 0\n\u2139 pass 8\n\u2139 fail 0\n\u2139 cancelled 0\n\u2139 skipped 0\n\u2139 todo 0\n\u2139 duration_ms 69.9433\nPASS tests/test_emulator_wardrive.mjs\nEXEC C:\\Users\\mati\\Documents\\GitHub\\M5MonsterC5-Tab5\\tools\\ui_emulator\\.venv\\Scripts\\python.exe tests/test_emulator_phase4_wardrive.py\n.....\n----------------------------------------------------------------------\nRan 5 tests in 7.184s\n\nOK\nPASS tests/test_emulator_phase4_wardrive.py\n"
+    },
+    {
+      "command": [
+        "node",
+        "--test",
+        "tests/test_emulator_pcap_deep.mjs",
+        "tests/test_emulator_files.mjs"
+      ],
+      "exit_code": 0,
+      "output": "\u2714 virtual artifact transactions validate paths and roll back quota failures (1.4533ms)\n\u2714 wardrive cleanup previews, then archives only sessions done on both services (1.1416ms)\n\u2714 artifact writes are detached and module isolated (0.2215ms)\n\u2714 unavailable or busy module rejects an entire artifact mutation (0.3086ms)\n\u2714 example installation is explicit, deterministic, isolated and idempotent (2.0707ms)\n\u2714 fixture storage guards never partially install files (0.7043ms)\n\u2714 fixture capacity includes existing captures and exact capacity permits repeat installation (1.583ms)\n\u2714 example frames have valid IPv4 and transport lengths and checksums (0.6704ms)\n\u2139 tests 8\n\u2139 suites 0\n\u2139 pass 8\n\u2139 fail 0\n\u2139 cancelled 0\n\u2139 skipped 0\n\u2139 todo 0\n\u2139 duration_ms 69.915\n"
+    },
+    {
+      "command": [
+        "C:\\Users\\mati\\Documents\\GitHub\\M5MonsterC5-Tab5\\tools\\ui_emulator\\.venv\\Scripts\\python.exe",
+        "tests/test_emulator_sha256.py"
+      ],
+      "exit_code": 0,
+      "output": "PASS: 8 SHA-256 vectors, streaming chunks and padding boundaries, ASan/UBSan\n"
+    },
+    {
+      "command": [
+        "C:\\Users\\mati\\Documents\\GitHub\\M5MonsterC5-Tab5\\tools\\ui_emulator\\.venv\\Scripts\\python.exe",
+        "tests/test_emulator_phase4_pcap_deep.py"
+      ],
+      "exit_code": 0,
+      "output": "test_file_pages_back_after_switching_sources (__main__.PcapDeepBrowser.test_file_pages_back_after_switching_sources) ... ok\ntest_full_storage_shows_error_without_partial_install (__main__.PcapDeepBrowser.test_full_storage_shows_error_without_partial_install) ... ok\ntest_invalid_capture_shows_native_error (__main__.PcapDeepBrowser.test_invalid_capture_shows_native_error) ... ok\ntest_native_deep_views (__main__.PcapDeepBrowser.test_native_deep_views) ... ok\ntest_native_http_object_export_preserves_capture (__main__.PcapDeepBrowser.test_native_http_object_export_preserves_capture) ... ok\n\n----------------------------------------------------------------------\nRan 5 tests in 6.492s\n\nOK\n"
+    }
+  ],
+  "limitations": [
+    "Synthetic offline PCAPs and virtual SD; no physical device or radio validation",
+    "Wardrive Fix rejects JSON simulator sessions: native CSV repair is not simulated",
+    "Chromium only; manual file-dialog acceptance remains required"
+  ],
+  "download_bytes": {
+    "app.mjs": 13669,
+    "display.mjs": 1288,
+    "emulator.js": 126350,
+    "emulator.wasm": 1681096,
+    "index.html": 4875,
+    "model/attacks.mjs": 5303,
+    "model/bridge.mjs": 2594,
+    "model/device.mjs": 28803,
+    "model/nettools.mjs": 4946,
+    "model/pcap-deep.mjs": 4606,
+    "model/pcap.mjs": 1563,
+    "pcap-story.mjs": 4366,
+    "persistence.mjs": 2944,
+    "portal-story.mjs": 4012,
+    "queue2-attacks.mjs": 7662,
+    "queue2-common.mjs": 1279,
+    "queue2-nettools.mjs": 7046,
+    "queue2-system.mjs": 7636,
+    "queue2-wardrive.mjs": 13953,
+    "recon-stories.mjs": 5692,
+    "scenario.json": 13404,
+    "settings-s18.mjs": 4491,
+    "settings-s19.mjs": 6763,
+    "settings-s20.mjs": 4018,
+    "startup-story.mjs": 4295,
+    "stories.mjs": 9763,
+    "story-restart.mjs": 786,
+    "style.css": 3458,
+    "wifi-stories.mjs": 7300
+  },
+  "artifact_sha256": {
+    "app.mjs": "3adbe65a23412369dcbae95e240983e97e2110f6e4636b03133a15b0e9584497",
+    "display.mjs": "8fd915df5b8dd7f38d2e29fc80bf9cf9c2afd54f8466ba99e4928b6490f865d3",
+    "emulator.js": "d1d54e619310d27506098eaa205bbef4425fd6448374e552e461e366b81c2155",
+    "emulator.wasm": "8937f36e124efecfdc43f0fd38a4ff1d1b91eb1b1ba2897136b3a930c2e35b65",
+    "index.html": "356a789516a2678373912ed2ef6ffebda72a21b42e1ff7e0eba03b261f74e5ae",
+    "model/attacks.mjs": "5814cffece99efe9076e8bbe6e2f63a6e1317ef84214bbc5f9bd12718694938f",
+    "model/bridge.mjs": "7ce7d94c5d5960f57ec439e6243012ed78471496bcbf273fb3f95a782932b02f",
+    "model/device.mjs": "7b471b5e69e3ab2d0d54aa7a469f3fe7c6abbb3d1337326fa2af3c60193b16ec",
+    "model/nettools.mjs": "61538946098a0da2910caecdeff98b325c94ef1c9a7bc4d8c21345899cd84623",
+    "model/pcap-deep.mjs": "99e3d25cfb5ed768ccdd03b4447ae0cfe4f0804abe192ec5011ce786341b783a",
+    "model/pcap.mjs": "bb754971c4e534a38c974c07ea815046a260c284aabdac051e7abc0581c3d591",
+    "pcap-story.mjs": "6d74f275bf1333f6866427a2302305fcfe609e5bb9dbdba6cc8642ce314f8db6",
+    "persistence.mjs": "cea73f05fb8e10e58ad09dfef993551e9f5f6769c5c390aa12e6618b8bf0a5fc",
+    "portal-story.mjs": "4bfb39c13d90724e4781ae1aa8dd886b24f74dfb15b4c552b0a13a53025b89dc",
+    "queue2-attacks.mjs": "2dfedddbbc4493f4075f1a10dc03cbcaff55f18897e9a7827c2fde8215ec3031",
+    "queue2-common.mjs": "97c7cc3d6261b37282cf3247ef92d3cad926519684eb7dd03e3530790478cb52",
+    "queue2-nettools.mjs": "f512cbe0157e141d80f099ce3ee1db487c90abe4c73f476e230a50ba060ca2f2",
+    "queue2-system.mjs": "c9ef995af625ed5478cb7859ccfbd3f836c4126b1ae68b083a1df3c5523df4fb",
+    "queue2-wardrive.mjs": "6825eaf49ccc2fcf92fde534798207e0ab03d2f360b91306fe99818ecdcc1412",
+    "recon-stories.mjs": "32f597b6f8d36ddb7b2b556e48f61c80a38f98d48cbbea6a803939d60205da9b",
+    "scenario.json": "a2862050d87adb855250d96906bf6404138fe04dfbc772e107d2358721342711",
+    "settings-s18.mjs": "e638d60639e2c4e1fc1a0aaa60a9126b286d917af95a66412c21931827ee5300",
+    "settings-s19.mjs": "1bde9025e3c0c19015c27a50790a2e4e753fe61088c20d9902f8c5fe9cf51ded",
+    "settings-s20.mjs": "82541c1c978c8d12215f45c65d04ba547620bef4eb3cedc48c9787117b869295",
+    "startup-story.mjs": "5ece1a8c4f4aff934f0594d25e27c1d4be16a2eceed79c21ce19ce138c48fc96",
+    "stories.mjs": "1e7d071ec56b862ddd4ae66e5c28936c0ddce920cc4beb484422cd32292c5d90",
+    "story-restart.mjs": "c6fd126ca9e76de0270c9c0581eca9b65bc1b8ef43afbf0289dbcc41f34852a1",
+    "style.css": "abaf75223da73bd49b15820670162dd5414513607e660788b3f5c38bd79c1da5",
+    "wifi-stories.mjs": "e5e87419b2d18501dccdecf0b0b92500309946a4379bb48631bac5176a95b219"
+  }
+}

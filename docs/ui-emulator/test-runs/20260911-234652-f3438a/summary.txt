@@ -1,0 +1,47 @@
+
+TEST SUMMARY
+==============================================================================
+phase4_attacks
+  PASS          114.31s  verify_emulator_phase4_nettools.py
+  PASS            0.14s  test_emulator_attacks.mjs
+  FAIL           12.53s  test_emulator_phase4_attacks.py
+phase4_nettools
+  PASS          102.84s  verify_emulator_phase4_pcap_deep.py
+  PASS            0.14s  test_emulator_nettools.mjs
+  PASS            0.09s  test_emulator_slice_tokens.py
+  PASS           11.04s  test_emulator_phase4_nettools.py
+phase4_pcap_deep
+  PASS           92.92s  verify_emulator_phase4_wardrive.py
+  PASS            0.16s  test_emulator_pcap_deep.mjs test_emulator_files.mjs
+  PASS            2.95s  test_emulator_sha256.py
+  PASS            6.65s  test_emulator_phase4_pcap_deep.py
+phase4_wardrive
+  PASS           85.08s  verify_emulator_phase4_bluetooth.py
+  PASS            0.14s  test_emulator_wardrive.mjs
+  PASS            7.51s  test_emulator_phase4_wardrive.py
+phase4_bluetooth
+  PASS           79.90s  verify_emulator_phase3.py
+  PASS            1.36s  test_emulator_phase4_bluetooth.py
+  PASS            3.65s  test_emulator_bluetooth_lifecycle.py
+phase3
+  PASS           66.33s  verify_emulator_phase2.py
+  PASS            0.13s  test_emulator_device.mjs
+  PASS            0.13s  test_emulator_bridge.mjs
+  PASS            2.21s  run_emulator_capture_tests.py
+  PASS            2.29s  test_emulator_phase3.py
+  PASS            8.65s  test_emulator_lifecycle.py
+phase2
+  PASS            1.86s  test_emulator_slice.py
+  PASS            0.10s  test_emulator_contracts.py
+  PASS            0.12s  test_emulator_input.mjs
+  PASS           20.82s  test_emulator_browser.py
+  PASS           22.24s  test_emulator_phase2.py
+  PASS            7.02s  test_emulator_settings.py
+  PASS           14.00s  test_emulator_performance.py
+------------------------------------------------------------------------------
+Result: FAIL | scripts PASS: 23 | FAIL/ERROR: 1
+Total elapsed: 127.07s
+Section wrapper times include their children; do not add them together.
+Run incomplete: checks after the failure may NOT HAVE RUN. Missing entries are not passes.
+Failure log: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\docs\ui-emulator\test-runs\20260911-234652-f3438a\d7ff43b0466340d3bf044c3ac517e617.log
+Report: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\docs\ui-emulator\test-runs\20260911-234652-f3438a\summary.json
