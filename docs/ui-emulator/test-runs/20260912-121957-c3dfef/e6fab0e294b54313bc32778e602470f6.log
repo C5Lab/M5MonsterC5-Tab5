@@ -1,0 +1,27 @@
+test_disconnected_flags_nothing (__main__.AntiSurvBrowser.test_disconnected_flags_nothing) ... ok
+test_start_flags_followers_then_stop_summary (__main__.AntiSurvBrowser.test_start_flags_followers_then_stop_summary) ... ok
+test_back_while_running_stops_detection (__main__.DeauthDetectorBrowser.test_back_while_running_stops_detection) ... ok
+test_disconnected_module_detects_nothing (__main__.DeauthDetectorBrowser.test_disconnected_module_detects_nothing) ... ok
+test_start_detects_and_stop_freezes (__main__.DeauthDetectorBrowser.test_start_detects_and_stop_freezes) ... ok
+test_handshaker_captures_and_closes (__main__.HandshakerBrowser.test_handshaker_captures_and_closes) ... FAIL
+
+======================================================================
+FAIL: test_handshaker_captures_and_closes (__main__.HandshakerBrowser.test_handshaker_captures_and_closes)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tests\test_emulator_phase4_detectors.py", line 179, in test_handshaker_captures_and_closes
+    self.assertEqual(page.evaluate('unavailable'), [])
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: Lists differ: ['alert_chime_play'] != []
+
+First list contains 1 additional elements.
+First extra element 0:
+'alert_chime_play'
+
+- ['alert_chime_play']
++ []
+
+----------------------------------------------------------------------
+Ran 6 tests in 12.123s
+
+FAILED (failures=1)

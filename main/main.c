@@ -22,6 +22,8 @@
 #include "freertos/timers.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
+#include "esp_private/esp_clk.h"
+#include "esp_rom_crc.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "driver/uart.h"
@@ -41,6 +43,9 @@
 #include "usb/usb_types_ch9.h"
 #include "screens/subghz_host.h"
 #include "screens/cgw_parser.h"
+#include "scan_filter.h"
+#include "app_power_manager.h"
+#include "app_power_telemetry.h"
 
 // ESP-Hosted includes for WiFi via ESP32C6 SDIO
 #include "esp_hosted.h"
@@ -48,6 +53,7 @@
 #include "esp_netif.h"
 #include "esp_event.h"
 #include "esp_system.h"
+#include "esp_timer.h"
 #include "esp_vfs_fat.h"
 #include "janos_file_transfer.h"
 #include "pcap_reader.h"
@@ -56,6 +62,14 @@
 #include "pcap_analysis_store.h"
 #include "pcap_investigation.h"
 #include "pcap_extract.h"
+
+// WPA handshake dictionary cracker (on-device, trivial-password check)
+#include "mbedtls/pkcs5.h"
+#include "mbedtls/md.h"
+#include "mbedtls/platform_util.h"
+#include "hs_crack_crypto.h"
+#include <stdatomic.h>
+#include "freertos/queue.h"
 
 // Captive portal includes
 #include "esp_http_server.h"
@@ -75,8 +89,8 @@ extern void pthread_internal_local_storage_destructor_callback(TaskHandle_t hand
 #endif
 
 
-#define JANOS_TAB_VERSION "1.5.3"
-#define JANOS_VERSION_REQUIRED "1.7.2"
+#define JANOS_TAB_VERSION "1.5.4"
+#define JANOS_VERSION_REQUIRED "1.7.4"
 
 #include "lwip/netdb.h"
 #include <dirent.h>
@@ -99,6 +113,21 @@ static lv_font_t *ssid_utf8_cached_font = NULL;
 #define UART_BAUD_RATE    115200
 #define UART_BUF_SIZE     4096
 #define UART_RX_TIMEOUT   30000  // 30 seconds timeout for scan
+
+// RX ring for the two external consoles. Both can carry a JanOS file transfer,
+// and the ring is what absorbs the line while the receive loop is busy with a
+// CRC, an SD write, or simply not scheduled - so what it has to cover is the
+// worst stall, not one block.
+//
+// Sized from measurement rather than from the block: at 16 KiB a transfer at
+// 921600 dropped bytes the moment the backlight came back on (16 KiB is 178 ms
+// there), and at 3 MBaud - 55 ms of headroom - 11% of all blocks came up short.
+// 64 KiB buys 218 ms even at 3 MBaud, which covers the UI events that were
+// visibly causing it. The ring lands in PSRAM on this build
+// (CONFIG_SPIRAM_USE_MALLOC with no always-internal threshold, confirmed by
+// internal free not moving when this last changed), so the cost is PSRAM the
+// board has 26 MB of.
+#define UART_RX_RING_SIZE 65536
 
 // ESP Modem configuration (configurable pins for future external ESP32C5)
 #define ESP_MODEM_UART_TX_PIN  GPIO_NUM_37
@@ -219,6 +248,22 @@ typedef struct {
     char uptime[64];
     bool inspected;
 } observer_network_t;
+
+// LVGL handles for one Observer network tile. The data model lives in
+// observer_network_t; these handles let periodic polls update only the tile
+// whose client list changed instead of deleting and rebuilding the whole list.
+typedef struct {
+    lv_obj_t *tile;
+    lv_obj_t *ssid_label;
+    lv_obj_t *saved_badge;
+    lv_obj_t *summary_label;
+    lv_obj_t *info_label;
+    lv_obj_t *client_toggle;
+    lv_obj_t *client_toggle_label;
+    lv_obj_t *client_container;
+    int rendered_client_count;
+    bool clients_expanded;
+} observer_network_ui_t;
 
 // Deauth Detector entry
 #define DEAUTH_DETECTOR_MAX_ENTRIES 200
@@ -656,12 +701,24 @@ typedef struct {
     lv_obj_t *scan_status_label;
     lv_obj_t *network_list;
     lv_obj_t *spinner;
+    lv_obj_t *network_rows[MAX_NETWORKS];
+    lv_obj_t *scan_filter_btn_label;
+    lv_obj_t *scan_filter_summary_label;
+    lv_obj_t *scan_filter_overlay;
+    lv_obj_t *scan_filter_sort_dd;
+    lv_obj_t *scan_filter_order_dd;
+    lv_obj_t *scan_filter_ssid_input;
+    lv_obj_t *scan_filter_visibility_dd;
+    lv_obj_t *scan_filter_security_cb[7];
+    lv_obj_t *scan_filter_keyboard;
+    scan_filter_options_t scan_filter;
 
     wifi_network_t *networks;           // PSRAM
     int network_count;
     int selected_indices[MAX_NETWORKS];
     int selected_count;
     bool scan_in_progress;
+    bool scan_last_timed_out;
     bool observer_attack_override_active;
     bool observer_attack_return_to_observer;
     wifi_network_t observer_attack_network;
@@ -742,6 +799,8 @@ typedef struct {
     lv_obj_t *handshaker_stop_btn;       // STOP/DONE button
     lv_obj_t *handshaker_stop_label;     // STOP/DONE label
     lv_obj_t *handshaker_wpasec_btn;     // "Send to wpa-sec" button (shown on success)
+    lv_obj_t *handshaker_result_actions;
+    char handshaker_saved_pcap[WARDRIVE_WIGLE_PATH_MAX];
     char handshaker_log_buffer[2048];    // Accumulated log messages
     bool handshaker_capture_success;      // True when capture/already-captured was detected
     volatile bool handshaker_monitoring;
@@ -758,7 +817,9 @@ typedef struct {
     lv_obj_t *observer_status_label;
 
     observer_network_t *observer_networks;  // PSRAM
+    observer_network_ui_t *observer_network_ui;  // PSRAM, LVGL handles per network
     int observer_network_count;
+    bool observer_ui_refresh_pending;
     bool observer_running;
     volatile bool observer_start_active;
     bool observer_page_visible;
@@ -849,6 +910,7 @@ typedef struct {
     lv_obj_t *wardrive_gps_popup;
     lv_obj_t *wardrive_gps_label;
     volatile bool wardrive_monitoring;
+    atomic_bool wardrive_ui_dirty;
     // Bumped by every explicit stop and every start. The monitor task captures it
     // on entry and exits as soon as it no longer matches, which is what keeps a
     // stop/start cycle from ending up with two tasks on one UART: clearing
@@ -1802,6 +1864,186 @@ static void style_popup_card(lv_obj_t *popup, lv_coord_t radius, lv_color_t acce
     lv_obj_set_style_shadow_opa(popup, dark_mode_enabled ? LV_OPA_30 : LV_OPA_20, 0);
 }
 
+// True when the screen is wide enough to run in one line what portrait has to
+// stack. A 90/270 orientation gives 1280 px across against the panel's native
+// 720. Same threshold create_tile() uses for its own "large" decision.
+static bool ui_wide_layout(void)
+{
+    return lv_disp_get_hor_res(NULL) >= 960;
+}
+
+// Clamp a hand-tuned popup height to what the display actually offers. The
+// panel-sized panels below were laid out for the native 1280 px portrait
+// height; in a 90/270 orientation the screen is only 720 px tall and they
+// would run off both edges. Leaves a small margin so the card keeps its
+// rounded border visible.
+//
+// The budget is the tab container, not the display: every one of these popups
+// is parented to it, and it starts below the status and tab bars. Measuring
+// against the full 720 px is what pushed the Network Observer popup half a
+// close button under the tab bar in landscape and clipped the attack bar off
+// the bottom - the card was 680 px tall inside 590 px of container.
+static lv_coord_t popup_clamp_h(lv_coord_t desired)
+{
+    lv_coord_t avail = (lv_coord_t)lv_disp_get_ver_res(NULL) - UI_TOP_OFFSET - 40;
+    return desired < avail ? desired : avail;
+}
+
+// The same for width. This one is not about rotation at all: the panel is only
+// 720 px wide in its native portrait orientation, so a card hand-tuned wider
+// than that has always been centred with its ends off both edges. Landscape,
+// at 1280 px, is where those cards happened to fit.
+static lv_coord_t popup_clamp_w(lv_coord_t desired)
+{
+    lv_coord_t avail = (lv_coord_t)lv_disp_get_hor_res(NULL) - 40;
+    return desired < avail ? desired : avail;
+}
+
+// Scan rows use one metadata line in landscape and two in portrait. Together
+// with the independent SSID/saved title row this produces a stable two- or
+// three-line tile without leaving Vendor alone on a fourth line.
+#define NETWORK_INFO_BUF 384
+static void format_network_info(char *out, size_t out_sz,
+                                const char *bssid, int channel,
+                                const char *band, const char *security,
+                                int rssi, const char *mfp_text,
+                                const char *uptime, const char *vendor)
+{
+    const char *row_sep = ui_wide_layout() ? "  |  " : "\n";
+    const char *rssi_col = rssi > -50 ? "#55DD55" : (rssi > -70 ? "#FFAA00" : "#FF5555");
+    const char *band_col = (band && strstr(band, "5")) ? "#CC66FF" : "#FFAA33";
+
+    char sec_part[80] = "";
+    if (security && security[0]) {
+        const char *sec_col = strstr(security, "WPA3") ? "#55DD55" :
+                              strstr(security, "WPA2") ? "#00CCCC" : "#FF6666";
+        snprintf(sec_part, sizeof(sec_part), "  |  %s %s#", sec_col, security);
+    }
+
+    const char *mfp_display = (mfp_text && mfp_text[0])
+                                  ? mfp_text
+                                  : "#888888 MFP ?#";
+
+    snprintf(out, out_sz,
+             "#5599FF %s#  |  #5599FF CH%d#  |  %s %s#%s  |  %s %d dBm#"
+             "  |  %s%sUptime: %s  |  Vendor: %s",
+             bssid ? bssid : "-", channel,
+             band_col, band ? band : "-",
+             sec_part,
+             rssi_col, rssi,
+             mfp_display, row_sep,
+             (uptime && uptime[0]) ? uptime : "?",
+             (vendor && vendor[0]) ? vendor : "-");
+}
+
+// Observer keeps radio metadata in one stable row below the title. Uptime and
+// vendor live in the title row and are formatted separately below.
+static void format_observer_network_info(char *out, size_t out_sz,
+                                         const observer_network_t *net)
+{
+    if (!out || out_sz == 0) return;
+    if (!net) {
+        out[0] = '\0';
+        return;
+    }
+
+    const char *rssi_col = net->rssi > -50 ? "#55DD55" :
+                           (net->rssi > -70 ? "#FFAA00" : "#FF5555");
+    const char *band_col = strstr(net->band, "5") ? "#CC66FF" : "#FFAA33";
+    const char *security = net->security[0] ? net->security : "-";
+    const char *sec_col = strstr(security, "WPA3") ? "#55DD55" :
+                          (strstr(security, "WPA2") ? "#00CCCC" : "#FF6666");
+    const char *mfp_text = net->inspected
+                               ? (net->mfp_capable
+                                      ? "#FF5555 MFP On#"
+                                      : "#55DD55 MFP Off#")
+                               : "#888888 MFP ?#";
+    snprintf(out, out_sz,
+             "#5599FF %s#  |  #5599FF CH%d#  |  %s %s#  |  %s %s#  |  "
+             "%s %d dBm#  |  %s",
+             net->bssid[0] ? net->bssid : "-", net->channel,
+             band_col, net->band[0] ? net->band : "-",
+             sec_col, security,
+             rssi_col, net->rssi,
+             mfp_text);
+}
+
+static void format_observer_summary_info(char *out, size_t out_sz,
+                                         const observer_network_t *net)
+{
+    if (!out || out_sz == 0) return;
+    if (!net) {
+        out[0] = '\0';
+        return;
+    }
+
+    const char *uptime = (net->inspected && net->uptime[0]) ? net->uptime : "?";
+    snprintf(out, out_sz, "Uptime: %s  |  Vendor: %s",
+             uptime, net->vendor[0] ? net->vendor : "-");
+}
+
+static void observer_update_summary_label(tab_context_t *ctx, int network_idx)
+{
+    if (!ctx || !ctx->observer_networks || !ctx->observer_network_ui ||
+        network_idx < 0 || network_idx >= ctx->observer_network_count) {
+        return;
+    }
+
+    observer_network_ui_t *ui = &ctx->observer_network_ui[network_idx];
+    if (!ui->summary_label || !lv_obj_is_valid(ui->summary_label)) return;
+
+    char summary[160];
+    format_observer_summary_info(summary, sizeof(summary),
+                                 &ctx->observer_networks[network_idx]);
+    lv_label_set_text(ui->summary_label, summary);
+}
+
+// A row of buttons that scrolls sideways instead of stacking into more rows.
+// The attack bar's shape, generalised: a block of three stacked full-width rows
+// costs 138 px of a 590 px page and stretches every button to ~300 px because
+// the rows grow with the screen. One strip is 50 px and the buttons keep a size
+// a finger expects.
+//
+// `content_w` is what the caller is about to put in - the strip centres its
+// children when that fits, so a short strip does not hug the left edge, and
+// left-aligns when it overflows so scrolling starts at the first button.
+static lv_obj_t *create_button_strip(lv_obj_t *parent, lv_coord_t h,
+                                     lv_coord_t gap, lv_coord_t content_w)
+{
+    lv_obj_t *strip = lv_obj_create(parent);
+    lv_obj_set_size(strip, lv_pct(100), h);
+    lv_obj_set_style_bg_opa(strip, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(strip, 0, 0);
+    lv_obj_set_style_pad_all(strip, 0, 0);
+    lv_obj_set_style_pad_column(strip, gap, 0);
+    lv_obj_set_flex_flow(strip, LV_FLEX_FLOW_ROW);
+    lv_obj_add_flag(strip, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(strip, LV_DIR_HOR);
+    lv_obj_set_scrollbar_mode(strip, LV_SCROLLBAR_MODE_AUTO);
+
+    lv_obj_update_layout(parent);
+    lv_coord_t avail = lv_obj_get_content_width(strip);
+    if (avail <= 0) avail = (lv_coord_t)lv_disp_get_hor_res(NULL) - 40;
+    lv_obj_set_flex_align(strip,
+                          content_w <= avail ? LV_FLEX_ALIGN_CENTER : LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    return strip;
+}
+
+// Let a tile grid scroll vertically instead of silently clipping its lower
+// rows. These grids take their height from flex_grow, so it is fixed by the
+// page; how many rows the tiles wrap into depends on the width. A layout tuned
+// for the tall portrait screen therefore overflows in a 90/270 orientation,
+// where the screen is 560 px shorter, and with scrolling off the tiles past
+// the fold cannot be reached at all.
+static void style_scrollable_tile_grid(lv_obj_t *grid)
+{
+    if (!grid) return;
+    lv_obj_add_flag(grid, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(grid, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(grid, LV_SCROLLBAR_MODE_AUTO);
+}
+
 static void style_neutral_button(lv_obj_t *btn)
 {
     if (!btn) return;
@@ -2073,6 +2315,8 @@ static void hide_all_pages(tab_context_t *ctx) {
 
 // Initialize tab context - allocate PSRAM for large data arrays
 static void init_tab_context(tab_context_t *ctx) {
+    atomic_init(&ctx->wardrive_ui_dirty, false);
+
     // WiFi scan results
     if (!ctx->networks) {
         ctx->networks = heap_caps_calloc(MAX_NETWORKS, sizeof(wifi_network_t), MALLOC_CAP_SPIRAM);
@@ -2086,6 +2330,13 @@ static void init_tab_context(tab_context_t *ctx) {
         ctx->observer_networks = heap_caps_calloc(MAX_OBSERVER_NETWORKS, sizeof(observer_network_t), MALLOC_CAP_SPIRAM);
         if (!ctx->observer_networks) {
             ESP_LOGE(TAG, "Failed to allocate observer_networks in PSRAM");
+        }
+    }
+    if (!ctx->observer_network_ui) {
+        ctx->observer_network_ui = heap_caps_calloc(
+            MAX_OBSERVER_NETWORKS, sizeof(observer_network_ui_t), MALLOC_CAP_SPIRAM);
+        if (!ctx->observer_network_ui) {
+            ESP_LOGE(TAG, "Failed to allocate observer_network_ui in PSRAM");
         }
     }
     if (!ctx->observer_rx_buffer) {
@@ -2257,6 +2508,7 @@ static float current_battery_voltage = 0.0f;
 static float current_battery_current_a = 0.0f;
 static bool current_battery_current_valid = false;
 static bool current_charging_status = false;
+static uint8_t power_telemetry_log_divider = 0;
 
 // Full-screen "Scanning..." overlay shown while a wifi_scan_task is running on the
 // active tab. Only one overlay can be visible at a time so it stays a global.
@@ -2313,6 +2565,12 @@ static void lock_screen_activate(void);     // Defined below; used by the dim ti
 // screen_timeout_setting: 0=10s, 1=30s, 2=1min, 3=5min, 4=StaysOn
 static uint8_t screen_timeout_setting = 1;  // Default: 30s (index 1)
 static uint8_t screen_brightness_setting = 80;  // Default: 80%
+// screen_rotation_setting: index into LV_DISPLAY_ROTATION_* (0=0deg, 1=90deg,
+// 2=180deg, 3=270deg). Applied once, right after the display comes up: the UI
+// caches its pages, so switching orientation on a live tree would leave the
+// already-built ones laid out for the old resolution. Changing it therefore
+// reboots the device.
+static uint8_t screen_rotation_setting = 0;  // Default: native portrait (720x1280)
 static bool clock_24h = true;   // status-bar clock format (24h vs 12h)
 static bool clock_dst = false;  // daylight saving applied to the RTC (+1h)
 static bool clock_show = true;  // show the clock on the top status bar
@@ -2668,6 +2926,8 @@ static void main_tile_event_cb(lv_event_t *e);
 static void back_btn_event_cb(lv_event_t *e);
 static void network_checkbox_event_cb(lv_event_t *e);
 static void network_item_event_cb(lv_event_t *e);
+static void scan_filter_btn_cb(lv_event_t *e);
+static void scan_filter_apply_view(tab_context_t *ctx);
 static void attack_tile_event_cb(lv_event_t *e);
 static void observer_attack_tile_event_cb(lv_event_t *e);
 static void observer_station_attack_tile_event_cb(lv_event_t *e);
@@ -2737,6 +2997,7 @@ static void destroy_deauth_popup_ui(void);
 static void close_deauth_popup(void);
 static void deauth_btn_click_cb(lv_event_t *e);
 static void update_observer_table(tab_context_t *ctx);
+static void observer_flush_incremental_ui(tab_context_t *ctx);
 static void observer_export_btn_cb(lv_event_t *e);
 static bool observer_export_csv(tab_context_t *ctx, char *out_path, size_t out_path_sz, char *err_msg, size_t err_msg_sz);
 static bool parse_sniffer_network_line(const char *line, observer_network_t *net);
@@ -2753,6 +3014,7 @@ static void show_sae_popup(int network_idx);
 static void sae_popup_close_cb(lv_event_t *e);
 static void show_handshaker_popup(void);
 static void handshaker_popup_close_cb(lv_event_t *e);
+static void handshaker_crack_cb(lv_event_t *e);
 static void handshaker_monitor_task(void *arg);
 static void show_mitm_popup(void);
 static void mitm_connect_and_start_cb(lv_event_t *e);
@@ -2849,6 +3111,7 @@ static void theme_alert_sound_switch_cb(lv_event_t *e);
 static void alert_chime_play(alert_tone_t tone);
 static void show_red_team_settings_page(void);
 static void show_screen_timeout_popup(void);
+static void show_ft_baud_popup(void);
 static void show_screen_brightness_popup(void);
 static void get_uart1_pins(int *tx_pin, int *rx_pin);
 static void get_uart2_pins(int *tx_pin, int *rx_pin);
@@ -2929,6 +3192,7 @@ static void wardrive_back_cb(lv_event_t *e);
 static void wardrive_monitor_task(void *arg);
 static void update_wardrive_table(tab_context_t *ctx);
 static void update_wardrive_count_label(tab_context_t *ctx);
+static void refresh_deferred_wardrive_ui(void);
 static void update_wardrive_trace_button(tab_context_t *ctx);
 static void close_wardrive_gps_overlay(tab_context_t *ctx);
 static void wardrive_upload_btn_cb(lv_event_t *e);
@@ -3072,6 +3336,7 @@ static bool compromised_start_cleanup_operation(tab_context_t *ctx,
 static void compromised_cleanup_task(void *arg);
 static void compromised_cleanup_async_refresh(void *user_data);
 static void wpasec_btn_event_cb(lv_event_t *e);
+static void hs_crack_file_cb(lv_event_t *e);
 static void show_deauth_detector_page(void);
 static void deauth_detector_back_btn_event_cb(lv_event_t *e);
 static void deauth_detector_start_cb(lv_event_t *e);
@@ -4081,6 +4346,30 @@ static void battery_status_timer_cb(lv_timer_t *timer)
     // Read new values
     update_battery_status();
 
+    app_power_telemetry_snapshot_t telemetry;
+    if (app_power_telemetry_record(current_battery_voltage,
+                                   current_battery_current_a,
+                                   current_battery_current_valid,
+                                   esp_timer_get_time(),
+                                   &telemetry)) {
+        power_telemetry_log_divider++;
+        if (power_telemetry_log_divider >= 5) {
+            power_telemetry_log_divider = 0;
+            app_power_profile_t profile = app_power_manager_get_profile();
+            ESP_LOGI(TAG,
+                     "POWER_CSV,%llu,%s,%s,%u,%.3f,%.1f,%.1f,%.1f,%.3f",
+                     (unsigned long long)(esp_timer_get_time() / 1000),
+                     app_power_manager_profile_name(profile),
+                     app_power_manager_is_screen_dimmed() ? "off" : "on",
+                     (unsigned)app_power_manager_get_max_frequency_mhz(),
+                     telemetry.voltage_v,
+                     telemetry.current_a * 1000.0f,
+                     telemetry.battery_power_w * 1000.0f,
+                     telemetry.average_60s_power_w * 1000.0f,
+                     telemetry.energy_mwh);
+        }
+    }
+
     // Memory stats
     size_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
     size_t psram_min = heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM);
@@ -4170,22 +4459,33 @@ static void set_brightness_gamma(uint8_t percent)
     ledc_update_duty(LEDC_LOW_SPEED_MODE, BRIGHTNESS_LEDC_CH);
 }
 
-// Wake screen helper - restores brightness and clears dimmed state
+// Wake screen helper - refreshes deferred UI before the backlight is restored.
 static void wake_screen(const char *source)
 {
+    esp_err_t power_err = app_power_manager_set_screen_dimmed(false);
+    if (power_err != ESP_OK && power_err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(TAG, "Could not record interactive screen state: %s",
+                 esp_err_to_name(power_err));
+    }
+    screen_dimmed = false;
+
     if (sleep_overlay) {
         lv_obj_delete(sleep_overlay);
         sleep_overlay = NULL;
     }
 
+    // The monitor task only marked the Wardrive UI dirty while the panel was
+    // dark. Rebuild it once at full speed before it becomes visible again.
+    refresh_deferred_wardrive_ui();
     set_brightness_gamma(screen_brightness_setting);  // Restore brightness with gamma correction
-    screen_dimmed = false;
     last_activity_time = lv_tick_get();
     ESP_LOGI(TAG, "Screen woken by %s (brightness %d%%)", source, screen_brightness_setting);
 }
 
-// Sleep overlay click callback - wakes screen and removes overlay (GT911 only)
-static void sleep_overlay_click_cb(lv_event_t *e)
+// Wake on the initial press, before LVGL can classify a moving finger as a
+// scroll gesture. Deleting the pressed overlay makes LVGL wait for release, so
+// this first contact is consumed and cannot also move the unlock slider.
+static void sleep_overlay_press_cb(lv_event_t *e)
 {
     (void)e;
     wake_screen("touch");
@@ -4196,7 +4496,7 @@ static void screen_timeout_timer_cb(lv_timer_t *timer)
 {
     (void)timer;
 
-    // If screen is dimmed, touch overlay handles wake via sleep_overlay_click_cb
+    // If screen is dimmed, touch overlay handles wake via sleep_overlay_press_cb
     if (screen_dimmed) {
         return;
     }
@@ -4206,6 +4506,11 @@ static void screen_timeout_timer_cb(lv_timer_t *timer)
     if (timeout_ms != UINT32_MAX && (now - last_activity_time) >= timeout_ms) {
         bsp_display_brightness_set(0);  // Turn off backlight
         screen_dimmed = true;
+        esp_err_t power_err = app_power_manager_set_screen_dimmed(true);
+        if (power_err != ESP_OK && power_err != ESP_ERR_INVALID_STATE) {
+            ESP_LOGW(TAG, "Could not record dimmed screen state: %s",
+                     esp_err_to_name(power_err));
+        }
 
         // Auto-lock: engage the lock now (before the wake overlay) so it stays in
         // place underneath and the user must slide to unlock after waking.
@@ -4219,7 +4524,8 @@ static void screen_timeout_timer_cb(lv_timer_t *timer)
         lv_obj_set_size(sleep_overlay, LV_PCT(100), LV_PCT(100));
         lv_obj_set_style_bg_opa(sleep_overlay, LV_OPA_TRANSP, 0);
         lv_obj_add_flag(sleep_overlay, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_add_event_cb(sleep_overlay, sleep_overlay_click_cb, LV_EVENT_CLICKED, NULL);
+        lv_obj_clear_flag(sleep_overlay, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_event_cb(sleep_overlay, sleep_overlay_press_cb, LV_EVENT_PRESSED, NULL);
 
         ESP_LOGI(TAG, "Screen dimmed (touch to wake)");
     }
@@ -4314,6 +4620,10 @@ static bool usb_host_started_by_us = false;
 static uint32_t usb_next_retry_ms = 0;
 static bool usb_log_tuned = false;
 static bool board_redetect_pending = false;
+// True only once bsp_display_start() has run lv_init(). Guards any lv_async_call
+// (and other LVGL calls) made from USB callbacks that can fire during the early
+// boot USB open, before LVGL exists - calling into LVGL then corrupts the heap.
+static volatile bool lvgl_ready = false;
 static bool usb_debug_logs = true;
 static bool usb_cdc_preferred_valid = false;
 static bool usb_cdc_driver_installed = false;
@@ -4542,7 +4852,9 @@ static void usb_log_cdc_state(const char *where)
 
 static void schedule_board_redetect(void);
 
-static void board_redetect_cb(void *user_data)
+// Retained for a possible future runtime-redetect path, but currently unused:
+// USB detection is boot-only, so nothing schedules this anymore.
+static __attribute__((unused)) void board_redetect_cb(void *user_data)
 {
     (void)user_data;
     ESP_LOGI(TAG, "board_redetect_cb called");
@@ -4596,8 +4908,15 @@ static void board_redetect_cb(void *user_data)
     }
 }
 
-static void schedule_board_redetect(void)
+static __attribute__((unused)) void schedule_board_redetect(void)
 {
+    // A USB device can be opened before LVGL is up (usb_boot_open_early runs
+    // ahead of bsp_display_start). The redetect drives the GUI, so there is
+    // nothing to do yet and lv_async_call() into an uninitialized LVGL would
+    // corrupt the heap - the normal boot detection will pick the device up.
+    if (!lvgl_ready) {
+        return;
+    }
     if (board_redetect_pending) {
         return;
     }
@@ -4659,7 +4978,10 @@ static void usb_cdc_connect_cb(usbh_cdc_handle_t cdc_handle, void *user_data)
     }
 
     start_usb_gps_drain_task();
-    schedule_board_redetect();
+    // Board detection is boot-only (see usb_boot_open_early): the boot probe
+    // classifies whatever is already open. Do NOT kick a runtime redetect from
+    // the connect callback - a device that shows up after boot is intentionally
+    // not brought into the UI live.
 }
 
 static void usb_cdc_disconnect_cb(usbh_cdc_handle_t cdc_handle, void *user_data)
@@ -4689,7 +5011,8 @@ static void usb_cdc_disconnect_cb(usbh_cdc_handle_t cdc_handle, void *user_data)
     if (usb_debug_logs) {
         usb_log_cdc_state("disconnect");
     }
-    schedule_board_redetect();
+    // Boot-only detection: don't run a runtime redetect when a device is
+    // unplugged. The tab layout is fixed at boot.
 }
 
 static void usb_cdc_recv_cb(usbh_cdc_handle_t cdc_handle, void *user_data)
@@ -4734,12 +5057,16 @@ static void usb_transport_init(void)
     }
 
     if (!usb_log_tuned) {
+        // USBH_CDC logs "cdc read failed" (ESP_LOGE) on every empty poll while
+        // we ping a still-booting Monster - pure noise, and our own [USB] logs
+        // already say what matters. Silence that tag regardless of debug mode;
+        // esp_log_level_set is per-tag and can only be done here in code, not in
+        // sdkconfig (which carries only the global default/max level).
+        esp_log_level_set("USBH_CDC", ESP_LOG_NONE);
         if (usb_debug_logs) {
-            esp_log_level_set("USBH_CDC", ESP_LOG_INFO);
             esp_log_level_set("USBH", ESP_LOG_INFO);
             esp_log_level_set("USB HOST", ESP_LOG_INFO);
         } else {
-            esp_log_level_set("USBH_CDC", ESP_LOG_NONE);
             esp_log_level_set("USBH", ESP_LOG_NONE);
             esp_log_level_set("USB HOST", ESP_LOG_NONE);
         }
@@ -4834,6 +5161,38 @@ static void usb_transport_init(void)
     usb_transport_ready = true;
     usb_transport_warned = false;
     ESP_LOGI(TAG, "[USB] USB CDC host ready, waiting for device...");
+}
+
+// Open the Monster-over-USB-A link *before* the audio codec, SD card and
+// MIPI-DSI panel each claim their slice of the board's tiny internal
+// DMA-capable pool (only ~128 KiB total, RTCRAM and TCM excluded). usbh_cdc
+// needs several 512-byte-aligned DMA blocks for the endpoint transfer-descriptor
+// lists; once those peripherals are up the pool is fragmented down to a few KiB
+// and the create fails for good with "EP Alloc error: ESP_ERR_NO_MEM" - and
+// every failed attempt leaks DMA, so retrying only drives it lower. Run once,
+// early in app_main, this enumerates and opens the CH340 while DMA is still
+// plentiful; the boot board detection later just reuses the handle. Detection
+// itself stays boot-only - nothing retries the open afterwards.
+static void usb_boot_open_early(void)
+{
+    ESP_LOGI(TAG, "[USB] Early open (before codec/SD/display grab DMA)...");
+    usb_transport_init();   // install host + CDC driver, arm new_dev_cb
+
+    // Wait for the CH340 to enumerate, then open it. Bounded so a USB-less boot
+    // pays only a small fixed cost. Enumeration on this board takes ~400 ms.
+    for (int i = 0; i < 35 && !usb_cdc_handle; i++) {
+        vTaskDelay(pdMS_TO_TICKS(20));
+        if (usb_cdc_preferred_valid && !usb_cdc_handle) {
+            usb_next_retry_ms = 0;   // clear the 1 s backoff a failed probe set
+            usb_transport_init();
+        }
+    }
+
+    if (usb_cdc_handle) {
+        ESP_LOGI(TAG, "[USB] Monster opened early over USB-A");
+    } else {
+        ESP_LOGI(TAG, "[USB] No USB-A device opened early (none present or not ready)");
+    }
 }
 
 static __attribute__((unused)) void usb_transport_deinit(void)
@@ -5325,7 +5684,7 @@ static void uart_init(void)
     int tx_pin, rx_pin;
     get_uart1_pins(&tx_pin, &rx_pin);
 
-    ESP_ERROR_CHECK(uart_driver_install(UART_NUM, UART_BUF_SIZE * 2, 0, 0, NULL, 0));
+    ESP_ERROR_CHECK(uart_driver_install(UART_NUM, UART_RX_RING_SIZE, 0, 0, NULL, 0));
     ESP_ERROR_CHECK(uart_param_config(UART_NUM, &uart_config));
     ESP_ERROR_CHECK(uart_set_pin(UART_NUM, tx_pin, rx_pin,
                                   UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
@@ -5659,6 +6018,13 @@ static void creds_fetch(tab_context_t *ctx, tab_id_t tab, uart_port_t port)
             if (line_pos < (int)sizeof(line) - 1) line[line_pos++] = c;
         }
     }
+    // JanOS does not guarantee a trailing CR/LF after the last password row.
+    // Parse the buffered tail as well or the final saved network disappears
+    // from the cache and its UI badge is never shown.
+    if (line_pos > 0) {
+        line[line_pos] = '\0';
+        creds_parse_line(ctx, line);
+    }
     ESP_LOGI(TAG, "[%s] Cached %d captured password(s)",
              tab_transport_name(tab), ctx->evil_twin_entry_count);
 }
@@ -5678,14 +6044,6 @@ static const char *creds_lookup(tab_context_t *ctx, const char *ssid)
 static bool creds_have(tab_context_t *ctx, const char *ssid)
 {
     return creds_lookup(ctx, ssid) != NULL;
-}
-
-// Recolor-markup badge appended to a network row when we hold its password.
-// Every list that renders a row must use this, including the inspect tasks that
-// rewrite rows in place - otherwise the badge is painted and then overwritten.
-static const char *creds_badge(tab_context_t *ctx, const char *ssid)
-{
-    return creds_have(ctx, ssid) ? "  |  #55DD99 password saved#" : "";
 }
 
 static void inspect_networks_task(void *arg)
@@ -5783,19 +6141,13 @@ static void inspect_networks_task(void *arg)
                 const char *up_text = uptime_str[0] ? uptime_str : "?";
 
                 lv_label_set_recolor(ctx->inspect_info_labels[i - 1], true);
-                const char *rssi_col_s  = net->rssi > -50 ? "#55DD55" : (net->rssi > -70 ? "#FFAA00" : "#FF5555");
-                const char *band_col_s  = strstr(net->band, "5") ? "#CC66FF" : "#FFAA33";
-                const char *sec_col_s   = strstr(net->security, "WPA3") ? "#55DD55" :
-                                          strstr(net->security, "WPA2") ? "#00CCCC" : "#FF6666";
-                lv_label_set_text_fmt(ctx->inspect_info_labels[i - 1],
-                    "#5599FF %s#  |  #5599FF CH%d#  |  %s %s#  |  %s %s#  |  %s %d dBm#%s\n%s  |  Uptime: %s\nVendor: %s",
-                    net->bssid, net->channel,
-                    band_col_s, net->band,
-                    sec_col_s, net->security,
-                    rssi_col_s, net->rssi,
-                    creds_badge(ctx, net->ssid),
-                    mfp_capable ? "#FF5555 MFP On#" : "#55DD55 MFP Off#",
-                    up_text, vendor_display);
+                char info_buf[NETWORK_INFO_BUF];
+                format_network_info(info_buf, sizeof(info_buf),
+                                    net->bssid, net->channel, net->band, net->security,
+                                    net->rssi,
+                                    mfp_capable ? "#FF5555 MFP On#" : "#55DD55 MFP Off#",
+                                    up_text, vendor_display);
+                lv_label_set_text(ctx->inspect_info_labels[i - 1], info_buf);
             }
             bsp_display_unlock();
         } else if (!got_line) {
@@ -5862,18 +6214,11 @@ static void inspect_observer_task(void *arg)
                     i < ctx->observer_inspect_label_count &&
                     ctx->observer_inspect_info_labels[i] &&
                     lv_obj_is_valid(ctx->observer_inspect_info_labels[i])) {
-                    const char *up_text = net->uptime[0] ? net->uptime : "?";
                     lv_label_set_recolor(ctx->observer_inspect_info_labels[i], true);
-                    const char *rssi_col_oa = net->rssi > -50 ? "#55DD55" : (net->rssi > -70 ? "#FFAA00" : "#FF5555");
-                    const char *band_col_oa = strstr(net->band, "5") ? "#CC66FF" : "#FFAA33";
-                    lv_label_set_text_fmt(ctx->observer_inspect_info_labels[i],
-                        "#5599FF %s#  |  #5599FF CH%d#  |  %s %s#  |  %s %d dBm#%s\n%s  |  Uptime: %s\nVendor: %s",
-                        net->bssid, net->channel,
-                        band_col_oa, net->band,
-                        rssi_col_oa, net->rssi,
-                        creds_badge(ctx, net->ssid),
-                        net->mfp_capable ? "#FF5555 MFP On#" : "#55DD55 MFP Off#",
-                        up_text, net->vendor[0] ? net->vendor : "-");
+                    char info_buf[NETWORK_INFO_BUF];
+                    format_observer_network_info(info_buf, sizeof(info_buf), net);
+                    lv_label_set_text(ctx->observer_inspect_info_labels[i], info_buf);
+                    observer_update_summary_label(ctx, i);
                 }
                 bsp_display_unlock();
             }
@@ -5935,18 +6280,11 @@ static void inspect_observer_task(void *arg)
                     i < ctx->observer_inspect_label_count &&
                     ctx->observer_inspect_info_labels[i] &&
                     lv_obj_is_valid(ctx->observer_inspect_info_labels[i])) {
-                        const char *up_text = uptime_str[0] ? uptime_str : "?";
                     lv_label_set_recolor(ctx->observer_inspect_info_labels[i], true);
-                    const char *rssi_col_ob = net->rssi > -50 ? "#55DD55" : (net->rssi > -70 ? "#FFAA00" : "#FF5555");
-                    const char *band_col_ob = strstr(net->band, "5") ? "#CC66FF" : "#FFAA33";
-                    lv_label_set_text_fmt(ctx->observer_inspect_info_labels[i],
-                        "#5599FF %s#  |  #5599FF CH%d#  |  %s %s#  |  %s %d dBm#%s\n%s  |  Uptime: %s\nVendor: %s",
-                        net->bssid, net->channel,
-                        band_col_ob, net->band,
-                        rssi_col_ob, net->rssi,
-                        creds_badge(ctx, net->ssid),
-                        mfp_capable ? "#FF5555 MFP On#" : "#55DD55 MFP Off#",
-                        up_text, net->vendor[0] ? net->vendor : "-");
+                    char info_buf[NETWORK_INFO_BUF];
+                    format_observer_network_info(info_buf, sizeof(info_buf), net);
+                    lv_label_set_text(ctx->observer_inspect_info_labels[i], info_buf);
+                    observer_update_summary_label(ctx, i);
                 }
                 bsp_display_unlock();
             }
@@ -6070,11 +6408,6 @@ static void wifi_scan_task(void *arg)
     // Update UI on main thread
     bsp_display_lock(0);
 
-    // Hide spinner
-    if (ctx->spinner) {
-        lv_obj_add_flag(ctx->spinner, LV_OBJ_FLAG_HIDDEN);
-    }
-
     // Update status
     if (ctx->scan_status_label) {
         if (scan_complete) {
@@ -6087,6 +6420,7 @@ static void wifi_scan_task(void *arg)
     // Update network list
     if (ctx->network_list) {
         lv_obj_clean(ctx->network_list);
+        memset(ctx->network_rows, 0, sizeof(ctx->network_rows));
 
         // Reallocate per-row label pointer array in PSRAM so the inspect
         // task can address each row's info_label by 0-based index.
@@ -6109,6 +6443,7 @@ static void wifi_scan_task(void *arg)
 
             // Create list item with horizontal layout (checkbox + text container)
             lv_obj_t *item = lv_obj_create(ctx->network_list);
+            ctx->network_rows[i] = item;
             lv_obj_set_size(item, lv_pct(100), LV_SIZE_CONTENT);
             lv_obj_set_style_pad_all(item, 8, 0);
             lv_obj_set_style_bg_color(item, lv_color_hex(0x2D2D2D), 0);
@@ -6120,13 +6455,22 @@ static void wifi_scan_task(void *arg)
             lv_obj_set_style_pad_column(item, 12, 0);
             lv_obj_add_flag(item, LV_OBJ_FLAG_CLICKABLE);
 
-            // Checkbox (on the left) - explicit size for better touch accuracy
-            lv_obj_t *cb = lv_checkbox_create(item);
+            // Keep a 50x50 touch/alignment slot, but let the checkbox itself use
+            // its natural height. LVGL draws an empty checkbox indicator near
+            // the top of a fixed-height checkbox; on a one-line wide layout a
+            // 50x50 checkbox therefore appeared above the SSID baseline.
+            lv_obj_t *selection_slot = lv_obj_create(item);
+            lv_obj_remove_style_all(selection_slot);
+            lv_obj_set_size(selection_slot, 50, 50);
+            lv_obj_clear_flag(selection_slot, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_remove_flag(selection_slot, LV_OBJ_FLAG_CLICKABLE);
+
+            lv_obj_t *cb = lv_checkbox_create(selection_slot);
             lv_checkbox_set_text(cb, "");  // Empty text - we use separate labels
-            lv_obj_set_size(cb, 50, 50);  // Explicit size for touch target
             lv_obj_set_ext_click_area(cb, 15);  // Extend touch area by 15px
             lv_obj_set_style_pad_all(cb, 4, 0);
-            lv_obj_set_style_align(cb, LV_ALIGN_LEFT_MID, 0);  // Center vertically in row
+            lv_obj_set_size(cb, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+            lv_obj_center(cb);
             // Style the indicator - dark when unchecked, green when checked
             lv_obj_set_style_bg_color(cb, lv_color_hex(0x3D3D3D), LV_PART_INDICATOR);
             lv_obj_set_style_bg_color(cb, lv_color_hex(0x4CAF50), LV_PART_INDICATOR | LV_STATE_CHECKED);
@@ -6137,9 +6481,11 @@ static void wifi_scan_task(void *arg)
             lv_obj_add_event_cb(cb, network_checkbox_event_cb, LV_EVENT_VALUE_CHANGED, (void*)(intptr_t)i);
             lv_obj_add_event_cb(item, network_item_event_cb, LV_EVENT_CLICKED, cb);
 
-            // Text container (vertical layout for SSID and info)
+            // Remaining row width belongs to a compact responsive text block.
+            // The checkbox keeps its fixed alignment slot at the left.
             lv_obj_t *text_cont = lv_obj_create(item);
-            lv_obj_set_size(text_cont, lv_pct(85), LV_SIZE_CONTENT);
+            lv_obj_set_size(text_cont, 0, LV_SIZE_CONTENT);
+            lv_obj_set_flex_grow(text_cont, 1);
             lv_obj_set_style_bg_opa(text_cont, LV_OPA_TRANSP, 0);
             lv_obj_set_style_border_width(text_cont, 0, 0);
             lv_obj_set_style_pad_all(text_cont, 0, 0);
@@ -6147,8 +6493,19 @@ static void wifi_scan_task(void *arg)
             lv_obj_set_style_pad_row(text_cont, 4, 0);
             lv_obj_clear_flag(text_cont, LV_OBJ_FLAG_CLICKABLE);  // Don't steal clicks
 
-            // SSID (or "Hidden" if empty)
-            lv_obj_t *ssid_label = lv_label_create(text_cont);
+            // Title stays on one line. The saved marker is independent from
+            // SSID so neither can create the old "password saved" orphan wrap.
+            lv_obj_t *title_row = lv_obj_create(text_cont);
+            lv_obj_remove_style_all(title_row);
+            lv_obj_set_size(title_row, lv_pct(100), LV_SIZE_CONTENT);
+            lv_obj_set_flex_flow(title_row, LV_FLEX_FLOW_ROW);
+            lv_obj_set_flex_align(title_row, LV_FLEX_ALIGN_START,
+                                  LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+            lv_obj_set_style_pad_column(title_row, 12, 0);
+            lv_obj_clear_flag(title_row, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_remove_flag(title_row, LV_OBJ_FLAG_CLICKABLE);
+
+            lv_obj_t *ssid_label = lv_label_create(title_row);
             if (strlen(net->ssid) > 0) {
                 lv_label_set_text(ssid_label, net->ssid);
             } else {
@@ -6156,25 +6513,30 @@ static void wifi_scan_task(void *arg)
             }
             lv_obj_set_style_text_font(ssid_label, &lv_font_montserrat_18, 0);
             lv_obj_set_style_text_color(ssid_label, lv_color_hex(0xFFFFFF), 0);
+            lv_obj_set_width(ssid_label, LV_SIZE_CONTENT);
+            lv_obj_set_style_max_width(ssid_label, ui_wide_layout() ? 360 : 400, 0);
+            lv_label_set_long_mode(ssid_label, LV_LABEL_LONG_DOT);
 
-            // BSSID, Band, Security, RSSI and vendor
+            if (creds_have(ctx, net->ssid)) {
+                lv_obj_t *saved_badge = lv_label_create(title_row);
+                lv_label_set_text(saved_badge, "password saved");
+                lv_obj_set_width(saved_badge, LV_SIZE_CONTENT);
+                lv_obj_set_style_text_font(saved_badge, &lv_font_montserrat_12, 0);
+                lv_obj_set_style_text_color(saved_badge, lv_color_hex(0x55DD99), 0);
+            }
+
+            // Landscape has one metadata line; portrait splits once before
+            // MFP/Uptime/Vendor, yielding two or three total tile lines.
             lv_obj_t *info_label = lv_label_create(text_cont);
-            const char *vendor_display = strlen(net->vendor) > 0 ? net->vendor : "-";
-            const char *rssi_col   = net->rssi > -50 ? "#55DD55" : (net->rssi > -70 ? "#FFAA00" : "#FF5555");
-            const char *band_col   = strstr(net->band, "5") ? "#CC66FF" : "#FFAA33";
-            const char *sec_col    = strstr(net->security, "WPA3") ? "#55DD55" :
-                                     strstr(net->security, "WPA2") ? "#00CCCC" : "#FF6666";
             lv_label_set_recolor(info_label, true);
-            lv_label_set_text_fmt(info_label,
-                "#5599FF %s#  |  #5599FF CH%d#  |  %s %s#  |  %s %s#  |  %s %d dBm#%s\nVendor: %s",
-                net->bssid, net->channel,
-                band_col, net->band,
-                sec_col, net->security,
-                rssi_col, net->rssi,
-                creds_badge(ctx, net->ssid),
-                vendor_display);
+            char info_buf[NETWORK_INFO_BUF];
+            format_network_info(info_buf, sizeof(info_buf),
+                                net->bssid, net->channel, net->band, net->security,
+                                net->rssi, NULL, NULL, net->vendor);
+            lv_label_set_text(info_label, info_buf);
             lv_obj_set_style_text_font(info_label, &lv_font_montserrat_12, 0);
             lv_obj_set_style_text_color(info_label, lv_color_hex(0x888888), 0);
+            lv_obj_set_width(info_label, lv_pct(100));
 
             if (ctx->inspect_info_labels && i < ctx->inspect_label_count) {
                 ctx->inspect_info_labels[i] = info_label;
@@ -6187,17 +6549,14 @@ static void wifi_scan_task(void *arg)
         lv_obj_clear_state(ctx->scan_btn, LV_STATE_DISABLED);
     }
 
-    // Hide small spinner
-    if (ctx->spinner) {
-        lv_obj_add_flag(ctx->spinner, LV_OBJ_FLAG_HIDDEN);
-    }
-
     // Hide large centered overlay only if user is still on the same tab
     if (current_tab == scan_tab) {
         hide_scan_overlay();
     }
 
     ctx->scan_in_progress = false;
+    ctx->scan_last_timed_out = !scan_complete;
+    scan_filter_apply_view(ctx);
     ESP_LOGI(TAG, "[%s] Stored %d scan results in tab %d context",
              uart_name, ctx->network_count, scan_tab);
 
@@ -6863,6 +7222,20 @@ static void audio_play_notes(const melody_note_t *notes, int count, const char *
     }
 }
 
+// Silence the speaker before a deliberate reboot. esp_restart() kills the I2S
+// DMA mid-buffer while the amplifier is still driven, so whichever sample was
+// in flight is held on the output and comes out as a click or a stuck tone.
+// Muting the DAC first lets it settle against silence instead. Any tune still
+// running is left to die with the reset - waiting for the player would mean
+// blocking for the rest of the melody.
+static void audio_silence_for_restart(void)
+{
+    bsp_codec_config_t *codec = bsp_get_codec_handle();
+    if (!codec) return;
+    if (codec->set_volume) codec->set_volume(0);
+    if (codec->set_mute) codec->set_mute(true);
+}
+
 static void play_startup_beep(void)
 {
     boot_sound_mode_t selected_mode = boot_sound_mode;
@@ -6943,6 +7316,28 @@ static void play_startup_beep(void)
 
     audio_play_notes(melody, melody_notes, what, BOOT_SOUND_VOLUME_PERCENT,
                      0.85f, 5, 15, pause_ms, 160);
+    vTaskDelete(NULL);
+}
+
+// What the reboot that applies a screen rotation plays instead of the full
+// melody. That reset belongs to a settings change the user just made, so a
+// jingle is too much - but silence reads as a fault, which is what happens
+// when a device you rebooted on purpose comes back mute. Two notes, a rising
+// fourth, both well above the band where this micro-driver falls away.
+static const melody_note_t rotation_chime[] = {
+    { 659.25f,  70 },  // E5
+    { 880.00f, 170 },  // A5
+};
+
+static void play_rotation_chime(void)
+{
+    if (boot_sound_mode == BOOT_SOUND_MODE_OFF) {
+        vTaskDelete(NULL);
+        return;
+    }
+
+    audio_play_notes(rotation_chime, (int)(sizeof(rotation_chime) / sizeof(rotation_chime[0])),
+                     "the rotation chime", BOOT_SOUND_VOLUME_PERCENT, 0.75f, 10, 120, 10, 120);
     vTaskDelete(NULL);
 }
 
@@ -7114,6 +7509,7 @@ static void scan_btn_click_cb(lv_event_t *e)
     cancel_inspect_task(ctx);
 
     ctx->scan_in_progress = true;
+    ctx->scan_last_timed_out = false;
 
     // Clear previous selections (rescan = fresh selection)
     ctx->selected_count = 0;
@@ -7127,11 +7523,6 @@ static void scan_btn_click_cb(lv_event_t *e)
     // Show large centered overlay with spinner
     show_scan_overlay();
 
-    // Show small spinner next to button (optional backup)
-    if (ctx->spinner) {
-        lv_obj_clear_flag(ctx->spinner, LV_OBJ_FLAG_HIDDEN);
-    }
-
     // Update status
     if (ctx->scan_status_label) {
         lv_label_set_text(ctx->scan_status_label, "Scanning...");
@@ -7141,10 +7532,411 @@ static void scan_btn_click_cb(lv_event_t *e)
     if (ctx->network_list) {
         lv_obj_clean(ctx->network_list);
     }
+    memset(ctx->network_rows, 0, sizeof(ctx->network_rows));
 
     // Start scan task for the tab whose scan page is currently active.
     tab_id_t scan_tab = tab_id_for_ctx(ctx);
     xTaskCreate(wifi_scan_task, "wifi_scan", 8192, (void*)(uintptr_t)scan_tab, 5, NULL);
+}
+
+static bool scan_filter_index_selected(const tab_context_t *ctx, int source_index)
+{
+    if (!ctx) return false;
+    for (int i = 0; i < ctx->selected_count; i++) {
+        if (ctx->selected_indices[i] == source_index) return true;
+    }
+    return false;
+}
+
+static int scan_filter_active_group_count(const scan_filter_options_t *options)
+{
+    if (!options) return 0;
+    int count = 0;
+    if (options->sort_key != SCAN_SORT_DEFAULT || options->reverse) count++;
+    if (options->ssid_query[0] != '\0') count++;
+    if (options->security_mask != SCAN_SECURITY_ALL) count++;
+    if (options->visibility != SCAN_VISIBILITY_ALL) count++;
+    return count;
+}
+
+static void scan_filter_update_button(tab_context_t *ctx)
+{
+    if (!ctx) return;
+    int active = scan_filter_active_group_count(&ctx->scan_filter);
+    if (ctx->scan_filter_btn_label) {
+        if (active > 0) {
+            lv_label_set_text_fmt(ctx->scan_filter_btn_label, "FILTER %d", active);
+        } else {
+            lv_label_set_text(ctx->scan_filter_btn_label, "FILTER");
+        }
+    }
+    if (ctx->scan_filter_summary_label) {
+        char summary[256];
+        scan_filter_format_summary(summary, sizeof(summary), &ctx->scan_filter);
+        lv_label_set_text(ctx->scan_filter_summary_label, summary);
+    }
+}
+
+static void scan_filter_apply_view(tab_context_t *ctx)
+{
+    if (!ctx || !ctx->networks || !ctx->network_list) return;
+
+    scan_filter_record_t records[MAX_NETWORKS];
+    int display_order[MAX_NETWORKS];
+    bool visible[MAX_NETWORKS] = {false};
+    int count = ctx->network_count;
+    if (count < 0) count = 0;
+    if (count > MAX_NETWORKS) count = MAX_NETWORKS;
+
+    for (int i = 0; i < count; i++) {
+        records[i] = (scan_filter_record_t){
+            .ssid = ctx->networks[i].ssid,
+            .security = ctx->networks[i].security,
+            .rssi = ctx->networks[i].rssi,
+            .channel = ctx->networks[i].channel,
+            .source_index = i,
+        };
+        if (ctx->network_rows[i] && lv_obj_is_valid(ctx->network_rows[i])) {
+            lv_obj_add_flag(ctx->network_rows[i], LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+
+    size_t shown = 0;
+    if (count > 0) {
+        shown = scan_filter_build_order(records, (size_t)count,
+                                        &ctx->scan_filter,
+                                        display_order, MAX_NETWORKS);
+    }
+    for (size_t position = 0; position < shown; position++) {
+        int source_index = display_order[position];
+        if (source_index < 0 || source_index >= count) continue;
+        lv_obj_t *row = ctx->network_rows[source_index];
+        if (!row || !lv_obj_is_valid(row)) continue;
+        visible[source_index] = true;
+        lv_obj_move_to_index(row, (int32_t)position);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    int hidden_selected = 0;
+    for (int i = 0; i < count; i++) {
+        if (!visible[i] && scan_filter_index_selected(ctx, i)) hidden_selected++;
+    }
+
+    if (ctx->scan_status_label && !ctx->scan_in_progress) {
+        char status[160];
+        scan_filter_format_status(status, sizeof(status), count, shown,
+                                  ctx->selected_count, hidden_selected,
+                                  scan_filter_active_group_count(&ctx->scan_filter) > 0,
+                                  ctx->scan_last_timed_out);
+        lv_label_set_text(ctx->scan_status_label, status);
+    }
+    scan_filter_update_button(ctx);
+}
+
+static void scan_filter_close_popup(tab_context_t *ctx)
+{
+    if (!ctx) return;
+    if (ctx->scan_filter_overlay && lv_obj_is_valid(ctx->scan_filter_overlay)) {
+        lv_obj_del(ctx->scan_filter_overlay);
+    }
+    ctx->scan_filter_overlay = NULL;
+    ctx->scan_filter_sort_dd = NULL;
+    ctx->scan_filter_order_dd = NULL;
+    ctx->scan_filter_ssid_input = NULL;
+    ctx->scan_filter_visibility_dd = NULL;
+    memset(ctx->scan_filter_security_cb, 0, sizeof(ctx->scan_filter_security_cb));
+    ctx->scan_filter_keyboard = NULL;
+}
+
+static void scan_filter_cancel_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = lv_event_get_user_data(e);
+    scan_filter_close_popup(ctx);
+}
+
+static void scan_filter_keyboard_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = lv_event_get_user_data(e);
+    lv_event_code_t code = lv_event_get_code(e);
+    if (ctx && ctx->scan_filter_keyboard &&
+        (code == LV_EVENT_READY || code == LV_EVENT_CANCEL)) {
+        lv_obj_add_flag(ctx->scan_filter_keyboard, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void scan_filter_text_focus_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = lv_event_get_user_data(e);
+    if (!ctx || !ctx->scan_filter_keyboard || !ctx->scan_filter_ssid_input) return;
+    lv_keyboard_set_textarea(ctx->scan_filter_keyboard, ctx->scan_filter_ssid_input);
+    lv_obj_clear_flag(ctx->scan_filter_keyboard, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(ctx->scan_filter_keyboard);
+}
+
+static const uint32_t scan_filter_security_bits[7] = {
+    SCAN_SECURITY_ALL,
+    SCAN_SECURITY_OPEN,
+    SCAN_SECURITY_WPA,
+    SCAN_SECURITY_WPA2,
+    SCAN_SECURITY_WPA3,
+    SCAN_SECURITY_WEP,
+    SCAN_SECURITY_UNKNOWN,
+};
+
+static void scan_filter_security_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = lv_event_get_user_data(e);
+    lv_obj_t *target = lv_event_get_target(e);
+    if (!ctx || !target) return;
+
+    if (target == ctx->scan_filter_security_cb[0] &&
+        lv_obj_has_state(target, LV_STATE_CHECKED)) {
+        for (int i = 1; i < 7; i++) {
+            if (ctx->scan_filter_security_cb[i]) {
+                lv_obj_remove_state(ctx->scan_filter_security_cb[i], LV_STATE_CHECKED);
+            }
+        }
+        return;
+    }
+
+    if (lv_obj_has_state(target, LV_STATE_CHECKED) && ctx->scan_filter_security_cb[0]) {
+        lv_obj_remove_state(ctx->scan_filter_security_cb[0], LV_STATE_CHECKED);
+    }
+
+    bool any_specific = false;
+    for (int i = 1; i < 7; i++) {
+        if (ctx->scan_filter_security_cb[i] &&
+            lv_obj_has_state(ctx->scan_filter_security_cb[i], LV_STATE_CHECKED)) {
+            any_specific = true;
+            break;
+        }
+    }
+    if (!any_specific && ctx->scan_filter_security_cb[0]) {
+        lv_obj_add_state(ctx->scan_filter_security_cb[0], LV_STATE_CHECKED);
+    }
+}
+
+static void scan_filter_read_controls(tab_context_t *ctx)
+{
+    if (!ctx) return;
+    ctx->scan_filter.sort_key = ctx->scan_filter_sort_dd
+        ? (scan_sort_key_t)lv_dropdown_get_selected(ctx->scan_filter_sort_dd)
+        : SCAN_SORT_DEFAULT;
+    ctx->scan_filter.reverse = ctx->scan_filter_order_dd &&
+        lv_dropdown_get_selected(ctx->scan_filter_order_dd) == 1;
+    ctx->scan_filter.visibility = ctx->scan_filter_visibility_dd
+        ? (scan_visibility_t)lv_dropdown_get_selected(ctx->scan_filter_visibility_dd)
+        : SCAN_VISIBILITY_ALL;
+    ctx->scan_filter.security_mask = SCAN_SECURITY_ALL;
+    for (int i = 1; i < 7; i++) {
+        if (ctx->scan_filter_security_cb[i] &&
+            lv_obj_has_state(ctx->scan_filter_security_cb[i], LV_STATE_CHECKED)) {
+            ctx->scan_filter.security_mask |= scan_filter_security_bits[i];
+        }
+    }
+    const char *query = ctx->scan_filter_ssid_input
+        ? lv_textarea_get_text(ctx->scan_filter_ssid_input) : "";
+    snprintf(ctx->scan_filter.ssid_query, sizeof(ctx->scan_filter.ssid_query),
+             "%s", query ? query : "");
+}
+
+static void scan_filter_apply_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = lv_event_get_user_data(e);
+    if (!ctx) return;
+    scan_filter_read_controls(ctx);
+    scan_filter_close_popup(ctx);
+    scan_filter_apply_view(ctx);
+}
+
+static void scan_filter_clear_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = lv_event_get_user_data(e);
+    if (!ctx) return;
+    memset(&ctx->scan_filter, 0, sizeof(ctx->scan_filter));
+    scan_filter_close_popup(ctx);
+    scan_filter_apply_view(ctx);
+}
+
+static lv_obj_t *scan_filter_section_label(lv_obj_t *parent, const char *text)
+{
+    lv_obj_t *label = lv_label_create(parent);
+    lv_label_set_text(label, text);
+    lv_obj_set_style_text_font(label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(label, ui_muted_color(), 0);
+    return label;
+}
+
+static lv_obj_t *scan_filter_action_button(lv_obj_t *parent, const char *text,
+                                           lv_color_t color, lv_event_cb_t cb,
+                                           tab_context_t *ctx)
+{
+    lv_obj_t *button = lv_btn_create(parent);
+    lv_obj_set_height(button, 48);
+    lv_obj_set_flex_grow(button, 1);
+    lv_obj_set_style_bg_color(button, color, 0);
+    lv_obj_set_style_radius(button, 8, 0);
+    lv_obj_add_event_cb(button, cb, LV_EVENT_CLICKED, ctx);
+    lv_obj_t *label = lv_label_create(button);
+    lv_label_set_text(label, text);
+    lv_obj_set_style_text_font(label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(label, lv_color_white(), 0);
+    lv_obj_center(label);
+    return button;
+}
+
+static void show_scan_filter_popup(tab_context_t *ctx)
+{
+    if (!ctx || !ctx->scan_page || ctx->scan_filter_overlay) return;
+
+    ctx->scan_filter_overlay = lv_obj_create(ctx->scan_page);
+    lv_obj_remove_style_all(ctx->scan_filter_overlay);
+    lv_obj_set_size(ctx->scan_filter_overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(ctx->scan_filter_overlay, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(ctx->scan_filter_overlay, LV_OPA_60, 0);
+    lv_obj_add_flag(ctx->scan_filter_overlay, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_IGNORE_LAYOUT);
+    lv_obj_clear_flag(ctx->scan_filter_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_move_foreground(ctx->scan_filter_overlay);
+
+    lv_obj_t *popup = lv_obj_create(ctx->scan_filter_overlay);
+    lv_obj_set_size(popup, popup_clamp_w(640), popup_clamp_h(650));
+    lv_obj_center(popup);
+    style_popup_card(popup, 14, COLOR_LAB5_MAGENTA);
+    lv_obj_set_style_pad_all(popup, 16, 0);
+    lv_obj_set_style_pad_row(popup, 10, 0);
+    lv_obj_set_flex_flow(popup, LV_FLEX_FLOW_COLUMN);
+    lv_obj_clear_flag(popup, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *header = lv_obj_create(popup);
+    lv_obj_set_size(header, lv_pct(100), 46);
+    lv_obj_set_style_bg_opa(header, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(header, 0, 0);
+    lv_obj_set_style_pad_all(header, 0, 0);
+    lv_obj_set_flex_flow(header, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(header, LV_FLEX_ALIGN_SPACE_BETWEEN,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(header, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(header);
+    lv_label_set_text(title, "Sort & Filter");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_22, 0);
+    lv_obj_set_style_text_color(title, COLOR_LAB5_MAGENTA, 0);
+
+    lv_obj_t *close_btn = lv_btn_create(header);
+    lv_obj_set_size(close_btn, 44, 40);
+    lv_obj_set_style_bg_color(close_btn, ui_card_color(), 0);
+    lv_obj_set_style_border_width(close_btn, 1, 0);
+    lv_obj_set_style_border_color(close_btn, ui_border_color(), 0);
+    lv_obj_set_style_radius(close_btn, 8, 0);
+    lv_obj_add_event_cb(close_btn, scan_filter_cancel_cb, LV_EVENT_CLICKED, ctx);
+    lv_obj_t *close_label = lv_label_create(close_btn);
+    lv_label_set_text(close_label, LV_SYMBOL_CLOSE);
+    lv_obj_set_style_text_color(close_label, ui_text_color(), 0);
+    lv_obj_center(close_label);
+
+    lv_obj_t *form = lv_obj_create(popup);
+    lv_obj_set_width(form, lv_pct(100));
+    lv_obj_set_flex_grow(form, 1);
+    lv_obj_set_style_bg_opa(form, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(form, 0, 0);
+    lv_obj_set_style_pad_all(form, 2, 0);
+    lv_obj_set_style_pad_row(form, 8, 0);
+    lv_obj_set_flex_flow(form, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_scroll_dir(form, LV_DIR_VER);
+
+    scan_filter_section_label(form, "SORT BY");
+    ctx->scan_filter_sort_dd = lv_dropdown_create(form);
+    lv_dropdown_set_options(ctx->scan_filter_sort_dd, "Default\nName\nSignal\nChannel");
+    lv_dropdown_set_selected(ctx->scan_filter_sort_dd, (uint16_t)ctx->scan_filter.sort_key);
+    lv_obj_set_width(ctx->scan_filter_sort_dd, lv_pct(100));
+
+    scan_filter_section_label(form, "ORDER");
+    ctx->scan_filter_order_dd = lv_dropdown_create(form);
+    lv_dropdown_set_options(ctx->scan_filter_order_dd, "Primary (A-Z / strongest / low channel)\nReverse");
+    lv_dropdown_set_selected(ctx->scan_filter_order_dd, ctx->scan_filter.reverse ? 1 : 0);
+    lv_obj_set_width(ctx->scan_filter_order_dd, lv_pct(100));
+
+    scan_filter_section_label(form, "SSID CONTAINS");
+    ctx->scan_filter_ssid_input = lv_textarea_create(form);
+    lv_obj_set_size(ctx->scan_filter_ssid_input, lv_pct(100), 46);
+    lv_textarea_set_one_line(ctx->scan_filter_ssid_input, true);
+    lv_textarea_set_max_length(ctx->scan_filter_ssid_input, SCAN_FILTER_QUERY_MAX);
+    lv_textarea_set_placeholder_text(ctx->scan_filter_ssid_input, "Type part of a network name...");
+    lv_textarea_set_text(ctx->scan_filter_ssid_input, ctx->scan_filter.ssid_query);
+    lv_obj_set_style_bg_color(ctx->scan_filter_ssid_input, ui_bg_color(), 0);
+    lv_obj_set_style_border_color(ctx->scan_filter_ssid_input, ui_border_color(), 0);
+    lv_obj_set_style_border_width(ctx->scan_filter_ssid_input, 1, 0);
+    lv_obj_set_style_text_color(ctx->scan_filter_ssid_input, ui_text_color(), 0);
+    lv_obj_add_event_cb(ctx->scan_filter_ssid_input, scan_filter_text_focus_cb,
+                        LV_EVENT_FOCUSED, ctx);
+    lv_obj_add_event_cb(ctx->scan_filter_ssid_input, scan_filter_text_focus_cb,
+                        LV_EVENT_CLICKED, ctx);
+
+    scan_filter_section_label(form, "SECURITY");
+    lv_obj_t *security_row = lv_obj_create(form);
+    lv_obj_set_size(security_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(security_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(security_row, 0, 0);
+    lv_obj_set_style_pad_all(security_row, 0, 0);
+    lv_obj_set_style_pad_row(security_row, 10, 0);
+    lv_obj_set_style_pad_column(security_row, 16, 0);
+    lv_obj_set_flex_flow(security_row, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_clear_flag(security_row, LV_OBJ_FLAG_SCROLLABLE);
+    static const char *security_names[7] = {
+        "All", "Open", "WPA", "WPA2", "WPA3", "WEP", "Unknown"
+    };
+    for (int i = 0; i < 7; i++) {
+        lv_obj_t *checkbox = lv_checkbox_create(security_row);
+        lv_checkbox_set_text(checkbox, security_names[i]);
+        lv_obj_set_style_text_color(checkbox, ui_text_color(), 0);
+        lv_obj_set_style_text_font(checkbox, &lv_font_montserrat_14, 0);
+        lv_obj_add_event_cb(checkbox, scan_filter_security_cb,
+                            LV_EVENT_VALUE_CHANGED, ctx);
+        ctx->scan_filter_security_cb[i] = checkbox;
+        bool checked = i == 0
+            ? ctx->scan_filter.security_mask == SCAN_SECURITY_ALL
+            : (ctx->scan_filter.security_mask & scan_filter_security_bits[i]) != 0;
+        if (checked) lv_obj_add_state(checkbox, LV_STATE_CHECKED);
+    }
+
+    scan_filter_section_label(form, "VISIBILITY");
+    ctx->scan_filter_visibility_dd = lv_dropdown_create(form);
+    lv_dropdown_set_options(ctx->scan_filter_visibility_dd, "All networks\nNamed only\nHidden only");
+    lv_dropdown_set_selected(ctx->scan_filter_visibility_dd,
+                             (uint16_t)ctx->scan_filter.visibility);
+    lv_obj_set_width(ctx->scan_filter_visibility_dd, lv_pct(100));
+
+    lv_obj_t *actions = lv_obj_create(popup);
+    lv_obj_set_size(actions, lv_pct(100), 48);
+    lv_obj_set_style_bg_opa(actions, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(actions, 0, 0);
+    lv_obj_set_style_pad_all(actions, 0, 0);
+    lv_obj_set_style_pad_column(actions, 10, 0);
+    lv_obj_set_flex_flow(actions, LV_FLEX_FLOW_ROW);
+    lv_obj_clear_flag(actions, LV_OBJ_FLAG_SCROLLABLE);
+    scan_filter_action_button(actions, "CLEAR", lv_color_hex(0x555555),
+                              scan_filter_clear_cb, ctx);
+    scan_filter_action_button(actions, "APPLY", COLOR_LAB5_MAGENTA,
+                              scan_filter_apply_cb, ctx);
+
+    ctx->scan_filter_keyboard = lv_keyboard_create(ctx->scan_filter_overlay);
+    lv_obj_set_size(ctx->scan_filter_keyboard, lv_pct(100), 240);
+    lv_obj_align(ctx->scan_filter_keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_add_flag(ctx->scan_filter_keyboard, LV_OBJ_FLAG_FLOATING);
+    style_on_screen_keyboard(ctx->scan_filter_keyboard);
+    lv_keyboard_set_textarea(ctx->scan_filter_keyboard, ctx->scan_filter_ssid_input);
+    lv_obj_add_flag(ctx->scan_filter_keyboard, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(ctx->scan_filter_keyboard, scan_filter_keyboard_cb,
+                        LV_EVENT_READY, ctx);
+    lv_obj_add_event_cb(ctx->scan_filter_keyboard, scan_filter_keyboard_cb,
+                        LV_EVENT_CANCEL, ctx);
+}
+
+static void scan_filter_btn_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = lv_event_get_user_data(e);
+    if (!ctx) ctx = get_current_ctx();
+    show_scan_filter_popup(ctx);
 }
 
 static void style_fade_border_strip(lv_obj_t *strip, lv_color_t start_color, lv_color_t end_color, lv_grad_dir_t dir)
@@ -7305,13 +8097,77 @@ static lv_obj_t *create_small_tile(lv_obj_t *parent, const char *icon, const cha
     return tile;
 }
 
+// The single row of the attack bar: full width, fixed height, tiles left to
+// right. Kept apart from the bar itself so the bar can pad it and so the row
+// owns the horizontal scrolling.
+static lv_obj_t *create_attack_bar_row(lv_obj_t *bar, lv_coord_t h)
+{
+    lv_obj_t *row = lv_obj_create(bar);
+    lv_obj_set_size(row, lv_pct(100), h);
+    lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(row, 0, 0);
+    lv_obj_set_style_pad_all(row, 0, 0);
+    lv_obj_set_style_pad_gap(row, 8, 0);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+    return row;
+}
+
 static void create_attack_action_bar(lv_obj_t *parent, lv_event_cb_t callback, lv_event_cb_t karma_callback)
 {
-    bool three_cols = enable_red_team;
-    lv_coord_t bar_h = three_cols ? 318 : 162;
+    // What the bar carries, in display order. Kept as data so the layout below
+    // is the only thing that has to know about the shape of the screen.
+    typedef struct {
+        const char   *icon;
+        const char   *label;
+        lv_color_t    color;
+        lv_event_cb_t cb;
+        const char   *action;
+    } bar_tile_t;
+
+    bar_tile_t tiles[11];
+    int count = 0;
+
+    if (enable_red_team) {
+        tiles[count++] = (bar_tile_t){ LV_SYMBOL_CHARGE,   "Deauth",       COLOR_MATERIAL_RED,    callback, "Deauth" };
+        tiles[count++] = (bar_tile_t){ LV_SYMBOL_WARNING,  "Evil Twin",    COLOR_MATERIAL_ORANGE, callback, "Evil Twin" };
+        tiles[count++] = (bar_tile_t){ LV_SYMBOL_POWER,    "SAE Overflow", COLOR_MATERIAL_PINK,   callback, "SAE Overflow" };
+        tiles[count++] = (bar_tile_t){ LV_SYMBOL_DOWNLOAD, "Handshake",    COLOR_MATERIAL_AMBER,  callback, "Handshaker" };
+        tiles[count++] = (bar_tile_t){ LV_SYMBOL_SHUFFLE,  "ARP",          COLOR_MATERIAL_PURPLE, callback, "ARP Poison" };
+        tiles[count++] = (bar_tile_t){ LV_SYMBOL_EYE_OPEN, "RogueAP",      COLOR_MATERIAL_CYAN,   callback, "Rogue AP" };
+        tiles[count++] = (bar_tile_t){ LV_SYMBOL_COPY,     "MITM",         COLOR_MATERIAL_TEAL,   callback, "MITM" };
+        tiles[count++] = (bar_tile_t){ LV_SYMBOL_LIST,     "Nmap",         COLOR_MATERIAL_GREEN,  callback, "Nmap" };
+        if (karma_callback != NULL) {
+            tiles[count++] = (bar_tile_t){ LV_SYMBOL_WIFI, "Karma", COLOR_MATERIAL_AMBER, karma_callback, "Karma" };
+        } else {
+            tiles[count++] = (bar_tile_t){ LV_SYMBOL_GPS,  "Radar", COLOR_MATERIAL_BLUE,  callback,       "Radar" };
+        }
+        // Capture Gateway (GITM): connect upstream + raise our own AP on JanOS,
+        // route + capture the client's traffic.
+        tiles[count++] = (bar_tile_t){ LV_SYMBOL_LOOP, "GITM", COLOR_MATERIAL_BLUE, callback, "Capture GW" };
+        // Rogue GITM: deauth + same-SSID mirror + capture through our uplink.
+        // Last in the strip and the only magenta tile, so it still reads as the
+        // loud one without costing a row of its own.
+        tiles[count++] = (bar_tile_t){ LV_SYMBOL_LOOP, "Rogue GITM", COLOR_LAB5_MAGENTA, callback, "Rogue GITM" };
+    } else {
+        // Non-red-team: ARP + Nmap (+ Karma if requested)
+        tiles[count++] = (bar_tile_t){ LV_SYMBOL_SHUFFLE, "ARP",  COLOR_MATERIAL_PURPLE, callback, "ARP Poison" };
+        tiles[count++] = (bar_tile_t){ LV_SYMBOL_LIST,    "Nmap", COLOR_MATERIAL_GREEN,  callback, "Nmap" };
+        if (karma_callback != NULL) {
+            tiles[count++] = (bar_tile_t){ LV_SYMBOL_WIFI, "Karma", COLOR_MATERIAL_AMBER, karma_callback, "Karma" };
+        }
+    }
+
+    // Same heuristic create_small_tile() uses for its own size and fonts, so the
+    // explicit size below matches what the tile drew itself for.
+    const bool large_tiles   = lv_disp_get_ver_res(NULL) >= 1000;
+    const lv_coord_t tile_w  = large_tiles ? 126 : 118;
+    const lv_coord_t row_h   = large_tiles ? 74 : 72;
+    const lv_coord_t col_gap = 8;
 
     lv_obj_t *attack_bar = lv_obj_create(parent);
-    lv_obj_set_size(attack_bar, lv_pct(100), bar_h);
+    lv_obj_set_width(attack_bar, lv_pct(100));
     lv_obj_set_style_bg_opa(attack_bar, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(attack_bar, 0, 0);
     lv_obj_set_style_pad_all(attack_bar, 4, 0);
@@ -7320,110 +8176,38 @@ static void create_attack_action_bar(lv_obj_t *parent, lv_event_cb_t callback, l
     lv_obj_set_flex_align(attack_bar, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_clear_flag(attack_bar, LV_OBJ_FLAG_SCROLLABLE);
 
-    lv_obj_t *attack_row1 = lv_obj_create(attack_bar);
-    lv_obj_set_size(attack_row1, lv_pct(100), 72);
-    lv_obj_set_style_bg_opa(attack_row1, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(attack_row1, 0, 0);
-    lv_obj_set_style_pad_all(attack_row1, 0, 0);
-    lv_obj_set_style_pad_gap(attack_row1, 8, 0);
-    lv_obj_set_flex_flow(attack_row1, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(attack_row1, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_clear_flag(attack_row1, LV_OBJ_FLAG_SCROLLABLE);
-
-    lv_obj_t *attack_row2 = lv_obj_create(attack_bar);
-    lv_obj_set_size(attack_row2, lv_pct(100), 72);
-    lv_obj_set_style_bg_opa(attack_row2, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(attack_row2, 0, 0);
-    lv_obj_set_style_pad_all(attack_row2, 0, 0);
-    lv_obj_set_style_pad_gap(attack_row2, 8, 0);
-    lv_obj_set_flex_flow(attack_row2, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(attack_row2, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_clear_flag(attack_row2, LV_OBJ_FLAG_SCROLLABLE);
-
     lv_obj_update_layout(parent);
-    lv_coord_t row_inner_w = lv_obj_get_content_width(attack_row1);
+    lv_coord_t row_inner_w = lv_obj_get_content_width(attack_bar);
     if (row_inner_w <= 0) {
         row_inner_w = lv_disp_get_hor_res(NULL) - 16;
     }
     if (row_inner_w < 280) row_inner_w = 280;
 
-    if (enable_red_team) {
-        if (three_cols) {
-            // 3x3 layout: 3 columns, 2 gaps of 8px each = 16px total
-            lv_obj_t *attack_row3 = lv_obj_create(attack_bar);
-            lv_obj_set_size(attack_row3, lv_pct(100), 72);
-            lv_obj_set_style_bg_opa(attack_row3, LV_OPA_TRANSP, 0);
-            lv_obj_set_style_border_width(attack_row3, 0, 0);
-            lv_obj_set_style_pad_all(attack_row3, 0, 0);
-            lv_obj_set_style_pad_gap(attack_row3, 8, 0);
-            lv_obj_set_flex_flow(attack_row3, LV_FLEX_FLOW_ROW);
-            lv_obj_set_flex_align(attack_row3, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-            lv_obj_clear_flag(attack_row3, LV_OBJ_FLAG_SCROLLABLE);
+    // One row that scrolls sideways, in every orientation. This used to be a
+    // stacked grid - 3 + 3 + the rest, plus a full-width row for Rogue GITM -
+    // which cost up to four rows of height: ~314 px in portrait and about half
+    // the page in a 90/270 orientation, where the screen is only 720 px tall.
+    // The strip shows the same tiles at the same size for one row, and the
+    // network list underneath grows into everything it gives back.
+    lv_obj_set_height(attack_bar, row_h + 8);
 
-            // Row 4 carries the single Rogue GITM tile at full width.
-            lv_obj_t *attack_row4 = lv_obj_create(attack_bar);
-            lv_obj_set_size(attack_row4, lv_pct(100), 72);
-            lv_obj_set_style_bg_opa(attack_row4, LV_OPA_TRANSP, 0);
-            lv_obj_set_style_border_width(attack_row4, 0, 0);
-            lv_obj_set_style_pad_all(attack_row4, 0, 0);
-            lv_obj_set_style_pad_gap(attack_row4, 8, 0);
-            lv_obj_set_flex_flow(attack_row4, LV_FLEX_FLOW_ROW);
-            lv_obj_set_flex_align(attack_row4, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-            lv_obj_clear_flag(attack_row4, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *strip = create_attack_bar_row(attack_bar, row_h);
+    lv_obj_add_flag(strip, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(strip, LV_DIR_HOR);
+    lv_obj_set_scrollbar_mode(strip, LV_SCROLLBAR_MODE_AUTO);
 
-            const lv_coord_t gap3 = 16;
-            lv_coord_t bw = (row_inner_w - gap3) / 3;
-            if (bw < 60) bw = 60;
-            lv_coord_t bw_last = bw + (row_inner_w - gap3 - bw * 3);
+    // With Red Team off there are only two or three tiles, which would sit hard
+    // against the left edge of the strip. Centre them when they fit; leave the
+    // overflowing case left-aligned so scrolling starts at the first tile.
+    const lv_coord_t strip_w = count * tile_w + (count - 1) * col_gap;
+    if (strip_w <= row_inner_w) {
+        lv_obj_set_flex_align(strip, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    }
 
-            lv_obj_t *b1 = create_small_tile(attack_row1, LV_SYMBOL_CHARGE,    "Deauth",       COLOR_MATERIAL_RED,    callback,       "Deauth");
-            lv_obj_t *b2 = create_small_tile(attack_row1, LV_SYMBOL_WARNING,   "Evil Twin",    COLOR_MATERIAL_ORANGE, callback,       "Evil Twin");
-            lv_obj_t *b3 = create_small_tile(attack_row1, LV_SYMBOL_POWER,     "SAE Overflow", COLOR_MATERIAL_PINK,   callback,       "SAE Overflow");
-            lv_obj_t *b4 = create_small_tile(attack_row2, LV_SYMBOL_DOWNLOAD,  "Handshake",    COLOR_MATERIAL_AMBER,  callback,       "Handshaker");
-            lv_obj_t *b5 = create_small_tile(attack_row2, LV_SYMBOL_SHUFFLE,   "ARP",          COLOR_MATERIAL_PURPLE, callback,       "ARP Poison");
-            lv_obj_t *b6 = create_small_tile(attack_row2, LV_SYMBOL_EYE_OPEN,  "RogueAP",      COLOR_MATERIAL_CYAN,   callback,       "Rogue AP");
-            lv_obj_t *b7 = create_small_tile(attack_row3, LV_SYMBOL_COPY,      "MITM",         COLOR_MATERIAL_TEAL,   callback,       "MITM");
-            lv_obj_t *b8 = create_small_tile(attack_row3, LV_SYMBOL_LIST,      "Nmap",         COLOR_MATERIAL_GREEN,  callback,       "Nmap");
-            lv_obj_t *b9;
-            if (karma_callback != NULL) {
-                b9 = create_small_tile(attack_row3, LV_SYMBOL_WIFI, "Karma", COLOR_MATERIAL_AMBER, karma_callback, "Karma");
-            } else {
-                b9 = create_small_tile(attack_row3, LV_SYMBOL_GPS, "Radar", COLOR_MATERIAL_BLUE, callback, "Radar");
-            }
-            // Capture Gateway (GITM): connect upstream + raise our own AP on JanOS,
-            // route + capture the client's traffic. Shares row 3 as a fourth tile.
-            lv_obj_t *b10 = create_small_tile(attack_row3, LV_SYMBOL_LOOP, "GITM", COLOR_MATERIAL_BLUE, callback, "Capture GW");
-
-            lv_obj_set_size(b1, bw, 72); lv_obj_set_size(b2, bw, 72); lv_obj_set_size(b3, bw_last, 72);
-            lv_obj_set_size(b4, bw, 72); lv_obj_set_size(b5, bw, 72); lv_obj_set_size(b6, bw_last, 72);
-
-            // Row 3 now holds four tiles; size them on a 4-column grid (3 gaps).
-            const lv_coord_t gap4 = 24;
-            lv_coord_t bw4 = (row_inner_w - gap4) / 4;
-            if (bw4 < 52) bw4 = 52;
-            lv_coord_t bw4_last = bw4 + (row_inner_w - gap4 - bw4 * 4);
-            lv_obj_set_size(b7, bw4, 72); lv_obj_set_size(b8, bw4, 72);
-            lv_obj_set_size(b9, bw4, 72); lv_obj_set_size(b10, bw4_last, 72);
-
-            // Rogue GITM: deauth + same-SSID mirror + capture through our uplink.
-            // Kept apart from the clean GITM tile as its own full-width row.
-            lv_obj_t *b11 = create_small_tile(attack_row4, LV_SYMBOL_LOOP, "Rogue GITM",
-                                              COLOR_LAB5_MAGENTA, callback, "Rogue GITM");
-            lv_obj_set_size(b11, row_inner_w, 72);
-        }
-    } else {
-        // Non-red-team: ARP + Nmap (+ Karma if requested)
-        int nr_count = karma_callback ? 3 : 2;
-        lv_coord_t nr_gap = 8 * (nr_count - 1);
-        lv_coord_t nr_btn_w = (row_inner_w - nr_gap) / nr_count;
-        lv_obj_t *btn_arp  = create_small_tile(attack_row1, LV_SYMBOL_SHUFFLE, "ARP",  COLOR_MATERIAL_PURPLE, callback, "ARP Poison");
-        lv_obj_t *btn_nmap = create_small_tile(attack_row1, LV_SYMBOL_LIST,    "Nmap", COLOR_MATERIAL_GREEN,  callback, "Nmap");
-        lv_obj_set_size(btn_arp,  nr_btn_w, 72);
-        lv_obj_set_size(btn_nmap, nr_btn_w, 72);
-        if (karma_callback) {
-            lv_obj_t *btn_karma = create_small_tile(attack_row1, LV_SYMBOL_WIFI, "Karma", COLOR_MATERIAL_AMBER, karma_callback, "Karma");
-            lv_obj_set_size(btn_karma, nr_btn_w, 72);
-        }
+    for (int i = 0; i < count; i++) {
+        const bar_tile_t *t = &tiles[i];
+        lv_obj_t *b = create_small_tile(strip, t->icon, t->label, t->color, t->cb, t->action);
+        lv_obj_set_size(b, tile_w, row_h);
     }
 }
 
@@ -8558,6 +9342,7 @@ static void network_checkbox_event_cb(lv_event_t *e)
             }
         }
     }
+    scan_filter_apply_view(ctx);
 }
 
 static void network_item_event_cb(lv_event_t *e)
@@ -12604,15 +13389,18 @@ static void handshaker_popup_close_cb(lv_event_t *e)
     ESP_LOGI(TAG, "Handshaker popup closed - sending stop command");
 
     tab_context_t *ctx = get_current_ctx();
-    if (!ctx || !ctx->gitm) return;
+    if (!ctx) return;
 
     // Stop JanOS first, then wait for the UART reader to leave before deleting
-    // any LVGL objects it may still reference.
+    // any LVGL objects it may still reference. The reader needs one read timeout
+    // (100 ms) plus at most one contended log update (50 ms) to notice the
+    // cleared flag, so 1 s of headroom means the force-delete below stays a
+    // last resort rather than the normal path.
     ctx->handshaker_monitoring = false;
     uart_send_command_for_tab("stop");
 
     if (ctx->handshaker_task != NULL) {
-        for (int wait = 0; wait < 50 && ctx->handshaker_task != NULL; wait++) {
+        for (int wait = 0; wait < 100 && ctx->handshaker_task != NULL; wait++) {
             vTaskDelay(pdMS_TO_TICKS(10));
         }
         if (ctx->handshaker_task != NULL) {
@@ -12633,10 +13421,12 @@ static void handshaker_popup_close_cb(lv_event_t *e)
         ctx->handshaker_stop_btn = NULL;
         ctx->handshaker_stop_label = NULL;
         ctx->handshaker_wpasec_btn = NULL;
+        ctx->handshaker_result_actions = NULL;
     }
     ctx->observer_attack_return_to_observer = false;
     clear_observer_attack_override(ctx);
     ctx->handshaker_capture_success = false;
+    ctx->handshaker_saved_pcap[0] = '\0';
 
     // Clear global pointers
     handshaker_log_container = NULL;
@@ -12657,7 +13447,11 @@ static void handshaker_set_done_state(tab_context_t *ctx, bool show_wpasec_butto
 {
     if (!ctx) return;
 
-    bsp_display_lock(0);
+    // Bounded wait: the monitor task calls this, and the LVGL task may be
+    // sitting in handshaker_popup_close_cb() holding the display lock while it
+    // waits for that very task to exit. Blocking forever here would deadlock
+    // both until the close path force-deletes us.
+    if (!bsp_display_lock(200)) return;
 
     if (ctx->handshaker_stop_btn) {
         lv_obj_set_style_bg_color(ctx->handshaker_stop_btn, COLOR_MATERIAL_GREEN, 0);
@@ -12673,8 +13467,38 @@ static void handshaker_set_done_state(tab_context_t *ctx, bool show_wpasec_butto
             lv_obj_add_flag(ctx->handshaker_wpasec_btn, LV_OBJ_FLAG_HIDDEN);
         }
     }
+    if (ctx->handshaker_result_actions) {
+        if (show_wpasec_button) lv_obj_clear_flag(ctx->handshaker_result_actions, LV_OBJ_FLAG_HIDDEN);
+        else lv_obj_add_flag(ctx->handshaker_result_actions, LV_OBJ_FLAG_HIDDEN);
+    }
 
     bsp_display_unlock();
+}
+
+// Capture the path from JanOS's saved-file notification, never guess from SSID.
+// Store its PCAP spelling because the shared checker resolves the companion.
+static bool handshaker_saved_path(const char *line, char *out, size_t out_size)
+{
+    const char *marker = strstr(line, "PCAP saved:");
+    bool hccapx = false;
+    if (!marker) {
+        marker = strstr(line, "HCCAPX saved:");
+        hccapx = true;
+    }
+    if (!marker) return false;
+    if (!out || !out_size) return false;
+    out[0] = '\0';
+    const char *path = strstr(marker, "/sdcard/");
+    if (!path) return false;
+    const char *extension = strstr(path, hccapx ? ".hccapx" : ".pcap");
+    if (!extension) return false;
+    const char *end = extension + (hccapx ? 7 : 5);
+    if (*end && !isspace((unsigned char)*end) && *end != '\'' && *end != '"' && *end != '\x1b') return false;
+    size_t stem_len = (size_t)(extension - path);
+    if (stem_len + sizeof(".pcap") > out_size) return false;
+    memcpy(out, path, stem_len);
+    memcpy(out + stem_len, ".pcap", sizeof(".pcap"));
+    return true;
 }
 
 // Append message to handshaker log with color coding
@@ -12729,8 +13553,11 @@ static void append_handshaker_log(const char *message, hs_log_type_t log_type)
     }
     strncat(handshaker_log_buffer, message, sizeof(handshaker_log_buffer) - strlen(handshaker_log_buffer) - 1);
 
-    // Update UI
-    bsp_display_lock(0);
+    // Update UI. Bounded wait for the same reason as handshaker_set_done_state:
+    // the closing LVGL task holds the display lock while waiting for us. The
+    // label is rendered from the whole buffer, so a skipped repaint costs
+    // nothing - the next line that does get the lock shows this text too.
+    if (!bsp_display_lock(50)) return;
     if (handshaker_status_label) {
         lv_label_set_text(handshaker_status_label, handshaker_log_buffer);
         // Set color for last message (entire label gets same color - latest determines it)
@@ -12763,6 +13590,7 @@ static void handshaker_monitor_task(void *arg)
     // Track state for detecting "already captured" scenario
     int networks_attacked_this_cycle = -1;
     int handshakes_so_far = -1;
+    bool janos_finished = false;   // set when JanOS reports its own cleanup
     if (ctx) {
         ctx->handshaker_capture_success = false;
     }
@@ -12775,6 +13603,11 @@ static void handshaker_monitor_task(void *arg)
             rx_buffer[len] = '\0';
 
             for (int i = 0; i < len; i++) {
+                // A Stop from the UI has to be honoured mid-chunk. The LVGL task
+                // holds the display lock while it waits for this task to leave,
+                // so every further line would only burn the log's lock timeout.
+                if (!ctx->handshaker_monitoring && !janos_finished) break;
+
                 char c = rx_buffer[i];
 
                 if (c == '\n' || c == '\r') {
@@ -12817,6 +13650,8 @@ static void handshaker_monitor_task(void *arg)
                         }
                         else if (strstr(line_buffer, "PCAP saved:") != NULL ||
                                  strstr(line_buffer, "HCCAPX saved:") != NULL) {
+                            handshaker_saved_path(line_buffer, ctx->handshaker_saved_pcap,
+                                                  sizeof(ctx->handshaker_saved_pcap));
                             // Extract filename from path
                             char *path = strstr(line_buffer, "/sdcard/");
                             if (path) {
@@ -12976,6 +13811,7 @@ static void handshaker_monitor_task(void *arg)
                         }
 
                         if (attack_finished) {
+                            janos_finished = true;
                             handshaker_set_done_state(ctx, ctx->handshaker_capture_success);
                             ctx->handshaker_monitoring = false;
                             handshaker_monitoring = false;
@@ -13002,7 +13838,7 @@ static void handshaker_monitor_task(void *arg)
 static void show_handshaker_popup(void)
 {
     tab_context_t *ctx = get_current_ctx();
-    if (!ctx || !ctx->gitm) return;
+    if (!ctx) return;
     if (ctx->handshaker_popup != NULL) return;  // Already showing in this tab
 
     scan_view_t hsv = get_scan_view(ctx);
@@ -13171,8 +14007,15 @@ static void show_handshaker_popup(void)
     lv_obj_center(ctx->handshaker_stop_label);
 
     // Hidden by default, shown only when attack is done and handshake exists
-    ctx->handshaker_wpasec_btn = lv_btn_create(ctx->handshaker_popup);
-    lv_obj_set_size(ctx->handshaker_wpasec_btn, lv_pct(100), 50);
+    ctx->handshaker_result_actions = lv_obj_create(ctx->handshaker_popup);
+    lv_obj_remove_style_all(ctx->handshaker_result_actions);
+    lv_obj_set_size(ctx->handshaker_result_actions, lv_pct(100), 50);
+    lv_obj_set_flex_flow(ctx->handshaker_result_actions, LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_column(ctx->handshaker_result_actions, 10, 0);
+    lv_obj_add_flag(ctx->handshaker_result_actions, LV_OBJ_FLAG_HIDDEN);
+    ctx->handshaker_wpasec_btn = lv_btn_create(ctx->handshaker_result_actions);
+    lv_obj_set_size(ctx->handshaker_wpasec_btn, 0, 50);
+    lv_obj_set_flex_grow(ctx->handshaker_wpasec_btn, 1);
     lv_obj_set_style_bg_color(ctx->handshaker_wpasec_btn, COLOR_MATERIAL_PURPLE, 0);
     lv_obj_set_style_bg_color(ctx->handshaker_wpasec_btn, lv_color_hex(0x9C27B0), LV_STATE_PRESSED);
     lv_obj_set_style_radius(ctx->handshaker_wpasec_btn, 8, 0);
@@ -13184,7 +14027,19 @@ static void show_handshaker_popup(void)
     lv_obj_set_style_text_font(wpasec_btn_lbl, &lv_font_montserrat_18, 0);
     lv_obj_set_style_text_color(wpasec_btn_lbl, lv_color_hex(0xFFFFFF), 0);
     lv_obj_center(wpasec_btn_lbl);
+    lv_obj_t *crack_btn = lv_btn_create(ctx->handshaker_result_actions);
+    lv_obj_set_size(crack_btn, 0, 50);
+    lv_obj_set_flex_grow(crack_btn, 1);
+    lv_obj_set_style_bg_color(crack_btn, COLOR_MATERIAL_PURPLE, 0);
+    lv_obj_set_style_radius(crack_btn, 8, 0);
+    lv_obj_add_event_cb(crack_btn, handshaker_crack_cb, LV_EVENT_CLICKED, ctx);
+    lv_obj_t *crack_label = lv_label_create(crack_btn);
+    lv_label_set_text(crack_label, "Crack latest");
+    lv_obj_set_style_text_font(crack_label, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_color(crack_label, lv_color_white(), 0);
+    lv_obj_center(crack_label);
     ctx->handshaker_capture_success = false;
+    ctx->handshaker_saved_pcap[0] = '\0';
 
     // Now send UART commands and start monitoring
 
@@ -16991,8 +17846,12 @@ static void create_uart_tiles_in_container(lv_obj_t *container, tab_context_t *c
 
     bool large = lv_disp_get_ver_res(NULL) >= 1000;
     lv_coord_t tile_gap = large ? 10 : 8;
-    lv_coord_t footer_h = large ? 210 : 184;
     lv_coord_t row_h = large ? 88 : 76;
+    // Two stacked rows of dashboard cards on the tall portrait screen. In a
+    // 90/270 orientation they all share one row instead (see below), so the
+    // footer only needs the height of a single card - 184 px of dashboard out
+    // of the ~620 px the page has was a third of the screen.
+    lv_coord_t footer_h = large ? 210 : row_h + 8;
 
     if (ctx) reset_home_dashboard_bindings(ctx);
 
@@ -17017,7 +17876,7 @@ static void create_uart_tiles_in_container(lv_obj_t *container, tab_context_t *c
     lv_obj_set_style_pad_gap(tile_grid, tile_gap, 0);
     lv_obj_set_flex_flow(tile_grid, LV_FLEX_FLOW_ROW_WRAP);
     lv_obj_set_flex_align(tile_grid, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
-    lv_obj_clear_flag(tile_grid, LV_OBJ_FLAG_SCROLLABLE);
+    style_scrollable_tile_grid(tile_grid);
 
     create_tile(tile_grid, LV_SYMBOL_WIFI,
         enable_red_team ? "WiFi Scan\n& Attack" : "WiFi Scan\n& Test",
@@ -17061,15 +17920,23 @@ static void create_uart_tiles_in_container(lv_obj_t *container, tab_context_t *c
         lv_obj_set_flex_align(row_top, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
         lv_obj_clear_flag(row_top, LV_OBJ_FLAG_SCROLLABLE);
 
-        lv_obj_t *row_bottom = lv_obj_create(footer);
-        lv_obj_set_size(row_bottom, lv_pct(100), row_h);
-        lv_obj_set_style_bg_opa(row_bottom, LV_OPA_TRANSP, 0);
-        lv_obj_set_style_border_width(row_bottom, 0, 0);
-        lv_obj_set_style_pad_all(row_bottom, 0, 0);
-        lv_obj_set_style_pad_gap(row_bottom, large ? 8 : 6, 0);
-        lv_obj_set_flex_flow(row_bottom, LV_FLEX_FLOW_ROW);
-        lv_obj_set_flex_align(row_bottom, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
-        lv_obj_clear_flag(row_bottom, LV_OBJ_FLAG_SCROLLABLE);
+        // Landscape puts every card on one line. The cards size themselves with
+        // flex_grow, so seven of them across 1264 px land at ~175 px each -
+        // which is what four of them already measure on the 720 px portrait
+        // width. Same card size the user is used to, half the footer height,
+        // and nothing has to be scrolled out of sight to get it.
+        lv_obj_t *row_bottom = row_top;
+        if (large) {
+            row_bottom = lv_obj_create(footer);
+            lv_obj_set_size(row_bottom, lv_pct(100), row_h);
+            lv_obj_set_style_bg_opa(row_bottom, LV_OPA_TRANSP, 0);
+            lv_obj_set_style_border_width(row_bottom, 0, 0);
+            lv_obj_set_style_pad_all(row_bottom, 0, 0);
+            lv_obj_set_style_pad_gap(row_bottom, 8, 0);
+            lv_obj_set_flex_flow(row_bottom, LV_FLEX_FLOW_ROW);
+            lv_obj_set_flex_align(row_bottom, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+            lv_obj_clear_flag(row_bottom, LV_OBJ_FLAG_SCROLLABLE);
+        }
 
         lv_obj_t *last_card = create_home_info_card(row_top, LV_SYMBOL_WIFI " LAST NET", "No scan data",
                                                      ui_tab_icon_color(), row_h, large, ctx ? &ctx->home_last_net_label : NULL);
@@ -17343,7 +18210,7 @@ static void show_internal_tiles(void)
     lv_obj_set_style_pad_gap(internal_tiles, 10, 0);
     lv_obj_set_flex_flow(internal_tiles, LV_FLEX_FLOW_ROW_WRAP);
     lv_obj_set_flex_align(internal_tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_clear_flag(internal_tiles, LV_OBJ_FLAG_SCROLLABLE);
+    style_scrollable_tile_grid(internal_tiles);
 
     // Create 2 tiles for INTERNAL tab
     create_tile(internal_tiles, LV_SYMBOL_SETTINGS, "Settings", COLOR_MATERIAL_PURPLE, internal_tile_event_cb, "Settings");
@@ -17506,9 +18373,11 @@ static void show_scan_page(void)
     lv_obj_set_style_text_font(title, &lv_font_montserrat_24, 0);
     lv_obj_set_style_text_color(title, COLOR_LAB5_MAGENTA, 0);
 
-    // Scan button container (for button + spinner)
+    // Scan action container
     lv_obj_t *btn_cont = lv_obj_create(header);
-    lv_obj_set_size(btn_cont, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    // 116 px filter + 12 px gap + 120 px rescan. An explicit width avoids
+    // clipping the leading FILTER action in the nested flex row.
+    lv_obj_set_size(btn_cont, 248, 40);
     lv_obj_set_style_bg_opa(btn_cont, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(btn_cont, 0, 0);
     lv_obj_set_style_pad_all(btn_cont, 0, 0);
@@ -17516,11 +18385,22 @@ static void show_scan_page(void)
     lv_obj_set_flex_align(btn_cont, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_column(btn_cont, 12, 0);
 
-    // Spinner (hidden by default)
-    ctx->spinner = lv_spinner_create(btn_cont);
-    lv_obj_set_size(ctx->spinner, 32, 32);
-    lv_spinner_set_anim_params(ctx->spinner, 1000, 200);
-    lv_obj_add_flag(ctx->spinner, LV_OBJ_FLAG_HIDDEN);
+    // Sort and filter controls. The list rows are reordered/hidden in-place so
+    // their JanOS indices and async inspect labels always remain stable.
+    lv_obj_t *filter_btn = lv_btn_create(btn_cont);
+    lv_obj_set_size(filter_btn, 116, 40);
+    lv_obj_set_style_bg_color(filter_btn, ui_card_color(), 0);
+    lv_obj_set_style_bg_color(filter_btn, ui_card_pressed_color(), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(filter_btn, 1, 0);
+    lv_obj_set_style_border_color(filter_btn, COLOR_MATERIAL_CYAN, 0);
+    lv_obj_set_style_border_opa(filter_btn, LV_OPA_80, 0);
+    lv_obj_set_style_radius(filter_btn, 8, 0);
+    lv_obj_add_event_cb(filter_btn, scan_filter_btn_cb, LV_EVENT_CLICKED, ctx);
+    ctx->scan_filter_btn_label = lv_label_create(filter_btn);
+    lv_obj_set_style_text_font(ctx->scan_filter_btn_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(ctx->scan_filter_btn_label, ui_text_color(), 0);
+    lv_obj_center(ctx->scan_filter_btn_label);
+    scan_filter_update_button(ctx);
 
     // Scan button
     ctx->scan_btn = lv_btn_create(btn_cont);
@@ -17539,6 +18419,22 @@ static void show_scan_page(void)
     lv_obj_set_style_text_font(btn_label, &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_color(btn_label, lv_color_hex(0xFFFFFF), 0);
     lv_obj_center(btn_label);
+
+    // Always-visible summary of active sorting and filters. The summary is
+    // also a generous shortcut back into the filter controls.
+    ctx->scan_filter_summary_label = lv_label_create(ctx->scan_page);
+    lv_obj_set_width(ctx->scan_filter_summary_label, lv_pct(100));
+    lv_obj_set_height(ctx->scan_filter_summary_label, LV_SIZE_CONTENT);
+    lv_label_set_long_mode(ctx->scan_filter_summary_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(ctx->scan_filter_summary_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(ctx->scan_filter_summary_label, COLOR_MATERIAL_CYAN, 0);
+    lv_obj_set_style_text_color(ctx->scan_filter_summary_label, COLOR_LAB5_MAGENTA,
+                                LV_STATE_PRESSED);
+    lv_obj_add_flag(ctx->scan_filter_summary_label, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_ext_click_area(ctx->scan_filter_summary_label, 6);
+    lv_obj_add_event_cb(ctx->scan_filter_summary_label, scan_filter_btn_cb,
+                        LV_EVENT_CLICKED, ctx);
+    scan_filter_update_button(ctx);
 
     // Status label (compact)
     ctx->scan_status_label = lv_label_create(ctx->scan_page);
@@ -18240,7 +19136,7 @@ static void close_network_popup(void)
     }
 
     if (ctx->observer_table) {
-        update_observer_table(ctx);
+        observer_flush_incremental_ui(ctx);
     }
 
     ctx->observer_attack_return_to_observer = false;
@@ -18291,7 +19187,10 @@ static void show_network_popup(int network_idx)
         return;
     }
     ctx->network_popup = lv_obj_create(container);
-    lv_obj_set_size(ctx->network_popup, 640, enable_red_team ? 700 : 640);
+    // 700 px of popup does not fit a 720 px tall landscape screen, and the
+    // attack bar inside it is shorter there anyway.
+    const lv_coord_t net_popup_h = popup_clamp_h(enable_red_team ? 700 : 640);
+    lv_obj_set_size(ctx->network_popup, 640, net_popup_h);
     lv_obj_center(ctx->network_popup);
     lv_obj_set_style_bg_color(ctx->network_popup, lv_color_hex(0x1A2A2A), 0);
     lv_obj_set_style_border_color(ctx->network_popup, COLOR_MATERIAL_TEAL, 0);
@@ -18303,7 +19202,11 @@ static void show_network_popup(int network_idx)
     lv_obj_set_style_pad_all(ctx->network_popup, 16, 0);
     lv_obj_set_flex_flow(ctx->network_popup, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_row(ctx->network_popup, 8, 0);
-    lv_obj_clear_flag(ctx->network_popup, LV_OBJ_FLAG_SCROLLABLE);
+    if (net_popup_h >= (enable_red_team ? 700 : 640)) {
+        // Only pin the popup when it got the height it was drawn for; once
+        // clamped, let it scroll rather than hide the buttons at the bottom.
+        lv_obj_clear_flag(ctx->network_popup, LV_OBJ_FLAG_SCROLLABLE);
+    }
 
     // Header with title and close button
     lv_obj_t *header = lv_obj_create(ctx->network_popup);
@@ -18380,6 +19283,13 @@ static void show_network_popup(int network_idx)
     // Clients scrollable container
     ctx->popup_clients_container = lv_obj_create(ctx->network_popup);
     lv_obj_set_size(ctx->popup_clients_container, lv_pct(100), 170);
+    // The attack bar below is one row now instead of four, which leaves ~230 px
+    // of the card empty. Give it to the client list - it is what the popup is
+    // for - rather than to a hole above the tiles. The 170 px above is only the
+    // starting value: flex_grow sizes this from the parent, and the fixed
+    // children around it (40 + info + 20 + ~80 of bar) leave 300 px or more free
+    // in either orientation.
+    lv_obj_set_flex_grow(ctx->popup_clients_container, 1);
     lv_obj_set_style_bg_color(ctx->popup_clients_container, lv_color_hex(0x0A1A1A), 0);
     lv_obj_set_style_border_width(ctx->popup_clients_container, 0, 0);
     lv_obj_set_style_radius(ctx->popup_clients_container, 8, 0);
@@ -18578,10 +19488,205 @@ static void popup_poll_task(void *arg)
     vTaskDelete(NULL);
 }
 
-// Update observer table UI with current data
+static void observer_update_ssid_label(tab_context_t *ctx, int network_idx)
+{
+    if (!ctx || !ctx->observer_networks || !ctx->observer_network_ui ||
+        network_idx < 0 || network_idx >= ctx->observer_network_count) {
+        return;
+    }
+
+    observer_network_t *net = &ctx->observer_networks[network_idx];
+    observer_network_ui_t *ui = &ctx->observer_network_ui[network_idx];
+    if (!ui->ssid_label || !lv_obj_is_valid(ui->ssid_label)) return;
+
+    const char *ssid = net->ssid[0] ? net->ssid : "(Hidden)";
+    lv_label_set_text(ui->ssid_label, ssid);
+}
+
+static void observer_update_client_toggle(tab_context_t *ctx, int network_idx)
+{
+    if (!ctx || !ctx->observer_networks || !ctx->observer_network_ui ||
+        network_idx < 0 || network_idx >= ctx->observer_network_count) {
+        return;
+    }
+
+    observer_network_t *net = &ctx->observer_networks[network_idx];
+    observer_network_ui_t *ui = &ctx->observer_network_ui[network_idx];
+    if (!ui->client_toggle || !ui->client_toggle_label ||
+        !lv_obj_is_valid(ui->client_toggle) ||
+        !lv_obj_is_valid(ui->client_toggle_label)) {
+        return;
+    }
+
+    if (net->client_count <= 0) {
+        ui->clients_expanded = false;
+        lv_obj_add_flag(ui->client_toggle, LV_OBJ_FLAG_HIDDEN);
+        if (ui->client_container && lv_obj_is_valid(ui->client_container)) {
+            lv_obj_add_flag(ui->client_container, LV_OBJ_FLAG_HIDDEN);
+        }
+        return;
+    }
+
+    lv_obj_clear_flag(ui->client_toggle, LV_OBJ_FLAG_HIDDEN);
+    lv_label_set_text_fmt(ui->client_toggle_label, "%d client%s  %s",
+                          net->client_count,
+                          net->client_count == 1 ? "" : "s",
+                          ui->clients_expanded ? LV_SYMBOL_UP : LV_SYMBOL_DOWN);
+    if (ui->client_container && lv_obj_is_valid(ui->client_container)) {
+        if (ui->clients_expanded) {
+            lv_obj_clear_flag(ui->client_container, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(ui->client_container, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+}
+
+static void observer_client_toggle_cb(lv_event_t *e)
+{
+    lv_event_stop_bubbling(e);
+    int network_idx = (int)(intptr_t)lv_event_get_user_data(e);
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx || !ctx->observer_network_ui || network_idx < 0 ||
+        network_idx >= ctx->observer_network_count) {
+        return;
+    }
+
+    observer_network_ui_t *ui = &ctx->observer_network_ui[network_idx];
+    bool expand_selected = !ui->clients_expanded;
+
+    // Accordion behavior: collapse every tile before optionally opening the
+    // selected one. This keeps the list dense and prevents large scroll jumps.
+    for (int i = 0; i < ctx->observer_network_count; i++) {
+        observer_network_ui_t *other_ui = &ctx->observer_network_ui[i];
+        other_ui->clients_expanded = false;
+        if (other_ui->client_container &&
+            lv_obj_is_valid(other_ui->client_container)) {
+            lv_obj_add_flag(other_ui->client_container, LV_OBJ_FLAG_HIDDEN);
+        }
+        observer_update_client_toggle(ctx, i);
+    }
+
+    if (expand_selected) {
+        ui->clients_expanded = true;
+        if (ui->client_container && lv_obj_is_valid(ui->client_container)) {
+            lv_obj_clear_flag(ui->client_container, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    observer_update_client_toggle(ctx, network_idx);
+}
+
+static void observer_add_client_row(tab_context_t *ctx, int network_idx, int client_idx)
+{
+    if (!ctx || !ctx->observer_networks || !ctx->observer_network_ui ||
+        network_idx < 0 || network_idx >= ctx->observer_network_count ||
+        client_idx < 0 || client_idx >= MAX_CLIENTS_PER_NETWORK) {
+        return;
+    }
+
+    observer_network_t *net = &ctx->observer_networks[network_idx];
+    observer_network_ui_t *ui = &ctx->observer_network_ui[network_idx];
+    if (!ui->client_container || !lv_obj_is_valid(ui->client_container) ||
+        net->clients[client_idx][0] == '\0') {
+        return;
+    }
+
+    lv_obj_t *client_row = lv_obj_create(ui->client_container);
+    lv_obj_set_size(client_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_pad_all(client_row, 6, 0);
+    lv_obj_set_style_pad_left(client_row, 24, 0);
+    lv_obj_set_style_bg_color(client_row, lv_color_hex(0x1E2828), 0);
+    lv_obj_set_style_bg_color(client_row, lv_color_hex(0x2E3838), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(client_row, 0, 0);
+    lv_obj_set_style_radius(client_row, 4, 0);
+    lv_obj_clear_flag(client_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(client_row, LV_OBJ_FLAG_CLICKABLE);
+
+    intptr_t packed_data = ((intptr_t)network_idx << 16) | (intptr_t)client_idx;
+    lv_obj_add_event_cb(client_row, client_row_click_cb,
+                        LV_EVENT_CLICKED, (void *)packed_data);
+
+    lv_obj_t *mac_label = lv_label_create(client_row);
+    lv_label_set_text(mac_label, net->clients[client_idx]);
+    lv_obj_set_style_text_font(mac_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(mac_label, COLOR_MATERIAL_TEAL, 0);
+}
+
+// Synchronize only network tiles whose client counts changed. Existing LVGL
+// objects remain alive, so an input gesture can never lose its target because
+// a periodic Observer poll deleted the complete table.
+static void observer_sync_changed_tiles(tab_context_t *ctx)
+{
+    if (!ctx || !ctx->observer_networks || !ctx->observer_network_ui) return;
+
+    for (int i = 0; i < ctx->observer_network_count; i++) {
+        observer_network_t *net = &ctx->observer_networks[i];
+        observer_network_ui_t *ui = &ctx->observer_network_ui[i];
+        if (!ui->tile || !lv_obj_is_valid(ui->tile)) continue;
+        if (ui->rendered_client_count == net->client_count) continue;
+
+        int first_new = ui->rendered_client_count;
+        if (first_new < 0 || first_new > net->client_count) first_new = 0;
+        for (int j = first_new; j < net->client_count &&
+             j < MAX_CLIENTS_PER_NETWORK; j++) {
+            observer_add_client_row(ctx, i, j);
+        }
+        ui->rendered_client_count = net->client_count;
+        observer_update_client_toggle(ctx, i);
+    }
+    ctx->observer_ui_refresh_pending = false;
+}
+
+// Called with the LVGL mutex held. Layout changes are deferred while kinetic
+// or finger-driven scrolling is active and applied by the scroll-end callback.
+static void observer_flush_incremental_ui(tab_context_t *ctx)
+{
+    if (!ctx || !ctx->observer_table ||
+        !lv_obj_is_valid(ctx->observer_table)) {
+        return;
+    }
+    lv_indev_t *touch = bsp_display_get_input_dev();
+    bool touch_pressed = touch &&
+                         lv_indev_get_state(touch) == LV_INDEV_STATE_PRESSED;
+    if (touch_pressed || lv_obj_is_scrolling(ctx->observer_table)) {
+        ctx->observer_ui_refresh_pending = true;
+        return;
+    }
+    observer_sync_changed_tiles(ctx);
+}
+
+static void observer_table_scroll_end_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = lv_event_get_user_data(e);
+    if (!ctx || !ctx->observer_ui_refresh_pending) return;
+    observer_sync_changed_tiles(ctx);
+}
+
+// A tap may postpone an update before LVGL has entered the scrolling state.
+// Apply that pending update on release; kinetic scrolling remains protected by
+// the table's LV_EVENT_SCROLL_END callback.
+static void observer_touch_release_cb(lv_event_t *e)
+{
+    (void)e;
+    tab_context_t *const contexts[] = {
+        &grove_ctx, &usb_ctx, &mbus_ctx, &internal_ctx,
+    };
+    for (size_t i = 0; i < sizeof(contexts) / sizeof(contexts[0]); i++) {
+        tab_context_t *ctx = contexts[i];
+        if (!ctx->observer_ui_refresh_pending || !ctx->observer_table ||
+            !lv_obj_is_valid(ctx->observer_table) ||
+            lv_obj_is_scrolling(ctx->observer_table)) {
+            continue;
+        }
+        observer_sync_changed_tiles(ctx);
+    }
+}
+
+// Build the complete observer table after a fresh network scan. Periodic
+// sniffer polls use observer_sync_changed_tiles() instead.
 static void update_observer_table(tab_context_t *ctx)
 {
-    if (!ctx || !ctx->observer_table || !ctx->observer_networks) return;
+    if (!ctx || !ctx->observer_table || !ctx->observer_networks ||
+        !ctx->observer_network_ui) return;
 
     // Show export button as soon as there are results
     if (ctx->observer_export_btn && ctx->observer_network_count > 0) {
@@ -18600,6 +19705,9 @@ static void update_observer_table(tab_context_t *ctx)
     lv_coord_t scroll_y = lv_obj_get_scroll_y(ctx->observer_table);
 
     lv_obj_clean(ctx->observer_table);
+    memset(ctx->observer_network_ui, 0,
+           sizeof(observer_network_ui_t) * MAX_OBSERVER_NETWORKS);
+    ctx->observer_ui_refresh_pending = false;
 
     // Allocate inspect label array before building rows
     if (ctx->observer_network_count > 0) {
@@ -18609,11 +19717,16 @@ static void update_observer_table(tab_context_t *ctx)
             ? ctx->observer_network_count : 0;
     }
 
+    bool wide_layout = ui_wide_layout();
+
     for (int i = 0; i < ctx->observer_network_count; i++) {
         observer_network_t *net = &ctx->observer_networks[i];
+        observer_network_ui_t *ui = &ctx->observer_network_ui[i];
 
-        // Create network row (darker background, clickable) - 2 lines like WiFi Scanner
+        // The outer tile remains stable for the lifetime of this scan. Client
+        // rows are appended to its child container as they are discovered.
         lv_obj_t *net_row = lv_obj_create(ctx->observer_table);
+        ui->tile = net_row;
         lv_obj_set_size(net_row, lv_pct(100), LV_SIZE_CONTENT);
         lv_obj_set_style_pad_all(net_row, 8, 0);
         lv_obj_set_style_bg_color(net_row, lv_color_hex(0x2D2D2D), 0);
@@ -18628,81 +19741,128 @@ static void update_observer_table(tab_context_t *ctx)
         // Add click event with network index as user data
         lv_obj_add_event_cb(net_row, network_row_click_cb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
 
-        // First row: SSID (or "Hidden") + client count
-        lv_obj_t *ssid_label = lv_label_create(net_row);
-        if (strlen(net->ssid) > 0) {
-            if (net->client_count > 0) {
-                lv_label_set_text_fmt(ssid_label, "%s  (%d clients)", net->ssid, net->client_count);
-            } else {
-                lv_label_set_text(ssid_label, net->ssid);
-            }
-        } else {
-            if (net->client_count > 0) {
-                lv_label_set_text_fmt(ssid_label, "(Hidden)  (%d clients)", net->client_count);
-            } else {
-                lv_label_set_text(ssid_label, "(Hidden)");
-            }
-        }
+        lv_obj_t *header = lv_obj_create(net_row);
+        lv_obj_set_size(header, lv_pct(100), LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_opa(header, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(header, 0, 0);
+        lv_obj_set_style_pad_all(header, 0, 0);
+        lv_obj_set_flex_flow(header, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_style_pad_row(header, 2, 0);
+        lv_obj_clear_flag(header, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_remove_flag(header, LV_OBJ_FLAG_CLICKABLE);
+
+        // First row: identity/status starts at the left and the independent
+        // client-list disclosure remains pinned to the right. Landscape also
+        // keeps uptime/vendor in this row; portrait places it below metadata.
+        lv_obj_t *title_row = lv_obj_create(header);
+        lv_obj_set_size(title_row, lv_pct(100), LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_opa(title_row, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(title_row, 0, 0);
+        lv_obj_set_style_pad_all(title_row, 0, 0);
+        lv_obj_set_style_pad_column(title_row, 8, 0);
+        lv_obj_set_flex_flow(title_row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(title_row, LV_FLEX_ALIGN_START,
+                              LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_clear_flag(title_row, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_remove_flag(title_row, LV_OBJ_FLAG_CLICKABLE);
+
+        lv_obj_t *title_content = lv_obj_create(title_row);
+        lv_obj_set_size(title_content, 0, LV_SIZE_CONTENT);
+        lv_obj_set_flex_grow(title_content, 1);
+        lv_obj_set_style_bg_opa(title_content, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(title_content, 0, 0);
+        lv_obj_set_style_pad_all(title_content, 0, 0);
+        lv_obj_set_style_pad_column(title_content, 12, 0);
+        lv_obj_set_flex_flow(title_content, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(title_content, LV_FLEX_ALIGN_START,
+                              LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_clear_flag(title_content, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_remove_flag(title_content, LV_OBJ_FLAG_CLICKABLE);
+
+        lv_obj_t *ssid_label = lv_label_create(title_content);
+        ui->ssid_label = ssid_label;
+        lv_label_set_recolor(ssid_label, true);
         lv_obj_set_style_text_font(ssid_label, &lv_font_montserrat_18, 0);
         lv_obj_set_style_text_color(ssid_label, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_set_width(ssid_label, LV_SIZE_CONTENT);
+        lv_obj_set_style_max_width(ssid_label, wide_layout ? 320 : 360, 0);
+        lv_label_set_long_mode(ssid_label, LV_LABEL_LONG_DOT);
+        observer_update_ssid_label(ctx, i);
 
-        // Second row: BSSID | Band | RSSI | MFP | Uptime | Vendor
-        lv_obj_t *info_label = lv_label_create(net_row);
-        lv_label_set_recolor(info_label, true);
-        const char *rssi_col_nr = net->rssi > -50 ? "#55DD55" : (net->rssi > -70 ? "#FFAA00" : "#FF5555");
-        const char *band_col_nr = strstr(net->band, "5") ? "#CC66FF" : "#FFAA33";
-        const char *pass_badge = creds_badge(ctx, net->ssid);
-        if (net->inspected) {
-            lv_label_set_text_fmt(info_label,
-                "#5599FF %s#  |  #5599FF CH%d#  |  %s %s#  |  %s %d dBm#%s\n%s  |  Uptime: %s\nVendor: %s",
-                net->bssid, net->channel,
-                band_col_nr, net->band,
-                rssi_col_nr, net->rssi,
-                pass_badge,
-                net->mfp_capable ? "#FF5555 MFP On#" : "#55DD55 MFP Off#",
-                net->uptime[0] ? net->uptime : "?",
-                net->vendor[0] ? net->vendor : "-");
-        } else {
-            lv_label_set_text_fmt(info_label,
-                "#5599FF %s#  |  #5599FF CH%d#  |  %s %s#  |  %s %d dBm#%s\nVendor: %s",
-                net->bssid, net->channel,
-                band_col_nr, net->band,
-                rssi_col_nr, net->rssi,
-                pass_badge,
-                net->vendor[0] ? net->vendor : "-");
+        ui->saved_badge = lv_label_create(title_content);
+        lv_label_set_text(ui->saved_badge, LV_SYMBOL_OK " saved");
+        lv_obj_set_style_text_font(ui->saved_badge, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(ui->saved_badge, lv_color_hex(0x55DD99), 0);
+        if (!creds_have(ctx, net->ssid)) {
+            lv_obj_add_flag(ui->saved_badge, LV_OBJ_FLAG_HIDDEN);
         }
+
+        ui->client_toggle = lv_btn_create(title_row);
+        lv_obj_set_size(ui->client_toggle, LV_SIZE_CONTENT, 34);
+        lv_obj_set_ext_click_area(ui->client_toggle, 6);
+        lv_obj_set_style_pad_hor(ui->client_toggle, 8, 0);
+        lv_obj_set_style_pad_ver(ui->client_toggle, 0, 0);
+        lv_obj_set_style_bg_color(ui->client_toggle, lv_color_hex(0x163534), 0);
+        lv_obj_set_style_bg_opa(ui->client_toggle, LV_OPA_70, 0);
+        lv_obj_set_style_radius(ui->client_toggle, 6, 0);
+        lv_obj_clear_flag(ui->client_toggle, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_remove_flag(ui->client_toggle, LV_OBJ_FLAG_EVENT_BUBBLE);
+        lv_obj_add_flag(ui->client_toggle, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_event_cb(ui->client_toggle, observer_client_toggle_cb,
+                            LV_EVENT_CLICKED, (void *)(intptr_t)i);
+
+        ui->client_toggle_label = lv_label_create(ui->client_toggle);
+        lv_obj_set_style_text_font(ui->client_toggle_label,
+                                   &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(ui->client_toggle_label,
+                                    COLOR_MATERIAL_TEAL, 0);
+        lv_obj_center(ui->client_toggle_label);
+
+        // Second row: BSSID | channel | band | security | RSSI | MFP
+        lv_obj_t *info_label = lv_label_create(header);
+        ui->info_label = info_label;
+        lv_label_set_recolor(info_label, true);
+        char info_buf[NETWORK_INFO_BUF];
+        format_observer_network_info(info_buf, sizeof(info_buf), net);
+        lv_label_set_text(info_label, info_buf);
         lv_obj_set_style_text_font(info_label, &lv_font_montserrat_12, 0);
         lv_obj_set_style_text_color(info_label, lv_color_hex(0x888888), 0);
+        lv_obj_set_width(info_label, lv_pct(100));
+
+        // Landscape: immediately after SSID/saved, producing a compact two-row
+        // tile. Portrait: full-width third row so long SSIDs never collide with
+        // uptime/vendor or force the saved badge onto a stray line.
+        lv_obj_t *summary_parent = wide_layout ? title_content : header;
+        ui->summary_label = lv_label_create(summary_parent);
+        lv_obj_set_width(ui->summary_label, wide_layout ? 300 : lv_pct(100));
+        lv_label_set_long_mode(ui->summary_label, LV_LABEL_LONG_DOT);
+        lv_obj_set_style_text_font(ui->summary_label, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(ui->summary_label, lv_color_hex(0xAAAAAA), 0);
+        lv_obj_set_style_text_align(ui->summary_label, LV_TEXT_ALIGN_LEFT, 0);
+        observer_update_summary_label(ctx, i);
 
         // Register for async inspect update
         if (ctx->observer_inspect_info_labels && i < ctx->observer_inspect_label_count) {
             ctx->observer_inspect_info_labels[i] = info_label;
         }
 
-        // Create client rows (indented, lighter background, clickable)
-        for (int j = 0; j < MAX_CLIENTS_PER_NETWORK; j++) {
-            if (net->clients[j][0] == '\0') continue;
+        ui->client_container = lv_obj_create(net_row);
+        lv_obj_set_size(ui->client_container, lv_pct(100), LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_opa(ui->client_container, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(ui->client_container, 0, 0);
+        lv_obj_set_style_pad_all(ui->client_container, 0, 0);
+        lv_obj_set_style_pad_row(ui->client_container, 4, 0);
+        lv_obj_set_flex_flow(ui->client_container, LV_FLEX_FLOW_COLUMN);
+        lv_obj_clear_flag(ui->client_container, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_remove_flag(ui->client_container, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_flag(ui->client_container, LV_OBJ_FLAG_HIDDEN);
 
-            lv_obj_t *client_row = lv_obj_create(ctx->observer_table);
-            lv_obj_set_size(client_row, lv_pct(100), LV_SIZE_CONTENT);
-            lv_obj_set_style_pad_all(client_row, 6, 0);
-            lv_obj_set_style_pad_left(client_row, 32, 0);  // Indent
-            lv_obj_set_style_bg_color(client_row, lv_color_hex(0x1E2828), 0);
-            lv_obj_set_style_bg_color(client_row, lv_color_hex(0x2E3838), LV_STATE_PRESSED);
-            lv_obj_set_style_border_width(client_row, 0, 0);
-            lv_obj_set_style_radius(client_row, 4, 0);
-            lv_obj_clear_flag(client_row, LV_OBJ_FLAG_SCROLLABLE);
-            lv_obj_add_flag(client_row, LV_OBJ_FLAG_CLICKABLE);
-
-            // Pack network_idx and client_idx into user_data: (network_idx << 16) | client_idx
-            intptr_t packed_data = ((intptr_t)i << 16) | (intptr_t)j;
-            lv_obj_add_event_cb(client_row, client_row_click_cb, LV_EVENT_CLICKED, (void*)packed_data);
-
-            lv_obj_t *mac_label = lv_label_create(client_row);
-            lv_label_set_text(mac_label, net->clients[j]);
-            lv_obj_set_style_text_font(mac_label, &lv_font_montserrat_14, 0);
-            lv_obj_set_style_text_color(mac_label, COLOR_MATERIAL_TEAL, 0);
+        for (int j = 0; j < net->client_count &&
+             j < MAX_CLIENTS_PER_NETWORK; j++) {
+            observer_add_client_row(ctx, i, j);
         }
+        ui->rendered_client_count = net->client_count;
+        observer_update_client_toggle(ctx, i);
     }
 
     // Restore scroll position after rebuild
@@ -18778,7 +19938,11 @@ static void show_deauth_popup(int network_idx, int client_idx)
     lv_obj_t *container = get_current_tab_container();
     if (!container) return;
     deauth_popup_obj = lv_obj_create(container);
-    lv_obj_set_size(deauth_popup_obj, 620, 520);
+    // 520 px was drawn around a four-row attack bar. With the bar down to one
+    // row the card would carry ~150 px of empty space, so let it take its
+    // content instead: every child below has a fixed or content-sized height,
+    // and the total lands near 360 px - inside the short landscape screen too.
+    lv_obj_set_size(deauth_popup_obj, 620, LV_SIZE_CONTENT);
     lv_obj_center(deauth_popup_obj);
     lv_obj_set_style_bg_color(deauth_popup_obj, lv_color_hex(0x1A1A2A), 0);
     lv_obj_set_style_border_color(deauth_popup_obj, COLOR_MATERIAL_RED, 0);
@@ -19203,7 +20367,7 @@ static void observer_poll_task(void *arg)
             lv_label_set_text_fmt(ctx->observer_status_label, "Found %d networks", ctx->observer_network_count);
         }
 
-        update_observer_table(ctx);
+        observer_flush_incremental_ui(ctx);
 
         bsp_display_unlock();
     }
@@ -20187,6 +21351,8 @@ static void show_observer_page(void)
     lv_obj_set_flex_flow(ctx->observer_table, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_row(ctx->observer_table, 6, 0);
     lv_obj_set_scroll_dir(ctx->observer_table, LV_DIR_VER);
+    lv_obj_add_event_cb(ctx->observer_table, observer_table_scroll_end_cb,
+                        LV_EVENT_SCROLL_END, ctx);
 
     // If we have existing data in context, show it
     if (ctx->observer_network_count > 0) {
@@ -20552,6 +21718,17 @@ static void show_esp_modem_page(void)
             cur_ctx->scan_status_label = NULL;
             cur_ctx->network_list = NULL;
             cur_ctx->spinner = NULL;
+            cur_ctx->scan_filter_btn_label = NULL;
+            cur_ctx->scan_filter_summary_label = NULL;
+            cur_ctx->scan_filter_overlay = NULL;
+            cur_ctx->scan_filter_sort_dd = NULL;
+            cur_ctx->scan_filter_order_dd = NULL;
+            cur_ctx->scan_filter_ssid_input = NULL;
+            cur_ctx->scan_filter_visibility_dd = NULL;
+            cur_ctx->scan_filter_keyboard = NULL;
+            memset(cur_ctx->scan_filter_security_cb, 0,
+                   sizeof(cur_ctx->scan_filter_security_cb));
+            memset(cur_ctx->network_rows, 0, sizeof(cur_ctx->network_rows));
         }
     }
 
@@ -22608,22 +23785,29 @@ static void show_wardrive_gps_overlay(tab_context_t *ctx)
 static void update_wardrive_count_label(tab_context_t *ctx)
 {
     if (!ctx || !ctx->wardrive_net_count_label) return;
+    if (app_power_manager_is_screen_dimmed()) {
+        atomic_store_explicit(&ctx->wardrive_ui_dirty, true, memory_order_release);
+        return;
+    }
+    // LVGL's builtin formatter has floating-point conversions disabled.
+    char distance_text[32];
+    snprintf(distance_text, sizeof(distance_text), "%.2f", ctx->wardrive_distance_m / 1000.0);
     if (ctx->wardrive_relogs > 0 || ctx->wardrive_best_ch > 0) {
         lv_label_set_text_fmt(ctx->wardrive_net_count_label,
-                              "WiFi: %d  BT: %d  relog: %d  ch: %d  SAT: %d  %.2f km",
+                              "WiFi: %d  BT: %d  relog: %d  ch: %d  SAT: %d  %s km",
                               ctx->wardrive_wifi_count,
                               ctx->wardrive_bt_count,
                               ctx->wardrive_relogs,
                               ctx->wardrive_best_ch,
                               ctx->wardrive_sat_count,
-                              ctx->wardrive_distance_m / 1000.0);
+                              distance_text);
     } else {
         lv_label_set_text_fmt(ctx->wardrive_net_count_label,
-                              "WiFi: %d  BT: %d  SAT: %d  %.2f km",
+                              "WiFi: %d  BT: %d  SAT: %d  %s km",
                               ctx->wardrive_wifi_count,
                               ctx->wardrive_bt_count,
                               ctx->wardrive_sat_count,
-                              ctx->wardrive_distance_m / 1000.0);
+                              distance_text);
     }
 }
 
@@ -22645,6 +23829,10 @@ static void update_wardrive_trace_button(tab_context_t *ctx)
 static void update_wardrive_table(tab_context_t *ctx)
 {
     if (!ctx || !ctx->wardrive_table) return;
+    if (app_power_manager_is_screen_dimmed()) {
+        atomic_store_explicit(&ctx->wardrive_ui_dirty, true, memory_order_release);
+        return;
+    }
 
     lv_coord_t scroll_y = lv_obj_get_scroll_y(ctx->wardrive_table);
     lv_obj_clean(ctx->wardrive_table);
@@ -22734,6 +23922,32 @@ static void update_wardrive_table(tab_context_t *ctx)
     }
 
     lv_obj_scroll_to_y(ctx->wardrive_table, scroll_y, LV_ANIM_OFF);
+}
+
+// Called only from the LVGL task while waking the display. Background monitor
+// tasks leave the flag set instead of rebuilding dozens of hidden LVGL rows.
+static void refresh_deferred_wardrive_ui(void)
+{
+    tab_context_t *const contexts[] = {
+        &grove_ctx, &usb_ctx, &mbus_ctx, &internal_ctx,
+    };
+
+    for (size_t i = 0; i < sizeof(contexts) / sizeof(contexts[0]); i++) {
+        tab_context_t *ctx = contexts[i];
+        if (!atomic_load_explicit(&ctx->wardrive_ui_dirty, memory_order_acquire)) {
+            continue;
+        }
+        bool page_visible = ctx->wardrive_page &&
+                            !lv_obj_has_flag(ctx->wardrive_page, LV_OBJ_FLAG_HIDDEN);
+        if (!page_visible) {
+            continue;
+        }
+
+        // Clear first so a concurrent parser update during the rebuild is not lost.
+        atomic_store_explicit(&ctx->wardrive_ui_dirty, false, memory_order_release);
+        update_wardrive_table(ctx);
+        update_wardrive_count_label(ctx);
+    }
 }
 
 // Parse a wardrive CSV network line and add to ring buffer
@@ -28603,7 +29817,6 @@ static void wardrive_monitor_task(void *arg)
     char rx_buffer[512];
     char line_buffer[512];
     int line_pos = 0;
-    bool batch_has_new_networks = false;
     uint32_t last_table_update_tick = 0;
     bool gps_push_initialized = false;
     bool gps_push_last_fix_valid = false;
@@ -28661,8 +29874,6 @@ static void wardrive_monitor_task(void *arg)
 
         if (len > 0) {
             rx_buffer[len] = '\0';
-            batch_has_new_networks = false;
-
             for (int i = 0; i < len; i++) {
                 char c = rx_buffer[i];
 
@@ -28862,7 +30073,7 @@ static void wardrive_monitor_task(void *arg)
 
                         // Try to parse as CSV network line
                         if (parse_wardrive_network_line(ctx, line_buffer)) {
-                            batch_has_new_networks = true;
+                            atomic_store_explicit(&ctx->wardrive_ui_dirty, true, memory_order_release);
                             // Auto-upload: check the just-parsed network against the home list.
                             int last_idx = (ctx->wardrive_net_head - 1 + WARDRIVE_MAX_NETWORKS)
                                            % WARDRIVE_MAX_NETWORKS;
@@ -28876,17 +30087,26 @@ static void wardrive_monitor_task(void *arg)
                 }
             }
 
-            // Update table at most once per second, and only if the page is visible
-            uint32_t now_tick = xTaskGetTickCount();
-            bool page_visible = ctx->wardrive_page && !lv_obj_has_flag(ctx->wardrive_page, LV_OBJ_FLAG_HIDDEN);
-            if (batch_has_new_networks && page_visible &&
-                (now_tick - last_table_update_tick) >= pdMS_TO_TICKS(1000)) {
+        }
+
+        // Network parsing continues while the screen is dark, but rebuilding
+        // the LVGL table does not. One deferred refresh is performed on wake.
+        uint32_t now_tick = xTaskGetTickCount();
+        bool screen_is_off = app_power_manager_is_screen_dimmed();
+        if (atomic_load_explicit(&ctx->wardrive_ui_dirty, memory_order_acquire) &&
+            !screen_is_off &&
+            (now_tick - last_table_update_tick) >= pdMS_TO_TICKS(1000)) {
+            bsp_display_lock(0);
+            bool page_visible = ctx->wardrive_page &&
+                                !lv_obj_has_flag(ctx->wardrive_page, LV_OBJ_FLAG_HIDDEN);
+            if (page_visible &&
+                atomic_exchange_explicit(&ctx->wardrive_ui_dirty, false,
+                                         memory_order_acq_rel)) {
                 last_table_update_tick = now_tick;
-                bsp_display_lock(0);
                 update_wardrive_table(ctx);
                 update_wardrive_count_label(ctx);
-                bsp_display_unlock();
             }
+            bsp_display_unlock();
         }
 
         vTaskDelay(pdMS_TO_TICKS(50));
@@ -29641,8 +30861,11 @@ static void wardrive_setup_btn_cb(lv_event_t *e)
     // using nearly the complete height of the Tab5 display.
     lv_obj_t *popup = lv_obj_create(ctx->wardrive_setup_overlay);
     ctx->wardrive_setup_popup = popup;
-    lv_obj_set_size(popup, 600, 700);
-    lv_obj_align(popup, LV_ALIGN_CENTER, 0, -50);
+    const lv_coord_t setup_popup_h = popup_clamp_h(700);
+    lv_obj_set_size(popup, 600, setup_popup_h);
+    // The -50 nudge only makes room for the status bar on the tall portrait
+    // screen; once the height is clamped there is nothing left to give.
+    lv_obj_align(popup, LV_ALIGN_CENTER, 0, setup_popup_h < 700 ? 0 : -50);
     lv_obj_set_style_bg_color(popup, lv_color_hex(0x1A1A2A), 0);
     lv_obj_set_style_border_color(popup, COLOR_MATERIAL_TEAL, 0);
     lv_obj_set_style_border_width(popup, 3, 0);
@@ -30105,8 +31328,11 @@ static void wardrive_gps_debug_parse_nmea(tab_context_t *ctx, const char *line)
         }
         if (ctx->wardrive_gps_debug_coord_label) {
             if (have_coords) {
+                char latitude_text[24], longitude_text[24];
+                snprintf(latitude_text, sizeof(latitude_text), "%.6f", latitude);
+                snprintf(longitude_text, sizeof(longitude_text), "%.6f", longitude);
                 lv_label_set_text_fmt(ctx->wardrive_gps_debug_coord_label,
-                                      "Coordinates: %.6f, %.6f", latitude, longitude);
+                                      "Coordinates: %s, %s", latitude_text, longitude_text);
                 lv_obj_set_style_text_color(ctx->wardrive_gps_debug_coord_label,
                                             COLOR_MATERIAL_GREEN, 0);
             } else {
@@ -30289,8 +31515,9 @@ static void wardrive_gps_debug_btn_cb(lv_event_t *e)
 
     ctx->wardrive_gps_debug_popup = lv_obj_create(ctx->wardrive_gps_debug_overlay);
     lv_obj_t *popup = ctx->wardrive_gps_debug_popup;
-    lv_obj_set_size(popup, 600, 800);
-    lv_obj_align(popup, LV_ALIGN_TOP_MID, 0, 50);
+    const lv_coord_t gps_popup_h = popup_clamp_h(800);
+    lv_obj_set_size(popup, 600, gps_popup_h);
+    lv_obj_align(popup, LV_ALIGN_TOP_MID, 0, gps_popup_h < 800 ? 10 : 50);
     lv_obj_set_style_bg_color(popup, lv_color_hex(0x1A1A2A), 0);
     lv_obj_set_style_border_color(popup, COLOR_MATERIAL_TEAL, 0);
     lv_obj_set_style_border_width(popup, 3, 0);
@@ -30298,7 +31525,12 @@ static void wardrive_gps_debug_btn_cb(lv_event_t *e)
     lv_obj_set_style_pad_all(popup, 16, 0);
     lv_obj_set_flex_flow(popup, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_row(popup, 8, 0);
-    lv_obj_clear_flag(popup, LV_OBJ_FLAG_SCROLLABLE);
+    if (gps_popup_h >= 800) {
+        // Everything fits at the full height; keep the panel rigid. When the
+        // height had to be clamped the content stays 800 px tall, so leave
+        // scrolling on instead of hiding the bottom rows.
+        lv_obj_clear_flag(popup, LV_OBJ_FLAG_SCROLLABLE);
+    }
 
     lv_obj_t *title = lv_label_create(popup);
     lv_label_set_text(title, LV_SYMBOL_GPS " GPS Debug");
@@ -30930,6 +32162,11 @@ static void show_wardrive_page(void)
     if (ctx->wardrive_page) {
         lv_obj_clear_flag(ctx->wardrive_page, LV_OBJ_FLAG_HIDDEN);
         ctx->current_visible_page = ctx->wardrive_page;
+        if (atomic_exchange_explicit(&ctx->wardrive_ui_dirty, false,
+                                     memory_order_acq_rel)) {
+            update_wardrive_table(ctx);
+            update_wardrive_count_label(ctx);
+        }
         return;
     }
 
@@ -31097,6 +32334,11 @@ static void show_wardrive_page(void)
     lv_obj_set_style_pad_row(ctx->wardrive_table, 6, 0);
 
     ctx->current_visible_page = ctx->wardrive_page;
+    if (atomic_exchange_explicit(&ctx->wardrive_ui_dirty, false,
+                                 memory_order_acq_rel)) {
+        update_wardrive_table(ctx);
+        update_wardrive_count_label(ctx);
+    }
 }
 
 //==================================================================================
@@ -33471,8 +34713,8 @@ static void compromised_build_delete_path(const char *src_path, char *out, size_
 // Quote one path for esp_console_split_argv(), which understands "..." plus \"
 // and \\ inside them. Handshake filenames are built from SSIDs, so a quote or a
 // backslash in the name is possible and must not end the argument early - that
-// would hand the module a different path than the one we meant to delete.
-static bool compromised_quote_delete_arg(const char *path, char *out, size_t out_sz)
+// would hand the module a different path than the one we named.
+static bool compromised_quote_console_arg(const char *path, char *out, size_t out_sz)
 {
     if (!path || path[0] == '\0' || !out || out_sz < 4) {
         return false;
@@ -33517,7 +34759,7 @@ static int compromised_pack_delete_cmd(char paths[][WARDRIVE_WIGLE_PATH_MAX], in
         compromised_build_delete_path(paths[i], rel, sizeof(rel));
 
         char quoted[WARDRIVE_WIGLE_PATH_MAX * 2 + 4];
-        if (rel[0] == '\0' || !compromised_quote_delete_arg(rel, quoted, sizeof(quoted))) {
+        if (rel[0] == '\0' || !compromised_quote_console_arg(rel, quoted, sizeof(quoted))) {
             break; // caller fails this one and resumes packing after it
         }
 
@@ -33629,7 +34871,7 @@ static bool compromised_delete_file_locked(tab_id_t tab, uart_port_t uart_port, 
     // never named. esp_console has understood quotes since forever, so there is no
     // firmware where the bare form works and this one does not - hence no retry.
     char quoted[WARDRIVE_WIGLE_PATH_MAX * 2 + 4];
-    if (!compromised_quote_delete_arg(delete_path, quoted, sizeof(quoted))) {
+    if (!compromised_quote_console_arg(delete_path, quoted, sizeof(quoted))) {
         ESP_LOGW(TAG, "[%s] Delete skipped, path does not fit quoting: %s",
                  tab_transport_name(tab), delete_path);
         rx_buffer[0] = '\0';
@@ -35535,7 +36777,9 @@ static void show_compromised_file_page(compromised_file_kind_t kind)
         if (is_copyable_pcap) {
             // Explicit dimensions avoid LVGL resolving a percentage inside a
             // content-sized flex parent to zero and hiding the copy action.
-            lv_obj_set_size(actions, 392, 62);
+            // Handshakes carry an extra "Crack" button, so widen the row for them.
+            lv_obj_set_size(actions,
+                            kind == COMPROMISED_FILE_KIND_HANDSHAKE ? 526 : 392, 62);
         } else {
             lv_obj_set_size(actions, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
         }
@@ -35559,6 +36803,31 @@ static void show_compromised_file_page(compromised_file_kind_t kind)
             lv_obj_set_style_text_font(fix_lbl, &lv_font_montserrat_14, 0);
             lv_obj_set_style_text_color(fix_lbl, lv_color_hex(0xFFFFFF), 0);
             lv_obj_center(fix_lbl);
+        }
+
+        if (kind == COMPROMISED_FILE_KIND_HANDSHAKE) {
+            lv_obj_t *crack_btn = lv_btn_create(actions);
+            lv_obj_set_size(crack_btn, 122, 62);
+            lv_obj_set_style_bg_color(crack_btn, COLOR_MATERIAL_PURPLE, 0);
+            lv_obj_set_style_bg_color(crack_btn, lv_color_hex(0x9C27B0), LV_STATE_PRESSED);
+            lv_obj_set_style_radius(crack_btn, 10, 0);
+            lv_obj_set_style_shadow_width(crack_btn, 0, 0);
+            lv_obj_set_flex_flow(crack_btn, LV_FLEX_FLOW_COLUMN);
+            lv_obj_set_flex_align(crack_btn, LV_FLEX_ALIGN_CENTER,
+                                  LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+            lv_obj_set_style_pad_row(crack_btn, 1, 0);
+            lv_obj_add_event_cb(crack_btn, hs_crack_file_cb, LV_EVENT_CLICKED,
+                                compromised_make_user_data(kind, i));
+
+            lv_obj_t *crack_title = lv_label_create(crack_btn);
+            lv_label_set_text(crack_title, "CRACK");
+            lv_obj_set_style_text_font(crack_title, &lv_font_montserrat_16, 0);
+            lv_obj_set_style_text_color(crack_title, lv_color_hex(0xFFFFFF), 0);
+
+            lv_obj_t *crack_hint = lv_label_create(crack_btn);
+            lv_label_set_text(crack_hint, "dictionary");
+            lv_obj_set_style_text_font(crack_hint, &lv_font_montserrat_12, 0);
+            lv_obj_set_style_text_color(crack_hint, lv_color_hex(0xEAD6F5), 0);
         }
 
         if (is_copyable_pcap) {
@@ -36014,7 +37283,10 @@ static lv_obj_t *espshark_create_action_card(lv_obj_t *parent, const char *icon,
                                               const char *action)
 {
     lv_obj_t *card = lv_btn_create(parent);
-    lv_obj_set_width(card, lv_pct(49));
+    // Half the page is 620 px in a 90/270 orientation, which turns a card with
+    // two lines of text into a mostly empty billboard. Fixed width there, and
+    // the strip that holds them keeps them centred.
+    lv_obj_set_width(card, ui_wide_layout() ? 460 : lv_pct(49));
     lv_obj_set_height(card, 190);
     lv_obj_set_style_bg_color(card, ui_card_color(), 0);
     lv_obj_set_style_bg_color(card, lv_color_hex(0x16364A), LV_STATE_PRESSED);
@@ -36129,16 +37401,24 @@ static void show_espshark_page(void)
     lv_obj_set_style_text_font(intro, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(intro, ui_muted_color(), 0);
 
-    lv_obj_t *actions = lv_obj_create(page);
-    lv_obj_set_size(actions, lv_pct(100), LV_SIZE_CONTENT);
-    lv_obj_set_style_bg_opa(actions, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(actions, 0, 0);
-    lv_obj_set_style_pad_all(actions, 0, 0);
-    lv_obj_set_style_pad_gap(actions, 12, 0);
-    lv_obj_set_flex_flow(actions, LV_FLEX_FLOW_ROW_WRAP);
-    lv_obj_set_flex_align(actions, LV_FLEX_ALIGN_SPACE_BETWEEN,
-                          LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
-    lv_obj_clear_flag(actions, LV_OBJ_FLAG_SCROLLABLE);
+    // Two source cards side by side. On the wide screen they go into a strip:
+    // fixed width, centred, and it scrolls the day a third source is added
+    // instead of wrapping into a second row the page cannot afford.
+    lv_obj_t *actions;
+    if (ui_wide_layout()) {
+        actions = create_button_strip(page, 200, 12, 2 * 460 + 12);
+    } else {
+        actions = lv_obj_create(page);
+        lv_obj_set_size(actions, lv_pct(100), LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_opa(actions, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(actions, 0, 0);
+        lv_obj_set_style_pad_all(actions, 0, 0);
+        lv_obj_set_style_pad_gap(actions, 12, 0);
+        lv_obj_set_flex_flow(actions, LV_FLEX_FLOW_ROW_WRAP);
+        lv_obj_set_flex_align(actions, LV_FLEX_ALIGN_SPACE_BETWEEN,
+                              LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+        lv_obj_clear_flag(actions, LV_OBJ_FLAG_SCROLLABLE);
+    }
 
     bool monster_ready = !tab_is_internal(current_tab) && current_tab_has_sd_card();
     char monster_status[128];
@@ -36263,7 +37543,7 @@ static void show_compromised_data_page(void)
     lv_obj_set_style_pad_gap(tiles, 10, 0);
     lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
     lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
-    lv_obj_clear_flag(tiles, LV_OBJ_FLAG_SCROLLABLE);
+    style_scrollable_tile_grid(tiles);
 
     // Same responsive row-wrap flow as the main menu. Category tiles wrap
     // into additional rows when the available width is smaller.
@@ -39568,10 +40848,12 @@ static void wpasec_upload_task(void *arg)
     if (!ctx->wpasec_task_running) goto done;
 
     if (strstr(rx_buf, "not set") != NULL) {
+        bsp_display_lock(0);
         if (ctx->wpasec_status_label) {
             lv_label_set_text(ctx->wpasec_status_label,
                 "Add your key to /lab/wpa-sec.txt\nin C5Monster and reboot.");
         }
+        bsp_display_unlock();
         goto done;
     }
 
@@ -40695,13 +41977,15 @@ static void pcap_viewer_progress_cb(uint64_t offset, uint64_t file_size,
         if (percent > 100) percent = 100;
         if (bps >= 1.0 && file_size > offset) {
             char eta_text[24];
+            char rate_text[32];
+            snprintf(rate_text, sizeof(rate_text), "%.0f", bps / 1024.0);
             compromised_format_duration((uint64_t)((double)(file_size - offset) / bps),
                                         eta_text, sizeof(eta_text));
             lv_label_set_text_fmt(state->status_label,
                                   "Indexing packets... %d%%\n%llu packet(s)\n"
-                                  "%.0f KB/s  -  %s left",
+                                  "%s KB/s  -  %s left",
                                   percent, (unsigned long long)packet_count,
-                                  bps / 1024.0, eta_text);
+                                  rate_text, eta_text);
         } else {
             lv_label_set_text_fmt(state->status_label,
                                   "Indexing packets... %d%%\n%llu packet(s)",
@@ -40728,14 +42012,16 @@ static void pcap_viewer_summary_progress_cb(size_t processed_packets,
         if (percent > 100) percent = 100;
         if (pps >= 1.0 && total_packets > processed_packets) {
             char eta_text[24];
+            char rate_text[32];
+            snprintf(rate_text, sizeof(rate_text), "%.0f", pps);
             compromised_format_duration(
                 (uint64_t)((double)(total_packets - processed_packets) / pps),
                 eta_text, sizeof(eta_text));
             lv_label_set_text_fmt(state->status_label,
                                   "Building Zeek-style summary... %d%%\n"
-                                  "%u/%u indexed packets\n%.0f pkt/s  -  %s left",
+                                  "%u/%u indexed packets\n%s pkt/s  -  %s left",
                                   percent, (unsigned)processed_packets,
-                                  (unsigned)total_packets, pps, eta_text);
+                                  (unsigned)total_packets, rate_text, eta_text);
         } else {
             lv_label_set_text_fmt(state->status_label,
                                   "Building Zeek-style summary... %d%%\n%u/%u indexed packets",
@@ -40753,7 +42039,7 @@ static void pcap_viewer_render_load_result_async(void *user_data)
         return;
     }
     state->loading = false;
-    bool usable = (state->load_status == PCAP_READER_OK ||
+    bool usable = state->reader && (state->load_status == PCAP_READER_OK ||
                    state->load_status == PCAP_READER_LIMIT_REACHED ||
                    state->load_status == PCAP_READER_TRUNCATED);
     ESP_LOGI(TAG,
@@ -40800,6 +42086,16 @@ static void pcap_viewer_load_task(void *arg)
              state->selected_path, state->force_reanalyze ? "yes" : "no");
     state->load_status = pcap_reader_open(state->selected_path, &state->reader,
                                           &state->capture_info);
+    /* A truncated global header has no reader. Preserve the open error;
+     * only a truncated packet tail can proceed to summary construction. */
+    if (state->load_status != PCAP_READER_OK) {
+        state->summary_status = state->load_status;
+        state->force_reanalyze = false;
+        state->task = NULL;
+        lv_async_call(pcap_viewer_render_load_result_async, state);
+        vTaskDelete(NULL);
+        return;
+    }
     bool cache_loaded = false;
     if (state->load_status == PCAP_READER_OK && !state->force_reanalyze) {
         pcap_capture_info_t opened_capture_info = state->capture_info;
@@ -41256,6 +42552,19 @@ static void pcap_viewer_detail_action_cb(lv_event_t *e)
     }
     state->packet_page = 0;
     pcap_viewer_render_capture_page(state);
+}
+
+// One analysis button on the capture page: a fixed cell in the landscape strip,
+// or an equal share of its row in the stacked portrait layout.
+#define PCAP_ANALYSIS_BTN_W 152
+static void pcap_analysis_size_button(lv_obj_t *btn, bool strip)
+{
+    if (strip) {
+        lv_obj_set_size(btn, PCAP_ANALYSIS_BTN_W, 42);
+    } else {
+        lv_obj_set_size(btn, 0, 42);
+        lv_obj_set_flex_grow(btn, 1);
+    }
 }
 
 static lv_obj_t *pcap_viewer_add_detail_action(lv_obj_t *parent, const char *text,
@@ -42870,12 +44179,14 @@ static void pcap_viewer_show_device_profile(pcap_viewer_state_t *state,
     double active_seconds = dossier.last_time_us >= dossier.first_time_us
                                 ? (double)(dossier.last_time_us - dossier.first_time_us) /
                                       1000000.0 : 0.0;
+    char active_seconds_text[32];
+    snprintf(active_seconds_text, sizeof(active_seconds_text), "%.3f", active_seconds);
     lv_label_set_text_fmt(
         traffic,
-        "Observed activity\n%lu flow(s) | %lu peer(s) | %lu service(s) | %.3f s span\nTX %llu B | RX %llu B",
+        "Observed activity\n%lu flow(s) | %lu peer(s) | %lu service(s) | %s s span\nTX %llu B | RX %llu B",
         (unsigned long)dossier.flow_count,
         (unsigned long)dossier.remote_peer_count,
-        (unsigned long)dossier.service_count, active_seconds,
+        (unsigned long)dossier.service_count, active_seconds_text,
         (unsigned long long)dossier.sent_bytes,
         (unsigned long long)dossier.received_bytes);
     lv_obj_set_width(traffic, lv_pct(100));
@@ -43426,9 +44737,11 @@ static void pcap_viewer_render_investigation(pcap_viewer_state_t *state,
             lv_obj_t *label = lv_label_create(row);
             double relative = event->time_us > 0U && event->time_us >= first_time
                                   ? (double)(event->time_us - first_time) / 1000000.0 : 0.0;
+            char relative_text[40];
+            snprintf(relative_text, sizeof(relative_text), "%.3f", relative);
             lv_label_set_text_fmt(
-                label, "+%.3fs | %s | %s | %s\n%s",
-                relative,
+                label, "+%ss | %s | %s | %s\n%s",
+                relative_text,
                 pcap_investigation_event_name(
                     (pcap_investigation_event_type_t)event->type),
                 pcap_flow_health_name((pcap_health_level_t)event->severity),
@@ -45696,13 +47009,23 @@ static void pcap_viewer_tools_cb(lv_event_t *e)
     lv_obj_clear_flag(state->artifact_overlay, LV_OBJ_FLAG_SCROLLABLE);
 
     state->artifact_popup = lv_obj_create(state->artifact_overlay);
-    lv_obj_set_size(state->artifact_popup, 900, 570);
+    // 900 px was never a width this panel has: portrait is 720 px across, so the
+    // card was centred with 90 px hanging off each edge and two of the eleven
+    // tool buttons unreachable. Clamped, the 210 px buttons wrap two per row
+    // instead of three, which is why the card has to scroll once it is narrowed.
+    const lv_coord_t tools_w = popup_clamp_w(900);
+    lv_obj_set_size(state->artifact_popup, tools_w, popup_clamp_h(570));
     lv_obj_center(state->artifact_popup);
     style_surface_panel(state->artifact_popup, 14);
     lv_obj_set_style_pad_all(state->artifact_popup, 20, 0);
     lv_obj_set_style_pad_row(state->artifact_popup, 14, 0);
     lv_obj_set_flex_flow(state->artifact_popup, LV_FLEX_FLOW_COLUMN);
-    lv_obj_clear_flag(state->artifact_popup, LV_OBJ_FLAG_SCROLLABLE);
+    if (tools_w >= 900) {
+        lv_obj_clear_flag(state->artifact_popup, LV_OBJ_FLAG_SCROLLABLE);
+    } else {
+        lv_obj_set_scroll_dir(state->artifact_popup, LV_DIR_VER);
+        lv_obj_set_scrollbar_mode(state->artifact_popup, LV_SCROLLBAR_MODE_AUTO);
+    }
 
     lv_obj_t *title = lv_label_create(state->artifact_popup);
     lv_label_set_text(title, LV_SYMBOL_SAVE " ESPShark Cache & Export");
@@ -45805,7 +47128,10 @@ static void pcap_viewer_start_extraction(pcap_viewer_state_t *state)
     lv_obj_clear_flag(state->artifact_overlay, LV_OBJ_FLAG_SCROLLABLE);
 
     state->artifact_popup = lv_obj_create(state->artifact_overlay);
-    lv_obj_set_size(state->artifact_popup, 860, 460);
+    // Same 720 px portrait width as the tools card above; this one only carries
+    // a status line, a spinner and one CLOSE button, so clamping cannot make it
+    // overflow.
+    lv_obj_set_size(state->artifact_popup, popup_clamp_w(860), popup_clamp_h(460));
     lv_obj_center(state->artifact_popup);
     style_surface_panel(state->artifact_popup, 14);
     lv_obj_set_style_pad_all(state->artifact_popup, 20, 0);
@@ -46175,9 +47501,11 @@ static void pcap_viewer_render_capture_page(pcap_viewer_state_t *state)
     pcap_viewer_format_size(state->capture_info.file_size,
                             file_size_text, sizeof(file_size_text));
     lv_obj_t *summary_label = lv_label_create(summary);
+    char duration_text[32];
+    snprintf(duration_text, sizeof(duration_text), "%.3f", duration);
     lv_label_set_text_fmt(summary_label,
                           "#52B6FF %s#  |  PCAP %u.%u %s-endian %s\n"
-                          "#5EDCA3 %llu packets#  |  indexed %lu  |  flows %lu  |  %.3f s  |  %s  |  snaplen %lu%s%s%s\n"
+                          "#5EDCA3 %llu packets#  |  indexed %lu  |  flows %lu  |  %s s  |  %s  |  snaplen %lu%s%s%s\n"
                           "%s",
                           pcap_reader_link_type_name(state->capture_info.link_type),
                           state->capture_info.version_major, state->capture_info.version_minor,
@@ -46188,7 +47516,7 @@ static void pcap_viewer_render_capture_page(pcap_viewer_state_t *state)
                           (unsigned long)state->scan_summary.indexed_packets,
                           state->flow_analysis
                               ? (unsigned long)state->flow_analysis->flow_count : 0UL,
-                          duration, file_size_text,
+                          duration_text, file_size_text,
                           (unsigned long)state->capture_info.snaplen,
                           state->scan_summary.index_limited ? "  |  INDEX LIMITED" : "",
                           state->scan_summary.truncated_tail ? "  |  TRUNCATED TAIL" : "",
@@ -46205,8 +47533,15 @@ static void pcap_viewer_render_capture_page(pcap_viewer_state_t *state)
     lv_obj_set_style_text_font(summary_label, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(summary_label, ui_text_color(), 0);
 
+    // Nine analysis buttons. On the portrait panel they stack into three
+    // full-width rows; on a wide screen that block costs 138 px of a 590 px
+    // page and stretches every button to about 300 px, so the three rows
+    // collapse into one strip that scrolls sideways instead. The rows below
+    // alias the same strip in that case, which keeps the nine call sites
+    // untouched - they still say which row they belong to.
+    const bool analysis_strip = ui_wide_layout();
     lv_obj_t *analysis_actions = lv_obj_create(page);
-    lv_obj_set_size(analysis_actions, lv_pct(100), 138);
+    lv_obj_set_size(analysis_actions, lv_pct(100), analysis_strip ? 50 : 138);
     lv_obj_set_style_bg_opa(analysis_actions, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(analysis_actions, 0, 0);
     lv_obj_set_style_pad_all(analysis_actions, 0, 0);
@@ -46216,42 +47551,52 @@ static void pcap_viewer_render_capture_page(pcap_viewer_state_t *state)
                           LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_clear_flag(analysis_actions, LV_OBJ_FLAG_SCROLLABLE);
 
-    lv_obj_t *analysis_row_top = lv_obj_create(analysis_actions);
-    lv_obj_set_size(analysis_row_top, lv_pct(100), 42);
-    lv_obj_set_style_bg_opa(analysis_row_top, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(analysis_row_top, 0, 0);
-    lv_obj_set_style_pad_all(analysis_row_top, 0, 0);
-    lv_obj_set_style_pad_column(analysis_row_top, 8, 0);
-    lv_obj_set_flex_flow(analysis_row_top, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(analysis_row_top, LV_FLEX_ALIGN_START,
-                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_clear_flag(analysis_row_top, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *analysis_row_top;
+    lv_obj_t *analysis_row_bottom;
+    lv_obj_t *analysis_row_third;
 
-    lv_obj_t *analysis_row_bottom = lv_obj_create(analysis_actions);
-    lv_obj_set_size(analysis_row_bottom, lv_pct(100), 42);
-    lv_obj_set_style_bg_opa(analysis_row_bottom, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(analysis_row_bottom, 0, 0);
-    lv_obj_set_style_pad_all(analysis_row_bottom, 0, 0);
-    lv_obj_set_style_pad_column(analysis_row_bottom, 8, 0);
-    lv_obj_set_flex_flow(analysis_row_bottom, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(analysis_row_bottom, LV_FLEX_ALIGN_START,
-                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_clear_flag(analysis_row_bottom, LV_OBJ_FLAG_SCROLLABLE);
+    if (analysis_strip) {
+        analysis_row_top = create_button_strip(analysis_actions, 46, 8,
+                                               9 * PCAP_ANALYSIS_BTN_W + 8 * 8);
+        analysis_row_bottom = analysis_row_top;
+        analysis_row_third  = analysis_row_top;
+    } else {
+        analysis_row_top = lv_obj_create(analysis_actions);
+        lv_obj_set_size(analysis_row_top, lv_pct(100), 42);
+        lv_obj_set_style_bg_opa(analysis_row_top, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(analysis_row_top, 0, 0);
+        lv_obj_set_style_pad_all(analysis_row_top, 0, 0);
+        lv_obj_set_style_pad_column(analysis_row_top, 8, 0);
+        lv_obj_set_flex_flow(analysis_row_top, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(analysis_row_top, LV_FLEX_ALIGN_START,
+                              LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_clear_flag(analysis_row_top, LV_OBJ_FLAG_SCROLLABLE);
 
-    lv_obj_t *analysis_row_third = lv_obj_create(analysis_actions);
-    lv_obj_set_size(analysis_row_third, lv_pct(100), 42);
-    lv_obj_set_style_bg_opa(analysis_row_third, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(analysis_row_third, 0, 0);
-    lv_obj_set_style_pad_all(analysis_row_third, 0, 0);
-    lv_obj_set_style_pad_column(analysis_row_third, 8, 0);
-    lv_obj_set_flex_flow(analysis_row_third, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(analysis_row_third, LV_FLEX_ALIGN_START,
-                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_clear_flag(analysis_row_third, LV_OBJ_FLAG_SCROLLABLE);
+        analysis_row_bottom = lv_obj_create(analysis_actions);
+        lv_obj_set_size(analysis_row_bottom, lv_pct(100), 42);
+        lv_obj_set_style_bg_opa(analysis_row_bottom, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(analysis_row_bottom, 0, 0);
+        lv_obj_set_style_pad_all(analysis_row_bottom, 0, 0);
+        lv_obj_set_style_pad_column(analysis_row_bottom, 8, 0);
+        lv_obj_set_flex_flow(analysis_row_bottom, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(analysis_row_bottom, LV_FLEX_ALIGN_START,
+                              LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_clear_flag(analysis_row_bottom, LV_OBJ_FLAG_SCROLLABLE);
+
+        analysis_row_third = lv_obj_create(analysis_actions);
+        lv_obj_set_size(analysis_row_third, lv_pct(100), 42);
+        lv_obj_set_style_bg_opa(analysis_row_third, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(analysis_row_third, 0, 0);
+        lv_obj_set_style_pad_all(analysis_row_third, 0, 0);
+        lv_obj_set_style_pad_column(analysis_row_third, 8, 0);
+        lv_obj_set_flex_flow(analysis_row_third, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(analysis_row_third, LV_FLEX_ALIGN_START,
+                              LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_clear_flag(analysis_row_third, LV_OBJ_FLAG_SCROLLABLE);
+    }
 
     lv_obj_t *overview_btn = lv_btn_create(analysis_row_top);
-    lv_obj_set_size(overview_btn, 0, 42);
-    lv_obj_set_flex_grow(overview_btn, 1);
+    pcap_analysis_size_button(overview_btn, analysis_strip);
     lv_obj_set_style_bg_color(overview_btn, lv_color_hex(0x087EA4), 0);
     lv_obj_set_style_radius(overview_btn, 8, 0);
     lv_obj_add_event_cb(overview_btn, pcap_viewer_summary_cb,
@@ -46263,8 +47608,7 @@ static void pcap_viewer_render_capture_page(pcap_viewer_state_t *state)
     lv_obj_center(overview_label);
 
     lv_obj_t *dns_btn = lv_btn_create(analysis_row_top);
-    lv_obj_set_size(dns_btn, 0, 42);
-    lv_obj_set_flex_grow(dns_btn, 1);
+    pcap_analysis_size_button(dns_btn, analysis_strip);
     lv_obj_set_style_bg_color(dns_btn, COLOR_MATERIAL_PURPLE, 0);
     lv_obj_set_style_radius(dns_btn, 8, 0);
     lv_obj_add_event_cb(dns_btn, pcap_viewer_summary_cb,
@@ -46278,8 +47622,7 @@ static void pcap_viewer_render_capture_page(pcap_viewer_state_t *state)
     lv_obj_center(dns_label);
 
     lv_obj_t *connections_btn = lv_btn_create(analysis_row_top);
-    lv_obj_set_size(connections_btn, 0, 42);
-    lv_obj_set_flex_grow(connections_btn, 1);
+    pcap_analysis_size_button(connections_btn, analysis_strip);
     lv_obj_set_style_bg_color(connections_btn, COLOR_MATERIAL_BLUE, 0);
     lv_obj_set_style_radius(connections_btn, 8, 0);
     lv_obj_add_event_cb(connections_btn, pcap_viewer_connections_cb,
@@ -46293,8 +47636,7 @@ static void pcap_viewer_render_capture_page(pcap_viewer_state_t *state)
     lv_obj_center(connections_label);
 
     lv_obj_t *protocols_btn = lv_btn_create(analysis_row_top);
-    lv_obj_set_size(protocols_btn, 0, 42);
-    lv_obj_set_flex_grow(protocols_btn, 1);
+    pcap_analysis_size_button(protocols_btn, analysis_strip);
     lv_obj_set_style_bg_color(protocols_btn, COLOR_MATERIAL_AMBER, 0);
     lv_obj_set_style_radius(protocols_btn, 8, 0);
     lv_obj_add_event_cb(protocols_btn, pcap_viewer_protocols_cb,
@@ -46306,8 +47648,7 @@ static void pcap_viewer_render_capture_page(pcap_viewer_state_t *state)
     lv_obj_center(protocols_label);
 
     lv_obj_t *devices_btn = lv_btn_create(analysis_row_bottom);
-    lv_obj_set_size(devices_btn, 0, 42);
-    lv_obj_set_flex_grow(devices_btn, 1);
+    pcap_analysis_size_button(devices_btn, analysis_strip);
     lv_obj_set_style_bg_color(devices_btn, COLOR_MATERIAL_GREEN, 0);
     lv_obj_set_style_radius(devices_btn, 8, 0);
     lv_obj_add_event_cb(devices_btn, pcap_viewer_devices_cb,
@@ -46322,8 +47663,7 @@ static void pcap_viewer_render_capture_page(pcap_viewer_state_t *state)
     lv_obj_center(devices_label);
 
     lv_obj_t *health_btn = lv_btn_create(analysis_row_bottom);
-    lv_obj_set_size(health_btn, 0, 42);
-    lv_obj_set_flex_grow(health_btn, 1);
+    pcap_analysis_size_button(health_btn, analysis_strip);
     lv_color_t health_color = !state->flow_analysis || !state->investigation
                                   ? lv_color_hex(0x555555)
                                   : (state->investigation->critical_count > 0U ||
@@ -46347,8 +47687,7 @@ static void pcap_viewer_render_capture_page(pcap_viewer_state_t *state)
     lv_obj_center(health_label);
 
     lv_obj_t *map_btn = lv_btn_create(analysis_row_bottom);
-    lv_obj_set_size(map_btn, 0, 42);
-    lv_obj_set_flex_grow(map_btn, 1);
+    pcap_analysis_size_button(map_btn, analysis_strip);
     lv_obj_set_style_bg_color(map_btn, lv_color_hex(0x1565C0), 0);
     lv_obj_set_style_radius(map_btn, 8, 0);
     lv_obj_add_event_cb(map_btn, pcap_viewer_map_cb,
@@ -46360,8 +47699,7 @@ static void pcap_viewer_render_capture_page(pcap_viewer_state_t *state)
     lv_obj_center(map_label);
 
     lv_obj_t *tools_btn = lv_btn_create(analysis_row_bottom);
-    lv_obj_set_size(tools_btn, 0, 42);
-    lv_obj_set_flex_grow(tools_btn, 1);
+    pcap_analysis_size_button(tools_btn, analysis_strip);
     lv_obj_set_style_bg_color(tools_btn, COLOR_MATERIAL_TEAL, 0);
     lv_obj_set_style_radius(tools_btn, 8, 0);
     lv_obj_add_event_cb(tools_btn, pcap_viewer_tools_cb, LV_EVENT_CLICKED, state);
@@ -46372,8 +47710,7 @@ static void pcap_viewer_render_capture_page(pcap_viewer_state_t *state)
     lv_obj_center(tools_label);
 
     lv_obj_t *objects_btn = lv_btn_create(analysis_row_third);
-    lv_obj_set_size(objects_btn, 0, 42);
-    lv_obj_set_flex_grow(objects_btn, 1);
+    pcap_analysis_size_button(objects_btn, analysis_strip);
     lv_obj_set_style_bg_color(objects_btn, lv_color_hex(0x8E24AA), 0);
     lv_obj_set_style_radius(objects_btn, 8, 0);
     lv_obj_add_event_cb(objects_btn, pcap_viewer_objects_cb, LV_EVENT_CLICKED, state);
@@ -47107,7 +48444,7 @@ static void show_bluetooth_menu_page(void)
     lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
     lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
     lv_obj_set_style_pad_gap(tiles, 15, 0);
-    lv_obj_clear_flag(tiles, LV_OBJ_FLAG_SCROLLABLE);
+    style_scrollable_tile_grid(tiles);
 
     create_tile(tiles, LV_SYMBOL_GPS, "AirTag\nScan",
                 dark_mode_enabled ? COLOR_LAB5_MAGENTA : ui_tab_icon_color(),
@@ -49688,7 +51025,7 @@ static void show_beacon_spam_page(void)
     lv_obj_set_style_pad_gap(tiles, 10, 0);
     lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
     lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
-    lv_obj_clear_flag(tiles, LV_OBJ_FLAG_SCROLLABLE);
+    style_scrollable_tile_grid(tiles);
 
     create_tile(tiles, LV_SYMBOL_LIST, "List SSIDs", COLOR_MATERIAL_CYAN, beacon_spam_tile_event_cb, "List SSIDs");
     create_tile(tiles, LV_SYMBOL_WIFI, "Start Spam", COLOR_MATERIAL_RED, beacon_spam_tile_event_cb, "Start Spam");
@@ -49830,7 +51167,7 @@ static void show_global_attacks_page(void)
     lv_obj_set_style_pad_gap(tiles, 10, 0);
     lv_obj_set_flex_flow(tiles, LV_FLEX_FLOW_ROW_WRAP);
     lv_obj_set_flex_align(tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
-    lv_obj_clear_flag(tiles, LV_OBJ_FLAG_SCROLLABLE);
+    style_scrollable_tile_grid(tiles);
 
     // Create attack tiles (some only visible when Red Team enabled)
 
@@ -49879,6 +51216,7 @@ static __attribute__((unused)) lv_obj_t *settings_popup_obj = NULL;
 #define NVS_KEY_RED_TEAM        "red_team"
 #define NVS_KEY_SCREEN_TIMEOUT  "scr_timeout"
 #define NVS_KEY_SCREEN_BRIGHT   "scr_bright"
+#define NVS_KEY_SCREEN_ROT      "scr_rot"
 #define NVS_KEY_DASHBOARD       "dashboard"
 #define NVS_KEY_DARK_MODE       "dark_mode"
 #define NVS_KEY_BOOT_SOUND      "boot_sound"
@@ -49893,6 +51231,63 @@ static __attribute__((unused)) lv_obj_t *settings_popup_obj = NULL;
 #define NVS_KEY_WD_AUTOUP_WDG   "wd_au_wdg"
 #define NVS_KEY_WD_AUTOUP_ARCH  "wd_au_arch"
 #define NVS_KEY_WD_AUTOUP_POFF  "wd_au_poff"
+#define NVS_KEY_FT_BAUD         "ft_baud"
+
+// Console rate used for JanOS file transfers over the external UARTs.
+//
+// This is a setting rather than a constant because what limits it is the wiring
+// between the two boards, and the only way to find that limit is to try rates
+// on the actual hardware. Every entry here is one JanOS accepts; if the switch
+// is not confirmed both ends fall back to 115200 and the transfer still runs,
+// so a rate the cable cannot carry costs one slow transfer, not a dead link.
+static const uint32_t JANOS_FT_BAUD_CHOICES[] = {
+    115200, 230400, 460800, 921600, 1000000, 1500000, 2000000, 3000000, 4000000
+};
+#define JANOS_FT_BAUD_CHOICE_COUNT (sizeof(JANOS_FT_BAUD_CHOICES) / sizeof(JANOS_FT_BAUD_CHOICES[0]))
+#define JANOS_FT_BAUD_DEFAULT 460800U
+
+static uint32_t janos_ft_baud = JANOS_FT_BAUD_DEFAULT;
+
+// Index of `rate` in the choice list, or of the default when it is not one of
+// them - which is what a stored value from a build with a different ladder
+// looks like.
+static uint16_t janos_ft_baud_index(uint32_t rate)
+{
+    uint16_t fallback = 0;
+    for (uint16_t i = 0; i < JANOS_FT_BAUD_CHOICE_COUNT; i++) {
+        if (JANOS_FT_BAUD_CHOICES[i] == rate) return i;
+        if (JANOS_FT_BAUD_CHOICES[i] == JANOS_FT_BAUD_DEFAULT) fallback = i;
+    }
+    return fallback;
+}
+
+static void load_janos_ft_baud_from_nvs(void)
+{
+    nvs_handle_t nvs;
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs) != ESP_OK) {
+        return;
+    }
+    uint32_t stored = 0;
+    if (nvs_get_u32(nvs, NVS_KEY_FT_BAUD, &stored) == ESP_OK &&
+        JANOS_FT_BAUD_CHOICES[janos_ft_baud_index(stored)] == stored) {
+        janos_ft_baud = stored;
+    }
+    nvs_close(nvs);
+    ESP_LOGI(TAG, "Monster transfer rate: %lu baud", (unsigned long)janos_ft_baud);
+}
+
+static void save_janos_ft_baud_to_nvs(uint32_t rate)
+{
+    nvs_handle_t nvs;
+    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs) != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to open NVS for writing transfer rate");
+        return;
+    }
+    nvs_set_u32(nvs, NVS_KEY_FT_BAUD, rate);
+    nvs_commit(nvs);
+    nvs_close(nvs);
+    ESP_LOGI(TAG, "Saved Monster transfer rate to NVS: %lu baud", (unsigned long)rate);
+}
 
 // Load Red Team setting from NVS (called on startup)
 // Note: Device detection is automatic via ping/pong
@@ -49993,6 +51388,16 @@ static void load_screen_settings_from_nvs(void)
             ESP_LOGI(TAG, "No Screen Brightness in NVS, using default: 80%%");
         }
 
+        // Load screen rotation setting
+        uint8_t rotation = 0;
+        err = nvs_get_u8(nvs, NVS_KEY_SCREEN_ROT, &rotation);
+        if (err == ESP_OK && rotation <= 3) {
+            screen_rotation_setting = rotation;
+            ESP_LOGI(TAG, "Loaded Screen Rotation from NVS: %d deg", screen_rotation_setting * 90);
+        } else {
+            ESP_LOGI(TAG, "No Screen Rotation in NVS, using default: 0 deg");
+        }
+
         uint8_t dash = 1;
         err = nvs_get_u8(nvs, NVS_KEY_DASHBOARD, &dash);
         if (err == ESP_OK) {
@@ -50077,6 +51482,21 @@ static void save_screen_timeout_to_nvs(uint8_t setting)
         ESP_LOGI(TAG, "Saved Screen Timeout to NVS: %d", setting);
     } else {
         ESP_LOGE(TAG, "Failed to open NVS for writing Screen Timeout: %s", esp_err_to_name(err));
+    }
+}
+
+// Save screen rotation setting to NVS
+static void save_screen_rotation_to_nvs(uint8_t setting)
+{
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs);
+    if (err == ESP_OK) {
+        nvs_set_u8(nvs, NVS_KEY_SCREEN_ROT, setting);
+        nvs_commit(nvs);
+        nvs_close(nvs);
+        ESP_LOGI(TAG, "Saved Screen Rotation to NVS: %d deg", setting * 90);
+    } else {
+        ESP_LOGE(TAG, "Failed to open NVS for writing Screen Rotation: %s", esp_err_to_name(err));
     }
 }
 
@@ -50267,7 +51687,7 @@ static void init_uart2(void)
         .source_clk = UART_SCLK_DEFAULT,
     };
 
-    ESP_ERROR_CHECK(uart_driver_install(UART2_NUM, UART_BUF_SIZE * 2, 0, 0, NULL, 0));
+    ESP_ERROR_CHECK(uart_driver_install(UART2_NUM, UART_RX_RING_SIZE, 0, 0, NULL, 0));
     ESP_ERROR_CHECK(uart_param_config(UART2_NUM, &uart_config));
     ESP_ERROR_CHECK(uart_set_pin(UART2_NUM, tx_pin, rx_pin, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
 
@@ -50483,7 +51903,36 @@ static void detect_boards(void)
 
     // Detect each device independently using ping/pong (also snoops JanOS boot banner)
     grove_detected = ping_uart_direct(UART_NUM, "Grove", &grove_ctx);
-    usb_detected = usb_cdc_connected ? ping_usb() : false;  // Must respond to ping, not just be connected
+
+    // A Monster on USB-A powers up together with the Tab5 and can still be in
+    // its own boot/OTA phase when this first probe runs - the port is open and
+    // streaming its boot banner, but it will not answer "ping" with "pong" yet.
+    // Retry a few times inside this one boot probe (detection stays boot-only)
+    // so a slow-booting Monster is still caught. Stop early once it is a GPS
+    // (NMEA stream), which is not a board and never pongs.
+    usb_detected = false;
+    if (usb_cdc_connected) {
+        for (int attempt = 0; attempt < 6 && !usb_detected; attempt++) {
+            if (attempt > 0) {
+                vTaskDelay(pdMS_TO_TICKS(600));
+            }
+            usb_detected = ping_usb();
+            // The USB-A port is JanOS's interactive console, not the machine
+            // port: it prints its boot banner ("JanOS version: X") but does not
+            // answer "ping" with "pong". ping_usb() snoops that banner into
+            // usb_ctx, so a captured version is proof a Monster is on USB-A -
+            // accept it as detection even without a pong.
+            if (!usb_detected && usb_ctx.janos_version[0] != '\0') {
+                usb_detected = true;
+                ESP_LOGI(TAG, "[USB] Monster detected via boot-snoop version %s (console port, no pong)",
+                         usb_ctx.janos_version);
+                break;
+            }
+            if (!usb_detected && (usb_nmea_device_seen || usb_is_known_gps)) {
+                break;  // GPS accessory, not a Monster - no point pinging again
+            }
+        }
+    }
     if (usb_cdc_connected && !usb_detected && usb_debug_logs && !usb_nmea_device_seen && !usb_is_known_gps) {
         usb_log_cdc_state("detect_boards_usb_ping_failed");
     }
@@ -51836,6 +53285,21 @@ static void invalidate_red_team_dependent_pages(void)
         if (ctx->scan_page) {
             lv_obj_del(ctx->scan_page);
             ctx->scan_page = NULL;
+            ctx->scan_btn = NULL;
+            ctx->scan_status_label = NULL;
+            ctx->network_list = NULL;
+            ctx->spinner = NULL;
+            ctx->scan_filter_btn_label = NULL;
+            ctx->scan_filter_summary_label = NULL;
+            ctx->scan_filter_overlay = NULL;
+            ctx->scan_filter_sort_dd = NULL;
+            ctx->scan_filter_order_dd = NULL;
+            ctx->scan_filter_ssid_input = NULL;
+            ctx->scan_filter_visibility_dd = NULL;
+            ctx->scan_filter_keyboard = NULL;
+            memset(ctx->scan_filter_security_cb, 0,
+                   sizeof(ctx->scan_filter_security_cb));
+            memset(ctx->network_rows, 0, sizeof(ctx->network_rows));
         }
 
         // Delete cached nmap page
@@ -52173,6 +53637,11 @@ static void show_red_team_settings_page(void)
 static lv_obj_t *screen_timeout_popup_overlay = NULL;
 static lv_obj_t *screen_timeout_popup_obj = NULL;
 
+// Screen Rotation popup variables
+static lv_obj_t *screen_rotation_popup_overlay = NULL;
+static lv_obj_t *screen_rotation_popup_obj = NULL;
+static lv_obj_t *screen_rotation_hint_label = NULL;
+
 // Screen Brightness popup variables
 static lv_obj_t *screen_brightness_popup_overlay = NULL;
 static lv_obj_t *screen_brightness_popup_obj = NULL;
@@ -52269,6 +53738,180 @@ static void show_screen_timeout_popup(void)
     lv_label_set_text(close_label, "Close");
     lv_obj_set_style_text_font(close_label, &lv_font_montserrat_16, 0);
     lv_obj_center(close_label);
+}
+
+// ======================= Screen Rotation =======================
+
+static const char *const SCREEN_ROTATION_NAMES[4] = {
+    "0 (Portrait)", "90 (Landscape)", "180 (Portrait flipped)", "270 (Landscape flipped)"
+};
+
+// The orientation LVGL is running with right now, which is the one applied at
+// boot. It only differs from screen_rotation_setting between picking a new
+// value and rebooting.
+static uint8_t screen_rotation_active(void)
+{
+    lv_display_t *disp = lv_display_get_default();
+    return disp ? (uint8_t)lv_display_get_rotation(disp) : 0;
+}
+
+// Close Screen Rotation popup
+static void close_screen_rotation_popup(void)
+{
+    if (screen_rotation_popup_overlay) {
+        lv_obj_del(screen_rotation_popup_overlay);
+        screen_rotation_popup_overlay = NULL;
+        screen_rotation_popup_obj = NULL;
+        screen_rotation_hint_label = NULL;
+    }
+}
+
+static void update_screen_rotation_hint(void)
+{
+    if (!screen_rotation_hint_label) return;
+
+    if (screen_rotation_setting == screen_rotation_active()) {
+        lv_label_set_text(screen_rotation_hint_label, "Currently active");
+        lv_obj_set_style_text_color(screen_rotation_hint_label, ui_muted_color(), 0);
+    } else {
+        lv_label_set_text(screen_rotation_hint_label, LV_SYMBOL_WARNING " Restart to apply");
+        lv_obj_set_style_text_color(screen_rotation_hint_label, COLOR_MATERIAL_AMBER, 0);
+    }
+}
+
+// Screen rotation dropdown change callback
+static void screen_rotation_dropdown_cb(lv_event_t *e)
+{
+    lv_obj_t *dropdown = lv_event_get_target(e);
+    uint16_t sel = lv_dropdown_get_selected(dropdown);
+
+    if (sel <= 3) {
+        screen_rotation_setting = (uint8_t)sel;
+        save_screen_rotation_to_nvs(screen_rotation_setting);
+        update_screen_rotation_hint();
+        ESP_LOGI(TAG, "Screen rotation changed to: %s", SCREEN_ROTATION_NAMES[sel]);
+    }
+}
+
+static void screen_rotation_close_cb(lv_event_t *e)
+{
+    (void)e;
+    close_screen_rotation_popup();
+}
+
+// Reboot so the whole UI is rebuilt against the new resolution.
+static void screen_rotation_restart_cb(lv_event_t *e)
+{
+    (void)e;
+    ESP_LOGI(TAG, "Restarting to apply screen rotation: %s",
+             SCREEN_ROTATION_NAMES[screen_rotation_setting & 0x03]);
+
+    // Take the speaker down before the display: the mute is a couple of I2C
+    // writes, so it lands well inside the backlight settling delay below.
+    audio_silence_for_restart();
+
+    // Kill the backlight first. esp_restart() drops the MIPI-DSI panel
+    // mid-frame and the LEDC channel driving the backlight is only cleared
+    // once the peripherals reset, so leaving it lit shows a flash of
+    // undefined framebuffer across the reboot. This is the mirror image of
+    // what app_main() does on the way in, where the base screen is painted
+    // dark and flushed before the backlight is brought up.
+    set_brightness_gamma(0);
+    vTaskDelay(pdMS_TO_TICKS(60));
+
+    esp_restart();
+}
+
+// Show Screen Rotation popup with dropdown
+static void show_screen_rotation_popup(void)
+{
+    lv_obj_t *container = get_current_tab_container();
+    if (!container) return;
+    if (screen_rotation_popup_overlay) return;
+
+    // Create modal overlay
+    screen_rotation_popup_overlay = lv_obj_create(container);
+    style_modal_overlay(screen_rotation_popup_overlay, LV_OPA_50);
+
+    // Create popup
+    screen_rotation_popup_obj = lv_obj_create(screen_rotation_popup_overlay);
+    lv_obj_set_size(screen_rotation_popup_obj, 380, 290);
+    lv_obj_center(screen_rotation_popup_obj);
+    style_popup_card(screen_rotation_popup_obj, 12, ui_tab_icon_color());
+    lv_obj_set_style_pad_all(screen_rotation_popup_obj, 20, 0);
+    lv_obj_set_flex_flow(screen_rotation_popup_obj, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(screen_rotation_popup_obj, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(screen_rotation_popup_obj, 12, 0);
+    lv_obj_clear_flag(screen_rotation_popup_obj, LV_OBJ_FLAG_SCROLLABLE);
+
+    // Title
+    lv_obj_t *title = lv_label_create(screen_rotation_popup_obj);
+    lv_label_set_text(title, "Screen Rotation");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, dark_mode_enabled ? COLOR_LAB5_MAGENTA : ui_tab_icon_color(), 0);
+
+    // Dropdown
+    lv_obj_t *dropdown = lv_dropdown_create(screen_rotation_popup_obj);
+    // ASCII only: the built-in Montserrat faces carry no U+00B0, so a literal
+    // degree sign would render as a placeholder box.
+    lv_dropdown_set_options(dropdown,
+                            "Portrait (0)\n"
+                            "Landscape (90)\n"
+                            "Portrait flipped (180)\n"
+                            "Landscape flipped (270)");
+    lv_dropdown_set_selected(dropdown, screen_rotation_setting);
+    lv_obj_set_width(dropdown, 260);
+    lv_obj_set_style_text_font(dropdown, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_bg_color(dropdown, ui_card_color(), 0);
+    lv_obj_set_style_border_color(dropdown, ui_border_color(), 0);
+    lv_obj_set_style_text_color(dropdown, ui_text_color(), 0);
+    lv_obj_t *rotation_list = lv_dropdown_get_list(dropdown);
+    if (rotation_list) {
+        lv_obj_set_style_bg_color(rotation_list, ui_card_color(), 0);
+        lv_obj_set_style_border_color(rotation_list, ui_border_color(), 0);
+        lv_obj_set_style_text_color(rotation_list, ui_text_color(), 0);
+    }
+    lv_obj_add_event_cb(dropdown, screen_rotation_dropdown_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    // Hint: the choice only takes effect on the next boot
+    screen_rotation_hint_label = lv_label_create(screen_rotation_popup_obj);
+    lv_obj_set_style_text_font(screen_rotation_hint_label, &lv_font_montserrat_14, 0);
+    update_screen_rotation_hint();
+
+    // Button row
+    lv_obj_t *btn_row = lv_obj_create(screen_rotation_popup_obj);
+    lv_obj_set_size(btn_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(btn_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(btn_row, 0, 0);
+    lv_obj_set_style_pad_all(btn_row, 0, 0);
+    lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(btn_row, 12, 0);
+    lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    // Close button
+    lv_obj_t *close_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(close_btn, 100, 40);
+    style_neutral_button(close_btn);
+    lv_obj_add_event_cb(close_btn, screen_rotation_close_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *close_label = lv_label_create(close_btn);
+    lv_label_set_text(close_label, "Close");
+    lv_obj_set_style_text_font(close_label, &lv_font_montserrat_16, 0);
+    lv_obj_center(close_label);
+
+    // Restart button
+    lv_obj_t *restart_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(restart_btn, 130, 40);
+    style_neutral_button(restart_btn);
+    lv_obj_set_style_bg_color(restart_btn, COLOR_MATERIAL_AMBER, 0);
+    lv_obj_add_event_cb(restart_btn, screen_rotation_restart_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *restart_label = lv_label_create(restart_btn);
+    lv_label_set_text(restart_label, LV_SYMBOL_REFRESH " Restart");
+    lv_obj_set_style_text_font(restart_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(restart_label, lv_color_hex(0x000000), 0);
+    lv_obj_center(restart_label);
 }
 
 // Close Screen Brightness popup
@@ -52673,14 +54316,23 @@ static void show_time_popup(void)
     style_modal_overlay(time_popup_overlay, dark_mode_enabled ? LV_OPA_50 : LV_OPA_30);
 
     lv_obj_t *card = lv_obj_create(time_popup_overlay);
-    lv_obj_set_size(card, 600, 640);
+    // The tallest unclamped card in the file: 640 px against the 680 px a
+    // landscape screen offers. It fits today, with nothing left for a longer
+    // label or one more row, so it goes through the clamp like the rest.
+    const lv_coord_t time_card_h = popup_clamp_h(640);
+    lv_obj_set_size(card, 600, time_card_h);
     lv_obj_center(card);
     style_popup_card(card, 12, ui_tab_icon_color());
     lv_obj_set_style_pad_all(card, 18, 0);
     lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(card, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_row(card, 12, 0);
-    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    if (time_card_h >= 640) {
+        lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    } else {
+        lv_obj_set_scroll_dir(card, LV_DIR_VER);
+        lv_obj_set_scrollbar_mode(card, LV_SCROLLBAR_MODE_AUTO);
+    }
 
     lv_obj_t *title = lv_label_create(card);
     lv_label_set_text(title, LV_SYMBOL_BELL " Time (RTC)");
@@ -53067,6 +54719,119 @@ static void show_screen_lock_popup(void)
     lv_obj_set_size(close_btn, 120, 44);
     style_neutral_button(close_btn);
     lv_obj_add_event_cb(close_btn, screen_lock_popup_close_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *close_label = lv_label_create(close_btn);
+    lv_label_set_text(close_label, "Close");
+    lv_obj_set_style_text_font(close_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(close_label, ui_text_color(), 0);
+    lv_obj_center(close_label);
+}
+
+// ====================== Monster transfer speed ========================
+// The console rate JanOS is asked to switch to for the duration of a file
+// transfer. Kept here rather than in a header constant because the ceiling is a
+// property of the cable between the boards, so finding it means trying rates on
+// the hardware in hand - and a rate that does not work costs one slow transfer,
+// not a reflash.
+
+static lv_obj_t *ft_baud_popup_overlay = NULL;
+
+static void ft_baud_popup_close_cb(lv_event_t *e)
+{
+    (void)e;
+    if (ft_baud_popup_overlay) {
+        lv_obj_del(ft_baud_popup_overlay);
+        ft_baud_popup_overlay = NULL;
+    }
+}
+
+static void ft_baud_dropdown_cb(lv_event_t *e)
+{
+    lv_obj_t *dropdown = lv_event_get_target(e);
+    uint16_t sel = lv_dropdown_get_selected(dropdown);
+    if (sel >= JANOS_FT_BAUD_CHOICE_COUNT) return;
+
+    janos_ft_baud = JANOS_FT_BAUD_CHOICES[sel];
+    save_janos_ft_baud_to_nvs(janos_ft_baud);
+}
+
+static void show_ft_baud_popup(void)
+{
+    lv_obj_t *container = get_current_tab_container();
+    if (!container) return;
+    if (ft_baud_popup_overlay) return;
+
+    ft_baud_popup_overlay = lv_obj_create(container);
+    style_modal_overlay(ft_baud_popup_overlay, dark_mode_enabled ? LV_OPA_50 : LV_OPA_30);
+
+    lv_obj_t *card = lv_obj_create(ft_baud_popup_overlay);
+    lv_obj_set_size(card, 430, 340);
+    lv_obj_center(card);
+    style_popup_card(card, 12, ui_tab_icon_color());
+    lv_obj_set_style_pad_all(card, 18, 0);
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(card, 14, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(card);
+    lv_label_set_text(title, "Transfer Speed");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_22, 0);
+    lv_obj_set_style_text_color(title, dark_mode_enabled ? COLOR_LAB5_MAGENTA : ui_tab_icon_color(), 0);
+
+    lv_obj_t *row = lv_obj_create(card);
+    lv_obj_set_size(row, lv_pct(100), 64);
+    lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(row, 0, 0);
+    lv_obj_set_style_pad_all(row, 0, 0);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *row_label = lv_label_create(row);
+    lv_label_set_text(row_label, "Console baud");
+    lv_obj_set_style_text_font(row_label, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_color(row_label, ui_text_color(), 0);
+
+    char options[160];
+    size_t used = 0;
+    for (uint16_t i = 0; i < JANOS_FT_BAUD_CHOICE_COUNT && used < sizeof(options); i++) {
+        int written = snprintf(options + used, sizeof(options) - used, "%s%lu",
+                               i ? "\n" : "", (unsigned long)JANOS_FT_BAUD_CHOICES[i]);
+        if (written <= 0 || (size_t)written >= sizeof(options) - used) break;
+        used += (size_t)written;
+    }
+
+    lv_obj_t *dropdown = lv_dropdown_create(row);
+    lv_dropdown_set_options(dropdown, options);
+    lv_dropdown_set_selected(dropdown, janos_ft_baud_index(janos_ft_baud));
+    lv_obj_set_width(dropdown, 190);
+    lv_obj_set_style_text_font(dropdown, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_bg_color(dropdown, ui_card_color(), 0);
+    lv_obj_set_style_border_color(dropdown, ui_border_color(), 0);
+    lv_obj_set_style_text_color(dropdown, ui_text_color(), 0);
+    lv_obj_t *list = lv_dropdown_get_list(dropdown);
+    if (list) {
+        lv_obj_set_style_bg_color(list, ui_card_color(), 0);
+        lv_obj_set_style_border_color(list, ui_border_color(), 0);
+        lv_obj_set_style_text_color(list, ui_text_color(), 0);
+    }
+    lv_obj_add_event_cb(dropdown, ft_baud_dropdown_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    lv_obj_t *desc = lv_label_create(card);
+    lv_label_set_text(desc,
+        "Rate the Monster console is switched to while a file\n"
+        "is copied over Grove or M-BUS. Higher is faster but\n"
+        "depends on the cable: if the switch is not confirmed,\n"
+        "the copy still runs at 115200.\n"
+        "The transfer popup reports the KB/s it achieved.");
+    lv_obj_set_style_text_font(desc, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(desc, ui_muted_color(), 0);
+    lv_obj_set_width(desc, lv_pct(100));
+    lv_label_set_long_mode(desc, LV_LABEL_LONG_WRAP);
+
+    lv_obj_t *close_btn = lv_btn_create(card);
+    lv_obj_set_size(close_btn, 120, 40);
+    style_neutral_button(close_btn);
+    lv_obj_add_event_cb(close_btn, ft_baud_popup_close_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_t *close_label = lv_label_create(close_btn);
     lv_label_set_text(close_label, "Close");
     lv_obj_set_style_text_font(close_label, &lv_font_montserrat_16, 0);
@@ -55236,6 +57001,8 @@ static void settings_tile_event_cb(lv_event_t *e)
         show_screen_timeout_popup();
     } else if (strcmp(tile_name, "Screen Brightness") == 0) {
         show_screen_brightness_popup();
+    } else if (strcmp(tile_name, "Screen Rotation") == 0) {
+        show_screen_rotation_popup();
     } else if (strcmp(tile_name, "Theme") == 0) {
         show_theme_popup();
     } else if (strcmp(tile_name, "Time") == 0) {
@@ -55246,6 +57013,8 @@ static void settings_tile_event_cb(lv_event_t *e)
         show_ota_page();
     } else if (strcmp(tile_name, "Monster SD Admin") == 0) {
         show_sd_admin_page();
+    } else if (strcmp(tile_name, "Transfer Speed") == 0) {
+        show_ft_baud_popup();
     }
 }
 
@@ -55279,7 +57048,10 @@ static void show_settings_page(void)
     lv_obj_set_style_pad_all(settings_page, 16, 0);
     lv_obj_set_flex_flow(settings_page, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_row(settings_page, 16, 0);
-    lv_obj_clear_flag(settings_page, LV_OBJ_FLAG_SCROLLABLE);
+    // The settings tile grid is content-sized rather than grown, so it is the
+    // page that has to absorb the overflow when the tiles wrap into more rows
+    // than the current orientation has room for.
+    style_scrollable_tile_grid(settings_page);
 
     // Header with back button and title
     lv_obj_t *header = lv_obj_create(settings_page);
@@ -55333,6 +57105,9 @@ static void show_settings_page(void)
     // Screen Brightness tile
     create_tile(tiles, LV_SYMBOL_IMAGE, "Screen\nBrightness", COLOR_MATERIAL_CYAN, settings_tile_event_cb, "Screen Brightness");
 
+    // Screen Rotation tile
+    create_tile(tiles, LV_SYMBOL_LOOP, "Screen\nRotation", COLOR_MATERIAL_PINK, settings_tile_event_cb, "Screen Rotation");
+
     // Theme tile
     create_tile(tiles, LV_SYMBOL_SETTINGS, "Theme", COLOR_MATERIAL_TEAL, settings_tile_event_cb, "Theme");
 
@@ -55347,6 +57122,9 @@ static void show_settings_page(void)
 
     // JanOS SD card file manager (controlled over the selected external UART).
     create_tile(tiles, LV_SYMBOL_SAVE, "Monster SD\nAdmin", COLOR_MATERIAL_GREEN, settings_tile_event_cb, "Monster SD Admin");
+
+    // Console rate used while copying a file off the Monster SD.
+    create_tile(tiles, LV_SYMBOL_SHUFFLE, "Transfer\nSpeed", COLOR_MATERIAL_PURPLE, settings_tile_event_cb, "Transfer Speed");
 }
 
 #define SD_ADMIN_STOPPED   0
@@ -56143,7 +57921,9 @@ static void compromised_transfer_show_popup(const char *file_name)
     lv_obj_clear_flag(compromised_transfer_ui.overlay, LV_OBJ_FLAG_SCROLLABLE);
 
     compromised_transfer_ui.popup = lv_obj_create(compromised_transfer_ui.overlay);
-    lv_obj_set_size(compromised_transfer_ui.popup, 680, 340);
+    // 680 leaves 20 px a side on the portrait panel, with the card's own shadow
+    // sitting in it. Clamping costs nothing here and keeps the margin honest.
+    lv_obj_set_size(compromised_transfer_ui.popup, popup_clamp_w(680), 340);
     lv_obj_center(compromised_transfer_ui.popup);
     style_surface_panel(compromised_transfer_ui.popup, 16);
     lv_obj_set_style_pad_all(compromised_transfer_ui.popup, 24, 0);
@@ -56520,9 +58300,8 @@ static bool janos_transfer_build_unique_local_path(tab_id_t tab, const char *fil
             return false;
         }
 
-        char part_path[288];
-        snprintf(part_path, sizeof(part_path), "%s.part", output);
-        if (access(output, F_OK) != 0 && access(part_path, F_OK) != 0) {
+        /* A partial file belongs to this destination and can be resumed. */
+        if (access(output, F_OK) != 0) {
             return true;
         }
     }
@@ -56792,40 +58571,111 @@ static void compromised_transfer_delete_current_task(void)
 #define JANOS_UART_FT_ACK           0x06
 #define JANOS_UART_FT_NAK           0x15
 #define JANOS_UART_FT_CAN           0x18
-#define JANOS_UART_FT_BLOCK_MAX     4096
 #define JANOS_UART_FT_HEADER_BYTES  16
-#define JANOS_UART_FT_RETRIES          3
+
+/* How many times a block may be rejected before the transfer is given up on.
+ * This is one less than JanOS's FT_MAX_BLOCK_ATTEMPTS, and has to be: that
+ * counts sends, this counts NAKs, and the last send has no NAK left to answer
+ * it. At 3 it asked for a fourth send that JanOS was never going to make - the
+ * sender had already printed [FT] error retry limit and gone back to its
+ * prompt, the magic hunt then swallowed that line looking for a block that
+ * would never come, and the transfer died reporting "No block magic ...
+ * (last line: none)" instead of the retry limit that actually happened. */
+#define JANOS_UART_FT_RETRIES          2
 #define JANOS_UART_FT_DEFAULT_BAUD 115200
 
-/* The console is raised to this rate for the duration of a transfer, which
- * takes 115200's ~10.8 KB/s to roughly 85 KB/s.
+/* The block size asked for, and the largest one that will be accepted back.
  *
- * Two things make that safe. JanOS reverts to 115200 by itself after 60 seconds
- * without a command, so an abandoned transfer can no longer leave the Monster
- * fast while the Tab5 drops back. And it suppresses that revert while a
- * transfer is running, so a long send is not cut in half. Without both of
- * those, set this back to JANOS_UART_FT_DEFAULT_BAUD. */
-/* 921600 carried about a megabyte and then the Monster stopped sending, so the
- * line is marginal at that rate over the M-BUS connector. Stop-and-wait ACKs
- * cap throughput at roughly a third of the line rate anyway - measured 36.7 KB/s
- * at 921600 - so halving the signalling rate costs only about a quarter of the
- * speed while giving the physical layer far more margin. */
-#define JANOS_UART_FT_FAST_BAUD    460800
+ * The request is on this side because this is the side with the RAM: the block
+ * has to fit in the UART ring with room to spare while the receive loop is busy
+ * checksumming and writing, and UART_RX_RING_SIZE is 2x the request for exactly
+ * that reason. Raising the request means raising that ring, and the ring is
+ * internal RAM.
+ *
+ * JanOS clamps what it cannot honour and reports the effective size as bsize=,
+ * so what is used is always read back out of the header rather than assumed.
+ * The ceiling is what JanOS will grant at most; nothing sizes a buffer from it. */
+#define JANOS_UART_FT_BLOCK_REQUEST 8192
+#define JANOS_UART_FT_BLOCK_MAX     32768
+#define JANOS_UART_FT_BLOCK_MIN     512
+
+/* Margin between the sender's ACK timeout and this side's per-block deadline.
+ * Must match FT_ACK_TIMEOUT_MARGIN_MS in JanOS: the sender publishes only its
+ * own timeout in ack_ms=, and this is what turns it back into a deadline that
+ * expires first. See the timeout note in JanOS's cmd_send_file block. */
+#define JANOS_UART_FT_ACK_MARGIN_MS 2000
+
+/* A JanOS predating ack_ms= gives up on the ACK after a fixed 5 s, so without
+ * the field the deadline has to stay well inside that. */
+#define JANOS_UART_FT_LEGACY_RX_MS  3000
+
+/* One fwrite per block otherwise reaches FATFS through stdio's few-hundred-byte
+ * default buffer, turning every block into its own sector run. 64 KiB is the
+ * chunk the JanOS PCAP writer uses and the unit sd_benchmark measures, so it is
+ * the known-good size on this hardware. Kept for the life of the process: only
+ * one transfer runs at a time, and re-taking 64 KiB of PSRAM per attempt buys
+ * nothing. An unflushed tail lost to a failure is harmless - resume is derived
+ * from the on-disk size of the .part, so it simply restarts a little further
+ * back - and the stream is flushed before the CRC comparison and the rename. */
+#define JANOS_UART_FT_WRITE_BUF     65536
 
 /* Below this the Wi-Fi path is both faster and reliable, so it stays in use. */
 #define JANOS_UART_TRANSFER_MIN_BYTES (1024L * 1024L)
 
+/* The ROM CRC32 uses the same convention as the bitwise loop this replaces and
+ * as esp_rom_crc32_le(0, ...) on the JanOS side: seed 0, reflected polynomial,
+ * inverted in and out, chainable across calls. Same values, without spending
+ * eight iterations per byte three times over on every block. */
 static uint32_t janos_uart_crc32(uint32_t crc, const uint8_t *data, size_t len)
 {
-    crc = ~crc;
-    for (size_t i = 0; i < len; i++) {
-        crc ^= data[i];
-        for (int bit = 0; bit < 8; bit++) {
-            uint32_t mask = (uint32_t)-(int32_t)(crc & 1U);
-            crc = (crc >> 1) ^ (0xEDB88320U & mask);
+    return esp_rom_crc32_le(crc, data, len);
+}
+
+/* The 64 KiB stdio buffer described above, taken from PSRAM on first use. */
+static char *janos_uart_ft_write_buffer(void)
+{
+    static char *buffer;
+    if (!buffer) {
+        buffer = heap_caps_malloc(JANOS_UART_FT_WRITE_BUF, MALLOC_CAP_SPIRAM);
+        if (!buffer) {
+            buffer = malloc(JANOS_UART_FT_WRITE_BUF);
         }
     }
-    return ~crc;
+    return buffer;
+}
+
+/* Time one block spends on an ideal line, header included. Identical to
+ * ft_block_wire_ms() in JanOS. */
+static uint32_t janos_uart_ft_wire_ms(uint32_t block_size, uint32_t baud)
+{
+    if (baud == 0) baud = JANOS_UART_FT_DEFAULT_BAUD;
+    uint64_t bit_ms = ((uint64_t)block_size + JANOS_UART_FT_HEADER_BYTES) * 10ULL * 1000ULL;
+    return (uint32_t)((bit_ms + baud - 1U) / baud);
+}
+
+/* How long to wait for one block. Both ends derive this from the negotiated
+ * block size and the rate the line is running at, because no fixed constant is
+ * right across the range: a 4 KiB block is 21 ms of wire time at 2 MBaud and a
+ * 32 KiB block is 2.8 s at 115200.
+ *
+ * Whatever it works out to, it has to expire before the sender's ACK timeout.
+ * When the header carries ack_ms= that is known exactly, and the deadline is
+ * the tighter of the two; older senders get the conservative legacy value.
+ * Getting this backwards is what the 6 s block deadline against a 5 s ACK
+ * timeout used to do: between 5 s and 6 s the Monster had already given up and
+ * gone back to its prompt while this side was still preparing a NAK, and the
+ * next thing seen here was "No block magic after N bytes". */
+static uint32_t janos_uart_ft_block_timeout_ms(uint32_t block_size, uint32_t baud,
+                                               uint32_t sender_ack_ms)
+{
+    uint32_t local = 1000U + 3U * janos_uart_ft_wire_ms(block_size, baud);
+    if (local > 30000U) local = 30000U;
+
+    if (sender_ack_ms > JANOS_UART_FT_ACK_MARGIN_MS + 500U) {
+        uint32_t allowed = sender_ack_ms - JANOS_UART_FT_ACK_MARGIN_MS;
+        return local < allowed ? local : allowed;
+    }
+    return local < JANOS_UART_FT_LEGACY_RX_MS ? local : JANOS_UART_FT_LEGACY_RX_MS;
 }
 
 /* Reads one line without over-reading into the binary stream that follows. */
@@ -57033,11 +58883,53 @@ static uint32_t janos_uart_header_timeout_ms(uint64_t size_bytes)
     return (uint32_t)timeout;
 }
 
-static esp_err_t janos_uart_download(tab_id_t tab, uart_port_t port,
-                                     const char *remote_path, const char *local_path,
-                                     uint64_t expected_size,
-                                     const volatile bool *cancel,
-                                     janos_file_transfer_result_t *result)
+static esp_err_t janos_uart_prepare_directories(const char *local_path)
+{
+    char parent[256];
+    int written = snprintf(parent, sizeof(parent), "%s", local_path);
+    if (written < 0 || (size_t)written >= sizeof(parent)) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    for (char *p = parent + 1; *p; p++) {
+        if (*p != '/') continue;
+        *p = '\0';
+        struct stat info;
+        if (stat(parent, &info) != 0) {
+            if (errno != ENOENT || mkdir(parent, 0755) != 0) {
+                int saved_errno = errno;
+                ESP_LOGE(TAG, "[UART-FT] Could not create %s: errno=%d (%s)",
+                         parent, saved_errno, strerror(saved_errno));
+                return ESP_FAIL;
+            }
+        } else if (!S_ISDIR(info.st_mode)) {
+            ESP_LOGE(TAG, "[UART-FT] Not a directory: %s", parent);
+            return ESP_FAIL;
+        }
+        *p = '/';
+    }
+    return ESP_OK;
+}
+
+/* Stop the binary protocol while both ends still use the transfer baud rate.
+ * Do not flush RX first: the terminating response may already be queued. */
+static void janos_uart_abort(tab_id_t tab, uart_port_t port)
+{
+    uint8_t can = JANOS_UART_FT_CAN;
+    transport_write_bytes_tab(tab, port, (const char *)&can, 1);
+    if (!janos_uart_wait_marker(tab, port, "[FT] END", NULL, NULL, 0, 6000)) {
+        ESP_LOGW(TAG, "[UART-FT] No transfer end after cancellation; console recovery will retry");
+    }
+}
+
+/* Returns ESP_ERR_NOT_FINISHED when the partial file turned out not to match the
+ * Monster copy: nothing was transferred, and the caller should come back with
+ * allow_resume cleared. */
+static esp_err_t janos_uart_download_attempt(tab_id_t tab, uart_port_t port,
+                                             const char *remote_path, const char *local_path,
+                                             uint64_t expected_size,
+                                             const volatile bool *cancel,
+                                             janos_file_transfer_result_t *result,
+                                             bool allow_resume)
 {
     if (!remote_path || !local_path || !result) {
         return ESP_ERR_INVALID_ARG;
@@ -57049,12 +58941,27 @@ static esp_err_t janos_uart_download(tab_id_t tab, uart_port_t port,
         return ESP_ERR_INVALID_STATE;
     }
 
+    esp_err_t prepare_err = janos_uart_prepare_directories(local_path);
+    if (prepare_err != ESP_OK) {
+        janos_uart_emit_progress(JANOS_FILE_TRANSFER_ERROR, 0, expected_size, 0,
+                                 prepare_err, "Could not create local directory");
+        return prepare_err;
+    }
+
     /* Resume where a previous attempt stopped, folding the existing prefix into
-     * the CRC so the check still covers the whole file. */
+     * result->crc32 so the checksum reported for the file still covers all of
+     * it. A complete or oversized partial may be left by a failed CRC check or
+     * a changed remote file: retry those from zero instead of repeatedly
+     * requesting an unusable offset. Without a known remote size there is no
+     * way to tell a resumable partial from a complete one, so that starts over
+     * as well. */
     uint64_t resume_from = 0;
     struct stat part_info;
-    if (stat(result->part_path, &part_info) == 0 && part_info.st_size > 0) {
+    if (allow_resume && expected_size > 0 && stat(result->part_path, &part_info) == 0 &&
+        part_info.st_size > 0 && (uint64_t)part_info.st_size < expected_size) {
         FILE *prefix = fopen(result->part_path, "rb");
+        int prefix_errno = errno;
+        bool prefix_usable = false;
         if (prefix) {
             uint8_t chunk[512];
             size_t got = 0;
@@ -57062,73 +58969,206 @@ static esp_err_t janos_uart_download(tab_id_t tab, uart_port_t port,
                 result->crc32 = janos_uart_crc32(result->crc32, chunk, got);
                 resume_from += got;
             }
+            if (ferror(prefix)) {
+                prefix_errno = errno;
+            } else {
+                prefix_usable = true;
+            }
             fclose(prefix);
+        }
+
+        /* An unreadable .part is a cache that went bad, not a failed transfer.
+         * Keeping it would fail every future attempt the same way, with no way
+         * to clear it from the UI, so it goes and the file is fetched whole.
+         * errno is taken where it was set - after the fopen or the fread - so
+         * that fclose cannot overwrite it first. */
+        if (prefix_usable) {
             ESP_LOGI(TAG, "[UART-FT] Resuming %s at %llu bytes",
                      result->part_path, (unsigned long long)resume_from);
         } else {
+            ESP_LOGW(TAG, "[UART-FT] Discarding unreadable %s (errno=%d %s); "
+                     "fetching from the start",
+                     result->part_path, prefix_errno, strerror(prefix_errno));
             unlink(result->part_path);
+            resume_from = 0;
+            result->crc32 = 0;
         }
     }
+
+    result->bytes_written = resume_from;
+    if (cancel && *cancel) return ESP_ERR_INVALID_STATE;
+    /* Sized from the bsize= the Monster grants, so it cannot be taken before
+     * the header has been read. Every exit above this point leaves it NULL,
+     * and free(NULL) is what the shared cleanup paths rely on. */
+    uint8_t *block = NULL;
+    FILE *file = fopen(result->part_path, resume_from > 0 ? "ab" : "wb");
+    if (!file) {
+        int saved_errno = errno;
+        ESP_LOGE(TAG, "[UART-FT] Could not open %s: errno=%d (%s)",
+                 result->part_path, saved_errno, strerror(saved_errno));
+        janos_uart_emit_progress(JANOS_FILE_TRANSFER_ERROR, resume_from, expected_size,
+                                 result->crc32, ESP_FAIL, "Could not open local .part file");
+        return ESP_FAIL;
+    }
+    char *write_buffer = janos_uart_ft_write_buffer();
+    if (write_buffer) {
+        setvbuf(file, write_buffer, _IOFBF, JANOS_UART_FT_WRITE_BUF);
+    }
+    esp_err_t err = ESP_OK;
 
     janos_uart_emit_progress(JANOS_FILE_TRANSFER_QUERYING, resume_from, expected_size,
                              result->crc32, ESP_OK,
                              "Monster is checksumming the file before sending");
 
-    char command[320];
-    snprintf(command, sizeof(command), "send_file %s %llu\r\n", remote_path,
-             (unsigned long long)resume_from);
-    compromised_transport_flush(tab, port);
-    transport_write_bytes_tab(tab, port, command, strlen(command));
-
-    char header[256];
-    if (!janos_uart_wait_marker(tab, port, "[FT] END", "[FT] ", header, sizeof(header),
-                                janos_uart_header_timeout_ms(expected_size))) {
+    /* Quoted for the same reason file_delete quotes: bare, a name with a space
+     * in it splits into two arguments, the Monster counts the wrong argc and
+     * answers with a usage error - which the retry below would then spend on a
+     * command that was never going to parse either. esp_console has understood
+     * quotes since forever, so this needs no bare fallback. */
+    char quoted_remote[WARDRIVE_WIGLE_PATH_MAX * 2 + 4];
+    if (!compromised_quote_console_arg(remote_path, quoted_remote, sizeof(quoted_remote))) {
+        ESP_LOGE(TAG, "[UART-FT] Path does not fit quoting: %s", remote_path);
         janos_uart_emit_progress(JANOS_FILE_TRANSFER_ERROR, resume_from, 0, result->crc32,
-                                 ESP_FAIL, "Monster did not answer send_file");
-        return ESP_FAIL;
+                                 ESP_ERR_INVALID_ARG, "Remote path cannot be quoted");
+        fclose(file);
+        return ESP_ERR_INVALID_ARG;
     }
-    if (!strstr(header, "begin")) {
+
+    /* The third argument is the block size. A JanOS predating it rejects the
+     * whole command as a usage error rather than ignoring the extra word, so
+     * that answer is retried once without it - which is also the only thing
+     * that keeps a current Tab5 working against an older Monster. */
+    char command[WARDRIVE_WIGLE_PATH_MAX * 2 + 64];
+    char header[256];
+    bool asked_for_bsize = true;
+    int command_len = snprintf(command, sizeof(command), "send_file %s %llu %d\r\n",
+                               quoted_remote, (unsigned long long)resume_from,
+                               JANOS_UART_FT_BLOCK_REQUEST);
+    if (command_len < 0 || (size_t)command_len >= sizeof(command)) {
+        ESP_LOGE(TAG, "[UART-FT] Request line too long for: %s", remote_path);
+        janos_uart_emit_progress(JANOS_FILE_TRANSFER_ERROR, resume_from, 0, result->crc32,
+                                 ESP_ERR_INVALID_SIZE, "Remote path is too long to request");
+        fclose(file);
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    for (;;) {
+        compromised_transport_flush(tab, port);
+        transport_write_bytes_tab(tab, port, command, strlen(command));
+
+        if (!janos_uart_wait_marker(tab, port, "[FT] END", "[FT] ", header, sizeof(header),
+                                    janos_uart_header_timeout_ms(expected_size))) {
+            janos_uart_emit_progress(JANOS_FILE_TRANSFER_ERROR, resume_from, 0, result->crc32,
+                                     ESP_FAIL, "Monster did not answer send_file");
+            err = ESP_FAIL;
+            goto transfer_failed;
+        }
+        if (strstr(header, "begin")) {
+            break;
+        }
+        if (asked_for_bsize && strstr(header, "usage")) {
+            ESP_LOGW(TAG, "[UART-FT] Monster does not accept a block size; using its default");
+            asked_for_bsize = false;
+            snprintf(command, sizeof(command), "send_file %s %llu\r\n", quoted_remote,
+                     (unsigned long long)resume_from);
+            continue;
+        }
         ESP_LOGE(TAG, "[UART-FT] %s", header);
         janos_uart_emit_progress(JANOS_FILE_TRANSFER_ERROR, resume_from, 0, result->crc32,
                                  ESP_FAIL, "Monster refused the file");
+        /* A refusal terminated normally; there is no binary sender to cancel. */
+        fclose(file);
         return ESP_FAIL;
     }
 
     result->remote_size_before = janos_uart_field_u64(header, "size=", 10);
-    uint64_t expected_crc = janos_uart_field_u64(header, "crc32=", 16);
-    if (result->remote_size_before == 0 || resume_from > result->remote_size_before) {
+    /* The crc32 field of the header is a placeholder JanOS fills with zeroes,
+     * so only the trailer is read below. An offset that leaves nothing to send
+     * is rejected here: the Monster would checksum zero bytes, leaving the
+     * commit with nothing to verify the .part against. */
+    if (result->remote_size_before == 0 || resume_from >= result->remote_size_before) {
         janos_uart_emit_progress(JANOS_FILE_TRANSFER_ERROR, resume_from, 0, result->crc32,
                                  ESP_ERR_INVALID_SIZE, "Reported file size is unusable");
-        return ESP_ERR_INVALID_SIZE;
+        err = ESP_ERR_INVALID_SIZE;
+        goto transfer_failed;
     }
 
-    FILE *file = fopen(result->part_path, resume_from > 0 ? "ab" : "wb");
-    uint8_t *block = malloc(JANOS_UART_FT_BLOCK_MAX);
-    if (!file || !block) {
-        if (file) fclose(file);
-        free(block);
-        janos_uart_emit_progress(JANOS_FILE_TRANSFER_ERROR, resume_from,
-                                 result->remote_size_before, result->crc32,
-                                 ESP_ERR_NO_MEM, "Could not open .part or allocate buffer");
-        return ESP_ERR_NO_MEM;
+    /* No block has arrived yet, so result->crc32 still describes exactly the
+     * prefix the .part file holds - which is what prefix_crc covers on the
+     * Monster side. Catching a stale partial here costs one round trip; the
+     * trailer would only catch it after the whole remainder had been sent.
+     * A JanOS old enough not to report the field leaves the partial unchecked,
+     * exactly as before. */
+    if (resume_from > 0 && strstr(header, "prefix_crc=")) {
+        uint32_t remote_prefix = (uint32_t)janos_uart_field_u64(header, "prefix_crc=", 16);
+        if (remote_prefix != result->crc32) {
+            ESP_LOGW(TAG, "[UART-FT] %s does not match the Monster copy over %llu B: "
+                     "local %08lX vs Monster %08lX; starting over",
+                     result->part_path, (unsigned long long)resume_from,
+                     (unsigned long)result->crc32, (unsigned long)remote_prefix);
+            janos_uart_abort(tab, port);
+            fclose(file);
+            unlink(result->part_path);
+            /* Not an error state: the caller retries from zero, and flagging a
+             * failure would show the user one that is already being handled. */
+            janos_uart_emit_progress(JANOS_FILE_TRANSFER_QUERYING, 0, expected_size, 0, ESP_OK,
+                                     "Partial file did not match; starting over");
+            return ESP_ERR_NOT_FINISHED;
+        }
     }
 
-    result->bytes_written = resume_from;
-    esp_err_t err = ESP_OK;
+    /* What the Monster granted, which is not necessarily what was asked for:
+     * it clamps a request it cannot allocate, and a JanOS old enough not to
+     * report the field is always sending 4096. */
+    uint32_t block_size = (uint32_t)janos_uart_field_u64(header, "bsize=", 10);
+    if (block_size == 0) {
+        block_size = 4096;
+    }
+    if (block_size < JANOS_UART_FT_BLOCK_MIN || block_size > JANOS_UART_FT_BLOCK_MAX) {
+        ESP_LOGE(TAG, "[UART-FT] Monster announced an unusable block size of %lu B",
+                 (unsigned long)block_size);
+        err = ESP_ERR_INVALID_SIZE;
+        goto transfer_failed;
+    }
+    block = malloc(block_size);
+    if (!block) {
+        ESP_LOGE(TAG, "[UART-FT] Could not allocate a %lu B transfer buffer",
+                 (unsigned long)block_size);
+        err = ESP_ERR_NO_MEM;
+        goto transfer_failed;
+    }
+
+    /* On a USB tab this reads the idle Grove UART rather than the link in use,
+     * but USB CDC is faster than any of these rates, so the deadline only comes
+     * out generous - and ack_ms, when the Monster reports it, caps it anyway. */
+    uint32_t line_baud = 0;
+    if (uart_get_baudrate(port, &line_baud) != ESP_OK) {
+        line_baud = JANOS_UART_FT_DEFAULT_BAUD;
+    }
+    uint32_t sender_ack_ms = (uint32_t)janos_uart_field_u64(header, "ack_ms=", 10);
+    uint32_t block_timeout_ms = janos_uart_ft_block_timeout_ms(block_size, line_baud,
+                                                               sender_ack_ms);
+    ESP_LOGI(TAG, "[UART-FT] %lu B blocks at %lu baud, %lu ms per block "
+             "(Monster gives up after %lu ms)",
+             (unsigned long)block_size, (unsigned long)line_baud,
+             (unsigned long)block_timeout_ms, (unsigned long)sender_ack_ms);
+
     unsigned retries = 0;
     unsigned long nak_total = 0;
     int64_t last_progress_us = 0;
+    /* JanOS checksums only the bytes it puts on the wire, so its trailer has to
+     * be matched against what arrived during this attempt. result->crc32 covers
+     * the whole file and would never match after a resume. */
+    uint32_t attempt_crc = 0;
 
     while (result->bytes_written < result->remote_size_before) {
         if (cancel && *cancel) {
-            uint8_t can = JANOS_UART_FT_CAN;
-            transport_write_bytes_tab(tab, port, (const char *)&can, 1);
             err = ESP_ERR_INVALID_STATE;
             break;
         }
 
         uint8_t head[JANOS_UART_FT_HEADER_BYTES];
-        if (!janos_uart_sync_magic(tab, port, head, 6000)) {
+        if (!janos_uart_sync_magic(tab, port, head, block_timeout_ms)) {
             /* Silence here almost always means the Monster gave up and printed a
              * text reason, which the magic hunt skipped over. Grab it. */
             char reason[192];
@@ -57142,7 +59182,7 @@ static esp_err_t janos_uart_download(tab_id_t tab, uart_port_t port,
             break;
         }
         size_t got = 4;
-        int64_t deadline = esp_timer_get_time() + 6000000;
+        int64_t deadline = esp_timer_get_time() + (int64_t)block_timeout_ms * 1000;
         while (got < sizeof(head) && esp_timer_get_time() < deadline) {
             int read = transport_read_bytes_tab(tab, port, head + got,
                                                 sizeof(head) - got, pdMS_TO_TICKS(200));
@@ -57159,13 +59199,13 @@ static esp_err_t janos_uart_download(tab_id_t tab, uart_port_t port,
                           ((uint32_t)head[10] << 16) | ((uint32_t)head[11] << 24);
         uint32_t block_crc = (uint32_t)head[12] | ((uint32_t)head[13] << 8) |
                              ((uint32_t)head[14] << 16) | ((uint32_t)head[15] << 24);
-        if (length == 0 || length > JANOS_UART_FT_BLOCK_MAX) {
+        if (length == 0 || length > block_size) {
             err = ESP_ERR_INVALID_RESPONSE;
             break;
         }
 
         got = 0;
-        deadline = esp_timer_get_time() + 6000000;
+        deadline = esp_timer_get_time() + (int64_t)block_timeout_ms * 1000;
         while (got < length && esp_timer_get_time() < deadline) {
             int read = transport_read_bytes_tab(tab, port, block + got, length - got,
                                                 pdMS_TO_TICKS(200));
@@ -57183,8 +59223,6 @@ static esp_err_t janos_uart_download(tab_id_t tab, uart_port_t port,
                      retries + 1U, JANOS_UART_FT_RETRIES);
             if (++retries > JANOS_UART_FT_RETRIES) {
                 err = ESP_ERR_INVALID_CRC;
-                reply = JANOS_UART_FT_CAN;
-                transport_write_bytes_tab(tab, port, (const char *)&reply, 1);
                 break;
             }
             reply = JANOS_UART_FT_NAK;
@@ -57193,8 +59231,6 @@ static esp_err_t janos_uart_download(tab_id_t tab, uart_port_t port,
         }
 
         if (fwrite(block, 1, length, file) != length) {
-            reply = JANOS_UART_FT_CAN;
-            transport_write_bytes_tab(tab, port, (const char *)&reply, 1);
             err = ESP_FAIL;
             break;
         }
@@ -57202,6 +59238,7 @@ static esp_err_t janos_uart_download(tab_id_t tab, uart_port_t port,
 
         retries = 0;
         result->crc32 = janos_uart_crc32(result->crc32, block, length);
+        attempt_crc = janos_uart_crc32(attempt_crc, block, length);
         result->bytes_written += length;
 
         int64_t now = esp_timer_get_time();
@@ -57213,30 +59250,55 @@ static esp_err_t janos_uart_download(tab_id_t tab, uart_port_t port,
         }
     }
 
-    fflush(file);
+    if (err != ESP_OK) goto transfer_failed;
+
+    if (fflush(file) != 0) err = ESP_FAIL;
     int fd = fileno(file);
-    if (fd >= 0) fsync(fd);
-    fclose(file);
+    if (fd >= 0 && fsync(fd) != 0) err = ESP_FAIL;
+    if (fclose(file) != 0) err = ESP_FAIL;
+    file = NULL;
     free(block);
+    block = NULL;
 
     if (err != ESP_OK) {
-        janos_uart_emit_progress(JANOS_FILE_TRANSFER_ERROR, result->bytes_written,
-                                 result->remote_size_before, result->crc32, err,
-                                 "Transfer interrupted; .part was kept for resume");
-        return err;
+        goto transfer_failed;
     }
 
-    /* The trailer reports what the Monster actually sent, so prefer it over the
-     * value announced up front. */
+    /* "[FT] done sent=<bytes> crc32=<crc>" describes the range the Monster read
+     * from its own offset, which is why it is checked against attempt_crc. */
     char trailer[192];
+    uint32_t expected_crc = 0;
+    uint64_t reported_sent = 0;
+    bool trailer_crc_seen = false;
+    bool trailer_sent_seen = false;
     if (janos_uart_wait_marker(tab, port, "[FT] END", "[FT] done", trailer,
-                               sizeof(trailer), 5000) && strstr(trailer, "crc32=")) {
+                               sizeof(trailer), 5000)) {
+        trailer_crc_seen = strstr(trailer, "crc32=") != NULL;
+        trailer_sent_seen = strstr(trailer, "sent=") != NULL;
         expected_crc = (uint32_t)janos_uart_field_u64(trailer, "crc32=", 16);
+        reported_sent = janos_uart_field_u64(trailer, "sent=", 10);
+    }
+    if (!trailer_crc_seen) {
+        ESP_LOGW(TAG, "[UART-FT] No checksum in the transfer trailer; "
+                 "relying on the per-block CRCs alone");
     }
 
-    if (expected_crc != 0 && result->crc32 != expected_crc) {
-        ESP_LOGE(TAG, "[UART-FT] CRC mismatch: local %08lX vs Monster %08lX",
-                 (unsigned long)result->crc32, (unsigned long)expected_crc);
+    uint64_t received_now = result->bytes_written - resume_from;
+    if (trailer_sent_seen && reported_sent != received_now) {
+        ESP_LOGE(TAG, "[UART-FT] Monster sent %llu B but %llu B were stored this attempt",
+                 (unsigned long long)reported_sent, (unsigned long long)received_now);
+        janos_uart_emit_progress(JANOS_FILE_TRANSFER_ERROR, result->bytes_written,
+                                 result->remote_size_before, result->crc32,
+                                 ESP_ERR_INVALID_SIZE,
+                                 "Byte count does not match the Monster copy");
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    if (trailer_crc_seen && attempt_crc != expected_crc) {
+        ESP_LOGE(TAG, "[UART-FT] CRC mismatch over %llu B from offset %llu: "
+                 "local %08lX vs Monster %08lX",
+                 (unsigned long long)received_now, (unsigned long long)resume_from,
+                 (unsigned long)attempt_crc, (unsigned long)expected_crc);
         janos_uart_emit_progress(JANOS_FILE_TRANSFER_ERROR, result->bytes_written,
                                  result->remote_size_before, result->crc32,
                                  ESP_ERR_INVALID_CRC, "CRC32 does not match the Monster copy");
@@ -57260,6 +59322,32 @@ static esp_err_t janos_uart_download(tab_id_t tab, uart_port_t port,
              result->final_path, (unsigned long long)result->bytes_written,
              (unsigned long)result->crc32, nak_total);
     return ESP_OK;
+
+transfer_failed:
+    janos_uart_abort(tab, port);
+    if (file) fclose(file);
+    free(block);
+    janos_uart_emit_progress(JANOS_FILE_TRANSFER_ERROR, result->bytes_written,
+                             result->remote_size_before, result->crc32, err,
+                             "Transfer interrupted; .part was kept for resume");
+    return err;
+}
+
+/* One retry is enough: the second attempt starts from zero, so it has no prefix
+ * left to disagree about. */
+static esp_err_t janos_uart_download(tab_id_t tab, uart_port_t port,
+                                     const char *remote_path, const char *local_path,
+                                     uint64_t expected_size,
+                                     const volatile bool *cancel,
+                                     janos_file_transfer_result_t *result)
+{
+    esp_err_t err = janos_uart_download_attempt(tab, port, remote_path, local_path,
+                                                expected_size, cancel, result, true);
+    if (err == ESP_ERR_NOT_FINISHED) {
+        err = janos_uart_download_attempt(tab, port, remote_path, local_path,
+                                          expected_size, cancel, result, false);
+    }
+    return err;
 }
 
 static void compromised_transfer_task(void *arg)
@@ -57314,17 +59402,22 @@ static void compromised_transfer_task(void *arg)
 
         compromised_transfer_set_stage("Switching M-BUS to high speed...",
                                        "Wi-Fi cannot carry a file this size", 0);
-        bool fast = janos_uart_set_baud(tab, uart_port, JANOS_UART_FT_FAST_BAUD);
+        /* Settings > Transfer Speed, persisted in NVS. Selecting the default
+         * rate makes janos_uart_set_baud a no-op, which is the same path an
+         * unconfirmed switch lands on: the copy runs at 115200. */
+        int fast_baud = (int)janos_ft_baud;
+        bool fast = janos_uart_set_baud(tab, uart_port, fast_baud);
 
-        compromised_transfer_set_stage("Copying over M-BUS...",
-                                       fast ? "Console raised to 921600 baud"
-                                            : "Console stayed at 115200 baud", 0);
+        char baud_detail[64];
+        snprintf(baud_detail, sizeof(baud_detail), "Console running at %d baud",
+                 fast ? fast_baud : JANOS_UART_FT_DEFAULT_BAUD);
+        compromised_transfer_set_stage("Copying over M-BUS...", baud_detail, 0);
         result_err = janos_uart_download(tab, uart_port, args->remote_path, uart_local_path,
                                          (uint64_t)args->size_bytes,
                                          &compromised_transfer_ui.cancel_requested, &result);
 
         if (fast) {
-            janos_uart_restore_baud(tab, uart_port, JANOS_UART_FT_FAST_BAUD);
+            janos_uart_restore_baud(tab, uart_port, fast_baud);
         }
 
         if (result_err == ESP_OK) {
@@ -57703,6 +59796,1014 @@ static void compromised_files_sync_cb(lv_event_t *e)
     }
 }
 
+//==================================================================================
+// WPA Handshake Dictionary Cracker (on-device trivial-password check)
+//
+// Pulls the Monster's .hccapx companion for a captured handshake over M-BUS,
+// then tries a small dictionary (SD /lab/wordlist.txt + a built-in common list +
+// a few SSID-derived guesses) against the 4-way handshake MIC using mbedtls.
+//
+// Throughput depends on the device and capture count; display the measured rate.
+//==================================================================================
+
+#define HCCAPX_SIGNATURE      0x58504348u  /* "HCPX", little-endian on disk */
+#define HCCAPX_RECORD_SIZE    393
+#define HS_CRACK_MAX_RECORDS  16
+#define HS_CRACK_LOCAL_HCCAPX "/sdcard/lab/handshakes/_crack_tmp.hccapx"
+#define HS_CRACK_WORDLIST     "/sdcard/lab/wordlist.txt"
+
+typedef struct __attribute__((packed)) {
+    uint32_t signature;
+    uint32_t version;
+    uint8_t  message_pair;
+    uint8_t  essid_len;
+    uint8_t  essid[32];
+    uint8_t  keyver;
+    uint8_t  keymic[16];
+    uint8_t  mac_ap[6];
+    uint8_t  nonce_ap[32];
+    uint8_t  mac_sta[6];
+    uint8_t  nonce_sta[32];
+    uint16_t eapol_len;
+    uint8_t  eapol[256];
+} hccapx_record_t;
+
+_Static_assert(sizeof(hccapx_record_t) == HCCAPX_RECORD_SIZE,
+               "hccapx record must be exactly 393 packed bytes");
+
+typedef struct hs_crack_run hs_crack_run_t;
+
+typedef struct {
+    volatile bool active;
+    volatile bool cancel_requested;
+    TaskHandle_t task;
+    int tab;
+    int64_t last_update_us;
+    bool counting_candidates;
+    uint64_t total_candidates;
+    bool started;
+    bool dual_mode;
+    lv_obj_t *mode_dropdown;
+    hs_crack_run_t *run;
+    const char *candidate_source;
+    char candidate_status[96];
+    lv_timer_t *metrics_timer;
+    lv_obj_t *metrics_label;
+    int64_t metrics_sample_us;
+    uint64_t idle_runtime[2];
+    char remote_pcap_path[WARDRIVE_WIGLE_PATH_MAX];
+    char file_name[96];
+    lv_obj_t *overlay;
+    lv_obj_t *popup;
+    lv_obj_t *status_label;
+    lv_obj_t *detail_label;
+    lv_obj_t *progress_bar;
+    lv_obj_t *action_btn;
+    lv_obj_t *action_label;
+} hs_crack_ui_t;
+
+static hs_crack_ui_t hs_crack_ui;
+static void hs_crack_task(void *arg);
+
+// A short built-in list of common/obvious WPA passphrases (all 8..63 chars, so
+// they clear the PSK length gate). The SD wordlist and SSID guesses extend this.
+static const char *const hs_crack_builtin[] = {
+    "12345678", "123456789", "1234567890", "0123456789", "87654321",
+    "11111111", "00000000", "password", "password1", "password123",
+    "passw0rd", "P@ssw0rd", "qwertyui", "qwerty123", "qwertyuiop",
+    "1qaz2wsx", "zaq12wsx", "1q2w3e4r", "q1w2e3r4", "asdfghjkl",
+    "abcd1234", "a1b2c3d4", "1a2b3c4d", "changeme", "welcome1",
+    "welcome123", "letmein1", "iloveyou", "superman", "football",
+    "baseball", "sunshine", "princess", "dragon12", "monkey12",
+    "computer", "internet", "wireless", "adminadmin", "admin123",
+    "administrator", "linksys123", "netgear123", "guestguest", "homewifi1",
+    "test1234", "root1234", "pass1234", "secret12", "master12",
+};
+
+// PRF-512 block 0 -> the first 16 bytes are the KCK we sign the EAPOL frame with.
+static bool hs_crack_compute_kck(const uint8_t pmk[32], const hccapx_record_t *r, uint8_t kck[16])
+{
+    static const char label[] = "Pairwise key expansion"; // 22 bytes, no NUL in the PRF input
+    const uint8_t *mmin, *mmax, *nmin, *nmax;
+    if (memcmp(r->mac_ap, r->mac_sta, 6) < 0) { mmin = r->mac_ap; mmax = r->mac_sta; }
+    else                                       { mmin = r->mac_sta; mmax = r->mac_ap; }
+    if (memcmp(r->nonce_ap, r->nonce_sta, 32) < 0) { nmin = r->nonce_ap; nmax = r->nonce_sta; }
+    else                                            { nmin = r->nonce_sta; nmax = r->nonce_ap; }
+
+    uint8_t data[100];
+    size_t o = 0;
+    memcpy(data + o, label, 22); o += 22;
+    data[o++] = 0x00;
+    memcpy(data + o, mmin, 6);  o += 6;
+    memcpy(data + o, mmax, 6);  o += 6;
+    memcpy(data + o, nmin, 32); o += 32;
+    memcpy(data + o, nmax, 32); o += 32;
+    data[o++] = 0x00;  // PRF counter i = 0
+    // o == 100
+
+    uint8_t out[20];
+    if (hs_crack_hmac_sha1(pmk, 32, data, o, out) != 0) {
+        return false;
+    }
+    memcpy(kck, out, 16);
+    return true;
+}
+
+static bool hs_crack_record_valid(const hccapx_record_t *r)
+{
+    return r->signature == HCCAPX_SIGNATURE && r->version == 4 &&
+           (r->message_pair & 0x7f) <= 5 && r->essid_len <= 32 &&
+           (r->keyver == 1 || r->keyver == 2) &&
+           r->eapol_len >= 99 && r->eapol_len <= sizeof(r->eapol) &&
+           r->eapol[1] == 3 &&
+           (((unsigned)r->eapol[2] << 8) | r->eapol[3]) + 4 == r->eapol_len &&
+           (r->eapol[6] & 7) == r->keyver;
+}
+
+// 1 match, 0 mismatch, -2 crypto failure. PMK is reused across records
+// sharing an SSID for this candidate only; it is never shared across workers.
+static int hs_crack_test_pmk(const uint8_t pmk[32], const hccapx_record_t *r)
+{
+    uint8_t kck[16] = {0}, mic[20] = {0}, eapol[256];
+    int rc = -2;
+    if (!hs_crack_record_valid(r) || !hs_crack_compute_kck(pmk, r, kck)) goto done;
+    memcpy(eapol, r->eapol, r->eapol_len);
+    memset(eapol + 81, 0, 16);
+    int err = r->keyver == 1 ?
+        mbedtls_md_hmac(mbedtls_md_info_from_type(MBEDTLS_MD_MD5), kck, 16,
+                        eapol, r->eapol_len, mic) :
+        hs_crack_hmac_sha1(kck, 16, eapol, r->eapol_len, mic);
+    if (!err) rc = memcmp(mic, r->keymic, 16) == 0;
+done:
+    mbedtls_platform_zeroize(kck, sizeof(kck));
+    mbedtls_platform_zeroize(mic, sizeof(mic));
+    return rc;
+}
+
+// Returns record index, -1 no match, -2 error, -3 cancellation.
+static int hs_crack_verify_candidate(const char *pw, const hccapx_record_t *recs,
+                                     int nrecs, hs_crack_checkpoint_fn checkpoint, void *arg)
+{
+    uint8_t pmks[HS_CRACK_MAX_RECORDS][32] = {{0}};
+    int result = -1;
+    if (nrecs < 1 || nrecs > HS_CRACK_MAX_RECORDS) return -2;
+    for (int i = 0; i < nrecs; i++) {
+        if (checkpoint && !checkpoint(arg)) { result = -3; break; }
+        if (!hs_crack_record_valid(&recs[i])) { result = -2; break; }
+        int same = -1;
+        for (int j = 0; j < i; j++) {
+            if (recs[j].essid_len == recs[i].essid_len &&
+                !memcmp(recs[j].essid, recs[i].essid, recs[i].essid_len)) {
+                same = j;
+                break;
+            }
+        }
+        if (same >= 0) memcpy(pmks[i], pmks[same], 32);
+        else {
+            int rc = hs_crack_derive_pmk(pw, recs[i].essid, recs[i].essid_len,
+                                        pmks[i], checkpoint, arg);
+            if (rc) { result = rc == -1 ? -3 : -2; break; }
+        }
+        int match = hs_crack_test_pmk(pmks[i], &recs[i]);
+        if (match < 0) { result = -2; break; }
+        if (match) { result = i; break; }
+    }
+    mbedtls_platform_zeroize(pmks, sizeof(pmks));
+    return result;
+}
+
+#ifndef ESP_PLATFORM
+// Direct entry points retained for synthetic host regression vectors.
+static bool hs_crack_test_password(const char *pw, const hccapx_record_t *r)
+{
+    return hs_crack_verify_candidate(pw, r, 1, NULL, NULL) == 0;
+}
+#endif
+
+static int hs_crack_load_records(const char *path, hccapx_record_t *recs, int max_recs)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+    int n = 0;
+    while (n < max_recs) {
+        size_t got = fread(&recs[n], 1, sizeof(hccapx_record_t), f);
+        if (got == 0 && !ferror(f)) break;
+        if (got != sizeof(hccapx_record_t) || !hs_crack_record_valid(&recs[n])) {
+            n = -1;
+            break;
+        }
+        n++;
+    }
+    // Do not silently ignore captures beyond the fixed memory budget.
+    if (n == max_recs && fgetc(f) != EOF) n = -1;
+    if (ferror(f)) n = -1;
+    fclose(f);
+    return n;
+}
+
+// Read one whole line, preserving spaces and discarding oversized/binary lines.
+// 1 = candidate, 0 = skipped line, -1 = EOF/cancel, -2 = read error.
+static int hs_crack_read_word(FILE *f, char word[65], const volatile bool *cancel)
+{
+    size_t len = 0;
+#ifdef ESP_PLATFORM
+    unsigned bytes_since_yield = 0;
+#endif
+    bool binary = false;
+    int c = EOF;
+    while (!*cancel && (c = fgetc(f)) != EOF && c != '\n') {
+#ifdef ESP_PLATFORM
+        // Also service idle while discarding an arbitrarily long malformed line.
+        if (++bytes_since_yield == 4096) {
+            bytes_since_yield = 0;
+            vTaskDelay(1);
+        }
+#endif
+        if (c == 0) binary = true;
+        if (len < 64) word[len] = (char)c;
+        if (len < 65) len++;
+    }
+    if (*cancel) return -1;
+    if (ferror(f)) return -2;
+    if (c == EOF && len == 0) return -1;
+    if (len <= 64 && len && word[len - 1] == '\r') len--;
+    if (binary || len < 8 || len > 63) return 0;
+    word[len] = '\0';
+    return 1;
+}
+
+#ifndef ESP_PLATFORM
+static int hs_crack_try_candidate(const char *pw, const hccapx_record_t *recs, int nrecs)
+{
+    int rc = hs_crack_verify_candidate(pw, recs, nrecs, NULL, NULL);
+    return rc >= 0 ? rc : -1;
+}
+#endif
+
+// UINT64_MAX means that no measured estimate is available yet.
+static uint64_t hs_crack_eta_seconds(uint64_t total, uint32_t tried, int64_t elapsed_us)
+{
+    if (total <= tried) return 0;
+    if (!tried || elapsed_us <= 0) return UINT64_MAX;
+    double seconds = (double)(total - tried) * (double)elapsed_us / (1000000.0 * tried);
+    if (seconds >= (double)UINT64_MAX) return UINT64_MAX;
+    uint64_t rounded = (uint64_t)seconds;
+    return rounded + (seconds > (double)rounded);
+}
+
+static void hs_crack_set_stage(const char *status, const char *detail, int bar_value)
+{
+    if (!bsp_display_lock(200)) return;
+    if (hs_crack_ui.status_label && lv_obj_is_valid(hs_crack_ui.status_label) && status) {
+        lv_label_set_text(hs_crack_ui.status_label, status);
+    }
+    if (hs_crack_ui.detail_label && lv_obj_is_valid(hs_crack_ui.detail_label) && detail) {
+        lv_label_set_text(hs_crack_ui.detail_label, detail);
+    }
+    if (hs_crack_ui.progress_bar && lv_obj_is_valid(hs_crack_ui.progress_bar) && bar_value >= 0) {
+        lv_obj_clear_flag(hs_crack_ui.progress_bar, LV_OBJ_FLAG_HIDDEN);
+        lv_bar_set_value(hs_crack_ui.progress_bar, bar_value, LV_ANIM_OFF);
+    }
+    if (hs_crack_ui.progress_bar && bar_value < 0) {
+        // Total dictionary size is unknown; the tried count and measured rate
+        // are progress, not a percentage that wraps back to zero.
+        lv_obj_add_flag(hs_crack_ui.progress_bar, LV_OBJ_FLAG_HIDDEN);
+    }
+    bsp_display_unlock();
+}
+
+// Called by the LVGL timer, independently of the password worker. All fields
+// below belong to the display thread; no extra task or heap snapshot is needed.
+static void hs_crack_metrics_update(lv_timer_t *timer)
+{
+    (void)timer;
+    if (!hs_crack_ui.metrics_label) return;
+    char cpu[64] = "CPU0 --  CPU1 --";
+#if configUSE_TRACE_FACILITY && configGENERATE_RUN_TIME_STATS && \
+    CONFIG_FREERTOS_RUN_TIME_STATS_USING_ESP_TIMER && !CONFIG_FREERTOS_SMP && !CONFIG_FREERTOS_UNICORE
+    int64_t now = esp_timer_get_time();
+    int64_t elapsed = now - hs_crack_ui.metrics_sample_us;
+    unsigned busy[2] = {0, 0};
+    for (int core = 0; core < 2; core++) {
+        TaskStatus_t idle;
+        vTaskGetInfo(xTaskGetIdleTaskHandleForCore(core), &idle, pdFALSE, eInvalid);
+        // Subtract in the configured counter width to handle a single wrap.
+        configRUN_TIME_COUNTER_TYPE idle_delta = idle.ulRunTimeCounter -
+            (configRUN_TIME_COUNTER_TYPE)hs_crack_ui.idle_runtime[core];
+        hs_crack_ui.idle_runtime[core] = idle.ulRunTimeCounter;
+        if (elapsed > 0 && elapsed <= UINT32_MAX) {
+            double idle_percent = 100.0 * (double)idle_delta / (double)elapsed;
+            busy[core] = idle_percent >= 100.0 ? 0 : (unsigned)(100.0 - idle_percent + 0.5);
+        }
+    }
+    if (hs_crack_ui.metrics_sample_us && elapsed > 0 && elapsed <= UINT32_MAX) {
+        snprintf(cpu, sizeof(cpu), "CPU0 %u%%  CPU1 %u%%", busy[0], busy[1]);
+    }
+    hs_crack_ui.metrics_sample_us = now;
+#endif
+    const uint32_t ram_caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
+    const uint32_t psram_caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
+    size_t ram_total = heap_caps_get_total_size(ram_caps);
+    size_t ram_free = heap_caps_get_free_size(ram_caps);
+    size_t psram_total = heap_caps_get_total_size(psram_caps);
+    size_t psram_free = heap_caps_get_free_size(psram_caps);
+    size_t ram_used = ram_total > ram_free ? ram_total - ram_free : 0;
+    size_t psram_used = psram_total > psram_free ? psram_total - psram_free : 0;
+    char text[256];
+    snprintf(text, sizeof(text),
+             "%s | %d MHz\nRAM %lu/%lu KiB | PSRAM %.1f/%.1f MiB\n"
+             "DMA free %lu KiB | Largest RAM block %lu KiB",
+             cpu, esp_clk_cpu_freq() / 1000000,
+             (unsigned long)(ram_used / 1024), (unsigned long)(ram_total / 1024),
+             (double)psram_used / 1048576.0, (double)psram_total / 1048576.0,
+             (unsigned long)(heap_caps_get_free_size(MALLOC_CAP_DMA) / 1024),
+             (unsigned long)(heap_caps_get_largest_free_block(ram_caps) / 1024));
+    lv_label_set_text(hs_crack_ui.metrics_label, text);
+}
+
+static void hs_crack_metrics_stop(void)
+{
+    if (hs_crack_ui.metrics_timer) {
+        lv_timer_delete(hs_crack_ui.metrics_timer);
+        hs_crack_ui.metrics_timer = NULL;
+    }
+}
+
+// Caller owns the LVGL lock (including the task-start failure callback).
+static void hs_crack_finish_ui_unlocked(bool found, const char *status, const char *detail)
+{
+    hs_crack_metrics_stop();
+    hs_crack_ui.active = false;
+    alert_chime_play(found ? ALERT_TONE_WIN : ALERT_TONE_WARN);
+    if (hs_crack_ui.status_label && lv_obj_is_valid(hs_crack_ui.status_label)) {
+        lv_label_set_text(hs_crack_ui.status_label,
+                          status);
+        lv_obj_set_style_text_color(hs_crack_ui.status_label,
+                                    found ? COLOR_MATERIAL_GREEN : COLOR_MATERIAL_AMBER, 0);
+    }
+    if (hs_crack_ui.detail_label && lv_obj_is_valid(hs_crack_ui.detail_label)) {
+        lv_label_set_text(hs_crack_ui.detail_label, detail ? detail : "");
+    }
+    if (hs_crack_ui.progress_bar && lv_obj_is_valid(hs_crack_ui.progress_bar)) {
+        lv_bar_set_value(hs_crack_ui.progress_bar, 100, LV_ANIM_OFF);
+    }
+    if (hs_crack_ui.action_btn && lv_obj_is_valid(hs_crack_ui.action_btn)) {
+        lv_obj_clear_state(hs_crack_ui.action_btn, LV_STATE_DISABLED);
+        lv_obj_set_style_bg_color(hs_crack_ui.action_btn,
+                                  found ? COLOR_MATERIAL_GREEN : COLOR_MATERIAL_BLUE, 0);
+    }
+    if (hs_crack_ui.action_label && lv_obj_is_valid(hs_crack_ui.action_label)) {
+        lv_label_set_text(hs_crack_ui.action_label, "Close");
+    }
+}
+
+static void hs_crack_overlay_deleted_cb(lv_event_t *e)
+{
+    if (lv_event_get_target(e) != hs_crack_ui.overlay) return;
+    hs_crack_metrics_stop();
+    hs_crack_ui.metrics_label = NULL;
+    hs_crack_ui.mode_dropdown = NULL;
+    hs_crack_ui.cancel_requested = true;
+    hs_crack_ui.overlay = NULL;
+    hs_crack_ui.popup = NULL;
+    hs_crack_ui.status_label = NULL;
+    hs_crack_ui.detail_label = NULL;
+    hs_crack_ui.progress_bar = NULL;
+    hs_crack_ui.action_btn = NULL;
+    hs_crack_ui.action_label = NULL;
+}
+
+static void hs_crack_close_or_cancel_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!hs_crack_ui.started) {
+        hs_crack_ui.dual_mode = lv_dropdown_get_selected(hs_crack_ui.mode_dropdown) == 1;
+        hs_crack_ui.started = true;
+        hs_crack_ui.active = true;
+        lv_obj_add_state(hs_crack_ui.mode_dropdown, LV_STATE_DISABLED);
+        lv_label_set_text(hs_crack_ui.action_label, "Cancel");
+        if (xTaskCreate(hs_crack_task, "hs_crack", 12288, NULL, 4, &hs_crack_ui.task) != pdPASS) {
+            hs_crack_ui.task = NULL;
+            hs_crack_finish_ui_unlocked(false, "Check failed", "Could not start coordinator.");
+        }
+        return;
+    }
+    if (hs_crack_ui.active) {
+        hs_crack_ui.cancel_requested = true;
+        if (hs_crack_ui.action_btn && lv_obj_is_valid(hs_crack_ui.action_btn)) {
+            lv_obj_add_state(hs_crack_ui.action_btn, LV_STATE_DISABLED);
+        }
+        if (hs_crack_ui.action_label && lv_obj_is_valid(hs_crack_ui.action_label)) {
+            lv_label_set_text(hs_crack_ui.action_label, "Cancelling...");
+        }
+        return;
+    }
+    if (hs_crack_ui.overlay && lv_obj_is_valid(hs_crack_ui.overlay)) {
+        lv_obj_del(hs_crack_ui.overlay);
+    }
+    hs_crack_ui.overlay = NULL;
+    hs_crack_ui.popup = NULL;
+    hs_crack_ui.status_label = NULL;
+    hs_crack_ui.detail_label = NULL;
+    hs_crack_ui.progress_bar = NULL;
+    hs_crack_ui.action_btn = NULL;
+    hs_crack_ui.action_label = NULL;
+}
+
+static void hs_crack_dismiss_cb(lv_event_t *e)
+{
+    (void)e;
+    if (hs_crack_ui.overlay) lv_obj_del(hs_crack_ui.overlay);
+}
+
+static void hs_crack_show_popup(const char *file_name)
+{
+    hs_crack_ui.overlay = lv_obj_create(lv_scr_act());
+    lv_obj_add_event_cb(hs_crack_ui.overlay, hs_crack_overlay_deleted_cb, LV_EVENT_DELETE, NULL);
+    lv_obj_remove_style_all(hs_crack_ui.overlay);
+    lv_obj_set_size(hs_crack_ui.overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(hs_crack_ui.overlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(hs_crack_ui.overlay, LV_OPA_60, 0);
+    lv_obj_add_flag(hs_crack_ui.overlay, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(hs_crack_ui.overlay, LV_OBJ_FLAG_SCROLLABLE);
+
+    hs_crack_ui.popup = lv_obj_create(hs_crack_ui.overlay);
+    lv_obj_set_size(hs_crack_ui.popup, popup_clamp_w(680), popup_clamp_h(640));
+    lv_obj_center(hs_crack_ui.popup);
+    style_surface_panel(hs_crack_ui.popup, 16);
+    lv_obj_set_style_pad_all(hs_crack_ui.popup, 24, 0);
+    lv_obj_set_flex_flow(hs_crack_ui.popup, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(hs_crack_ui.popup, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(hs_crack_ui.popup, 16, 0);
+    lv_obj_add_flag(hs_crack_ui.popup, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(hs_crack_ui.popup);
+    lv_label_set_text(title, LV_SYMBOL_KEYBOARD " Crack handshake (dictionary)");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_PURPLE, 0);
+
+    lv_obj_t *name = lv_label_create(hs_crack_ui.popup);
+    lv_label_set_text(name, file_name ? file_name : "handshake");
+    lv_obj_set_width(name, lv_pct(100));
+    lv_label_set_long_mode(name, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_align(name, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(name, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(name, ui_text_color(), 0);
+
+    hs_crack_ui.mode_dropdown = lv_dropdown_create(hs_crack_ui.popup);
+    lv_dropdown_set_options(hs_crack_ui.mode_dropdown, "Single (CPU1)\nDual (CPU0 + CPU1)");
+    lv_dropdown_set_selected(hs_crack_ui.mode_dropdown, hs_crack_ui.dual_mode ? 1 : 0);
+    lv_obj_set_width(hs_crack_ui.mode_dropdown, lv_pct(100));
+#if CONFIG_FREERTOS_UNICORE
+    lv_dropdown_set_selected(hs_crack_ui.mode_dropdown, 0);
+    lv_obj_add_state(hs_crack_ui.mode_dropdown, LV_STATE_DISABLED);
+#endif
+    hs_crack_ui.status_label = lv_label_create(hs_crack_ui.popup);
+    lv_label_set_text(hs_crack_ui.status_label, "Choose mode and press Start");
+    lv_obj_set_width(hs_crack_ui.status_label, lv_pct(100));
+    lv_label_set_long_mode(hs_crack_ui.status_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(hs_crack_ui.status_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(hs_crack_ui.status_label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(hs_crack_ui.status_label, COLOR_MATERIAL_AMBER, 0);
+
+    hs_crack_ui.progress_bar = lv_bar_create(hs_crack_ui.popup);
+    lv_obj_set_size(hs_crack_ui.progress_bar, lv_pct(100), 20);
+    lv_bar_set_range(hs_crack_ui.progress_bar, 0, 100);
+    lv_bar_set_value(hs_crack_ui.progress_bar, 0, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(hs_crack_ui.progress_bar, ui_card_color(), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(hs_crack_ui.progress_bar, COLOR_MATERIAL_PURPLE, LV_PART_INDICATOR);
+
+    hs_crack_ui.detail_label = lv_label_create(hs_crack_ui.popup);
+    lv_label_set_text(hs_crack_ui.detail_label,
+                      "Trivial-password check only. Serious cracking: wpa-sec / hashcat.");
+    lv_obj_set_width(hs_crack_ui.detail_label, lv_pct(100));
+    lv_label_set_long_mode(hs_crack_ui.detail_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(hs_crack_ui.detail_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(hs_crack_ui.detail_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(hs_crack_ui.detail_label, ui_muted_color(), 0);
+
+    hs_crack_ui.metrics_label = lv_label_create(hs_crack_ui.popup);
+    lv_obj_set_width(hs_crack_ui.metrics_label, lv_pct(100));
+    lv_label_set_long_mode(hs_crack_ui.metrics_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(hs_crack_ui.metrics_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(hs_crack_ui.metrics_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(hs_crack_ui.metrics_label, ui_muted_color(), 0);
+    hs_crack_ui.metrics_sample_us = 0;
+    hs_crack_metrics_update(NULL);
+    hs_crack_ui.metrics_timer = lv_timer_create(hs_crack_metrics_update, 1000, NULL);
+
+    hs_crack_ui.action_btn = lv_btn_create(hs_crack_ui.popup);
+    lv_obj_set_size(hs_crack_ui.action_btn, 180, 48);
+    style_danger_button(hs_crack_ui.action_btn);
+    lv_obj_add_event_cb(hs_crack_ui.action_btn, hs_crack_close_or_cancel_cb, LV_EVENT_CLICKED, NULL);
+
+    hs_crack_ui.action_label = lv_label_create(hs_crack_ui.action_btn);
+    lv_label_set_text(hs_crack_ui.action_label, "Start");
+    lv_obj_set_style_text_font(hs_crack_ui.action_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(hs_crack_ui.action_label, lv_color_white(), 0);
+    lv_obj_center(hs_crack_ui.action_label);
+    lv_obj_t *dismiss = lv_btn_create(hs_crack_ui.popup);
+    lv_obj_set_size(dismiss, 180, 40);
+    lv_obj_add_event_cb(dismiss, hs_crack_dismiss_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *dismiss_label = lv_label_create(dismiss);
+    lv_label_set_text(dismiss_label, "Dismiss / stop");
+    lv_obj_center(dismiss_label);
+}
+
+static void hs_crack_set_source(const char *source, uint32_t tried)
+{
+    hs_crack_ui.candidate_source = source;
+    snprintf(hs_crack_ui.candidate_status, sizeof(hs_crack_ui.candidate_status),
+             "%s: %s", hs_crack_ui.counting_candidates ? "Counting" : "Checking", source);
+    int percent = hs_crack_ui.total_candidates ?
+                  (int)(100.0 * (double)tried / (double)hs_crack_ui.total_candidates) : 0;
+    hs_crack_set_stage(hs_crack_ui.candidate_status, NULL,
+                       hs_crack_ui.counting_candidates ? -1 : (percent > 100 ? 100 : percent));
+}
+
+// Runs one candidate, updates the tried counter and periodic progress, and
+// reports a hit. Returns true when the caller should stop (found or cancelled).
+typedef struct {
+    char password[64];
+    const char *source;
+    int match;
+    int core;
+    int64_t elapsed_us;
+} hs_crack_job_t;
+
+typedef struct {
+    hs_crack_run_t *run;
+    int core;
+    int64_t slice_started;
+} hs_crack_worker_t;
+
+struct hs_crack_run {
+    QueueHandle_t jobs, results;
+    TaskHandle_t coordinator;
+    atomic_bool stop;
+    const hccapx_record_t *records;
+    int record_count;
+    unsigned workers, pending;
+    bool error;
+    hs_crack_worker_t worker[2];
+};
+
+static bool hs_crack_checkpoint(void *arg)
+{
+    hs_crack_worker_t *worker = arg;
+    if (atomic_load(&worker->run->stop)) return false;
+    int64_t now = esp_timer_get_time();
+    int64_t slice_us = worker->core == 0 ? 19000 : 49000;
+    if (now - worker->slice_started >= slice_us) {
+        // A real blocking interval lets IDLE run; taskYIELD alone cannot do so.
+        int64_t resume_after = now + 1000;
+        do { vTaskDelay(1); } while (esp_timer_get_time() < resume_after);
+        worker->slice_started = esp_timer_get_time();
+    }
+    return !atomic_load(&worker->run->stop);
+}
+
+static void hs_crack_worker_task(void *arg)
+{
+    hs_crack_worker_t *worker = arg;
+    hs_crack_run_t *run = worker->run;
+    hs_crack_job_t job = {0};
+    while (!atomic_load(&run->stop)) {
+        if (xQueueReceive(run->jobs, &job, pdMS_TO_TICKS(20)) != pdTRUE) continue;
+        worker->slice_started = esp_timer_get_time();
+        int64_t start = worker->slice_started;
+        job.match = hs_crack_verify_candidate(job.password, run->records,
+                                              run->record_count, hs_crack_checkpoint, worker);
+        job.elapsed_us = esp_timer_get_time() - start;
+        job.core = worker->core;
+        if (job.match == -3) break;
+        while (!atomic_load(&run->stop) &&
+               xQueueSend(run->results, &job, pdMS_TO_TICKS(20)) != pdTRUE) {}
+        mbedtls_platform_zeroize(&job, sizeof(job));
+        // Also service idle when a whole candidate finishes inside one slice.
+        vTaskDelay(1);
+    }
+    mbedtls_platform_zeroize(&job, sizeof(job));
+    TaskHandle_t coordinator = run->coordinator;
+    // No accesses to run/worker after this notification: coordinator may free them.
+    xTaskNotifyGive(coordinator);
+    vTaskDelete(NULL);
+}
+
+static void hs_crack_workers_stop(void)
+{
+    hs_crack_run_t *run = hs_crack_ui.run;
+    if (!run) return;
+    atomic_store(&run->stop, true);
+    for (unsigned i = 0; i < run->workers; i++) {
+        while (!ulTaskNotifyTake(pdFALSE, pdMS_TO_TICKS(50))) {}
+    }
+    hs_crack_job_t discarded;
+    if (run->jobs) {
+        while (xQueueReceive(run->jobs, &discarded, 0) == pdTRUE) {}
+        vQueueDelete(run->jobs);
+    }
+    if (run->results) {
+        while (xQueueReceive(run->results, &discarded, 0) == pdTRUE) {}
+        vQueueDelete(run->results);
+    }
+    mbedtls_platform_zeroize(&discarded, sizeof(discarded));
+    free(run);
+    hs_crack_ui.run = NULL;
+}
+
+static bool hs_crack_workers_start(const hccapx_record_t *recs, int nrecs)
+{
+    hs_crack_run_t *run = calloc(1, sizeof(*run));
+    if (!run) return false;
+    hs_crack_ui.run = run;
+    atomic_init(&run->stop, false);
+    run->coordinator = xTaskGetCurrentTaskHandle();
+    (void)ulTaskNotifyTake(pdTRUE, 0);
+    run->records = recs;
+    run->record_count = nrecs;
+    run->jobs = xQueueCreate(4, sizeof(hs_crack_job_t));
+    run->results = xQueueCreate(4, sizeof(hs_crack_job_t));
+    if (!run->jobs || !run->results) goto fail;
+    unsigned count = hs_crack_ui.dual_mode ? 2 : 1;
+    for (unsigned i = 0; i < count; i++) {
+        run->worker[i].run = run;
+        run->worker[i].core = i == 0 ? 1 : 0;
+#if CONFIG_FREERTOS_UNICORE
+        run->worker[i].core = 0;
+#endif
+        if (xTaskCreatePinnedToCore(hs_crack_worker_task, i == 0 ? "hs_cpu1" : "hs_cpu0",
+                                   8192, &run->worker[i], 3, NULL,
+                                   run->worker[i].core) != pdPASS) goto fail;
+        run->workers++;
+    }
+    ESP_LOGI(TAG, "[HS-CRACK] mode=%s workers=%u software SHA1; CPU0 19ms/1ms, CPU1 49ms/1ms",
+             hs_crack_ui.dual_mode ? "Dual" : "Single", run->workers);
+    return true;
+fail:
+    hs_crack_workers_stop();
+    return false;
+}
+
+static void hs_crack_progress(const char *pw, uint32_t tried, int64_t t0)
+{
+    int64_t now = esp_timer_get_time();
+    if (now - hs_crack_ui.last_update_us < 250000) return;
+    hs_crack_ui.last_update_us = now;
+    int64_t elapsed = now - t0;
+    double rate = elapsed > 0 ? tried * 1000000.0 / elapsed : 0;
+    char detail[192], eta_text[48];
+    uint64_t eta = hs_crack_eta_seconds(hs_crack_ui.total_candidates, tried, elapsed);
+    if (eta == UINT64_MAX) snprintf(eta_text, sizeof(eta_text), "calculating...");
+    else compromised_format_duration(eta, eta_text, sizeof(eta_text));
+    snprintf(detail, sizeof(detail), "Tried %lu / %llu - %.2f/s (%.1f s/try)\nETA: %s\nLast: %.20s",
+             (unsigned long)tried, (unsigned long long)hs_crack_ui.total_candidates,
+             rate, tried ? elapsed / (1000000.0 * tried) : 0, eta_text, pw);
+    int percent = hs_crack_ui.total_candidates ?
+        (int)(100.0 * tried / hs_crack_ui.total_candidates) : 0;
+    hs_crack_set_stage(hs_crack_ui.candidate_status, detail, percent > 100 ? 100 : percent);
+}
+
+// Only the coordinator publishes results, counts completions and changes sources.
+static bool hs_crack_collect(uint32_t *tried, int64_t t0, int *found_idx,
+                              char *found_pw, size_t size, bool drain)
+{
+    hs_crack_run_t *run = hs_crack_ui.run;
+    if (!run) return hs_crack_ui.cancel_requested;
+    hs_crack_job_t result;
+    while (run->pending) {
+        if (hs_crack_ui.cancel_requested) { atomic_store(&run->stop, true); return true; }
+        if (xQueueReceive(run->results, &result, drain ? pdMS_TO_TICKS(20) : 0) != pdTRUE) {
+            if (drain) continue;
+            break;
+        }
+        run->pending--;
+        if (result.match == -2) run->error = true;
+        else (*tried)++;
+        if (*tried <= 3 || (*tried % 32u) == 0) {
+            ESP_LOGI(TAG, "[HS-CRACK] completed=%lu core=%d candidate=%lldus",
+                     (unsigned long)*tried, result.core, (long long)result.elapsed_us);
+        }
+        if (result.match >= 0) {
+            *found_idx = result.match;
+            snprintf(found_pw, size, "%s", result.password);
+            hs_crack_ui.candidate_source = result.source;
+        }
+        bool stop = run->error || result.match >= 0;
+        if (!stop) hs_crack_progress(result.password, *tried, t0);
+        mbedtls_platform_zeroize(&result, sizeof(result));
+        if (stop) { atomic_store(&run->stop, true); return true; }
+    }
+    return hs_crack_ui.cancel_requested;
+}
+
+static bool hs_crack_step(const char *pw, const hccapx_record_t *recs, int nrecs,
+                          uint32_t *tried, int64_t t0, int *found_idx, char *found_pw,
+                          size_t found_pw_sz)
+{
+    if (hs_crack_ui.cancel_requested) return true;
+    size_t pwlen = strlen(pw);
+    if (pwlen < 8 || pwlen > 63) return false;
+    if (hs_crack_ui.counting_candidates) {
+        hs_crack_ui.total_candidates++;
+        if ((hs_crack_ui.total_candidates % 1024u) == 0) {
+            char detail[96];
+            snprintf(detail, sizeof(detail), "%llu valid candidates counted; no password checks yet.",
+                     (unsigned long long)hs_crack_ui.total_candidates);
+            hs_crack_set_stage(hs_crack_ui.candidate_status, detail, -1);
+            vTaskDelay(1);
+        }
+        return false;
+    }
+    (void)recs; (void)nrecs;
+    hs_crack_run_t *run = hs_crack_ui.run;
+    hs_crack_job_t job = {0};
+    snprintf(job.password, sizeof(job.password), "%s", pw);
+    job.source = hs_crack_ui.candidate_source;
+    bool stop = false;
+    while (!(stop = hs_crack_collect(tried, t0, found_idx, found_pw, found_pw_sz, false))) {
+        if (xQueueSend(run->jobs, &job, pdMS_TO_TICKS(10)) == pdTRUE) {
+            run->pending++;
+            break;
+        }
+    }
+    mbedtls_platform_zeroize(&job, sizeof(job));
+    return stop;
+}
+
+static void hs_crack_task(void *arg)
+{
+    (void)arg;
+    bool performance_claimed =
+        app_power_manager_acquire_performance("wpa-crack") == ESP_OK;
+    tab_id_t tab = (tab_id_t)hs_crack_ui.tab;
+    uart_port_t uart_port = uart_port_for_tab(tab);
+    bool usb_lock_set = false;
+    hccapx_record_t *recs = NULL;
+    int nrecs = 0;
+    int found_idx = -1;
+    char found_pw[64] = {0};
+    char final_detail[256] = {0};
+    const char *final_status = "Check failed";
+    char ssid[33] = {0};
+    uint32_t tried = 0;
+    int64_t t0 = 0;
+    bool sd_wordlist_used = false;
+
+    // Build the remote .hccapx path from the .pcap path.
+    char remote_hccapx[WARDRIVE_WIGLE_PATH_MAX];
+    snprintf(remote_hccapx, sizeof(remote_hccapx), "%s", hs_crack_ui.remote_pcap_path);
+    char *dot = strrchr(remote_hccapx, '.');
+    if (!dot || !str_ends_with_ext(remote_hccapx, ".pcap") ||
+        (size_t)(dot - remote_hccapx) + sizeof(".hccapx") > sizeof(remote_hccapx)) {
+        snprintf(final_detail, sizeof(final_detail), "Not a .pcap handshake file.");
+        goto finish;
+    }
+    snprintf(dot, sizeof(remote_hccapx) - (size_t)(dot - remote_hccapx), ".hccapx");
+
+    // Fetch the companion over M-BUS (tiny file, so Wi-Fi/portal is not needed).
+    unlink(HS_CRACK_LOCAL_HCCAPX);
+    unlink(HS_CRACK_LOCAL_HCCAPX ".part");
+    compromised_transport_lock_begin(tab, uart_port, &usb_lock_set);
+    hs_crack_set_stage("Fetching handshake...", "Copying .hccapx from Monster over M-BUS", 0);
+    transport_write_bytes_tab(tab, uart_port, "stop\r\n", 6);
+    char stop_response[512];
+    (void)home_collect_uart_response(tab, uart_port, stop_response, sizeof(stop_response), 2500);
+
+    janos_file_transfer_result_t result = {0};
+    esp_err_t err = janos_uart_download(tab, uart_port, remote_hccapx, HS_CRACK_LOCAL_HCCAPX,
+                                        0, &hs_crack_ui.cancel_requested, &result);
+    compromised_transport_lock_end(usb_lock_set);
+    usb_lock_set = false;
+
+    if (hs_crack_ui.cancel_requested) {
+        snprintf(final_detail, sizeof(final_detail), "Cancelled.");
+        goto finish;
+    }
+    if (err != ESP_OK) {
+        snprintf(final_detail, sizeof(final_detail),
+                 "Could not fetch .hccapx (%s).\nNeed a complete 4-way capture on the Monster.",
+                 esp_err_to_name(err));
+        goto finish;
+    }
+
+    recs = heap_caps_calloc(HS_CRACK_MAX_RECORDS, sizeof(hccapx_record_t), MALLOC_CAP_SPIRAM);
+    if (!recs) {
+        recs = calloc(HS_CRACK_MAX_RECORDS, sizeof(hccapx_record_t));
+    }
+    if (!recs) {
+        snprintf(final_detail, sizeof(final_detail), "Out of memory.");
+        goto finish;
+    }
+    nrecs = hs_crack_load_records(HS_CRACK_LOCAL_HCCAPX, recs, HS_CRACK_MAX_RECORDS);
+    if (nrecs <= 0) {
+        snprintf(final_detail, sizeof(final_detail),
+                 "Need 1-16 valid hccapx v4 records (WPA/WPA2 keyver 1 or 2).\nPMKID and keyver 3 are not supported.");
+        goto finish;
+    }
+
+    uint8_t ssid_len = recs[0].essid_len > 32 ? 32 : recs[0].essid_len;
+    memcpy(ssid, recs[0].essid, ssid_len);
+
+run_candidates:
+    // Both passes use the exact same enumeration and length/line filters.
+    // The first only counts; transfer and counting time are excluded from ETA.
+    t0 = esp_timer_get_time();
+    hs_crack_set_stage(hs_crack_ui.counting_candidates ? "Counting candidates..." : "Trying passwords...",
+                       hs_crack_ui.counting_candidates ? "Reading lists; ETA will follow the first completed attempt."
+                                                       : "SSID variants first; ETA calculating...", 0);
+
+    // 1) SSID-derived guesses for each distinct, printable SSID.
+    hs_crack_set_source("SSID variants", tried);
+    for (int record_index = 0; record_index < nrecs; record_index++) {
+        const hccapx_record_t *record = &recs[record_index];
+        if (!record->essid_len || memchr(record->essid, 0, record->essid_len)) continue;
+        bool duplicate = false;
+        for (int previous = 0; previous < record_index; previous++) {
+            if (recs[previous].essid_len == record->essid_len &&
+                memcmp(recs[previous].essid, record->essid, record->essid_len) == 0) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) continue;
+        char guess_ssid[33] = {0};
+        memcpy(guess_ssid, record->essid, record->essid_len);
+        static const char *const suffixes[] = {
+            "", "1", "12", "123", "1234", "12345", "123456", "1234567", "12345678",
+            "2020", "2021", "2022", "2023", "2024", "2025", "2026",
+            "!", "@123", "wifi", "admin",
+            "1234@", "1234%", "1234#", "1234!", "1234^", "1234&", "1234*",
+            "1234(", "1234)", "1234_", "1234-", "1234+", "1234=",
+        };
+        for (size_t i = 0; i < sizeof(suffixes) / sizeof(suffixes[0]); i++) {
+            char cand[64];
+            snprintf(cand, sizeof(cand), "%s%s", guess_ssid, suffixes[i]);
+            if (hs_crack_step(cand, recs, nrecs, &tried, t0,
+                              &found_idx, found_pw, sizeof(found_pw))) {
+                goto done;
+            }
+        }
+    }
+
+    // 2) Built-in common list.
+    if (hs_crack_collect(&tried, t0, &found_idx, found_pw, sizeof(found_pw), true)) goto done;
+    hs_crack_set_source("Generic (built-in)", tried);
+    for (size_t i = 0; i < sizeof(hs_crack_builtin) / sizeof(hs_crack_builtin[0]); i++) {
+        if (hs_crack_step(hs_crack_builtin[i], recs, nrecs, &tried, t0,
+                          &found_idx, found_pw, sizeof(found_pw))) {
+            goto done;
+        }
+    }
+
+    // 3) SD wordlist, one passphrase per line.
+    if (hs_crack_collect(&tried, t0, &found_idx, found_pw, sizeof(found_pw), true)) goto done;
+    hs_crack_set_source("SD: /lab/wordlist.txt", tried);
+    FILE *wl = fopen(HS_CRACK_WORDLIST, "r");
+    if (wl) {
+        sd_wordlist_used = true;
+        char line[65];
+        int read_status;
+        uint32_t lines_read = 0;
+        while ((read_status = hs_crack_read_word(wl, line, &hs_crack_ui.cancel_requested)) >= 0) {
+            if ((++lines_read % 128u) == 0) vTaskDelay(1);
+            if (read_status == 0) continue;
+            if (hs_crack_step(line, recs, nrecs, &tried, t0,
+                              &found_idx, found_pw, sizeof(found_pw))) {
+                break;
+            }
+        }
+        if (read_status == -2) {
+            snprintf(final_detail, sizeof(final_detail), "Could not read /lab/wordlist.txt.");
+        }
+        fclose(wl);
+    } else if (errno != ENOENT) {
+        snprintf(final_detail, sizeof(final_detail), "Could not open /lab/wordlist.txt.");
+    }
+
+done:
+    if (final_detail[0]) goto finish;
+    if (hs_crack_ui.counting_candidates && !hs_crack_ui.cancel_requested) {
+        if (!hs_crack_workers_start(recs, nrecs)) {
+            snprintf(final_detail, sizeof(final_detail), "Insufficient RAM for workers. Close this dialog and retry Single mode.");
+            goto finish;
+        }
+        hs_crack_ui.counting_candidates = false;
+        hs_crack_ui.last_update_us = 0;
+        goto run_candidates;
+    }
+    if (found_idx < 0 && hs_crack_ui.run && !hs_crack_ui.run->error)
+        (void)hs_crack_collect(&tried, t0, &found_idx, found_pw, sizeof(found_pw), true);
+    if (hs_crack_ui.run && hs_crack_ui.run->error) {
+        snprintf(final_detail, sizeof(final_detail), "Cryptographic verification failed; result is incomplete.");
+        goto finish;
+    }
+    if (found_idx >= 0) {
+        final_status = "Password found!";
+        memset(ssid, 0, sizeof(ssid));
+        memcpy(ssid, recs[found_idx].essid, recs[found_idx].essid_len);
+        snprintf(final_detail, sizeof(final_detail),
+                 "SSID: %s\nPassword: %s\nSource: %s\n(%lu tried)",
+                 ssid, found_pw, hs_crack_ui.candidate_source, (unsigned long)tried);
+    } else if (hs_crack_ui.cancel_requested) {
+        final_status = "Cancelled";
+        snprintf(final_detail, sizeof(final_detail),
+                 "Cancelled after %lu passwords.", (unsigned long)tried);
+    } else {
+        final_status = "Not in dictionary";
+        snprintf(final_detail, sizeof(final_detail),
+                 "SSID: %s\n%lu passwords tried, no match.\n%s",
+                 ssid, (unsigned long)tried,
+                 sd_wordlist_used ? "SD dictionary exhausted." : "No /lab/wordlist.txt; built-in + SSID guesses only.");
+    }
+
+finish:
+    if (usb_lock_set) {
+        compromised_transport_lock_end(usb_lock_set);
+    }
+    hs_crack_workers_stop();
+    free(recs);
+    unlink(HS_CRACK_LOCAL_HCCAPX);
+    unlink(HS_CRACK_LOCAL_HCCAPX ".part");
+    if (performance_claimed) {
+        (void)app_power_manager_release_performance("wpa-crack");
+    }
+    // Publish completion atomically with the Close button, even if LVGL was busy.
+    while (!bsp_display_lock(200)) vTaskDelay(1);
+    if (hs_crack_ui.cancel_requested && found_idx < 0) final_status = "Cancelled";
+    hs_crack_ui.task = NULL;
+    hs_crack_finish_ui_unlocked(found_idx >= 0, final_status, final_detail);
+    bsp_display_unlock();
+    vTaskDelete(NULL);
+}
+
+static void hs_crack_start_file(tab_context_t *ctx, const char *remote_path, const char *file_name)
+{
+    if (!ctx || hs_crack_ui.overlay || hs_crack_ui.active || hs_crack_ui.task ||
+        compromised_transfer_ui.active || compromised_transfer_ui.task ||
+        tab_is_internal(current_tab) || !remote_path || !remote_path[0] || !file_name) return;
+    if (!compromised_transfer_preflight(ctx, false)) return;
+    hs_crack_ui.tab = current_tab;
+    hs_crack_ui.cancel_requested = false;
+    hs_crack_ui.last_update_us = 0;
+    hs_crack_ui.counting_candidates = true;
+    hs_crack_ui.total_candidates = 0;
+    hs_crack_ui.started = false;
+    hs_crack_ui.run = NULL;
+    snprintf(hs_crack_ui.remote_pcap_path, sizeof(hs_crack_ui.remote_pcap_path), "%s", remote_path);
+    snprintf(hs_crack_ui.file_name, sizeof(hs_crack_ui.file_name), "%s", file_name);
+
+    hs_crack_ui.active = false;
+    hs_crack_show_popup(file_name);
+}
+
+static void hs_crack_file_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx || hs_crack_ui.active || hs_crack_ui.task) {
+        return;
+    }
+    // Both flows share the M-BUS transport; do not overlap them.
+    if (compromised_transfer_ui.active || compromised_transfer_ui.task) {
+        return;
+    }
+
+    compromised_file_kind_t kind = compromised_kind_from_user_data(lv_event_get_user_data(e));
+    int index = compromised_index_from_user_data(lv_event_get_user_data(e));
+    if (kind != COMPROMISED_FILE_KIND_HANDSHAKE || index < 0 ||
+        index >= ctx->wardrive_wigle_file_count || tab_is_internal(current_tab)) {
+        return;
+    }
+
+    wardrive_wigle_file_t *file = &ctx->wardrive_wigle_files[index];
+    if (!file->path[0] || !file->name[0]) {
+        return;
+    }
+
+    hs_crack_start_file(ctx, file->path, file->name);
+}
+
+static void handshaker_crack_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = lv_event_get_user_data(e);
+    if (!ctx || ctx != get_current_ctx() || !ctx->handshaker_capture_success ||
+        ctx->handshaker_monitoring || hs_crack_ui.active || hs_crack_ui.task ||
+        compromised_transfer_ui.active || compromised_transfer_ui.task) return;
+
+    // Closing stops/joins the UART reader and clears its state; preserve the path first.
+    char remote_path[WARDRIVE_WIGLE_PATH_MAX];
+    snprintf(remote_path, sizeof(remote_path), "%s", ctx->handshaker_saved_pcap);
+    handshaker_popup_close_cb(NULL);
+    if (!remote_path[0]) {
+        // Older firmware may report success without a file path. Let the user choose.
+        show_handshakes_page();
+        return;
+    }
+    const char *name = strrchr(remote_path, '/');
+    hs_crack_start_file(ctx, remote_path, name ? name + 1 : remote_path);
+}
+
 static void compromised_file_copy_cb(lv_event_t *e)
 {
     tab_context_t *ctx = get_current_ctx();
@@ -57781,6 +60882,13 @@ void app_main(void)
     // Initialize IO expander
     bsp_io_expander_pi4ioe_init(bsp_i2c_get_handle());
 
+    // Open the Monster over USB-A now, while the internal DMA pool is still
+    // almost entirely free. usbh_cdc_create() cannot find its 512-byte-aligned
+    // DMA blocks once the codec, SD card and MIPI-DSI panel below have taken
+    // their share, so this has to run before them. Boot-only: detection reuses
+    // the handle and nothing retries afterwards.
+    usb_boot_open_early();
+
     // Initialize RX8130CE RTC and seed the system clock from it
     if (rx8130_init() == ESP_OK) {
         rx8130_sync_system_from_rtc();
@@ -57818,16 +60926,28 @@ void app_main(void)
     load_dashboard_from_nvs();
     load_clock_settings_from_nvs();
     load_wd_autoupload_from_nvs();
+    load_janos_ft_baud_from_nvs();
 
     // Kick the startup melody off here, the first moment both prerequisites are
     // met: the codec is up and NVS has told us which melody to play. It used to
     // start from show_splash_screen(), i.e. only after UART init, the USB host
     // enumeration wait and the full display bring-up.
+    //
+    // Not on the reboot that applies a screen rotation, though. That reset is
+    // part of a settings change the user just made, not a power-on, and the
+    // melody turns it into a jingle - it gets the two-note chime instead, which
+    // still says the tablet came back rather than leaving it silently mute.
+    // esp_restart() is the only software reset this firmware issues, so
+    // ESP_RST_SW identifies exactly that path; a cold boot, a crash or a
+    // watchdog reset all still get the tune.
+    const bool rotation_reboot = (esp_reset_reason() == ESP_RST_SW);
     if (boot_sound_mode != BOOT_SOUND_MODE_OFF) {
         // Priority 6 keeps it above the LVGL task (5): it spends almost all of
         // its life blocked inside i2s_write, so it steals no real CPU, but it
         // must not be starved between buffers or the DMA underruns.
-        xTaskCreate((TaskFunction_t)play_startup_beep, "melody", 4096, NULL, 6, NULL);
+        xTaskCreate(rotation_reboot ? (TaskFunction_t)play_rotation_chime
+                                    : (TaskFunction_t)play_startup_beep,
+                    "melody", 4096, NULL, 6, NULL);
     }
 
     // Initialize both UARTs for board detection
@@ -57843,6 +60963,22 @@ void app_main(void)
         ESP_LOGE(TAG, "Failed to initialize display");
         return;
     }
+    // LVGL exists now: USB callbacks may schedule GUI redetects from here on.
+    lvgl_ready = true;
+
+    // Apply the saved orientation before a single widget exists, so everything
+    // below is built against the final resolution. The rotation itself is done
+    // in software by esp_lvgl_port (90 deg goes through the PPA, the rest
+    // through the CPU); the panel keeps scanning its native 720x1280.
+    if (screen_rotation_setting != 0) {
+        bsp_display_lock(0);
+        bsp_display_rotate(disp, (lv_disp_rotation_t)screen_rotation_setting);
+        bsp_display_unlock();
+        ESP_LOGI(TAG, "Screen rotated to %d deg (%dx%d)",
+                 screen_rotation_setting * 90,
+                 (int)lv_display_get_horizontal_resolution(disp),
+                 (int)lv_display_get_vertical_resolution(disp));
+    }
 
     // Paint the base screen dark and flush it *before* the backlight comes on, so
     // the very first visible frame is already dark. Otherwise the default (light)
@@ -57853,6 +60989,17 @@ void app_main(void)
     lv_refr_now(disp);
     bsp_display_unlock();
 
+    // Start application-controlled DFS only after the display driver has
+    // completed its full-speed initialization. Light sleep remains disabled;
+    // touch and the MIPI-DPI framebuffer stay active while the backlight is off.
+    ret = app_power_manager_init();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Power manager initialization failed: %s", esp_err_to_name(ret));
+    }
+    app_power_telemetry_reset();
+    ESP_LOGI(TAG,
+             "POWER_CSV_HEADER,time_ms,profile,screen,cpu_max_mhz,voltage_v,current_ma,power_mw,avg60_power_mw,energy_mwh");
+
     // Set display brightness from saved setting with gamma correction
     set_brightness_gamma(screen_brightness_setting);
 
@@ -57861,6 +61008,8 @@ void app_main(void)
     lv_indev_t *touch_indev = bsp_display_get_input_dev();
     if (touch_indev) {
         lv_indev_add_event_cb(touch_indev, touch_activity_cb, LV_EVENT_PRESSED, NULL);
+        lv_indev_add_event_cb(touch_indev, observer_touch_release_cb,
+                              LV_EVENT_RELEASED, NULL);
         uint32_t timeout_ms = get_screen_timeout_ms();
         if (timeout_ms == UINT32_MAX) {
             ESP_LOGI(TAG, "Screen timeout disabled (Stays On)");

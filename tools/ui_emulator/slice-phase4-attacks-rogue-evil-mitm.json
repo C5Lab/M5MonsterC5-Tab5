@@ -1,0 +1,17 @@
+{
+  "show_mitm_popup": "adapter",
+  "mitm_connect_and_start_cb": "adapter",
+  "mitm_popup_close_cb": "adapter",
+  "show_evil_twin_popup": "adapter",
+  "do_evil_twin_start": "adapter",
+  "evil_twin_close_cb": "adapter",
+  "show_rogue_ap_page": "adapter",
+  "show_rogue_ap_popup": "adapter",
+  "rogue_ap_start_cb": "adapter",
+  "rogue_ap_popup_close_cb": "adapter",
+  "rogue_ap_back_cb": "adapter",
+  "evil_twin_start_cb": "retain",
+  "mitm_keyboard_cb": "retain",
+  "mitm_password_input_cb": "retain",
+  "rogue_ap_password_focus_cb": "retain"
+}

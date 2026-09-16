@@ -1,0 +1,603 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Monster emulator scenario draft",
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "status": {
+      "type": "string"
+    },
+    "seed": {
+      "type": "integer"
+    },
+    "experience": {
+      "type": "object",
+      "properties": {
+        "default_timing": {
+          "enum": [
+            "demo",
+            "realistic"
+          ]
+        },
+        "demo_clock_scale": {
+          "type": "number",
+          "minimum": 1
+        },
+        "realistic_clock_scale": {
+          "const": 1
+        },
+        "default_module_profile": {
+          "const": "available-virtual-modules"
+        },
+        "excluded_features": {
+          "const": [
+            "subghz"
+          ]
+        }
+      },
+      "required": [
+        "default_timing",
+        "demo_clock_scale",
+        "realistic_clock_scale",
+        "default_module_profile",
+        "excluded_features"
+      ],
+      "additionalProperties": false
+    },
+    "source": {
+      "type": "object",
+      "properties": {
+        "repository": {
+          "type": "string"
+        },
+        "head": {
+          "type": "string"
+        },
+        "main_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      },
+      "required": [
+        "repository",
+        "head",
+        "main_sha256"
+      ],
+      "additionalProperties": false
+    },
+    "networks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "index": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "ssid": {
+            "type": "string",
+            "maxLength": 32
+          },
+          "bssid": {
+            "type": "string",
+            "pattern": "^(?:[0-9A-F]{2}:){5}[0-9A-F]{2}$"
+          },
+          "vendor": {
+            "type": "string"
+          },
+          "channel": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 196
+          },
+          "security": {
+            "enum": [
+              "Open",
+              "WEP",
+              "WPA",
+              "WPA2",
+              "WPA/WPA2 Mixed",
+              "WPA2 Enterprise",
+              "WPA3",
+              "WPA2/WPA3 Mixed",
+              "WAPI",
+              "OWE",
+              "Unknown"
+            ]
+          },
+          "rssi": {
+            "type": "integer",
+            "minimum": -127,
+            "maximum": 0
+          },
+          "band": {
+            "enum": [
+              "2.4GHz",
+              "5GHz"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "index",
+          "ssid",
+          "bssid",
+          "vendor",
+          "channel",
+          "security",
+          "rssi",
+          "band"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "clients": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "label": {
+            "type": "string"
+          },
+          "mac": {
+            "type": "string",
+            "pattern": "^(?:[0-9A-F]{2}:){5}[0-9A-F]{2}$"
+          },
+          "network_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "ip": {
+            "type": "string",
+            "format": "ipv4"
+          }
+        },
+        "required": [
+          "id",
+          "label",
+          "mac",
+          "network_id",
+          "ip"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "lan": {
+      "type": "object",
+      "properties": {
+        "network_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "module_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "own_ip": {
+          "type": "string",
+          "format": "ipv4"
+        },
+        "netmask": {
+          "type": "string",
+          "format": "ipv4"
+        }
+      },
+      "required": [
+        "network_id",
+        "module_id",
+        "own_ip",
+        "netmask"
+      ],
+      "additionalProperties": false
+    },
+    "bluetooth": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "name": {
+            "type": "string",
+            "maxLength": 63
+          },
+          "mac": {
+            "type": "string",
+            "pattern": "^(?:[0-9A-F]{2}:){5}[0-9A-F]{2}$"
+          },
+          "rssi": {
+            "type": "integer",
+            "minimum": -127,
+            "maximum": 0
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "mac",
+          "rssi"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "probe_network_ids": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "portal_filenames": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "notes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "modules": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "transport": {
+            "enum": [
+              "grove",
+              "mbus",
+              "usb",
+              "internal"
+            ]
+          },
+          "connected": {
+            "type": "boolean"
+          },
+          "sd_present": {
+            "type": "boolean"
+          },
+          "radio_mode": {
+            "enum": [
+              "wifi",
+              "ble",
+              "idle"
+            ]
+          },
+          "producer": {
+            "enum": [
+              "janos",
+              "tab5-internal",
+              "subghz-separate"
+            ]
+          },
+          "capabilities": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "id",
+          "transport",
+          "connected",
+          "sd_present",
+          "radio_mode",
+          "producer",
+          "capabilities"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "settings": {
+      "type": "object",
+      "properties": {
+        "rotation": {
+          "enum": [
+            0,
+            90,
+            180,
+            270
+          ]
+        },
+        "red_team": {
+          "type": "boolean"
+        },
+        "theme": {
+          "type": "string"
+        },
+        "scan_time_ms": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "required": [
+        "rotation",
+        "red_team",
+        "theme",
+        "scan_time_ms"
+      ],
+      "additionalProperties": false
+    },
+    "gps": {
+      "type": "object",
+      "properties": {
+        "fix": {
+          "type": "boolean"
+        },
+        "latitude": {
+          "type": "number",
+          "minimum": -90,
+          "maximum": 90
+        },
+        "longitude": {
+          "type": "number",
+          "minimum": -180,
+          "maximum": 180
+        },
+        "speed_kmh": {
+          "type": "number",
+          "minimum": 0
+        },
+        "route": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "at_ms": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "latitude": {
+                "type": "number"
+              },
+              "longitude": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "at_ms",
+              "latitude",
+              "longitude"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": [
+        "fix",
+        "latitude",
+        "longitude",
+        "speed_kmh",
+        "route"
+      ],
+      "additionalProperties": false
+    },
+    "subghz_signals": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "label": {
+            "type": "string"
+          },
+          "frequency_hz": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "rssi": {
+            "type": "integer",
+            "minimum": -127,
+            "maximum": 0
+          },
+          "protocol": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "label",
+          "frequency_hz",
+          "rssi",
+          "protocol"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "files": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "path": {
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "pcap",
+              "html",
+              "wardrive",
+              "subghz",
+              "credentials",
+              "report"
+            ]
+          },
+          "content_status": {
+            "enum": [
+              "planned",
+              "materialized"
+            ]
+          },
+          "network_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "size_bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          }
+        },
+        "required": [
+          "id",
+          "path",
+          "kind",
+          "content_status",
+          "network_id",
+          "size_bytes"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "jobs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "module_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "kind": {
+            "type": "string"
+          },
+          "state": {
+            "enum": [
+              "queued",
+              "running",
+              "completed",
+              "failed",
+              "cancelled"
+            ]
+          },
+          "generation": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "started_at_ms": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "progress": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1
+          },
+          "result_file_ids": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        "required": [
+          "id",
+          "module_id",
+          "kind",
+          "state",
+          "generation",
+          "started_at_ms",
+          "progress",
+          "result_file_ids"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "variants": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "domain": {
+            "type": "string"
+          },
+          "condition": {
+            "enum": [
+              "populated",
+              "empty",
+              "disconnected",
+              "timeout",
+              "failure"
+            ]
+          },
+          "expected_outcome": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "domain",
+          "condition",
+          "expected_outcome"
+        ],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": [
+    "schema_version",
+    "id",
+    "status",
+    "seed",
+    "experience",
+    "source",
+    "networks",
+    "clients",
+    "lan",
+    "bluetooth",
+    "probe_network_ids",
+    "portal_filenames",
+    "notes",
+    "modules",
+    "settings",
+    "gps",
+    "subghz_signals",
+    "files",
+    "jobs",
+    "variants"
+  ],
+  "additionalProperties": false
+}

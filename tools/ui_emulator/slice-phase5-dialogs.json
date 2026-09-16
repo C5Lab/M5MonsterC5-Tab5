@@ -1,0 +1,17 @@
+{
+  "show_sd_warning_popup": "retain",
+  "sd_warning_cancel_cb": "retain",
+  "sd_warning_continue_cb": "retain",
+  "close_sd_warning_popup": "retain",
+  "show_version_mismatch_popup": "retain",
+  "version_popup_close_cb": "retain",
+  "version_popup_ota_cb": "retain",
+  "board_detect_popup_close_cb": "retain",
+  "show_wardrive_home_confirm": "retain",
+  "wardrive_home_confirm_no_cb": "retain",
+  "close_wardrive_home_confirm": "retain",
+  "ota_create_info_slot_card": "retain",
+  "show_no_board_popup": "adapter",
+  "wardrive_home_confirm_yes_cb": "adapter",
+  "ota_slot_activate_cb": "adapter"
+}

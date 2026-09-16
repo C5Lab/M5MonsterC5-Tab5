@@ -1,0 +1,19 @@
+✔ all seven simulated operations start, change and stop without another module changing (3.9439ms)
+✔ cancel, disconnect and reset never resurrect jobs or write captures (0.3377ms)
+✔ invalid inputs never reserve the module and credentials never enter model history (0.332ms)
+✔ MITM creates target-specific PCAP only on stop and handles SD/quota failures atomically (0.4581ms)
+✔ clock slicing produces identical bounded simulated results (0.5968ms)
+✔ Observer preserves scenario identities, changes activity, freezes on stop and resets (0.4021ms)
+✔ Observer discovers independently and its targets work without a WiFi scan (2.0256ms)
+✔ C boundary scan rows preserve scenario identities and cancellation (0.4382ms)
+✔ portal story reveals connection, page visit and synthetic submission in order (2.2508ms)
+✔ stop or disconnect before submission freezes the story; other module stays independent (1.2595ms)
+✔ every selectable network completes the demo even without a seeded client (2.9564ms)
+ℹ tests 11
+ℹ suites 0
+ℹ pass 11
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 75.8333

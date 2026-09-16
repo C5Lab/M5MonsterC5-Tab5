@@ -1,0 +1,8 @@
+{
+  "status": "interrupted",
+  "reason": "User requested a checkpoint and pause before sleep",
+  "completed_scripts": 17,
+  "completed_pass": 17,
+  "full_pass": false,
+  "resume": "../../RESUME_Queue2.md"
+}

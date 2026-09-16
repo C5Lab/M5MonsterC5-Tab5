@@ -1,0 +1,20 @@
+test_cancel_before_submission_and_reset (__main__.PortalDemoBrowser.test_cancel_before_submission_and_reset) ... FAIL
+test_evil_and_rogue_sequence_all_rotations (__main__.PortalDemoBrowser.test_evil_and_rogue_sequence_all_rotations) ... ok
+test_internal_portal_sequence_stop_and_reopen (__main__.PortalDemoBrowser.test_internal_portal_sequence_stop_and_reopen) ... ok
+
+======================================================================
+FAIL: test_cancel_before_submission_and_reset (__main__.PortalDemoBrowser.test_cancel_before_submission_and_reset)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tests\test_emulator_portal_demo.py", line 67, in test_cancel_before_submission_and_reset
+    click_text(p,'Show Probes',contains=True);click_text(p,'1. NEON-BAZAAR');click_text(p,'\uf04b Start')
+    ~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tests\emulator_browser.py", line 55, in click_text
+    assert len(matches) == 1, (text, [(m['text'], m['x'], m['y']) for m in matches])
+           ^^^^^^^^^^^^^^^^^
+AssertionError: ('Show Probes', [('\uf00b Show Probes', 290, 354), ('Offline demo: choose a synthetic scenario network in Show Probes.', 15, 402)])
+
+----------------------------------------------------------------------
+Ran 3 tests in 15.556s
+
+FAILED (failures=1)

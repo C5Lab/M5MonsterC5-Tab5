@@ -1,0 +1,16 @@
+✔ transfer baud accepts only firmware choices, survives reload and resets (0.7742ms)
+✔ settings survive reconstruction; reset restores defaults without clearing unrelated storage (0.6682ms)
+✔ legacy settings migrate once and do not return after reset (0.1516ms)
+✔ corrupt, future and invalid settings recover to safe defaults (0.1294ms)
+✔ denied storage and quota exhaustion keep settings usable for this session (0.2517ms)
+✔ invalid writes cannot replace a valid value (0.1154ms)
+✔ existing Wardrive adapter settings remain writable and migrate (0.0944ms)
+✔ session fallback survives reboot and overrides stale disk after a failed reset write (0.1035ms)
+ℹ tests 8
+ℹ suites 0
+ℹ pass 8
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 70.5311

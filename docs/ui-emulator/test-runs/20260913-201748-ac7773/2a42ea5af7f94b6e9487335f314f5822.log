@@ -1,0 +1,12 @@
+test_files_empty_delete_cancel_and_copy_four_rotations (__main__.Queue2WardriveBrowser.test_files_empty_delete_cancel_and_copy_four_rotations) ... ok
+test_gps_home_and_blacklist_four_rotations (__main__.Queue2WardriveBrowser.test_gps_home_and_blacklist_four_rotations) ... ok
+test_handshakes_demo_upload_cancel_retry_four_rotations (__main__.Queue2WardriveBrowser.test_handshakes_demo_upload_cancel_retry_four_rotations) ... ok
+test_missing_gps_and_sd_four_rotations (__main__.Queue2WardriveBrowser.test_missing_gps_and_sd_four_rotations) ... ok
+test_native_uploaded_all_none_selection_is_distinct (__main__.Queue2WardriveBrowser.test_native_uploaded_all_none_selection_is_distinct) ... ok
+test_record_providers_and_settings_four_rotations (__main__.Queue2WardriveBrowser.test_record_providers_and_settings_four_rotations) ... ok
+test_restart_wrong_module_cancel_and_disconnect_do_not_complete (__main__.Queue2WardriveBrowser.test_restart_wrong_module_cancel_and_disconnect_do_not_complete) ... ok
+
+----------------------------------------------------------------------
+Ran 7 tests in 210.810s
+
+OK

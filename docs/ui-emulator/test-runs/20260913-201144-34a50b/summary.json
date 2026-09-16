@@ -1,0 +1,96 @@
+{
+  "status": "FAIL",
+  "seconds": 37.47588089999772,
+  "checks": [
+    {
+      "section": "phase5_settings",
+      "name": "test_emulator_persistence.mjs",
+      "started": 1789323104.5253036,
+      "seconds": 0.11492569999973057,
+      "status": "PASS",
+      "exit_code": 0,
+      "log": "C:\\Users\\mati\\Documents\\GitHub\\M5MonsterC5-Tab5\\docs\\ui-emulator\\test-runs\\20260913-201144-34a50b\\e13d40395de649bf8542be971003dfe5.log",
+      "aggregate": false
+    },
+    {
+      "section": "phase5_settings",
+      "name": "test_emulator_phase5_settings.py",
+      "started": 1789323104.6410341,
+      "seconds": 10.18785399999615,
+      "status": "PASS",
+      "exit_code": 0,
+      "log": "C:\\Users\\mati\\Documents\\GitHub\\M5MonsterC5-Tab5\\docs\\ui-emulator\\test-runs\\20260913-201144-34a50b\\9dae262aed914a7185d9521ae14fafa8.log",
+      "aggregate": false
+    },
+    {
+      "section": "phase5_settings",
+      "name": "verify_emulator_time.py",
+      "started": 1789323114.8295414,
+      "seconds": 10.23717939999915,
+      "status": "PASS",
+      "exit_code": 0,
+      "log": "C:\\Users\\mati\\Documents\\GitHub\\M5MonsterC5-Tab5\\docs\\ui-emulator\\test-runs\\20260913-201144-34a50b\\96820118c8bb450e84b6aa856089228b.log",
+      "aggregate": true
+    },
+    {
+      "section": "time",
+      "name": "test_emulator_persistence.mjs",
+      "started": 1789323114.9685218,
+      "seconds": 0.10072159999981523,
+      "status": "PASS",
+      "exit_code": 0,
+      "log": "C:\\Users\\mati\\Documents\\GitHub\\M5MonsterC5-Tab5\\docs\\ui-emulator\\test-runs\\20260913-201144-34a50b\\e72eac3efd4249988db8c53bbcc22548.log",
+      "aggregate": false
+    },
+    {
+      "section": "time",
+      "name": "test_emulator_time.py",
+      "started": 1789323115.069745,
+      "seconds": 9.738113400002476,
+      "status": "PASS",
+      "exit_code": 0,
+      "log": "C:\\Users\\mati\\Documents\\GitHub\\M5MonsterC5-Tab5\\docs\\ui-emulator\\test-runs\\20260913-201144-34a50b\\e57fcbab3d79439998c878b942596e31.log",
+      "aggregate": false
+    },
+    {
+      "section": "time",
+      "name": "test_emulator_phase4_audit.py",
+      "started": 1789323124.8083737,
+      "seconds": 0.23890669999673264,
+      "status": "PASS",
+      "exit_code": 0,
+      "log": "C:\\Users\\mati\\Documents\\GitHub\\M5MonsterC5-Tab5\\docs\\ui-emulator\\test-runs\\20260913-201144-34a50b\\46014b87fa30456888e1f15a44da6426.log",
+      "aggregate": false
+    },
+    {
+      "section": "phase5_settings",
+      "name": "verify_emulator_portal_demo.py",
+      "started": 1789323125.0674453,
+      "seconds": 16.770263599995815,
+      "status": "FAIL",
+      "exit_code": 1,
+      "log": "C:\\Users\\mati\\Documents\\GitHub\\M5MonsterC5-Tab5\\docs\\ui-emulator\\test-runs\\20260913-201144-34a50b\\035efd80afc1445dbd3f87d04bf70529.log",
+      "aggregate": true
+    },
+    {
+      "section": "portal_demo",
+      "name": "test_emulator_portal_demo.mjs test_emulator_attacks.mjs test_emulator_bridge.mjs",
+      "started": 1789323125.189034,
+      "seconds": 0.11889379999774974,
+      "status": "PASS",
+      "exit_code": 0,
+      "log": "C:\\Users\\mati\\Documents\\GitHub\\M5MonsterC5-Tab5\\docs\\ui-emulator\\test-runs\\20260913-201144-34a50b\\670e2744d2a7472ea8a41377148c41b8.log",
+      "aggregate": false
+    },
+    {
+      "section": "portal_demo",
+      "name": "test_emulator_portal_demo.py",
+      "started": 1789323125.3085542,
+      "seconds": 16.502910999995947,
+      "status": "FAIL",
+      "exit_code": 1,
+      "log": "C:\\Users\\mati\\Documents\\GitHub\\M5MonsterC5-Tab5\\docs\\ui-emulator\\test-runs\\20260913-201144-34a50b\\28d2f120a4ba417cb71a27f246edcb8c.log",
+      "aggregate": false
+    }
+  ]
+}

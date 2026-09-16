@@ -1,0 +1,19 @@
+✔ all seven simulated operations start, change and stop without another module changing (3.969ms)
+✔ cancel, disconnect and reset never resurrect jobs or write captures (0.3554ms)
+✔ invalid inputs never reserve the module and credentials never enter model history (0.3789ms)
+✔ MITM creates target-specific PCAP only on stop and handles SD/quota failures atomically (0.5189ms)
+✔ clock slicing produces identical bounded simulated results (0.6402ms)
+✔ Observer preserves scenario identities, changes activity, freezes on stop and resets (0.4523ms)
+✔ global operations need no selection, own one module, advance and freeze on stop (2.7106ms)
+✔ global Handshaker emits deterministic bounded scenario results, including an empty scenario (1.1888ms)
+✔ global jobs cancel on disconnect/reset and do not stop another module (0.7095ms)
+✔ SAE requires exactly one scenario target and rejects invalid selection without reserving radio (2.2096ms)
+✔ SAE cancellation, module disconnect and reset cannot resume old activity (0.454ms)
+ℹ tests 11
+ℹ suites 0
+ℹ pass 11
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 71.4099

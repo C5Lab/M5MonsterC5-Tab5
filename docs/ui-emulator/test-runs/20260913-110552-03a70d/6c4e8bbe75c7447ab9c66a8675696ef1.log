@@ -1,0 +1,9 @@
+test_analysis_walks_every_submenu (__main__.PcapStoryBrowser.test_analysis_walks_every_submenu) ... ok
+test_extract_objects_preview_and_hash (__main__.PcapStoryBrowser.test_extract_objects_preview_and_hash) ... ok
+test_invalid_capture_then_recovery_all_rotations (__main__.PcapStoryBrowser.test_invalid_capture_then_recovery_all_rotations) ... ok
+test_investigate_packet_health_fqdn_export (__main__.PcapStoryBrowser.test_investigate_packet_health_fqdn_export) ... ok
+
+----------------------------------------------------------------------
+Ran 4 tests in 5.658s
+
+OK

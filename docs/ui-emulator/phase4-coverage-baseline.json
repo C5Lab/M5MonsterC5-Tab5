@@ -1,0 +1,866 @@
+{
+  "note": "Phase 4.7 coverage-ledger baseline. Regenerate with python tools/ui_emulator/audit_coverage.py --write-baseline after a deliberate slice-policy change.",
+  "summary": {
+    "retained": 263,
+    "adapter": 90,
+    "unsupported": 6,
+    "not-wired": 93,
+    "total": 452,
+    "covered": 353,
+    "open": 0,
+    "deferred": 93,
+    "uncategorized": 0,
+    "back_routes": 10,
+    "back_routes_covered": 3,
+    "back_routes_uncovered": 0
+  },
+  "not_wired": [
+    "main/main.c::app_main::event-0",
+    "main/main.c::karma2_fetch_probes::event-0",
+    "main/main.c::karma2_fetch_probes::event-1",
+    "main/main.c::lock_screen_activate::event-0",
+    "main/main.c::lock_screen_activate::event-1",
+    "main/main.c::lock_screen_activate::event-2",
+    "main/main.c::rogue_gitm_pass_row::event-0",
+    "main/main.c::rogue_gitm_pass_row::event-1",
+    "main/main.c::screen_timeout_timer_cb::event-0",
+    "main/main.c::show_airtag_scan_page::event-0",
+    "main/main.c::show_esp_modem_page::event-0",
+    "main/main.c::show_esp_modem_page::event-1",
+    "main/main.c::show_evil_twin_connect_popup::event-0",
+    "main/main.c::show_evil_twin_connect_popup::event-1",
+    "main/main.c::show_evil_twin_passwords_page::event-1",
+    "main/main.c::show_jammer_page::event-0",
+    "main/main.c::show_jammer_page::event-1",
+    "main/main.c::show_jammer_page::event-2",
+    "main/main.c::show_karma2_attack_popup::event-0",
+    "main/main.c::show_karma2_attack_popup::event-1",
+    "main/main.c::show_karma2_html_popup::event-0",
+    "main/main.c::show_karma2_html_popup::event-1",
+    "main/main.c::show_phishing_portal_active_popup::event-0",
+    "main/main.c::show_phishing_portal_popup::event-0",
+    "main/main.c::show_phishing_portal_popup::event-1",
+    "main/main.c::show_phishing_portal_popup::event-2",
+    "main/main.c::show_phishing_portal_popup::event-3",
+    "main/main.c::show_rogue_gitm_popup::event-0",
+    "main/main.c::show_rogue_gitm_popup::event-1",
+    "main/main.c::show_rogue_gitm_popup::event-2",
+    "main/main.c::show_rogue_gitm_popup::event-3",
+    "main/main.c::show_screen_lock_popup::event-0",
+    "main/main.c::show_screen_lock_popup::event-1",
+    "main/main.c::show_screen_lock_popup::event-2",
+    "main/main.c::show_screen_lock_popup::event-3",
+    "main/main.c::show_splash_screen::event-0",
+    "main/main.c::wardrive_autoup_make_btn::event-0",
+    "main/main.c::wardrive_wigle_create_credentials_prompt::event-0",
+    "main/main.c::wardrive_wigle_create_credentials_prompt::event-1",
+    "main/main.c::wardrive_wigle_create_credentials_prompt::event-2",
+    "main/main.c::wardrive_wigle_create_credentials_prompt::event-3",
+    "main/main.c::wardrive_wigle_create_credentials_prompt::event-4",
+    "main/main.c::wardrive_wigle_create_credentials_prompt::event-5",
+    "main/main.c::wardrive_wigle_create_credentials_prompt::event-6",
+    "main/main.c::wardrive_wigle_ensure_wifi_connected::event-0",
+    "main/main.c::wardrive_wigle_ensure_wifi_connected::event-1",
+    "main/main.c::wardrive_wigle_ensure_wifi_connected::event-2",
+    "main/screens/subghz_hunter_screen.c::build_page_and_start::event-0",
+    "main/screens/subghz_hunter_screen.c::rebuild_rows::event-0",
+    "main/screens/subghz_hunter_screen.c::show_action_popup::event-0",
+    "main/screens/subghz_hunter_screen.c::show_leave_popup::event-0",
+    "main/screens/subghz_hunter_screen.c::show_leave_popup::event-1",
+    "main/screens/subghz_hunter_settings_screen.c::show_subghz_hunter_settings_page::event-0",
+    "main/screens/subghz_hunter_settings_screen.c::show_subghz_hunter_settings_page::event-1",
+    "main/screens/subghz_hunter_settings_screen.c::show_subghz_hunter_settings_page::event-2",
+    "main/screens/subghz_hunter_settings_screen.c::show_subghz_hunter_settings_page::event-3",
+    "main/screens/subghz_hunter_settings_screen.c::show_subghz_hunter_settings_page::event-4",
+    "main/screens/subghz_jammer_screen.c::on_freq_tap::event-0",
+    "main/screens/subghz_jammer_screen.c::on_freq_tap::event-1",
+    "main/screens/subghz_jammer_screen.c::show_subghz_jammer_page::event-0",
+    "main/screens/subghz_jammer_screen.c::show_subghz_jammer_page::event-1",
+    "main/screens/subghz_listen_screen.c::configure_signal_row::event-0",
+    "main/screens/subghz_listen_screen.c::on_freq_tap::event-0",
+    "main/screens/subghz_listen_screen.c::on_freq_tap::event-1",
+    "main/screens/subghz_listen_screen.c::show_action_popup::event-0",
+    "main/screens/subghz_listen_screen.c::show_leave_popup::event-0",
+    "main/screens/subghz_listen_screen.c::show_leave_popup::event-1",
+    "main/screens/subghz_listen_screen.c::show_subghz_listen_page::event-0",
+    "main/screens/subghz_listen_screen.c::show_subghz_listen_page::event-1",
+    "main/screens/subghz_listen_screen.c::show_subghz_listen_page::event-2",
+    "main/screens/subghz_listen_screen.c::show_subghz_listen_page::event-3",
+    "main/screens/subghz_listen_screen.c::show_tx_warn_popup::event-0",
+    "main/screens/subghz_listen_settings_screen.c::show_subghz_listen_settings_page::event-0",
+    "main/screens/subghz_manage_screen.c::build_one_row::event-0",
+    "main/screens/subghz_manage_screen.c::show_action_popup::event-0",
+    "main/screens/subghz_manage_screen.c::show_delete_confirm::event-0",
+    "main/screens/subghz_manage_screen.c::show_delete_confirm::event-1",
+    "main/screens/subghz_manage_screen.c::show_tx_count_popup::event-0",
+    "main/screens/subghz_manage_screen.c::show_tx_count_popup::event-1",
+    "main/screens/subghz_scanner_screen.c::make_freq_tile::event-0",
+    "main/screens/subghz_scanner_settings_screen.c::show_subghz_scanner_settings_page::event-0",
+    "main/screens/subghz_scanner_settings_screen.c::show_subghz_scanner_settings_page::event-1",
+    "main/screens/subghz_scanner_settings_screen.c::show_subghz_scanner_settings_page::event-2",
+    "main/screens/subghz_scanner_settings_screen.c::show_subghz_scanner_settings_page::event-3",
+    "main/screens/subghz_screen.c::subghz_add_header_action::event-0",
+    "main/screens/subghz_screen.c::subghz_create_header::event-0",
+    "main/screens/subghz_screen.c::subghz_create_tile::event-0",
+    "main/screens/subghz_settings_screen.c::show_subghz_settings_page::event-0",
+    "main/screens/subghz_tesla_screen.c::show_subghz_tesla_page::event-0",
+    "main/screens/subghz_text_input_popup.c::subghz_show_text_input_popup::event-0",
+    "main/screens/subghz_text_input_popup.c::subghz_show_text_input_popup::event-1",
+    "main/screens/subghz_text_input_popup.c::subghz_show_text_input_popup::event-2",
+    "main/screens/subghz_text_input_popup.c::subghz_show_text_input_popup::event-3"
+  ],
+  "unsupported": [
+    "main/main.c::create_status_bar::event-0",
+    "main/main.c::create_status_bar::event-1",
+    "main/main.c::create_status_bar::event-2",
+    "main/main.c::create_status_bar::event-3",
+    "main/main.c::show_observer_page::event-3",
+    "main/main.c::update_observer_table::event-1"
+  ],
+  "open_items": [
+    {
+      "id": "main/main.c::karma2_fetch_probes::event-0",
+      "owner": "karma2_fetch_probes",
+      "callback": "karma2_probe_click_cb",
+      "category": "adhoc-karma-portal",
+      "open": false,
+      "reason": "Remaining Karma2 and phishing-portal screens are unsupported; INTERNAL demo is wired."
+    },
+    {
+      "id": "main/main.c::karma2_fetch_probes::event-1",
+      "owner": "karma2_fetch_probes",
+      "callback": "karma2_probes_popup_close_cb",
+      "category": "adhoc-karma-portal",
+      "open": false,
+      "reason": "Remaining Karma2 and phishing-portal screens are unsupported; INTERNAL demo is wired."
+    },
+    {
+      "id": "main/main.c::show_karma2_attack_popup::event-0",
+      "owner": "show_karma2_attack_popup",
+      "callback": "karma2_attack_background_cb",
+      "category": "adhoc-karma-portal",
+      "open": false,
+      "reason": "Remaining Karma2 and phishing-portal screens are unsupported; INTERNAL demo is wired."
+    },
+    {
+      "id": "main/main.c::show_karma2_attack_popup::event-1",
+      "owner": "show_karma2_attack_popup",
+      "callback": "karma2_attack_stop_cb",
+      "category": "adhoc-karma-portal",
+      "open": false,
+      "reason": "Remaining Karma2 and phishing-portal screens are unsupported; INTERNAL demo is wired."
+    },
+    {
+      "id": "main/main.c::show_karma2_html_popup::event-0",
+      "owner": "show_karma2_html_popup",
+      "callback": "karma2_html_popup_close_cb",
+      "category": "adhoc-karma-portal",
+      "open": false,
+      "reason": "Remaining Karma2 and phishing-portal screens are unsupported; INTERNAL demo is wired."
+    },
+    {
+      "id": "main/main.c::show_karma2_html_popup::event-1",
+      "owner": "show_karma2_html_popup",
+      "callback": "karma2_html_select_cb",
+      "category": "adhoc-karma-portal",
+      "open": false,
+      "reason": "Remaining Karma2 and phishing-portal screens are unsupported; INTERNAL demo is wired."
+    },
+    {
+      "id": "main/main.c::show_phishing_portal_active_popup::event-0",
+      "owner": "show_phishing_portal_active_popup",
+      "callback": "phishing_portal_stop_cb",
+      "category": "adhoc-karma-portal",
+      "open": false,
+      "reason": "Remaining Karma2 and phishing-portal screens are unsupported; INTERNAL demo is wired."
+    },
+    {
+      "id": "main/main.c::show_phishing_portal_popup::event-0",
+      "owner": "show_phishing_portal_popup",
+      "callback": "phishing_portal_textarea_focus_cb",
+      "category": "adhoc-karma-portal",
+      "open": false,
+      "reason": "Remaining Karma2 and phishing-portal screens are unsupported; INTERNAL demo is wired."
+    },
+    {
+      "id": "main/main.c::show_phishing_portal_popup::event-1",
+      "owner": "show_phishing_portal_popup",
+      "callback": "phishing_portal_close_cb",
+      "category": "adhoc-karma-portal",
+      "open": false,
+      "reason": "Remaining Karma2 and phishing-portal screens are unsupported; INTERNAL demo is wired."
+    },
+    {
+      "id": "main/main.c::show_phishing_portal_popup::event-2",
+      "owner": "show_phishing_portal_popup",
+      "callback": "phishing_portal_start_cb",
+      "category": "adhoc-karma-portal",
+      "open": false,
+      "reason": "Remaining Karma2 and phishing-portal screens are unsupported; INTERNAL demo is wired."
+    },
+    {
+      "id": "main/main.c::show_phishing_portal_popup::event-3",
+      "owner": "show_phishing_portal_popup",
+      "callback": "phishing_portal_keyboard_cb",
+      "category": "adhoc-karma-portal",
+      "open": false,
+      "reason": "Remaining Karma2 and phishing-portal screens are unsupported; INTERNAL demo is wired."
+    },
+    {
+      "id": "main/main.c::show_airtag_scan_page::event-0",
+      "owner": "show_airtag_scan_page",
+      "callback": "airtag_scan_back_btn_event_cb",
+      "category": "bluetooth-detector-unsupported",
+      "open": false,
+      "reason": "AirTag scan and nRF24 jammer remain explicit unsupported boundaries (Phase 4.1)."
+    },
+    {
+      "id": "main/main.c::show_jammer_page::event-0",
+      "owner": "show_jammer_page",
+      "callback": "jammer_back_btn_event_cb",
+      "category": "bluetooth-detector-unsupported",
+      "open": false,
+      "reason": "AirTag scan and nRF24 jammer remain explicit unsupported boundaries (Phase 4.1)."
+    },
+    {
+      "id": "main/main.c::show_jammer_page::event-1",
+      "owner": "show_jammer_page",
+      "callback": "jammer_band_event_cb",
+      "category": "bluetooth-detector-unsupported",
+      "open": false,
+      "reason": "AirTag scan and nRF24 jammer remain explicit unsupported boundaries (Phase 4.1)."
+    },
+    {
+      "id": "main/main.c::show_jammer_page::event-2",
+      "owner": "show_jammer_page",
+      "callback": "jammer_big_btn_event_cb",
+      "category": "bluetooth-detector-unsupported",
+      "open": false,
+      "reason": "AirTag scan and nRF24 jammer remain explicit unsupported boundaries (Phase 4.1)."
+    },
+    {
+      "id": "main/main.c::app_main::event-0",
+      "owner": "app_main",
+      "callback": "touch_activity_cb",
+      "category": "device-chrome",
+      "open": false,
+      "reason": "Splash / sleep / screen-lock chrome is hardware behaviour, not simulated."
+    },
+    {
+      "id": "main/main.c::lock_screen_activate::event-0",
+      "owner": "lock_screen_activate",
+      "callback": "lock_slider_value_cb",
+      "category": "device-chrome",
+      "open": false,
+      "reason": "Splash / sleep / screen-lock chrome is hardware behaviour, not simulated."
+    },
+    {
+      "id": "main/main.c::lock_screen_activate::event-1",
+      "owner": "lock_screen_activate",
+      "callback": "lock_slider_release_cb",
+      "category": "device-chrome",
+      "open": false,
+      "reason": "Splash / sleep / screen-lock chrome is hardware behaviour, not simulated."
+    },
+    {
+      "id": "main/main.c::lock_screen_activate::event-2",
+      "owner": "lock_screen_activate",
+      "callback": "lock_slider_release_cb",
+      "category": "device-chrome",
+      "open": false,
+      "reason": "Splash / sleep / screen-lock chrome is hardware behaviour, not simulated."
+    },
+    {
+      "id": "main/main.c::screen_timeout_timer_cb::event-0",
+      "owner": "screen_timeout_timer_cb",
+      "callback": "sleep_overlay_click_cb",
+      "category": "device-chrome",
+      "open": false,
+      "reason": "Splash / sleep / screen-lock chrome is hardware behaviour, not simulated."
+    },
+    {
+      "id": "main/main.c::show_screen_lock_popup::event-0",
+      "owner": "show_screen_lock_popup",
+      "callback": "screen_lock_switch_cb",
+      "category": "device-chrome",
+      "open": false,
+      "reason": "Splash / sleep / screen-lock chrome is hardware behaviour, not simulated."
+    },
+    {
+      "id": "main/main.c::show_screen_lock_popup::event-1",
+      "owner": "show_screen_lock_popup",
+      "callback": "auto_lock_switch_cb",
+      "category": "device-chrome",
+      "open": false,
+      "reason": "Splash / sleep / screen-lock chrome is hardware behaviour, not simulated."
+    },
+    {
+      "id": "main/main.c::show_screen_lock_popup::event-2",
+      "owner": "show_screen_lock_popup",
+      "callback": "screen_lock_now_cb",
+      "category": "device-chrome",
+      "open": false,
+      "reason": "Splash / sleep / screen-lock chrome is hardware behaviour, not simulated."
+    },
+    {
+      "id": "main/main.c::show_screen_lock_popup::event-3",
+      "owner": "show_screen_lock_popup",
+      "callback": "screen_lock_popup_close_cb",
+      "category": "device-chrome",
+      "open": false,
+      "reason": "Splash / sleep / screen-lock chrome is hardware behaviour, not simulated."
+    },
+    {
+      "id": "main/main.c::show_splash_screen::event-0",
+      "owner": "show_splash_screen",
+      "callback": "intro_skip_cb",
+      "category": "device-chrome",
+      "open": false,
+      "reason": "Splash / sleep / screen-lock chrome is hardware behaviour, not simulated."
+    },
+    {
+      "id": "main/main.c::show_esp_modem_page::event-0",
+      "owner": "show_esp_modem_page",
+      "callback": "esp_modem_back_btn_event_cb",
+      "category": "esp-modem-not-simulated",
+      "open": false,
+      "reason": "ESP modem serial tool drives real hardware; not simulated."
+    },
+    {
+      "id": "main/main.c::show_esp_modem_page::event-1",
+      "owner": "show_esp_modem_page",
+      "callback": "esp_modem_scan_btn_click_cb",
+      "category": "esp-modem-not-simulated",
+      "open": false,
+      "reason": "ESP modem serial tool drives real hardware; not simulated."
+    },
+    {
+      "id": "main/main.c::show_evil_twin_connect_popup::event-0",
+      "owner": "show_evil_twin_connect_popup",
+      "callback": "evil_twin_connect_popup_cancel_cb",
+      "category": "evil-twin-extra",
+      "open": false,
+      "reason": "Evil-twin client-connect popup and password list beyond the simulated lifecycle."
+    },
+    {
+      "id": "main/main.c::show_evil_twin_connect_popup::event-1",
+      "owner": "show_evil_twin_connect_popup",
+      "callback": "evil_twin_connect_popup_yes_cb",
+      "category": "evil-twin-extra",
+      "open": false,
+      "reason": "Evil-twin client-connect popup and password list beyond the simulated lifecycle."
+    },
+    {
+      "id": "main/main.c::show_evil_twin_passwords_page::event-1",
+      "owner": "show_evil_twin_passwords_page",
+      "callback": "evil_twin_row_click_cb",
+      "category": "evil-twin-extra",
+      "open": false,
+      "reason": "Evil-twin client-connect popup and password list beyond the simulated lifecycle."
+    },
+    {
+      "id": "main/main.c::rogue_gitm_pass_row::event-0",
+      "owner": "rogue_gitm_pass_row",
+      "callback": "rogue_gitm_input_focus_cb",
+      "category": "rogue-gitm-deferred",
+      "open": false,
+      "reason": "Rogue GITM mirror popup deferred with the GITM rework."
+    },
+    {
+      "id": "main/main.c::rogue_gitm_pass_row::event-1",
+      "owner": "rogue_gitm_pass_row",
+      "callback": "rogue_gitm_input_focus_cb",
+      "category": "rogue-gitm-deferred",
+      "open": false,
+      "reason": "Rogue GITM mirror popup deferred with the GITM rework."
+    },
+    {
+      "id": "main/main.c::show_rogue_gitm_popup::event-0",
+      "owner": "show_rogue_gitm_popup",
+      "callback": "rogue_gitm_uplink_changed_cb",
+      "category": "rogue-gitm-deferred",
+      "open": false,
+      "reason": "Rogue GITM mirror popup deferred with the GITM rework."
+    },
+    {
+      "id": "main/main.c::show_rogue_gitm_popup::event-1",
+      "owner": "show_rogue_gitm_popup",
+      "callback": "rogue_gitm_cancel_cb",
+      "category": "rogue-gitm-deferred",
+      "open": false,
+      "reason": "Rogue GITM mirror popup deferred with the GITM rework."
+    },
+    {
+      "id": "main/main.c::show_rogue_gitm_popup::event-2",
+      "owner": "show_rogue_gitm_popup",
+      "callback": "rogue_gitm_start_cb",
+      "category": "rogue-gitm-deferred",
+      "open": false,
+      "reason": "Rogue GITM mirror popup deferred with the GITM rework."
+    },
+    {
+      "id": "main/main.c::show_rogue_gitm_popup::event-3",
+      "owner": "show_rogue_gitm_popup",
+      "callback": "rogue_gitm_keyboard_cb",
+      "category": "rogue-gitm-deferred",
+      "open": false,
+      "reason": "Rogue GITM mirror popup deferred with the GITM rework."
+    },
+    {
+      "id": "main/screens/subghz_hunter_screen.c::build_page_and_start::event-0",
+      "owner": "build_page_and_start",
+      "callback": "on_stop",
+      "category": "subghz-deferred",
+      "open": false,
+      "reason": "SubGHz module, screens and operations deferred by user decision."
+    },
+    {
+      "id": "main/screens/subghz_hunter_screen.c::rebuild_rows::event-0",
+      "owner": "rebuild_rows",
+      "callback": "on_row_click",
+      "category": "subghz-deferred",
+      "open": false,
+      "reason": "SubGHz module, screens and operations deferred by user decision."
+    },
+    {
+      "id": "main/screens/subghz_hunter_screen.c::show_action_popup::event-0",
+      "owner": "show_action_popup",
+      "callback": "bs[i].cb",
+      "category": "subghz-deferred",
+      "open": false,
+      "reason": "SubGHz module, screens and operations deferred by user decision."
+    },
+    {
+      "id": "main/screens/subghz_hunter_screen.c::show_leave_popup::event-0",
+      "owner": "show_leave_popup",
+      "callback": "on_leave_confirm",
+      "category": "subghz-deferred",
+      "open": false,
+      "reason": "SubGHz module, screens and operations deferred by user decision."
+    },
+    {
+      "id": "main/screens/subghz_hunter_screen.c::show_leave_popup::event-1",
+      "owner": "show_leave_popup",
+      "callback": "on_leave_cancel",
+      "category": "subghz-deferred",
+      "open": false,
+      "reason": "SubGHz module, screens and operations deferred by user decision."
+    },
+    {
+      "id": "main/screens/subghz_hunter_settings_screen.c::show_subghz_hunter_settings_page::event-0",
+      "owner": "show_subghz_hunter_settings_page",
+      "callback": "on_trigger_changed",
+      "category": "subghz-deferred",
+      "open": false,
+      "reason": "SubGHz module, screens and operations deferred by user decision."
+    },
+    {
+      "id": "main/screens/subghz_hunter_settings_screen.c::show_subghz_hunter_settings_page::event-1",
+      "owner": "show_subghz_hunter_settings_page",
+      "callback": "on_timeout_changed",
+      "category": "subghz-deferred",
+      "open": false,
+      "reason": "SubGHz module, screens and operations deferred by user decision."
+    },
+    {
+      "id": "main/screens/subghz_hunter_settings_screen.c::show_subghz_hunter_settings_page::event-2",
+      "owner": "show_subghz_hunter_settings_page",
+      "callback": "on_mode_changed",
+      "category": "subghz-deferred",
+      "open": false,
+      "reason": "SubGHz module, screens and operations deferred by user decision."
+    },
+    {
+      "id": "main/screens/subghz_hunter_settings_screen.c::show_subghz_hunter_settings_page::event-3",
+      "owner": "show_subghz_hunter_settings_page",
+      "callback": "on_single_changed",
+      "category": "subghz-deferred",
+      "open": false,
+      "reason": "SubGHz module, screens and operations deferred by user decision."
+    },
+    {
+      "id": "main/screens/subghz_hunter_settings_screen.c::show_subghz_hunter_settings_page::event-4",
+      "owner": "show_subghz_hunter_settings_page",
+      "callback": "on_fast_changed",
+      "category": "subghz-deferred",
+      "open": false,
+      "reason": "SubGHz module, screens and operations deferred by user decision."
+    },
+    {
+      "id": "main/screens/subghz_jammer_screen.c::on_freq_tap::event-0",
+      "owner": "on_freq_tap",
+      "callback": "on_freq_set",
+      "category": "subghz-deferred",
+      "open": false,
+      "reason": "SubGHz module, screens and operations deferred by user decision."
+    },
+    {
+      "id": "main/screens/subghz_jammer_screen.c::on_freq_tap::event-1",
+      "owner": "on_freq_tap",
+      "callback": "on_freq_cancel",
+      "category": "subghz-deferred",
+      "open": false,
+      "reason": "SubGHz module, screens and operations deferred by user decision."
+    },
+    {
+      "id": "main/screens/subghz_jammer_screen.c::show_subghz_jammer_page::event-0",
+      "owner": "show_subghz_jammer_page",
+      "callback": "on_freq_tap",
+      "category": "subghz-deferred",
+      "open": false,
+      "reason": "SubGHz module, screens and operations deferred by user decision."
+    },
+    {
+      "id": "main/screens/subghz_jammer_screen.c::show_subghz_jammer_page::event-1",
+      "owner": "show_subghz_jammer_page",
+      "callback": "on_big_btn",
+      "category": "subghz-deferred",
+      "open": false,
+      "reason": "SubGHz module, screens and operations deferred by user decision."
+    },
+    {
+      "id": "main/screens/subghz_listen_screen.c::configure_signal_row::event-0",
+      "owner": "configure_signal_row",
+      "callback": "on_signal_row_clicked",
+      "category": "subghz-deferred",
+      "open": false,
+      "reason": "SubGHz module, screens and operations deferred by user decision."
+    },
+    {
+      "id": "main/screens/subghz_listen_screen.c::on_freq_tap::event-0",
+      "owner": "on_freq_tap",
+      "callback": "on_freq_set",
+      "category": "subghz-deferred",
+      "open": false,
+      "reason": "SubGHz module, screens and operations deferred by user decision."
+    },
+    {
+      "id": "main/screens/subghz_listen_screen.c::on_freq_tap::event-1",
+      "owner": "on_freq_tap",
+      "callback": "on_freq_cancel",
+      "category": "subghz-deferred",
+      "open": false,
+      "reason": "SubGHz module, screens and operations deferred by user decision."
+    },
+    {
+      "id": "main/screens/subghz_listen_screen.c::show_action_popup::event-0",
+      "owner": "show_action_popup",
+      "callback": "btns[i].cb",
+      "category": "subghz-deferred",
+      "open": false,
+      "reason": "SubGHz module, screens and operations deferred by user decision."
+    },
+    {
+      "id": "main/screens/subghz_listen_screen.c::show_leave_popup::event-0",
+      "owner": "show_leave_popup",
+      "callback": "on_leave_confirm",
+      "category": "subghz-deferred",
+      "open": false,
+      "reason": "SubGHz module, screens and operations deferred by user decision."
+    },
+    {
+      "id": "main/screens/subghz_listen_screen.c::show_leave_popup::event-1",
+      "owner": "show_leave_popup",
+      "callback": "on_leave_cancel",
+      "category": "subghz-deferred",
+      "open": false,
+      "reason": "SubGHz module, screens and operations deferred by user decision."
+    },
+    {
+      "id": "main/screens/subghz_listen_screen.c::show_subghz_listen_page::event-0",
+      "owner": "show_subghz_listen_page",
+      "callback": "on_freq_tap",
+      "category": "subghz-deferred",
+      "open": false,
+      "reason": "SubGHz module, screens and operations deferred by user decision."
+    },
+    {
+      "id": "main/screens/subghz_listen_screen.c::show_subghz_listen_page::event-1",
+      "owner": "show_subghz_listen_page",
+      "callback": "on_start_stop",
+      "category": "subghz-deferred",
+      "open": false,
+      "reason": "SubGHz module, screens and operations deferred by user decision."
+    },
+    {
+      "id": "main/screens/subghz_listen_screen.c::show_subghz_listen_page::event-2",
+      "owner": "show_subghz_listen_page",
+      "callback": "on_raw_toggle",
+      "category": "subghz-deferred",
+      "open": false,
+      "reason": "SubGHz module, screens and operations deferred by user decision."
+    },
+    {
+      "id": "main/screens/subghz_listen_screen.c::show_subghz_listen_page::event-3",
+      "owner": "show_subghz_listen_page",
+      "callback": "on_signal_list_scroll",
+      "category": "subghz-deferred",
+      "open": false,
+      "reason": "SubGHz module, screens and operations deferred by user decision."
+    },
+    {
+      "id": "main/screens/subghz_listen_screen.c::show_tx_warn_popup::event-0",
+      "owner": "show_tx_warn_popup",
+      "callback": "on_tx_warn_ok",
+      "category": "subghz-deferred",
+      "open": false,
+      "reason": "SubGHz module, screens and operations deferred by user decision."
+    },
+    {
+      "id": "main/screens/subghz_listen_settings_screen.c::show_subghz_listen_settings_page::event-0",
+      "owner": "show_subghz_listen_settings_page",
+      "callback": "on_rssi_changed",
+      "category": "subghz-deferred",
+      "open": false,
+      "reason": "SubGHz module, screens and operations deferred by user decision."
+    },
+    {
+      "id": "main/screens/subghz_manage_screen.c::build_one_row::event-0",
+      "owner": "build_one_row",
+      "callback": "on_row_click",
+      "category": "subghz-deferred",
+      "open": false,
+      "reason": "SubGHz module, screens and operations deferred by user decision."
+    },
+    {
+      "id": "main/screens/subghz_manage_screen.c::show_action_popup::event-0",
+      "owner": "show_action_popup",
+      "callback": "btns[i].cb",
+      "category": "subghz-deferred",
+      "open": false,
+      "reason": "SubGHz module, screens and operations deferred by user decision."
+    },
+    {
+      "id": "main/screens/subghz_manage_screen.c::show_delete_confirm::event-0",
+      "owner": "show_delete_confirm",
+      "callback": "on_delete_confirmed",
+      "category": "subghz-deferred",
+      "open": false,
+      "reason": "SubGHz module, screens and operations deferred by user decision."
+    },
+    {
+      "id": "main/screens/subghz_manage_screen.c::show_delete_confirm::event-1",
+      "owner": "show_delete_confirm",
+      "callback": "on_delete_cancel",
+      "category": "subghz-deferred",
+      "open": false,
+      "reason": "SubGHz module, screens and operations deferred by user decision."
+    },
+    {
+      "id": "main/screens/subghz_manage_screen.c::show_tx_count_popup::event-0",
+      "owner": "show_tx_count_popup",
+      "callback": "on_tx_count_confirm",
+      "category": "subghz-deferred",
+      "open": false,
+      "reason": "SubGHz module, screens and operations deferred by user decision."
+    },
+    {
+      "id": "main/screens/subghz_manage_screen.c::show_tx_count_popup::event-1",
+      "owner": "show_tx_count_popup",
+      "callback": "on_tx_count_cancel",
+      "category": "subghz-deferred",
+      "open": false,
+      "reason": "SubGHz module, screens and operations deferred by user decision."
+    },
+    {
+      "id": "main/screens/subghz_scanner_screen.c::make_freq_tile::event-0",
+      "owner": "make_freq_tile",
+      "callback": "on_tile_clicked",
+      "category": "subghz-deferred",
+      "open": false,
+      "reason": "SubGHz module, screens and operations deferred by user decision."
+    },
+    {
+      "id": "main/screens/subghz_scanner_settings_screen.c::show_subghz_scanner_settings_page::event-0",
+      "owner": "show_subghz_scanner_settings_page",
+      "callback": "on_rssi_changed",
+      "category": "subghz-deferred",
+      "open": false,
+      "reason": "SubGHz module, screens and operations deferred by user decision."
+    },
+    {
+      "id": "main/screens/subghz_scanner_settings_screen.c::show_subghz_scanner_settings_page::event-1",
+      "owner": "show_subghz_scanner_settings_page",
+      "callback": "on_dwell_changed",
+      "category": "subghz-deferred",
+      "open": false,
+      "reason": "SubGHz module, screens and operations deferred by user decision."
+    },
+    {
+      "id": "main/screens/subghz_scanner_settings_screen.c::show_subghz_scanner_settings_page::event-2",
+      "owner": "show_subghz_scanner_settings_page",
+      "callback": "on_edges_changed",
+      "category": "subghz-deferred",
+      "open": false,
+      "reason": "SubGHz module, screens and operations deferred by user decision."
+    },
+    {
+      "id": "main/screens/subghz_scanner_settings_screen.c::show_subghz_scanner_settings_page::event-3",
+      "owner": "show_subghz_scanner_settings_page",
+      "callback": "on_fast_changed",
+      "category": "subghz-deferred",
+      "open": false,
+      "reason": "SubGHz module, screens and operations deferred by user decision."
+    },
+    {
+      "id": "main/screens/subghz_screen.c::subghz_add_header_action::event-0",
+      "owner": "subghz_add_header_action",
+      "callback": "cb",
+      "category": "subghz-deferred",
+      "open": false,
+      "reason": "SubGHz module, screens and operations deferred by user decision."
+    },
+    {
+      "id": "main/screens/subghz_screen.c::subghz_create_header::event-0",
+      "owner": "subghz_create_header",
+      "callback": "on_back",
+      "category": "subghz-deferred",
+      "open": false,
+      "reason": "SubGHz module, screens and operations deferred by user decision."
+    },
+    {
+      "id": "main/screens/subghz_screen.c::subghz_create_tile::event-0",
+      "owner": "subghz_create_tile",
+      "callback": "cb",
+      "category": "subghz-deferred",
+      "open": false,
+      "reason": "SubGHz module, screens and operations deferred by user decision."
+    },
+    {
+      "id": "main/screens/subghz_settings_screen.c::show_subghz_settings_page::event-0",
+      "owner": "show_subghz_settings_page",
+      "callback": "on_set",
+      "category": "subghz-deferred",
+      "open": false,
+      "reason": "SubGHz module, screens and operations deferred by user decision."
+    },
+    {
+      "id": "main/screens/subghz_tesla_screen.c::show_subghz_tesla_page::event-0",
+      "owner": "show_subghz_tesla_page",
+      "callback": "on_open_port",
+      "category": "subghz-deferred",
+      "open": false,
+      "reason": "SubGHz module, screens and operations deferred by user decision."
+    },
+    {
+      "id": "main/screens/subghz_text_input_popup.c::subghz_show_text_input_popup::event-0",
+      "owner": "subghz_show_text_input_popup",
+      "callback": "on_confirm_clicked",
+      "category": "subghz-deferred",
+      "open": false,
+      "reason": "SubGHz module, screens and operations deferred by user decision."
+    },
+    {
+      "id": "main/screens/subghz_text_input_popup.c::subghz_show_text_input_popup::event-1",
+      "owner": "subghz_show_text_input_popup",
+      "callback": "on_cancel_clicked",
+      "category": "subghz-deferred",
+      "open": false,
+      "reason": "SubGHz module, screens and operations deferred by user decision."
+    },
+    {
+      "id": "main/screens/subghz_text_input_popup.c::subghz_show_text_input_popup::event-2",
+      "owner": "subghz_show_text_input_popup",
+      "callback": "on_kb_event",
+      "category": "subghz-deferred",
+      "open": false,
+      "reason": "SubGHz module, screens and operations deferred by user decision."
+    },
+    {
+      "id": "main/screens/subghz_text_input_popup.c::subghz_show_text_input_popup::event-3",
+      "owner": "subghz_show_text_input_popup",
+      "callback": "on_kb_event",
+      "category": "subghz-deferred",
+      "open": false,
+      "reason": "SubGHz module, screens and operations deferred by user decision."
+    },
+    {
+      "id": "main/main.c::wardrive_autoup_make_btn::event-0",
+      "owner": "wardrive_autoup_make_btn",
+      "callback": "cb",
+      "category": "wardrive-wigle-wifi",
+      "open": false,
+      "reason": "WiGLE credential entry and real Wi-Fi join are out of the offline upload scope."
+    },
+    {
+      "id": "main/main.c::wardrive_wigle_create_credentials_prompt::event-0",
+      "owner": "wardrive_wigle_create_credentials_prompt",
+      "callback": "wardrive_wigle_text_input_cb",
+      "category": "wardrive-wigle-wifi",
+      "open": false,
+      "reason": "WiGLE credential entry and real Wi-Fi join are out of the offline upload scope."
+    },
+    {
+      "id": "main/main.c::wardrive_wigle_create_credentials_prompt::event-1",
+      "owner": "wardrive_wigle_create_credentials_prompt",
+      "callback": "wardrive_wigle_text_input_cb",
+      "category": "wardrive-wigle-wifi",
+      "open": false,
+      "reason": "WiGLE credential entry and real Wi-Fi join are out of the offline upload scope."
+    },
+    {
+      "id": "main/main.c::wardrive_wigle_create_credentials_prompt::event-2",
+      "owner": "wardrive_wigle_create_credentials_prompt",
+      "callback": "wardrive_wigle_text_input_cb",
+      "category": "wardrive-wigle-wifi",
+      "open": false,
+      "reason": "WiGLE credential entry and real Wi-Fi join are out of the offline upload scope."
+    },
+    {
+      "id": "main/main.c::wardrive_wigle_create_credentials_prompt::event-3",
+      "owner": "wardrive_wigle_create_credentials_prompt",
+      "callback": "wardrive_wigle_text_input_cb",
+      "category": "wardrive-wigle-wifi",
+      "open": false,
+      "reason": "WiGLE credential entry and real Wi-Fi join are out of the offline upload scope."
+    },
+    {
+      "id": "main/main.c::wardrive_wigle_create_credentials_prompt::event-4",
+      "owner": "wardrive_wigle_create_credentials_prompt",
+      "callback": "wardrive_wigle_connect_btn_cb",
+      "category": "wardrive-wigle-wifi",
+      "open": false,
+      "reason": "WiGLE credential entry and real Wi-Fi join are out of the offline upload scope."
+    },
+    {
+      "id": "main/main.c::wardrive_wigle_create_credentials_prompt::event-5",
+      "owner": "wardrive_wigle_create_credentials_prompt",
+      "callback": "wardrive_wigle_show_password_toggle_cb",
+      "category": "wardrive-wigle-wifi",
+      "open": false,
+      "reason": "WiGLE credential entry and real Wi-Fi join are out of the offline upload scope."
+    },
+    {
+      "id": "main/main.c::wardrive_wigle_create_credentials_prompt::event-6",
+      "owner": "wardrive_wigle_create_credentials_prompt",
+      "callback": "wardrive_wigle_keyboard_cb",
+      "category": "wardrive-wigle-wifi",
+      "open": false,
+      "reason": "WiGLE credential entry and real Wi-Fi join are out of the offline upload scope."
+    },
+    {
+      "id": "main/main.c::wardrive_wigle_ensure_wifi_connected::event-0",
+      "owner": "wardrive_wigle_ensure_wifi_connected",
+      "callback": "wardrive_wigle_network_row_click_cb",
+      "category": "wardrive-wigle-wifi",
+      "open": false,
+      "reason": "WiGLE credential entry and real Wi-Fi join are out of the offline upload scope."
+    },
+    {
+      "id": "main/main.c::wardrive_wigle_ensure_wifi_connected::event-1",
+      "owner": "wardrive_wigle_ensure_wifi_connected",
+      "callback": "wardrive_wigle_network_row_click_cb",
+      "category": "wardrive-wigle-wifi",
+      "open": false,
+      "reason": "WiGLE credential entry and real Wi-Fi join are out of the offline upload scope."
+    },
+    {
+      "id": "main/main.c::wardrive_wigle_ensure_wifi_connected::event-2",
+      "owner": "wardrive_wigle_ensure_wifi_connected",
+      "callback": "wardrive_wigle_rescan_btn_cb",
+      "category": "wardrive-wigle-wifi",
+      "open": false,
+      "reason": "WiGLE credential entry and real Wi-Fi join are out of the offline upload scope."
+    }
+  ]
+}

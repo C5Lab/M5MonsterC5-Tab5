@@ -1,0 +1,36 @@
+
+TEST SUMMARY
+==============================================================================
+phase4_detectors
+  FAIL            7.56s  verify_emulator_phase4_settings_sys.py
+phase4_settings_sys
+  FAIL            5.94s  verify_emulator_phase4_attacks.py
+phase4_attacks
+  FAIL            4.96s  verify_emulator_phase4_nettools.py
+phase4_nettools
+  FAIL            4.35s  verify_emulator_phase4_pcap_deep.py
+phase4_pcap_deep
+  FAIL            3.96s  verify_emulator_phase4_wardrive.py
+phase4_wardrive
+  FAIL            3.65s  verify_emulator_phase4_bluetooth.py
+phase4_bluetooth
+  FAIL            3.37s  verify_emulator_phase3.py
+phase3
+  FAIL            3.11s  verify_emulator_phase2.py
+phase2
+  FAIL            2.88s  test_emulator_slice.py
+------------------------------------------------------------------------------
+Result: FAIL | scripts PASS: 0 | FAIL/ERROR: 1
+Total elapsed: 9.23s
+Section wrapper times include their children; do not add them together.
+Run incomplete: checks after the failure may NOT HAVE RUN. Missing entries are not passes.
+Failure log: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\docs\ui-emulator\test-runs\20260912-091754-370b73\e2a80f7920f64998b1100aac02baa59d.log
+Failure log: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\docs\ui-emulator\test-runs\20260912-091754-370b73\77c90bbc233a4bbb96a8ddebfd01bd68.log
+Failure log: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\docs\ui-emulator\test-runs\20260912-091754-370b73\89c7cb659f6d44eaac2630f1c4aa9c27.log
+Failure log: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\docs\ui-emulator\test-runs\20260912-091754-370b73\6d50d889fc3a42cab273597d13ada804.log
+Failure log: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\docs\ui-emulator\test-runs\20260912-091754-370b73\22bfed6e9f094f5795d19a684e853282.log
+Failure log: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\docs\ui-emulator\test-runs\20260912-091754-370b73\9becef6a5e964952b913587d66510dea.log
+Failure log: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\docs\ui-emulator\test-runs\20260912-091754-370b73\0c7904f59e964cddb0b1c219deabfaee.log
+Failure log: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\docs\ui-emulator\test-runs\20260912-091754-370b73\5b7c20ea7842445689f83a4b84991ec2.log
+Failure log: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\docs\ui-emulator\test-runs\20260912-091754-370b73\d18ee23259874b4dae31c6b65e65ad85.log
+Report: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\docs\ui-emulator\test-runs\20260912-091754-370b73\summary.json

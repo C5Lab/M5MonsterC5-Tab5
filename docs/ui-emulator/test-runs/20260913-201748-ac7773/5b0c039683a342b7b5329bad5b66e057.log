@@ -1,0 +1,7 @@
+test_each_permanent_id_matches_constructor_callback_event_data_and_branch (__main__.AdapterSites.test_each_permanent_id_matches_constructor_callback_event_data_and_branch) ... ok
+test_no_copied_form_uses_a_numeric_source_line (__main__.AdapterSites.test_no_copied_form_uses_a_numeric_source_line) ... ok
+
+----------------------------------------------------------------------
+Ran 2 tests in 0.390s
+
+OK

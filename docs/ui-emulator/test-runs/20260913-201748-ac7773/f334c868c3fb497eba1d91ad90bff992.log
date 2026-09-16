@@ -1,0 +1,26 @@
+✔ S18 exposes scan save/validation and both disclaimer choices (1.072ms)
+✔ scan save requires changed native values, reopening and fresh GROVE scan (1.0274ms)
+✔ disclaimer cancellation and old state do not count as enabling (0.3642ms)
+✔ repeated scan story cannot credit Cancel against already saved defaults (0.1433ms)
+✔ disabled Red Team needs the restricted action bar and wrong tabs are ignored (0.1687ms)
+✔ restarting validation with old open error requires closing and reopening (0.1267ms)
+✔ timeout needs fresh changed preference and close/reopen before restoration (0.8597ms)
+✔ brightness requires saved release and actual canvas filter (0.8125ms)
+✔ hidden, wrong tab and stale epochs never advance (0.2404ms)
+✔ theme automatic rebuild still requires changed native preference and reopening (0.2665ms)
+✔ rotation handoff only follows native pending change and rejects invalid or replayed data (0.817ms)
+✔ date needs fresh native changed rollers, successful write and ticking clock (0.8329ms)
+✔ invalid calendar cannot advance on old failure or successful normalization (0.1598ms)
+✔ unchanged preferences, hidden context and stale epochs cannot progress (0.3205ms)
+✔ cancel requires unsaved edit and preserved offset on reopen (0.1602ms)
+✔ format must match RTC and DST must shift exactly one hour within RTC precision (0.1946ms)
+✔ native rotation handoff is consumed from the URL without storing progress (1.2723ms)
+✔ unrelated, malformed and unsupported handoffs cannot restore a guide (0.2365ms)
+ℹ tests 18
+ℹ suites 0
+ℹ pass 18
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 96.8797

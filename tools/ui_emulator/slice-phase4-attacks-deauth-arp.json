@@ -1,0 +1,18 @@
+{
+  "show_scan_deauth_popup": "adapter",
+  "scan_deauth_popup_close_cb": "adapter",
+  "show_deauth_popup": "adapter",
+  "destroy_deauth_popup_ui": "adapter",
+  "stop_and_close_deauth_popup": "adapter",
+  "close_deauth_popup": "adapter",
+  "deauth_btn_click_cb": "adapter",
+  "arp_keyboard_cb": "adapter",
+  "arp_password_input_cb": "adapter",
+  "arp_poison_back_cb": "adapter",
+  "arp_host_click_cb": "adapter",
+  "arp_attack_popup_close_cb": "adapter",
+  "arp_connect_cb": "adapter",
+  "arp_list_hosts_cb": "adapter",
+  "show_arp_poison_page": "adapter",
+  "arp_auto_connect_timer_cb": "adapter"
+}

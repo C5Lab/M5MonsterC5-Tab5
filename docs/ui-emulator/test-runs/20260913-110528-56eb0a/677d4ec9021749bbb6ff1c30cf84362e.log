@@ -1,0 +1,16 @@
+✔ S08 exposes three independent client & password demos (0.8398ms)
+✔ evil-twin rejects wrong target, hidden view and stale run, then completes (0.2151ms)
+✔ rogue-ap rejects wrong target, hidden view and stale run, then completes (0.0766ms)
+✔ internal-portal runs on the INTERNAL tab and needs the portal page (0.1155ms)
+✔ disconnection pauses any portal story (0.1321ms)
+✔ evil_twin yields the fixed demo password and freezes on disconnect (1.1447ms)
+✔ rogue_ap yields the fixed demo password and freezes on disconnect (0.2504ms)
+✔ portal_demo yields the fixed demo password and freezes on disconnect (0.2495ms)
+ℹ tests 8
+ℹ suites 0
+ℹ pass 8
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 61.8596

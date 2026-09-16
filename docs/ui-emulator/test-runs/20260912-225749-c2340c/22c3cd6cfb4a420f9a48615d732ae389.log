@@ -1,0 +1,8 @@
+test_all_conditions_and_rotations (__main__.StartupStoryBrowser.test_all_conditions_and_rotations) ... ok
+test_switching_story_requires_new_bluetooth_evidence (__main__.StartupStoryBrowser.test_switching_story_requires_new_bluetooth_evidence) ... ok
+test_wrong_module_warning_and_independent_status_cards (__main__.StartupStoryBrowser.test_wrong_module_warning_and_independent_status_cards) ... ok
+
+----------------------------------------------------------------------
+Ran 3 tests in 48.123s
+
+OK

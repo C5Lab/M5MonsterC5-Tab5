@@ -1,3 +1,22 @@
 .vscode/settings.json
 .claude/settings.local.json
+skill-observations/
 build/
+
+# Local Polish-language emulator technical notes and reports (September 2026)
+/docs/ui-emulator/Full_Scope_and_Stories.md
+/docs/ui-emulator/Queue2_Stories_Report.md
+/docs/ui-emulator/Queue2_System_Report.md
+/docs/ui-emulator/RESUME_Queue2.md
+/docs/ui-emulator/Resume_2026-09-12.md
+/docs/ui-emulator/S01_Module_Tour_Report.md
+/docs/ui-emulator/S02_S03_WiFi_Stories_Report.md
+/docs/ui-emulator/S05_S06_Recon_Stories_Report.md
+/docs/ui-emulator/S08_Portal_Stories_Report.md
+/docs/ui-emulator/S15_ESPShark_PCAP_Report.md
+/docs/ui-emulator/S18_S20_Integration_Report.md
+/docs/ui-emulator/S27_Guide_Lifecycle_Report.md
+/docs/ui-emulator/Stories_TODO.md
+/docs/ui-emulator/UI_Endpoints_and_Controls.md
+/docs/ui-emulator/communication-endpoints.md
+skill-observations/checkpoints.log

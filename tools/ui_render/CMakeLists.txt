@@ -1,0 +1,25 @@
+cmake_minimum_required(VERSION 3.16)
+project(tab5_ui_render C CXX)
+set(CMAKE_C_STANDARD 11)
+if(EXISTS "/repo/managed_components/lvgl__lvgl")
+    set(REPO_ROOT "/repo")
+    set(RENDER_WORK "/work")
+else()
+    get_filename_component(REPO_ROOT "${CMAKE_CURRENT_LIST_DIR}/../.." ABSOLUTE)
+    set(RENDER_WORK "${CMAKE_CURRENT_LIST_DIR}")
+endif()
+set(LV_BUILD_CONF_PATH "${RENDER_WORK}/lv_conf.h" CACHE PATH "" FORCE)
+set(CONFIG_LV_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(CONFIG_LV_BUILD_DEMOS OFF CACHE BOOL "" FORCE)
+add_subdirectory("${REPO_ROOT}/managed_components/lvgl__lvgl" /tmp/tab5-lvgl)
+file(GLOB COMPONENT_INCLUDES "${REPO_ROOT}/components/*/include")
+file(GLOB SUBGHZ_SOURCES "${REPO_ROOT}/main/screens/subghz*.c")
+add_executable(render generated.c "${REPO_ROOT}/main/scan_filter.c"
+    "${REPO_ROOT}/main/lv_font_lato_regular_ttf.c"
+    "${REPO_ROOT}/main/screens/cgw_parser.c"
+    "${REPO_ROOT}/main/screens/psram_dynarr.c" ${SUBGHZ_SOURCES})
+target_include_directories(render PRIVATE "${RENDER_WORK}" "${RENDER_WORK}/shims"
+    "${REPO_ROOT}/main" "${REPO_ROOT}/main/screens" ${COMPONENT_INCLUDES})
+target_compile_options(render PRIVATE -w -g -ffunction-sections -fdata-sections -fsanitize=address)
+target_link_options(render PRIVATE -Wl,--gc-sections -fsanitize=address)
+target_link_libraries(render PRIVATE lvgl m)

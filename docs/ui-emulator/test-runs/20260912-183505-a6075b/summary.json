@@ -1,0 +1,36 @@
+{
+  "status": "PASS",
+  "seconds": 20.11816500000714,
+  "checks": [
+    {
+      "section": "portal_demo",
+      "name": "test_emulator_portal_demo.mjs test_emulator_attacks.mjs test_emulator_bridge.mjs",
+      "started": 1789230905.6686356,
+      "seconds": 0.15918660000897944,
+      "status": "PASS",
+      "exit_code": 0,
+      "log": "C:\\Users\\mati\\Documents\\GitHub\\M5MonsterC5-Tab5\\docs\\ui-emulator\\test-runs\\20260912-183505-a6075b\\221c629666634bee98a91e168ad0d72b.log",
+      "aggregate": false
+    },
+    {
+      "section": "portal_demo",
+      "name": "test_emulator_portal_demo.py",
+      "started": 1789230905.82881,
+      "seconds": 19.713389799988363,
+      "status": "PASS",
+      "exit_code": 0,
+      "log": "C:\\Users\\mati\\Documents\\GitHub\\M5MonsterC5-Tab5\\docs\\ui-emulator\\test-runs\\20260912-183505-a6075b\\886af478de334c398ad1ad00fa09f7c7.log",
+      "aggregate": false
+    },
+    {
+      "section": "portal_demo",
+      "name": "test_emulator_phase4_audit.py",
+      "started": 1789230925.5430424,
+      "seconds": 0.23654749999695923,
+      "status": "PASS",
+      "exit_code": 0,
+      "log": "C:\\Users\\mati\\Documents\\GitHub\\M5MonsterC5-Tab5\\docs\\ui-emulator\\test-runs\\20260912-183505-a6075b\\bc6d9194dbc045a49d3f7dd3f25b2575.log",
+      "aggregate": false
+    }
+  ]
+}

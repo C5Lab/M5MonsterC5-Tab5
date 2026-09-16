@@ -1,0 +1,16 @@
+✔ module captures have distinct paths when copied to the shared analysis filesystem (1.3717ms)
+✔ PCAP packet timestamps carry into seconds rather than overflowing microseconds (1.5407ms)
+✔ scan selection and clients use the seed identities, independently for each module (0.7461ms)
+✔ cancelled captures cannot create files; reset makes all previous job IDs stale (0.2913ms)
+✔ completed capture stores valid PCAP bytes for the selected network and clients (0.3169ms)
+✔ missing/full SD and missing clients fail explicitly without committing a file (0.2842ms)
+✔ Bluetooth respects connection state, explicit time zero and immutable discovery snapshots (0.2155ms)
+✔ disconnect cancels work, snapshots cannot mutate the model, invalid clocks are rejected (0.188ms)
+ℹ tests 8
+ℹ suites 0
+ℹ pass 8
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 80.7852

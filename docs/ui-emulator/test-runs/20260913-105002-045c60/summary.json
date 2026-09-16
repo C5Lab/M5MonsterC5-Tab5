@@ -1,0 +1,26 @@
+{
+  "status": "PASS",
+  "seconds": 25.59309209999992,
+  "checks": [
+    {
+      "section": "portal_story",
+      "name": "test_emulator_portal_story.mjs",
+      "started": 1789289402.4645438,
+      "seconds": 0.11360959999979059,
+      "status": "PASS",
+      "exit_code": 0,
+      "log": "C:\\Users\\mati\\Documents\\GitHub\\M5MonsterC5-Tab5\\docs\\ui-emulator\\test-runs\\20260913-105002-045c60\\66a2d0a5d78d48daa0a931c37e3e86c5.log",
+      "aggregate": false
+    },
+    {
+      "section": "portal_story",
+      "name": "test_emulator_portal_story.py",
+      "started": 1789289402.5791595,
+      "seconds": 25.460621100000026,
+      "status": "PASS",
+      "exit_code": 0,
+      "log": "C:\\Users\\mati\\Documents\\GitHub\\M5MonsterC5-Tab5\\docs\\ui-emulator\\test-runs\\20260913-105002-045c60\\7c099bef0ec34b85be0a0ee99bf15736.log",
+      "aggregate": false
+    }
+  ]
+}

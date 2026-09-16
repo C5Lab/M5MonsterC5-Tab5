@@ -1,0 +1,123 @@
+
+TEST SUMMARY
+==============================================================================
+phase5_settings
+  PASS            0.12s  test_emulator_persistence.mjs
+  PASS            0.56s  test_emulator_adapter_sites.py
+  PASS           10.58s  test_emulator_phase5_settings.py
+  PASS          186.09s  verify_emulator_phase4.py
+  PASS           10.67s  verify_emulator_time.py
+  PASS           19.39s  verify_emulator_portal_demo.py
+  PASS           17.81s  verify_emulator_radar.py
+  PASS           11.83s  verify_emulator_settings_followup.py
+  PASS          898.03s  verify_emulator_guided_dialogs.py
+phase4
+  PASS          152.89s  verify_emulator_phase4_detectors.py
+  PASS            9.31s  verify_emulator_sae.py
+  PASS           23.48s  verify_emulator_global_attacks.py
+  PASS            0.21s  test_emulator_phase4_audit.py
+phase4_detectors
+  PASS          144.82s  verify_emulator_phase4_settings_sys.py
+  PASS            0.11s  test_emulator_detectors.mjs
+  PASS            7.77s  test_emulator_phase4_detectors.py
+phase4_settings_sys
+  PASS          137.72s  verify_emulator_phase4_attacks.py
+  PASS            0.10s  test_emulator_settings_sys.mjs
+  PASS            6.78s  test_emulator_phase4_settings_sys.py
+phase4_attacks
+  PASS          122.49s  verify_emulator_phase4_nettools.py
+  PASS            0.10s  test_emulator_attacks.mjs
+  PASS           14.95s  test_emulator_phase4_attacks.py
+phase4_nettools
+  PASS          102.20s  verify_emulator_phase4_pcap_deep.py
+  PASS            0.12s  test_emulator_nettools.mjs
+  PASS            0.08s  test_emulator_slice_tokens.py
+  PASS           19.89s  test_emulator_phase4_nettools.py
+phase4_pcap_deep
+  PASS           92.51s  verify_emulator_phase4_wardrive.py
+  PASS            0.11s  test_emulator_pcap_deep.mjs test_emulator_files.mjs
+  PASS            2.72s  test_emulator_sha256.py
+  PASS            6.67s  test_emulator_phase4_pcap_deep.py
+phase4_wardrive
+  PASS           84.76s  verify_emulator_phase4_bluetooth.py
+  PASS            0.11s  test_emulator_wardrive.mjs
+  PASS            7.39s  test_emulator_phase4_wardrive.py
+phase4_bluetooth
+  PASS           79.64s  verify_emulator_phase3.py
+  PASS            1.13s  test_emulator_phase4_bluetooth.py
+  PASS            3.74s  test_emulator_bluetooth_lifecycle.py
+phase3
+  PASS           67.26s  verify_emulator_phase2.py
+  PASS            0.22s  test_emulator_device.mjs
+  PASS            0.15s  test_emulator_bridge.mjs
+  PASS            2.56s  run_emulator_capture_tests.py
+  PASS            2.80s  test_emulator_phase3.py
+  PASS            6.41s  test_emulator_lifecycle.py
+phase2
+  PASS            2.75s  test_emulator_slice.py
+  PASS            0.09s  test_emulator_contracts.py
+  PASS            0.11s  test_emulator_input.mjs
+  PASS           21.35s  test_emulator_browser.py
+  PASS           21.51s  test_emulator_phase2.py
+  PASS            7.16s  test_emulator_settings.py
+  PASS           14.00s  test_emulator_performance.py
+sae
+  PASS            0.10s  test_emulator_sae.mjs test_emulator_attacks.mjs
+  PASS            9.05s  test_emulator_sae.py
+global_attacks
+  PASS            0.11s  test_emulator_global_attacks.mjs test_emulator_sae.mjs test_emulator_attacks.mjs
+  PASS           14.01s  test_emulator_global_attacks.py
+  PASS            9.22s  test_emulator_sae.py
+time
+  PASS            0.10s  test_emulator_persistence.mjs
+  PASS           10.17s  test_emulator_time.py
+  PASS            0.24s  test_emulator_phase4_audit.py
+portal_demo
+  PASS            0.14s  test_emulator_portal_demo.mjs test_emulator_attacks.mjs test_emulator_bridge.mjs
+  PASS           18.87s  test_emulator_portal_demo.py
+  PASS            0.22s  test_emulator_phase4_audit.py
+radar
+  PASS            0.13s  test_emulator_radar.mjs test_emulator_attacks.mjs test_emulator_bridge.mjs
+  PASS           17.29s  test_emulator_radar.py
+  PASS            0.22s  test_emulator_phase4_audit.py
+settings_followup
+  PASS            0.10s  test_emulator_persistence.mjs
+  PASS            8.19s  test_emulator_transfer_speed.py
+  PASS            3.16s  test_emulator_observer_exit.py
+  PASS            0.22s  test_emulator_phase4_audit.py
+guided_dialogs
+  PASS            0.14s  test_emulator_stories.mjs test_emulator_startup_story.mjs test_emulator_wifi_stories.mjs test_emulator_recon_stories.mjs test_emulator_dialogs.mjs
+  PASS           28.19s  test_emulator_stories.py
+  PASS           21.08s  test_emulator_story_lifecycle.py
+  PASS           48.66s  test_emulator_startup_story.py
+  PASS           47.52s  test_emulator_wifi_stories.py
+  PASS           56.36s  test_emulator_recon_stories.py
+  PASS           18.55s  test_emulator_dialogs.py
+  PASS            0.25s  test_emulator_phase4_audit.py
+  PASS           25.63s  verify_emulator_portal_story.py
+  PASS            6.89s  verify_emulator_pcap_story.py
+  PASS          102.67s  verify_emulator_settings_stories.py
+  PASS          541.95s  verify_emulator_queue2.py
+portal_story
+  PASS            0.11s  test_emulator_portal_story.mjs
+  PASS           25.35s  test_emulator_portal_story.py
+pcap_story
+  PASS            0.10s  test_emulator_pcap_story.mjs
+  PASS            6.65s  test_emulator_pcap_story.py
+settings_stories
+  PASS            0.15s  test_emulator_story_restart.mjs test_emulator_settings_s18.mjs test_emulator_settings_s19.mjs test_emulator_settings_s20.mjs
+  PASS           30.77s  test_emulator_settings_s18.py
+  PASS           31.36s  test_emulator_settings_s19.py
+  PASS           40.07s  test_emulator_settings_s20.py
+queue2
+  PASS            0.16s  test_emulator_queue2_common.mjs test_emulator_queue2_system.mjs test_emulator_queue2_attacks.mjs test_emulator_queue2_nettools.mjs test_emulator_queue2_wardrive.mjs
+  PASS           66.47s  test_emulator_queue2_system.py
+  PASS           85.66s  test_emulator_queue2_attacks.py
+  PASS          178.45s  test_emulator_queue2_nettools.py
+  PASS          210.96s  test_emulator_queue2_wardrive.py
+  PASS            0.09s  test_emulator_runtime_inventory.py
+------------------------------------------------------------------------------
+Result: PASS | scripts PASS: 72 | FAIL/ERROR: 0
+Total elapsed: 1155.20s
+Section wrapper times include their children; do not add them together.
+Report: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\docs\ui-emulator\test-runs\20260913-201748-ac7773\summary.json

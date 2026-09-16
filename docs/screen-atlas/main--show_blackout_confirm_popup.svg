@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="654" viewBox="0 0 1080 654">
+<title>show_blackout_confirm_popup</title>
+<rect width="100%" height="100%" fill="#111827"/>
+<text x="28" y="38" fill="#7dd3fc" font-family="monospace" font-size="21">show_blackout_confirm_popup</text>
+<text x="28" y="69" fill="#fbbf24" font-family="sans-serif" font-size="17">SOURCE DIAGRAM - not a screenshot or screen render</text>
+<text x="28" y="110" fill="#7dd3fc" font-family="monospace" font-size="16">SOURCE</text>
+<text x="28" y="133" fill="#e5e7eb" font-family="monospace" font-size="16">main/main.c:20980</text>
+<text x="28" y="156" fill="#e5e7eb" font-family="monospace" font-size="16"></text>
+<text x="28" y="179" fill="#7dd3fc" font-family="monospace" font-size="16">DIRECT TEXT LITERALS IN THIS FUNCTION</text>
+<text x="28" y="202" fill="#e5e7eb" font-family="monospace" font-size="16">BLACKOUT</text>
+<text x="28" y="225" fill="#e5e7eb" font-family="monospace" font-size="16">This will deauth all networks / around you. Are you sure?</text>
+<text x="28" y="248" fill="#e5e7eb" font-family="monospace" font-size="16">No</text>
+<text x="28" y="271" fill="#e5e7eb" font-family="monospace" font-size="16">Yes</text>
+<text x="28" y="294" fill="#e5e7eb" font-family="monospace" font-size="16"></text>
+<text x="28" y="317" fill="#7dd3fc" font-family="monospace" font-size="16">SOURCE DIMENSIONS (UNEVALUATED EXPRESSIONS)</text>
+<text x="28" y="340" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_size(ctx-&gt;blackout_popup_overlay, lv_pct(100), lv_pct(100));</text>
+<text x="28" y="363" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_size(ctx-&gt;blackout_popup, 500, 350);</text>
+<text x="28" y="386" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_size(btn_container, lv_pct(100), LV_SIZE_CONTENT);</text>
+<text x="28" y="409" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_size(no_btn, 120, 50);</text>
+<text x="28" y="432" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_size(yes_btn, 120, 50);</text>
+<text x="28" y="455" fill="#e5e7eb" font-family="monospace" font-size="16"></text>
+<text x="28" y="478" fill="#7dd3fc" font-family="monospace" font-size="16">EVENTS -&gt; CALLBACKS</text>
+<text x="28" y="501" fill="#e5e7eb" font-family="monospace" font-size="16">blackout_confirm_no_cb</text>
+<text x="28" y="524" fill="#e5e7eb" font-family="monospace" font-size="16">blackout_confirm_yes_cb</text>
+<text x="28" y="547" fill="#e5e7eb" font-family="monospace" font-size="16"></text>
+<text x="28" y="570" fill="#7dd3fc" font-family="monospace" font-size="16">DIRECT UI FUNCTION CALLS</text>
+<text x="28" y="593" fill="#e5e7eb" font-family="monospace" font-size="16">—</text>
+<text x="28" y="616" fill="#e5e7eb" font-family="monospace" font-size="16"></text>
+</svg>

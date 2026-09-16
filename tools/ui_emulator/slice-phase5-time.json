@@ -1,0 +1,16 @@
+{
+  "show_time_popup": "retain",
+  "time_make_roller": "retain",
+  "time_popup_close_cb": "retain",
+  "time_popup_set_cb": "retain",
+  "time_popup_refresh_from_rtc": "retain",
+  "time_add_switch_row": "retain",
+  "time_24h_switch_cb": "retain",
+  "time_show_switch_cb": "retain",
+  "time_dst_switch_cb": "adapter",
+  "save_clock_settings_to_nvs": "retain",
+  "rx8130_read_time": "adapter",
+  "rx8130_set_time": "adapter",
+  "rx8130_sync_system_from_rtc": "adapter",
+  "update_status_clock": "adapter"
+}

@@ -1,0 +1,73 @@
+{
+  "status": "passed",
+  "checks": [
+    {
+      "command": "tools/ui_emulator/inventory.py",
+      "exit_code": 0,
+      "output": "{\n  \"source_files\": 19,\n  \"functions\": 1593,\n  \"event_registration_sites\": 452,\n  \"resolved_callback_sites\": 452,\n  \"boundary_call_sites\": 1745,\n  \"global_declarations\": 990,\n  \"routes\": 110,\n  \"story_steps\": 44,\n  \"syntax_diagnostics\": 0\n}\n"
+    },
+    {
+      "command": "tools/ui_emulator/control_contracts.py",
+      "exit_code": 0,
+      "output": "452 permanent templates: 406 current, 46 deferred\n"
+    },
+    {
+      "command": "tools/ui_emulator/dependency_registry.py",
+      "exit_code": 0,
+      "output": "531 external symbols recorded; unclassified: \n"
+    },
+    {
+      "command": "tools/ui_emulator/scenario_schema.py",
+      "exit_code": 0,
+      "output": "Wrote scenario.schema.json\n"
+    },
+    {
+      "command": "tests/test_emulator_contracts.py",
+      "exit_code": 0,
+      "output": "......\n----------------------------------------------------------------------\nRan 6 tests in 0.001s\n\nOK\n"
+    },
+    {
+      "command": "tests/validate_emulator_inventory.py",
+      "exit_code": 0,
+      "output": "PASS: schema, references, invalid-data rejection, source hashes, callback candidates and route anchors\n"
+    },
+    {
+      "command": "tests/run_emulator_parser_tests.py",
+      "exit_code": 0,
+      "output": "PASS: five response families, six chunk sizes, fields, duplicate probes, ICMP exclusion, CSV escaping, empty/error/timeout cases\n"
+    }
+  ],
+  "scope": "Phase 1 specifications and native parser tests; no live browser emulator",
+  "registration_sites": 452,
+  "current_contracts": 406,
+  "deferred_contracts": 46,
+  "external_symbols": 531,
+  "source_hashes": {
+    "main/main.c": "900e1adfedca93ce66e72fcee7764b807076badab14600c5c57380ed26a5a014",
+    "main/screens/cgw_parser.c": "65309137e1b643147a16286bd946e3b10ab61ae1b8a3135f9f522b10c048655d",
+    "main/screens/psram_dynarr.c": "f107d20831202bbb198e54fed0ae925b68d6c343de71ab5b3cccc3825e622bc6",
+    "main/screens/subghz_hunter_screen.c": "74e7831acc02c609a8b658a9cf5645ae992192da96ddc3f5f54cfc4337d6e197",
+    "main/screens/subghz_hunter_settings_screen.c": "f482581abaec08d66d2214f7d0b8ea06136a234d608efab07987c54206f9fd0d",
+    "main/screens/subghz_jammer_screen.c": "db69e347feb02cbd8ddf151735045c4e736bf31572befbc8aa6aaf4c6c35b88d",
+    "main/screens/subghz_listen_screen.c": "3bd6e3ef129c980001eba386c0dbac6d7a4b8a8fc3f74f73be6fe719af24e5da",
+    "main/screens/subghz_listen_settings_screen.c": "4660d9545b7aa182efbe319b826804a0598bd42cdff5cc23ee7e6fac011c4e26",
+    "main/screens/subghz_manage_screen.c": "96e8f65f20565675e7a9b7d39f97ea32f9f054c1ccb88b8bbf8e53df60b54a59",
+    "main/screens/subghz_parser.c": "d0f7781ba6dd16db8a8e9f811ae91a3ab0c4a9f8d06337ebaded0f705b31e677",
+    "main/screens/subghz_rf_settings.c": "0e29a4beea227f154cf8cc7f2e3901cd47cdd7d7699f5729c02a3aa2e2ff03ff",
+    "main/screens/subghz_scanner_screen.c": "7c98f7ac9887c6a3fcb64b77c81f538d129f4be68af89aa426bf86fb63e85e6c",
+    "main/screens/subghz_scanner_settings_screen.c": "71cfbc78d4137c051949e5ce8ddfb8e22ab03d4b07e05897cc1b7e51913a73e2",
+    "main/screens/subghz_screen.c": "ce43a283b781a9b3080bedf08cd50efac7f761ab3bed83785c02919c3491d634",
+    "main/screens/subghz_settings_screen.c": "f46e6c84d565c7aead9756fb8137801b205046228985a1e9bb7a2125f1079201",
+    "main/screens/subghz_signal_list.c": "e62217f7953233ca75c174edbdef5e1dd55600309a5cc79e87381a90259c7056",
+    "main/screens/subghz_tesla_screen.c": "b264a6455f80a1240608d733eee9707168d3e74c17b422546650c81b234fa863",
+    "main/screens/subghz_text_input_popup.c": "338399e27626d67c2c9050d3c1f3427f00d41dc3c36746868472f68c23fb67a5",
+    "main/screens/subghz_weather_screen.c": "9dbc5096d4a63d2445318965fae497bc824598dfafdbdcec54110f7635cccfeb"
+  },
+  "artifact_sha256": {
+    "tools/ui_emulator/control-identities.json": "57076231eaf86239b430b635a888d6b35e3fef4e182fa7b7059dd58a99286c56",
+    "tools/ui_emulator/control-contracts.json": "a3f2da0c9630ace13ea36a52cdd0c14aa1a52c0d060601725bba2e5f9bb1cacd",
+    "tools/ui_emulator/adapter-decisions.json": "ef044bcc139310a86148f8851afce28bde7db09b63c8d911a59b9e3cab627da5",
+    "tools/ui_emulator/dependency-registry.json": "4c62f5903559224e64db129acd1da60a6f1ec3e99ccb1063bb9c4886c43337e6",
+    "docs/ui-emulator/neon-district.seed.json": "a2862050d87adb855250d96906bf6404138fe04dfbc772e107d2358721342711"
+  }
+}

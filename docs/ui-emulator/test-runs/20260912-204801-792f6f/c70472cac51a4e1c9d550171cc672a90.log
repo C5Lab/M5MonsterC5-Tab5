@@ -1,0 +1,41 @@
+EXEC node --test tests/test_emulator_persistence.mjs
+✔ transfer baud accepts only firmware choices, survives reload and resets (1.1059ms)
+✔ settings survive reconstruction; reset restores defaults without clearing unrelated storage (1.6733ms)
+✔ legacy settings migrate once and do not return after reset (0.238ms)
+✔ corrupt, future and invalid settings recover to safe defaults (0.182ms)
+✔ denied storage and quota exhaustion keep settings usable for this session (0.431ms)
+✔ invalid writes cannot replace a valid value (0.2275ms)
+✔ existing Wardrive adapter settings remain writable and migrate (0.2347ms)
+✔ session fallback survives reboot and overrides stale disk after a failed reset write (0.1994ms)
+ℹ tests 8
+ℹ suites 0
+ℹ pass 8
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 89.6423
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_time.py
+test_format_visibility_dst_reload_and_reset (__main__.TimeTests.test_format_visibility_dst_reload_and_reset) ... ok
+test_invalid_calendar_date_does_not_change_clock (__main__.TimeTests.test_invalid_calendar_date_does_not_change_clock) ... ok
+test_picker_edits_persist_and_clock_ticks_in_all_rotations (__main__.TimeTests.test_picker_edits_persist_and_clock_ticks_in_all_rotations) ... ok
+
+----------------------------------------------------------------------
+Ran 3 tests in 10.529s
+
+OK
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_phase4_audit.py
+test_all_back_routes_covered_or_deferred (__main__.CoverageAudit.test_all_back_routes_covered_or_deferred)
+Every back route works, unless it is an explicitly deferred screen. ... ok
+test_every_ledger_control_is_categorized (__main__.CoverageAudit.test_every_ledger_control_is_categorized)
+No dead control may ship without a documented reason. ... ok
+test_ledger_control_total_conserved (__main__.CoverageAudit.test_ledger_control_total_conserved) ... ok
+test_matches_committed_baseline (__main__.CoverageAudit.test_matches_committed_baseline)
+Guard against silent coverage regressions or stale baselines. ... ok
+test_open_items_are_identified (__main__.CoverageAudit.test_open_items_are_identified)
+Each open item carries a category and a human-readable reason. ... ok
+
+----------------------------------------------------------------------
+Ran 5 tests in 0.109s
+
+OK

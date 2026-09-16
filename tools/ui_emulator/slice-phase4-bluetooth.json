@@ -1,0 +1,16 @@
+{
+  "show_bluetooth_menu_page": "retain",
+  "bt_menu_tile_event_cb": "retain",
+  "bt_menu_back_btn_event_cb": "retain",
+  "show_bt_scan_page": "retain",
+  "bt_scan_back_btn_event_cb": "retain",
+  "bt_scan_rescan_cb": "adapter",
+  "bt_scan_device_click_cb": "adapter",
+  "parse_bt_device_line": "retain",
+  "show_bt_locator_page": "retain",
+  "bt_locator_tracking_back_btn_event_cb": "adapter",
+  "bt_locator_tracking_task": "unsupported",
+  "transport_read_bytes": "adapter",
+  "show_airtag_scan_page": "unsupported",
+  "show_jammer_page": "unsupported"
+}

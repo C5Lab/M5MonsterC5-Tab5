@@ -362,7 +362,7 @@ void show_subghz_scanner_page(void)
     lv_obj_set_flex_flow(grid, LV_FLEX_FLOW_ROW_WRAP);
     lv_obj_set_flex_align(grid, LV_FLEX_ALIGN_SPACE_EVENLY,
                           LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
-    lv_obj_clear_flag(grid, LV_OBJ_FLAG_SCROLLABLE);
+    subghz_grid_scrollable(grid);
 
     for (int i = 0; i < MAX_FREQ_TILES; i++) make_freq_tile(st, grid, i);
     refresh_tiles(st);

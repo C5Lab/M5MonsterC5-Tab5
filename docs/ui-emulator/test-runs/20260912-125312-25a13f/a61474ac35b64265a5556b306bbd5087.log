@@ -1,0 +1,15 @@
+✔ settings survive reconstruction; reset restores defaults without clearing unrelated storage (0.5947ms)
+✔ legacy settings migrate once and do not return after reset (0.1359ms)
+✔ corrupt, future and invalid settings recover to safe defaults (0.5912ms)
+✔ denied storage and quota exhaustion keep settings usable for this session (0.2829ms)
+✔ invalid writes cannot replace a valid value (0.2059ms)
+✔ existing Wardrive adapter settings remain writable and migrate (0.1051ms)
+✔ session fallback survives reboot and overrides stale disk after a failed reset write (0.1117ms)
+ℹ tests 7
+ℹ suites 0
+ℹ pass 7
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 72.3728

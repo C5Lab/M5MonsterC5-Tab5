@@ -1,0 +1,48 @@
+flowchart LR
+    shell["Persistent tab shell"]
+    internal["Internal tools"]
+    adhoc["Ad Hoc Portal & Karma"]
+    settings["Settings"]
+    scan_cfg["Scan Setup popup"]
+    red["Red Team page / disclaimer"]
+    timeout["Screen Timeout popup"]
+    brightness["Screen Brightness popup"]
+    rotation["Screen Rotation popup"]
+    theme["Theme popup"]
+    time["Time popup"]
+    lock["Screen Lock popup"]
+    ota["Monster OTA page / modals"]
+    sdadmin["Monster SD Admin / leave dialog"]
+    baud["Transfer Speed popup"]
+    home["Transport dashboard"]
+    bt["Bluetooth menu"]
+    airtag["AirTag Scan"]
+    btscan["BT Scan & Locate"]
+    locator["BT Locator"]
+    jammer["2.4 GHz Jammer"]
+    shell -- "tap Internal tab" --> internal
+    internal -- "tap Settings" --> settings
+    internal -- "tap Ad Hoc Portal & Karma" --> adhoc
+    settings -- "tap Scan Setup" --> scan_cfg
+    settings -- "tap Red Team" --> red
+    settings -- "tap Screen Timeout" --> timeout
+    settings -- "tap Screen Brightness" --> brightness
+    settings -- "tap Screen Rotation" --> rotation
+    settings -- "tap Theme" --> theme
+    settings -- "tap Time" --> time
+    settings -- "tap Screen Lock" --> lock
+    settings -- "tap Monster OTA" --> ota
+    settings -- "tap Monster SD Admin" --> sdadmin
+    settings -- "tap Transfer Speed" --> baud
+    home -- "tap Bluetooth" --> bt
+    bt -- "tap AirTag Scan" --> airtag
+    bt -- "tap BT Scan & Locate" --> btscan
+    bt -. "tap Jammer; Red Team tile only" .-> jammer
+    btscan -- "tap discovered device" --> locator
+    btscan -- "tap Rescan" --> btscan
+    classDef screen fill:#111827,color:#f9fafb,stroke:#7dd3fc,stroke-width:1.5px;
+    classDef popup fill:#2a2036,color:#f9fafb,stroke:#d8b4fe,stroke-width:1.5px;
+    classDef condition fill:#3a2d12,color:#fff7d6,stroke:#f2b84b,stroke-width:1.5px;
+    class boot,splash,shell,uart,mbus,internal,home,hub,scan,observer,global,data,bt,subghz,settings,analysis,local,remote screen;
+    class no_board,net_popup,client_popup,deauth,evil,sae,handshake,mitm,rogue_gitm,blackout,sniffer,global_hs,portal,transfer,packet,summary,flows,entities,health,map,tools,objects,delete,scan_cfg,red,timeout,brightness,rotation,theme,time,lock,ota,sdadmin,baud,listen_action,listen_leave,tx_warn,hunter_action,hunter_leave,manage_action,rename,repeat popup;
+    class sd condition;

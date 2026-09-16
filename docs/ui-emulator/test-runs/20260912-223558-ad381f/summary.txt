@@ -1,0 +1,14 @@
+
+TEST SUMMARY
+==============================================================================
+guided_dialogs
+  PASS            0.11s  test_emulator_stories.mjs test_emulator_dialogs.mjs
+  PASS           27.94s  test_emulator_stories.py
+  PASS           11.27s  test_emulator_story_lifecycle.py
+  PASS           18.93s  test_emulator_dialogs.py
+  PASS            0.25s  test_emulator_phase4_audit.py
+------------------------------------------------------------------------------
+Result: PASS | scripts PASS: 5 | FAIL/ERROR: 0
+Total elapsed: 58.51s
+Section wrapper times include their children; do not add them together.
+Report: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\docs\ui-emulator\test-runs\20260912-223558-ad381f\summary.json

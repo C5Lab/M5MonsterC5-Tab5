@@ -1,0 +1,16 @@
+✔ all seven simulated operations start, change and stop without another module changing (4.251ms)
+✔ cancel, disconnect and reset never resurrect jobs or write captures (0.382ms)
+✔ invalid inputs never reserve the module and credentials never enter model history (0.3846ms)
+✔ MITM creates target-specific PCAP only on stop and handles SD/quota failures atomically (0.5082ms)
+✔ clock slicing produces identical bounded simulated results (0.6399ms)
+✔ Observer preserves scenario identities, changes activity, freezes on stop and resets (0.4575ms)
+✔ SAE requires exactly one scenario target and rejects invalid selection without reserving radio (2.3168ms)
+✔ SAE cancellation, module disconnect and reset cannot resume old activity (0.4265ms)
+ℹ tests 8
+ℹ suites 0
+ℹ pass 8
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 99.5198

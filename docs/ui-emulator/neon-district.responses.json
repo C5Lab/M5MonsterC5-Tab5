@@ -1,0 +1,10 @@
+{
+  "status": "draft-response-bodies-not-full-session-replay",
+  "responses": {
+    "show_scan_results": "\"1\",\"NEON-BAZAAR\",\"\",\"02:20:77:00:00:01\",\"1\",\"WPA2\",\"-38\",\"2.4GHz\"\n\"2\",\"GHOST-LINE\",\"\",\"02:20:77:00:00:02\",\"1\",\"WPA2\",\"-47\",\"2.4GHz\"\n\"3\",\"CHROME-CLINIC\",\"\",\"02:20:77:00:00:03\",\"6\",\"WPA2/WPA3 Mixed\",\"-56\",\"2.4GHz\"\n\"4\",\"BLACK-ICE\",\"\",\"02:20:77:00:00:04\",\"36\",\"WPA3\",\"-65\",\"5GHz\"\n\"5\",\"AFTERLIFE-GUEST\",\"\",\"02:20:77:00:00:05\",\"11\",\"Open\",\"-74\",\"2.4GHz\"\n\"6\",\"SYNAPSE-RELAY\",\"\",\"02:20:77:00:00:06\",\"44\",\"WPA2\",\"-83\",\"5GHz\"\n\"7\",\"NIGHT-CITY\",\"\",\"02:20:77:00:00:07\",\"8\",\"WPA2\",\"-61\",\"2.4GHz\"\n\"8\",\"VOODOO-BOYS\",\"\",\"02:20:77:00:00:08\",\"9\",\"WPA2\",\"-64\",\"2.4GHz\"\n\"9\",\"SAMURAI\",\"\",\"02:20:77:00:00:09\",\"10\",\"WPA2\",\"-67\",\"2.4GHz\"\n\"10\",\"BRAINDANCE\",\"\",\"02:20:77:00:00:0A\",\"11\",\"WPA2\",\"-70\",\"2.4GHz\"\n\"11\",\"NETRUNNER\",\"\",\"02:20:77:00:00:0B\",\"1\",\"WPA2\",\"-73\",\"2.4GHz\"\n\"12\",\"AFTERLIFE\",\"\",\"02:20:77:00:00:0C\",\"2\",\"WPA2\",\"-76\",\"2.4GHz\"\nScan results printed.\n",
+    "scan_bt": "BLE scan starting (10 seconds)...\n\n=== BLE Scan Results ===\nFound 6 devices:\n\n  1. 02:20:77:02:00:01  RSSI: -44 dBm  Name: NEURODECK-07\n  2. 02:20:77:02:00:02  RSSI: -51 dBm  Name: GHOST-EARPIECE\n  3. 02:20:77:02:00:03  RSSI: -58 dBm  Name: CHROME-PULSE\n  4. 02:20:77:02:00:04  RSSI: -65 dBm  Name: SYNAPSE-BAND\n  5. 02:20:77:02:00:05  RSSI: -72 dBm  Name: NIGHT-COURIER\n  6. 02:20:77:02:00:06  RSSI: -79 dBm\n\nSummary: 0 AirTags, 0 SmartTags, 6 total devices\n",
+    "list_hosts": "Our IP: 192.0.2.10, Netmask: 255.255.255.0\n=== Discovered Hosts ===\n  192.0.2.20  ->  02:20:77:01:00:01  [ARP]\n  192.0.2.21  ->  02:20:77:01:00:02  [ARP]\n  192.0.2.22  ->  02:20:77:01:00:03  [ARP]\n========================\nFound 3 hosts (3 via ARP, 0 via ICMP)\n",
+    "list_probes": "1 NEON-BAZAAR\n2 GHOST-LINE\n3 AFTERLIFE-GUEST\n",
+    "list_sd": "HTML files found on SD card:\n1 neon-bazaar.html\n2 afterlife-guest.html\n"
+  }
+}

@@ -1,0 +1,30 @@
+test_cancel_busy_speed_and_reset_are_independent_of_guide (__main__.StoryLifecycleBrowser.test_cancel_busy_speed_and_reset_are_independent_of_guide) ... 
+  test_cancel_busy_speed_and_reset_are_independent_of_guide (__main__.StoryLifecycleBrowser.test_cancel_busy_speed_and_reset_are_independent_of_guide) (rotation=2) ... FAIL
+  test_cancel_busy_speed_and_reset_are_independent_of_guide (__main__.StoryLifecycleBrowser.test_cancel_busy_speed_and_reset_are_independent_of_guide) (rotation=3) ... FAIL
+test_download_retry_and_reset_recovery_keep_guide_disabled_until_ready (__main__.StoryLifecycleBrowser.test_download_retry_and_reset_recovery_keep_guide_disabled_until_ready) ... ok
+test_each_module_condition_starts_a_fresh_volatile_session (__main__.StoryLifecycleBrowser.test_each_module_condition_starts_a_fresh_volatile_session) ... ok
+test_interrupted_download_recovers_on_third_attempt (__main__.StoryLifecycleBrowser.test_interrupted_download_recovers_on_third_attempt) ... ok
+test_restart_leave_fullscreen_and_rotation_all_orientations (__main__.StoryLifecycleBrowser.test_restart_leave_fullscreen_and_rotation_all_orientations) ... ok
+
+======================================================================
+FAIL: test_cancel_busy_speed_and_reset_are_independent_of_guide (__main__.StoryLifecycleBrowser.test_cancel_busy_speed_and_reset_are_independent_of_guide) (rotation=2)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tests\test_emulator_story_lifecycle.py", line 58, in test_cancel_busy_speed_and_reset_are_independent_of_guide
+    self.assertTrue(p.locator('#timing').is_disabled())
+    ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: False is not true
+
+======================================================================
+FAIL: test_cancel_busy_speed_and_reset_are_independent_of_guide (__main__.StoryLifecycleBrowser.test_cancel_busy_speed_and_reset_are_independent_of_guide) (rotation=3)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tests\test_emulator_story_lifecycle.py", line 58, in test_cancel_busy_speed_and_reset_are_independent_of_guide
+    self.assertTrue(p.locator('#timing').is_disabled())
+    ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: False is not true
+
+----------------------------------------------------------------------
+Ran 5 tests in 31.613s
+
+FAILED (failures=2)

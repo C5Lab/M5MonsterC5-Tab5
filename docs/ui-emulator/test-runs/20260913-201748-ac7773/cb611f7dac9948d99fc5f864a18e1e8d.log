@@ -1,0 +1,26 @@
+EXEC node --test tests/test_emulator_portal_story.mjs
+✔ S08 exposes three independent client & password demos (0.9417ms)
+✔ evil-twin rejects wrong target, hidden view and stale run, then completes (0.2288ms)
+✔ rogue-ap rejects wrong target, hidden view and stale run, then completes (0.0905ms)
+✔ internal-portal runs on the INTERNAL tab and needs the portal page (0.119ms)
+✔ disconnection pauses any portal story (0.1465ms)
+✔ evil_twin yields the fixed demo password and freezes on disconnect (1.2586ms)
+✔ rogue_ap yields the fixed demo password and freezes on disconnect (0.2934ms)
+✔ portal_demo yields the fixed demo password and freezes on disconnect (0.2715ms)
+ℹ tests 8
+ℹ suites 0
+ℹ pass 8
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 62.9673
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_portal_story.py
+test_all_three_demos_across_rotations (__main__.PortalStoryBrowser.test_all_three_demos_across_rotations) ... ok
+test_cancel_before_submission_does_not_complete (__main__.PortalStoryBrowser.test_cancel_before_submission_does_not_complete) ... ok
+test_stories_are_independent_of_the_previous_session (__main__.PortalStoryBrowser.test_stories_are_independent_of_the_previous_session) ... ok
+
+----------------------------------------------------------------------
+Ran 3 tests in 25.170s
+
+OK

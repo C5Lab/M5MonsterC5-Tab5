@@ -1,0 +1,12 @@
+test_beacon_list_start_empty_and_rotations (__main__.Queue2AttacksBrowser.test_beacon_list_start_empty_and_rotations) ... ok
+test_global_confirm_no_yes_stop_and_rotations (__main__.Queue2AttacksBrowser.test_global_confirm_no_yes_stop_and_rotations) ... ok
+test_handshake_no_result_does_not_claim_capture (__main__.Queue2AttacksBrowser.test_handshake_no_result_does_not_claim_capture) ... ok
+test_handshake_wrong_target_and_busy_refusal (__main__.Queue2AttacksBrowser.test_handshake_wrong_target_and_busy_refusal) ... ok
+test_karma_menu_and_rotations (__main__.Queue2AttacksBrowser.test_karma_menu_and_rotations) ... ok
+test_restart_wrong_module_disconnect_and_busy (__main__.Queue2AttacksBrowser.test_restart_wrong_module_disconnect_and_busy) ... ok
+test_scan_actions_success_cancel_and_rotations (__main__.Queue2AttacksBrowser.test_scan_actions_success_cancel_and_rotations) ... ok
+
+----------------------------------------------------------------------
+Ran 7 tests in 85.503s
+
+OK

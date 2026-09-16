@@ -1,0 +1,36 @@
+{
+  "status": "FAIL",
+  "seconds": 140.63726769998902,
+  "checks": [
+    {
+      "section": "sae",
+      "name": "test_emulator_sae.mjs test_emulator_attacks.mjs",
+      "started": 1789217313.1549234,
+      "seconds": 0.15572120000433642,
+      "status": "PASS",
+      "exit_code": 0,
+      "log": "C:\\Users\\mati\\Documents\\GitHub\\M5MonsterC5-Tab5\\docs\\ui-emulator\\test-runs\\20260912-144833-9fe5b9\\2a5c195699054a6bac0a7f5b7ac48560.log",
+      "aggregate": false
+    },
+    {
+      "section": "sae",
+      "name": "test_emulator_sae.py",
+      "started": 1789217313.3116982,
+      "seconds": 8.239108699999633,
+      "status": "PASS",
+      "exit_code": 0,
+      "log": "C:\\Users\\mati\\Documents\\GitHub\\M5MonsterC5-Tab5\\docs\\ui-emulator\\test-runs\\20260912-144833-9fe5b9\\dce5ccc586194594ac9acf6891759215.log",
+      "aggregate": false
+    },
+    {
+      "section": "sae",
+      "name": "test_emulator_phase4_attacks.py",
+      "started": 1789217321.551288,
+      "seconds": 132.22297790000448,
+      "status": "FAIL",
+      "exit_code": 1,
+      "log": "C:\\Users\\mati\\Documents\\GitHub\\M5MonsterC5-Tab5\\docs\\ui-emulator\\test-runs\\20260912-144833-9fe5b9\\efb7fa64b7f24f23ba59b0d6fad22133.log",
+      "aggregate": false
+    }
+  ]
+}

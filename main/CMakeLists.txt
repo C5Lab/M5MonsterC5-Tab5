@@ -1,5 +1,10 @@
+file(TO_CMAKE_PATH "$ENV{IDF_PATH}" HS_CRACK_IDF_PATH)
 idf_component_register(SRCS
                     "main.c"
+                    "app_power_manager.c"
+                    "app_power_telemetry.c"
+                    "scan_filter.c"
+                    "hs_crack_crypto.c"
                     "lv_font_lato_regular_ttf.c"
                     "screens/psram_dynarr.c"
                     "screens/cgw_parser.c"
@@ -20,6 +25,7 @@ idf_component_register(SRCS
                     "screens/subghz_weather_screen.c"
                     "screens/subghz_settings_screen.c"
                     INCLUDE_DIRS "." "screens"
-                    REQUIRES lvgl m5stack_tab5 nvs_flash esp_lvgl_port driver esp_netif esp_event esp_wifi espressif__esp_hosted esp_http_server esp_http_client fatfs janos_file_transfer pcap_reader pcap_summary pcap_flow pcap_analysis_store pcap_investigation pcap_extract pthread)
+                    PRIV_INCLUDE_DIRS "${HS_CRACK_IDF_PATH}/components/mbedtls/mbedtls/library"
+                    REQUIRES lvgl m5stack_tab5 nvs_flash esp_lvgl_port driver esp_pm esp_netif esp_event esp_wifi espressif__esp_hosted esp_http_server esp_http_client fatfs janos_file_transfer pcap_reader pcap_summary pcap_flow pcap_analysis_store pcap_investigation pcap_extract pthread mbedtls)
 
 target_compile_definitions(${COMPONENT_LIB} PRIVATE LV_LVGL_H_INCLUDE_SIMPLE)

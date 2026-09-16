@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="700" viewBox="0 0 1080 700">
+<title>compromised_transfer_show_popup</title>
+<rect width="100%" height="100%" fill="#111827"/>
+<text x="28" y="38" fill="#7dd3fc" font-family="monospace" font-size="21">compromised_transfer_show_popup</text>
+<text x="28" y="69" fill="#fbbf24" font-family="sans-serif" font-size="17">SOURCE DIAGRAM - not a screenshot or screen render</text>
+<text x="28" y="110" fill="#7dd3fc" font-family="monospace" font-size="16">SOURCE</text>
+<text x="28" y="133" fill="#e5e7eb" font-family="monospace" font-size="16">main/main.c:56809</text>
+<text x="28" y="156" fill="#e5e7eb" font-family="monospace" font-size="16"></text>
+<text x="28" y="179" fill="#7dd3fc" font-family="monospace" font-size="16">DIRECT TEXT LITERALS IN THIS FUNCTION</text>
+<text x="28" y="202" fill="#e5e7eb" font-family="monospace" font-size="16"> Sync Monster SD Copy to Tab5</text>
+<text x="28" y="225" fill="#e5e7eb" font-family="monospace" font-size="16">PCAP file</text>
+<text x="28" y="248" fill="#e5e7eb" font-family="monospace" font-size="16">Preparing transfer...</text>
+<text x="28" y="271" fill="#e5e7eb" font-family="monospace" font-size="16">The original file will remain on the Monster.</text>
+<text x="28" y="294" fill="#e5e7eb" font-family="monospace" font-size="16">Cancel</text>
+<text x="28" y="317" fill="#e5e7eb" font-family="monospace" font-size="16"></text>
+<text x="28" y="340" fill="#7dd3fc" font-family="monospace" font-size="16">SOURCE DIMENSIONS (UNEVALUATED EXPRESSIONS)</text>
+<text x="28" y="363" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_size(compromised_transfer_ui.overlay, lv_pct(100), lv_pct(100));</text>
+<text x="28" y="386" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_size(compromised_transfer_ui.popup, popup_clamp_w(680), 340);</text>
+<text x="28" y="409" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_width(name, lv_pct(100));</text>
+<text x="28" y="432" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_width(compromised_transfer_ui.status_label, lv_pct(100));</text>
+<text x="28" y="455" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_size(compromised_transfer_ui.progress_bar, 580, 24);</text>
+<text x="28" y="478" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_width(compromised_transfer_ui.detail_label, lv_pct(100));</text>
+<text x="28" y="501" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_size(compromised_transfer_ui.action_btn, 180, 48);</text>
+<text x="28" y="524" fill="#e5e7eb" font-family="monospace" font-size="16"></text>
+<text x="28" y="547" fill="#7dd3fc" font-family="monospace" font-size="16">EVENTS -&gt; CALLBACKS</text>
+<text x="28" y="570" fill="#e5e7eb" font-family="monospace" font-size="16">compromised_transfer_close_or_cancel_cb</text>
+<text x="28" y="593" fill="#e5e7eb" font-family="monospace" font-size="16"></text>
+<text x="28" y="616" fill="#7dd3fc" font-family="monospace" font-size="16">DIRECT UI FUNCTION CALLS</text>
+<text x="28" y="639" fill="#e5e7eb" font-family="monospace" font-size="16">—</text>
+<text x="28" y="662" fill="#e5e7eb" font-family="monospace" font-size="16"></text>
+</svg>

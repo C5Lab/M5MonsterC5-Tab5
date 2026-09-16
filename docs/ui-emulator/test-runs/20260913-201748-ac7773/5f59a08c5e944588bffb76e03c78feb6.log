@@ -1,0 +1,372 @@
+EXEC node --test tests/test_emulator_stories.mjs tests/test_emulator_startup_story.mjs tests/test_emulator_wifi_stories.mjs tests/test_emulator_recon_stories.mjs tests/test_emulator_dialogs.mjs
+✔ slot activates only after successful reboot; cancellation and disconnect retain running image (1.8717ms)
+✔ firmware update refreshes the running slot image (0.3321ms)
+✔ Observer: fresh independent discovery, capture, both exit decisions and home (0.9309ms)
+✔ Mesh: changing counters, native nodes, Stop preserves results, Clear and Back (0.16ms)
+✔ Old sessions, modules, hidden views, earlier runs and restart do not advance (0.7534ms)
+✔ Hidden observation and a new run reset partial evidence (0.1466ms)
+✔ External cancellation cannot replace native Stop or preserve progress (0.1144ms)
+✔ Wrong target, previous capture and absent file cannot complete capture (0.1549ms)
+✔ ordered startup tour: normal (0.9474ms)
+✔ ordered startup tour: missing-board (0.1315ms)
+✔ ordered startup tour: missing-sd (0.9334ms)
+✔ ordered startup tour: version-mismatch (0.1562ms)
+✔ wrong screen, unseen warning, stale session and hidden document cannot advance (0.204ms)
+✔ partial card viewing resets when the card is clipped or another tab is selected (0.1434ms)
+✔ SD warning must belong to the requested Grove Wardrive route (0.0976ms)
+✔ guide advances only from ordered native events for the right module and target (1.4501ms)
+✔ disconnect, premature back, restart and leaving cannot manufacture completion (0.1659ms)
+✔ events from a previous guide session cannot enter a restarted story (0.1157ms)
+✔ visibility and module transitions reset an unfinished observation window (0.1421ms)
+✔ scan story normal (1.047ms)
+✔ scan story hidden (0.1742ms)
+✔ scan story empty (0.0942ms)
+✔ scan story cancel (0.0891ms)
+✔ radar requires rejected invalid selections, correct target, live samples and native stop (0.2267ms)
+✔ stale scans, wrong module, stale epoch, cancelled scans and restart cannot supply evidence (0.1175ms)
+✔ demo variants do not mutate the original seed (0.1962ms)
+✔ Radar completes only after an observed live signal and completed native return (0.1489ms)
+✔ Radar does not credit hidden time, wrong targets, loss of signal or previous jobs (0.5309ms)
+✔ selection changes cannot reuse a rejection from another selection (0.2611ms)
+ℹ tests 29
+ℹ suites 0
+ℹ pass 29
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 94.8229
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_stories.py
+test_complete_native_story_all_rotations (__main__.BluetoothStoryBrowser.test_complete_native_story_all_rotations) ... ok
+test_hidden_browser_document_cannot_supply_viewing_evidence (__main__.BluetoothStoryBrowser.test_hidden_browser_document_cannot_supply_viewing_evidence) ... ok
+test_hidden_locator_does_not_advance_and_fullscreen_keeps_guide (__main__.BluetoothStoryBrowser.test_hidden_locator_does_not_advance_and_fullscreen_keeps_guide) ... ok
+test_no_signal_cannot_complete_and_conditions_reset_to_normal (__main__.BluetoothStoryBrowser.test_no_signal_cannot_complete_and_conditions_reset_to_normal) ... ok
+test_rescan_queued_before_restart_keeps_its_original_session (__main__.BluetoothStoryBrowser.test_rescan_queued_before_restart_keeps_its_original_session) ... ok
+test_restart_during_scan_delivery_rejects_previous_session (__main__.BluetoothStoryBrowser.test_restart_during_scan_delivery_rejects_previous_session) ... ok
+test_wrong_device_module_restart_and_reload_do_not_complete (__main__.BluetoothStoryBrowser.test_wrong_device_module_restart_and_reload_do_not_complete) ... ok
+
+----------------------------------------------------------------------
+Ran 7 tests in 27.999s
+
+OK
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_story_lifecycle.py
+test_cancel_busy_speed_and_reset_are_independent_of_guide (__main__.StoryLifecycleBrowser.test_cancel_busy_speed_and_reset_are_independent_of_guide) ... ok
+test_download_retry_and_reset_recovery_keep_guide_disabled_until_ready (__main__.StoryLifecycleBrowser.test_download_retry_and_reset_recovery_keep_guide_disabled_until_ready) ... ok
+test_each_module_condition_starts_a_fresh_volatile_session (__main__.StoryLifecycleBrowser.test_each_module_condition_starts_a_fresh_volatile_session) ... ok
+test_interrupted_download_recovers_on_third_attempt (__main__.StoryLifecycleBrowser.test_interrupted_download_recovers_on_third_attempt) ... ok
+test_restart_leave_fullscreen_and_rotation_all_orientations (__main__.StoryLifecycleBrowser.test_restart_leave_fullscreen_and_rotation_all_orientations) ... ok
+
+----------------------------------------------------------------------
+Ran 5 tests in 20.919s
+
+OK
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_startup_story.py
+WAIT 30s: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_startup_story.py
+test_all_conditions_and_rotations (__main__.StartupStoryBrowser.test_all_conditions_and_rotations) ... ok
+test_switching_story_requires_new_bluetooth_evidence (__main__.StartupStoryBrowser.test_switching_story_requires_new_bluetooth_evidence) ... ok
+test_wrong_module_warning_and_independent_status_cards (__main__.StartupStoryBrowser.test_wrong_module_warning_and_independent_status_cards) ... ok
+
+----------------------------------------------------------------------
+Ran 3 tests in 48.477s
+
+OK
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_wifi_stories.py
+test_preset_reload_reset_and_stale_scan (__main__.WiFiStoriesBrowser.test_preset_reload_reset_and_stale_scan) ... ok
+test_radar_background_cancel_reopen_and_restart (__main__.WiFiStoriesBrowser.test_radar_background_cancel_reopen_and_restart) ... ok
+test_radar_signal_stop_and_back_all_rotations (__main__.WiFiStoriesBrowser.test_radar_signal_stop_and_back_all_rotations) ... ok
+WAIT 30s: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_wifi_stories.py
+test_rejection_must_match_selection_at_the_time_of_the_action (__main__.WiFiStoriesBrowser.test_rejection_must_match_selection_at_the_time_of_the_action) ... ok
+test_scan_variants_all_rotations (__main__.WiFiStoriesBrowser.test_scan_variants_all_rotations) ... ok
+
+----------------------------------------------------------------------
+Ran 5 tests in 47.318s
+
+OK
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_recon_stories.py
+test_empty_observer_and_cancelled_capture_cannot_supply_result (__main__.ReconStoriesBrowser.test_empty_observer_and_cancelled_capture_cannot_supply_result) ... ok
+test_mesh_stop_clear_and_home_all_rotations (__main__.ReconStoriesBrowser.test_mesh_stop_clear_and_home_all_rotations) ... ok
+WAIT 30s: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_recon_stories.py
+test_observer_capture_and_both_exit_choices_all_rotations (__main__.ReconStoriesBrowser.test_observer_capture_and_both_exit_choices_all_rotations) ... ok
+test_observer_restart_and_disconnect_do_not_complete (__main__.ReconStoriesBrowser.test_observer_restart_and_disconnect_do_not_complete) ... ok
+test_restart_hidden_module_and_cancel_require_fresh_session (__main__.ReconStoriesBrowser.test_restart_hidden_module_and_cancel_require_fresh_session) ... ok
+
+----------------------------------------------------------------------
+Ran 5 tests in 56.186s
+
+OK
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_dialogs.py
+test_home_confirmation_no_yes_and_reopen (__main__.NativeDialogs.test_home_confirmation_no_yes_and_reopen) ... ok
+test_missing_board_all_rotations (__main__.NativeDialogs.test_missing_board_all_rotations) ... ok
+test_ota_slot_activation_all_rotations (__main__.NativeDialogs.test_ota_slot_activation_all_rotations) ... ok
+test_sd_cancel_continue_all_rotations (__main__.NativeDialogs.test_sd_cancel_continue_all_rotations) ... ok
+test_version_actions_all_rotations (__main__.NativeDialogs.test_version_actions_all_rotations) ... ok
+
+----------------------------------------------------------------------
+Ran 5 tests in 18.389s
+
+OK
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_phase4_audit.py
+test_all_back_routes_covered_or_deferred (__main__.CoverageAudit.test_all_back_routes_covered_or_deferred)
+Every back route works, unless it is an explicitly deferred screen. ... ok
+test_every_ledger_control_is_categorized (__main__.CoverageAudit.test_every_ledger_control_is_categorized)
+No dead control may ship without a documented reason. ... ok
+test_ledger_control_total_conserved (__main__.CoverageAudit.test_ledger_control_total_conserved) ... ok
+test_matches_committed_baseline (__main__.CoverageAudit.test_matches_committed_baseline)
+Guard against silent coverage regressions or stale baselines. ... ok
+test_open_items_are_identified (__main__.CoverageAudit.test_open_items_are_identified)
+Each open item carries a category and a human-readable reason. ... ok
+
+----------------------------------------------------------------------
+Ran 5 tests in 0.083s
+
+OK
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/verify_emulator_portal_story.py
+EXEC node --test tests/test_emulator_portal_story.mjs
+✔ S08 exposes three independent client & password demos (0.9417ms)
+✔ evil-twin rejects wrong target, hidden view and stale run, then completes (0.2288ms)
+✔ rogue-ap rejects wrong target, hidden view and stale run, then completes (0.0905ms)
+✔ internal-portal runs on the INTERNAL tab and needs the portal page (0.119ms)
+✔ disconnection pauses any portal story (0.1465ms)
+✔ evil_twin yields the fixed demo password and freezes on disconnect (1.2586ms)
+✔ rogue_ap yields the fixed demo password and freezes on disconnect (0.2934ms)
+✔ portal_demo yields the fixed demo password and freezes on disconnect (0.2715ms)
+ℹ tests 8
+ℹ suites 0
+ℹ pass 8
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 62.9673
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_portal_story.py
+test_all_three_demos_across_rotations (__main__.PortalStoryBrowser.test_all_three_demos_across_rotations) ... ok
+test_cancel_before_submission_does_not_complete (__main__.PortalStoryBrowser.test_cancel_before_submission_does_not_complete) ... ok
+test_stories_are_independent_of_the_previous_session (__main__.PortalStoryBrowser.test_stories_are_independent_of_the_previous_session) ... ok
+
+----------------------------------------------------------------------
+Ran 3 tests in 25.170s
+
+OK
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/verify_emulator_pcap_story.py
+EXEC node --test tests/test_emulator_pcap_story.mjs
+✔ S15 exposes analysis, investigate, extract and invalid variants (0.9244ms)
+✔ analysis walks every inspection submenu then returns (0.6261ms)
+✔ investigate covers packet, health, FQDN and export (0.1218ms)
+✔ extract reaches objects, preview and the SHA-256 hash (0.0918ms)
+✔ invalid capture guides recovery to a valid one (0.0918ms)
+✔ losing the capture pauses an analysis story (0.1377ms)
+ℹ tests 6
+ℹ suites 0
+ℹ pass 6
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 57.948
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_pcap_story.py
+test_analysis_walks_every_submenu (__main__.PcapStoryBrowser.test_analysis_walks_every_submenu) ... ok
+test_extract_objects_preview_and_hash (__main__.PcapStoryBrowser.test_extract_objects_preview_and_hash) ... ok
+test_invalid_capture_then_recovery_all_rotations (__main__.PcapStoryBrowser.test_invalid_capture_then_recovery_all_rotations) ... ok
+test_investigate_packet_health_fqdn_export (__main__.PcapStoryBrowser.test_investigate_packet_health_fqdn_export) ... ok
+
+----------------------------------------------------------------------
+Ran 4 tests in 6.484s
+
+OK
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/verify_emulator_settings_stories.py
+EXEC node --test tests/test_emulator_story_restart.mjs tests/test_emulator_settings_s18.mjs tests/test_emulator_settings_s19.mjs tests/test_emulator_settings_s20.mjs
+✔ S18 exposes scan save/validation and both disclaimer choices (1.072ms)
+✔ scan save requires changed native values, reopening and fresh GROVE scan (1.0274ms)
+✔ disclaimer cancellation and old state do not count as enabling (0.3642ms)
+✔ repeated scan story cannot credit Cancel against already saved defaults (0.1433ms)
+✔ disabled Red Team needs the restricted action bar and wrong tabs are ignored (0.1687ms)
+✔ restarting validation with old open error requires closing and reopening (0.1267ms)
+✔ timeout needs fresh changed preference and close/reopen before restoration (0.8597ms)
+✔ brightness requires saved release and actual canvas filter (0.8125ms)
+✔ hidden, wrong tab and stale epochs never advance (0.2404ms)
+✔ theme automatic rebuild still requires changed native preference and reopening (0.2665ms)
+✔ rotation handoff only follows native pending change and rejects invalid or replayed data (0.817ms)
+✔ date needs fresh native changed rollers, successful write and ticking clock (0.8329ms)
+✔ invalid calendar cannot advance on old failure or successful normalization (0.1598ms)
+✔ unchanged preferences, hidden context and stale epochs cannot progress (0.3205ms)
+✔ cancel requires unsaved edit and preserved offset on reopen (0.1602ms)
+✔ format must match RTC and DST must shift exactly one hour within RTC precision (0.1946ms)
+✔ native rotation handoff is consumed from the URL without storing progress (1.2723ms)
+✔ unrelated, malformed and unsupported handoffs cannot restore a guide (0.2365ms)
+ℹ tests 18
+ℹ suites 0
+ℹ pass 18
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 96.8797
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_settings_s18.py
+test_invalid_range_and_cancel_all_rotations (__main__.SettingsS18Browser.test_invalid_range_and_cancel_all_rotations) ... ok
+test_red_team_both_choices_all_rotations (__main__.SettingsS18Browser.test_red_team_both_choices_all_rotations) ... ok
+test_restart_rejects_old_validation_error_and_cancel_as_save (__main__.SettingsS18Browser.test_restart_rejects_old_validation_error_and_cancel_as_save) ... ok
+test_scan_save_all_rotations (__main__.SettingsS18Browser.test_scan_save_all_rotations) ... ok
+WAIT 30s: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/verify_emulator_settings_stories.py
+WAIT 30s: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_settings_s18.py
+test_wrong_module_and_restart_do_not_credit_existing_dialog (__main__.SettingsS18Browser.test_wrong_module_and_restart_do_not_credit_existing_dialog) ... ok
+
+----------------------------------------------------------------------
+Ran 5 tests in 30.604s
+
+OK
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_settings_s19.py
+test_brightness_effect_reopened_restored_all_rotations (__main__.SettingsS19Browser.test_brightness_effect_reopened_restored_all_rotations) ... ok
+test_close_without_change_restart_guide_and_wrong_tab (__main__.SettingsS19Browser.test_close_without_change_restart_guide_and_wrong_tab) ... ok
+test_rotation_native_restart_resumes_once_all_rotations (__main__.SettingsS19Browser.test_rotation_native_restart_resumes_once_all_rotations) ... ok
+test_theme_rebuild_reopen_restore_all_rotations (__main__.SettingsS19Browser.test_theme_rebuild_reopen_restore_all_rotations) ... ok
+WAIT 60s: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/verify_emulator_settings_stories.py
+WAIT 30s: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_settings_s19.py
+test_timeout_saved_reopened_restored_all_rotations (__main__.SettingsS19Browser.test_timeout_saved_reopened_restored_all_rotations) ... ok
+
+----------------------------------------------------------------------
+Ran 5 tests in 31.208s
+
+OK
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_settings_s20.py
+test_baud_saved_all_rotations (__main__.SettingsS20Browser.test_baud_saved_all_rotations) ... ok
+test_clock_preferences_all_rotations (__main__.SettingsS20Browser.test_clock_preferences_all_rotations) ... ok
+test_restart_requires_reopen_and_fresh_change (__main__.SettingsS20Browser.test_restart_requires_reopen_and_fresh_change) ... ok
+WAIT 90s: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/verify_emulator_settings_stories.py
+WAIT 30s: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_settings_s20.py
+test_set_invalid_and_cancel_all_rotations (__main__.SettingsS20Browser.test_set_invalid_and_cancel_all_rotations) ... ok
+
+----------------------------------------------------------------------
+Ran 4 tests in 39.897s
+
+OK
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/verify_emulator_queue2.py
+EXEC node --test tests/test_emulator_queue2_common.mjs tests/test_emulator_queue2_system.mjs tests/test_emulator_queue2_attacks.mjs tests/test_emulator_queue2_nettools.mjs tests/test_emulator_queue2_wardrive.mjs
+✔ all S09-S12 variants have isolated guides (1.4734ms)
+✔ deauth rejects stale, wrong target, hidden and changed run (0.367ms)
+✔ sae rejects stale, wrong target, hidden and changed run (0.1164ms)
+✔ handshake rejects stale, wrong target, hidden and changed run (0.0985ms)
+✔ beacon rejects stale, wrong target, hidden and changed run (0.1431ms)
+✔ blackout requires confirmation cancellation before start (0.1921ms)
+✔ global-handshaker requires confirmation cancellation before start (0.1014ms)
+✔ snifferdog requires confirmation cancellation before start (0.0753ms)
+✔ Handshake reserves its target and module and freezes on cancellation (2.2444ms)
+✔ karma-menu requires correct entry and a second fresh portal session (0.4273ms)
+✔ Beacon empty refusal needs an empty native list and no reserved operation (0.1986ms)
+✔ queue guide enforces native evidence, module, visibility and session (0.6742ms)
+✔ queue2-arp: stale, hidden, module and restart isolation (1.1506ms)
+✔ queue2-mitm: stale, hidden, module and restart isolation (0.1539ms)
+✔ queue2-nmap: stale, hidden, module and restart isolation (0.1173ms)
+✔ queue2-gitm-scan: stale, hidden, module and restart isolation (0.1209ms)
+✔ queue2-gitm-global: stale, hidden, module and restart isolation (0.1019ms)
+✔ queue2-arp: complete only with current native outcomes (0.3537ms)
+✔ queue2-mitm: complete only with current native outcomes (0.1413ms)
+✔ queue2-nmap: complete only with current native outcomes (0.1545ms)
+✔ queue2-gitm-scan: complete only with current native outcomes (0.1625ms)
+✔ queue2-gitm-global: complete only with current native outcomes (0.1833ms)
+✔ S21 reboot must belong to grove and a fresh completed native job (0.873ms)
+✔ S21 reboot must belong to mbus and a fresh completed native job (0.9147ms)
+✔ S21 cancelled slot cannot credit activation and leaves original image (0.301ms)
+✔ S21 SD requires native Stop and back for current service (0.2081ms)
+✔ S07 old run and disconnection cannot credit detection (0.2092ms)
+✔ Wardrive requires a fresh run, visible target module, observations and its own saved file (1.0516ms)
+✔ restart, stale epochs and hidden context do not advance recording (0.1981ms)
+✔ all Wardrive and file variants have observable predicates (0.439ms)
+✔ copy accepts an existing fixture but requires a fresh successful native copy of that exact file (0.3147ms)
+✔ delete requires both native confirmation decisions and preserves unrelated files (0.2697ms)
+✔ GPS failure setup precedes the fresh run; recovery requires native networks (0.1823ms)
+✔ Home target and provider must match before confirming a fresh session (0.2016ms)
+✔ WPA-SEC uses a new service job and verifies the two fixed demo results after cancel/retry (0.2634ms)
+✔ settings require a changed value and a new Apply, not a previously applied label (0.1651ms)
+✔ launching on INTERNAL still captures the existing GROVE run as the freshness floor (0.5772ms)
+ℹ tests 37
+ℹ suites 0
+ℹ pass 37
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 114.4708
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_queue2_system.py
+test_detector_full_history_still_accepts_new_session_events (__main__.Queue2SystemBrowser.test_detector_full_history_still_accepts_new_session_events) ... ok
+WAIT 30s: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/verify_emulator_queue2.py
+WAIT 30s: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_queue2_system.py
+test_detectors_stop_restart_and_back_all_rotations (__main__.Queue2SystemBrowser.test_detectors_stop_restart_and_back_all_rotations) ... ok
+test_each_module_reboot_all_rotations (__main__.Queue2SystemBrowser.test_each_module_reboot_all_rotations) ... ok
+test_ota_info_releases_update_and_cancel_all_rotations (__main__.Queue2SystemBrowser.test_ota_info_releases_update_and_cancel_all_rotations) ... ok
+WAIT 60s: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/verify_emulator_queue2.py
+WAIT 60s: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_queue2_system.py
+test_ota_slot_activate_and_cancel_all_rotations (__main__.Queue2SystemBrowser.test_ota_slot_activate_and_cancel_all_rotations) ... ok
+test_sd_admin_both_exit_choices_all_rotations (__main__.Queue2SystemBrowser.test_sd_admin_both_exit_choices_all_rotations) ... ok
+
+----------------------------------------------------------------------
+Ran 6 tests in 66.286s
+
+OK
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_queue2_attacks.py
+test_beacon_list_start_empty_and_rotations (__main__.Queue2AttacksBrowser.test_beacon_list_start_empty_and_rotations) ... ok
+WAIT 90s: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/verify_emulator_queue2.py
+test_global_confirm_no_yes_stop_and_rotations (__main__.Queue2AttacksBrowser.test_global_confirm_no_yes_stop_and_rotations) ... ok
+test_handshake_no_result_does_not_claim_capture (__main__.Queue2AttacksBrowser.test_handshake_no_result_does_not_claim_capture) ... ok
+WAIT 30s: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_queue2_attacks.py
+test_handshake_wrong_target_and_busy_refusal (__main__.Queue2AttacksBrowser.test_handshake_wrong_target_and_busy_refusal) ... ok
+test_karma_menu_and_rotations (__main__.Queue2AttacksBrowser.test_karma_menu_and_rotations) ... ok
+test_restart_wrong_module_disconnect_and_busy (__main__.Queue2AttacksBrowser.test_restart_wrong_module_disconnect_and_busy) ... ok
+WAIT 120s: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/verify_emulator_queue2.py
+WAIT 60s: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_queue2_attacks.py
+WAIT 150s: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/verify_emulator_queue2.py
+test_scan_actions_success_cancel_and_rotations (__main__.Queue2AttacksBrowser.test_scan_actions_success_cancel_and_rotations) ... ok
+
+----------------------------------------------------------------------
+Ran 7 tests in 85.503s
+
+OK
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_queue2_nettools.py
+WAIT 180s: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/verify_emulator_queue2.py
+WAIT 30s: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_queue2_nettools.py
+WAIT 210s: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/verify_emulator_queue2.py
+WAIT 60s: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_queue2_nettools.py
+WAIT 240s: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/verify_emulator_queue2.py
+WAIT 90s: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_queue2_nettools.py
+WAIT 270s: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/verify_emulator_queue2.py
+WAIT 120s: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_queue2_nettools.py
+WAIT 300s: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/verify_emulator_queue2.py
+WAIT 150s: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_queue2_nettools.py
+WAIT 330s: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/verify_emulator_queue2.py
+.......
+----------------------------------------------------------------------
+Ran 7 tests in 178.282s
+
+OK
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_queue2_wardrive.py
+WAIT 360s: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/verify_emulator_queue2.py
+WAIT 30s: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_queue2_wardrive.py
+test_files_empty_delete_cancel_and_copy_four_rotations (__main__.Queue2WardriveBrowser.test_files_empty_delete_cancel_and_copy_four_rotations) ... ok
+WAIT 390s: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/verify_emulator_queue2.py
+WAIT 60s: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_queue2_wardrive.py
+test_gps_home_and_blacklist_four_rotations (__main__.Queue2WardriveBrowser.test_gps_home_and_blacklist_four_rotations) ... ok
+WAIT 420s: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/verify_emulator_queue2.py
+WAIT 90s: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_queue2_wardrive.py
+WAIT 450s: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/verify_emulator_queue2.py
+WAIT 120s: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_queue2_wardrive.py
+test_handshakes_demo_upload_cancel_retry_four_rotations (__main__.Queue2WardriveBrowser.test_handshakes_demo_upload_cancel_retry_four_rotations) ... ok
+WAIT 480s: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/verify_emulator_queue2.py
+WAIT 150s: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_queue2_wardrive.py
+test_missing_gps_and_sd_four_rotations (__main__.Queue2WardriveBrowser.test_missing_gps_and_sd_four_rotations) ... ok
+test_native_uploaded_all_none_selection_is_distinct (__main__.Queue2WardriveBrowser.test_native_uploaded_all_none_selection_is_distinct) ... ok
+WAIT 510s: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/verify_emulator_queue2.py
+WAIT 180s: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_queue2_wardrive.py
+test_record_providers_and_settings_four_rotations (__main__.Queue2WardriveBrowser.test_record_providers_and_settings_four_rotations) ... ok
+WAIT 540s: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/verify_emulator_queue2.py
+WAIT 210s: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_queue2_wardrive.py
+test_restart_wrong_module_cancel_and_disconnect_do_not_complete (__main__.Queue2WardriveBrowser.test_restart_wrong_module_cancel_and_disconnect_do_not_complete) ... ok
+
+----------------------------------------------------------------------
+Ran 7 tests in 210.810s
+
+OK
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_runtime_inventory.py
+..
+----------------------------------------------------------------------
+Ran 2 tests in 0.010s
+
+OK

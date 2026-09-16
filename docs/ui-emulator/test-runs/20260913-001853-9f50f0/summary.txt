@@ -1,0 +1,53 @@
+
+TEST SUMMARY
+==============================================================================
+phase5_settings
+  PASS            0.11s  test_emulator_persistence.mjs
+  PASS           11.01s  test_emulator_phase5_settings.py
+  PASS           11.17s  verify_emulator_time.py
+  PASS           19.52s  verify_emulator_portal_demo.py
+  PASS           18.03s  verify_emulator_radar.py
+  PASS           12.42s  verify_emulator_settings_followup.py
+  FAIL          751.40s  verify_emulator_guided_dialogs.py
+time
+  PASS            0.13s  test_emulator_persistence.mjs
+  PASS           10.66s  test_emulator_time.py
+  PASS            0.23s  test_emulator_phase4_audit.py
+portal_demo
+  PASS            0.14s  test_emulator_portal_demo.mjs test_emulator_attacks.mjs test_emulator_bridge.mjs
+  PASS           18.98s  test_emulator_portal_demo.py
+  PASS            0.25s  test_emulator_phase4_audit.py
+radar
+  PASS            0.15s  test_emulator_radar.mjs test_emulator_attacks.mjs test_emulator_bridge.mjs
+  PASS           17.47s  test_emulator_radar.py
+  PASS            0.24s  test_emulator_phase4_audit.py
+settings_followup
+  PASS            0.11s  test_emulator_persistence.mjs
+  PASS            8.55s  test_emulator_transfer_speed.py
+  PASS            3.36s  test_emulator_observer_exit.py
+  PASS            0.24s  test_emulator_phase4_audit.py
+guided_dialogs
+  PASS            0.15s  test_emulator_stories.mjs test_emulator_startup_story.mjs test_emulator_wifi_stories.mjs test_emulator_recon_stories.mjs test_emulator_dialogs.mjs
+  PASS           29.48s  test_emulator_stories.py
+  PASS           23.79s  test_emulator_story_lifecycle.py
+  PASS           48.20s  test_emulator_startup_story.py
+  PASS           45.62s  test_emulator_wifi_stories.py
+  PASS           55.89s  test_emulator_recon_stories.py
+  PASS           18.20s  test_emulator_dialogs.py
+  PASS            0.23s  test_emulator_phase4_audit.py
+  FAIL          529.67s  verify_emulator_queue2.py
+queue2
+  PASS            0.17s  test_emulator_queue2_common.mjs test_emulator_queue2_system.mjs test_emulator_queue2_attacks.mjs test_emulator_queue2_nettools.mjs test_emulator_queue2_wardrive.mjs
+  PASS           63.40s  test_emulator_queue2_system.py
+  PASS           84.41s  test_emulator_queue2_attacks.py
+  PASS          175.89s  test_emulator_queue2_nettools.py
+  FAIL          205.67s  test_emulator_queue2_wardrive.py
+------------------------------------------------------------------------------
+Result: FAIL | scripts PASS: 27 | FAIL/ERROR: 1
+Total elapsed: 823.75s
+Section wrapper times include their children; do not add them together.
+Run incomplete: checks after the failure may NOT HAVE RUN. Missing entries are not passes.
+Failure log: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\docs\ui-emulator\test-runs\20260913-001853-9f50f0\cea5fa46901748b98eea947faf50b819.log
+Failure log: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\docs\ui-emulator\test-runs\20260913-001853-9f50f0\6427b39a8a654e2f8058cb55fb886de0.log
+Failure log: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\docs\ui-emulator\test-runs\20260913-001853-9f50f0\71b23b446dad4d54bff590a5859eac06.log
+Report: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\docs\ui-emulator\test-runs\20260913-001853-9f50f0\summary.json

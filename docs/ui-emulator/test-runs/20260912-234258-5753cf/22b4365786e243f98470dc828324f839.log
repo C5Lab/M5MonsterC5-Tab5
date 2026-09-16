@@ -1,0 +1,37 @@
+✔ slot activates only after successful reboot; cancellation and disconnect retain running image (1.6696ms)
+✔ firmware update refreshes the running slot image (0.2922ms)
+✔ Observer: fresh independent discovery, capture, both exit decisions and home (0.9496ms)
+✔ Mesh: changing counters, native nodes, Stop preserves results, Clear and Back (0.1696ms)
+✔ Old sessions, modules, hidden views, earlier runs and restart do not advance (0.7173ms)
+✔ Hidden observation and a new run reset partial evidence (0.138ms)
+✔ External cancellation cannot replace native Stop or preserve progress (0.1105ms)
+✔ Wrong target, previous capture and absent file cannot complete capture (0.1307ms)
+✔ ordered startup tour: normal (0.762ms)
+✔ ordered startup tour: missing-board (0.1644ms)
+✔ ordered startup tour: missing-sd (0.7206ms)
+✔ ordered startup tour: version-mismatch (0.0844ms)
+✔ wrong screen, unseen warning, stale session and hidden document cannot advance (0.1768ms)
+✔ partial card viewing resets when the card is clipped or another tab is selected (0.1254ms)
+✔ SD warning must belong to the requested Grove Wardrive route (0.0899ms)
+✔ guide advances only from ordered native events for the right module and target (1.3566ms)
+✔ disconnect, premature back, restart and leaving cannot manufacture completion (0.1605ms)
+✔ events from a previous guide session cannot enter a restarted story (0.1023ms)
+✔ visibility and module transitions reset an unfinished observation window (0.1223ms)
+✔ scan story normal (0.9627ms)
+✔ scan story hidden (0.1819ms)
+✔ scan story empty (0.0994ms)
+✔ scan story cancel (0.0998ms)
+✔ radar requires rejected invalid selections, correct target, live samples and native stop (0.2313ms)
+✔ stale scans, wrong module, stale epoch, cancelled scans and restart cannot supply evidence (0.1209ms)
+✔ demo variants do not mutate the original seed (0.2236ms)
+✔ Radar completes only after an observed live signal and completed native return (0.1542ms)
+✔ Radar does not credit hidden time, wrong targets, loss of signal or previous jobs (0.2537ms)
+✔ selection changes cannot reuse a rejection from another selection (0.2351ms)
+ℹ tests 29
+ℹ suites 0
+ℹ pass 29
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 114.2619

@@ -1,0 +1,45 @@
+{
+  "version": 2,
+  "scope": "Acceptance budgets for the static emulator bundle served over HTTP. The download byte limits scale with full-application (Phase 4) coverage; the live per-profile timing budgets below are the real UX guardrails and are unchanged.",
+  "notes": {
+    "first_frame_ms": "globalThis.emulator.measurements.startupMs: module script start to the first painted frame, including the WebAssembly download and instantiation.",
+    "page_load_to_first_frame_ms": "Harness wall clock from navigation until three frames are painted; includes browser navigation and document parsing.",
+    "average_frame_ms": "Mean of _emu_tick plus framebuffer conversion and putImageData, measured only across a realistic-speed simulated scan. Browser paint and compositing are excluded.",
+    "peak_frame_ms": "Largest single render callback of the session, including the first frame after initialization.",
+    "wasm_memory_bytes": "module.HEAPU8.byteLength: current committed WebAssembly linear memory, not live allocations. Memory can grow beyond its initial size.",
+    "throttling": "Chromium DevTools Protocol Emulation.setCPUThrottlingRate and Network.emulateNetworkConditions. This approximates a mid-range phone on a mobile network; it is not a measurement on physical hardware."
+  },
+  "download": {
+    "comment": "Raw uncompressed file sizes. HTTP transfer is gzipped to roughly 40% of these (emulator.wasm ~1.03 MB raw is ~0.41 MB on the wire). Limits carry headroom for the remaining Phase 4 domain slices; runaway growth still trips the mobile first_frame_ms and page_load budgets.",
+    "total_bytes_max": 2200000,
+    "largest_file_bytes_max": 1800000
+  },
+  "profiles": {
+    "desktop": {
+      "description": "Unthrottled Chromium on the developer workstation over localhost.",
+      "viewport": {"width": 1440, "height": 1000},
+      "cpu_throttling_rate": 1,
+      "network": null,
+      "first_frame_ms_max": 1500,
+      "page_load_to_first_frame_ms_max": 3000,
+      "average_frame_ms_max": 10,
+      "peak_frame_ms_max": 50,
+      "wasm_memory_bytes_max": 100663296
+    },
+    "mobile": {
+      "description": "Mid-range phone approximation: 4x CPU throttling and a 9 Mbit/s, 150 ms-latency link.",
+      "viewport": {"width": 390, "height": 844},
+      "cpu_throttling_rate": 4,
+      "network": {
+        "latency_ms": 150,
+        "download_bytes_per_second": 1179648,
+        "upload_bytes_per_second": 196608
+      },
+      "first_frame_ms_max": 8000,
+      "page_load_to_first_frame_ms_max": 12000,
+      "average_frame_ms_max": 33,
+      "peak_frame_ms_max": 150,
+      "wasm_memory_bytes_max": 100663296
+    }
+  }
+}

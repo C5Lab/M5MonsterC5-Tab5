@@ -1,0 +1,8 @@
+test_format_visibility_dst_reload_and_reset (__main__.TimeTests.test_format_visibility_dst_reload_and_reset) ... ok
+test_invalid_calendar_date_does_not_change_clock (__main__.TimeTests.test_invalid_calendar_date_does_not_change_clock) ... ok
+test_picker_edits_persist_and_clock_ticks_in_all_rotations (__main__.TimeTests.test_picker_edits_persist_and_clock_ticks_in_all_rotations) ... ok
+
+----------------------------------------------------------------------
+Ran 3 tests in 9.806s
+
+OK

@@ -1,0 +1,25 @@
+EXEC node --test tests/test_emulator_pcap_story.mjs
+✔ S15 exposes analysis, investigate, extract and invalid variants (0.9244ms)
+✔ analysis walks every inspection submenu then returns (0.6261ms)
+✔ investigate covers packet, health, FQDN and export (0.1218ms)
+✔ extract reaches objects, preview and the SHA-256 hash (0.0918ms)
+✔ invalid capture guides recovery to a valid one (0.0918ms)
+✔ losing the capture pauses an analysis story (0.1377ms)
+ℹ tests 6
+ℹ suites 0
+ℹ pass 6
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 57.948
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_pcap_story.py
+test_analysis_walks_every_submenu (__main__.PcapStoryBrowser.test_analysis_walks_every_submenu) ... ok
+test_extract_objects_preview_and_hash (__main__.PcapStoryBrowser.test_extract_objects_preview_and_hash) ... ok
+test_invalid_capture_then_recovery_all_rotations (__main__.PcapStoryBrowser.test_invalid_capture_then_recovery_all_rotations) ... ok
+test_investigate_packet_health_fqdn_export (__main__.PcapStoryBrowser.test_investigate_packet_health_fqdn_export) ... ok
+
+----------------------------------------------------------------------
+Ran 4 tests in 6.484s
+
+OK

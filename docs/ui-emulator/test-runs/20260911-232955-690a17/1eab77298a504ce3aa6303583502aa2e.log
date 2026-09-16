@@ -1,0 +1,370 @@
+RUN tests/verify_emulator_phase4_pcap_deep.py
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/verify_emulator_phase4_pcap_deep.py
+RUN tests/verify_emulator_phase4_wardrive.py
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/verify_emulator_phase4_wardrive.py
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/verify_emulator_phase4_bluetooth.py
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/verify_emulator_phase3.py
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/verify_emulator_phase2.py
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_slice.py
+.554 retained production functions; 154 explicit boundaries
+..
+----------------------------------------------------------------------
+Ran 3 tests in 1.819s
+
+OK
+PASS tests/test_emulator_slice.py
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_contracts.py
+......
+----------------------------------------------------------------------
+Ran 6 tests in 0.000s
+
+OK
+PASS tests/test_emulator_contracts.py
+EXEC node --test tests/test_emulator_input.mjs
+✔ one pointer owns a gesture; cancellation releases its last position exactly once (0.854ms)
+✔ CSS scaling maps to logical pixels without applying rotation twice (0.12ms)
+✔ captured pointer outside Canvas clamps to valid display pixels (0.2121ms)
+✔ RGB565 framebuffer preserves primary colors and opaque alpha (0.1055ms)
+ℹ tests 4
+ℹ suites 0
+ℹ pass 4
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 57.9947
+PASS tests/test_emulator_input.mjs
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_browser.py
+Navigation, scan and Settings passed: 0 1440
+Navigation, scan and Settings passed: 1 1440
+Navigation, scan and Settings passed: 2 1440
+Navigation, scan and Settings passed: 3 1440
+Navigation, scan and Settings passed: 0 390
+Navigation, scan and Settings passed: 1 390
+Navigation, scan and Settings passed: 2 390
+Navigation, scan and Settings passed: 3 390
+PASS tests/test_emulator_browser.py
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_phase2.py
+WAIT 30s: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/verify_emulator_phase4_pcap_deep.py
+WAIT 30s: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/verify_emulator_phase4_wardrive.py
+WAIT 30s: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/verify_emulator_phase4_bluetooth.py
+WAIT 30s: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/verify_emulator_phase3.py
+WAIT 30s: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/verify_emulator_phase2.py
+......
+----------------------------------------------------------------------
+Ran 6 tests in 29.211s
+
+OK
+PASS tests/test_emulator_phase2.py
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_settings.py
+WAIT 60s: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/verify_emulator_phase4_pcap_deep.py
+WAIT 60s: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/verify_emulator_phase4_wardrive.py
+WAIT 60s: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/verify_emulator_phase4_bluetooth.py
+WAIT 60s: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/verify_emulator_phase3.py
+WAIT 60s: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/verify_emulator_phase2.py
+.....
+----------------------------------------------------------------------
+Ran 5 tests in 9.998s
+
+OK
+PASS tests/test_emulator_settings.py
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_performance.py
+desktop profile measured
+mobile profile measured
+PASS tests/test_emulator_performance.py
+PASS tests/verify_emulator_phase2.py
+EXEC node --test tests/test_emulator_device.mjs
+✔ module captures have distinct paths when copied to the shared analysis filesystem (1.8037ms)
+✔ PCAP packet timestamps carry into seconds rather than overflowing microseconds (2.7968ms)
+✔ scan selection and clients use the seed identities, independently for each module (2.5586ms)
+✔ cancelled captures cannot create files; reset makes all previous job IDs stale (1.41ms)
+✔ completed capture stores valid PCAP bytes for the selected network and clients (0.5554ms)
+✔ missing/full SD and missing clients fail explicitly without committing a file (0.4752ms)
+✔ Bluetooth respects connection state, explicit time zero and immutable discovery snapshots (0.2669ms)
+✔ disconnect cancels work, snapshots cannot mutate the model, invalid clocks are rejected (0.2539ms)
+ℹ tests 8
+ℹ suites 0
+ℹ pass 8
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 198.5684
+PASS tests/test_emulator_device.mjs
+EXEC node --test tests/test_emulator_bridge.mjs
+✔ C boundary scan rows preserve scenario identities and cancellation (2.4302ms)
+ℹ tests 1
+ℹ suites 0
+ℹ pass 1
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 120.3356
+PASS tests/test_emulator_bridge.mjs
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/run_emulator_capture_tests.py
+PASS: production PCAP reader parsed three synthetic ARP frames, selected AP and all three clients
+PASS tests/run_emulator_capture_tests.py
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_phase3.py
+PASS tests/test_emulator_phase3.py
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_lifecycle.py
+WAIT 90s: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/verify_emulator_phase4_pcap_deep.py
+WAIT 90s: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/verify_emulator_phase4_wardrive.py
+WAIT 90s: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/verify_emulator_phase4_bluetooth.py
+WAIT 90s: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/verify_emulator_phase3.py
+....
+----------------------------------------------------------------------
+Ran 4 tests in 10.354s
+
+OK
+PASS tests/test_emulator_lifecycle.py
+PASS tests/verify_emulator_phase3.py
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_phase4_bluetooth.py
+PASS tests/test_emulator_phase4_bluetooth.py
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_bluetooth_lifecycle.py
+....
+----------------------------------------------------------------------
+Ran 4 tests in 6.198s
+
+OK
+PASS tests/test_emulator_bluetooth_lifecycle.py
+PASS tests/verify_emulator_phase4_bluetooth.py
+EXEC node --test tests/test_emulator_wardrive.mjs
+✔ Bluetooth blacklist affects only its module and WiFi picker returns immutable seed snapshots (4.9668ms)
+✔ native upload selection, pending and force-all modes preserve provider and module isolation (2.4162ms)
+✔ Wardrive acquires GPS and discovers seed identities deterministically regardless of tick size (2.1615ms)
+✔ Stop commits a session once, frees radio, upload outcomes are simulated and retry only pending sessions (1.3652ms)
+✔ Disconnect and cancellation cannot later save stale sessions; reset clears all state (1.2676ms)
+✔ SD errors never commit partial session metadata and do not leave the radio busy (0.8227ms)
+✔ GPS loss freezes track until restored, isolated by module; empty scenarios stay empty (0.9802ms)
+✔ Configured GPS coordinates are used and long sessions retain a bounded recent track (1.3909ms)
+ℹ tests 8
+ℹ suites 0
+ℹ pass 8
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 158.4152
+PASS tests/test_emulator_wardrive.mjs
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_phase4_wardrive.py
+.....
+----------------------------------------------------------------------
+Ran 5 tests in 7.941s
+
+OK
+PASS tests/test_emulator_phase4_wardrive.py
+PASS tests/verify_emulator_phase4_wardrive.py
+RUN --test tests/test_emulator_pcap_deep.mjs tests/test_emulator_files.mjs
+EXEC node --test tests/test_emulator_pcap_deep.mjs tests/test_emulator_files.mjs
+✔ virtual artifact transactions validate paths and roll back quota failures (1.4679ms)
+✔ wardrive cleanup previews, then archives only sessions done on both services (1.2299ms)
+✔ artifact writes are detached and module isolated (0.2452ms)
+✔ unavailable or busy module rejects an entire artifact mutation (0.3111ms)
+✔ example installation is explicit, deterministic, isolated and idempotent (2.4722ms)
+✔ fixture storage guards never partially install files (0.7628ms)
+✔ fixture capacity includes existing captures and exact capacity permits repeat installation (1.6684ms)
+✔ example frames have valid IPv4 and transport lengths and checksums (0.7386ms)
+ℹ tests 8
+ℹ suites 0
+ℹ pass 8
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 100.396
+PASS tests/test_emulator_files.mjs
+RUN tests/test_emulator_sha256.py
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_sha256.py
+PASS: 8 SHA-256 vectors, streaming chunks and padding boundaries, ASan/UBSan
+PASS tests/test_emulator_sha256.py
+RUN tests/test_emulator_phase4_pcap_deep.py
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_phase4_pcap_deep.py
+WAIT 120s: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/verify_emulator_phase4_pcap_deep.py
+test_file_pages_back_after_switching_sources (__main__.PcapDeepBrowser.test_file_pages_back_after_switching_sources) ... ok
+test_full_storage_shows_error_without_partial_install (__main__.PcapDeepBrowser.test_full_storage_shows_error_without_partial_install) ... ok
+test_invalid_capture_shows_native_error (__main__.PcapDeepBrowser.test_invalid_capture_shows_native_error) ... ok
+test_native_deep_views (__main__.PcapDeepBrowser.test_native_deep_views) ... ok
+test_native_http_object_export_preserves_capture (__main__.PcapDeepBrowser.test_native_http_object_export_preserves_capture) ... ok
+
+----------------------------------------------------------------------
+Ran 5 tests in 7.070s
+
+OK
+PASS tests/test_emulator_phase4_pcap_deep.py
+PASS tests/verify_emulator_phase4_pcap_deep.py
+RUN --test tests/test_emulator_nettools.mjs
+EXEC node --test tests/test_emulator_nettools.mjs
+✔ nmap returns deterministic host and service data without storing credentials (1.6987ms)
+✔ tool busy, cancellation, disconnect and reset cannot publish stale results (0.5998ms)
+✔ IoT result is detached and agrees with PAN/node inventory (0.3718ms)
+✔ GITM stop saves valid capture once; cancellation and SD failures save nothing (2.821ms)
+✔ GITM deterministic timing and input validation do not strand radio (2.8291ms)
+✔ wpa-sec simulated outcomes expose no credentials and require SD (0.3926ms)
+ℹ tests 6
+ℹ suites 0
+ℹ pass 6
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 97.1759
+PASS tests/test_emulator_nettools.mjs
+RUN tests/test_emulator_slice_tokens.py
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_slice_tokens.py
+.
+----------------------------------------------------------------------
+Ran 1 test in 0.000s
+
+OK
+PASS tests/test_emulator_slice_tokens.py
+RUN tests/test_emulator_phase4_nettools.py
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_phase4_nettools.py
+....FFFF.F
+======================================================================
+FAIL: test_nmap_connect_hosts_quick_scan (test_emulator_nettools_nmap_iot.NettoolsNmapIotBrowser.test_nmap_connect_hosts_quick_scan)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tests\test_emulator_nettools_nmap_iot.py", line 54, in test_nmap_connect_hosts_quick_scan
+    click_text(page, 'Nmap')
+    ~~~~~~~~~~^^^^^^^^^^^^^^
+  File "C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tests\emulator_browser.py", line 56, in click_text
+    click_object(page, matches[0])
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^
+  File "C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tests\emulator_browser.py", line 64, in click_object
+    assert 0 <= x < size['width'] and 0 <= y < size['height'], obj
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: {'id': 3529536, 'parent': 3528956, 'x': 953, 'y': 1240, 'width': 112, 'height': 16, 'text': 'Nmap', 'clickable': False, 'state': 0, 'scrollY': 0, 'binding': '', 'generation': 0}
+
+======================================================================
+FAIL: test_nmap_requires_single_network (test_emulator_nettools_nmap_iot.NettoolsNmapIotBrowser.test_nmap_requires_single_network)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tests\test_emulator_nettools_nmap_iot.py", line 84, in test_nmap_requires_single_network
+    click_text(page, 'Nmap')
+    ~~~~~~~~~~^^^^^^^^^^^^^^
+  File "C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tests\emulator_browser.py", line 56, in click_text
+    click_object(page, matches[0])
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^
+  File "C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tests\emulator_browser.py", line 64, in click_object
+    assert 0 <= x < size['width'] and 0 <= y < size['height'], obj
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: {'id': 3529536, 'parent': 3528956, 'x': 953, 'y': 1240, 'width': 112, 'height': 16, 'text': 'Nmap', 'clickable': False, 'state': 0, 'scrollY': 0, 'binding': '', 'generation': 0}
+
+======================================================================
+FAIL: test_close_cancels_and_reopens (test_emulator_nettools_wpasec.WpasecBrowser.test_close_cancels_and_reopens)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tests\test_emulator_nettools_wpasec.py", line 52, in test_close_cancels_and_reopens
+    self.connect()
+    ~~~~~~~~~~~~^^
+  File "C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tests\test_emulator_nettools_wpasec.py", line 39, in connect
+    self.assertIn('Show password', self.text())
+    ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 'Show password' not found in '\n\n\n\n\n\uf053\nCaptured Handshakes\n\n\n\uf093 Send to wpa-sec\n\n\uf2ed Clean\nNo handshake files found on this tab.\n\nNo handshake files found on this tab.\n\n\n\uf093 WPA-SEC Upload\nOffline simulation: NEON-BAZAAR\nEnter optional demo password and Connect.\nCredentials stay in memory; no files sent.\n\n\n\n\n\nConnect\n\n\nClose\n\n\n#FF2FA3 LAB5# | control the chaos\n--:--\n\n\n\n4.00V (SIM)\n\n\n\uf070\n\n\uf013\n\n\n\n\uf1eb\nGROVE\n\n\n\uf124\nMBUS\n\n\n\uf013\nINTERNAL\n'
+
+======================================================================
+FAIL: test_failure_is_visible (test_emulator_nettools_wpasec.WpasecBrowser.test_failure_is_visible)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tests\test_emulator_nettools_wpasec.py", line 76, in test_failure_is_visible
+    self.connect()
+    ~~~~~~~~~~~~^^
+  File "C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tests\test_emulator_nettools_wpasec.py", line 39, in connect
+    self.assertIn('Show password', self.text())
+    ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 'Show password' not found in '\n\n\n\n\n\uf053\nCaptured Handshakes\n\n\n\uf093 Send to wpa-sec\n\n\uf2ed Clean\nNo handshake files found on this tab.\n\nNo handshake files found on this tab.\n\n\n\uf093 WPA-SEC Upload\nOffline simulation: NEON-BAZAAR\nEnter optional demo password and Connect.\nCredentials stay in memory; no files sent.\n\n\n\n\n\nConnect\n\n\nClose\n\n\n#FF2FA3 LAB5# | control the chaos\n--:--\n\n\n\n4.00V (SIM)\n\n\n\uf070\n\n\uf013\n\n\n\n\uf1eb\nGROVE\n\n\n\uf124\nMBUS\n\n\n\uf013\nINTERNAL\n'
+
+======================================================================
+FAIL: test_simulated_upload_results (test_emulator_nettools_wpasec.WpasecBrowser.test_simulated_upload_results)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tests\test_emulator_nettools_wpasec.py", line 45, in test_simulated_upload_results
+    self.connect()
+    ~~~~~~~~~~~~^^
+  File "C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tests\test_emulator_nettools_wpasec.py", line 39, in connect
+    self.assertIn('Show password', self.text())
+    ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 'Show password' not found in '\n\n\n\n\n\uf053\nCaptured Handshakes\n\n\n\uf093 Send to wpa-sec\n\n\uf2ed Clean\nNo handshake files found on this tab.\n\nNo handshake files found on this tab.\n\n\n\uf093 WPA-SEC Upload\nOffline simulation: NEON-BAZAAR\nEnter optional demo password and Connect.\nCredentials stay in memory; no files sent.\n\n\n\n\n\nConnect\n\n\nClose\n\n\n#FF2FA3 LAB5# | control the chaos\n--:--\n\n\n\n4.00V (SIM)\n\n\n\uf070\n\n\uf013\n\n\n\n\uf1eb\nGROVE\n\n\n\uf124\nMBUS\n\n\n\uf013\nINTERNAL\n'
+
+----------------------------------------------------------------------
+Ran 10 tests in 14.495s
+
+FAILED (failures=5)
+FAIL tests/test_emulator_phase4_nettools.py
+Traceback (most recent call last):
+  File "C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tests\verify_emulator_phase4_nettools.py", line 23, in <module>
+    if result.returncode:raise RuntimeError(result.stdout+result.stderr)
+                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: ....FFFF.F
+======================================================================
+FAIL: test_nmap_connect_hosts_quick_scan (test_emulator_nettools_nmap_iot.NettoolsNmapIotBrowser.test_nmap_connect_hosts_quick_scan)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tests\test_emulator_nettools_nmap_iot.py", line 54, in test_nmap_connect_hosts_quick_scan
+    click_text(page, 'Nmap')
+    ~~~~~~~~~~^^^^^^^^^^^^^^
+  File "C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tests\emulator_browser.py", line 56, in click_text
+    click_object(page, matches[0])
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^
+  File "C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tests\emulator_browser.py", line 64, in click_object
+    assert 0 <= x < size['width'] and 0 <= y < size['height'], obj
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: {'id': 3529536, 'parent': 3528956, 'x': 953, 'y': 1240, 'width': 112, 'height': 16, 'text': 'Nmap', 'clickable': False, 'state': 0, 'scrollY': 0, 'binding': '', 'generation': 0}
+
+======================================================================
+FAIL: test_nmap_requires_single_network (test_emulator_nettools_nmap_iot.NettoolsNmapIotBrowser.test_nmap_requires_single_network)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tests\test_emulator_nettools_nmap_iot.py", line 84, in test_nmap_requires_single_network
+    click_text(page, 'Nmap')
+    ~~~~~~~~~~^^^^^^^^^^^^^^
+  File "C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tests\emulator_browser.py", line 56, in click_text
+    click_object(page, matches[0])
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^
+  File "C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tests\emulator_browser.py", line 64, in click_object
+    assert 0 <= x < size['width'] and 0 <= y < size['height'], obj
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: {'id': 3529536, 'parent': 3528956, 'x': 953, 'y': 1240, 'width': 112, 'height': 16, 'text': 'Nmap', 'clickable': False, 'state': 0, 'scrollY': 0, 'binding': '', 'generation': 0}
+
+======================================================================
+FAIL: test_close_cancels_and_reopens (test_emulator_nettools_wpasec.WpasecBrowser.test_close_cancels_and_reopens)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tests\test_emulator_nettools_wpasec.py", line 52, in test_close_cancels_and_reopens
+    self.connect()
+    ~~~~~~~~~~~~^^
+  File "C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tests\test_emulator_nettools_wpasec.py", line 39, in connect
+    self.assertIn('Show password', self.text())
+    ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 'Show password' not found in '\n\n\n\n\n\uf053\nCaptured Handshakes\n\n\n\uf093 Send to wpa-sec\n\n\uf2ed Clean\nNo handshake files found on this tab.\n\nNo handshake files found on this tab.\n\n\n\uf093 WPA-SEC Upload\nOffline simulation: NEON-BAZAAR\nEnter optional demo password and Connect.\nCredentials stay in memory; no files sent.\n\n\n\n\n\nConnect\n\n\nClose\n\n\n#FF2FA3 LAB5# | control the chaos\n--:--\n\n\n\n4.00V (SIM)\n\n\n\uf070\n\n\uf013\n\n\n\n\uf1eb\nGROVE\n\n\n\uf124\nMBUS\n\n\n\uf013\nINTERNAL\n'
+
+======================================================================
+FAIL: test_failure_is_visible (test_emulator_nettools_wpasec.WpasecBrowser.test_failure_is_visible)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tests\test_emulator_nettools_wpasec.py", line 76, in test_failure_is_visible
+    self.connect()
+    ~~~~~~~~~~~~^^
+  File "C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tests\test_emulator_nettools_wpasec.py", line 39, in connect
+    self.assertIn('Show password', self.text())
+    ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 'Show password' not found in '\n\n\n\n\n\uf053\nCaptured Handshakes\n\n\n\uf093 Send to wpa-sec\n\n\uf2ed Clean\nNo handshake files found on this tab.\n\nNo handshake files found on this tab.\n\n\n\uf093 WPA-SEC Upload\nOffline simulation: NEON-BAZAAR\nEnter optional demo password and Connect.\nCredentials stay in memory; no files sent.\n\n\n\n\n\nConnect\n\n\nClose\n\n\n#FF2FA3 LAB5# | control the chaos\n--:--\n\n\n\n4.00V (SIM)\n\n\n\uf070\n\n\uf013\n\n\n\n\uf1eb\nGROVE\n\n\n\uf124\nMBUS\n\n\n\uf013\nINTERNAL\n'
+
+======================================================================
+FAIL: test_simulated_upload_results (test_emulator_nettools_wpasec.WpasecBrowser.test_simulated_upload_results)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tests\test_emulator_nettools_wpasec.py", line 45, in test_simulated_upload_results
+    self.connect()
+    ~~~~~~~~~~~~^^
+  File "C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tests\test_emulator_nettools_wpasec.py", line 39, in connect
+    self.assertIn('Show password', self.text())
+    ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 'Show password' not found in '\n\n\n\n\n\uf053\nCaptured Handshakes\n\n\n\uf093 Send to wpa-sec\n\n\uf2ed Clean\nNo handshake files found on this tab.\n\nNo handshake files found on this tab.\n\n\n\uf093 WPA-SEC Upload\nOffline simulation: NEON-BAZAAR\nEnter optional demo password and Connect.\nCredentials stay in memory; no files sent.\n\n\n\n\n\nConnect\n\n\nClose\n\n\n#FF2FA3 LAB5# | control the chaos\n--:--\n\n\n\n4.00V (SIM)\n\n\n\uf070\n\n\uf013\n\n\n\n\uf1eb\nGROVE\n\n\n\uf124\nMBUS\n\n\n\uf013\nINTERNAL\n'
+
+----------------------------------------------------------------------
+Ran 10 tests in 14.495s
+
+FAILED (failures=5)
+

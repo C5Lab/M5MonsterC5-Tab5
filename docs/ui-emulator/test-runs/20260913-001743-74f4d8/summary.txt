@@ -1,0 +1,13 @@
+
+TEST SUMMARY
+==============================================================================
+phase5_settings
+  PASS            0.11s  test_emulator_persistence.mjs
+  FAIL           37.51s  test_emulator_phase5_settings.py
+------------------------------------------------------------------------------
+Result: FAIL | scripts PASS: 1 | FAIL/ERROR: 1
+Total elapsed: 37.70s
+Section wrapper times include their children; do not add them together.
+Run incomplete: checks after the failure may NOT HAVE RUN. Missing entries are not passes.
+Failure log: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\docs\ui-emulator\test-runs\20260913-001743-74f4d8\696fcbf65fed4fe381f937dc69385e40.log
+Report: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\docs\ui-emulator\test-runs\20260913-001743-74f4d8\summary.json

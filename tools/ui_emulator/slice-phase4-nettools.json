@@ -1,0 +1,7 @@
+{
+  "close_hidden_ssid_popup": "retain",
+  "get_current_uart": "retain",
+  "show_handshakes_page": "retain",
+  "show_global_attacks_page": "retain",
+  "global_attack_tile_event_cb": "adapter"
+}

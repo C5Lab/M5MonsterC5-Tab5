@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="700" viewBox="0 0 1080 700">
+<title>show_ft_baud_popup</title>
+<rect width="100%" height="100%" fill="#111827"/>
+<text x="28" y="38" fill="#7dd3fc" font-family="monospace" font-size="21">show_ft_baud_popup</text>
+<text x="28" y="69" fill="#fbbf24" font-family="sans-serif" font-size="17">SOURCE DIAGRAM - not a screenshot or screen render</text>
+<text x="28" y="110" fill="#7dd3fc" font-family="monospace" font-size="16">SOURCE</text>
+<text x="28" y="133" fill="#e5e7eb" font-family="monospace" font-size="16">main/main.c:53653</text>
+<text x="28" y="156" fill="#e5e7eb" font-family="monospace" font-size="16"></text>
+<text x="28" y="179" fill="#7dd3fc" font-family="monospace" font-size="16">DIRECT TEXT LITERALS IN THIS FUNCTION</text>
+<text x="28" y="202" fill="#e5e7eb" font-family="monospace" font-size="16">Transfer Speed</text>
+<text x="28" y="225" fill="#e5e7eb" font-family="monospace" font-size="16">Console baud</text>
+<text x="28" y="248" fill="#e5e7eb" font-family="monospace" font-size="16">Rate the Monster console is switched to while a file / is copied over Grove or M-BUS. Higher is faster</text>
+<text x="28" y="271" fill="#e5e7eb" font-family="monospace" font-size="16">but / depends on the cable: if the switch is not confirmed, / the copy still runs at 115200. / The</text>
+<text x="28" y="294" fill="#e5e7eb" font-family="monospace" font-size="16">transfer popup reports the KB/s it achieved.</text>
+<text x="28" y="317" fill="#e5e7eb" font-family="monospace" font-size="16">Close</text>
+<text x="28" y="340" fill="#e5e7eb" font-family="monospace" font-size="16"></text>
+<text x="28" y="363" fill="#7dd3fc" font-family="monospace" font-size="16">SOURCE DIMENSIONS (UNEVALUATED EXPRESSIONS)</text>
+<text x="28" y="386" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_size(card, 430, 340);</text>
+<text x="28" y="409" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_size(row, lv_pct(100), 64);</text>
+<text x="28" y="432" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_width(dropdown, 190);</text>
+<text x="28" y="455" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_width(desc, lv_pct(100));</text>
+<text x="28" y="478" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_size(close_btn, 120, 40);</text>
+<text x="28" y="501" fill="#e5e7eb" font-family="monospace" font-size="16"></text>
+<text x="28" y="524" fill="#7dd3fc" font-family="monospace" font-size="16">EVENTS -&gt; CALLBACKS</text>
+<text x="28" y="547" fill="#e5e7eb" font-family="monospace" font-size="16">ft_baud_dropdown_cb</text>
+<text x="28" y="570" fill="#e5e7eb" font-family="monospace" font-size="16">ft_baud_popup_close_cb</text>
+<text x="28" y="593" fill="#e5e7eb" font-family="monospace" font-size="16"></text>
+<text x="28" y="616" fill="#7dd3fc" font-family="monospace" font-size="16">DIRECT UI FUNCTION CALLS</text>
+<text x="28" y="639" fill="#e5e7eb" font-family="monospace" font-size="16">—</text>
+<text x="28" y="662" fill="#e5e7eb" font-family="monospace" font-size="16"></text>
+</svg>

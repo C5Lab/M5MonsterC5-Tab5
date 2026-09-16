@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="585" viewBox="0 0 1080 585">
+<title>show_tx_warn_popup</title>
+<rect width="100%" height="100%" fill="#111827"/>
+<text x="28" y="38" fill="#7dd3fc" font-family="monospace" font-size="21">show_tx_warn_popup</text>
+<text x="28" y="69" fill="#fbbf24" font-family="sans-serif" font-size="17">SOURCE DIAGRAM - not a screenshot or screen render</text>
+<text x="28" y="110" fill="#7dd3fc" font-family="monospace" font-size="16">SOURCE</text>
+<text x="28" y="133" fill="#e5e7eb" font-family="monospace" font-size="16">main/screens/subghz_listen_screen.c:1471</text>
+<text x="28" y="156" fill="#e5e7eb" font-family="monospace" font-size="16"></text>
+<text x="28" y="179" fill="#7dd3fc" font-family="monospace" font-size="16">DIRECT TEXT LITERALS IN THIS FUNCTION</text>
+<text x="28" y="202" fill="#e5e7eb" font-family="monospace" font-size="16">Stop Listening First</text>
+<text x="28" y="225" fill="#e5e7eb" font-family="monospace" font-size="16">Pause listening before transmitting a signal, then try again.</text>
+<text x="28" y="248" fill="#e5e7eb" font-family="monospace" font-size="16">OK</text>
+<text x="28" y="271" fill="#e5e7eb" font-family="monospace" font-size="16"></text>
+<text x="28" y="294" fill="#7dd3fc" font-family="monospace" font-size="16">SOURCE DIMENSIONS (UNEVALUATED EXPRESSIONS)</text>
+<text x="28" y="317" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_size(overlay, lv_pct(100), lv_pct(100));</text>
+<text x="28" y="340" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_size(popup, 560, 260);</text>
+<text x="28" y="363" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_width(body, lv_pct(100));</text>
+<text x="28" y="386" fill="#e5e7eb" font-family="monospace" font-size="16">lv_obj_set_size(ok_btn, 200, 50);</text>
+<text x="28" y="409" fill="#e5e7eb" font-family="monospace" font-size="16"></text>
+<text x="28" y="432" fill="#7dd3fc" font-family="monospace" font-size="16">EVENTS -&gt; CALLBACKS</text>
+<text x="28" y="455" fill="#e5e7eb" font-family="monospace" font-size="16">on_tx_warn_ok</text>
+<text x="28" y="478" fill="#e5e7eb" font-family="monospace" font-size="16"></text>
+<text x="28" y="501" fill="#7dd3fc" font-family="monospace" font-size="16">DIRECT UI FUNCTION CALLS</text>
+<text x="28" y="524" fill="#e5e7eb" font-family="monospace" font-size="16">—</text>
+<text x="28" y="547" fill="#e5e7eb" font-family="monospace" font-size="16"></text>
+</svg>

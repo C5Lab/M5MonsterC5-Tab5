@@ -1,0 +1,10 @@
+test_cancel_busy_speed_and_reset_are_independent_of_guide (__main__.StoryLifecycleBrowser.test_cancel_busy_speed_and_reset_are_independent_of_guide) ... ok
+test_download_retry_and_reset_recovery_keep_guide_disabled_until_ready (__main__.StoryLifecycleBrowser.test_download_retry_and_reset_recovery_keep_guide_disabled_until_ready) ... ok
+test_each_module_condition_starts_a_fresh_volatile_session (__main__.StoryLifecycleBrowser.test_each_module_condition_starts_a_fresh_volatile_session) ... ok
+test_interrupted_download_recovers_on_third_attempt (__main__.StoryLifecycleBrowser.test_interrupted_download_recovers_on_third_attempt) ... ok
+test_restart_leave_fullscreen_and_rotation_all_orientations (__main__.StoryLifecycleBrowser.test_restart_leave_fullscreen_and_rotation_all_orientations) ... ok
+
+----------------------------------------------------------------------
+Ran 5 tests in 11.039s
+
+OK

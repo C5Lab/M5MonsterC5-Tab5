@@ -1,0 +1,10 @@
+✔ Observer discovers independently and its targets work without a WiFi scan (3.6019ms)
+✔ C boundary scan rows preserve scenario identities and cancellation (0.8823ms)
+ℹ tests 2
+ℹ suites 0
+ℹ pass 2
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 87.2133

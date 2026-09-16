@@ -1,0 +1,11 @@
+✔ deauth events cycle the scenario networks and drift RSSI within bounds (0.915ms)
+✔ a disconnected module detects nothing (0.3414ms)
+✔ the bridge formats a firmware-shaped [DEAUTH] line and empty text when idle (0.3526ms)
+ℹ tests 3
+ℹ suites 0
+ℹ pass 3
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 103.7208

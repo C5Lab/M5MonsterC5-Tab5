@@ -1,0 +1,4 @@
+{
+  "show_internal_tiles": "adapter",
+  "internal_tile_event_cb": "adapter"
+}

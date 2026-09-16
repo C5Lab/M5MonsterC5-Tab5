@@ -1,0 +1,11 @@
+2026-09-05 UART transfer fix: no reusable skill observations; regression tests and ESP-IDF app build passed.
+2026-09-08 rotation audit: no observations; host tests and source atlas generated.
+2026-09-08 LVGL renderer: production widgets rendered in four rotations; English documentation preference applied.
+2026-09-09 resumed Phase 2: no new skill observations; input tests and compiler image verified.
+2026-09-13: handoff review, verifier regression tests and wordlist fixes completed; no new skill observations.
+2026-09-13: final review, 7 host tests, firmware build and merged image verification completed; no new skill observations.
+2026-09-16: ESP-IDF 6.0.2 power-management feasibility audit; no new reusable skill observations.
+2026-09-16: Tab5 screen-wake and hardware Power-button behavior audit; no new reusable skill observations.
+2026-09-16: Tab5 PMS150G power-button schematic audit; no new reusable skill observations.
+2026-09-16: Tab5 Power remapping feasibility conclusion; no new reusable skill observations.
+2026-09-16: Tab5 power-profile implementation; reusable ESP-IDF 6.x check: pre-v3 ESP32-P4 boards must explicitly pin CONFIG_ESP32P4_SELECTS_REV_LESS_V3 before using the 360/180 MHz clock pair.

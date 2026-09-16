@@ -1,0 +1,14 @@
+✔ S15 exposes analysis, investigate, extract and invalid variants (0.8579ms)
+✔ analysis walks every inspection submenu then returns (0.6406ms)
+✔ investigate covers packet, health, FQDN and export (0.1255ms)
+✔ extract reaches objects, preview and the SHA-256 hash (0.094ms)
+✔ invalid capture guides recovery to a valid one (0.0959ms)
+✔ losing the capture pauses an analysis story (0.138ms)
+ℹ tests 6
+ℹ suites 0
+ℹ pass 6
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 55.1064

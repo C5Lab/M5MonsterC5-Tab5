@@ -1,0 +1,16 @@
+✔ Bluetooth blacklist affects only its module and WiFi picker returns immutable seed snapshots (4.9668ms)
+✔ native upload selection, pending and force-all modes preserve provider and module isolation (2.4162ms)
+✔ Wardrive acquires GPS and discovers seed identities deterministically regardless of tick size (2.1615ms)
+✔ Stop commits a session once, frees radio, upload outcomes are simulated and retry only pending sessions (1.3652ms)
+✔ Disconnect and cancellation cannot later save stale sessions; reset clears all state (1.2676ms)
+✔ SD errors never commit partial session metadata and do not leave the radio busy (0.8227ms)
+✔ GPS loss freezes track until restored, isolated by module; empty scenarios stay empty (0.9802ms)
+✔ Configured GPS coordinates are used and long sessions retain a bounded recent track (1.3909ms)
+ℹ tests 8
+ℹ suites 0
+ℹ pass 8
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 158.4152

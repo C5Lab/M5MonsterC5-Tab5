@@ -1,0 +1,18 @@
+{
+  "pcap_viewer_close_tools_popup": "retain",
+  "pcap_viewer_show_objects": "retain",
+  "pcap_viewer_extract_progress_cb": "retain",
+  "pcap_viewer_extract_progress_timer_cb": "retain",
+  "pcap_viewer_artifact_finish_async": "retain",
+  "pcap_viewer_artifact_task": "retain",
+  "pcap_viewer_tool_action_cb": "retain",
+  "pcap_viewer_add_tool_button": "retain",
+  "pcap_viewer_start_extraction": "retain",
+  "pcap_viewer_object_preview_cb": "retain",
+  "pcap_viewer_object_filter_cb": "retain",
+  "pcap_viewer_show_objects_async": "retain",
+  "pcap_viewer_start_extraction_async": "retain",
+  "pcap_viewer_object_delete_cb": "adapter",
+  "pcap_viewer_object_reextract_cb": "retain",
+  "pcap_viewer_objects_cb": "retain"
+}

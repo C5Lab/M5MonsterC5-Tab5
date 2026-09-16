@@ -1,0 +1,45 @@
+✔ all S09-S12 variants have isolated guides (1.0945ms)
+✔ deauth rejects stale, wrong target, hidden and changed run (0.2537ms)
+✔ sae rejects stale, wrong target, hidden and changed run (0.0943ms)
+✔ handshake rejects stale, wrong target, hidden and changed run (0.0823ms)
+✔ beacon rejects stale, wrong target, hidden and changed run (0.1009ms)
+✔ blackout requires confirmation cancellation before start (0.2489ms)
+✔ global-handshaker requires confirmation cancellation before start (0.102ms)
+✔ snifferdog requires confirmation cancellation before start (0.0643ms)
+✔ Handshake reserves its target and module and freezes on cancellation (1.694ms)
+✔ karma-menu requires correct entry and a second fresh portal session (0.3157ms)
+✔ Beacon empty refusal needs an empty native list and no reserved operation (0.1625ms)
+✔ queue guide enforces native evidence, module, visibility and session (0.5224ms)
+✔ queue2-arp: stale, hidden, module and restart isolation (0.9465ms)
+✔ queue2-mitm: stale, hidden, module and restart isolation (0.1262ms)
+✔ queue2-nmap: stale, hidden, module and restart isolation (0.0904ms)
+✔ queue2-gitm-scan: stale, hidden, module and restart isolation (0.0813ms)
+✔ queue2-gitm-global: stale, hidden, module and restart isolation (0.0799ms)
+✔ queue2-arp: complete only with current native outcomes (0.2928ms)
+✔ queue2-mitm: complete only with current native outcomes (0.1083ms)
+✔ queue2-nmap: complete only with current native outcomes (0.1145ms)
+✔ queue2-gitm-scan: complete only with current native outcomes (0.1193ms)
+✔ queue2-gitm-global: complete only with current native outcomes (0.127ms)
+✔ S21 reboot must belong to grove and a fresh completed native job (0.973ms)
+✔ S21 reboot must belong to mbus and a fresh completed native job (0.7032ms)
+✔ S21 cancelled slot cannot credit activation and leaves original image (0.2169ms)
+✔ S21 SD requires native Stop and back for current service (0.1585ms)
+✔ S07 old run and disconnection cannot credit detection (0.1701ms)
+✔ Wardrive requires a fresh run, visible target module, observations and its own saved file (0.8789ms)
+✔ restart, stale epochs and hidden context do not advance recording (0.1736ms)
+✔ all Wardrive and file variants have observable predicates (0.3582ms)
+✔ copy accepts an existing fixture but requires a fresh successful native copy of that exact file (0.2801ms)
+✔ delete requires both native confirmation decisions and preserves unrelated files (0.2422ms)
+✔ GPS failure setup precedes the fresh run; recovery requires native networks (0.1571ms)
+✔ Home target and provider must match before confirming a fresh session (0.1664ms)
+✔ WPA-SEC uses a new service job and verifies the two fixed demo results after cancel/retry (0.1999ms)
+✔ settings require a changed value and a new Apply, not a previously applied label (0.1412ms)
+✔ launching on INTERNAL still captures the existing GROVE run as the freshness floor (0.5149ms)
+ℹ tests 37
+ℹ suites 0
+ℹ pass 37
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 81.286

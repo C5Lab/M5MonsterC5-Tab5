@@ -1,0 +1,15 @@
+
+TEST SUMMARY
+==============================================================================
+observer
+  PASS            0.13s  test_emulator_bridge.mjs test_emulator_attacks.mjs test_emulator_device.mjs
+  PASS            3.39s  test_emulator_observer_exit.py
+  PASS            6.92s  test_emulator_lifecycle.py
+  PASS            2.40s  test_emulator_observer_activity.py
+  PASS            2.81s  test_emulator_phase3.py
+  PASS            0.23s  test_emulator_phase4_audit.py
+------------------------------------------------------------------------------
+Result: PASS | scripts PASS: 6 | FAIL/ERROR: 0
+Total elapsed: 15.90s
+Section wrapper times include their children; do not add them together.
+Report: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\docs\ui-emulator\test-runs\20260912-204300-62976a\summary.json

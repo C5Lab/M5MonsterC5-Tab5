@@ -1,0 +1,62 @@
+EXEC node --test tests/test_emulator_story_restart.mjs tests/test_emulator_settings_s18.mjs tests/test_emulator_settings_s19.mjs tests/test_emulator_settings_s20.mjs
+✔ S18 exposes scan save/validation and both disclaimer choices (1.072ms)
+✔ scan save requires changed native values, reopening and fresh GROVE scan (1.0274ms)
+✔ disclaimer cancellation and old state do not count as enabling (0.3642ms)
+✔ repeated scan story cannot credit Cancel against already saved defaults (0.1433ms)
+✔ disabled Red Team needs the restricted action bar and wrong tabs are ignored (0.1687ms)
+✔ restarting validation with old open error requires closing and reopening (0.1267ms)
+✔ timeout needs fresh changed preference and close/reopen before restoration (0.8597ms)
+✔ brightness requires saved release and actual canvas filter (0.8125ms)
+✔ hidden, wrong tab and stale epochs never advance (0.2404ms)
+✔ theme automatic rebuild still requires changed native preference and reopening (0.2665ms)
+✔ rotation handoff only follows native pending change and rejects invalid or replayed data (0.817ms)
+✔ date needs fresh native changed rollers, successful write and ticking clock (0.8329ms)
+✔ invalid calendar cannot advance on old failure or successful normalization (0.1598ms)
+✔ unchanged preferences, hidden context and stale epochs cannot progress (0.3205ms)
+✔ cancel requires unsaved edit and preserved offset on reopen (0.1602ms)
+✔ format must match RTC and DST must shift exactly one hour within RTC precision (0.1946ms)
+✔ native rotation handoff is consumed from the URL without storing progress (1.2723ms)
+✔ unrelated, malformed and unsupported handoffs cannot restore a guide (0.2365ms)
+ℹ tests 18
+ℹ suites 0
+ℹ pass 18
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 96.8797
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_settings_s18.py
+test_invalid_range_and_cancel_all_rotations (__main__.SettingsS18Browser.test_invalid_range_and_cancel_all_rotations) ... ok
+test_red_team_both_choices_all_rotations (__main__.SettingsS18Browser.test_red_team_both_choices_all_rotations) ... ok
+test_restart_rejects_old_validation_error_and_cancel_as_save (__main__.SettingsS18Browser.test_restart_rejects_old_validation_error_and_cancel_as_save) ... ok
+test_scan_save_all_rotations (__main__.SettingsS18Browser.test_scan_save_all_rotations) ... ok
+WAIT 30s: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_settings_s18.py
+test_wrong_module_and_restart_do_not_credit_existing_dialog (__main__.SettingsS18Browser.test_wrong_module_and_restart_do_not_credit_existing_dialog) ... ok
+
+----------------------------------------------------------------------
+Ran 5 tests in 30.604s
+
+OK
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_settings_s19.py
+test_brightness_effect_reopened_restored_all_rotations (__main__.SettingsS19Browser.test_brightness_effect_reopened_restored_all_rotations) ... ok
+test_close_without_change_restart_guide_and_wrong_tab (__main__.SettingsS19Browser.test_close_without_change_restart_guide_and_wrong_tab) ... ok
+test_rotation_native_restart_resumes_once_all_rotations (__main__.SettingsS19Browser.test_rotation_native_restart_resumes_once_all_rotations) ... ok
+test_theme_rebuild_reopen_restore_all_rotations (__main__.SettingsS19Browser.test_theme_rebuild_reopen_restore_all_rotations) ... ok
+WAIT 30s: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_settings_s19.py
+test_timeout_saved_reopened_restored_all_rotations (__main__.SettingsS19Browser.test_timeout_saved_reopened_restored_all_rotations) ... ok
+
+----------------------------------------------------------------------
+Ran 5 tests in 31.208s
+
+OK
+EXEC C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_settings_s20.py
+test_baud_saved_all_rotations (__main__.SettingsS20Browser.test_baud_saved_all_rotations) ... ok
+test_clock_preferences_all_rotations (__main__.SettingsS20Browser.test_clock_preferences_all_rotations) ... ok
+test_restart_requires_reopen_and_fresh_change (__main__.SettingsS20Browser.test_restart_requires_reopen_and_fresh_change) ... ok
+WAIT 30s: C:\Users\mati\Documents\GitHub\M5MonsterC5-Tab5\tools\ui_emulator\.venv\Scripts\python.exe tests/test_emulator_settings_s20.py
+test_set_invalid_and_cancel_all_rotations (__main__.SettingsS20Browser.test_set_invalid_and_cancel_all_rotations) ... ok
+
+----------------------------------------------------------------------
+Ran 4 tests in 39.897s
+
+OK

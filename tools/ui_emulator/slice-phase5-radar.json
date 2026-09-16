@@ -1,0 +1,8 @@
+{
+  "show_ap_radar_page": "adapter",
+  "ap_radar_panel_draw_cb": "adapter",
+  "ap_radar_back_btn_event_cb": "adapter",
+  "ap_radar_stop_btn_event_cb": "adapter",
+  "ap_radar_rssi_to_dist_frac": "retain",
+  "ap_radar_rssi_color": "retain"
+}

@@ -1,0 +1,4 @@
+{
+  "show_sae_popup": "retain",
+  "sae_popup_close_cb": "retain"
+}

@@ -1,0 +1,14 @@
+✔ all seven simulated operations start, change and stop without another module changing (3.5885ms)
+✔ cancel, disconnect and reset never resurrect jobs or write captures (0.3208ms)
+✔ invalid inputs never reserve the module and credentials never enter model history (0.3194ms)
+✔ MITM creates target-specific PCAP only on stop and handles SD/quota failures atomically (0.5407ms)
+✔ clock slicing produces identical bounded simulated results (0.5511ms)
+✔ Observer preserves scenario identities, changes activity, freezes on stop and resets (0.4201ms)
+ℹ tests 6
+ℹ suites 0
+ℹ pass 6
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 86.2916
