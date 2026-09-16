@@ -44,6 +44,8 @@
 #include "screens/subghz_host.h"
 #include "screens/cgw_parser.h"
 #include "scan_filter.h"
+#include "app_power_manager.h"
+#include "app_power_telemetry.h"
 
 // ESP-Hosted includes for WiFi via ESP32C6 SDIO
 #include "esp_hosted.h"
@@ -51,6 +53,7 @@
 #include "esp_netif.h"
 #include "esp_event.h"
 #include "esp_system.h"
+#include "esp_timer.h"
 #include "esp_vfs_fat.h"
 #include "janos_file_transfer.h"
 #include "pcap_reader.h"
@@ -87,7 +90,7 @@ extern void pthread_internal_local_storage_destructor_callback(TaskHandle_t hand
 
 
 #define JANOS_TAB_VERSION "1.5.4"
-#define JANOS_VERSION_REQUIRED "1.7.3"
+#define JANOS_VERSION_REQUIRED "1.7.4"
 
 #include "lwip/netdb.h"
 #include <dirent.h>
@@ -245,6 +248,22 @@ typedef struct {
     char uptime[64];
     bool inspected;
 } observer_network_t;
+
+// LVGL handles for one Observer network tile. The data model lives in
+// observer_network_t; these handles let periodic polls update only the tile
+// whose client list changed instead of deleting and rebuilding the whole list.
+typedef struct {
+    lv_obj_t *tile;
+    lv_obj_t *ssid_label;
+    lv_obj_t *saved_badge;
+    lv_obj_t *summary_label;
+    lv_obj_t *info_label;
+    lv_obj_t *client_toggle;
+    lv_obj_t *client_toggle_label;
+    lv_obj_t *client_container;
+    int rendered_client_count;
+    bool clients_expanded;
+} observer_network_ui_t;
 
 // Deauth Detector entry
 #define DEAUTH_DETECTOR_MAX_ENTRIES 200
@@ -798,7 +817,9 @@ typedef struct {
     lv_obj_t *observer_status_label;
 
     observer_network_t *observer_networks;  // PSRAM
+    observer_network_ui_t *observer_network_ui;  // PSRAM, LVGL handles per network
     int observer_network_count;
+    bool observer_ui_refresh_pending;
     bool observer_running;
     volatile bool observer_start_active;
     bool observer_page_visible;
@@ -889,6 +910,7 @@ typedef struct {
     lv_obj_t *wardrive_gps_popup;
     lv_obj_t *wardrive_gps_label;
     volatile bool wardrive_monitoring;
+    atomic_bool wardrive_ui_dirty;
     // Bumped by every explicit stop and every start. The monitor task captures it
     // on entry and exits as soon as it no longer matches, which is what keeps a
     // stop/start cycle from ending up with two tasks on one UART: clearing
@@ -1877,28 +1899,17 @@ static lv_coord_t popup_clamp_w(lv_coord_t desired)
     return desired < avail ? desired : avail;
 }
 
-// The metadata run that sits under a network's SSID in the scan list and the
-// Network Observer. Six call sites build it - each list in its initial form and
-// in the forms the async `inspect_network` fills in later - so the format lives
-// here rather than in six format strings that have already drifted apart.
-//
-// Portrait keeps the three stacked lines it was drawn with. In a 90/270
-// orientation the list is 1264 px wide instead of 704, which is room for the
-// whole run on one line: the row drops from three lines to one, and the callers
-// put it beside the SSID instead of under it. That is the difference between
-// four visible networks and a dozen.
-//
-// `security`, `mfp_text` and `uptime` are optional - the Observer has no
-// security field, and neither list has MFP or uptime before the inspect lands.
+// Scan rows use one metadata line in landscape and two in portrait. Together
+// with the independent SSID/saved title row this produces a stable two- or
+// three-line tile without leaving Vendor alone on a fourth line.
 #define NETWORK_INFO_BUF 384
 static void format_network_info(char *out, size_t out_sz,
                                 const char *bssid, int channel,
                                 const char *band, const char *security,
-                                int rssi, const char *badge,
-                                const char *mfp_text, const char *uptime,
-                                const char *vendor)
+                                int rssi, const char *mfp_text,
+                                const char *uptime, const char *vendor)
 {
-    const char *sep      = ui_wide_layout() ? "  |  " : "\n";
+    const char *row_sep = ui_wide_layout() ? "  |  " : "\n";
     const char *rssi_col = rssi > -50 ? "#55DD55" : (rssi > -70 ? "#FFAA00" : "#FF5555");
     const char *band_col = (band && strstr(band, "5")) ? "#CC66FF" : "#FFAA33";
 
@@ -1909,43 +1920,82 @@ static void format_network_info(char *out, size_t out_sz,
         snprintf(sec_part, sizeof(sec_part), "  |  %s %s#", sec_col, security);
     }
 
-    char mfp_part[160] = "";
-    if (mfp_text && mfp_text[0]) {
-        snprintf(mfp_part, sizeof(mfp_part), "%s%s  |  Uptime: %s",
-                 sep, mfp_text, (uptime && uptime[0]) ? uptime : "?");
-    }
+    const char *mfp_display = (mfp_text && mfp_text[0])
+                                  ? mfp_text
+                                  : "#888888 MFP ?#";
 
     snprintf(out, out_sz,
-             "#5599FF %s#  |  #5599FF CH%d#  |  %s %s#%s  |  %s %d dBm#%s%s%sVendor: %s",
+             "#5599FF %s#  |  #5599FF CH%d#  |  %s %s#%s  |  %s %d dBm#"
+             "  |  %s%sUptime: %s  |  Vendor: %s",
              bssid ? bssid : "-", channel,
              band_col, band ? band : "-",
              sec_part,
              rssi_col, rssi,
-             badge ? badge : "",
-             mfp_part,
-             sep,
+             mfp_display, row_sep,
+             (uptime && uptime[0]) ? uptime : "?",
              (vendor && vendor[0]) ? vendor : "-");
 }
 
-// Lay a network row out as SSID + metadata side by side on a wide screen, or
-// stacked on the portrait panel. The SSID gets a fixed column so a long name
-// cannot push the run off the edge; the run takes the rest and wraps if it
-// still does not fit.
-static void style_network_row_text(lv_obj_t *cont, lv_obj_t *ssid_label,
-                                   lv_obj_t *info_label, lv_coord_t ssid_w)
+// Observer keeps radio metadata in one stable row below the title. Uptime and
+// vendor live in the title row and are formatted separately below.
+static void format_observer_network_info(char *out, size_t out_sz,
+                                         const observer_network_t *net)
 {
-    if (!cont || !ssid_label || !info_label) return;
-    if (!ui_wide_layout()) return;
+    if (!out || out_sz == 0) return;
+    if (!net) {
+        out[0] = '\0';
+        return;
+    }
 
-    lv_obj_set_flex_flow(cont, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(cont, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_column(cont, 14, 0);
+    const char *rssi_col = net->rssi > -50 ? "#55DD55" :
+                           (net->rssi > -70 ? "#FFAA00" : "#FF5555");
+    const char *band_col = strstr(net->band, "5") ? "#CC66FF" : "#FFAA33";
+    const char *security = net->security[0] ? net->security : "-";
+    const char *sec_col = strstr(security, "WPA3") ? "#55DD55" :
+                          (strstr(security, "WPA2") ? "#00CCCC" : "#FF6666");
+    const char *mfp_text = net->inspected
+                               ? (net->mfp_capable
+                                      ? "#FF5555 MFP On#"
+                                      : "#55DD55 MFP Off#")
+                               : "#888888 MFP ?#";
+    snprintf(out, out_sz,
+             "#5599FF %s#  |  #5599FF CH%d#  |  %s %s#  |  %s %s#  |  "
+             "%s %d dBm#  |  %s",
+             net->bssid[0] ? net->bssid : "-", net->channel,
+             band_col, net->band[0] ? net->band : "-",
+             sec_col, security,
+             rssi_col, net->rssi,
+             mfp_text);
+}
 
-    lv_obj_set_width(ssid_label, ssid_w);
-    lv_label_set_long_mode(ssid_label, LV_LABEL_LONG_DOT);
+static void format_observer_summary_info(char *out, size_t out_sz,
+                                         const observer_network_t *net)
+{
+    if (!out || out_sz == 0) return;
+    if (!net) {
+        out[0] = '\0';
+        return;
+    }
 
-    lv_obj_set_flex_grow(info_label, 1);
-    lv_label_set_long_mode(info_label, LV_LABEL_LONG_WRAP);
+    const char *uptime = (net->inspected && net->uptime[0]) ? net->uptime : "?";
+    snprintf(out, out_sz, "Uptime: %s  |  Vendor: %s",
+             uptime, net->vendor[0] ? net->vendor : "-");
+}
+
+static void observer_update_summary_label(tab_context_t *ctx, int network_idx)
+{
+    if (!ctx || !ctx->observer_networks || !ctx->observer_network_ui ||
+        network_idx < 0 || network_idx >= ctx->observer_network_count) {
+        return;
+    }
+
+    observer_network_ui_t *ui = &ctx->observer_network_ui[network_idx];
+    if (!ui->summary_label || !lv_obj_is_valid(ui->summary_label)) return;
+
+    char summary[160];
+    format_observer_summary_info(summary, sizeof(summary),
+                                 &ctx->observer_networks[network_idx]);
+    lv_label_set_text(ui->summary_label, summary);
 }
 
 // A row of buttons that scrolls sideways instead of stacking into more rows.
@@ -2265,6 +2315,8 @@ static void hide_all_pages(tab_context_t *ctx) {
 
 // Initialize tab context - allocate PSRAM for large data arrays
 static void init_tab_context(tab_context_t *ctx) {
+    atomic_init(&ctx->wardrive_ui_dirty, false);
+
     // WiFi scan results
     if (!ctx->networks) {
         ctx->networks = heap_caps_calloc(MAX_NETWORKS, sizeof(wifi_network_t), MALLOC_CAP_SPIRAM);
@@ -2278,6 +2330,13 @@ static void init_tab_context(tab_context_t *ctx) {
         ctx->observer_networks = heap_caps_calloc(MAX_OBSERVER_NETWORKS, sizeof(observer_network_t), MALLOC_CAP_SPIRAM);
         if (!ctx->observer_networks) {
             ESP_LOGE(TAG, "Failed to allocate observer_networks in PSRAM");
+        }
+    }
+    if (!ctx->observer_network_ui) {
+        ctx->observer_network_ui = heap_caps_calloc(
+            MAX_OBSERVER_NETWORKS, sizeof(observer_network_ui_t), MALLOC_CAP_SPIRAM);
+        if (!ctx->observer_network_ui) {
+            ESP_LOGE(TAG, "Failed to allocate observer_network_ui in PSRAM");
         }
     }
     if (!ctx->observer_rx_buffer) {
@@ -2449,6 +2508,7 @@ static float current_battery_voltage = 0.0f;
 static float current_battery_current_a = 0.0f;
 static bool current_battery_current_valid = false;
 static bool current_charging_status = false;
+static uint8_t power_telemetry_log_divider = 0;
 
 // Full-screen "Scanning..." overlay shown while a wifi_scan_task is running on the
 // active tab. Only one overlay can be visible at a time so it stays a global.
@@ -2937,6 +2997,7 @@ static void destroy_deauth_popup_ui(void);
 static void close_deauth_popup(void);
 static void deauth_btn_click_cb(lv_event_t *e);
 static void update_observer_table(tab_context_t *ctx);
+static void observer_flush_incremental_ui(tab_context_t *ctx);
 static void observer_export_btn_cb(lv_event_t *e);
 static bool observer_export_csv(tab_context_t *ctx, char *out_path, size_t out_path_sz, char *err_msg, size_t err_msg_sz);
 static bool parse_sniffer_network_line(const char *line, observer_network_t *net);
@@ -3131,6 +3192,7 @@ static void wardrive_back_cb(lv_event_t *e);
 static void wardrive_monitor_task(void *arg);
 static void update_wardrive_table(tab_context_t *ctx);
 static void update_wardrive_count_label(tab_context_t *ctx);
+static void refresh_deferred_wardrive_ui(void);
 static void update_wardrive_trace_button(tab_context_t *ctx);
 static void close_wardrive_gps_overlay(tab_context_t *ctx);
 static void wardrive_upload_btn_cb(lv_event_t *e);
@@ -4284,6 +4346,30 @@ static void battery_status_timer_cb(lv_timer_t *timer)
     // Read new values
     update_battery_status();
 
+    app_power_telemetry_snapshot_t telemetry;
+    if (app_power_telemetry_record(current_battery_voltage,
+                                   current_battery_current_a,
+                                   current_battery_current_valid,
+                                   esp_timer_get_time(),
+                                   &telemetry)) {
+        power_telemetry_log_divider++;
+        if (power_telemetry_log_divider >= 5) {
+            power_telemetry_log_divider = 0;
+            app_power_profile_t profile = app_power_manager_get_profile();
+            ESP_LOGI(TAG,
+                     "POWER_CSV,%llu,%s,%s,%u,%.3f,%.1f,%.1f,%.1f,%.3f",
+                     (unsigned long long)(esp_timer_get_time() / 1000),
+                     app_power_manager_profile_name(profile),
+                     app_power_manager_is_screen_dimmed() ? "off" : "on",
+                     (unsigned)app_power_manager_get_max_frequency_mhz(),
+                     telemetry.voltage_v,
+                     telemetry.current_a * 1000.0f,
+                     telemetry.battery_power_w * 1000.0f,
+                     telemetry.average_60s_power_w * 1000.0f,
+                     telemetry.energy_mwh);
+        }
+    }
+
     // Memory stats
     size_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
     size_t psram_min = heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM);
@@ -4373,22 +4459,33 @@ static void set_brightness_gamma(uint8_t percent)
     ledc_update_duty(LEDC_LOW_SPEED_MODE, BRIGHTNESS_LEDC_CH);
 }
 
-// Wake screen helper - restores brightness and clears dimmed state
+// Wake screen helper - refreshes deferred UI before the backlight is restored.
 static void wake_screen(const char *source)
 {
+    esp_err_t power_err = app_power_manager_set_screen_dimmed(false);
+    if (power_err != ESP_OK && power_err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(TAG, "Could not record interactive screen state: %s",
+                 esp_err_to_name(power_err));
+    }
+    screen_dimmed = false;
+
     if (sleep_overlay) {
         lv_obj_delete(sleep_overlay);
         sleep_overlay = NULL;
     }
 
+    // The monitor task only marked the Wardrive UI dirty while the panel was
+    // dark. Rebuild it once at full speed before it becomes visible again.
+    refresh_deferred_wardrive_ui();
     set_brightness_gamma(screen_brightness_setting);  // Restore brightness with gamma correction
-    screen_dimmed = false;
     last_activity_time = lv_tick_get();
     ESP_LOGI(TAG, "Screen woken by %s (brightness %d%%)", source, screen_brightness_setting);
 }
 
-// Sleep overlay click callback - wakes screen and removes overlay (GT911 only)
-static void sleep_overlay_click_cb(lv_event_t *e)
+// Wake on the initial press, before LVGL can classify a moving finger as a
+// scroll gesture. Deleting the pressed overlay makes LVGL wait for release, so
+// this first contact is consumed and cannot also move the unlock slider.
+static void sleep_overlay_press_cb(lv_event_t *e)
 {
     (void)e;
     wake_screen("touch");
@@ -4399,7 +4496,7 @@ static void screen_timeout_timer_cb(lv_timer_t *timer)
 {
     (void)timer;
 
-    // If screen is dimmed, touch overlay handles wake via sleep_overlay_click_cb
+    // If screen is dimmed, touch overlay handles wake via sleep_overlay_press_cb
     if (screen_dimmed) {
         return;
     }
@@ -4409,6 +4506,11 @@ static void screen_timeout_timer_cb(lv_timer_t *timer)
     if (timeout_ms != UINT32_MAX && (now - last_activity_time) >= timeout_ms) {
         bsp_display_brightness_set(0);  // Turn off backlight
         screen_dimmed = true;
+        esp_err_t power_err = app_power_manager_set_screen_dimmed(true);
+        if (power_err != ESP_OK && power_err != ESP_ERR_INVALID_STATE) {
+            ESP_LOGW(TAG, "Could not record dimmed screen state: %s",
+                     esp_err_to_name(power_err));
+        }
 
         // Auto-lock: engage the lock now (before the wake overlay) so it stays in
         // place underneath and the user must slide to unlock after waking.
@@ -4422,7 +4524,8 @@ static void screen_timeout_timer_cb(lv_timer_t *timer)
         lv_obj_set_size(sleep_overlay, LV_PCT(100), LV_PCT(100));
         lv_obj_set_style_bg_opa(sleep_overlay, LV_OPA_TRANSP, 0);
         lv_obj_add_flag(sleep_overlay, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_add_event_cb(sleep_overlay, sleep_overlay_click_cb, LV_EVENT_CLICKED, NULL);
+        lv_obj_clear_flag(sleep_overlay, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_event_cb(sleep_overlay, sleep_overlay_press_cb, LV_EVENT_PRESSED, NULL);
 
         ESP_LOGI(TAG, "Screen dimmed (touch to wake)");
     }
@@ -5915,6 +6018,13 @@ static void creds_fetch(tab_context_t *ctx, tab_id_t tab, uart_port_t port)
             if (line_pos < (int)sizeof(line) - 1) line[line_pos++] = c;
         }
     }
+    // JanOS does not guarantee a trailing CR/LF after the last password row.
+    // Parse the buffered tail as well or the final saved network disappears
+    // from the cache and its UI badge is never shown.
+    if (line_pos > 0) {
+        line[line_pos] = '\0';
+        creds_parse_line(ctx, line);
+    }
     ESP_LOGI(TAG, "[%s] Cached %d captured password(s)",
              tab_transport_name(tab), ctx->evil_twin_entry_count);
 }
@@ -5934,14 +6044,6 @@ static const char *creds_lookup(tab_context_t *ctx, const char *ssid)
 static bool creds_have(tab_context_t *ctx, const char *ssid)
 {
     return creds_lookup(ctx, ssid) != NULL;
-}
-
-// Recolor-markup badge appended to a network row when we hold its password.
-// Every list that renders a row must use this, including the inspect tasks that
-// rewrite rows in place - otherwise the badge is painted and then overwritten.
-static const char *creds_badge(tab_context_t *ctx, const char *ssid)
-{
-    return creds_have(ctx, ssid) ? "  |  #55DD99 password saved#" : "";
 }
 
 static void inspect_networks_task(void *arg)
@@ -6042,7 +6144,7 @@ static void inspect_networks_task(void *arg)
                 char info_buf[NETWORK_INFO_BUF];
                 format_network_info(info_buf, sizeof(info_buf),
                                     net->bssid, net->channel, net->band, net->security,
-                                    net->rssi, creds_badge(ctx, net->ssid),
+                                    net->rssi,
                                     mfp_capable ? "#FF5555 MFP On#" : "#55DD55 MFP Off#",
                                     up_text, vendor_display);
                 lv_label_set_text(ctx->inspect_info_labels[i - 1], info_buf);
@@ -6114,12 +6216,9 @@ static void inspect_observer_task(void *arg)
                     lv_obj_is_valid(ctx->observer_inspect_info_labels[i])) {
                     lv_label_set_recolor(ctx->observer_inspect_info_labels[i], true);
                     char info_buf[NETWORK_INFO_BUF];
-                    format_network_info(info_buf, sizeof(info_buf),
-                                        net->bssid, net->channel, net->band, NULL,
-                                        net->rssi, creds_badge(ctx, net->ssid),
-                                        net->mfp_capable ? "#FF5555 MFP On#" : "#55DD55 MFP Off#",
-                                        net->uptime, net->vendor);
+                    format_observer_network_info(info_buf, sizeof(info_buf), net);
                     lv_label_set_text(ctx->observer_inspect_info_labels[i], info_buf);
+                    observer_update_summary_label(ctx, i);
                 }
                 bsp_display_unlock();
             }
@@ -6183,12 +6282,9 @@ static void inspect_observer_task(void *arg)
                     lv_obj_is_valid(ctx->observer_inspect_info_labels[i])) {
                     lv_label_set_recolor(ctx->observer_inspect_info_labels[i], true);
                     char info_buf[NETWORK_INFO_BUF];
-                    format_network_info(info_buf, sizeof(info_buf),
-                                        net->bssid, net->channel, net->band, NULL,
-                                        net->rssi, creds_badge(ctx, net->ssid),
-                                        mfp_capable ? "#FF5555 MFP On#" : "#55DD55 MFP Off#",
-                                        uptime_str, net->vendor);
+                    format_observer_network_info(info_buf, sizeof(info_buf), net);
                     lv_label_set_text(ctx->observer_inspect_info_labels[i], info_buf);
+                    observer_update_summary_label(ctx, i);
                 }
                 bsp_display_unlock();
             }
@@ -6359,13 +6455,22 @@ static void wifi_scan_task(void *arg)
             lv_obj_set_style_pad_column(item, 12, 0);
             lv_obj_add_flag(item, LV_OBJ_FLAG_CLICKABLE);
 
-            // Checkbox (on the left) - explicit size for better touch accuracy
-            lv_obj_t *cb = lv_checkbox_create(item);
+            // Keep a 50x50 touch/alignment slot, but let the checkbox itself use
+            // its natural height. LVGL draws an empty checkbox indicator near
+            // the top of a fixed-height checkbox; on a one-line wide layout a
+            // 50x50 checkbox therefore appeared above the SSID baseline.
+            lv_obj_t *selection_slot = lv_obj_create(item);
+            lv_obj_remove_style_all(selection_slot);
+            lv_obj_set_size(selection_slot, 50, 50);
+            lv_obj_clear_flag(selection_slot, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_remove_flag(selection_slot, LV_OBJ_FLAG_CLICKABLE);
+
+            lv_obj_t *cb = lv_checkbox_create(selection_slot);
             lv_checkbox_set_text(cb, "");  // Empty text - we use separate labels
-            lv_obj_set_size(cb, 50, 50);  // Explicit size for touch target
             lv_obj_set_ext_click_area(cb, 15);  // Extend touch area by 15px
             lv_obj_set_style_pad_all(cb, 4, 0);
-            lv_obj_set_style_align(cb, LV_ALIGN_LEFT_MID, 0);  // Center vertically in row
+            lv_obj_set_size(cb, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+            lv_obj_center(cb);
             // Style the indicator - dark when unchecked, green when checked
             lv_obj_set_style_bg_color(cb, lv_color_hex(0x3D3D3D), LV_PART_INDICATOR);
             lv_obj_set_style_bg_color(cb, lv_color_hex(0x4CAF50), LV_PART_INDICATOR | LV_STATE_CHECKED);
@@ -6376,9 +6481,11 @@ static void wifi_scan_task(void *arg)
             lv_obj_add_event_cb(cb, network_checkbox_event_cb, LV_EVENT_VALUE_CHANGED, (void*)(intptr_t)i);
             lv_obj_add_event_cb(item, network_item_event_cb, LV_EVENT_CLICKED, cb);
 
-            // Text container (vertical layout for SSID and info)
+            // Remaining row width belongs to a compact responsive text block.
+            // The checkbox keeps its fixed alignment slot at the left.
             lv_obj_t *text_cont = lv_obj_create(item);
-            lv_obj_set_size(text_cont, lv_pct(85), LV_SIZE_CONTENT);
+            lv_obj_set_size(text_cont, 0, LV_SIZE_CONTENT);
+            lv_obj_set_flex_grow(text_cont, 1);
             lv_obj_set_style_bg_opa(text_cont, LV_OPA_TRANSP, 0);
             lv_obj_set_style_border_width(text_cont, 0, 0);
             lv_obj_set_style_pad_all(text_cont, 0, 0);
@@ -6386,8 +6493,19 @@ static void wifi_scan_task(void *arg)
             lv_obj_set_style_pad_row(text_cont, 4, 0);
             lv_obj_clear_flag(text_cont, LV_OBJ_FLAG_CLICKABLE);  // Don't steal clicks
 
-            // SSID (or "Hidden" if empty)
-            lv_obj_t *ssid_label = lv_label_create(text_cont);
+            // Title stays on one line. The saved marker is independent from
+            // SSID so neither can create the old "password saved" orphan wrap.
+            lv_obj_t *title_row = lv_obj_create(text_cont);
+            lv_obj_remove_style_all(title_row);
+            lv_obj_set_size(title_row, lv_pct(100), LV_SIZE_CONTENT);
+            lv_obj_set_flex_flow(title_row, LV_FLEX_FLOW_ROW);
+            lv_obj_set_flex_align(title_row, LV_FLEX_ALIGN_START,
+                                  LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+            lv_obj_set_style_pad_column(title_row, 12, 0);
+            lv_obj_clear_flag(title_row, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_remove_flag(title_row, LV_OBJ_FLAG_CLICKABLE);
+
+            lv_obj_t *ssid_label = lv_label_create(title_row);
             if (strlen(net->ssid) > 0) {
                 lv_label_set_text(ssid_label, net->ssid);
             } else {
@@ -6395,21 +6513,30 @@ static void wifi_scan_task(void *arg)
             }
             lv_obj_set_style_text_font(ssid_label, &lv_font_montserrat_18, 0);
             lv_obj_set_style_text_color(ssid_label, lv_color_hex(0xFFFFFF), 0);
+            lv_obj_set_width(ssid_label, LV_SIZE_CONTENT);
+            lv_obj_set_style_max_width(ssid_label, ui_wide_layout() ? 360 : 400, 0);
+            lv_label_set_long_mode(ssid_label, LV_LABEL_LONG_DOT);
 
-            // BSSID, Band, Security, RSSI and vendor
+            if (creds_have(ctx, net->ssid)) {
+                lv_obj_t *saved_badge = lv_label_create(title_row);
+                lv_label_set_text(saved_badge, "password saved");
+                lv_obj_set_width(saved_badge, LV_SIZE_CONTENT);
+                lv_obj_set_style_text_font(saved_badge, &lv_font_montserrat_12, 0);
+                lv_obj_set_style_text_color(saved_badge, lv_color_hex(0x55DD99), 0);
+            }
+
+            // Landscape has one metadata line; portrait splits once before
+            // MFP/Uptime/Vendor, yielding two or three total tile lines.
             lv_obj_t *info_label = lv_label_create(text_cont);
             lv_label_set_recolor(info_label, true);
             char info_buf[NETWORK_INFO_BUF];
             format_network_info(info_buf, sizeof(info_buf),
                                 net->bssid, net->channel, net->band, net->security,
-                                net->rssi, creds_badge(ctx, net->ssid),
-                                NULL, NULL, net->vendor);
+                                net->rssi, NULL, NULL, net->vendor);
             lv_label_set_text(info_label, info_buf);
             lv_obj_set_style_text_font(info_label, &lv_font_montserrat_12, 0);
             lv_obj_set_style_text_color(info_label, lv_color_hex(0x888888), 0);
-
-            // On a wide screen the whole run fits beside the SSID.
-            style_network_row_text(text_cont, ssid_label, info_label, 240);
+            lv_obj_set_width(info_label, lv_pct(100));
 
             if (ctx->inspect_info_labels && i < ctx->inspect_label_count) {
                 ctx->inspect_info_labels[i] = info_label;
@@ -19009,7 +19136,7 @@ static void close_network_popup(void)
     }
 
     if (ctx->observer_table) {
-        update_observer_table(ctx);
+        observer_flush_incremental_ui(ctx);
     }
 
     ctx->observer_attack_return_to_observer = false;
@@ -19361,10 +19488,205 @@ static void popup_poll_task(void *arg)
     vTaskDelete(NULL);
 }
 
-// Update observer table UI with current data
+static void observer_update_ssid_label(tab_context_t *ctx, int network_idx)
+{
+    if (!ctx || !ctx->observer_networks || !ctx->observer_network_ui ||
+        network_idx < 0 || network_idx >= ctx->observer_network_count) {
+        return;
+    }
+
+    observer_network_t *net = &ctx->observer_networks[network_idx];
+    observer_network_ui_t *ui = &ctx->observer_network_ui[network_idx];
+    if (!ui->ssid_label || !lv_obj_is_valid(ui->ssid_label)) return;
+
+    const char *ssid = net->ssid[0] ? net->ssid : "(Hidden)";
+    lv_label_set_text(ui->ssid_label, ssid);
+}
+
+static void observer_update_client_toggle(tab_context_t *ctx, int network_idx)
+{
+    if (!ctx || !ctx->observer_networks || !ctx->observer_network_ui ||
+        network_idx < 0 || network_idx >= ctx->observer_network_count) {
+        return;
+    }
+
+    observer_network_t *net = &ctx->observer_networks[network_idx];
+    observer_network_ui_t *ui = &ctx->observer_network_ui[network_idx];
+    if (!ui->client_toggle || !ui->client_toggle_label ||
+        !lv_obj_is_valid(ui->client_toggle) ||
+        !lv_obj_is_valid(ui->client_toggle_label)) {
+        return;
+    }
+
+    if (net->client_count <= 0) {
+        ui->clients_expanded = false;
+        lv_obj_add_flag(ui->client_toggle, LV_OBJ_FLAG_HIDDEN);
+        if (ui->client_container && lv_obj_is_valid(ui->client_container)) {
+            lv_obj_add_flag(ui->client_container, LV_OBJ_FLAG_HIDDEN);
+        }
+        return;
+    }
+
+    lv_obj_clear_flag(ui->client_toggle, LV_OBJ_FLAG_HIDDEN);
+    lv_label_set_text_fmt(ui->client_toggle_label, "%d client%s  %s",
+                          net->client_count,
+                          net->client_count == 1 ? "" : "s",
+                          ui->clients_expanded ? LV_SYMBOL_UP : LV_SYMBOL_DOWN);
+    if (ui->client_container && lv_obj_is_valid(ui->client_container)) {
+        if (ui->clients_expanded) {
+            lv_obj_clear_flag(ui->client_container, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(ui->client_container, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+}
+
+static void observer_client_toggle_cb(lv_event_t *e)
+{
+    lv_event_stop_bubbling(e);
+    int network_idx = (int)(intptr_t)lv_event_get_user_data(e);
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx || !ctx->observer_network_ui || network_idx < 0 ||
+        network_idx >= ctx->observer_network_count) {
+        return;
+    }
+
+    observer_network_ui_t *ui = &ctx->observer_network_ui[network_idx];
+    bool expand_selected = !ui->clients_expanded;
+
+    // Accordion behavior: collapse every tile before optionally opening the
+    // selected one. This keeps the list dense and prevents large scroll jumps.
+    for (int i = 0; i < ctx->observer_network_count; i++) {
+        observer_network_ui_t *other_ui = &ctx->observer_network_ui[i];
+        other_ui->clients_expanded = false;
+        if (other_ui->client_container &&
+            lv_obj_is_valid(other_ui->client_container)) {
+            lv_obj_add_flag(other_ui->client_container, LV_OBJ_FLAG_HIDDEN);
+        }
+        observer_update_client_toggle(ctx, i);
+    }
+
+    if (expand_selected) {
+        ui->clients_expanded = true;
+        if (ui->client_container && lv_obj_is_valid(ui->client_container)) {
+            lv_obj_clear_flag(ui->client_container, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    observer_update_client_toggle(ctx, network_idx);
+}
+
+static void observer_add_client_row(tab_context_t *ctx, int network_idx, int client_idx)
+{
+    if (!ctx || !ctx->observer_networks || !ctx->observer_network_ui ||
+        network_idx < 0 || network_idx >= ctx->observer_network_count ||
+        client_idx < 0 || client_idx >= MAX_CLIENTS_PER_NETWORK) {
+        return;
+    }
+
+    observer_network_t *net = &ctx->observer_networks[network_idx];
+    observer_network_ui_t *ui = &ctx->observer_network_ui[network_idx];
+    if (!ui->client_container || !lv_obj_is_valid(ui->client_container) ||
+        net->clients[client_idx][0] == '\0') {
+        return;
+    }
+
+    lv_obj_t *client_row = lv_obj_create(ui->client_container);
+    lv_obj_set_size(client_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_pad_all(client_row, 6, 0);
+    lv_obj_set_style_pad_left(client_row, 24, 0);
+    lv_obj_set_style_bg_color(client_row, lv_color_hex(0x1E2828), 0);
+    lv_obj_set_style_bg_color(client_row, lv_color_hex(0x2E3838), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(client_row, 0, 0);
+    lv_obj_set_style_radius(client_row, 4, 0);
+    lv_obj_clear_flag(client_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(client_row, LV_OBJ_FLAG_CLICKABLE);
+
+    intptr_t packed_data = ((intptr_t)network_idx << 16) | (intptr_t)client_idx;
+    lv_obj_add_event_cb(client_row, client_row_click_cb,
+                        LV_EVENT_CLICKED, (void *)packed_data);
+
+    lv_obj_t *mac_label = lv_label_create(client_row);
+    lv_label_set_text(mac_label, net->clients[client_idx]);
+    lv_obj_set_style_text_font(mac_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(mac_label, COLOR_MATERIAL_TEAL, 0);
+}
+
+// Synchronize only network tiles whose client counts changed. Existing LVGL
+// objects remain alive, so an input gesture can never lose its target because
+// a periodic Observer poll deleted the complete table.
+static void observer_sync_changed_tiles(tab_context_t *ctx)
+{
+    if (!ctx || !ctx->observer_networks || !ctx->observer_network_ui) return;
+
+    for (int i = 0; i < ctx->observer_network_count; i++) {
+        observer_network_t *net = &ctx->observer_networks[i];
+        observer_network_ui_t *ui = &ctx->observer_network_ui[i];
+        if (!ui->tile || !lv_obj_is_valid(ui->tile)) continue;
+        if (ui->rendered_client_count == net->client_count) continue;
+
+        int first_new = ui->rendered_client_count;
+        if (first_new < 0 || first_new > net->client_count) first_new = 0;
+        for (int j = first_new; j < net->client_count &&
+             j < MAX_CLIENTS_PER_NETWORK; j++) {
+            observer_add_client_row(ctx, i, j);
+        }
+        ui->rendered_client_count = net->client_count;
+        observer_update_client_toggle(ctx, i);
+    }
+    ctx->observer_ui_refresh_pending = false;
+}
+
+// Called with the LVGL mutex held. Layout changes are deferred while kinetic
+// or finger-driven scrolling is active and applied by the scroll-end callback.
+static void observer_flush_incremental_ui(tab_context_t *ctx)
+{
+    if (!ctx || !ctx->observer_table ||
+        !lv_obj_is_valid(ctx->observer_table)) {
+        return;
+    }
+    lv_indev_t *touch = bsp_display_get_input_dev();
+    bool touch_pressed = touch &&
+                         lv_indev_get_state(touch) == LV_INDEV_STATE_PRESSED;
+    if (touch_pressed || lv_obj_is_scrolling(ctx->observer_table)) {
+        ctx->observer_ui_refresh_pending = true;
+        return;
+    }
+    observer_sync_changed_tiles(ctx);
+}
+
+static void observer_table_scroll_end_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = lv_event_get_user_data(e);
+    if (!ctx || !ctx->observer_ui_refresh_pending) return;
+    observer_sync_changed_tiles(ctx);
+}
+
+// A tap may postpone an update before LVGL has entered the scrolling state.
+// Apply that pending update on release; kinetic scrolling remains protected by
+// the table's LV_EVENT_SCROLL_END callback.
+static void observer_touch_release_cb(lv_event_t *e)
+{
+    (void)e;
+    tab_context_t *const contexts[] = {
+        &grove_ctx, &usb_ctx, &mbus_ctx, &internal_ctx,
+    };
+    for (size_t i = 0; i < sizeof(contexts) / sizeof(contexts[0]); i++) {
+        tab_context_t *ctx = contexts[i];
+        if (!ctx->observer_ui_refresh_pending || !ctx->observer_table ||
+            !lv_obj_is_valid(ctx->observer_table) ||
+            lv_obj_is_scrolling(ctx->observer_table)) {
+            continue;
+        }
+        observer_sync_changed_tiles(ctx);
+    }
+}
+
+// Build the complete observer table after a fresh network scan. Periodic
+// sniffer polls use observer_sync_changed_tiles() instead.
 static void update_observer_table(tab_context_t *ctx)
 {
-    if (!ctx || !ctx->observer_table || !ctx->observer_networks) return;
+    if (!ctx || !ctx->observer_table || !ctx->observer_networks ||
+        !ctx->observer_network_ui) return;
 
     // Show export button as soon as there are results
     if (ctx->observer_export_btn && ctx->observer_network_count > 0) {
@@ -19383,6 +19705,9 @@ static void update_observer_table(tab_context_t *ctx)
     lv_coord_t scroll_y = lv_obj_get_scroll_y(ctx->observer_table);
 
     lv_obj_clean(ctx->observer_table);
+    memset(ctx->observer_network_ui, 0,
+           sizeof(observer_network_ui_t) * MAX_OBSERVER_NETWORKS);
+    ctx->observer_ui_refresh_pending = false;
 
     // Allocate inspect label array before building rows
     if (ctx->observer_network_count > 0) {
@@ -19392,11 +19717,16 @@ static void update_observer_table(tab_context_t *ctx)
             ? ctx->observer_network_count : 0;
     }
 
+    bool wide_layout = ui_wide_layout();
+
     for (int i = 0; i < ctx->observer_network_count; i++) {
         observer_network_t *net = &ctx->observer_networks[i];
+        observer_network_ui_t *ui = &ctx->observer_network_ui[i];
 
-        // Create network row (darker background, clickable) - 2 lines like WiFi Scanner
+        // The outer tile remains stable for the lifetime of this scan. Client
+        // rows are appended to its child container as they are discovered.
         lv_obj_t *net_row = lv_obj_create(ctx->observer_table);
+        ui->tile = net_row;
         lv_obj_set_size(net_row, lv_pct(100), LV_SIZE_CONTENT);
         lv_obj_set_style_pad_all(net_row, 8, 0);
         lv_obj_set_style_bg_color(net_row, lv_color_hex(0x2D2D2D), 0);
@@ -19411,72 +19741,128 @@ static void update_observer_table(tab_context_t *ctx)
         // Add click event with network index as user data
         lv_obj_add_event_cb(net_row, network_row_click_cb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
 
-        // First row: SSID (or "Hidden") + client count
-        lv_obj_t *ssid_label = lv_label_create(net_row);
-        if (strlen(net->ssid) > 0) {
-            if (net->client_count > 0) {
-                lv_label_set_text_fmt(ssid_label, "%s  (%d clients)", net->ssid, net->client_count);
-            } else {
-                lv_label_set_text(ssid_label, net->ssid);
-            }
-        } else {
-            if (net->client_count > 0) {
-                lv_label_set_text_fmt(ssid_label, "(Hidden)  (%d clients)", net->client_count);
-            } else {
-                lv_label_set_text(ssid_label, "(Hidden)");
-            }
-        }
+        lv_obj_t *header = lv_obj_create(net_row);
+        lv_obj_set_size(header, lv_pct(100), LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_opa(header, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(header, 0, 0);
+        lv_obj_set_style_pad_all(header, 0, 0);
+        lv_obj_set_flex_flow(header, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_style_pad_row(header, 2, 0);
+        lv_obj_clear_flag(header, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_remove_flag(header, LV_OBJ_FLAG_CLICKABLE);
+
+        // First row: identity/status starts at the left and the independent
+        // client-list disclosure remains pinned to the right. Landscape also
+        // keeps uptime/vendor in this row; portrait places it below metadata.
+        lv_obj_t *title_row = lv_obj_create(header);
+        lv_obj_set_size(title_row, lv_pct(100), LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_opa(title_row, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(title_row, 0, 0);
+        lv_obj_set_style_pad_all(title_row, 0, 0);
+        lv_obj_set_style_pad_column(title_row, 8, 0);
+        lv_obj_set_flex_flow(title_row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(title_row, LV_FLEX_ALIGN_START,
+                              LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_clear_flag(title_row, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_remove_flag(title_row, LV_OBJ_FLAG_CLICKABLE);
+
+        lv_obj_t *title_content = lv_obj_create(title_row);
+        lv_obj_set_size(title_content, 0, LV_SIZE_CONTENT);
+        lv_obj_set_flex_grow(title_content, 1);
+        lv_obj_set_style_bg_opa(title_content, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(title_content, 0, 0);
+        lv_obj_set_style_pad_all(title_content, 0, 0);
+        lv_obj_set_style_pad_column(title_content, 12, 0);
+        lv_obj_set_flex_flow(title_content, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(title_content, LV_FLEX_ALIGN_START,
+                              LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_clear_flag(title_content, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_remove_flag(title_content, LV_OBJ_FLAG_CLICKABLE);
+
+        lv_obj_t *ssid_label = lv_label_create(title_content);
+        ui->ssid_label = ssid_label;
+        lv_label_set_recolor(ssid_label, true);
         lv_obj_set_style_text_font(ssid_label, &lv_font_montserrat_18, 0);
         lv_obj_set_style_text_color(ssid_label, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_set_width(ssid_label, LV_SIZE_CONTENT);
+        lv_obj_set_style_max_width(ssid_label, wide_layout ? 320 : 360, 0);
+        lv_label_set_long_mode(ssid_label, LV_LABEL_LONG_DOT);
+        observer_update_ssid_label(ctx, i);
 
-        // Second row: BSSID | Band | RSSI | MFP | Uptime | Vendor
-        lv_obj_t *info_label = lv_label_create(net_row);
+        ui->saved_badge = lv_label_create(title_content);
+        lv_label_set_text(ui->saved_badge, LV_SYMBOL_OK " saved");
+        lv_obj_set_style_text_font(ui->saved_badge, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(ui->saved_badge, lv_color_hex(0x55DD99), 0);
+        if (!creds_have(ctx, net->ssid)) {
+            lv_obj_add_flag(ui->saved_badge, LV_OBJ_FLAG_HIDDEN);
+        }
+
+        ui->client_toggle = lv_btn_create(title_row);
+        lv_obj_set_size(ui->client_toggle, LV_SIZE_CONTENT, 34);
+        lv_obj_set_ext_click_area(ui->client_toggle, 6);
+        lv_obj_set_style_pad_hor(ui->client_toggle, 8, 0);
+        lv_obj_set_style_pad_ver(ui->client_toggle, 0, 0);
+        lv_obj_set_style_bg_color(ui->client_toggle, lv_color_hex(0x163534), 0);
+        lv_obj_set_style_bg_opa(ui->client_toggle, LV_OPA_70, 0);
+        lv_obj_set_style_radius(ui->client_toggle, 6, 0);
+        lv_obj_clear_flag(ui->client_toggle, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_remove_flag(ui->client_toggle, LV_OBJ_FLAG_EVENT_BUBBLE);
+        lv_obj_add_flag(ui->client_toggle, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_event_cb(ui->client_toggle, observer_client_toggle_cb,
+                            LV_EVENT_CLICKED, (void *)(intptr_t)i);
+
+        ui->client_toggle_label = lv_label_create(ui->client_toggle);
+        lv_obj_set_style_text_font(ui->client_toggle_label,
+                                   &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(ui->client_toggle_label,
+                                    COLOR_MATERIAL_TEAL, 0);
+        lv_obj_center(ui->client_toggle_label);
+
+        // Second row: BSSID | channel | band | security | RSSI | MFP
+        lv_obj_t *info_label = lv_label_create(header);
+        ui->info_label = info_label;
         lv_label_set_recolor(info_label, true);
         char info_buf[NETWORK_INFO_BUF];
-        format_network_info(info_buf, sizeof(info_buf),
-                            net->bssid, net->channel, net->band, NULL,
-                            net->rssi, creds_badge(ctx, net->ssid),
-                            net->inspected
-                                ? (net->mfp_capable ? "#FF5555 MFP On#" : "#55DD55 MFP Off#")
-                                : NULL,
-                            net->uptime, net->vendor);
+        format_observer_network_info(info_buf, sizeof(info_buf), net);
         lv_label_set_text(info_label, info_buf);
         lv_obj_set_style_text_font(info_label, &lv_font_montserrat_12, 0);
         lv_obj_set_style_text_color(info_label, lv_color_hex(0x888888), 0);
+        lv_obj_set_width(info_label, lv_pct(100));
 
-        // On a wide screen the run sits beside the SSID; the SSID column is
-        // wider than the scan list's because it also carries the client count.
-        style_network_row_text(net_row, ssid_label, info_label, 300);
+        // Landscape: immediately after SSID/saved, producing a compact two-row
+        // tile. Portrait: full-width third row so long SSIDs never collide with
+        // uptime/vendor or force the saved badge onto a stray line.
+        lv_obj_t *summary_parent = wide_layout ? title_content : header;
+        ui->summary_label = lv_label_create(summary_parent);
+        lv_obj_set_width(ui->summary_label, wide_layout ? 300 : lv_pct(100));
+        lv_label_set_long_mode(ui->summary_label, LV_LABEL_LONG_DOT);
+        lv_obj_set_style_text_font(ui->summary_label, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(ui->summary_label, lv_color_hex(0xAAAAAA), 0);
+        lv_obj_set_style_text_align(ui->summary_label, LV_TEXT_ALIGN_LEFT, 0);
+        observer_update_summary_label(ctx, i);
 
         // Register for async inspect update
         if (ctx->observer_inspect_info_labels && i < ctx->observer_inspect_label_count) {
             ctx->observer_inspect_info_labels[i] = info_label;
         }
 
-        // Create client rows (indented, lighter background, clickable)
-        for (int j = 0; j < MAX_CLIENTS_PER_NETWORK; j++) {
-            if (net->clients[j][0] == '\0') continue;
+        ui->client_container = lv_obj_create(net_row);
+        lv_obj_set_size(ui->client_container, lv_pct(100), LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_opa(ui->client_container, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(ui->client_container, 0, 0);
+        lv_obj_set_style_pad_all(ui->client_container, 0, 0);
+        lv_obj_set_style_pad_row(ui->client_container, 4, 0);
+        lv_obj_set_flex_flow(ui->client_container, LV_FLEX_FLOW_COLUMN);
+        lv_obj_clear_flag(ui->client_container, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_remove_flag(ui->client_container, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_flag(ui->client_container, LV_OBJ_FLAG_HIDDEN);
 
-            lv_obj_t *client_row = lv_obj_create(ctx->observer_table);
-            lv_obj_set_size(client_row, lv_pct(100), LV_SIZE_CONTENT);
-            lv_obj_set_style_pad_all(client_row, 6, 0);
-            lv_obj_set_style_pad_left(client_row, 32, 0);  // Indent
-            lv_obj_set_style_bg_color(client_row, lv_color_hex(0x1E2828), 0);
-            lv_obj_set_style_bg_color(client_row, lv_color_hex(0x2E3838), LV_STATE_PRESSED);
-            lv_obj_set_style_border_width(client_row, 0, 0);
-            lv_obj_set_style_radius(client_row, 4, 0);
-            lv_obj_clear_flag(client_row, LV_OBJ_FLAG_SCROLLABLE);
-            lv_obj_add_flag(client_row, LV_OBJ_FLAG_CLICKABLE);
-
-            // Pack network_idx and client_idx into user_data: (network_idx << 16) | client_idx
-            intptr_t packed_data = ((intptr_t)i << 16) | (intptr_t)j;
-            lv_obj_add_event_cb(client_row, client_row_click_cb, LV_EVENT_CLICKED, (void*)packed_data);
-
-            lv_obj_t *mac_label = lv_label_create(client_row);
-            lv_label_set_text(mac_label, net->clients[j]);
-            lv_obj_set_style_text_font(mac_label, &lv_font_montserrat_14, 0);
-            lv_obj_set_style_text_color(mac_label, COLOR_MATERIAL_TEAL, 0);
+        for (int j = 0; j < net->client_count &&
+             j < MAX_CLIENTS_PER_NETWORK; j++) {
+            observer_add_client_row(ctx, i, j);
         }
+        ui->rendered_client_count = net->client_count;
+        observer_update_client_toggle(ctx, i);
     }
 
     // Restore scroll position after rebuild
@@ -19981,7 +20367,7 @@ static void observer_poll_task(void *arg)
             lv_label_set_text_fmt(ctx->observer_status_label, "Found %d networks", ctx->observer_network_count);
         }
 
-        update_observer_table(ctx);
+        observer_flush_incremental_ui(ctx);
 
         bsp_display_unlock();
     }
@@ -20965,6 +21351,8 @@ static void show_observer_page(void)
     lv_obj_set_flex_flow(ctx->observer_table, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_row(ctx->observer_table, 6, 0);
     lv_obj_set_scroll_dir(ctx->observer_table, LV_DIR_VER);
+    lv_obj_add_event_cb(ctx->observer_table, observer_table_scroll_end_cb,
+                        LV_EVENT_SCROLL_END, ctx);
 
     // If we have existing data in context, show it
     if (ctx->observer_network_count > 0) {
@@ -23397,6 +23785,10 @@ static void show_wardrive_gps_overlay(tab_context_t *ctx)
 static void update_wardrive_count_label(tab_context_t *ctx)
 {
     if (!ctx || !ctx->wardrive_net_count_label) return;
+    if (app_power_manager_is_screen_dimmed()) {
+        atomic_store_explicit(&ctx->wardrive_ui_dirty, true, memory_order_release);
+        return;
+    }
     // LVGL's builtin formatter has floating-point conversions disabled.
     char distance_text[32];
     snprintf(distance_text, sizeof(distance_text), "%.2f", ctx->wardrive_distance_m / 1000.0);
@@ -23437,6 +23829,10 @@ static void update_wardrive_trace_button(tab_context_t *ctx)
 static void update_wardrive_table(tab_context_t *ctx)
 {
     if (!ctx || !ctx->wardrive_table) return;
+    if (app_power_manager_is_screen_dimmed()) {
+        atomic_store_explicit(&ctx->wardrive_ui_dirty, true, memory_order_release);
+        return;
+    }
 
     lv_coord_t scroll_y = lv_obj_get_scroll_y(ctx->wardrive_table);
     lv_obj_clean(ctx->wardrive_table);
@@ -23526,6 +23922,32 @@ static void update_wardrive_table(tab_context_t *ctx)
     }
 
     lv_obj_scroll_to_y(ctx->wardrive_table, scroll_y, LV_ANIM_OFF);
+}
+
+// Called only from the LVGL task while waking the display. Background monitor
+// tasks leave the flag set instead of rebuilding dozens of hidden LVGL rows.
+static void refresh_deferred_wardrive_ui(void)
+{
+    tab_context_t *const contexts[] = {
+        &grove_ctx, &usb_ctx, &mbus_ctx, &internal_ctx,
+    };
+
+    for (size_t i = 0; i < sizeof(contexts) / sizeof(contexts[0]); i++) {
+        tab_context_t *ctx = contexts[i];
+        if (!atomic_load_explicit(&ctx->wardrive_ui_dirty, memory_order_acquire)) {
+            continue;
+        }
+        bool page_visible = ctx->wardrive_page &&
+                            !lv_obj_has_flag(ctx->wardrive_page, LV_OBJ_FLAG_HIDDEN);
+        if (!page_visible) {
+            continue;
+        }
+
+        // Clear first so a concurrent parser update during the rebuild is not lost.
+        atomic_store_explicit(&ctx->wardrive_ui_dirty, false, memory_order_release);
+        update_wardrive_table(ctx);
+        update_wardrive_count_label(ctx);
+    }
 }
 
 // Parse a wardrive CSV network line and add to ring buffer
@@ -29395,7 +29817,6 @@ static void wardrive_monitor_task(void *arg)
     char rx_buffer[512];
     char line_buffer[512];
     int line_pos = 0;
-    bool batch_has_new_networks = false;
     uint32_t last_table_update_tick = 0;
     bool gps_push_initialized = false;
     bool gps_push_last_fix_valid = false;
@@ -29453,8 +29874,6 @@ static void wardrive_monitor_task(void *arg)
 
         if (len > 0) {
             rx_buffer[len] = '\0';
-            batch_has_new_networks = false;
-
             for (int i = 0; i < len; i++) {
                 char c = rx_buffer[i];
 
@@ -29654,7 +30073,7 @@ static void wardrive_monitor_task(void *arg)
 
                         // Try to parse as CSV network line
                         if (parse_wardrive_network_line(ctx, line_buffer)) {
-                            batch_has_new_networks = true;
+                            atomic_store_explicit(&ctx->wardrive_ui_dirty, true, memory_order_release);
                             // Auto-upload: check the just-parsed network against the home list.
                             int last_idx = (ctx->wardrive_net_head - 1 + WARDRIVE_MAX_NETWORKS)
                                            % WARDRIVE_MAX_NETWORKS;
@@ -29668,17 +30087,26 @@ static void wardrive_monitor_task(void *arg)
                 }
             }
 
-            // Update table at most once per second, and only if the page is visible
-            uint32_t now_tick = xTaskGetTickCount();
-            bool page_visible = ctx->wardrive_page && !lv_obj_has_flag(ctx->wardrive_page, LV_OBJ_FLAG_HIDDEN);
-            if (batch_has_new_networks && page_visible &&
-                (now_tick - last_table_update_tick) >= pdMS_TO_TICKS(1000)) {
+        }
+
+        // Network parsing continues while the screen is dark, but rebuilding
+        // the LVGL table does not. One deferred refresh is performed on wake.
+        uint32_t now_tick = xTaskGetTickCount();
+        bool screen_is_off = app_power_manager_is_screen_dimmed();
+        if (atomic_load_explicit(&ctx->wardrive_ui_dirty, memory_order_acquire) &&
+            !screen_is_off &&
+            (now_tick - last_table_update_tick) >= pdMS_TO_TICKS(1000)) {
+            bsp_display_lock(0);
+            bool page_visible = ctx->wardrive_page &&
+                                !lv_obj_has_flag(ctx->wardrive_page, LV_OBJ_FLAG_HIDDEN);
+            if (page_visible &&
+                atomic_exchange_explicit(&ctx->wardrive_ui_dirty, false,
+                                         memory_order_acq_rel)) {
                 last_table_update_tick = now_tick;
-                bsp_display_lock(0);
                 update_wardrive_table(ctx);
                 update_wardrive_count_label(ctx);
-                bsp_display_unlock();
             }
+            bsp_display_unlock();
         }
 
         vTaskDelay(pdMS_TO_TICKS(50));
@@ -31734,6 +32162,11 @@ static void show_wardrive_page(void)
     if (ctx->wardrive_page) {
         lv_obj_clear_flag(ctx->wardrive_page, LV_OBJ_FLAG_HIDDEN);
         ctx->current_visible_page = ctx->wardrive_page;
+        if (atomic_exchange_explicit(&ctx->wardrive_ui_dirty, false,
+                                     memory_order_acq_rel)) {
+            update_wardrive_table(ctx);
+            update_wardrive_count_label(ctx);
+        }
         return;
     }
 
@@ -31901,6 +32334,11 @@ static void show_wardrive_page(void)
     lv_obj_set_style_pad_row(ctx->wardrive_table, 6, 0);
 
     ctx->current_visible_page = ctx->wardrive_page;
+    if (atomic_exchange_explicit(&ctx->wardrive_ui_dirty, false,
+                                 memory_order_acq_rel)) {
+        update_wardrive_table(ctx);
+        update_wardrive_count_label(ctx);
+    }
 }
 
 //==================================================================================
@@ -60097,6 +60535,8 @@ static bool hs_crack_step(const char *pw, const hccapx_record_t *recs, int nrecs
 static void hs_crack_task(void *arg)
 {
     (void)arg;
+    bool performance_claimed =
+        app_power_manager_acquire_performance("wpa-crack") == ESP_OK;
     tab_id_t tab = (tab_id_t)hs_crack_ui.tab;
     uart_port_t uart_port = uart_port_for_tab(tab);
     bool usb_lock_set = false;
@@ -60286,6 +60726,9 @@ finish:
     free(recs);
     unlink(HS_CRACK_LOCAL_HCCAPX);
     unlink(HS_CRACK_LOCAL_HCCAPX ".part");
+    if (performance_claimed) {
+        (void)app_power_manager_release_performance("wpa-crack");
+    }
     // Publish completion atomically with the Close button, even if LVGL was busy.
     while (!bsp_display_lock(200)) vTaskDelay(1);
     if (hs_crack_ui.cancel_requested && found_idx < 0) final_status = "Cancelled";
@@ -60546,6 +60989,17 @@ void app_main(void)
     lv_refr_now(disp);
     bsp_display_unlock();
 
+    // Start application-controlled DFS only after the display driver has
+    // completed its full-speed initialization. Light sleep remains disabled;
+    // touch and the MIPI-DPI framebuffer stay active while the backlight is off.
+    ret = app_power_manager_init();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Power manager initialization failed: %s", esp_err_to_name(ret));
+    }
+    app_power_telemetry_reset();
+    ESP_LOGI(TAG,
+             "POWER_CSV_HEADER,time_ms,profile,screen,cpu_max_mhz,voltage_v,current_ma,power_mw,avg60_power_mw,energy_mwh");
+
     // Set display brightness from saved setting with gamma correction
     set_brightness_gamma(screen_brightness_setting);
 
@@ -60554,6 +61008,8 @@ void app_main(void)
     lv_indev_t *touch_indev = bsp_display_get_input_dev();
     if (touch_indev) {
         lv_indev_add_event_cb(touch_indev, touch_activity_cb, LV_EVENT_PRESSED, NULL);
+        lv_indev_add_event_cb(touch_indev, observer_touch_release_cb,
+                              LV_EVENT_RELEASED, NULL);
         uint32_t timeout_ms = get_screen_timeout_ms();
         if (timeout_ms == UINT32_MAX) {
             ESP_LOGI(TAG, "Screen timeout disabled (Stays On)");

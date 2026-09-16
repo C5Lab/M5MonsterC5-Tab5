@@ -1,5 +1,13 @@
 CONFIG_IDF_TARGET="esp32p4"
 
+# Tab5 uses the ESP32-P4 revision 1 clock tree (360/180/90 MHz).
+CONFIG_ESP32P4_REV_MIN_1=y
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_360=y
+
+# Power-manager profiles and performance locks. Automatic light sleep stays
+# disabled because MIPI-DSI and touch remain active while the backlight is off.
+CONFIG_PM_ENABLE=y
+
 # Increase watchdog timeout for LCD init
 CONFIG_ESP_TASK_WDT_TIMEOUT_S=30
 CONFIG_ESP_INT_WDT_TIMEOUT_MS=800
