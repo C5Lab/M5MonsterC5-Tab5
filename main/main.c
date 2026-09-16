@@ -43,6 +43,7 @@
 #include "usb/usb_types_ch9.h"
 #include "screens/subghz_host.h"
 #include "screens/cgw_parser.h"
+#include "scan_filter.h"
 
 // ESP-Hosted includes for WiFi via ESP32C6 SDIO
 #include "esp_hosted.h"
@@ -85,7 +86,7 @@ extern void pthread_internal_local_storage_destructor_callback(TaskHandle_t hand
 #endif
 
 
-#define JANOS_TAB_VERSION "1.5.5"
+#define JANOS_TAB_VERSION "1.5.4"
 #define JANOS_VERSION_REQUIRED "1.7.3"
 
 #include "lwip/netdb.h"
@@ -681,12 +682,24 @@ typedef struct {
     lv_obj_t *scan_status_label;
     lv_obj_t *network_list;
     lv_obj_t *spinner;
+    lv_obj_t *network_rows[MAX_NETWORKS];
+    lv_obj_t *scan_filter_btn_label;
+    lv_obj_t *scan_filter_summary_label;
+    lv_obj_t *scan_filter_overlay;
+    lv_obj_t *scan_filter_sort_dd;
+    lv_obj_t *scan_filter_order_dd;
+    lv_obj_t *scan_filter_ssid_input;
+    lv_obj_t *scan_filter_visibility_dd;
+    lv_obj_t *scan_filter_security_cb[7];
+    lv_obj_t *scan_filter_keyboard;
+    scan_filter_options_t scan_filter;
 
     wifi_network_t *networks;           // PSRAM
     int network_count;
     int selected_indices[MAX_NETWORKS];
     int selected_count;
     bool scan_in_progress;
+    bool scan_last_timed_out;
     bool observer_attack_override_active;
     bool observer_attack_return_to_observer;
     wifi_network_t observer_attack_network;
@@ -2853,6 +2866,8 @@ static void main_tile_event_cb(lv_event_t *e);
 static void back_btn_event_cb(lv_event_t *e);
 static void network_checkbox_event_cb(lv_event_t *e);
 static void network_item_event_cb(lv_event_t *e);
+static void scan_filter_btn_cb(lv_event_t *e);
+static void scan_filter_apply_view(tab_context_t *ctx);
 static void attack_tile_event_cb(lv_event_t *e);
 static void observer_attack_tile_event_cb(lv_event_t *e);
 static void observer_station_attack_tile_event_cb(lv_event_t *e);
@@ -6297,11 +6312,6 @@ static void wifi_scan_task(void *arg)
     // Update UI on main thread
     bsp_display_lock(0);
 
-    // Hide spinner
-    if (ctx->spinner) {
-        lv_obj_add_flag(ctx->spinner, LV_OBJ_FLAG_HIDDEN);
-    }
-
     // Update status
     if (ctx->scan_status_label) {
         if (scan_complete) {
@@ -6314,6 +6324,7 @@ static void wifi_scan_task(void *arg)
     // Update network list
     if (ctx->network_list) {
         lv_obj_clean(ctx->network_list);
+        memset(ctx->network_rows, 0, sizeof(ctx->network_rows));
 
         // Reallocate per-row label pointer array in PSRAM so the inspect
         // task can address each row's info_label by 0-based index.
@@ -6336,6 +6347,7 @@ static void wifi_scan_task(void *arg)
 
             // Create list item with horizontal layout (checkbox + text container)
             lv_obj_t *item = lv_obj_create(ctx->network_list);
+            ctx->network_rows[i] = item;
             lv_obj_set_size(item, lv_pct(100), LV_SIZE_CONTENT);
             lv_obj_set_style_pad_all(item, 8, 0);
             lv_obj_set_style_bg_color(item, lv_color_hex(0x2D2D2D), 0);
@@ -6410,17 +6422,14 @@ static void wifi_scan_task(void *arg)
         lv_obj_clear_state(ctx->scan_btn, LV_STATE_DISABLED);
     }
 
-    // Hide small spinner
-    if (ctx->spinner) {
-        lv_obj_add_flag(ctx->spinner, LV_OBJ_FLAG_HIDDEN);
-    }
-
     // Hide large centered overlay only if user is still on the same tab
     if (current_tab == scan_tab) {
         hide_scan_overlay();
     }
 
     ctx->scan_in_progress = false;
+    ctx->scan_last_timed_out = !scan_complete;
+    scan_filter_apply_view(ctx);
     ESP_LOGI(TAG, "[%s] Stored %d scan results in tab %d context",
              uart_name, ctx->network_count, scan_tab);
 
@@ -7373,6 +7382,7 @@ static void scan_btn_click_cb(lv_event_t *e)
     cancel_inspect_task(ctx);
 
     ctx->scan_in_progress = true;
+    ctx->scan_last_timed_out = false;
 
     // Clear previous selections (rescan = fresh selection)
     ctx->selected_count = 0;
@@ -7386,11 +7396,6 @@ static void scan_btn_click_cb(lv_event_t *e)
     // Show large centered overlay with spinner
     show_scan_overlay();
 
-    // Show small spinner next to button (optional backup)
-    if (ctx->spinner) {
-        lv_obj_clear_flag(ctx->spinner, LV_OBJ_FLAG_HIDDEN);
-    }
-
     // Update status
     if (ctx->scan_status_label) {
         lv_label_set_text(ctx->scan_status_label, "Scanning...");
@@ -7400,10 +7405,411 @@ static void scan_btn_click_cb(lv_event_t *e)
     if (ctx->network_list) {
         lv_obj_clean(ctx->network_list);
     }
+    memset(ctx->network_rows, 0, sizeof(ctx->network_rows));
 
     // Start scan task for the tab whose scan page is currently active.
     tab_id_t scan_tab = tab_id_for_ctx(ctx);
     xTaskCreate(wifi_scan_task, "wifi_scan", 8192, (void*)(uintptr_t)scan_tab, 5, NULL);
+}
+
+static bool scan_filter_index_selected(const tab_context_t *ctx, int source_index)
+{
+    if (!ctx) return false;
+    for (int i = 0; i < ctx->selected_count; i++) {
+        if (ctx->selected_indices[i] == source_index) return true;
+    }
+    return false;
+}
+
+static int scan_filter_active_group_count(const scan_filter_options_t *options)
+{
+    if (!options) return 0;
+    int count = 0;
+    if (options->sort_key != SCAN_SORT_DEFAULT || options->reverse) count++;
+    if (options->ssid_query[0] != '\0') count++;
+    if (options->security_mask != SCAN_SECURITY_ALL) count++;
+    if (options->visibility != SCAN_VISIBILITY_ALL) count++;
+    return count;
+}
+
+static void scan_filter_update_button(tab_context_t *ctx)
+{
+    if (!ctx) return;
+    int active = scan_filter_active_group_count(&ctx->scan_filter);
+    if (ctx->scan_filter_btn_label) {
+        if (active > 0) {
+            lv_label_set_text_fmt(ctx->scan_filter_btn_label, "FILTER %d", active);
+        } else {
+            lv_label_set_text(ctx->scan_filter_btn_label, "FILTER");
+        }
+    }
+    if (ctx->scan_filter_summary_label) {
+        char summary[256];
+        scan_filter_format_summary(summary, sizeof(summary), &ctx->scan_filter);
+        lv_label_set_text(ctx->scan_filter_summary_label, summary);
+    }
+}
+
+static void scan_filter_apply_view(tab_context_t *ctx)
+{
+    if (!ctx || !ctx->networks || !ctx->network_list) return;
+
+    scan_filter_record_t records[MAX_NETWORKS];
+    int display_order[MAX_NETWORKS];
+    bool visible[MAX_NETWORKS] = {false};
+    int count = ctx->network_count;
+    if (count < 0) count = 0;
+    if (count > MAX_NETWORKS) count = MAX_NETWORKS;
+
+    for (int i = 0; i < count; i++) {
+        records[i] = (scan_filter_record_t){
+            .ssid = ctx->networks[i].ssid,
+            .security = ctx->networks[i].security,
+            .rssi = ctx->networks[i].rssi,
+            .channel = ctx->networks[i].channel,
+            .source_index = i,
+        };
+        if (ctx->network_rows[i] && lv_obj_is_valid(ctx->network_rows[i])) {
+            lv_obj_add_flag(ctx->network_rows[i], LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+
+    size_t shown = 0;
+    if (count > 0) {
+        shown = scan_filter_build_order(records, (size_t)count,
+                                        &ctx->scan_filter,
+                                        display_order, MAX_NETWORKS);
+    }
+    for (size_t position = 0; position < shown; position++) {
+        int source_index = display_order[position];
+        if (source_index < 0 || source_index >= count) continue;
+        lv_obj_t *row = ctx->network_rows[source_index];
+        if (!row || !lv_obj_is_valid(row)) continue;
+        visible[source_index] = true;
+        lv_obj_move_to_index(row, (int32_t)position);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    int hidden_selected = 0;
+    for (int i = 0; i < count; i++) {
+        if (!visible[i] && scan_filter_index_selected(ctx, i)) hidden_selected++;
+    }
+
+    if (ctx->scan_status_label && !ctx->scan_in_progress) {
+        char status[160];
+        scan_filter_format_status(status, sizeof(status), count, shown,
+                                  ctx->selected_count, hidden_selected,
+                                  scan_filter_active_group_count(&ctx->scan_filter) > 0,
+                                  ctx->scan_last_timed_out);
+        lv_label_set_text(ctx->scan_status_label, status);
+    }
+    scan_filter_update_button(ctx);
+}
+
+static void scan_filter_close_popup(tab_context_t *ctx)
+{
+    if (!ctx) return;
+    if (ctx->scan_filter_overlay && lv_obj_is_valid(ctx->scan_filter_overlay)) {
+        lv_obj_del(ctx->scan_filter_overlay);
+    }
+    ctx->scan_filter_overlay = NULL;
+    ctx->scan_filter_sort_dd = NULL;
+    ctx->scan_filter_order_dd = NULL;
+    ctx->scan_filter_ssid_input = NULL;
+    ctx->scan_filter_visibility_dd = NULL;
+    memset(ctx->scan_filter_security_cb, 0, sizeof(ctx->scan_filter_security_cb));
+    ctx->scan_filter_keyboard = NULL;
+}
+
+static void scan_filter_cancel_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = lv_event_get_user_data(e);
+    scan_filter_close_popup(ctx);
+}
+
+static void scan_filter_keyboard_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = lv_event_get_user_data(e);
+    lv_event_code_t code = lv_event_get_code(e);
+    if (ctx && ctx->scan_filter_keyboard &&
+        (code == LV_EVENT_READY || code == LV_EVENT_CANCEL)) {
+        lv_obj_add_flag(ctx->scan_filter_keyboard, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void scan_filter_text_focus_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = lv_event_get_user_data(e);
+    if (!ctx || !ctx->scan_filter_keyboard || !ctx->scan_filter_ssid_input) return;
+    lv_keyboard_set_textarea(ctx->scan_filter_keyboard, ctx->scan_filter_ssid_input);
+    lv_obj_clear_flag(ctx->scan_filter_keyboard, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(ctx->scan_filter_keyboard);
+}
+
+static const uint32_t scan_filter_security_bits[7] = {
+    SCAN_SECURITY_ALL,
+    SCAN_SECURITY_OPEN,
+    SCAN_SECURITY_WPA,
+    SCAN_SECURITY_WPA2,
+    SCAN_SECURITY_WPA3,
+    SCAN_SECURITY_WEP,
+    SCAN_SECURITY_UNKNOWN,
+};
+
+static void scan_filter_security_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = lv_event_get_user_data(e);
+    lv_obj_t *target = lv_event_get_target(e);
+    if (!ctx || !target) return;
+
+    if (target == ctx->scan_filter_security_cb[0] &&
+        lv_obj_has_state(target, LV_STATE_CHECKED)) {
+        for (int i = 1; i < 7; i++) {
+            if (ctx->scan_filter_security_cb[i]) {
+                lv_obj_remove_state(ctx->scan_filter_security_cb[i], LV_STATE_CHECKED);
+            }
+        }
+        return;
+    }
+
+    if (lv_obj_has_state(target, LV_STATE_CHECKED) && ctx->scan_filter_security_cb[0]) {
+        lv_obj_remove_state(ctx->scan_filter_security_cb[0], LV_STATE_CHECKED);
+    }
+
+    bool any_specific = false;
+    for (int i = 1; i < 7; i++) {
+        if (ctx->scan_filter_security_cb[i] &&
+            lv_obj_has_state(ctx->scan_filter_security_cb[i], LV_STATE_CHECKED)) {
+            any_specific = true;
+            break;
+        }
+    }
+    if (!any_specific && ctx->scan_filter_security_cb[0]) {
+        lv_obj_add_state(ctx->scan_filter_security_cb[0], LV_STATE_CHECKED);
+    }
+}
+
+static void scan_filter_read_controls(tab_context_t *ctx)
+{
+    if (!ctx) return;
+    ctx->scan_filter.sort_key = ctx->scan_filter_sort_dd
+        ? (scan_sort_key_t)lv_dropdown_get_selected(ctx->scan_filter_sort_dd)
+        : SCAN_SORT_DEFAULT;
+    ctx->scan_filter.reverse = ctx->scan_filter_order_dd &&
+        lv_dropdown_get_selected(ctx->scan_filter_order_dd) == 1;
+    ctx->scan_filter.visibility = ctx->scan_filter_visibility_dd
+        ? (scan_visibility_t)lv_dropdown_get_selected(ctx->scan_filter_visibility_dd)
+        : SCAN_VISIBILITY_ALL;
+    ctx->scan_filter.security_mask = SCAN_SECURITY_ALL;
+    for (int i = 1; i < 7; i++) {
+        if (ctx->scan_filter_security_cb[i] &&
+            lv_obj_has_state(ctx->scan_filter_security_cb[i], LV_STATE_CHECKED)) {
+            ctx->scan_filter.security_mask |= scan_filter_security_bits[i];
+        }
+    }
+    const char *query = ctx->scan_filter_ssid_input
+        ? lv_textarea_get_text(ctx->scan_filter_ssid_input) : "";
+    snprintf(ctx->scan_filter.ssid_query, sizeof(ctx->scan_filter.ssid_query),
+             "%s", query ? query : "");
+}
+
+static void scan_filter_apply_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = lv_event_get_user_data(e);
+    if (!ctx) return;
+    scan_filter_read_controls(ctx);
+    scan_filter_close_popup(ctx);
+    scan_filter_apply_view(ctx);
+}
+
+static void scan_filter_clear_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = lv_event_get_user_data(e);
+    if (!ctx) return;
+    memset(&ctx->scan_filter, 0, sizeof(ctx->scan_filter));
+    scan_filter_close_popup(ctx);
+    scan_filter_apply_view(ctx);
+}
+
+static lv_obj_t *scan_filter_section_label(lv_obj_t *parent, const char *text)
+{
+    lv_obj_t *label = lv_label_create(parent);
+    lv_label_set_text(label, text);
+    lv_obj_set_style_text_font(label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(label, ui_muted_color(), 0);
+    return label;
+}
+
+static lv_obj_t *scan_filter_action_button(lv_obj_t *parent, const char *text,
+                                           lv_color_t color, lv_event_cb_t cb,
+                                           tab_context_t *ctx)
+{
+    lv_obj_t *button = lv_btn_create(parent);
+    lv_obj_set_height(button, 48);
+    lv_obj_set_flex_grow(button, 1);
+    lv_obj_set_style_bg_color(button, color, 0);
+    lv_obj_set_style_radius(button, 8, 0);
+    lv_obj_add_event_cb(button, cb, LV_EVENT_CLICKED, ctx);
+    lv_obj_t *label = lv_label_create(button);
+    lv_label_set_text(label, text);
+    lv_obj_set_style_text_font(label, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(label, lv_color_white(), 0);
+    lv_obj_center(label);
+    return button;
+}
+
+static void show_scan_filter_popup(tab_context_t *ctx)
+{
+    if (!ctx || !ctx->scan_page || ctx->scan_filter_overlay) return;
+
+    ctx->scan_filter_overlay = lv_obj_create(ctx->scan_page);
+    lv_obj_remove_style_all(ctx->scan_filter_overlay);
+    lv_obj_set_size(ctx->scan_filter_overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(ctx->scan_filter_overlay, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(ctx->scan_filter_overlay, LV_OPA_60, 0);
+    lv_obj_add_flag(ctx->scan_filter_overlay, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_IGNORE_LAYOUT);
+    lv_obj_clear_flag(ctx->scan_filter_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_move_foreground(ctx->scan_filter_overlay);
+
+    lv_obj_t *popup = lv_obj_create(ctx->scan_filter_overlay);
+    lv_obj_set_size(popup, popup_clamp_w(640), popup_clamp_h(650));
+    lv_obj_center(popup);
+    style_popup_card(popup, 14, COLOR_LAB5_MAGENTA);
+    lv_obj_set_style_pad_all(popup, 16, 0);
+    lv_obj_set_style_pad_row(popup, 10, 0);
+    lv_obj_set_flex_flow(popup, LV_FLEX_FLOW_COLUMN);
+    lv_obj_clear_flag(popup, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *header = lv_obj_create(popup);
+    lv_obj_set_size(header, lv_pct(100), 46);
+    lv_obj_set_style_bg_opa(header, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(header, 0, 0);
+    lv_obj_set_style_pad_all(header, 0, 0);
+    lv_obj_set_flex_flow(header, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(header, LV_FLEX_ALIGN_SPACE_BETWEEN,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(header, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(header);
+    lv_label_set_text(title, "Sort & Filter");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_22, 0);
+    lv_obj_set_style_text_color(title, COLOR_LAB5_MAGENTA, 0);
+
+    lv_obj_t *close_btn = lv_btn_create(header);
+    lv_obj_set_size(close_btn, 44, 40);
+    lv_obj_set_style_bg_color(close_btn, ui_card_color(), 0);
+    lv_obj_set_style_border_width(close_btn, 1, 0);
+    lv_obj_set_style_border_color(close_btn, ui_border_color(), 0);
+    lv_obj_set_style_radius(close_btn, 8, 0);
+    lv_obj_add_event_cb(close_btn, scan_filter_cancel_cb, LV_EVENT_CLICKED, ctx);
+    lv_obj_t *close_label = lv_label_create(close_btn);
+    lv_label_set_text(close_label, LV_SYMBOL_CLOSE);
+    lv_obj_set_style_text_color(close_label, ui_text_color(), 0);
+    lv_obj_center(close_label);
+
+    lv_obj_t *form = lv_obj_create(popup);
+    lv_obj_set_width(form, lv_pct(100));
+    lv_obj_set_flex_grow(form, 1);
+    lv_obj_set_style_bg_opa(form, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(form, 0, 0);
+    lv_obj_set_style_pad_all(form, 2, 0);
+    lv_obj_set_style_pad_row(form, 8, 0);
+    lv_obj_set_flex_flow(form, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_scroll_dir(form, LV_DIR_VER);
+
+    scan_filter_section_label(form, "SORT BY");
+    ctx->scan_filter_sort_dd = lv_dropdown_create(form);
+    lv_dropdown_set_options(ctx->scan_filter_sort_dd, "Default\nName\nSignal\nChannel");
+    lv_dropdown_set_selected(ctx->scan_filter_sort_dd, (uint16_t)ctx->scan_filter.sort_key);
+    lv_obj_set_width(ctx->scan_filter_sort_dd, lv_pct(100));
+
+    scan_filter_section_label(form, "ORDER");
+    ctx->scan_filter_order_dd = lv_dropdown_create(form);
+    lv_dropdown_set_options(ctx->scan_filter_order_dd, "Primary (A-Z / strongest / low channel)\nReverse");
+    lv_dropdown_set_selected(ctx->scan_filter_order_dd, ctx->scan_filter.reverse ? 1 : 0);
+    lv_obj_set_width(ctx->scan_filter_order_dd, lv_pct(100));
+
+    scan_filter_section_label(form, "SSID CONTAINS");
+    ctx->scan_filter_ssid_input = lv_textarea_create(form);
+    lv_obj_set_size(ctx->scan_filter_ssid_input, lv_pct(100), 46);
+    lv_textarea_set_one_line(ctx->scan_filter_ssid_input, true);
+    lv_textarea_set_max_length(ctx->scan_filter_ssid_input, SCAN_FILTER_QUERY_MAX);
+    lv_textarea_set_placeholder_text(ctx->scan_filter_ssid_input, "Type part of a network name...");
+    lv_textarea_set_text(ctx->scan_filter_ssid_input, ctx->scan_filter.ssid_query);
+    lv_obj_set_style_bg_color(ctx->scan_filter_ssid_input, ui_bg_color(), 0);
+    lv_obj_set_style_border_color(ctx->scan_filter_ssid_input, ui_border_color(), 0);
+    lv_obj_set_style_border_width(ctx->scan_filter_ssid_input, 1, 0);
+    lv_obj_set_style_text_color(ctx->scan_filter_ssid_input, ui_text_color(), 0);
+    lv_obj_add_event_cb(ctx->scan_filter_ssid_input, scan_filter_text_focus_cb,
+                        LV_EVENT_FOCUSED, ctx);
+    lv_obj_add_event_cb(ctx->scan_filter_ssid_input, scan_filter_text_focus_cb,
+                        LV_EVENT_CLICKED, ctx);
+
+    scan_filter_section_label(form, "SECURITY");
+    lv_obj_t *security_row = lv_obj_create(form);
+    lv_obj_set_size(security_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(security_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(security_row, 0, 0);
+    lv_obj_set_style_pad_all(security_row, 0, 0);
+    lv_obj_set_style_pad_row(security_row, 10, 0);
+    lv_obj_set_style_pad_column(security_row, 16, 0);
+    lv_obj_set_flex_flow(security_row, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_clear_flag(security_row, LV_OBJ_FLAG_SCROLLABLE);
+    static const char *security_names[7] = {
+        "All", "Open", "WPA", "WPA2", "WPA3", "WEP", "Unknown"
+    };
+    for (int i = 0; i < 7; i++) {
+        lv_obj_t *checkbox = lv_checkbox_create(security_row);
+        lv_checkbox_set_text(checkbox, security_names[i]);
+        lv_obj_set_style_text_color(checkbox, ui_text_color(), 0);
+        lv_obj_set_style_text_font(checkbox, &lv_font_montserrat_14, 0);
+        lv_obj_add_event_cb(checkbox, scan_filter_security_cb,
+                            LV_EVENT_VALUE_CHANGED, ctx);
+        ctx->scan_filter_security_cb[i] = checkbox;
+        bool checked = i == 0
+            ? ctx->scan_filter.security_mask == SCAN_SECURITY_ALL
+            : (ctx->scan_filter.security_mask & scan_filter_security_bits[i]) != 0;
+        if (checked) lv_obj_add_state(checkbox, LV_STATE_CHECKED);
+    }
+
+    scan_filter_section_label(form, "VISIBILITY");
+    ctx->scan_filter_visibility_dd = lv_dropdown_create(form);
+    lv_dropdown_set_options(ctx->scan_filter_visibility_dd, "All networks\nNamed only\nHidden only");
+    lv_dropdown_set_selected(ctx->scan_filter_visibility_dd,
+                             (uint16_t)ctx->scan_filter.visibility);
+    lv_obj_set_width(ctx->scan_filter_visibility_dd, lv_pct(100));
+
+    lv_obj_t *actions = lv_obj_create(popup);
+    lv_obj_set_size(actions, lv_pct(100), 48);
+    lv_obj_set_style_bg_opa(actions, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(actions, 0, 0);
+    lv_obj_set_style_pad_all(actions, 0, 0);
+    lv_obj_set_style_pad_column(actions, 10, 0);
+    lv_obj_set_flex_flow(actions, LV_FLEX_FLOW_ROW);
+    lv_obj_clear_flag(actions, LV_OBJ_FLAG_SCROLLABLE);
+    scan_filter_action_button(actions, "CLEAR", lv_color_hex(0x555555),
+                              scan_filter_clear_cb, ctx);
+    scan_filter_action_button(actions, "APPLY", COLOR_LAB5_MAGENTA,
+                              scan_filter_apply_cb, ctx);
+
+    ctx->scan_filter_keyboard = lv_keyboard_create(ctx->scan_filter_overlay);
+    lv_obj_set_size(ctx->scan_filter_keyboard, lv_pct(100), 240);
+    lv_obj_align(ctx->scan_filter_keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_add_flag(ctx->scan_filter_keyboard, LV_OBJ_FLAG_FLOATING);
+    style_on_screen_keyboard(ctx->scan_filter_keyboard);
+    lv_keyboard_set_textarea(ctx->scan_filter_keyboard, ctx->scan_filter_ssid_input);
+    lv_obj_add_flag(ctx->scan_filter_keyboard, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(ctx->scan_filter_keyboard, scan_filter_keyboard_cb,
+                        LV_EVENT_READY, ctx);
+    lv_obj_add_event_cb(ctx->scan_filter_keyboard, scan_filter_keyboard_cb,
+                        LV_EVENT_CANCEL, ctx);
+}
+
+static void scan_filter_btn_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = lv_event_get_user_data(e);
+    if (!ctx) ctx = get_current_ctx();
+    show_scan_filter_popup(ctx);
 }
 
 static void style_fade_border_strip(lv_obj_t *strip, lv_color_t start_color, lv_color_t end_color, lv_grad_dir_t dir)
@@ -8809,6 +9215,7 @@ static void network_checkbox_event_cb(lv_event_t *e)
             }
         }
     }
+    scan_filter_apply_view(ctx);
 }
 
 static void network_item_event_cb(lv_event_t *e)
@@ -17839,9 +18246,11 @@ static void show_scan_page(void)
     lv_obj_set_style_text_font(title, &lv_font_montserrat_24, 0);
     lv_obj_set_style_text_color(title, COLOR_LAB5_MAGENTA, 0);
 
-    // Scan button container (for button + spinner)
+    // Scan action container
     lv_obj_t *btn_cont = lv_obj_create(header);
-    lv_obj_set_size(btn_cont, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    // 116 px filter + 12 px gap + 120 px rescan. An explicit width avoids
+    // clipping the leading FILTER action in the nested flex row.
+    lv_obj_set_size(btn_cont, 248, 40);
     lv_obj_set_style_bg_opa(btn_cont, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(btn_cont, 0, 0);
     lv_obj_set_style_pad_all(btn_cont, 0, 0);
@@ -17849,11 +18258,22 @@ static void show_scan_page(void)
     lv_obj_set_flex_align(btn_cont, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_column(btn_cont, 12, 0);
 
-    // Spinner (hidden by default)
-    ctx->spinner = lv_spinner_create(btn_cont);
-    lv_obj_set_size(ctx->spinner, 32, 32);
-    lv_spinner_set_anim_params(ctx->spinner, 1000, 200);
-    lv_obj_add_flag(ctx->spinner, LV_OBJ_FLAG_HIDDEN);
+    // Sort and filter controls. The list rows are reordered/hidden in-place so
+    // their JanOS indices and async inspect labels always remain stable.
+    lv_obj_t *filter_btn = lv_btn_create(btn_cont);
+    lv_obj_set_size(filter_btn, 116, 40);
+    lv_obj_set_style_bg_color(filter_btn, ui_card_color(), 0);
+    lv_obj_set_style_bg_color(filter_btn, ui_card_pressed_color(), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(filter_btn, 1, 0);
+    lv_obj_set_style_border_color(filter_btn, COLOR_MATERIAL_CYAN, 0);
+    lv_obj_set_style_border_opa(filter_btn, LV_OPA_80, 0);
+    lv_obj_set_style_radius(filter_btn, 8, 0);
+    lv_obj_add_event_cb(filter_btn, scan_filter_btn_cb, LV_EVENT_CLICKED, ctx);
+    ctx->scan_filter_btn_label = lv_label_create(filter_btn);
+    lv_obj_set_style_text_font(ctx->scan_filter_btn_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(ctx->scan_filter_btn_label, ui_text_color(), 0);
+    lv_obj_center(ctx->scan_filter_btn_label);
+    scan_filter_update_button(ctx);
 
     // Scan button
     ctx->scan_btn = lv_btn_create(btn_cont);
@@ -17872,6 +18292,22 @@ static void show_scan_page(void)
     lv_obj_set_style_text_font(btn_label, &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_color(btn_label, lv_color_hex(0xFFFFFF), 0);
     lv_obj_center(btn_label);
+
+    // Always-visible summary of active sorting and filters. The summary is
+    // also a generous shortcut back into the filter controls.
+    ctx->scan_filter_summary_label = lv_label_create(ctx->scan_page);
+    lv_obj_set_width(ctx->scan_filter_summary_label, lv_pct(100));
+    lv_obj_set_height(ctx->scan_filter_summary_label, LV_SIZE_CONTENT);
+    lv_label_set_long_mode(ctx->scan_filter_summary_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(ctx->scan_filter_summary_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(ctx->scan_filter_summary_label, COLOR_MATERIAL_CYAN, 0);
+    lv_obj_set_style_text_color(ctx->scan_filter_summary_label, COLOR_LAB5_MAGENTA,
+                                LV_STATE_PRESSED);
+    lv_obj_add_flag(ctx->scan_filter_summary_label, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_ext_click_area(ctx->scan_filter_summary_label, 6);
+    lv_obj_add_event_cb(ctx->scan_filter_summary_label, scan_filter_btn_cb,
+                        LV_EVENT_CLICKED, ctx);
+    scan_filter_update_button(ctx);
 
     // Status label (compact)
     ctx->scan_status_label = lv_label_create(ctx->scan_page);
@@ -20894,6 +21330,17 @@ static void show_esp_modem_page(void)
             cur_ctx->scan_status_label = NULL;
             cur_ctx->network_list = NULL;
             cur_ctx->spinner = NULL;
+            cur_ctx->scan_filter_btn_label = NULL;
+            cur_ctx->scan_filter_summary_label = NULL;
+            cur_ctx->scan_filter_overlay = NULL;
+            cur_ctx->scan_filter_sort_dd = NULL;
+            cur_ctx->scan_filter_order_dd = NULL;
+            cur_ctx->scan_filter_ssid_input = NULL;
+            cur_ctx->scan_filter_visibility_dd = NULL;
+            cur_ctx->scan_filter_keyboard = NULL;
+            memset(cur_ctx->scan_filter_security_cb, 0,
+                   sizeof(cur_ctx->scan_filter_security_cb));
+            memset(cur_ctx->network_rows, 0, sizeof(cur_ctx->network_rows));
         }
     }
 
@@ -52400,6 +52847,21 @@ static void invalidate_red_team_dependent_pages(void)
         if (ctx->scan_page) {
             lv_obj_del(ctx->scan_page);
             ctx->scan_page = NULL;
+            ctx->scan_btn = NULL;
+            ctx->scan_status_label = NULL;
+            ctx->network_list = NULL;
+            ctx->spinner = NULL;
+            ctx->scan_filter_btn_label = NULL;
+            ctx->scan_filter_summary_label = NULL;
+            ctx->scan_filter_overlay = NULL;
+            ctx->scan_filter_sort_dd = NULL;
+            ctx->scan_filter_order_dd = NULL;
+            ctx->scan_filter_ssid_input = NULL;
+            ctx->scan_filter_visibility_dd = NULL;
+            ctx->scan_filter_keyboard = NULL;
+            memset(ctx->scan_filter_security_cb, 0,
+                   sizeof(ctx->scan_filter_security_cb));
+            memset(ctx->network_rows, 0, sizeof(ctx->network_rows));
         }
 
         // Delete cached nmap page

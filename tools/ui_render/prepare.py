@@ -80,6 +80,7 @@ selected = set()
 
 def keep(name):
     body = text(funcs[name].child_by_field_name('body'))
+    if name.startswith('scan_filter_'): return True
     if name.startswith('subghz_host_'): return 'uart_' not in name and 'free_state' not in name
     if name in {'tab_transport_name', 'current_tab_has_sd_card', 'wardrive_config_set_defaults', 'antisurv_sens_name', 'sd_admin_state_name', 'wardrive_upload_provider_label', 'compromised_cleanup_initial_log', 'compromised_cleanup_initial_status', 'compromised_cleanup_title_for_action'} or (name.startswith('compromised_') and name.endswith('_for_kind')): return True
     if name in {'get_current_ctx', 'get_ctx_for_tab', 'get_container_for_tab', 'tab_id_for_ctx', 'get_scan_view', 'gitm_ctx', 'pcap_viewer_get_state'} or name.startswith('tab_is_'): return True
@@ -103,7 +104,7 @@ while True:
     if old == (len(full), len(stubs), len(selected), len(used)): break
 stubs -= full
 
-parts = ['#include "host.h"']
+parts = ['#include "host.h"', '#include "scan_filter.h"']
 parts += [text(n) for n in macros]
 parts += [text(n) + (';' if n.type in ('struct_specifier', 'enum_specifier') else '') for i,n in enumerate(decls) if i in selected]
 for name in sorted(full | stubs):
@@ -138,6 +139,7 @@ arguments = {
     'show_compromised_file_page':'0',
     'show_evil_twin_connect_popup':'"LAB-NETWORK-1", "demo-password"',
     'show_rogue_ap_popup':'get_current_ctx()', 'show_karma2_attack_popup':'"LAB-NETWORK-1"',
+    'show_scan_filter_popup':'(show_scan_page(), get_current_ctx())',
     'show_ap_radar_page':'0', 'show_bt_locator_page':'0',
 }
 for name in sorted(roots):

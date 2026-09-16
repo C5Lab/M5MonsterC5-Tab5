@@ -1,4 +1,15 @@
 static uint16_t *host_frame;
+static int host_visible_spinner_count(lv_obj_t *parent) {
+    int count = 0;
+    uint32_t child_count = lv_obj_get_child_count(parent);
+    for(uint32_t i=0;i<child_count;i++) {
+        lv_obj_t *child=lv_obj_get_child(parent,(int32_t)i);
+        if(lv_obj_check_type(child,&lv_spinner_class) &&
+           !lv_obj_has_flag(child,LV_OBJ_FLAG_HIDDEN)) count++;
+        count+=host_visible_spinner_count(child);
+    }
+    return count;
+}
 static void host_flush(lv_display_t *display, const lv_area_t *area, uint8_t *pixels) {
     int w=lv_display_get_horizontal_resolution(display);
     unsigned stride=lv_draw_buf_width_to_stride(area->x2-area->x1+1,LV_COLOR_FORMAT_RGB565);
@@ -7,6 +18,8 @@ static void host_flush(lv_display_t *display, const lv_area_t *area, uint8_t *pi
     lv_display_flush_ready(display);
 }
 static bool host_show(const char *screen) {
+    if(!strcmp(screen,"show_scan_scanning")) { show_scan_page(); return true; }
+    if(!strcmp(screen,"show_scan_filter_summary")) { show_scan_page(); return true; }
     #include "dispatch.h"
 }
 int main(int argc, char **argv) {
@@ -76,8 +89,26 @@ int main(int argc, char **argv) {
         host_scan_rows(&grove_ctx);
         lv_label_set_text_fmt(grove_ctx.scan_status_label,"Found %d networks",grove_ctx.network_count);
     }
+    if(!strcmp(screen,"show_scan_scanning")) {
+        show_scan_overlay();
+        if(grove_ctx.spinner) lv_obj_clear_flag(grove_ctx.spinner,LV_OBJ_FLAG_HIDDEN);
+    }
+    if(!strcmp(screen,"show_scan_filter_summary")) {
+        grove_ctx.scan_filter.sort_key=SCAN_SORT_SIGNAL;
+        grove_ctx.scan_filter.reverse=true;
+        grove_ctx.scan_filter.security_mask=SCAN_SECURITY_OPEN|SCAN_SECURITY_WPA2|
+                                              SCAN_SECURITY_WPA3|SCAN_SECURITY_UNKNOWN;
+        grove_ctx.scan_filter.visibility=SCAN_VISIBILITY_HIDDEN;
+        strcpy(grove_ctx.scan_filter.ssid_query,"lab");
+        scan_filter_update_button(&grove_ctx);
+    }
     if(!strcmp(screen,"show_observer_page")) update_observer_table(&grove_ctx);
     lv_obj_update_layout(lv_screen_active());
+    if(!strcmp(screen,"show_scan_scanning") && host_visible_spinner_count(lv_screen_active()) != 1) {
+        fprintf(stderr,"Expected exactly one visible scan spinner, got %d\n",
+                host_visible_spinner_count(lv_screen_active()));
+        return 6;
+    }
     lv_refr_now(display);
     FILE *out=fopen(argv[3],"wb"); if(!out) return 5;
     int w=lv_display_get_horizontal_resolution(display), h=lv_display_get_vertical_resolution(display);
