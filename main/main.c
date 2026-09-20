@@ -67,7 +67,10 @@
 #include "mbedtls/pkcs5.h"
 #include "mbedtls/md.h"
 #include "mbedtls/platform_util.h"
+#include "hs_crack_cache.h"
 #include "hs_crack_crypto.h"
+#include "hs_crack_remote_core.h"
+#include "usb_vcp_config.h"
 #include <stdatomic.h>
 #include "freertos/queue.h"
 
@@ -89,8 +92,12 @@ extern void pthread_internal_local_storage_destructor_callback(TaskHandle_t hand
 #endif
 
 
-#define JANOS_TAB_VERSION "1.5.4"
-#define JANOS_VERSION_REQUIRED "1.7.4"
+#define JANOS_TAB_VERSION "1.5.5"
+#define JANOS_VERSION_REQUIRED "1.7.5"
+#define USB_CH34X_BULK_MPS 32
+
+_Static_assert(CONFIG_IN_TRANSFER_BUFFER_SIZE == USB_CH34X_BULK_MPS,
+               "CH34X ACK32 requires one-MPS USB BULK IN transfers");
 
 #include "lwip/netdb.h"
 #include <dirent.h>
@@ -1608,6 +1615,8 @@ typedef struct {
     char file_name[96];
     /* From "list_dir -s"; 0 when the size is unknown. Decides Wi-Fi vs M-BUS. */
     long size_bytes;
+    /* A handshake copies into lab/handshakes; everything else into pcaps/imported. */
+    bool is_handshake;
 } compromised_transfer_task_args_t;
 
 typedef struct {
@@ -2159,6 +2168,10 @@ static volatile bool board_detect_retry_stop = false;
 // Set while a UART board probe is running, so the retry task and the hotplug
 // redetect never talk to the same UARTs at once.
 static volatile bool board_probe_in_progress = false;
+/* Distributed cracking owns complete CRACK/1 byte streams. Transport helpers
+ * reject accesses from other tasks while the crack coordinator owns a port. */
+static TaskHandle_t crack_transport_owner[3] = {NULL, NULL, NULL};
+static portMUX_TYPE crack_transport_owner_mux = portMUX_INITIALIZER_UNLOCKED;
 // Boot-time probe task (runs once, behind the splash).
 static TaskHandle_t boot_detect_task_handle = NULL;
 static lv_obj_t *board_detect_popup = NULL;
@@ -4639,6 +4652,8 @@ static size_t usb_gps_line_len = 0;
 static bool usb_nmea_device_seen = false;
 static bool usb_is_known_gps = false;
 static TaskHandle_t usb_gps_drain_task_handle = NULL;
+static TaskHandle_t usb_vcp_config_task_handle = NULL;
+static volatile bool usb_vcp_config_done = false;
 static volatile bool usb_rx_exclusive = false;
 
 #define USB_GPS_FIX_MAX_AGE_MS 15000
@@ -4716,6 +4731,134 @@ static void cp210x_init_port(uint16_t index)
     if (usb_debug_logs) {
         ESP_LOGI(TAG, "[USB][CP210X] init done: itf=%u baud=%u line=0x%04X mhs=0x%04X",
                  index, (unsigned)UART_BAUD_RATE, line_ctl, mhs);
+    }
+}
+
+#define CH34X_REQTYPE_HOST_TO_DEVICE 0x40
+#define CH34X_REQTYPE_DEVICE_TO_HOST 0xC0
+#define CH34X_READ_VERSION 0x5F
+
+static bool ch34x_send_control_request(
+    const usb_vcp_control_request_t *request)
+{
+    if (!usb_cdc_handle || !request) return false;
+    esp_err_t err = usbh_cdc_send_custom_request(usb_cdc_handle,
+                                                 CH34X_REQTYPE_HOST_TO_DEVICE,
+                                                 request->request,
+                                                 request->value,
+                                                 request->index,
+                                                 0,
+                                                 NULL);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG,
+                 "[USB][CH34X] request=0x%02X value=0x%04X index=0x%04X failed: %s",
+                 (unsigned)request->request, (unsigned)request->value,
+                 (unsigned)request->index,
+                 esp_err_to_name(err));
+        return false;
+    }
+    return true;
+}
+
+static bool ch34x_read_version(uint8_t *version)
+{
+    if (!usb_cdc_handle || !version) return false;
+    uint8_t response[2] = {0};
+    esp_err_t err = usbh_cdc_send_custom_request(usb_cdc_handle,
+                                                 CH34X_REQTYPE_DEVICE_TO_HOST,
+                                                 CH34X_READ_VERSION,
+                                                 0,
+                                                 0,
+                                                 sizeof(response),
+                                                 response);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "[USB][CH34X] version read failed: %s",
+                 esp_err_to_name(err));
+        return false;
+    }
+    *version = response[0];
+    return true;
+}
+
+static bool ch34x_set_port_baud(uint32_t baud_rate)
+{
+    if (!usb_cdc_handle || !usb_cdc_connected || !usb_vcp_config_done ||
+        !usb_vcp_is_ch34x(usb_last_vid, usb_last_pid)) {
+        return false;
+    }
+    uint8_t chip_version = 0;
+    usb_vcp_control_request_t request;
+    if (!ch34x_read_version(&chip_version) ||
+        !usb_vcp_ch34x_baud_request(baud_rate, chip_version, &request)) {
+        ESP_LOGW(TAG, "[USB][CH34X] Cannot prepare baud=%lu",
+                 (unsigned long)baud_rate);
+        return false;
+    }
+    if (!ch34x_send_control_request(&request)) return false;
+    ESP_LOGI(TAG,
+             "[USB][CH34X] Local bridge configured: %lu baud reg=0x%04X version=0x%02X",
+             (unsigned long)baud_rate, (unsigned)request.index,
+             (unsigned)chip_version);
+    return true;
+}
+
+static bool ch34x_init_port_115200(void)
+{
+    uint8_t chip_version = 0;
+    if (!ch34x_read_version(&chip_version)) return false;
+    usb_vcp_control_request_t steps[USB_VCP_CH34X_INIT_MAX_STEPS];
+    size_t step_count = usb_vcp_ch34x_init_plan(
+        UART_BAUD_RATE, chip_version, steps,
+        USB_VCP_CH34X_INIT_MAX_STEPS);
+    if (step_count == 0) {
+        ESP_LOGE(TAG, "[USB][CH34X] Cannot encode baud=%u",
+                 (unsigned)UART_BAUD_RATE);
+        return false;
+    }
+    for (size_t i = 0; i < step_count; ++i) {
+        if (!ch34x_send_control_request(&steps[i])) return false;
+    }
+    ESP_LOGI(TAG,
+             "[USB][CH34X] Fixed console configured: 115200 8N1 version=0x%02X baud_reg=0x%04X steps=%u",
+             (unsigned)chip_version, (unsigned)steps[1].index,
+             (unsigned)step_count);
+    return true;
+}
+
+static void usb_vcp_config_task(void *arg)
+{
+    usbh_cdc_handle_t connected_handle = (usbh_cdc_handle_t)arg;
+    bool configured = false;
+    if (connected_handle == usb_cdc_handle && usb_cdc_connected) {
+        ESP_LOGI(TAG, "[USB] Configuring VCP vid=0x%04X pid=0x%04X at fixed 115200",
+                 usb_last_vid, usb_last_pid);
+        if (usb_vcp_is_ch34x(usb_last_vid, usb_last_pid)) {
+            configured = ch34x_init_port_115200();
+        } else if (usb_last_vid == CP210X_VID) {
+            cp210x_init_port(usb_cdc_preferred_itf);
+            configured = true;
+        } else {
+            ESP_LOGI(TAG, "[USB] VCP does not require a vendor-specific baud setup");
+            configured = true;
+        }
+    }
+    if (!configured) {
+        ESP_LOGW(TAG, "[USB] VCP fixed-115200 configuration failed");
+    }
+    usb_vcp_config_done = configured;
+    usb_vcp_config_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+static void usb_schedule_vcp_config(usbh_cdc_handle_t connected_handle)
+{
+    usb_vcp_config_done = false;
+    if (usb_vcp_config_task_handle) return;
+    if (xTaskCreate(usb_vcp_config_task, "usb_vcp_cfg", 4096,
+                    (void *)connected_handle, 6,
+                    &usb_vcp_config_task_handle) != pdPASS) {
+        usb_vcp_config_task_handle = NULL;
+        ESP_LOGE(TAG, "[USB] Failed to create VCP configuration task");
     }
 }
 
@@ -4834,11 +4977,11 @@ static void usb_log_cdc_state(const char *where)
 
     usbh_cdc_state_t state = USBH_CDC_CLOSE;
     esp_err_t state_err = usbh_cdc_get_state(usb_cdc_handle, &state);
-    size_t rx_size = 0;
-    esp_err_t rx_err = usbh_cdc_get_rx_buffer_size(usb_cdc_handle, &rx_size);
+    usbh_cdc_debug_stats_t stats = {0};
+    esp_err_t stats_err = usbh_cdc_get_debug_stats(usb_cdc_handle, &stats);
 
     ESP_LOGI(TAG,
-             "[USB] %s: handle=%p connected=%d transport_ready=%d state=%s(%d) state_err=%s rx_buf=%u rx_err=%s",
+             "[USB-DIAG] %s handle=%p connected=%d ready=%d state=%s(%d) state_err=%s stats_err=%s rxq=%u txq=%u rx_done=%lu rx_bytes=%llu rx_err=%lu rx_submit_err=%lu rx_status=%ld rx_submit=%ld tx_done=%lu tx_bytes=%llu tx_err=%lu tx_submit_err=%lu tx_status=%ld tx_submit=%ld",
              where,
              (void *)usb_cdc_handle,
              usb_cdc_connected,
@@ -4846,8 +4989,21 @@ static void usb_log_cdc_state(const char *where)
              usb_cdc_state_str(state),
              (int)state,
              esp_err_to_name(state_err),
-             (unsigned)rx_size,
-             esp_err_to_name(rx_err));
+             esp_err_to_name(stats_err),
+             (unsigned)stats.rx_buffered,
+             (unsigned)stats.tx_buffered,
+             (unsigned long)stats.rx_completed,
+             (unsigned long long)stats.rx_bytes,
+             (unsigned long)stats.rx_errors,
+             (unsigned long)stats.rx_submit_errors,
+             (long)stats.last_rx_status,
+             (long)stats.last_rx_submit_error,
+             (unsigned long)stats.tx_completed,
+             (unsigned long long)stats.tx_bytes,
+             (unsigned long)stats.tx_errors,
+             (unsigned long)stats.tx_submit_errors,
+             (long)stats.last_tx_status,
+             (long)stats.last_tx_submit_error);
 }
 
 static void schedule_board_redetect(void);
@@ -4956,10 +5112,8 @@ static void usb_cdc_connect_cb(usbh_cdc_handle_t cdc_handle, void *user_data)
     usb_transport_warned = false;
     ESP_LOGI(TAG, "[USB] CDC device connected (handle=%p)", (void *)cdc_handle);
 
-    // Note: SET_LINE_CODING and SET_CONTROL_LINE_STATE are skipped because:
-    // 1. They cause 5-second blocking timeouts
-    // 2. ESP32 USB Serial/JTAG doesn't support these CDC class requests (returns STALL)
-    // 3. Data transfer works without them for this device type
+    /* Standard USB Serial/JTAG needs no line coding. Vendor USB-UART bridges
+     * are configured below by VID/PID, outside this callback. */
 
     // Flush any stale data in the RX buffer
     esp_err_t flush_err = usbh_cdc_flush_rx_buffer(cdc_handle);
@@ -4973,9 +5127,10 @@ static void usb_cdc_connect_cb(usbh_cdc_handle_t cdc_handle, void *user_data)
         usb_log_cdc_state("connect");
     }
 
-    if (usb_last_vid == CP210X_VID) {
-        cp210x_init_port(usb_cdc_preferred_itf);
-    }
+    /* This callback runs in the USB client task which also completes control
+     * transfers. Waiting for a vendor request here can therefore deadlock
+     * until its timeout; perform bridge setup in a separate short task. */
+    usb_schedule_vcp_config(cdc_handle);
 
     start_usb_gps_drain_task();
     // Board detection is boot-only (see usb_boot_open_early): the boot probe
@@ -4997,6 +5152,7 @@ static void usb_cdc_disconnect_cb(usbh_cdc_handle_t cdc_handle, void *user_data)
         alert_chime_play(ALERT_TONE_WARN);
     }
     usb_cdc_connected = false;
+    usb_vcp_config_done = false;
     usb_transport_ready = false;
     usb_transport_warned = false;
     usb_nmea_device_seen = false;
@@ -5057,12 +5213,9 @@ static void usb_transport_init(void)
     }
 
     if (!usb_log_tuned) {
-        // USBH_CDC logs "cdc read failed" (ESP_LOGE) on every empty poll while
-        // we ping a still-booting Monster - pure noise, and our own [USB] logs
-        // already say what matters. Silence that tag regardless of debug mode;
-        // esp_log_level_set is per-tag and can only be done here in code, not in
-        // sdkconfig (which carries only the global default/max level).
-        esp_log_level_set("USBH_CDC", ESP_LOG_NONE);
+        // Keep transport warnings visible. Empty ring-buffer polls are logged
+        // at DEBUG by our local component, so WARN is useful without flooding.
+        esp_log_level_set("USBH_CDC", ESP_LOG_WARN);
         if (usb_debug_logs) {
             esp_log_level_set("USBH", ESP_LOG_INFO);
             esp_log_level_set("USB HOST", ESP_LOG_INFO);
@@ -5101,8 +5254,10 @@ static void usb_transport_init(void)
             .user_data = NULL,
         };
         if (usb_debug_logs) {
-            ESP_LOGI(TAG, "[USB] CDC driver config: stack=%d prio=%d core=%d",
-                     config.task_stack_size, config.task_priority, config.task_coreid);
+            ESP_LOGI(TAG,
+                     "[USB] CDC driver config: stack=%d prio=%d core=%d in_xfer=%d",
+                     config.task_stack_size, config.task_priority,
+                     config.task_coreid, CONFIG_IN_TRANSFER_BUFFER_SIZE);
         }
 
         err = usbh_cdc_driver_install(&config);
@@ -5189,7 +5344,14 @@ static void usb_boot_open_early(void)
     }
 
     if (usb_cdc_handle) {
-        ESP_LOGI(TAG, "[USB] Monster opened early over USB-A");
+        /* For a CH34x bridge the USB endpoint can already be open while the
+         * vendor requests which pin its UART side to 115200 are still in
+         * flight. Finish that small setup before boot detection sends ping. */
+        for (int i = 0; i < 300 && usb_vcp_config_task_handle; i++) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+        ESP_LOGI(TAG, "[USB] Monster opened early over USB-A (vcp_config=%s)",
+                 usb_vcp_config_done ? "ok" : "not-confirmed");
     } else {
         ESP_LOGI(TAG, "[USB] No USB-A device opened early (none present or not ready)");
     }
@@ -5256,22 +5418,14 @@ static int usb_transport_read(void *data, size_t len, TickType_t ticks_to_wait)
     if (!usb_cdc_handle || !usb_cdc_connected) {
         ESP_LOGD(TAG, "[USB] Read failed: no CDC device (handle=%p, connected=%d)",
                  (void*)usb_cdc_handle, usb_cdc_connected);
-        return 0;
+        return -1;
     }
-    size_t rx_size = 0;
-    esp_err_t rx_err = usbh_cdc_get_rx_buffer_size(usb_cdc_handle, &rx_size);
-    if (rx_err == ESP_OK && rx_size == 0) {
-        if (ticks_to_wait > 0) {
-            vTaskDelay(ticks_to_wait);
-            rx_err = usbh_cdc_get_rx_buffer_size(usb_cdc_handle, &rx_size);
-        }
-        if (rx_err == ESP_OK && rx_size == 0) {
-            return 0;
-        }
-    }
-
     size_t read_len = len;
-    esp_err_t err = usbh_cdc_read_bytes(usb_cdc_handle, (uint8_t *)data, &read_len, 0);
+    /* The CDC component's byte ring buffer already provides a blocking read.
+     * Let it wake this task as soon as data arrives instead of polling the
+     * buffered length and sleeping for the whole caller-provided interval. */
+    esp_err_t err = usbh_cdc_read_bytes(usb_cdc_handle, (uint8_t *)data,
+                                        &read_len, ticks_to_wait);
     if (err != ESP_OK) {
         // ESP_FAIL often means no data available - treat as timeout (normal during polling)
         // ESP_ERR_TIMEOUT is also normal
@@ -5281,6 +5435,7 @@ static int usb_transport_read(void *data, size_t len, TickType_t ticks_to_wait)
             if (usb_debug_logs) {
                 usb_log_cdc_state("read_error");
             }
+            return -1;
         }
         return 0;
     }
@@ -5589,9 +5744,18 @@ static bool usb_gps_get_fix(double *lat_out, double *lon_out, uint32_t wait_ms)
         return false;
     }
 
-    usb_rx_exclusive = true;
-    usb_gps_poll(wait_ms);
-    usb_rx_exclusive = false;
+    /* The battery/dashboard timer calls this every two seconds.  Polling an
+     * arbitrary CDC device here used to consume one CRACK/1 ACK32 packet from
+     * a Monster on every refresh.  Cached GPS state remains readable while a
+     * different task owns RX, but only an identified idle GPS may drain USB. */
+    bool transport_owned = crack_transport_owner[TAB_USB] != NULL;
+    if (usb_vcp_gps_poll_allowed(usb_is_known_gps, usb_nmea_device_seen,
+                                 usb_detected, usb_rx_exclusive,
+                                 transport_owned)) {
+        usb_rx_exclusive = true;
+        usb_gps_poll(wait_ms);
+        usb_rx_exclusive = false;
+    }
 
     if (!usb_gps_fix_valid) {
         return false;
@@ -5644,6 +5808,9 @@ static void start_usb_gps_drain_task(void)
 
 static int transport_write_bytes_tab(tab_id_t tab, uart_port_t port, const char *data, size_t len)
 {
+    if (tab >= TAB_GROVE && tab <= TAB_MBUS &&
+        crack_transport_owner[tab] != NULL &&
+        crack_transport_owner[tab] != xTaskGetCurrentTaskHandle()) return 0;
     if (port == UART_NUM && tab == TAB_USB) {
         return usb_transport_write(data, len);
     }
@@ -5652,6 +5819,9 @@ static int transport_write_bytes_tab(tab_id_t tab, uart_port_t port, const char 
 
 static int transport_read_bytes_tab(tab_id_t tab, uart_port_t port, void *data, size_t len, TickType_t ticks_to_wait)
 {
+    if (tab >= TAB_GROVE && tab <= TAB_MBUS &&
+        crack_transport_owner[tab] != NULL &&
+        crack_transport_owner[tab] != xTaskGetCurrentTaskHandle()) return 0;
     if (port == UART_NUM && tab == TAB_USB) {
         return usb_transport_read(data, len, ticks_to_wait);
     }
@@ -6830,7 +7000,7 @@ static void intro_build_glitch(lv_obj_t *parent, int w, int h)
     lv_obj_add_flag(intro_glitch_bar, LV_OBJ_FLAG_HIDDEN);
 }
 
-static void intro_build_scanlines(lv_obj_t *parent, int w, int h)
+static __attribute__((unused)) void intro_build_scanlines(lv_obj_t *parent, int w, int h)
 {
     // Fill a tiny ARGB8888 tile in code: one dark, semi-transparent row per tile.
     lv_color32_t *px = (lv_color32_t *)intro_scan_buf;
@@ -7486,7 +7656,13 @@ static void show_splash_screen(void)
     intro_build_boot(splash_screen, w, h);
     intro_build_footer(splash_screen, w, h);
     intro_build_glitch(splash_screen, w, h);
-    intro_build_scanlines(splash_screen, w, h);
+    // CRT scanline overlay removed: it was a full-screen 720x1280 tiled ARGB8888
+    // image whose first paint is a ~0.9M-pixel software alpha blend, read and
+    // written entirely in PSRAM. Under a USB-A Monster console flood it crawled
+    // for 100+s (taskLVGL stuck in lv_draw_image_tiled_helper), and even without
+    // USB it was heavy enough to intermittently stall the boot splash / trip the
+    // task watchdog. It is pure cosmetics, so it is dropped rather than gated.
+    // intro_build_scanlines(splash_screen, w, h);
 
     splash_timer = lv_timer_create(splash_timer_cb, INTRO_TICK_MS, NULL);
 
@@ -57715,6 +57891,9 @@ static void show_sd_admin_page(void)
 #define JANOS_TRANSFER_HTTP_TIMEOUT_MS    20000
 #define JANOS_TRANSFER_BASE_URL           "http://172.0.0.1"
 #define JANOS_TRANSFER_LOCAL_ROOT         "/sdcard/lab/pcaps/imported"
+/* Handshakes copy straight into the folder the handshake list reads from, so a
+ * freshly copied .pcap shows up there instead of under pcaps/imported/<source>. */
+#define JANOS_TRANSFER_HANDSHAKE_ROOT     "/sdcard/lab/handshakes"
 
 typedef struct {
     EventGroupHandle_t events;
@@ -58271,6 +58450,7 @@ static void janos_transfer_sanitize_filename(const char *input, char *output, si
 }
 
 static bool janos_transfer_build_unique_local_path(tab_id_t tab, const char *file_name,
+                                                   bool is_handshake,
                                                    char *output, size_t output_size)
 {
     char safe_name[96];
@@ -58285,16 +58465,24 @@ static bool janos_transfer_build_unique_local_path(tab_id_t tab, const char *fil
         *dot = '\0';
     }
 
+    /* Handshakes land flat under the handshake folder the list view reads;
+     * everything else keeps the pcaps/imported/<source> layout. */
+    char dest_dir[128];
+    if (is_handshake) {
+        snprintf(dest_dir, sizeof(dest_dir), "%s", JANOS_TRANSFER_HANDSHAKE_ROOT);
+    } else {
+        snprintf(dest_dir, sizeof(dest_dir), "%s/%s",
+                 JANOS_TRANSFER_LOCAL_ROOT, janos_transfer_source_folder(tab));
+    }
+
     for (int suffix = 0; suffix < 1000; suffix++) {
         int written;
         if (suffix == 0) {
-            written = snprintf(output, output_size, "%s/%s/%s%s",
-                               JANOS_TRANSFER_LOCAL_ROOT, janos_transfer_source_folder(tab),
-                               base, extension);
+            written = snprintf(output, output_size, "%s/%s%s",
+                               dest_dir, base, extension);
         } else {
-            written = snprintf(output, output_size, "%s/%s/%s_%d%s",
-                               JANOS_TRANSFER_LOCAL_ROOT, janos_transfer_source_folder(tab),
-                               base, suffix, extension);
+            written = snprintf(output, output_size, "%s/%s_%d%s",
+                               dest_dir, base, suffix, extension);
         }
         if (written < 0 || (size_t)written >= output_size) {
             return false;
@@ -58583,6 +58771,13 @@ static void compromised_transfer_delete_current_task(void)
  * (last line: none)" instead of the retry limit that actually happened. */
 #define JANOS_UART_FT_RETRIES          2
 #define JANOS_UART_FT_DEFAULT_BAUD 115200
+#define JANOS_USB_FT_FAST_BAUD     921600
+
+typedef enum {
+    JANOS_BAUD_LOST = -1,
+    JANOS_BAUD_DEFAULT = 0,
+    JANOS_BAUD_FAST = 1,
+} janos_uart_baud_result_t;
 
 /* The block size asked for, and the largest one that will be accepted back.
  *
@@ -58618,9 +58813,6 @@ static void compromised_transfer_delete_current_task(void)
  * from the on-disk size of the .part, so it simply restarts a little further
  * back - and the stream is flushed before the CRC comparison and the rename. */
 #define JANOS_UART_FT_WRITE_BUF     65536
-
-/* Below this the Wi-Fi path is both faster and reliable, so it stays in use. */
-#define JANOS_UART_TRANSFER_MIN_BYTES (1024L * 1024L)
 
 /* The ROM CRC32 uses the same convention as the bitwise loop this replaces and
  * as esp_rom_crc32_le(0, ...) on the JanOS side: seed 0, reflected polynomial,
@@ -58679,16 +58871,27 @@ static uint32_t janos_uart_ft_block_timeout_ms(uint32_t block_size, uint32_t bau
 }
 
 /* Reads one line without over-reading into the binary stream that follows. */
+#define JANOS_UART_LINE_COMPLETION_MS 2000U
+
 static bool janos_uart_read_line(tab_id_t tab, uart_port_t port, char *out,
                                  size_t out_size, uint32_t timeout_ms)
 {
     size_t len = 0;
     int64_t deadline = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
+    bool started = false;
     out[0] = '\0';
     while (esp_timer_get_time() < deadline) {
         uint8_t c = 0;
         if (transport_read_bytes_tab(tab, port, &c, 1, pdMS_TO_TICKS(50)) != 1) {
             continue;
+        }
+        if (!started) {
+            /* timeout_ms limits waiting for the first byte.  Once a line has
+             * started, finish it within a separate bounded window instead of
+             * discarding a prefix merely because preparation used the slice. */
+            deadline = esp_timer_get_time() +
+                       (int64_t)JANOS_UART_LINE_COMPLETION_MS * 1000;
+            started = true;
         }
         if (c == '\n') {
             out[len] = '\0';
@@ -58740,45 +58943,130 @@ static uint64_t janos_uart_field_u64(const char *line, const char *key, int base
     return strtoull(found + strlen(key), NULL, base);
 }
 
-/* Raises the console baud rate. JanOS answers at the old rate, switches, and
- * reverts to 115200 by itself if the confirmation does not arrive - so a failed
- * switch degrades to a slow link instead of a dead one. */
-static bool janos_uart_set_baud(tab_id_t tab, uart_port_t port, int rate)
+static bool janos_transport_baud_supported(tab_id_t tab)
 {
-    if (tab_is_internal(tab) || tab == TAB_USB) {
-        return false; /* USB CDC has no meaningful line rate to change. */
+    if (tab_is_internal(tab)) return false;
+    if (tab != TAB_USB) return true;
+    return usb_cdc_handle != NULL && usb_cdc_connected &&
+           usb_vcp_config_done &&
+           usb_vcp_is_ch34x(usb_last_vid, usb_last_pid);
+}
+
+static bool janos_transport_set_local_baud(tab_id_t tab, uart_port_t port,
+                                           int rate)
+{
+    if (tab == TAB_USB) return ch34x_set_port_baud((uint32_t)rate);
+    return uart_set_baudrate(port, rate) == ESP_OK;
+}
+
+static bool janos_uart_baud_status_matches(tab_id_t tab, uart_port_t port,
+                                           int rate, bool pending)
+{
+    char status[128] = {0};
+    char rate_field[32];
+    snprintf(rate_field, sizeof(rate_field), "rate=%d", rate);
+    compromised_transport_flush(tab, port);
+    transport_write_bytes_tab(tab, port, "uart_baud_status\r\n", 18);
+    if (!janos_uart_wait_marker(tab, port, "[UARTB] END", "[UARTB] status",
+                                status, sizeof(status), 1500)) {
+        return false;
     }
+    return strstr(status, rate_field) != NULL &&
+           strstr(status, pending ? "pending=yes" : "pending=no") != NULL;
+}
+
+/* Raises the console baud rate. JanOS answers at the old rate, switches, and
+ * reverts to 115200 if confirmation does not arrive. Missing replies are
+ * reconciled with uart_baud_status; callers may use the slow link only after
+ * its boundary is proven, never merely inferred from a timeout. */
+static janos_uart_baud_result_t janos_uart_set_baud(tab_id_t tab,
+                                                    uart_port_t port, int rate)
+{
+    if (!janos_transport_baud_supported(tab)) return JANOS_BAUD_DEFAULT;
     if (rate == JANOS_UART_FT_DEFAULT_BAUD) {
-        return false; /* Nothing to raise, and nothing to restore afterwards. */
+        return JANOS_BAUD_DEFAULT;
     }
     char command[48];
     snprintf(command, sizeof(command), "uart_baud %d\r\n", rate);
     compromised_transport_flush(tab, port);
     transport_write_bytes_tab(tab, port, command, strlen(command));
     if (!janos_uart_wait_marker(tab, port, "[UARTB] END", NULL, NULL, 0, 3000)) {
-        ESP_LOGW(TAG, "[UART-FT] Monster did not acknowledge baud %d", rate);
-        return false;
+        ESP_LOGW(TAG,
+                 "[UART-FT] Monster did not acknowledge baud %d; waiting for safe fallback",
+                 rate);
+        vTaskDelay(pdMS_TO_TICKS(11000));
+        (void)janos_transport_set_local_baud(
+            tab, port, JANOS_UART_FT_DEFAULT_BAUD);
+        if (janos_uart_baud_status_matches(
+                tab, port, JANOS_UART_FT_DEFAULT_BAUD, false)) {
+            return JANOS_BAUD_DEFAULT;
+        }
+        ESP_LOGE(TAG, "[UART-FT] Baud command boundary lost on %s",
+                 tab_transport_name(tab));
+        return JANOS_BAUD_LOST;
     }
 
     vTaskDelay(pdMS_TO_TICKS(60));
-    if (uart_set_baudrate(port, rate) != ESP_OK) {
-        return false;
+    if (!janos_transport_set_local_baud(tab, port, rate)) {
+        ESP_LOGW(TAG,
+                 "[UART-FT] Local %s switch to %d failed; waiting for JanOS fallback",
+                 tab_transport_name(tab), rate);
+        vTaskDelay(pdMS_TO_TICKS(11000));
+        (void)janos_transport_set_local_baud(
+            tab, port, JANOS_UART_FT_DEFAULT_BAUD);
+        if (janos_uart_baud_status_matches(
+                tab, port, JANOS_UART_FT_DEFAULT_BAUD, false)) {
+            return JANOS_BAUD_DEFAULT;
+        }
+        return JANOS_BAUD_LOST;
     }
     vTaskDelay(pdMS_TO_TICKS(60));
     compromised_transport_flush(tab, port);
 
     transport_write_bytes_tab(tab, port, "uart_baud_confirm\r\n", 19);
     if (!janos_uart_wait_marker(tab, port, "[UARTB] END", NULL, NULL, 0, 3000)) {
-        /* Not confirmed: JanOS falls back on its own, so follow it back down. */
-        ESP_LOGW(TAG, "[UART-FT] Baud %d not confirmed; returning to %d",
-                 rate, JANOS_UART_FT_DEFAULT_BAUD);
-        uart_set_baudrate(port, JANOS_UART_FT_DEFAULT_BAUD);
-        vTaskDelay(pdMS_TO_TICKS(11000));
+        /* The command and its response are separate failure domains. If the
+         * first confirmation reached JanOS but its END was lost, immediately
+         * dropping the bridge to 115200 strands the peer at the fast rate. */
+        ESP_LOGW(TAG,
+                 "[UART-FT] Baud %d confirmation response missing; retrying at fast rate",
+                 rate);
         compromised_transport_flush(tab, port);
-        return false;
+        transport_write_bytes_tab(tab, port, "uart_baud_confirm\r\n", 19);
+        if (janos_uart_wait_marker(tab, port, "[UARTB] END", NULL, NULL, 0,
+                                   2000) ||
+            janos_uart_baud_status_matches(tab, port, rate, false)) {
+            ESP_LOGI(TAG, "[UART-FT] Console confirmed at %d baud after retry",
+                     rate);
+            return JANOS_BAUD_FAST;
+        }
+
+        /* Neither fast-rate confirmation nor status was observable. Let an
+         * unconfirmed JanOS switch expire, then prove which side is alive. */
+        vTaskDelay(pdMS_TO_TICKS(11000));
+        (void)janos_transport_set_local_baud(
+            tab, port, JANOS_UART_FT_DEFAULT_BAUD);
+        if (janos_uart_baud_status_matches(
+                tab, port, JANOS_UART_FT_DEFAULT_BAUD, false)) {
+            ESP_LOGI(TAG, "[UART-FT] Console safely fell back to %d baud",
+                     JANOS_UART_FT_DEFAULT_BAUD);
+            return JANOS_BAUD_DEFAULT;
+        }
+        if (janos_transport_set_local_baud(tab, port, rate) &&
+            janos_uart_baud_status_matches(tab, port, rate, false)) {
+            ESP_LOGI(TAG, "[UART-FT] Console remained confirmed at %d baud",
+                     rate);
+            return JANOS_BAUD_FAST;
+        }
+        (void)janos_transport_set_local_baud(
+            tab, port, JANOS_UART_FT_DEFAULT_BAUD);
+        compromised_transport_flush(tab, port);
+        ESP_LOGE(TAG, "[UART-FT] Confirmation boundary lost on %s",
+                 tab_transport_name(tab));
+        return JANOS_BAUD_LOST;
     }
     ESP_LOGI(TAG, "[UART-FT] Console running at %d baud", rate);
-    return true;
+    return JANOS_BAUD_FAST;
 }
 
 /* Is the Monster console answering at the rate the port is set to right now? */
@@ -58796,7 +59084,7 @@ static bool janos_uart_console_alive(tab_id_t tab, uart_port_t port)
  * down, and the Monster is still running fast. So probe the default first, and
  * if nothing answers, go back up, command the change properly, and come down
  * together. */
-static void janos_uart_restore_baud(tab_id_t tab, uart_port_t port, int fast_rate)
+static bool janos_uart_restore_baud(tab_id_t tab, uart_port_t port, int fast_rate)
 {
     char command[48];
     snprintf(command, sizeof(command), "uart_baud %d\r\n", JANOS_UART_FT_DEFAULT_BAUD);
@@ -58805,7 +59093,12 @@ static void janos_uart_restore_baud(tab_id_t tab, uart_port_t port, int fast_rat
         transport_write_bytes_tab(tab, port, command, strlen(command));
         janos_uart_wait_marker(tab, port, "[UARTB] END", NULL, NULL, 0, 2000);
         vTaskDelay(pdMS_TO_TICKS(60));
-        uart_set_baudrate(port, JANOS_UART_FT_DEFAULT_BAUD);
+        if (!janos_transport_set_local_baud(
+                tab, port, JANOS_UART_FT_DEFAULT_BAUD)) {
+            ESP_LOGW(TAG, "[UART-FT] Could not set local %s transport to %d",
+                     tab_transport_name(tab), JANOS_UART_FT_DEFAULT_BAUD);
+            continue;
+        }
         vTaskDelay(pdMS_TO_TICKS(60));
         compromised_transport_flush(tab, port);
         transport_write_bytes_tab(tab, port, "uart_baud_confirm\r\n", 19);
@@ -58814,19 +59107,22 @@ static void janos_uart_restore_baud(tab_id_t tab, uart_port_t port, int fast_rat
         if (janos_uart_console_alive(tab, port)) {
             ESP_LOGI(TAG, "[UART-FT] Console back at %d baud",
                      JANOS_UART_FT_DEFAULT_BAUD);
-            return;
+            return true;
         }
         /* Silence at the default rate means the Monster is still running fast. */
         ESP_LOGW(TAG, "[UART-FT] No console at %d baud; retrying from %d",
                  JANOS_UART_FT_DEFAULT_BAUD, fast_rate);
-        uart_set_baudrate(port, fast_rate);
+        if (!janos_transport_set_local_baud(tab, port, fast_rate)) break;
         vTaskDelay(pdMS_TO_TICKS(60));
         compromised_transport_flush(tab, port);
     }
 
-    uart_set_baudrate(port, JANOS_UART_FT_DEFAULT_BAUD);
+    (void)janos_transport_set_local_baud(
+        tab, port, JANOS_UART_FT_DEFAULT_BAUD);
     ESP_LOGE(TAG, "[UART-FT] Could not resynchronise the console. "
-                  "Reboot the Monster to recover M-BUS.");
+                  "Reboot the %s Monster to recover it.",
+             tab_transport_name(tab));
+    return false;
 }
 
 static void janos_uart_emit_progress(janos_file_transfer_state_t state,
@@ -59381,18 +59677,19 @@ static void compromised_transfer_task(void *arg)
         goto cleanup;
     }
 
-    /* Anything the Wi-Fi path cannot finish goes over M-BUS instead. That path
-     * needs neither the admin portal nor the C6, so it skips both. */
-    bool use_uart = args->size_bytes >= JANOS_UART_TRANSFER_MIN_BYTES &&
-                    !tab_is_internal(tab);
-    ESP_LOGI(TAG, "[Monster transfer] %s (%ld B) -> %s (threshold %ld B)",
+    /* The serial bus copy is the reliable path: it needs neither the admin
+     * portal nor the internal C6, and send_file reads the real size from its
+     * own header, so it carries small files (a fresh handshake .pcap can even
+     * report 0 B here) just as well as large ones. Wi-Fi stays only for the
+     * internal tab, which has no console UART of its own to copy over. */
+    bool use_uart = !tab_is_internal(tab);
+    ESP_LOGI(TAG, "[Monster transfer] %s (%ld B) -> %s",
              args->file_name, args->size_bytes,
-             use_uart ? "M-BUS UART" : "Wi-Fi",
-             (long)JANOS_UART_TRANSFER_MIN_BYTES);
+             use_uart ? "M-BUS UART" : "Wi-Fi");
 
     if (use_uart) {
         char uart_local_path[256];
-        if (!janos_transfer_build_unique_local_path(tab, args->file_name,
+        if (!janos_transfer_build_unique_local_path(tab, args->file_name, args->is_handshake,
                                                     uart_local_path, sizeof(uart_local_path))) {
             result_err = ESP_ERR_INVALID_SIZE;
             snprintf(final_detail, sizeof(final_detail),
@@ -59401,12 +59698,20 @@ static void compromised_transfer_task(void *arg)
         }
 
         compromised_transfer_set_stage("Switching M-BUS to high speed...",
-                                       "Wi-Fi cannot carry a file this size", 0);
+                                       "Copying over the serial bus", 0);
         /* Settings > Transfer Speed, persisted in NVS. Selecting the default
          * rate makes janos_uart_set_baud a no-op, which is the same path an
          * unconfirmed switch lands on: the copy runs at 115200. */
         int fast_baud = (int)janos_ft_baud;
-        bool fast = janos_uart_set_baud(tab, uart_port, fast_baud);
+        janos_uart_baud_result_t baud_result =
+            janos_uart_set_baud(tab, uart_port, fast_baud);
+        if (baud_result == JANOS_BAUD_LOST) {
+            result_err = ESP_ERR_INVALID_STATE;
+            snprintf(final_detail, sizeof(final_detail),
+                     "Serial console boundary lost during baud negotiation.");
+            goto cleanup;
+        }
+        bool fast = baud_result == JANOS_BAUD_FAST;
 
         char baud_detail[64];
         snprintf(baud_detail, sizeof(baud_detail), "Console running at %d baud",
@@ -59417,7 +59722,7 @@ static void compromised_transfer_task(void *arg)
                                          &compromised_transfer_ui.cancel_requested, &result);
 
         if (fast) {
-            janos_uart_restore_baud(tab, uart_port, fast_baud);
+            (void)janos_uart_restore_baud(tab, uart_port, fast_baud);
         }
 
         if (result_err == ESP_OK) {
@@ -59465,7 +59770,7 @@ static void compromised_transfer_task(void *arg)
     }
 
     char local_path[256];
-    if (!janos_transfer_build_unique_local_path(tab, args->file_name,
+    if (!janos_transfer_build_unique_local_path(tab, args->file_name, args->is_handshake,
                                                 local_path, sizeof(local_path))) {
         result_err = ESP_ERR_INVALID_SIZE;
         snprintf(final_detail, sizeof(final_detail), "Could not create a unique local filename.");
@@ -59645,7 +59950,7 @@ static void compromised_sync_task(void *arg)
         }
 
         char local_path[256];
-        if (!janos_transfer_build_unique_local_path(tab, item->file_name,
+        if (!janos_transfer_build_unique_local_path(tab, item->file_name, false,
                                                     local_path, sizeof(local_path))) {
             ESP_LOGE(TAG, "[%s] Sync could not create a local path for %s",
                      tab_transport_name(tab), item->remote_path);
@@ -59799,9 +60104,10 @@ static void compromised_files_sync_cb(lv_event_t *e)
 //==================================================================================
 // WPA Handshake Dictionary Cracker (on-device trivial-password check)
 //
-// Pulls the Monster's .hccapx companion for a captured handshake over M-BUS,
-// then tries a small dictionary (SD /lab/wordlist.txt + a built-in common list +
-// a few SSID-derived guesses) against the 4-way handshake MIC using mbedtls.
+// Pulls the capture .pcap over M-BUS, extracts the 4-way handshake into hccapx
+// records on-device (so no Monster .hccapx companion is needed), then tries a
+// small dictionary (SD /lab/wordlist.txt + a built-in common list + a few
+// SSID-derived guesses) against the handshake MIC using mbedtls.
 //
 // Throughput depends on the device and capture count; display the measured rate.
 //==================================================================================
@@ -59809,8 +60115,35 @@ static void compromised_files_sync_cb(lv_event_t *e)
 #define HCCAPX_SIGNATURE      0x58504348u  /* "HCPX", little-endian on disk */
 #define HCCAPX_RECORD_SIZE    393
 #define HS_CRACK_MAX_RECORDS  16
-#define HS_CRACK_LOCAL_HCCAPX "/sdcard/lab/handshakes/_crack_tmp.hccapx"
-#define HS_CRACK_WORDLIST     "/sdcard/lab/wordlist.txt"
+#define HS_CRACK_LOCAL_PCAP   "/sdcard/lab/handshakes/_crack_tmp.pcap"
+#define HS_CRACK_WORDLIST     "/sdcard/lab/wordlist.txt"   // legacy single-file fallback
+#define HS_CRACK_WORDLIST_DIR "/sdcard/lab/wordlist"        // folder of wordlists
+#define HS_CRACK_WORDLIST_MAX 16                            // dropdown cap
+#define HS_CRACK_REMOTE_MAX 3
+#define HS_CRACK_REMOTE_HCCAPX "/sdcard/lab/handshakes/_crack_worker.hccapx"
+#define HS_CRACK_WORDLIST_CRC_CSV "/sdcard/lab/handshakes/wordlist_crc.csv"
+/* Raw 802.11 without a radiotap header. The extractor also handles a radiotap
+ * capture (link type 127) by skipping its variable-length header. */
+#define HS_CRACK_LINKTYPE_RADIOTAP 127U
+
+// Which candidate lists a crack run tries. GENERIC is the SSID-derived guesses
+// plus the built-in common list; WORDLIST is /lab/wordlist.txt; BOTH runs the
+// generic phase first and only falls through to the wordlist if it misses.
+typedef enum {
+    HS_CRACK_METHOD_GENERIC = 0,
+    HS_CRACK_METHOD_WORDLIST,
+    HS_CRACK_METHOD_BOTH,
+} hs_crack_method_t;
+
+// Per-file crack outcome, kept in a CSV journal next to the handshakes so the
+// crack manager can show what was already tried (like the wardrive upload
+// state). A method column is "none" (not tried), "notfound", "found" or "error".
+// Columns: filename,ssid,size,generic,wordlist,password. Commas/quotes inside a
+// field are replaced with spaces so a plain comma split always parses back.
+#define HS_CRACK_STATE_CSV "/sdcard/lab/handshakes/crack_state.csv"
+#define HS_CRACK_STATE_TMP "/sdcard/lab/handshakes/crack_state.csv.tmp"
+#define HS_CRACK_ATTEMPTS_CSV "/sdcard/lab/handshakes/crack_attempts.csv"
+#define HS_CRACK_RESUME_FILE "/sdcard/lab/handshakes/.crack_resume"
 
 typedef struct __attribute__((packed)) {
     uint32_t signature;
@@ -59834,16 +60167,51 @@ _Static_assert(sizeof(hccapx_record_t) == HCCAPX_RECORD_SIZE,
 typedef struct hs_crack_run hs_crack_run_t;
 
 typedef struct {
+    tab_id_t tab;
+    uart_port_t port;
+    bool usable;
+    bool active;
+    bool finished;
+    bool failed;
+    bool counted;
+    bool cancel_pending;
+    bool usb_lock_set;
+    bool owner_claimed;
+    uint8_t stage_attempt;
+    uint8_t stage_max;
+    char stage[16];
+    char stage_reason[24];
+    char job[32];
+    uint64_t shard_start;
+    uint64_t shard_end;
+    uint64_t checked;
+    uint64_t accounted;
+    hs_remote_lease_t lease;
+    uint8_t found_ssid[32];
+    size_t found_ssid_length;
+    bool pending_found;
+    uint8_t pending_password[63];
+    size_t pending_password_length;
+    uint8_t pending_ssid[32];
+    size_t pending_ssid_length;
+} hs_crack_remote_worker_t;
+
+typedef struct {
     volatile bool active;
     volatile bool cancel_requested;
     TaskHandle_t task;
     int tab;
     int64_t last_update_us;
-    bool counting_candidates;
-    uint64_t total_candidates;
+    uint64_t wordlist_size;
+    uint64_t wordlist_offset;
+    uint32_t source_tried_base;
+    uint8_t remote_total;
+    uint8_t remote_active;
+    uint8_t remote_finished;
+    uint8_t remote_failed;
+    int64_t source_started_us;
+    bool force_rerun;
     bool started;
-    bool dual_mode;
-    lv_obj_t *mode_dropdown;
     hs_crack_run_t *run;
     const char *candidate_source;
     char candidate_status[96];
@@ -59853,6 +60221,15 @@ typedef struct {
     uint64_t idle_runtime[2];
     char remote_pcap_path[WARDRIVE_WIGLE_PATH_MAX];
     char file_name[96];
+    hs_crack_method_t method;   // which candidate lists this run tries
+    // Wordlist selection: a folder of lists plus the legacy single file. wl_choice
+    // indexes wl_paths/wl_names, or == wl_count to mean "run them all in turn".
+    lv_obj_t *wordlist_dropdown;
+    char wl_paths[HS_CRACK_WORDLIST_MAX][112];
+    char wl_names[HS_CRACK_WORDLIST_MAX][48];
+    int wl_count;
+    int wl_choice;
+    char wl_source[80];         // persistent backing for candidate_source ("WL: name")
     lv_obj_t *overlay;
     lv_obj_t *popup;
     lv_obj_t *status_label;
@@ -59860,6 +60237,15 @@ typedef struct {
     lv_obj_t *progress_bar;
     lv_obj_t *action_btn;
     lv_obj_t *action_label;
+    lv_obj_t *dismiss_btn;   // back-out button, shown only before the run starts
+    lv_obj_t *sync_hs_cb;    // "Sync handshake" checkbox (pre-start)
+    lv_obj_t *sync_wl_cb;    // "Sync wordlist" checkbox (pre-start)
+    lv_obj_t *worker_box;    // per-worker status rows (fills the lower area)
+    bool sync_capture;       // captured from sync_hs_cb at Start
+    bool sync_wordlist;      // captured from sync_wl_cb at Start
+    // Per-tab (Grove/USB/MBus) one-line status shown in the worker table. Only
+    // ever touched from the crack task, so no lock is needed around it.
+    char worker_status[3][60];
 } hs_crack_ui_t;
 
 static hs_crack_ui_t hs_crack_ui;
@@ -59980,25 +60366,433 @@ static bool hs_crack_test_password(const char *pw, const hccapx_record_t *r)
 }
 #endif
 
-static int hs_crack_load_records(const char *path, hccapx_record_t *recs, int max_recs)
+// ---------------------------------------------------------------------------
+// Build hccapx records straight from a .pcap of a WPA/WPA2 4-way handshake, so
+// a capture with no Monster-side .hccapx companion is still crackable - the
+// same job hcxtools/wpa-sec do. Only the fields the verifier reads are filled.
+// ---------------------------------------------------------------------------
+
+static inline uint16_t hs_crack_le16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
+static inline uint16_t hs_crack_be16(const uint8_t *p) { return (uint16_t)((p[0] << 8) | p[1]); }
+
+// Derive an SSID from the Monster's "<ssid>_<bssid6>_<n>.pcap" naming when the
+// capture carries no SSID-bearing frame. The SSID itself may contain
+// underscores, so only the trailing "_<hex>_<digits>" pair is stripped.
+static void hs_crack_ssid_from_filename(const char *file_name, char *out, size_t out_sz)
 {
-    FILE *f = fopen(path, "rb");
-    if (!f) return -1;
-    int n = 0;
-    while (n < max_recs) {
-        size_t got = fread(&recs[n], 1, sizeof(hccapx_record_t), f);
-        if (got == 0 && !ferror(f)) break;
-        if (got != sizeof(hccapx_record_t) || !hs_crack_record_valid(&recs[n])) {
-            n = -1;
-            break;
-        }
-        n++;
+    if (out_sz) out[0] = '\0';
+    if (!file_name || out_sz == 0) return;
+    const char *slash = strrchr(file_name, '/');
+    const char *base = slash ? slash + 1 : file_name;
+    char tmp[128];
+    snprintf(tmp, sizeof(tmp), "%s", base);
+    char *dot = strrchr(tmp, '.');
+    if (dot) *dot = '\0';            // drop extension
+    char *seq = strrchr(tmp, '_');   // trailing sequence number
+    if (seq) *seq = '\0';
+    char *mac = strrchr(tmp, '_');   // bssid tail
+    if (mac) *mac = '\0';
+    snprintf(out, out_sz, "%.32s", tmp);   // ESSID is at most 32 bytes
+}
+
+typedef struct {
+    uint8_t ap[6];
+    uint8_t sta[6];
+    uint8_t anonce[32];
+    bool valid;
+} hs_crack_pending_t;
+
+typedef struct {
+    uint8_t bssid[6];
+    char ssid[33];
+} hs_crack_ssid_t;
+
+static int hs_crack_build_records_from_pcap(const char *path, const char *file_name,
+                                            hccapx_record_t *recs, int max_recs,
+                                            const volatile bool *cancel)
+{
+    pcap_reader_t *reader = NULL;
+    pcap_capture_info_t info = {0};
+    if (pcap_reader_open(path, &reader, &info) != PCAP_READER_OK || !reader) {
+        return -1;
     }
-    // Do not silently ignore captures beyond the fixed memory budget.
-    if (n == max_recs && fgetc(f) != EOF) n = -1;
-    if (ferror(f)) n = -1;
+    uint32_t link = pcap_reader_link_type(reader);
+    if (link != PCAP_LINKTYPE_IEEE802_11 && link != HS_CRACK_LINKTYPE_RADIOTAP) {
+        pcap_reader_close(reader);
+        return -1;
+    }
+
+    hs_crack_pending_t pend[4] = {0};
+    hs_crack_ssid_t ssids[4] = {0};
+    int ssid_count = 0;
+    int nrecs = 0;
+
+    pcap_reader_iterate_begin(reader);
+    uint8_t buf[512];
+    for (;;) {
+        if (cancel && *cancel) break;
+        pcap_packet_index_t idx;
+        size_t got = 0;
+        bool have = false;
+        pcap_reader_status_t st = pcap_reader_iterate_next(reader, &idx, buf, sizeof(buf),
+                                                           &got, &have);
+        if (st != PCAP_READER_OK && st != PCAP_READER_LIMIT_REACHED) break;
+        if (!have) break;
+
+        const uint8_t *f = buf;
+        size_t flen = got;
+        if (link == HS_CRACK_LINKTYPE_RADIOTAP) {
+            if (flen < 4) continue;
+            uint16_t rt = hs_crack_le16(f + 2);
+            if (rt == 0 || rt > flen) continue;
+            f += rt;
+            flen -= rt;
+        }
+        if (flen < 24) continue;
+
+        uint16_t fc = hs_crack_le16(f);
+        uint8_t type = (uint8_t)((fc >> 2) & 0x03);
+        uint8_t subtype = (uint8_t)((fc >> 4) & 0x0F);
+        bool to_ds = (fc & 0x0100) != 0;
+        bool from_ds = (fc & 0x0200) != 0;
+
+        if (type == 0) {
+            // Management frame: harvest the SSID IE from beacon/probe/assoc.
+            size_t fixed;
+            if (subtype == 8 || subtype == 5) fixed = 12;      // beacon / probe resp
+            else if (subtype == 0) fixed = 4;                  // assoc req
+            else if (subtype == 2) fixed = 6;                  // reassoc req
+            else continue;
+            const uint8_t *bssid = f + 16;                     // addr3
+            size_t off = 24 + fixed;
+            while (off + 2 <= flen) {
+                uint8_t tag = f[off];
+                uint8_t len = f[off + 1];
+                if (off + 2 + len > flen) break;
+                if (tag == 0) {
+                    if (len > 0 && len <= 32 && memchr(f + off + 2, 0, len) == NULL) {
+                        int slot = -1;
+                        for (int s = 0; s < ssid_count; s++) {
+                            if (memcmp(ssids[s].bssid, bssid, 6) == 0) { slot = s; break; }
+                        }
+                        if (slot < 0 && ssid_count < 4) slot = ssid_count++;
+                        if (slot >= 0) {
+                            memcpy(ssids[slot].bssid, bssid, 6);
+                            memcpy(ssids[slot].ssid, f + off + 2, len);
+                            ssids[slot].ssid[len] = '\0';
+                        }
+                    }
+                    break;
+                }
+                off += 2 + len;
+            }
+            continue;
+        }
+        if (type != 2) continue;   // only data frames carry EAPOL
+
+        size_t hdr = 24;
+        if (to_ds && from_ds) hdr += 6;
+        if (subtype & 0x08) hdr += 2;   // QoS data
+        if (hdr + 8 > flen) continue;
+
+        const uint8_t *pl = f + hdr;
+        size_t pll = flen - hdr;
+        if (pll < 8 || pl[0] != 0xAA || pl[1] != 0xAA || pl[2] != 0x03) continue;
+        if (hs_crack_be16(pl + 6) != 0x888EU) continue;   // EtherType EAPOL
+
+        const uint8_t *e = pl + 8;
+        size_t elen = pll - 8;
+        if (elen < 99 || e[1] != 3) continue;             // EAPOL-Key type
+        size_t frame_len = (size_t)hs_crack_be16(e + 2) + 4;
+        if (frame_len < 99 || frame_len > 256 || frame_len > elen) continue;
+
+        uint16_t kinfo = hs_crack_be16(e + 5);
+        uint8_t keyver = (uint8_t)(kinfo & 0x0007);
+        if (keyver != 1 && keyver != 2) continue;
+        bool mic = (kinfo & 0x0100) != 0;
+        bool ack = (kinfo & 0x0080) != 0;
+        const uint8_t *nonce = e + 17;
+        bool nonce_zero = true;
+        for (int i = 0; i < 32; i++) { if (nonce[i]) { nonce_zero = false; break; } }
+
+        const uint8_t *ap, *sta;
+        if (from_ds && !to_ds)      { ap = f + 10; sta = f + 4; }
+        else if (to_ds && !from_ds) { ap = f + 4;  sta = f + 10; }
+        else continue;
+
+        if (ack) {
+            // From the AP with ACK set (M1 or M3): both carry the same ANonce,
+            // so either one seeds the pair - handy when M1 was missed.
+            if (nonce_zero) continue;
+            int slot = -1;
+            for (int s = 0; s < 4; s++) {
+                if (pend[s].valid && memcmp(pend[s].ap, ap, 6) == 0 &&
+                    memcmp(pend[s].sta, sta, 6) == 0) { slot = s; break; }
+            }
+            if (slot < 0) for (int s = 0; s < 4; s++) if (!pend[s].valid) { slot = s; break; }
+            if (slot < 0) slot = 0;
+            memcpy(pend[slot].ap, ap, 6);
+            memcpy(pend[slot].sta, sta, 6);
+            memcpy(pend[slot].anonce, nonce, 32);
+            pend[slot].valid = true;
+        } else if (mic && !ack) {
+            // M2 from the STA: pair its SNonce/MIC/EAPOL with a stored ANonce.
+            if (nonce_zero) continue;   // M4 carries a zero SNonce
+            int slot = -1;
+            for (int s = 0; s < 4; s++) {
+                if (pend[s].valid && memcmp(pend[s].ap, ap, 6) == 0 &&
+                    memcmp(pend[s].sta, sta, 6) == 0) { slot = s; break; }
+            }
+            if (slot < 0) continue;     // no ANonce seen for this pair yet
+            if (nrecs >= max_recs) break;
+
+            hccapx_record_t *r = &recs[nrecs];
+            memset(r, 0, sizeof(*r));
+            r->signature = HCCAPX_SIGNATURE;
+            r->version = 4;
+            r->message_pair = 0;        // M1+M2; not used by the verifier
+            r->keyver = keyver;
+            memcpy(r->mac_ap, ap, 6);
+            memcpy(r->mac_sta, sta, 6);
+            memcpy(r->nonce_ap, pend[slot].anonce, 32);
+            memcpy(r->nonce_sta, nonce, 32);
+            memcpy(r->keymic, e + 81, 16);
+            memcpy(r->eapol, e, frame_len);
+            r->eapol_len = (uint16_t)frame_len;
+            nrecs++;
+        }
+    }
+    pcap_reader_close(reader);
+
+    if (cancel && *cancel) return -2;
+    if (nrecs <= 0) return 0;
+
+    // Stamp the ESSID: prefer a beacon SSID matching the record's AP, then any
+    // SSID seen in the capture, then one derived from the filename.
+    char fallback[33];
+    hs_crack_ssid_from_filename(file_name, fallback, sizeof(fallback));
+    for (int i = 0; i < nrecs; i++) {
+        const char *ssid = NULL;
+        for (int s = 0; s < ssid_count; s++) {
+            if (memcmp(ssids[s].bssid, recs[i].mac_ap, 6) == 0) { ssid = ssids[s].ssid; break; }
+        }
+        if (!ssid && ssid_count > 0) ssid = ssids[0].ssid;
+        if (!ssid || !ssid[0]) ssid = fallback;
+        size_t l = strnlen(ssid, 32);
+        recs[i].essid_len = (uint8_t)l;
+        memcpy(recs[i].essid, ssid, l);
+    }
+
+    // Keep only records that clear the strict validator.
+    int valid = 0;
+    for (int i = 0; i < nrecs; i++) {
+        if (hs_crack_record_valid(&recs[i])) {
+            if (valid != i) recs[valid] = recs[i];
+            valid++;
+        }
+    }
+    return valid;
+}
+
+// Local log of cracked keys, kept next to the copied handshakes in the same
+// `"SSID", "password"` shape the Monster's eviltwin.txt uses. Appends only new
+// SSID/password pairs so re-cracking the same file does not duplicate a row.
+#define HS_CRACK_CRACKED_TXT "/sdcard/lab/handshakes/cracked.txt"
+static bool hs_crack_save_cracked_local(const char *ssid, const char *password)
+{
+    if (!ssid || !ssid[0] || !password || !password[0]) return false;
+
+    char match[128];
+    snprintf(match, sizeof(match), "\"%s\", \"%s\"", ssid, password);
+
+    FILE *existing = fopen(HS_CRACK_CRACKED_TXT, "r");
+    if (existing) {
+        char line[192];
+        while (fgets(line, sizeof(line), existing)) {
+            if (strstr(line, match)) { fclose(existing); return true; }
+        }
+        fclose(existing);
+    }
+
+    FILE *f = fopen(HS_CRACK_CRACKED_TXT, "a");
+    if (!f) return false;
+    fprintf(f, "%s\n", match);
+    fflush(f);
     fclose(f);
-    return n;
+    return true;
+}
+
+// Hand the cracked key to the Monster so it lands in eviltwin.txt and gets
+// reused by `--saved`. Needs JanOS's `save_pass "<ssid>" "<pass>"` command,
+// which replies with a line containing "save_pass:" ("saved" or "exists" on
+// success). Older firmware without the command answers with a usage/error line,
+// which simply reads back as "not saved".
+static bool hs_crack_save_to_monster(tab_id_t tab, uart_port_t port,
+                                     const char *ssid, const char *password)
+{
+    char qs[80];
+    char qp[160];
+    if (!compromised_quote_console_arg(ssid, qs, sizeof(qs)) ||
+        !compromised_quote_console_arg(password, qp, sizeof(qp))) {
+        return false;
+    }
+    char cmd[256];
+    int n = snprintf(cmd, sizeof(cmd), "save_pass %s %s\r\n", qs, qp);
+    if (n < 0 || n >= (int)sizeof(cmd)) return false;
+
+    bool lock = false;
+    compromised_transport_lock_begin(tab, port, &lock);
+    transport_write_bytes_tab(tab, port, cmd, strlen(cmd));
+    char resp[256] = {0};
+    (void)home_collect_uart_response(tab, port, resp, sizeof(resp), 1500);
+    compromised_transport_lock_end(lock);
+
+    return strstr(resp, "save_pass: saved") != NULL ||
+           strstr(resp, "save_pass: exists") != NULL;
+}
+
+// --- Crack journal (crack_state.csv) -------------------------------------
+// One row per handshake file: filename,ssid,size,generic,wordlist,password.
+// The crack manager reads it to show what was already tried, mirroring the
+// wardrive upload state. Any comma/quote/newline inside a field is flattened to
+// a space so a plain comma split always parses back cleanly.
+
+static void hs_crack_csv_sanitize(char *dst, size_t dsz, const char *src)
+{
+    size_t o = 0;
+    for (const char *p = src; p && *p && o + 1 < dsz; p++) {
+        char c = *p;
+        if (c == ',' || c == '"' || c == '\t' || c == '\n' || c == '\r') c = ' ';
+        dst[o++] = c;
+    }
+    if (dsz) dst[o] = '\0';
+}
+
+// Insert or update the row for `filename`. A NULL generic/wordlist/password
+// keeps whatever the existing row had (so a generic-only run does not clobber a
+// prior wordlist result), and size <= 0 keeps the stored size.
+static bool hs_crack_state_upsert(const char *filename, const char *ssid, long size,
+                                  const char *generic, const char *wordlist,
+                                  const char *password)
+{
+    if (!filename || !filename[0]) return false;
+
+    char ex_ssid[33] = "";
+    char ex_generic[16] = "none";
+    char ex_wordlist[16] = "none";
+    char ex_password[65] = "";
+    long ex_size = 0;
+
+    FILE *in = fopen(HS_CRACK_STATE_CSV, "r");
+    FILE *out = fopen(HS_CRACK_STATE_TMP, "w");
+    if (!out) { if (in) fclose(in); return false; }
+
+    if (in) {
+        char line[512];
+        while (fgets(line, sizeof(line), in)) {
+            char fn[96];
+            int i = 0;
+            while (line[i] && line[i] != ',' && i < (int)sizeof(fn) - 1) { fn[i] = line[i]; i++; }
+            fn[i] = '\0';
+            if (strcmp(fn, filename) != 0) {
+                fputs(line, out);
+                continue;
+            }
+            // Matching row: split all 6 comma fields (empty allowed) so any the
+            // caller did not specify survive the merge.
+            char buf[512];
+            snprintf(buf, sizeof(buf), "%s", line);
+            buf[strcspn(buf, "\r\n")] = '\0';
+            char *field[6] = {0};
+            int nf = 0;
+            char *p = buf;
+            field[nf++] = p;
+            for (; *p && nf < 6; p++) {
+                if (*p == ',') { *p = '\0'; field[nf++] = p + 1; }
+            }
+            if (nf > 1 && field[1]) snprintf(ex_ssid, sizeof(ex_ssid), "%s", field[1]);
+            if (nf > 2 && field[2]) ex_size = atol(field[2]);
+            if (nf > 3 && field[3] && field[3][0]) snprintf(ex_generic, sizeof(ex_generic), "%s", field[3]);
+            if (nf > 4 && field[4] && field[4][0]) snprintf(ex_wordlist, sizeof(ex_wordlist), "%s", field[4]);
+            if (nf > 5 && field[5]) snprintf(ex_password, sizeof(ex_password), "%s", field[5]);
+        }
+        fclose(in);
+    }
+
+    char m_fn[96], m_ssid[33], m_generic[16], m_wordlist[16], m_password[65];
+    hs_crack_csv_sanitize(m_fn, sizeof(m_fn), filename);
+    hs_crack_csv_sanitize(m_ssid, sizeof(m_ssid), ssid ? ssid : ex_ssid);
+    hs_crack_csv_sanitize(m_generic, sizeof(m_generic), generic ? generic : ex_generic);
+    hs_crack_csv_sanitize(m_wordlist, sizeof(m_wordlist), wordlist ? wordlist : ex_wordlist);
+    hs_crack_csv_sanitize(m_password, sizeof(m_password), password ? password : ex_password);
+    long m_size = size > 0 ? size : ex_size;
+
+    fprintf(out, "%s,%s,%ld,%s,%s,%s\n", m_fn, m_ssid, m_size,
+            m_generic[0] ? m_generic : "none",
+            m_wordlist[0] ? m_wordlist : "none", m_password);
+    fclose(out);
+
+    unlink(HS_CRACK_STATE_CSV);
+    return rename(HS_CRACK_STATE_TMP, HS_CRACK_STATE_CSV) == 0;
+}
+
+// Turn a finished run's outcome into per-method journal columns and store it.
+// Skips cancelled runs so a partial pass is never recorded as "notfound".
+static void hs_crack_journal_result(const char *filename, const char *ssid, long size,
+                                    hs_crack_method_t method, int found_idx,
+                                    const char *source, bool sd_wordlist_used,
+                                    const char *found_pw)
+{
+    if (!filename || !filename[0]) return;
+
+    bool inc_generic = (method != HS_CRACK_METHOD_WORDLIST);
+    bool inc_wordlist = (method != HS_CRACK_METHOD_GENERIC);
+    bool found_in_wordlist = (found_idx >= 0 && source &&
+                              (strstr(source, "WL:") != NULL || strstr(source, "SD:") != NULL));
+    bool found_in_generic = (found_idx >= 0 && !found_in_wordlist);
+
+    const char *gen = NULL;
+    const char *wl = NULL;
+    if (inc_generic) gen = found_in_generic ? "found" : "notfound";
+    if (inc_wordlist) {
+        if (found_in_generic)        wl = NULL;              // never reached; keep prior
+        else if (found_in_wordlist)  wl = "found";
+        else if (sd_wordlist_used)   wl = "notfound";
+        else                         wl = "error";           // requested but no wordlist file
+    }
+    const char *pw = (found_idx >= 0) ? found_pw : NULL;
+    (void)hs_crack_state_upsert(filename, ssid, size, gen, wl, pw);
+}
+
+static void hs_crack_set_stage(const char *status, const char *detail, int bar_value);
+static void hs_crack_render_workers(void);
+
+static void hs_crack_remote_report(hs_crack_remote_worker_t *worker,
+                                   const char *stage, unsigned attempt,
+                                   const char *reason)
+{
+    if (!worker) return;
+    worker->stage_attempt = (uint8_t)attempt;
+    worker->stage_max = HS_REMOTE_STAGE_ATTEMPTS;
+    snprintf(worker->stage, sizeof(worker->stage), "%s", stage ? stage : "idle");
+    snprintf(worker->stage_reason, sizeof(worker->stage_reason), "%s",
+             reason ? reason : "");
+    if (attempt > 0) {
+        snprintf(hs_crack_ui.worker_status[worker->tab],
+                 sizeof(hs_crack_ui.worker_status[0]),
+                 "%.14s %u/%u %.22s", worker->stage, attempt,
+                 HS_REMOTE_STAGE_ATTEMPTS, worker->stage_reason);
+    } else {
+        snprintf(hs_crack_ui.worker_status[worker->tab],
+                 sizeof(hs_crack_ui.worker_status[0]),
+                 "%.14s %.30s", worker->stage, worker->stage_reason);
+    }
+    ESP_LOGI(TAG,
+             "[HS-CRACK] WORKER %s stage=%s attempt=%u/%u reason=%s",
+             tab_transport_name(worker->tab), worker->stage, attempt,
+             HS_REMOTE_STAGE_ATTEMPTS,
+             worker->stage_reason[0] ? worker->stage_reason : "-");
+    hs_crack_render_workers();
 }
 
 // Read one whole line, preserving spaces and discarding oversized/binary lines.
@@ -60032,6 +60826,1754 @@ static int hs_crack_read_word(FILE *f, char word[65], const volatile bool *cance
     return 1;
 }
 
+static bool hs_crack_remote_detected(tab_id_t tab)
+{
+    if (tab == TAB_GROVE) return grove_detected;
+    if (tab == TAB_USB) return usb_detected && usb_cdc_handle != NULL;
+    if (tab == TAB_MBUS) return mbus_detected && uart2_initialized;
+    return false;
+}
+
+static bool hs_crack_remote_claim_transport(hs_crack_remote_worker_t *worker)
+{
+    if (!worker || worker->tab < TAB_GROVE || worker->tab > TAB_MBUS)
+        return false;
+    TaskHandle_t current = xTaskGetCurrentTaskHandle();
+    bool claimed = false;
+    portENTER_CRITICAL(&crack_transport_owner_mux);
+    if (crack_transport_owner[worker->tab] == NULL ||
+        crack_transport_owner[worker->tab] == current) {
+        crack_transport_owner[worker->tab] = current;
+        claimed = true;
+    }
+    portEXIT_CRITICAL(&crack_transport_owner_mux);
+    worker->owner_claimed = claimed;
+    return claimed;
+}
+
+static void hs_crack_remote_release_transport(hs_crack_remote_worker_t *worker)
+{
+    if (!worker || !worker->owner_claimed) return;
+    TaskHandle_t current = xTaskGetCurrentTaskHandle();
+    portENTER_CRITICAL(&crack_transport_owner_mux);
+    if (crack_transport_owner[worker->tab] == current)
+        crack_transport_owner[worker->tab] = NULL;
+    portEXIT_CRITICAL(&crack_transport_owner_mux);
+    worker->owner_claimed = false;
+}
+
+static bool hs_crack_remote_write_all(tab_id_t tab, uart_port_t port,
+                                      const void *data, size_t size)
+{
+    const uint8_t *bytes = data;
+    size_t sent = 0;
+    while (sent < size && !hs_crack_ui.cancel_requested) {
+        int written = transport_write_bytes_tab(tab, port,
+                                                (const char *)bytes + sent,
+                                                size - sent);
+        if (written <= 0) return false;
+        sent += (size_t)written;
+    }
+    return sent == size;
+}
+
+static bool hs_crack_remote_write_all_force(tab_id_t tab, uart_port_t port,
+                                            const void *data, size_t size)
+{
+    const uint8_t *bytes = data;
+    size_t sent = 0;
+    while (sent < size) {
+        int written = transport_write_bytes_tab(tab, port,
+                                                (const char *)bytes + sent,
+                                                size - sent);
+        if (written <= 0) return false;
+        sent += (size_t)written;
+    }
+    return true;
+}
+
+#define HS_CRACK_REMOTE_COMMAND_BYTES 192
+
+static bool hs_crack_remote_send_line(tab_id_t tab, uart_port_t port,
+                                      const char *line)
+{
+    char framed[HS_CRACK_REMOTE_COMMAND_BYTES];
+    return hs_remote_frame_command(framed, sizeof(framed), line) &&
+           hs_crack_remote_write_all(tab, port, framed, strlen(framed));
+}
+
+static bool hs_crack_remote_send_line_force(tab_id_t tab, uart_port_t port,
+                                            const char *line)
+{
+    char framed[HS_CRACK_REMOTE_COMMAND_BYTES];
+    return hs_remote_frame_command(framed, sizeof(framed), line) &&
+           hs_crack_remote_write_all_force(tab, port, framed, strlen(framed));
+}
+
+#define HS_CRACK_REMOTE_LINE_BYTES 640
+#define HS_CRACK_REMOTE_LINE_SLICE_MS 500U
+
+static bool hs_crack_remote_read_message(tab_id_t tab, uart_port_t port,
+                                         hs_remote_message_t *message,
+                                         uint32_t timeout_ms)
+{
+    char line[HS_CRACK_REMOTE_LINE_BYTES];
+    int64_t deadline = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
+    while (!hs_crack_ui.cancel_requested) {
+        int64_t remaining_us = deadline - esp_timer_get_time();
+        if (remaining_us <= 0) break;
+        uint32_t left = (uint32_t)(remaining_us / 1000);
+        /* USB CDC may spend part of this call waiting for JanOS to prepare the
+         * response, then deliver a long READY line in small packets. The line
+         * reader gives an observed first byte its own bounded completion time. */
+        if (left > HS_CRACK_REMOTE_LINE_SLICE_MS)
+            left = HS_CRACK_REMOTE_LINE_SLICE_MS;
+        if (left == 0) left = 1;
+        if (!janos_uart_read_line(tab, port, line, sizeof(line), left)) continue;
+        if (hs_remote_parse_line(line, message)) return true;
+        if (strncmp(line, "[CRACK/1] ", 10) == 0) {
+            ESP_LOGW(TAG, "[HS-DBG] %s: unparsed CRACK line: %.240s",
+                     tab_transport_name(tab), line);
+        }
+    }
+    return false;
+}
+
+static bool hs_crack_remote_read_exact_bytes(hs_crack_remote_worker_t *worker,
+                                             uint8_t *bytes, size_t size,
+                                             uint32_t timeout_ms)
+{
+    size_t received = 0;
+    const int64_t deadline = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
+    while (received < size && !hs_crack_ui.cancel_requested) {
+        const int64_t remaining_us = deadline - esp_timer_get_time();
+        if (remaining_us <= 0) break;
+        uint32_t wait_ms = (uint32_t)(remaining_us / 1000);
+        if (wait_ms > 100U) wait_ms = 100U;
+        TickType_t wait_ticks = pdMS_TO_TICKS(wait_ms);
+        if (wait_ticks == 0) wait_ticks = 1;
+        int got = transport_read_bytes_tab(worker->tab, worker->port,
+                                            bytes + received, size - received,
+                                            wait_ticks);
+        if (got < 0 || (size_t)got > size - received) return false;
+        received += (size_t)got;
+    }
+    return received == size && esp_timer_get_time() <= deadline;
+}
+
+static bool hs_crack_remote_read_message_force(tab_id_t tab, uart_port_t port,
+                                               hs_remote_message_t *message,
+                                               uint32_t timeout_ms)
+{
+    char line[HS_CRACK_REMOTE_LINE_BYTES];
+    int64_t deadline = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
+    while (esp_timer_get_time() < deadline) {
+        if (!janos_uart_read_line(tab, port, line, sizeof(line), 250)) continue;
+        if (hs_remote_parse_line(line, message)) return true;
+        if (strncmp(line, "[CRACK/1] ", 10) == 0) {
+            ESP_LOGW(TAG, "[HS-DBG] %s: unparsed CRACK line: %.240s",
+                     tab_transport_name(tab), line);
+        }
+    }
+    return false;
+}
+
+static bool hs_crack_remote_query_diag(hs_crack_remote_worker_t *worker);
+static bool hs_crack_remote_reset_partial(hs_crack_remote_worker_t *worker,
+                                          const char *kind, uint64_t size,
+                                          uint32_t crc32);
+
+static bool hs_crack_remote_wait_end(tab_id_t tab, uart_port_t port,
+                                     uint32_t timeout_ms)
+{
+    hs_remote_message_t message;
+    int64_t deadline = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
+    while (esp_timer_get_time() < deadline) {
+        uint32_t left = (uint32_t)((deadline - esp_timer_get_time()) / 1000);
+        if (!hs_crack_remote_read_message(tab, port, &message, left)) return false;
+        if (message.type == HS_REMOTE_END) {
+            char blank[4];
+            (void)janos_uart_read_line(tab, port, blank, sizeof(blank), 100);
+            return true;
+        }
+    }
+    return false;
+}
+
+static void hs_crack_remote_report_current(hs_crack_remote_worker_t *worker,
+                                           const char *reason)
+{
+    char stage[sizeof(worker->stage)];
+    snprintf(stage, sizeof(stage), "%.15s",
+             worker->stage[0] ? worker->stage : "sync");
+    unsigned attempt = worker->stage_attempt ? worker->stage_attempt : 1U;
+    hs_crack_remote_report(worker, stage, attempt, reason);
+}
+
+static void hs_crack_remote_sync_lost(hs_crack_remote_worker_t *worker,
+                                      const char *reason)
+{
+    worker->failed = true;
+    worker->usable = false;
+    hs_crack_remote_report_current(worker, reason ? reason : "CLI boundary lost");
+}
+
+static bool hs_crack_remote_uart_recover(hs_crack_remote_worker_t *worker,
+                                         bool consume_ready_end,
+                                         bool send_can,
+                                         const char *reason)
+{
+    if (consume_ready_end &&
+        !hs_crack_remote_wait_end(worker->tab, worker->port, 3000)) {
+        hs_crack_remote_sync_lost(worker, "READY without END");
+        return false;
+    }
+    if (send_can) {
+        const uint8_t can = JANOS_UART_FT_CAN;
+        if (transport_write_bytes_tab(worker->tab, worker->port,
+                                      (const char *)&can, 1) != 1) {
+            hs_crack_remote_sync_lost(worker, "CAN write uncertain");
+            return false;
+        }
+    }
+    if (!hs_crack_remote_wait_end(worker->tab, worker->port, 12000)) {
+        hs_crack_remote_sync_lost(worker, "CLI boundary lost");
+        return false;
+    }
+    hs_crack_remote_report_current(worker, reason ? reason : "retry safe");
+    return true;
+}
+
+static bool hs_crack_remote_reset_safe(hs_crack_remote_worker_t *worker,
+                                       const char *kind, uint64_t size,
+                                       uint32_t crc32)
+{
+    if (hs_crack_remote_reset_partial(worker, kind, size, crc32)) return true;
+    if (hs_crack_remote_query_diag(worker)) {
+        hs_crack_remote_report_current(worker, "reset failed; retry safe");
+        return false;
+    }
+    hs_crack_remote_sync_lost(worker, "reset boundary lost");
+    return false;
+}
+
+static bool hs_crack_remote_query_diag(hs_crack_remote_worker_t *worker)
+{
+    compromised_transport_flush(worker->tab, worker->port);
+    /* A CAN sent after the receiver has already left raw mode may be sitting at
+     * the start of a CLI line. Terminate that line before issuing DIAG. */
+    if (!hs_crack_remote_write_all_force(worker->tab, worker->port, "\r\n", 2) ||
+        !hs_crack_remote_send_line_force(worker->tab, worker->port,
+                                         "crack_worker diag")) {
+        ESP_LOGW(TAG, "[HS-DIAG] %s: could not send diagnostic query",
+                 tab_transport_name(worker->tab));
+        return false;
+    }
+
+    hs_remote_message_t message;
+    int64_t deadline = esp_timer_get_time() + 3500000LL;
+    while (esp_timer_get_time() < deadline) {
+        if (!hs_crack_remote_read_message_force(worker->tab, worker->port,
+                                                &message, 500)) continue;
+        if (message.type != HS_REMOTE_DIAG) continue;
+        ESP_LOGW(TAG,
+                 "[HS-DIAG] %s phase=%s reason=%s header=%llu/%llu payload=%llu/%llu offset=%llu block=%llu baud=%u rd=%llu rb=%llu sd=%llu sb=%llu aa=%llu as=%llu cp=%llu stage_us=%llu",
+                 tab_transport_name(worker->tab), message.phase, message.reason,
+                 (unsigned long long)message.header_got,
+                 (unsigned long long)message.header_expected,
+                 (unsigned long long)message.payload_got,
+                 (unsigned long long)message.payload_expected,
+                 (unsigned long long)message.offset,
+                 (unsigned long long)message.block_index,
+                 (unsigned)message.baud,
+                 (unsigned long long)message.diag_read_calls,
+                 (unsigned long long)message.diag_read_bytes,
+                 (unsigned long long)message.diag_sd_write_calls,
+                 (unsigned long long)message.diag_sd_write_bytes,
+                 (unsigned long long)message.diag_ack_attempts,
+                 (unsigned long long)message.diag_acks_sent,
+                 (unsigned long long)message.diag_checkpoint_calls,
+                 (unsigned long long)message.diag_stage_us);
+        char report[sizeof(worker->stage_reason)];
+        snprintf(report, sizeof(report), "diag %.6s: %.10s",
+                 message.phase, message.reason);
+        hs_crack_remote_report_current(worker, report);
+        char detail[160];
+        snprintf(detail, sizeof(detail),
+                 "%s: %s\nheader %llu/%llu, payload %llu/%llu",
+                 message.phase, message.reason,
+                 (unsigned long long)message.header_got,
+                 (unsigned long long)message.header_expected,
+                 (unsigned long long)message.payload_got,
+                 (unsigned long long)message.payload_expected);
+        hs_crack_set_stage("Worker diagnostic", detail, -1);
+        return true;
+    }
+    ESP_LOGW(TAG, "[HS-DIAG] %s: no DIAG response",
+             tab_transport_name(worker->tab));
+    return false;
+}
+
+static bool hs_crack_remote_capabilities(hs_crack_remote_worker_t *worker)
+{
+    for (unsigned attempt = 1; attempt <= HS_REMOTE_STAGE_ATTEMPTS; ++attempt) {
+        hs_crack_remote_report(worker, "capabilities", attempt, "query");
+        compromised_transport_flush(worker->tab, worker->port);
+        bool sent = hs_crack_remote_send_line(worker->tab, worker->port,
+                                               "crack_worker capabilities");
+        hs_remote_message_t message = {0};
+        bool received = sent && hs_crack_remote_read_message(
+            worker->tab, worker->port, &message, 2500);
+        if (received && hs_remote_capabilities_v4_valid(&message)) {
+            hs_crack_remote_report(worker, "capabilities", attempt, "ready");
+            return true;
+        }
+        if (received && message.type == HS_REMOTE_CAPABILITIES) {
+            hs_crack_remote_report(worker, "capabilities", attempt,
+                                   "incompatible");
+            return false;
+        }
+        bool safe = hs_crack_remote_query_diag(worker);
+        if (!hs_remote_stage_retry_allowed(attempt,
+                                           hs_crack_ui.cancel_requested, safe)) {
+            hs_crack_remote_report(worker, "capabilities", attempt,
+                                   safe ? "exhausted" : "CLI lost");
+            return false;
+        }
+        hs_crack_remote_report(worker, "capabilities", attempt, "retry");
+        vTaskDelay(pdMS_TO_TICKS(hs_remote_stage_backoff_ms(attempt + 1U)));
+    }
+    return false;
+}
+
+static bool hs_crack_remote_file_prefix_crc(const char *path, uint64_t length,
+                                            uint32_t *out, int64_t deadline)
+{
+    FILE *file = fopen(path, "rb");
+    if (!file) return false;
+    uint8_t buffer[4096];
+    uint32_t crc = 0;
+    uint64_t done = 0;
+    bool ok = true;
+    while (done < length && !hs_crack_ui.cancel_requested) {
+        if (deadline && esp_timer_get_time() >= deadline) {
+            ok = false;
+            break;
+        }
+        size_t want = (length - done) > sizeof(buffer)
+                          ? sizeof(buffer) : (size_t)(length - done);
+        size_t got = fread(buffer, 1, want, file);
+        if (got != want) {
+            ok = false;
+            break;
+        }
+        crc = hs_crack_cache_crc32_update(crc, buffer, got);
+        done += got;
+        if ((done & 0xFFFFU) == 0) vTaskDelay(1);
+        if (deadline && esp_timer_get_time() >= deadline) {
+            ok = false;
+            break;
+        }
+    }
+    fclose(file);
+    if (!ok || done != length) return false;
+    *out = crc;
+    return true;
+}
+
+static bool hs_crack_wordlist_crc_checkpoint(void *context)
+{
+    (void)context;
+    vTaskDelay(1);
+    return !hs_crack_ui.cancel_requested;
+}
+
+static void hs_crack_remote_put_le32(uint8_t *dst, uint32_t value)
+{
+    dst[0] = (uint8_t)value;
+    dst[1] = (uint8_t)(value >> 8);
+    dst[2] = (uint8_t)(value >> 16);
+    dst[3] = (uint8_t)(value >> 24);
+}
+
+static bool hs_crack_remote_probe(hs_crack_remote_worker_t *worker,
+                                  const char *kind, uint64_t size,
+                                  uint32_t crc32, bool *present)
+{
+    char command[128];
+    snprintf(command, sizeof(command), "crack_worker probe %s %llu %08lX",
+             kind, (unsigned long long)size, (unsigned long)crc32);
+    const bool usb_cdc = worker->tab == TAB_USB;
+    const unsigned attempts = 1U;
+    const uint32_t timeout_ms = HS_REMOTE_PROBE_TIMEOUT_MS;
+    for (unsigned attempt = 0; attempt < attempts; ++attempt) {
+        compromised_transport_flush(worker->tab, worker->port);
+        if (!hs_crack_remote_send_line(worker->tab, worker->port, command)) {
+            if (!usb_cdc) return false;
+            usb_log_cdc_state("probe_write_failed");
+        } else {
+            hs_remote_message_t message = {0};
+            ESP_LOGI(TAG,
+                     "[HS-CRACK] probing %s on %s (attempt %u/%u, timeout %u ms)",
+                     kind, tab_transport_name(worker->tab), attempt + 1U,
+                     attempts, (unsigned)timeout_ms);
+            bool received = hs_crack_remote_read_message(
+                worker->tab, worker->port, &message, timeout_ms);
+            if (received && message.type == HS_REMOTE_FILE &&
+                strcmp(message.kind, kind) == 0 && message.size == size &&
+                message.crc32 == crc32) {
+                *present = message.file_present;
+                return true;
+            }
+            if (!usb_cdc) return false;
+            ESP_LOGW(TAG,
+                     "[HS-DBG] USB: probe attempt %u/%u failed kind=%s received=%d type=%d",
+                     attempt + 1U, attempts, kind, (int)received,
+                     (int)message.type);
+            usb_log_cdc_state("probe_timeout");
+        }
+        if (attempt + 1U < attempts && !hs_crack_ui.cancel_requested) {
+            ESP_LOGW(TAG, "[HS-DBG] USB: recovering CLI before probe retry");
+            /* DIAG is the ordering barrier: its reply proves that any delayed
+             * first probe and the recovery newline have both left the CLI
+             * queue. Without that barrier, a late FILE could be mistaken for
+             * the retry response and corrupt the following receive exchange. */
+            if (!hs_crack_remote_query_diag(worker)) {
+                ESP_LOGW(TAG,
+                         "[HS-DBG] USB: CLI recovery barrier failed; probe retry suppressed");
+                return false;
+            }
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+    }
+    return false;
+}
+
+static bool hs_crack_remote_reset_partial(hs_crack_remote_worker_t *worker,
+                                          const char *kind, uint64_t size,
+                                          uint32_t crc32)
+{
+    char command[128];
+    snprintf(command, sizeof(command), "crack_worker reset %s %llu %08lX",
+             kind, (unsigned long long)size, (unsigned long)crc32);
+    if (!hs_crack_remote_send_line(worker->tab, worker->port, command)) return false;
+    hs_remote_message_t message;
+    return hs_crack_remote_read_message(worker->tab, worker->port, &message, 3000) &&
+           message.type == HS_REMOTE_RESET;
+}
+
+/* USB ACK32 upload helpers begin */
+typedef struct {
+    hs_remote_ack_stream_t ack;
+    hs_remote_ack32_t pending_ack;
+    bool has_pending_ack;
+    uint8_t attempt_rx[HS_REMOTE_ACK32_SIZE];
+    size_t attempt_rx_used;
+    size_t attempt_rx_total;
+    unsigned attempt_read_calls;
+    unsigned attempt_empty_reads;
+    int64_t receiver_deadline;
+    bool header_boundary;
+    bool preparing;
+    bool end_seen;
+    bool synced;
+    bool text_error;
+    char line[320];
+    size_t line_used;
+} hs_crack_remote_usb_t;
+
+static void hs_crack_remote_usb_log_ack_timeout(
+    const hs_crack_remote_usb_t *state, uint32_t index, unsigned transmission)
+{
+    char raw[HS_REMOTE_ACK32_SIZE * 3U + 1U];
+    size_t out = 0;
+    for (size_t i = 0; i < state->attempt_rx_used &&
+                       out + 3U < sizeof(raw); ++i) {
+        int written = snprintf(raw + out, sizeof(raw) - out, "%02X ",
+                               (unsigned)state->attempt_rx[i]);
+        if (written <= 0) break;
+        out += (size_t)written;
+    }
+    if (out != 0U) raw[out - 1U] = '\0';
+    else raw[0] = '\0';
+
+    ESP_LOGW(TAG,
+             "[HS-DIAG] USB ACK wait timeout blk=%u transmission=%u "
+             "read=%uB captured=%uB calls=%u empty=%u stream_used=%u raw=%s",
+             (unsigned)index, transmission,
+             (unsigned)state->attempt_rx_total,
+             (unsigned)state->attempt_rx_used,
+             state->attempt_read_calls, state->attempt_empty_reads,
+             (unsigned)state->ack.used, raw[0] ? raw : "-");
+}
+
+static TickType_t hs_crack_remote_usb_wait_ticks(int64_t deadline)
+{
+    int64_t left = deadline - esp_timer_get_time();
+    uint32_t ms = left > 100000 ? 100U : (left > 0 ? (uint32_t)(left / 1000) : 0U);
+    TickType_t ticks = pdMS_TO_TICKS(ms);
+    return ticks ? ticks : 1;
+}
+
+/* One accumulator survives all blocks, attempts, FIN, and terminal draining. */
+static bool hs_crack_remote_usb_exchange(hs_crack_remote_worker_t *worker,
+                                          hs_crack_remote_usb_t *state,
+                                          const hs_remote_message_t *ready,
+                                          const uint8_t header[16],
+                                          const uint8_t *payload, size_t length,
+                                          uint32_t index, uint64_t before)
+{
+    for (unsigned transmissions = 1; transmissions <= 3; ++transmissions) {
+        int64_t now = esp_timer_get_time();
+        int64_t margin = state->preparing ? 1000000LL : 0;
+        if (hs_crack_ui.cancel_requested ||
+            now >= state->receiver_deadline - margin) return false;
+
+        /* Failed enqueue may have delivered an arbitrary prefix. Neither CAN
+         * nor another header is safe until the receiver has returned to CLI. */
+        state->header_boundary = false;
+        bool written = hs_crack_remote_write_all_force(worker->tab, worker->port,
+                                                        header, 16) &&
+                       hs_crack_remote_write_all_force(worker->tab, worker->port,
+                                                        payload, length);
+        now = esp_timer_get_time();
+        if (!written) {
+            /* Zero bytes may have reached JanOS, leaving its previous first-byte
+             * deadline active. A partial header/payload instead has up to two
+             * rx_ms waits. Retain the later bound while framing is uncertain. */
+            int64_t partial_deadline = now + (int64_t)ready->timeout_ms * 2000;
+            if (partial_deadline > state->receiver_deadline)
+                state->receiver_deadline = partial_deadline;
+            return false;
+        }
+        state->preparing = false;
+        state->header_boundary = true;
+        state->receiver_deadline = now + (int64_t)(length ? ready->next_header_ms
+                                                        : ready->finish_linger_ms) * 1000;
+        const int64_t deadline = now + (int64_t)ready->ack_wait_ms * 1000;
+        state->attempt_rx_used = 0U;
+        state->attempt_rx_total = 0U;
+        state->attempt_read_calls = 0U;
+        state->attempt_empty_reads = 0U;
+        ESP_LOGW(TAG, "[HS-DBG] USB: %s blk=%u transmission=%u",
+                 length ? "data" : "FIN", (unsigned)index, transmissions);
+        bool retry_nak = false;
+        while (!hs_crack_ui.cancel_requested && esp_timer_get_time() < deadline) {
+            hs_remote_ack32_t ack;
+            if (state->has_pending_ack) {
+                ack = state->pending_ack;
+                state->has_pending_ack = false;
+            } else {
+                uint8_t bytes[HS_REMOTE_ACK32_SIZE];
+                size_t wanted = sizeof(bytes) - state->ack.used;
+                int got = transport_read_bytes_tab(worker->tab, worker->port, bytes,
+                                                    wanted, hs_crack_remote_usb_wait_ticks(deadline));
+                state->attempt_read_calls++;
+                if (got < 0 || (size_t)got > wanted) {
+                    state->header_boundary = false;
+                    return false;
+                }
+                if (got == 0) {
+                    state->attempt_empty_reads++;
+                    continue;
+                }
+                state->attempt_rx_total += (size_t)got;
+                size_t capture_left = sizeof(state->attempt_rx) - state->attempt_rx_used;
+                size_t capture = (size_t)got < capture_left ? (size_t)got : capture_left;
+                if (capture != 0U) {
+                    memcpy(state->attempt_rx + state->attempt_rx_used, bytes, capture);
+                    state->attempt_rx_used += capture;
+                }
+                (void)hs_remote_ack_stream_push(&state->ack, bytes, (size_t)got, &ack);
+                if (state->ack.used) continue;
+                if (esp_timer_get_time() > deadline) {
+                    hs_remote_ack_action_t late = hs_remote_ack_classify(
+                        &ack, index, before, before + length, index != 0);
+                    if (late == HS_ACK_CAN || late == HS_ACK_INVALID) {
+                        /* A complete terminal reply forbids replay even when
+                         * the transport returns it after the attempt budget. */
+                        if (late == HS_ACK_CAN) state->header_boundary = false;
+                        return false;
+                    }
+                    /* Preserve a complete late reply separately; the byte
+                     * accumulator always retains only 0..31 partial bytes. */
+                    state->pending_ack = ack;
+                    state->has_pending_ack = true;
+                    break;
+                }
+            }
+            hs_remote_ack_action_t action = hs_remote_ack_classify(
+                &ack, index, before, before + length, index != 0);
+            ESP_LOGW(TAG, "[HS-DBG] USB: ACK32 status=0x%02X blk=%u offset=%llu action=%u",
+                     (unsigned)ack.status, (unsigned)ack.block_index,
+                     (unsigned long long)ack.committed_offset, (unsigned)action);
+            if (action == HS_ACK_CURRENT) return true;
+            if (action == HS_ACK_STALE) continue;
+            if (action == HS_ACK_RETRY_NAK) {
+                retry_nak = true;
+                break;
+            }
+            if (action == HS_ACK_CAN) state->header_boundary = false;
+            if (action == HS_ACK_INVALID) {
+                const char *reason = hs_remote_ack32_parse_error(state->ack.bytes,
+                                                                 HS_REMOTE_ACK32_SIZE);
+                ESP_LOGW(TAG, "[HS-DBG] USB: invalid ACK32: %s",
+                         reason ? reason : "index/offset");
+            }
+            return false;
+        }
+        if (hs_crack_ui.cancel_requested) {
+            usb_log_cdc_state("ack_cancelled");
+        } else if (retry_nak) {
+            usb_log_cdc_state("ack_nak");
+        } else {
+            hs_crack_remote_usb_log_ack_timeout(state, index, transmissions);
+            usb_log_cdc_state("ack_timeout");
+        }
+        if (hs_remote_tx_on_deadline(transmissions) != HS_TX_RETRANSMIT) return false;
+    }
+    return false;
+}
+
+/* Feed binary frames and text without losing the boundary between them. A
+ * terminal END plus the actual CLI prompt is required before any text write. */
+static bool hs_crack_remote_usb_terminal(hs_crack_remote_worker_t *worker,
+                                          hs_crack_remote_usb_t *state,
+                                          int64_t deadline, bool completion,
+                                          uint32_t fin_index, uint64_t size)
+{
+    while (esp_timer_get_time() < deadline) {
+        if (completion && hs_crack_ui.cancel_requested) return false;
+        uint8_t byte;
+        int got = transport_read_bytes_tab(worker->tab, worker->port, &byte, 1,
+                                            hs_crack_remote_usb_wait_ticks(deadline));
+        if (got < 0 || got > 1) {
+            state->header_boundary = false;
+            return false;
+        }
+        if (!got) continue;
+        if (state->ack.used || (state->line_used == 0 && byte == 'F')) {
+            hs_remote_ack32_t ack;
+            (void)hs_remote_ack_stream_push(&state->ack, &byte, 1, &ack);
+            if (state->ack.used) continue;
+            if (ack.status == JANOS_UART_FT_CAN) {
+                /* The peer has terminated raw mode; recovery may only drain
+                 * to its terminal boundary, never inject another CAN. */
+                state->header_boundary = false;
+                if (completion) return false;
+            }
+            if (!ack.status || (completion &&
+                !hs_remote_ack32_matches(&ack, fin_index, size))) return false;
+            ESP_LOGW(TAG, "[HS-DBG] USB: discarded residual ACK32 blk=%u",
+                     (unsigned)ack.block_index);
+            continue;
+        }
+        if (state->end_seen && byte == '>') return true;
+        if (byte == '\r') continue;
+        if (byte != '\n') {
+            if (state->line_used < sizeof(state->line) - 1)
+                state->line[state->line_used++] = (char)byte;
+            continue;
+        }
+        state->line[state->line_used] = '\0';
+        hs_remote_message_t message;
+        if (hs_remote_parse_line(state->line, &message)) {
+            if (message.type == HS_REMOTE_SYNCED) state->synced = true;
+            if (message.type == HS_REMOTE_SYNC_ERROR) state->text_error = true;
+            if (message.type == HS_REMOTE_END) state->end_seen = true;
+        }
+        state->line_used = 0;
+    }
+    return false;
+}
+
+static bool hs_crack_remote_usb_recover(hs_crack_remote_worker_t *worker,
+                                         hs_crack_remote_usb_t *state,
+                                         bool query_diag)
+{
+    const int64_t margin = 1000000LL;
+    if (state->header_boundary && !state->end_seen &&
+        esp_timer_get_time() <= state->receiver_deadline - margin) {
+        const uint8_t can = JANOS_UART_FT_CAN;
+        (void)transport_write_bytes_tab(worker->tab, worker->port,
+                                        (const char *)&can, 1);
+        state->header_boundary = false;
+    }
+    bool boundary = hs_crack_remote_usb_terminal(worker, state,
+                         state->receiver_deadline + 3000000LL, false, 0, 0);
+    if (!boundary) {
+        ESP_LOGW(TAG, "[HS-DBG] USB: no terminal END/prompt; worker lost");
+        hs_crack_remote_sync_lost(worker, "USB terminal boundary lost");
+    } else if (query_diag && !hs_crack_ui.cancel_requested) {
+        if (!hs_crack_remote_query_diag(worker)) {
+            hs_crack_remote_sync_lost(worker, "USB DIAG boundary lost");
+            return false;
+        }
+    } else if (hs_crack_ui.cancel_requested) {
+        hs_crack_remote_report_current(worker, "cancelled; CLI ready");
+    }
+    return boundary;
+}
+
+/* -1 = failed, 0 = safe prefix-reset/restart, 1 = synchronized. */
+static int hs_crack_remote_usb_upload(hs_crack_remote_worker_t *worker,
+                                       const char *kind, const char *path,
+                                       uint64_t size, uint32_t crc32,
+                                       const hs_remote_message_t *ready,
+                                       int64_t ready_received)
+{
+    hs_crack_remote_usb_t state = {0};
+    state.preparing = true;
+    uint32_t prepare_ms = ready->prepare_ms >= 10000 && ready->prepare_ms <= 600000
+                             ? ready->prepare_ms : 600000;
+    state.receiver_deadline = ready_received + (int64_t)prepare_ms * 1000;
+    if (!hs_remote_ready_valid(ready, true) || strcmp(ready->kind, kind) != 0 ||
+        ready->size != size || ready->crc32 != crc32 || ready->offset > size ||
+        ready->block_size != hs_remote_receive_block_size(true)) {
+        /* Invalid negotiation provides no authority to inject binary control. */
+        (void)hs_crack_remote_usb_recover(worker, &state, true);
+        return -1;
+    }
+    ESP_LOGW(TAG, "[HS-DBG] USB: READY off=%llu bsize=%u rx_ms=%u ack_size=%u ack_wait_ms=%u next_header_ms=%u prepare_ms=%u finish_linger_ms=%u",
+             (unsigned long long)ready->offset, (unsigned)ready->block_size,
+             (unsigned)ready->timeout_ms, (unsigned)ready->ack_size,
+             (unsigned)ready->ack_wait_ms, (unsigned)ready->next_header_ms,
+             (unsigned)ready->prepare_ms, (unsigned)ready->finish_linger_ms);
+    state.header_boundary = true;
+    if (!hs_crack_remote_wait_end(worker->tab, worker->port, 2000)) {
+        (void)hs_crack_remote_usb_recover(worker, &state, true);
+        return -1;
+    }
+    uint32_t prefix_crc = 0;
+    if (!hs_crack_remote_file_prefix_crc(path, ready->offset, &prefix_crc,
+                                         state.receiver_deadline - 1000000LL)) {
+        (void)hs_crack_remote_usb_recover(worker, &state, true);
+        return -1;
+    }
+    if (prefix_crc != ready->prefix_crc32) {
+        return hs_crack_remote_usb_recover(worker, &state, false) ? 0 : -1;
+    }
+    FILE *file = fopen(path, "rb");
+    bool ok = file && fseek(file, (long)ready->offset, SEEK_SET) == 0;
+    uint8_t *payload = ok ? malloc(ready->block_size) : NULL;
+    if (!payload) ok = false;
+    uint64_t offset = ready->offset;
+    uint32_t index = 0;
+    while (ok && offset < size && !hs_crack_ui.cancel_requested) {
+        size_t length = size - offset > ready->block_size
+                            ? ready->block_size : (size_t)(size - offset);
+        if (fread(payload, 1, length, file) != length) { ok = false; break; }
+        uint8_t header[16] = {'F', 'T', 'B', 1};
+        hs_crack_remote_put_le32(header + 4, index);
+        hs_crack_remote_put_le32(header + 8, (uint32_t)length);
+        hs_crack_remote_put_le32(header + 12, hs_crack_cache_crc32_update(0, payload, length));
+        ok = hs_crack_remote_usb_exchange(worker, &state, ready, header,
+                                           payload, length, index, offset);
+        if (ok) {
+            offset += length;
+            index++;
+            char detail[160];
+            snprintf(detail, sizeof(detail), "%s -> USB\n%llu / %llu bytes", kind,
+                     (unsigned long long)offset, (unsigned long long)size);
+            hs_crack_set_stage("Preparing workers...", detail,
+                               size ? (int)((offset * 100U) / size) : 100);
+        }
+    }
+    free(payload);
+    if (file) fclose(file);
+    if (ok && !hs_crack_ui.cancel_requested) {
+        uint8_t fin[16] = {'F', 'T', 'B', 1};
+        hs_crack_remote_put_le32(fin + 4, index);
+        ok = hs_crack_remote_usb_exchange(worker, &state, ready, fin, NULL, 0,
+                                           index, offset);
+    }
+    if (ok && !hs_crack_ui.cancel_requested) {
+        ESP_LOGW(TAG, "[HS-DBG] USB: FIN acknowledged, waiting SYNCED");
+        int64_t deadline = esp_timer_get_time() +
+            ((int64_t)ready->finish_linger_ms + ready->ack_wait_ms + 3000) * 1000;
+        bool boundary = hs_crack_remote_usb_terminal(worker, &state, deadline,
+                                                       true, index, size);
+        if (boundary) {
+            if (!state.synced || state.text_error) (void)hs_crack_remote_query_diag(worker);
+            return state.synced && !state.text_error ? 1 : -1;
+        }
+    }
+    (void)hs_crack_remote_usb_recover(worker, &state, true);
+    return -1;
+}
+/* USB ACK32 upload helpers end */
+
+static bool hs_crack_remote_upload(hs_crack_remote_worker_t *worker,
+                                   const char *kind, const char *path,
+                                   uint64_t size, uint32_t crc32)
+{
+    char prepare_detail[160];
+    hs_crack_remote_report_current(worker, "checking cache");
+    snprintf(prepare_detail, sizeof(prepare_detail),
+             "%s: checking %s",
+             tab_transport_name(worker->tab), kind);
+    hs_crack_render_workers();
+    hs_crack_set_stage("Preparing workers...", prepare_detail, -1);
+
+    bool present = false;
+    if (!hs_crack_remote_probe(worker, kind, size, crc32, &present)) {
+        ESP_LOGW(TAG, "[HS-DBG] %s: probe FAILED (%s)", tab_transport_name(worker->tab), kind);
+        if (!hs_crack_remote_query_diag(worker)) {
+            hs_crack_remote_sync_lost(worker, "probe boundary lost");
+        } else {
+            hs_crack_remote_report_current(worker, "probe failed; retry safe");
+        }
+        return false;
+    }
+    ESP_LOGW(TAG, "[HS-DBG] %s: probe ok present=%d (%s)", tab_transport_name(worker->tab), (int)present, kind);
+    if (present) return true;
+
+    hs_crack_remote_report_current(worker, "transferring");
+
+    const bool usb_cdc = worker->tab == TAB_USB;
+    const uint32_t requested_block_size =
+        hs_remote_receive_block_size(usb_cdc);
+    for (unsigned restart = 0; restart < 2; ++restart) {
+        char command[144];
+        if (!hs_remote_format_receive_command(
+                command, sizeof(command), kind, size, crc32, usb_cdc)) {
+            return false;
+        }
+        if (!hs_crack_remote_send_line(worker->tab, worker->port, command)) {
+            hs_crack_remote_sync_lost(worker, "receive write uncertain");
+            return false;
+        }
+
+        hs_remote_message_t ready;
+        if (!hs_crack_remote_read_message(worker->tab, worker->port, &ready,
+                                          hs_remote_probe_timeout_ms(size))) {
+            ESP_LOGW(TAG, "[HS-DBG] %s: no READY after 'receive'", tab_transport_name(worker->tab));
+            /* The peer may already be waiting for a binary header. Without a
+             * READY/END boundary, sending another CLI command is unsafe. */
+            hs_crack_remote_sync_lost(worker, "READY boundary lost");
+            return false;
+        }
+        const int64_t ready_received = esp_timer_get_time();
+        if (ready.type == HS_REMOTE_FILE && ready.file_present) return true;
+        if (usb_cdc) {
+            if (ready.type != HS_REMOTE_READY) {
+                ESP_LOGW(TAG,
+                         "[HS-DBG] USB: response before READY type=%d code=%s received=%llu size=%llu",
+                         (int)ready.type, ready.code[0] ? ready.code : "-",
+                         (unsigned long long)ready.received,
+                         (unsigned long long)ready.size);
+                usb_log_cdc_state("ready_rejected");
+                hs_crack_remote_usb_t state = {0};
+                state.receiver_deadline = ready_received;
+                /* REJECTED is emitted only before JanOS enters raw mode and
+                 * returns directly to the CLI.  The parsed rejection is its
+                 * terminal record; drain only the prompt, then DIAG safely. */
+                if (ready.type == HS_REMOTE_REJECTED) {
+                    state.end_seen = true;
+                    state.text_error = true;
+                } else if (ready.type == HS_REMOTE_SYNC_ERROR) {
+                    state.text_error = true;
+                }
+                (void)hs_crack_remote_usb_recover(worker, &state, true);
+                return false;
+            }
+            int result = hs_crack_remote_usb_upload(worker, kind, path, size,
+                                                      crc32, &ready, ready_received);
+            if (result != 0) return result > 0;
+            (void)hs_crack_remote_reset_safe(worker, kind, size, crc32);
+            return false;
+        }
+        if (ready.type != HS_REMOTE_READY) {
+            ESP_LOGW(TAG,
+                     "[HS-DBG] %s: response before READY type=%d code=%s received=%llu size=%llu",
+                     tab_transport_name(worker->tab), (int)ready.type,
+                     ready.code[0] ? ready.code : "-",
+                     (unsigned long long)ready.received,
+                     (unsigned long long)ready.size);
+            /* A parsed END can be the tail of the receive response while the
+             * peer is already waiting for a raw FTB header.  Never inject a
+             * text DIAG into that ambiguous state.  REJECTED never enters raw
+             * mode; SYNC_ERROR is safe only after its following END. */
+            bool safe = ready.type == HS_REMOTE_REJECTED;
+            if (ready.type == HS_REMOTE_SYNC_ERROR)
+                safe = hs_crack_remote_wait_end(worker->tab, worker->port, 3000);
+            if (!safe || !hs_crack_remote_query_diag(worker))
+                hs_crack_remote_sync_lost(worker, "unexpected reply boundary");
+            return false;
+        }
+        if (strcmp(ready.kind, kind) != 0 ||
+            ready.size != size || ready.crc32 != crc32 || ready.offset > size ||
+            ready.block_size != requested_block_size ||
+            (usb_cdc ? ready.ack_size != HS_REMOTE_ACK32_SIZE : ready.ack_size > 1U)) {
+            ESP_LOGW(TAG, "[HS-DBG] %s: bad READY type=%d kind=%s size=%llu bsize=%u expected=%u off=%llu ack_size=%u expected_ack_size=%u",
+                     tab_transport_name(worker->tab), (int)ready.type, ready.kind,
+                     (unsigned long long)ready.size, (unsigned)ready.block_size,
+                     (unsigned)requested_block_size,
+                     (unsigned long long)ready.offset, (unsigned)ready.ack_size,
+                     usb_cdc ? (unsigned)HS_REMOTE_ACK32_SIZE : 1U);
+            (void)hs_crack_remote_uart_recover(worker, true, true,
+                                               "bad READY; retry safe");
+            return false;
+        }
+        ESP_LOGW(TAG, "[HS-DBG] %s: READY off=%llu bsize=%u rx_ms=%u ack_size=%u prepare_ms=%u",
+                 tab_transport_name(worker->tab), (unsigned long long)ready.offset,
+                 (unsigned)ready.block_size, (unsigned)ready.timeout_ms,
+                 (unsigned)ready.ack_size, (unsigned)ready.prepare_ms);
+        if (!hs_crack_remote_wait_end(worker->tab, worker->port, 2000)) {
+            ESP_LOGW(TAG, "[HS-DBG] %s: no END after READY", tab_transport_name(worker->tab));
+            hs_crack_remote_sync_lost(worker, "READY without END");
+            return false;
+        }
+
+        if (ready.offset > 0) {
+            char resume_detail[160];
+            char resume_reason[24];
+            unsigned resume_percent = size
+                ? (unsigned)((ready.offset * 100U) / size) : 0U;
+            snprintf(resume_reason, sizeof(resume_reason), "resume %u%%",
+                     resume_percent > 100U ? 100U : resume_percent);
+            hs_crack_remote_report_current(worker, resume_reason);
+            snprintf(resume_detail, sizeof(resume_detail),
+                     "%s: resuming %s from %llu / %llu bytes",
+                     tab_transport_name(worker->tab), kind,
+                     (unsigned long long)ready.offset,
+                     (unsigned long long)size);
+            ESP_LOGI(TAG, "[HS-CRACK] RESUME %s %s at %llu/%llu prefix=%08lX",
+                     tab_transport_name(worker->tab), kind,
+                     (unsigned long long)ready.offset,
+                     (unsigned long long)size,
+                     (unsigned long)ready.prefix_crc32);
+            hs_crack_render_workers();
+            hs_crack_set_stage("Preparing workers...", resume_detail,
+                               size ? (int)((ready.offset * 100U) / size) : 0);
+        }
+
+        uint32_t prefix_crc = 0;
+        if (!hs_crack_remote_file_prefix_crc(path, ready.offset, &prefix_crc, 0)) {
+            (void)hs_crack_remote_uart_recover(worker, false, true,
+                                               "prefix read failed");
+            return false;
+        }
+        if (prefix_crc != ready.prefix_crc32) {
+            if (hs_crack_remote_uart_recover(worker, false, true,
+                                              "prefix mismatch") &&
+                hs_crack_remote_reset_safe(worker, kind, size, crc32)) {
+                hs_crack_remote_report_current(worker, "prefix reset; retry safe");
+            }
+            return false;
+        }
+
+        FILE *file = fopen(path, "rb");
+        if (!file) {
+            (void)hs_crack_remote_uart_recover(worker, false, true,
+                                               "local open failed");
+            return false;
+        }
+        bool ok = fseek(file, (long)ready.offset, SEEK_SET) == 0;
+        uint8_t *payload = ok ? malloc(ready.block_size) : NULL;
+        if (!payload) ok = false;
+        bool can_safe = true;
+        uint64_t offset = ready.offset;
+        uint32_t index = 0;
+        uint32_t ack_timeout = ready.timeout_ms + 2000U;
+        if (ack_timeout < 8000U) ack_timeout = 8000U;
+        if (ack_timeout > 60000U) ack_timeout = 60000U;
+
+        while (ok && offset < size && !hs_crack_ui.cancel_requested) {
+            size_t length = (size - offset) > ready.block_size
+                                ? ready.block_size : (size_t)(size - offset);
+            if (fread(payload, 1, length, file) != length) {
+                ok = false;
+                break;
+            }
+            uint8_t header[JANOS_UART_FT_HEADER_BYTES] = {'F', 'T', 'B', 1};
+            hs_crack_remote_put_le32(header + 4, index);
+            hs_crack_remote_put_le32(header + 8, (uint32_t)length);
+            hs_crack_remote_put_le32(
+                header + 12, hs_crack_cache_crc32_update(0, payload, length));
+            bool accepted = false;
+            for (unsigned attempt = 0; attempt < 3 && !accepted; ++attempt) {
+                /* Once a block starts it must be completed. CAN is meaningful
+                 * only where JanOS expects the first byte of the next header. */
+                int64_t header_started_us = esp_timer_get_time();
+                can_safe = false;
+                bool header_written = hs_crack_remote_write_all_force(
+                    worker->tab, worker->port, header, sizeof(header));
+                int64_t header_done_us = esp_timer_get_time();
+                bool payload_written = header_written && hs_crack_remote_write_all_force(
+                    worker->tab, worker->port, payload, length);
+                int64_t payload_done_us = esp_timer_get_time();
+                if (usb_cdc && index == 0) {
+                    ESP_LOGW(TAG,
+                             "[HS-DIAG] USB enqueue blk=0 attempt=%u header=%u/%lldus payload=%u/%lldus",
+                             attempt, header_written ? (unsigned)sizeof(header) : 0U,
+                             (long long)(header_done_us - header_started_us),
+                             payload_written ? (unsigned)length : 0U,
+                             (long long)(payload_done_us - header_done_us));
+                }
+                if (!header_written || !payload_written) {
+                    ok = false;
+                    break;
+                }
+                can_safe = true;
+                if (usb_cdc) {
+                    uint8_t frame[HS_REMOTE_ACK32_SIZE];
+                    hs_remote_ack32_t ack;
+                    if (!hs_crack_remote_read_exact_bytes(
+                            worker, frame, sizeof(frame), ack_timeout)) {
+                        ESP_LOGW(TAG, "[HS-DBG] USB: ACK32 blk=%u attempt=%u read failed (%s)",
+                                 (unsigned)index, attempt,
+                                 hs_crack_ui.cancel_requested ? "cancelled" : "timeout/transport error");
+                        ok = false;
+                        break;
+                    }
+                    if (!hs_remote_ack32_parse(frame, sizeof(frame), &ack)) {
+                        ESP_LOGW(TAG, "[HS-DBG] USB: ACK32 blk=%u attempt=%u invalid: %s",
+                                 (unsigned)index, attempt,
+                                 hs_remote_ack32_parse_error(frame, sizeof(frame)));
+                        ok = false;
+                        break;
+                    }
+                    ESP_LOGW(TAG, "[HS-DBG] USB: ACK32 status=0x%02X blk=%u offset=%llu attempt=%u",
+                             (unsigned)ack.status, (unsigned)ack.block_index,
+                             (unsigned long long)ack.committed_offset, attempt);
+                    accepted = hs_remote_ack32_matches(&ack, index, offset + length);
+                    if (!accepted && !(ack.status == JANOS_UART_FT_NAK &&
+                                       ack.block_index == index &&
+                                       ack.committed_offset == offset)) {
+                        ESP_LOGW(TAG, "[HS-DBG] USB: ACK32 rejected: %s expected_blk=%u before=%llu after=%llu",
+                                 ack.status == JANOS_UART_FT_CAN ? "CAN" : "stale index/offset",
+                                 (unsigned)index, (unsigned long long)offset,
+                                 (unsigned long long)(offset + length));
+                        ok = false;
+                        break;
+                    }
+                } else {
+                    uint8_t reply = 0;
+                    int got = transport_read_bytes_tab(worker->tab, worker->port, &reply, 1,
+                                                        pdMS_TO_TICKS(ack_timeout));
+                    ESP_LOGW(TAG, "[HS-DBG] %s: blk=%u attempt=%u got=%d reply=0x%02X",
+                             tab_transport_name(worker->tab), (unsigned)index,
+                             attempt, got, (unsigned)reply);
+                    if (got != 1 || reply == JANOS_UART_FT_CAN) {
+                        if (got < 0 || reply == JANOS_UART_FT_CAN)
+                            can_safe = false;
+                        ok = false;
+                        break;
+                    }
+                    if (reply == JANOS_UART_FT_ACK) accepted = true;
+                    else if (reply != JANOS_UART_FT_NAK) {
+                        /* A printable byte is commonly the beginning of a
+                         * delayed [CRACK/1] terminal line, not a raw ACK. */
+                        can_safe = false;
+                        ok = false;
+                    }
+                }
+            }
+            if (!accepted) ok = false;
+            if (ok) {
+                offset += length;
+                index++;
+                int percent = size ? (int)((offset * 100U) / size) : 100;
+                char detail[160];
+                snprintf(detail, sizeof(detail), "%s -> %s\n%llu / %llu bytes",
+                         kind, tab_transport_name(worker->tab),
+                         (unsigned long long)offset, (unsigned long long)size);
+                hs_crack_set_stage("Preparing workers...", detail, percent);
+            }
+        }
+        if (!ok || hs_crack_ui.cancel_requested) {
+            ok = false;
+        }
+        free(payload);
+        fclose(file);
+        if (!ok) {
+            ESP_LOGW(TAG, "[HS-DBG] %s: block loop ended NOT ok", tab_transport_name(worker->tab));
+            if (usb_cdc && !hs_crack_ui.cancel_requested) {
+                usb_log_cdc_state("crack_tx_failed");
+                (void)hs_crack_remote_query_diag(worker);
+            } else if (!usb_cdc) {
+                /* CAN was emitted at the next-header boundary above. Consume
+                 * JanOS' terminal record and prompt before any retry, or the
+                 * leading bytes of "[CRACK/1]" become fake one-byte ACKs. */
+                (void)hs_crack_remote_uart_recover(
+                    worker, false, can_safe,
+                    hs_crack_ui.cancel_requested ? "cancelled; CLI ready"
+                                                  : "transfer failed; retry safe");
+            }
+            return false;
+        }
+        ESP_LOGW(TAG, "[HS-DBG] %s: all blocks sent, waiting SYNCED", tab_transport_name(worker->tab));
+
+        bool synced = false;
+        bool terminal_error = false;
+        hs_remote_message_t message;
+        int64_t deadline = esp_timer_get_time() + 15000000LL;
+        while (esp_timer_get_time() < deadline) {
+            if (!hs_crack_remote_read_message(worker->tab, worker->port,
+                                               &message, 2000)) continue;
+            if (message.type == HS_REMOTE_SYNCED) synced = true;
+            if (message.type == HS_REMOTE_SYNC_ERROR) terminal_error = true;
+            if (message.type == HS_REMOTE_END) {
+                if (!synced || terminal_error)
+                    hs_crack_remote_report_current(worker,
+                                                   "remote sync error; retry safe");
+                return synced && !terminal_error;
+            }
+        }
+        hs_crack_remote_sync_lost(worker, "terminal END missing");
+        return false;
+    }
+    return false;
+}
+
+static bool hs_crack_remote_start_confirmed(const hs_remote_message_t *message,
+                                            const char *job)
+{
+    if (!message || !job || strcmp(message->job, job) != 0) return false;
+    return message->type == HS_REMOTE_ACCEPTED ||
+           message->type == HS_REMOTE_STARTED ||
+           message->type == HS_REMOTE_STATUS ||
+           message->type == HS_REMOTE_DONE;
+}
+
+/* 1 = the requested job exists, -1 = an ordered status says unknown_job,
+ * 0 = silence or unrelated records until the deadline.  JanOS start errors do
+ * not echo the requested job, so a bare REJECTED is never start-correlated. */
+static int hs_crack_remote_wait_start(hs_crack_remote_worker_t *worker,
+                                      hs_remote_message_t *message,
+                                      uint32_t timeout_ms,
+                                      bool status_query)
+{
+    int64_t deadline = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
+    while (esp_timer_get_time() < deadline) {
+        if (!hs_crack_remote_read_message(worker->tab, worker->port,
+                                          message, 500)) continue;
+        if (hs_crack_remote_start_confirmed(message, worker->job)) return 1;
+        if (status_query && message->type == HS_REMOTE_REJECTED &&
+            strcmp(message->code, "unknown_job") == 0) return -1;
+    }
+    return 0;
+}
+
+static bool hs_crack_remote_start(hs_crack_remote_worker_t *worker,
+                                  uint64_t capture_size, uint32_t capture_crc,
+                                  uint64_t wordlist_size, uint32_t wordlist_crc,
+                                  uint64_t start, uint64_t end,
+                                  unsigned sequence)
+{
+    snprintf(worker->job, sizeof(worker->job), "t%08lXw%u",
+             (unsigned long)((uint64_t)esp_timer_get_time() & 0xFFFFFFFFU), sequence);
+    char command[240];
+    snprintf(command, sizeof(command),
+             "crack_worker start %s %llu %08lX %llu %08lX %llu %llu",
+             worker->job, (unsigned long long)capture_size,
+             (unsigned long)capture_crc, (unsigned long long)wordlist_size,
+             (unsigned long)wordlist_crc, (unsigned long long)start,
+             (unsigned long long)end);
+    ESP_LOGI(TAG, "[HS-CRACK] ASSIGN %s job=%s range=%llu-%llu",
+             tab_transport_name(worker->tab), worker->job,
+             (unsigned long long)start, (unsigned long long)end);
+    worker->cancel_pending = true;
+    const bool usb_cdc = worker->tab == TAB_USB;
+    const unsigned attempts = HS_REMOTE_STAGE_ATTEMPTS;
+    hs_remote_message_t message = {0};
+    bool accepted = false;
+
+    for (unsigned attempt = 0; attempt < attempts && !accepted; ++attempt) {
+        hs_crack_remote_report(worker, "start", attempt + 1U, "assigning");
+        compromised_transport_flush(worker->tab, worker->port);
+        bool sent = hs_crack_remote_send_line(worker->tab, worker->port, command);
+        if (!sent) {
+            /* A short CLI write may leave an unterminated command. DIAG first
+             * emits CRLF, proving a fresh CLI boundary before status/retry. */
+            if (!hs_crack_remote_query_diag(worker)) {
+                hs_crack_remote_sync_lost(worker, "start write uncertain");
+                return false;
+            }
+            hs_crack_remote_report_current(worker, "start write recovered");
+        }
+        memset(&message, 0, sizeof(message));
+        int start_state = sent ? hs_crack_remote_wait_start(worker, &message,
+                                                            5000, false)
+                               : 0;
+        if (start_state > 0) {
+            accepted = true;
+            break;
+        }
+        ESP_LOGW(TAG,
+                 "[HS-CRACK] %s: no start confirmation job=%s attempt=%u/%u; querying status",
+                 tab_transport_name(worker->tab), worker->job,
+                 attempt + 1U, attempts);
+        if (usb_cdc) usb_log_cdc_state("start_timeout");
+        char status_command[80];
+        snprintf(status_command, sizeof(status_command),
+                 "crack_worker status %s", worker->job);
+        if (!hs_crack_remote_send_line(worker->tab, worker->port,
+                                       status_command)) {
+            hs_crack_remote_sync_lost(worker, "status write uncertain");
+            return false;
+        }
+        memset(&message, 0, sizeof(message));
+        int status_state = hs_crack_remote_wait_start(worker, &message,
+                                                      5000, true);
+        if (status_state > 0) {
+            ESP_LOGW(TAG,
+                     "[HS-DBG] USB: recovered start confirmation job=%s via status",
+                     worker->job);
+            accepted = true;
+            break;
+        }
+        bool unknown_job = status_state < 0 &&
+                           strcmp(message.code, "unknown_job") == 0;
+        if (!unknown_job) {
+            hs_crack_remote_sync_lost(worker, "status boundary ambiguous");
+            return false;
+        }
+        worker->cancel_pending = false;
+        if (attempt + 1U < attempts) {
+            ESP_LOGW(TAG,
+                     "[HS-CRACK] %s: status confirms unknown job=%s; retrying start",
+                     tab_transport_name(worker->tab), worker->job);
+            hs_crack_remote_report(worker, "start", attempt + 1U,
+                                   "unknown, retry");
+            vTaskDelay(pdMS_TO_TICKS(
+                hs_remote_stage_backoff_ms(attempt + 2U)));
+            worker->cancel_pending = true;
+        }
+    }
+    if (!accepted) {
+        hs_crack_remote_report(worker, "start", attempts, "exhausted");
+        return false;
+    }
+    worker->shard_start = start;
+    worker->shard_end = end;
+    worker->active = true;
+    worker->finished = false;
+    worker->failed = false;
+    worker->counted = true;
+    worker->cancel_pending = false;
+    worker->checked = (message.type == HS_REMOTE_STATUS ||
+                       message.type == HS_REMOTE_DONE) ? message.checked : 0;
+    worker->accounted = 0;
+    hs_remote_lease_init(&worker->lease, start);
+    worker->pending_found = false;
+    worker->pending_password_length = 0;
+    worker->pending_ssid_length = 0;
+    if ((message.type == HS_REMOTE_STATUS || message.type == HS_REMOTE_DONE) &&
+        message.result == HS_REMOTE_RESULT_FOUND &&
+        message.password_length > 0 &&
+        message.password_length <= sizeof(worker->pending_password)) {
+        memcpy(worker->pending_password, message.password,
+               message.password_length);
+        worker->pending_password_length = message.password_length;
+        if (message.ssid_length <= sizeof(worker->pending_ssid)) {
+            memcpy(worker->pending_ssid, message.ssid, message.ssid_length);
+            worker->pending_ssid_length = message.ssid_length;
+        }
+        worker->pending_found = true;
+    }
+    if ((message.type == HS_REMOTE_STATUS || message.type == HS_REMOTE_DONE) &&
+        message.offset >= start && message.offset <= end &&
+        (message.result != HS_REMOTE_RESULT_FOUND || worker->pending_found)) {
+        hs_remote_lease_note_response(&worker->lease, message.offset);
+    }
+    worker->found_ssid_length = 0;
+    snprintf(hs_crack_ui.worker_status[worker->tab],
+             sizeof(hs_crack_ui.worker_status[0]), "cracking");
+    snprintf(worker->stage, sizeof(worker->stage), "running");
+    snprintf(worker->stage_reason, sizeof(worker->stage_reason), "confirmed");
+    hs_crack_render_workers();
+    ESP_LOGI(TAG, "[HS-CRACK] ACK %s job=%s",
+             tab_transport_name(worker->tab), worker->job);
+    return true;
+}
+
+static void hs_crack_remote_publish_counts(const hs_crack_remote_worker_t *workers,
+                                           size_t count)
+{
+    unsigned total = 0;
+    unsigned active = 0;
+    unsigned finished = 0;
+    unsigned failed = 0;
+    for (size_t i = 0; i < count; ++i) {
+        if (!workers[i].counted) continue;
+        total++;
+        if (workers[i].failed) failed++;
+        else if (workers[i].active) active++;
+        else if (workers[i].finished) finished++;
+    }
+    hs_crack_ui.remote_total = (uint8_t)total;
+    hs_crack_ui.remote_active = (uint8_t)active;
+    hs_crack_ui.remote_finished = (uint8_t)finished;
+    hs_crack_ui.remote_failed = (uint8_t)failed;
+}
+
+static void hs_crack_remote_add_checked(hs_crack_remote_worker_t *worker,
+                                        uint32_t *tried, uint64_t checked)
+{
+    if (checked <= worker->accounted) return;
+    uint64_t delta = checked - worker->accounted;
+    uint64_t room = UINT32_MAX - (uint64_t)*tried;
+    *tried += (uint32_t)(delta > room ? room : delta);
+    worker->accounted = checked;
+    worker->checked = checked;
+}
+
+static bool hs_crack_remote_take_pending_found(
+    hs_crack_remote_worker_t *worker, uint32_t *tried,
+    char *found_pw, size_t found_pw_size)
+{
+    if (!worker || !tried || !found_pw || !worker->pending_found ||
+        worker->pending_password_length == 0 ||
+        worker->pending_password_length >= found_pw_size) return false;
+
+    hs_crack_remote_add_checked(worker, tried, worker->checked);
+    memcpy(found_pw, worker->pending_password, worker->pending_password_length);
+    found_pw[worker->pending_password_length] = '\0';
+    if (worker->pending_ssid_length <= sizeof(worker->found_ssid)) {
+        memcpy(worker->found_ssid, worker->pending_ssid,
+               worker->pending_ssid_length);
+        worker->found_ssid_length = worker->pending_ssid_length;
+    }
+    worker->pending_found = false;
+    worker->pending_password_length = 0;
+    worker->pending_ssid_length = 0;
+    worker->finished = true;
+    worker->active = false;
+    ESP_LOGI(TAG,
+             "[HS-CRACK] DONE %s job=%s result=found checked=%llu (recovered during start)",
+             tab_transport_name(worker->tab), worker->job,
+             (unsigned long long)worker->checked);
+    snprintf(hs_crack_ui.worker_status[worker->tab],
+             sizeof(hs_crack_ui.worker_status[0]), LV_SYMBOL_OK " FOUND KEY");
+    hs_crack_render_workers();
+    return true;
+}
+
+static void hs_crack_remote_mark_lost(hs_crack_remote_worker_t *worker,
+                                      const char *reason)
+{
+    worker->failed = true;
+    worker->finished = false;
+    worker->active = false;
+    worker->cancel_pending = true;
+    snprintf(worker->stage, sizeof(worker->stage), "fallback");
+    snprintf(worker->stage_reason, sizeof(worker->stage_reason), "%s",
+             reason ? reason : "lost");
+    snprintf(hs_crack_ui.worker_status[worker->tab],
+             sizeof(hs_crack_ui.worker_status[0]), "lost -> local (%.24s)",
+             worker->stage_reason);
+    hs_crack_render_workers();
+    ESP_LOGW(TAG, "[HS-CRACK] LOST %s job=%s safe_offset=%llu reason=%s",
+             tab_transport_name(worker->tab), worker->job,
+             (unsigned long long)worker->lease.confirmed_safe_offset,
+             worker->stage_reason);
+}
+
+static bool hs_crack_remote_poll(hs_crack_remote_worker_t *worker,
+                                 uint32_t *tried, char *found_pw,
+                                 size_t found_pw_size)
+{
+    if (!worker->active || worker->finished) return false;
+    if (hs_crack_remote_take_pending_found(worker, tried, found_pw,
+                                            found_pw_size)) return true;
+    char command[80];
+    snprintf(command, sizeof(command), "crack_worker status %s", worker->job);
+    if (!hs_crack_remote_send_line(worker->tab, worker->port, command)) {
+        bool lost = hs_remote_lease_note_timeout(&worker->lease);
+        ESP_LOGW(TAG, "[HS-CRACK] MISS %s job=%s (%u/%u): send failed",
+                 tab_transport_name(worker->tab), worker->job,
+                 worker->lease.missed_polls, HS_REMOTE_MISSED_POLLS_LIMIT);
+        if (lost) {
+            hs_crack_remote_mark_lost(worker, "status send failed");
+        } else {
+            hs_crack_remote_report(worker, "status",
+                                   worker->lease.missed_polls, "send miss");
+        }
+        return false;
+    }
+    hs_remote_message_t message;
+    int64_t deadline = esp_timer_get_time() + 2000000LL;
+    while (esp_timer_get_time() < deadline) {
+        if (!hs_crack_remote_read_message(worker->tab, worker->port,
+                                          &message, 500)) continue;
+        if ((message.type != HS_REMOTE_STATUS && message.type != HS_REMOTE_DONE) ||
+            strcmp(message.job, worker->job) != 0) continue;
+        uint64_t previous_checked = worker->checked;
+        hs_remote_lease_note_response(&worker->lease, message.offset);
+        hs_crack_remote_add_checked(worker, tried, message.checked);
+        if (message.result == HS_REMOTE_RESULT_RUNNING) {
+            if (message.checked != previous_checked) {
+                ESP_LOGI(TAG,
+                         "[HS-CRACK] STATUS %s job=%s checked=%llu safe_offset=%llu phase=%s progress_age_ms=%llu",
+                         tab_transport_name(worker->tab), worker->job,
+                         (unsigned long long)message.checked,
+                         (unsigned long long)worker->lease.confirmed_safe_offset,
+                         message.phase[0] ? message.phase : "running",
+                         (unsigned long long)(message.progress_age_valid
+                             ? message.progress_age_ms : 0));
+            }
+            snprintf(worker->stage, sizeof(worker->stage), "%.15s",
+                     message.phase[0] ? message.phase : "running");
+            if (message.progress_age_valid) {
+                uint32_t age_ms = message.progress_age_ms > 99999999ULL
+                                      ? 99999999U
+                                      : (uint32_t)message.progress_age_ms;
+                snprintf(worker->stage_reason, sizeof(worker->stage_reason),
+                         "age %ums", (unsigned)age_ms);
+            } else {
+                snprintf(worker->stage_reason, sizeof(worker->stage_reason),
+                         "healthy");
+            }
+            snprintf(hs_crack_ui.worker_status[worker->tab],
+                     sizeof(hs_crack_ui.worker_status[0]),
+                     "%.14s %lluk %.22s", worker->stage,
+                     (unsigned long long)(worker->checked / 1000ULL),
+                     worker->stage_reason);
+            hs_crack_render_workers();
+            return false;
+        }
+        worker->finished = true;
+        worker->active = false;
+        if (message.result == HS_REMOTE_RESULT_FOUND &&
+            message.password_length > 0 && message.password_length < found_pw_size) {
+            memcpy(found_pw, message.password, message.password_length);
+            found_pw[message.password_length] = '\0';
+            if (message.ssid_length <= sizeof(worker->found_ssid)) {
+                memcpy(worker->found_ssid, message.ssid, message.ssid_length);
+                worker->found_ssid_length = message.ssid_length;
+            }
+            ESP_LOGI(TAG, "[HS-CRACK] DONE %s job=%s result=found checked=%llu",
+                     tab_transport_name(worker->tab), worker->job,
+                     (unsigned long long)message.checked);
+            snprintf(hs_crack_ui.worker_status[worker->tab],
+                     sizeof(hs_crack_ui.worker_status[0]), LV_SYMBOL_OK " FOUND KEY");
+            hs_crack_render_workers();
+            return true;
+        }
+        if (message.result == HS_REMOTE_RESULT_NOT_FOUND &&
+            hs_remote_not_found_completes_shard(
+                worker->lease.confirmed_safe_offset, worker->shard_end)) {
+            ESP_LOGI(TAG,
+                     "[HS-CRACK] DONE %s job=%s result=not_found checked=%llu safe_offset=%llu",
+                     tab_transport_name(worker->tab), worker->job,
+                     (unsigned long long)message.checked,
+                     (unsigned long long)worker->lease.confirmed_safe_offset);
+            snprintf(hs_crack_ui.worker_status[worker->tab],
+                     sizeof(hs_crack_ui.worker_status[0]), "done, no key");
+            hs_crack_render_workers();
+            return false;
+        }
+        worker->failed = true;
+        worker->finished = false;
+        snprintf(hs_crack_ui.worker_status[worker->tab],
+                 sizeof(hs_crack_ui.worker_status[0]), "failed");
+        hs_crack_render_workers();
+        ESP_LOGW(TAG,
+                 "[HS-CRACK] FALLBACK %s job=%s result=%d code=%s checked=%llu safe_offset=%llu end=%llu",
+                 tab_transport_name(worker->tab), worker->job,
+                 (int)message.result,
+                 message.code[0] ? message.code : "none",
+                 (unsigned long long)message.checked,
+                 (unsigned long long)worker->lease.confirmed_safe_offset,
+                 (unsigned long long)worker->shard_end);
+        return false;
+    }
+    bool lost = hs_remote_lease_note_timeout(&worker->lease);
+    ESP_LOGW(TAG, "[HS-CRACK] MISS %s job=%s (%u/%u): status timeout",
+             tab_transport_name(worker->tab), worker->job,
+             worker->lease.missed_polls, HS_REMOTE_MISSED_POLLS_LIMIT);
+    if (lost) {
+        hs_crack_remote_mark_lost(worker, "status timeout");
+    } else {
+        hs_crack_remote_report(worker, "status",
+                               worker->lease.missed_polls, "timeout");
+    }
+    return false;
+}
+
+static int hs_crack_remote_record_index(const hs_crack_remote_worker_t *worker,
+                                        const hccapx_record_t *records,
+                                        int count, const char *password)
+{
+    if (!worker || !records || !password) return -1;
+    int verified = hs_crack_verify_candidate(password, records, count, NULL, NULL);
+    if (verified < 0) return -1;
+    if (worker->found_ssid_length > 0) {
+        size_t length = records[verified].essid_len > 32
+                            ? 32 : records[verified].essid_len;
+        if (length != worker->found_ssid_length ||
+            memcmp(records[verified].essid, worker->found_ssid, length) != 0)
+            return -1;
+    }
+    return verified;
+}
+
+static void hs_crack_remote_cancel_one(hs_crack_remote_worker_t *worker)
+{
+    if (!worker || (!worker->active && !worker->cancel_pending)) return;
+    char command[80];
+    snprintf(command, sizeof(command), "crack_worker cancel %s", worker->job);
+    bool sent = hs_crack_remote_send_line_force(worker->tab, worker->port,
+                                                command);
+    if (!sent) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        sent = hs_crack_remote_send_line_force(worker->tab, worker->port,
+                                               command);
+    }
+
+    bool confirmed = false;
+    int64_t deadline = esp_timer_get_time() + 5000000LL;
+    bool status_sent = false;
+    hs_remote_message_t message;
+    while (esp_timer_get_time() < deadline) {
+        if (!hs_crack_remote_read_message_force(worker->tab, worker->port,
+                                                &message, 500)) {
+            if (!status_sent) {
+                snprintf(command, sizeof(command), "crack_worker status %s",
+                         worker->job);
+                (void)hs_crack_remote_send_line_force(worker->tab,
+                                                      worker->port, command);
+                status_sent = true;
+            }
+            continue;
+        }
+        if (message.type == HS_REMOTE_DONE &&
+            strcmp(message.job, worker->job) == 0) {
+            confirmed = true;
+            break;
+        }
+        if (message.type == HS_REMOTE_STATUS &&
+            strcmp(message.job, worker->job) == 0 &&
+            message.result != HS_REMOTE_RESULT_RUNNING) {
+            confirmed = true;
+            break;
+        }
+        if (message.type == HS_REMOTE_REJECTED &&
+            strcmp(message.code, "no_running_job") == 0) {
+            confirmed = true;
+            break;
+        }
+    }
+    if (!confirmed) {
+        ESP_LOGW(TAG, "[HS-CRACK] cancel not confirmed by %s",
+                 tab_transport_name(worker->tab));
+    }
+    worker->active = false;
+    worker->finished = true;
+    worker->cancel_pending = !confirmed;
+}
+
+static void hs_crack_remote_cancel(hs_crack_remote_worker_t *workers,
+                                   size_t count)
+{
+    for (size_t i = 0; i < count; ++i)
+        hs_crack_remote_cancel_one(&workers[i]);
+    hs_crack_remote_publish_counts(workers, count);
+}
+
+static bool hs_crack_remote_write_capture(const char *path,
+                                          const hccapx_record_t *records,
+                                          int count, uint64_t *size,
+                                          uint32_t *crc32)
+{
+    FILE *file = fopen(path, "wb");
+    if (!file) return false;
+    size_t written = fwrite(records, sizeof(*records), (size_t)count, file);
+    bool ok = written == (size_t)count && fflush(file) == 0;
+    int fd = fileno(file);
+    if (ok && fd >= 0) ok = fsync(fd) == 0;
+    if (fclose(file) != 0) ok = false;
+    if (!ok) {
+        unlink(path);
+        return false;
+    }
+    *size = (uint64_t)count * sizeof(*records);
+    return hs_crack_cache_file_crc32(path, crc32) == HS_CRACK_CACHE_OK;
+}
+
+static void hs_crack_remote_abandon_fast_baud(
+    hs_crack_remote_worker_t *worker)
+{
+    if (!worker || tab_is_internal(worker->tab)) return;
+    (void)janos_transport_set_local_baud(worker->tab, worker->port,
+                                         JANOS_UART_FT_DEFAULT_BAUD);
+    vTaskDelay(pdMS_TO_TICKS(60));
+    compromised_transport_flush(worker->tab, worker->port);
+    ESP_LOGW(TAG,
+             "[HS-CRACK] %s raw/CLI boundary lost; local UART returned to %d without peer commands",
+             tab_transport_name(worker->tab), JANOS_UART_FT_DEFAULT_BAUD);
+}
+
+static bool hs_crack_remote_sync_file(hs_crack_remote_worker_t *worker,
+                                      bool enabled, const char *kind,
+                                      const char *path, uint64_t size,
+                                      uint32_t crc32)
+{
+    if (!enabled) return true;
+
+    int fast_baud = worker->tab == TAB_USB
+                        ? JANOS_USB_FT_FAST_BAUD
+                        : (int)janos_ft_baud;
+    bool fast = false;
+    for (unsigned attempt = 1; attempt <= HS_REMOTE_STAGE_ATTEMPTS; ++attempt) {
+        if (attempt == 1U) {
+            janos_uart_baud_result_t baud_result =
+                janos_uart_set_baud(worker->tab, worker->port, fast_baud);
+            if (baud_result == JANOS_BAUD_LOST) {
+                worker->failed = true;
+                hs_crack_remote_report(worker, kind, attempt,
+                                       "baud boundary lost");
+                return false;
+            }
+            fast = baud_result == JANOS_BAUD_FAST;
+        }
+        hs_crack_remote_report(worker, kind, attempt,
+                               attempt == 1U && fast ? "fast sync" : "sync");
+        bool synced = hs_crack_remote_upload(worker, kind, path, size, crc32);
+
+        if (attempt == 1U && fast && worker->failed) {
+            hs_crack_remote_abandon_fast_baud(worker);
+            return false;
+        }
+        if (attempt == 1U && fast &&
+            !janos_uart_restore_baud(worker->tab, worker->port, fast_baud)) {
+            worker->failed = true;
+            hs_crack_remote_report(worker, kind, attempt, "baud restore failed");
+            return false;
+        }
+        if (synced) {
+            hs_crack_remote_report(worker, kind, attempt, "ready");
+            return true;
+        }
+
+        bool boundary_safe = !worker->failed;
+        if (!hs_remote_stage_retry_allowed(attempt,
+                                           hs_crack_ui.cancel_requested,
+                                           boundary_safe)) {
+            if (boundary_safe) {
+                char last_reason[sizeof(worker->stage_reason)];
+                snprintf(last_reason, sizeof(last_reason), "%.12s",
+                         worker->stage_reason);
+                char final_reason[sizeof(worker->stage_reason)];
+                snprintf(final_reason, sizeof(final_reason),
+                         hs_crack_ui.cancel_requested ? "cancelled %.12s"
+                                                       : "exhausted %.12s",
+                         last_reason);
+                hs_crack_remote_report_current(worker, final_reason);
+            }
+            return false;
+        }
+        ESP_LOGW(TAG,
+                 "[HS-CRACK] RETRY %s %s stage attempt=%u/%u at 115200 baud (resume enabled)",
+                 tab_transport_name(worker->tab), kind, attempt + 1U,
+                 HS_REMOTE_STAGE_ATTEMPTS);
+        vTaskDelay(pdMS_TO_TICKS(hs_remote_stage_backoff_ms(attempt + 1U)));
+    }
+    return false;
+}
+
+static size_t hs_crack_remote_discover(hs_crack_remote_worker_t *workers,
+                                       uint64_t capture_size,
+                                       uint32_t capture_crc,
+                                       bool *probe_claimed)
+{
+    static const tab_id_t tabs[] = {TAB_GROVE, TAB_USB, TAB_MBUS};
+    while (board_probe_in_progress && !hs_crack_ui.cancel_requested) vTaskDelay(1);
+    if (hs_crack_ui.cancel_requested) return 0;
+    board_probe_in_progress = true;
+    *probe_claimed = true;
+
+    size_t count = 0;
+    for (size_t i = 0; i < sizeof(tabs) / sizeof(tabs[0]); ++i) {
+        if (!hs_crack_remote_detected(tabs[i])) continue;
+        hs_crack_remote_worker_t *worker = &workers[count];
+        memset(worker, 0, sizeof(*worker));
+        worker->tab = tabs[i];
+        worker->port = uart_port_for_tab(tabs[i]);
+        if (!hs_crack_remote_claim_transport(worker)) continue;
+        compromised_transport_lock_begin(worker->tab, worker->port,
+                                         &worker->usb_lock_set);
+        if (!hs_crack_remote_capabilities(worker)) {
+            ESP_LOGI(TAG, "[HS-CRACK] %s has no CRACK/1 worker",
+                     tab_transport_name(worker->tab));
+            snprintf(hs_crack_ui.worker_status[worker->tab],
+                     sizeof(hs_crack_ui.worker_status[0]), "no worker");
+            compromised_transport_lock_end(worker->usb_lock_set);
+            worker->usb_lock_set = false;
+            hs_crack_remote_release_transport(worker);
+            continue;
+        }
+
+        bool synced = hs_crack_remote_sync_file(
+            worker, hs_crack_ui.sync_capture, "capture",
+            HS_CRACK_REMOTE_HCCAPX, capture_size, capture_crc);
+        if (!synced) {
+            ESP_LOGW(TAG, "[HS-CRACK] capture sync failed on %s",
+                     tab_transport_name(worker->tab));
+            compromised_transport_lock_end(worker->usb_lock_set);
+            worker->usb_lock_set = false;
+            hs_crack_remote_release_transport(worker);
+            continue;
+        }
+        worker->usable = true;
+        snprintf(hs_crack_ui.worker_status[worker->tab],
+                 sizeof(hs_crack_ui.worker_status[0]), "ready");
+        ESP_LOGI(TAG, "[HS-CRACK] remote worker ready: %s",
+                 tab_transport_name(worker->tab));
+        count++;
+        hs_crack_render_workers();
+        if (count == HS_CRACK_REMOTE_MAX) break;
+    }
+    hs_crack_render_workers();
+    return count;
+}
+
+static size_t hs_crack_remote_sync_wordlist(hs_crack_remote_worker_t *workers,
+                                            size_t count, const char *path,
+                                            uint64_t size, uint32_t crc32)
+{
+    size_t ready = 0;
+    for (size_t i = 0; i < count; ++i) {
+        hs_crack_remote_worker_t *worker = &workers[i];
+        if (!worker->usable) continue;
+        bool synced = hs_crack_remote_sync_file(
+            worker, hs_crack_ui.sync_wordlist, "wordlist", path, size, crc32);
+        if (!synced) {
+            worker->usable = false;
+            worker->failed = true;
+            ESP_LOGW(TAG, "[HS-CRACK] wordlist sync failed on %s",
+                     tab_transport_name(worker->tab));
+            continue;
+        }
+        worker->finished = false;
+        worker->failed = false;
+        snprintf(hs_crack_ui.worker_status[worker->tab],
+                 sizeof(hs_crack_ui.worker_status[0]), "ready");
+        ready++;
+    }
+    hs_crack_render_workers();
+    return ready;
+}
+
+static bool hs_crack_seek_range_start(FILE *file, uint64_t requested)
+{
+    if (requested == 0) return fseek(file, 0, SEEK_SET) == 0;
+    if (requested > LONG_MAX || fseek(file, (long)(requested - 1U), SEEK_SET) != 0)
+        return false;
+    int previous = fgetc(file);
+    if (previous == EOF) return !ferror(file);
+    if (previous != '\n') {
+        int c;
+        do {
+            c = fgetc(file);
+        } while (c != EOF && c != '\n');
+        if (c == EOF && ferror(file)) return false;
+    }
+    return true;
+}
+
 #ifndef ESP_PLATFORM
 static int hs_crack_try_candidate(const char *pw, const hccapx_record_t *recs, int nrecs)
 {
@@ -60039,17 +62581,6 @@ static int hs_crack_try_candidate(const char *pw, const hccapx_record_t *recs, i
     return rc >= 0 ? rc : -1;
 }
 #endif
-
-// UINT64_MAX means that no measured estimate is available yet.
-static uint64_t hs_crack_eta_seconds(uint64_t total, uint32_t tried, int64_t elapsed_us)
-{
-    if (total <= tried) return 0;
-    if (!tried || elapsed_us <= 0) return UINT64_MAX;
-    double seconds = (double)(total - tried) * (double)elapsed_us / (1000000.0 * tried);
-    if (seconds >= (double)UINT64_MAX) return UINT64_MAX;
-    uint64_t rounded = (uint64_t)seconds;
-    return rounded + (seconds > (double)rounded);
-}
 
 static void hs_crack_set_stage(const char *status, const char *detail, int bar_value)
 {
@@ -60072,12 +62603,131 @@ static void hs_crack_set_stage(const char *status, const char *detail, int bar_v
     bsp_display_unlock();
 }
 
+static bool hs_crack_worker_uses_usb_icon(int tab)
+{
+    return tab == TAB_USB;
+}
+
+static lv_obj_t *hs_crack_worker_row_create(lv_obj_t *parent)
+{
+    lv_obj_t *row = lv_obj_create(parent);
+    lv_obj_remove_style_all(row);
+    lv_obj_set_size(row, lv_pct(100), 22);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START,
+                         LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(row, 8, 0);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+    return row;
+}
+
+static void hs_crack_worker_add_symbol(lv_obj_t *row, const char *symbol)
+{
+    lv_obj_t *icon = lv_label_create(row);
+    lv_obj_set_width(icon, 18);
+    lv_label_set_text(icon, symbol);
+    lv_obj_set_style_text_align(icon, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(icon, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(icon, ui_text_color(), 0);
+}
+
+static void hs_crack_worker_add_plug(lv_obj_t *row)
+{
+    lv_color_t color = ui_text_color();
+    lv_obj_t *icon = lv_obj_create(row);
+    lv_obj_remove_style_all(icon);
+    lv_obj_set_size(icon, 18, 20);
+    lv_obj_clear_flag(icon, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *body = lv_obj_create(icon);
+    lv_obj_remove_style_all(body);
+    lv_obj_set_size(body, 12, 9);
+    lv_obj_set_pos(body, 3, 4);
+    lv_obj_set_style_bg_opa(body, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(body, 2, 0);
+    lv_obj_set_style_border_color(body, color, 0);
+    lv_obj_set_style_radius(body, 2, 0);
+
+    static const int pin_x[] = {5, 11};
+    for (size_t i = 0; i < 2; ++i) {
+        lv_obj_t *pin = lv_obj_create(icon);
+        lv_obj_remove_style_all(pin);
+        lv_obj_set_size(pin, 2, 5);
+        lv_obj_set_pos(pin, pin_x[i], 0);
+        lv_obj_set_style_bg_color(pin, color, 0);
+        lv_obj_set_style_bg_opa(pin, LV_OPA_COVER, 0);
+    }
+
+    lv_obj_t *cord = lv_obj_create(icon);
+    lv_obj_remove_style_all(cord);
+    lv_obj_set_size(cord, 2, 6);
+    lv_obj_set_pos(cord, 8, 12);
+    lv_obj_set_style_bg_color(cord, color, 0);
+    lv_obj_set_style_bg_opa(cord, LV_OPA_COVER, 0);
+}
+
+static void hs_crack_worker_add_row(lv_obj_t *parent, int tab,
+                                    const char *name, const char *status)
+{
+    lv_obj_t *row = hs_crack_worker_row_create(parent);
+    if (tab < 0) hs_crack_worker_add_symbol(row, LV_SYMBOL_DRIVE);
+    else if (hs_crack_worker_uses_usb_icon(tab))
+        hs_crack_worker_add_symbol(row, LV_SYMBOL_USB);
+    else hs_crack_worker_add_plug(row);
+
+    lv_obj_t *name_label = lv_label_create(row);
+    lv_obj_set_width(name_label, 64);
+    lv_label_set_text(name_label, name);
+    lv_obj_set_style_text_font(name_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(name_label, ui_text_color(), 0);
+
+    lv_obj_t *status_label = lv_label_create(row);
+    lv_obj_set_flex_grow(status_label, 1);
+    lv_label_set_long_mode(status_label, LV_LABEL_LONG_DOT);
+    lv_label_set_text(status_label, status);
+    lv_obj_set_style_text_font(status_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(status_label, ui_muted_color(), 0);
+}
+
+static void hs_crack_render_workers_unlocked(void)
+{
+    if (!hs_crack_ui.worker_box || !lv_obj_is_valid(hs_crack_ui.worker_box)) return;
+    lv_obj_clean(hs_crack_ui.worker_box);
+
+    lv_obj_t *heading = lv_label_create(hs_crack_ui.worker_box);
+    lv_label_set_text(heading, "Workers");
+    lv_obj_set_style_text_font(heading, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(heading, ui_text_color(), 0);
+
+    hs_crack_worker_add_row(hs_crack_ui.worker_box, -1,
+                            "Tab5", "local engine");
+    static const int order[3] = { TAB_GROVE, TAB_USB, TAB_MBUS };
+    for (size_t i = 0; i < 3; ++i) {
+        int tab = order[i];
+        const char *status = hs_crack_ui.worker_status[tab];
+        if (!status[0]) continue;
+        hs_crack_worker_add_row(hs_crack_ui.worker_box, tab,
+                                tab_transport_name(tab), status);
+    }
+    lv_obj_clear_flag(hs_crack_ui.worker_box, LV_OBJ_FLAG_HIDDEN);
+}
+
+// Repaint the per-worker status box from hs_crack_ui.worker_status[]. One row per
+// transport that has a status, plus the always-present local Tab5 engine.
+static void hs_crack_render_workers(void)
+{
+    if (!bsp_display_lock(200)) return;
+    hs_crack_render_workers_unlocked();
+    bsp_display_unlock();
+}
+
 // Called by the LVGL timer, independently of the password worker. All fields
 // below belong to the display thread; no extra task or heap snapshot is needed.
 static void hs_crack_metrics_update(lv_timer_t *timer)
 {
     (void)timer;
     if (!hs_crack_ui.metrics_label) return;
+    if (app_power_manager_is_screen_dimmed()) return;
     char cpu[64] = "CPU0 --  CPU1 --";
 #if configUSE_TRACE_FACILITY && configGENERATE_RUN_TIME_STATS && \
     CONFIG_FREERTOS_RUN_TIME_STATS_USING_ESP_TIMER && !CONFIG_FREERTOS_SMP && !CONFIG_FREERTOS_UNICORE
@@ -60162,7 +62812,7 @@ static void hs_crack_overlay_deleted_cb(lv_event_t *e)
     if (lv_event_get_target(e) != hs_crack_ui.overlay) return;
     hs_crack_metrics_stop();
     hs_crack_ui.metrics_label = NULL;
-    hs_crack_ui.mode_dropdown = NULL;
+    hs_crack_ui.wordlist_dropdown = NULL;
     hs_crack_ui.cancel_requested = true;
     hs_crack_ui.overlay = NULL;
     hs_crack_ui.popup = NULL;
@@ -60171,16 +62821,66 @@ static void hs_crack_overlay_deleted_cb(lv_event_t *e)
     hs_crack_ui.progress_bar = NULL;
     hs_crack_ui.action_btn = NULL;
     hs_crack_ui.action_label = NULL;
+    hs_crack_ui.dismiss_btn = NULL;
+    hs_crack_ui.sync_hs_cb = NULL;
+    hs_crack_ui.sync_wl_cb = NULL;
+    hs_crack_ui.worker_box = NULL;
 }
 
 static void hs_crack_close_or_cancel_cb(lv_event_t *e)
 {
     (void)e;
     if (!hs_crack_ui.started) {
-        hs_crack_ui.dual_mode = lv_dropdown_get_selected(hs_crack_ui.mode_dropdown) == 1;
+        unsigned selected_source = 0;
+        hs_crack_source_kind_t source_kind = HS_CRACK_SOURCE_NONE;
+        size_t wordlist_index = 0;
+        if (hs_crack_ui.wordlist_dropdown && lv_obj_is_valid(hs_crack_ui.wordlist_dropdown)) {
+            selected_source = lv_dropdown_get_selected(hs_crack_ui.wordlist_dropdown);
+        }
+        if (!hs_crack_cache_decode_source(selected_source,
+                                          (size_t)hs_crack_ui.wl_count,
+                                          &source_kind, &wordlist_index) ||
+            source_kind == HS_CRACK_SOURCE_NONE) {
+            if (hs_crack_ui.status_label && lv_obj_is_valid(hs_crack_ui.status_label)) {
+                lv_label_set_text(hs_crack_ui.status_label,
+                                  "Choose Internal, a wordlist, or ALL");
+            }
+            return;
+        }
+
+        if (source_kind == HS_CRACK_SOURCE_INTERNAL) {
+            hs_crack_ui.method = HS_CRACK_METHOD_GENERIC;
+            hs_crack_ui.wl_choice = -1;
+        } else if (source_kind == HS_CRACK_SOURCE_WORDLIST) {
+            hs_crack_ui.method = HS_CRACK_METHOD_WORDLIST;
+            hs_crack_ui.wl_choice = (int)wordlist_index;
+        } else {
+            hs_crack_ui.method = HS_CRACK_METHOD_BOTH;
+            hs_crack_ui.wl_choice = hs_crack_ui.wl_count;
+        }
+        if (hs_crack_ui.wordlist_dropdown && lv_obj_is_valid(hs_crack_ui.wordlist_dropdown)) {
+            lv_obj_add_state(hs_crack_ui.wordlist_dropdown, LV_STATE_DISABLED);
+        }
+
+        // Capture the sync toggles, then lock the pre-start controls.
+        hs_crack_ui.sync_capture = !hs_crack_ui.sync_hs_cb ||
+            lv_obj_has_state(hs_crack_ui.sync_hs_cb, LV_STATE_CHECKED);
+        hs_crack_ui.sync_wordlist = !hs_crack_ui.sync_wl_cb ||
+            lv_obj_has_state(hs_crack_ui.sync_wl_cb, LV_STATE_CHECKED);
+        if (hs_crack_ui.sync_hs_cb && lv_obj_is_valid(hs_crack_ui.sync_hs_cb))
+            lv_obj_add_state(hs_crack_ui.sync_hs_cb, LV_STATE_DISABLED);
+        if (hs_crack_ui.sync_wl_cb && lv_obj_is_valid(hs_crack_ui.sync_wl_cb))
+            lv_obj_add_state(hs_crack_ui.sync_wl_cb, LV_STATE_DISABLED);
+
+        // Fresh worker table for this run.
+        for (int i = 0; i < 3; i++) hs_crack_ui.worker_status[i][0] = '\0';
+        hs_crack_render_workers_unlocked();
+
         hs_crack_ui.started = true;
         hs_crack_ui.active = true;
-        lv_obj_add_state(hs_crack_ui.mode_dropdown, LV_STATE_DISABLED);
+        if (hs_crack_ui.dismiss_btn && lv_obj_is_valid(hs_crack_ui.dismiss_btn)) {
+            lv_obj_add_flag(hs_crack_ui.dismiss_btn, LV_OBJ_FLAG_HIDDEN);
+        }
         lv_label_set_text(hs_crack_ui.action_label, "Cancel");
         if (xTaskCreate(hs_crack_task, "hs_crack", 12288, NULL, 4, &hs_crack_ui.task) != pdPASS) {
             hs_crack_ui.task = NULL;
@@ -60208,12 +62908,62 @@ static void hs_crack_close_or_cancel_cb(lv_event_t *e)
     hs_crack_ui.progress_bar = NULL;
     hs_crack_ui.action_btn = NULL;
     hs_crack_ui.action_label = NULL;
+    hs_crack_ui.dismiss_btn = NULL;
+    hs_crack_ui.sync_hs_cb = NULL;
+    hs_crack_ui.sync_wl_cb = NULL;
+    hs_crack_ui.worker_box = NULL;
 }
 
 static void hs_crack_dismiss_cb(lv_event_t *e)
 {
     (void)e;
     if (hs_crack_ui.overlay) lv_obj_del(hs_crack_ui.overlay);
+}
+
+// Fill hs_crack_ui.wl_paths/wl_names with the wordlists under /lab/wordlist/,
+// plus the legacy /lab/wordlist.txt if present. Returns the count.
+static int hs_crack_scan_wordlists(void)
+{
+    int n = 0;
+    hs_crack_wordlist_entry_t entries[HS_CRACK_WORDLIST_MAX] = {0};
+    DIR *d = opendir(HS_CRACK_WORDLIST_DIR);
+    if (d) {
+        struct dirent *ent;
+        while (n < HS_CRACK_WORDLIST_MAX && (ent = readdir(d)) != NULL) {
+            if (!hs_crack_cache_wordlist_name_allowed(ent->d_name)) continue;
+            char full[112];
+            int w = snprintf(full, sizeof(full), "%s/%s", HS_CRACK_WORDLIST_DIR, ent->d_name);
+            if (w < 0 || w >= (int)sizeof(full)) continue;
+            struct stat st;
+            if (stat(full, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size == 0) continue;
+            memcpy(entries[n].path, full, (size_t)w + 1U);
+            size_t name_len = strnlen(ent->d_name, sizeof(entries[n].name) - 1U);
+            memcpy(entries[n].name, ent->d_name, name_len);
+            entries[n].name[name_len] = '\0';
+            n++;
+        }
+        closedir(d);
+    }
+    if (n < HS_CRACK_WORDLIST_MAX) {
+        struct stat st;
+        if (stat(HS_CRACK_WORDLIST, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0) {
+            memcpy(entries[n].path, HS_CRACK_WORDLIST, sizeof(HS_CRACK_WORDLIST));
+            memcpy(entries[n].name, "wordlist.txt", sizeof("wordlist.txt"));
+            n++;
+        }
+    }
+    hs_crack_cache_sort_wordlists(entries, (size_t)n);
+    for (int i = 0; i < n; ++i) {
+        size_t path_len = strnlen(entries[i].path, sizeof(hs_crack_ui.wl_paths[i]) - 1U);
+        memcpy(hs_crack_ui.wl_paths[i], entries[i].path, path_len);
+        hs_crack_ui.wl_paths[i][path_len] = '\0';
+        size_t name_len = strnlen(entries[i].name, sizeof(hs_crack_ui.wl_names[i]) - 1U);
+        memcpy(hs_crack_ui.wl_names[i], entries[i].name, name_len);
+        hs_crack_ui.wl_names[i][name_len] = '\0';
+    }
+    hs_crack_ui.wl_count = n;
+    hs_crack_ui.wl_choice = 0;
+    return n;
 }
 
 static void hs_crack_show_popup(const char *file_name)
@@ -60251,16 +63001,56 @@ static void hs_crack_show_popup(const char *file_name)
     lv_obj_set_style_text_font(name, &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_color(name, ui_text_color(), 0);
 
-    hs_crack_ui.mode_dropdown = lv_dropdown_create(hs_crack_ui.popup);
-    lv_dropdown_set_options(hs_crack_ui.mode_dropdown, "Single (CPU1)\nDual (CPU0 + CPU1)");
-    lv_dropdown_set_selected(hs_crack_ui.mode_dropdown, hs_crack_ui.dual_mode ? 1 : 0);
-    lv_obj_set_width(hs_crack_ui.mode_dropdown, lv_pct(100));
-#if CONFIG_FREERTOS_UNICORE
-    lv_dropdown_set_selected(hs_crack_ui.mode_dropdown, 0);
-    lv_obj_add_state(hs_crack_ui.mode_dropdown, LV_STATE_DISABLED);
-#endif
+    // Candidate source picker: no source, the internal SSID/common-password
+    // flow, one SD wordlist, or all sources in sequence.
+    hs_crack_scan_wordlists();
+    char wl_opts[HS_CRACK_WORDLIST_MAX * 50 + 64];
+    size_t o = (size_t)snprintf(wl_opts, sizeof(wl_opts), "None\nInternal");
+    for (int i = 0; i < hs_crack_ui.wl_count && o < sizeof(wl_opts); i++) {
+        int written = snprintf(wl_opts + o, sizeof(wl_opts) - o,
+                               "\n%s", hs_crack_ui.wl_names[i]);
+        if (written < 0 || (size_t)written >= sizeof(wl_opts) - o) break;
+        o += (size_t)written;
+    }
+    if (hs_crack_ui.wl_count > 1 && o < sizeof(wl_opts)) {
+        (void)snprintf(wl_opts + o, sizeof(wl_opts) - o,
+                       "\nALL (Internal + SD)");
+    }
+    hs_crack_ui.wordlist_dropdown = lv_dropdown_create(hs_crack_ui.popup);
+    lv_dropdown_set_options(hs_crack_ui.wordlist_dropdown, wl_opts);
+    lv_dropdown_set_selected(hs_crack_ui.wordlist_dropdown, 1);
+    lv_obj_set_width(hs_crack_ui.wordlist_dropdown, lv_pct(100));
+
+    // Sync toggles: whether to (re)send the handshake and the wordlist to remote
+    // workers before cracking. Both on by default; unticking one skips its upload
+    // (useful when the workers already hold the file from a previous run).
+    lv_obj_t *sync_row = lv_obj_create(hs_crack_ui.popup);
+    lv_obj_remove_style_all(sync_row);
+    lv_obj_set_width(sync_row, lv_pct(100));
+    lv_obj_set_height(sync_row, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(sync_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(sync_row, LV_FLEX_ALIGN_SPACE_EVENLY,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(sync_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    hs_crack_ui.sync_hs_cb = lv_checkbox_create(sync_row);
+    lv_checkbox_set_text(hs_crack_ui.sync_hs_cb, "Sync handshake");
+    lv_obj_add_state(hs_crack_ui.sync_hs_cb, LV_STATE_CHECKED);
+    lv_obj_set_style_text_font(hs_crack_ui.sync_hs_cb, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(hs_crack_ui.sync_hs_cb, ui_text_color(), 0);
+    lv_obj_set_style_bg_color(hs_crack_ui.sync_hs_cb, COLOR_MATERIAL_PURPLE,
+                              LV_PART_INDICATOR | LV_STATE_CHECKED);
+
+    hs_crack_ui.sync_wl_cb = lv_checkbox_create(sync_row);
+    lv_checkbox_set_text(hs_crack_ui.sync_wl_cb, "Sync wordlist");
+    lv_obj_add_state(hs_crack_ui.sync_wl_cb, LV_STATE_CHECKED);
+    lv_obj_set_style_text_font(hs_crack_ui.sync_wl_cb, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(hs_crack_ui.sync_wl_cb, ui_text_color(), 0);
+    lv_obj_set_style_bg_color(hs_crack_ui.sync_wl_cb, COLOR_MATERIAL_PURPLE,
+                              LV_PART_INDICATOR | LV_STATE_CHECKED);
+
     hs_crack_ui.status_label = lv_label_create(hs_crack_ui.popup);
-    lv_label_set_text(hs_crack_ui.status_label, "Choose mode and press Start");
+    lv_label_set_text(hs_crack_ui.status_label, "Choose source and press Start");
     lv_obj_set_width(hs_crack_ui.status_label, lv_pct(100));
     lv_label_set_long_mode(hs_crack_ui.status_label, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_align(hs_crack_ui.status_label, LV_TEXT_ALIGN_CENTER, 0);
@@ -60276,12 +63066,31 @@ static void hs_crack_show_popup(const char *file_name)
 
     hs_crack_ui.detail_label = lv_label_create(hs_crack_ui.popup);
     lv_label_set_text(hs_crack_ui.detail_label,
-                      "Trivial-password check only. Serious cracking: wpa-sec / hashcat.");
+                      "Maximum CPU power. Screen timeout remains active.");
     lv_obj_set_width(hs_crack_ui.detail_label, lv_pct(100));
     lv_label_set_long_mode(hs_crack_ui.detail_label, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_align(hs_crack_ui.detail_label, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_text_font(hs_crack_ui.detail_label, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(hs_crack_ui.detail_label, ui_muted_color(), 0);
+
+    // Per-worker table. One line per worker (Tab5 + each remote) once the run is
+    // underway. It flex-grows so it soaks up the slack that used to sit empty
+    // below the buttons. Hidden until Start fills it.
+    hs_crack_ui.worker_box = lv_obj_create(hs_crack_ui.popup);
+    lv_obj_set_width(hs_crack_ui.worker_box, lv_pct(100));
+    lv_obj_set_height(hs_crack_ui.worker_box, LV_SIZE_CONTENT);
+    lv_obj_set_flex_grow(hs_crack_ui.worker_box, 1);
+    lv_obj_set_flex_flow(hs_crack_ui.worker_box, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(hs_crack_ui.worker_box, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_set_style_bg_color(hs_crack_ui.worker_box, ui_card_color(), 0);
+    lv_obj_set_style_bg_opa(hs_crack_ui.worker_box, LV_OPA_40, 0);
+    lv_obj_set_style_border_width(hs_crack_ui.worker_box, 0, 0);
+    lv_obj_set_style_radius(hs_crack_ui.worker_box, 10, 0);
+    lv_obj_set_style_pad_all(hs_crack_ui.worker_box, 12, 0);
+    lv_obj_set_style_pad_row(hs_crack_ui.worker_box, 4, 0);
+    lv_obj_clear_flag(hs_crack_ui.worker_box, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(hs_crack_ui.worker_box, LV_OBJ_FLAG_HIDDEN);
 
     hs_crack_ui.metrics_label = lv_label_create(hs_crack_ui.popup);
     lv_obj_set_width(hs_crack_ui.metrics_label, lv_pct(100));
@@ -60293,7 +63102,20 @@ static void hs_crack_show_popup(const char *file_name)
     hs_crack_metrics_update(NULL);
     hs_crack_ui.metrics_timer = lv_timer_create(hs_crack_metrics_update, 1000, NULL);
 
-    hs_crack_ui.action_btn = lv_btn_create(hs_crack_ui.popup);
+    // Buttons sit side by side in a row. The morphing action button
+    // (Start -> Cancel -> Close) is all that is needed once the run begins, so
+    // the separate back-out button is only shown before Start.
+    lv_obj_t *btn_row = lv_obj_create(hs_crack_ui.popup);
+    lv_obj_remove_style_all(btn_row);
+    lv_obj_set_width(btn_row, lv_pct(100));
+    lv_obj_set_height(btn_row, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(btn_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btn_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(btn_row, 12, 0);
+    lv_obj_clear_flag(btn_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    hs_crack_ui.action_btn = lv_btn_create(btn_row);
     lv_obj_set_size(hs_crack_ui.action_btn, 180, 48);
     style_danger_button(hs_crack_ui.action_btn);
     lv_obj_add_event_cb(hs_crack_ui.action_btn, hs_crack_close_or_cancel_cb, LV_EVENT_CLICKED, NULL);
@@ -60303,23 +63125,55 @@ static void hs_crack_show_popup(const char *file_name)
     lv_obj_set_style_text_font(hs_crack_ui.action_label, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(hs_crack_ui.action_label, lv_color_white(), 0);
     lv_obj_center(hs_crack_ui.action_label);
-    lv_obj_t *dismiss = lv_btn_create(hs_crack_ui.popup);
-    lv_obj_set_size(dismiss, 180, 40);
-    lv_obj_add_event_cb(dismiss, hs_crack_dismiss_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *dismiss_label = lv_label_create(dismiss);
-    lv_label_set_text(dismiss_label, "Dismiss / stop");
+
+    hs_crack_ui.dismiss_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(hs_crack_ui.dismiss_btn, 180, 48);
+    lv_obj_add_event_cb(hs_crack_ui.dismiss_btn, hs_crack_dismiss_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *dismiss_label = lv_label_create(hs_crack_ui.dismiss_btn);
+    lv_label_set_text(dismiss_label, "Cancel");
     lv_obj_center(dismiss_label);
 }
 
 static void hs_crack_set_source(const char *source, uint32_t tried)
 {
     hs_crack_ui.candidate_source = source;
+    hs_crack_ui.source_tried_base = tried;
+    hs_crack_ui.source_started_us = esp_timer_get_time();
     snprintf(hs_crack_ui.candidate_status, sizeof(hs_crack_ui.candidate_status),
-             "%s: %s", hs_crack_ui.counting_candidates ? "Counting" : "Checking", source);
-    int percent = hs_crack_ui.total_candidates ?
-                  (int)(100.0 * (double)tried / (double)hs_crack_ui.total_candidates) : 0;
+             "Checking: %s", source);
     hs_crack_set_stage(hs_crack_ui.candidate_status, NULL,
-                       hs_crack_ui.counting_candidates ? -1 : (percent > 100 ? 100 : percent));
+                       hs_crack_ui.wordlist_size ? 0 : -1);
+}
+
+static bool hs_crack_cache_store_attempt(const hs_crack_capture_id_t *capture,
+                                         bool generic,
+                                         const hs_crack_wordlist_id_t *wordlist,
+                                         hs_crack_attempt_status_t status,
+                                         uint64_t tried,
+                                         const char *password,
+                                         int match_index)
+{
+    if (!capture || (!generic && !wordlist)) return false;
+    hs_crack_attempt_t attempt = {0};
+    attempt.capture = *capture;
+    attempt.generic = generic;
+    attempt.generic_version = generic ? HS_CRACK_GENERIC_VERSION : 0;
+    if (wordlist) attempt.wordlist = *wordlist;
+    attempt.status = status;
+    attempt.tried = tried;
+    attempt.match_index = match_index >= 0 ? (uint32_t)match_index : UINT32_MAX;
+    if (password) {
+        size_t len = strnlen(password, sizeof(attempt.password) - 1U);
+        memcpy(attempt.password, password, len);
+        attempt.password[len] = '\0';
+    }
+    hs_crack_cache_result_t result =
+        hs_crack_cache_upsert_attempt(HS_CRACK_ATTEMPTS_CSV, &attempt);
+    if (result != HS_CRACK_CACHE_OK) {
+        ESP_LOGW(TAG, "[HS-CRACK] could not persist attempt (%d)", (int)result);
+        return false;
+    }
+    return true;
 }
 
 // Runs one candidate, updates the tried counter and periodic progress, and
@@ -60426,7 +63280,12 @@ static bool hs_crack_workers_start(const hccapx_record_t *recs, int nrecs)
     run->jobs = xQueueCreate(4, sizeof(hs_crack_job_t));
     run->results = xQueueCreate(4, sizeof(hs_crack_job_t));
     if (!run->jobs || !run->results) goto fail;
-    unsigned count = hs_crack_ui.dual_mode ? 2 : 1;
+#if CONFIG_FREERTOS_UNICORE
+    const bool unicore = true;
+#else
+    const bool unicore = false;
+#endif
+    unsigned count = hs_crack_recommended_worker_count(unicore);
     for (unsigned i = 0; i < count; i++) {
         run->worker[i].run = run;
         run->worker[i].core = i == 0 ? 1 : 0;
@@ -60438,8 +63297,8 @@ static bool hs_crack_workers_start(const hccapx_record_t *recs, int nrecs)
                                    run->worker[i].core) != pdPASS) goto fail;
         run->workers++;
     }
-    ESP_LOGI(TAG, "[HS-CRACK] mode=%s workers=%u software SHA1; CPU0 19ms/1ms, CPU1 49ms/1ms",
-             hs_crack_ui.dual_mode ? "Dual" : "Single", run->workers);
+    ESP_LOGI(TAG, "[HS-CRACK] mode=Max workers=%u software SHA1; CPU0 19ms/1ms, CPU1 49ms/1ms",
+             run->workers);
     return true;
 fail:
     hs_crack_workers_stop();
@@ -60449,20 +63308,51 @@ fail:
 static void hs_crack_progress(const char *pw, uint32_t tried, int64_t t0)
 {
     int64_t now = esp_timer_get_time();
+    if (app_power_manager_is_screen_dimmed()) {
+        hs_crack_ui.last_update_us = 0;
+        return;
+    }
     if (now - hs_crack_ui.last_update_us < 250000) return;
     hs_crack_ui.last_update_us = now;
     int64_t elapsed = now - t0;
-    double rate = elapsed > 0 ? tried * 1000000.0 / elapsed : 0;
-    char detail[192], eta_text[48];
-    uint64_t eta = hs_crack_eta_seconds(hs_crack_ui.total_candidates, tried, elapsed);
-    if (eta == UINT64_MAX) snprintf(eta_text, sizeof(eta_text), "calculating...");
-    else compromised_format_duration(eta, eta_text, sizeof(eta_text));
-    snprintf(detail, sizeof(detail), "Tried %lu / %llu - %.2f/s (%.1f s/try)\nETA: %s\nLast: %.20s",
-             (unsigned long)tried, (unsigned long long)hs_crack_ui.total_candidates,
-             rate, tried ? elapsed / (1000000.0 * tried) : 0, eta_text, pw);
-    int percent = hs_crack_ui.total_candidates ?
-        (int)(100.0 * tried / hs_crack_ui.total_candidates) : 0;
-    hs_crack_set_stage(hs_crack_ui.candidate_status, detail, percent > 100 ? 100 : percent);
+    int64_t source_elapsed = now - hs_crack_ui.source_started_us;
+    uint32_t source_tried = tried - hs_crack_ui.source_tried_base;
+    double rate = source_elapsed > 0 ? source_tried * 1000000.0 / source_elapsed : 0;
+    char detail[320], eta_text[48];
+    int percent = -1;
+    if (hs_crack_ui.wordlist_size) {
+        percent = (int)hs_crack_cache_byte_percent(hs_crack_ui.wordlist_offset,
+                                                   hs_crack_ui.wordlist_size);
+        uint64_t eta = hs_crack_cache_eta_seconds(hs_crack_ui.wordlist_offset,
+                                                  hs_crack_ui.wordlist_size,
+                                                  source_tried,
+                                                  source_elapsed > 0
+                                                      ? (uint64_t)source_elapsed : 0);
+        if (eta == UINT64_MAX) snprintf(eta_text, sizeof(eta_text), "calculating...");
+        else compromised_format_duration(eta, eta_text, sizeof(eta_text));
+        snprintf(detail, sizeof(detail),
+                 "Tried %lu total - %.2f/s\nFile %llu / %llu bytes (%d%%)\n"
+                 "Workers: Tab5 + %u/%u remote (%u done, %u fallback)\nETA: %s | Last: %.20s",
+                 (unsigned long)tried, rate,
+                 (unsigned long long)hs_crack_ui.wordlist_offset,
+                 (unsigned long long)hs_crack_ui.wordlist_size,
+                 percent, (unsigned)hs_crack_ui.remote_active,
+                 (unsigned)hs_crack_ui.remote_total,
+                 (unsigned)hs_crack_ui.remote_finished,
+                 (unsigned)hs_crack_ui.remote_failed, eta_text, pw);
+    } else {
+        snprintf(detail, sizeof(detail),
+                 "Tried %lu - %.2f/s (%.1f s/try)\n"
+                 "Workers: Tab5 + %u/%u remote (%u done, %u fallback)\nLast: %.20s",
+                 (unsigned long)tried, rate,
+                 source_tried ? source_elapsed / (1000000.0 * source_tried) : 0,
+                 (unsigned)hs_crack_ui.remote_active,
+                 (unsigned)hs_crack_ui.remote_total,
+                 (unsigned)hs_crack_ui.remote_finished,
+                 (unsigned)hs_crack_ui.remote_failed, pw);
+    }
+    (void)elapsed;
+    hs_crack_set_stage(hs_crack_ui.candidate_status, detail, percent);
 }
 
 // Only the coordinator publishes results, counts completions and changes sources.
@@ -60505,17 +63395,6 @@ static bool hs_crack_step(const char *pw, const hccapx_record_t *recs, int nrecs
     if (hs_crack_ui.cancel_requested) return true;
     size_t pwlen = strlen(pw);
     if (pwlen < 8 || pwlen > 63) return false;
-    if (hs_crack_ui.counting_candidates) {
-        hs_crack_ui.total_candidates++;
-        if ((hs_crack_ui.total_candidates % 1024u) == 0) {
-            char detail[96];
-            snprintf(detail, sizeof(detail), "%llu valid candidates counted; no password checks yet.",
-                     (unsigned long long)hs_crack_ui.total_candidates);
-            hs_crack_set_stage(hs_crack_ui.candidate_status, detail, -1);
-            vTaskDelay(1);
-        }
-        return false;
-    }
     (void)recs; (void)nrecs;
     hs_crack_run_t *run = hs_crack_ui.run;
     hs_crack_job_t job = {0};
@@ -60550,30 +63429,47 @@ static void hs_crack_task(void *arg)
     uint32_t tried = 0;
     int64_t t0 = 0;
     bool sd_wordlist_used = false;
+    hs_crack_capture_id_t capture_id = {0};
+    hs_crack_wordlist_id_t active_wordlist_id = {0};
+    bool capture_cache_ready = false;
+    bool active_source_generic = true;
+    bool active_source_valid = false;
+    bool found_from_cache = false;
+    bool cache_save_failed = false;
+    uint64_t active_resumed_tried = 0;
+    uint32_t active_run_tried_start = 0;
+    hs_crack_remote_worker_t remote_workers[HS_CRACK_REMOTE_MAX] = {0};
+    size_t remote_worker_count = 0;
+    bool remote_probe_claimed = false;
+    bool remote_discovery_done = false;
+    bool remote_capture_ready = false;
+    uint64_t remote_capture_size = 0;
+    uint32_t remote_capture_crc = 0;
+    hs_crack_ui.remote_total = 0;
+    hs_crack_ui.remote_active = 0;
+    hs_crack_ui.remote_finished = 0;
+    hs_crack_ui.remote_failed = 0;
 
-    // Build the remote .hccapx path from the .pcap path.
-    char remote_hccapx[WARDRIVE_WIGLE_PATH_MAX];
-    snprintf(remote_hccapx, sizeof(remote_hccapx), "%s", hs_crack_ui.remote_pcap_path);
-    char *dot = strrchr(remote_hccapx, '.');
-    if (!dot || !str_ends_with_ext(remote_hccapx, ".pcap") ||
-        (size_t)(dot - remote_hccapx) + sizeof(".hccapx") > sizeof(remote_hccapx)) {
+    if (!str_ends_with_ext(hs_crack_ui.remote_pcap_path, ".pcap")) {
         snprintf(final_detail, sizeof(final_detail), "Not a .pcap handshake file.");
         goto finish;
     }
-    snprintf(dot, sizeof(remote_hccapx) - (size_t)(dot - remote_hccapx), ".hccapx");
 
-    // Fetch the companion over M-BUS (tiny file, so Wi-Fi/portal is not needed).
-    unlink(HS_CRACK_LOCAL_HCCAPX);
-    unlink(HS_CRACK_LOCAL_HCCAPX ".part");
+    // Fetch the capture .pcap over M-BUS and build the handshake records from it
+    // on-device, so a capture with no Monster .hccapx companion still cracks
+    // (the same thing wpa-sec does). Tiny file, so Wi-Fi/portal is not needed.
+    unlink(HS_CRACK_LOCAL_PCAP);
+    unlink(HS_CRACK_LOCAL_PCAP ".part");
     compromised_transport_lock_begin(tab, uart_port, &usb_lock_set);
-    hs_crack_set_stage("Fetching handshake...", "Copying .hccapx from Monster over M-BUS", 0);
+    hs_crack_set_stage("Fetching handshake...", "Copying .pcap from Monster over M-BUS", 0);
     transport_write_bytes_tab(tab, uart_port, "stop\r\n", 6);
     char stop_response[512];
     (void)home_collect_uart_response(tab, uart_port, stop_response, sizeof(stop_response), 2500);
 
     janos_file_transfer_result_t result = {0};
-    esp_err_t err = janos_uart_download(tab, uart_port, remote_hccapx, HS_CRACK_LOCAL_HCCAPX,
-                                        0, &hs_crack_ui.cancel_requested, &result);
+    esp_err_t err = janos_uart_download(tab, uart_port, hs_crack_ui.remote_pcap_path,
+                                        HS_CRACK_LOCAL_PCAP, 0,
+                                        &hs_crack_ui.cancel_requested, &result);
     compromised_transport_lock_end(usb_lock_set);
     usb_lock_set = false;
 
@@ -60583,8 +63479,7 @@ static void hs_crack_task(void *arg)
     }
     if (err != ESP_OK) {
         snprintf(final_detail, sizeof(final_detail),
-                 "Could not fetch .hccapx (%s).\nNeed a complete 4-way capture on the Monster.",
-                 esp_err_to_name(err));
+                 "Could not fetch .pcap (%s).", esp_err_to_name(err));
         goto finish;
     }
 
@@ -60596,24 +63491,79 @@ static void hs_crack_task(void *arg)
         snprintf(final_detail, sizeof(final_detail), "Out of memory.");
         goto finish;
     }
-    nrecs = hs_crack_load_records(HS_CRACK_LOCAL_HCCAPX, recs, HS_CRACK_MAX_RECORDS);
+    hs_crack_set_stage("Reading handshake...",
+                       "Extracting the 4-way handshake from the capture", 0);
+    nrecs = hs_crack_build_records_from_pcap(HS_CRACK_LOCAL_PCAP, hs_crack_ui.file_name,
+                                             recs, HS_CRACK_MAX_RECORDS,
+                                             &hs_crack_ui.cancel_requested);
+    if (hs_crack_ui.cancel_requested) {
+        snprintf(final_detail, sizeof(final_detail), "Cancelled.");
+        goto finish;
+    }
     if (nrecs <= 0) {
         snprintf(final_detail, sizeof(final_detail),
-                 "Need 1-16 valid hccapx v4 records (WPA/WPA2 keyver 1 or 2).\nPMKID and keyver 3 are not supported.");
+                 "No complete WPA/WPA2 4-way handshake (M1+M2, keyver 1 or 2) found in this capture.");
         goto finish;
     }
 
     uint8_t ssid_len = recs[0].essid_len > 32 ? 32 : recs[0].essid_len;
     memcpy(ssid, recs[0].essid, ssid_len);
 
-run_candidates:
-    // Both passes use the exact same enumeration and length/line filters.
-    // The first only counts; transfer and counting time are excluded from ETA.
-    t0 = esp_timer_get_time();
-    hs_crack_set_stage(hs_crack_ui.counting_candidates ? "Counting candidates..." : "Trying passwords...",
-                       hs_crack_ui.counting_candidates ? "Reading lists; ETA will follow the first completed attempt."
-                                                       : "SSID variants first; ETA calculating...", 0);
+    char bssid[18];
+    snprintf(bssid, sizeof(bssid), "%02X:%02X:%02X:%02X:%02X:%02X",
+             (unsigned)recs[0].mac_ap[0], (unsigned)recs[0].mac_ap[1],
+             (unsigned)recs[0].mac_ap[2], (unsigned)recs[0].mac_ap[3],
+             (unsigned)recs[0].mac_ap[4], (unsigned)recs[0].mac_ap[5]);
+    capture_cache_ready =
+        hs_crack_cache_capture_id(HS_CRACK_LOCAL_PCAP, ssid, bssid, &capture_id) ==
+        HS_CRACK_CACHE_OK;
+    if (!capture_cache_ready) {
+        ESP_LOGW(TAG, "[HS-CRACK] capture fingerprint unavailable; persistent cache disabled");
+    }
+    if (hs_crack_ui.method != HS_CRACK_METHOD_GENERIC) {
+        remote_capture_ready = hs_crack_remote_write_capture(
+            HS_CRACK_REMOTE_HCCAPX, recs, nrecs,
+            &remote_capture_size, &remote_capture_crc);
+        if (!remote_capture_ready) {
+            ESP_LOGW(TAG, "[HS-CRACK] could not prepare HCCAPX for remote workers");
+        }
+    }
 
+    t0 = esp_timer_get_time();
+
+    // Generic phase (SSID variants + built-in list). An exact completed cache
+    // entry skips it; a cached hit follows the normal success path.
+    bool run_generic = hs_crack_ui.method != HS_CRACK_METHOD_WORDLIST;
+    if (run_generic && capture_cache_ready && !hs_crack_ui.force_rerun) {
+        hs_crack_attempt_t cached = {0};
+        if (hs_crack_cache_find_attempt(HS_CRACK_ATTEMPTS_CSV, &capture_id, true,
+                                        HS_CRACK_GENERIC_VERSION, NULL,
+                                        &cached) == HS_CRACK_CACHE_OK) {
+            if (cached.status == HS_CRACK_ATTEMPT_FOUND) {
+                if (cached.match_index < (uint32_t)nrecs) {
+                    snprintf(found_pw, sizeof(found_pw), "%s", cached.password);
+                    found_idx = (int)cached.match_index;
+                    hs_crack_ui.candidate_source = "Cached: Generic";
+                    found_from_cache = true;
+                    goto done;
+                }
+                ESP_LOGW(TAG, "[HS-CRACK] ignoring invalid cached match index");
+            } else {
+                run_generic = false;
+                ESP_LOGI(TAG, "[HS-CRACK] generic cache hit: already exhausted");
+            }
+        }
+    }
+    if (run_generic) {
+    if (!hs_crack_ui.run && !hs_crack_workers_start(recs, nrecs)) {
+        snprintf(final_detail, sizeof(final_detail),
+                 "Insufficient RAM for workers. Close this dialog and retry Single mode.");
+        goto finish;
+    }
+    active_source_generic = true;
+    active_source_valid = capture_cache_ready;
+    active_resumed_tried = 0;
+    active_run_tried_start = tried;
     // 1) SSID-derived guesses for each distinct, printable SSID.
     hs_crack_set_source("SSID variants", tried);
     for (int record_index = 0; record_index < nrecs; record_index++) {
@@ -60657,55 +63607,453 @@ run_candidates:
         }
     }
 
-    // 3) SD wordlist, one passphrase per line.
     if (hs_crack_collect(&tried, t0, &found_idx, found_pw, sizeof(found_pw), true)) goto done;
-    hs_crack_set_source("SD: /lab/wordlist.txt", tried);
-    FILE *wl = fopen(HS_CRACK_WORDLIST, "r");
-    if (wl) {
-        sd_wordlist_used = true;
-        char line[65];
-        int read_status;
-        uint32_t lines_read = 0;
-        while ((read_status = hs_crack_read_word(wl, line, &hs_crack_ui.cancel_requested)) >= 0) {
-            if ((++lines_read % 128u) == 0) vTaskDelay(1);
-            if (read_status == 0) continue;
-            if (hs_crack_step(line, recs, nrecs, &tried, t0,
-                              &found_idx, found_pw, sizeof(found_pw))) {
-                break;
+    if (capture_cache_ready &&
+        !hs_crack_cache_store_attempt(&capture_id, true, NULL,
+                                      HS_CRACK_ATTEMPT_NOTFOUND,
+                                      tried - active_run_tried_start, NULL, -1)) {
+        cache_save_failed = true;
+    }
+    active_source_valid = false;
+
+    } // end generic phase
+
+    // Wordlist phase. Each exact capture+wordlist pair can be skipped from the
+    // completed-attempt journal. In-progress work resumes only from a drained,
+    // persisted safe offset.
+    if (hs_crack_ui.method != HS_CRACK_METHOD_GENERIC && hs_crack_ui.wl_count > 0) {
+        bool all = (hs_crack_ui.wl_choice >= hs_crack_ui.wl_count);
+        int wl_from = all ? 0 : hs_crack_ui.wl_choice;
+        int wl_to   = all ? hs_crack_ui.wl_count : hs_crack_ui.wl_choice + 1;
+        if (wl_from < 0) wl_from = 0;
+        for (int wi = wl_from; wi < wl_to; wi++) {
+            if (hs_crack_collect(&tried, t0, &found_idx, found_pw,
+                                 sizeof(found_pw), true)) goto done;
+
+            hs_crack_wordlist_id_t wordlist_id = {0};
+            bool wordlist_id_valid =
+                hs_crack_cache_wordlist_id(hs_crack_ui.wl_paths[wi],
+                                           &wordlist_id) == HS_CRACK_CACHE_OK;
+            if (!wordlist_id_valid) {
+                snprintf(final_detail, sizeof(final_detail),
+                         "Could not fingerprint %s.", hs_crack_ui.wl_names[wi]);
+                continue;
             }
+            hs_crack_ui.wordlist_offset = 0;
+            hs_crack_ui.wordlist_size = wordlist_id.size;
+            snprintf(hs_crack_ui.wl_source, sizeof(hs_crack_ui.wl_source),
+                     "WL: %s", hs_crack_ui.wl_names[wi]);
+
+            if (capture_cache_ready && !hs_crack_ui.force_rerun) {
+                hs_crack_attempt_t cached = {0};
+                if (hs_crack_cache_find_attempt(HS_CRACK_ATTEMPTS_CSV,
+                                                &capture_id, false, 0,
+                                                &wordlist_id,
+                                                &cached) == HS_CRACK_CACHE_OK) {
+                    sd_wordlist_used = true;
+                    if (cached.status == HS_CRACK_ATTEMPT_FOUND) {
+                        if (cached.match_index < (uint32_t)nrecs) {
+                            snprintf(found_pw, sizeof(found_pw), "%s", cached.password);
+                            found_idx = (int)cached.match_index;
+                            snprintf(hs_crack_ui.wl_source,
+                                     sizeof(hs_crack_ui.wl_source),
+                                     "Cached WL: %s", hs_crack_ui.wl_names[wi]);
+                            hs_crack_ui.candidate_source = hs_crack_ui.wl_source;
+                            found_from_cache = true;
+                            (void)hs_crack_cache_remove_resume(HS_CRACK_RESUME_FILE);
+                            goto done;
+                        }
+                        ESP_LOGW(TAG, "[HS-CRACK] ignoring invalid cached match index");
+                    } else {
+                        ESP_LOGI(TAG, "[HS-CRACK] wordlist cache hit: %s already exhausted",
+                                 hs_crack_ui.wl_names[wi]);
+                        hs_crack_set_stage("Cached: already exhausted",
+                                           hs_crack_ui.wl_names[wi], 100);
+                        continue;
+                    }
+                }
+            }
+
+            if (!remote_discovery_done && remote_capture_ready) {
+                hs_crack_set_stage(
+                    "Preparing workers...",
+                    "Discovering Grove, USB and M-BUS crack workers", -1);
+                remote_worker_count = hs_crack_remote_discover(
+                    remote_workers, remote_capture_size, remote_capture_crc,
+                    &remote_probe_claimed);
+                remote_discovery_done = true;
+            }
+
+            uint32_t wordlist_crc = 0;
+            bool wordlist_crc_ready = false;
+            size_t remote_synced = 0;
+            if (remote_worker_count > 0) {
+                hs_crack_cache_result_t crc_cache = hs_crack_cache_find_full_crc(
+                    HS_CRACK_WORDLIST_CRC_CSV, &wordlist_id, &wordlist_crc);
+                wordlist_crc_ready = crc_cache == HS_CRACK_CACHE_OK;
+                if (crc_cache != HS_CRACK_CACHE_OK) {
+                    char crc_detail[128];
+                    snprintf(crc_detail, sizeof(crc_detail),
+                             "Checking wordlist once: %.80s", hs_crack_ui.wl_names[wi]);
+                    hs_crack_set_stage("Preparing workers...", crc_detail, -1);
+                    if (hs_crack_cache_file_crc32_checked(
+                            hs_crack_ui.wl_paths[wi],
+                            hs_crack_wordlist_crc_checkpoint, NULL,
+                            &wordlist_crc) == HS_CRACK_CACHE_OK) {
+                        wordlist_crc_ready = true;
+                        if (hs_crack_cache_store_full_crc(
+                                HS_CRACK_WORDLIST_CRC_CSV, &wordlist_id,
+                                wordlist_crc) != HS_CRACK_CACHE_OK) {
+                            cache_save_failed = true;
+                        }
+                    } else {
+                        wordlist_crc = 0;
+                    }
+                }
+                if (wordlist_crc_ready) {
+                    remote_synced = hs_crack_remote_sync_wordlist(
+                        remote_workers, remote_worker_count,
+                        hs_crack_ui.wl_paths[wi], wordlist_id.size,
+                        wordlist_crc);
+                }
+            }
+            if (hs_crack_ui.cancel_requested) goto done;
+
+            FILE *wl = fopen(hs_crack_ui.wl_paths[wi], "r");
+            if (!wl) {
+                snprintf(final_detail, sizeof(final_detail),
+                         "Could not open %s.", hs_crack_ui.wl_names[wi]);
+                continue;
+            }
+            if (!hs_crack_ui.run && !hs_crack_workers_start(recs, nrecs)) {
+                fclose(wl);
+                snprintf(final_detail, sizeof(final_detail),
+                         "Insufficient RAM for workers. Close this dialog and retry Single mode.");
+                goto finish;
+            }
+
+            uint64_t resumed_tried = 0;
+            hs_crack_resume_t resume = {0};
+            if (!hs_crack_ui.force_rerun && capture_cache_ready &&
+                hs_crack_cache_load_resume(HS_CRACK_RESUME_FILE, &capture_id,
+                                           &wordlist_id,
+                                           &resume) == HS_CRACK_CACHE_OK &&
+                resume.safe_offset <= wordlist_id.size &&
+                fseek(wl, (long)resume.safe_offset, SEEK_SET) == 0) {
+                resumed_tried = resume.tried;
+                tried += (uint32_t)(resume.tried > UINT32_MAX
+                                        ? UINT32_MAX : resume.tried);
+                hs_crack_ui.wordlist_offset = resume.safe_offset;
+                ESP_LOGI(TAG, "[HS-CRACK] resumed %s at byte %llu",
+                         hs_crack_ui.wl_names[wi],
+                         (unsigned long long)resume.safe_offset);
+            }
+
+            uint64_t work_start = hs_crack_ui.wordlist_offset;
+            uint64_t local_end = wordlist_id.size;
+            hs_remote_shard_t shards[HS_CRACK_REMOTE_MAX + 1] = {0};
+            size_t remote_started = 0;
+            if (remote_synced > 0 &&
+                hs_remote_make_shards(work_start, wordlist_id.size,
+                                      remote_synced + 1U, shards)) {
+                size_t shard_index = 1;
+                for (size_t ri = 0; ri < remote_worker_count; ++ri) {
+                    hs_crack_remote_worker_t *worker = &remote_workers[ri];
+                    worker->active = false;
+                    worker->finished = false;
+                    worker->failed = false;
+                    worker->counted = false;
+                    worker->shard_start = 0;
+                    worker->shard_end = 0;
+                    if (!worker->usable) continue;
+                    worker->shard_start = shards[shard_index].start;
+                    worker->shard_end = shards[shard_index].end;
+                    if (worker->shard_start == worker->shard_end) {
+                        worker->finished = true;
+                    } else if (hs_crack_remote_start(
+                                   worker, remote_capture_size,
+                                   remote_capture_crc, wordlist_id.size,
+                                   wordlist_crc, worker->shard_start,
+                                   worker->shard_end, (unsigned)ri)) {
+                        remote_started++;
+                    } else {
+                        worker->failed = true;
+                        worker->finished = false;
+                        worker->counted = true;
+                        snprintf(hs_crack_ui.worker_status[worker->tab],
+                                 sizeof(hs_crack_ui.worker_status[0]),
+                                 "start failed - local fallback");
+                    }
+                    shard_index++;
+                }
+                if (remote_started > 0) local_end = shards[0].end;
+            }
+            hs_crack_remote_publish_counts(remote_workers, remote_worker_count);
+            hs_crack_render_workers();
+            bool distributed = remote_started > 0;
+            if (distributed) {
+                char worker_detail[128];
+                snprintf(worker_detail, sizeof(worker_detail),
+                         "Tab5 + %u Monster worker(s): %.60s",
+                         (unsigned)remote_started, hs_crack_ui.wl_names[wi]);
+                hs_crack_set_stage("Distributed cracking...", worker_detail, 0);
+            }
+
+            active_source_generic = false;
+            active_wordlist_id = wordlist_id;
+            active_source_valid = capture_cache_ready;
+            active_resumed_tried = resumed_tried;
+            active_run_tried_start = tried;
+            hs_crack_set_source(hs_crack_ui.wl_source, tried);
+            sd_wordlist_used = true;
+
+            char line[65];
+            int read_status = -1;
+            uint32_t lines_read = 0;
+            uint32_t checkpoint_tried = tried;
+            int64_t checkpoint_started = esp_timer_get_time();
+            int64_t remote_polled = checkpoint_started;
+            bool stop_source = false;
+            for (;;) {
+                long line_start = ftell(wl);
+                if (line_start < 0) {
+                    read_status = -2;
+                    break;
+                }
+                if (distributed && (uint64_t)line_start >= local_end) {
+                    read_status = -1;
+                    break;
+                }
+                read_status = hs_crack_read_word(
+                    wl, line, &hs_crack_ui.cancel_requested);
+                if (read_status < 0) break;
+                long offset = ftell(wl);
+                if (offset >= 0) hs_crack_ui.wordlist_offset = (uint64_t)offset;
+                if ((++lines_read % 128u) == 0) vTaskDelay(1);
+                if (read_status == 0) continue;
+                if (hs_crack_step(line, recs, nrecs, &tried, t0,
+                                  &found_idx, found_pw, sizeof(found_pw))) {
+                    stop_source = true;
+                    break;
+                }
+
+                int64_t now = esp_timer_get_time();
+                if (distributed && now - remote_polled >= 2000000LL) {
+                    remote_polled = now;
+                    for (size_t ri = 0; ri < remote_worker_count; ++ri) {
+                        if (hs_crack_remote_poll(&remote_workers[ri], &tried,
+                                                 found_pw, sizeof(found_pw))) {
+                            int remote_match = hs_crack_remote_record_index(
+                                &remote_workers[ri], recs, nrecs, found_pw);
+                            if (remote_match < 0) {
+                                remote_workers[ri].failed = true;
+                                found_pw[0] = '\0';
+                                continue;
+                            }
+                            found_idx = remote_match;
+                            hs_crack_workers_stop();
+                            hs_crack_ui.candidate_source = hs_crack_ui.wl_source;
+                            stop_source = true;
+                            hs_crack_remote_cancel(remote_workers,
+                                                   remote_worker_count);
+                            break;
+                        }
+                    }
+                    hs_crack_remote_publish_counts(remote_workers,
+                                                   remote_worker_count);
+                    if (stop_source) break;
+                }
+                if (!distributed &&
+                    hs_crack_checkpoint_due(tried - checkpoint_tried,
+                                            now - checkpoint_started)) {
+                    if (hs_crack_collect(&tried, t0, &found_idx, found_pw,
+                                         sizeof(found_pw), true)) {
+                        stop_source = true;
+                        break;
+                    }
+                    hs_crack_resume_t checkpoint = {
+                        .capture = capture_id,
+                        .wordlist = wordlist_id,
+                        .safe_offset = hs_crack_ui.wordlist_offset,
+                        .tried = resumed_tried +
+                                 (uint64_t)(tried - active_run_tried_start),
+                        .all_mode = all,
+                        .selected_list_index = (uint32_t)wi,
+                        .updated_sequence = (uint64_t)esp_timer_get_time(),
+                    };
+                    if (capture_cache_ready &&
+                        hs_crack_cache_save_resume(HS_CRACK_RESUME_FILE,
+                                                   &checkpoint) !=
+                            HS_CRACK_CACHE_OK) {
+                        cache_save_failed = true;
+                        ESP_LOGW(TAG, "[HS-CRACK] checkpoint save failed");
+                    }
+                    checkpoint_tried = tried;
+                    checkpoint_started = now;
+                }
+            }
+
+            if (!stop_source && read_status != -2 &&
+                hs_crack_collect(&tried, t0, &found_idx, found_pw,
+                                 sizeof(found_pw), true)) {
+                stop_source = true;
+            }
+
+            if (distributed && !stop_source && read_status != -2) {
+                for (;;) {
+                    bool any_active = false;
+                    for (size_t ri = 0; ri < remote_worker_count; ++ri) {
+                        if (remote_workers[ri].active) any_active = true;
+                        if (hs_crack_remote_poll(&remote_workers[ri], &tried,
+                                                 found_pw, sizeof(found_pw))) {
+                            int remote_match = hs_crack_remote_record_index(
+                                &remote_workers[ri], recs, nrecs, found_pw);
+                            if (remote_match < 0) {
+                                remote_workers[ri].failed = true;
+                                found_pw[0] = '\0';
+                                continue;
+                            }
+                            found_idx = remote_match;
+                            hs_crack_workers_stop();
+                            hs_crack_ui.candidate_source = hs_crack_ui.wl_source;
+                            stop_source = true;
+                            break;
+                        }
+                    }
+                    hs_crack_remote_publish_counts(remote_workers,
+                                                   remote_worker_count);
+                    if (stop_source || !any_active || hs_crack_ui.cancel_requested)
+                        break;
+                    hs_crack_progress("remote workers", tried, t0);
+                    vTaskDelay(pdMS_TO_TICKS(100));
+                }
+            }
+
+            /* A failed or disconnected remote shard is never treated as
+             * exhausted. Re-run that exact byte range locally, preserving the
+             * line-boundary ownership used by JanOS. */
+            if (distributed && !stop_source && !hs_crack_ui.cancel_requested &&
+                read_status != -2) {
+                for (size_t ri = 0; ri < remote_worker_count; ++ri) {
+                    hs_crack_remote_worker_t *worker = &remote_workers[ri];
+                    if (!worker->failed || worker->shard_end <= worker->shard_start)
+                        continue;
+                    hs_crack_remote_cancel_one(worker);
+                    uint64_t fallback_start = hs_remote_lease_fallback_start(
+                        &worker->lease, worker->shard_start, worker->shard_end);
+                    if (fallback_start >= worker->shard_end) {
+                        worker->failed = false;
+                        worker->finished = true;
+                        hs_crack_remote_publish_counts(remote_workers,
+                                                       remote_worker_count);
+                        continue;
+                    }
+                    if (!hs_crack_seek_range_start(wl, fallback_start)) {
+                        read_status = -2;
+                        break;
+                    }
+                    ESP_LOGW(TAG,
+                             "[HS-CRACK] REQUEUE %s job=%s range=%llu-%llu",
+                             tab_transport_name(worker->tab), worker->job,
+                             (unsigned long long)fallback_start,
+                             (unsigned long long)worker->shard_end);
+                    snprintf(hs_crack_ui.candidate_status,
+                             sizeof(hs_crack_ui.candidate_status),
+                             "Local fallback: %s", tab_transport_name(worker->tab));
+                    for (;;) {
+                        long line_start = ftell(wl);
+                        if (line_start < 0) {
+                            read_status = -2;
+                            break;
+                        }
+                        if ((uint64_t)line_start >= worker->shard_end) break;
+                        read_status = hs_crack_read_word(
+                            wl, line, &hs_crack_ui.cancel_requested);
+                        if (read_status < 0) break;
+                        long offset = ftell(wl);
+                        if (offset >= 0)
+                            hs_crack_ui.wordlist_offset = (uint64_t)offset;
+                        if (read_status == 0) continue;
+                        if (hs_crack_step(line, recs, nrecs, &tried, t0,
+                                          &found_idx, found_pw,
+                                          sizeof(found_pw))) {
+                            stop_source = true;
+                            break;
+                        }
+                    }
+                    if (!stop_source && read_status != -2 &&
+                        hs_crack_collect(&tried, t0, &found_idx, found_pw,
+                                         sizeof(found_pw), true)) {
+                        stop_source = true;
+                    }
+                    if (stop_source || read_status == -2 ||
+                        hs_crack_ui.cancel_requested) break;
+                    worker->failed = false;
+                    worker->finished = true;
+                    hs_crack_remote_publish_counts(remote_workers,
+                                                   remote_worker_count);
+                }
+            }
+            if (stop_source || hs_crack_ui.cancel_requested || read_status == -2)
+                hs_crack_remote_cancel(remote_workers, remote_worker_count);
+            fclose(wl);
+
+            if (read_status == -2) {
+                snprintf(final_detail, sizeof(final_detail),
+                         "Could not read %s.", hs_crack_ui.wl_names[wi]);
+            } else if (!stop_source && !hs_crack_ui.cancel_requested &&
+                       (!hs_crack_ui.run || !hs_crack_ui.run->error)) {
+                uint64_t source_tried =
+                    resumed_tried + (uint64_t)(tried - active_run_tried_start);
+                if (capture_cache_ready &&
+                    !hs_crack_cache_store_attempt(&capture_id, false,
+                                                  &wordlist_id,
+                                                  HS_CRACK_ATTEMPT_NOTFOUND,
+                                                  source_tried, NULL, -1)) {
+                    cache_save_failed = true;
+                }
+                (void)hs_crack_cache_remove_resume(HS_CRACK_RESUME_FILE);
+                active_source_valid = false;
+            }
+            if (stop_source || hs_crack_ui.cancel_requested) break;
         }
-        if (read_status == -2) {
-            snprintf(final_detail, sizeof(final_detail), "Could not read /lab/wordlist.txt.");
-        }
-        fclose(wl);
-    } else if (errno != ENOENT) {
-        snprintf(final_detail, sizeof(final_detail), "Could not open /lab/wordlist.txt.");
     }
 
 done:
-    if (final_detail[0]) goto finish;
-    if (hs_crack_ui.counting_candidates && !hs_crack_ui.cancel_requested) {
-        if (!hs_crack_workers_start(recs, nrecs)) {
-            snprintf(final_detail, sizeof(final_detail), "Insufficient RAM for workers. Close this dialog and retry Single mode.");
-            goto finish;
-        }
-        hs_crack_ui.counting_candidates = false;
-        hs_crack_ui.last_update_us = 0;
-        goto run_candidates;
-    }
     if (found_idx < 0 && hs_crack_ui.run && !hs_crack_ui.run->error)
         (void)hs_crack_collect(&tried, t0, &found_idx, found_pw, sizeof(found_pw), true);
-    if (hs_crack_ui.run && hs_crack_ui.run->error) {
+    if (found_idx >= 0) final_detail[0] = '\0';
+    if (hs_crack_ui.run && hs_crack_ui.run->error && found_idx < 0) {
         snprintf(final_detail, sizeof(final_detail), "Cryptographic verification failed; result is incomplete.");
         goto finish;
+    }
+    if (final_detail[0] && found_idx < 0) goto finish;
+    if (found_idx >= 0 && !found_from_cache && capture_cache_ready &&
+        active_source_valid) {
+        uint64_t source_tried =
+            active_resumed_tried +
+            (uint64_t)(tried - active_run_tried_start);
+        if (!hs_crack_cache_store_attempt(
+                &capture_id, active_source_generic,
+                active_source_generic ? NULL : &active_wordlist_id,
+                HS_CRACK_ATTEMPT_FOUND, source_tried, found_pw, found_idx)) {
+            cache_save_failed = true;
+        }
+        if (!active_source_generic) {
+            (void)hs_crack_cache_remove_resume(HS_CRACK_RESUME_FILE);
+        }
     }
     if (found_idx >= 0) {
         final_status = "Password found!";
         memset(ssid, 0, sizeof(ssid));
         memcpy(ssid, recs[found_idx].essid, recs[found_idx].essid_len);
+        bool saved_local = hs_crack_save_cracked_local(ssid, found_pw);
+        bool saved_monster = hs_crack_save_to_monster(tab, uart_port, ssid, found_pw);
         snprintf(final_detail, sizeof(final_detail),
-                 "SSID: %s\nPassword: %s\nSource: %s\n(%lu tried)",
-                 ssid, found_pw, hs_crack_ui.candidate_source, (unsigned long)tried);
+                 "SSID: %s\nPassword: %s\nSource: %s\n(%lu tried)\ncracked.txt: %s | Monster: %s",
+                 ssid, found_pw, hs_crack_ui.candidate_source, (unsigned long)tried,
+                 saved_local ? "saved" : "failed",
+                 saved_monster ? "saved" : "not saved");
     } else if (hs_crack_ui.cancel_requested) {
         final_status = "Cancelled";
         snprintf(final_detail, sizeof(final_detail),
@@ -60715,17 +64063,44 @@ done:
         snprintf(final_detail, sizeof(final_detail),
                  "SSID: %s\n%lu passwords tried, no match.\n%s",
                  ssid, (unsigned long)tried,
-                 sd_wordlist_used ? "SD dictionary exhausted." : "No /lab/wordlist.txt; built-in + SSID guesses only.");
+                 sd_wordlist_used ? "Wordlist(s) exhausted."
+                                  : "No wordlists in /lab/wordlist; built-in + SSID guesses only.");
+    }
+
+    // Record the outcome so the crack manager shows what was tried. Skips
+    // cancelled runs (a partial pass is not a real "notfound").
+    if (!hs_crack_ui.cancel_requested) {
+        struct stat pcap_stat;
+        long pcap_size = (stat(HS_CRACK_LOCAL_PCAP, &pcap_stat) == 0)
+                             ? (long)pcap_stat.st_size : 0;
+        hs_crack_journal_result(hs_crack_ui.file_name, ssid, pcap_size, hs_crack_ui.method,
+                                found_idx, hs_crack_ui.candidate_source,
+                                sd_wordlist_used, found_pw);
+    }
+    if (cache_save_failed) {
+        size_t used = strlen(final_detail);
+        if (used + 1U < sizeof(final_detail)) {
+            snprintf(final_detail + used, sizeof(final_detail) - used,
+                     "\nCache/checkpoint save failed.");
+        }
     }
 
 finish:
+    hs_crack_remote_cancel(remote_workers, remote_worker_count);
+    for (size_t i = 0; i < remote_worker_count; ++i) {
+        compromised_transport_lock_end(remote_workers[i].usb_lock_set);
+        remote_workers[i].usb_lock_set = false;
+        hs_crack_remote_release_transport(&remote_workers[i]);
+    }
+    if (remote_probe_claimed) board_probe_in_progress = false;
     if (usb_lock_set) {
         compromised_transport_lock_end(usb_lock_set);
     }
     hs_crack_workers_stop();
     free(recs);
-    unlink(HS_CRACK_LOCAL_HCCAPX);
-    unlink(HS_CRACK_LOCAL_HCCAPX ".part");
+    unlink(HS_CRACK_LOCAL_PCAP);
+    unlink(HS_CRACK_LOCAL_PCAP ".part");
+    unlink(HS_CRACK_REMOTE_HCCAPX);
     if (performance_claimed) {
         (void)app_power_manager_release_performance("wpa-crack");
     }
@@ -60747,10 +64122,14 @@ static void hs_crack_start_file(tab_context_t *ctx, const char *remote_path, con
     hs_crack_ui.tab = current_tab;
     hs_crack_ui.cancel_requested = false;
     hs_crack_ui.last_update_us = 0;
-    hs_crack_ui.counting_candidates = true;
-    hs_crack_ui.total_candidates = 0;
+    hs_crack_ui.wordlist_size = 0;
+    hs_crack_ui.wordlist_offset = 0;
+    hs_crack_ui.source_tried_base = 0;
+    hs_crack_ui.source_started_us = 0;
+    hs_crack_ui.force_rerun = false;
     hs_crack_ui.started = false;
     hs_crack_ui.run = NULL;
+    hs_crack_ui.method = HS_CRACK_METHOD_GENERIC;  // dropdown defaults to Internal
     snprintf(hs_crack_ui.remote_pcap_path, sizeof(hs_crack_ui.remote_pcap_path), "%s", remote_path);
     snprintf(hs_crack_ui.file_name, sizeof(hs_crack_ui.file_name), "%s", file_name);
 
@@ -60838,6 +64217,7 @@ static void compromised_file_copy_cb(lv_event_t *e)
     snprintf(args->remote_path, sizeof(args->remote_path), "%s", file->path);
     snprintf(args->file_name, sizeof(args->file_name), "%s", file->name);
     args->size_bytes = file->size_bytes;
+    args->is_handshake = (kind == COMPROMISED_FILE_KIND_HANDSHAKE);
 
     compromised_transfer_ui.active = true;
     compromised_transfer_ui.cancel_requested = false;

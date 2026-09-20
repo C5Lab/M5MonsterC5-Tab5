@@ -9,3 +9,49 @@
 2026-09-16: Tab5 PMS150G power-button schematic audit; no new reusable skill observations.
 2026-09-16: Tab5 Power remapping feasibility conclusion; no new reusable skill observations.
 2026-09-16: Tab5 power-profile implementation; reusable ESP-IDF 6.x check: pre-v3 ESP32-P4 boards must explicitly pin CONFIG_ESP32P4_SELECTS_REV_LESS_V3 before using the 360/180 MHz clock pair.
+2026-09-18 distributed-crack Tab5 checkpoint: no reusable skill observations.
+2026-09-18 distributed-crack review fixes checkpoint: no reusable skill observations.
+2026-09-19 USB crack-worker sync investigation checkpoint: no reusable skill observations.
+2026-09-19 USB CDC block-size implementation checkpoint: no reusable skill observations.
+2026-09-19 USB CDC sync final verification: no new observation; target-toolchain portability is already tracked by observation 0002.
+2026-09-19 handshake-cracker worker icon UI checkpoint: no new reusable skill observations.
+2026-09-19 handshake-cracker roadmap/history audit checkpoint: no new reusable skill observations.
+2026-09-19 USB fixed-115200 VCP initialization checkpoint: recorded observation 0010 about avoiding synchronous control-transfer waits in USB client callbacks.
+2026-09-19 local Ollama cracker review checkpoint: recorded observation 0011 after two passes produced eleven source-refuted findings; no build or source changes performed.
+2026-09-20 USB binary-transfer diagnosis design checkpoint: no new reusable skill observation; boundary instrumentation follows the existing systematic-debugging guidance.
+2026-09-20 resumable sync and USB diagnostics checkpoint: recorded observation 0012 after Qwen successfully requested an allowlisted non-compiling Python test through Ollama tool calling.
+2026-09-20 Qwen commit-message drafting checkpoint: no new observation; the need to source-check and edit local-LLM output is already captured by observation 0011.
+2026-09-20 Tab5 format-truncation build fix checkpoint: no new observation; target compiler verification remains covered by observation 0002.
+2026-09-20 USB lost-ACK diagnosis checkpoint: no new observation; persisted receiver phase and byte counters validated the existing boundary-instrumentation workflow.
+2026-09-20 Tab5 daily changelog audit checkpoint: no new reusable skill observation.
+2026-09-20 USB ACK diagnosis: when the receiver's committed offset advances but the sender times out, use the receiver checkpoint to prove the forward payload path and isolate the reverse acknowledgement path; single-byte acknowledgements are unsafe across USB-UART bridges that may buffer sub-endpoint packets, so negotiate an endpoint-sized acknowledgement frame instead of tuning timeouts.
+2026-09-20 ACK32 Task 4 checkpoint: no new reusable skill observations; host checks cover parser boundaries and the actual exact-read function, while target and hardware verification remain explicitly deferred to the user.
+2026-09-20 ACK32 Task 4 review checkpoint: no new reusable skill observations; development-version override propagated to implementation and documentation while preserving protocol 3 admission.
+2026-09-20 ACK32 Task 5 audit checkpoint: no new reusable skill observations; cross-repository layout checks and fresh host verification confirmed the negotiated contract while target/hardware acceptance remains explicitly deferred.
+2026-09-20 ACK32 final review checkpoint: no new reusable skill observations; independent full-feature review and controller-run host verification were clean, with both dirty development checkouts intentionally preserved for user hardware testing.
+2026-09-20 USB pre-READY diagnostic checkpoint: no new reusable skill observation yet; evidence narrowed the failure to a pre-data SYNC_ERROR, and Tab5 now preserves `received`, logs malformed CRACK lines, and queries DIAG before any further transport change.
+2026-09-20 USB ACK32 hardware analysis checkpoint: recorded observation 0013 after endpoint MPS 32, host IN request 512, delayed ACK timing, and the exact 53-byte remainder proved a bulk-transfer completion mismatch.
+2026-09-20 USB ACK32 IN=32 implementation checkpoint: no new reusable skill observation; the active/default configuration, compile-time guard, startup log, regression test, sanitized core tests, VCP test, and exact-read harness are green, while target build and hardware acceptance remain with the user.
+2026-09-20 ACK32 Task 1 checkpoint: no new reusable skill observation; the portable receiver classifier is host-tested with literal FTB fixtures, while ESP-IDF build, flashing, and hardware verification remain explicitly deferred to the user.
+2026-09-20 ACK32 Task 1 review-fix checkpoint: no new reusable skill observation; targeted mutation testing proved replay requires both the immediately previous index and ACK32 mode.
+2026-09-20 — no new skill observations after spec audit, implementation plan, and Task 1 reviewed completion.
+2026-09-20 — no new skill observations after Tasks 2–4 reviewed completion; recovery review caught and closed two protocol-boundary defects.
+2026-09-20 — no new skill observations after Task 5, final review, final fix wave, scoped re-review, and fresh controller verification.
+2026-09-20 ACK32 Task 3 checkpoint: no new reusable skill observations; portable capability/timing validation and ACK-stream state are covered by sanitized host tests, with integration, target build, and hardware acceptance deferred to later/user work.
+2026-09-20 ACK32 final-fix checkpoint: no new reusable skill observations after the two production failure-boundary fixes and short-final-block handoff correction; honest RED/GREEN and the permitted host regressions are recorded in the final-fix report.
+2026-09-20 USB ACK32 cross-repo diagnostics: no new reusable skill observations.
+2026-09-20 parallel worker sync feasibility spike: no new reusable skill observations.
+2026-09-20 USB pre-READY failure analysis: no new reusable skill observations; project-specific protocol evidence isolated an unlogged non-READY response.
+2026-09-20 USB pre-READY RED/GREEN checkpoint: no new reusable skill observations; the project-specific rejection recovery contract is covered by the production-loop host test.
+2026-09-20 M-BUS resume timeout analysis: no new reusable skill observations; the issue is specific to the legacy byte-ACK preparation window.
+2026-09-20 M-BUS resume timeout RED/GREEN checkpoint: no new reusable skill observations; the byte-ACK first-byte preparation window is now covered by host tests and protocol documentation.
+2026-09-20 M-BUS prepare-window review checkpoint: no new reusable skill observations; review found and RED/GREEN closed an ACK32 max(prepare_ms, rx_ms) integration edge case.
+2026-09-20 USB probe recovery checkpoint: no new reusable skill observations; atomically framed CLI commands and DIAG-assisted bounded retry are covered by an extracted production-path host test.
+2026-09-20 USB probe recovery review-fix checkpoint: no new reusable skill observations; retry is now forbidden unless DIAG proves an ordered CLI barrier, with RED/GREEN coverage for barrier failure.
+2026-09-20 fast-UART sync fallback checkpoint: no new reusable skill observations; fixed 5-second FILE probes and a restore-confirmed, resume-safe 115200 retry are covered by extracted production-path host tests and independent re-review.
+2026-09-20 USB start recovery checkpoint: no new reusable skill observations; ordered status reconciliation, duplicate-safe retry, and transport-independent preservation of a recovered FOUND result are covered by production-path host tests and independent re-review.
+2026-09-20 USB READY boundary checkpoint: no new reusable skill observations; hardware evidence exposed stateless partial-line loss, now fixed with a bounded post-first-byte completion window and signed deadline arithmetic under production-path tests and independent re-review.
+2026-09-20 worker reliability implementation checkpoint: no new reusable skill observations; bounded stage retry and terminal-boundary recovery are protocol-specific design results covered by cross-repository host contracts.
+2026-09-20 USB 921600 checkpoint: no new reusable skill observations; CH34x-only baud negotiation, confirmed restore, slow fallback, and unsafe-boundary local recovery are covered by extracted production-path host tests.
+2026-09-20 USB 921600 post-arbitration retest checkpoint: no new reusable skill observations; the existing sustained-baud and transport-ownership observations cover this controlled profile change.
+2026-09-20 USB blocking-read optimization checkpoint: observation 0017 records that a driver-provided blocking ring-buffer read should replace check-then-sleep polling, with arrival-before-timeout behavior pinned by a host test.

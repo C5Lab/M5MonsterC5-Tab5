@@ -1780,6 +1780,12 @@ lv_display_t* bsp_display_start(void)
                              }};
     // Increase LVGL task stack size for complex UIs with spinners and overlays
     cfg.lvgl_port_cfg.task_stack = 16384;
+    // Leave task_affinity at the port default (-1, unpinned). Pinning LVGL to
+    // core 1 was tried and made the UI noticeably less smooth: esp_lvgl_port
+    // shares timer_mux between lv_tick_inc (esp_timer task, core 0) and the
+    // touch read in the LVGL task, so pinning forces that 5 ms handoff across
+    // cores, with priority inheritance crossing the core boundary each time.
+    // It also did not help the symptom it was meant to fix.
     return bsp_display_start_with_config(&cfg);
 }
 

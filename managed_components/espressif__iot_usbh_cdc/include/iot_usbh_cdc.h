@@ -33,6 +33,29 @@ typedef enum {
 } usbh_cdc_state_t;
 
 /**
+ * @brief Snapshot of the CDC bulk transport for field diagnostics
+ *
+ * Transfer statuses use the numeric usb_transfer_status_t values. A value of
+ * -1 means that the corresponding callback has not run yet.
+ */
+typedef struct {
+    size_t rx_buffered;
+    size_t tx_buffered;
+    uint32_t rx_completed;
+    uint32_t tx_completed;
+    uint64_t rx_bytes;
+    uint64_t tx_bytes;
+    uint32_t rx_errors;
+    uint32_t tx_errors;
+    uint32_t rx_submit_errors;
+    uint32_t tx_submit_errors;
+    int32_t last_rx_status;
+    int32_t last_tx_status;
+    int32_t last_rx_submit_error;
+    int32_t last_tx_submit_error;
+} usbh_cdc_debug_stats_t;
+
+/**
  * @brief New USB device callback
  *
  * Provides already opened usb_dev, that will be closed after this callback returns.
@@ -294,6 +317,19 @@ esp_err_t usbh_cdc_flush_tx_buffer(usbh_cdc_handle_t cdc_handle);
  *     - ESP_ERR_INVALID_ARG: Invalid CDC handle provided
  */
 esp_err_t usbh_cdc_get_rx_buffer_size(usbh_cdc_handle_t cdc_handle, size_t *size);
+
+/**
+ * @brief Get a non-destructive snapshot of the CDC bulk transport
+ *
+ * @param[in] cdc_handle The CDC device handle
+ * @param[out] stats Destination for counters, queue occupancy and last errors
+ *
+ * @return
+ *     - ESP_OK: Snapshot retrieved successfully
+ *     - ESP_ERR_INVALID_ARG: Invalid handle or destination
+ */
+esp_err_t usbh_cdc_get_debug_stats(usbh_cdc_handle_t cdc_handle,
+                                   usbh_cdc_debug_stats_t *stats);
 
 /**
  * @brief Register an additional callback function for new device detection
