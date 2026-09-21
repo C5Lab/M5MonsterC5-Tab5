@@ -50,6 +50,21 @@ def test_sync_retry_requires_a_safe_boundary_and_uses_resume_backoff():
     assert "hs_crack_remote_abandon_fast_baud(worker)" in sync_file
 
 
+def test_cache_probe_precedes_baud_switch_and_upload_only_handles_missing_files():
+    sync_file = production_function("hs_crack_remote_sync_file")
+    checking_report = sync_file.index(
+        'hs_crack_remote_report(worker, kind, attempt, "checking cache")')
+    cache_check = sync_file.index("hs_crack_remote_check_cache")
+    baud_switch = sync_file.index("janos_uart_set_baud")
+    upload = sync_file.index("hs_crack_remote_upload")
+    assert checking_report < cache_check < baud_switch < upload
+    assert "HS_REMOTE_CACHE_PRESENT" in sync_file
+    assert "HS_REMOTE_CACHE_ERROR" in sync_file
+
+    upload_body = production_function("hs_crack_remote_upload")
+    assert "hs_crack_remote_probe" not in upload_body
+
+
 def test_plain_uart_failure_drains_terminal_text_before_retry():
     upload = production_function("hs_crack_remote_upload")
     recovery = upload.index("block loop ended NOT ok")
@@ -105,8 +120,33 @@ def test_both_poll_failure_paths_mark_lost_and_show_intermediate_misses():
     assert poll.count("hs_crack_remote_mark_lost") == 2
     assert poll.count("hs_crack_remote_report(worker, \"status\"") == 2
     lost = production_function("hs_crack_remote_mark_lost")
-    assert "lost -> local" in lost
+    assert "hs_sched_note_loss" in lost
+    assert "worker->recovery_pending = true" in lost
+    assert "lost, probing" in lost
     assert "confirmed_safe_offset" in lost
+
+
+def test_cancel_logs_request_intermediate_and_terminal_confirmation():
+    cancel = production_function("hs_crack_remote_cancel_one")
+    requested = cancel.index("CANCEL %s job=%s requested")
+    cancelling = cancel.index("message.type == HS_REMOTE_CANCELLING")
+    done = cancel.index("message.type == HS_REMOTE_DONE")
+    status = cancel.index("message.type == HS_REMOTE_STATUS")
+    rejected = cancel.index("message.type == HS_REMOTE_REJECTED")
+    assert requested < cancelling < done < status < rejected
+    assert "CANCELLING %s job=%s acknowledged" in cancel
+    assert "CANCELLED %s job=%s confirmed via DONE" in cancel
+    assert "CANCELLED %s job=%s confirmed via STATUS" in cancel
+    assert "CANCELLED %s job=%s already stopped" in cancel
+    assert "cancel request write failed for %s" in cancel
+
+
+def test_manual_cancel_does_not_play_the_warning_chime():
+    finish = production_function("hs_crack_finish_ui_unlocked")
+    assert "if (found)" in finish
+    assert "ALERT_TONE_WIN" in finish
+    assert "else if (!hs_crack_ui.cancel_requested)" in finish
+    assert "ALERT_TONE_WARN" in finish
 
 
 if __name__ == "__main__":

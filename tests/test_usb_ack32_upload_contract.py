@@ -232,8 +232,6 @@ static int transport_read_bytes_tab(int tab, int port, void *out, size_t n, Tick
     if((scenario==OVERSHOOT || scenario==LATE_CAN) && data_sends[0]==1 && sends==1) now_us+=2100000;
     return (int)got;
 }
-static bool hs_crack_remote_probe(hs_crack_remote_worker_t *w, const char *k, uint64_t s, uint32_t c, bool *p)
-{ (void)w;(void)k;(void)s;(void)c;*p=false;return true; }
 static void compromised_transport_flush(int t, int p) { (void)t;(void)p; }
 static bool hs_crack_remote_send_line(int t,int p,const char *line)
 { (void)t;(void)p; reading_caps=strstr(line,"capabilities")!=NULL; return true; }

@@ -7,6 +7,8 @@ idf_component_register(SRCS
                     "hs_crack_cache.c"
                     "hs_crack_crypto.c"
                     "hs_crack_remote_core.c"
+                    "hs_crack_scheduler.c"
+                    "transfer_speed_config.c"
                     "usb_vcp_config.c"
                     "lv_font_lato_regular_ttf.c"
                     "screens/psram_dynarr.c"

@@ -306,7 +306,9 @@ bool hs_remote_parse_line(const char *line, hs_remote_message_t *message)
     if (!(COMMAND("CAPABILITIES", HS_REMOTE_CAPABILITIES) ||
           COMMAND("FILE", HS_REMOTE_FILE) || COMMAND("READY", HS_REMOTE_READY) ||
           COMMAND("SYNCED", HS_REMOTE_SYNCED) || COMMAND("ACCEPTED", HS_REMOTE_ACCEPTED) ||
-          COMMAND("STARTED", HS_REMOTE_STARTED) || COMMAND("STATUS", HS_REMOTE_STATUS) ||
+          COMMAND("STARTED", HS_REMOTE_STARTED) ||
+          COMMAND("CANCELLING", HS_REMOTE_CANCELLING) ||
+          COMMAND("STATUS", HS_REMOTE_STATUS) ||
           COMMAND("DONE", HS_REMOTE_DONE) || COMMAND("RESET", HS_REMOTE_RESET) ||
           COMMAND("REJECTED", HS_REMOTE_REJECTED) ||
           COMMAND("SYNC_ERROR", HS_REMOTE_SYNC_ERROR) ||
@@ -374,6 +376,10 @@ bool hs_remote_parse_line(const char *line, hs_remote_message_t *message)
         (void)number(line, "cp", 10, &message->diag_checkpoint_calls);
         (void)number(line, "stage_us", 10, &message->diag_stage_us);
         return true;
+    }
+
+    if (message->type == HS_REMOTE_CANCELLING) {
+        return message->job[0] != '\0';
     }
 
     if (message->type == HS_REMOTE_FILE) {

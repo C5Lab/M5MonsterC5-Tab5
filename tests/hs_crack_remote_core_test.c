@@ -114,6 +114,13 @@ static void test_protocol_parser(void)
     CHECK(message.progress_age_ms == 37);
 
     CHECK(hs_remote_parse_line(
+        "[CRACK/1] CANCELLING job=j-1", &message));
+    CHECK(message.type == HS_REMOTE_CANCELLING);
+    CHECK(strcmp(message.job, "j-1") == 0);
+    CHECK(message.result == HS_REMOTE_RESULT_NONE);
+    CHECK(!hs_remote_parse_line("[CRACK/1] CANCELLING", &message));
+
+    CHECK(hs_remote_parse_line(
         "[CRACK/1] DONE job=j-1 result=found checked=22 safe_offset=900 ssid_hex=54657374 password_hex=70617373776F7264", &message));
     CHECK(message.type == HS_REMOTE_DONE);
     CHECK(message.result == HS_REMOTE_RESULT_FOUND);

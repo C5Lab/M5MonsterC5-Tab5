@@ -28,6 +28,7 @@ HARNESS = r'''
 #include <string.h>
 #include <stdarg.h>
 #include "hs_crack_remote_core.h"
+#include "hs_crack_scheduler.h"
 
 typedef int tab_id_t;
 typedef int uart_port_t;
@@ -46,6 +47,7 @@ typedef struct {
     char job[32];
     uint64_t shard_start, shard_end, checked, accounted;
     hs_remote_lease_t lease;
+    hs_sched_shard_t *sched_shard;
     uint8_t found_ssid[32];
     size_t found_ssid_length;
     bool pending_found;
@@ -186,6 +188,8 @@ for function_name in (
     "hs_crack_remote_start_confirmed",
     "hs_crack_remote_wait_start",
     "hs_crack_remote_start",
+    "hs_crack_sched_owner",
+    "hs_crack_remote_owns_sched_generation",
     "hs_crack_remote_add_checked",
     "hs_crack_remote_take_pending_found",
 ):
@@ -359,6 +363,7 @@ with tempfile.TemporaryDirectory() as temporary:
             str(ROOT / "main"),
             str(harness),
             str(ROOT / "main/hs_crack_remote_core.c"),
+            str(ROOT / "main/hs_crack_scheduler.c"),
             str(ROOT / "main/hs_crack_cache.c"),
             "-o",
             str(binary),

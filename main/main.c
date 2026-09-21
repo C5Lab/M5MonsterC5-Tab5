@@ -70,6 +70,8 @@
 #include "hs_crack_cache.h"
 #include "hs_crack_crypto.h"
 #include "hs_crack_remote_core.h"
+#include "hs_crack_scheduler.h"
+#include "transfer_speed_config.h"
 #include "usb_vcp_config.h"
 #include <stdatomic.h>
 #include "freertos/queue.h"
@@ -51408,6 +51410,7 @@ static __attribute__((unused)) lv_obj_t *settings_popup_obj = NULL;
 #define NVS_KEY_WD_AUTOUP_ARCH  "wd_au_arch"
 #define NVS_KEY_WD_AUTOUP_POFF  "wd_au_poff"
 #define NVS_KEY_FT_BAUD         "ft_baud"
+#define NVS_KEY_USB_FT_BAUD     "usb_ft_baud"
 
 // Console rate used for JanOS file transfers over the external UARTs.
 //
@@ -51416,26 +51419,8 @@ static __attribute__((unused)) lv_obj_t *settings_popup_obj = NULL;
 // on the actual hardware. Every entry here is one JanOS accepts; if the switch
 // is not confirmed both ends fall back to 115200 and the transfer still runs,
 // so a rate the cable cannot carry costs one slow transfer, not a dead link.
-static const uint32_t JANOS_FT_BAUD_CHOICES[] = {
-    115200, 230400, 460800, 921600, 1000000, 1500000, 2000000, 3000000, 4000000
-};
-#define JANOS_FT_BAUD_CHOICE_COUNT (sizeof(JANOS_FT_BAUD_CHOICES) / sizeof(JANOS_FT_BAUD_CHOICES[0]))
-#define JANOS_FT_BAUD_DEFAULT 460800U
-
-static uint32_t janos_ft_baud = JANOS_FT_BAUD_DEFAULT;
-
-// Index of `rate` in the choice list, or of the default when it is not one of
-// them - which is what a stored value from a build with a different ladder
-// looks like.
-static uint16_t janos_ft_baud_index(uint32_t rate)
-{
-    uint16_t fallback = 0;
-    for (uint16_t i = 0; i < JANOS_FT_BAUD_CHOICE_COUNT; i++) {
-        if (JANOS_FT_BAUD_CHOICES[i] == rate) return i;
-        if (JANOS_FT_BAUD_CHOICES[i] == JANOS_FT_BAUD_DEFAULT) fallback = i;
-    }
-    return fallback;
-}
+static uint32_t janos_ft_baud = JANOS_FT_HARDWARE_DEFAULT;
+static uint32_t janos_usb_ft_baud = JANOS_FT_USB_DEFAULT;
 
 static void load_janos_ft_baud_from_nvs(void)
 {
@@ -51444,25 +51429,63 @@ static void load_janos_ft_baud_from_nvs(void)
         return;
     }
     uint32_t stored = 0;
-    if (nvs_get_u32(nvs, NVS_KEY_FT_BAUD, &stored) == ESP_OK &&
-        JANOS_FT_BAUD_CHOICES[janos_ft_baud_index(stored)] == stored) {
-        janos_ft_baud = stored;
+    if (nvs_get_u32(nvs, NVS_KEY_FT_BAUD, &stored) == ESP_OK) {
+        janos_ft_baud = janos_ft_baud_sanitize(
+            JANOS_FT_LINK_HARDWARE_UART, stored);
+    }
+    if (nvs_get_u32(nvs, NVS_KEY_USB_FT_BAUD, &stored) == ESP_OK) {
+        janos_usb_ft_baud = janos_ft_baud_sanitize(
+            JANOS_FT_LINK_USB_CH34X, stored);
     }
     nvs_close(nvs);
-    ESP_LOGI(TAG, "Monster transfer rate: %lu baud", (unsigned long)janos_ft_baud);
+    ESP_LOGI(TAG, "Monster transfer rates: Grove/M-BUS=%lu, USB=%lu baud",
+             (unsigned long)janos_ft_baud,
+             (unsigned long)janos_usb_ft_baud);
 }
 
 static void save_janos_ft_baud_to_nvs(uint32_t rate)
 {
     nvs_handle_t nvs;
-    if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs) != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to open NVS for writing transfer rate");
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to open NVS for writing transfer rate: %s",
+                 esp_err_to_name(err));
         return;
     }
-    nvs_set_u32(nvs, NVS_KEY_FT_BAUD, rate);
-    nvs_commit(nvs);
+    err = nvs_set_u32(nvs, NVS_KEY_FT_BAUD, rate);
+    if (err == ESP_OK) {
+        err = nvs_commit(nvs);
+    }
     nvs_close(nvs);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to save Monster transfer rate: %s",
+                 esp_err_to_name(err));
+        return;
+    }
     ESP_LOGI(TAG, "Saved Monster transfer rate to NVS: %lu baud", (unsigned long)rate);
+}
+
+static void save_janos_usb_ft_baud_to_nvs(uint32_t rate)
+{
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to open NVS for writing USB transfer rate: %s",
+                 esp_err_to_name(err));
+        return;
+    }
+    err = nvs_set_u32(nvs, NVS_KEY_USB_FT_BAUD, rate);
+    if (err == ESP_OK) {
+        err = nvs_commit(nvs);
+    }
+    nvs_close(nvs);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to save USB transfer rate: %s",
+                 esp_err_to_name(err));
+        return;
+    }
+    ESP_LOGI(TAG, "Saved USB transfer rate to NVS: %lu baud",
+             (unsigned long)rate);
 }
 
 // Load Red Team setting from NVS (called on startup)
@@ -54903,11 +54926,9 @@ static void show_screen_lock_popup(void)
 }
 
 // ====================== Monster transfer speed ========================
-// The console rate JanOS is asked to switch to for the duration of a file
-// transfer. Kept here rather than in a header constant because the ceiling is a
-// property of the cable between the boards, so finding it means trying rates on
-// the hardware in hand - and a rate that does not work costs one slow transfer,
-// not a reflash.
+// JanOS temporarily switches its console while a file is transferred. Hardware
+// UART wiring and the CH34x USB bridge have independent ceilings, so Settings
+// keeps and validates one rate for each transport family.
 
 static lv_obj_t *ft_baud_popup_overlay = NULL;
 
@@ -54920,14 +54941,82 @@ static void ft_baud_popup_close_cb(lv_event_t *e)
     }
 }
 
-static void ft_baud_dropdown_cb(lv_event_t *e)
+static void ft_baud_hardware_dropdown_cb(lv_event_t *e)
 {
     lv_obj_t *dropdown = lv_event_get_target(e);
     uint16_t sel = lv_dropdown_get_selected(dropdown);
-    if (sel >= JANOS_FT_BAUD_CHOICE_COUNT) return;
+    uint32_t rate = janos_ft_baud_choice_at(JANOS_FT_LINK_HARDWARE_UART, sel);
+    if (rate == 0U) return;
 
-    janos_ft_baud = JANOS_FT_BAUD_CHOICES[sel];
+    janos_ft_baud = rate;
     save_janos_ft_baud_to_nvs(janos_ft_baud);
+}
+
+static void ft_baud_usb_dropdown_cb(lv_event_t *e)
+{
+    lv_obj_t *dropdown = lv_event_get_target(e);
+    uint16_t sel = lv_dropdown_get_selected(dropdown);
+    uint32_t rate = janos_ft_baud_choice_at(JANOS_FT_LINK_USB_CH34X, sel);
+    if (rate == 0U) return;
+
+    janos_usb_ft_baud = rate;
+    save_janos_usb_ft_baud_to_nvs(janos_usb_ft_baud);
+}
+
+static void ft_baud_build_options(janos_ft_link_t link,
+                                  char *options, size_t options_size)
+{
+    if (!options || options_size == 0U) return;
+    options[0] = '\0';
+    size_t used = 0;
+    size_t count = janos_ft_baud_choice_count(link);
+    for (size_t i = 0; i < count && used < options_size; ++i) {
+        int written = snprintf(options + used, options_size - used, "%s%lu",
+                               i ? "\n" : "",
+                               (unsigned long)janos_ft_baud_choice_at(link, i));
+        if (written <= 0 || (size_t)written >= options_size - used) break;
+        used += (size_t)written;
+    }
+}
+
+static lv_obj_t *ft_baud_create_row(lv_obj_t *parent, const char *label,
+                                    janos_ft_link_t link, uint32_t selected,
+                                    lv_event_cb_t callback)
+{
+    lv_obj_t *row = lv_obj_create(parent);
+    lv_obj_set_size(row, lv_pct(100), 64);
+    lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(row, 0, 0);
+    lv_obj_set_style_pad_all(row, 0, 0);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN,
+                         LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *row_label = lv_label_create(row);
+    lv_label_set_text(row_label, label);
+    lv_obj_set_style_text_font(row_label, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_color(row_label, ui_text_color(), 0);
+
+    char options[160];
+    ft_baud_build_options(link, options, sizeof(options));
+
+    lv_obj_t *dropdown = lv_dropdown_create(row);
+    lv_dropdown_set_options(dropdown, options);
+    lv_dropdown_set_selected(dropdown, janos_ft_baud_index(link, selected));
+    lv_obj_set_width(dropdown, 190);
+    lv_obj_set_style_text_font(dropdown, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_bg_color(dropdown, ui_card_color(), 0);
+    lv_obj_set_style_border_color(dropdown, ui_border_color(), 0);
+    lv_obj_set_style_text_color(dropdown, ui_text_color(), 0);
+    lv_obj_t *list = lv_dropdown_get_list(dropdown);
+    if (list) {
+        lv_obj_set_style_bg_color(list, ui_card_color(), 0);
+        lv_obj_set_style_border_color(list, ui_border_color(), 0);
+        lv_obj_set_style_text_color(list, ui_text_color(), 0);
+    }
+    lv_obj_add_event_cb(dropdown, callback, LV_EVENT_VALUE_CHANGED, NULL);
+    return row;
 }
 
 static void show_ft_baud_popup(void)
@@ -54940,7 +55029,7 @@ static void show_ft_baud_popup(void)
     style_modal_overlay(ft_baud_popup_overlay, dark_mode_enabled ? LV_OPA_50 : LV_OPA_30);
 
     lv_obj_t *card = lv_obj_create(ft_baud_popup_overlay);
-    lv_obj_set_size(card, 430, 340);
+    lv_obj_set_size(card, 500, 420);
     lv_obj_center(card);
     style_popup_card(card, 12, ui_tab_icon_color());
     lv_obj_set_style_pad_all(card, 18, 0);
@@ -54953,52 +55042,18 @@ static void show_ft_baud_popup(void)
     lv_obj_set_style_text_font(title, &lv_font_montserrat_22, 0);
     lv_obj_set_style_text_color(title, dark_mode_enabled ? COLOR_LAB5_MAGENTA : ui_tab_icon_color(), 0);
 
-    lv_obj_t *row = lv_obj_create(card);
-    lv_obj_set_size(row, lv_pct(100), 64);
-    lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(row, 0, 0);
-    lv_obj_set_style_pad_all(row, 0, 0);
-    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-
-    lv_obj_t *row_label = lv_label_create(row);
-    lv_label_set_text(row_label, "Console baud");
-    lv_obj_set_style_text_font(row_label, &lv_font_montserrat_18, 0);
-    lv_obj_set_style_text_color(row_label, ui_text_color(), 0);
-
-    char options[160];
-    size_t used = 0;
-    for (uint16_t i = 0; i < JANOS_FT_BAUD_CHOICE_COUNT && used < sizeof(options); i++) {
-        int written = snprintf(options + used, sizeof(options) - used, "%s%lu",
-                               i ? "\n" : "", (unsigned long)JANOS_FT_BAUD_CHOICES[i]);
-        if (written <= 0 || (size_t)written >= sizeof(options) - used) break;
-        used += (size_t)written;
-    }
-
-    lv_obj_t *dropdown = lv_dropdown_create(row);
-    lv_dropdown_set_options(dropdown, options);
-    lv_dropdown_set_selected(dropdown, janos_ft_baud_index(janos_ft_baud));
-    lv_obj_set_width(dropdown, 190);
-    lv_obj_set_style_text_font(dropdown, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_bg_color(dropdown, ui_card_color(), 0);
-    lv_obj_set_style_border_color(dropdown, ui_border_color(), 0);
-    lv_obj_set_style_text_color(dropdown, ui_text_color(), 0);
-    lv_obj_t *list = lv_dropdown_get_list(dropdown);
-    if (list) {
-        lv_obj_set_style_bg_color(list, ui_card_color(), 0);
-        lv_obj_set_style_border_color(list, ui_border_color(), 0);
-        lv_obj_set_style_text_color(list, ui_text_color(), 0);
-    }
-    lv_obj_add_event_cb(dropdown, ft_baud_dropdown_cb, LV_EVENT_VALUE_CHANGED, NULL);
+    ft_baud_create_row(card, "Grove / M-BUS",
+                       JANOS_FT_LINK_HARDWARE_UART, janos_ft_baud,
+                       ft_baud_hardware_dropdown_cb);
+    ft_baud_create_row(card, "USB (CH34x)",
+                       JANOS_FT_LINK_USB_CH34X, janos_usb_ft_baud,
+                       ft_baud_usb_dropdown_cb);
 
     lv_obj_t *desc = lv_label_create(card);
     lv_label_set_text(desc,
-        "Rate the Monster console is switched to while a file\n"
-        "is copied over Grove or M-BUS. Higher is faster but\n"
-        "depends on the cable: if the switch is not confirmed,\n"
-        "the copy still runs at 115200.\n"
-        "The transfer popup reports the KB/s it achieved.");
+        "Temporary console rate used while files are copied.\n"
+        "Each link returns to 115200 after the transfer. USB\n"
+        "uses a CH34x-safe list and resumes at 115200 on failure.");
     lv_obj_set_style_text_font(desc, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(desc, ui_muted_color(), 0);
     lv_obj_set_width(desc, lv_pct(100));
@@ -58771,8 +58826,6 @@ static void compromised_transfer_delete_current_task(void)
  * (last line: none)" instead of the retry limit that actually happened. */
 #define JANOS_UART_FT_RETRIES          2
 #define JANOS_UART_FT_DEFAULT_BAUD 115200
-#define JANOS_USB_FT_FAST_BAUD     921600
-
 typedef enum {
     JANOS_BAUD_LOST = -1,
     JANOS_BAUD_DEFAULT = 0,
@@ -59685,7 +59738,7 @@ static void compromised_transfer_task(void *arg)
     bool use_uart = !tab_is_internal(tab);
     ESP_LOGI(TAG, "[Monster transfer] %s (%ld B) -> %s",
              args->file_name, args->size_bytes,
-             use_uart ? "M-BUS UART" : "Wi-Fi");
+             use_uart ? tab_transport_name(tab) : "Wi-Fi");
 
     if (use_uart) {
         char uart_local_path[256];
@@ -59697,12 +59750,19 @@ static void compromised_transfer_task(void *arg)
             goto cleanup;
         }
 
-        compromised_transfer_set_stage("Switching M-BUS to high speed...",
-                                       "Copying over the serial bus", 0);
-        /* Settings > Transfer Speed, persisted in NVS. Selecting the default
-         * rate makes janos_uart_set_baud a no-op, which is the same path an
+        char switch_stage[64];
+        snprintf(switch_stage, sizeof(switch_stage),
+                 "Switching %s to high speed...", tab_transport_name(tab));
+        compromised_transfer_set_stage(switch_stage,
+                                       "Copying over the serial console", 0);
+        /* Settings > Transfer Speed, persisted in NVS. Selecting 115200
+         * makes janos_uart_set_baud a no-op, which is the same path an
          * unconfirmed switch lands on: the copy runs at 115200. */
-        int fast_baud = (int)janos_ft_baud;
+        janos_ft_link_t speed_link = tab == TAB_USB
+                                         ? JANOS_FT_LINK_USB_CH34X
+                                         : JANOS_FT_LINK_HARDWARE_UART;
+        int fast_baud = (int)janos_ft_baud_selected(
+            speed_link, janos_ft_baud, janos_usb_ft_baud);
         janos_uart_baud_result_t baud_result =
             janos_uart_set_baud(tab, uart_port, fast_baud);
         if (baud_result == JANOS_BAUD_LOST) {
@@ -59716,7 +59776,10 @@ static void compromised_transfer_task(void *arg)
         char baud_detail[64];
         snprintf(baud_detail, sizeof(baud_detail), "Console running at %d baud",
                  fast ? fast_baud : JANOS_UART_FT_DEFAULT_BAUD);
-        compromised_transfer_set_stage("Copying over M-BUS...", baud_detail, 0);
+        char copy_stage[64];
+        snprintf(copy_stage, sizeof(copy_stage), "Copying over %s...",
+                 tab_transport_name(tab));
+        compromised_transfer_set_stage(copy_stage, baud_detail, 0);
         result_err = janos_uart_download(tab, uart_port, args->remote_path, uart_local_path,
                                          (uint64_t)args->size_bytes,
                                          &compromised_transfer_ui.cancel_requested, &result);
@@ -59727,13 +59790,14 @@ static void compromised_transfer_task(void *arg)
 
         if (result_err == ESP_OK) {
             snprintf(final_detail, sizeof(final_detail),
-                     "Copied over M-BUS.\n%s\n%llu bytes, CRC32 %08lX",
-                     result.final_path, (unsigned long long)result.bytes_written,
+                     "Copied over %s.\n%s\n%llu bytes, CRC32 %08lX",
+                     tab_transport_name(tab), result.final_path,
+                     (unsigned long long)result.bytes_written,
                      (unsigned long)result.crc32);
         } else {
             snprintf(final_detail, sizeof(final_detail),
-                     "M-BUS copy failed: %s\n%llu of %llu bytes kept in .part for resume",
-                     esp_err_to_name(result_err),
+                     "%s copy failed: %s\n%llu of %llu bytes kept in .part for resume",
+                     tab_transport_name(tab), esp_err_to_name(result_err),
                      (unsigned long long)result.bytes_written,
                      (unsigned long long)result.remote_size_before);
         }
@@ -60187,6 +60251,11 @@ typedef struct {
     uint64_t checked;
     uint64_t accounted;
     hs_remote_lease_t lease;
+    hs_sched_shard_t *sched_shard;
+    bool recovery_pending;
+    uint8_t recovery_attempts;
+    int64_t next_recovery_us;
+    char retired_job[32];
     uint8_t found_ssid[32];
     size_t found_ssid_length;
     bool pending_found;
@@ -60195,6 +60264,26 @@ typedef struct {
     uint8_t pending_ssid[32];
     size_t pending_ssid_length;
 } hs_crack_remote_worker_t;
+
+typedef struct {
+    uint64_t capture_size;
+    uint32_t capture_crc;
+    const char *wordlist_path;
+    uint64_t wordlist_size;
+    uint32_t wordlist_crc;
+} hs_crack_remote_recovery_ctx_t;
+
+#define HS_CRACK_RECOVERY_INTERVAL_US 5000000LL
+
+static hs_sched_owner_t hs_crack_sched_owner(tab_id_t tab)
+{
+    switch (tab) {
+    case TAB_GROVE: return HS_SCHED_OWNER_GROVE;
+    case TAB_USB: return HS_SCHED_OWNER_USB;
+    case TAB_MBUS: return HS_SCHED_OWNER_MBUS;
+    default: return HS_SCHED_OWNER_NONE;
+    }
+}
 
 typedef struct {
     volatile bool active;
@@ -60990,7 +61079,12 @@ static bool hs_crack_remote_wait_end(tab_id_t tab, uart_port_t port,
     int64_t deadline = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
     while (esp_timer_get_time() < deadline) {
         uint32_t left = (uint32_t)((deadline - esp_timer_get_time()) / 1000);
-        if (!hs_crack_remote_read_message(tab, port, &message, left)) return false;
+        /* Raw-transfer cleanup is mandatory even after the user presses
+         * Cancel.  The normal reader stops immediately on cancel_requested,
+         * which used to leave JanOS at the fast baud and made the next worker
+         * discovery report "no CRACK/1 worker". */
+        if (!hs_crack_remote_read_message_force(tab, port, &message, left))
+            return false;
         if (message.type == HS_REMOTE_END) {
             char blank[4];
             (void)janos_uart_read_line(tab, port, blank, sizeof(blank), 100);
@@ -60998,6 +61092,59 @@ static bool hs_crack_remote_wait_end(tab_id_t tab, uart_port_t port,
         }
     }
     return false;
+}
+
+/* Recovery owns the same transport lock as the cracker.  Keep this probe
+ * separate from boot-time board detection: those helpers mutate global board
+ * state and may hand the RX stream to unrelated consumers. */
+static bool hs_crack_remote_recovery_ping(tab_id_t tab, uart_port_t port)
+{
+    if (!hs_crack_remote_send_line(tab, port, "ping")) return false;
+
+    char line[HS_CRACK_REMOTE_LINE_BYTES];
+    int64_t deadline = esp_timer_get_time() + 1500000LL;
+    while (esp_timer_get_time() < deadline) {
+        uint32_t left = (uint32_t)((deadline - esp_timer_get_time()) / 1000LL);
+        uint32_t slice = left > 250U ? 250U : left;
+        if (!janos_uart_read_line(tab, port, line, sizeof(line), slice)) continue;
+        if (strstr(line, "pong") != NULL) return true;
+    }
+    return false;
+}
+
+static hs_sched_recovery_event_t hs_crack_remote_recovery_status(
+    tab_id_t tab, uart_port_t port, const char *job,
+    hs_remote_message_t *reply)
+{
+    if (!job || !job[0] || !reply) return HS_SCHED_AMBIGUOUS;
+
+    char command[80];
+    snprintf(command, sizeof(command), "crack_worker status %s", job);
+    if (!hs_crack_remote_send_line(tab, port, command))
+        return HS_SCHED_AMBIGUOUS;
+
+    int64_t deadline = esp_timer_get_time() + 2000000LL;
+    while (esp_timer_get_time() < deadline) {
+        uint32_t left = (uint32_t)((deadline - esp_timer_get_time()) / 1000LL);
+        memset(reply, 0, sizeof(*reply));
+        if (!hs_crack_remote_read_message_force(tab, port, reply, left)) break;
+        if (reply->type == HS_REMOTE_REJECTED &&
+            strcmp(reply->code, "unknown_job") == 0) {
+            return HS_SCHED_UNKNOWN_JOB;
+        }
+        if ((reply->type != HS_REMOTE_STATUS && reply->type != HS_REMOTE_DONE) ||
+            strcmp(reply->job, job) != 0) {
+            continue;
+        }
+        if (reply->result == HS_REMOTE_RESULT_RUNNING)
+            return HS_SCHED_OLD_JOB_RUNNING;
+        if (reply->result == HS_REMOTE_RESULT_FOUND)
+            return HS_SCHED_OLD_JOB_FOUND;
+        if (reply->result == HS_REMOTE_RESULT_NOT_FOUND)
+            return HS_SCHED_OLD_JOB_NOT_FOUND;
+        return HS_SCHED_AMBIGUOUS;
+    }
+    return HS_SCHED_AMBIGUOUS;
 }
 
 static void hs_crack_remote_report_current(hs_crack_remote_worker_t *worker,
@@ -61603,12 +61750,17 @@ static int hs_crack_remote_usb_upload(hs_crack_remote_worker_t *worker,
 }
 /* USB ACK32 upload helpers end */
 
-static bool hs_crack_remote_upload(hs_crack_remote_worker_t *worker,
-                                   const char *kind, const char *path,
-                                   uint64_t size, uint32_t crc32)
+typedef enum {
+    HS_REMOTE_CACHE_ERROR = -1,
+    HS_REMOTE_CACHE_MISSING = 0,
+    HS_REMOTE_CACHE_PRESENT = 1,
+} hs_remote_cache_state_t;
+
+static hs_remote_cache_state_t hs_crack_remote_check_cache(
+    hs_crack_remote_worker_t *worker, const char *kind,
+    uint64_t size, uint32_t crc32)
 {
     char prepare_detail[160];
-    hs_crack_remote_report_current(worker, "checking cache");
     snprintf(prepare_detail, sizeof(prepare_detail),
              "%s: checking %s",
              tab_transport_name(worker->tab), kind);
@@ -61623,11 +61775,16 @@ static bool hs_crack_remote_upload(hs_crack_remote_worker_t *worker,
         } else {
             hs_crack_remote_report_current(worker, "probe failed; retry safe");
         }
-        return false;
+        return HS_REMOTE_CACHE_ERROR;
     }
     ESP_LOGW(TAG, "[HS-DBG] %s: probe ok present=%d (%s)", tab_transport_name(worker->tab), (int)present, kind);
-    if (present) return true;
+    return present ? HS_REMOTE_CACHE_PRESENT : HS_REMOTE_CACHE_MISSING;
+}
 
+static bool hs_crack_remote_upload(hs_crack_remote_worker_t *worker,
+                                   const char *kind, const char *path,
+                                   uint64_t size, uint32_t crc32)
+{
     hs_crack_remote_report_current(worker, "transferring");
 
     const bool usb_cdc = worker->tab == TAB_USB;
@@ -62109,11 +62266,25 @@ static void hs_crack_remote_publish_counts(const hs_crack_remote_worker_t *worke
     hs_crack_ui.remote_failed = (uint8_t)failed;
 }
 
+static bool hs_crack_remote_owns_sched_generation(
+    const hs_crack_remote_worker_t *worker)
+{
+    if (!worker || !worker->sched_shard) return false;
+    const hs_sched_shard_t *shard = worker->sched_shard;
+    return shard->state == HS_SCHED_LEASED &&
+           shard->owner == hs_crack_sched_owner(worker->tab) &&
+           shard->active_job[0] && worker->job[0] &&
+           strcmp(shard->active_job, worker->job) == 0;
+}
+
 static void hs_crack_remote_add_checked(hs_crack_remote_worker_t *worker,
                                         uint32_t *tried, uint64_t checked)
 {
-    if (checked <= worker->accounted) return;
-    uint64_t delta = checked - worker->accounted;
+    uint64_t delta = hs_crack_remote_owns_sched_generation(worker)
+                         ? hs_sched_account_checked(worker->sched_shard, checked)
+                         : (checked > worker->accounted
+                                ? checked - worker->accounted : 0U);
+    if (delta == 0U) return;
     uint64_t room = UINT32_MAX - (uint64_t)*tried;
     *tried += (uint32_t)(delta > room ? room : delta);
     worker->accounted = checked;
@@ -62154,15 +62325,22 @@ static bool hs_crack_remote_take_pending_found(
 static void hs_crack_remote_mark_lost(hs_crack_remote_worker_t *worker,
                                       const char *reason)
 {
+    snprintf(worker->retired_job, sizeof(worker->retired_job), "%s",
+             worker->job);
+    if (worker->sched_shard)
+        (void)hs_sched_note_loss(worker->sched_shard, worker->retired_job);
     worker->failed = true;
     worker->finished = false;
     worker->active = false;
     worker->cancel_pending = true;
-    snprintf(worker->stage, sizeof(worker->stage), "fallback");
+    worker->recovery_pending = true;
+    worker->recovery_attempts = 0;
+    worker->next_recovery_us = esp_timer_get_time();
+    snprintf(worker->stage, sizeof(worker->stage), "recovering");
     snprintf(worker->stage_reason, sizeof(worker->stage_reason), "%s",
              reason ? reason : "lost");
     snprintf(hs_crack_ui.worker_status[worker->tab],
-             sizeof(hs_crack_ui.worker_status[0]), "lost -> local (%.24s)",
+             sizeof(hs_crack_ui.worker_status[0]), "lost, probing (%.24s)",
              worker->stage_reason);
     hs_crack_render_workers();
     ESP_LOGW(TAG, "[HS-CRACK] LOST %s job=%s safe_offset=%llu reason=%s",
@@ -62171,10 +62349,19 @@ static void hs_crack_remote_mark_lost(hs_crack_remote_worker_t *worker,
              worker->stage_reason);
 }
 
+static bool hs_crack_remote_try_recover(
+    hs_crack_remote_worker_t *worker,
+    const hs_crack_remote_recovery_ctx_t *recovery,
+    uint32_t *tried, char *found_pw, size_t found_pw_size);
+
 static bool hs_crack_remote_poll(hs_crack_remote_worker_t *worker,
+                                 const hs_crack_remote_recovery_ctx_t *recovery,
                                  uint32_t *tried, char *found_pw,
                                  size_t found_pw_size)
 {
+    if (worker->recovery_pending)
+        return hs_crack_remote_try_recover(worker, recovery, tried,
+                                           found_pw, found_pw_size);
     if (!worker->active || worker->finished) return false;
     if (hs_crack_remote_take_pending_found(worker, tried, found_pw,
                                             found_pw_size)) return true;
@@ -62202,6 +62389,8 @@ static bool hs_crack_remote_poll(hs_crack_remote_worker_t *worker,
             strcmp(message.job, worker->job) != 0) continue;
         uint64_t previous_checked = worker->checked;
         hs_remote_lease_note_response(&worker->lease, message.offset);
+        if (worker->sched_shard)
+            (void)hs_sched_note_progress(worker->sched_shard, message.offset);
         hs_crack_remote_add_checked(worker, tried, message.checked);
         if (message.result == HS_REMOTE_RESULT_RUNNING) {
             if (message.checked != previous_checked) {
@@ -62255,6 +62444,8 @@ static bool hs_crack_remote_poll(hs_crack_remote_worker_t *worker,
         if (message.result == HS_REMOTE_RESULT_NOT_FOUND &&
             hs_remote_not_found_completes_shard(
                 worker->lease.confirmed_safe_offset, worker->shard_end)) {
+            if (worker->sched_shard)
+                (void)hs_sched_complete(worker->sched_shard, message.offset);
             ESP_LOGI(TAG,
                      "[HS-CRACK] DONE %s job=%s result=not_found checked=%llu safe_offset=%llu",
                      tab_transport_name(worker->tab), worker->job,
@@ -62267,6 +62458,10 @@ static bool hs_crack_remote_poll(hs_crack_remote_worker_t *worker,
         }
         worker->failed = true;
         worker->finished = false;
+        if (worker->sched_shard) {
+            (void)hs_sched_note_progress(worker->sched_shard, message.offset);
+            (void)hs_sched_queue_suffix(worker->sched_shard);
+        }
         snprintf(hs_crack_ui.worker_status[worker->tab],
                  sizeof(hs_crack_ui.worker_status[0]), "failed");
         hs_crack_render_workers();
@@ -62313,14 +62508,21 @@ static int hs_crack_remote_record_index(const hs_crack_remote_worker_t *worker,
 static void hs_crack_remote_cancel_one(hs_crack_remote_worker_t *worker)
 {
     if (!worker || (!worker->active && !worker->cancel_pending)) return;
+    const char *transport = tab_transport_name(worker->tab);
     char command[80];
     snprintf(command, sizeof(command), "crack_worker cancel %s", worker->job);
+    ESP_LOGI(TAG, "[HS-CRACK] CANCEL %s job=%s requested",
+             transport, worker->job);
     bool sent = hs_crack_remote_send_line_force(worker->tab, worker->port,
                                                 command);
     if (!sent) {
         vTaskDelay(pdMS_TO_TICKS(100));
         sent = hs_crack_remote_send_line_force(worker->tab, worker->port,
                                                command);
+    }
+    if (!sent) {
+        ESP_LOGW(TAG, "[HS-CRACK] cancel request write failed for %s",
+                 transport);
     }
 
     bool confirmed = false;
@@ -62339,26 +62541,38 @@ static void hs_crack_remote_cancel_one(hs_crack_remote_worker_t *worker)
             }
             continue;
         }
+        if (message.type == HS_REMOTE_CANCELLING &&
+            strcmp(message.job, worker->job) == 0) {
+            ESP_LOGI(TAG, "[HS-CRACK] CANCELLING %s job=%s acknowledged",
+                     transport, worker->job);
+            continue;
+        }
         if (message.type == HS_REMOTE_DONE &&
             strcmp(message.job, worker->job) == 0) {
+            ESP_LOGI(TAG, "[HS-CRACK] CANCELLED %s job=%s confirmed via DONE",
+                     transport, worker->job);
             confirmed = true;
             break;
         }
         if (message.type == HS_REMOTE_STATUS &&
             strcmp(message.job, worker->job) == 0 &&
             message.result != HS_REMOTE_RESULT_RUNNING) {
+            ESP_LOGI(TAG, "[HS-CRACK] CANCELLED %s job=%s confirmed via STATUS",
+                     transport, worker->job);
             confirmed = true;
             break;
         }
         if (message.type == HS_REMOTE_REJECTED &&
             strcmp(message.code, "no_running_job") == 0) {
+            ESP_LOGI(TAG, "[HS-CRACK] CANCELLED %s job=%s already stopped",
+                     transport, worker->job);
             confirmed = true;
             break;
         }
     }
     if (!confirmed) {
         ESP_LOGW(TAG, "[HS-CRACK] cancel not confirmed by %s",
-                 tab_transport_name(worker->tab));
+                 transport);
     }
     worker->active = false;
     worker->finished = true;
@@ -62413,35 +62627,53 @@ static bool hs_crack_remote_sync_file(hs_crack_remote_worker_t *worker,
 {
     if (!enabled) return true;
 
-    int fast_baud = worker->tab == TAB_USB
-                        ? JANOS_USB_FT_FAST_BAUD
-                        : (int)janos_ft_baud;
+    janos_ft_link_t speed_link = worker->tab == TAB_USB
+                                     ? JANOS_FT_LINK_USB_CH34X
+                                     : JANOS_FT_LINK_HARDWARE_UART;
+    int fast_baud = (int)janos_ft_baud_selected(
+        speed_link, janos_ft_baud, janos_usb_ft_baud);
     bool fast = false;
     for (unsigned attempt = 1; attempt <= HS_REMOTE_STAGE_ATTEMPTS; ++attempt) {
-        if (attempt == 1U) {
-            janos_uart_baud_result_t baud_result =
-                janos_uart_set_baud(worker->tab, worker->port, fast_baud);
-            if (baud_result == JANOS_BAUD_LOST) {
-                worker->failed = true;
-                hs_crack_remote_report(worker, kind, attempt,
-                                       "baud boundary lost");
+        hs_crack_remote_report(worker, kind, attempt, "checking cache");
+        hs_remote_cache_state_t cache_state = hs_crack_remote_check_cache(
+            worker, kind, size, crc32);
+        if (cache_state == HS_REMOTE_CACHE_PRESENT) {
+            hs_crack_remote_report(worker, kind, attempt, "ready");
+            return true;
+        }
+
+        bool synced = false;
+        if (cache_state == HS_REMOTE_CACHE_ERROR) {
+            /* Stay at the default console rate and let the bounded stage
+             * retry recover only after the probe path confirmed it is safe. */
+            synced = false;
+        } else if (cache_state == HS_REMOTE_CACHE_MISSING) {
+            if (attempt == 1U) {
+                janos_uart_baud_result_t baud_result =
+                    janos_uart_set_baud(worker->tab, worker->port, fast_baud);
+                if (baud_result == JANOS_BAUD_LOST) {
+                    worker->failed = true;
+                    hs_crack_remote_report(worker, kind, attempt,
+                                           "baud boundary lost");
+                    return false;
+                }
+                fast = baud_result == JANOS_BAUD_FAST;
+            }
+            hs_crack_remote_report(worker, kind, attempt,
+                                   attempt == 1U && fast ? "fast sync" : "sync");
+            synced = hs_crack_remote_upload(worker, kind, path, size, crc32);
+
+            if (attempt == 1U && fast && worker->failed) {
+                hs_crack_remote_abandon_fast_baud(worker);
                 return false;
             }
-            fast = baud_result == JANOS_BAUD_FAST;
-        }
-        hs_crack_remote_report(worker, kind, attempt,
-                               attempt == 1U && fast ? "fast sync" : "sync");
-        bool synced = hs_crack_remote_upload(worker, kind, path, size, crc32);
-
-        if (attempt == 1U && fast && worker->failed) {
-            hs_crack_remote_abandon_fast_baud(worker);
-            return false;
-        }
-        if (attempt == 1U && fast &&
-            !janos_uart_restore_baud(worker->tab, worker->port, fast_baud)) {
-            worker->failed = true;
-            hs_crack_remote_report(worker, kind, attempt, "baud restore failed");
-            return false;
+            if (attempt == 1U && fast &&
+                !janos_uart_restore_baud(worker->tab, worker->port, fast_baud)) {
+                worker->failed = true;
+                hs_crack_remote_report(worker, kind, attempt,
+                                       "baud restore failed");
+                return false;
+            }
         }
         if (synced) {
             hs_crack_remote_report(worker, kind, attempt, "ready");
@@ -62471,6 +62703,266 @@ static bool hs_crack_remote_sync_file(hs_crack_remote_worker_t *worker,
                  HS_REMOTE_STAGE_ATTEMPTS);
         vTaskDelay(pdMS_TO_TICKS(hs_remote_stage_backoff_ms(attempt + 1U)));
     }
+    return false;
+}
+
+static bool hs_crack_remote_cancel_job_id(hs_crack_remote_worker_t *worker,
+                                          const char *job)
+{
+    if (!worker || !job || !job[0]) return false;
+    char command[80];
+    snprintf(command, sizeof(command), "crack_worker cancel %s", job);
+    if (!hs_crack_remote_send_line_force(worker->tab, worker->port, command))
+        return false;
+
+    int64_t deadline = esp_timer_get_time() + 3000000LL;
+    hs_remote_message_t message;
+    while (esp_timer_get_time() < deadline) {
+        uint32_t left = (uint32_t)((deadline - esp_timer_get_time()) / 1000LL);
+        if (!hs_crack_remote_read_message_force(worker->tab, worker->port,
+                                                 &message, left)) break;
+        if (message.type == HS_REMOTE_CANCELLING &&
+            strcmp(message.job, job) == 0) continue;
+        if ((message.type == HS_REMOTE_DONE || message.type == HS_REMOTE_STATUS) &&
+            strcmp(message.job, job) == 0 &&
+            message.result != HS_REMOTE_RESULT_RUNNING) return true;
+        if (message.type == HS_REMOTE_REJECTED &&
+            strcmp(message.code, "no_running_job") == 0) return true;
+    }
+    return false;
+}
+
+static void hs_crack_remote_recovery_wait(hs_crack_remote_worker_t *worker,
+                                          const char *reason)
+{
+    worker->next_recovery_us = esp_timer_get_time() +
+                               HS_CRACK_RECOVERY_INTERVAL_US;
+    snprintf(worker->stage, sizeof(worker->stage), "recovering");
+    snprintf(worker->stage_reason, sizeof(worker->stage_reason), "%.23s",
+             reason ? reason : "waiting");
+    snprintf(hs_crack_ui.worker_status[worker->tab],
+             sizeof(hs_crack_ui.worker_status[0]), "lost, probing (%.24s)",
+             worker->stage_reason);
+    hs_crack_render_workers();
+}
+
+static bool hs_crack_remote_try_recover(
+    hs_crack_remote_worker_t *worker,
+    const hs_crack_remote_recovery_ctx_t *recovery,
+    uint32_t *tried, char *found_pw, size_t found_pw_size)
+{
+    if (!worker || !worker->recovery_pending || !recovery ||
+        hs_crack_ui.cancel_requested) return false;
+    int64_t now = esp_timer_get_time();
+    if (now < worker->next_recovery_us) return false;
+
+    worker->recovery_attempts++;
+    ESP_LOGI(TAG, "[HS-CRACK] RECOVERY_TICK %s attempt=%u action=ping",
+             tab_transport_name(worker->tab), worker->recovery_attempts);
+    snprintf(hs_crack_ui.worker_status[worker->tab],
+             sizeof(hs_crack_ui.worker_status[0]), "lost, probing #%u",
+             worker->recovery_attempts);
+    hs_crack_render_workers();
+
+    if (!hs_crack_remote_recovery_ping(worker->tab, worker->port)) {
+        hs_crack_remote_recovery_wait(worker, "no pong");
+        return false;
+    }
+    ESP_LOGI(TAG, "[HS-CRACK] RECOVERY_ALIVE %s result=pong",
+             tab_transport_name(worker->tab));
+    snprintf(hs_crack_ui.worker_status[worker->tab],
+             sizeof(hs_crack_ui.worker_status[0]), "alive, checking job");
+    hs_crack_render_workers();
+
+    hs_remote_message_t message = {0};
+    hs_sched_recovery_event_t event = hs_crack_remote_recovery_status(
+        worker->tab, worker->port, worker->retired_job, &message);
+    hs_sched_action_t action = worker->sched_shard
+                                   ? hs_sched_recovery_action(
+                                         worker->sched_shard, event,
+                                         message.offset)
+                                   : HS_SCHED_WAIT;
+    const char *event_name = event == HS_SCHED_OLD_JOB_RUNNING ? "running" :
+                             event == HS_SCHED_OLD_JOB_FOUND ? "found" :
+                             event == HS_SCHED_OLD_JOB_NOT_FOUND ? "not_found" :
+                             event == HS_SCHED_UNKNOWN_JOB ? "unknown_job" :
+                             "ambiguous";
+    ESP_LOGI(TAG, "[HS-CRACK] RECOVERY_STATUS %s job=%s result=%s",
+             tab_transport_name(worker->tab), worker->retired_job, event_name);
+
+    if (action == HS_SCHED_REATTACH && worker->sched_shard &&
+        hs_sched_reattach(worker->sched_shard,
+                          hs_crack_sched_owner(worker->tab),
+                          worker->retired_job)) {
+        snprintf(worker->job, sizeof(worker->job), "%s", worker->retired_job);
+        hs_remote_lease_note_response(&worker->lease, message.offset);
+        (void)hs_sched_note_progress(worker->sched_shard, message.offset);
+        hs_crack_remote_add_checked(worker, tried, message.checked);
+        worker->active = true;
+        worker->finished = false;
+        worker->failed = false;
+        worker->cancel_pending = false;
+        worker->recovery_pending = false;
+        snprintf(worker->stage, sizeof(worker->stage), "running");
+        snprintf(worker->stage_reason, sizeof(worker->stage_reason), "reattached");
+        snprintf(hs_crack_ui.worker_status[worker->tab],
+                 sizeof(hs_crack_ui.worker_status[0]), "reattached");
+        ESP_LOGI(TAG,
+                 "[HS-CRACK] REATTACH %s job=%s range=%llu-%llu safe_offset=%llu",
+                 tab_transport_name(worker->tab), worker->job,
+                 (unsigned long long)worker->sched_shard->range_start,
+                 (unsigned long long)worker->sched_shard->range_end,
+                 (unsigned long long)worker->sched_shard->confirmed_safe_offset);
+        hs_crack_render_workers();
+        return false;
+    }
+
+    if (action == HS_SCHED_VERIFY_FOUND && message.password_length > 0 &&
+        message.password_length < found_pw_size) {
+        if (worker->sched_shard)
+            (void)hs_sched_note_progress(worker->sched_shard, message.offset);
+        hs_crack_remote_add_checked(worker, tried, message.checked);
+        memcpy(found_pw, message.password, message.password_length);
+        found_pw[message.password_length] = '\0';
+        if (message.ssid_length <= sizeof(worker->found_ssid)) {
+            memcpy(worker->found_ssid, message.ssid, message.ssid_length);
+            worker->found_ssid_length = message.ssid_length;
+        }
+        worker->recovery_pending = false;
+        ESP_LOGI(TAG, "[HS-CRACK] RECOVERY_FOUND %s old_job=%s",
+                 tab_transport_name(worker->tab), worker->retired_job);
+        return true;
+    }
+
+    if (action == HS_SCHED_COMPLETE && worker->sched_shard) {
+        hs_crack_remote_add_checked(worker, tried, message.checked);
+        (void)hs_sched_complete(worker->sched_shard, message.offset);
+        worker->active = false;
+        worker->finished = true;
+        worker->failed = false;
+        worker->cancel_pending = false;
+        worker->recovery_pending = false;
+        snprintf(hs_crack_ui.worker_status[worker->tab],
+                 sizeof(hs_crack_ui.worker_status[0]), "done, no key");
+        hs_crack_render_workers();
+        return false;
+    }
+
+    if (action == HS_SCHED_CANCEL_RETIRED) {
+        if (worker->sched_shard)
+            (void)hs_sched_note_progress(worker->sched_shard, message.offset);
+        hs_crack_remote_add_checked(worker, tried, message.checked);
+        (void)hs_crack_remote_cancel_job_id(worker, worker->retired_job);
+        worker->recovery_pending = false;
+        worker->failed = false;
+        worker->finished = true;
+        worker->cancel_pending = false;
+        snprintf(hs_crack_ui.worker_status[worker->tab],
+                 sizeof(hs_crack_ui.worker_status[0]), "recovered, idle");
+        ESP_LOGI(TAG, "[HS-CRACK] RECOVERED %s state=idle",
+                 tab_transport_name(worker->tab));
+        hs_crack_render_workers();
+        return false;
+    }
+
+    bool restart = action == HS_SCHED_PREPARE_RESTART ||
+                   action == HS_SCHED_QUEUE_SUFFIX;
+    if (!restart) {
+        if (event == HS_SCHED_UNKNOWN_JOB && worker->sched_shard &&
+            worker->sched_shard->state != HS_SCHED_RECOVERING) {
+            worker->recovery_pending = false;
+            worker->failed = false;
+            worker->finished = true;
+            worker->cancel_pending = false;
+            snprintf(hs_crack_ui.worker_status[worker->tab],
+                     sizeof(hs_crack_ui.worker_status[0]), "recovered, idle");
+            hs_crack_render_workers();
+            return false;
+        }
+        hs_crack_remote_recovery_wait(worker, "job ambiguous");
+        return false;
+    }
+
+    if (!worker->sched_shard) {
+        hs_crack_remote_recovery_wait(worker, "no shard");
+        return false;
+    }
+    if (action == HS_SCHED_QUEUE_SUFFIX) {
+        (void)hs_sched_note_progress(worker->sched_shard, message.offset);
+        (void)hs_sched_queue_suffix(worker->sched_shard);
+    }
+
+    snprintf(hs_crack_ui.worker_status[worker->tab],
+             sizeof(hs_crack_ui.worker_status[0]), "rebuilding cache");
+    worker->failed = false;
+    if (!hs_crack_remote_capabilities(worker) ||
+        !hs_crack_remote_sync_file(worker, true, "capture",
+                                   HS_CRACK_REMOTE_HCCAPX,
+                                   recovery->capture_size,
+                                   recovery->capture_crc) ||
+        !hs_crack_remote_sync_file(worker, true, "wordlist",
+                                   recovery->wordlist_path,
+                                   recovery->wordlist_size,
+                                   recovery->wordlist_crc)) {
+        worker->failed = true;
+        hs_crack_remote_recovery_wait(worker, "prepare failed");
+        return false;
+    }
+
+    /* The suffix may have been leased to another worker while this transport
+     * was offline.  Rebuild its cache so the recovered Monster can accept
+     * future work, but never start the retired range over a newer lease. */
+    if (worker->sched_shard->state != HS_SCHED_RECOVERING &&
+        worker->sched_shard->state != HS_SCHED_PENDING) {
+        worker->active = false;
+        worker->finished = true;
+        worker->failed = false;
+        worker->cancel_pending = false;
+        worker->recovery_pending = false;
+        worker->sched_shard = NULL;
+        snprintf(hs_crack_ui.worker_status[worker->tab],
+                 sizeof(hs_crack_ui.worker_status[0]), "recovered, idle");
+        ESP_LOGI(TAG, "[HS-CRACK] RECOVERED %s state=ready",
+                 tab_transport_name(worker->tab));
+        hs_crack_render_workers();
+        return false;
+    }
+
+    uint64_t start = hs_sched_pending_start(worker->sched_shard);
+    uint64_t end = worker->sched_shard->range_end;
+    char old_job[sizeof(worker->retired_job)];
+    snprintf(old_job, sizeof(old_job), "%s", worker->retired_job);
+    if (start >= end ||
+        !hs_crack_remote_start(worker, recovery->capture_size,
+                               recovery->capture_crc,
+                               recovery->wordlist_size,
+                               recovery->wordlist_crc, start, end,
+                               (unsigned)worker->tab)) {
+        worker->failed = true;
+        hs_crack_remote_recovery_wait(worker, "restart failed");
+        return false;
+    }
+
+    hs_sched_assignment_t assignment;
+    if (!hs_sched_lease_pending(worker->sched_shard,
+                                hs_crack_sched_owner(worker->tab),
+                                worker->job, &assignment)) {
+        (void)hs_crack_remote_cancel_job_id(worker, worker->job);
+        worker->active = false;
+        worker->finished = true;
+        worker->failed = false;
+        worker->recovery_pending = false;
+        return false;
+    }
+    worker->recovery_pending = false;
+    worker->failed = false;
+    worker->cancel_pending = false;
+    ESP_LOGI(TAG,
+             "[HS-CRACK] REASSIGN %s old_job=%s new_job=%s range=%llu-%llu",
+             tab_transport_name(worker->tab), old_job, worker->job,
+             (unsigned long long)assignment.start,
+             (unsigned long long)assignment.end);
+    hs_crack_render_workers();
     return false;
 }
 
@@ -62555,6 +63047,139 @@ static size_t hs_crack_remote_sync_wordlist(hs_crack_remote_worker_t *workers,
     }
     hs_crack_render_workers();
     return ready;
+}
+
+static const char *hs_crack_sched_owner_name(hs_sched_owner_t owner)
+{
+    switch (owner) {
+    case HS_SCHED_OWNER_GROVE: return "Grove";
+    case HS_SCHED_OWNER_USB: return "USB";
+    case HS_SCHED_OWNER_MBUS: return "MBus";
+    case HS_SCHED_OWNER_LOCAL: return "Tab5";
+    default: return "none";
+    }
+}
+
+static bool hs_crack_remote_assign_pending(
+    hs_crack_remote_worker_t *workers, size_t worker_count,
+    hs_sched_shard_t *shards, size_t shard_count,
+    const hs_crack_remote_recovery_ctx_t *recovery)
+{
+    if (!workers || !shards || !recovery || hs_crack_ui.cancel_requested)
+        return false;
+
+    bool assigned = false;
+    for (size_t wi = 0; wi < worker_count; ++wi) {
+        hs_crack_remote_worker_t *worker = &workers[wi];
+        if (!worker->usable || worker->active || worker->recovery_pending ||
+            worker->failed || worker->cancel_pending) {
+            continue;
+        }
+
+        hs_sched_shard_t *shard = NULL;
+        size_t shard_index = 0;
+        for (size_t si = 0; si < shard_count; ++si) {
+            hs_sched_shard_t *candidate = &shards[si];
+            if ((candidate->state == HS_SCHED_PENDING ||
+                 candidate->state == HS_SCHED_RECOVERING) &&
+                hs_sched_pending_start(candidate) < candidate->range_end) {
+                shard = candidate;
+                shard_index = si;
+                break;
+            }
+        }
+        if (!shard) break;
+
+        uint64_t start = hs_sched_pending_start(shard);
+        uint64_t end = shard->range_end;
+        char old_job[HS_SCHED_JOB_BYTES];
+        snprintf(old_job, sizeof(old_job), "%s",
+                 shard->retired_job[0] ? shard->retired_job : "none");
+        ESP_LOGW(TAG,
+                 "[HS-CRACK] REQUEUE %s old_job=%s range=%llu-%llu",
+                 hs_crack_sched_owner_name(shard->retired_owner), old_job,
+                 (unsigned long long)start, (unsigned long long)end);
+
+        if (!hs_crack_remote_start(worker, recovery->capture_size,
+                                   recovery->capture_crc,
+                                   recovery->wordlist_size,
+                                   recovery->wordlist_crc, start, end,
+                                   (unsigned)(wi + shard_index *
+                                              HS_CRACK_REMOTE_MAX))) {
+            worker->failed = true;
+            snprintf(hs_crack_ui.worker_status[worker->tab],
+                     sizeof(hs_crack_ui.worker_status[0]),
+                     "reassign failed");
+            continue;
+        }
+
+        hs_sched_assignment_t assignment;
+        if (!hs_sched_lease_pending(shard,
+                                    hs_crack_sched_owner(worker->tab),
+                                    worker->job, &assignment)) {
+            (void)hs_crack_remote_cancel_job_id(worker, worker->job);
+            worker->active = false;
+            worker->finished = true;
+            continue;
+        }
+
+        worker->sched_shard = shard;
+        worker->recovery_pending = false;
+        worker->recovery_attempts = 0;
+        worker->next_recovery_us = 0;
+        worker->retired_job[0] = '\0';
+        worker->failed = false;
+        worker->finished = false;
+        worker->counted = true;
+        snprintf(hs_crack_ui.worker_status[worker->tab],
+                 sizeof(hs_crack_ui.worker_status[0]), "reassigned");
+        ESP_LOGI(TAG,
+                 "[HS-CRACK] REASSIGN %s old_job=%s new_job=%s range=%llu-%llu",
+                 tab_transport_name(worker->tab), old_job, worker->job,
+                 (unsigned long long)assignment.start,
+                 (unsigned long long)assignment.end);
+        assigned = true;
+    }
+    return assigned;
+}
+
+static int hs_crack_remote_scheduler_tick(
+    hs_crack_remote_worker_t *workers, size_t worker_count,
+    hs_sched_shard_t *shards, size_t shard_count,
+    const hs_crack_remote_recovery_ctx_t *recovery,
+    uint32_t *tried, char *found_pw, size_t found_pw_size)
+{
+    if (!workers || !recovery || !tried || !found_pw ||
+        hs_crack_ui.cancel_requested) {
+        return -1;
+    }
+
+    /* Poll every live lease first.  A bounded recovery ping/status exchange
+     * must never delay a healthy worker's status update in the same tick. */
+    for (size_t i = 0; i < worker_count; ++i) {
+        hs_crack_remote_worker_t *worker = &workers[i];
+        if (worker->active && !worker->recovery_pending &&
+            hs_crack_remote_poll(worker, recovery, tried, found_pw,
+                                 found_pw_size)) {
+            return (int)i;
+        }
+    }
+
+    /* Recovery attempts are individually rate-limited by next_recovery_us.
+     * Polling all entries here is cheap when their deadline is not due. */
+    for (size_t i = 0; i < worker_count; ++i) {
+        hs_crack_remote_worker_t *worker = &workers[i];
+        if (worker->recovery_pending &&
+            hs_crack_remote_poll(worker, recovery, tried, found_pw,
+                                 found_pw_size)) {
+            return (int)i;
+        }
+    }
+
+    (void)hs_crack_remote_assign_pending(workers, worker_count, shards,
+                                         shard_count, recovery);
+    hs_crack_remote_publish_counts(workers, worker_count);
+    return -1;
 }
 
 static bool hs_crack_seek_range_start(FILE *file, uint64_t requested)
@@ -62784,7 +63409,11 @@ static void hs_crack_finish_ui_unlocked(bool found, const char *status, const ch
 {
     hs_crack_metrics_stop();
     hs_crack_ui.active = false;
-    alert_chime_play(found ? ALERT_TONE_WIN : ALERT_TONE_WARN);
+    if (found) {
+        alert_chime_play(ALERT_TONE_WIN);
+    } else if (!hs_crack_ui.cancel_requested) {
+        alert_chime_play(ALERT_TONE_WARN);
+    }
     if (hs_crack_ui.status_label && lv_obj_is_valid(hs_crack_ui.status_label)) {
         lv_label_set_text(hs_crack_ui.status_label,
                           status);
@@ -63719,6 +64348,14 @@ static void hs_crack_task(void *arg)
             }
             if (hs_crack_ui.cancel_requested) goto done;
 
+            hs_crack_remote_recovery_ctx_t recovery_ctx = {
+                .capture_size = remote_capture_size,
+                .capture_crc = remote_capture_crc,
+                .wordlist_path = hs_crack_ui.wl_paths[wi],
+                .wordlist_size = wordlist_id.size,
+                .wordlist_crc = wordlist_crc,
+            };
+
             FILE *wl = fopen(hs_crack_ui.wl_paths[wi], "r");
             if (!wl) {
                 snprintf(final_detail, sizeof(final_detail),
@@ -63752,6 +64389,10 @@ static void hs_crack_task(void *arg)
             uint64_t work_start = hs_crack_ui.wordlist_offset;
             uint64_t local_end = wordlist_id.size;
             hs_remote_shard_t shards[HS_CRACK_REMOTE_MAX + 1] = {0};
+            hs_sched_shard_t remote_shards[HS_CRACK_REMOTE_MAX] = {0};
+            for (size_t ri = 0; ri < HS_CRACK_REMOTE_MAX; ++ri)
+                hs_sched_init(&remote_shards[ri], 0, 0,
+                              HS_SCHED_OWNER_NONE);
             size_t remote_started = 0;
             if (remote_synced > 0 &&
                 hs_remote_make_shards(work_start, wordlist_id.size,
@@ -63765,9 +64406,18 @@ static void hs_crack_task(void *arg)
                     worker->counted = false;
                     worker->shard_start = 0;
                     worker->shard_end = 0;
+                    worker->sched_shard = NULL;
+                    worker->recovery_pending = false;
+                    worker->recovery_attempts = 0;
+                    worker->next_recovery_us = 0;
+                    worker->retired_job[0] = '\0';
                     if (!worker->usable) continue;
                     worker->shard_start = shards[shard_index].start;
                     worker->shard_end = shards[shard_index].end;
+                    hs_sched_init(&remote_shards[ri], worker->shard_start,
+                                  worker->shard_end,
+                                  hs_crack_sched_owner(worker->tab));
+                    worker->sched_shard = &remote_shards[ri];
                     if (worker->shard_start == worker->shard_end) {
                         worker->finished = true;
                     } else if (hs_crack_remote_start(
@@ -63775,11 +64425,20 @@ static void hs_crack_task(void *arg)
                                    remote_capture_crc, wordlist_id.size,
                                    wordlist_crc, worker->shard_start,
                                    worker->shard_end, (unsigned)ri)) {
-                        remote_started++;
+                        if (hs_sched_bind_active_job(worker->sched_shard,
+                                                     worker->job)) {
+                            remote_started++;
+                        } else {
+                            hs_crack_remote_cancel_one(worker);
+                            worker->failed = true;
+                            worker->finished = false;
+                            (void)hs_sched_queue_suffix(worker->sched_shard);
+                        }
                     } else {
                         worker->failed = true;
                         worker->finished = false;
                         worker->counted = true;
+                        (void)hs_sched_queue_suffix(worker->sched_shard);
                         snprintf(hs_crack_ui.worker_status[worker->tab],
                                  sizeof(hs_crack_ui.worker_status[0]),
                                  "start failed - local fallback");
@@ -63840,27 +64499,27 @@ static void hs_crack_task(void *arg)
                 int64_t now = esp_timer_get_time();
                 if (distributed && now - remote_polled >= 2000000LL) {
                     remote_polled = now;
-                    for (size_t ri = 0; ri < remote_worker_count; ++ri) {
-                        if (hs_crack_remote_poll(&remote_workers[ri], &tried,
-                                                 found_pw, sizeof(found_pw))) {
-                            int remote_match = hs_crack_remote_record_index(
-                                &remote_workers[ri], recs, nrecs, found_pw);
-                            if (remote_match < 0) {
-                                remote_workers[ri].failed = true;
-                                found_pw[0] = '\0';
-                                continue;
-                            }
+                    int found_worker = hs_crack_remote_scheduler_tick(
+                        remote_workers, remote_worker_count, remote_shards,
+                        HS_CRACK_REMOTE_MAX, &recovery_ctx, &tried,
+                        found_pw, sizeof(found_pw));
+                    if (found_worker >= 0) {
+                        int remote_match = hs_crack_remote_record_index(
+                            &remote_workers[found_worker], recs, nrecs,
+                            found_pw);
+                        if (remote_match < 0) {
+                            remote_workers[found_worker].failed = true;
+                            found_pw[0] = '\0';
+                        } else {
                             found_idx = remote_match;
                             hs_crack_workers_stop();
-                            hs_crack_ui.candidate_source = hs_crack_ui.wl_source;
+                            hs_crack_ui.candidate_source =
+                                hs_crack_ui.wl_source;
                             stop_source = true;
                             hs_crack_remote_cancel(remote_workers,
                                                    remote_worker_count);
-                            break;
                         }
                     }
-                    hs_crack_remote_publish_counts(remote_workers,
-                                                   remote_worker_count);
                     if (stop_source) break;
                 }
                 if (!distributed &&
@@ -63901,27 +64560,28 @@ static void hs_crack_task(void *arg)
 
             if (distributed && !stop_source && read_status != -2) {
                 for (;;) {
-                    bool any_active = false;
-                    for (size_t ri = 0; ri < remote_worker_count; ++ri) {
-                        if (remote_workers[ri].active) any_active = true;
-                        if (hs_crack_remote_poll(&remote_workers[ri], &tried,
-                                                 found_pw, sizeof(found_pw))) {
-                            int remote_match = hs_crack_remote_record_index(
-                                &remote_workers[ri], recs, nrecs, found_pw);
-                            if (remote_match < 0) {
-                                remote_workers[ri].failed = true;
-                                found_pw[0] = '\0';
-                                continue;
-                            }
+                    int found_worker = hs_crack_remote_scheduler_tick(
+                        remote_workers, remote_worker_count, remote_shards,
+                        HS_CRACK_REMOTE_MAX, &recovery_ctx, &tried,
+                        found_pw, sizeof(found_pw));
+                    if (found_worker >= 0) {
+                        int remote_match = hs_crack_remote_record_index(
+                            &remote_workers[found_worker], recs, nrecs,
+                            found_pw);
+                        if (remote_match < 0) {
+                            remote_workers[found_worker].failed = true;
+                            found_pw[0] = '\0';
+                        } else {
                             found_idx = remote_match;
                             hs_crack_workers_stop();
-                            hs_crack_ui.candidate_source = hs_crack_ui.wl_source;
+                            hs_crack_ui.candidate_source =
+                                hs_crack_ui.wl_source;
                             stop_source = true;
-                            break;
                         }
                     }
-                    hs_crack_remote_publish_counts(remote_workers,
-                                                   remote_worker_count);
+                    bool any_active = false;
+                    for (size_t ri = 0; ri < remote_worker_count; ++ri)
+                        any_active = any_active || remote_workers[ri].active;
                     if (stop_source || !any_active || hs_crack_ui.cancel_requested)
                         break;
                     hs_crack_progress("remote workers", tried, t0);
@@ -63929,44 +64589,45 @@ static void hs_crack_task(void *arg)
                 }
             }
 
-            /* A failed or disconnected remote shard is never treated as
-             * exhausted. Re-run that exact byte range locally, preserving the
-             * line-boundary ownership used by JanOS. */
+            /* A remote shard is complete only through its ledger.  After no
+             * remote assignment can make progress, Tab5 claims and drains
+             * every unfinished suffix from its monotonic safe offset. */
             if (distributed && !stop_source && !hs_crack_ui.cancel_requested &&
                 read_status != -2) {
-                for (size_t ri = 0; ri < remote_worker_count; ++ri) {
-                    hs_crack_remote_worker_t *worker = &remote_workers[ri];
-                    if (!worker->failed || worker->shard_end <= worker->shard_start)
-                        continue;
-                    hs_crack_remote_cancel_one(worker);
-                    uint64_t fallback_start = hs_remote_lease_fallback_start(
-                        &worker->lease, worker->shard_start, worker->shard_end);
-                    if (fallback_start >= worker->shard_end) {
-                        worker->failed = false;
-                        worker->finished = true;
-                        hs_crack_remote_publish_counts(remote_workers,
-                                                       remote_worker_count);
+                for (size_t si = 0; si < HS_CRACK_REMOTE_MAX; ++si) {
+                    hs_sched_shard_t *shard = &remote_shards[si];
+                    if (shard->state == HS_SCHED_DONE ||
+                        hs_sched_pending_start(shard) >= shard->range_end) {
                         continue;
                     }
-                    if (!hs_crack_seek_range_start(wl, fallback_start)) {
+                    if (shard->state == HS_SCHED_LEASED)
+                        (void)hs_sched_queue_suffix(shard);
+
+                    hs_sched_assignment_t local_assignment;
+                    if (!hs_sched_lease_local(shard, &local_assignment))
+                        continue;
+                    if (!hs_crack_seek_range_start(wl,
+                                                   local_assignment.start)) {
                         read_status = -2;
                         break;
                     }
                     ESP_LOGW(TAG,
-                             "[HS-CRACK] REQUEUE %s job=%s range=%llu-%llu",
-                             tab_transport_name(worker->tab), worker->job,
-                             (unsigned long long)fallback_start,
-                             (unsigned long long)worker->shard_end);
+                             "[HS-CRACK] REQUEUE %s old_job=%s range=%llu-%llu owner=Tab5",
+                             hs_crack_sched_owner_name(shard->retired_owner),
+                             shard->retired_job[0] ? shard->retired_job : "none",
+                             (unsigned long long)local_assignment.start,
+                             (unsigned long long)local_assignment.end);
                     snprintf(hs_crack_ui.candidate_status,
                              sizeof(hs_crack_ui.candidate_status),
-                             "Local fallback: %s", tab_transport_name(worker->tab));
+                             "Local fallback: %s",
+                             hs_crack_sched_owner_name(shard->retired_owner));
                     for (;;) {
                         long line_start = ftell(wl);
                         if (line_start < 0) {
                             read_status = -2;
                             break;
                         }
-                        if ((uint64_t)line_start >= worker->shard_end) break;
+                        if ((uint64_t)line_start >= local_assignment.end) break;
                         read_status = hs_crack_read_word(
                             wl, line, &hs_crack_ui.cancel_requested);
                         if (read_status < 0) break;
@@ -63988,8 +64649,7 @@ static void hs_crack_task(void *arg)
                     }
                     if (stop_source || read_status == -2 ||
                         hs_crack_ui.cancel_requested) break;
-                    worker->failed = false;
-                    worker->finished = true;
+                    (void)hs_sched_complete(shard, local_assignment.end);
                     hs_crack_remote_publish_counts(remote_workers,
                                                    remote_worker_count);
                 }

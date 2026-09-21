@@ -150,6 +150,8 @@ path, size, modification time, head CRC, and tail CRC still match.
 Exercises `CRACK/1` capability response parsing, password/SSID hex decoding,
 malformed messages, deterministic gap-free byte sharding, three-strike lease
 loss, monotonic safe checkpoints, and fallback range selection. Also covers
+the non-terminal `CANCELLING job=...` acknowledgement without mistaking it for
+a completed cancellation. It additionally covers
 USB `ack32` receive negotiation, `READY ack_size`, ACK32 validation and diagnostic
 reasons (length, magic/version, reserved bytes, status and CRC), stale ACKs,
 and NAK/CAN frames that must never satisfy ACK matching. Protocol 4 tests cover
@@ -163,12 +165,67 @@ gcc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -I main \
 /tmp/hs_crack_remote_core_test
 ```
 
+## `hs_crack_scheduler_test.c`
+
+Exercises the transport-independent shard ledger used by distributed worker
+recovery. It verifies monotonic safe offsets, lease loss without lost coverage,
+same-generation reattachment, migration of only the unfinished suffix, refusal
+of a retired generation to reclaim migrated work, completion at the immutable
+range end, explicit local ownership of the final suffix, and independent
+`checked` accounting for replacement jobs.
+
+```sh
+gcc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -I main \
+    tests/hs_crack_scheduler_test.c main/hs_crack_scheduler.c \
+    -o /tmp/hs_crack_scheduler_test
+/tmp/hs_crack_scheduler_test
+```
+
+## `test_worker_auto_recovery_contract.py`
+
+Host-compiles the production lost-worker liveness and retired-job status
+helpers. It verifies that boot noise may precede `pong`, waits are bounded,
+status is correlated to the retired job, and only an ordered `unknown_job`
+response proves that a reboot discarded the job. Global board detection is
+never called from the cracker-owned transport.
+
+```sh
+python3 tests/test_worker_auto_recovery_contract.py
+```
+
+## `test_worker_reassignment_contract.py`
+
+Checks and host-compiles the production scheduler tick and reassignment path.
+It pins active-worker polling before recovery, the five-second recovery rate
+limit, leasing an unfinished suffix to an idle different worker, use of the
+same tick during local and remote phases, cancel-gated leasing, and final local
+drain from the authoritative ledger rather than `worker->failed`.
+
+```sh
+python3 tests/test_worker_reassignment_contract.py
+```
+
+## `transfer_speed_config_test.c`
+
+Exercises the shared transfer-speed model used by Settings > Transfer Speed.
+It pins separate Grove/M-BUS and USB (CH34x) choice lists, their defaults,
+invalid stored-value fallback, and selection of the correct link-specific rate.
+The USB list stops at the exactly representable 3 MBaud value.
+
+```sh
+gcc -std=c11 -Wall -Wextra -Werror -I main \
+    tests/transfer_speed_config_test.c main/transfer_speed_config.c \
+    -o /tmp/transfer_speed_config_test
+/tmp/transfer_speed_config_test
+```
+
 ## `usb_vcp_config_test.c`
 
 Exercises the pure CH34x USB-UART configuration helpers used before USB board
 detection. It pins the supported CH340/CH341 VID/PID set, the fixed 115200 baud
 register for both the inverted-short-packet `0x27` revision (`0xCC03`) and newer
-revisions (`0xCC83`), the future 921600/2000000 encodings, 8N1 line control,
+revisions (`0xCC83`), the 921600/1500000/2000000/3000000 encodings, the reason
+4 MBaud is omitted from USB settings, 8N1 line control,
 and the SERIAL_INIT -> baud/LCR -> MODEM_CTRL request sequence used by the
 Linux driver.
 
@@ -231,9 +288,11 @@ python3 tests/test_usb_probe_recovery_contract.py
 ## `test_fast_uart_sync_fallback_contract.py`
 
 Host-compiles the production Grove/M-BUS/USB file-sync wrapper. It verifies
-that USB selects 921600 while hardware UART links retain their configured fast
-rate, and that a failed sync restores the console to 115200 and
-uses the remaining attempts through the existing resumable upload path.
+that a warm-cache hit completes entirely at 115200 without set/restore calls,
+while a cache miss makes USB select its configured CH34x rate and hardware UART
+links retain their independently configured fast rate. A probe error never
+enters raw receive mode or changes baud. A failed fast sync restores the console
+to 115200 and uses the remaining attempts through the existing resumable upload path.
 Disabled sync and a cancelled operation do not trigger another upload. A failed
 115200 restore rejects an otherwise successful fast upload, so the worker
 cannot be marked ready with an unusable control channel. If the CLI boundary is
@@ -290,6 +349,19 @@ limit while no line has started.
 
 ```sh
 python3 tests/test_usb_ready_line_budget_contract.py
+```
+
+## `test_cancel_transfer_recovery_contract.py`
+
+Host-compiles the production `hs_crack_remote_wait_end()` cleanup path and
+starts it with the UI cancellation flag already set. It proves that mandatory
+raw-transfer recovery does not use the normal cancel-aware reader: the bounded
+forced reader must still drain the worker's terminal `END` and prompt. This
+prevents a cancelled Grove or M-BUS synchronization from stranding JanOS at the
+fast baud and making the next Crack attempt report `no CRACK/1 worker`.
+
+```sh
+python3 tests/test_cancel_transfer_recovery_contract.py
 ```
 
 ## Manual distributed-crack smoke test
@@ -395,10 +467,26 @@ M-BUS also drain END/prompt after CAN so delayed `[CRACK/1]` text cannot be
 misread as one-byte ACKs. A missing boundary immediately marks that worker
 lost and leaves its unconfirmed suffix for local fallback.
 
+If the user presses Cancel during a Grove or M-BUS raw transfer, cleanup still
+finishes the bounded END/prompt drain despite the UI cancellation flag. Only
+after that confirmed protocol boundary may Tab5 restore the console to 115200
+and finish closing the cracker. Reopening Crack without a reboot must therefore
+discover the same worker, and the retained `.part` file may resume at a
+validated non-zero offset.
+
+Distributed cancellation logs the request, the non-terminal correlated
+`CANCELLING` acknowledgement, and the terminal confirmation for every worker.
+`CANCELLING` never completes cancellation by itself. A user-requested Cancel is
+silent; warning and success chimes remain reserved for actual terminal results.
+
 `start` keeps one job ID and range for all attempts. A missing confirmation is
 reconciled with `status <job>` first; `start` is resent only after an ordered
 `unknown_job`. JanOS 1.7.5 may answer an identical replay with
 `ACCEPTED ... replay=1 state=...` without creating another task. During work,
 `STATUS` may add `phase` and `progress_age_ms`; three consecutive missed status
-responses are shown as `1/3`, `2/3`, then `lost -> local`, while any valid
-correlated response resets the miss counter.
+responses are shown as `1/3`, `2/3`, then `lost, probing`, while any valid
+correlated response resets the miss counter. The two-second scheduler tick
+pings a lost transport no more often than every five seconds, reconciles its
+retired job, reattaches a still-running generation, rebuilds cache after an
+ordered `unknown_job`, or leases the unfinished suffix to an idle worker. When
+no remote can make progress, Tab5 drains every remaining ledger suffix locally.

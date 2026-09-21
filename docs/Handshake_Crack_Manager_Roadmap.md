@@ -1,6 +1,6 @@
 # Handshake Cracker — dalsza mapa prac
 
-Stan zapisany: 2026-09-19
+Stan zapisany: 2026-09-21
 
 Ten dokument utrwala uzgodnione etapy, aby plan nie zależał od historii czatu.
 Nie oznacza, że wszystkie punkty są już zaimplementowane.
@@ -18,14 +18,38 @@ Gotowa jest podstawa pojedynczego zadania crackowania:
 - ekran postępu z osobnymi stanami workerów,
 - zachowanie dotychczasowych akcji `Crack` przy pliku i `Crack latest`.
 
-Aktualna blokada sprzętowa: binarna synchronizacja pierwszego bloku do workera USB
-kończy się `USB Sync fail`, mimo że komendy tekstowe, `READY`, Grove i M-BUS działają.
-To trzeba zamknąć przed rozbudową managera.
+USB poprawnie negocjuje obecnie 921600 dla synchronizacji, używa bloków 1024 B
+z ACK32/FIN32 i wraca do konsoli 115200. Pierwsze logi sprzętowe potwierdziły
+skrócenie czasu odpowiedzi ACK, ale Etap 0 pozostaje otwarty do zakończenia
+pełnej macierzy cold-cache, warm-cache, resume, multi-worker, fallback i cancel.
+
+Plan odbioru: `docs/superpowers/plans/2026-09-21-stage-0-transport-closure.md`.
+
+Macierz wyników: `docs/Handshake_Crack_Stage0_Acceptance.md`.
+
+Zaimplementowano rozpoznanie nieterminalnego komunikatu `CANCELLING` oraz probe
+cache na 115200 przed ewentualną negocjacją szybkiego baud. Log sprzętowy
+potwierdził warm-cache bez zmiany prędkości dla Grove, USB i M-BUS. Kolejny
+firmware dodaje jawne potwierdzenia każdego etapu Cancel i nie odtwarza dźwięku
+ostrzeżenia po świadomym anulowaniu. Plan techniczny:
+`docs/superpowers/plans/2026-09-21-cancelling-and-warm-cache-probe.md`.
+
+Koordynator Tab5 ma również hostowo przetestowany ledger shardów i automatyczne
+recovery utraconego workera. Po trzech brakujących STATUS zachowuje ostatni
+potwierdzony `safe_offset`, okresowo wykonuje `ping`, odpytuje stary job,
+reattachuje go po przejściowym zerwaniu albo po `unknown_job` przygotowuje
+workera i uruchamia nową generację. Wolny Monster może przejąć niedokończony
+suffix, a końcowy fallback lokalny konsumuje ten sam ledger. Odbiór sprzętowy
+restartu Grove/USB/M-BUS pozostaje otwarty; plan i specyfikacja znajdują się w
+`docs/superpowers/plans/2026-09-21-worker-auto-recovery.md` oraz
+`docs/superpowers/specs/2026-09-21-worker-auto-recovery-design.md`.
 
 ## Etap 0 — stabilizacja transportów
 
-- Naprawić i potwierdzić transfer capture oraz wordlisty przez USB.
-- Zachować osobne traktowanie USB: bez zmiany baudrate UART.
+- Potwierdzić dwa pełne transfery capture oraz dużej wordlisty przez USB.
+- Zachować osobne traktowanie USB: konsola 115200, synchronizacja 921600,
+  bloki 1024 B i potwierdzony powrót do 115200; przy błędzie bezpieczny resumowalny
+  fallback 115200.
 - Zweryfikować cache hit po ponownym uruchomieniu: worker nie może ponownie kopiować
   poprawnie oznaczonego capture ani wordlisty.
 - Kryterium odbioru: Grove, USB i M-BUS przechodzą `probe -> receive -> SYNCED`, a

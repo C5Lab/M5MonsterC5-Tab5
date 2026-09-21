@@ -30,6 +30,17 @@ int main(void)
     assert(usb_vcp_ch34x_baud_register(2000000, 0x30, &baud_register));
     assert(baud_register == 0xFD83);
 
+    assert(usb_vcp_ch34x_baud_register(1500000, 0x30, &baud_register));
+    assert(baud_register == 0xFC83);
+
+    assert(usb_vcp_ch34x_baud_register(3000000, 0x30, &baud_register));
+    assert(baud_register == 0xFE83);
+
+    /* 4 MBaud is not representable by this divisor ladder and rounds to the
+     * same register as 3 MBaud, so the USB settings UI intentionally omits it. */
+    assert(usb_vcp_ch34x_baud_register(4000000, 0x30, &baud_register));
+    assert(baud_register == 0xFE83);
+
     usb_vcp_control_request_t baud_request = {0};
     assert(usb_vcp_ch34x_baud_request(921600, 0x35, &baud_request));
     assert(baud_request.request == 0x9A);
