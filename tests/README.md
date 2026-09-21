@@ -145,6 +145,39 @@ The cache test also verifies the persistent full-file CRC used to identify
 wordlists copied to distributed JanOS workers. An entry is reused only when the
 path, size, modification time, head CRC, and tail CRC still match.
 
+## WPA PSK Auditor foundation tests
+
+The Auditor foundation stays independent of LVGL and ESP-IDF so malformed or
+stale SD/serial data can be checked under ASan/UBSan before device flashing.
+
+```sh
+gcc -std=c17 -Wall -Wextra -Werror -fsanitize=address,undefined \
+    -I main -I components/pcap_reader/include \
+    tests/hs_capture_analyzer_test.c main/hs_capture_analyzer.c \
+    components/pcap_reader/pcap_reader.c -o /tmp/hs_capture_analyzer_test
+/tmp/hs_capture_analyzer_test
+
+gcc -std=c17 -Wall -Wextra -Werror -fsanitize=address,undefined -I main \
+    tests/hs_crack_session_test.c main/hs_crack_session.c \
+    -o /tmp/hs_crack_session_test
+/tmp/hs_crack_session_test
+
+gcc -std=c17 -Wall -Wextra -Werror -fsanitize=address,undefined -I main \
+    tests/hs_audit_history_test.c main/hs_audit_history.c \
+    -o /tmp/hs_audit_history_test
+/tmp/hs_audit_history_test
+
+gcc -std=c17 -Wall -Wextra -Werror -fsanitize=address,undefined -I main \
+    tests/hs_artifact_inventory_test.c main/hs_artifact_inventory.c \
+    -o /tmp/hs_artifact_inventory_test
+/tmp/hs_artifact_inventory_test
+```
+
+These pin structured PCAP qualification, the versioned A/B session codec,
+immutable bounded history, strict fragmented `ARTIFACT/1` parsing, request and
+snapshot correlation, legacy inventory rows and exact/provisional catalog
+identity. They do not compile firmware.
+
 ## `hs_crack_remote_core_test.c`
 
 Exercises `CRACK/1` capability response parsing, password/SSID hex decoding,
@@ -179,6 +212,17 @@ gcc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -I main \
     tests/hs_crack_scheduler_test.c main/hs_crack_scheduler.c \
     -o /tmp/hs_crack_scheduler_test
 /tmp/hs_crack_scheduler_test
+```
+
+## `test_distributed_resume_contract.py`
+
+Guards the Tab5 orchestration for durable Cancel -> Start resume. It requires
+the A/B session store, exact capture and wordlist identity matching, terminal
+cancel offsets to advance the worker ledger, drained local checkpoints, exact
+local/remote shard restoration, and tombstoning only after a terminal result.
+
+```sh
+python3 tests/test_distributed_resume_contract.py
 ```
 
 ## `test_worker_auto_recovery_contract.py`
@@ -366,7 +410,7 @@ python3 tests/test_cancel_transfer_recovery_contract.py
 
 ## Manual distributed-crack smoke test
 
-1. For hardware acceptance, the operator flashes JanOS 1.7.5 containing
+1. For hardware acceptance, the operator flashes the current JanOS 1.7.5 development build containing
    `crack_worker` capability protocol 4 to the Monsters, then Tab5, and puts an
    SD card in each worker. Capability protocol 4 must advertise `sync=ftb1`,
    `frame32` membership in `ack=byte,frame32`, `replay=last_block`, and

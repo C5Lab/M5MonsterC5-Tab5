@@ -8,7 +8,8 @@ może zostać zamknięty dopiero po zaliczeniu wszystkich wierszy.
 
 ## Zamrożony profil
 
-- JanOS: `1.7.5`, CRACK/1 protocol `4`.
+- JanOS: `1.7.5`, CRACK/1 protocol `4` (the protocol remains unchanged;
+  `ARTIFACT/1` is an independent additive capability).
 - USB CH34x: konsola `115200`, synchronizacja domyślnie `921600`, bloki
   `1024 B`, ACK32/FIN32, powrót do `115200`.
 - Grove i M-BUS: synchronizacja `2000000`, bloki `8192 B`, odpowiedź

@@ -53,6 +53,7 @@
 #include "esp_netif.h"
 #include "esp_event.h"
 #include "esp_system.h"
+#include "esp_random.h"
 #include "esp_timer.h"
 #include "esp_vfs_fat.h"
 #include "janos_file_transfer.h"
@@ -71,6 +72,7 @@
 #include "hs_crack_crypto.h"
 #include "hs_crack_remote_core.h"
 #include "hs_crack_scheduler.h"
+#include "hs_crack_session.h"
 #include "transfer_speed_config.h"
 #include "usb_vcp_config.h"
 #include <stdatomic.h>
@@ -60186,9 +60188,6 @@ static void compromised_files_sync_cb(lv_event_t *e)
 #define HS_CRACK_REMOTE_MAX 3
 #define HS_CRACK_REMOTE_HCCAPX "/sdcard/lab/handshakes/_crack_worker.hccapx"
 #define HS_CRACK_WORDLIST_CRC_CSV "/sdcard/lab/handshakes/wordlist_crc.csv"
-/* Raw 802.11 without a radiotap header. The extractor also handles a radiotap
- * capture (link type 127) by skipping its variable-length header. */
-#define HS_CRACK_LINKTYPE_RADIOTAP 127U
 
 // Which candidate lists a crack run tries. GENERIC is the SSID-derived guesses
 // plus the built-in common list; WORDLIST is /lab/wordlist.txt; BOTH runs the
@@ -60208,25 +60207,13 @@ typedef enum {
 #define HS_CRACK_STATE_TMP "/sdcard/lab/handshakes/crack_state.csv.tmp"
 #define HS_CRACK_ATTEMPTS_CSV "/sdcard/lab/handshakes/crack_attempts.csv"
 #define HS_CRACK_RESUME_FILE "/sdcard/lab/handshakes/.crack_resume"
+#define HS_CRACK_AUDIT_DIR "/sdcard/lab/handshakes/.crack_audit"
+#define HS_CRACK_SESSION_A "/sdcard/lab/handshakes/.crack_audit/active.a"
+#define HS_CRACK_SESSION_B "/sdcard/lab/handshakes/.crack_audit/active.b"
 
-typedef struct __attribute__((packed)) {
-    uint32_t signature;
-    uint32_t version;
-    uint8_t  message_pair;
-    uint8_t  essid_len;
-    uint8_t  essid[32];
-    uint8_t  keyver;
-    uint8_t  keymic[16];
-    uint8_t  mac_ap[6];
-    uint8_t  nonce_ap[32];
-    uint8_t  mac_sta[6];
-    uint8_t  nonce_sta[32];
-    uint16_t eapol_len;
-    uint8_t  eapol[256];
-} hccapx_record_t;
-
-_Static_assert(sizeof(hccapx_record_t) == HCCAPX_RECORD_SIZE,
-               "hccapx record must be exactly 393 packed bytes");
+/* Shared wire type and validation; kept with the verifier declarations so
+ * standalone host verifier tests include the same canonical definition. */
+#include "hs_capture_analyzer.h"
 
 typedef struct hs_crack_run hs_crack_run_t;
 
@@ -60340,6 +60327,14 @@ typedef struct {
 static hs_crack_ui_t hs_crack_ui;
 static void hs_crack_task(void *arg);
 
+#define HS_CRACK_TASK_STACK_BYTES 16384
+
+static void hs_crack_log_stack_watermark(const char *phase)
+{
+    ESP_LOGI(TAG, "[HS-STACK] phase=%s watermark=%u",
+             phase, (unsigned)uxTaskGetStackHighWaterMark(NULL));
+}
+
 // A short built-in list of common/obvious WPA passphrases (all 8..63 chars, so
 // they clear the PSK length gate). The SD wordlist and SSID guesses extend this.
 static const char *const hs_crack_builtin[] = {
@@ -60386,13 +60381,7 @@ static bool hs_crack_compute_kck(const uint8_t pmk[32], const hccapx_record_t *r
 
 static bool hs_crack_record_valid(const hccapx_record_t *r)
 {
-    return r->signature == HCCAPX_SIGNATURE && r->version == 4 &&
-           (r->message_pair & 0x7f) <= 5 && r->essid_len <= 32 &&
-           (r->keyver == 1 || r->keyver == 2) &&
-           r->eapol_len >= 99 && r->eapol_len <= sizeof(r->eapol) &&
-           r->eapol[1] == 3 &&
-           (((unsigned)r->eapol[2] << 8) | r->eapol[3]) + 4 == r->eapol_len &&
-           (r->eapol[6] & 7) == r->keyver;
+    return hs_capture_record_valid(r);
 }
 
 // 1 match, 0 mismatch, -2 crypto failure. PMK is reused across records
@@ -60454,234 +60443,6 @@ static bool hs_crack_test_password(const char *pw, const hccapx_record_t *r)
     return hs_crack_verify_candidate(pw, r, 1, NULL, NULL) == 0;
 }
 #endif
-
-// ---------------------------------------------------------------------------
-// Build hccapx records straight from a .pcap of a WPA/WPA2 4-way handshake, so
-// a capture with no Monster-side .hccapx companion is still crackable - the
-// same job hcxtools/wpa-sec do. Only the fields the verifier reads are filled.
-// ---------------------------------------------------------------------------
-
-static inline uint16_t hs_crack_le16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
-static inline uint16_t hs_crack_be16(const uint8_t *p) { return (uint16_t)((p[0] << 8) | p[1]); }
-
-// Derive an SSID from the Monster's "<ssid>_<bssid6>_<n>.pcap" naming when the
-// capture carries no SSID-bearing frame. The SSID itself may contain
-// underscores, so only the trailing "_<hex>_<digits>" pair is stripped.
-static void hs_crack_ssid_from_filename(const char *file_name, char *out, size_t out_sz)
-{
-    if (out_sz) out[0] = '\0';
-    if (!file_name || out_sz == 0) return;
-    const char *slash = strrchr(file_name, '/');
-    const char *base = slash ? slash + 1 : file_name;
-    char tmp[128];
-    snprintf(tmp, sizeof(tmp), "%s", base);
-    char *dot = strrchr(tmp, '.');
-    if (dot) *dot = '\0';            // drop extension
-    char *seq = strrchr(tmp, '_');   // trailing sequence number
-    if (seq) *seq = '\0';
-    char *mac = strrchr(tmp, '_');   // bssid tail
-    if (mac) *mac = '\0';
-    snprintf(out, out_sz, "%.32s", tmp);   // ESSID is at most 32 bytes
-}
-
-typedef struct {
-    uint8_t ap[6];
-    uint8_t sta[6];
-    uint8_t anonce[32];
-    bool valid;
-} hs_crack_pending_t;
-
-typedef struct {
-    uint8_t bssid[6];
-    char ssid[33];
-} hs_crack_ssid_t;
-
-static int hs_crack_build_records_from_pcap(const char *path, const char *file_name,
-                                            hccapx_record_t *recs, int max_recs,
-                                            const volatile bool *cancel)
-{
-    pcap_reader_t *reader = NULL;
-    pcap_capture_info_t info = {0};
-    if (pcap_reader_open(path, &reader, &info) != PCAP_READER_OK || !reader) {
-        return -1;
-    }
-    uint32_t link = pcap_reader_link_type(reader);
-    if (link != PCAP_LINKTYPE_IEEE802_11 && link != HS_CRACK_LINKTYPE_RADIOTAP) {
-        pcap_reader_close(reader);
-        return -1;
-    }
-
-    hs_crack_pending_t pend[4] = {0};
-    hs_crack_ssid_t ssids[4] = {0};
-    int ssid_count = 0;
-    int nrecs = 0;
-
-    pcap_reader_iterate_begin(reader);
-    uint8_t buf[512];
-    for (;;) {
-        if (cancel && *cancel) break;
-        pcap_packet_index_t idx;
-        size_t got = 0;
-        bool have = false;
-        pcap_reader_status_t st = pcap_reader_iterate_next(reader, &idx, buf, sizeof(buf),
-                                                           &got, &have);
-        if (st != PCAP_READER_OK && st != PCAP_READER_LIMIT_REACHED) break;
-        if (!have) break;
-
-        const uint8_t *f = buf;
-        size_t flen = got;
-        if (link == HS_CRACK_LINKTYPE_RADIOTAP) {
-            if (flen < 4) continue;
-            uint16_t rt = hs_crack_le16(f + 2);
-            if (rt == 0 || rt > flen) continue;
-            f += rt;
-            flen -= rt;
-        }
-        if (flen < 24) continue;
-
-        uint16_t fc = hs_crack_le16(f);
-        uint8_t type = (uint8_t)((fc >> 2) & 0x03);
-        uint8_t subtype = (uint8_t)((fc >> 4) & 0x0F);
-        bool to_ds = (fc & 0x0100) != 0;
-        bool from_ds = (fc & 0x0200) != 0;
-
-        if (type == 0) {
-            // Management frame: harvest the SSID IE from beacon/probe/assoc.
-            size_t fixed;
-            if (subtype == 8 || subtype == 5) fixed = 12;      // beacon / probe resp
-            else if (subtype == 0) fixed = 4;                  // assoc req
-            else if (subtype == 2) fixed = 6;                  // reassoc req
-            else continue;
-            const uint8_t *bssid = f + 16;                     // addr3
-            size_t off = 24 + fixed;
-            while (off + 2 <= flen) {
-                uint8_t tag = f[off];
-                uint8_t len = f[off + 1];
-                if (off + 2 + len > flen) break;
-                if (tag == 0) {
-                    if (len > 0 && len <= 32 && memchr(f + off + 2, 0, len) == NULL) {
-                        int slot = -1;
-                        for (int s = 0; s < ssid_count; s++) {
-                            if (memcmp(ssids[s].bssid, bssid, 6) == 0) { slot = s; break; }
-                        }
-                        if (slot < 0 && ssid_count < 4) slot = ssid_count++;
-                        if (slot >= 0) {
-                            memcpy(ssids[slot].bssid, bssid, 6);
-                            memcpy(ssids[slot].ssid, f + off + 2, len);
-                            ssids[slot].ssid[len] = '\0';
-                        }
-                    }
-                    break;
-                }
-                off += 2 + len;
-            }
-            continue;
-        }
-        if (type != 2) continue;   // only data frames carry EAPOL
-
-        size_t hdr = 24;
-        if (to_ds && from_ds) hdr += 6;
-        if (subtype & 0x08) hdr += 2;   // QoS data
-        if (hdr + 8 > flen) continue;
-
-        const uint8_t *pl = f + hdr;
-        size_t pll = flen - hdr;
-        if (pll < 8 || pl[0] != 0xAA || pl[1] != 0xAA || pl[2] != 0x03) continue;
-        if (hs_crack_be16(pl + 6) != 0x888EU) continue;   // EtherType EAPOL
-
-        const uint8_t *e = pl + 8;
-        size_t elen = pll - 8;
-        if (elen < 99 || e[1] != 3) continue;             // EAPOL-Key type
-        size_t frame_len = (size_t)hs_crack_be16(e + 2) + 4;
-        if (frame_len < 99 || frame_len > 256 || frame_len > elen) continue;
-
-        uint16_t kinfo = hs_crack_be16(e + 5);
-        uint8_t keyver = (uint8_t)(kinfo & 0x0007);
-        if (keyver != 1 && keyver != 2) continue;
-        bool mic = (kinfo & 0x0100) != 0;
-        bool ack = (kinfo & 0x0080) != 0;
-        const uint8_t *nonce = e + 17;
-        bool nonce_zero = true;
-        for (int i = 0; i < 32; i++) { if (nonce[i]) { nonce_zero = false; break; } }
-
-        const uint8_t *ap, *sta;
-        if (from_ds && !to_ds)      { ap = f + 10; sta = f + 4; }
-        else if (to_ds && !from_ds) { ap = f + 4;  sta = f + 10; }
-        else continue;
-
-        if (ack) {
-            // From the AP with ACK set (M1 or M3): both carry the same ANonce,
-            // so either one seeds the pair - handy when M1 was missed.
-            if (nonce_zero) continue;
-            int slot = -1;
-            for (int s = 0; s < 4; s++) {
-                if (pend[s].valid && memcmp(pend[s].ap, ap, 6) == 0 &&
-                    memcmp(pend[s].sta, sta, 6) == 0) { slot = s; break; }
-            }
-            if (slot < 0) for (int s = 0; s < 4; s++) if (!pend[s].valid) { slot = s; break; }
-            if (slot < 0) slot = 0;
-            memcpy(pend[slot].ap, ap, 6);
-            memcpy(pend[slot].sta, sta, 6);
-            memcpy(pend[slot].anonce, nonce, 32);
-            pend[slot].valid = true;
-        } else if (mic && !ack) {
-            // M2 from the STA: pair its SNonce/MIC/EAPOL with a stored ANonce.
-            if (nonce_zero) continue;   // M4 carries a zero SNonce
-            int slot = -1;
-            for (int s = 0; s < 4; s++) {
-                if (pend[s].valid && memcmp(pend[s].ap, ap, 6) == 0 &&
-                    memcmp(pend[s].sta, sta, 6) == 0) { slot = s; break; }
-            }
-            if (slot < 0) continue;     // no ANonce seen for this pair yet
-            if (nrecs >= max_recs) break;
-
-            hccapx_record_t *r = &recs[nrecs];
-            memset(r, 0, sizeof(*r));
-            r->signature = HCCAPX_SIGNATURE;
-            r->version = 4;
-            r->message_pair = 0;        // M1+M2; not used by the verifier
-            r->keyver = keyver;
-            memcpy(r->mac_ap, ap, 6);
-            memcpy(r->mac_sta, sta, 6);
-            memcpy(r->nonce_ap, pend[slot].anonce, 32);
-            memcpy(r->nonce_sta, nonce, 32);
-            memcpy(r->keymic, e + 81, 16);
-            memcpy(r->eapol, e, frame_len);
-            r->eapol_len = (uint16_t)frame_len;
-            nrecs++;
-        }
-    }
-    pcap_reader_close(reader);
-
-    if (cancel && *cancel) return -2;
-    if (nrecs <= 0) return 0;
-
-    // Stamp the ESSID: prefer a beacon SSID matching the record's AP, then any
-    // SSID seen in the capture, then one derived from the filename.
-    char fallback[33];
-    hs_crack_ssid_from_filename(file_name, fallback, sizeof(fallback));
-    for (int i = 0; i < nrecs; i++) {
-        const char *ssid = NULL;
-        for (int s = 0; s < ssid_count; s++) {
-            if (memcmp(ssids[s].bssid, recs[i].mac_ap, 6) == 0) { ssid = ssids[s].ssid; break; }
-        }
-        if (!ssid && ssid_count > 0) ssid = ssids[0].ssid;
-        if (!ssid || !ssid[0]) ssid = fallback;
-        size_t l = strnlen(ssid, 32);
-        recs[i].essid_len = (uint8_t)l;
-        memcpy(recs[i].essid, ssid, l);
-    }
-
-    // Keep only records that clear the strict validator.
-    int valid = 0;
-    for (int i = 0; i < nrecs; i++) {
-        if (hs_crack_record_valid(&recs[i])) {
-            if (valid != i) recs[valid] = recs[i];
-            valid++;
-        }
-    }
-    return valid;
-}
 
 // Local log of cracked keys, kept next to the copied handshakes in the same
 // `"SSID", "password"` shape the Monster's eviltwin.txt uses. Appends only new
@@ -62549,6 +62310,10 @@ static void hs_crack_remote_cancel_one(hs_crack_remote_worker_t *worker)
         }
         if (message.type == HS_REMOTE_DONE &&
             strcmp(message.job, worker->job) == 0) {
+            hs_remote_lease_note_response(&worker->lease, message.offset);
+            if (worker->sched_shard)
+                (void)hs_sched_note_progress(worker->sched_shard,
+                                             message.offset);
             ESP_LOGI(TAG, "[HS-CRACK] CANCELLED %s job=%s confirmed via DONE",
                      transport, worker->job);
             confirmed = true;
@@ -62557,6 +62322,10 @@ static void hs_crack_remote_cancel_one(hs_crack_remote_worker_t *worker)
         if (message.type == HS_REMOTE_STATUS &&
             strcmp(message.job, worker->job) == 0 &&
             message.result != HS_REMOTE_RESULT_RUNNING) {
+            hs_remote_lease_note_response(&worker->lease, message.offset);
+            if (worker->sched_shard)
+                (void)hs_sched_note_progress(worker->sched_shard,
+                                             message.offset);
             ESP_LOGI(TAG, "[HS-CRACK] CANCELLED %s job=%s confirmed via STATUS",
                      transport, worker->job);
             confirmed = true;
@@ -63060,6 +62829,222 @@ static const char *hs_crack_sched_owner_name(hs_sched_owner_t owner)
     }
 }
 
+static hs_session_source_t hs_crack_session_source(tab_id_t tab)
+{
+    switch (tab) {
+    case TAB_GROVE: return HS_SESSION_SOURCE_GROVE;
+    case TAB_USB: return HS_SESSION_SOURCE_USB;
+    case TAB_MBUS: return HS_SESSION_SOURCE_MBUS;
+    default: return HS_SESSION_SOURCE_LOCAL;
+    }
+}
+
+static bool hs_crack_session_matches_active_wordlist(
+    const hs_session_t *session, const hs_crack_capture_id_t *capture,
+    const hs_crack_wordlist_id_t *wordlist, uint16_t wordlist_index)
+{
+    if (!session || !capture || !wordlist ||
+        session->state != HS_SESSION_ACTIVE || session->wordlist_count != 1U ||
+        session->phase.kind != HS_SESSION_PHASE_WORDLIST ||
+        session->phase.wordlist_index != wordlist_index) {
+        return false;
+    }
+    const hs_session_wordlist_t *saved = &session->wordlists[0];
+    return session->capture.size == capture->size &&
+           session->capture.crc32 == capture->crc32 &&
+           strcmp(saved->path, wordlist->path) == 0 &&
+           saved->size == wordlist->size &&
+           saved->mtime == (uint64_t)wordlist->mtime &&
+           saved->head_crc32 == wordlist->head_crc32 &&
+           saved->tail_crc32 == wordlist->tail_crc32;
+}
+
+static void hs_crack_session_begin(hs_session_t *session,
+                                   const hs_crack_capture_id_t *capture,
+                                   const hs_crack_wordlist_id_t *wordlist,
+                                   uint32_t wordlist_crc,
+                                   bool wordlist_crc_valid,
+                                   uint16_t wordlist_index, tab_id_t tab)
+{
+    memset(session, 0, sizeof(*session));
+    session->schema_version = HS_SESSION_SCHEMA_VERSION;
+    session->state = HS_SESSION_ACTIVE;
+    esp_fill_random(session->session_id, sizeof(session->session_id));
+    session->capture.size = capture->size;
+    session->capture.crc32 = capture->crc32;
+    size_t ssid_length = strnlen(capture->ssid, sizeof(capture->ssid));
+    if (ssid_length > sizeof(session->capture.ssid))
+        ssid_length = sizeof(session->capture.ssid);
+    session->capture.ssid_length = (uint8_t)ssid_length;
+    memcpy(session->capture.ssid, capture->ssid, ssid_length);
+    session->origin.source = hs_crack_session_source(tab);
+    snprintf(session->origin.local_path, sizeof(session->origin.local_path),
+             "%s", HS_CRACK_LOCAL_PCAP);
+    snprintf(session->origin.remote_path, sizeof(session->origin.remote_path),
+             "%s", hs_crack_ui.remote_pcap_path);
+    session->config.method = (uint8_t)hs_crack_ui.method;
+    session->config.selected_source = (uint8_t)hs_crack_ui.wl_choice;
+    session->config.sync_capture = hs_crack_ui.sync_capture;
+    session->config.sync_wordlists = hs_crack_ui.sync_wordlist;
+    session->config.force_rerun = hs_crack_ui.force_rerun;
+    session->config.requested_workers = HS_CRACK_REMOTE_MAX;
+    session->wordlist_count = 1;
+    hs_session_wordlist_t *saved = &session->wordlists[0];
+    snprintf(saved->path, sizeof(saved->path), "%s", wordlist->path);
+    saved->size = wordlist->size;
+    saved->mtime = (uint64_t)wordlist->mtime;
+    saved->head_crc32 = wordlist->head_crc32;
+    saved->tail_crc32 = wordlist->tail_crc32;
+    saved->full_crc32 = wordlist_crc;
+    saved->full_crc_valid = wordlist_crc_valid;
+    session->phase.kind = HS_SESSION_PHASE_WORDLIST;
+    session->phase.wordlist_index = wordlist_index;
+}
+
+static hs_session_shard_state_t hs_crack_session_shard_state(
+    const hs_sched_shard_t *shard)
+{
+    switch (shard->state) {
+    case HS_SCHED_PENDING: return HS_SESSION_SHARD_PENDING;
+    case HS_SCHED_RECOVERING: return HS_SESSION_SHARD_RECOVERING;
+    case HS_SCHED_DONE: return HS_SESSION_SHARD_COMPLETE;
+    case HS_SCHED_LOCAL:
+    case HS_SCHED_LEASED:
+    default: return HS_SESSION_SHARD_LEASED;
+    }
+}
+
+static bool hs_crack_session_checkpoint(
+    hs_session_t *session, uint64_t local_start, uint64_t local_end,
+    uint64_t local_safe_offset, const hs_sched_shard_t *remote_shards,
+    size_t remote_shard_count, const hs_crack_remote_worker_t *workers,
+    size_t worker_count, uint64_t total_tried)
+{
+    if (!session || session->state != HS_SESSION_ACTIVE ||
+        local_start > local_safe_offset || local_safe_offset > local_end ||
+        remote_shard_count > HS_CRACK_REMOTE_MAX ||
+        worker_count > HS_CRACK_REMOTE_MAX) {
+        return false;
+    }
+    session->shard_count = 1U + remote_shard_count;
+    hs_session_shard_t *local = &session->shards[0];
+    memset(local, 0, sizeof(*local));
+    local->shard_id = 0;
+    local->kind = HS_SESSION_SHARD_LOCAL;
+    local->state = local_safe_offset >= local_end
+                       ? HS_SESSION_SHARD_COMPLETE
+                       : HS_SESSION_SHARD_LEASED;
+    local->owner = HS_SCHED_OWNER_LOCAL;
+    local->previous_owner = HS_SCHED_OWNER_LOCAL;
+    local->range_start = local_start;
+    local->range_end = local_end;
+    local->safe_offset = local_safe_offset;
+    local->generation = 1;
+
+    for (size_t i = 0; i < remote_shard_count; ++i) {
+        const hs_sched_shard_t *source = &remote_shards[i];
+        hs_session_shard_t *target = &session->shards[i + 1U];
+        memset(target, 0, sizeof(*target));
+        target->shard_id = (uint8_t)(i + 1U);
+        target->kind = HS_SESSION_SHARD_REMOTE;
+        target->state = hs_crack_session_shard_state(source);
+        target->owner = (int8_t)source->owner;
+        target->previous_owner = (int8_t)source->retired_owner;
+        target->range_start = source->range_start;
+        target->range_end = source->range_end;
+        target->safe_offset = source->confirmed_safe_offset;
+        target->accounted_checked = source->generation_accounted;
+        target->generation = source->generation;
+        snprintf(target->job_id, sizeof(target->job_id), "%s",
+                 source->active_job);
+        snprintf(target->retired_job_id, sizeof(target->retired_job_id), "%s",
+                 source->retired_job);
+    }
+
+    session->worker_count = worker_count;
+    for (size_t i = 0; i < worker_count; ++i) {
+        const hs_crack_remote_worker_t *source = &workers[i];
+        hs_session_worker_t *target = &session->workers[i];
+        memset(target, 0, sizeof(*target));
+        target->transport = hs_crack_session_source(source->tab);
+        target->state = source->active ? HS_SESSION_WORKER_ACTIVE
+                        : source->recovery_pending ? HS_SESSION_WORKER_RECOVERING
+                        : source->failed ? HS_SESSION_WORKER_LOST
+                                         : HS_SESSION_WORKER_IDLE;
+        target->recovery_attempt = source->recovery_attempts;
+        target->safe_offset = source->sched_shard
+                                  ? source->sched_shard->confirmed_safe_offset
+                                  : 0;
+        target->checked = source->checked;
+        snprintf(target->job_id, sizeof(target->job_id), "%s", source->job);
+        snprintf(target->retired_job_id, sizeof(target->retired_job_id), "%s",
+                 source->retired_job);
+    }
+    session->metrics.total_tried = total_tried;
+    if (mkdir(HS_CRACK_AUDIT_DIR, 0775) != 0 && errno != EEXIST) return false;
+    hs_session_result_t result = hs_session_save_next(
+        HS_CRACK_SESSION_A, HS_CRACK_SESSION_B, session);
+    if (result != HS_SESSION_OK) {
+        ESP_LOGW(TAG, "[HS-CRACK] distributed checkpoint failed (%d)",
+                 (int)result);
+        return false;
+    }
+    return true;
+}
+
+static bool hs_crack_restore_session_shards(
+    const hs_session_t *session, uint64_t wordlist_size,
+    uint64_t *local_start, uint64_t *local_end, uint64_t *local_safe_offset,
+    hs_sched_shard_t *remote_shards, size_t remote_capacity,
+    size_t *remote_shard_count)
+{
+    if (!session || !local_start || !local_end || !local_safe_offset ||
+        !remote_shards || !remote_shard_count || session->shard_count < 1U ||
+        session->shard_count > remote_capacity + 1U) {
+        return false;
+    }
+    const hs_session_shard_t *local = &session->shards[0];
+    if (local->kind != HS_SESSION_SHARD_LOCAL ||
+        local->range_start > local->safe_offset ||
+        local->safe_offset > local->range_end ||
+        local->range_end > wordlist_size) {
+        return false;
+    }
+    uint64_t expected = local->range_end;
+    *local_start = local->range_start;
+    *local_end = local->range_end;
+    *local_safe_offset = local->safe_offset;
+    *remote_shard_count = 0;
+    for (size_t i = 1; i < session->shard_count; ++i) {
+        const hs_session_shard_t *saved = &session->shards[i];
+        if (saved->kind != HS_SESSION_SHARD_REMOTE ||
+            saved->range_start != expected || saved->range_start > saved->safe_offset ||
+            saved->safe_offset > saved->range_end ||
+            saved->range_end > wordlist_size) {
+            return false;
+        }
+        hs_sched_shard_t *target = &remote_shards[*remote_shard_count];
+        hs_sched_init(target, saved->range_start, saved->range_end,
+                      HS_SCHED_OWNER_GROVE);
+        target->confirmed_safe_offset = saved->safe_offset;
+        target->generation = saved->generation ? saved->generation : 1U;
+        target->retired_owner = (hs_sched_owner_t)saved->owner;
+        snprintf(target->retired_job, sizeof(target->retired_job), "%s",
+                 saved->job_id[0] ? saved->job_id : saved->retired_job_id);
+        if (saved->safe_offset >= saved->range_end) {
+            target->state = HS_SCHED_DONE;
+            target->owner = HS_SCHED_OWNER_NONE;
+        } else {
+            target->state = HS_SCHED_PENDING;
+            target->owner = HS_SCHED_OWNER_NONE;
+            target->active_job[0] = '\0';
+        }
+        expected = saved->range_end;
+        (*remote_shard_count)++;
+    }
+    return expected == wordlist_size;
+}
+
 static bool hs_crack_remote_assign_pending(
     hs_crack_remote_worker_t *workers, size_t worker_count,
     hs_sched_shard_t *shards, size_t shard_count,
@@ -63511,9 +63496,26 @@ static void hs_crack_close_or_cancel_cb(lv_event_t *e)
             lv_obj_add_flag(hs_crack_ui.dismiss_btn, LV_OBJ_FLAG_HIDDEN);
         }
         lv_label_set_text(hs_crack_ui.action_label, "Cancel");
-        if (xTaskCreate(hs_crack_task, "hs_crack", 12288, NULL, 4, &hs_crack_ui.task) != pdPASS) {
+        bool coordinator_stack_in_psram = true;
+        BaseType_t task_created = xTaskCreateWithCaps(
+            hs_crack_task, "hs_crack", HS_CRACK_TASK_STACK_BYTES,
+            NULL, 4, &hs_crack_ui.task,
+            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (task_created != pdPASS) {
+            ESP_LOGW(TAG, "[HS-MEM] PSRAM coordinator stack allocation failed; trying internal RAM");
+            coordinator_stack_in_psram = false;
+            task_created = xTaskCreateWithCaps(
+                hs_crack_task, "hs_crack", HS_CRACK_TASK_STACK_BYTES,
+                NULL, 4, &hs_crack_ui.task,
+                MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        }
+        if (task_created != pdPASS) {
             hs_crack_ui.task = NULL;
             hs_crack_finish_ui_unlocked(false, "Check failed", "Could not start coordinator.");
+        } else {
+            ESP_LOGI(TAG, "[HS-MEM] coordinator stack=%s bytes=%u",
+                     coordinator_stack_in_psram ? "PSRAM" : "internal",
+                     (unsigned)HS_CRACK_TASK_STACK_BYTES);
         }
         return;
     }
@@ -63896,10 +63898,28 @@ static void hs_crack_workers_stop(void)
     hs_crack_ui.run = NULL;
 }
 
+static void hs_crack_log_worker_memory(const char *stage)
+{
+    ESP_LOGI(TAG,
+             "[HS-MEM] local workers stage=%s internal_free=%u internal_largest=%u "
+             "dma_free=%u psram_free=%u",
+             stage,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+}
+
 static bool hs_crack_workers_start(const hccapx_record_t *recs, int nrecs)
 {
+    hs_crack_log_worker_memory("before");
     hs_crack_run_t *run = calloc(1, sizeof(*run));
-    if (!run) return false;
+    if (!run) {
+        ESP_LOGE(TAG, "[HS-CRACK] local worker allocation failed at run control");
+        hs_crack_log_worker_memory("failed");
+        return false;
+    }
+    const char *failure_stage = "jobs queue";
     hs_crack_ui.run = run;
     atomic_init(&run->stop, false);
     run->coordinator = xTaskGetCurrentTaskHandle();
@@ -63907,8 +63927,10 @@ static bool hs_crack_workers_start(const hccapx_record_t *recs, int nrecs)
     run->records = recs;
     run->record_count = nrecs;
     run->jobs = xQueueCreate(4, sizeof(hs_crack_job_t));
+    if (!run->jobs) goto fail;
+    failure_stage = "results queue";
     run->results = xQueueCreate(4, sizeof(hs_crack_job_t));
-    if (!run->jobs || !run->results) goto fail;
+    if (!run->results) goto fail;
 #if CONFIG_FREERTOS_UNICORE
     const bool unicore = true;
 #else
@@ -63916,6 +63938,7 @@ static bool hs_crack_workers_start(const hccapx_record_t *recs, int nrecs)
 #endif
     unsigned count = hs_crack_recommended_worker_count(unicore);
     for (unsigned i = 0; i < count; i++) {
+        failure_stage = i == 0 ? "CPU worker 1" : "CPU worker 2";
         run->worker[i].run = run;
         run->worker[i].core = i == 0 ? 1 : 0;
 #if CONFIG_FREERTOS_UNICORE
@@ -63928,8 +63951,11 @@ static bool hs_crack_workers_start(const hccapx_record_t *recs, int nrecs)
     }
     ESP_LOGI(TAG, "[HS-CRACK] mode=Max workers=%u software SHA1; CPU0 19ms/1ms, CPU1 49ms/1ms",
              run->workers);
+    hs_crack_log_worker_memory("ready");
     return true;
 fail:
+    ESP_LOGE(TAG, "[HS-CRACK] local worker allocation failed at %s", failure_stage);
+    hs_crack_log_worker_memory("failed");
     hs_crack_workers_stop();
     return false;
 }
@@ -64078,6 +64104,7 @@ static void hs_crack_task(void *arg)
     hs_crack_ui.remote_active = 0;
     hs_crack_ui.remote_finished = 0;
     hs_crack_ui.remote_failed = 0;
+    hs_crack_log_stack_watermark("start");
 
     if (!str_ends_with_ext(hs_crack_ui.remote_pcap_path, ".pcap")) {
         snprintf(final_detail, sizeof(final_detail), "Not a .pcap handshake file.");
@@ -64107,8 +64134,9 @@ static void hs_crack_task(void *arg)
         goto finish;
     }
     if (err != ESP_OK) {
+        final_status = "Capture unavailable";
         snprintf(final_detail, sizeof(final_detail),
-                 "Could not fetch .pcap (%s).", esp_err_to_name(err));
+                 "Could not fetch .pcap (%s); capture was not analyzed.", esp_err_to_name(err));
         goto finish;
     }
 
@@ -64122,18 +64150,30 @@ static void hs_crack_task(void *arg)
     }
     hs_crack_set_stage("Reading handshake...",
                        "Extracting the 4-way handshake from the capture", 0);
-    nrecs = hs_crack_build_records_from_pcap(HS_CRACK_LOCAL_PCAP, hs_crack_ui.file_name,
-                                             recs, HS_CRACK_MAX_RECORDS,
-                                             &hs_crack_ui.cancel_requested);
-    if (hs_crack_ui.cancel_requested) {
-        snprintf(final_detail, sizeof(final_detail), "Cancelled.");
-        goto finish;
-    }
-    if (nrecs <= 0) {
+    hs_capture_report_t capture_report = hs_capture_analyze_pcap(
+        HS_CRACK_LOCAL_PCAP, hs_crack_ui.file_name, recs, HS_CRACK_MAX_RECORDS,
+        &hs_crack_ui.cancel_requested);
+    hs_crack_log_stack_watermark("capture analyzed");
+    if (capture_report.state != HS_CAPTURE_READY || hs_crack_ui.cancel_requested) {
+        if (capture_report.state == HS_CAPTURE_CANCELLED || hs_crack_ui.cancel_requested) {
+            final_status = "Cancelled";
+        } else if (capture_report.state == HS_CAPTURE_UNAVAILABLE) {
+            final_status = "Capture unavailable";
+        } else if (capture_report.state == HS_CAPTURE_UNSUPPORTED) {
+            final_status = "Capture unsupported";
+        } else {
+            final_status = "Capture needs investigation";
+        }
         snprintf(final_detail, sizeof(final_detail),
-                 "No complete WPA/WPA2 4-way handshake (M1+M2, keyver 1 or 2) found in this capture.");
+                 "%s. Packets: %lu; EAPOL: %lu; AP nonces: %lu; STA responses: %lu.",
+                 hs_capture_reason_name(capture_report.reason),
+                 (unsigned long)capture_report.packet_count,
+                 (unsigned long)capture_report.eapol_count,
+                 (unsigned long)capture_report.ap_nonce_count,
+                 (unsigned long)capture_report.sta_response_count);
         goto finish;
     }
+    nrecs = (int)capture_report.record_count;
 
     uint8_t ssid_len = recs[0].essid_len > 32 ? 32 : recs[0].essid_len;
     memcpy(ssid, recs[0].essid, ssid_len);
@@ -64304,12 +64344,14 @@ static void hs_crack_task(void *arg)
             }
 
             if (!remote_discovery_done && remote_capture_ready) {
+                hs_crack_log_stack_watermark("before worker discovery");
                 hs_crack_set_stage(
                     "Preparing workers...",
                     "Discovering Grove, USB and M-BUS crack workers", -1);
                 remote_worker_count = hs_crack_remote_discover(
                     remote_workers, remote_capture_size, remote_capture_crc,
                     &remote_probe_claimed);
+                hs_crack_log_stack_watermark("after worker discovery");
                 remote_discovery_done = true;
             }
 
@@ -64370,86 +64412,191 @@ static void hs_crack_task(void *arg)
             }
 
             uint64_t resumed_tried = 0;
-            hs_crack_resume_t resume = {0};
-            if (!hs_crack_ui.force_rerun && capture_cache_ready &&
-                hs_crack_cache_load_resume(HS_CRACK_RESUME_FILE, &capture_id,
-                                           &wordlist_id,
-                                           &resume) == HS_CRACK_CACHE_OK &&
-                resume.safe_offset <= wordlist_id.size &&
-                fseek(wl, (long)resume.safe_offset, SEEK_SET) == 0) {
-                resumed_tried = resume.tried;
-                tried += (uint32_t)(resume.tried > UINT32_MAX
-                                        ? UINT32_MAX : resume.tried);
-                hs_crack_ui.wordlist_offset = resume.safe_offset;
-                ESP_LOGI(TAG, "[HS-CRACK] resumed %s at byte %llu",
-                         hs_crack_ui.wl_names[wi],
-                         (unsigned long long)resume.safe_offset);
-            }
-
-            uint64_t work_start = hs_crack_ui.wordlist_offset;
+            uint64_t work_start = 0;
+            uint64_t local_start = 0;
             uint64_t local_end = wordlist_id.size;
+            uint64_t local_safe_offset = 0;
             hs_remote_shard_t shards[HS_CRACK_REMOTE_MAX + 1] = {0};
             hs_sched_shard_t remote_shards[HS_CRACK_REMOTE_MAX] = {0};
             for (size_t ri = 0; ri < HS_CRACK_REMOTE_MAX; ++ri)
                 hs_sched_init(&remote_shards[ri], 0, 0,
                               HS_SCHED_OWNER_NONE);
+            size_t remote_shard_count = 0;
+            hs_session_t *crack_session = heap_caps_calloc(
+                1, sizeof(*crack_session), MALLOC_CAP_SPIRAM);
+            if (!crack_session) crack_session = calloc(1, sizeof(*crack_session));
+            bool crack_session_active = false;
+            bool restored_session = false;
+            hs_session_result_t load_result = crack_session
+                ? hs_session_load_latest(HS_CRACK_SESSION_A,
+                                         HS_CRACK_SESSION_B,
+                                         crack_session, NULL)
+                : HS_SESSION_IO_ERROR;
+
+            if (!hs_crack_ui.force_rerun && capture_cache_ready &&
+                load_result == HS_SESSION_OK &&
+                hs_crack_session_matches_active_wordlist(
+                    crack_session, &capture_id, &wordlist_id,
+                    (uint16_t)wi) &&
+                hs_crack_restore_session_shards(
+                    crack_session, wordlist_id.size, &local_start,
+                    &local_end, &local_safe_offset, remote_shards,
+                    HS_CRACK_REMOTE_MAX, &remote_shard_count) &&
+                hs_crack_seek_range_start(wl, local_safe_offset)) {
+                crack_session->metrics.resume_count++;
+                crack_session_active = true;
+                restored_session = true;
+                resumed_tried = crack_session->metrics.total_tried;
+                tried += (uint32_t)(resumed_tried > UINT32_MAX
+                                        ? UINT32_MAX : resumed_tried);
+                hs_crack_ui.wordlist_offset = local_safe_offset;
+                ESP_LOGI(TAG,
+                         "[HS-CRACK] RESUME session=%02X%02X%02X%02X local=%llu/%llu shards=%u",
+                         crack_session->session_id[0], crack_session->session_id[1],
+                         crack_session->session_id[2], crack_session->session_id[3],
+                         (unsigned long long)local_safe_offset,
+                         (unsigned long long)local_end,
+                         (unsigned)remote_shard_count);
+                for (size_t si = 0; si < remote_shard_count; ++si) {
+                    ESP_LOGI(TAG,
+                             "[HS-CRACK] RESUME shard=%u range=%llu-%llu safe_offset=%llu",
+                             (unsigned)(si + 1U),
+                             (unsigned long long)remote_shards[si].range_start,
+                             (unsigned long long)remote_shards[si].range_end,
+                             (unsigned long long)remote_shards[si].confirmed_safe_offset);
+                }
+            }
+
+            if (!restored_session) {
+                if (load_result == HS_SESSION_OK &&
+                    crack_session->state != HS_SESSION_TOMBSTONE) {
+                    (void)hs_session_tombstone(
+                        HS_CRACK_SESSION_A, HS_CRACK_SESSION_B,
+                        crack_session->session_id);
+                }
+                hs_crack_resume_t resume = {0};
+                if (!hs_crack_ui.force_rerun && capture_cache_ready &&
+                    hs_crack_cache_load_resume(HS_CRACK_RESUME_FILE,
+                                               &capture_id, &wordlist_id,
+                                               &resume) == HS_CRACK_CACHE_OK &&
+                    resume.safe_offset <= wordlist_id.size) {
+                    resumed_tried = resume.tried;
+                    tried += (uint32_t)(resume.tried > UINT32_MAX
+                                            ? UINT32_MAX : resume.tried);
+                    work_start = resume.safe_offset;
+                }
+                local_start = work_start;
+                local_safe_offset = work_start;
+                hs_crack_ui.wordlist_offset = work_start;
+
+                if (remote_synced > 0 &&
+                    hs_remote_make_shards(work_start, wordlist_id.size,
+                                          remote_synced + 1U, shards)) {
+                    local_end = shards[0].end;
+                    for (size_t si = 1; si <= remote_synced; ++si) {
+                        hs_sched_shard_t *shard =
+                            &remote_shards[remote_shard_count++];
+                        hs_sched_init(shard, shards[si].start, shards[si].end,
+                                      HS_SCHED_OWNER_GROVE);
+                        if (shard->state != HS_SCHED_DONE)
+                            (void)hs_sched_queue_suffix(shard);
+                    }
+                }
+                if (!hs_crack_seek_range_start(wl, local_safe_offset)) {
+                    fclose(wl);
+                    free(crack_session);
+                    snprintf(final_detail, sizeof(final_detail),
+                             "Could not seek %s.", hs_crack_ui.wl_names[wi]);
+                    goto finish;
+                }
+                if (capture_cache_ready && crack_session) {
+                    hs_crack_session_begin(
+                        crack_session, &capture_id, &wordlist_id,
+                        wordlist_crc, wordlist_crc_ready, (uint16_t)wi, tab);
+                    crack_session_active = true;
+                    if (!hs_crack_session_checkpoint(
+                            crack_session, local_start, local_end,
+                            local_safe_offset, remote_shards,
+                            remote_shard_count, remote_workers,
+                            remote_worker_count, resumed_tried)) {
+                        cache_save_failed = true;
+                        crack_session_active = false;
+                    }
+                }
+            }
+
             size_t remote_started = 0;
-            if (remote_synced > 0 &&
-                hs_remote_make_shards(work_start, wordlist_id.size,
-                                      remote_synced + 1U, shards)) {
-                size_t shard_index = 1;
-                for (size_t ri = 0; ri < remote_worker_count; ++ri) {
-                    hs_crack_remote_worker_t *worker = &remote_workers[ri];
-                    worker->active = false;
-                    worker->finished = false;
-                    worker->failed = false;
-                    worker->counted = false;
-                    worker->shard_start = 0;
-                    worker->shard_end = 0;
-                    worker->sched_shard = NULL;
-                    worker->recovery_pending = false;
-                    worker->recovery_attempts = 0;
-                    worker->next_recovery_us = 0;
-                    worker->retired_job[0] = '\0';
-                    if (!worker->usable) continue;
-                    worker->shard_start = shards[shard_index].start;
-                    worker->shard_end = shards[shard_index].end;
-                    hs_sched_init(&remote_shards[ri], worker->shard_start,
-                                  worker->shard_end,
-                                  hs_crack_sched_owner(worker->tab));
-                    worker->sched_shard = &remote_shards[ri];
-                    if (worker->shard_start == worker->shard_end) {
-                        worker->finished = true;
-                    } else if (hs_crack_remote_start(
-                                   worker, remote_capture_size,
-                                   remote_capture_crc, wordlist_id.size,
-                                   wordlist_crc, worker->shard_start,
-                                   worker->shard_end, (unsigned)ri)) {
-                        if (hs_sched_bind_active_job(worker->sched_shard,
-                                                     worker->job)) {
-                            remote_started++;
-                        } else {
-                            hs_crack_remote_cancel_one(worker);
-                            worker->failed = true;
-                            worker->finished = false;
-                            (void)hs_sched_queue_suffix(worker->sched_shard);
-                        }
+            for (size_t ri = 0; ri < remote_worker_count; ++ri) {
+                hs_crack_remote_worker_t *worker = &remote_workers[ri];
+                worker->active = false;
+                worker->finished = false;
+                worker->failed = false;
+                worker->counted = false;
+                worker->shard_start = 0;
+                worker->shard_end = 0;
+                worker->sched_shard = NULL;
+                worker->recovery_pending = false;
+                worker->recovery_attempts = 0;
+                worker->next_recovery_us = 0;
+                worker->retired_job[0] = '\0';
+                if (!worker->usable) continue;
+
+                hs_sched_shard_t *shard = NULL;
+                size_t shard_index = 0;
+                for (size_t si = 0; si < remote_shard_count; ++si) {
+                    if (remote_shards[si].state == HS_SCHED_PENDING &&
+                        hs_sched_pending_start(&remote_shards[si]) <
+                            remote_shards[si].range_end) {
+                        shard = &remote_shards[si];
+                        shard_index = si;
+                        break;
+                    }
+                }
+                if (!shard) {
+                    worker->finished = true;
+                    continue;
+                }
+                uint64_t start = hs_sched_pending_start(shard);
+                uint64_t end = shard->range_end;
+                worker->shard_start = start;
+                worker->shard_end = end;
+                worker->sched_shard = shard;
+                worker->counted = true;
+                if (hs_crack_remote_start(
+                        worker, remote_capture_size, remote_capture_crc,
+                        wordlist_id.size, wordlist_crc, start, end,
+                        (unsigned)(ri + shard_index * HS_CRACK_REMOTE_MAX))) {
+                    hs_sched_assignment_t assignment;
+                    if (hs_sched_lease_pending(
+                            shard, hs_crack_sched_owner(worker->tab),
+                            worker->job, &assignment)) {
+                        remote_started++;
                     } else {
+                        hs_crack_remote_cancel_one(worker);
                         worker->failed = true;
                         worker->finished = false;
-                        worker->counted = true;
-                        (void)hs_sched_queue_suffix(worker->sched_shard);
-                        snprintf(hs_crack_ui.worker_status[worker->tab],
-                                 sizeof(hs_crack_ui.worker_status[0]),
-                                 "start failed - local fallback");
+                        (void)hs_sched_queue_suffix(shard);
                     }
-                    shard_index++;
+                } else {
+                    worker->failed = true;
+                    worker->finished = false;
+                    (void)hs_sched_queue_suffix(shard);
+                    snprintf(hs_crack_ui.worker_status[worker->tab],
+                             sizeof(hs_crack_ui.worker_status[0]),
+                             "start failed - local fallback");
                 }
-                if (remote_started > 0) local_end = shards[0].end;
+            }
+            if (crack_session_active &&
+                !hs_crack_session_checkpoint(
+                    crack_session, local_start, local_end,
+                    local_safe_offset, remote_shards, remote_shard_count,
+                    remote_workers, remote_worker_count, resumed_tried)) {
+                cache_save_failed = true;
+                crack_session_active = false;
             }
             hs_crack_remote_publish_counts(remote_workers, remote_worker_count);
             hs_crack_render_workers();
-            bool distributed = remote_started > 0;
+            bool distributed = remote_shard_count > 0;
             if (distributed) {
                 char worker_detail[128];
                 snprintf(worker_detail, sizeof(worker_detail),
@@ -64501,7 +64648,7 @@ static void hs_crack_task(void *arg)
                     remote_polled = now;
                     int found_worker = hs_crack_remote_scheduler_tick(
                         remote_workers, remote_worker_count, remote_shards,
-                        HS_CRACK_REMOTE_MAX, &recovery_ctx, &tried,
+                        remote_shard_count, &recovery_ctx, &tried,
                         found_pw, sizeof(found_pw));
                     if (found_worker >= 0) {
                         int remote_match = hs_crack_remote_record_index(
@@ -64522,18 +64669,20 @@ static void hs_crack_task(void *arg)
                     }
                     if (stop_source) break;
                 }
-                if (!distributed &&
-                    hs_crack_checkpoint_due(tried - checkpoint_tried,
+                if (hs_crack_checkpoint_due(tried - checkpoint_tried,
                                             now - checkpoint_started)) {
                     if (hs_crack_collect(&tried, t0, &found_idx, found_pw,
                                          sizeof(found_pw), true)) {
                         stop_source = true;
                         break;
                     }
+                    local_safe_offset = hs_crack_ui.wordlist_offset;
+                    if (local_safe_offset > local_end)
+                        local_safe_offset = local_end;
                     hs_crack_resume_t checkpoint = {
                         .capture = capture_id,
                         .wordlist = wordlist_id,
-                        .safe_offset = hs_crack_ui.wordlist_offset,
+                        .safe_offset = local_safe_offset,
                         .tried = resumed_tried +
                                  (uint64_t)(tried - active_run_tried_start),
                         .all_mode = all,
@@ -64547,6 +64696,16 @@ static void hs_crack_task(void *arg)
                         cache_save_failed = true;
                         ESP_LOGW(TAG, "[HS-CRACK] checkpoint save failed");
                     }
+                    if (crack_session_active &&
+                        !hs_crack_session_checkpoint(
+                            crack_session, local_start, local_end,
+                            local_safe_offset, remote_shards,
+                            remote_shard_count, remote_workers,
+                            remote_worker_count,
+                            resumed_tried +
+                                (uint64_t)(tried - active_run_tried_start))) {
+                        cache_save_failed = true;
+                    }
                     checkpoint_tried = tried;
                     checkpoint_started = now;
                 }
@@ -64557,12 +64716,28 @@ static void hs_crack_task(void *arg)
                                  sizeof(found_pw), true)) {
                 stop_source = true;
             }
+            if (!stop_source && !hs_crack_ui.cancel_requested &&
+                read_status != -2) {
+                local_safe_offset = local_end;
+                if (crack_session_active &&
+                    !hs_crack_session_checkpoint(
+                        crack_session, local_start, local_end,
+                        local_safe_offset, remote_shards,
+                        remote_shard_count, remote_workers,
+                        remote_worker_count,
+                        resumed_tried +
+                            (uint64_t)(tried - active_run_tried_start))) {
+                    cache_save_failed = true;
+                }
+                checkpoint_tried = tried;
+                checkpoint_started = esp_timer_get_time();
+            }
 
             if (distributed && !stop_source && read_status != -2) {
                 for (;;) {
                     int found_worker = hs_crack_remote_scheduler_tick(
                         remote_workers, remote_worker_count, remote_shards,
-                        HS_CRACK_REMOTE_MAX, &recovery_ctx, &tried,
+                        remote_shard_count, &recovery_ctx, &tried,
                         found_pw, sizeof(found_pw));
                     if (found_worker >= 0) {
                         int remote_match = hs_crack_remote_record_index(
@@ -64584,6 +64759,22 @@ static void hs_crack_task(void *arg)
                         any_active = any_active || remote_workers[ri].active;
                     if (stop_source || !any_active || hs_crack_ui.cancel_requested)
                         break;
+                    int64_t now = esp_timer_get_time();
+                    if (crack_session_active &&
+                        hs_crack_checkpoint_due(tried - checkpoint_tried,
+                                                now - checkpoint_started)) {
+                        if (!hs_crack_session_checkpoint(
+                                crack_session, local_start, local_end,
+                                local_safe_offset, remote_shards,
+                                remote_shard_count, remote_workers,
+                                remote_worker_count,
+                                resumed_tried +
+                                    (uint64_t)(tried - active_run_tried_start))) {
+                            cache_save_failed = true;
+                        }
+                        checkpoint_tried = tried;
+                        checkpoint_started = now;
+                    }
                     hs_crack_progress("remote workers", tried, t0);
                     vTaskDelay(pdMS_TO_TICKS(100));
                 }
@@ -64594,7 +64785,7 @@ static void hs_crack_task(void *arg)
              * every unfinished suffix from its monotonic safe offset. */
             if (distributed && !stop_source && !hs_crack_ui.cancel_requested &&
                 read_status != -2) {
-                for (size_t si = 0; si < HS_CRACK_REMOTE_MAX; ++si) {
+                for (size_t si = 0; si < remote_shard_count; ++si) {
                     hs_sched_shard_t *shard = &remote_shards[si];
                     if (shard->state == HS_SCHED_DONE ||
                         hs_sched_pending_start(shard) >= shard->range_end) {
@@ -64656,7 +64847,27 @@ static void hs_crack_task(void *arg)
             }
             if (stop_source || hs_crack_ui.cancel_requested || read_status == -2)
                 hs_crack_remote_cancel(remote_workers, remote_worker_count);
+            if (hs_crack_ui.cancel_requested && crack_session_active) {
+                if (!hs_crack_session_checkpoint(
+                        crack_session, local_start, local_end,
+                        local_safe_offset, remote_shards,
+                        remote_shard_count, remote_workers,
+                        remote_worker_count,
+                        resumed_tried +
+                            (uint64_t)(tried - active_run_tried_start))) {
+                    cache_save_failed = true;
+                }
+            } else if (crack_session_active && read_status != -2 &&
+                       (!hs_crack_ui.run || !hs_crack_ui.run->error)) {
+                if (hs_session_tombstone(
+                        HS_CRACK_SESSION_A, HS_CRACK_SESSION_B,
+                        crack_session->session_id) != HS_SESSION_OK) {
+                    cache_save_failed = true;
+                }
+                crack_session_active = false;
+            }
             fclose(wl);
+            free(crack_session);
 
             if (read_status == -2) {
                 snprintf(final_detail, sizeof(final_detail),
@@ -64770,7 +64981,7 @@ finish:
     hs_crack_ui.task = NULL;
     hs_crack_finish_ui_unlocked(found_idx >= 0, final_status, final_detail);
     bsp_display_unlock();
-    vTaskDelete(NULL);
+    vTaskDeleteWithCaps(NULL);
 }
 
 static void hs_crack_start_file(tab_context_t *ctx, const char *remote_path, const char *file_name)
