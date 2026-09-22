@@ -1,6 +1,7 @@
 #include "hs_capture_analyzer.h"
 #include "pcap_reader.h"
 
+#include <stdio.h>
 #include <string.h>
 
 #define HS_CAPTURE_LINKTYPE_RADIOTAP 127U
@@ -259,6 +260,86 @@ done:
     if (r.state != HS_CAPTURE_READY) {
         memset(records, 0, capacity * sizeof(*records));
         r.record_count = 0;
+    }
+    return r;
+}
+
+hs_capture_report_t hs_capture_analyze_hccapx(
+    const char *path, hccapx_record_t *records, size_t capacity,
+    const volatile bool *cancel)
+{
+    hs_capture_report_t r = {.state = HS_CAPTURE_UNAVAILABLE,
+                             .reason = HS_CAPTURE_REASON_IO_ERROR};
+    FILE *file = NULL;
+    size_t count = 0;
+    if (!path || !records || capacity == 0U ||
+        capacity > HS_CAPTURE_HCCAPX_MAX_RECORDS) {
+        r.reason = HS_CAPTURE_REASON_LIMIT_REACHED;
+        return r;
+    }
+    memset(records, 0, capacity * sizeof(*records));
+    if (cancel && *cancel) goto cancelled;
+    file = fopen(path, "rb");
+    if (!file) goto done;
+
+    for (;;) {
+        if (cancel && *cancel) goto cancelled;
+        hccapx_record_t record;
+        size_t got = fread(&record, 1, sizeof(record), file);
+        if (got == 0U) {
+            if (ferror(file)) goto done;
+            break;
+        }
+        if (got != sizeof(record)) {
+            r.state = HS_CAPTURE_INVALID;
+            r.reason = HS_CAPTURE_REASON_TRUNCATED;
+            goto done;
+        }
+        if (count >= capacity) {
+            r.state = HS_CAPTURE_UNAVAILABLE;
+            r.reason = HS_CAPTURE_REASON_LIMIT_REACHED;
+            goto done;
+        }
+        if (record.signature != HCCAPX_SIGNATURE || record.version != 4U) {
+            r.state = HS_CAPTURE_UNSUPPORTED;
+            r.reason = HS_CAPTURE_REASON_UNSUPPORTED_FORMAT;
+            goto done;
+        }
+        if (record.essid_len == 0U || record.essid_len > sizeof(record.essid)) {
+            r.state = HS_CAPTURE_INVALID;
+            r.reason = HS_CAPTURE_REASON_MISSING_SSID;
+            goto done;
+        }
+        if (record.keyver != 1U && record.keyver != 2U) {
+            r.state = HS_CAPTURE_UNSUPPORTED;
+            r.reason = HS_CAPTURE_REASON_UNSUPPORTED_KEYVER;
+            goto done;
+        }
+        if (!hs_capture_record_valid(&record)) {
+            r.state = HS_CAPTURE_INVALID;
+            r.reason = HS_CAPTURE_REASON_MALFORMED_EAPOL;
+            goto done;
+        }
+        records[count++] = record;
+    }
+    if (count == 0U) {
+        r.state = HS_CAPTURE_INVALID;
+        r.reason = HS_CAPTURE_REASON_BAD_HEADER;
+        goto done;
+    }
+    r.state = HS_CAPTURE_READY;
+    r.reason = HS_CAPTURE_REASON_OK;
+    r.record_count = (uint32_t)count;
+    goto done;
+
+cancelled:
+    r.state = HS_CAPTURE_CANCELLED;
+    r.reason = HS_CAPTURE_REASON_CANCELLED;
+done:
+    if (file) fclose(file);
+    if (r.state != HS_CAPTURE_READY) {
+        memset(records, 0, capacity * sizeof(*records));
+        r.record_count = 0U;
     }
     return r;
 }

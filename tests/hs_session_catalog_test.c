@@ -147,7 +147,7 @@ static void mismatched_directory_identity_is_rejected(void)
     fill_session(&session, 0x44, "identity.pcap", "identity.txt");
     assert(hs_session_catalog_save(root, &session) == HS_SESSION_OK);
 
-    char real_hex[33], fake_hex[33], fake_dir[512], source[512], target[512];
+    char real_hex[33], fake_hex[33], fake_dir[560], source[560], target[600];
     session_hex(0x44, real_hex);
     session_hex(0x55, fake_hex);
     snprintf(fake_dir, sizeof(fake_dir), "%s/%s", root, fake_hex);

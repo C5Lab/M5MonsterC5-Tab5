@@ -6,6 +6,7 @@
 #include <stdint.h>
 
 #define HS_CAPTURE_VALIDATOR_VERSION 1U
+#define HS_CAPTURE_HCCAPX_MAX_RECORDS 16U
 #define HCCAPX_SIGNATURE 0x58504348u
 #define HCCAPX_RECORD_SIZE 393
 
@@ -91,6 +92,9 @@ typedef struct {
 hs_capture_report_t hs_capture_analyze_pcap(const char *path, const char *file_name,
                                            hccapx_record_t *records, size_t record_capacity,
                                            const volatile bool *cancel_requested);
+hs_capture_report_t hs_capture_analyze_hccapx(
+    const char *path, hccapx_record_t *records, size_t record_capacity,
+    const volatile bool *cancel_requested);
 const char *hs_capture_reason_name(hs_capture_reason_t reason);
 
 #endif

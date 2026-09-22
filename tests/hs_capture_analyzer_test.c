@@ -277,6 +277,50 @@ static void limits_and_full_scan(void)
     assert(r.state == HS_CAPTURE_UNAVAILABLE && r.reason == HS_CAPTURE_REASON_LIMIT_REACHED);
 }
 
+static void hccapx_files(void)
+{
+    ready_pair();
+    hccapx_record_t valid = records[0];
+    hccapx_record_t output[16];
+    FILE *f = fopen(path, "wb");
+    assert(f && fwrite(&valid, 1, sizeof(valid), f) == sizeof(valid));
+    assert(fclose(f) == 0);
+
+    hs_capture_report_t r = hs_capture_analyze_hccapx(
+        path, output, 16, NULL);
+    assert(r.state == HS_CAPTURE_READY && r.reason == HS_CAPTURE_REASON_OK);
+    assert(r.record_count == 1 && hs_capture_record_valid(&output[0]));
+
+    f = fopen(path, "ab");
+    assert(f && fputc(0, f) != EOF && fclose(f) == 0);
+    r = hs_capture_analyze_hccapx(path, output, 16, NULL);
+    assert(r.state == HS_CAPTURE_INVALID &&
+           r.reason == HS_CAPTURE_REASON_TRUNCATED);
+
+    valid.essid_len = 0;
+    f = fopen(path, "wb");
+    assert(f && fwrite(&valid, 1, sizeof(valid), f) == sizeof(valid));
+    assert(fclose(f) == 0);
+    r = hs_capture_analyze_hccapx(path, output, 16, NULL);
+    assert(r.state == HS_CAPTURE_INVALID &&
+           r.reason == HS_CAPTURE_REASON_MISSING_SSID);
+
+    valid = records[0];
+    f = fopen(path, "wb");
+    assert(f);
+    for (unsigned i = 0; i < 17; ++i)
+        assert(fwrite(&valid, 1, sizeof(valid), f) == sizeof(valid));
+    assert(fclose(f) == 0);
+    r = hs_capture_analyze_hccapx(path, output, 16, NULL);
+    assert(r.state == HS_CAPTURE_UNAVAILABLE &&
+           r.reason == HS_CAPTURE_REASON_LIMIT_REACHED);
+
+    volatile bool cancel = true;
+    r = hs_capture_analyze_hccapx(path, output, 16, &cancel);
+    assert(r.state == HS_CAPTURE_CANCELLED &&
+           r.reason == HS_CAPTURE_REASON_CANCELLED);
+}
+
 int main(void)
 {
     int fd = mkstemp(path);
@@ -286,6 +330,7 @@ int main(void)
     ssid_and_linktypes();
     incomplete_capture_and_cancellation();
     limits_and_full_scan();
+    hccapx_files();
     assert(strcmp(hs_capture_reason_name(HS_CAPTURE_REASON_NO_MATCHING_PAIR), "no_matching_pair") == 0);
     assert(strcmp(hs_capture_reason_name(HS_CAPTURE_REASON_TRUNCATED), "truncated") == 0);
     assert(strcmp(hs_capture_reason_name(HS_CAPTURE_REASON_IO_ERROR), "io_error") == 0);

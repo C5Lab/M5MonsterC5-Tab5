@@ -30,12 +30,24 @@ formats, audit history and the cross-repository read-only inventory protocol.
   A missing or changed wordlist is never silently replaced: Start stays locked
   until the operator selects a replacement, which begins a new audit.
   Starting a different audit does not retire older resumable sessions; terminal
-  completion and Start over tombstone only the selected session.
+  completion, Start over and the confirmed `Delete audit` action tombstone only
+  the selected session. Deletion also makes a best-effort cancellation of that
+  session's matching live worker jobs, while preserving captures and wordlist
+  caches on every Monster.
 
 Merged multi-source discovery, per-source filtering, `Sync to Tab5`, and the
 sequential `Sync all to Tab5` batch are wired into the dashboard. Hardware
 acceptance must confirm that a duplicate present on multiple workers produces
-one local file and does not create a `_1` copy.
+one local file and does not create a `_1` copy. `Sync all` remains reusable:
+each press refreshes all sources before rebuilding the missing-file queue. Its
+availability follows connected remote workers rather than the previous catalog
+snapshot; selecting `LOCAL` still keeps the global refresh-and-sync action.
+
+Every newly synchronized PCAP/HCCAPX is validated locally. A hidden,
+CRC-protected sidecar binds the report to file size, full CRC32, format and
+validator version. LOCAL catalog refresh reuses only an exact match and
+revalidates stale or corrupt cache entries. Invalid files remain visible as
+`Needs investigation`, but cannot be launched for audit.
 
 ## Host gate
 
@@ -47,6 +59,10 @@ gcc -std=c17 -Wall -Wextra -Werror -fsanitize=address,undefined \
   tests/hs_capture_analyzer_test.c main/hs_capture_analyzer.c \
   components/pcap_reader/pcap_reader.c -o /tmp/hs_capture_analyzer_test
 /tmp/hs_capture_analyzer_test
+gcc -std=c17 -Wall -Wextra -Werror -fsanitize=address,undefined -I main \
+  tests/hs_capture_validation_test.c main/hs_capture_validation.c \
+  -o /tmp/hs_capture_validation_test
+/tmp/hs_capture_validation_test
 gcc -std=c17 -Wall -Wextra -Werror -fsanitize=address,undefined -I main \
   tests/hs_crack_session_test.c main/hs_crack_session.c -o /tmp/hs_crack_session_test
 /tmp/hs_crack_session_test
@@ -61,6 +77,10 @@ gcc -std=c17 -Wall -Wextra -Werror -fsanitize=address,undefined -I main \
   tests/hs_artifact_inventory_test.c main/hs_artifact_inventory.c \
   -o /tmp/hs_artifact_inventory_test
 /tmp/hs_artifact_inventory_test
+gcc -std=c17 -Wall -Wextra -Werror -fsanitize=address,undefined -I main \
+  tests/hs_audit_queue_test.c main/hs_audit_queue.c \
+  -o /tmp/hs_audit_queue_test
+/tmp/hs_audit_queue_test
 ```
 
 Run in `projectZero/ESP32C5`:
@@ -100,17 +120,30 @@ python3 tests/test_wpa_psk_auditor_contract.py
    operation. The accepted request must emit exactly one cancelled terminal;
    another request during it must receive `snapshot=0 reason=busy`.
 5. **Limits:** a 16-record HCCAPX may validate; a 17-record HCCAPX must be
-   flagged `invalid/limit_reached`. A PCAP may be fingerprinted up to 16 MiB.
+   flagged `unknown/limit_reached` for inspection. A PCAP may be fingerprinted
+   up to 16 MiB.
 6. **Old firmware fallback:** connect a worker without `ARTIFACT/1`; Tab5 must
    use `list_dir -s`, mark identity provisional and never label a transport
    timeout as invalid capture.
 7. **Power-cut durability:** interrupt alternating session-slot and history
    writes at several offsets. At least the previous valid A/B snapshot must
    load; corrupt history candidates stay untouched and are skipped.
-8. **Sync validation (after runtime wiring):** interrupt Sync to Tab5, resume
+8. **Sync validation:** interrupt Sync to Tab5, resume
    its `.part`, confirm prefix CRC, atomically publish the local file, then run
-   the Tab5 analyzer. Invalid material remains in the local catalog.
-9. **Dashboard:** open INTERNAL -> WPA PSK Auditor. With no checkpoint it must
+   the Tab5 analyzer. Invalid material remains in the local catalog as
+   `Needs investigation` and its Audit action is disabled. Reopen the catalog
+   to confirm an unchanged file uses its sidecar; mutate the file and confirm
+   its size/CRC mismatch forces fresh validation.
+9. **Local deletion:** choose `Delete from Tab5` for a local capture, cancel
+   once, then confirm. The capture, its hidden `.audit` sidecar and sync-index
+   aliases must disappear; copies on Grove, USB and M-BUS must remain. After
+   the automatic rescan, `Sync all to Tab5` must offer the missing capture.
+10. **Repeatable batch sync:** complete `Sync all to Tab5`, add a new remote
+   capture without reopening the Auditor and press `Sync all` again. The action
+   must remain enabled, refresh every source, copy only the new capture and
+   report the already-local items without creating duplicate files. Repeat once
+   with the source dropdown on `LOCAL`; the global action must remain available.
+11. **Dashboard:** open INTERNAL -> WPA PSK Auditor. With no checkpoint it must
    show an explicit empty state. Cancel a long distributed crack, reopen the
    dashboard and confirm capture, wordlist, safe progress and worker count.
    Resume must open the normal Crack dialog with the saved wordlist and sync
@@ -121,7 +154,7 @@ python3 tests/test_wpa_psk_auditor_contract.py
    confirm Resume remaps the saved fingerprint instead of discarding progress.
    Start over must first show a destructive confirmation. Back must return to
    the INTERNAL tiles without rebooting.
-10. **Multiple resumable audits:** start capture A with wordlist A, wait for
+12. **Multiple resumable audits:** start capture A with wordlist A, wait for
    non-zero safe offsets and Cancel. Start capture B with wordlist B and Cancel
    it as well. The dashboard must show both rows. Resume A and verify its own
    wordlist and saved shard suffixes, Cancel again, then Resume B and verify its
@@ -129,6 +162,27 @@ python3 tests/test_wpa_psk_auditor_contract.py
    not remove the other checkpoint. A legacy `.crack_audit/active.a|active.b`
    checkpoint must appear once; after its next saved checkpoint the per-session
    copy is preferred and the legacy copy must not create a duplicate row.
+13. **Batch creation:** select three valid LOCAL captures using the catalog
+   checkboxes, choose one candidate source and press `Add to queue`. Confirm the
+   collapsed Batch queue reports three items. Expand it and verify all rows use
+   the same locked wordlist. Invalid captures must not be selectable.
+14. **Remote-only batch:** select a valid capture available only on Grove, USB
+   or M-BUS. Adding it must first synchronize only the selected missing capture
+   to Tab5, validate the completed local file, refresh the catalog, and then add
+   exactly one queue item. A failed sync must not enqueue a nonexistent path.
+15. **Sequential execution:** start a three-item batch and confirm only one
+   normal Crack coordinator is active. FOUND, NOT FOUND and ERROR each persist
+   their item state before the next item starts. The aggregate card must update
+   completed count, percent, elapsed time, ETA and active remote worker count.
+16. **Pause/reboot/resume:** pause during an active item and wait for its normal
+   cancellation/checkpoint boundary. Reboot Tab5. The A/B batch journal must
+   restore the interrupted item as Paused, preserve its `session_id`, wordlist
+   fingerprint and remaining queue, and `Resume batch` must continue that item
+   before later queued captures.
+17. **Cancel/remove isolation:** `Cancel current` must mark only the current
+   item Cancelled and continue with the next queued capture. Removing a queued,
+   paused or terminal row must change only the batch journal; capture files,
+   validation sidecars, resumable sessions and Monster caches must remain.
 
 Record serial excerpts for every terminal `ARTIFACT/1` response and retain SD
 directory listings from before and after the test as the non-destructive proof.

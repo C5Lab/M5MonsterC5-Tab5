@@ -176,6 +176,11 @@ gcc -std=c17 -Wall -Wextra -Werror -fsanitize=address,undefined \
 /tmp/hs_capture_analyzer_test
 
 gcc -std=c17 -Wall -Wextra -Werror -fsanitize=address,undefined -I main \
+    tests/hs_capture_validation_test.c main/hs_capture_validation.c \
+    -o /tmp/hs_capture_validation_test
+/tmp/hs_capture_validation_test
+
+gcc -std=c17 -Wall -Wextra -Werror -fsanitize=address,undefined -I main \
     tests/hs_crack_session_test.c main/hs_crack_session.c \
     -o /tmp/hs_crack_session_test
 /tmp/hs_crack_session_test
@@ -194,6 +199,11 @@ gcc -std=c17 -Wall -Wextra -Werror -fsanitize=address,undefined -I main \
     tests/hs_artifact_inventory_test.c main/hs_artifact_inventory.c \
     -o /tmp/hs_artifact_inventory_test
 /tmp/hs_artifact_inventory_test
+
+gcc -std=c17 -Wall -Wextra -Werror -fsanitize=address,undefined -I main \
+    tests/hs_audit_queue_test.c main/hs_audit_queue.c \
+    -o /tmp/hs_audit_queue_test
+/tmp/hs_audit_queue_test
 ```
 
 These pin structured PCAP qualification, the versioned A/B session codec,
@@ -217,6 +227,14 @@ source dropdown. Its selection filters both rendered catalog rows and the
 catalog-wide synchronization queue.
 The default dropdown state stays collapsed and renders no capture rows until a
 worker (or the explicit `All sources` option) is selected.
+
+Variant A extends this gate with a durable 32-item batch journal. The queue
+test covers guarded state transitions, duplicate rejection, remove semantics,
+interrupted RUNNING/SYNCING reconciliation, canonical encoding, CRC rejection,
+and alternating A/B recovery. The Python dashboard contract additionally pins
+multi-select and state filters, selected-only remote synchronization, the
+shared single-audit coordinator, pause/cancel/remove controls, aggregate
+progress, and save-before-advance completion ordering.
 
 ## `hs_crack_remote_core_test.c`
 

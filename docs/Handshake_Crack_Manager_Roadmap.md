@@ -54,8 +54,12 @@ nadal odczytywany. Oba flow korzystają z tego samego launchera i silnika.
 Widok pokazuje również stan źródeł, ostatnie wpisy historii i połączony katalog
 LOCAL/GROVE/USB/M-BUS. Skan jest serializowany per transport, używa `ARTIFACT/1`
 z fallbackiem `list_dir -s`, pokazuje badge źródeł oraz akcje `Audit` i
-`Sync to Tab5`. Sync korzysta ze wspólnego resumowalnego transferu; automatyczna
-walidacja lokalnej kopii po zakończeniu synchronizacji pozostaje do domknięcia.
+`Sync to Tab5`. Sync korzysta ze wspólnego resumowalnego transferu i po
+opublikowaniu lokalnego pliku uruchamia ten sam walidator PCAP/HCCAPX co cracker.
+Raport jest zapisywany w ukrytym sidecarze związanym z pełnym `size+CRC32` oraz
+wersją walidatora. Zmiana pliku lub wersji unieważnia cache. Materiał wadliwy
+pozostaje na SD i w katalogu jako `Needs investigation`, ale nie można uruchomić
+na nim audytu.
 Katalog ma również `Sync all to Tab5`: buduje ograniczoną kolejkę brakujących
 capture'ów ze wszystkich dostępnych workerów, pomija wpisy niepoprawne oraz już
 lokalne/zaindeksowane, kopiuje kolejno z zachowaniem `.part` i resume, a po
@@ -70,6 +74,24 @@ ogranicza batch sync do wybranego źródła; `All sources` zachowuje widok zbior
 Katalog startuje zwinięty jako `Workers (N) - tap to browse`, więc długa lista
 nie rozciąga dashboardu dopóki operator nie wybierze workera albo świadomie
 nie przełączy się na `All sources`.
+
+Wariant A managera batch jest zaimplementowany. Katalog ma checkboxy, filtry
+`All/New/Resumable/Found/Not found/Error/Invalid`, wybór widocznych pozycji i
+akcję `Add to queue`. Plik istniejący wyłącznie na Monsterze jest najpierw
+kopiowany i walidowany na Tab5. Kolejka do 32 pozycji korzysta z jednego
+wspólnego źródła kandydatów i istniejącego koordynatora crackera, więc nigdy nie
+uruchamia dwóch audytów równolegle. Stan każdej pozycji oraz metryki są zapisane
+w naprzemiennym, CRC-protected journalu A/B. Po restarcie aktywne `Running` lub
+`Syncing` wraca jako `Paused`; `Resume batch` najpierw podejmuje przerwany wpis.
+`Cancel current` przechodzi do kolejnego elementu, a `Remove` usuwa tylko wpis
+managera bez kasowania capture, sidecarów, sesji ani cache workerów.
+
+Każdy wiersz `Resumable audits` ma potwierdzaną akcję `Delete audit`. Wycofuje
+ona tylko wskazany checkpoint Tab5 i próbuje zatrzymać pasujące joby na
+dostępnych workerach; nie usuwa z Monsterów współdzielonego cache capture ani
+wordlist. `Sync all to Tab5` pozostaje dostępny po pełnej synchronizacji i przy
+każdym kolejnym użyciu najpierw odświeża źródła, a dopiero potem buduje kolejkę
+brakujących plików.
 
 ## Punkt wznowienia na następną sesję
 
@@ -100,12 +122,13 @@ Po odbiorze multi-resume i katalogu kolejność dalszych prac:
 1. Test sprzętowy `Scan all sources`: jeden snapshot ma zawierać wpisy z
    LOCAL/GROVE/USB/M-BUS bez odpowiedzi `/lab` lub `/vendors` przypisanych do
    listy handshake'ów.
-2. Domknięcie Task 6: po `Sync to Tab5` uruchomić lokalną walidację kopii,
-   zapisać raport i dokładny fingerprint, a następnie scalić pewne duplikaty.
-3. Rozbudowa kafla o manager wielu handshake'ów: filtrowanie, wybór wielu
-   pozycji, stan i historia każdego audytu.
-4. Silnik batch oraz kolejka crackowania, dopiero gdy katalog i synchronizacja
-   przejdą odbiór sprzętowy.
+2. [Zrobione, czeka na test sprzętowy] Task 6: `Sync to Tab5`, `Sync all` i skan
+   LOCAL uruchamiają lokalną walidację, zapisują wersjonowany raport oraz pełny
+   fingerprint i blokują audyt materiału oznaczonego jako niepoprawny.
+3. [Zrobione, czeka na test sprzętowy] Manager wielu handshake'ów: filtrowanie,
+   multi-select, trwała kolejka, resume po restarcie i historia stanu pozycji.
+4. [Zrobione, czeka na test sprzętowy] Sekwencyjny silnik batch nad istniejącym
+   koordynatorem, wraz z automatycznym sync wybranych zdalnych capture'ów.
 5. Naprawa cytowania/formatowania `crack_state.csv` oraz końcowa macierz
    regresji Grove/USB/M-BUS.
 
@@ -157,6 +180,10 @@ Manager ma korzystać z istniejących wierszy workerów i obecnego modelu wyboru
 źródła, zamiast tworzyć drugi, rozbieżny mechanizm.
 
 ## Etap 3 — silnik batch
+
+Status: zaimplementowany jako trwała kolejka `hs_audit_queue` oraz cienka
+warstwa uruchamiająca istniejący pojedynczy coordinator. Odbiór sprzętowy jest
+opisany w `docs/WPA_PSK_Auditor_Acceptance.md`.
 
 Wyodrębnić wielokrotnego użytku warstwę uruchamiania:
 
