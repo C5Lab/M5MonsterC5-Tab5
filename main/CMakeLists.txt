@@ -6,6 +6,7 @@ idf_component_register(SRCS
                     "scan_filter.c"
                     "hs_capture_analyzer.c"
                     "hs_crack_session.c"
+                    "hs_session_catalog.c"
                     "hs_audit_history.c"
                     "hs_artifact_inventory.c"
                     "hs_crack_cache.c"

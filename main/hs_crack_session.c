@@ -257,6 +257,43 @@ static bool validate_semantics(const hs_session_t *session)
     return !session->has_result || session->result.outcome <= HS_SESSION_OUTCOME_ERROR;
 }
 
+bool hs_session_matches_active_wordlist(
+    const hs_session_t *session, uint64_t capture_size, uint32_t capture_crc32,
+    const char *wordlist_path, uint64_t wordlist_size, uint64_t wordlist_mtime,
+    uint32_t wordlist_head_crc32, uint32_t wordlist_tail_crc32)
+{
+    if (!session || !wordlist_path || session->state != HS_SESSION_ACTIVE ||
+        session->phase.kind != HS_SESSION_PHASE_WORDLIST ||
+        session->wordlist_count != 1U) {
+        return false;
+    }
+    const hs_session_wordlist_t *saved = &session->wordlists[0];
+    return session->capture.size == capture_size &&
+           session->capture.crc32 == capture_crc32 &&
+           strcmp(saved->path, wordlist_path) == 0 &&
+           saved->size == wordlist_size &&
+           saved->mtime == wordlist_mtime &&
+           saved->head_crc32 == wordlist_head_crc32 &&
+           saved->tail_crc32 == wordlist_tail_crc32;
+}
+
+int hs_session_find_active_wordlist(
+    const hs_session_t *session, uint64_t capture_size, uint32_t capture_crc32,
+    const hs_session_wordlist_t *catalog, size_t catalog_count)
+{
+    if (!catalog && catalog_count) return -1;
+    for (size_t i = 0; i < catalog_count; ++i) {
+        const hs_session_wordlist_t *candidate = &catalog[i];
+        if (hs_session_matches_active_wordlist(
+                session, capture_size, capture_crc32, candidate->path,
+                candidate->size, candidate->mtime, candidate->head_crc32,
+                candidate->tail_crc32)) {
+            return i <= INT32_MAX ? (int)i : -1;
+        }
+    }
+    return -1;
+}
+
 hs_session_result_t hs_session_encode(const hs_session_t *session, uint8_t *output,
                                       size_t capacity, size_t *length_out)
 {

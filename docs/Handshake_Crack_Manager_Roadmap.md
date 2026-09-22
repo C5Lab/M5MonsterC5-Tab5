@@ -1,6 +1,6 @@
 # Handshake Cracker — dalsza mapa prac
 
-Stan zapisany: 2026-09-21
+Stan zapisany: 2026-09-22
 
 Ten dokument utrwala uzgodnione etapy, aby plan nie zależał od historii czatu.
 Nie oznacza, że wszystkie punkty są już zaimplementowane.
@@ -44,6 +44,76 @@ restartu Grove/USB/M-BUS pozostaje otwarty; plan i specyfikacja znajdują się w
 `docs/superpowers/plans/2026-09-21-worker-auto-recovery.md` oraz
 `docs/superpowers/specs/2026-09-21-worker-auto-recovery-design.md`.
 
+`WPA PSK Auditor` jest dostępny jako osobny kafel w zakładce INTERNAL.
+Dashboard przechowuje niezależny checkpoint A/B dla każdej sesji i pokazuje do
+ośmiu ostatnio aktualizowanych, resumowalnych audytów wraz z capture, wordlistą,
+bezpiecznym postępem, liczbą prób, workerami i ETA. Nowy audyt nie usuwa
+poprzednich; `Resume` wybiera dokładny `session_id`, a `Start over` po
+potwierdzeniu wycofuje tylko wskazaną sesję. Stary globalny checkpoint A/B jest
+nadal odczytywany. Oba flow korzystają z tego samego launchera i silnika.
+Widok pokazuje również stan źródeł, ostatnie wpisy historii i połączony katalog
+LOCAL/GROVE/USB/M-BUS. Skan jest serializowany per transport, używa `ARTIFACT/1`
+z fallbackiem `list_dir -s`, pokazuje badge źródeł oraz akcje `Audit` i
+`Sync to Tab5`. Sync korzysta ze wspólnego resumowalnego transferu; automatyczna
+walidacja lokalnej kopii po zakończeniu synchronizacji pozostaje do domknięcia.
+Katalog ma również `Sync all to Tab5`: buduje ograniczoną kolejkę brakujących
+capture'ów ze wszystkich dostępnych workerów, pomija wpisy niepoprawne oraz już
+lokalne/zaindeksowane, kopiuje kolejno z zachowaniem `.part` i resume, a po
+udanym batchu automatycznie odświeża widok. Dokładne zdalne duplikaty są scalane
+po rozmiarze i CRC32. Gdy starszy/fallbackowy wpis nie ma fingerprintu, batch
+ostrożnie scala zgodną nazwę, rozmiar i format, kopiuje tylko jedną kanoniczną
+sztukę, a wszystkie lokalizacje workerów zapisuje jako aliasy w indeksie sync.
+Różne znane CRC nigdy nie są scalane, nawet przy tej samej nazwie.
+Osobna wysoka sekcja źródeł została zastąpiona kompaktowym dropdownem w nagłówku
+katalogu. Pokazuje wyłącznie dostępne LOCAL/GROVE/USB/M-BUS, filtruje wiersze i
+ogranicza batch sync do wybranego źródła; `All sources` zachowuje widok zbiorczy.
+Katalog startuje zwinięty jako `Workers (N) - tap to browse`, więc długa lista
+nie rozciąga dashboardu dopóki operator nie wybierze workera albo świadomie
+nie przełączy się na `All sources`.
+
+## Punkt wznowienia na następną sesję
+
+Ostatnia zakończona implementacja to wielosesyjny Resume oraz pierwszy zbiorczy
+katalog w `WPA PSK Auditor`. Kod i kontrakty hostowe są gotowe, ale firmware nie
+został przez agenta kompilowany ani sprawdzony na urządzeniu. Następną sesję
+zaczynamy od:
+
+0. [Zrobione, czeka na test sprzętowy] Arbitraż konsoli podczas skanu katalogu.
+   Grove, USB i M-BUS mają osobne mutexy własności konsoli współdzielone przez
+   odświeżanie metadanych, stare listy plików, transfery i nowy katalog. Skan
+   źródeł odbywa się kolejno i publikuje do UI dopiero kompletny snapshot.
+
+1. Skompilowania i wgrania Tab5 przez operatora. JanOS pozostaje `1.7.5`; obecny
+   build zawiera już wymagane `artifact_inventory=1`.
+2. Testu sprzętowego dwóch sesji: uruchom A -> Cancel, uruchom B -> Cancel,
+   sprawdź dwa wiersze w kaflu, Resume A -> Cancel, następnie Resume B.
+3. Testu izolacji: `Start over` albo ukończenie A nie może usunąć B. Po restarcie
+   Tab5 oba nieukończone checkpointy muszą nadal istnieć.
+4. Testu starego flow `Compromised Data -> Handshakes -> Crack`: ma wybrać
+   najnowszy dokładnie pasujący capture+wordlist, również gdy checkpoint nie
+   mieści się w ośmiu wierszach dashboardu.
+5. Zebrania logów `RESUME session=...`, bezpiecznych offsetów i listy katalogów
+   `/sdcard/lab/handshakes/.crack_audit/active/` przed i po `Start over`.
+
+Po odbiorze multi-resume i katalogu kolejność dalszych prac:
+
+1. Test sprzętowy `Scan all sources`: jeden snapshot ma zawierać wpisy z
+   LOCAL/GROVE/USB/M-BUS bez odpowiedzi `/lab` lub `/vendors` przypisanych do
+   listy handshake'ów.
+2. Domknięcie Task 6: po `Sync to Tab5` uruchomić lokalną walidację kopii,
+   zapisać raport i dokładny fingerprint, a następnie scalić pewne duplikaty.
+3. Rozbudowa kafla o manager wielu handshake'ów: filtrowanie, wybór wielu
+   pozycji, stan i historia każdego audytu.
+4. Silnik batch oraz kolejka crackowania, dopiero gdy katalog i synchronizacja
+   przejdą odbiór sprzętowy.
+5. Naprawa cytowania/formatowania `crack_state.csv` oraz końcowa macierz
+   regresji Grove/USB/M-BUS.
+
+Pozostałe ograniczenie testowe: `hs_session_catalog_test.c` przeszedł ścisłe
+sprawdzenie składni kompilatorem RISC-V, ale natywny test runtime z ASan/UBSan
+czeka na dostępny hostowy kompilator. Nie blokuje to kompilacji wykonywanej przez
+operatora, lecz pozostaje bramką przed finalnym zamknięciem etapu.
+
 ## Etap 0 — stabilizacja transportów
 
 - Potwierdzić dwa pełne transfery capture oraz dużej wordlisty przez USB.
@@ -67,10 +137,10 @@ restartu Grove/USB/M-BUS pozostaje otwarty; plan i specyfikacja znajdują się w
 
 ## Etap 2 — ekran Crack Manager
 
-Dwa wejścia prowadzą do tego samego ekranu:
+Dwa wejścia korzystają z tego samego modelu sesji i silnika:
 
-- przycisk `Crack` w nagłówku listy Handshakes,
-- kafelek `Crack` na ekranie Compromised Data.
+- istniejąca akcja `Crack` przy pliku w `Compromised Data -> Handshakes`,
+- kafel `WPA PSK Auditor` w zakładce INTERNAL.
 
 Ekran ma zawierać hybrydowy katalog plików lokalnych i plików widocznych na
 Monsterach:

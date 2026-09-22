@@ -273,12 +273,48 @@ static void legacy_and_catalog(void)
            HS_ARTIFACT_CATALOG_FULL);
 }
 
+static void synchronization_identity(void)
+{
+    hs_artifact_location_t grove = {0};
+    grove.source = HS_ARTIFACT_SOURCE_GROVE;
+    grove.scope = HS_ARTIFACT_SCOPE_HANDSHAKES;
+    grove.size = 11202;
+    grove.format = HS_ARTIFACT_FORMAT_PCAP;
+    strcpy(grove.name, "Nt_Holiday.pcap");
+
+    hs_artifact_location_t usb = grove;
+    usb.source = HS_ARTIFACT_SOURCE_USB;
+    assert(hs_artifact_locations_same_content(&grove, &usb));
+
+    usb.size++;
+    assert(!hs_artifact_locations_same_content(&grove, &usb));
+    usb.size = grove.size;
+
+    strcpy(usb.name, "renamed.pcap");
+    assert(!hs_artifact_locations_same_content(&grove, &usb));
+
+    grove.crc32_known = true;
+    grove.crc32 = 0x57BF22AF;
+    usb.crc32_known = true;
+    usb.crc32 = grove.crc32;
+    assert(hs_artifact_locations_same_content(&grove, &usb));
+
+    usb.crc32 = 0xE4FBC4A9;
+    strcpy(usb.name, grove.name);
+    assert(!hs_artifact_locations_same_content(&grove, &usb));
+
+    usb.crc32_known = false;
+    usb.format = HS_ARTIFACT_FORMAT_HCCAPX;
+    assert(!hs_artifact_locations_same_content(&grove, &usb));
+}
+
 int main(void)
 {
     parser_cases();
     fragmented_stream();
     correlation_and_paging();
     legacy_and_catalog();
+    synchronization_identity();
     puts("hs_artifact_inventory_test: PASS");
     return 0;
 }

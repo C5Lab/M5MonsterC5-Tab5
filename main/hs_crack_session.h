@@ -215,5 +215,12 @@ hs_session_result_t hs_session_save_next(const char *slot_a, const char *slot_b,
                                          hs_session_t *session);
 hs_session_result_t hs_session_tombstone(const char *slot_a, const char *slot_b,
                                          const uint8_t session_id[HS_SESSION_ID_BYTES]);
+bool hs_session_matches_active_wordlist(
+    const hs_session_t *session, uint64_t capture_size, uint32_t capture_crc32,
+    const char *wordlist_path, uint64_t wordlist_size, uint64_t wordlist_mtime,
+    uint32_t wordlist_head_crc32, uint32_t wordlist_tail_crc32);
+int hs_session_find_active_wordlist(
+    const hs_session_t *session, uint64_t capture_size, uint32_t capture_crc32,
+    const hs_session_wordlist_t *catalog, size_t catalog_count);
 
 #endif

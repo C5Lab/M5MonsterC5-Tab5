@@ -3,6 +3,24 @@
 Pure-logic pieces that carry no LVGL or ESP-IDF dependency are tested on the
 host, so they can be verified without flashing a Tab5.
 
+## `test_wpa_psk_auditor_contract.py`
+
+Pins the first INTERNAL-tab `WPA PSK Auditor` dashboard integration without
+building firmware. It verifies that the tile opens the dedicated page, the page
+reads the durable multi-session A/B catalog and bounded audit history, and each
+row's Resume/confirmed Start over routes through the existing crack launcher.
+It also preserves the
+legacy handshake browser as the current catalog entry point and requires clear
+empty/offline states. Resume must preselect the saved wordlist and sync controls
+from its stable fingerprint; a missing or changed list must not be silently
+substituted. The distributed-resume contract also pins ALL-mode catalog
+reordering so a newly inserted earlier filename cannot tombstone valid progress.
+Starting a different capture must preserve prior resumable sessions.
+
+```sh
+python tests/test_wpa_psk_auditor_contract.py
+```
+
 Run any of them with a host compiler. On a Windows workstation without one, the
 same commands work inside WSL against the `/mnt/c/...` checkout.
 
@@ -163,6 +181,11 @@ gcc -std=c17 -Wall -Wextra -Werror -fsanitize=address,undefined -I main \
 /tmp/hs_crack_session_test
 
 gcc -std=c17 -Wall -Wextra -Werror -fsanitize=address,undefined -I main \
+    tests/hs_session_catalog_test.c main/hs_session_catalog.c \
+    main/hs_crack_session.c -o /tmp/hs_session_catalog_test
+/tmp/hs_session_catalog_test
+
+gcc -std=c17 -Wall -Wextra -Werror -fsanitize=address,undefined -I main \
     tests/hs_audit_history_test.c main/hs_audit_history.c \
     -o /tmp/hs_audit_history_test
 /tmp/hs_audit_history_test
@@ -174,9 +197,26 @@ gcc -std=c17 -Wall -Wextra -Werror -fsanitize=address,undefined -I main \
 ```
 
 These pin structured PCAP qualification, the versioned A/B session codec,
+independent per-session stores with legacy checkpoint compatibility,
 immutable bounded history, strict fragmented `ARTIFACT/1` parsing, request and
 snapshot correlation, legacy inventory rows and exact/provisional catalog
 identity. They do not compile firmware.
+
+`python tests/test_wpa_psk_auditor_contract.py` additionally pins the LVGL
+integration: LOCAL/Grove/USB/M-BUS discovery stays serialized behind per-link
+console ownership, `ARTIFACT/1` falls back to `list_dir -s`, and catalog rows
+expose their source plus `Audit` and resumable `Sync to Tab5` actions.
+It also pins the catalog-wide `Sync all to Tab5` queue: invalid captures are
+excluded, exact remote duplicates share one transfer, provisional duplicates
+with matching name/size/format are coalesced, and every worker path is indexed
+to the canonical local file. Existing local/indexed copies are skipped,
+conflicting known CRC values remain separate, transfers stay sequential, and
+the catalog is refreshed after a successful batch.
+The former full-width source status block is replaced by a compact connected-
+source dropdown. Its selection filters both rendered catalog rows and the
+catalog-wide synchronization queue.
+The default dropdown state stays collapsed and renders no capture rows until a
+worker (or the explicit `All sources` option) is selected.
 
 ## `hs_crack_remote_core_test.c`
 

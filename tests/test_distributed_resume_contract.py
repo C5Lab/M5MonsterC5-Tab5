@@ -11,6 +11,8 @@ import re
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = (ROOT / "main" / "main.c").read_text(encoding="utf-8")
+SESSION_SOURCE = (ROOT / "main" / "hs_crack_session.c").read_text(encoding="utf-8")
+CATALOG_SOURCE = (ROOT / "main" / "hs_session_catalog.c").read_text(encoding="utf-8")
 
 
 def production_function(name: str) -> str:
@@ -30,29 +32,81 @@ def production_function(name: str) -> str:
     raise AssertionError(f"unterminated function {name}")
 
 
-def test_runtime_uses_the_ab_session_store():
+def test_runtime_uses_the_multi_session_ab_catalog():
     assert '#include "hs_crack_session.h"' in SOURCE
+    assert '#include "hs_session_catalog.h"' in SOURCE
     assert '"/sdcard/lab/handshakes/.crack_audit/active.a"' in SOURCE
     assert '"/sdcard/lab/handshakes/.crack_audit/active.b"' in SOURCE
+    assert '"/sdcard/lab/handshakes/.crack_audit/active"' in SOURCE
     task = production_function("hs_crack_task")
-    assert "hs_session_load_latest(" in task
-    assert "hs_session_save_next(" in SOURCE
-    assert "hs_session_tombstone(" in task
+    assert "hs_crack_load_matching_session(" in task
+    checkpoint = production_function("hs_crack_session_checkpoint")
+    assert "hs_session_catalog_save(" in checkpoint
+    assert "hs_session_catalog_tombstone(" in task
+
+
+def test_starting_a_different_audit_does_not_retire_other_sessions():
+    task = production_function("hs_crack_task")
+    fresh = task.index("if (!restored_session)")
+    begin = task.index("hs_crack_session_begin(", fresh)
+    window = task[fresh:begin]
+    assert "hs_session_tombstone(" not in window
 
 
 def test_only_an_exact_active_capture_and_wordlist_can_resume():
-    match = production_function("hs_crack_session_matches_active_wordlist")
+    match_start = SESSION_SOURCE.index("bool hs_session_matches_active_wordlist(")
+    match_end = SESSION_SOURCE.index("\n}\n", match_start) + 2
+    match = SESSION_SOURCE[match_start:match_end]
     for token in (
         "HS_SESSION_ACTIVE",
-        "capture->size",
-        "capture->crc32",
-        "wordlist->path",
-        "wordlist->size",
-        "wordlist->mtime",
-        "wordlist->head_crc32",
-        "wordlist->tail_crc32",
+        "capture_size",
+        "capture_crc32",
+        "wordlist_path",
+        "wordlist_size",
+        "wordlist_mtime",
+        "wordlist_head_crc32",
+        "wordlist_tail_crc32",
     ):
         assert token in match
+    assert "wordlist_index" not in match
+    task = production_function("hs_crack_task")
+    assert "crack_session->phase.wordlist_index = (uint16_t)wi" in task
+
+
+def test_all_mode_remaps_the_saved_identity_before_iterating_the_catalog():
+    resolver = production_function("hs_crack_resume_wordlist_index")
+    assert "hs_session_catalog_find_newest_wordlist(" in resolver
+    assert "hs_crack_cache_wordlist_id(" in resolver
+    assert "hs_session_find_active_wordlist(" in resolver
+    task = production_function("hs_crack_task")
+    remap = task.index("hs_crack_resume_wordlist_index(&capture_id)")
+    loop = task.index("for (int wi = wl_from; wi < wl_to; wi++)")
+    assert remap < loop
+    assert "wl_from = resume_index" in task[remap:loop]
+
+
+def test_all_mode_fails_closed_when_active_wordlist_becomes_unreadable():
+    resolver = production_function("hs_crack_resume_wordlist_index")
+    assert "HS_CRACK_RESUME_STALE" in resolver
+    assert "matching_capture" in resolver
+    task = production_function("hs_crack_task")
+    stale = task.index("resume_index == HS_CRACK_RESUME_STALE")
+    loop = task.index("for (int wi = wl_from; wi < wl_to; wi++)")
+    assert stale < loop
+    assert "goto finish" in task[stale:loop]
+
+
+def test_single_wordlist_also_runs_fail_closed_preflight_before_iteration():
+    task = production_function("hs_crack_task")
+    wordlist_phase = task.index("bool all = (hs_crack_ui.wl_choice")
+    preflight = task.index(
+        "if (capture_cache_ready && !hs_crack_ui.force_rerun)", wordlist_phase)
+    loop = task.index("for (int wi = wl_from; wi < wl_to; wi++)")
+    assert preflight < loop
+    window = task[preflight:loop]
+    assert "hs_crack_resume_wordlist_index(&capture_id)" in window
+    assert "resume_index == HS_CRACK_RESUME_STALE" in window
+    assert "if (all && resume_index >= 0)" in window
 
 
 def test_cancel_terminal_status_advances_remote_safe_offsets():
@@ -67,7 +121,7 @@ def test_checkpoint_snapshots_local_and_remote_shards():
     assert "local_safe_offset" in checkpoint
     assert "remote_shards" in checkpoint
     assert "confirmed_safe_offset" in checkpoint
-    assert "hs_session_save_next" in checkpoint
+    assert "hs_session_catalog_save" in checkpoint
 
 
 def test_distributed_runs_checkpoint_after_a_drained_local_boundary():
@@ -82,7 +136,7 @@ def test_distributed_runs_checkpoint_after_a_drained_local_boundary():
 
 def test_resume_restores_ranges_before_starting_workers():
     task = production_function("hs_crack_task")
-    load = task.index("hs_session_load_latest(")
+    load = task.index("hs_crack_load_matching_session(")
     restore = task.index("hs_crack_restore_session_shards(")
     first_remote_start = task.index("hs_crack_remote_start(", restore)
     assert load < restore < first_remote_start

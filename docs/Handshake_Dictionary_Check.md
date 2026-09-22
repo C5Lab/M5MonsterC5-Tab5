@@ -315,7 +315,10 @@ using deleted widgets.
 Cancellation is cooperative inside PBKDF2 as well as during enumeration. The
 coordinator sets an atomic stop flag, waits for both workers to acknowledge exit,
 then releases queues and capture storage. Workers never access LVGL objects.
-There is no persistent pause/resume: a new run starts from the beginning.
+`Stop` preserves a versioned A/B session checkpoint. A later run with the same
+capture and wordlist identities restores the local and remote shard suffixes from
+their monotonic safe offsets. The `WPA PSK Auditor` tile exposes that checkpoint
+as `Resume`; `Start over` is a separately confirmed action.
 
 ## Source map
 
@@ -335,6 +338,10 @@ in `main/CMakeLists.txt`.
 | `hs_crack_eta_seconds` | Estimate remaining seconds from measured throughput |
 | `hs_crack_ui` | Task, cancellation, candidate total and widget state |
 | `hs_crack_finish_ui_unlocked` | Publish the final result while the caller holds the display lock |
+| `show_wpa_psk_auditor_page` | Present the durable session, source readiness and recent history |
+| `wpa_auditor_launch_saved` | Route Resume/Start over through the existing `hs_crack_start_file` launcher |
+| `main/hs_crack_session.c` | Versioned A/B session codec and durable store |
+| `main/hs_audit_history.c` | Bounded immutable audit-history records |
 
 ## Verification
 

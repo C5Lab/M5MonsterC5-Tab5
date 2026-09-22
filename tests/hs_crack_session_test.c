@@ -336,12 +336,58 @@ static void ab_store_and_tombstone(void)
     assert(rmdir(directory) == 0);
 }
 
+static void stable_wordlist_identity_ignores_catalog_reordering(void)
+{
+    hs_session_t session = {0};
+    session.schema_version = HS_SESSION_SCHEMA_VERSION;
+    session.state = HS_SESSION_ACTIVE;
+    session.capture.size = 11202;
+    session.capture.crc32 = 0x57bf22af;
+    session.phase.kind = HS_SESSION_PHASE_WORDLIST;
+    session.phase.wordlist_index = 9; /* old UI/catalog position */
+    session.wordlist_count = 1;
+    hs_session_wordlist_t *saved = &session.wordlists[0];
+    strcpy(saved->path, "/sdcard/lab/wordlist/rockyou.txt");
+    saved->size = 15645263;
+    saved->mtime = 1726900000;
+    saved->head_crc32 = 0x12345678;
+    saved->tail_crc32 = 0x9abcdef0;
+
+    /* The current catalog index is intentionally not part of this API: adding
+     * a file that sorts before rockyou.txt must not discard valid progress. */
+    assert(hs_session_matches_active_wordlist(
+        &session, 11202, 0x57bf22af, saved->path, saved->size,
+        saved->mtime, saved->head_crc32, saved->tail_crc32));
+
+    hs_session_wordlist_t catalog[2] = {0};
+    strcpy(catalog[0].path, "/sdcard/lab/wordlist/aaa-new.txt");
+    catalog[0].size = 77;
+    catalog[0].mtime = 1727000000;
+    catalog[0].head_crc32 = 1;
+    catalog[0].tail_crc32 = 2;
+    catalog[1] = *saved;
+    assert(hs_session_find_active_wordlist(
+               &session, 11202, 0x57bf22af, catalog, 2) == 1);
+
+    assert(!hs_session_matches_active_wordlist(
+        &session, 11202, 0x57bf22af, saved->path, saved->size + 1,
+        saved->mtime, saved->head_crc32, saved->tail_crc32));
+    assert(!hs_session_matches_active_wordlist(
+        &session, 11202, 0x57bf22af, "/sdcard/lab/wordlist/other.txt",
+        saved->size, saved->mtime, saved->head_crc32, saved->tail_crc32));
+    session.state = HS_SESSION_TOMBSTONE;
+    assert(!hs_session_matches_active_wordlist(
+        &session, 11202, 0x57bf22af, saved->path, saved->size,
+        saved->mtime, saved->head_crc32, saved->tail_crc32));
+}
+
 int main(void)
 {
     round_trip_and_bounds();
     minimal_round_trip();
     corruption_and_tlv_rules();
     ab_store_and_tombstone();
+    stable_wordlist_identity_ignores_catalog_reordering();
     puts("hs_crack_session_test: PASS");
     return 0;
 }

@@ -73,6 +73,9 @@
 #include "hs_crack_remote_core.h"
 #include "hs_crack_scheduler.h"
 #include "hs_crack_session.h"
+#include "hs_session_catalog.h"
+#include "hs_audit_history.h"
+#include "hs_artifact_inventory.h"
 #include "transfer_speed_config.h"
 #include "usb_vcp_config.h"
 #include <stdatomic.h>
@@ -1616,7 +1619,7 @@ typedef struct {
     tab_context_t *ctx;
     int tab;
     char remote_path[WARDRIVE_WIGLE_PATH_MAX];
-    char file_name[96];
+    char file_name[WARDRIVE_WIGLE_PATH_MAX];
     /* From "list_dir -s"; 0 when the size is unknown. Decides Wi-Fi vs M-BUS. */
     long size_bytes;
     /* A handshake copies into lab/handshakes; everything else into pcaps/imported. */
@@ -1646,6 +1649,9 @@ typedef struct {
     volatile bool active;
     volatile bool cancel_requested;
     bool sync_mode;
+    size_t batch_current;
+    size_t batch_total;
+    char batch_file[96];
     TaskHandle_t task;
     lv_obj_t *overlay;
     lv_obj_t *popup;
@@ -2213,6 +2219,25 @@ static lv_obj_t *internal_container = NULL;
 // INTERNAL tab page objects
 static lv_obj_t *internal_tiles = NULL;
 static lv_obj_t *internal_settings_page = NULL;
+static lv_obj_t *wpa_auditor_page = NULL;
+static lv_obj_t *wpa_auditor_status_label = NULL;
+static lv_obj_t *wpa_auditor_confirm_overlay = NULL;
+static hs_session_catalog_entry_t *wpa_auditor_sessions = NULL;
+static size_t wpa_auditor_session_count = 0;
+static size_t wpa_auditor_pending_session = SIZE_MAX;
+static hs_artifact_catalog_t *wpa_auditor_catalog = NULL;
+static lv_obj_t *wpa_auditor_catalog_list = NULL;
+static lv_obj_t *wpa_auditor_catalog_status = NULL;
+static lv_obj_t *wpa_auditor_catalog_scan_btn = NULL;
+static lv_obj_t *wpa_auditor_catalog_sync_all_btn = NULL;
+static lv_obj_t *wpa_auditor_source_dropdown = NULL;
+static hs_artifact_source_t wpa_auditor_source_options[4];
+static size_t wpa_auditor_source_option_count = 0;
+/* -2 = collapsed, -1 = all sources, otherwise hs_artifact_source_t. */
+static int wpa_auditor_source_filter = -2;
+static TaskHandle_t wpa_auditor_catalog_task_handle = NULL;
+static volatile bool wpa_auditor_catalog_cancel = false;
+static uint32_t wpa_auditor_catalog_generation = 0;
 
 // Helper to get current tab's context
 static tab_context_t* get_current_ctx(void) {
@@ -2938,6 +2963,7 @@ static void show_scan_page(void);
 static void show_observer_page(void);
 static void show_esp_modem_page(void);
 static void show_settings_page(void);
+static void show_wpa_psk_auditor_page(void);
 static void show_time_popup(void);
 static void main_tile_event_cb(lv_event_t *e);
 static void back_btn_event_cb(lv_event_t *e);
@@ -2961,6 +2987,9 @@ static void save_screenshot_to_sd(void);
 static void update_home_dashboard_labels(tab_context_t *ctx, int battery_pct);
 static void trigger_home_meta_refresh(tab_context_t *ctx, bool force);
 static void home_meta_refresh_task(void *arg);
+static void compromised_transport_lock_begin(tab_id_t tab, uart_port_t uart_port,
+                                             bool *lock_set);
+static void compromised_transport_lock_end(tab_id_t tab, bool lock_set);
 static void rebuild_all_home_tiles(void);
 static void show_global_attacks_page(void);
 static void show_sd_admin_page(void);
@@ -3711,6 +3740,7 @@ static int battery_percent_from_voltage(float voltage_v)
 
 // Forward declaration for USB RX arbitration flag (defined with initializer later).
 static volatile bool usb_rx_exclusive;
+static SemaphoreHandle_t transport_console_mutex[3];
 
 static void format_uptime(char *out, size_t out_len)
 {
@@ -3878,20 +3908,14 @@ static void home_read_remote_meta(tab_context_t *ctx)
     bool wdgwars_ok = false;
     bool white_ok = false;
     bool home_ok = false;
-    bool usb_lock_set = false;
+    bool transport_lock_set = false;
 
     if (tab == TAB_INTERNAL) {
         home_read_local_meta(ctx);
         return;
     }
 
-    if (tab == TAB_USB) {
-        usb_rx_exclusive = true;
-        usb_lock_set = true;
-        usb_flush_input(180);
-    } else {
-        uart_flush_input(uart_port);
-    }
+    compromised_transport_lock_begin(tab, uart_port, &transport_lock_set);
 
     const char *hs_paths[] = { "/sdcard/lab/handshakes", "/lab/handshakes" };
     for (size_t i = 0; i < sizeof(hs_paths) / sizeof(hs_paths[0]); i++) {
@@ -3943,9 +3967,7 @@ static void home_read_remote_meta(tab_context_t *ctx)
         }
     }
 
-    if (usb_lock_set) {
-        usb_rx_exclusive = false;
-    }
+    compromised_transport_lock_end(tab, transport_lock_set);
 
     ctx->home_handshake_count = pcap_count;
     ctx->home_wpasec_present  = wpasec_ok;
@@ -18357,6 +18379,8 @@ static void internal_tile_event_cb(lv_event_t *e)
     } else if (strcmp(tile_name, "Ad Hoc Portal") == 0) {
         // Show Ad Hoc Portal page (with portal status or probe selection)
         show_adhoc_portal_page();
+    } else if (strcmp(tile_name, "WPA PSK Auditor") == 0) {
+        show_wpa_psk_auditor_page();
     }
 }
 
@@ -18392,7 +18416,12 @@ static void show_internal_tiles(void)
     lv_obj_set_flex_align(internal_tiles, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     style_scrollable_tile_grid(internal_tiles);
 
-    // Create 2 tiles for INTERNAL tab
+    // Tab5-local tools and settings. The auditor is the central entry point;
+    // the legacy per-Monster Compromised Data -> Handshakes -> Crack flow
+    // remains available on each transport tab and uses the same engine.
+    create_tile(internal_tiles, LV_SYMBOL_EYE_OPEN, "WPA PSK\nAuditor",
+                COLOR_MATERIAL_AMBER, internal_tile_event_cb,
+                "WPA PSK Auditor");
     create_tile(internal_tiles, LV_SYMBOL_SETTINGS, "Settings", COLOR_MATERIAL_PURPLE, internal_tile_event_cb, "Settings");
     create_tile(internal_tiles, LV_SYMBOL_WIFI, "Ad Hoc\nPortal & Karma", COLOR_MATERIAL_ORANGE, internal_tile_event_cb, "Ad Hoc Portal");
 
@@ -34495,27 +34524,41 @@ static void wardrive_recompute_file_summary(tab_context_t *ctx)
     s->announced = (announced > 0) ? s->files : 0;
 }
 
-static void compromised_transport_lock_begin(tab_id_t tab, uart_port_t uart_port, bool *usb_lock_set)
+static void compromised_transport_lock_begin(tab_id_t tab, uart_port_t uart_port,
+                                             bool *lock_set)
 {
-    if (usb_lock_set) {
-        *usb_lock_set = false;
+    if (lock_set) {
+        *lock_set = false;
+    }
+
+    if (tab >= TAB_GROVE && tab <= TAB_MBUS) {
+        SemaphoreHandle_t mutex = transport_console_mutex[(size_t)tab];
+        if (mutex && xSemaphoreTake(mutex, portMAX_DELAY) != pdTRUE) {
+            ESP_LOGW(TAG, "[%s] Could not acquire console ownership",
+                     tab_transport_name(tab));
+            return;
+        }
+        if (lock_set && mutex) {
+            *lock_set = true;
+        }
     }
 
     if (tab == TAB_USB) {
         usb_rx_exclusive = true;
-        if (usb_lock_set) {
-            *usb_lock_set = true;
-        }
         usb_flush_input(120);
     } else if (!tab_is_internal(tab)) {
         uart_flush_input(uart_port);
     }
 }
 
-static void compromised_transport_lock_end(bool usb_lock_set)
+static void compromised_transport_lock_end(tab_id_t tab, bool lock_set)
 {
-    if (usb_lock_set) {
+    if (tab == TAB_USB) {
         usb_rx_exclusive = false;
+    }
+    if (lock_set && tab >= TAB_GROVE && tab <= TAB_MBUS) {
+        SemaphoreHandle_t mutex = transport_console_mutex[(size_t)tab];
+        if (mutex) xSemaphoreGive(mutex);
     }
 }
 
@@ -34719,7 +34762,7 @@ static int compromised_load_handshake_files(tab_context_t *ctx, tab_id_t active_
         }
     }
 
-    compromised_transport_lock_end(usb_lock_set);
+    compromised_transport_lock_end(active_tab, usb_lock_set);
     return ctx->wardrive_wigle_file_count;
 }
 
@@ -34782,7 +34825,7 @@ static int compromised_load_pcap_capture_files(tab_context_t *ctx, tab_id_t acti
         }
     }
 
-    compromised_transport_lock_end(usb_lock_set);
+    compromised_transport_lock_end(active_tab, usb_lock_set);
     return ctx->wardrive_wigle_file_count;
 }
 
@@ -34810,7 +34853,7 @@ static int compromised_load_wardrive_files(tab_context_t *ctx, tab_id_t active_t
     int marker_files = wardrive_load_files_from_command(ctx, active_tab, uart_port,
                                                     WARDRIVE_LISTING_TIMEOUT_MS);
     if (marker_files > 0 || ctx->wardrive_file_summary.valid) {
-        compromised_transport_lock_end(usb_lock_set);
+        compromised_transport_lock_end(active_tab, usb_lock_set);
         return ctx->wardrive_wigle_file_count;
     }
 
@@ -34853,7 +34896,7 @@ static int compromised_load_wardrive_files(tab_context_t *ctx, tab_id_t active_t
         }
     }
 
-    compromised_transport_lock_end(usb_lock_set);
+    compromised_transport_lock_end(active_tab, usb_lock_set);
     return ctx->wardrive_wigle_file_count;
 }
 
@@ -35704,7 +35747,7 @@ static void wardrive_cleanup_task(void *arg)
         rx = malloc(rx_size);
     }
     if (!rx) {
-        compromised_transport_lock_end(usb_lock_set);
+        compromised_transport_lock_end(tab, usb_lock_set);
         bsp_display_lock(0);
         if (ctx->compromised_cleanup_spinner) {
             lv_obj_add_flag(ctx->compromised_cleanup_spinner, LV_OBJ_FLAG_HIDDEN);
@@ -35755,7 +35798,7 @@ static void wardrive_cleanup_task(void *arg)
         elapsed_ms += poll_ms;
     }
     bool cleanup_buffer_full = (total_len >= (int)rx_size - 1);
-    compromised_transport_lock_end(usb_lock_set);
+    compromised_transport_lock_end(tab, usb_lock_set);
 
     int scanned = 0, matched = 0, moved = 0, failed = 0, dry_run = args->move ? 0 : 1;
     int announced = 0;
@@ -35819,7 +35862,7 @@ static void wardrive_cleanup_task(void *arg)
     if (cleanup_truncated) {
         compromised_transport_lock_begin(tab, uart_port, &usb_lock_set);
         wardrive_drain_transport(tab, uart_port);
-        compromised_transport_lock_end(usb_lock_set);
+        compromised_transport_lock_end(tab, usb_lock_set);
     }
 
     bsp_display_lock(0);
@@ -35885,7 +35928,7 @@ static void wardrive_fix_task(void *arg)
         rx = malloc(rx_size);
     }
     if (!rx) {
-        compromised_transport_lock_end(usb_lock_set);
+        compromised_transport_lock_end(tab, usb_lock_set);
         bsp_display_lock(0);
         if (ctx->compromised_cleanup_spinner) {
             lv_obj_add_flag(ctx->compromised_cleanup_spinner, LV_OBJ_FLAG_HIDDEN);
@@ -35928,7 +35971,7 @@ static void wardrive_fix_task(void *arg)
         }
         elapsed_ms += poll_ms;
     }
-    compromised_transport_lock_end(usb_lock_set);
+    compromised_transport_lock_end(tab, usb_lock_set);
 
     char filename[96] = {0};
     char output[96] = {0};
@@ -36116,7 +36159,7 @@ static void compromised_cleanup_task(void *arg)
         vTaskDelay(pdMS_TO_TICKS(80));
     }
 
-    compromised_transport_lock_end(usb_lock_set);
+    compromised_transport_lock_end(tab, usb_lock_set);
     free(rx_buffer);
 
     bsp_display_lock(0);
@@ -58089,6 +58132,23 @@ static void compromised_transfer_progress_cb(const janos_file_transfer_progress_
         detail[0] = '\0';
     }
 
+    if (compromised_transfer_ui.batch_total > 0U) {
+        int overall = (int)((((compromised_transfer_ui.batch_current - 1U) * 100U) +
+                             (size_t)percent) /
+                            compromised_transfer_ui.batch_total);
+        char batch_detail[320];
+        snprintf(batch_detail, sizeof(batch_detail),
+                 "%u/%u  %.90s\n%.190s",
+                 (unsigned)compromised_transfer_ui.batch_current,
+                 (unsigned)compromised_transfer_ui.batch_total,
+                 compromised_transfer_ui.batch_file[0]
+                     ? compromised_transfer_ui.batch_file
+                     : "capture",
+                 detail);
+        snprintf(detail, sizeof(detail), "%.255s", batch_detail);
+        percent = overall;
+    }
+
     /* Kept from the hunt for the Wi-Fi transfer failures: a collapsing pool is
      * invisible without sampling it as the transfer runs. Sparse enough now not
      * to bury the rest of the log during a multi-minute copy. */
@@ -58139,6 +58199,9 @@ static void compromised_transfer_close_or_cancel_cb(lv_event_t *e)
     compromised_transfer_ui.action_label = NULL;
     compromised_transfer_ui.cancel_requested = false;
     compromised_transfer_ui.sync_mode = false;
+    compromised_transfer_ui.batch_current = 0;
+    compromised_transfer_ui.batch_total = 0;
+    compromised_transfer_ui.batch_file[0] = '\0';
 
     if (refresh_espshark_monster) {
         ctx->compromised_files_loaded = false;
@@ -58556,6 +58619,8 @@ static bool janos_transfer_build_unique_local_path(tab_id_t tab, const char *fil
 #define JANOS_SYNC_STATE_FILE ".monster_sync.tsv"
 #define JANOS_SYNC_LINE_MAX   768
 
+static esp_err_t janos_uart_prepare_directories(const char *local_path);
+
 static bool janos_sync_build_state_path(tab_id_t tab, char *output, size_t output_size)
 {
     if (!output || output_size == 0) {
@@ -58704,6 +58769,11 @@ static esp_err_t janos_sync_state_append(tab_id_t tab, const char *remote_path,
     char state_path[320];
     if (!janos_sync_build_state_path(tab, state_path, sizeof(state_path))) {
         return ESP_ERR_INVALID_SIZE;
+    }
+
+    esp_err_t prepare_err = janos_uart_prepare_directories(state_path);
+    if (prepare_err != ESP_OK) {
+        return prepare_err;
     }
 
     FILE *state = fopen(state_path, "a");
@@ -59791,11 +59861,15 @@ static void compromised_transfer_task(void *arg)
         }
 
         if (result_err == ESP_OK) {
+            esp_err_t state_err = janos_sync_state_append(
+                tab, args->remote_path, result.remote_size_before,
+                result.final_path, result.crc32);
             snprintf(final_detail, sizeof(final_detail),
-                     "Copied over %s.\n%s\n%llu bytes, CRC32 %08lX",
+                     "Copied over %s.\n%s\n%llu bytes, CRC32 %08lX%s",
                      tab_transport_name(tab), result.final_path,
                      (unsigned long long)result.bytes_written,
-                     (unsigned long)result.crc32);
+                     (unsigned long)result.crc32,
+                     state_err == ESP_OK ? "" : "\nWarning: sync index was not saved.");
         } else {
             snprintf(final_detail, sizeof(final_detail),
                      "%s copy failed: %s\n%llu of %llu bytes kept in .part for resume",
@@ -59882,7 +59956,7 @@ cleanup:
         vTaskDelay(pdMS_TO_TICKS(350));
     }
     janos_transfer_restore_wifi(&wifi_session);
-    compromised_transport_lock_end(usb_lock_set);
+    compromised_transport_lock_end(tab, usb_lock_set);
 
     ESP_LOGI(TAG, "[%s] Monster file transfer finished: %s",
              tab_transport_name(tab), esp_err_to_name(result_err));
@@ -60085,7 +60159,7 @@ cleanup:
         vTaskDelay(pdMS_TO_TICKS(350));
     }
     janos_transfer_restore_wifi(&wifi_session);
-    compromised_transport_lock_end(usb_lock_set);
+    compromised_transport_lock_end(tab, usb_lock_set);
 
     if (!final_detail[0]) {
         snprintf(final_detail, sizeof(final_detail),
@@ -60154,6 +60228,9 @@ static void compromised_files_sync_cb(lv_event_t *e)
     compromised_transfer_ui.active = true;
     compromised_transfer_ui.cancel_requested = false;
     compromised_transfer_ui.sync_mode = true;
+    compromised_transfer_ui.batch_current = 0;
+    compromised_transfer_ui.batch_total = 0;
+    compromised_transfer_ui.batch_file[0] = '\0';
     char popup_name[128];
     snprintf(popup_name, sizeof(popup_name), "%s: %d file(s)",
              compromised_title_for_kind(kind), args->item_count);
@@ -60208,6 +60285,7 @@ typedef enum {
 #define HS_CRACK_ATTEMPTS_CSV "/sdcard/lab/handshakes/crack_attempts.csv"
 #define HS_CRACK_RESUME_FILE "/sdcard/lab/handshakes/.crack_resume"
 #define HS_CRACK_AUDIT_DIR "/sdcard/lab/handshakes/.crack_audit"
+#define HS_CRACK_SESSION_DIR "/sdcard/lab/handshakes/.crack_audit/active"
 #define HS_CRACK_SESSION_A "/sdcard/lab/handshakes/.crack_audit/active.a"
 #define HS_CRACK_SESSION_B "/sdcard/lab/handshakes/.crack_audit/active.b"
 
@@ -60286,7 +60364,10 @@ typedef struct {
     uint8_t remote_finished;
     uint8_t remote_failed;
     int64_t source_started_us;
+    int64_t source_started_unix_seconds;
     bool force_rerun;
+    bool resume_session_valid;
+    uint8_t resume_session_id[HS_SESSION_ID_BYTES];
     bool started;
     hs_crack_run_t *run;
     const char *candidate_source;
@@ -60495,7 +60576,7 @@ static bool hs_crack_save_to_monster(tab_id_t tab, uart_port_t port,
     transport_write_bytes_tab(tab, port, cmd, strlen(cmd));
     char resp[256] = {0};
     (void)home_collect_uart_response(tab, port, resp, sizeof(resp), 1500);
-    compromised_transport_lock_end(lock);
+    compromised_transport_lock_end(tab, lock);
 
     return strstr(resp, "save_pass: saved") != NULL ||
            strstr(resp, "save_pass: exists") != NULL;
@@ -62761,7 +62842,7 @@ static size_t hs_crack_remote_discover(hs_crack_remote_worker_t *workers,
                      tab_transport_name(worker->tab));
             snprintf(hs_crack_ui.worker_status[worker->tab],
                      sizeof(hs_crack_ui.worker_status[0]), "no worker");
-            compromised_transport_lock_end(worker->usb_lock_set);
+            compromised_transport_lock_end(worker->tab, worker->usb_lock_set);
             worker->usb_lock_set = false;
             hs_crack_remote_release_transport(worker);
             continue;
@@ -62773,7 +62854,7 @@ static size_t hs_crack_remote_discover(hs_crack_remote_worker_t *workers,
         if (!synced) {
             ESP_LOGW(TAG, "[HS-CRACK] capture sync failed on %s",
                      tab_transport_name(worker->tab));
-            compromised_transport_lock_end(worker->usb_lock_set);
+            compromised_transport_lock_end(worker->tab, worker->usb_lock_set);
             worker->usb_lock_set = false;
             hs_crack_remote_release_transport(worker);
             continue;
@@ -62839,24 +62920,107 @@ static hs_session_source_t hs_crack_session_source(tab_id_t tab)
     }
 }
 
-static bool hs_crack_session_matches_active_wordlist(
-    const hs_session_t *session, const hs_crack_capture_id_t *capture,
-    const hs_crack_wordlist_id_t *wordlist, uint16_t wordlist_index)
+/* Resolve an active ALL-mode checkpoint against the freshly sorted SD
+ * catalog. Returning the saved numeric index would be unsafe because adding a
+ * dictionary can move every later entry. */
+enum {
+    HS_CRACK_RESUME_NONE = -1,
+    HS_CRACK_RESUME_ERROR = -2,
+    HS_CRACK_RESUME_STALE = -3,
+};
+
+static int hs_crack_resume_wordlist_index(
+    const hs_crack_capture_id_t *capture)
 {
-    if (!session || !capture || !wordlist ||
-        session->state != HS_SESSION_ACTIVE || session->wordlist_count != 1U ||
-        session->phase.kind != HS_SESSION_PHASE_WORDLIST ||
-        session->phase.wordlist_index != wordlist_index) {
-        return false;
+    if (!capture || hs_crack_ui.wl_count <= 0) return HS_CRACK_RESUME_NONE;
+    size_t count = (size_t)hs_crack_ui.wl_count;
+    hs_session_wordlist_t *catalog = heap_caps_calloc(
+        count, sizeof(*catalog), MALLOC_CAP_SPIRAM);
+    if (!catalog) catalog = calloc(count, sizeof(*catalog));
+    if (!catalog) return HS_CRACK_RESUME_ERROR;
+    for (size_t i = 0; i < count; ++i) {
+        hs_crack_wordlist_id_t id = {0};
+        if (hs_crack_cache_wordlist_id(hs_crack_ui.wl_paths[i], &id) !=
+            HS_CRACK_CACHE_OK) {
+            continue;
+        }
+        snprintf(catalog[i].path, sizeof(catalog[i].path), "%s", id.path);
+        catalog[i].size = id.size;
+        catalog[i].mtime = (uint64_t)id.mtime;
+        catalog[i].head_crc32 = id.head_crc32;
+        catalog[i].tail_crc32 = id.tail_crc32;
     }
-    const hs_session_wordlist_t *saved = &session->wordlists[0];
-    return session->capture.size == capture->size &&
-           session->capture.crc32 == capture->crc32 &&
-           strcmp(saved->path, wordlist->path) == 0 &&
-           saved->size == wordlist->size &&
-           saved->mtime == (uint64_t)wordlist->mtime &&
-           saved->head_crc32 == wordlist->head_crc32 &&
-           saved->tail_crc32 == wordlist->tail_crc32;
+
+    hs_session_t *session = heap_caps_calloc(
+        1, sizeof(*session), MALLOC_CAP_SPIRAM);
+    if (!session) session = calloc(1, sizeof(*session));
+    if (!session) {
+        free(catalog);
+        return HS_CRACK_RESUME_ERROR;
+    }
+    int index = HS_CRACK_RESUME_NONE;
+    bool matching_capture = false;
+    hs_session_result_t loaded;
+    if (hs_crack_ui.resume_session_valid) {
+        loaded = hs_session_catalog_find_id(
+            HS_CRACK_SESSION_DIR, HS_CRACK_SESSION_A, HS_CRACK_SESSION_B,
+            hs_crack_ui.resume_session_id, session);
+        if (loaded == HS_SESSION_OK &&
+            session->capture.size == capture->size &&
+            session->capture.crc32 == capture->crc32) {
+            matching_capture = true;
+            index = hs_session_find_active_wordlist(
+                session, capture->size, capture->crc32, catalog, count);
+        }
+    } else {
+        loaded = hs_session_catalog_find_newest_wordlist(
+            HS_CRACK_SESSION_DIR, HS_CRACK_SESSION_A, HS_CRACK_SESSION_B,
+            capture->size, capture->crc32, catalog, count, session, &index,
+            &matching_capture);
+    }
+    if (loaded != HS_SESSION_OK && loaded != HS_SESSION_NOT_FOUND) {
+        index = HS_CRACK_RESUME_ERROR;
+    } else if (loaded != HS_SESSION_OK && matching_capture) {
+        index = HS_CRACK_RESUME_STALE;
+    } else if (loaded == HS_SESSION_OK && index < 0 && matching_capture) {
+        index = HS_CRACK_RESUME_STALE;
+    } else if (!matching_capture) {
+        index = HS_CRACK_RESUME_NONE;
+    }
+    free(session);
+    free(catalog);
+    return index;
+}
+
+static hs_session_result_t hs_crack_load_matching_session(
+    const hs_crack_capture_id_t *capture,
+    const hs_crack_wordlist_id_t *wordlist, hs_session_t *session_out)
+{
+    if (!capture || !wordlist || !session_out) return HS_SESSION_RANGE;
+    if (hs_crack_ui.resume_session_valid) {
+        hs_session_result_t result = hs_session_catalog_find_id(
+            HS_CRACK_SESSION_DIR, HS_CRACK_SESSION_A, HS_CRACK_SESSION_B,
+            hs_crack_ui.resume_session_id, session_out);
+        if (result != HS_SESSION_OK) return result;
+        return hs_session_matches_active_wordlist(
+                   session_out, capture->size, capture->crc32,
+                   wordlist->path, wordlist->size,
+                   (uint64_t)wordlist->mtime, wordlist->head_crc32,
+                   wordlist->tail_crc32)
+                   ? HS_SESSION_OK : HS_SESSION_NOT_FOUND;
+    }
+    hs_session_wordlist_t candidate = {0};
+    snprintf(candidate.path, sizeof(candidate.path), "%s", wordlist->path);
+    candidate.size = wordlist->size;
+    candidate.mtime = (uint64_t)wordlist->mtime;
+    candidate.head_crc32 = wordlist->head_crc32;
+    candidate.tail_crc32 = wordlist->tail_crc32;
+    int index = -1;
+    bool matching_capture = false;
+    return hs_session_catalog_find_newest_wordlist(
+        HS_CRACK_SESSION_DIR, HS_CRACK_SESSION_A, HS_CRACK_SESSION_B,
+        capture->size, capture->crc32, &candidate, 1, session_out, &index,
+        &matching_capture);
 }
 
 static void hs_crack_session_begin(hs_session_t *session,
@@ -62899,6 +63063,67 @@ static void hs_crack_session_begin(hs_session_t *session,
     saved->full_crc_valid = wordlist_crc_valid;
     session->phase.kind = HS_SESSION_PHASE_WORDLIST;
     session->phase.wordlist_index = wordlist_index;
+}
+
+static void hs_crack_session_update_metrics(hs_session_t *session,
+                                            uint64_t previous_active_ms,
+                                            uint64_t total_tried,
+                                            uint64_t episode_tried)
+{
+    if (!session) return;
+    int64_t now = esp_timer_get_time();
+    uint64_t elapsed_us = hs_crack_ui.source_started_us > 0 &&
+                                  now > hs_crack_ui.source_started_us
+                              ? (uint64_t)(now - hs_crack_ui.source_started_us)
+                              : 0U;
+    session->metrics.total_tried = total_tried;
+    session->metrics.active_time_ms = previous_active_ms + elapsed_us / 1000U;
+    session->metrics.last_rate_milli_per_second = elapsed_us && episode_tried
+        ? (episode_tried > UINT64_MAX / 1000000000ULL
+               ? UINT64_MAX
+               : (episode_tried * 1000000000ULL) / elapsed_us)
+        : 0U;
+    uint64_t eta = hs_crack_cache_eta_seconds(
+        hs_crack_ui.wordlist_offset, hs_crack_ui.wordlist_size,
+        episode_tried, elapsed_us);
+    session->metrics.last_eta_seconds = eta == UINT64_MAX ? 0U : eta;
+}
+
+static bool hs_crack_history_append_session(hs_session_t *session,
+                                            hs_session_outcome_t outcome,
+                                            int32_t reason)
+{
+    if (!session) return false;
+    session->has_result = true;
+    session->result.outcome = outcome;
+    session->result.reason = reason;
+
+    hs_audit_history_record_t *record = heap_caps_calloc(
+        1, sizeof(*record), MALLOC_CAP_SPIRAM);
+    if (!record) record = calloc(1, sizeof(*record));
+    if (!record) return false;
+
+    time_t now = time(NULL);
+    bool rtc_available = now >= 1577836800; /* 2020-01-01 */
+    int64_t finished = rtc_available ? (int64_t)now : 0;
+    bool started_available =
+        hs_crack_ui.source_started_unix_seconds >= 1577836800;
+    int64_t started = started_available
+                          ? hs_crack_ui.source_started_unix_seconds
+                          : 0;
+    uint64_t episode = (uint64_t)session->metrics.resume_count + 1U;
+    hs_audit_history_result_t result = hs_audit_history_from_session(
+        session, episode, started_available, started, rtc_available, finished,
+        record);
+    if (result == HS_AUDIT_HISTORY_OK)
+        result = hs_audit_history_append(HS_CRACK_AUDIT_DIR, record);
+    free(record);
+    if (result != HS_AUDIT_HISTORY_OK) {
+        ESP_LOGW(TAG, "[HS-CRACK] audit history append failed (%d)",
+                 (int)result);
+        return false;
+    }
+    return true;
 }
 
 static hs_session_shard_state_t hs_crack_session_shard_state(
@@ -62982,8 +63207,8 @@ static bool hs_crack_session_checkpoint(
     }
     session->metrics.total_tried = total_tried;
     if (mkdir(HS_CRACK_AUDIT_DIR, 0775) != 0 && errno != EEXIST) return false;
-    hs_session_result_t result = hs_session_save_next(
-        HS_CRACK_SESSION_A, HS_CRACK_SESSION_B, session);
+    hs_session_result_t result = hs_session_catalog_save(
+        HS_CRACK_SESSION_DIR, session);
     if (result != HS_SESSION_OK) {
         ESP_LOGW(TAG, "[HS-CRACK] distributed checkpoint failed (%d)",
                  (int)result);
@@ -63770,6 +63995,9 @@ static void hs_crack_set_source(const char *source, uint32_t tried)
     hs_crack_ui.candidate_source = source;
     hs_crack_ui.source_tried_base = tried;
     hs_crack_ui.source_started_us = esp_timer_get_time();
+    time_t wall_now = time(NULL);
+    hs_crack_ui.source_started_unix_seconds =
+        wall_now >= 1577836800 ? (int64_t)wall_now : 0;
     snprintf(hs_crack_ui.candidate_status, sizeof(hs_crack_ui.candidate_status),
              "Checking: %s", source);
     hs_crack_set_stage(hs_crack_ui.candidate_status, NULL,
@@ -64126,7 +64354,7 @@ static void hs_crack_task(void *arg)
     esp_err_t err = janos_uart_download(tab, uart_port, hs_crack_ui.remote_pcap_path,
                                         HS_CRACK_LOCAL_PCAP, 0,
                                         &hs_crack_ui.cancel_requested, &result);
-    compromised_transport_lock_end(usb_lock_set);
+    compromised_transport_lock_end(tab, usb_lock_set);
     usb_lock_set = false;
 
     if (hs_crack_ui.cancel_requested) {
@@ -64294,6 +64522,27 @@ static void hs_crack_task(void *arg)
         bool all = (hs_crack_ui.wl_choice >= hs_crack_ui.wl_count);
         int wl_from = all ? 0 : hs_crack_ui.wl_choice;
         int wl_to   = all ? hs_crack_ui.wl_count : hs_crack_ui.wl_choice + 1;
+        if (capture_cache_ready && !hs_crack_ui.force_rerun) {
+            int resume_index = hs_crack_resume_wordlist_index(&capture_id);
+            if (resume_index == HS_CRACK_RESUME_STALE) {
+                final_status = "Resume unavailable";
+                snprintf(final_detail, sizeof(final_detail),
+                         "Saved wordlist is missing, changed or unreadable; progress was preserved.");
+                goto finish;
+            }
+            if (resume_index == HS_CRACK_RESUME_ERROR) {
+                final_status = "Resume unavailable";
+                snprintf(final_detail, sizeof(final_detail),
+                         "Could not read the saved wordlist checkpoint safely; progress was preserved.");
+                goto finish;
+            }
+            if (all && resume_index >= 0) {
+                wl_from = resume_index;
+                ESP_LOGI(TAG,
+                         "[HS-CRACK] RESUME ALL remapped wordlist index=%d/%d",
+                         resume_index, hs_crack_ui.wl_count);
+            }
+        }
         if (wl_from < 0) wl_from = 0;
         for (int wi = wl_from; wi < wl_to; wi++) {
             if (hs_crack_collect(&tried, t0, &found_idx, found_pw,
@@ -64412,6 +64661,7 @@ static void hs_crack_task(void *arg)
             }
 
             uint64_t resumed_tried = 0;
+            uint64_t previous_active_ms = 0;
             uint64_t work_start = 0;
             uint64_t local_start = 0;
             uint64_t local_end = wordlist_id.size;
@@ -64428,25 +64678,25 @@ static void hs_crack_task(void *arg)
             bool crack_session_active = false;
             bool restored_session = false;
             hs_session_result_t load_result = crack_session
-                ? hs_session_load_latest(HS_CRACK_SESSION_A,
-                                         HS_CRACK_SESSION_B,
-                                         crack_session, NULL)
+                ? hs_crack_load_matching_session(
+                      &capture_id, &wordlist_id, crack_session)
                 : HS_SESSION_IO_ERROR;
 
             if (!hs_crack_ui.force_rerun && capture_cache_ready &&
                 load_result == HS_SESSION_OK &&
-                hs_crack_session_matches_active_wordlist(
-                    crack_session, &capture_id, &wordlist_id,
-                    (uint16_t)wi) &&
                 hs_crack_restore_session_shards(
                     crack_session, wordlist_id.size, &local_start,
                     &local_end, &local_safe_offset, remote_shards,
                     HS_CRACK_REMOTE_MAX, &remote_shard_count) &&
                 hs_crack_seek_range_start(wl, local_safe_offset)) {
+                /* The SD catalog is sorted dynamically. Keep the durable
+                 * identity stable, then remap only the current UI index. */
+                crack_session->phase.wordlist_index = (uint16_t)wi;
                 crack_session->metrics.resume_count++;
                 crack_session_active = true;
                 restored_session = true;
                 resumed_tried = crack_session->metrics.total_tried;
+                previous_active_ms = crack_session->metrics.active_time_ms;
                 tried += (uint32_t)(resumed_tried > UINT32_MAX
                                         ? UINT32_MAX : resumed_tried);
                 hs_crack_ui.wordlist_offset = local_safe_offset;
@@ -64467,12 +64717,32 @@ static void hs_crack_task(void *arg)
                 }
             }
 
+            if (!restored_session && hs_crack_ui.resume_session_valid &&
+                !hs_crack_ui.force_rerun) {
+                fclose(wl);
+                free(crack_session);
+                final_status = "Resume unavailable";
+                snprintf(final_detail, sizeof(final_detail),
+                         "The selected checkpoint no longer matches this capture and wordlist.");
+                goto finish;
+            }
+
             if (!restored_session) {
-                if (load_result == HS_SESSION_OK &&
-                    crack_session->state != HS_SESSION_TOMBSTONE) {
-                    (void)hs_session_tombstone(
-                        HS_CRACK_SESSION_A, HS_CRACK_SESSION_B,
-                        crack_session->session_id);
+                if (hs_crack_ui.force_rerun &&
+                    hs_crack_ui.resume_session_valid) {
+                    hs_session_result_t retired = hs_session_catalog_tombstone(
+                        HS_CRACK_SESSION_DIR, HS_CRACK_SESSION_A,
+                        HS_CRACK_SESSION_B, hs_crack_ui.resume_session_id);
+                    if (retired != HS_SESSION_OK &&
+                        retired != HS_SESSION_NOT_FOUND) {
+                        fclose(wl);
+                        free(crack_session);
+                        final_status = "Start over unavailable";
+                        snprintf(final_detail, sizeof(final_detail),
+                                 "Could not retire the selected checkpoint safely.");
+                        goto finish;
+                    }
+                    hs_crack_ui.resume_session_valid = false;
                 }
                 hs_crack_resume_t resume = {0};
                 if (!hs_crack_ui.force_rerun && capture_cache_ready &&
@@ -64696,15 +64966,21 @@ static void hs_crack_task(void *arg)
                         cache_save_failed = true;
                         ESP_LOGW(TAG, "[HS-CRACK] checkpoint save failed");
                     }
-                    if (crack_session_active &&
-                        !hs_crack_session_checkpoint(
+                    if (crack_session_active) {
+                        uint64_t episode_tried =
+                            (uint64_t)(tried - active_run_tried_start);
+                        uint64_t total_session_tried =
+                            resumed_tried + episode_tried;
+                        hs_crack_session_update_metrics(
+                            crack_session, previous_active_ms,
+                            total_session_tried, episode_tried);
+                        if (!hs_crack_session_checkpoint(
                             crack_session, local_start, local_end,
                             local_safe_offset, remote_shards,
                             remote_shard_count, remote_workers,
-                            remote_worker_count,
-                            resumed_tried +
-                                (uint64_t)(tried - active_run_tried_start))) {
-                        cache_save_failed = true;
+                            remote_worker_count, total_session_tried)) {
+                            cache_save_failed = true;
+                        }
                     }
                     checkpoint_tried = tried;
                     checkpoint_started = now;
@@ -64719,15 +64995,21 @@ static void hs_crack_task(void *arg)
             if (!stop_source && !hs_crack_ui.cancel_requested &&
                 read_status != -2) {
                 local_safe_offset = local_end;
-                if (crack_session_active &&
-                    !hs_crack_session_checkpoint(
+                if (crack_session_active) {
+                    uint64_t episode_tried =
+                        (uint64_t)(tried - active_run_tried_start);
+                    uint64_t total_session_tried =
+                        resumed_tried + episode_tried;
+                    hs_crack_session_update_metrics(
+                        crack_session, previous_active_ms,
+                        total_session_tried, episode_tried);
+                    if (!hs_crack_session_checkpoint(
                         crack_session, local_start, local_end,
                         local_safe_offset, remote_shards,
                         remote_shard_count, remote_workers,
-                        remote_worker_count,
-                        resumed_tried +
-                            (uint64_t)(tried - active_run_tried_start))) {
-                    cache_save_failed = true;
+                        remote_worker_count, total_session_tried)) {
+                        cache_save_failed = true;
+                    }
                 }
                 checkpoint_tried = tried;
                 checkpoint_started = esp_timer_get_time();
@@ -64763,13 +65045,18 @@ static void hs_crack_task(void *arg)
                     if (crack_session_active &&
                         hs_crack_checkpoint_due(tried - checkpoint_tried,
                                                 now - checkpoint_started)) {
+                        uint64_t episode_tried =
+                            (uint64_t)(tried - active_run_tried_start);
+                        uint64_t total_session_tried =
+                            resumed_tried + episode_tried;
+                        hs_crack_session_update_metrics(
+                            crack_session, previous_active_ms,
+                            total_session_tried, episode_tried);
                         if (!hs_crack_session_checkpoint(
                                 crack_session, local_start, local_end,
                                 local_safe_offset, remote_shards,
                                 remote_shard_count, remote_workers,
-                                remote_worker_count,
-                                resumed_tried +
-                                    (uint64_t)(tried - active_run_tried_start))) {
+                                remote_worker_count, total_session_tried)) {
                             cache_save_failed = true;
                         }
                         checkpoint_tried = tried;
@@ -64848,23 +65135,74 @@ static void hs_crack_task(void *arg)
             if (stop_source || hs_crack_ui.cancel_requested || read_status == -2)
                 hs_crack_remote_cancel(remote_workers, remote_worker_count);
             if (hs_crack_ui.cancel_requested && crack_session_active) {
+                uint64_t episode_tried = (uint64_t)(tried - active_run_tried_start);
+                uint64_t total_session_tried = resumed_tried + episode_tried;
+                hs_crack_session_update_metrics(
+                    crack_session, previous_active_ms, total_session_tried,
+                    episode_tried);
+                crack_session->has_result = true;
+                crack_session->result.outcome = HS_SESSION_OUTCOME_INTERRUPTED;
                 if (!hs_crack_session_checkpoint(
                         crack_session, local_start, local_end,
                         local_safe_offset, remote_shards,
                         remote_shard_count, remote_workers,
-                        remote_worker_count,
-                        resumed_tried +
-                            (uint64_t)(tried - active_run_tried_start))) {
+                        remote_worker_count, total_session_tried)) {
+                    cache_save_failed = true;
+                }
+                if (!hs_crack_history_append_session(
+                        crack_session, HS_SESSION_OUTCOME_INTERRUPTED, 0)) {
                     cache_save_failed = true;
                 }
             } else if (crack_session_active && read_status != -2 &&
                        (!hs_crack_ui.run || !hs_crack_ui.run->error)) {
-                if (hs_session_tombstone(
-                        HS_CRACK_SESSION_A, HS_CRACK_SESSION_B,
+                uint64_t episode_tried = (uint64_t)(tried - active_run_tried_start);
+                uint64_t total_session_tried = resumed_tried + episode_tried;
+                hs_session_outcome_t outcome = found_idx >= 0
+                                                   ? HS_SESSION_OUTCOME_FOUND
+                                                   : HS_SESSION_OUTCOME_NOT_FOUND;
+                hs_crack_session_update_metrics(
+                    crack_session, previous_active_ms, total_session_tried,
+                    episode_tried);
+                crack_session->has_result = true;
+                crack_session->result.outcome = outcome;
+                if (!hs_crack_session_checkpoint(
+                        crack_session, local_start, local_end,
+                        local_safe_offset, remote_shards,
+                        remote_shard_count, remote_workers,
+                        remote_worker_count, total_session_tried)) {
+                    cache_save_failed = true;
+                }
+                if (!hs_crack_history_append_session(crack_session, outcome, 0)) {
+                    cache_save_failed = true;
+                }
+                if (hs_session_catalog_tombstone(
+                        HS_CRACK_SESSION_DIR, HS_CRACK_SESSION_A,
+                        HS_CRACK_SESSION_B,
                         crack_session->session_id) != HS_SESSION_OK) {
                     cache_save_failed = true;
                 }
                 crack_session_active = false;
+            } else if (crack_session_active) {
+                uint64_t episode_tried = (uint64_t)(tried - active_run_tried_start);
+                uint64_t total_session_tried = resumed_tried + episode_tried;
+                hs_crack_session_update_metrics(
+                    crack_session, previous_active_ms, total_session_tried,
+                    episode_tried);
+                crack_session->has_result = true;
+                crack_session->result.outcome = HS_SESSION_OUTCOME_ERROR;
+                crack_session->result.reason = read_status == -2 ? 1 : 2;
+                if (!hs_crack_session_checkpoint(
+                        crack_session, local_start, local_end,
+                        local_safe_offset, remote_shards,
+                        remote_shard_count, remote_workers,
+                        remote_worker_count, total_session_tried)) {
+                    cache_save_failed = true;
+                }
+                if (!hs_crack_history_append_session(
+                        crack_session, HS_SESSION_OUTCOME_ERROR,
+                        crack_session->result.reason)) {
+                    cache_save_failed = true;
+                }
             }
             fclose(wl);
             free(crack_session);
@@ -64959,13 +65297,14 @@ done:
 finish:
     hs_crack_remote_cancel(remote_workers, remote_worker_count);
     for (size_t i = 0; i < remote_worker_count; ++i) {
-        compromised_transport_lock_end(remote_workers[i].usb_lock_set);
+        compromised_transport_lock_end(remote_workers[i].tab,
+                                       remote_workers[i].usb_lock_set);
         remote_workers[i].usb_lock_set = false;
         hs_crack_remote_release_transport(&remote_workers[i]);
     }
     if (remote_probe_claimed) board_probe_in_progress = false;
     if (usb_lock_set) {
-        compromised_transport_lock_end(usb_lock_set);
+        compromised_transport_lock_end(tab, usb_lock_set);
     }
     hs_crack_workers_stop();
     free(recs);
@@ -64997,7 +65336,11 @@ static void hs_crack_start_file(tab_context_t *ctx, const char *remote_path, con
     hs_crack_ui.wordlist_offset = 0;
     hs_crack_ui.source_tried_base = 0;
     hs_crack_ui.source_started_us = 0;
+    hs_crack_ui.source_started_unix_seconds = 0;
     hs_crack_ui.force_rerun = false;
+    hs_crack_ui.resume_session_valid = false;
+    memset(hs_crack_ui.resume_session_id, 0,
+           sizeof(hs_crack_ui.resume_session_id));
     hs_crack_ui.started = false;
     hs_crack_ui.run = NULL;
     hs_crack_ui.method = HS_CRACK_METHOD_GENERIC;  // dropdown defaults to Internal
@@ -65032,6 +65375,1935 @@ static void hs_crack_file_cb(lv_event_t *e)
     }
 
     hs_crack_start_file(ctx, file->path, file->name);
+}
+
+static bool compromised_start_copy(tab_id_t tab, tab_context_t *ctx,
+                                   const char *remote_path, const char *file_name,
+                                   uint64_t size_bytes, bool is_handshake)
+{
+    if (!ctx || tab_is_internal(tab) || !remote_path || !remote_path[0] ||
+        !file_name || !file_name[0] || compromised_transfer_ui.active ||
+        compromised_transfer_ui.task || !compromised_transfer_preflight(ctx, false)) {
+        return false;
+    }
+
+    compromised_transfer_task_args_t *args = calloc(1, sizeof(*args));
+    if (!args) return false;
+    args->ctx = ctx;
+    args->tab = tab;
+    snprintf(args->remote_path, sizeof(args->remote_path), "%s", remote_path);
+    snprintf(args->file_name, sizeof(args->file_name), "%s", file_name);
+    args->size_bytes = size_bytes > (uint64_t)LONG_MAX ? LONG_MAX : (long)size_bytes;
+    args->is_handshake = is_handshake;
+
+    compromised_transfer_ui.active = true;
+    compromised_transfer_ui.cancel_requested = false;
+    compromised_transfer_ui.sync_mode = false;
+    compromised_transfer_ui.batch_current = 0;
+    compromised_transfer_ui.batch_total = 0;
+    compromised_transfer_ui.batch_file[0] = '\0';
+    compromised_transfer_show_popup(file_name);
+    if (xTaskCreate(compromised_transfer_task, "janos_copy", 12288, args, 6,
+                    &compromised_transfer_ui.task) != pdPASS) {
+        compromised_transfer_ui.active = false;
+        compromised_transfer_ui.task = NULL;
+        compromised_transfer_finish_ui_unlocked(
+            false, "Could not start the transfer task.");
+        free(args);
+        return false;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// WPA PSK Auditor dashboard
+// ---------------------------------------------------------------------------
+
+#define WPA_AUDITOR_HISTORY_ROWS 3U
+#define WPA_AUDITOR_RESUME_ROWS HS_SESSION_CATALOG_UI_LIMIT
+
+static const char *wpa_auditor_basename(const char *path)
+{
+    if (!path || !path[0]) return "Unknown capture";
+    const char *slash = strrchr(path, '/');
+    return slash && slash[1] ? slash + 1 : path;
+}
+
+static const char *wpa_auditor_outcome_name(hs_session_outcome_t outcome)
+{
+    switch (outcome) {
+    case HS_SESSION_OUTCOME_FOUND: return "Password found";
+    case HS_SESSION_OUTCOME_NOT_FOUND: return "Not found";
+    case HS_SESSION_OUTCOME_INTERRUPTED: return "Interrupted";
+    case HS_SESSION_OUTCOME_STALE: return "Inputs changed";
+    case HS_SESSION_OUTCOME_ERROR: return "Error";
+    default: return "Incomplete";
+    }
+}
+
+static void wpa_auditor_history_time(
+    const hs_audit_history_record_t *record, char *output, size_t capacity)
+{
+    if (!output || capacity == 0) return;
+    if (record && record->started_at_available) {
+        time_t stamp = (time_t)record->started_at_unix_seconds;
+        struct tm local = {0};
+        if (localtime_r(&stamp, &local) &&
+            strftime(output, capacity, "%Y-%m-%d %H:%M", &local) > 0) {
+            return;
+        }
+    }
+    snprintf(output, capacity, "Run #%llu",
+             (unsigned long long)(record ? record->episode_sequence : 0U));
+}
+
+static tab_id_t wpa_auditor_tab_for_source(hs_session_source_t source)
+{
+    switch (source) {
+    case HS_SESSION_SOURCE_GROVE: return TAB_GROVE;
+    case HS_SESSION_SOURCE_USB: return TAB_USB;
+    case HS_SESSION_SOURCE_MBUS: return TAB_MBUS;
+    default: return TAB_INTERNAL;
+    }
+}
+
+static bool wpa_auditor_transport_ready(tab_id_t tab)
+{
+    switch (tab) {
+    case TAB_GROVE: return grove_detected;
+    case TAB_USB: return usb_detected;
+    case TAB_MBUS: return mbus_detected;
+    default: return internal_sd_present;
+    }
+}
+
+static lv_obj_t *wpa_auditor_tab_button(tab_id_t tab)
+{
+    switch (tab) {
+    case TAB_GROVE: return grove_tab_btn;
+    case TAB_USB: return usb_tab_btn;
+    case TAB_MBUS: return mbus_tab_btn;
+    default: return internal_tab_btn;
+    }
+}
+
+static bool wpa_auditor_switch_transport(tab_id_t tab)
+{
+    if (tab == TAB_INTERNAL || !wpa_auditor_transport_ready(tab)) return false;
+    if (tab == current_tab) return true;
+    lv_obj_t *button = wpa_auditor_tab_button(tab);
+    if (!button || !lv_obj_is_valid(button)) return false;
+    lv_obj_send_event(button, LV_EVENT_CLICKED, NULL);
+    return current_tab == tab;
+}
+
+static void wpa_auditor_set_status(const char *message, lv_color_t color)
+{
+    if (!wpa_auditor_status_label ||
+        !lv_obj_is_valid(wpa_auditor_status_label)) return;
+    lv_label_set_text(wpa_auditor_status_label, message ? message : "");
+    lv_obj_set_style_text_color(wpa_auditor_status_label, color, 0);
+}
+
+static lv_obj_t *wpa_auditor_card(lv_obj_t *parent)
+{
+    lv_obj_t *card = lv_obj_create(parent);
+    lv_obj_set_width(card, lv_pct(100));
+    lv_obj_set_height(card, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_color(card, ui_panel_color(), 0);
+    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(card, 0, 0);
+    lv_obj_set_style_radius(card, 14, 0);
+    lv_obj_set_style_pad_all(card, 14, 0);
+    lv_obj_set_style_pad_gap(card, 7, 0);
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    return card;
+}
+
+static lv_obj_t *wpa_auditor_label(lv_obj_t *parent, const char *text,
+                                   const lv_font_t *font, lv_color_t color)
+{
+    lv_obj_t *label = lv_label_create(parent);
+    lv_label_set_text(label, text ? text : "");
+    lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(label, lv_pct(100));
+    lv_obj_set_style_text_font(label, font, 0);
+    lv_obj_set_style_text_color(label, color, 0);
+    return label;
+}
+
+static lv_obj_t *wpa_auditor_button_data(
+    lv_obj_t *parent, const char *text, lv_color_t color,
+    lv_event_cb_t callback, void *user_data, bool disabled)
+{
+    lv_obj_t *button = lv_btn_create(parent);
+    lv_obj_set_height(button, 46);
+    lv_obj_set_flex_grow(button, 1);
+    lv_obj_set_style_bg_color(button, color, 0);
+    lv_obj_set_style_bg_opa(button, disabled ? LV_OPA_40 : LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(button, 12, 0);
+    lv_obj_set_style_shadow_width(button, 0, 0);
+    if (callback)
+        lv_obj_add_event_cb(button, callback, LV_EVENT_CLICKED, user_data);
+    if (disabled) lv_obj_add_state(button, LV_STATE_DISABLED);
+    lv_obj_t *label = lv_label_create(button);
+    lv_label_set_text(label, text);
+    lv_obj_set_style_text_font(label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(label, lv_color_white(), 0);
+    lv_obj_center(label);
+    return button;
+}
+
+static lv_obj_t *wpa_auditor_button(lv_obj_t *parent, const char *text,
+                                    lv_color_t color, lv_event_cb_t callback,
+                                    bool disabled)
+{
+    return wpa_auditor_button_data(parent, text, color, callback, NULL,
+                                   disabled);
+}
+
+static void wpa_auditor_resume_source_changed_cb(lv_event_t *e)
+{
+    (void)e;
+    hs_crack_ui.force_rerun = true;
+    if (hs_crack_ui.action_btn && lv_obj_is_valid(hs_crack_ui.action_btn)) {
+        lv_obj_clear_state(hs_crack_ui.action_btn, LV_STATE_DISABLED);
+    }
+    if (hs_crack_ui.status_label && lv_obj_is_valid(hs_crack_ui.status_label)) {
+        lv_label_set_text(hs_crack_ui.status_label,
+                          "Replacement selected; this starts a new audit");
+    }
+}
+
+static bool wpa_auditor_apply_saved_config(const hs_session_t *session)
+{
+    if (!session || !hs_crack_ui.wordlist_dropdown ||
+        !lv_obj_is_valid(hs_crack_ui.wordlist_dropdown)) {
+        return false;
+    }
+
+    if (session->config.sync_capture) {
+        lv_obj_add_state(hs_crack_ui.sync_hs_cb, LV_STATE_CHECKED);
+    } else {
+        lv_obj_clear_state(hs_crack_ui.sync_hs_cb, LV_STATE_CHECKED);
+    }
+    if (session->config.sync_wordlists) {
+        lv_obj_add_state(hs_crack_ui.sync_wl_cb, LV_STATE_CHECKED);
+    } else {
+        lv_obj_clear_state(hs_crack_ui.sync_wl_cb, LV_STATE_CHECKED);
+    }
+
+    bool valid = session->config.method <= HS_CRACK_METHOD_BOTH;
+    int saved_index = -1;
+    const hs_session_wordlist_t *saved = NULL;
+    if (valid && session->config.method != HS_CRACK_METHOD_GENERIC) {
+        valid = session->wordlist_count == 1U;
+        if (valid) {
+            saved = &session->wordlists[0];
+            for (int i = 0; i < hs_crack_ui.wl_count; ++i) {
+                if (strcmp(hs_crack_ui.wl_paths[i], saved->path) == 0) {
+                    saved_index = i;
+                    break;
+                }
+            }
+            valid = saved_index >= 0;
+        }
+        if (valid) {
+            hs_crack_wordlist_id_t current = {0};
+            valid = hs_crack_cache_wordlist_id(
+                        session->wordlists[0].path, &current) == HS_CRACK_CACHE_OK &&
+                    current.size == saved->size &&
+                    current.mtime == (int64_t)saved->mtime &&
+                    current.head_crc32 == saved->head_crc32 &&
+                    current.tail_crc32 == saved->tail_crc32;
+        }
+        if (valid && session->config.method == HS_CRACK_METHOD_BOTH) {
+            valid = hs_crack_ui.wl_count > 1;
+        }
+    }
+
+    if (!valid) {
+        /* None is an explicit stale-input state. It also guarantees that
+         * choosing Internal emits VALUE_CHANGED instead of looking selected
+         * only because it was the legacy popup default. */
+        lv_dropdown_set_selected(hs_crack_ui.wordlist_dropdown, 0);
+        lv_obj_add_state(hs_crack_ui.action_btn, LV_STATE_DISABLED);
+        lv_obj_add_event_cb(hs_crack_ui.wordlist_dropdown,
+                            wpa_auditor_resume_source_changed_cb,
+                            LV_EVENT_VALUE_CHANGED, NULL);
+        lv_label_set_text(hs_crack_ui.status_label,
+                          "Saved wordlist is missing or changed");
+        lv_label_set_text(hs_crack_ui.detail_label,
+                          "Choose a replacement to start a new audit; saved progress will not be reused.");
+        return false;
+    }
+
+    unsigned dropdown_index = 1U;
+    hs_crack_ui.method = (hs_crack_method_t)session->config.method;
+    if (hs_crack_ui.method == HS_CRACK_METHOD_WORDLIST) {
+        hs_crack_ui.wl_choice = saved_index;
+        dropdown_index = (unsigned)saved_index + 2U;
+    } else if (hs_crack_ui.method == HS_CRACK_METHOD_BOTH) {
+        hs_crack_ui.wl_choice = hs_crack_ui.wl_count;
+        dropdown_index = (unsigned)hs_crack_ui.wl_count + 2U;
+    } else {
+        hs_crack_ui.wl_choice = -1;
+    }
+    lv_dropdown_set_selected(hs_crack_ui.wordlist_dropdown, dropdown_index);
+    lv_obj_add_event_cb(hs_crack_ui.wordlist_dropdown,
+                        wpa_auditor_resume_source_changed_cb,
+                        LV_EVENT_VALUE_CHANGED, NULL);
+
+    char status[128];
+    snprintf(status, sizeof(status), "Resume settings restored: %.80s",
+             saved ? wpa_auditor_basename(saved->path) : "Internal");
+    lv_label_set_text(hs_crack_ui.status_label, status);
+    return true;
+}
+
+static unsigned wpa_auditor_progress_percent(const hs_session_t *session)
+{
+    uint64_t total = 0;
+    uint64_t done = 0;
+    if (!session) return 0;
+    for (size_t i = 0; i < session->shard_count; ++i) {
+        const hs_session_shard_t *shard = &session->shards[i];
+        if (shard->range_end < shard->range_start) continue;
+        uint64_t span = shard->range_end - shard->range_start;
+        uint64_t safe = shard->safe_offset;
+        if (safe < shard->range_start) safe = shard->range_start;
+        if (safe > shard->range_end) safe = shard->range_end;
+        total += span;
+        done += safe - shard->range_start;
+    }
+    return total ? (unsigned)((done * 100U) / total) : 0U;
+}
+
+static void wpa_auditor_confirm_close_cb(lv_event_t *e)
+{
+    (void)e;
+    if (wpa_auditor_confirm_overlay &&
+        lv_obj_is_valid(wpa_auditor_confirm_overlay)) {
+        lv_obj_del(wpa_auditor_confirm_overlay);
+    }
+    wpa_auditor_confirm_overlay = NULL;
+    wpa_auditor_pending_session = SIZE_MAX;
+}
+
+static bool wpa_auditor_launch_saved(size_t session_index, bool start_over)
+{
+    if (!wpa_auditor_sessions ||
+        session_index >= wpa_auditor_session_count ||
+        wpa_auditor_sessions[session_index].session.state != HS_SESSION_ACTIVE) {
+        wpa_auditor_set_status("No resumable audit is available.",
+                               COLOR_MATERIAL_AMBER);
+        return false;
+    }
+    const hs_session_t *session =
+        &wpa_auditor_sessions[session_index].session;
+    if (hs_crack_ui.active || hs_crack_ui.task || hs_crack_ui.overlay ||
+        compromised_transfer_ui.active || compromised_transfer_ui.task) {
+        wpa_auditor_set_status("Another crack or transfer is already active.",
+                               COLOR_MATERIAL_AMBER);
+        return false;
+    }
+
+    tab_id_t tab = wpa_auditor_tab_for_source(session->origin.source);
+    if (tab == TAB_INTERNAL || !wpa_auditor_transport_ready(tab)) {
+        wpa_auditor_set_status("The source Monster is offline. Reconnect it to resume.",
+                               COLOR_MATERIAL_RED);
+        return false;
+    }
+    if (!session->origin.remote_path[0]) {
+        wpa_auditor_set_status("The saved capture path is unavailable.",
+                               COLOR_MATERIAL_RED);
+        return false;
+    }
+
+    char remote_path[HS_SESSION_PATH_MAX];
+    snprintf(remote_path, sizeof(remote_path), "%s",
+             session->origin.remote_path);
+    char file_name[HS_SESSION_PATH_MAX];
+    snprintf(file_name, sizeof(file_name), "%s",
+             wpa_auditor_basename(remote_path));
+    wpa_auditor_confirm_close_cb(NULL);
+
+    if (!wpa_auditor_switch_transport(tab)) {
+        wpa_auditor_set_status("Could not open the source transport.",
+                               COLOR_MATERIAL_RED);
+        return false;
+    }
+    tab_context_t *ctx = get_ctx_for_tab(tab);
+    hs_crack_start_file(ctx, remote_path, file_name);
+    if (!hs_crack_ui.overlay ||
+        !wpa_auditor_apply_saved_config(session)) {
+        return false;
+    }
+    hs_crack_ui.force_rerun = start_over;
+    hs_crack_ui.resume_session_valid = true;
+    memcpy(hs_crack_ui.resume_session_id, session->session_id,
+           sizeof(hs_crack_ui.resume_session_id));
+    return hs_crack_ui.overlay != NULL;
+}
+
+static void wpa_auditor_resume_cb(lv_event_t *e)
+{
+    size_t session_index = (size_t)(uintptr_t)lv_event_get_user_data(e);
+    (void)wpa_auditor_launch_saved(session_index, false);
+}
+
+static void wpa_auditor_start_over_confirm_cb(lv_event_t *e)
+{
+    (void)e;
+    size_t session_index = wpa_auditor_pending_session;
+    wpa_auditor_pending_session = SIZE_MAX;
+    (void)wpa_auditor_launch_saved(session_index, true);
+}
+
+static void wpa_auditor_start_over_request_cb(lv_event_t *e)
+{
+    if (!wpa_auditor_page || !lv_obj_is_valid(wpa_auditor_page) ||
+        wpa_auditor_confirm_overlay) return;
+    size_t session_index = (size_t)(uintptr_t)lv_event_get_user_data(e);
+    if (session_index >= wpa_auditor_session_count) return;
+    wpa_auditor_pending_session = session_index;
+
+    wpa_auditor_confirm_overlay = lv_obj_create(wpa_auditor_page);
+    lv_obj_set_size(wpa_auditor_confirm_overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(wpa_auditor_confirm_overlay, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(wpa_auditor_confirm_overlay, LV_OPA_70, 0);
+    lv_obj_set_style_border_width(wpa_auditor_confirm_overlay, 0, 0);
+    lv_obj_set_style_pad_all(wpa_auditor_confirm_overlay, 18, 0);
+    lv_obj_set_flex_flow(wpa_auditor_confirm_overlay, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(wpa_auditor_confirm_overlay, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    lv_obj_t *dialog = wpa_auditor_card(wpa_auditor_confirm_overlay);
+    lv_obj_set_width(dialog, lv_pct(90));
+    wpa_auditor_label(dialog, "Discard saved progress?",
+                      &lv_font_montserrat_22, ui_text_color());
+    wpa_auditor_label(dialog,
+                      "Start over retires the current checkpoint and begins this capture from the first candidate.",
+                      &lv_font_montserrat_14, ui_muted_color());
+    lv_obj_t *actions = lv_obj_create(dialog);
+    lv_obj_set_size(actions, lv_pct(100), 48);
+    lv_obj_set_style_bg_opa(actions, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(actions, 0, 0);
+    lv_obj_set_style_pad_all(actions, 0, 0);
+    lv_obj_set_style_pad_gap(actions, 8, 0);
+    lv_obj_set_flex_flow(actions, LV_FLEX_FLOW_ROW);
+    wpa_auditor_button(actions, "Keep progress", COLOR_MATERIAL_TEAL,
+                       wpa_auditor_confirm_close_cb, false);
+    wpa_auditor_button(actions, "Start over", COLOR_MATERIAL_RED,
+                       wpa_auditor_start_over_confirm_cb, false);
+}
+
+#define WPA_AUDITOR_CATALOG_PAGE_LIMIT 16U
+#define WPA_AUDITOR_CATALOG_TASK_STACK 12288U
+#define WPA_AUDITOR_SYNC_TASK_STACK 14336U
+
+typedef struct {
+    uint32_t generation;
+} wpa_auditor_catalog_task_args_t;
+
+typedef struct {
+    tab_id_t tab;
+    uint64_t size;
+    char remote_path[WARDRIVE_WIGLE_PATH_MAX];
+} wpa_auditor_sync_source_t;
+
+typedef struct {
+    hs_artifact_location_t identity;
+    size_t source_count;
+    wpa_auditor_sync_source_t sources[HS_ARTIFACT_CATALOG_MAX_LOCATIONS];
+    char file_name[HS_ARTIFACT_NAME_MAX + 1U];
+} wpa_auditor_sync_item_t;
+
+typedef struct {
+    size_t item_count;
+    size_t already_local;
+    wpa_auditor_sync_item_t items[];
+} wpa_auditor_sync_task_args_t;
+
+static void wpa_auditor_catalog_audit_cb(lv_event_t *e);
+static void wpa_auditor_catalog_sync_cb(lv_event_t *e);
+static void wpa_auditor_catalog_sync_all_cb(lv_event_t *e);
+static bool wpa_auditor_catalog_local_equivalent(
+    const hs_artifact_location_t *remote);
+static bool wpa_auditor_catalog_source_selected(
+    const hs_artifact_location_t *location);
+static void wpa_auditor_source_filter_cb(lv_event_t *e);
+static void wpa_auditor_catalog_render_locked(void);
+static size_t wpa_auditor_catalog_syncable_count(void);
+static bool wpa_auditor_catalog_request_refresh(void);
+
+static const char *wpa_auditor_catalog_source_name(hs_artifact_source_t source)
+{
+    switch (source) {
+    case HS_ARTIFACT_SOURCE_LOCAL: return "LOCAL";
+    case HS_ARTIFACT_SOURCE_GROVE: return "GROVE";
+    case HS_ARTIFACT_SOURCE_USB: return "USB";
+    case HS_ARTIFACT_SOURCE_MBUS: return "M-BUS";
+    default: return "?";
+    }
+}
+
+static void wpa_auditor_source_dropdown_options(lv_obj_t *dropdown)
+{
+    if (!dropdown) return;
+    wpa_auditor_source_option_count = 0;
+    unsigned available = (internal_sd_present ? 1U : 0U) +
+                         (grove_detected ? 1U : 0U) +
+                         (usb_detected ? 1U : 0U) +
+                         (mbus_detected ? 1U : 0U);
+    char options[160];
+    int used = snprintf(options, sizeof(options),
+                        "Workers (%u) - tap to browse\nAll sources", available);
+    if (used < 0 || (size_t)used >= sizeof(options)) return;
+
+#define WPA_ADD_SOURCE_OPTION(ready, source_value, label)                         \
+    do {                                                                           \
+        if ((ready) && wpa_auditor_source_option_count <                           \
+                           sizeof(wpa_auditor_source_options) /                    \
+                               sizeof(wpa_auditor_source_options[0])) {            \
+            int added = snprintf(options + used, sizeof(options) - (size_t)used,   \
+                                 "\n%s", (label));                                \
+            if (added > 0 && (size_t)added < sizeof(options) - (size_t)used) {     \
+                used += added;                                                     \
+                wpa_auditor_source_options[wpa_auditor_source_option_count++] =    \
+                    (source_value);                                                \
+            }                                                                      \
+        }                                                                          \
+    } while (0)
+    WPA_ADD_SOURCE_OPTION(internal_sd_present, HS_ARTIFACT_SOURCE_LOCAL,
+                          "LOCAL  Tab5 SD");
+    WPA_ADD_SOURCE_OPTION(grove_detected, HS_ARTIFACT_SOURCE_GROVE,
+                          "GROVE  connected");
+    WPA_ADD_SOURCE_OPTION(usb_detected, HS_ARTIFACT_SOURCE_USB,
+                          "USB  connected");
+    WPA_ADD_SOURCE_OPTION(mbus_detected, HS_ARTIFACT_SOURCE_MBUS,
+                          "M-BUS  connected");
+#undef WPA_ADD_SOURCE_OPTION
+
+    wpa_auditor_source_filter = -2;
+    lv_dropdown_set_options(dropdown, options);
+    lv_dropdown_set_selected(dropdown, 0);
+}
+
+static bool wpa_auditor_catalog_source_selected(
+    const hs_artifact_location_t *location)
+{
+    return location && wpa_auditor_source_filter != -2 &&
+           (wpa_auditor_source_filter == -1 ||
+            location->source == (hs_artifact_source_t)wpa_auditor_source_filter);
+}
+
+static void wpa_auditor_source_filter_cb(lv_event_t *e)
+{
+    lv_obj_t *dropdown = lv_event_get_target(e);
+    uint32_t selected = lv_dropdown_get_selected(dropdown);
+    if (selected == 0U) {
+        wpa_auditor_source_filter = -2;
+    } else if (selected == 1U) {
+        wpa_auditor_source_filter = -1;
+    } else if (selected - 2U < wpa_auditor_source_option_count) {
+        wpa_auditor_source_filter =
+            (int)wpa_auditor_source_options[selected - 2U];
+    }
+    if (wpa_auditor_catalog_sync_all_btn &&
+        lv_obj_is_valid(wpa_auditor_catalog_sync_all_btn)) {
+        lv_obj_t *label = lv_obj_get_child(wpa_auditor_catalog_sync_all_btn, 0);
+        if (label && lv_obj_is_valid(label))
+            lv_label_set_text(label, selected == 1U ? "Sync all to Tab5"
+                                                     : "Sync source to Tab5");
+    }
+    wpa_auditor_catalog_render_locked();
+}
+
+static hs_artifact_source_t wpa_auditor_catalog_source_for_tab(tab_id_t tab)
+{
+    switch (tab) {
+    case TAB_GROVE: return HS_ARTIFACT_SOURCE_GROVE;
+    case TAB_USB: return HS_ARTIFACT_SOURCE_USB;
+    case TAB_MBUS: return HS_ARTIFACT_SOURCE_MBUS;
+    default: return HS_ARTIFACT_SOURCE_LOCAL;
+    }
+}
+
+static tab_id_t wpa_auditor_catalog_tab_for_source(hs_artifact_source_t source)
+{
+    switch (source) {
+    case HS_ARTIFACT_SOURCE_GROVE: return TAB_GROVE;
+    case HS_ARTIFACT_SOURCE_USB: return TAB_USB;
+    case HS_ARTIFACT_SOURCE_MBUS: return TAB_MBUS;
+    default: return TAB_INTERNAL;
+    }
+}
+
+static hs_artifact_format_t wpa_auditor_catalog_format(const char *name)
+{
+    if (str_ends_with_ext(name, ".pcap")) return HS_ARTIFACT_FORMAT_PCAP;
+    if (str_ends_with_ext(name, ".hccapx")) return HS_ARTIFACT_FORMAT_HCCAPX;
+    return HS_ARTIFACT_FORMAT_UNKNOWN;
+}
+
+static void *wpa_auditor_catalog_action_data(size_t asset, size_t location)
+{
+    return (void *)(uintptr_t)(1U + asset * HS_ARTIFACT_CATALOG_MAX_LOCATIONS +
+                               location);
+}
+
+static bool wpa_auditor_catalog_action_indices(void *data, size_t *asset,
+                                                size_t *location)
+{
+    uintptr_t packed = (uintptr_t)data;
+    if (!packed || !asset || !location) return false;
+    --packed;
+    *asset = packed / HS_ARTIFACT_CATALOG_MAX_LOCATIONS;
+    *location = packed % HS_ARTIFACT_CATALOG_MAX_LOCATIONS;
+    return wpa_auditor_catalog && *asset < wpa_auditor_catalog->asset_count &&
+           *location < wpa_auditor_catalog->assets[*asset].location_count;
+}
+
+static void wpa_auditor_catalog_size(uint64_t bytes, char *output,
+                                     size_t capacity)
+{
+    if (!output || capacity == 0) return;
+    if (bytes >= 1024U * 1024U)
+        snprintf(output, capacity, "%.1f MB", (double)bytes / (1024.0 * 1024.0));
+    else if (bytes >= 1024U)
+        snprintf(output, capacity, "%.1f KB", (double)bytes / 1024.0);
+    else
+        snprintf(output, capacity, "%llu B", (unsigned long long)bytes);
+}
+
+static void wpa_auditor_catalog_add_badge(lv_obj_t *parent, const char *text,
+                                           lv_color_t color)
+{
+    lv_obj_t *badge = lv_obj_create(parent);
+    lv_obj_set_size(badge, LV_SIZE_CONTENT, 28);
+    lv_obj_set_style_bg_color(badge, color, 0);
+    lv_obj_set_style_bg_opa(badge, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(badge, 0, 0);
+    lv_obj_set_style_radius(badge, 9, 0);
+    lv_obj_set_style_pad_hor(badge, 8, 0);
+    lv_obj_set_style_pad_ver(badge, 4, 0);
+    lv_obj_clear_flag(badge, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *label = lv_label_create(badge);
+    lv_label_set_text(label, text);
+    lv_obj_set_style_text_font(label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(label, lv_color_white(), 0);
+    lv_obj_center(label);
+}
+
+static void wpa_auditor_catalog_render_locked(void)
+{
+    if (!wpa_auditor_catalog_list ||
+        !lv_obj_is_valid(wpa_auditor_catalog_list)) return;
+    lv_obj_clean(wpa_auditor_catalog_list);
+
+    if (wpa_auditor_source_filter == -2) {
+        wpa_auditor_label(wpa_auditor_catalog_list,
+                          "Select a worker above to show its captures.",
+                          &lv_font_montserrat_14, ui_muted_color());
+        if (wpa_auditor_catalog_sync_all_btn &&
+            lv_obj_is_valid(wpa_auditor_catalog_sync_all_btn))
+            lv_obj_add_state(wpa_auditor_catalog_sync_all_btn,
+                             LV_STATE_DISABLED);
+        return;
+    }
+
+    if (!wpa_auditor_catalog || wpa_auditor_catalog->asset_count == 0) {
+        wpa_auditor_label(
+            wpa_auditor_catalog_list,
+            "No handshake captures found on Tab5 or connected Monsters.",
+            &lv_font_montserrat_14, ui_muted_color());
+        if (wpa_auditor_catalog_sync_all_btn &&
+            lv_obj_is_valid(wpa_auditor_catalog_sync_all_btn))
+            lv_obj_add_state(wpa_auditor_catalog_sync_all_btn,
+                             LV_STATE_DISABLED);
+        return;
+    }
+
+    bool busy = hs_crack_ui.active || hs_crack_ui.task ||
+                compromised_transfer_ui.active || compromised_transfer_ui.task;
+    size_t rendered = 0;
+    for (size_t i = 0; i < wpa_auditor_catalog->asset_count; ++i) {
+        const hs_artifact_asset_t *asset = &wpa_auditor_catalog->assets[i];
+        if (asset->location_count == 0) continue;
+        const hs_artifact_location_t *primary = NULL;
+        for (size_t j = 0; j < asset->location_count; ++j) {
+            if (wpa_auditor_catalog_source_selected(&asset->locations[j])) {
+                primary = &asset->locations[j];
+                break;
+            }
+        }
+        if (!primary) continue;
+        ++rendered;
+        size_t audit_location = SIZE_MAX;
+        size_t sync_location = SIZE_MAX;
+        bool any_valid = false;
+        bool any_invalid = false;
+
+        lv_obj_t *row = lv_obj_create(wpa_auditor_catalog_list);
+        lv_obj_set_width(row, lv_pct(100));
+        lv_obj_set_height(row, LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_color(row, ui_bg_color(), 0);
+        lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(row, 0, 0);
+        lv_obj_set_style_radius(row, 12, 0);
+        lv_obj_set_style_pad_all(row, 10, 0);
+        lv_obj_set_style_pad_gap(row, 6, 0);
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_COLUMN);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+        char title[288];
+        snprintf(title, sizeof(title), "%.255s", primary->name);
+        wpa_auditor_label(row, title, &lv_font_montserrat_14,
+                          ui_text_color());
+
+        lv_obj_t *badges = lv_obj_create(row);
+        lv_obj_set_size(badges, lv_pct(100), 30);
+        lv_obj_set_style_bg_opa(badges, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(badges, 0, 0);
+        lv_obj_set_style_pad_all(badges, 0, 0);
+        lv_obj_set_style_pad_gap(badges, 5, 0);
+        lv_obj_set_flex_flow(badges, LV_FLEX_FLOW_ROW);
+        lv_obj_clear_flag(badges, LV_OBJ_FLAG_SCROLLABLE);
+
+        for (size_t j = 0; j < asset->location_count; ++j) {
+            const hs_artifact_location_t *location = &asset->locations[j];
+            if (!wpa_auditor_catalog_source_selected(location)) continue;
+            lv_color_t badge_color = location->source == HS_ARTIFACT_SOURCE_LOCAL
+                                         ? lv_color_hex(0x52616B)
+                                         : lv_color_hex(0x146C5A);
+            wpa_auditor_catalog_add_badge(
+                badges, wpa_auditor_catalog_source_name(location->source),
+                badge_color);
+            any_valid |= location->validation == HS_ARTIFACT_VALIDATION_VALID;
+            any_invalid |= location->validation == HS_ARTIFACT_VALIDATION_INVALID;
+            bool path_fits = !strchr(location->name, '/') &&
+                             !strchr(location->name, '\\') &&
+                             strlen(location->name) +
+                                     sizeof("/sdcard/lab/handshakes/") <=
+                                 WARDRIVE_WIGLE_PATH_MAX;
+            if (location->source != HS_ARTIFACT_SOURCE_LOCAL &&
+                location->validation != HS_ARTIFACT_VALIDATION_INVALID &&
+                path_fits) {
+                if (sync_location == SIZE_MAX &&
+                    !wpa_auditor_catalog_local_equivalent(location))
+                    sync_location = j;
+                if (audit_location == SIZE_MAX &&
+                    location->format == HS_ARTIFACT_FORMAT_PCAP)
+                    audit_location = j;
+            }
+        }
+
+        char size_text[24];
+        wpa_auditor_catalog_size(primary->size, size_text, sizeof(size_text));
+        const char *format = primary->format == HS_ARTIFACT_FORMAT_PCAP
+                                 ? "PCAP"
+                                 : (primary->format == HS_ARTIFACT_FORMAT_HCCAPX
+                                        ? "HCCAPX"
+                                        : "Unknown format");
+        const char *state = any_valid
+                                ? "Ready"
+                                : (any_invalid ? "Needs investigation"
+                                               : (primary->format == HS_ARTIFACT_FORMAT_PCAP
+                                                      ? "Needs preflight"
+                                                      : "Needs inspection"));
+        char detail[160];
+        snprintf(detail, sizeof(detail), "%s  |  %s  |  %s", format,
+                 size_text, state);
+        wpa_auditor_label(row, detail, &lv_font_montserrat_12,
+                          any_invalid ? COLOR_MATERIAL_RED : ui_muted_color());
+
+        lv_obj_t *actions = lv_obj_create(row);
+        lv_obj_set_size(actions, lv_pct(100), 46);
+        lv_obj_set_style_bg_opa(actions, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(actions, 0, 0);
+        lv_obj_set_style_pad_all(actions, 0, 0);
+        lv_obj_set_style_pad_gap(actions, 8, 0);
+        lv_obj_set_flex_flow(actions, LV_FLEX_FLOW_ROW);
+        wpa_auditor_button_data(
+            actions, "Audit", COLOR_MATERIAL_TEAL,
+            wpa_auditor_catalog_audit_cb,
+            audit_location == SIZE_MAX
+                ? NULL
+                : wpa_auditor_catalog_action_data(i, audit_location),
+            busy || audit_location == SIZE_MAX);
+        wpa_auditor_button_data(
+            actions, "Sync to Tab5", COLOR_MATERIAL_BLUE,
+            wpa_auditor_catalog_sync_cb,
+            sync_location == SIZE_MAX
+                ? NULL
+                : wpa_auditor_catalog_action_data(i, sync_location),
+            busy || sync_location == SIZE_MAX);
+    }
+    if (rendered == 0U) {
+        wpa_auditor_label(wpa_auditor_catalog_list,
+                          "No captures found for this source.",
+                          &lv_font_montserrat_14, ui_muted_color());
+    }
+    if (wpa_auditor_catalog_sync_all_btn &&
+        lv_obj_is_valid(wpa_auditor_catalog_sync_all_btn)) {
+        if (busy || wpa_auditor_catalog_syncable_count() == 0U)
+            lv_obj_add_state(wpa_auditor_catalog_sync_all_btn,
+                             LV_STATE_DISABLED);
+        else
+            lv_obj_clear_state(wpa_auditor_catalog_sync_all_btn,
+                               LV_STATE_DISABLED);
+    }
+}
+
+static bool wpa_auditor_catalog_remote_path(
+    const hs_artifact_location_t *location, char *path, size_t capacity)
+{
+    if (!location || !path || capacity == 0 || !location->name[0] ||
+        strchr(location->name, '/') || strchr(location->name, '\\')) return false;
+    int written = snprintf(path, capacity, "/sdcard/lab/handshakes/%s",
+                           location->name);
+    return written > 0 && written < (int)capacity;
+}
+
+static void wpa_auditor_catalog_audit_cb(lv_event_t *e)
+{
+    size_t asset_index = 0, location_index = 0;
+    if (!wpa_auditor_catalog_action_indices(lv_event_get_user_data(e),
+                                             &asset_index, &location_index) ||
+        hs_crack_ui.active || hs_crack_ui.task ||
+        compromised_transfer_ui.active || compromised_transfer_ui.task) return;
+    const hs_artifact_location_t *location =
+        &wpa_auditor_catalog->assets[asset_index].locations[location_index];
+    tab_id_t tab = wpa_auditor_catalog_tab_for_source(location->source);
+    char path[WARDRIVE_WIGLE_PATH_MAX];
+    if (tab == TAB_INTERNAL || location->format != HS_ARTIFACT_FORMAT_PCAP ||
+        !wpa_auditor_catalog_remote_path(location, path, sizeof(path)) ||
+        !wpa_auditor_switch_transport(tab)) {
+        wpa_auditor_set_status("This capture source is unavailable for audit.",
+                               COLOR_MATERIAL_RED);
+        return;
+    }
+    hs_crack_start_file(get_ctx_for_tab(tab), path, location->name);
+}
+
+static void wpa_auditor_catalog_sync_cb(lv_event_t *e)
+{
+    size_t asset_index = 0, location_index = 0;
+    if (!wpa_auditor_catalog_action_indices(lv_event_get_user_data(e),
+                                             &asset_index, &location_index)) return;
+    const hs_artifact_location_t *location =
+        &wpa_auditor_catalog->assets[asset_index].locations[location_index];
+    tab_id_t tab = wpa_auditor_catalog_tab_for_source(location->source);
+    char path[WARDRIVE_WIGLE_PATH_MAX];
+    if (tab == TAB_INTERNAL ||
+        !wpa_auditor_catalog_remote_path(location, path, sizeof(path)) ||
+        !compromised_start_copy(tab, get_ctx_for_tab(tab), path, location->name,
+                                location->size, true)) {
+        wpa_auditor_set_status("Could not start Sync to Tab5.",
+                               COLOR_MATERIAL_RED);
+    }
+}
+
+static bool wpa_auditor_catalog_local_equivalent(
+    const hs_artifact_location_t *remote)
+{
+    if (!remote || !wpa_auditor_catalog) return false;
+    for (size_t i = 0; i < wpa_auditor_catalog->asset_count; ++i) {
+        const hs_artifact_asset_t *asset = &wpa_auditor_catalog->assets[i];
+        for (size_t j = 0; j < asset->location_count; ++j) {
+            const hs_artifact_location_t *local = &asset->locations[j];
+            if (local->source == HS_ARTIFACT_SOURCE_LOCAL &&
+                hs_artifact_locations_same_content(local, remote))
+                return true;
+        }
+    }
+    return false;
+}
+
+static size_t wpa_auditor_catalog_syncable_count(void)
+{
+    if (!wpa_auditor_catalog) return 0;
+    size_t count = 0;
+    for (size_t i = 0; i < wpa_auditor_catalog->asset_count; ++i) {
+        const hs_artifact_asset_t *asset = &wpa_auditor_catalog->assets[i];
+        for (size_t j = 0; j < asset->location_count; ++j) {
+            const hs_artifact_location_t *location = &asset->locations[j];
+            if (!wpa_auditor_catalog_source_selected(location)) continue;
+            tab_id_t tab = wpa_auditor_catalog_tab_for_source(location->source);
+            char path[WARDRIVE_WIGLE_PATH_MAX];
+            if (tab != TAB_INTERNAL && wpa_auditor_transport_ready(tab) &&
+                location->validation != HS_ARTIFACT_VALIDATION_INVALID &&
+                wpa_auditor_catalog_remote_path(location, path, sizeof(path)) &&
+                !wpa_auditor_catalog_local_equivalent(location)) {
+                ++count;
+                break;
+            }
+        }
+    }
+    return count;
+}
+
+static bool wpa_auditor_sync_item_add_source(
+    wpa_auditor_sync_item_t *item, const hs_artifact_location_t *location,
+    const char *remote_path)
+{
+    if (!item || !location || !remote_path) return false;
+    tab_id_t tab = wpa_auditor_catalog_tab_for_source(location->source);
+    for (size_t i = 0; i < item->source_count; ++i) {
+        if (item->sources[i].tab == tab &&
+            strcmp(item->sources[i].remote_path, remote_path) == 0)
+            return true;
+    }
+    if (item->source_count >= HS_ARTIFACT_CATALOG_MAX_LOCATIONS) return false;
+
+    wpa_auditor_sync_source_t source = {
+        .tab = tab,
+        .size = location->size,
+    };
+    snprintf(source.remote_path, sizeof(source.remote_path), "%s", remote_path);
+    item->sources[item->source_count++] = source;
+
+    /* Prefer a source with an inspected CRC as the canonical transfer. */
+    if (location->crc32_known && !item->identity.crc32_known) {
+        wpa_auditor_sync_source_t first = item->sources[0];
+        item->sources[0] = item->sources[item->source_count - 1U];
+        item->sources[item->source_count - 1U] = first;
+        item->identity = *location;
+        snprintf(item->file_name, sizeof(item->file_name), "%s", location->name);
+    }
+    return true;
+}
+
+static wpa_auditor_sync_task_args_t *wpa_auditor_catalog_build_sync_queue(void)
+{
+    if (!wpa_auditor_catalog) return NULL;
+    size_t bytes = sizeof(wpa_auditor_sync_task_args_t) +
+                   HS_ARTIFACT_CATALOG_MAX_ASSETS * sizeof(wpa_auditor_sync_item_t);
+    wpa_auditor_sync_task_args_t *args = heap_caps_calloc(
+        1, bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!args) return NULL;
+
+    for (size_t i = 0; i < wpa_auditor_catalog->asset_count; ++i) {
+        const hs_artifact_asset_t *asset = &wpa_auditor_catalog->assets[i];
+        bool local = false;
+        for (size_t j = 0; j < asset->location_count; ++j) {
+            const hs_artifact_location_t *location = &asset->locations[j];
+            if (!wpa_auditor_catalog_source_selected(location)) continue;
+            tab_id_t tab = wpa_auditor_catalog_tab_for_source(location->source);
+            if (tab == TAB_INTERNAL || !wpa_auditor_transport_ready(tab) ||
+                location->validation == HS_ARTIFACT_VALIDATION_INVALID)
+                continue;
+            if (wpa_auditor_catalog_local_equivalent(location)) {
+                local = true;
+                break;
+            }
+        }
+        if (local) {
+            ++args->already_local;
+            continue;
+        }
+
+        for (size_t j = 0; j < asset->location_count; ++j) {
+            const hs_artifact_location_t *location = &asset->locations[j];
+            if (!wpa_auditor_catalog_source_selected(location)) continue;
+            tab_id_t tab = wpa_auditor_catalog_tab_for_source(location->source);
+            char remote_path[WARDRIVE_WIGLE_PATH_MAX];
+            if (tab == TAB_INTERNAL || !wpa_auditor_transport_ready(tab) ||
+                location->validation == HS_ARTIFACT_VALIDATION_INVALID ||
+                !wpa_auditor_catalog_remote_path(location, remote_path,
+                                                  sizeof(remote_path)))
+                continue;
+
+            wpa_auditor_sync_item_t *item = NULL;
+            for (size_t k = 0; k < args->item_count; ++k) {
+                if (hs_artifact_locations_same_content(&args->items[k].identity,
+                                                       location)) {
+                    item = &args->items[k];
+                    if (!item->identity.crc32_known || !location->crc32_known)
+                        ESP_LOGI(TAG,
+                                 "[HS-AUDIT] Probable duplicate %.96s on %s (name + size)",
+                                 location->name, tab_transport_name(tab));
+                    break;
+                }
+            }
+            if (!item) {
+                if (args->item_count >= HS_ARTIFACT_CATALOG_MAX_ASSETS) continue;
+                item = &args->items[args->item_count++];
+                item->identity = *location;
+                snprintf(item->file_name, sizeof(item->file_name), "%s",
+                         location->name);
+            }
+            if (!wpa_auditor_sync_item_add_source(item, location, remote_path))
+                ESP_LOGW(TAG, "[HS-AUDIT] Too many sources for %.96s",
+                         item->file_name);
+        }
+    }
+    return args;
+}
+
+static esp_err_t wpa_auditor_catalog_copy_item(
+    const wpa_auditor_sync_item_t *item, janos_file_transfer_result_t *result_out)
+{
+    if (!item || item->source_count == 0U || !result_out ||
+        item->sources[0].tab == TAB_INTERNAL)
+        return ESP_ERR_INVALID_ARG;
+    const wpa_auditor_sync_source_t *source = &item->sources[0];
+    uart_port_t port = uart_port_for_tab(source->tab);
+    bool lock_set = false;
+    bool fast = false;
+    int fast_baud = JANOS_UART_FT_DEFAULT_BAUD;
+    esp_err_t result_err = ESP_FAIL;
+    janos_file_transfer_result_t result = {0};
+    char local_path[256];
+
+    compromised_transport_lock_begin(source->tab, port, &lock_set);
+    transport_write_bytes_tab(source->tab, port, "stop\r\n", 6);
+    char stop_response[1024];
+    (void)home_collect_uart_response(source->tab, port, stop_response,
+                                     sizeof(stop_response), 4500);
+    if (compromised_transfer_ui.cancel_requested) {
+        result_err = ESP_ERR_INVALID_STATE;
+        goto cleanup;
+    }
+    if (!janos_transfer_build_unique_local_path(source->tab, item->file_name, true,
+                                                local_path, sizeof(local_path))) {
+        result_err = ESP_ERR_INVALID_SIZE;
+        goto cleanup;
+    }
+
+    janos_ft_link_t speed_link = source->tab == TAB_USB
+                                     ? JANOS_FT_LINK_USB_CH34X
+                                     : JANOS_FT_LINK_HARDWARE_UART;
+    fast_baud = (int)janos_ft_baud_selected(speed_link, janos_ft_baud,
+                                            janos_usb_ft_baud);
+    janos_uart_baud_result_t baud_result =
+        janos_uart_set_baud(source->tab, port, fast_baud);
+    if (baud_result == JANOS_BAUD_LOST) {
+        result_err = ESP_ERR_INVALID_STATE;
+        goto cleanup;
+    }
+    fast = baud_result == JANOS_BAUD_FAST;
+    result_err = janos_uart_download(
+        source->tab, port, source->remote_path, local_path, source->size,
+        &compromised_transfer_ui.cancel_requested, &result);
+    if (fast) {
+        (void)janos_uart_restore_baud(source->tab, port, fast_baud);
+        fast = false;
+    }
+    if (result_err == ESP_OK) *result_out = result;
+
+cleanup:
+    if (fast) (void)janos_uart_restore_baud(source->tab, port, fast_baud);
+    compromised_transport_lock_end(source->tab, lock_set);
+    return result_err;
+}
+
+static bool wpa_auditor_sync_item_find_indexed(
+    const wpa_auditor_sync_item_t *item, char *local_path, size_t capacity)
+{
+    if (!item || !local_path || capacity == 0U) return false;
+    for (size_t i = 0; i < item->source_count; ++i) {
+        const wpa_auditor_sync_source_t *source = &item->sources[i];
+        if (janos_sync_state_contains(source->tab, source->remote_path,
+                                      source->size, local_path, capacity))
+            return true;
+    }
+    return false;
+}
+
+static unsigned wpa_auditor_sync_item_index_sources(
+    const wpa_auditor_sync_item_t *item,
+    const janos_file_transfer_result_t *result)
+{
+    if (!item || !result || !result->final_path[0]) return 0U;
+    unsigned saved = 0;
+    for (size_t i = 0; i < item->source_count; ++i) {
+        const wpa_auditor_sync_source_t *source = &item->sources[i];
+        char existing_path[256];
+        if (janos_sync_state_contains(source->tab, source->remote_path,
+                                      source->size, existing_path,
+                                      sizeof(existing_path))) {
+            ++saved;
+            continue;
+        }
+        esp_err_t state_err = janos_sync_state_append(
+            source->tab, source->remote_path, source->size,
+            result->final_path, result->crc32);
+        if (state_err == ESP_OK) {
+            ++saved;
+        } else {
+            ESP_LOGW(TAG, "[%s] Sync-all could not save alias for %s",
+                     tab_transport_name(source->tab), source->remote_path);
+        }
+    }
+    return saved;
+}
+
+static void wpa_auditor_catalog_sync_all_task(void *argument)
+{
+    wpa_auditor_sync_task_args_t *args = argument;
+    unsigned copied = 0;
+    unsigned skipped = args ? (unsigned)args->already_local : 0;
+    unsigned failed = 0;
+    unsigned duplicates = 0;
+
+    if (args) {
+        compromised_transfer_ui.batch_total = args->item_count;
+        for (size_t i = 0; i < args->item_count; ++i) {
+            if (compromised_transfer_ui.cancel_requested) break;
+            const wpa_auditor_sync_item_t *item = &args->items[i];
+            if (item->source_count == 0U) continue;
+            compromised_transfer_ui.batch_current = i + 1U;
+            snprintf(compromised_transfer_ui.batch_file,
+                     sizeof(compromised_transfer_ui.batch_file), "%.95s",
+                     item->file_name);
+            char detail[192];
+            snprintf(detail, sizeof(detail), "%u/%u  %.120s",
+                     (unsigned)(i + 1U), (unsigned)args->item_count,
+                     item->file_name);
+            compromised_transfer_set_stage("Syncing all captures...", detail,
+                                           (int)((i * 100U) / args->item_count));
+
+            char indexed_path[256];
+            if (wpa_auditor_sync_item_find_indexed(item, indexed_path,
+                                                    sizeof(indexed_path))) {
+                janos_file_transfer_result_t indexed = {
+                    .remote_size_before = item->sources[0].size,
+                    .crc32 = item->identity.crc32_known ? item->identity.crc32 : 0U,
+                };
+                snprintf(indexed.final_path, sizeof(indexed.final_path), "%s",
+                         indexed_path);
+                (void)wpa_auditor_sync_item_index_sources(item, &indexed);
+                ++skipped;
+                duplicates += (unsigned)(item->source_count - 1U);
+                continue;
+            }
+            janos_file_transfer_result_t result = {0};
+            esp_err_t err = wpa_auditor_catalog_copy_item(item, &result);
+            if (err == ESP_OK && item->identity.crc32_known &&
+                result.crc32 != item->identity.crc32) {
+                ESP_LOGE(TAG,
+                         "[HS-AUDIT] CRC changed for %.96s: expected %08lX got %08lX",
+                         item->file_name, (unsigned long)item->identity.crc32,
+                         (unsigned long)result.crc32);
+                err = ESP_ERR_INVALID_CRC;
+            }
+            if (err == ESP_OK) {
+                (void)wpa_auditor_sync_item_index_sources(item, &result);
+                ++copied;
+                duplicates += (unsigned)(item->source_count - 1U);
+            } else if (!compromised_transfer_ui.cancel_requested) {
+                ++failed;
+            }
+        }
+    }
+
+    char final_detail[192];
+    snprintf(final_detail, sizeof(final_detail),
+             "Copied: %u | Already local: %u | Duplicates: %u | Failed: %u",
+             copied, skipped, duplicates, failed);
+    bool success = args && !compromised_transfer_ui.cancel_requested && failed == 0U;
+    compromised_transfer_finish_ui(success, final_detail);
+    compromised_transfer_ui.batch_current = 0;
+    compromised_transfer_ui.batch_total = 0;
+    compromised_transfer_ui.batch_file[0] = '\0';
+    compromised_transfer_ui.task = NULL;
+    heap_caps_free(args);
+
+    if (success && wpa_auditor_page)
+        (void)wpa_auditor_catalog_request_refresh();
+    vTaskDeleteWithCaps(NULL);
+}
+
+static void wpa_auditor_catalog_sync_all_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!wpa_auditor_catalog || wpa_auditor_catalog_task_handle ||
+        hs_crack_ui.active || hs_crack_ui.task || compromised_transfer_ui.active ||
+        compromised_transfer_ui.task ||
+        !compromised_transfer_preflight(&internal_ctx, true)) return;
+    wpa_auditor_sync_task_args_t *args =
+        wpa_auditor_catalog_build_sync_queue();
+    if (!args) {
+        wpa_auditor_set_status("Not enough PSRAM to create the sync queue.",
+                               COLOR_MATERIAL_RED);
+        return;
+    }
+    if (args->item_count == 0U) {
+        heap_caps_free(args);
+        wpa_auditor_set_status("All remote captures are already on Tab5.",
+                               COLOR_MATERIAL_GREEN);
+        return;
+    }
+
+    compromised_transfer_ui.active = true;
+    compromised_transfer_ui.cancel_requested = false;
+    compromised_transfer_ui.sync_mode = true;
+    compromised_transfer_ui.batch_current = 0;
+    compromised_transfer_ui.batch_total = 0;
+    compromised_transfer_ui.batch_file[0] = '\0';
+    char title[96];
+    snprintf(title, sizeof(title), "All remote handshakes: %u file(s)",
+             (unsigned)args->item_count);
+    compromised_transfer_show_popup(title);
+    BaseType_t created = xTaskCreateWithCaps(
+        wpa_auditor_catalog_sync_all_task, "wpa_sync_all",
+        WPA_AUDITOR_SYNC_TASK_STACK, args, 6, &compromised_transfer_ui.task,
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (created != pdPASS) {
+        created = xTaskCreateWithCaps(
+            wpa_auditor_catalog_sync_all_task, "wpa_sync_all",
+            WPA_AUDITOR_SYNC_TASK_STACK, args, 6,
+            &compromised_transfer_ui.task,
+            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
+    if (created != pdPASS) {
+        compromised_transfer_ui.active = false;
+        compromised_transfer_ui.task = NULL;
+        compromised_transfer_finish_ui_unlocked(
+            false, "Could not start the Sync all task.");
+        heap_caps_free(args);
+    }
+}
+
+static bool wpa_auditor_catalog_add_location(
+    hs_artifact_catalog_t *catalog, const hs_artifact_location_t *location)
+{
+    hs_artifact_catalog_result_t result =
+        hs_artifact_catalog_add(catalog, location, NULL);
+    return result != HS_ARTIFACT_CATALOG_INVALID &&
+           result != HS_ARTIFACT_CATALOG_FULL;
+}
+
+static bool wpa_auditor_catalog_scan_local(hs_artifact_catalog_t *catalog)
+{
+    if (!catalog || !internal_sd_present) return false;
+    DIR *directory = opendir("/sdcard/lab/handshakes");
+    if (!directory) return false;
+    uint32_t entry = 0;
+    struct dirent *item = NULL;
+    while (!wpa_auditor_catalog_cancel &&
+           catalog->asset_count < HS_ARTIFACT_CATALOG_MAX_ASSETS &&
+           (item = readdir(directory)) != NULL) {
+        hs_artifact_format_t format = wpa_auditor_catalog_format(item->d_name);
+        if (item->d_name[0] == '.' || format == HS_ARTIFACT_FORMAT_UNKNOWN)
+            continue;
+        char path[320];
+        int written = snprintf(path, sizeof(path), "/sdcard/lab/handshakes/%s",
+                               item->d_name);
+        struct stat stat_info;
+        if (written <= 0 || written >= (int)sizeof(path) ||
+            stat(path, &stat_info) != 0 || !S_ISREG(stat_info.st_mode)) continue;
+        hs_artifact_location_t location = {
+            .source = HS_ARTIFACT_SOURCE_LOCAL,
+            .scope = HS_ARTIFACT_SCOPE_HANDSHAKES,
+            .entry = ++entry,
+            .size = (uint64_t)stat_info.st_size,
+            .mtime = (uint64_t)stat_info.st_mtime,
+            .format = format,
+            .validation = HS_ARTIFACT_VALIDATION_UNKNOWN,
+        };
+        snprintf(location.reason, sizeof(location.reason), "local_pending");
+        snprintf(location.name, sizeof(location.name), "%s", item->d_name);
+        if (!wpa_auditor_catalog_add_location(catalog, &location)) break;
+        if ((entry & 7U) == 0U) vTaskDelay(1);
+    }
+    closedir(directory);
+    return true;
+}
+
+static bool wpa_auditor_catalog_capabilities(const char *response)
+{
+    if (!response) return false;
+    bool capable = false;
+    bool ended = false;
+    const char *cursor = response;
+    while (*cursor) {
+        const char *end = strpbrk(cursor, "\r\n");
+        size_t length = end ? (size_t)(end - cursor) : strlen(cursor);
+        if (length > 0 && length <= HS_ARTIFACT_LINE_MAX) {
+            char line[HS_ARTIFACT_LINE_MAX + 1U];
+            memcpy(line, cursor, length);
+            line[length] = '\0';
+            hs_artifact_message_t message;
+            if (hs_artifact_parse_line(line, &message) == HS_ARTIFACT_PARSE_OK) {
+                if (message.type == HS_ARTIFACT_CAPABILITIES)
+                    capable = true;
+                else if (message.type == HS_ARTIFACT_END &&
+                         strcmp(message.request_id, "0") == 0 &&
+                         message.end_status == HS_ARTIFACT_END_OK)
+                    ended = true;
+            }
+        }
+        if (!end) break;
+        cursor = end + 1;
+        while (*cursor == '\r' || *cursor == '\n') ++cursor;
+    }
+    return capable && ended;
+}
+
+static bool wpa_auditor_catalog_scan_artifact(
+    tab_id_t tab, uart_port_t port, hs_artifact_catalog_t *catalog,
+    hs_artifact_source_t source)
+{
+    char *response = heap_caps_malloc(24576, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    hs_artifact_location_t *page = heap_caps_calloc(
+        HS_ARTIFACT_PAGE_MAX, sizeof(*page), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!response || !page) {
+        free(response);
+        free(page);
+        return false;
+    }
+
+    uint32_t cursor = 0;
+    unsigned page_number = 0;
+    bool success = true;
+    bool more = true;
+    while (more && !wpa_auditor_catalog_cancel &&
+           catalog->asset_count < HS_ARTIFACT_CATALOG_MAX_ASSETS &&
+           page_number < 16U) {
+        char request_id[HS_ARTIFACT_REQUEST_ID_MAX + 1U];
+        snprintf(request_id, sizeof(request_id), "T%08lX%u%u",
+                 (unsigned long)lv_tick_get(), (unsigned)source, page_number);
+        char command[128];
+        snprintf(command, sizeof(command),
+                 "artifact_inventory list %s handshakes %lu %u",
+                 request_id, (unsigned long)cursor,
+                 (unsigned)WPA_AUDITOR_CATALOG_PAGE_LIMIT);
+        compromised_transport_flush(tab, port);
+        transport_write_bytes_tab(tab, port, command, strlen(command));
+        transport_write_bytes_tab(tab, port, "\r\n", 2);
+        int received = home_collect_uart_response(tab, port, response, 24576, 8000);
+        if (received <= 0) {
+            success = false;
+            break;
+        }
+
+        hs_artifact_request_t request;
+        hs_artifact_request_init(&request, request_id);
+        size_t page_count = 0;
+        bool terminal_ok = false;
+        char *save = NULL;
+        char *line = strtok_r(response, "\r\n", &save);
+        while (line) {
+            hs_artifact_message_t message;
+            hs_artifact_parse_result_t parsed =
+                hs_artifact_parse_line(line, &message);
+            if (parsed == HS_ARTIFACT_PARSE_MALFORMED) {
+                success = false;
+                break;
+            }
+            if (parsed == HS_ARTIFACT_PARSE_OK) {
+                hs_artifact_request_result_t accepted =
+                    hs_artifact_request_accept(&request, &message);
+                if (accepted == HS_ARTIFACT_REQUEST_ACCEPTED &&
+                    message.type == HS_ARTIFACT_ITEM &&
+                    page_count < HS_ARTIFACT_PAGE_MAX) {
+                    hs_artifact_location_t *location = &page[page_count++];
+                    memset(location, 0, sizeof(*location));
+                    location->source = source;
+                    location->scope = message.scope == HS_ARTIFACT_SCOPE_UNKNOWN
+                                          ? HS_ARTIFACT_SCOPE_HANDSHAKES
+                                          : message.scope;
+                    location->snapshot = message.snapshot;
+                    location->entry = message.entry;
+                    location->size = message.size;
+                    location->mtime = message.mtime;
+                    location->format = message.format;
+                    location->validation = message.validation;
+                    location->crc32_known = message.crc32_known;
+                    location->crc32 = message.crc32;
+                    snprintf(location->reason, sizeof(location->reason), "%s",
+                             message.reason);
+                    memcpy(location->name, message.name, message.name_length);
+                    location->name[message.name_length] = '\0';
+                } else if (accepted == HS_ARTIFACT_REQUEST_DONE &&
+                           message.type == HS_ARTIFACT_END) {
+                    terminal_ok = message.end_status == HS_ARTIFACT_END_OK;
+                } else if (accepted == HS_ARTIFACT_REQUEST_STALE &&
+                           strcmp(message.request_id, request_id) == 0) {
+                    success = false;
+                    break;
+                }
+            }
+            line = strtok_r(NULL, "\r\n", &save);
+        }
+        if (!success || !terminal_ok ||
+            hs_artifact_request_finish(&request) != HS_ARTIFACT_REQUEST_DONE) {
+            success = false;
+            break;
+        }
+        for (size_t i = 0; i < page_count; ++i) {
+            if (!wpa_auditor_catalog_add_location(catalog, &page[i])) {
+                more = false;
+                break;
+            }
+        }
+        more = more && request.more;
+        if (more && request.next_cursor <= cursor) {
+            success = false;
+            break;
+        }
+        cursor = request.next_cursor;
+        ++page_number;
+    }
+
+    free(page);
+    free(response);
+    return success && !wpa_auditor_catalog_cancel;
+}
+
+static bool wpa_auditor_catalog_scan_legacy(
+    tab_id_t tab, uart_port_t port, hs_artifact_catalog_t *catalog,
+    hs_artifact_source_t source)
+{
+    char *response = heap_caps_malloc(24576, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!response) return false;
+    compromised_transport_flush(tab, port);
+    const char *command = "list_dir /sdcard/lab/handshakes -s";
+    transport_write_bytes_tab(tab, port, command, strlen(command));
+    transport_write_bytes_tab(tab, port, "\r\n", 2);
+    int received = home_collect_uart_response(tab, port, response, 24576, 5000);
+    bool listing_seen = received > 0 &&
+                        (strstr(response, "Files in ") != NULL ||
+                         strstr(response, "Found ") != NULL ||
+                         strstr(response, "No files found in ") != NULL);
+    uint32_t entry = 0;
+    char *save = NULL;
+    char *line = received > 0 ? strtok_r(response, "\r\n", &save) : NULL;
+    while (line && !wpa_auditor_catalog_cancel &&
+           catalog->asset_count < HS_ARTIFACT_CATALOG_MAX_ASSETS) {
+        uint64_t size = 0;
+        char name[HS_ARTIFACT_NAME_MAX + 1U];
+        if (hs_artifact_parse_legacy_sized_row(line, &size, name,
+                                                sizeof(name))) {
+            hs_artifact_format_t format = wpa_auditor_catalog_format(name);
+            if (format != HS_ARTIFACT_FORMAT_UNKNOWN) {
+                hs_artifact_location_t location = {
+                    .source = source,
+                    .scope = HS_ARTIFACT_SCOPE_HANDSHAKES,
+                    .entry = ++entry,
+                    .size = size,
+                    .format = format,
+                    .validation = HS_ARTIFACT_VALIDATION_UNKNOWN,
+                };
+                snprintf(location.reason, sizeof(location.reason), "legacy_list");
+                snprintf(location.name, sizeof(location.name), "%s", name);
+                if (!wpa_auditor_catalog_add_location(catalog, &location)) break;
+            }
+        }
+        line = strtok_r(NULL, "\r\n", &save);
+    }
+    free(response);
+    return listing_seen && !wpa_auditor_catalog_cancel;
+}
+
+static bool wpa_auditor_catalog_scan_remote(tab_id_t tab,
+                                             hs_artifact_catalog_t *catalog)
+{
+    if (!catalog || !wpa_auditor_transport_ready(tab)) return false;
+    uart_port_t port = uart_port_for_tab(tab);
+    bool lock_set = false;
+    compromised_transport_lock_begin(tab, port, &lock_set);
+    bool result = false;
+    if (!wpa_auditor_catalog_cancel) {
+        char *response = heap_caps_malloc(2048,
+                                          MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        bool artifact = false;
+        if (response) {
+            compromised_transport_flush(tab, port);
+            const char *command = "artifact_inventory capabilities";
+            transport_write_bytes_tab(tab, port, command, strlen(command));
+            transport_write_bytes_tab(tab, port, "\r\n", 2);
+            int received = home_collect_uart_response(tab, port, response, 2048,
+                                                      2500);
+            artifact = received > 0 &&
+                       wpa_auditor_catalog_capabilities(response);
+            free(response);
+        }
+        hs_artifact_source_t source =
+            wpa_auditor_catalog_source_for_tab(tab);
+        if (artifact)
+            result = wpa_auditor_catalog_scan_artifact(tab, port, catalog,
+                                                       source);
+        if (!result && !wpa_auditor_catalog_cancel)
+            result = wpa_auditor_catalog_scan_legacy(tab, port, catalog,
+                                                     source);
+    }
+    compromised_transport_lock_end(tab, lock_set);
+    return result;
+}
+
+static void wpa_auditor_catalog_set_scan_status(uint32_t generation,
+                                                 const char *status)
+{
+    bsp_display_lock(0);
+    if (generation == wpa_auditor_catalog_generation &&
+        wpa_auditor_catalog_status &&
+        lv_obj_is_valid(wpa_auditor_catalog_status)) {
+        lv_label_set_text(wpa_auditor_catalog_status, status);
+        lv_obj_set_style_text_color(wpa_auditor_catalog_status,
+                                    COLOR_MATERIAL_AMBER, 0);
+    }
+    bsp_display_unlock();
+}
+
+static void wpa_auditor_catalog_task(void *argument)
+{
+    wpa_auditor_catalog_task_args_t *args = argument;
+    uint32_t generation = args ? args->generation : 0;
+    free(args);
+    hs_artifact_catalog_t *working = heap_caps_calloc(
+        1, sizeof(*working), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    unsigned scanned_sources = 0;
+    unsigned failed_sources = 0;
+
+    if (working) {
+        wpa_auditor_catalog_set_scan_status(generation, "Scanning LOCAL...");
+        if (wpa_auditor_catalog_scan_local(working)) ++scanned_sources;
+        else if (internal_sd_present) ++failed_sources;
+
+        static const tab_id_t tabs[] = {TAB_GROVE, TAB_USB, TAB_MBUS};
+        for (size_t i = 0; i < sizeof(tabs) / sizeof(tabs[0]) &&
+                           !wpa_auditor_catalog_cancel; ++i) {
+            if (!wpa_auditor_transport_ready(tabs[i])) continue;
+            char status[48];
+            snprintf(status, sizeof(status), "Scanning %s...",
+                     tab_transport_name(tabs[i]));
+            wpa_auditor_catalog_set_scan_status(generation, status);
+            if (wpa_auditor_catalog_scan_remote(tabs[i], working))
+                ++scanned_sources;
+            else
+                ++failed_sources;
+        }
+    }
+
+    bsp_display_lock(0);
+    bool publish = working && !wpa_auditor_catalog_cancel &&
+                   generation == wpa_auditor_catalog_generation &&
+                   wpa_auditor_page && lv_obj_is_valid(wpa_auditor_page) &&
+                   wpa_auditor_catalog_list &&
+                   lv_obj_is_valid(wpa_auditor_catalog_list);
+    wpa_auditor_catalog_task_handle = NULL;
+    if (publish) {
+        free(wpa_auditor_catalog);
+        wpa_auditor_catalog = working;
+        working = NULL;
+        wpa_auditor_catalog_render_locked();
+        if (wpa_auditor_catalog_status &&
+            lv_obj_is_valid(wpa_auditor_catalog_status)) {
+            char status[128];
+            snprintf(status, sizeof(status),
+                     "%u capture%s from %u source%s%s",
+                     (unsigned)wpa_auditor_catalog->asset_count,
+                     wpa_auditor_catalog->asset_count == 1 ? "" : "s",
+                     scanned_sources, scanned_sources == 1 ? "" : "s",
+                     failed_sources ? "; one or more sources unavailable" : "");
+            lv_label_set_text(wpa_auditor_catalog_status, status);
+            lv_obj_set_style_text_color(
+                wpa_auditor_catalog_status,
+                failed_sources ? COLOR_MATERIAL_AMBER : COLOR_MATERIAL_GREEN, 0);
+        }
+    } else if (!working && generation == wpa_auditor_catalog_generation &&
+               wpa_auditor_catalog_status &&
+               lv_obj_is_valid(wpa_auditor_catalog_status)) {
+        lv_label_set_text(wpa_auditor_catalog_status,
+                          "Catalog scan failed: not enough PSRAM.");
+        lv_obj_set_style_text_color(wpa_auditor_catalog_status,
+                                    COLOR_MATERIAL_RED, 0);
+    }
+    if (wpa_auditor_catalog_scan_btn &&
+        lv_obj_is_valid(wpa_auditor_catalog_scan_btn))
+        lv_obj_clear_state(wpa_auditor_catalog_scan_btn, LV_STATE_DISABLED);
+    bsp_display_unlock();
+    free(working);
+    vTaskDeleteWithCaps(NULL);
+}
+
+static bool wpa_auditor_catalog_request_refresh(void)
+{
+    if (wpa_auditor_catalog_task_handle) return false;
+    wpa_auditor_catalog_task_args_t *args = calloc(1, sizeof(*args));
+    if (!args) return false;
+    args->generation = wpa_auditor_catalog_generation;
+    wpa_auditor_catalog_cancel = false;
+    BaseType_t created = xTaskCreateWithCaps(
+        wpa_auditor_catalog_task, "wpa_catalog", WPA_AUDITOR_CATALOG_TASK_STACK,
+        args, 3, &wpa_auditor_catalog_task_handle,
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (created != pdPASS) {
+        created = xTaskCreateWithCaps(
+            wpa_auditor_catalog_task, "wpa_catalog",
+            WPA_AUDITOR_CATALOG_TASK_STACK, args, 3,
+            &wpa_auditor_catalog_task_handle,
+            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
+    if (created != pdPASS) {
+        wpa_auditor_catalog_task_handle = NULL;
+        free(args);
+        return false;
+    }
+    return true;
+}
+
+static void wpa_auditor_open_captures_cb(lv_event_t *e)
+{
+    (void)e;
+    if (wpa_auditor_catalog_task_handle || hs_crack_ui.active ||
+        hs_crack_ui.task || compromised_transfer_ui.active ||
+        compromised_transfer_ui.task) return;
+    if (!internal_sd_present && !grove_detected && !usb_detected &&
+        !mbus_detected) {
+        wpa_auditor_set_status(
+            "No storage source is available. Mount SD or connect a Monster.",
+            COLOR_MATERIAL_RED);
+        return;
+    }
+    if (wpa_auditor_catalog_scan_btn &&
+        lv_obj_is_valid(wpa_auditor_catalog_scan_btn))
+        lv_obj_add_state(wpa_auditor_catalog_scan_btn, LV_STATE_DISABLED);
+    if (wpa_auditor_catalog_sync_all_btn &&
+        lv_obj_is_valid(wpa_auditor_catalog_sync_all_btn))
+        lv_obj_add_state(wpa_auditor_catalog_sync_all_btn, LV_STATE_DISABLED);
+    if (!wpa_auditor_catalog_request_refresh()) {
+        if (wpa_auditor_catalog_scan_btn &&
+            lv_obj_is_valid(wpa_auditor_catalog_scan_btn))
+            lv_obj_clear_state(wpa_auditor_catalog_scan_btn,
+                               LV_STATE_DISABLED);
+        if (wpa_auditor_catalog_sync_all_btn &&
+            lv_obj_is_valid(wpa_auditor_catalog_sync_all_btn) &&
+            wpa_auditor_catalog_syncable_count() > 0U)
+            lv_obj_clear_state(wpa_auditor_catalog_sync_all_btn,
+                               LV_STATE_DISABLED);
+        wpa_auditor_set_status("Could not start catalog scan task.",
+                               COLOR_MATERIAL_RED);
+    }
+}
+
+static void wpa_auditor_back_cb(lv_event_t *e)
+{
+    (void)e;
+    wpa_auditor_catalog_cancel = true;
+    ++wpa_auditor_catalog_generation;
+    wpa_auditor_confirm_close_cb(NULL);
+    if (wpa_auditor_page && lv_obj_is_valid(wpa_auditor_page))
+        lv_obj_del(wpa_auditor_page);
+    wpa_auditor_page = NULL;
+    wpa_auditor_status_label = NULL;
+    wpa_auditor_catalog_list = NULL;
+    wpa_auditor_catalog_status = NULL;
+    wpa_auditor_catalog_scan_btn = NULL;
+    wpa_auditor_catalog_sync_all_btn = NULL;
+    wpa_auditor_source_dropdown = NULL;
+    free(wpa_auditor_sessions);
+    wpa_auditor_sessions = NULL;
+    wpa_auditor_session_count = 0;
+    wpa_auditor_pending_session = SIZE_MAX;
+    show_internal_tiles();
+}
+
+static void show_wpa_psk_auditor_page(void)
+{
+    if (!internal_container) return;
+    if (internal_tiles) lv_obj_add_flag(internal_tiles, LV_OBJ_FLAG_HIDDEN);
+    if (internal_settings_page)
+        lv_obj_add_flag(internal_settings_page, LV_OBJ_FLAG_HIDDEN);
+    if (wpa_auditor_page && lv_obj_is_valid(wpa_auditor_page))
+        lv_obj_del(wpa_auditor_page);
+    ++wpa_auditor_catalog_generation;
+    wpa_auditor_page = NULL;
+    wpa_auditor_status_label = NULL;
+    wpa_auditor_confirm_overlay = NULL;
+    wpa_auditor_catalog_list = NULL;
+    wpa_auditor_catalog_status = NULL;
+    wpa_auditor_catalog_scan_btn = NULL;
+    wpa_auditor_catalog_sync_all_btn = NULL;
+    wpa_auditor_source_dropdown = NULL;
+    free(wpa_auditor_sessions);
+    wpa_auditor_sessions = heap_caps_calloc(
+        WPA_AUDITOR_RESUME_ROWS, sizeof(*wpa_auditor_sessions),
+        MALLOC_CAP_SPIRAM);
+    if (!wpa_auditor_sessions)
+        wpa_auditor_sessions = calloc(
+            WPA_AUDITOR_RESUME_ROWS, sizeof(*wpa_auditor_sessions));
+    wpa_auditor_session_count = 0;
+    wpa_auditor_pending_session = SIZE_MAX;
+
+    hs_session_result_t session_result = HS_SESSION_IO_ERROR;
+    if (wpa_auditor_sessions) {
+        session_result = hs_session_catalog_list(
+            HS_CRACK_SESSION_DIR, HS_CRACK_SESSION_A, HS_CRACK_SESSION_B,
+            wpa_auditor_sessions, WPA_AUDITOR_RESUME_ROWS,
+            &wpa_auditor_session_count);
+        if (session_result != HS_SESSION_OK ||
+            wpa_auditor_session_count == 0) {
+            free(wpa_auditor_sessions);
+            wpa_auditor_sessions = NULL;
+            wpa_auditor_session_count = 0;
+        }
+    }
+
+    wpa_auditor_page = lv_obj_create(internal_container);
+    lv_obj_set_size(wpa_auditor_page, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(wpa_auditor_page, ui_bg_color(), 0);
+    lv_obj_set_style_border_width(wpa_auditor_page, 0, 0);
+    lv_obj_set_style_radius(wpa_auditor_page, 0, 0);
+    lv_obj_set_style_pad_all(wpa_auditor_page, 12, 0);
+    lv_obj_set_style_pad_gap(wpa_auditor_page, 10, 0);
+    lv_obj_set_flex_flow(wpa_auditor_page, LV_FLEX_FLOW_COLUMN);
+    lv_obj_clear_flag(wpa_auditor_page, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *header = lv_obj_create(wpa_auditor_page);
+    lv_obj_set_size(header, lv_pct(100), 58);
+    lv_obj_set_style_bg_opa(header, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(header, 0, 0);
+    lv_obj_set_style_pad_all(header, 0, 0);
+    lv_obj_set_style_pad_gap(header, 10, 0);
+    lv_obj_set_flex_flow(header, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(header, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(header, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *back = lv_btn_create(header);
+    lv_obj_set_size(back, 48, 48);
+    lv_obj_set_style_bg_color(back, ui_panel_color(), 0);
+    lv_obj_set_style_shadow_width(back, 0, 0);
+    lv_obj_set_style_radius(back, 12, 0);
+    lv_obj_add_event_cb(back, wpa_auditor_back_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *back_label = lv_label_create(back);
+    lv_label_set_text(back_label, LV_SYMBOL_LEFT);
+    lv_obj_set_style_text_color(back_label, ui_text_color(), 0);
+    lv_obj_center(back_label);
+
+    lv_obj_t *heading = lv_obj_create(header);
+    lv_obj_set_height(heading, LV_SIZE_CONTENT);
+    lv_obj_set_flex_grow(heading, 1);
+    lv_obj_set_style_bg_opa(heading, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(heading, 0, 0);
+    lv_obj_set_style_pad_all(heading, 0, 0);
+    lv_obj_set_style_pad_gap(heading, 2, 0);
+    lv_obj_set_flex_flow(heading, LV_FLEX_FLOW_COLUMN);
+    lv_obj_clear_flag(heading, LV_OBJ_FLAG_SCROLLABLE);
+    wpa_auditor_label(heading, "WPA PSK Auditor", &lv_font_montserrat_22,
+                      ui_text_color());
+    wpa_auditor_label(heading, "Capture readiness, durable resume and audit history",
+                      &lv_font_montserrat_12, ui_muted_color());
+
+    lv_obj_t *body = lv_obj_create(wpa_auditor_page);
+    lv_obj_set_width(body, lv_pct(100));
+    lv_obj_set_flex_grow(body, 1);
+    lv_obj_set_style_bg_opa(body, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(body, 0, 0);
+    lv_obj_set_style_pad_all(body, 0, 0);
+    lv_obj_set_style_pad_gap(body, 10, 0);
+    lv_obj_set_flex_flow(body, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_scroll_dir(body, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(body, LV_SCROLLBAR_MODE_AUTO);
+
+    lv_obj_t *audit = wpa_auditor_card(body);
+    bool running = hs_crack_ui.active || hs_crack_ui.task;
+    char audit_title[48];
+    snprintf(audit_title, sizeof(audit_title),
+             running ? "Active audit  |  %u saved" : "Resumable audits  |  %u",
+             (unsigned)wpa_auditor_session_count);
+    wpa_auditor_label(audit, audit_title, &lv_font_montserrat_18,
+                      wpa_auditor_sessions ? COLOR_MATERIAL_AMBER
+                                           : ui_muted_color());
+    if (wpa_auditor_sessions) {
+        for (size_t i = 0; i < wpa_auditor_session_count; ++i) {
+            const hs_session_t *session = &wpa_auditor_sessions[i].session;
+            lv_obj_t *session_box = lv_obj_create(audit);
+            lv_obj_set_width(session_box, lv_pct(100));
+            lv_obj_set_height(session_box, LV_SIZE_CONTENT);
+            lv_obj_set_style_bg_color(session_box, ui_bg_color(), 0);
+            lv_obj_set_style_bg_opa(session_box, LV_OPA_COVER, 0);
+            lv_obj_set_style_border_width(session_box, 0, 0);
+            lv_obj_set_style_radius(session_box, 12, 0);
+            lv_obj_set_style_pad_all(session_box, 10, 0);
+            lv_obj_set_style_pad_gap(session_box, 5, 0);
+            lv_obj_set_flex_flow(session_box, LV_FLEX_FLOW_COLUMN);
+            lv_obj_clear_flag(session_box, LV_OBJ_FLAG_SCROLLABLE);
+
+            const char *capture_path = session->origin.remote_path[0]
+                                           ? session->origin.remote_path
+                                           : session->origin.local_path;
+            const char *wordlist = session->wordlist_count
+                                       ? wpa_auditor_basename(
+                                             session->wordlists[0].path)
+                                       : "Generic candidates";
+            char identity[320];
+            snprintf(identity, sizeof(identity), "%.150s\nWordlist  %.150s",
+                     wpa_auditor_basename(capture_path), wordlist);
+            wpa_auditor_label(session_box, identity,
+                              &lv_font_montserrat_14, ui_text_color());
+
+            char metrics[224];
+            if (session->metrics.last_eta_seconds) {
+                snprintf(metrics, sizeof(metrics),
+                         "%u%% safe  |  %llu tried  |  Tab5 + %u remote\n"
+                         "%llus active  |  ETA %llus  |  %u resume%s",
+                         wpa_auditor_progress_percent(session),
+                         (unsigned long long)session->metrics.total_tried,
+                         (unsigned)session->worker_count,
+                         (unsigned long long)(session->metrics.active_time_ms / 1000U),
+                         (unsigned long long)session->metrics.last_eta_seconds,
+                         (unsigned)session->metrics.resume_count,
+                         session->metrics.resume_count == 1 ? "" : "s");
+            } else {
+                snprintf(metrics, sizeof(metrics),
+                         "%u%% safe  |  %llu tried  |  Tab5 + %u remote\n"
+                         "%llus active  |  ETA --  |  %u resume%s",
+                         wpa_auditor_progress_percent(session),
+                         (unsigned long long)session->metrics.total_tried,
+                         (unsigned)session->worker_count,
+                         (unsigned long long)(session->metrics.active_time_ms / 1000U),
+                         (unsigned)session->metrics.resume_count,
+                         session->metrics.resume_count == 1 ? "" : "s");
+            }
+            wpa_auditor_label(session_box, metrics, &lv_font_montserrat_12,
+                              ui_muted_color());
+
+            tab_id_t source = wpa_auditor_tab_for_source(
+                session->origin.source);
+            bool can_launch = !running && source != TAB_INTERNAL &&
+                              wpa_auditor_transport_ready(source);
+            lv_obj_t *actions = lv_obj_create(session_box);
+            lv_obj_set_size(actions, lv_pct(100), 48);
+            lv_obj_set_style_bg_opa(actions, LV_OPA_TRANSP, 0);
+            lv_obj_set_style_border_width(actions, 0, 0);
+            lv_obj_set_style_pad_all(actions, 0, 0);
+            lv_obj_set_style_pad_gap(actions, 8, 0);
+            lv_obj_set_flex_flow(actions, LV_FLEX_FLOW_ROW);
+            void *row = (void *)(uintptr_t)i;
+            wpa_auditor_button_data(
+                actions, running ? "Audit running" : "Resume",
+                COLOR_MATERIAL_TEAL, wpa_auditor_resume_cb, row,
+                !can_launch);
+            wpa_auditor_button_data(
+                actions, "Start over", COLOR_MATERIAL_RED,
+                wpa_auditor_start_over_request_cb, row, !can_launch);
+        }
+    } else {
+        wpa_auditor_label(audit, "No resumable audit",
+                          &lv_font_montserrat_16, ui_text_color());
+        wpa_auditor_label(audit,
+                          session_result == HS_SESSION_CORRUPT
+                              ? "The saved checkpoint is corrupt. Capture files were left untouched."
+                              : "Choose a capture to run its preflight before workers are prepared.",
+                          &lv_font_montserrat_14, ui_muted_color());
+    }
+
+    wpa_auditor_status_label = wpa_auditor_label(
+        audit, "", &lv_font_montserrat_12, COLOR_MATERIAL_AMBER);
+
+    lv_obj_t *catalog = wpa_auditor_card(body);
+    lv_obj_t *catalog_header = lv_obj_create(catalog);
+    lv_obj_set_size(catalog_header, lv_pct(100), 46);
+    lv_obj_set_style_bg_opa(catalog_header, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(catalog_header, 0, 0);
+    lv_obj_set_style_pad_all(catalog_header, 0, 0);
+    lv_obj_set_style_pad_gap(catalog_header, 8, 0);
+    lv_obj_set_flex_flow(catalog_header, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(catalog_header, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(catalog_header, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *catalog_title = wpa_auditor_label(
+        catalog_header, "Capture catalog", &lv_font_montserrat_18,
+        ui_text_color());
+    lv_obj_set_flex_grow(catalog_title, 1);
+    wpa_auditor_source_dropdown = lv_dropdown_create(catalog_header);
+    lv_obj_set_size(wpa_auditor_source_dropdown, 260, 42);
+    lv_obj_set_style_bg_color(wpa_auditor_source_dropdown,
+                              lv_color_hex(0x146C5A), 0);
+    lv_obj_set_style_text_color(wpa_auditor_source_dropdown,
+                                lv_color_white(), 0);
+    lv_obj_set_style_border_width(wpa_auditor_source_dropdown, 0, 0);
+    lv_obj_set_style_radius(wpa_auditor_source_dropdown, 11, 0);
+    lv_obj_set_style_pad_hor(wpa_auditor_source_dropdown, 12, 0);
+    lv_obj_set_style_text_font(wpa_auditor_source_dropdown,
+                               &lv_font_montserrat_14, 0);
+    wpa_auditor_source_dropdown_options(wpa_auditor_source_dropdown);
+    lv_obj_add_event_cb(wpa_auditor_source_dropdown,
+                        wpa_auditor_source_filter_cb, LV_EVENT_VALUE_CHANGED,
+                        NULL);
+    wpa_auditor_label(catalog,
+                      "Choose a connected source or show everything. Remote captures can be audited or synced to Tab5.",
+                      &lv_font_montserrat_14, ui_muted_color());
+    lv_obj_t *catalog_actions = lv_obj_create(catalog);
+    lv_obj_set_size(catalog_actions, lv_pct(100), 48);
+    lv_obj_set_style_bg_opa(catalog_actions, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(catalog_actions, 0, 0);
+    lv_obj_set_style_pad_all(catalog_actions, 0, 0);
+    lv_obj_set_flex_flow(catalog_actions, LV_FLEX_FLOW_ROW);
+    bool any_source = internal_sd_present || grove_detected || usb_detected ||
+                      mbus_detected;
+    wpa_auditor_catalog_scan_btn = wpa_auditor_button(
+        catalog_actions,
+        wpa_auditor_catalog ? "Refresh all sources" : "Scan all sources",
+        COLOR_MATERIAL_BLUE, wpa_auditor_open_captures_cb,
+        !any_source || wpa_auditor_catalog_task_handle != NULL);
+    wpa_auditor_catalog_sync_all_btn = wpa_auditor_button(
+        catalog_actions, "Sync all to Tab5", COLOR_MATERIAL_TEAL,
+        wpa_auditor_catalog_sync_all_cb,
+        !wpa_auditor_catalog || wpa_auditor_catalog_syncable_count() == 0U ||
+            hs_crack_ui.active || hs_crack_ui.task ||
+            compromised_transfer_ui.active || compromised_transfer_ui.task);
+    wpa_auditor_catalog_status = wpa_auditor_label(
+        catalog,
+        wpa_auditor_catalog
+            ? "Cached catalog shown. Scan again to refresh every source."
+            : "No catalog scan yet.",
+        &lv_font_montserrat_12, ui_muted_color());
+    wpa_auditor_catalog_list = lv_obj_create(catalog);
+    lv_obj_set_width(wpa_auditor_catalog_list, lv_pct(100));
+    lv_obj_set_height(wpa_auditor_catalog_list, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(wpa_auditor_catalog_list, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(wpa_auditor_catalog_list, 0, 0);
+    lv_obj_set_style_pad_all(wpa_auditor_catalog_list, 0, 0);
+    lv_obj_set_style_pad_gap(wpa_auditor_catalog_list, 8, 0);
+    lv_obj_set_flex_flow(wpa_auditor_catalog_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_clear_flag(wpa_auditor_catalog_list, LV_OBJ_FLAG_SCROLLABLE);
+    wpa_auditor_catalog_render_locked();
+
+    lv_obj_t *history_card = wpa_auditor_card(body);
+    wpa_auditor_label(history_card, "Recent history", &lv_font_montserrat_18,
+                      ui_text_color());
+    hs_audit_history_record_t *history = heap_caps_calloc(
+        WPA_AUDITOR_HISTORY_ROWS, sizeof(*history), MALLOC_CAP_SPIRAM);
+    if (!history)
+        history = calloc(WPA_AUDITOR_HISTORY_ROWS, sizeof(*history));
+    size_t history_count = 0;
+    hs_audit_history_result_t history_result = history
+        ? hs_audit_history_list(HS_CRACK_AUDIT_DIR, history,
+                                WPA_AUDITOR_HISTORY_ROWS, &history_count)
+        : HS_AUDIT_HISTORY_IO_ERROR;
+    if (history_result != HS_AUDIT_HISTORY_OK || history_count == 0) {
+        wpa_auditor_label(history_card, "No audit history yet",
+                          &lv_font_montserrat_14, ui_muted_color());
+    } else {
+        for (size_t i = 0; i < history_count; ++i) {
+            const hs_audit_history_record_t *record = &history[i];
+            char row[320];
+            char when[32];
+            wpa_auditor_history_time(record, when, sizeof(when));
+            const char *path = record->origin_remote_path[0]
+                                   ? record->origin_remote_path
+                                   : record->origin_local_path;
+            snprintf(row, sizeof(row),
+                     "%s  |  %s\n%s  |  %llu tried  |  %u remote  |  %llus",
+                     when, wpa_auditor_outcome_name(record->outcome),
+                     wpa_auditor_basename(path),
+                     (unsigned long long)record->tried_count,
+                     (unsigned)record->effective_workers,
+                     (unsigned long long)(record->elapsed_time_ms / 1000U));
+            wpa_auditor_label(history_card, row, &lv_font_montserrat_14,
+                              i == 0 ? ui_text_color()
+                                     : ui_muted_color());
+        }
+    }
+    free(history);
 }
 
 static void handshaker_crack_cb(lv_event_t *e)
@@ -65070,37 +67342,15 @@ static void compromised_file_copy_cb(lv_event_t *e)
         return;
     }
 
-    if (!compromised_transfer_preflight(ctx, false)) {
-        return;
-    }
-
     wardrive_wigle_file_t *file = &ctx->wardrive_wigle_files[index];
     if (!file->path[0] || !file->name[0]) {
         return;
     }
-
-    compromised_transfer_task_args_t *args = calloc(1, sizeof(*args));
-    if (!args) {
-        return;
-    }
-    args->ctx = ctx;
-    args->tab = current_tab;
-    snprintf(args->remote_path, sizeof(args->remote_path), "%s", file->path);
-    snprintf(args->file_name, sizeof(args->file_name), "%s", file->name);
-    args->size_bytes = file->size_bytes;
-    args->is_handshake = (kind == COMPROMISED_FILE_KIND_HANDSHAKE);
-
-    compromised_transfer_ui.active = true;
-    compromised_transfer_ui.cancel_requested = false;
-    compromised_transfer_ui.sync_mode = false;
-    compromised_transfer_show_popup(file->name);
-    if (xTaskCreate(compromised_transfer_task, "janos_copy", 12288, args, 6,
-                    &compromised_transfer_ui.task) != pdPASS) {
-        compromised_transfer_ui.active = false;
-        compromised_transfer_ui.task = NULL;
-        compromised_transfer_finish_ui_unlocked(false, "Could not start the transfer task.");
-        free(args);
-    }
+    (void)compromised_start_copy(current_tab, ctx, file->path, file->name,
+                                 (uint64_t)(file->size_bytes > 0
+                                                ? file->size_bytes
+                                                : 0),
+                                 kind == COMPROMISED_FILE_KIND_HANDSHAKE);
 }
 
 void app_main(void)
@@ -65139,6 +67389,18 @@ void app_main(void)
     // their share, so this has to run before them. Boot-only: detection reuses
     // the handle and nothing retries afterwards.
     usb_boot_open_early();
+
+    // Every transport has one console stream. Background dashboard refreshes,
+    // file browsers and cracking/sync tasks must never consume each other's
+    // replies. Create the ownership gates after the DMA-sensitive early USB
+    // open, but before detection and any UI background task can use a console.
+    for (tab_id_t tab = TAB_GROVE; tab <= TAB_MBUS; tab++) {
+        transport_console_mutex[(size_t)tab] = xSemaphoreCreateMutex();
+        if (!transport_console_mutex[(size_t)tab]) {
+            ESP_LOGE(TAG, "[%s] Failed to create console ownership mutex",
+                     tab_transport_name(tab));
+        }
+    }
 
     // Initialize RX8130CE RTC and seed the system clock from it
     if (rx8130_init() == ESP_OK) {

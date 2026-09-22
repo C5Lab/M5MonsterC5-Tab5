@@ -142,7 +142,7 @@
 - [x] Write failing fragmented-stream parser tests for BEGIN/ITEM/RESULT/END, bad hex, stale request IDs, missing terminal records, pagination, old-JanOS fallback and duplicate/provisional merge rules.
 - [x] Run targeted tests and confirm failures come from the missing client/catalog.
 - [x] Implement strict line parsing and bounded catalog structures independent of LVGL.
-- [ ] Add serialized discovery for LOCAL/GROVE/USB/MBUS without interleaving file transfer.
+- [x] Add serialized discovery for LOCAL/GROVE/USB/MBUS without interleaving file transfer.
 - [ ] Reuse resumable transfer for `Sync to Tab5`, perform final local validation and retain invalid material with its report.
 - [ ] Run inventory, UART transfer, capture analyzer and cache tests.
 

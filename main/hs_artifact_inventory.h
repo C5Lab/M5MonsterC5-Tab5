@@ -172,5 +172,7 @@ bool hs_artifact_parse_legacy_sized_row(const char *line, uint64_t *size_out,
 hs_artifact_catalog_result_t hs_artifact_catalog_add(hs_artifact_catalog_t *catalog,
                                                      const hs_artifact_location_t *location,
                                                      size_t *asset_index_out);
+bool hs_artifact_locations_same_content(const hs_artifact_location_t *left,
+                                        const hs_artifact_location_t *right);
 
 #endif

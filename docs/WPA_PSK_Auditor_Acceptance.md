@@ -18,12 +18,24 @@ formats, audit history and the cross-repository read-only inventory protocol.
 - The current JanOS `1.7.5` development tree adds read-only `ARTIFACT/1` while retaining exact
   `CRACK/1 protocol=4` behavior.
 - Tab5 has a strict fragmented-stream client and fixed-capacity merged catalog.
-  Exact cross-source deduplication requires full `size+CRC32`; provisional
-  records are not joined by filename.
+  Exact cross-source identity uses `size+CRC32`. Batch synchronization may
+  coalesce provisional records only when name, size and format agree; one
+  canonical copy is retained while every worker path is indexed as an alias.
+  Conflicting known CRC values are never coalesced.
+- The INTERNAL tab exposes `WPA PSK Auditor`. Its dashboard reads up to eight
+  resumable sessions from independent A/B checkpoint pairs plus the immutable
+  history store, reports source availability, and routes each row's Resume or
+  confirmed Start over through the existing crack flow.
+  Resume restores the saved wordlist and synchronization toggles before Start.
+  A missing or changed wordlist is never silently replaced: Start stays locked
+  until the operator selects a replacement, which begins a new audit.
+  Starting a different audit does not retire older resumable sessions; terminal
+  completion and Start over tombstone only the selected session.
 
-Runtime UI/discovery wiring and distributed execution restore are tracked as
-separate follow-up work. The current firmware must not present those as
-completed features merely because their durable formats are available.
+Merged multi-source discovery, per-source filtering, `Sync to Tab5`, and the
+sequential `Sync all to Tab5` batch are wired into the dashboard. Hardware
+acceptance must confirm that a duplicate present on multiple workers produces
+one local file and does not create a `_1` copy.
 
 ## Host gate
 
@@ -38,6 +50,10 @@ gcc -std=c17 -Wall -Wextra -Werror -fsanitize=address,undefined \
 gcc -std=c17 -Wall -Wextra -Werror -fsanitize=address,undefined -I main \
   tests/hs_crack_session_test.c main/hs_crack_session.c -o /tmp/hs_crack_session_test
 /tmp/hs_crack_session_test
+gcc -std=c17 -Wall -Wextra -Werror -fsanitize=address,undefined -I main \
+  tests/hs_session_catalog_test.c main/hs_session_catalog.c \
+  main/hs_crack_session.c -o /tmp/hs_session_catalog_test
+/tmp/hs_session_catalog_test
 gcc -std=c17 -Wall -Wextra -Werror -fsanitize=address,undefined -I main \
   tests/hs_audit_history_test.c main/hs_audit_history.c -o /tmp/hs_audit_history_test
 /tmp/hs_audit_history_test
@@ -62,6 +78,12 @@ cc -std=c11 -Wall -Wextra -Werror -I main \
 Also run the existing Tab5 worker recovery, reassignment, stage retry, USB
 ACK32/baud/probe/start/cancel and handshake verifier contracts. Finish with
 `cmake -P tests/check_hs_crack_cmake.cmake` and `git diff --check` in both repos.
+
+The dashboard source contract is:
+
+```sh
+python3 tests/test_wpa_psk_auditor_contract.py
+```
 
 ## Hardware acceptance after owner builds/flashes
 
@@ -88,6 +110,25 @@ ACK32/baud/probe/start/cancel and handshake verifier contracts. Finish with
 8. **Sync validation (after runtime wiring):** interrupt Sync to Tab5, resume
    its `.part`, confirm prefix CRC, atomically publish the local file, then run
    the Tab5 analyzer. Invalid material remains in the local catalog.
+9. **Dashboard:** open INTERNAL -> WPA PSK Auditor. With no checkpoint it must
+   show an explicit empty state. Cancel a long distributed crack, reopen the
+   dashboard and confirm capture, wordlist, safe progress and worker count.
+   Resume must open the normal Crack dialog with the saved wordlist and sync
+   toggles already selected, then continue the saved suffixes. Rename or modify
+   that wordlist and confirm Resume reports the stale input and disables Start;
+   choosing a replacement must explicitly switch to a new audit.
+   For an `ALL` run, add a new dictionary that sorts before the active one and
+   confirm Resume remaps the saved fingerprint instead of discarding progress.
+   Start over must first show a destructive confirmation. Back must return to
+   the INTERNAL tiles without rebooting.
+10. **Multiple resumable audits:** start capture A with wordlist A, wait for
+   non-zero safe offsets and Cancel. Start capture B with wordlist B and Cancel
+   it as well. The dashboard must show both rows. Resume A and verify its own
+   wordlist and saved shard suffixes, Cancel again, then Resume B and verify its
+   independent offsets. Starting B, resuming A, or completing either audit must
+   not remove the other checkpoint. A legacy `.crack_audit/active.a|active.b`
+   checkpoint must appear once; after its next saved checkpoint the per-session
+   copy is preferred and the legacy copy must not create a duplicate row.
 
 Record serial excerpts for every terminal `ARTIFACT/1` response and retain SD
 directory listings from before and after the test as the non-destructive proof.

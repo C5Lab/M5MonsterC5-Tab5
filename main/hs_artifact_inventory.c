@@ -671,3 +671,14 @@ hs_artifact_catalog_result_t hs_artifact_catalog_add(hs_artifact_catalog_t *cata
         *asset_index_out = index;
     return HS_ARTIFACT_CATALOG_ADDED;
 }
+
+bool hs_artifact_locations_same_content(const hs_artifact_location_t *left,
+                                        const hs_artifact_location_t *right)
+{
+    if (!left || !right || left->size != right->size ||
+        left->format != right->format)
+        return false;
+    if (left->crc32_known && right->crc32_known)
+        return left->crc32 == right->crc32;
+    return strcmp(left->name, right->name) == 0;
+}
