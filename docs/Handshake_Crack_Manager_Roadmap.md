@@ -83,8 +83,35 @@ wspólnego źródła kandydatów i istniejącego koordynatora crackera, więc ni
 uruchamia dwóch audytów równolegle. Stan każdej pozycji oraz metryki są zapisane
 w naprzemiennym, CRC-protected journalu A/B. Po restarcie aktywne `Running` lub
 `Syncing` wraca jako `Paused`; `Resume batch` najpierw podejmuje przerwany wpis.
-`Cancel current` przechodzi do kolejnego elementu, a `Remove` usuwa tylko wpis
-managera bez kasowania capture, sidecarów, sesji ani cache workerów.
+`Skip current` przechodzi do kolejnego elementu. `Cancel batch` ma osobne
+potwierdzenie, zatrzymuje aktywny koordynator, oznacza wszystkie pozostałe
+niezakończone wpisy jako Cancelled i nie uruchamia następnego. `Remove` usuwa
+tylko wpis managera. Żadna z tych akcji nie kasuje capture, sidecarów, sesji,
+historii ani cache workerów.
+
+Dodanie audytu z sekcji `Resumable audits` zachowuje dokładny `session_id` także
+po asynchronicznym Sync to Tab5. Jeżeli ten capture jest już w bieżącej kolejce
+jako `Cancelled`, nie powstaje duplikat: istniejący wiersz wraca atomowo do
+`Paused`, zachowuje metryki i staje się dostępny przez `Resume batch`. Wyniki
+końcowe (`Found`, `Not found`, `Invalid`, `Error`) nie są automatycznie
+reaktywowane.
+
+Do działającego batcha można dopisywać kolejne, już zwalidowane lokalne capture.
+Bieżący wpis i jego indeks pozostają `Running`, nowa praca trafia na koniec jako
+`Queued`, a journal A/B jest zapisany przed potwierdzeniem w UI. Operacje
+wymagające współdzielonych transportów (`Audit`, `Sync`, `Delete` oraz
+remote-only bez lokalnej kopii) pozostają zablokowane do końca bieżącego cracka.
+
+Terminalna kolejka zawierająca `Cancelled` lub `Error` nie jest już ślepą
+uliczką. Jawne `Recover batch` dopasowuje najnowsze sesje po tożsamości capture,
+metodzie i fingerprintcie wordlisty. Dopasowane wpisy wracają jako `Paused`, a
+pozostałe niedokończone wpisy jako `Queued`; `Found`, `Not found` i `Invalid`
+pozostają nienaruszone. Odzyskanie jest zawsze ręczne, więc świadome
+`Cancel batch` nie uruchamia pracy samoczynnie. Odczyt journalu loguje slot A/B,
+sequence, stan batcha oraz stan, sesję i postęp każdego wiersza. Zapisane
+`session_id` jest przed odzyskaniem ponownie ładowane z katalogu i sprawdzane
+względem capture, metody oraz wordlisty. Usunięty albo niepasujący checkpoint
+jest czyszczony, a wpis bezpiecznie wraca do `Queued` od początku.
 
 Każdy wiersz `Resumable audits` ma potwierdzaną akcję `Delete audit`. Wycofuje
 ona tylko wskazany checkpoint Tab5 i próbuje zatrzymać pasujące joby na
@@ -129,8 +156,11 @@ Po odbiorze multi-resume i katalogu kolejność dalszych prac:
    multi-select, trwała kolejka, resume po restarcie i historia stanu pozycji.
 4. [Zrobione, czeka na test sprzętowy] Sekwencyjny silnik batch nad istniejącym
    koordynatorem, wraz z automatycznym sync wybranych zdalnych capture'ów.
-5. Naprawa cytowania/formatowania `crack_state.csv` oraz końcowa macierz
-   regresji Grove/USB/M-BUS.
+5. [Zrobione, czeka na test sprzętowy] Cytowanie `crack_state.csv`: nowy
+   host-testowany moduł czyta stare niecytowane wiersze, zapisuje poprawne pola
+   CSV, odzyskuje przerwany publish z `.bak` i zachowuje przecinki, cudzysłowy
+   oraz końce linii. Pozostaje końcowa
+   macierz regresji Grove/USB/M-BUS oraz smoke test `Cancel batch`.
 
 Pozostałe ograniczenie testowe: `hs_session_catalog_test.c` przeszedł ścisłe
 sprawdzenie składni kompilatorem RISC-V, ale natywny test runtime z ASan/UBSan
@@ -150,9 +180,9 @@ operatora, lecz pozostaje bramką przed finalnym zamknięciem etapu.
 
 ## Etap 1 — przygotowanie danych i sterowania
 
-- Naprawić format zbiorczego `crack_state.csv`, aby przecinki i cudzysłowy w polach
-  nie niszczyły danych. Preferowany jest prawidłowo cytowany CSV albo budowanie
-  podsumowania z dziennika prób bez stratnego sanitizowania.
+- [Zrobione, czeka na test sprzętowy] Zbiorczy `crack_state.csv` używa
+  prawidłowo cytowanych pól z podwajaniem cudzysłowów, akceptuje stare
+  niecytowane rekordy i nie stosuje już stratnego sanitizowania.
 - Dodać jawne akcje dla istniejącego zadania:
   - `Resume`,
   - `Force re-run` / `Start over`.

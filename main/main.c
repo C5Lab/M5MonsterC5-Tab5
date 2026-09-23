@@ -69,6 +69,7 @@
 #include "mbedtls/md.h"
 #include "mbedtls/platform_util.h"
 #include "hs_crack_cache.h"
+#include "hs_crack_state.h"
 #include "hs_crack_crypto.h"
 #include "hs_crack_remote_core.h"
 #include "hs_crack_scheduler.h"
@@ -1626,6 +1627,10 @@ typedef struct {
     long size_bytes;
     /* A handshake copies into lab/handshakes; everything else into pcaps/imported. */
     bool is_handshake;
+    /* Add a validated local handshake copy to the WPA Auditor batch. */
+    bool enqueue_after_copy;
+    bool enqueue_resume_session_valid;
+    uint8_t enqueue_resume_session_id[HS_SESSION_ID_BYTES];
 } compromised_transfer_task_args_t;
 
 typedef struct {
@@ -2261,14 +2266,18 @@ static bool wpa_auditor_batch_selected[HS_ARTIFACT_CATALOG_MAX_ASSETS];
 static size_t wpa_auditor_batch_selected_count = 0;
 static int wpa_auditor_state_filter = 0;
 static lv_obj_t *wpa_auditor_batch_status = NULL;
+static lv_timer_t *wpa_auditor_batch_refresh_timer = NULL;
 static lv_obj_t *wpa_auditor_batch_list = NULL;
+static lv_obj_t *wpa_auditor_batch_live_item_label = NULL;
 static lv_obj_t *wpa_auditor_batch_wordlist = NULL;
 static lv_obj_t *wpa_auditor_state_dropdown = NULL;
+static lv_obj_t *wpa_auditor_selection_dock = NULL;
 static lv_obj_t *wpa_auditor_selection_label = NULL;
 static lv_obj_t *wpa_auditor_batch_add_btn = NULL;
 static lv_obj_t *wpa_auditor_batch_clear_btn = NULL;
 static bool wpa_auditor_batch_enqueue_after_sync = false;
 static bool wpa_auditor_batch_pause_requested = false;
+static bool wpa_auditor_batch_cancel_requested = false;
 static bool wpa_auditor_batch_expanded = false;
 static TaskHandle_t wpa_auditor_storage_task_handle = NULL;
 static volatile bool wpa_auditor_storage_ready = false;
@@ -42178,7 +42187,12 @@ static void show_pcap_viewer_page(void)
 
 static void compromised_format_duration(uint64_t seconds, char *out, size_t out_size)
 {
-    if (seconds >= 3600U) {
+    if (seconds >= 86400U) {
+        snprintf(out, out_size, "%llud %lluh %llum",
+                 (unsigned long long)(seconds / 86400U),
+                 (unsigned long long)((seconds % 86400U) / 3600U),
+                 (unsigned long long)((seconds % 3600U) / 60U));
+    } else if (seconds >= 3600U) {
         snprintf(out, out_size, "%lluh %llum", (unsigned long long)(seconds / 3600U),
                  (unsigned long long)((seconds % 3600U) / 60U));
     } else if (seconds >= 60U) {
@@ -60035,6 +60049,16 @@ static hs_capture_validation_result_t wpa_auditor_validate_local_capture(
     return wpa_auditor_validation_classify(&report);
 }
 
+static hs_audit_queue_result_t wpa_auditor_batch_append_local_capture(
+    const char *local_path, const char *file_name, uint32_t known_crc32,
+    const uint8_t resume_session_id[HS_SESSION_ID_BYTES]);
+static int wpa_auditor_batch_local_item_index(const char *local_path);
+static hs_audit_queue_result_t wpa_auditor_batch_restore_cancelled_resume(
+    const char *local_path,
+    const uint8_t resume_session_id[HS_SESSION_ID_BYTES]);
+static bool wpa_auditor_batch_contains_local_path(const char *local_path);
+static void hs_crack_mark_queued_ui(void);
+
 static void compromised_transfer_task(void *arg)
 {
     compromised_transfer_task_args_t *args = (compromised_transfer_task_args_t *)arg;
@@ -60056,6 +60080,7 @@ static void compromised_transfer_task(void *arg)
     hs_capture_validation_result_t validation_result =
         HS_CAPTURE_VALIDATION_UNAVAILABLE;
     bool validation_complete = true;
+    bool enqueue_complete = !args->enqueue_after_copy;
     char final_detail[384] = {0};
 
     compromised_transport_lock_begin(tab, uart_port, &usb_lock_set);
@@ -60273,9 +60298,47 @@ cleanup:
     janos_transfer_restore_wifi(&wifi_session);
     compromised_transport_lock_end(tab, usb_lock_set);
 
+    if (args->enqueue_after_copy) {
+        const char *queue_detail = NULL;
+        if (result_err == ESP_OK &&
+            validation_result == HS_CAPTURE_VALIDATION_OK) {
+            hs_audit_queue_result_t queue_result = HS_AUDIT_QUEUE_NOT_FOUND;
+            if (args->enqueue_resume_session_valid) {
+                queue_result = wpa_auditor_batch_restore_cancelled_resume(
+                    result.final_path, args->enqueue_resume_session_id);
+            }
+            if (queue_result == HS_AUDIT_QUEUE_NOT_FOUND) {
+                queue_result = wpa_auditor_batch_append_local_capture(
+                    result.final_path, args->file_name, result.crc32,
+                    args->enqueue_resume_session_valid
+                        ? args->enqueue_resume_session_id : NULL);
+            }
+            if (queue_result == HS_AUDIT_QUEUE_OK) {
+                enqueue_complete = true;
+                queue_detail = args->enqueue_resume_session_valid
+                    ? "Resumable audit added to WPA Auditor batch queue."
+                    : "Added to WPA Auditor batch queue.";
+            } else if (queue_result == HS_AUDIT_QUEUE_DUPLICATE) {
+                enqueue_complete = true;
+                queue_detail = "Already present in WPA Auditor batch queue.";
+            } else {
+                queue_detail = "Local copy is valid, but it could not be added to the batch queue.";
+            }
+        } else {
+            queue_detail = "Not added to the batch queue because validation did not pass.";
+        }
+        size_t detail_used = strnlen(final_detail, sizeof(final_detail));
+        if (detail_used < sizeof(final_detail) - 1U) {
+            snprintf(final_detail + detail_used,
+                     sizeof(final_detail) - detail_used, "%s%s",
+                     detail_used ? "\n" : "", queue_detail);
+        }
+    }
+
     ESP_LOGI(TAG, "[%s] Monster file transfer finished: %s",
              tab_transport_name(tab), esp_err_to_name(result_err));
-    compromised_transfer_finish_ui(result_err == ESP_OK && validation_complete,
+    compromised_transfer_finish_ui(result_err == ESP_OK && validation_complete &&
+                                       enqueue_complete,
                                    final_detail);
     free(args);
     compromised_transfer_delete_current_task();
@@ -60675,6 +60738,10 @@ typedef struct {
     uint64_t wordlist_size;
     uint64_t wordlist_offset;
     uint32_t source_tried_base;
+    volatile uint32_t live_tried;
+    volatile uint32_t live_elapsed_seconds;
+    volatile uint32_t live_eta_seconds;
+    volatile uint8_t live_progress_percent;
     uint8_t remote_total;
     uint8_t remote_active;
     uint8_t remote_finished;
@@ -60713,7 +60780,10 @@ typedef struct {
     lv_obj_t *progress_bar;
     lv_obj_t *action_btn;
     lv_obj_t *action_label;
+    lv_obj_t *queue_btn;     // add this configured capture to WPA Auditor
+    lv_obj_t *queue_label;
     lv_obj_t *dismiss_btn;   // back-out button, shown only before the run starts
+    bool queued_to_batch;    // refresh the Auditor after closing this popup
     lv_obj_t *sync_hs_cb;    // "Sync handshake" checkbox (pre-start)
     lv_obj_t *sync_wl_cb;    // "Sync wordlist" checkbox (pre-start)
     lv_obj_t *worker_box;    // per-worker status rows (fills the lower area)
@@ -60726,6 +60796,7 @@ typedef struct {
 
 static hs_crack_ui_t hs_crack_ui;
 static void hs_crack_task(void *arg);
+static void hs_crack_add_to_queue_cb(lv_event_t *e);
 
 #define HS_CRACK_TASK_STACK_BYTES 16384
 
@@ -60904,19 +60975,9 @@ static bool hs_crack_save_to_monster(tab_id_t tab, uart_port_t port,
 // --- Crack journal (crack_state.csv) -------------------------------------
 // One row per handshake file: filename,ssid,size,generic,wordlist,password.
 // The crack manager reads it to show what was already tried, mirroring the
-// wardrive upload state. Any comma/quote/newline inside a field is flattened to
-// a space so a plain comma split always parses back cleanly.
-
-static void hs_crack_csv_sanitize(char *dst, size_t dsz, const char *src)
-{
-    size_t o = 0;
-    for (const char *p = src; p && *p && o + 1 < dsz; p++) {
-        char c = *p;
-        if (c == ',' || c == '"' || c == '\t' || c == '\n' || c == '\r') c = ' ';
-        dst[o++] = c;
-    }
-    if (dsz) dst[o] = '\0';
-}
+// wardrive upload state. The portable state module accepts the legacy plain
+// rows and writes quoted CSV, so SSIDs/passwords keep commas, quotes and line
+// breaks instead of being flattened.
 
 // Insert or update the row for `filename`. A NULL generic/wordlist/password
 // keeps whatever the existing row had (so a generic-only run does not clobber a
@@ -60925,65 +60986,9 @@ static bool hs_crack_state_upsert(const char *filename, const char *ssid, long s
                                   const char *generic, const char *wordlist,
                                   const char *password)
 {
-    if (!filename || !filename[0]) return false;
-
-    char ex_ssid[33] = "";
-    char ex_generic[16] = "none";
-    char ex_wordlist[16] = "none";
-    char ex_password[65] = "";
-    long ex_size = 0;
-
-    FILE *in = fopen(HS_CRACK_STATE_CSV, "r");
-    FILE *out = fopen(HS_CRACK_STATE_TMP, "w");
-    if (!out) { if (in) fclose(in); return false; }
-
-    if (in) {
-        char line[512];
-        while (fgets(line, sizeof(line), in)) {
-            char fn[96];
-            int i = 0;
-            while (line[i] && line[i] != ',' && i < (int)sizeof(fn) - 1) { fn[i] = line[i]; i++; }
-            fn[i] = '\0';
-            if (strcmp(fn, filename) != 0) {
-                fputs(line, out);
-                continue;
-            }
-            // Matching row: split all 6 comma fields (empty allowed) so any the
-            // caller did not specify survive the merge.
-            char buf[512];
-            snprintf(buf, sizeof(buf), "%s", line);
-            buf[strcspn(buf, "\r\n")] = '\0';
-            char *field[6] = {0};
-            int nf = 0;
-            char *p = buf;
-            field[nf++] = p;
-            for (; *p && nf < 6; p++) {
-                if (*p == ',') { *p = '\0'; field[nf++] = p + 1; }
-            }
-            if (nf > 1 && field[1]) snprintf(ex_ssid, sizeof(ex_ssid), "%s", field[1]);
-            if (nf > 2 && field[2]) ex_size = atol(field[2]);
-            if (nf > 3 && field[3] && field[3][0]) snprintf(ex_generic, sizeof(ex_generic), "%s", field[3]);
-            if (nf > 4 && field[4] && field[4][0]) snprintf(ex_wordlist, sizeof(ex_wordlist), "%s", field[4]);
-            if (nf > 5 && field[5]) snprintf(ex_password, sizeof(ex_password), "%s", field[5]);
-        }
-        fclose(in);
-    }
-
-    char m_fn[96], m_ssid[33], m_generic[16], m_wordlist[16], m_password[65];
-    hs_crack_csv_sanitize(m_fn, sizeof(m_fn), filename);
-    hs_crack_csv_sanitize(m_ssid, sizeof(m_ssid), ssid ? ssid : ex_ssid);
-    hs_crack_csv_sanitize(m_generic, sizeof(m_generic), generic ? generic : ex_generic);
-    hs_crack_csv_sanitize(m_wordlist, sizeof(m_wordlist), wordlist ? wordlist : ex_wordlist);
-    hs_crack_csv_sanitize(m_password, sizeof(m_password), password ? password : ex_password);
-    long m_size = size > 0 ? size : ex_size;
-
-    fprintf(out, "%s,%s,%ld,%s,%s,%s\n", m_fn, m_ssid, m_size,
-            m_generic[0] ? m_generic : "none",
-            m_wordlist[0] ? m_wordlist : "none", m_password);
-    fclose(out);
-
-    unlink(HS_CRACK_STATE_CSV);
-    return rename(HS_CRACK_STATE_TMP, HS_CRACK_STATE_CSV) == 0;
+    return hs_crack_state_upsert_file(
+        HS_CRACK_STATE_CSV, HS_CRACK_STATE_TMP, filename, ssid,
+        (int64_t)size, generic, wordlist, password);
 }
 
 // Turn a finished run's outcome into per-method journal columns and store it.
@@ -63789,6 +63794,7 @@ static lv_obj_t *hs_crack_worker_row_create(lv_obj_t *parent)
                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_column(row, 8, 0);
     lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(row, LV_OBJ_FLAG_SCROLL_CHAIN_VER);
     return row;
 }
 
@@ -63982,6 +63988,58 @@ static void hs_crack_finish_ui_unlocked(bool found, const char *status, const ch
     }
 }
 
+/* Start the already-configured coordinator. The single-audit popup and the
+ * WPA Auditor batch share this path; UI objects are optional so batch jobs
+ * can run behind the dashboard without creating a modal overlay. */
+static bool hs_crack_start_configured(void)
+{
+    if (hs_crack_ui.started || hs_crack_ui.active || hs_crack_ui.task)
+        return false;
+
+    if (hs_crack_ui.wordlist_dropdown &&
+        lv_obj_is_valid(hs_crack_ui.wordlist_dropdown))
+        lv_obj_add_state(hs_crack_ui.wordlist_dropdown, LV_STATE_DISABLED);
+    if (hs_crack_ui.sync_hs_cb && lv_obj_is_valid(hs_crack_ui.sync_hs_cb))
+        lv_obj_add_state(hs_crack_ui.sync_hs_cb, LV_STATE_DISABLED);
+    if (hs_crack_ui.sync_wl_cb && lv_obj_is_valid(hs_crack_ui.sync_wl_cb))
+        lv_obj_add_state(hs_crack_ui.sync_wl_cb, LV_STATE_DISABLED);
+
+    for (int i = 0; i < 3; i++) hs_crack_ui.worker_status[i][0] = '\0';
+    hs_crack_render_workers_unlocked();
+    hs_crack_ui.started = true;
+    hs_crack_ui.active = true;
+    if (hs_crack_ui.dismiss_btn && lv_obj_is_valid(hs_crack_ui.dismiss_btn))
+        lv_obj_add_flag(hs_crack_ui.dismiss_btn, LV_OBJ_FLAG_HIDDEN);
+    if (hs_crack_ui.queue_btn && lv_obj_is_valid(hs_crack_ui.queue_btn))
+        lv_obj_add_flag(hs_crack_ui.queue_btn, LV_OBJ_FLAG_HIDDEN);
+    if (hs_crack_ui.action_label && lv_obj_is_valid(hs_crack_ui.action_label))
+        lv_label_set_text(hs_crack_ui.action_label, "Cancel");
+
+    bool coordinator_stack_in_psram = true;
+    BaseType_t task_created = xTaskCreateWithCaps(
+        hs_crack_task, "hs_crack", HS_CRACK_TASK_STACK_BYTES,
+        NULL, 4, &hs_crack_ui.task,
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (task_created != pdPASS) {
+        ESP_LOGW(TAG, "[HS-MEM] PSRAM coordinator stack allocation failed; trying internal RAM");
+        coordinator_stack_in_psram = false;
+        task_created = xTaskCreateWithCaps(
+            hs_crack_task, "hs_crack", HS_CRACK_TASK_STACK_BYTES,
+            NULL, 4, &hs_crack_ui.task,
+            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
+    if (task_created != pdPASS) {
+        hs_crack_ui.task = NULL;
+        hs_crack_finish_ui_unlocked(false, "Check failed",
+                                    "Could not start coordinator.");
+        return false;
+    }
+    ESP_LOGI(TAG, "[HS-MEM] coordinator stack=%s bytes=%u",
+             coordinator_stack_in_psram ? "PSRAM" : "internal",
+             (unsigned)HS_CRACK_TASK_STACK_BYTES);
+    return true;
+}
+
 static void hs_crack_overlay_deleted_cb(lv_event_t *e)
 {
     if (lv_event_get_target(e) != hs_crack_ui.overlay) return;
@@ -63996,6 +64054,8 @@ static void hs_crack_overlay_deleted_cb(lv_event_t *e)
     hs_crack_ui.progress_bar = NULL;
     hs_crack_ui.action_btn = NULL;
     hs_crack_ui.action_label = NULL;
+    hs_crack_ui.queue_btn = NULL;
+    hs_crack_ui.queue_label = NULL;
     hs_crack_ui.dismiss_btn = NULL;
     hs_crack_ui.sync_hs_cb = NULL;
     hs_crack_ui.sync_wl_cb = NULL;
@@ -64033,51 +64093,12 @@ static void hs_crack_close_or_cancel_cb(lv_event_t *e)
             hs_crack_ui.method = HS_CRACK_METHOD_BOTH;
             hs_crack_ui.wl_choice = hs_crack_ui.wl_count;
         }
-        if (hs_crack_ui.wordlist_dropdown && lv_obj_is_valid(hs_crack_ui.wordlist_dropdown)) {
-            lv_obj_add_state(hs_crack_ui.wordlist_dropdown, LV_STATE_DISABLED);
-        }
-
-        // Capture the sync toggles, then lock the pre-start controls.
+        // Capture the sync toggles before starting the shared coordinator.
         hs_crack_ui.sync_capture = !hs_crack_ui.sync_hs_cb ||
             lv_obj_has_state(hs_crack_ui.sync_hs_cb, LV_STATE_CHECKED);
         hs_crack_ui.sync_wordlist = !hs_crack_ui.sync_wl_cb ||
             lv_obj_has_state(hs_crack_ui.sync_wl_cb, LV_STATE_CHECKED);
-        if (hs_crack_ui.sync_hs_cb && lv_obj_is_valid(hs_crack_ui.sync_hs_cb))
-            lv_obj_add_state(hs_crack_ui.sync_hs_cb, LV_STATE_DISABLED);
-        if (hs_crack_ui.sync_wl_cb && lv_obj_is_valid(hs_crack_ui.sync_wl_cb))
-            lv_obj_add_state(hs_crack_ui.sync_wl_cb, LV_STATE_DISABLED);
-
-        // Fresh worker table for this run.
-        for (int i = 0; i < 3; i++) hs_crack_ui.worker_status[i][0] = '\0';
-        hs_crack_render_workers_unlocked();
-
-        hs_crack_ui.started = true;
-        hs_crack_ui.active = true;
-        if (hs_crack_ui.dismiss_btn && lv_obj_is_valid(hs_crack_ui.dismiss_btn)) {
-            lv_obj_add_flag(hs_crack_ui.dismiss_btn, LV_OBJ_FLAG_HIDDEN);
-        }
-        lv_label_set_text(hs_crack_ui.action_label, "Cancel");
-        bool coordinator_stack_in_psram = true;
-        BaseType_t task_created = xTaskCreateWithCaps(
-            hs_crack_task, "hs_crack", HS_CRACK_TASK_STACK_BYTES,
-            NULL, 4, &hs_crack_ui.task,
-            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        if (task_created != pdPASS) {
-            ESP_LOGW(TAG, "[HS-MEM] PSRAM coordinator stack allocation failed; trying internal RAM");
-            coordinator_stack_in_psram = false;
-            task_created = xTaskCreateWithCaps(
-                hs_crack_task, "hs_crack", HS_CRACK_TASK_STACK_BYTES,
-                NULL, 4, &hs_crack_ui.task,
-                MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-        }
-        if (task_created != pdPASS) {
-            hs_crack_ui.task = NULL;
-            hs_crack_finish_ui_unlocked(false, "Check failed", "Could not start coordinator.");
-        } else {
-            ESP_LOGI(TAG, "[HS-MEM] coordinator stack=%s bytes=%u",
-                     coordinator_stack_in_psram ? "PSRAM" : "internal",
-                     (unsigned)HS_CRACK_TASK_STACK_BYTES);
-        }
+        (void)hs_crack_start_configured();
         return;
     }
     if (hs_crack_ui.active) {
@@ -64100,16 +64121,37 @@ static void hs_crack_close_or_cancel_cb(lv_event_t *e)
     hs_crack_ui.progress_bar = NULL;
     hs_crack_ui.action_btn = NULL;
     hs_crack_ui.action_label = NULL;
+    hs_crack_ui.queue_btn = NULL;
+    hs_crack_ui.queue_label = NULL;
     hs_crack_ui.dismiss_btn = NULL;
     hs_crack_ui.sync_hs_cb = NULL;
     hs_crack_ui.sync_wl_cb = NULL;
     hs_crack_ui.worker_box = NULL;
 }
 
+static void hs_crack_refresh_auditor_after_queue_async(void *context)
+{
+    (void)context;
+    if (!tab_is_internal(current_tab) || !wpa_auditor_page ||
+        !lv_obj_is_valid(wpa_auditor_page))
+        return;
+    show_wpa_psk_auditor_page();
+}
+
 static void hs_crack_dismiss_cb(lv_event_t *e)
 {
     (void)e;
-    if (hs_crack_ui.overlay) lv_obj_del(hs_crack_ui.overlay);
+    bool refresh_auditor =
+        hs_crack_ui.queued_to_batch && tab_is_internal(current_tab) &&
+        wpa_auditor_page && lv_obj_is_valid(wpa_auditor_page);
+    hs_crack_ui.queued_to_batch = false;
+    if (hs_crack_ui.overlay && lv_obj_is_valid(hs_crack_ui.overlay))
+        lv_obj_del(hs_crack_ui.overlay);
+    if (refresh_auditor &&
+        lv_async_call(hs_crack_refresh_auditor_after_queue_async, NULL) !=
+            LV_RESULT_OK) {
+        ESP_LOGW(TAG, "[HS-AUDIT] could not schedule refresh after enqueue");
+    }
 }
 
 // Fill hs_crack_ui.wl_paths/wl_names with the wordlists under /lab/wordlist/,
@@ -64179,6 +64221,8 @@ static void hs_crack_show_popup(const char *file_name)
                           LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_row(hs_crack_ui.popup, 16, 0);
     lv_obj_add_flag(hs_crack_ui.popup, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(hs_crack_ui.popup, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(hs_crack_ui.popup, LV_SCROLLBAR_MODE_AUTO);
 
     lv_obj_t *title = lv_label_create(hs_crack_ui.popup);
     lv_label_set_text(title, LV_SYMBOL_KEYBOARD " Crack handshake (dictionary)");
@@ -64271,7 +64315,13 @@ static void hs_crack_show_popup(const char *file_name)
     hs_crack_ui.worker_box = lv_obj_create(hs_crack_ui.popup);
     lv_obj_set_width(hs_crack_ui.worker_box, lv_pct(100));
     lv_obj_set_height(hs_crack_ui.worker_box, LV_SIZE_CONTENT);
-    lv_obj_set_flex_grow(hs_crack_ui.worker_box, 1);
+    /* In the 90/270-degree layout the popup is height-constrained. Growing
+     * this box consumes only the remaining viewport height and clips the
+     * remote rows inside a non-scrollable child. Let its full content enlarge
+     * the popup there; the popup owns vertical scrolling. Portrait keeps the
+     * previous grow-to-fill presentation. */
+    if (!ui_wide_layout())
+        lv_obj_set_flex_grow(hs_crack_ui.worker_box, 1);
     lv_obj_set_flex_flow(hs_crack_ui.worker_box, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(hs_crack_ui.worker_box, LV_FLEX_ALIGN_START,
                           LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
@@ -64282,6 +64332,7 @@ static void hs_crack_show_popup(const char *file_name)
     lv_obj_set_style_pad_all(hs_crack_ui.worker_box, 12, 0);
     lv_obj_set_style_pad_row(hs_crack_ui.worker_box, 4, 0);
     lv_obj_clear_flag(hs_crack_ui.worker_box, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(hs_crack_ui.worker_box, LV_OBJ_FLAG_SCROLL_CHAIN_VER);
     lv_obj_add_flag(hs_crack_ui.worker_box, LV_OBJ_FLAG_HIDDEN);
 
     hs_crack_ui.metrics_label = lv_label_create(hs_crack_ui.popup);
@@ -64313,16 +64364,31 @@ static void hs_crack_show_popup(const char *file_name)
     lv_obj_add_event_cb(hs_crack_ui.action_btn, hs_crack_close_or_cancel_cb, LV_EVENT_CLICKED, NULL);
 
     hs_crack_ui.action_label = lv_label_create(hs_crack_ui.action_btn);
-    lv_label_set_text(hs_crack_ui.action_label, "Start");
+    lv_label_set_text(hs_crack_ui.action_label, "Start now");
     lv_obj_set_style_text_font(hs_crack_ui.action_label, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(hs_crack_ui.action_label, lv_color_white(), 0);
     lv_obj_center(hs_crack_ui.action_label);
+
+    hs_crack_ui.queue_btn = lv_btn_create(btn_row);
+    lv_obj_set_size(hs_crack_ui.queue_btn, 180, 48);
+    lv_obj_set_style_bg_color(hs_crack_ui.queue_btn, COLOR_MATERIAL_PURPLE, 0);
+    lv_obj_add_event_cb(hs_crack_ui.queue_btn, hs_crack_add_to_queue_cb,
+                        LV_EVENT_CLICKED, NULL);
+    hs_crack_ui.queue_label = lv_label_create(hs_crack_ui.queue_btn);
+    lv_label_set_text(hs_crack_ui.queue_label, "Add to queue");
+    lv_obj_center(hs_crack_ui.queue_label);
+
+    if (hs_crack_ui.local_capture &&
+        wpa_auditor_batch_contains_local_path(
+            hs_crack_ui.remote_pcap_path)) {
+        hs_crack_mark_queued_ui();
+    }
 
     hs_crack_ui.dismiss_btn = lv_btn_create(btn_row);
     lv_obj_set_size(hs_crack_ui.dismiss_btn, 180, 48);
     lv_obj_add_event_cb(hs_crack_ui.dismiss_btn, hs_crack_dismiss_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_t *dismiss_label = lv_label_create(hs_crack_ui.dismiss_btn);
-    lv_label_set_text(dismiss_label, "Cancel");
+    lv_label_set_text(dismiss_label, "Close");
     lv_obj_center(dismiss_label);
 }
 
@@ -64527,26 +64593,39 @@ fail:
 static void hs_crack_progress(const char *pw, uint32_t tried, int64_t t0)
 {
     int64_t now = esp_timer_get_time();
-    if (app_power_manager_is_screen_dimmed()) {
-        hs_crack_ui.last_update_us = 0;
-        return;
-    }
     if (now - hs_crack_ui.last_update_us < 250000) return;
     hs_crack_ui.last_update_us = now;
     int64_t elapsed = now - t0;
     int64_t source_elapsed = now - hs_crack_ui.source_started_us;
     uint32_t source_tried = tried - hs_crack_ui.source_tried_base;
-    double rate = source_elapsed > 0 ? source_tried * 1000000.0 / source_elapsed : 0;
-    char detail[320], eta_text[48];
     int percent = -1;
+    uint64_t eta = UINT64_MAX;
+    hs_crack_ui.live_tried = tried;
+    hs_crack_ui.live_elapsed_seconds = elapsed > 0
+                                                ? (uint32_t)(elapsed / 1000000LL)
+                                                : 0U;
+    hs_crack_ui.live_eta_seconds = UINT32_MAX;
+    hs_crack_ui.live_progress_percent = 0U;
     if (hs_crack_ui.wordlist_size) {
         percent = (int)hs_crack_cache_byte_percent(hs_crack_ui.wordlist_offset,
                                                    hs_crack_ui.wordlist_size);
-        uint64_t eta = hs_crack_cache_eta_seconds(hs_crack_ui.wordlist_offset,
-                                                  hs_crack_ui.wordlist_size,
-                                                  source_tried,
-                                                  source_elapsed > 0
-                                                      ? (uint64_t)source_elapsed : 0);
+        eta = hs_crack_cache_eta_seconds(hs_crack_ui.wordlist_offset,
+                                         hs_crack_ui.wordlist_size,
+                                         source_tried,
+                                         source_elapsed > 0
+                                             ? (uint64_t)source_elapsed : 0);
+        hs_crack_ui.live_progress_percent = (uint8_t)percent;
+        if (eta != UINT64_MAX)
+            hs_crack_ui.live_eta_seconds = eta > UINT32_MAX
+                                               ? UINT32_MAX - 1U
+                                               : (uint32_t)eta;
+    }
+    if (app_power_manager_is_screen_dimmed()) return;
+
+    double rate = source_elapsed > 0
+                      ? source_tried * 1000000.0 / source_elapsed : 0;
+    char detail[320], eta_text[48];
+    if (hs_crack_ui.wordlist_size) {
         if (eta == UINT64_MAX) snprintf(eta_text, sizeof(eta_text), "calculating...");
         else compromised_format_duration(eta, eta_text, sizeof(eta_text));
         snprintf(detail, sizeof(detail),
@@ -64570,7 +64649,6 @@ static void hs_crack_progress(const char *pw, uint32_t tried, int64_t t0)
                  (unsigned)hs_crack_ui.remote_finished,
                  (unsigned)hs_crack_ui.remote_failed, pw);
     }
-    (void)elapsed;
     hs_crack_set_stage(hs_crack_ui.candidate_status, detail, percent);
 }
 
@@ -65741,6 +65819,10 @@ finish:
         if (batch_outcome == HS_SESSION_OUTCOME_FOUND ||
             batch_outcome == HS_SESSION_OUTCOME_NOT_FOUND)
             batch_item->progress_percent = 100U;
+        if (batch_outcome == HS_SESSION_OUTCOME_FOUND) {
+            snprintf(batch_item->reason, sizeof(batch_item->reason), "%s",
+                     found_pw);
+        }
     }
     hs_crack_ui.task = NULL;
     hs_crack_finish_ui_unlocked(found_idx >= 0, final_status, final_detail);
@@ -65764,9 +65846,14 @@ finish:
                                          ? HS_AUDIT_ITEM_PAUSED
                                          : HS_AUDIT_ITEM_CANCELLED)
                                   : HS_AUDIT_ITEM_ERROR;
-                wpa_auditor_batch->state = HS_AUDIT_BATCH_PAUSED;
-                wpa_auditor_batch->current_index = SIZE_MAX;
+                if (wpa_auditor_batch_cancel_requested) {
+                    (void)hs_audit_queue_cancel_all(wpa_auditor_batch);
+                } else {
+                    wpa_auditor_batch->state = HS_AUDIT_BATCH_PAUSED;
+                    wpa_auditor_batch->current_index = SIZE_MAX;
+                }
                 wpa_auditor_batch_pause_requested = false;
+                wpa_auditor_batch_cancel_requested = false;
                 (void)wpa_auditor_batch_save();
             }
         }
@@ -65786,11 +65873,16 @@ static void hs_crack_start_file(tab_context_t *ctx, const char *remote_path, con
     hs_crack_ui.wordlist_size = 0;
     hs_crack_ui.wordlist_offset = 0;
     hs_crack_ui.source_tried_base = 0;
+    hs_crack_ui.live_tried = 0;
+    hs_crack_ui.live_elapsed_seconds = 0;
+    hs_crack_ui.live_eta_seconds = UINT32_MAX;
+    hs_crack_ui.live_progress_percent = 0;
     hs_crack_ui.source_started_us = 0;
     hs_crack_ui.source_started_unix_seconds = 0;
     hs_crack_ui.force_rerun = false;
     hs_crack_ui.local_capture = false;
     hs_crack_ui.batch_managed = false;
+    hs_crack_ui.queued_to_batch = false;
     hs_crack_ui.batch_item_index = SIZE_MAX;
     hs_crack_ui.resume_session_valid = false;
     memset(hs_crack_ui.resume_session_id, 0,
@@ -65805,8 +65897,8 @@ static void hs_crack_start_file(tab_context_t *ctx, const char *remote_path, con
     hs_crack_show_popup(file_name);
 }
 
-static bool hs_crack_start_local_file(const char *local_path,
-                                      const char *file_name)
+static bool hs_crack_prepare_local_file(const char *local_path,
+                                        const char *file_name)
 {
     if (!local_path || !local_path[0] || !file_name || !file_name[0] ||
         hs_crack_ui.overlay || hs_crack_ui.active || hs_crack_ui.task ||
@@ -65818,6 +65910,10 @@ static bool hs_crack_start_local_file(const char *local_path,
     hs_crack_ui.wordlist_size = 0;
     hs_crack_ui.wordlist_offset = 0;
     hs_crack_ui.source_tried_base = 0;
+    hs_crack_ui.live_tried = 0;
+    hs_crack_ui.live_elapsed_seconds = 0;
+    hs_crack_ui.live_eta_seconds = UINT32_MAX;
+    hs_crack_ui.live_progress_percent = 0;
     hs_crack_ui.source_started_us = 0;
     hs_crack_ui.source_started_unix_seconds = 0;
     hs_crack_ui.force_rerun = false;
@@ -65829,12 +65925,20 @@ static bool hs_crack_start_local_file(const char *local_path,
     hs_crack_ui.method = HS_CRACK_METHOD_GENERIC;
     hs_crack_ui.local_capture = true;
     hs_crack_ui.batch_managed = false;
+    hs_crack_ui.queued_to_batch = false;
     hs_crack_ui.batch_item_index = SIZE_MAX;
     snprintf(hs_crack_ui.remote_pcap_path,
              sizeof(hs_crack_ui.remote_pcap_path), "%s", local_path);
     snprintf(hs_crack_ui.file_name, sizeof(hs_crack_ui.file_name), "%s",
              file_name);
     hs_crack_ui.active = false;
+    return true;
+}
+
+static bool hs_crack_start_local_file(const char *local_path,
+                                      const char *file_name)
+{
+    if (!hs_crack_prepare_local_file(local_path, file_name)) return false;
     hs_crack_show_popup(file_name);
     return true;
 }
@@ -65867,7 +65971,8 @@ static void hs_crack_file_cb(lv_event_t *e)
 
 static bool compromised_start_copy(tab_id_t tab, tab_context_t *ctx,
                                    const char *remote_path, const char *file_name,
-                                   uint64_t size_bytes, bool is_handshake)
+                                   uint64_t size_bytes, bool is_handshake,
+                                   bool enqueue_after_copy)
 {
     if (!ctx || tab_is_internal(tab) || !remote_path || !remote_path[0] ||
         !file_name || !file_name[0] || compromised_transfer_ui.active ||
@@ -65883,6 +65988,13 @@ static bool compromised_start_copy(tab_id_t tab, tab_context_t *ctx,
     snprintf(args->file_name, sizeof(args->file_name), "%s", file_name);
     args->size_bytes = size_bytes > (uint64_t)LONG_MAX ? LONG_MAX : (long)size_bytes;
     args->is_handshake = is_handshake;
+    args->enqueue_after_copy = enqueue_after_copy;
+    args->enqueue_resume_session_valid =
+        enqueue_after_copy && hs_crack_ui.resume_session_valid;
+    if (args->enqueue_resume_session_valid) {
+        memcpy(args->enqueue_resume_session_id, hs_crack_ui.resume_session_id,
+               sizeof(args->enqueue_resume_session_id));
+    }
 
     compromised_transfer_ui.active = true;
     compromised_transfer_ui.cancel_requested = false;
@@ -65925,6 +66037,51 @@ static const char *wpa_auditor_batch_state_name(hs_audit_item_state_t state)
     }
 }
 
+static const char *wpa_auditor_batch_run_state_name(
+    hs_audit_batch_state_t state)
+{
+    switch (state) {
+    case HS_AUDIT_BATCH_READY: return "Ready";
+    case HS_AUDIT_BATCH_RUNNING: return "Running";
+    case HS_AUDIT_BATCH_PAUSED: return "Paused";
+    case HS_AUDIT_BATCH_COMPLETE: return "Complete";
+    case HS_AUDIT_BATCH_CANCELLED: return "Cancelled";
+    default: return "Unknown";
+    }
+}
+
+static const char *wpa_auditor_batch_slot_name(hs_audit_queue_slot_t slot)
+{
+    switch (slot) {
+    case HS_AUDIT_QUEUE_SLOT_A: return "A";
+    case HS_AUDIT_QUEUE_SLOT_B: return "B";
+    default: return "none";
+    }
+}
+
+static void wpa_auditor_batch_log_snapshot(const char *stage,
+                                            hs_audit_queue_slot_t slot)
+{
+    if (!wpa_auditor_batch) return;
+    int current = wpa_auditor_batch->current_index == SIZE_MAX
+                      ? -1 : (int)wpa_auditor_batch->current_index;
+    ESP_LOGI(TAG,
+             "[HS-BATCH] %s slot=%s seq=%llu state=%s count=%u current=%d recoverable=%u",
+             stage ? stage : "STATE", wpa_auditor_batch_slot_name(slot),
+             (unsigned long long)wpa_auditor_batch->sequence,
+             wpa_auditor_batch_run_state_name(wpa_auditor_batch->state),
+             (unsigned)wpa_auditor_batch->count, current,
+             (unsigned)hs_audit_queue_recoverable_count(wpa_auditor_batch));
+    for (size_t i = 0; i < wpa_auditor_batch->count; ++i) {
+        const hs_audit_queue_item_t *item = &wpa_auditor_batch->items[i];
+        ESP_LOGI(TAG,
+                 "[HS-BATCH] ITEM %u state=%s session=%u progress=%u tried=%llu name=%.64s",
+                 (unsigned)(i + 1U), wpa_auditor_batch_state_name(item->state),
+                 (unsigned)item->has_session, (unsigned)item->progress_percent,
+                 (unsigned long long)item->tried, item->name);
+    }
+}
+
 static bool wpa_auditor_batch_save(void)
 {
     if (!wpa_auditor_batch || !wpa_auditor_batch_scratch) return false;
@@ -65958,9 +66115,10 @@ static bool wpa_auditor_batch_ensure_loaded(void)
     }
     ESP_LOGI(TAG, "[HS-MEM] audit queue buffers bytes=%u (PSRAM preferred)",
              (unsigned)(sizeof(*wpa_auditor_batch) * 2U));
+    hs_audit_queue_slot_t slot = HS_AUDIT_QUEUE_SLOT_NONE;
     hs_audit_queue_result_t result = hs_audit_queue_load_latest_with_scratch(
         WPA_AUDITOR_BATCH_A, WPA_AUDITOR_BATCH_B, wpa_auditor_batch,
-        wpa_auditor_batch_scratch, NULL);
+        wpa_auditor_batch_scratch, &slot);
     if (result == HS_AUDIT_QUEUE_NOT_FOUND) {
         hs_audit_queue_init(wpa_auditor_batch,
                             ((uint64_t)esp_random() << 32U) | esp_random());
@@ -65982,11 +66140,100 @@ static bool wpa_auditor_batch_ensure_loaded(void)
         wpa_auditor_batch_scratch = NULL;
         return false;
     }
+    wpa_auditor_batch_log_snapshot("LOAD", slot);
     if (hs_audit_queue_reconcile_after_boot(wpa_auditor_batch)) {
         ESP_LOGI(TAG, "[HS-BATCH] interrupted item reconciled to paused");
         (void)wpa_auditor_batch_save();
+        wpa_auditor_batch_log_snapshot("RECONCILED", slot);
     }
     return true;
+}
+
+static bool wpa_auditor_batch_session_matches_item(
+    const hs_audit_queue_item_t *item, const hs_session_t *session)
+{
+    if (!item || !session || !wpa_auditor_batch ||
+        session->state != HS_SESSION_ACTIVE ||
+        session->capture.size != item->capture_size ||
+        session->capture.crc32 != item->capture_crc32 ||
+        session->config.method != wpa_auditor_batch->method)
+        return false;
+    if (wpa_auditor_batch->method != HS_CRACK_METHOD_WORDLIST) return true;
+    return session->wordlist_count == 1U &&
+           session->wordlists[0].size == wpa_auditor_batch->wordlist_size &&
+           session->wordlists[0].head_crc32 ==
+               wpa_auditor_batch->wordlist_head_crc32 &&
+           session->wordlists[0].tail_crc32 ==
+               wpa_auditor_batch->wordlist_tail_crc32;
+}
+
+static void wpa_auditor_batch_apply_session(
+    hs_audit_queue_item_t *item, const hs_session_t *session)
+{
+    if (!item || !session) return;
+    item->has_session = true;
+    memcpy(item->session_id, session->session_id, sizeof(item->session_id));
+    item->tried = session->metrics.total_tried;
+    item->elapsed_ms = session->metrics.active_time_ms;
+    item->eta_seconds = session->metrics.last_eta_seconds;
+    item->worker_count = (uint8_t)session->worker_count;
+    item->progress_percent = (uint8_t)wpa_auditor_progress_percent(session);
+}
+
+static bool wpa_auditor_batch_attach_session_from_entries(
+    hs_audit_queue_item_t *item, const hs_session_catalog_entry_t *entries,
+    size_t count)
+{
+    if (!item || !entries || !wpa_auditor_batch) return false;
+    for (size_t i = 0; i < count; ++i) {
+        const hs_session_t *session = &entries[i].session;
+        if (!wpa_auditor_batch_session_matches_item(item, session)) continue;
+        wpa_auditor_batch_apply_session(item, session);
+        return true;
+    }
+    return false;
+}
+
+static bool wpa_auditor_batch_refresh_recovery_session(
+    hs_audit_queue_item_t *item, const hs_session_catalog_entry_t *entries,
+    size_t count, hs_session_t *scratch)
+{
+    if (!item || !wpa_auditor_batch) return false;
+    if (item->has_session && scratch) {
+        hs_session_result_t loaded = hs_session_catalog_find_id(
+            HS_CRACK_SESSION_DIR, HS_CRACK_SESSION_A, HS_CRACK_SESSION_B,
+            item->session_id, scratch);
+        if (loaded == HS_SESSION_OK &&
+            wpa_auditor_batch_session_matches_item(item, scratch)) {
+            wpa_auditor_batch_apply_session(item, scratch);
+            return true;
+        }
+    }
+
+    item->has_session = false;
+    memset(item->session_id, 0, sizeof(item->session_id));
+    return wpa_auditor_batch_attach_session_from_entries(item, entries, count);
+}
+
+static size_t wpa_auditor_batch_attach_sessions(
+    const hs_session_catalog_entry_t *entries, size_t count)
+{
+    if (!wpa_auditor_batch) return 0U;
+    hs_session_t *scratch = heap_caps_calloc(
+        1, sizeof(*scratch), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!scratch) scratch = calloc(1, sizeof(*scratch));
+    size_t attached = 0U;
+    for (size_t i = 0; i < wpa_auditor_batch->count; ++i) {
+        hs_audit_queue_item_t *item = &wpa_auditor_batch->items[i];
+        if (item->state != HS_AUDIT_ITEM_CANCELLED &&
+            item->state != HS_AUDIT_ITEM_ERROR)
+            continue;
+        if (wpa_auditor_batch_refresh_recovery_session(
+                item, entries, count, scratch))
+            ++attached;
+    }
+    free(scratch);
+    return attached;
 }
 
 static void wpa_auditor_batch_attach_latest_session(
@@ -66004,54 +66251,35 @@ static void wpa_auditor_batch_attach_latest_session(
         free(entries);
         return;
     }
-    for (size_t i = 0; i < count; ++i) {
-        hs_session_t *session = &entries[i].session;
-        if (session->capture.size != item->capture_size ||
-            session->capture.crc32 != item->capture_crc32)
-            continue;
-        if (session->config.method != wpa_auditor_batch->method) continue;
-        if (wpa_auditor_batch->method == HS_CRACK_METHOD_WORDLIST) {
-            if (!session->wordlist_count ||
-                session->wordlists[0].size != wpa_auditor_batch->wordlist_size ||
-                session->wordlists[0].head_crc32 !=
-                    wpa_auditor_batch->wordlist_head_crc32 ||
-                session->wordlists[0].tail_crc32 !=
-                    wpa_auditor_batch->wordlist_tail_crc32)
-                continue;
-        }
-        item->has_session = true;
-        memcpy(item->session_id, session->session_id, sizeof(item->session_id));
-        item->tried = session->metrics.total_tried;
-        item->elapsed_ms = session->metrics.active_time_ms;
-        item->eta_seconds = session->metrics.last_eta_seconds;
-        item->worker_count = (uint8_t)session->worker_count;
-        item->progress_percent = (uint8_t)wpa_auditor_progress_percent(session);
-        break;
-    }
+    (void)wpa_auditor_batch_attach_session_from_entries(item, entries, count);
     free(entries);
 }
 
-static bool wpa_auditor_batch_select_source(void)
+static bool wpa_auditor_batch_configure_cracker(void)
 {
-    if (!wpa_auditor_batch || !hs_crack_ui.wordlist_dropdown ||
-        !lv_obj_is_valid(hs_crack_ui.wordlist_dropdown)) return false;
-    unsigned selected = 1U;
+    if (!wpa_auditor_batch) return false;
+    (void)hs_crack_scan_wordlists();
+    hs_crack_ui.sync_capture = true;
+    hs_crack_ui.sync_wordlist = true;
+    hs_crack_ui.method = (hs_crack_method_t)wpa_auditor_batch->method;
+    hs_crack_ui.wl_choice = -1;
+
     if (wpa_auditor_batch->method == HS_CRACK_METHOD_WORDLIST) {
-        selected = 0U;
         for (int i = 0; i < hs_crack_ui.wl_count; ++i) {
             if (strcmp(hs_crack_ui.wl_paths[i],
                        wpa_auditor_batch->wordlist_path) == 0) {
-                selected = (unsigned)i + 2U;
-                break;
+                hs_crack_ui.wl_choice = i;
+                return true;
             }
         }
-    } else if (wpa_auditor_batch->method == HS_CRACK_METHOD_BOTH) {
-        selected = hs_crack_ui.wl_count > 1
-                       ? (unsigned)hs_crack_ui.wl_count + 2U : 0U;
+        return false;
     }
-    if (selected == 0U) return false;
-    lv_dropdown_set_selected(hs_crack_ui.wordlist_dropdown, selected);
-    return true;
+    if (wpa_auditor_batch->method == HS_CRACK_METHOD_BOTH) {
+        if (hs_crack_ui.wl_count <= 1) return false;
+        hs_crack_ui.wl_choice = hs_crack_ui.wl_count;
+        return true;
+    }
+    return wpa_auditor_batch->method == HS_CRACK_METHOD_GENERIC;
 }
 
 static bool wpa_auditor_batch_launch(size_t index)
@@ -66096,15 +66324,13 @@ static bool wpa_auditor_batch_launch(size_t index)
         wpa_auditor_batch->state = HS_AUDIT_BATCH_PAUSED;
         return false;
     }
-    if (!hs_crack_start_local_file(item->local_path, item->name)) {
+    if (!hs_crack_prepare_local_file(item->local_path, item->name)) {
         item->state = HS_AUDIT_ITEM_ERROR;
         snprintf(item->reason, sizeof(item->reason), "could not start cracker");
         (void)wpa_auditor_batch_save();
         return false;
     }
-    if (!wpa_auditor_batch_select_source()) {
-        if (hs_crack_ui.overlay && lv_obj_is_valid(hs_crack_ui.overlay))
-            lv_obj_del(hs_crack_ui.overlay);
+    if (!wpa_auditor_batch_configure_cracker()) {
         item->state = HS_AUDIT_ITEM_ERROR;
         snprintf(item->reason, sizeof(item->reason), "wordlist unavailable");
         (void)wpa_auditor_batch_save();
@@ -66120,10 +66346,11 @@ static bool wpa_auditor_batch_launch(size_t index)
     ESP_LOGI(TAG, "[HS-BATCH] START %u/%u item=%llu file=%.96s",
              (unsigned)(index + 1U), (unsigned)wpa_auditor_batch->count,
              (unsigned long long)item->id, item->name);
-    hs_crack_close_or_cancel_cb(NULL);
-    if (!hs_crack_ui.task) {
+    if (!hs_crack_start_configured()) {
         item->state = HS_AUDIT_ITEM_ERROR;
         snprintf(item->reason, sizeof(item->reason), "coordinator allocation failed");
+        hs_crack_ui.batch_managed = false;
+        hs_crack_ui.batch_item_index = SIZE_MAX;
         (void)wpa_auditor_batch_save();
         return false;
     }
@@ -66173,7 +66400,11 @@ static void wpa_auditor_batch_crack_complete_async(void *context)
              (unsigned long long)item->id,
              wpa_auditor_batch_state_name(item->state),
              (unsigned long long)item->tried);
-    if (wpa_auditor_batch_pause_requested) {
+    if (wpa_auditor_batch_cancel_requested) {
+        (void)hs_audit_queue_cancel_all(wpa_auditor_batch);
+        wpa_auditor_batch_cancel_requested = false;
+        wpa_auditor_batch_pause_requested = false;
+    } else if (wpa_auditor_batch_pause_requested) {
         wpa_auditor_batch->state = HS_AUDIT_BATCH_PAUSED;
         wpa_auditor_batch_pause_requested = false;
     }
@@ -66305,7 +66536,8 @@ static lv_obj_t *wpa_auditor_button_data(
     lv_obj_set_height(button, 46);
     lv_obj_set_flex_grow(button, 1);
     lv_obj_set_style_bg_color(button, color, 0);
-    lv_obj_set_style_bg_opa(button, disabled ? LV_OPA_40 : LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_opa(button, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_opa(button, LV_OPA_40, LV_STATE_DISABLED);
     lv_obj_set_style_radius(button, 12, 0);
     lv_obj_set_style_shadow_width(button, 0, 0);
     if (callback)
@@ -66478,32 +66710,52 @@ static bool wpa_auditor_launch_saved(size_t session_index, bool start_over)
     }
 
     tab_id_t tab = wpa_auditor_tab_for_source(session->origin.source);
-    if (tab == TAB_INTERNAL || !wpa_auditor_transport_ready(tab)) {
-        wpa_auditor_set_status("The source Monster is offline. Reconnect it to resume.",
-                               COLOR_MATERIAL_RED);
-        return false;
-    }
-    if (!session->origin.remote_path[0]) {
-        wpa_auditor_set_status("The saved capture path is unavailable.",
-                               COLOR_MATERIAL_RED);
-        return false;
-    }
-
-    char remote_path[HS_SESSION_PATH_MAX];
-    snprintf(remote_path, sizeof(remote_path), "%s",
-             session->origin.remote_path);
     char file_name[HS_SESSION_PATH_MAX];
-    snprintf(file_name, sizeof(file_name), "%s",
-             wpa_auditor_basename(remote_path));
-    wpa_auditor_confirm_close_cb(NULL);
-
-    if (!wpa_auditor_switch_transport(tab)) {
-        wpa_auditor_set_status("Could not open the source transport.",
-                               COLOR_MATERIAL_RED);
-        return false;
+    if (tab == TAB_INTERNAL) {
+        if (!wpa_auditor_transport_ready(tab) ||
+            !session->origin.local_path[0]) {
+            wpa_auditor_set_status(
+                "The saved local capture is unavailable on Tab5.",
+                COLOR_MATERIAL_RED);
+            return false;
+        }
+        char local_path[HS_SESSION_PATH_MAX];
+        snprintf(local_path, sizeof(local_path), "%s",
+                 session->origin.local_path);
+        snprintf(file_name, sizeof(file_name), "%s",
+                 wpa_auditor_basename(local_path));
+        wpa_auditor_confirm_close_cb(NULL);
+        if (!hs_crack_start_local_file(local_path, file_name)) {
+            wpa_auditor_set_status("Could not open the saved local capture.",
+                                   COLOR_MATERIAL_RED);
+            return false;
+        }
+    } else {
+        if (!wpa_auditor_transport_ready(tab)) {
+            wpa_auditor_set_status(
+                "The source Monster is offline. Reconnect it to resume.",
+                COLOR_MATERIAL_RED);
+            return false;
+        }
+        if (!session->origin.remote_path[0]) {
+            wpa_auditor_set_status("The saved capture path is unavailable.",
+                                   COLOR_MATERIAL_RED);
+            return false;
+        }
+        char remote_path[HS_SESSION_PATH_MAX];
+        snprintf(remote_path, sizeof(remote_path), "%s",
+                 session->origin.remote_path);
+        snprintf(file_name, sizeof(file_name), "%s",
+                 wpa_auditor_basename(remote_path));
+        wpa_auditor_confirm_close_cb(NULL);
+        if (!wpa_auditor_switch_transport(tab)) {
+            wpa_auditor_set_status("Could not open the source transport.",
+                                   COLOR_MATERIAL_RED);
+            return false;
+        }
+        tab_context_t *ctx = get_ctx_for_tab(tab);
+        hs_crack_start_file(ctx, remote_path, file_name);
     }
-    tab_context_t *ctx = get_ctx_for_tab(tab);
-    hs_crack_start_file(ctx, remote_path, file_name);
     if (!hs_crack_ui.overlay ||
         !wpa_auditor_apply_saved_config(session)) {
         return false;
@@ -66799,6 +67051,8 @@ static void wpa_auditor_catalog_start_sync_current(void);
 static void wpa_auditor_batch_enqueue_selected(void);
 static void wpa_auditor_batch_enqueue_after_refresh_async(void *context);
 static void wpa_auditor_selection_update(void);
+static const hs_artifact_location_t *wpa_auditor_asset_local_ready(
+    const hs_artifact_asset_t *asset);
 
 typedef enum {
     WPA_AUDIT_FILTER_ALL = 0,
@@ -66972,6 +67226,26 @@ static bool wpa_auditor_asset_matches_state(const hs_artifact_asset_t *asset)
                (wpa_auditor_filter_t)wpa_auditor_state_filter;
 }
 
+static bool wpa_auditor_batch_accepts_live_append(void)
+{
+    return wpa_auditor_batch &&
+           wpa_auditor_batch->state == HS_AUDIT_BATCH_RUNNING &&
+           hs_crack_ui.batch_managed && hs_crack_ui.active &&
+           hs_crack_ui.task && !wpa_auditor_batch_pause_requested &&
+           !wpa_auditor_batch_cancel_requested;
+}
+
+static bool wpa_auditor_queue_edit_busy(void)
+{
+    bool incompatible_cracker =
+        (hs_crack_ui.active || hs_crack_ui.task) &&
+        !wpa_auditor_batch_accepts_live_append();
+    return wpa_auditor_catalog_task_handle ||
+           wpa_auditor_sync_after_refresh ||
+           wpa_auditor_delete_audit_task_handle || incompatible_cracker ||
+           compromised_transfer_ui.active || compromised_transfer_ui.task;
+}
+
 static void wpa_auditor_selection_update(void)
 {
     wpa_auditor_batch_selected_count = 0;
@@ -66980,8 +67254,12 @@ static void wpa_auditor_selection_update(void)
         if (wpa_auditor_batch_selected[i]) ++wpa_auditor_batch_selected_count;
     if (wpa_auditor_selection_label &&
         lv_obj_is_valid(wpa_auditor_selection_label)) {
-        char text[48];
-        snprintf(text, sizeof(text), "%u selected",
+        bool busy = wpa_auditor_queue_edit_busy();
+        char text[64];
+        snprintf(text, sizeof(text),
+                 busy && wpa_auditor_batch_selected_count
+                     ? "Queue selection: %u  |  wait for active task"
+                     : "Queue selection: %u",
                  (unsigned)wpa_auditor_batch_selected_count);
         lv_label_set_text(wpa_auditor_selection_label, text);
     }
@@ -66989,7 +67267,8 @@ static void wpa_auditor_selection_update(void)
                            wpa_auditor_batch_clear_btn};
     for (size_t i = 0; i < sizeof(buttons) / sizeof(buttons[0]); ++i) {
         if (!buttons[i] || !lv_obj_is_valid(buttons[i])) continue;
-        if (wpa_auditor_batch_selected_count)
+        if (wpa_auditor_batch_selected_count &&
+            !wpa_auditor_queue_edit_busy())
             lv_obj_clear_state(buttons[i], LV_STATE_DISABLED);
         else
             lv_obj_add_state(buttons[i], LV_STATE_DISABLED);
@@ -67003,6 +67282,12 @@ static void wpa_auditor_select_asset_cb(lv_event_t *e)
     size_t index = (size_t)(packed - 1U);
     if (!wpa_auditor_catalog || index >= wpa_auditor_catalog->asset_count)
         return;
+    if (wpa_auditor_batch_item_for_asset(
+            &wpa_auditor_catalog->assets[index]) >= 0) {
+        wpa_auditor_batch_selected[index] = false;
+        wpa_auditor_selection_update();
+        return;
+    }
     lv_obj_t *checkbox = lv_event_get_target(e);
     wpa_auditor_batch_selected[index] =
         lv_obj_has_state(checkbox, LV_STATE_CHECKED);
@@ -67020,6 +67305,7 @@ static void wpa_auditor_select_visible_cb(lv_event_t *e)
 {
     (void)e;
     if (!wpa_auditor_catalog) return;
+    bool live_append = wpa_auditor_batch_accepts_live_append();
     for (size_t i = 0; i < wpa_auditor_catalog->asset_count; ++i) {
         const hs_artifact_asset_t *asset = &wpa_auditor_catalog->assets[i];
         bool source_visible = false;
@@ -67027,7 +67313,9 @@ static void wpa_auditor_select_visible_cb(lv_event_t *e)
             source_visible |= wpa_auditor_catalog_source_selected(
                 &asset->locations[j]);
         if (source_visible && wpa_auditor_asset_matches_state(asset) &&
-            !wpa_auditor_asset_invalid(asset))
+            !wpa_auditor_asset_invalid(asset) &&
+            (!live_append || wpa_auditor_asset_local_ready(asset)) &&
+            wpa_auditor_batch_item_for_asset(asset) < 0)
             wpa_auditor_batch_selected[i] = true;
     }
     wpa_auditor_selection_update();
@@ -67043,12 +67331,31 @@ static void wpa_auditor_clear_selection_cb(lv_event_t *e)
     wpa_auditor_catalog_render_locked();
 }
 
-static bool wpa_auditor_batch_configure_from_dropdown(void)
+static unsigned wpa_auditor_batch_candidate_source_selection(void)
 {
-    if (!wpa_auditor_batch || !wpa_auditor_batch_wordlist ||
-        !lv_obj_is_valid(wpa_auditor_batch_wordlist)) return false;
-    if (wpa_auditor_batch->count) return true;
-    unsigned selected = lv_dropdown_get_selected(wpa_auditor_batch_wordlist);
+    if (!wpa_auditor_batch) return 1U;
+    if (wpa_auditor_batch->method == HS_CRACK_METHOD_WORDLIST) {
+        for (int i = 0; i < hs_crack_ui.wl_count; ++i) {
+            if (strcmp(hs_crack_ui.wl_paths[i],
+                       wpa_auditor_batch->wordlist_path) == 0)
+                return (unsigned)i + 2U;
+        }
+        return 0U;
+    }
+    if (wpa_auditor_batch->method == HS_CRACK_METHOD_BOTH)
+        return hs_crack_ui.wl_count > 1
+                   ? (unsigned)hs_crack_ui.wl_count + 2U : 0U;
+    return 1U;
+}
+
+static bool wpa_auditor_batch_configure_source_selection(unsigned selected)
+{
+    if (!wpa_auditor_batch) return false;
+    if (wpa_auditor_batch->count &&
+        !hs_audit_queue_can_change_candidate_source(wpa_auditor_batch)) {
+        unsigned locked = wpa_auditor_batch_candidate_source_selection();
+        return locked != 0U && selected == locked;
+    }
     hs_crack_source_kind_t kind = HS_CRACK_SOURCE_NONE;
     size_t index = 0;
     if (!hs_crack_cache_decode_source(selected, (size_t)hs_crack_ui.wl_count,
@@ -67057,6 +67364,9 @@ static bool wpa_auditor_batch_configure_from_dropdown(void)
         return false;
     memset(wpa_auditor_batch->wordlist_path, 0,
            sizeof(wpa_auditor_batch->wordlist_path));
+    wpa_auditor_batch->wordlist_size = 0;
+    wpa_auditor_batch->wordlist_head_crc32 = 0;
+    wpa_auditor_batch->wordlist_tail_crc32 = 0;
     if (kind == HS_CRACK_SOURCE_INTERNAL) {
         wpa_auditor_batch->method = HS_CRACK_METHOD_GENERIC;
     } else if (kind == HS_CRACK_SOURCE_WORDLIST) {
@@ -67082,6 +67392,286 @@ static bool wpa_auditor_batch_configure_from_dropdown(void)
     return true;
 }
 
+static bool wpa_auditor_batch_configure_from_dropdown(void)
+{
+    if (!wpa_auditor_batch_wordlist ||
+        !lv_obj_is_valid(wpa_auditor_batch_wordlist)) return false;
+    return wpa_auditor_batch_configure_source_selection(
+        lv_dropdown_get_selected(wpa_auditor_batch_wordlist));
+}
+
+static hs_audit_queue_result_t wpa_auditor_batch_append_local_capture(
+    const char *local_path, const char *file_name, uint32_t known_crc32,
+    const uint8_t resume_session_id[HS_SESSION_ID_BYTES])
+{
+    if (!local_path || !local_path[0] || !file_name || !file_name[0] ||
+        !wpa_auditor_batch_ensure_loaded())
+        return HS_AUDIT_QUEUE_RANGE;
+
+    struct stat state;
+    if (stat(local_path, &state) != 0 || !S_ISREG(state.st_mode) ||
+        state.st_size <= 0)
+        return HS_AUDIT_QUEUE_NOT_FOUND;
+    uint32_t crc32 = known_crc32;
+    if (!crc32 &&
+        hs_crack_cache_file_crc32(local_path, &crc32) != HS_CRACK_CACHE_OK)
+        return HS_AUDIT_QUEUE_IO_ERROR;
+
+    hs_audit_queue_item_t item = {
+        .id = ((uint64_t)crc32 << 32U) ^ (uint64_t)state.st_size,
+        .state = HS_AUDIT_ITEM_QUEUED,
+        .capture_size = (uint64_t)state.st_size,
+        .capture_crc32 = crc32,
+    };
+    if (!item.id) {
+        item.id = ((uint64_t)esp_random() << 32U) | esp_random();
+        if (!item.id) item.id = 1U;
+    }
+    size_t path_length = strnlen(local_path, sizeof(item.local_path));
+    if (!path_length || path_length >= sizeof(item.local_path))
+        return HS_AUDIT_QUEUE_RANGE;
+    memcpy(item.local_path, local_path, path_length + 1U);
+    snprintf(item.name, sizeof(item.name), "%.95s", file_name);
+    if (resume_session_id) {
+        item.has_session = true;
+        memcpy(item.session_id, resume_session_id, sizeof(item.session_id));
+    }
+
+    size_t previous_count = wpa_auditor_batch->count;
+    hs_audit_batch_state_t previous_state = wpa_auditor_batch->state;
+    uint64_t previous_sequence = wpa_auditor_batch->sequence;
+    hs_audit_queue_result_t result =
+        hs_audit_queue_append(wpa_auditor_batch, &item);
+    if (result != HS_AUDIT_QUEUE_OK) return result;
+    if (wpa_auditor_batch_save()) return HS_AUDIT_QUEUE_OK;
+
+    wpa_auditor_batch->count = previous_count;
+    wpa_auditor_batch->state = previous_state;
+    wpa_auditor_batch->sequence = previous_sequence;
+    memset(&wpa_auditor_batch->items[previous_count], 0,
+           sizeof(wpa_auditor_batch->items[previous_count]));
+    return HS_AUDIT_QUEUE_IO_ERROR;
+}
+
+static int wpa_auditor_batch_local_item_index(const char *local_path)
+{
+    if (!local_path || !local_path[0] ||
+        !wpa_auditor_batch_ensure_loaded()) return -1;
+    for (size_t i = 0; i < wpa_auditor_batch->count; ++i) {
+        if (strcmp(wpa_auditor_batch->items[i].local_path, local_path) == 0)
+            return (int)i;
+    }
+
+    struct stat state;
+    uint32_t crc32 = 0;
+    if (stat(local_path, &state) != 0 || !S_ISREG(state.st_mode) ||
+        state.st_size <= 0 ||
+        hs_crack_cache_file_crc32(local_path, &crc32) != HS_CRACK_CACHE_OK)
+        return -1;
+    for (size_t i = 0; i < wpa_auditor_batch->count; ++i) {
+        const hs_audit_queue_item_t *item = &wpa_auditor_batch->items[i];
+        if (item->capture_size == (uint64_t)state.st_size &&
+            item->capture_crc32 == crc32)
+            return (int)i;
+    }
+    return -1;
+}
+
+static hs_audit_queue_result_t wpa_auditor_batch_restore_cancelled_resume(
+    const char *local_path,
+    const uint8_t resume_session_id[HS_SESSION_ID_BYTES])
+{
+    if (!resume_session_id) return HS_AUDIT_QUEUE_RANGE;
+    int index = wpa_auditor_batch_local_item_index(local_path);
+    if (index < 0) return HS_AUDIT_QUEUE_NOT_FOUND;
+    hs_audit_queue_item_t *item = &wpa_auditor_batch->items[index];
+    if (item->state != HS_AUDIT_ITEM_CANCELLED)
+        return HS_AUDIT_QUEUE_DUPLICATE;
+
+    hs_audit_queue_item_t previous_item = *item;
+    hs_audit_batch_state_t previous_state = wpa_auditor_batch->state;
+    size_t previous_current_index = wpa_auditor_batch->current_index;
+    uint64_t previous_sequence = wpa_auditor_batch->sequence;
+    if (!hs_audit_queue_resume_cancelled(wpa_auditor_batch, (size_t)index))
+        return HS_AUDIT_QUEUE_RANGE;
+    item->has_session = true;
+    memcpy(item->session_id, resume_session_id, sizeof(item->session_id));
+    if (!wpa_auditor_batch_save()) {
+        *item = previous_item;
+        wpa_auditor_batch->state = previous_state;
+        wpa_auditor_batch->current_index = previous_current_index;
+        wpa_auditor_batch->sequence = previous_sequence;
+        return HS_AUDIT_QUEUE_IO_ERROR;
+    }
+    ESP_LOGI(TAG,
+             "[HS-BATCH] RESTORE item=%llu state=Paused session=%02X%02X%02X%02X",
+             (unsigned long long)item->id, resume_session_id[0],
+             resume_session_id[1], resume_session_id[2], resume_session_id[3]);
+    return HS_AUDIT_QUEUE_OK;
+}
+
+static bool wpa_auditor_batch_contains_local_path(const char *local_path)
+{
+    int index = wpa_auditor_batch_local_item_index(local_path);
+    return index >= 0 &&
+           wpa_auditor_batch->items[index].state != HS_AUDIT_ITEM_CANCELLED;
+}
+
+static void hs_crack_mark_queued_ui(void)
+{
+    hs_crack_ui.queued_to_batch = true;
+    if (hs_crack_ui.action_btn && lv_obj_is_valid(hs_crack_ui.action_btn))
+        lv_obj_add_flag(hs_crack_ui.action_btn, LV_OBJ_FLAG_HIDDEN);
+    if (hs_crack_ui.queue_btn && lv_obj_is_valid(hs_crack_ui.queue_btn))
+        lv_obj_add_state(hs_crack_ui.queue_btn, LV_STATE_DISABLED);
+    if (hs_crack_ui.queue_label && lv_obj_is_valid(hs_crack_ui.queue_label))
+        lv_label_set_text(hs_crack_ui.queue_label, "Already queued");
+}
+
+static void hs_crack_add_to_queue_cb(lv_event_t *e)
+{
+    (void)e;
+    if (hs_crack_ui.started || hs_crack_ui.active || hs_crack_ui.task ||
+        !hs_crack_ui.wordlist_dropdown ||
+        !lv_obj_is_valid(hs_crack_ui.wordlist_dropdown))
+        return;
+
+    unsigned selected = lv_dropdown_get_selected(hs_crack_ui.wordlist_dropdown);
+    hs_crack_source_kind_t source_kind = HS_CRACK_SOURCE_NONE;
+    size_t wordlist_index = 0;
+    if (!hs_crack_cache_decode_source(selected,
+                                      (size_t)hs_crack_ui.wl_count,
+                                      &source_kind, &wordlist_index) ||
+        source_kind == HS_CRACK_SOURCE_NONE) {
+        lv_label_set_text(hs_crack_ui.status_label,
+                          "Choose Internal, a wordlist, or ALL first.");
+        return;
+    }
+    (void)wordlist_index;
+    if (!wpa_auditor_batch_ensure_loaded()) {
+        lv_label_set_text(hs_crack_ui.status_label,
+                          "The WPA Auditor batch journal is unavailable.");
+        lv_obj_set_style_text_color(hs_crack_ui.status_label,
+                                    COLOR_MATERIAL_RED, 0);
+        return;
+    }
+    bool source_editable =
+        hs_audit_queue_can_change_candidate_source(wpa_auditor_batch);
+    if (!wpa_auditor_batch_configure_source_selection(selected)) {
+        lv_label_set_text(
+            hs_crack_ui.status_label,
+            "The existing batch uses a different candidate source.");
+        lv_obj_set_style_text_color(hs_crack_ui.status_label,
+                                    COLOR_MATERIAL_AMBER, 0);
+        return;
+    }
+    if (source_editable && !wpa_auditor_batch_save()) {
+        lv_label_set_text(hs_crack_ui.status_label,
+                          "Could not save the batch candidate source.");
+        lv_obj_set_style_text_color(hs_crack_ui.status_label,
+                                    COLOR_MATERIAL_RED, 0);
+        return;
+    }
+
+    if (hs_crack_ui.local_capture) {
+        if (hs_crack_ui.resume_session_valid) {
+            hs_audit_queue_result_t restore_result =
+                wpa_auditor_batch_restore_cancelled_resume(
+                    hs_crack_ui.remote_pcap_path,
+                    hs_crack_ui.resume_session_id);
+            if (restore_result == HS_AUDIT_QUEUE_OK) {
+                lv_label_set_text(
+                    hs_crack_ui.status_label,
+                    "Resumable audit restored to the batch queue.");
+                lv_obj_set_style_text_color(hs_crack_ui.status_label,
+                                            COLOR_MATERIAL_GREEN, 0);
+                hs_crack_mark_queued_ui();
+                return;
+            }
+            if (restore_result != HS_AUDIT_QUEUE_NOT_FOUND &&
+                restore_result != HS_AUDIT_QUEUE_DUPLICATE) {
+                lv_label_set_text(
+                    hs_crack_ui.status_label,
+                    "Could not restore this audit in the batch queue.");
+                lv_obj_set_style_text_color(hs_crack_ui.status_label,
+                                            COLOR_MATERIAL_RED, 0);
+                return;
+            }
+        }
+        hs_audit_queue_result_t result =
+            wpa_auditor_batch_append_local_capture(
+                hs_crack_ui.remote_pcap_path, hs_crack_ui.file_name, 0U,
+                hs_crack_ui.resume_session_valid
+                    ? hs_crack_ui.resume_session_id : NULL);
+        bool added = result == HS_AUDIT_QUEUE_OK;
+        bool duplicate = result == HS_AUDIT_QUEUE_DUPLICATE;
+        lv_label_set_text(hs_crack_ui.status_label,
+                          added ? "Added to WPA Auditor batch queue."
+                          : duplicate ? "Already present in the batch queue."
+                                      : "Could not add this capture to the batch queue.");
+        lv_obj_set_style_text_color(hs_crack_ui.status_label,
+                                    added ? COLOR_MATERIAL_GREEN
+                                    : duplicate ? COLOR_MATERIAL_AMBER
+                                                : COLOR_MATERIAL_RED,
+                                    0);
+        if (added || duplicate) hs_crack_mark_queued_ui();
+        return;
+    }
+
+    tab_id_t tab = (tab_id_t)hs_crack_ui.tab;
+    tab_context_t *ctx = get_ctx_for_tab(tab);
+    if (!ctx || !compromised_start_copy(
+                    tab, ctx, hs_crack_ui.remote_pcap_path,
+                    hs_crack_ui.file_name, 0U, true, true)) {
+        lv_label_set_text(hs_crack_ui.status_label,
+                          "Could not start Sync to Tab5.");
+        lv_obj_set_style_text_color(hs_crack_ui.status_label,
+                                    COLOR_MATERIAL_RED, 0);
+        return;
+    }
+    if (hs_crack_ui.overlay && lv_obj_is_valid(hs_crack_ui.overlay))
+        lv_obj_del(hs_crack_ui.overlay);
+}
+
+static void wpa_auditor_batch_wordlist_changed_cb(lv_event_t *e)
+{
+    lv_obj_t *dropdown = lv_event_get_target(e);
+    if (!wpa_auditor_batch || !dropdown ||
+        !hs_audit_queue_can_change_candidate_source(wpa_auditor_batch))
+        return;
+    unsigned previous = wpa_auditor_batch_candidate_source_selection();
+    uint8_t previous_method = wpa_auditor_batch->method;
+    char previous_path[HS_AUDIT_QUEUE_PATH_MAX];
+    snprintf(previous_path, sizeof(previous_path), "%s",
+             wpa_auditor_batch->wordlist_path);
+    uint64_t previous_size = wpa_auditor_batch->wordlist_size;
+    uint32_t previous_head = wpa_auditor_batch->wordlist_head_crc32;
+    uint32_t previous_tail = wpa_auditor_batch->wordlist_tail_crc32;
+    if (!wpa_auditor_batch_configure_from_dropdown()) {
+        lv_dropdown_set_selected(dropdown, previous);
+        wpa_auditor_set_status("Choose Internal, one SD wordlist, or ALL.",
+                               COLOR_MATERIAL_AMBER);
+        return;
+    }
+    if (wpa_auditor_batch->count && !wpa_auditor_batch_save()) {
+        wpa_auditor_batch->method = previous_method;
+        snprintf(wpa_auditor_batch->wordlist_path,
+                 sizeof(wpa_auditor_batch->wordlist_path), "%s",
+                 previous_path);
+        wpa_auditor_batch->wordlist_size = previous_size;
+        wpa_auditor_batch->wordlist_head_crc32 = previous_head;
+        wpa_auditor_batch->wordlist_tail_crc32 = previous_tail;
+        lv_dropdown_set_selected(dropdown, previous);
+        wpa_auditor_set_status("Could not save the batch candidate source.",
+                               COLOR_MATERIAL_RED);
+        return;
+    }
+    if (wpa_auditor_batch->count)
+        wpa_auditor_set_status(
+            "Candidate source updated for all queued captures.",
+            COLOR_MATERIAL_GREEN);
+}
+
 static const hs_artifact_location_t *wpa_auditor_asset_local_ready(
     const hs_artifact_asset_t *asset)
 {
@@ -67099,19 +67689,33 @@ static const hs_artifact_location_t *wpa_auditor_asset_local_ready(
 static void wpa_auditor_batch_enqueue_selected(void)
 {
     if (!wpa_auditor_catalog || !wpa_auditor_batch_ensure_loaded() ||
+        wpa_auditor_queue_edit_busy() ||
         !wpa_auditor_batch_configure_from_dropdown()) {
         wpa_auditor_set_status("Choose a candidate source before adding the batch.",
                                COLOR_MATERIAL_AMBER);
         return;
     }
+    bool live_append = wpa_auditor_batch_accepts_live_append();
+    size_t previous_count = wpa_auditor_batch->count;
+    size_t previous_current_index = wpa_auditor_batch->current_index;
+    hs_audit_batch_state_t previous_state = wpa_auditor_batch->state;
+    uint64_t previous_sequence = wpa_auditor_batch->sequence;
     bool needs_sync = false;
-    unsigned added = 0, skipped = 0;
+    unsigned added = 0, already_queued = 0, skipped = 0;
     for (size_t i = 0; i < wpa_auditor_catalog->asset_count; ++i) {
         if (!wpa_auditor_batch_selected[i]) continue;
         const hs_artifact_asset_t *asset = &wpa_auditor_catalog->assets[i];
+        if (wpa_auditor_batch_item_for_asset(asset) >= 0) {
+            ++already_queued;
+            continue;
+        }
         const hs_artifact_location_t *local =
             wpa_auditor_asset_local_ready(asset);
         if (!local) {
+            if (live_append) {
+                ++skipped;
+                continue;
+            }
             bool invalid = wpa_auditor_asset_invalid(asset);
             needs_sync |= !invalid;
             if (invalid ||
@@ -67137,10 +67741,28 @@ static void wpa_auditor_batch_enqueue_selected(void)
         hs_audit_queue_result_t result = hs_audit_queue_append(
             wpa_auditor_batch, &item);
         if (result == HS_AUDIT_QUEUE_OK) ++added;
-        else if (result == HS_AUDIT_QUEUE_DUPLICATE) ++skipped;
+        else if (result == HS_AUDIT_QUEUE_DUPLICATE) ++already_queued;
         else ++skipped;
     }
-    if (added) (void)wpa_auditor_batch_save();
+    if (added && !wpa_auditor_batch_save()) {
+        for (size_t i = previous_count; i < wpa_auditor_batch->count; ++i)
+            memset(&wpa_auditor_batch->items[i], 0,
+                   sizeof(wpa_auditor_batch->items[i]));
+        wpa_auditor_batch->count = previous_count;
+        wpa_auditor_batch->current_index = previous_current_index;
+        wpa_auditor_batch->state = previous_state;
+        wpa_auditor_batch->sequence = previous_sequence;
+        wpa_auditor_set_status(
+            "The queue changed in RAM but its journal could not be saved; additions were rolled back.",
+            COLOR_MATERIAL_RED);
+        return;
+    }
+    if (added && live_append) {
+        ESP_LOGI(TAG,
+                 "[HS-BATCH] APPEND_RUNNING added=%u total=%u current=%u",
+                 added, (unsigned)wpa_auditor_batch->count,
+                 (unsigned)wpa_auditor_batch->current_index);
+    }
     if (needs_sync && !wpa_auditor_batch_enqueue_after_sync) {
         if (!wpa_auditor_batch_stash_selection()) {
             wpa_auditor_set_status(
@@ -67171,9 +67793,15 @@ static void wpa_auditor_batch_enqueue_selected(void)
     memset(wpa_auditor_batch_selected, 0,
            sizeof(wpa_auditor_batch_selected));
     wpa_auditor_selection_update();
-    char status[112];
-    snprintf(status, sizeof(status), "Added %u capture%s; skipped %u.", added,
-             added == 1U ? "" : "s", skipped);
+    char status[144];
+    if (!added && already_queued && !skipped) {
+        snprintf(status, sizeof(status), "Already in queue: %u capture%s.",
+                 already_queued, already_queued == 1U ? "" : "s");
+    } else {
+        snprintf(status, sizeof(status),
+                 "Added %u capture%s; already in queue %u; skipped %u.",
+                 added, added == 1U ? "" : "s", already_queued, skipped);
+    }
     wpa_auditor_set_status(status, added ? COLOR_MATERIAL_GREEN
                                          : COLOR_MATERIAL_AMBER);
     show_wpa_psk_auditor_page();
@@ -67182,9 +67810,23 @@ static void wpa_auditor_batch_enqueue_selected(void)
 static void wpa_auditor_add_selected_cb(lv_event_t *e)
 {
     (void)e;
-    if (!wpa_auditor_batch_selected_count || hs_crack_ui.active ||
-        hs_crack_ui.task || compromised_transfer_ui.active ||
-        compromised_transfer_ui.task) return;
+    bool busy = wpa_auditor_queue_edit_busy();
+    ESP_LOGI(TAG,
+             "[HS-BATCH] ADD_SELECTED click selected=%u busy=%u catalog=%u",
+             (unsigned)wpa_auditor_batch_selected_count, (unsigned)busy,
+             (unsigned)(wpa_auditor_catalog != NULL));
+    if (!wpa_auditor_batch_selected_count) {
+        wpa_auditor_set_status("Select at least one valid capture first.",
+                               COLOR_MATERIAL_AMBER);
+        return;
+    }
+    if (busy) {
+        wpa_auditor_set_status(
+            "Queue editing is temporarily busy. Wait for the active scan, sync, or transfer.",
+            COLOR_MATERIAL_AMBER);
+        wpa_auditor_selection_update();
+        return;
+    }
     wpa_auditor_batch_enqueue_selected();
 }
 
@@ -67506,6 +68148,8 @@ static void wpa_auditor_catalog_render_locked(void)
                 wpa_auditor_delete_audit_task_handle || hs_crack_ui.active ||
                 hs_crack_ui.task ||
                 compromised_transfer_ui.active || compromised_transfer_ui.task;
+    bool live_append = wpa_auditor_batch_accepts_live_append();
+    bool queue_edit_busy = wpa_auditor_queue_edit_busy();
 
     if (wpa_auditor_source_filter == -2) {
         wpa_auditor_label(wpa_auditor_catalog_list,
@@ -67520,6 +68164,7 @@ static void wpa_auditor_catalog_render_locked(void)
                 lv_obj_clear_state(wpa_auditor_catalog_sync_all_btn,
                                    LV_STATE_DISABLED);
         }
+        wpa_auditor_selection_update();
         return;
     }
 
@@ -67532,6 +68177,7 @@ static void wpa_auditor_catalog_render_locked(void)
             lv_obj_is_valid(wpa_auditor_catalog_sync_all_btn))
             lv_obj_add_state(wpa_auditor_catalog_sync_all_btn,
                              LV_STATE_DISABLED);
+        wpa_auditor_selection_update();
         return;
     }
 
@@ -67549,6 +68195,12 @@ static void wpa_auditor_catalog_render_locked(void)
         if (!primary) continue;
         if (!wpa_auditor_asset_matches_state(asset)) continue;
         ++rendered;
+        bool already_queued = wpa_auditor_batch_item_for_asset(asset) >= 0;
+        bool local_ready = wpa_auditor_asset_local_ready(asset) != NULL;
+        if ((already_queued || (live_append && !local_ready)) &&
+            wpa_auditor_batch_selected[i]) {
+            wpa_auditor_batch_selected[i] = false;
+        }
         size_t audit_location = SIZE_MAX;
         size_t sync_location = SIZE_MAX;
         size_t delete_location = SIZE_MAX;
@@ -67580,7 +68232,8 @@ static void wpa_auditor_catalog_render_locked(void)
         lv_obj_add_event_cb(select, wpa_auditor_select_asset_cb,
                             LV_EVENT_VALUE_CHANGED,
                             (void *)(uintptr_t)(i + 1U));
-        if (busy || wpa_auditor_asset_invalid(asset))
+        if (queue_edit_busy || wpa_auditor_asset_invalid(asset) ||
+            already_queued || (live_append && !local_ready))
             lv_obj_add_state(select, LV_STATE_DISABLED);
 
         lv_obj_t *badges = lv_obj_create(row);
@@ -67591,6 +68244,9 @@ static void wpa_auditor_catalog_render_locked(void)
         lv_obj_set_style_pad_gap(badges, 5, 0);
         lv_obj_set_flex_flow(badges, LV_FLEX_FLOW_ROW);
         lv_obj_clear_flag(badges, LV_OBJ_FLAG_SCROLLABLE);
+        if (already_queued)
+            wpa_auditor_catalog_add_badge(
+                badges, "IN QUEUE", COLOR_MATERIAL_PURPLE);
 
         for (size_t j = 0; j < asset->location_count; ++j) {
             const hs_artifact_location_t *location = &asset->locations[j];
@@ -67655,6 +68311,13 @@ static void wpa_auditor_catalog_render_locked(void)
         }
         wpa_auditor_catalog_add_badge(badges, audit_state_text,
                                       audit_state_color);
+        if (live_append && !already_queued && !local_ready) {
+            wpa_auditor_catalog_add_badge(
+                badges,
+                sync_location != SIZE_MAX ? "PAUSE TO SYNC" : "NOT READY",
+                sync_location != SIZE_MAX ? COLOR_MATERIAL_AMBER
+                                          : COLOR_MATERIAL_RED);
+        }
         if (any_invalid) audit_location = SIZE_MAX;
 
         char size_text[24];
@@ -67718,6 +68381,29 @@ static void wpa_auditor_catalog_render_locked(void)
             lv_obj_clear_state(wpa_auditor_catalog_sync_all_btn,
                                LV_STATE_DISABLED);
     }
+    if (live_append && wpa_auditor_catalog_status &&
+        lv_obj_is_valid(wpa_auditor_catalog_status)) {
+        lv_label_set_text(
+            wpa_auditor_catalog_status,
+            "Batch is running. Ready local captures can still be added; IN QUEUE, NOT READY and PAUSE TO SYNC entries stay locked.");
+        lv_obj_set_style_text_color(wpa_auditor_catalog_status,
+                                    COLOR_MATERIAL_GREEN, 0);
+    }
+    if (wpa_auditor_batch &&
+        wpa_auditor_batch->state == HS_AUDIT_BATCH_RUNNING) {
+        ESP_LOGI(TAG,
+                 "[HS-BATCH] CATALOG_EDIT live=%u busy=%u active=%u task=%u managed=%u pause=%u cancel=%u",
+                 (unsigned)live_append, (unsigned)queue_edit_busy,
+                 (unsigned)hs_crack_ui.active,
+                 (unsigned)(hs_crack_ui.task != NULL),
+                 (unsigned)hs_crack_ui.batch_managed,
+                 (unsigned)wpa_auditor_batch_pause_requested,
+                 (unsigned)wpa_auditor_batch_cancel_requested);
+    }
+    /* Refreshing and background transfers can change the busy predicate
+     * without changing the selection. Always reconcile the fixed dock so an
+     * old disabled state cannot survive after the task has completed. */
+    wpa_auditor_selection_update();
 }
 
 static bool wpa_auditor_catalog_remote_path(
@@ -67776,7 +68462,7 @@ static void wpa_auditor_catalog_sync_cb(lv_event_t *e)
     if (tab == TAB_INTERNAL ||
         !wpa_auditor_catalog_remote_path(location, path, sizeof(path)) ||
         !compromised_start_copy(tab, get_ctx_for_tab(tab), path, location->name,
-                                location->size, true)) {
+                                location->size, true, false)) {
         wpa_auditor_set_status("Could not start Sync to Tab5.",
                                COLOR_MATERIAL_RED);
     }
@@ -68727,7 +69413,129 @@ static void wpa_auditor_open_captures_cb(lv_event_t *e)
                                LV_STATE_DISABLED);
         wpa_auditor_set_status("Could not start catalog scan task.",
                                COLOR_MATERIAL_RED);
+    } else {
+        /* The fixed selection dock is outside the catalog body, so explicitly
+         * reflect the newly active scan in its enabled state and copy. */
+        wpa_auditor_selection_update();
     }
+}
+
+static void wpa_auditor_batch_update_live_item_label(void)
+{
+    if (!wpa_auditor_batch_live_item_label ||
+        !lv_obj_is_valid(wpa_auditor_batch_live_item_label) ||
+        !wpa_auditor_batch || !hs_crack_ui.batch_managed ||
+        !hs_crack_ui.active ||
+        hs_crack_ui.batch_item_index >= wpa_auditor_batch->count)
+        return;
+
+    size_t index = hs_crack_ui.batch_item_index;
+    const hs_audit_queue_item_t *item = &wpa_auditor_batch->items[index];
+    char line[320];
+    snprintf(line, sizeof(line),
+             "%u. %.120s\n%s  |  %u%%  |  %lu tried",
+             (unsigned)(index + 1U), item->name,
+             wpa_auditor_batch_state_name(item->state),
+             (unsigned)hs_crack_ui.live_progress_percent,
+             (unsigned long)hs_crack_ui.live_tried);
+    lv_label_set_text(wpa_auditor_batch_live_item_label, line);
+}
+
+static void wpa_auditor_batch_update_status_label(void)
+{
+    if (!wpa_auditor_batch || !wpa_auditor_batch_status ||
+        !lv_obj_is_valid(wpa_auditor_batch_status))
+        return;
+
+    size_t count = wpa_auditor_batch->count;
+    unsigned terminal_count = 0, total_progress = 0, workers = 0;
+    uint64_t elapsed_ms = 0, eta_seconds = 0;
+    uint32_t current_progress = 0, current_tried = 0;
+    bool live = hs_crack_ui.batch_managed && hs_crack_ui.active &&
+                hs_crack_ui.batch_item_index < count;
+    for (size_t i = 0; i < count; ++i) {
+        const hs_audit_queue_item_t *item = &wpa_auditor_batch->items[i];
+        bool terminal = item->state == HS_AUDIT_ITEM_FOUND ||
+                        item->state == HS_AUDIT_ITEM_NOT_FOUND ||
+                        item->state == HS_AUDIT_ITEM_ERROR ||
+                        item->state == HS_AUDIT_ITEM_INVALID ||
+                        item->state == HS_AUDIT_ITEM_CANCELLED;
+        bool current = live && i == hs_crack_ui.batch_item_index;
+        uint32_t progress = current ? hs_crack_ui.live_progress_percent
+                                    : item->progress_percent;
+        terminal_count += terminal ? 1U : 0U;
+        total_progress += terminal ? 100U : progress;
+        elapsed_ms += item->elapsed_ms;
+        eta_seconds += item->eta_seconds;
+        if (current) {
+            current_progress = progress;
+            current_tried = hs_crack_ui.live_tried;
+            elapsed_ms += (uint64_t)hs_crack_ui.live_elapsed_seconds * 1000U;
+            if (item->eta_seconds <= eta_seconds)
+                eta_seconds -= item->eta_seconds;
+            if (hs_crack_ui.live_eta_seconds != UINT32_MAX)
+                eta_seconds += hs_crack_ui.live_eta_seconds;
+            workers = hs_crack_ui.remote_total;
+        } else if (item->state == HS_AUDIT_ITEM_RUNNING) {
+            workers = item->worker_count;
+        }
+    }
+
+    char summary[224];
+    char elapsed_text[32];
+    char eta_text[32];
+    compromised_format_duration(elapsed_ms / 1000U, elapsed_text,
+                                sizeof(elapsed_text));
+    if (live) {
+        if (hs_crack_ui.live_eta_seconds == UINT32_MAX)
+            snprintf(eta_text, sizeof(eta_text), "--");
+        else
+            compromised_format_duration(hs_crack_ui.live_eta_seconds,
+                                        eta_text, sizeof(eta_text));
+        snprintf(summary, sizeof(summary),
+                 "%u/%u complete  |  %u%% aggregate  |  %s elapsed\n"
+                 "Current %u%%  |  Tried %lu  |  ETA %s  |  Tab5 + %u remote",
+                 terminal_count, (unsigned)count,
+                 count ? total_progress / (unsigned)count : 0U,
+                 elapsed_text,
+                 (unsigned)current_progress,
+                 (unsigned long)current_tried, eta_text, workers);
+    } else {
+        if (eta_seconds)
+            compromised_format_duration(eta_seconds, eta_text,
+                                        sizeof(eta_text));
+        else
+            snprintf(eta_text, sizeof(eta_text), "--");
+        snprintf(summary, sizeof(summary),
+                 "%u/%u complete  |  %u%% aggregate  |  %s elapsed\n"
+                 "ETA %s  |  Tab5 + %u remote",
+                 terminal_count, (unsigned)count,
+                 count ? total_progress / (unsigned)count : 0U,
+                 elapsed_text, eta_text, workers);
+    }
+    lv_label_set_text(wpa_auditor_batch_status, summary);
+    wpa_auditor_batch_update_live_item_label();
+}
+
+static void wpa_auditor_batch_refresh_cb(lv_timer_t *timer)
+{
+    (void)timer;
+    wpa_auditor_batch_update_status_label();
+}
+
+static void wpa_auditor_batch_refresh_stop(void)
+{
+    if (!wpa_auditor_batch_refresh_timer) return;
+    lv_timer_delete(wpa_auditor_batch_refresh_timer);
+    wpa_auditor_batch_refresh_timer = NULL;
+}
+
+static void wpa_auditor_batch_refresh_start(void)
+{
+    wpa_auditor_batch_refresh_stop();
+    wpa_auditor_batch_update_status_label();
+    wpa_auditor_batch_refresh_timer =
+        lv_timer_create(wpa_auditor_batch_refresh_cb, 1000, NULL);
 }
 
 static void wpa_auditor_back_cb(lv_event_t *e)
@@ -68737,6 +69545,7 @@ static void wpa_auditor_back_cb(lv_event_t *e)
     wpa_auditor_sync_after_refresh = false;
     ++wpa_auditor_catalog_generation;
     wpa_auditor_confirm_close_cb(NULL);
+    wpa_auditor_batch_refresh_stop();
     if (wpa_auditor_page && lv_obj_is_valid(wpa_auditor_page))
         lv_obj_del(wpa_auditor_page);
     wpa_auditor_page = NULL;
@@ -68748,8 +69557,10 @@ static void wpa_auditor_back_cb(lv_event_t *e)
     wpa_auditor_source_dropdown = NULL;
     wpa_auditor_batch_status = NULL;
     wpa_auditor_batch_list = NULL;
+    wpa_auditor_batch_live_item_label = NULL;
     wpa_auditor_batch_wordlist = NULL;
     wpa_auditor_state_dropdown = NULL;
+    wpa_auditor_selection_dock = NULL;
     wpa_auditor_selection_label = NULL;
     wpa_auditor_batch_add_btn = NULL;
     wpa_auditor_batch_clear_btn = NULL;
@@ -68889,6 +69700,7 @@ static void wpa_auditor_batch_start_cb(lv_event_t *e)
         compromised_transfer_ui.active || compromised_transfer_ui.task)
         return;
     wpa_auditor_batch_pause_requested = false;
+    wpa_auditor_batch_cancel_requested = false;
     wpa_auditor_batch->state = HS_AUDIT_BATCH_RUNNING;
     if (!wpa_auditor_batch_save() || !wpa_auditor_batch_launch_next()) {
         if (wpa_auditor_batch->state == HS_AUDIT_BATCH_RUNNING)
@@ -68896,7 +69708,9 @@ static void wpa_auditor_batch_start_cb(lv_event_t *e)
         (void)wpa_auditor_batch_save();
         wpa_auditor_set_status("No runnable queue item. Check capture and wordlist status.",
                                COLOR_MATERIAL_AMBER);
+        return;
     }
+    show_wpa_psk_auditor_page();
 }
 
 static void wpa_auditor_batch_pause_cb(lv_event_t *e)
@@ -68904,6 +69718,7 @@ static void wpa_auditor_batch_pause_cb(lv_event_t *e)
     (void)e;
     if (!wpa_auditor_batch ||
         wpa_auditor_batch->state != HS_AUDIT_BATCH_RUNNING) return;
+    wpa_auditor_batch_cancel_requested = false;
     wpa_auditor_batch_pause_requested = true;
     if (hs_crack_ui.batch_managed && hs_crack_ui.active) {
         hs_crack_ui.cancel_requested = true;
@@ -68919,17 +69734,91 @@ static void wpa_auditor_batch_pause_cb(lv_event_t *e)
     }
 }
 
-static void wpa_auditor_batch_cancel_current_cb(lv_event_t *e)
+static void wpa_auditor_batch_skip_current_cb(lv_event_t *e)
 {
     (void)e;
     if (!wpa_auditor_batch || !hs_crack_ui.batch_managed ||
         !hs_crack_ui.active) return;
     wpa_auditor_batch_pause_requested = false;
+    wpa_auditor_batch_cancel_requested = false;
     hs_crack_ui.cancel_requested = true;
     if (hs_crack_ui.action_btn && lv_obj_is_valid(hs_crack_ui.action_btn))
         lv_obj_add_state(hs_crack_ui.action_btn, LV_STATE_DISABLED);
     if (hs_crack_ui.action_label && lv_obj_is_valid(hs_crack_ui.action_label))
-        lv_label_set_text(hs_crack_ui.action_label, "Cancelling current...");
+        lv_label_set_text(hs_crack_ui.action_label, "Skipping current...");
+}
+
+static void wpa_auditor_batch_cancel_confirm_cb(lv_event_t *e)
+{
+    (void)e;
+    wpa_auditor_confirm_close_cb(NULL);
+    if (!wpa_auditor_batch) return;
+
+    wpa_auditor_batch_pause_requested = false;
+    wpa_auditor_batch_cancel_requested = true;
+    size_t cancelled = hs_audit_queue_cancel_all(wpa_auditor_batch);
+    bool saved = wpa_auditor_batch_save();
+    ESP_LOGI(TAG,
+             "[HS-BATCH] CANCEL_BATCH items=%u active=%u saved=%u",
+             (unsigned)cancelled,
+             (unsigned)(hs_crack_ui.batch_managed && hs_crack_ui.active),
+             (unsigned)saved);
+
+    if (hs_crack_ui.batch_managed && hs_crack_ui.active) {
+        hs_crack_ui.cancel_requested = true;
+        if (hs_crack_ui.action_btn && lv_obj_is_valid(hs_crack_ui.action_btn))
+            lv_obj_add_state(hs_crack_ui.action_btn, LV_STATE_DISABLED);
+        if (hs_crack_ui.action_label && lv_obj_is_valid(hs_crack_ui.action_label))
+            lv_label_set_text(hs_crack_ui.action_label, "Cancelling batch...");
+        return;
+    }
+
+    wpa_auditor_batch_cancel_requested = false;
+    show_wpa_psk_auditor_page();
+    wpa_auditor_set_status(
+        saved ? "Batch cancelled. Files and resume checkpoints were kept."
+              : "Batch stopped, but its cancelled state could not be saved.",
+        saved ? COLOR_MATERIAL_GREEN : COLOR_MATERIAL_RED);
+}
+
+static void wpa_auditor_batch_cancel_request_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!wpa_auditor_page || !lv_obj_is_valid(wpa_auditor_page) ||
+        !wpa_auditor_batch || !wpa_auditor_batch->count ||
+        wpa_auditor_confirm_overlay ||
+        wpa_auditor_batch->state == HS_AUDIT_BATCH_COMPLETE ||
+        wpa_auditor_batch->state == HS_AUDIT_BATCH_CANCELLED) return;
+
+    wpa_auditor_confirm_overlay = lv_obj_create(wpa_auditor_page);
+    lv_obj_set_size(wpa_auditor_confirm_overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(wpa_auditor_confirm_overlay, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(wpa_auditor_confirm_overlay, LV_OPA_70, 0);
+    lv_obj_set_style_border_width(wpa_auditor_confirm_overlay, 0, 0);
+    lv_obj_set_style_pad_all(wpa_auditor_confirm_overlay, 18, 0);
+    lv_obj_set_flex_flow(wpa_auditor_confirm_overlay, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(wpa_auditor_confirm_overlay, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    lv_obj_t *dialog = wpa_auditor_card(wpa_auditor_confirm_overlay);
+    lv_obj_set_width(dialog, lv_pct(90));
+    wpa_auditor_label(dialog, "Cancel entire batch?",
+                      &lv_font_montserrat_22, ui_text_color());
+    wpa_auditor_label(
+        dialog,
+        "All queued and paused items will become Cancelled. Keep files and checkpoints: captures, audit sessions and worker caches are not deleted.",
+        &lv_font_montserrat_14, ui_muted_color());
+    lv_obj_t *actions = lv_obj_create(dialog);
+    lv_obj_set_size(actions, lv_pct(100), 48);
+    lv_obj_set_style_bg_opa(actions, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(actions, 0, 0);
+    lv_obj_set_style_pad_all(actions, 0, 0);
+    lv_obj_set_style_pad_gap(actions, 8, 0);
+    lv_obj_set_flex_flow(actions, LV_FLEX_FLOW_ROW);
+    wpa_auditor_button(actions, "Keep batch", COLOR_MATERIAL_TEAL,
+                       wpa_auditor_confirm_close_cb, false);
+    wpa_auditor_button(actions, "Cancel batch", COLOR_MATERIAL_RED,
+                       wpa_auditor_batch_cancel_confirm_cb, false);
 }
 
 static void wpa_auditor_batch_remove_cb(lv_event_t *e)
@@ -68941,6 +69830,80 @@ static void wpa_auditor_batch_remove_cb(lv_event_t *e)
         (void)wpa_auditor_batch_save();
         show_wpa_psk_auditor_page();
     }
+}
+
+static void wpa_auditor_batch_recover_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!wpa_auditor_batch || hs_crack_ui.active || hs_crack_ui.task ||
+        compromised_transfer_ui.active || compromised_transfer_ui.task)
+        return;
+
+    size_t attached = wpa_auditor_batch_attach_sessions(
+        wpa_auditor_sessions, wpa_auditor_session_count);
+    size_t recovered = hs_audit_queue_recover_unfinished(wpa_auditor_batch);
+    if (!recovered) {
+        wpa_auditor_set_status("This batch has no unfinished items to recover.",
+                               COLOR_MATERIAL_AMBER);
+        return;
+    }
+    if (!wpa_auditor_batch_save()) {
+        hs_audit_queue_result_t restored =
+            hs_audit_queue_load_latest_with_scratch(
+                WPA_AUDITOR_BATCH_A, WPA_AUDITOR_BATCH_B,
+                wpa_auditor_batch, wpa_auditor_batch_scratch, NULL);
+        ESP_LOGW(TAG,
+                 "[HS-BATCH] RECOVER save failed recovered=%u attached=%u restore=%d",
+                 (unsigned)recovered, (unsigned)attached, (int)restored);
+        wpa_auditor_set_status(
+            "Could not save the recovered batch. The previous queue was restored.",
+            COLOR_MATERIAL_RED);
+        return;
+    }
+
+    ESP_LOGI(TAG, "[HS-BATCH] RECOVER items=%u sessions=%u state=%s",
+             (unsigned)recovered, (unsigned)attached,
+             wpa_auditor_batch_run_state_name(wpa_auditor_batch->state));
+    wpa_auditor_batch_log_snapshot("RECOVERED", HS_AUDIT_QUEUE_SLOT_NONE);
+    show_wpa_psk_auditor_page();
+    wpa_auditor_set_status(
+        attached
+            ? "Batch recovered. Resume continues matched checkpoints; remaining unfinished items restart from the beginning."
+            : "Batch recovered. No matching checkpoints were found, so unfinished items restart from the beginning.",
+        attached ? COLOR_MATERIAL_GREEN : COLOR_MATERIAL_AMBER);
+}
+
+static void wpa_auditor_batch_new_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!wpa_auditor_batch ||
+        wpa_auditor_batch->state == HS_AUDIT_BATCH_RUNNING ||
+        hs_crack_ui.active || hs_crack_ui.task ||
+        compromised_transfer_ui.active || compromised_transfer_ui.task)
+        return;
+
+    hs_audit_queue_reset_batch(wpa_auditor_batch);
+    wpa_auditor_batch_pause_requested = false;
+    wpa_auditor_batch_cancel_requested = false;
+    wpa_auditor_batch_expanded = false;
+    if (!wpa_auditor_batch_save()) {
+        hs_audit_queue_result_t restored =
+            hs_audit_queue_load_latest_with_scratch(
+                WPA_AUDITOR_BATCH_A, WPA_AUDITOR_BATCH_B,
+                wpa_auditor_batch, wpa_auditor_batch_scratch, NULL);
+        ESP_LOGW(TAG, "[HS-BATCH] could not start new batch; restore=%d",
+                 (int)restored);
+        wpa_auditor_set_status(
+            "Could not save a new batch. The previous queue was kept.",
+            COLOR_MATERIAL_RED);
+        return;
+    }
+
+    ESP_LOGI(TAG, "[HS-BATCH] new empty batch ready");
+    show_wpa_psk_auditor_page();
+    wpa_auditor_set_status(
+        "New batch ready. Choose a candidate source and add captures.",
+        COLOR_MATERIAL_GREEN);
 }
 
 static void wpa_auditor_batch_expand_cb(lv_event_t *e)
@@ -68965,20 +69928,9 @@ static void wpa_auditor_batch_build_wordlist_options(lv_obj_t *dropdown)
         (void)snprintf(options + used, sizeof(options) - used,
                        "\nALL (Internal + SD)");
     lv_dropdown_set_options(dropdown, options);
-    unsigned selected = 1U;
-    if (wpa_auditor_batch && wpa_auditor_batch->count) {
-        if (wpa_auditor_batch->method == HS_CRACK_METHOD_WORDLIST) {
-            selected = 0U;
-            for (int i = 0; i < hs_crack_ui.wl_count; ++i)
-                if (strcmp(hs_crack_ui.wl_paths[i],
-                           wpa_auditor_batch->wordlist_path) == 0) {
-                    selected = (unsigned)i + 2U;
-                    break;
-                }
-        } else if (wpa_auditor_batch->method == HS_CRACK_METHOD_BOTH) {
-            selected = hs_crack_ui.wl_count > 1
-                           ? (unsigned)hs_crack_ui.wl_count + 2U : 0U;
-        }
+    unsigned selected = wpa_auditor_batch_candidate_source_selection();
+    if (wpa_auditor_batch && wpa_auditor_batch->count &&
+        !hs_audit_queue_can_change_candidate_source(wpa_auditor_batch)) {
         lv_obj_add_state(dropdown, LV_STATE_DISABLED);
     }
     lv_dropdown_set_selected(dropdown, selected);
@@ -68986,6 +69938,7 @@ static void wpa_auditor_batch_build_wordlist_options(lv_obj_t *dropdown)
 
 static void wpa_auditor_batch_render_card(lv_obj_t *body)
 {
+    wpa_auditor_batch_live_item_label = NULL;
     lv_obj_t *card = wpa_auditor_card(body);
     bool loaded = wpa_auditor_batch_ensure_loaded();
     size_t count = loaded ? wpa_auditor_batch->count : 0U;
@@ -69008,35 +69961,39 @@ static void wpa_auditor_batch_render_card(lv_obj_t *body)
             &lv_font_montserrat_12, COLOR_MATERIAL_AMBER);
     }
 
-    unsigned terminal_count = 0, total_progress = 0, workers = 0;
-    uint64_t elapsed_ms = 0, eta_seconds = 0;
-    for (size_t i = 0; i < count; ++i) {
-        const hs_audit_queue_item_t *item = &wpa_auditor_batch->items[i];
-        bool terminal = item->state == HS_AUDIT_ITEM_FOUND ||
-                        item->state == HS_AUDIT_ITEM_NOT_FOUND ||
-                        item->state == HS_AUDIT_ITEM_ERROR ||
-                        item->state == HS_AUDIT_ITEM_INVALID ||
-                        item->state == HS_AUDIT_ITEM_CANCELLED;
-        terminal_count += terminal ? 1U : 0U;
-        total_progress += terminal ? 100U : item->progress_percent;
-        elapsed_ms += item->elapsed_ms;
-        eta_seconds += item->eta_seconds;
-        if (item->state == HS_AUDIT_ITEM_RUNNING) workers = item->worker_count;
-    }
-    char summary[192];
-    snprintf(summary, sizeof(summary),
-             "%u/%u complete  |  %u%% aggregate  |  %llus elapsed\nETA %s%llu%s  |  Tab5 + %u remote",
-             terminal_count, (unsigned)count,
-             count ? total_progress / (unsigned)count : 0U,
-             (unsigned long long)(elapsed_ms / 1000U),
-             eta_seconds ? "" : "--", (unsigned long long)eta_seconds,
-             eta_seconds ? "s" : "", workers);
     wpa_auditor_batch_status = wpa_auditor_label(
-        card, summary, &lv_font_montserrat_14, ui_muted_color());
+        card, "Loading batch status...", &lv_font_montserrat_14,
+        ui_muted_color());
+    wpa_auditor_batch_update_status_label();
 
     wpa_auditor_batch_wordlist = lv_dropdown_create(card);
     lv_obj_set_width(wpa_auditor_batch_wordlist, lv_pct(100));
     wpa_auditor_batch_build_wordlist_options(wpa_auditor_batch_wordlist);
+    lv_obj_add_event_cb(wpa_auditor_batch_wordlist,
+                        wpa_auditor_batch_wordlist_changed_cb,
+                        LV_EVENT_VALUE_CHANGED, NULL);
+    bool candidate_source_editable =
+        hs_audit_queue_can_change_candidate_source(wpa_auditor_batch);
+    bool running = wpa_auditor_batch->state == HS_AUDIT_BATCH_RUNNING;
+    if (running) wpa_auditor_batch_refresh_start();
+    bool runnable = hs_audit_queue_next(wpa_auditor_batch) != SIZE_MAX;
+    bool finished = count && !running && !runnable;
+    size_t recoverable =
+        hs_audit_queue_recoverable_count(wpa_auditor_batch);
+    const char *candidate_source_help =
+        candidate_source_editable
+            ? "Candidate source applies to every queued capture. You can change it until Start batch."
+            : recoverable
+                  ? "This batch has unfinished terminal items. Recover it to reuse matching checkpoints or restart only those items."
+            : finished
+                  ? "Batch finished. Start a new batch to change candidate source."
+                  : wpa_auditor_batch->state == HS_AUDIT_BATCH_PAUSED
+                        ? "Candidate source is locked to preserve resumable progress."
+                        : "Candidate source is locked while this batch is active.";
+    wpa_auditor_label(
+        card, candidate_source_help,
+        &lv_font_montserrat_12,
+        candidate_source_editable ? ui_muted_color() : COLOR_MATERIAL_AMBER);
 
     lv_obj_t *actions = lv_obj_create(card);
     lv_obj_set_size(actions, lv_pct(100), 48);
@@ -69045,18 +70002,46 @@ static void wpa_auditor_batch_render_card(lv_obj_t *body)
     lv_obj_set_style_pad_all(actions, 0, 0);
     lv_obj_set_style_pad_gap(actions, 8, 0);
     lv_obj_set_flex_flow(actions, LV_FLEX_FLOW_ROW);
-    bool running = wpa_auditor_batch->state == HS_AUDIT_BATCH_RUNNING;
-    wpa_auditor_button(actions,
-                       wpa_auditor_batch->state == HS_AUDIT_BATCH_PAUSED
-                           ? "Resume batch" : "Start batch",
-                       COLOR_MATERIAL_TEAL, wpa_auditor_batch_start_cb,
-                       !count || running || hs_crack_ui.active || hs_crack_ui.task);
+    if (finished) {
+        if (recoverable) {
+            wpa_auditor_button(
+                actions, "Recover batch", COLOR_MATERIAL_AMBER,
+                wpa_auditor_batch_recover_cb,
+                hs_crack_ui.active || hs_crack_ui.task ||
+                    compromised_transfer_ui.active ||
+                    compromised_transfer_ui.task);
+        }
+        wpa_auditor_button(
+            actions, "New batch", COLOR_MATERIAL_TEAL,
+            wpa_auditor_batch_new_cb,
+            hs_crack_ui.active || hs_crack_ui.task ||
+                compromised_transfer_ui.active || compromised_transfer_ui.task);
+    } else {
+        wpa_auditor_button(
+            actions,
+            wpa_auditor_batch->state == HS_AUDIT_BATCH_PAUSED
+                ? "Resume batch" : running ? "Batch running" : "Start batch",
+            COLOR_MATERIAL_TEAL, wpa_auditor_batch_start_cb,
+            !count || !runnable || running || hs_crack_ui.active ||
+                hs_crack_ui.task);
+    }
     wpa_auditor_button(actions, "Pause", COLOR_MATERIAL_AMBER,
                        wpa_auditor_batch_pause_cb, !running);
-    wpa_auditor_button(actions, "Cancel current", COLOR_MATERIAL_RED,
-                       wpa_auditor_batch_cancel_current_cb,
+    wpa_auditor_button(actions, "Skip current", COLOR_MATERIAL_AMBER,
+                       wpa_auditor_batch_skip_current_cb,
                        !running || !hs_crack_ui.batch_managed);
-    wpa_auditor_button(actions,
+
+    lv_obj_t *secondary_actions = lv_obj_create(card);
+    lv_obj_set_size(secondary_actions, lv_pct(100), 48);
+    lv_obj_set_style_bg_opa(secondary_actions, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(secondary_actions, 0, 0);
+    lv_obj_set_style_pad_all(secondary_actions, 0, 0);
+    lv_obj_set_style_pad_gap(secondary_actions, 8, 0);
+    lv_obj_set_flex_flow(secondary_actions, LV_FLEX_FLOW_ROW);
+    wpa_auditor_button(secondary_actions, "Cancel batch", COLOR_MATERIAL_RED,
+                       wpa_auditor_batch_cancel_request_cb,
+                       !count || finished || wpa_auditor_batch_cancel_requested);
+    wpa_auditor_button(secondary_actions,
                        wpa_auditor_batch_expanded ? "Hide queue" : "Show queue",
                        COLOR_MATERIAL_BLUE, wpa_auditor_batch_expand_cb,
                        !count);
@@ -69069,6 +70054,8 @@ static void wpa_auditor_batch_render_card(lv_obj_t *body)
         wpa_auditor_batch_list = lv_obj_create(card);
         lv_obj_set_width(wpa_auditor_batch_list, lv_pct(100));
         lv_obj_set_height(wpa_auditor_batch_list, LV_SIZE_CONTENT);
+        lv_obj_clear_flag(wpa_auditor_batch_list, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(wpa_auditor_batch_list, LV_OBJ_FLAG_SCROLL_CHAIN_VER);
         lv_obj_set_style_bg_opa(wpa_auditor_batch_list, LV_OPA_TRANSP, 0);
         lv_obj_set_style_border_width(wpa_auditor_batch_list, 0, 0);
         lv_obj_set_style_pad_all(wpa_auditor_batch_list, 0, 0);
@@ -69078,22 +70065,41 @@ static void wpa_auditor_batch_render_card(lv_obj_t *body)
             const hs_audit_queue_item_t *item = &wpa_auditor_batch->items[i];
             lv_obj_t *row = lv_obj_create(wpa_auditor_batch_list);
             lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
+            lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_add_flag(row, LV_OBJ_FLAG_SCROLL_CHAIN_VER);
             lv_obj_set_style_bg_color(row, ui_bg_color(), 0);
             lv_obj_set_style_border_width(row, 0, 0);
             lv_obj_set_style_radius(row, 10, 0);
             lv_obj_set_style_pad_all(row, 8, 0);
             lv_obj_set_style_pad_gap(row, 6, 0);
             lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
-            char line[240];
-            snprintf(line, sizeof(line), "%u. %.120s\n%s  |  %u%%  |  %llu tried",
-                     (unsigned)(i + 1U), item->name,
-                     wpa_auditor_batch_state_name(item->state),
-                     item->progress_percent, (unsigned long long)item->tried);
+            char line[320];
+            if (item->state == HS_AUDIT_ITEM_FOUND && item->reason[0]) {
+                snprintf(line, sizeof(line),
+                         "%u. %.120s\n%s  |  %u%%  |  %llu tried\nPassword: %.63s",
+                         (unsigned)(i + 1U), item->name,
+                         wpa_auditor_batch_state_name(item->state),
+                         item->progress_percent,
+                         (unsigned long long)item->tried, item->reason);
+            } else {
+                snprintf(line, sizeof(line),
+                         "%u. %.120s\n%s  |  %u%%  |  %llu tried",
+                         (unsigned)(i + 1U), item->name,
+                         wpa_auditor_batch_state_name(item->state),
+                         item->progress_percent,
+                         (unsigned long long)item->tried);
+            }
             lv_obj_t *label = wpa_auditor_label(
-                row, line, &lv_font_montserrat_12, ui_text_color());
+                row, line, &lv_font_montserrat_12,
+                item->state == HS_AUDIT_ITEM_FOUND
+                    ? COLOR_MATERIAL_GREEN
+                    : ui_text_color());
             lv_obj_set_flex_grow(label, 1);
             bool active = item->state == HS_AUDIT_ITEM_RUNNING ||
                           item->state == HS_AUDIT_ITEM_SYNCING;
+            if (active && hs_crack_ui.batch_managed &&
+                hs_crack_ui.batch_item_index == i)
+                wpa_auditor_batch_live_item_label = label;
             wpa_auditor_button_data(
                 row, "Remove", lv_color_hex(0x7A3242),
                 wpa_auditor_batch_remove_cb,
@@ -69107,6 +70113,7 @@ static void show_wpa_psk_auditor_page(void)
     if (!internal_container) return;
     ESP_LOGI(TAG, "[HS-AUDIT] opening dashboard stack_free=%u",
              (unsigned)uxTaskGetStackHighWaterMark(NULL));
+    wpa_auditor_batch_refresh_stop();
     if (internal_tiles) lv_obj_add_flag(internal_tiles, LV_OBJ_FLAG_HIDDEN);
     if (internal_settings_page)
         lv_obj_add_flag(internal_settings_page, LV_OBJ_FLAG_HIDDEN);
@@ -69124,6 +70131,10 @@ static void show_wpa_psk_auditor_page(void)
     wpa_auditor_catalog_scan_btn = NULL;
     wpa_auditor_catalog_sync_all_btn = NULL;
     wpa_auditor_source_dropdown = NULL;
+    wpa_auditor_selection_dock = NULL;
+    wpa_auditor_selection_label = NULL;
+    wpa_auditor_batch_add_btn = NULL;
+    wpa_auditor_batch_clear_btn = NULL;
     wpa_auditor_pending_session = SIZE_MAX;
     if (!wpa_auditor_storage_ready) {
         bool task_started = wpa_auditor_storage_request();
@@ -69185,15 +70196,45 @@ static void show_wpa_psk_auditor_page(void)
                       &lv_font_montserrat_12, ui_muted_color());
 
     lv_obj_t *body = lv_obj_create(wpa_auditor_page);
-    lv_obj_set_width(body, lv_pct(100));
+    lv_obj_set_size(body, lv_pct(100), 0);
     lv_obj_set_flex_grow(body, 1);
     lv_obj_set_style_bg_opa(body, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(body, 0, 0);
     lv_obj_set_style_pad_all(body, 0, 0);
     lv_obj_set_style_pad_gap(body, 10, 0);
     lv_obj_set_flex_flow(body, LV_FLEX_FLOW_COLUMN);
+    lv_obj_add_flag(body, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_scroll_dir(body, LV_DIR_VER);
     lv_obj_set_scrollbar_mode(body, LV_SCROLLBAR_MODE_AUTO);
+
+    wpa_auditor_selection_dock = lv_obj_create(wpa_auditor_page);
+    lv_obj_set_size(wpa_auditor_selection_dock, lv_pct(100), 58);
+    lv_obj_set_style_bg_color(wpa_auditor_selection_dock,
+                              ui_panel_color(), 0);
+    lv_obj_set_style_bg_opa(wpa_auditor_selection_dock, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(wpa_auditor_selection_dock, 1, 0);
+    lv_obj_set_style_border_color(wpa_auditor_selection_dock,
+                                  ui_border_color(), 0);
+    lv_obj_set_style_radius(wpa_auditor_selection_dock, 12, 0);
+    lv_obj_set_style_pad_hor(wpa_auditor_selection_dock, 8, 0);
+    lv_obj_set_style_pad_ver(wpa_auditor_selection_dock, 6, 0);
+    lv_obj_set_style_pad_gap(wpa_auditor_selection_dock, 8, 0);
+    lv_obj_set_flex_flow(wpa_auditor_selection_dock, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(wpa_auditor_selection_dock, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(wpa_auditor_selection_dock, LV_OBJ_FLAG_SCROLLABLE);
+    wpa_auditor_selection_label = wpa_auditor_label(
+        wpa_auditor_selection_dock, "Queue selection: 0",
+        &lv_font_montserrat_14, COLOR_MATERIAL_PURPLE);
+    lv_obj_set_width(wpa_auditor_selection_label, 210);
+    lv_obj_set_flex_grow(wpa_auditor_selection_label, 1);
+    wpa_auditor_batch_clear_btn = wpa_auditor_button(
+        wpa_auditor_selection_dock, "Clear", lv_color_hex(0x52616B),
+        wpa_auditor_clear_selection_cb, true);
+    wpa_auditor_batch_add_btn = wpa_auditor_button(
+        wpa_auditor_selection_dock, "Add selected to queue",
+        COLOR_MATERIAL_PURPLE, wpa_auditor_add_selected_cb, true);
+    wpa_auditor_selection_update();
 
     wpa_auditor_batch_render_card(body);
     ESP_LOGI(TAG, "[HS-AUDIT] batch card ready stack_free=%u",
@@ -69267,8 +70308,11 @@ static void show_wpa_psk_auditor_page(void)
 
             tab_id_t source = wpa_auditor_tab_for_source(
                 session->origin.source);
+            bool capture_available =
+                source == TAB_INTERNAL ? session->origin.local_path[0] != '\0'
+                                       : session->origin.remote_path[0] != '\0';
             bool can_launch = !running && !dashboard_busy &&
-                              source != TAB_INTERNAL &&
+                              capture_available &&
                               wpa_auditor_transport_ready(source);
             lv_obj_t *actions = lv_obj_create(session_box);
             lv_obj_set_size(actions, lv_pct(100), 48);
@@ -69352,11 +70396,6 @@ static void show_wpa_psk_auditor_page(void)
     lv_obj_add_event_cb(wpa_auditor_state_dropdown,
                         wpa_auditor_state_filter_cb, LV_EVENT_VALUE_CHANGED,
                         NULL);
-    wpa_auditor_selection_label = wpa_auditor_label(
-        filter_row, "0 selected", &lv_font_montserrat_14,
-        COLOR_MATERIAL_PURPLE);
-    lv_obj_set_flex_grow(wpa_auditor_selection_label, 1);
-    wpa_auditor_selection_update();
     lv_obj_t *catalog_actions = lv_obj_create(catalog);
     lv_obj_set_size(catalog_actions, lv_pct(100), 48);
     lv_obj_set_style_bg_opa(catalog_actions, LV_OPA_TRANSP, 0);
@@ -69377,29 +70416,10 @@ static void show_wpa_psk_auditor_page(void)
             wpa_auditor_delete_audit_task_handle || hs_crack_ui.active ||
             hs_crack_ui.task ||
             compromised_transfer_ui.active || compromised_transfer_ui.task);
-    lv_obj_t *selection_actions = lv_obj_create(catalog);
-    lv_obj_set_size(selection_actions, lv_pct(100), 48);
-    lv_obj_set_style_bg_opa(selection_actions, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(selection_actions, 0, 0);
-    lv_obj_set_style_pad_all(selection_actions, 0, 0);
-    lv_obj_set_style_pad_gap(selection_actions, 8, 0);
-    lv_obj_set_flex_flow(selection_actions, LV_FLEX_FLOW_ROW);
-    bool catalog_busy = wpa_auditor_catalog_task_handle ||
-                        wpa_auditor_delete_audit_task_handle ||
-                        hs_crack_ui.active || hs_crack_ui.task ||
-                        compromised_transfer_ui.active ||
-                        compromised_transfer_ui.task;
-    wpa_auditor_button(selection_actions, "Select visible",
+    bool catalog_busy = wpa_auditor_queue_edit_busy();
+    wpa_auditor_button(catalog_actions, "Select visible",
                        COLOR_MATERIAL_BLUE, wpa_auditor_select_visible_cb,
                        catalog_busy || !wpa_auditor_catalog);
-    wpa_auditor_batch_clear_btn = wpa_auditor_button(
-        selection_actions, "Clear", lv_color_hex(0x52616B),
-        wpa_auditor_clear_selection_cb,
-        catalog_busy || !wpa_auditor_batch_selected_count);
-    wpa_auditor_batch_add_btn = wpa_auditor_button(
-        selection_actions, "Add to queue", COLOR_MATERIAL_PURPLE,
-        wpa_auditor_add_selected_cb,
-        catalog_busy || !wpa_auditor_batch_selected_count);
     wpa_auditor_catalog_status = wpa_auditor_label(
         catalog,
         wpa_auditor_catalog
@@ -69492,7 +70512,8 @@ static void compromised_file_copy_cb(lv_event_t *e)
                                  (uint64_t)(file->size_bytes > 0
                                                 ? file->size_bytes
                                                 : 0),
-                                 kind == COMPROMISED_FILE_KIND_HANDSHAKE);
+                                 kind == COMPROMISED_FILE_KIND_HANDSHAKE,
+                                 false);
 }
 
 void app_main(void)

@@ -179,10 +179,68 @@ python3 tests/test_wpa_psk_auditor_contract.py
    restore the interrupted item as Paused, preserve its `session_id`, wordlist
    fingerprint and remaining queue, and `Resume batch` must continue that item
    before later queued captures.
-17. **Cancel/remove isolation:** `Cancel current` must mark only the current
-   item Cancelled and continue with the next queued capture. Removing a queued,
+17. **Skip/remove isolation:** `Skip current` must mark only the current item
+   Cancelled and continue with the next queued capture. Removing a queued,
    paused or terminal row must change only the batch journal; capture files,
    validation sidecars, resumable sessions and Monster caches must remain.
+18. **Whole-batch cancellation:** press `Cancel batch`, reject the confirmation
+   once and confirm the queue is unchanged. Confirm it the second time while an
+   item is active. The current coordinator must stop cooperatively, every
+   remaining Queued/Syncing/Running/Paused row must become Cancelled, and no
+   later row may start. Reboot and verify the batch is still Cancelled while
+   captures, validation sidecars, resumable sessions, history and Monster
+   caches remain available.
+19. **Aggregate CSV quoting:** finish an audit whose SSID or recovered password
+   contains a comma or quote. `crack_state.csv` must contain valid doubled-quote
+   CSV fields and remain readable after another partial update of the same
+   capture. Existing legacy unquoted rows must remain importable.
+20. **Duplicate queue prevention:** add one capture to the batch, then locate it
+   again through the catalog, Resume audits and the legacy Crack dialog. The
+   catalog must show `IN QUEUE` with a disabled checkbox, Select visible must
+   skip it, and the legacy dialog must show `Already queued`. Repeated or stale
+   actions must not increase the batch item count or start another sync.
+21. **Resume into batch:** cancel a batch that has a resumable current item,
+   open that exact row under `Resumable audits`, and choose `Add to queue`.
+   Tab5 must reactivate the existing Cancelled row as Paused without increasing
+   the item count, persist the selected session ID, and enable `Resume batch`.
+   Starting the batch must continue the saved offsets. Repeat with a resumable
+   audit not yet present in the queue, first from a LOCAL capture and then from
+   a remote-only capture: both new rows must retain their session ID through
+   the optional Sync to Tab5 step and resume rather than restart from zero.
+22. **Append while running:** start a long batch item, keep the Auditor open,
+   filter the catalog to LOCAL and select a different valid `New` capture.
+   Its checkbox and `Add to queue` must remain enabled. Adding it must preserve
+   the current Running item and append exactly one Queued row at the tail; the
+   next scheduler pass must start it normally. Audit, Sync, Delete and a
+   remote-only capture that still requires Sync must remain disabled while the
+   active job owns the worker transports. Repeat during Pause/Cancel transition
+   and confirm queue editing is temporarily disabled until the transition ends.
+23. **Running-queue eligibility clarity:** while a batch item is running, the
+   catalog must label duplicate captures `IN QUEUE`, local captures that did
+   not pass preflight `NOT READY`, and remote-only captures `PAUSE TO SYNC`.
+   The catalog status must explain that a different, validated LOCAL capture
+   can still be selected and appended without pausing the active job.
+24. **Explicit terminal recovery:** cancel a mixed batch containing one
+   completed result, one item with a resumable session and one unstarted item.
+   Reboot and verify that nothing starts automatically. `Recover batch` must
+   preserve the completed result, restore the matched item as Paused with its
+   exact session metrics, restore the unstarted item as Queued, persist the A/B
+   journal and then expose the normal Resume/Start action. The boot log must
+   identify the selected A/B slot, sequence, batch state and every item state.
+   Repeat after deleting the resumable session from the Auditor. Recovery must
+   revalidate the saved `session_id`, reject the stale link and restore that
+   item as Queued from zero instead of offering a broken Resume action.
+25. **Viewport-local queue action:** refresh all sources, filter the catalog to
+   LOCAL and scroll to a capture near the end of the list. Selecting its
+   checkbox must immediately enable the fixed bottom `Add selected to queue`
+   action without moving the scroll position. `Clear` must deselect the row,
+   and both actions must remain visible in landscape and 90-degree rotation.
+26. **Selection action after refresh:** select one or more valid captures,
+   refresh the catalog, and wait until all source scans finish. The fixed dock
+   must show that it is waiting during the scan and become actionable again
+   when the scan completes without requiring a page exit/re-entry. A handled
+   tap must log `[HS-BATCH] ADD_SELECTED`; a concurrent scan, sync or transfer
+   must produce an explicit busy reason instead of silently ignoring the tap.
 
 Record serial excerpts for every terminal `ARTIFACT/1` response and retain SD
 directory listings from before and after the test as the non-destructive proof.

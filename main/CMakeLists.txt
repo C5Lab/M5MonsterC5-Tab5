@@ -12,6 +12,7 @@ idf_component_register(SRCS
                     "hs_audit_queue.c"
                     "hs_artifact_inventory.c"
                     "hs_crack_cache.c"
+                    "hs_crack_state.c"
                     "hs_crack_crypto.c"
                     "hs_crack_remote_core.c"
                     "hs_crack_scheduler.c"

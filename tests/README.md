@@ -204,18 +204,49 @@ gcc -std=c17 -Wall -Wextra -Werror -fsanitize=address,undefined -I main \
     tests/hs_audit_queue_test.c main/hs_audit_queue.c \
     -o /tmp/hs_audit_queue_test
 /tmp/hs_audit_queue_test
+
+gcc -std=c17 -Wall -Wextra -Werror -fsanitize=address,undefined -I main \
+    tests/hs_crack_state_test.c main/hs_crack_state.c \
+    -o /tmp/hs_crack_state_test
+/tmp/hs_crack_state_test
 ```
 
 These pin structured PCAP qualification, the versioned A/B session codec,
 independent per-session stores with legacy checkpoint compatibility,
 immutable bounded history, strict fragmented `ARTIFACT/1` parsing, request and
 snapshot correlation, legacy inventory rows and exact/provisional catalog
-identity. They do not compile firmware.
+identity. The queue suite also pins whole-batch cancellation without deleting
+terminal results or resume metadata, plus controlled reactivation of only a
+Cancelled item as a Paused resumable item. It also covers explicit recovery of
+a terminal mixed batch: matching checkpoint items become Paused, unfinished
+items without checkpoints restart as Queued, and completed/invalid results stay
+terminal. The dashboard contract additionally requires every persisted
+`session_id` to be reloaded and identity-checked before terminal recovery; a
+deleted or mismatched checkpoint is cleared and the item restarts as Queued.
+The crack-state suite pins legacy-row
+compatibility and lossless quoted CSV fields containing commas, quotes and
+embedded line breaks, including recovery of an interrupted `.bak` publish.
+They do not compile firmware.
 
 `python tests/test_wpa_psk_auditor_contract.py` additionally pins the LVGL
 integration: LOCAL/Grove/USB/M-BUS discovery stays serialized behind per-link
 console ownership, `ARTIFACT/1` falls back to `list_dir -s`, and catalog rows
 expose their source plus `Audit` and resumable `Sync to Tab5` actions.
+It also requires already queued captures to be labelled and disabled in the
+catalog, skipped by bulk selection and rejected again by the append boundary.
+An exact Resume may reactivate its existing Cancelled row in place, while a new
+local or remotely synchronized row must carry its selected session ID into the
+batch journal.
+The catalog contract also separates transport ownership from queue editing: a
+running batch may accept another validated LOCAL capture at its tail, while
+remote-only work that first needs Sync remains blocked until transports are
+free. Multi-selection actions live in a fixed footer outside the scrollable
+dashboard body, so selecting a capture at the end of a long catalog does not
+require returning to the top before enqueueing it. The footer's enabled state
+is reconciled when catalog scans start and finish even when the selection itself
+did not change, and handled taps emit an `ADD_SELECTED` diagnostic instead of
+failing silently. The queue unit suite pins
+that this append preserves the current Running item and scheduler index.
 It also pins the catalog-wide `Sync all to Tab5` queue: invalid captures are
 excluded, exact remote duplicates share one transfer, provisional duplicates
 with matching name/size/format are coalesced, and every worker path is indexed

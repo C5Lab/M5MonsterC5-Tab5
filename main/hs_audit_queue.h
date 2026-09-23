@@ -65,6 +65,7 @@ typedef struct {
     uint64_t tried;
     uint64_t elapsed_ms;
     uint64_t eta_seconds;
+    /* Error/invalid detail, or the recovered password for FOUND items. */
     char reason[HS_AUDIT_QUEUE_REASON_MAX];
 } hs_audit_queue_item_t;
 
@@ -86,13 +87,20 @@ typedef struct {
 } hs_audit_queue_t;
 
 void hs_audit_queue_init(hs_audit_queue_t *queue, uint64_t batch_id);
+void hs_audit_queue_reset_batch(hs_audit_queue_t *queue);
 hs_audit_queue_result_t hs_audit_queue_append(
     hs_audit_queue_t *queue, const hs_audit_queue_item_t *item);
 bool hs_audit_queue_transition(hs_audit_queue_t *queue, size_t index,
                                hs_audit_item_state_t state);
 bool hs_audit_queue_remove(hs_audit_queue_t *queue, size_t index);
+size_t hs_audit_queue_cancel_all(hs_audit_queue_t *queue);
+bool hs_audit_queue_resume_cancelled(hs_audit_queue_t *queue, size_t index);
+size_t hs_audit_queue_recoverable_count(const hs_audit_queue_t *queue);
+size_t hs_audit_queue_recover_unfinished(hs_audit_queue_t *queue);
 size_t hs_audit_queue_next(const hs_audit_queue_t *queue);
 bool hs_audit_queue_reconcile_after_boot(hs_audit_queue_t *queue);
+bool hs_audit_queue_can_change_candidate_source(
+    const hs_audit_queue_t *queue);
 
 hs_audit_queue_result_t hs_audit_queue_encode(
     const hs_audit_queue_t *queue, uint8_t *output, size_t capacity,

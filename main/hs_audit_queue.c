@@ -117,6 +117,15 @@ void hs_audit_queue_init(hs_audit_queue_t *queue, uint64_t batch_id)
     queue->current_index = SIZE_MAX;
 }
 
+void hs_audit_queue_reset_batch(hs_audit_queue_t *queue)
+{
+    if (!queue) return;
+    uint64_t batch_id = queue->batch_id;
+    uint64_t sequence = queue->sequence;
+    hs_audit_queue_init(queue, batch_id);
+    queue->sequence = sequence;
+}
+
 hs_audit_queue_result_t hs_audit_queue_append(
     hs_audit_queue_t *queue, const hs_audit_queue_item_t *item)
 {
@@ -171,6 +180,84 @@ bool hs_audit_queue_remove(hs_audit_queue_t *queue, size_t index)
     return true;
 }
 
+size_t hs_audit_queue_cancel_all(hs_audit_queue_t *queue)
+{
+    if (!queue) return 0U;
+    size_t changed = 0U;
+    for (size_t i = 0; i < queue->count; ++i) {
+        if (!terminal(queue->items[i].state)) {
+            queue->items[i].state = HS_AUDIT_ITEM_CANCELLED;
+            ++changed;
+        }
+    }
+    queue->state = HS_AUDIT_BATCH_CANCELLED;
+    queue->current_index = SIZE_MAX;
+    return changed;
+}
+
+bool hs_audit_queue_resume_cancelled(hs_audit_queue_t *queue, size_t index)
+{
+    if (!queue || index >= queue->count ||
+        queue->items[index].state != HS_AUDIT_ITEM_CANCELLED)
+        return false;
+
+    queue->items[index].state = HS_AUDIT_ITEM_PAUSED;
+    if (queue->state != HS_AUDIT_BATCH_RUNNING) {
+        queue->state = HS_AUDIT_BATCH_PAUSED;
+        queue->current_index = index;
+    }
+    return true;
+}
+
+size_t hs_audit_queue_recoverable_count(const hs_audit_queue_t *queue)
+{
+    if (!queue) return 0U;
+    size_t count = 0U;
+    for (size_t i = 0; i < queue->count; ++i) {
+        hs_audit_item_state_t state = queue->items[i].state;
+        if (state == HS_AUDIT_ITEM_CANCELLED || state == HS_AUDIT_ITEM_ERROR)
+            ++count;
+    }
+    return count;
+}
+
+size_t hs_audit_queue_recover_unfinished(hs_audit_queue_t *queue)
+{
+    if (!queue || queue->state == HS_AUDIT_BATCH_RUNNING) return 0U;
+    for (size_t i = 0; i < queue->count; ++i) {
+        if (queue->items[i].state == HS_AUDIT_ITEM_RUNNING ||
+            queue->items[i].state == HS_AUDIT_ITEM_SYNCING)
+            return 0U;
+    }
+    size_t recovered = 0U;
+    size_t first_paused = SIZE_MAX;
+    for (size_t i = 0; i < queue->count; ++i) {
+        hs_audit_queue_item_t *item = &queue->items[i];
+        if (item->state != HS_AUDIT_ITEM_CANCELLED &&
+            item->state != HS_AUDIT_ITEM_ERROR)
+            continue;
+
+        item->reason[0] = '\0';
+        if (item->has_session) {
+            item->state = HS_AUDIT_ITEM_PAUSED;
+            if (first_paused == SIZE_MAX) first_paused = i;
+        } else {
+            item->state = HS_AUDIT_ITEM_QUEUED;
+            item->progress_percent = 0U;
+            item->worker_count = 0U;
+            item->tried = 0U;
+            item->elapsed_ms = 0U;
+            item->eta_seconds = 0U;
+        }
+        ++recovered;
+    }
+    if (!recovered) return 0U;
+    queue->current_index = first_paused;
+    queue->state = first_paused == SIZE_MAX ? HS_AUDIT_BATCH_READY
+                                            : HS_AUDIT_BATCH_PAUSED;
+    return recovered;
+}
+
 size_t hs_audit_queue_next(const hs_audit_queue_t *queue)
 {
     if (!queue) return SIZE_MAX;
@@ -181,6 +268,17 @@ size_t hs_audit_queue_next(const hs_audit_queue_t *queue)
         if (queue->items[i].state == HS_AUDIT_ITEM_QUEUED) return i;
     }
     return SIZE_MAX;
+}
+
+bool hs_audit_queue_can_change_candidate_source(
+    const hs_audit_queue_t *queue)
+{
+    if (!queue || queue->state != HS_AUDIT_BATCH_READY ||
+        queue->current_index != SIZE_MAX) return false;
+    for (size_t i = 0; i < queue->count; ++i) {
+        if (queue->items[i].state != HS_AUDIT_ITEM_QUEUED) return false;
+    }
+    return true;
 }
 
 bool hs_audit_queue_reconcile_after_boot(hs_audit_queue_t *queue)
@@ -429,6 +527,16 @@ static hs_audit_queue_result_t write_slot(const char *path,
     if (file && fclose(file) != 0) ok = false;
     free(wire);
     if (!ok) { unlink(temporary); return HS_AUDIT_QUEUE_IO_ERROR; }
+
+    /* FatFs f_rename() returns FR_EXIST instead of replacing an existing
+     * destination.  Once both journal slots have been written, every later
+     * checkpoint revisits one of those paths, so remove only that older slot
+     * before publishing the fully flushed temporary file.  The other A/B
+     * slot remains a valid recovery point throughout this operation. */
+    if (unlink(path) != 0 && errno != ENOENT) {
+        unlink(temporary);
+        return HS_AUDIT_QUEUE_IO_ERROR;
+    }
     if (rename(temporary, path) != 0) {
         unlink(temporary);
         return HS_AUDIT_QUEUE_IO_ERROR;

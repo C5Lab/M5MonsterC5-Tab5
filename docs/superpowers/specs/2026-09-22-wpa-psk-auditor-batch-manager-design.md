@@ -22,8 +22,10 @@ and reuses the current CRACK/1 worker protocol without new commands.
 5. Start or resume the batch. Exactly one capture is audited at a time, while
    that audit distributes its dictionary ranges across Tab5 and all workers.
 6. Pause preserves the current crack checkpoint and prevents the next item
-   from starting. Cancel current interrupts only the current item and leaves
-   the rest of the queue intact. Remove affects only non-running queue items.
+   from starting. Skip current marks only the active item Cancelled and starts
+   the next runnable item. Cancel batch requires confirmation, marks every
+   remaining non-terminal item Cancelled and never advances. Remove affects
+   only non-running queue items.
 
 ## Ownership and data model
 
@@ -69,10 +71,16 @@ The worker preparation and distributed range logic is identical after that
 boundary. A local capture does not attempt `save_pass` to a source Monster;
 recovered credentials are still stored in local `cracked.txt`.
 
-Pause is cooperative: request the normal cracker cancellation, wait for the
-existing checkpoint/history path, then mark the item and batch paused. Resume
-loads the linked session when it still matches the capture and wordlist;
-otherwise the item remains in error with an actionable reason.
+Pause, Skip current and Cancel batch are cooperative: request the normal
+cracker cancellation and wait for the existing checkpoint/history path. Pause
+then marks the active item and batch Paused. Skip marks that item Cancelled but
+keeps the batch Running so the next item starts. Cancel batch first persists a
+Cancelled batch and all remaining non-terminal rows, then stops the active
+coordinator; its completion hook is explicitly barred from launching another
+item. All three paths retain capture files, validation sidecars, resumable
+sessions and worker caches. Resume loads the linked session when it still
+matches the capture and wordlist; otherwise the item remains in error with an
+actionable reason.
 
 ## Catalog and validation
 
@@ -94,12 +102,16 @@ The Auditor page adds a compact Batch queue section above the catalog:
 - current item and `x / n` aggregate progress;
 - elapsed time, ETA and active worker count;
 - shared candidate-source dropdown;
-- Start/Resume, Pause, Cancel current and Remove controls;
+- Start/Resume, Pause, Skip current, confirmed Cancel batch and Remove controls;
 - a collapsible queue list with per-item state and progress.
 
 Catalog actions show `n selected`, Select visible, Clear and Add to queue.
 Disabled controls explain their prerequisite in the nearby status line. The
 existing single-capture Audit action and Compromised Data flow remain available.
+An asset already represented by any batch item is labelled `IN QUEUE`; its
+checkbox is disabled and Select visible skips it. The queue model still checks
+the stable size/CRC identity at append time so stale UI events cannot create a
+duplicate or trigger an unnecessary remote synchronization.
 
 ## Failure and recovery policy
 
@@ -113,6 +125,8 @@ existing single-capture Audit action and Compromised Data flow remain available.
 - Wordlist changed: do not substitute silently; show Error and require the user
   to choose/requeue with the new source.
 - Password found: finish the current item as Found, persist it, then continue.
+- Cancel batch: persist all non-terminal rows as Cancelled, stop the active
+  coordinator, retain its last safe checkpoint and do not launch a successor.
 
 ## Acceptance
 
@@ -122,6 +136,8 @@ existing single-capture Audit action and Compromised Data flow remain available.
 - Pausing during preparation and cracking releases every transport and leaves
   a resumable item.
 - Removing an item never removes its capture, session or history.
+- Cancelling a batch never removes captures, validation reports, crack
+  sessions, history or worker caches, and cannot auto-start the next row.
 - Single-file Compromised Data and Auditor Resume flows remain unchanged.
 - Host tests cover persistence, CRC fallback, transition guards, reboot
   reconciliation, selection/filter derivation and coordinator decisions.
