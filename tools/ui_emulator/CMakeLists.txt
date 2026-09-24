@@ -26,6 +26,7 @@ file(GLOB PCAP_COMPONENT_SOURCES "${REPO_ROOT}/components/pcap_*/*.c")
 add_executable(emulator
     "${REPO_ROOT}/main/app_keyboard.c"
     "${REPO_ROOT}/main/app_keyboard_navigation.c"
+    "${REPO_ROOT}/main/app_keyboard_rotation.c"
     generated/browser.c
     runtime/runtime.c
     vendor/sha256.c

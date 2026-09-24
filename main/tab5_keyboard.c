@@ -13,7 +13,10 @@ static i2c_master_bus_handle_t keyboard_bus;
 static i2c_master_dev_handle_t keyboard_device;
 static QueueHandle_t key_queue;
 static atomic_bool connected;
+static atomic_uint discard_requested;
+static atomic_uint discard_completed;
 static bool (*on_activity)(void);
+static bool (*on_state)(bool);
 static bool started;
 
 static bool read_register(void *ctx, uint8_t reg, uint8_t *data, size_t size)
@@ -50,6 +53,17 @@ static void keyboard_task(void *arg)
             }
         }
 
+        /* Only the producer touches I2C. Flush its FIFO and any in-flight
+         * event before acknowledging a newly revealed confirmation dialog. */
+        unsigned discard_generation = atomic_load(&discard_requested);
+        if (discard_generation != atomic_load(&discard_completed)) {
+            if (write_register(NULL, 0x02, 0)) {
+                xQueueReset(key_queue);
+                atomic_store(&discard_completed, discard_generation);
+            } else {
+                kb.connected = false;
+            }
+        }
         if (++heartbeat >= 25) {
             uint8_t mode;
             /* A keyboard MCU reset may still ACK while reverting to Normal mode. */
@@ -80,6 +94,12 @@ static void keyboard_timer(lv_timer_t *timer)
         app_keyboard_set_connected(current);
         ui_connected = current;
     }
+    if (on_state && on_state(current)) {
+        atomic_fetch_add(&discard_requested, 1);
+        xQueueReset(key_queue);
+        return;
+    }
+    if (atomic_load(&discard_requested) != atomic_load(&discard_completed)) return;
     tab5_key_t key;
     for (unsigned i = 0; i < 8 && xQueueReceive(key_queue, &key, 0) == pdTRUE; ++i) {
         if (!current) continue;
@@ -95,7 +115,7 @@ static void keyboard_timer(lv_timer_t *timer)
     }
 }
 
-esp_err_t tab5_keyboard_init(bool (*activity_cb)(void))
+esp_err_t tab5_keyboard_init(bool (*activity_cb)(void), bool (*state_cb)(bool))
 {
     if (started) return ESP_OK;
     const i2c_master_bus_config_t bus_config = {
@@ -122,6 +142,7 @@ esp_err_t tab5_keyboard_init(bool (*activity_cb)(void))
     lv_timer_t *timer = lv_timer_create(keyboard_timer, 20, NULL);
     if (!timer) { err = ESP_ERR_NO_MEM; goto fail_queue; }
     on_activity = activity_cb;
+    on_state = state_cb;
     if (xTaskCreate(keyboard_task, "tab5_keyboard", 4096, NULL, 3, NULL) != pdPASS) {
         lv_timer_delete(timer);
         err = ESP_ERR_NO_MEM;

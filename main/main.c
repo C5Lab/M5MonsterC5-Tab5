@@ -33,6 +33,7 @@
 #include "lvgl.h"
 #include "app_keyboard.h"
 #include "app_keyboard_navigation.h"
+#include "app_keyboard_rotation.h"
 #include "tab5_keyboard.h"
 #if LV_USE_TINY_TTF
 #include "src/libs/tiny_ttf/lv_tiny_ttf.h"
@@ -51893,18 +51894,21 @@ static void save_screen_timeout_to_nvs(uint8_t setting)
 }
 
 // Save screen rotation setting to NVS
-static void save_screen_rotation_to_nvs(uint8_t setting)
+static esp_err_t save_screen_rotation_to_nvs(uint8_t setting)
 {
     nvs_handle_t nvs;
     esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs);
     if (err == ESP_OK) {
-        nvs_set_u8(nvs, NVS_KEY_SCREEN_ROT, setting);
-        nvs_commit(nvs);
+        err = nvs_set_u8(nvs, NVS_KEY_SCREEN_ROT, setting);
+        if (err == ESP_OK) err = nvs_commit(nvs);
         nvs_close(nvs);
+    }
+    if (err == ESP_OK) {
         ESP_LOGI(TAG, "Saved Screen Rotation to NVS: %d deg", setting * 90);
     } else {
-        ESP_LOGE(TAG, "Failed to open NVS for writing Screen Rotation: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "Failed to save Screen Rotation: %s", esp_err_to_name(err));
     }
+    return err;
 }
 
 // Save screen brightness setting to NVS
@@ -54234,6 +54238,37 @@ static void screen_rotation_restart_cb(lv_event_t *e)
     vTaskDelay(pdMS_TO_TICKS(60));
 
     esp_restart();
+}
+
+static bool keyboard_rotation_apply(void)
+{
+    if (save_screen_rotation_to_nvs(1) != ESP_OK) return false;
+    screen_rotation_setting = 1;
+    screen_rotation_restart_cb(NULL);
+    return true;
+}
+
+static void keyboard_rotation_style(lv_obj_t *overlay, lv_obj_t *card,
+                                    lv_obj_t *no, lv_obj_t *yes)
+{
+    style_modal_overlay(overlay, LV_OPA_50);
+    style_popup_card(card, 12, ui_tab_icon_color());
+    lv_obj_set_style_text_font(card, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(card, ui_text_color(), 0);
+    lv_obj_t *title = lv_obj_get_child(card, 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, dark_mode_enabled ? COLOR_LAB5_MAGENTA : ui_tab_icon_color(), 0);
+    style_neutral_button(no);
+    style_neutral_button(yes);
+    lv_obj_set_style_bg_color(yes, COLOR_MATERIAL_AMBER, 0);
+    lv_obj_set_style_text_color(yes, lv_color_black(), 0);
+}
+
+static bool keyboard_state_cb(bool connected)
+{
+    return app_keyboard_rotation_update(connected,
+        !splash_screen && !screen_dimmed && !lock_overlay,
+        screen_rotation_active() != LV_DISPLAY_ROTATION_90);
 }
 
 // Show Screen Rotation popup with dropdown
@@ -70825,7 +70860,8 @@ void app_main(void)
     // Show splash screen with animation (will transition to main tiles when done)
     bsp_display_lock(0);
     show_splash_screen();
-    esp_err_t keyboard_err = tab5_keyboard_init(keyboard_activity_cb);
+    app_keyboard_rotation_init(keyboard_rotation_apply, keyboard_rotation_style);
+    esp_err_t keyboard_err = tab5_keyboard_init(keyboard_activity_cb, keyboard_state_cb);
     if (keyboard_err != ESP_OK) {
         ESP_LOGW(TAG, "Physical keyboard unavailable: %s", esp_err_to_name(keyboard_err));
     }

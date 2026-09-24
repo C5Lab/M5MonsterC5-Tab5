@@ -11,6 +11,9 @@ bool tab5_keyboard_connect(tab5_keyboard_protocol_t *kb, const tab5_keyboard_io_
     kb->failures = 0;
     if (!io->read(io->ctx, 0xfe, &version, 1) || version == 0xff ||
         !io->read(io->ctx, 0xff, &address, 1) || address != 0x6d ||
+        /* Global RGB brightness: 0=off, 1=lowest nonzero, 100=maximum.
+         * Reapply on every connection; preserve the firmware's status colors. */
+        !io->write(io->ctx, 0x03, 1) ||
         !io->write(io->ctx, 0x10, 2) ||
         !io->read(io->ctx, 0x10, &mode, 1) || mode != 2 ||
         !io->write(io->ctx, 0x00, 0) || /* Polling: no interrupt pin ownership. */

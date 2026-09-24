@@ -22,6 +22,7 @@ with tempfile.TemporaryDirectory(prefix="tab5-keyboard-tests-") as tmp:
     # Compile against the actual bundled LVGL, not a mock of its lifecycle.
     # Disabled optional integrations preprocess to empty translation units.
     sources = ["main/app_keyboard.c", "main/app_keyboard_navigation.c",
+               "main/app_keyboard_rotation.c",
                "main/tab5_keyboard_protocol.c"]
     sources += [str(p) for p in sorted((lvgl / "src").rglob("*.c"))
                 if not {"drivers", "gltf"}.intersection(p.relative_to(lvgl / "src").parts)]
@@ -37,7 +38,8 @@ with tempfile.TemporaryDirectory(prefix="tab5-keyboard-tests-") as tmp:
     except subprocess.CalledProcessError as error:
         print(error.stderr.decode(), flush=True)
         raise
-    for index, test in enumerate(("app_keyboard_test", "app_keyboard_navigation_test")):
+    for index, test in enumerate(("app_keyboard_test", "app_keyboard_navigation_test",
+                                 "app_keyboard_rotation_test")):
         test_obj = compile_source((len(sources) + index, f"tests/{test}.c"))
         binary = build / test
         subprocess.run(flags + objects + [test_obj, "-lm", "-o", str(binary)], check=True)

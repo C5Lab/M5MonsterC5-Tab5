@@ -4,6 +4,10 @@ The A164 [M5Stack Tab5 Keyboard](https://docs.m5stack.com/en/tab5/Tab5_Keyboard)
 is detected automatically on Ext.Port1: SDA GPIO0, SCL GPIO1, default I2C
 address `0x6D`. No Setup toggle is needed.
 
+At startup and every reconnection, global RGB LED brightness is set to `1`
+(the lowest nonzero level in the 0–100 range, register `0x03`). The keyboard's
+status colors and indicator behavior are preserved.
+
 - After successful identification and Character-mode initialization, physical
   input replaces the on-screen keyboard in the application's text fields.
 - Detection runs at startup and every 500 ms while disconnected. After three
@@ -68,6 +72,15 @@ Screen code explicitly registers existing dismissal controls with
 `app_keyboard_navigation_register_escape()`. New dialogs should register their
 Close/Cancel button too; the router never guesses an action from a label/icon
 and does not substitute a Stop, Save or confirmation action for a missing exit.
+
+When a keyboard is detected and the active screen orientation is not 90 degrees,
+a **Keyboard detected** dialog offers to switch to 90. **Yes** saves the setting
+and restarts the device; **No** or **Esc** leaves it unchanged. The question is
+asked once per connection, including a keyboard already attached at startup.
+It waits until the splash has finished and the screen is awake and unlocked.
+Disconnecting dismisses the dialog; reconnecting allows another question. A save
+failure is shown in the dialog without restarting. The default keyboard action
+is **No**; navigate to **Yes** to confirm with Enter/Space, or tap it.
 
 The driver uses I2C controller 1 at 100 kHz and polls every 20 ms in a worker
 task, so bus timeouts do not block LVGL. GPIO50 (INT) is not required. System

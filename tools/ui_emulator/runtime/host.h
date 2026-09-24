@@ -18,6 +18,7 @@
 #include "lvgl.h"
 #include "app_keyboard.h"
 #include "app_keyboard_navigation.h"
+#include "app_keyboard_rotation.h"
 #include "pcap_reader.h"
 #include "pcap_summary.h"
 #include "pcap_flow.h"

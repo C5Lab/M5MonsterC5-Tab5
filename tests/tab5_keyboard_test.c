@@ -8,6 +8,9 @@
  * https://github.com/m5stack/M5Tab5-Keyboard-Internal-FW/blob/main/code/Keyboard_APP/Core/User/i2c/user_i2c_callback.c
  */
 static bool plugged = true, fail_write;
+static bool fail_brightness_write;
+static uint8_t brightness = 20;
+static unsigned brightness_writes;
 static unsigned pending;
 static uint8_t mode, length;
 static uint8_t payload[10];
@@ -34,6 +37,11 @@ static bool write_reg(void *ctx, uint8_t reg, uint8_t value)
 {
     (void)ctx;
     if (!plugged || fail_write) return false;
+    if (reg == 0x03) {
+        if (fail_brightness_write) return false;
+        brightness = value;
+        brightness_writes++;
+    }
     if (reg == 0x10) mode = value;
     if (reg == 0x02) pending = 0;
     return true;
@@ -62,6 +70,7 @@ int main(void)
     pending = 1;
     assert(tab5_keyboard_connect(&kb, &io));
     assert(kb.connected && mode == 2 && pending == 0);
+    assert(brightness == 1 && brightness_writes == 1);
     assert(!tab5_keyboard_poll(&kb, &io, &key));
     assert(kb.connected); /* Empty queue is not a disconnect. */
     put("A", 0);
@@ -110,7 +119,13 @@ int main(void)
     for (int i = 0; i < 3; ++i) tab5_keyboard_poll(&kb, &io, &key);
     assert(!kb.connected);
     plugged = true;
+    brightness = 20; /* Keyboard power cycle restores its bright default. */
+    fail_brightness_write = true;
+    assert(!tab5_keyboard_connect(&kb, &io));
+    assert(!kb.connected && brightness == 20);
+    fail_brightness_write = false;
     assert(tab5_keyboard_connect(&kb, &io));
+    assert(brightness == 1 && brightness_writes == 2);
     put("!", 0);
     assert(tab5_keyboard_poll(&kb, &io, &key) && key.character == '!');
     puts("Tab5 keyboard protocol: PASS");
