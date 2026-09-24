@@ -1,6 +1,10 @@
 file(TO_CMAKE_PATH "$ENV{IDF_PATH}" HS_CRACK_IDF_PATH)
 idf_component_register(SRCS
                     "main.c"
+                    "app_keyboard.c"
+                    "app_keyboard_navigation.c"
+                    "tab5_keyboard.c"
+                    "tab5_keyboard_protocol.c"
                     "app_power_manager.c"
                     "app_power_telemetry.c"
                     "scan_filter.c"

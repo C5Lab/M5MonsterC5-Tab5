@@ -1,4 +1,5 @@
 #include "subghz_host.h"
+#include "app_keyboard_navigation.h"
 #include "subghz_internal.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -83,7 +84,10 @@ lv_obj_t *subghz_create_header(lv_obj_t *parent, const char *title,
     lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x333333), 0);
     lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x444444), LV_STATE_PRESSED);
     lv_obj_set_style_radius(back_btn, 8, 0);
-    if (on_back) lv_obj_add_event_cb(back_btn, on_back, LV_EVENT_CLICKED, NULL);
+    if (on_back) {
+        lv_obj_add_event_cb(back_btn, on_back, LV_EVENT_CLICKED, NULL);
+        app_keyboard_navigation_register_escape(back_btn);
+    }
 
     lv_obj_t *back_icon = lv_label_create(back_btn);
     lv_label_set_text(back_icon, LV_SYMBOL_LEFT);

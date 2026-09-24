@@ -31,6 +31,9 @@
 #include "driver/ledc.h"
 #include "bsp/m5stack_tab5.h"
 #include "lvgl.h"
+#include "app_keyboard.h"
+#include "app_keyboard_navigation.h"
+#include "tab5_keyboard.h"
 #if LV_USE_TINY_TTF
 #include "src/libs/tiny_ttf/lv_tiny_ttf.h"
 #endif
@@ -4625,6 +4628,17 @@ static void screen_timeout_timer_cb(lv_timer_t *timer)
     }
 }
 
+// Called on the LVGL thread; the first key wakes without entering text.
+static bool keyboard_activity_cb(void)
+{
+    if (screen_dimmed) {
+        wake_screen("keyboard");
+        return false;
+    }
+    last_activity_time = lv_tick_get();
+    return lock_overlay == NULL;
+}
+
 // Touch activity callback - resets inactivity timer on any touch
 static void touch_activity_cb(lv_event_t *e)
 {
@@ -7917,7 +7931,7 @@ static void scan_filter_keyboard_cb(lv_event_t *e)
     lv_event_code_t code = lv_event_get_code(e);
     if (ctx && ctx->scan_filter_keyboard &&
         (code == LV_EVENT_READY || code == LV_EVENT_CANCEL)) {
-        lv_obj_add_flag(ctx->scan_filter_keyboard, LV_OBJ_FLAG_HIDDEN);
+        app_keyboard_set_visible(ctx->scan_filter_keyboard, false);
     }
 }
 
@@ -7925,8 +7939,8 @@ static void scan_filter_text_focus_cb(lv_event_t *e)
 {
     tab_context_t *ctx = lv_event_get_user_data(e);
     if (!ctx || !ctx->scan_filter_keyboard || !ctx->scan_filter_ssid_input) return;
-    lv_keyboard_set_textarea(ctx->scan_filter_keyboard, ctx->scan_filter_ssid_input);
-    lv_obj_clear_flag(ctx->scan_filter_keyboard, LV_OBJ_FLAG_HIDDEN);
+    app_keyboard_set_textarea(ctx->scan_filter_keyboard, ctx->scan_filter_ssid_input);
+    app_keyboard_set_visible(ctx->scan_filter_keyboard, true);
     lv_obj_move_foreground(ctx->scan_filter_keyboard);
 }
 
@@ -8086,6 +8100,7 @@ static void show_scan_filter_popup(tab_context_t *ctx)
     lv_obj_set_style_border_color(close_btn, ui_border_color(), 0);
     lv_obj_set_style_radius(close_btn, 8, 0);
     lv_obj_add_event_cb(close_btn, scan_filter_cancel_cb, LV_EVENT_CLICKED, ctx);
+    app_keyboard_navigation_register_escape(close_btn);
     lv_obj_t *close_label = lv_label_create(close_btn);
     lv_label_set_text(close_label, LV_SYMBOL_CLOSE);
     lv_obj_set_style_text_color(close_label, ui_text_color(), 0);
@@ -8124,6 +8139,7 @@ static void show_scan_filter_popup(tab_context_t *ctx)
     lv_obj_set_style_border_color(ctx->scan_filter_ssid_input, ui_border_color(), 0);
     lv_obj_set_style_border_width(ctx->scan_filter_ssid_input, 1, 0);
     lv_obj_set_style_text_color(ctx->scan_filter_ssid_input, ui_text_color(), 0);
+    app_keyboard_style_cursor(ctx->scan_filter_ssid_input, ui_text_color());
     lv_obj_add_event_cb(ctx->scan_filter_ssid_input, scan_filter_text_focus_cb,
                         LV_EVENT_FOCUSED, ctx);
     lv_obj_add_event_cb(ctx->scan_filter_ssid_input, scan_filter_text_focus_cb,
@@ -8176,13 +8192,13 @@ static void show_scan_filter_popup(tab_context_t *ctx)
     scan_filter_action_button(actions, "APPLY", COLOR_LAB5_MAGENTA,
                               scan_filter_apply_cb, ctx);
 
-    ctx->scan_filter_keyboard = lv_keyboard_create(ctx->scan_filter_overlay);
+    ctx->scan_filter_keyboard = app_keyboard_create(ctx->scan_filter_overlay);
     lv_obj_set_size(ctx->scan_filter_keyboard, lv_pct(100), 240);
     lv_obj_align(ctx->scan_filter_keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_add_flag(ctx->scan_filter_keyboard, LV_OBJ_FLAG_FLOATING);
     style_on_screen_keyboard(ctx->scan_filter_keyboard);
-    lv_keyboard_set_textarea(ctx->scan_filter_keyboard, ctx->scan_filter_ssid_input);
-    lv_obj_add_flag(ctx->scan_filter_keyboard, LV_OBJ_FLAG_HIDDEN);
+    app_keyboard_set_textarea(ctx->scan_filter_keyboard, ctx->scan_filter_ssid_input);
+    app_keyboard_set_visible(ctx->scan_filter_keyboard, false);
     lv_obj_add_event_cb(ctx->scan_filter_keyboard, scan_filter_keyboard_cb,
                         LV_EVENT_READY, ctx);
     lv_obj_add_event_cb(ctx->scan_filter_keyboard, scan_filter_keyboard_cb,
@@ -8303,6 +8319,7 @@ static lv_obj_t *create_tile(lv_obj_t *parent, const char *icon, const char *tex
     }
 
     apply_lab5_fade_border(tile, 1);
+    app_keyboard_navigation_register_tile(tile);
 
     return tile;
 }
@@ -8350,6 +8367,7 @@ static lv_obj_t *create_small_tile(lv_obj_t *parent, const char *icon, const cha
     }
 
     apply_lab5_fade_border(tile, 1);
+    app_keyboard_navigation_register_tile(tile);
 
     return tile;
 }
@@ -9021,6 +9039,7 @@ static void style_tab_button(lv_obj_t *btn, bool active, lv_color_t active_bg, l
     if (!btn) return;
 
     if (active) {
+        app_keyboard_navigation_set_tabs(lv_obj_get_parent(btn), btn);
         lv_obj_set_style_bg_color(btn, active_bg, 0);
         lv_obj_set_style_border_width(btn, 1, 0);
         lv_obj_set_style_border_color(btn, active_border, 0);
@@ -9647,8 +9666,8 @@ static void hidden_ssid_textarea_focus_cb(lv_event_t *e)
 {
     (void)e;
     if (hidden_ssid_keyboard) {
-        lv_obj_clear_flag(hidden_ssid_keyboard, LV_OBJ_FLAG_HIDDEN);
-        lv_keyboard_set_textarea(hidden_ssid_keyboard, hidden_ssid_textarea);
+        app_keyboard_set_visible(hidden_ssid_keyboard, true);
+        app_keyboard_set_textarea(hidden_ssid_keyboard, hidden_ssid_textarea);
     }
 }
 
@@ -9657,7 +9676,7 @@ static void hidden_ssid_keyboard_ready_cb(lv_event_t *e)
     lv_event_code_t code = lv_event_get_code(e);
     if (code == LV_EVENT_READY || code == LV_EVENT_CANCEL) {
         if (hidden_ssid_keyboard) {
-            lv_obj_add_flag(hidden_ssid_keyboard, LV_OBJ_FLAG_HIDDEN);
+            app_keyboard_set_visible(hidden_ssid_keyboard, false);
         }
     }
 }
@@ -9824,6 +9843,7 @@ static void show_hidden_ssid_popup(hidden_ssid_callback_t callback)
     lv_obj_set_style_border_color(hidden_ssid_textarea, COLOR_MATERIAL_ORANGE, 0);
     lv_obj_set_style_border_width(hidden_ssid_textarea, 1, 0);
     lv_obj_set_style_text_color(hidden_ssid_textarea, lv_color_hex(0xFFFFFF), 0);
+    app_keyboard_style_cursor(hidden_ssid_textarea, lv_color_hex(0xFFFFFF));
     lv_obj_set_style_text_font(hidden_ssid_textarea, &lv_font_montserrat_16, 0);
     lv_obj_add_event_cb(hidden_ssid_textarea, hidden_ssid_textarea_focus_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_add_event_cb(hidden_ssid_textarea, hidden_ssid_textarea_focus_cb, LV_EVENT_FOCUSED, NULL);
@@ -9849,6 +9869,7 @@ static void show_hidden_ssid_popup(hidden_ssid_callback_t callback)
     lv_obj_set_style_bg_color(cancel_btn, lv_color_hex(0x444444), 0);
     lv_obj_set_style_radius(cancel_btn, 8, 0);
     lv_obj_add_event_cb(cancel_btn, hidden_ssid_cancel_btn_cb, LV_EVENT_CLICKED, NULL);
+    app_keyboard_navigation_register_escape(cancel_btn);
     lv_obj_t *cancel_lbl = lv_label_create(cancel_btn);
     lv_label_set_text(cancel_lbl, "Cancel");
     lv_obj_set_style_text_font(cancel_lbl, &lv_font_montserrat_16, 0);
@@ -9864,12 +9885,12 @@ static void show_hidden_ssid_popup(hidden_ssid_callback_t callback)
     lv_obj_set_style_text_font(confirm_lbl, &lv_font_montserrat_16, 0);
     lv_obj_center(confirm_lbl);
 
-    hidden_ssid_keyboard = lv_keyboard_create(hidden_ssid_popup_overlay);
+    hidden_ssid_keyboard = app_keyboard_create(hidden_ssid_popup_overlay);
     lv_obj_set_size(hidden_ssid_keyboard, lv_pct(100), 260);
     lv_obj_align(hidden_ssid_keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
     style_on_screen_keyboard(hidden_ssid_keyboard);
-    lv_keyboard_set_textarea(hidden_ssid_keyboard, hidden_ssid_textarea);
-    lv_obj_add_flag(hidden_ssid_keyboard, LV_OBJ_FLAG_HIDDEN);
+    app_keyboard_set_textarea(hidden_ssid_keyboard, hidden_ssid_textarea);
+    app_keyboard_set_visible(hidden_ssid_keyboard, false);
     lv_obj_add_event_cb(hidden_ssid_keyboard, hidden_ssid_keyboard_ready_cb, LV_EVENT_READY, NULL);
     lv_obj_add_event_cb(hidden_ssid_keyboard, hidden_ssid_keyboard_ready_cb, LV_EVENT_CANCEL, NULL);
 }
@@ -10526,7 +10547,7 @@ static void mitm_keyboard_cb(lv_event_t *e)
     lv_obj_t *kb = lv_event_get_target(e);
 
     if (code == LV_EVENT_READY || code == LV_EVENT_CANCEL) {
-        lv_obj_add_flag(kb, LV_OBJ_FLAG_HIDDEN);
+        app_keyboard_set_visible(kb, false);
     }
 }
 
@@ -10537,8 +10558,8 @@ static void mitm_password_input_cb(lv_event_t *e)
         ctx->mitm_use_saved_password = false;
     }
     if (ctx && ctx->mitm_keyboard) {
-        lv_obj_clear_flag(ctx->mitm_keyboard, LV_OBJ_FLAG_HIDDEN);
-        lv_keyboard_set_textarea(ctx->mitm_keyboard, ctx->mitm_password_input);
+        app_keyboard_set_visible(ctx->mitm_keyboard, true);
+        app_keyboard_set_textarea(ctx->mitm_keyboard, ctx->mitm_password_input);
     }
 }
 
@@ -10583,7 +10604,7 @@ static void mitm_connect_and_start_cb(lv_event_t *e)
     ESP_LOGI(TAG, "MITM: Connecting to %s (%s)", ssid, auth_label);
 
     if (ctx->mitm_keyboard) {
-        lv_obj_add_flag(ctx->mitm_keyboard, LV_OBJ_FLAG_HIDDEN);
+        app_keyboard_set_visible(ctx->mitm_keyboard, false);
     }
 
     if (ctx->mitm_status_label) {
@@ -10889,6 +10910,7 @@ static void show_mitm_popup(void)
     lv_obj_set_style_border_color(ctx->mitm_password_input, COLOR_MATERIAL_TEAL, 0);
     lv_obj_set_style_border_width(ctx->mitm_password_input, 1, 0);
     lv_obj_set_style_text_color(ctx->mitm_password_input, lv_color_hex(0xFFFFFF), 0);
+    app_keyboard_style_cursor(ctx->mitm_password_input, lv_obj_get_style_text_color(ctx->mitm_password_input, LV_PART_MAIN));
     lv_obj_add_event_cb(ctx->mitm_password_input, mitm_password_input_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_add_event_cb(ctx->mitm_password_input, mitm_password_input_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
@@ -10951,6 +10973,7 @@ static void show_mitm_popup(void)
     lv_obj_set_style_bg_color(mitm_cancel_btn, lv_color_hex(0x333333), LV_STATE_PRESSED);
     lv_obj_set_style_radius(mitm_cancel_btn, 8, 0);
     lv_obj_add_event_cb(mitm_cancel_btn, mitm_popup_close_cb, LV_EVENT_CLICKED, NULL);
+    app_keyboard_navigation_register_escape(mitm_cancel_btn);
 
     lv_obj_t *cancel_label = lv_label_create(mitm_cancel_btn);
     lv_label_set_text(cancel_label, "Cancel");
@@ -10970,13 +10993,13 @@ static void show_mitm_popup(void)
     lv_obj_set_style_text_font(stop_label2, &lv_font_montserrat_18, 0);
     lv_obj_center(stop_label2);
 
-    ctx->mitm_keyboard = lv_keyboard_create(ctx->mitm_popup_overlay);
+    ctx->mitm_keyboard = app_keyboard_create(ctx->mitm_popup_overlay);
     lv_obj_set_size(ctx->mitm_keyboard, lv_pct(100), 260);
     lv_obj_align(ctx->mitm_keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
     style_on_screen_keyboard(ctx->mitm_keyboard);
-    lv_keyboard_set_textarea(ctx->mitm_keyboard, ctx->mitm_password_input);
+    app_keyboard_set_textarea(ctx->mitm_keyboard, ctx->mitm_password_input);
     lv_obj_add_event_cb(ctx->mitm_keyboard, mitm_keyboard_cb, LV_EVENT_ALL, NULL);
-    lv_obj_add_flag(ctx->mitm_keyboard, LV_OBJ_FLAG_HIDDEN);
+    app_keyboard_set_visible(ctx->mitm_keyboard, false);
 }
 
 // ======================= GITM (JanOS Capture Gateway) =======================
@@ -11906,7 +11929,7 @@ static void gitm_keyboard_cb(lv_event_t *e)
     lv_event_code_t code = lv_event_get_code(e);
     lv_obj_t *kb = lv_event_get_target(e);
     if (code == LV_EVENT_READY || code == LV_EVENT_CANCEL) {
-        lv_obj_add_flag(kb, LV_OBJ_FLAG_HIDDEN);
+        app_keyboard_set_visible(kb, false);
     }
 }
 
@@ -11914,8 +11937,8 @@ static void gitm_focus_cb(lv_event_t *e)
 {
     tab_context_t *ctx = get_current_ctx();
     if (!ctx || !ctx->gitm || !ctx->gitm->keyboard) return;
-    lv_keyboard_set_textarea(ctx->gitm->keyboard, lv_event_get_target(e));
-    lv_obj_clear_flag(ctx->gitm->keyboard, LV_OBJ_FLAG_HIDDEN);
+    app_keyboard_set_textarea(ctx->gitm->keyboard, lv_event_get_target(e));
+    app_keyboard_set_visible(ctx->gitm->keyboard, true);
 }
 
 // Refresh the generated-name preview from the current prefix and clock.
@@ -12243,7 +12266,7 @@ static void gitm_connect_cb(lv_event_t *e)
     ctx->gitm->tab = (int)current_tab;
     ctx->gitm->uart_port = uart_port_for_tab(current_tab);
 
-    if (ctx->gitm->keyboard) lv_obj_add_flag(ctx->gitm->keyboard, LV_OBJ_FLAG_HIDDEN);
+    if (ctx->gitm->keyboard) app_keyboard_set_visible(ctx->gitm->keyboard, false);
     if (ctx->gitm->connect_btn) lv_obj_add_state(ctx->gitm->connect_btn, LV_STATE_DISABLED);
     if (ctx->gitm->scan_btn) lv_obj_add_state(ctx->gitm->scan_btn, LV_STATE_DISABLED);
     gitm_set_state(ctx, GITM_CONNECTING, "Connecting the upstream Wi-Fi...",
@@ -12308,7 +12331,7 @@ static void gitm_start_cb(lv_event_t *e)
     memset(&ctx->gitm->final, 0, sizeof(ctx->gitm->final));
     gitm_reset_client_tracking(ctx);
 
-    if (ctx->gitm->keyboard) lv_obj_add_flag(ctx->gitm->keyboard, LV_OBJ_FLAG_HIDDEN);
+    if (ctx->gitm->keyboard) app_keyboard_set_visible(ctx->gitm->keyboard, false);
     // Both setup steps fold to a one-line summary; the live view takes over.
     gitm_collapse_upstream(ctx);
     gitm_collapse_ap(ctx);
@@ -12387,7 +12410,7 @@ static void close_gitm_exit_confirm(void)
 // Leave the page for real. Call with the display lock held.
 static void gitm_leave_page(tab_context_t *ctx)
 {
-    if (ctx->gitm->keyboard) lv_obj_add_flag(ctx->gitm->keyboard, LV_OBJ_FLAG_HIDDEN);
+    if (ctx->gitm->keyboard) app_keyboard_set_visible(ctx->gitm->keyboard, false);
     if (ctx->gitm->page) lv_obj_add_flag(ctx->gitm->page, LV_OBJ_FLAG_HIDDEN);
 
     ctx->observer_attack_return_to_observer = false;
@@ -12522,6 +12545,7 @@ static void show_gitm_exit_confirm(void)
     lv_obj_set_style_bg_color(stay_btn, lv_color_hex(0x2A4444), LV_STATE_PRESSED);
     lv_obj_set_style_radius(stay_btn, 8, 0);
     lv_obj_add_event_cb(stay_btn, gitm_exit_cancel_cb, LV_EVENT_CLICKED, NULL);
+    app_keyboard_navigation_register_escape(stay_btn);
     lv_obj_t *stay_lbl = lv_label_create(stay_btn);
     lv_label_set_text(stay_lbl, "Keep capturing");
     lv_obj_set_style_text_font(stay_lbl, &lv_font_montserrat_16, 0);
@@ -12731,6 +12755,7 @@ static lv_obj_t *gitm_make_field(lv_obj_t *parent, const char *label_text,
     lv_obj_set_style_border_color(ta, lv_color_hex(0x1A3333), 0);
     lv_obj_set_style_border_width(ta, 1, 0);
     lv_obj_set_style_text_color(ta, lv_color_hex(0xFFFFFF), 0);
+    app_keyboard_style_cursor(ta, lv_obj_get_style_text_color(ta, LV_PART_MAIN));
     lv_obj_add_event_cb(ta, gitm_focus_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_add_event_cb(ta, gitm_focus_cb, LV_EVENT_FOCUSED, NULL);
 
@@ -12893,6 +12918,7 @@ static void show_gitm_page(void)
     lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x2A4444), LV_STATE_PRESSED);
     lv_obj_set_style_radius(back_btn, 8, 0);
     lv_obj_add_event_cb(back_btn, gitm_back_cb, LV_EVENT_CLICKED, NULL);
+    app_keyboard_navigation_register_escape(back_btn);
     lv_obj_t *back_icon = lv_label_create(back_btn);
     lv_label_set_text(back_icon, LV_SYMBOL_LEFT);
     lv_obj_set_style_text_color(back_icon, lv_color_hex(0xFFFFFF), 0);
@@ -13113,13 +13139,13 @@ static void show_gitm_page(void)
     lv_obj_add_flag(ctx->gitm->copy_btn, LV_OBJ_FLAG_HIDDEN);
 
     // ---- Shared on-screen keyboard ----
-    ctx->gitm->keyboard = lv_keyboard_create(ctx->gitm->page);
+    ctx->gitm->keyboard = app_keyboard_create(ctx->gitm->page);
     lv_obj_set_size(ctx->gitm->keyboard, lv_pct(100), 260);
     lv_obj_align(ctx->gitm->keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
     style_on_screen_keyboard(ctx->gitm->keyboard);
-    lv_keyboard_set_textarea(ctx->gitm->keyboard, ctx->gitm->ap_ssid_input);
+    app_keyboard_set_textarea(ctx->gitm->keyboard, ctx->gitm->ap_ssid_input);
     lv_obj_add_event_cb(ctx->gitm->keyboard, gitm_keyboard_cb, LV_EVENT_ALL, NULL);
-    lv_obj_add_flag(ctx->gitm->keyboard, LV_OBJ_FLAG_HIDDEN);
+    app_keyboard_set_visible(ctx->gitm->keyboard, false);
 
     gitm_render_net_list(ctx);
     gitm_update_name_preview(ctx);
@@ -13193,15 +13219,15 @@ static void rogue_gitm_input_focus_cb(lv_event_t *e)
 {
     lv_obj_t *ta = lv_event_get_target(e);
     if (!rogue_gitm_keyboard || !ta) return;
-    lv_keyboard_set_textarea(rogue_gitm_keyboard, ta);
-    lv_obj_clear_flag(rogue_gitm_keyboard, LV_OBJ_FLAG_HIDDEN);
+    app_keyboard_set_textarea(rogue_gitm_keyboard, ta);
+    app_keyboard_set_visible(rogue_gitm_keyboard, true);
 }
 
 static void rogue_gitm_keyboard_cb(lv_event_t *e)
 {
     lv_event_code_t code = lv_event_get_code(e);
     if (code == LV_EVENT_READY || code == LV_EVENT_CANCEL) {
-        if (rogue_gitm_keyboard) lv_obj_add_flag(rogue_gitm_keyboard, LV_OBJ_FLAG_HIDDEN);
+        if (rogue_gitm_keyboard) app_keyboard_set_visible(rogue_gitm_keyboard, false);
     }
 }
 
@@ -13418,7 +13444,7 @@ static void rogue_gitm_start_cb(lv_event_t *e)
     gitm_reset_client_tracking(ctx);
 
     if (bsp_display_lock(300)) {
-        if (g->keyboard) lv_obj_add_flag(g->keyboard, LV_OBJ_FLAG_HIDDEN);
+        if (g->keyboard) app_keyboard_set_visible(g->keyboard, false);
         // The rogue setup lived in a popup, so fold the wizard steps away and
         // let the live view own the page.
         if (g->step1) lv_obj_add_flag(g->step1, LV_OBJ_FLAG_HIDDEN);
@@ -13471,6 +13497,7 @@ static lv_obj_t *rogue_gitm_pass_row(lv_obj_t *parent, const char *label_text,
     lv_obj_set_style_border_color(ta, COLOR_LAB5_MAGENTA, 0);
     lv_obj_set_style_border_width(ta, 1, 0);
     lv_obj_set_style_text_color(ta, lv_color_hex(0xFFFFFF), 0);
+    app_keyboard_style_cursor(ta, lv_obj_get_style_text_color(ta, LV_PART_MAIN));
     lv_obj_add_event_cb(ta, rogue_gitm_input_focus_cb, LV_EVENT_FOCUSED, NULL);
     lv_obj_add_event_cb(ta, rogue_gitm_input_focus_cb, LV_EVENT_CLICKED, NULL);
     *out_input = ta;
@@ -13608,6 +13635,7 @@ static void show_rogue_gitm_popup(tab_context_t *ctx, int victim_view_idx)
     lv_obj_set_style_bg_color(cancel_btn, lv_color_hex(0x333344), 0);
     lv_obj_set_style_radius(cancel_btn, 10, 0);
     lv_obj_add_event_cb(cancel_btn, rogue_gitm_cancel_cb, LV_EVENT_CLICKED, NULL);
+    app_keyboard_navigation_register_escape(cancel_btn);
     lv_obj_t *cancel_lbl = lv_label_create(cancel_btn);
     lv_label_set_text(cancel_lbl, LV_SYMBOL_CLOSE "  Cancel");
     lv_obj_set_style_text_color(cancel_lbl, lv_color_hex(0xFFFFFF), 0);
@@ -13623,12 +13651,12 @@ static void show_rogue_gitm_popup(tab_context_t *ctx, int victim_view_idx)
     lv_obj_set_style_text_color(start_lbl, lv_color_hex(0xFFFFFF), 0);
     lv_obj_center(start_lbl);
 
-    rogue_gitm_keyboard = lv_keyboard_create(rogue_gitm_overlay);
+    rogue_gitm_keyboard = app_keyboard_create(rogue_gitm_overlay);
     lv_obj_set_size(rogue_gitm_keyboard, lv_pct(100), 300);
     lv_obj_align(rogue_gitm_keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
     style_on_screen_keyboard(rogue_gitm_keyboard);
     lv_obj_add_event_cb(rogue_gitm_keyboard, rogue_gitm_keyboard_cb, LV_EVENT_ALL, NULL);
-    lv_obj_add_flag(rogue_gitm_keyboard, LV_OBJ_FLAG_HIDDEN);
+    app_keyboard_set_visible(rogue_gitm_keyboard, false);
 
     // Prefill the mirror password from the captured table when we hold it, and
     // set the uplink password field from the initial dropdown selection.
@@ -14419,7 +14447,7 @@ static void arp_keyboard_cb(lv_event_t *e)
     lv_obj_t *kb = lv_event_get_target(e);
 
     if (code == LV_EVENT_READY || code == LV_EVENT_CANCEL) {
-        lv_obj_add_flag(kb, LV_OBJ_FLAG_HIDDEN);
+        app_keyboard_set_visible(kb, false);
     }
 }
 
@@ -14428,8 +14456,8 @@ static void arp_password_input_cb(lv_event_t *e)
 {
     (void)e;
     if (arp_keyboard) {
-        lv_obj_clear_flag(arp_keyboard, LV_OBJ_FLAG_HIDDEN);
-        lv_keyboard_set_textarea(arp_keyboard, arp_password_input);
+        app_keyboard_set_visible(arp_keyboard, true);
+        app_keyboard_set_textarea(arp_keyboard, arp_password_input);
     }
 }
 
@@ -14460,7 +14488,7 @@ static void arp_connect_cb(lv_event_t *e)
     ESP_LOGI(TAG, "ARP Poison: Connecting to %s%s", arp_target_ssid, is_open ? " (open)" : "");
 
     if (arp_keyboard) {
-        lv_obj_add_flag(arp_keyboard, LV_OBJ_FLAG_HIDDEN);
+        app_keyboard_set_visible(arp_keyboard, false);
     }
 
     if (arp_status_label) {
@@ -14913,7 +14941,7 @@ static void nmap_keyboard_cb(lv_event_t *e)
     lv_event_code_t code = lv_event_get_code(e);
     lv_obj_t *kb = lv_event_get_target(e);
     if (code == LV_EVENT_READY || code == LV_EVENT_CANCEL) {
-        lv_obj_add_flag(kb, LV_OBJ_FLAG_HIDDEN);
+        app_keyboard_set_visible(kb, false);
     }
 }
 
@@ -14921,8 +14949,8 @@ static void nmap_password_input_cb(lv_event_t *e)
 {
     (void)e;
     if (nmap_keyboard) {
-        lv_obj_clear_flag(nmap_keyboard, LV_OBJ_FLAG_HIDDEN);
-        lv_keyboard_set_textarea(nmap_keyboard, nmap_password_input);
+        app_keyboard_set_visible(nmap_keyboard, true);
+        app_keyboard_set_textarea(nmap_keyboard, nmap_password_input);
     }
 }
 
@@ -15005,7 +15033,7 @@ static void nmap_connect_cb(lv_event_t *e)
     ESP_LOGI(TAG, "Nmap: Connecting to %s%s", nmap_target_ssid, is_open ? " (open)" : "");
 
     if (nmap_keyboard) {
-        lv_obj_add_flag(nmap_keyboard, LV_OBJ_FLAG_HIDDEN);
+        app_keyboard_set_visible(nmap_keyboard, false);
     }
 
     if (nmap_status_label) {
@@ -15387,6 +15415,7 @@ static void nmap_show_scan_type_popup(const char *target_ip)
     lv_obj_set_style_bg_color(close_btn, lv_color_hex(0x444444), 0);
     lv_obj_set_style_radius(close_btn, 8, 0);
     lv_obj_add_event_cb(close_btn, nmap_scan_type_popup_close_cb, LV_EVENT_CLICKED, NULL);
+    app_keyboard_navigation_register_escape(close_btn);
     lv_obj_t *close_label = lv_label_create(close_btn);
     lv_label_set_text(close_label, "Cancel");
     lv_obj_center(close_label);
@@ -15851,6 +15880,7 @@ static void show_nmap_page(void)
     lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x444444), LV_STATE_PRESSED);
     lv_obj_set_style_radius(back_btn, 8, 0);
     lv_obj_add_event_cb(back_btn, nmap_back_cb, LV_EVENT_CLICKED, NULL);
+    app_keyboard_navigation_register_escape(back_btn);
 
     lv_obj_t *back_icon = lv_label_create(back_btn);
     lv_label_set_text(back_icon, LV_SYMBOL_LEFT);
@@ -15972,6 +16002,7 @@ static void show_nmap_page(void)
         lv_obj_set_style_border_color(nmap_password_input, COLOR_MATERIAL_GREEN, 0);
         lv_obj_set_style_border_width(nmap_password_input, 1, 0);
         lv_obj_set_style_text_color(nmap_password_input, lv_color_hex(0xFFFFFF), 0);
+        app_keyboard_style_cursor(nmap_password_input, lv_obj_get_style_text_color(nmap_password_input, LV_PART_MAIN));
         lv_obj_add_event_cb(nmap_password_input, nmap_password_input_cb, LV_EVENT_CLICKED, NULL);
 
         lv_obj_t *btn_row = lv_obj_create(pass_section);
@@ -16079,6 +16110,7 @@ static void show_nmap_page(void)
         lv_obj_set_style_border_color(nmap_password_input, COLOR_MATERIAL_GREEN, 0);
         lv_obj_set_style_border_width(nmap_password_input, 1, 0);
         lv_obj_set_style_text_color(nmap_password_input, lv_color_hex(0xFFFFFF), 0);
+        app_keyboard_style_cursor(nmap_password_input, lv_obj_get_style_text_color(nmap_password_input, LV_PART_MAIN));
         lv_obj_add_event_cb(nmap_password_input, nmap_password_input_cb, LV_EVENT_CLICKED, NULL);
 
         nmap_connect_btn = lv_btn_create(pass_section);
@@ -16136,9 +16168,9 @@ static void show_nmap_page(void)
 
     // Keyboard (hidden, for password entry)
     if (nmap_password_input && !password_known) {
-        nmap_keyboard = lv_keyboard_create(nmap_page);
+        nmap_keyboard = app_keyboard_create(nmap_page);
         lv_obj_set_size(nmap_keyboard, lv_pct(100), 200);
-        lv_obj_add_flag(nmap_keyboard, LV_OBJ_FLAG_HIDDEN);
+        app_keyboard_set_visible(nmap_keyboard, false);
         lv_obj_add_event_cb(nmap_keyboard, nmap_keyboard_cb, LV_EVENT_ALL, NULL);
     }
 
@@ -16217,6 +16249,7 @@ static void show_arp_poison_page(void)
     lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x444444), LV_STATE_PRESSED);
     lv_obj_set_style_radius(back_btn, 8, 0);
     lv_obj_add_event_cb(back_btn, arp_poison_back_cb, LV_EVENT_CLICKED, NULL);
+    app_keyboard_navigation_register_escape(back_btn);
 
     lv_obj_t *back_icon = lv_label_create(back_btn);
     lv_label_set_text(back_icon, LV_SYMBOL_LEFT);
@@ -16438,6 +16471,7 @@ static void show_arp_poison_page(void)
             lv_obj_set_style_border_color(arp_password_input, COLOR_MATERIAL_PURPLE, 0);
             lv_obj_set_style_border_width(arp_password_input, 1, 0);
             lv_obj_set_style_text_color(arp_password_input, lv_color_hex(0xFFFFFF), 0);
+            app_keyboard_style_cursor(arp_password_input, lv_obj_get_style_text_color(arp_password_input, LV_PART_MAIN));
             lv_obj_add_event_cb(arp_password_input, arp_password_input_cb, LV_EVENT_CLICKED, NULL);
 
             // Connect button
@@ -16527,13 +16561,13 @@ static void show_arp_poison_page(void)
 
     // Create keyboard (hidden initially, only in manual mode)
     if (!arp_auto_mode) {
-        arp_keyboard = lv_keyboard_create(container);  // On parent container, not flex page
+        arp_keyboard = app_keyboard_create(container);  // On parent container, not flex page
         lv_obj_set_size(arp_keyboard, lv_pct(100), 260);  // Larger keys
         lv_obj_align(arp_keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);  // Pin to bottom
         style_on_screen_keyboard(arp_keyboard);
-        lv_keyboard_set_textarea(arp_keyboard, arp_password_input);
+        app_keyboard_set_textarea(arp_keyboard, arp_password_input);
         lv_obj_add_event_cb(arp_keyboard, arp_keyboard_cb, LV_EVENT_ALL, NULL);
-        lv_obj_add_flag(arp_keyboard, LV_OBJ_FLAG_HIDDEN);
+        app_keyboard_set_visible(arp_keyboard, false);
     }
 
     // In auto mode, start connection immediately
@@ -16890,6 +16924,7 @@ static void karma_probe_click_cb(lv_event_t *e)
         lv_obj_set_style_bg_color(close_btn, lv_color_hex(0x333333), 0);
         lv_obj_set_style_radius(close_btn, 8, 0);
         lv_obj_add_event_cb(close_btn, karma_html_popup_close_cb, LV_EVENT_CLICKED, NULL);
+        app_keyboard_navigation_register_escape(close_btn);
 
         lv_obj_t *close_label = lv_label_create(close_btn);
         lv_label_set_text(close_label, "Close");
@@ -16933,6 +16968,7 @@ static void karma_probe_click_cb(lv_event_t *e)
     lv_obj_set_style_bg_color(cancel_btn, lv_color_hex(0x333333), 0);
     lv_obj_set_style_radius(cancel_btn, 8, 0);
     lv_obj_add_event_cb(cancel_btn, karma_html_popup_close_cb, LV_EVENT_CLICKED, NULL);
+    app_keyboard_navigation_register_escape(cancel_btn);
 
     lv_obj_t *cancel_label = lv_label_create(cancel_btn);
     lv_label_set_text(cancel_label, "Cancel");
@@ -17280,6 +17316,7 @@ static void show_karma_page(void)
     lv_obj_set_size(back_btn, 72, 60);
     style_back_nav_button(back_btn);
     lv_obj_add_event_cb(back_btn, karma_back_cb, LV_EVENT_CLICKED, NULL);
+    app_keyboard_navigation_register_escape(back_btn);
 
     lv_obj_t *back_icon = lv_label_create(back_btn);
     lv_label_set_text(back_icon, LV_SYMBOL_LEFT);
@@ -17878,6 +17915,7 @@ static void show_evil_twin_popup(void)
     lv_obj_set_style_bg_color(close_btn, lv_color_hex(0x2E7D32), LV_STATE_PRESSED);
     lv_obj_set_style_radius(close_btn, 8, 0);
     lv_obj_add_event_cb(close_btn, evil_twin_close_cb, LV_EVENT_CLICKED, NULL);
+    app_keyboard_navigation_register_escape(close_btn);
     lv_obj_add_flag(close_btn, LV_OBJ_FLAG_HIDDEN);  // Hidden initially
 
     lv_obj_t *et_close_label = lv_label_create(close_btn);
@@ -18625,6 +18663,7 @@ static void show_scan_page(void)
     lv_obj_set_style_border_opa(back_btn, dark_mode_enabled ? LV_OPA_70 : LV_OPA_90, 0);
     lv_obj_set_style_radius(back_btn, 8, 0);
     lv_obj_add_event_cb(back_btn, back_btn_event_cb, LV_EVENT_CLICKED, NULL);
+    app_keyboard_navigation_register_escape(back_btn);
 
     lv_obj_t *back_icon = lv_label_create(back_btn);
     lv_label_set_text(back_icon, LV_SYMBOL_LEFT);
@@ -18719,6 +18758,9 @@ static void show_scan_page(void)
     lv_obj_set_flex_flow(ctx->network_list, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_row(ctx->network_list, 6, 0);
     lv_obj_set_scroll_dir(ctx->network_list, LV_DIR_VER);
+    // Up/Down browse the result rows; Space/Enter click the browsed row, which
+    // toggles its checkbox and updates the select_networks selection.
+    app_keyboard_navigation_register_scroll_area_activatable(ctx->network_list);
 
     create_attack_action_bar(ctx->scan_page, attack_tile_event_cb, NULL);
 
@@ -19497,6 +19539,7 @@ static void show_network_popup(int network_idx)
     lv_obj_set_style_bg_color(close_btn, lv_color_lighten(COLOR_MATERIAL_RED, 30), LV_STATE_PRESSED);
     lv_obj_set_style_radius(close_btn, 8, 0);
     lv_obj_add_event_cb(close_btn, popup_close_btn_cb, LV_EVENT_CLICKED, NULL);
+    app_keyboard_navigation_register_escape(close_btn);
 
     lv_obj_t *close_icon = lv_label_create(close_btn);
     lv_label_set_text(close_icon, LV_SYMBOL_CLOSE);
@@ -21186,6 +21229,7 @@ static void show_observer_exit_confirm(void)
     lv_obj_set_style_bg_color(stay_btn, lv_color_hex(0x2A4444), LV_STATE_PRESSED);
     lv_obj_set_style_radius(stay_btn, 8, 0);
     lv_obj_add_event_cb(stay_btn, observer_exit_cancel_cb, LV_EVENT_CLICKED, NULL);
+    app_keyboard_navigation_register_escape(stay_btn);
     lv_obj_t *stay_lbl = lv_label_create(stay_btn);
     lv_label_set_text(stay_lbl, "Keep running");
     lv_obj_set_style_text_font(stay_lbl, &lv_font_montserrat_16, 0);
@@ -21535,6 +21579,7 @@ static void show_observer_page(void)
     lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x2A4444), LV_STATE_PRESSED);
     lv_obj_set_style_radius(back_btn, 8, 0);
     lv_obj_add_event_cb(back_btn, observer_back_btn_event_cb, LV_EVENT_CLICKED, NULL);
+    app_keyboard_navigation_register_escape(back_btn);
 
     lv_obj_t *back_icon = lv_label_create(back_btn);
     lv_label_set_text(back_icon, LV_SYMBOL_LEFT);
@@ -22061,6 +22106,7 @@ static void show_esp_modem_page(void)
     lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x444444), LV_STATE_PRESSED);
     lv_obj_set_style_radius(back_btn, 8, 0);
     lv_obj_add_event_cb(back_btn, esp_modem_back_btn_event_cb, LV_EVENT_CLICKED, NULL);
+    app_keyboard_navigation_register_escape(back_btn);
 
     lv_obj_t *back_icon = lv_label_create(back_btn);
     lv_label_set_text(back_icon, LV_SYMBOL_LEFT);
@@ -22546,6 +22592,7 @@ static void show_sd_warning_popup(sd_warning_continue_cb_t continue_action)
     lv_obj_set_style_bg_color(cancel_btn, COLOR_MATERIAL_GREEN, 0);
     lv_obj_set_style_radius(cancel_btn, 8, 0);
     lv_obj_add_event_cb(cancel_btn, sd_warning_cancel_cb, LV_EVENT_CLICKED, NULL);
+    app_keyboard_navigation_register_escape(cancel_btn);
 
     lv_obj_t *cancel_label = lv_label_create(cancel_btn);
     lv_label_set_text(cancel_label, "Cancel");
@@ -23805,9 +23852,9 @@ static void phishing_portal_keyboard_cb(lv_event_t *e)
     if (!ctx) ctx = get_current_ctx();
 
     if (code == LV_EVENT_READY || code == LV_EVENT_CANCEL) {
-        lv_obj_add_flag(kb, LV_OBJ_FLAG_HIDDEN);
+        app_keyboard_set_visible(kb, false);
         if (ctx && ctx->phishing_portal_ssid_textarea) {
-            lv_keyboard_set_textarea(kb, ctx->phishing_portal_ssid_textarea);
+            app_keyboard_set_textarea(kb, ctx->phishing_portal_ssid_textarea);
         }
     }
 }
@@ -23821,12 +23868,12 @@ static void phishing_portal_textarea_focus_cb(lv_event_t *e)
 
     if (code == LV_EVENT_FOCUSED) {
         if (ctx && ctx->phishing_portal_keyboard) {
-            lv_keyboard_set_textarea(ctx->phishing_portal_keyboard, ctx->phishing_portal_ssid_textarea);
-            lv_obj_clear_flag(ctx->phishing_portal_keyboard, LV_OBJ_FLAG_HIDDEN);
+            app_keyboard_set_textarea(ctx->phishing_portal_keyboard, ctx->phishing_portal_ssid_textarea);
+            app_keyboard_set_visible(ctx->phishing_portal_keyboard, true);
         }
     } else if (code == LV_EVENT_DEFOCUSED) {
         if (ctx && ctx->phishing_portal_keyboard) {
-            lv_obj_add_flag(ctx->phishing_portal_keyboard, LV_OBJ_FLAG_HIDDEN);
+            app_keyboard_set_visible(ctx->phishing_portal_keyboard, false);
         }
     }
 }
@@ -23902,6 +23949,7 @@ static void show_phishing_portal_popup(void)
     lv_obj_set_style_bg_color(ctx->phishing_portal_ssid_textarea, lv_color_hex(0x2A2A3A), 0);
     lv_obj_set_style_border_color(ctx->phishing_portal_ssid_textarea, COLOR_MATERIAL_ORANGE, 0);
     lv_obj_set_style_text_color(ctx->phishing_portal_ssid_textarea, lv_color_hex(0xFFFFFF), 0);
+    app_keyboard_style_cursor(ctx->phishing_portal_ssid_textarea, lv_obj_get_style_text_color(ctx->phishing_portal_ssid_textarea, LV_PART_MAIN));
     lv_obj_add_event_cb(ctx->phishing_portal_ssid_textarea, phishing_portal_textarea_focus_cb, LV_EVENT_ALL, ctx);
 
     // HTML file label
@@ -23941,6 +23989,7 @@ static void show_phishing_portal_popup(void)
     lv_obj_set_style_bg_color(cancel_btn, lv_color_hex(0x444444), 0);
     lv_obj_set_style_radius(cancel_btn, 8, 0);
     lv_obj_add_event_cb(cancel_btn, phishing_portal_close_cb, LV_EVENT_CLICKED, ctx);
+    app_keyboard_navigation_register_escape(cancel_btn);
 
     lv_obj_t *cancel_label = lv_label_create(cancel_btn);
     lv_label_set_text(cancel_label, "Cancel");
@@ -23960,13 +24009,13 @@ static void show_phishing_portal_popup(void)
     lv_obj_center(ok_label);
 
     // Create keyboard (hidden by default)
-    ctx->phishing_portal_keyboard = lv_keyboard_create(ctx->phishing_portal_popup_overlay);
+    ctx->phishing_portal_keyboard = app_keyboard_create(ctx->phishing_portal_popup_overlay);
     lv_obj_set_size(ctx->phishing_portal_keyboard, lv_pct(100), 260);  // Larger keys
     lv_obj_align(ctx->phishing_portal_keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
     style_on_screen_keyboard(ctx->phishing_portal_keyboard);
-    lv_keyboard_set_textarea(ctx->phishing_portal_keyboard, ctx->phishing_portal_ssid_textarea);
+    app_keyboard_set_textarea(ctx->phishing_portal_keyboard, ctx->phishing_portal_ssid_textarea);
     lv_obj_add_event_cb(ctx->phishing_portal_keyboard, phishing_portal_keyboard_cb, LV_EVENT_ALL, ctx);
-    lv_obj_add_flag(ctx->phishing_portal_keyboard, LV_OBJ_FLAG_HIDDEN);
+    app_keyboard_set_visible(ctx->phishing_portal_keyboard, false);
 }
 
 //==================================================================================
@@ -24946,6 +24995,7 @@ static void show_wardrive_upload_menu(tab_context_t *ctx)
     lv_obj_set_style_bg_color(close_btn, lv_color_hex(0x555555), LV_STATE_PRESSED);
     lv_obj_set_style_radius(close_btn, 8, 0);
     lv_obj_add_event_cb(close_btn, wardrive_upload_menu_close_cb, LV_EVENT_CLICKED, ctx);
+    app_keyboard_navigation_register_escape(close_btn);
 
     lv_obj_t *close_lbl = lv_label_create(close_btn);
     lv_label_set_text(close_lbl, "Close");
@@ -26261,8 +26311,8 @@ static void wardrive_wigle_text_input_cb(lv_event_t *e)
 
     lv_obj_t *ta = lv_event_get_target(e);
     lv_textarea_set_placeholder_text(ta, "");
-    lv_obj_clear_flag(ctx->wardrive_wigle_keyboard, LV_OBJ_FLAG_HIDDEN);
-    lv_keyboard_set_textarea(ctx->wardrive_wigle_keyboard, ta);
+    app_keyboard_set_visible(ctx->wardrive_wigle_keyboard, true);
+    app_keyboard_set_textarea(ctx->wardrive_wigle_keyboard, ta);
 }
 
 static void wardrive_wigle_keyboard_cb(lv_event_t *e)
@@ -26270,7 +26320,7 @@ static void wardrive_wigle_keyboard_cb(lv_event_t *e)
     lv_event_code_t code = lv_event_get_code(e);
     lv_obj_t *kb = lv_event_get_target(e);
     if (code == LV_EVENT_READY || code == LV_EVENT_CANCEL) {
-        lv_obj_add_flag(kb, LV_OBJ_FLAG_HIDDEN);
+        app_keyboard_set_visible(kb, false);
     }
 }
 
@@ -26305,7 +26355,7 @@ static void wardrive_wigle_connect_btn_cb(lv_event_t *e)
     }
 
     if (ctx->wardrive_wigle_keyboard) {
-        lv_obj_add_flag(ctx->wardrive_wigle_keyboard, LV_OBJ_FLAG_HIDDEN);
+        app_keyboard_set_visible(ctx->wardrive_wigle_keyboard, false);
     }
 
     if (ctx->wardrive_wigle_connect_btn) {
@@ -26384,6 +26434,7 @@ static void wardrive_wigle_create_credentials_prompt(tab_context_t *ctx, bool wi
         lv_obj_set_style_border_color(ctx->wardrive_wigle_ssid_input, COLOR_MATERIAL_TEAL, 0);
         lv_obj_set_style_border_width(ctx->wardrive_wigle_ssid_input, 1, 0);
         lv_obj_set_style_text_color(ctx->wardrive_wigle_ssid_input, lv_color_hex(0xFFFFFF), 0);
+        app_keyboard_style_cursor(ctx->wardrive_wigle_ssid_input, lv_obj_get_style_text_color(ctx->wardrive_wigle_ssid_input, LV_PART_MAIN));
         lv_obj_set_style_text_font(ctx->wardrive_wigle_ssid_input, &lv_font_montserrat_16, 0);
         lv_obj_add_event_cb(ctx->wardrive_wigle_ssid_input, wardrive_wigle_text_input_cb, LV_EVENT_CLICKED, NULL);
         lv_obj_add_event_cb(ctx->wardrive_wigle_ssid_input, wardrive_wigle_text_input_cb, LV_EVENT_FOCUSED, NULL);
@@ -26410,6 +26461,7 @@ static void wardrive_wigle_create_credentials_prompt(tab_context_t *ctx, bool wi
     lv_obj_set_style_border_color(ctx->wardrive_wigle_password_input, COLOR_MATERIAL_TEAL, 0);
     lv_obj_set_style_border_width(ctx->wardrive_wigle_password_input, 1, 0);
     lv_obj_set_style_text_color(ctx->wardrive_wigle_password_input, lv_color_hex(0xFFFFFF), 0);
+    app_keyboard_style_cursor(ctx->wardrive_wigle_password_input, lv_obj_get_style_text_color(ctx->wardrive_wigle_password_input, LV_PART_MAIN));
     lv_obj_set_style_text_font(ctx->wardrive_wigle_password_input, &lv_font_montserrat_16, 0);
     lv_obj_add_event_cb(ctx->wardrive_wigle_password_input, wardrive_wigle_text_input_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_add_event_cb(ctx->wardrive_wigle_password_input, wardrive_wigle_text_input_cb, LV_EVENT_FOCUSED, NULL);
@@ -26439,15 +26491,15 @@ static void wardrive_wigle_create_credentials_prompt(tab_context_t *ctx, bool wi
         ctx->wardrive_wigle_keyboard = NULL;
     }
 
-    ctx->wardrive_wigle_keyboard = lv_keyboard_create(ctx->wardrive_wigle_popup_overlay);
+    ctx->wardrive_wigle_keyboard = app_keyboard_create(ctx->wardrive_wigle_popup_overlay);
     lv_obj_set_size(ctx->wardrive_wigle_keyboard, lv_pct(100), 240);
     lv_obj_add_flag(ctx->wardrive_wigle_keyboard, LV_OBJ_FLAG_FLOATING);
     lv_obj_align(ctx->wardrive_wigle_keyboard, LV_ALIGN_BOTTOM_MID, 0, -8);
     style_on_screen_keyboard(ctx->wardrive_wigle_keyboard);
-    lv_keyboard_set_textarea(ctx->wardrive_wigle_keyboard,
+    app_keyboard_set_textarea(ctx->wardrive_wigle_keyboard,
                              with_ssid ? ctx->wardrive_wigle_ssid_input : ctx->wardrive_wigle_password_input);
     lv_obj_add_event_cb(ctx->wardrive_wigle_keyboard, wardrive_wigle_keyboard_cb, LV_EVENT_ALL, NULL);
-    lv_obj_add_flag(ctx->wardrive_wigle_keyboard, LV_OBJ_FLAG_HIDDEN);
+    app_keyboard_set_visible(ctx->wardrive_wigle_keyboard, false);
 }
 
 static bool wardrive_wigle_ensure_wifi_connected(tab_context_t *ctx, tab_id_t active_tab, uart_port_t uart_port)
@@ -28503,6 +28555,7 @@ static void show_wardrive_upload_popup(tab_context_t *ctx, wardrive_upload_provi
     lv_obj_set_style_bg_color(close_btn, lv_color_hex(0x555555), LV_STATE_PRESSED);
     lv_obj_set_style_radius(close_btn, 8, 0);
     lv_obj_add_event_cb(close_btn, wardrive_wigle_close_cb, LV_EVENT_CLICKED, ctx);
+    app_keyboard_navigation_register_escape(close_btn);
 
     lv_obj_t *close_lbl = lv_label_create(close_btn);
     lv_label_set_text(close_lbl, "Close");
@@ -28999,10 +29052,10 @@ static void home_mgmt_ta_focus_cb(lv_event_t *e)
     lv_event_code_t code = lv_event_get_code(e);
     if (!ctx || !ctx->home_mgmt_keyboard) return;
     if (code == LV_EVENT_FOCUSED) {
-        lv_keyboard_set_textarea(ctx->home_mgmt_keyboard, ta);
-        lv_obj_clear_flag(ctx->home_mgmt_keyboard, LV_OBJ_FLAG_HIDDEN);
+        app_keyboard_set_textarea(ctx->home_mgmt_keyboard, ta);
+        app_keyboard_set_visible(ctx->home_mgmt_keyboard, true);
     } else if (code == LV_EVENT_DEFOCUSED || code == LV_EVENT_READY) {
-        lv_obj_add_flag(ctx->home_mgmt_keyboard, LV_OBJ_FLAG_HIDDEN);
+        app_keyboard_set_visible(ctx->home_mgmt_keyboard, false);
     }
 }
 
@@ -29256,6 +29309,7 @@ static void show_home_mgmt_overlay(tab_context_t *ctx)
 
     // SSID + password inputs
     ctx->home_mgmt_ssid_input = lv_textarea_create(popup);
+    app_keyboard_style_cursor(ctx->home_mgmt_ssid_input, lv_obj_get_style_text_color(ctx->home_mgmt_ssid_input, LV_PART_MAIN));
     lv_textarea_set_one_line(ctx->home_mgmt_ssid_input, true);
     lv_textarea_set_placeholder_text(ctx->home_mgmt_ssid_input, "SSID (spaces allowed)");
     lv_obj_set_width(ctx->home_mgmt_ssid_input, lv_pct(100));
@@ -29264,6 +29318,7 @@ static void show_home_mgmt_overlay(tab_context_t *ctx)
     lv_obj_add_event_cb(ctx->home_mgmt_ssid_input, home_mgmt_ta_focus_cb, LV_EVENT_READY, ctx);
 
     ctx->home_mgmt_pass_input = lv_textarea_create(popup);
+    app_keyboard_style_cursor(ctx->home_mgmt_pass_input, lv_obj_get_style_text_color(ctx->home_mgmt_pass_input, LV_PART_MAIN));
     lv_textarea_set_one_line(ctx->home_mgmt_pass_input, true);
     lv_textarea_set_placeholder_text(ctx->home_mgmt_pass_input, "Password");
     lv_obj_set_width(ctx->home_mgmt_pass_input, lv_pct(100));
@@ -29272,6 +29327,7 @@ static void show_home_mgmt_overlay(tab_context_t *ctx)
     lv_obj_add_event_cb(ctx->home_mgmt_pass_input, home_mgmt_ta_focus_cb, LV_EVENT_READY, ctx);
 
     ctx->home_mgmt_bssid_input = lv_textarea_create(popup);
+    app_keyboard_style_cursor(ctx->home_mgmt_bssid_input, lv_obj_get_style_text_color(ctx->home_mgmt_bssid_input, LV_PART_MAIN));
     lv_textarea_set_one_line(ctx->home_mgmt_bssid_input, true);
     lv_textarea_set_placeholder_text(ctx->home_mgmt_bssid_input, "BSSID (optional, for hidden SSID) AA:BB:CC:DD:EE:FF");
     lv_obj_set_width(ctx->home_mgmt_bssid_input, lv_pct(100));
@@ -29319,17 +29375,18 @@ static void show_home_mgmt_overlay(tab_context_t *ctx)
     lv_obj_set_style_bg_color(close_btn, lv_color_hex(0x444444), 0);
     lv_obj_set_style_radius(close_btn, 8, 0);
     lv_obj_add_event_cb(close_btn, home_mgmt_close_cb, LV_EVENT_CLICKED, ctx);
+    app_keyboard_navigation_register_escape(close_btn);
     lv_obj_t *close_lbl = lv_label_create(close_btn);
     lv_label_set_text(close_lbl, LV_SYMBOL_CLOSE " Close");
     lv_obj_center(close_lbl);
 
     // Hidden keyboard for the inputs — same look/behaviour as the WiGLE keyboard.
-    ctx->home_mgmt_keyboard = lv_keyboard_create(ctx->home_mgmt_overlay);
+    ctx->home_mgmt_keyboard = app_keyboard_create(ctx->home_mgmt_overlay);
     lv_obj_set_size(ctx->home_mgmt_keyboard, lv_pct(100), 240);
     lv_obj_add_flag(ctx->home_mgmt_keyboard, LV_OBJ_FLAG_FLOATING);
     lv_obj_align(ctx->home_mgmt_keyboard, LV_ALIGN_BOTTOM_MID, 0, -8);
     style_on_screen_keyboard(ctx->home_mgmt_keyboard);
-    lv_obj_add_flag(ctx->home_mgmt_keyboard, LV_OBJ_FLAG_HIDDEN);
+    app_keyboard_set_visible(ctx->home_mgmt_keyboard, false);
 
     // Paint the overlay now, before the (blocking, ~2 s) home_list fetch on this thread,
     // so it appears instantly instead of only after the UART round-trip completes.
@@ -30876,10 +30933,10 @@ static void wardrive_setup_ta_focus_cb(lv_event_t *e)
     lv_event_code_t code = lv_event_get_code(e);
     if (!ctx || !ctx->wardrive_setup_keyboard) return;
     if (code == LV_EVENT_FOCUSED) {
-        lv_keyboard_set_textarea(ctx->wardrive_setup_keyboard, ta);
-        lv_obj_clear_flag(ctx->wardrive_setup_keyboard, LV_OBJ_FLAG_HIDDEN);
+        app_keyboard_set_textarea(ctx->wardrive_setup_keyboard, ta);
+        app_keyboard_set_visible(ctx->wardrive_setup_keyboard, true);
     } else if (code == LV_EVENT_DEFOCUSED || code == LV_EVENT_READY) {
-        lv_obj_add_flag(ctx->wardrive_setup_keyboard, LV_OBJ_FLAG_HIDDEN);
+        app_keyboard_set_visible(ctx->wardrive_setup_keyboard, false);
     }
 }
 
@@ -31268,6 +31325,7 @@ static void wardrive_setup_btn_cb(lv_event_t *e)
     lv_obj_set_width(ctx->wardrive_setup_channel_dd, lv_pct(100));
     lv_obj_add_event_cb(ctx->wardrive_setup_channel_dd, wardrive_channel_dd_cb, LV_EVENT_VALUE_CHANGED, ctx);
     ctx->wardrive_setup_custom_ta = lv_textarea_create(popup);
+    app_keyboard_style_cursor(ctx->wardrive_setup_custom_ta, lv_obj_get_style_text_color(ctx->wardrive_setup_custom_ta, LV_PART_MAIN));
     lv_textarea_set_one_line(ctx->wardrive_setup_custom_ta, true);
     lv_textarea_set_placeholder_text(ctx->wardrive_setup_custom_ta, "1:6:11:36:149");
     lv_obj_set_width(ctx->wardrive_setup_custom_ta, lv_pct(100));
@@ -31414,15 +31472,16 @@ static void wardrive_setup_btn_cb(lv_event_t *e)
     lv_obj_set_style_bg_color(ctx->wardrive_setup_close_btn, lv_color_hex(0x555555), LV_STATE_DISABLED);
     lv_obj_set_style_radius(ctx->wardrive_setup_close_btn, 8, 0);
     lv_obj_add_event_cb(ctx->wardrive_setup_close_btn, wardrive_setup_close_cb, LV_EVENT_CLICKED, ctx);
+    app_keyboard_navigation_register_escape(ctx->wardrive_setup_close_btn);
     lv_obj_t *close_lbl = lv_label_create(ctx->wardrive_setup_close_btn);
     lv_label_set_text(close_lbl, LV_SYMBOL_CLOSE " Close");
     lv_obj_center(close_lbl);
 
     // Keyboard (hidden, for custom channels textarea)
-    ctx->wardrive_setup_keyboard = lv_keyboard_create(ctx->wardrive_setup_overlay);
+    ctx->wardrive_setup_keyboard = app_keyboard_create(ctx->wardrive_setup_overlay);
     lv_obj_set_size(ctx->wardrive_setup_keyboard, lv_pct(100), lv_pct(40));
     lv_obj_align(ctx->wardrive_setup_keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
-    lv_obj_add_flag(ctx->wardrive_setup_keyboard, LV_OBJ_FLAG_HIDDEN);
+    app_keyboard_set_visible(ctx->wardrive_setup_keyboard, false);
 
     // Populate controls from current config, then refresh from device
     wardrive_setup_sync_controls(ctx);
@@ -31895,6 +31954,7 @@ static void wardrive_gps_debug_btn_cb(lv_event_t *e)
     lv_obj_set_style_bg_color(ctx->wardrive_gps_debug_close_btn, lv_color_hex(0x455A64), 0);
     lv_obj_set_style_radius(ctx->wardrive_gps_debug_close_btn, 8, 0);
     lv_obj_add_event_cb(ctx->wardrive_gps_debug_close_btn, wardrive_gps_debug_close_cb, LV_EVENT_CLICKED, ctx);
+    app_keyboard_navigation_register_escape(ctx->wardrive_gps_debug_close_btn);
     lv_obj_t *close_label = lv_label_create(ctx->wardrive_gps_debug_close_btn);
     lv_label_set_text(close_label, LV_SYMBOL_CLOSE " Close");
     lv_obj_center(close_label);
@@ -32144,6 +32204,7 @@ static void wardrive_blacklist_scan_btn_cb(lv_event_t *e)
     lv_obj_set_style_bg_color(close_btn, lv_color_hex(0x444444), 0);
     lv_obj_set_style_radius(close_btn, 8, 0);
     lv_obj_add_event_cb(close_btn, wardrive_blacklist_scan_close_cb, LV_EVENT_CLICKED, ctx);
+    app_keyboard_navigation_register_escape(close_btn);
     lv_obj_t *close_lbl = lv_label_create(close_btn);
     lv_label_set_text(close_lbl, LV_SYMBOL_CLOSE " Close");
     lv_obj_center(close_lbl);
@@ -32261,10 +32322,10 @@ static void wardrive_blacklist_ta_focus_cb(lv_event_t *e)
     lv_event_code_t code = lv_event_get_code(e);
     if (!ctx || !ctx->wardrive_blacklist_keyboard) return;
     if (code == LV_EVENT_FOCUSED) {
-        lv_keyboard_set_textarea(ctx->wardrive_blacklist_keyboard, ta);
-        lv_obj_clear_flag(ctx->wardrive_blacklist_keyboard, LV_OBJ_FLAG_HIDDEN);
+        app_keyboard_set_textarea(ctx->wardrive_blacklist_keyboard, ta);
+        app_keyboard_set_visible(ctx->wardrive_blacklist_keyboard, true);
     } else if (code == LV_EVENT_DEFOCUSED || code == LV_EVENT_READY) {
-        lv_obj_add_flag(ctx->wardrive_blacklist_keyboard, LV_OBJ_FLAG_HIDDEN);
+        app_keyboard_set_visible(ctx->wardrive_blacklist_keyboard, false);
     }
 }
 
@@ -32340,6 +32401,7 @@ static void wardrive_blacklist_btn_cb(lv_event_t *e)
     lv_obj_clear_flag(add_row, LV_OBJ_FLAG_SCROLLABLE);
 
     ctx->wardrive_blacklist_input = lv_textarea_create(add_row);
+    app_keyboard_style_cursor(ctx->wardrive_blacklist_input, lv_obj_get_style_text_color(ctx->wardrive_blacklist_input, LV_PART_MAIN));
     lv_textarea_set_one_line(ctx->wardrive_blacklist_input, true);
     lv_textarea_set_placeholder_text(ctx->wardrive_blacklist_input, "AA:BB:CC:DD:EE:FF");
     lv_obj_set_flex_grow(ctx->wardrive_blacklist_input, 1);
@@ -32400,15 +32462,16 @@ static void wardrive_blacklist_btn_cb(lv_event_t *e)
     lv_obj_set_style_bg_color(close_btn, lv_color_hex(0x444444), 0);
     lv_obj_set_style_radius(close_btn, 8, 0);
     lv_obj_add_event_cb(close_btn, wardrive_blacklist_close_cb, LV_EVENT_CLICKED, ctx);
+    app_keyboard_navigation_register_escape(close_btn);
     lv_obj_t *close_lbl = lv_label_create(close_btn);
     lv_label_set_text(close_lbl, LV_SYMBOL_CLOSE " Close");
     lv_obj_center(close_lbl);
 
     // Keyboard (hidden)
-    ctx->wardrive_blacklist_keyboard = lv_keyboard_create(ctx->wardrive_blacklist_overlay);
+    ctx->wardrive_blacklist_keyboard = app_keyboard_create(ctx->wardrive_blacklist_overlay);
     lv_obj_set_size(ctx->wardrive_blacklist_keyboard, lv_pct(100), lv_pct(40));
     lv_obj_align(ctx->wardrive_blacklist_keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
-    lv_obj_add_flag(ctx->wardrive_blacklist_keyboard, LV_OBJ_FLAG_HIDDEN);
+    app_keyboard_set_visible(ctx->wardrive_blacklist_keyboard, false);
 
     wardrive_blacklist_refresh(ctx);
 }
@@ -32475,6 +32538,7 @@ static void show_wardrive_page(void)
     lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x444444), LV_STATE_PRESSED);
     lv_obj_set_style_radius(back_btn, 8, 0);
     lv_obj_add_event_cb(back_btn, wardrive_back_cb, LV_EVENT_CLICKED, NULL);
+    app_keyboard_navigation_register_escape(back_btn);
 
     lv_obj_t *back_icon = lv_label_create(back_btn);
     lv_label_set_text(back_icon, LV_SYMBOL_LEFT);
@@ -32913,6 +32977,7 @@ static void show_antisurv_page(void)
     lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x333333), 0);
     lv_obj_set_style_radius(back_btn, 8, 0);
     lv_obj_add_event_cb(back_btn, antisurv_back_cb, LV_EVENT_CLICKED, NULL);
+    app_keyboard_navigation_register_escape(back_btn);
     lv_obj_t *back_icon = lv_label_create(back_btn);
     lv_label_set_text(back_icon, LV_SYMBOL_LEFT);
     lv_obj_set_style_text_color(back_icon, lv_color_hex(0xFFFFFF), 0);
@@ -34291,6 +34356,7 @@ static void show_zig_recon_page(void)
     lv_obj_set_size(back_btn, 72, 60);
     style_back_nav_button(back_btn);
     lv_obj_add_event_cb(back_btn, iot_recon_back_cb, LV_EVENT_CLICKED, NULL);
+    app_keyboard_navigation_register_escape(back_btn);
     lv_obj_t *back_icon = lv_label_create(back_btn);
     lv_label_set_text(back_icon, LV_SYMBOL_LEFT);
     lv_obj_set_style_text_color(back_icon, lv_color_white(), 0);
@@ -35498,6 +35564,7 @@ static void show_compromised_cleanup_popup(tab_context_t *ctx, compromised_file_
     lv_obj_set_style_bg_color(ctx->compromised_cleanup_close_btn, lv_color_hex(0x555555), LV_STATE_PRESSED);
     lv_obj_set_style_radius(ctx->compromised_cleanup_close_btn, 8, 0);
     lv_obj_add_event_cb(ctx->compromised_cleanup_close_btn, wardrive_cleanup_close_cb, LV_EVENT_CLICKED, ctx);
+    app_keyboard_navigation_register_escape(ctx->compromised_cleanup_close_btn);
     lv_obj_t *close_lbl = lv_label_create(ctx->compromised_cleanup_close_btn);
     lv_label_set_text(close_lbl, "Close");
     lv_obj_set_style_text_font(close_lbl, &lv_font_montserrat_14, 0);
@@ -36650,6 +36717,7 @@ static void show_compromised_file_page(compromised_file_kind_t kind)
                             ? espshark_remote_back_btn_event_cb
                             : compromised_data_back_btn_event_cb,
                         LV_EVENT_CLICKED, NULL);
+    app_keyboard_navigation_register_escape(back_btn);
 
     lv_obj_t *back_icon = lv_label_create(back_btn);
     lv_label_set_text(back_icon, LV_SYMBOL_LEFT);
@@ -37644,6 +37712,7 @@ static void show_espshark_page(void)
     lv_obj_set_size(back_btn, 72, 60);
     style_back_nav_button(back_btn);
     lv_obj_add_event_cb(back_btn, espshark_back_btn_event_cb, LV_EVENT_CLICKED, NULL);
+    app_keyboard_navigation_register_escape(back_btn);
     lv_obj_t *back_icon = lv_label_create(back_btn);
     lv_label_set_text(back_icon, LV_SYMBOL_LEFT);
     lv_obj_set_style_text_color(back_icon, lv_color_white(), 0);
@@ -37799,6 +37868,7 @@ static void show_compromised_data_page(void)
     lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x444444), LV_STATE_PRESSED);
     lv_obj_set_style_radius(back_btn, 8, 0);
     lv_obj_add_event_cb(back_btn, compromised_data_main_back_btn_event_cb, LV_EVENT_CLICKED, NULL);
+    app_keyboard_navigation_register_escape(back_btn);
 
     lv_obj_t *back_icon = lv_label_create(back_btn);
     lv_label_set_text(back_icon, LV_SYMBOL_LEFT);
@@ -37881,6 +37951,7 @@ static void show_evil_twin_passwords_page(void)
     lv_obj_set_size(back_btn, 72, 60);
     style_back_nav_button(back_btn);
     lv_obj_add_event_cb(back_btn, compromised_data_back_btn_event_cb, LV_EVENT_CLICKED, NULL);
+    app_keyboard_navigation_register_escape(back_btn);
 
     lv_obj_t *back_icon = lv_label_create(back_btn);
     lv_label_set_text(back_icon, LV_SYMBOL_LEFT);
@@ -38124,6 +38195,7 @@ static void show_evil_twin_connect_popup(const char *ssid, const char *password)
     lv_obj_set_style_bg_color(cancel_btn, lv_color_hex(0x444444), 0);
     lv_obj_set_style_radius(cancel_btn, 8, 0);
     lv_obj_add_event_cb(cancel_btn, evil_twin_connect_popup_cancel_cb, LV_EVENT_CLICKED, NULL);
+    app_keyboard_navigation_register_escape(cancel_btn);
 
     lv_obj_t *cancel_label = lv_label_create(cancel_btn);
     lv_label_set_text(cancel_label, "Cancel");
@@ -38222,8 +38294,8 @@ static void rogue_ap_password_focus_cb(lv_event_t *e)
     lv_obj_t *ta = lv_event_get_target(e);
     tab_context_t *ctx = get_current_ctx();
     if (ctx && ctx->rogue_ap_keyboard) {
-        lv_obj_clear_flag(ctx->rogue_ap_keyboard, LV_OBJ_FLAG_HIDDEN);
-        lv_keyboard_set_textarea(ctx->rogue_ap_keyboard, ta);
+        app_keyboard_set_visible(ctx->rogue_ap_keyboard, true);
+        app_keyboard_set_textarea(ctx->rogue_ap_keyboard, ta);
     }
 }
 
@@ -38532,6 +38604,7 @@ static void show_rogue_ap_popup(tab_context_t *ctx)
     lv_obj_set_style_bg_color(close_btn, lv_color_lighten(COLOR_MATERIAL_RED, 30), LV_STATE_PRESSED);
     lv_obj_set_style_radius(close_btn, 8, 0);
     lv_obj_add_event_cb(close_btn, rogue_ap_popup_close_cb, LV_EVENT_CLICKED, NULL);
+    app_keyboard_navigation_register_escape(close_btn);
 
     lv_obj_t *close_label = lv_label_create(close_btn);
     lv_label_set_text(close_label, "Stop Rogue AP");
@@ -38611,6 +38684,7 @@ static void show_rogue_ap_page(void)
     lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x444444), LV_STATE_PRESSED);
     lv_obj_set_style_radius(back_btn, 8, 0);
     lv_obj_add_event_cb(back_btn, rogue_ap_back_cb, LV_EVENT_CLICKED, NULL);
+    app_keyboard_navigation_register_escape(back_btn);
 
     lv_obj_t *back_icon = lv_label_create(back_btn);
     lv_label_set_text(back_icon, LV_SYMBOL_LEFT);
@@ -38763,14 +38837,15 @@ static void show_rogue_ap_page(void)
         lv_obj_set_style_border_color(ctx->rogue_ap_password_input, COLOR_MATERIAL_CYAN, 0);
         lv_obj_set_style_border_width(ctx->rogue_ap_password_input, 1, 0);
         lv_obj_set_style_text_color(ctx->rogue_ap_password_input, lv_color_hex(0xFFFFFF), 0);
+        app_keyboard_style_cursor(ctx->rogue_ap_password_input, lv_obj_get_style_text_color(ctx->rogue_ap_password_input, LV_PART_MAIN));
 
         // Keyboard (hidden, activated on click)
-        ctx->rogue_ap_keyboard = lv_keyboard_create(container);
+        ctx->rogue_ap_keyboard = app_keyboard_create(container);
         lv_obj_set_size(ctx->rogue_ap_keyboard, lv_pct(100), 260);
         lv_obj_align(ctx->rogue_ap_keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
         style_on_screen_keyboard(ctx->rogue_ap_keyboard);
-        lv_keyboard_set_textarea(ctx->rogue_ap_keyboard, ctx->rogue_ap_password_input);
-        lv_obj_add_flag(ctx->rogue_ap_keyboard, LV_OBJ_FLAG_HIDDEN);
+        app_keyboard_set_textarea(ctx->rogue_ap_keyboard, ctx->rogue_ap_password_input);
+        app_keyboard_set_visible(ctx->rogue_ap_keyboard, false);
 
         // Add event handler to show keyboard when textarea is clicked
         lv_obj_add_event_cb(ctx->rogue_ap_password_input, rogue_ap_password_focus_cb, LV_EVENT_FOCUSED, NULL);
@@ -39020,6 +39095,7 @@ static void karma2_fetch_probes(void)
     lv_obj_set_size(close_btn, 120, 40);
     style_neutral_button(close_btn);
     lv_obj_add_event_cb(close_btn, karma2_probes_popup_close_cb, LV_EVENT_CLICKED, NULL);
+    app_keyboard_navigation_register_escape(close_btn);
 
     lv_obj_t *close_label = lv_label_create(close_btn);
     lv_label_set_text(close_label, "Close");
@@ -39204,6 +39280,7 @@ static void show_karma2_html_popup(void)
     lv_obj_set_size(cancel_btn, 100, 40);
     style_neutral_button(cancel_btn);
     lv_obj_add_event_cb(cancel_btn, karma2_html_popup_close_cb, LV_EVENT_CLICKED, NULL);
+    app_keyboard_navigation_register_escape(cancel_btn);
 
     lv_obj_t *cancel_label = lv_label_create(cancel_btn);
     lv_label_set_text(cancel_label, "Cancel");
@@ -40301,6 +40378,7 @@ static void adhoc_show_probes_cb(lv_event_t *e)
     lv_obj_set_size(close_btn, lv_pct(100), 45);
     style_neutral_button(close_btn);
     lv_obj_add_event_cb(close_btn, adhoc_html_popup_close_cb, LV_EVENT_CLICKED, NULL);
+    app_keyboard_navigation_register_escape(close_btn);
 
     lv_obj_t *close_label = lv_label_create(close_btn);
     lv_label_set_text(close_label, "Close");
@@ -40391,6 +40469,7 @@ static void adhoc_probe_click_cb(lv_event_t *e)
     lv_obj_set_size(cancel_btn, 150, 50);
     style_neutral_button(cancel_btn);
     lv_obj_add_event_cb(cancel_btn, adhoc_html_popup_close_cb, LV_EVENT_CLICKED, NULL);
+    app_keyboard_navigation_register_escape(cancel_btn);
 
     lv_obj_t *cancel_label = lv_label_create(cancel_btn);
     lv_label_set_text(cancel_label, "Cancel");
@@ -40511,6 +40590,7 @@ static void show_adhoc_portal_page(void)
     lv_obj_set_size(back_btn, 72, 60);
     style_back_nav_button(back_btn);
     lv_obj_add_event_cb(back_btn, adhoc_portal_back_cb, LV_EVENT_CLICKED, NULL);
+    app_keyboard_navigation_register_escape(back_btn);
 
     lv_obj_t *back_icon = lv_label_create(back_btn);
     lv_label_set_text(back_icon, LV_SYMBOL_LEFT);
@@ -40696,6 +40776,7 @@ static void show_portal_data_page(void)
     lv_obj_set_size(back_btn, 72, 60);
     style_back_nav_button(back_btn);
     lv_obj_add_event_cb(back_btn, compromised_data_back_btn_event_cb, LV_EVENT_CLICKED, NULL);
+    app_keyboard_navigation_register_escape(back_btn);
 
     lv_obj_t *back_icon = lv_label_create(back_btn);
     lv_label_set_text(back_icon, LV_SYMBOL_LEFT);
@@ -40934,8 +41015,8 @@ static void wpasec_text_input_cb(lv_event_t *e)
 
     lv_obj_t *ta = lv_event_get_target(e);
     lv_textarea_set_placeholder_text(ta, "");
-    lv_obj_clear_flag(ctx->wpasec_keyboard, LV_OBJ_FLAG_HIDDEN);
-    lv_keyboard_set_textarea(ctx->wpasec_keyboard, ta);
+    app_keyboard_set_visible(ctx->wpasec_keyboard, true);
+    app_keyboard_set_textarea(ctx->wpasec_keyboard, ta);
 }
 
 // Keyboard ready/cancel - hide keyboard
@@ -40944,7 +41025,7 @@ static void wpasec_keyboard_cb(lv_event_t *e)
     lv_event_code_t code = lv_event_get_code(e);
     lv_obj_t *kb = lv_event_get_target(e);
     if (code == LV_EVENT_READY || code == LV_EVENT_CANCEL) {
-        lv_obj_add_flag(kb, LV_OBJ_FLAG_HIDDEN);
+        app_keyboard_set_visible(kb, false);
     }
 }
 
@@ -40977,7 +41058,7 @@ static void wpasec_connect_btn_cb(lv_event_t *e)
 
     // Hide keyboard if visible
     if (ctx->wpasec_keyboard) {
-        lv_obj_add_flag(ctx->wpasec_keyboard, LV_OBJ_FLAG_HIDDEN);
+        app_keyboard_set_visible(ctx->wpasec_keyboard, false);
     }
 
     ctx->wpasec_connect_ready = true;
@@ -41028,6 +41109,7 @@ static void wpasec_create_credentials_prompt(tab_context_t *ctx, bool with_ssid)
         lv_obj_set_style_border_color(ssid_input, COLOR_MATERIAL_PURPLE, 0);
         lv_obj_set_style_border_width(ssid_input, 1, 0);
         lv_obj_set_style_text_color(ssid_input, lv_color_hex(0xFFFFFF), 0);
+        app_keyboard_style_cursor(ssid_input, lv_obj_get_style_text_color(ssid_input, LV_PART_MAIN));
         lv_obj_set_style_text_font(ssid_input, &lv_font_montserrat_16, 0);
         lv_obj_add_event_cb(ssid_input, wpasec_text_input_cb, LV_EVENT_CLICKED, NULL);
         lv_obj_add_event_cb(ssid_input, wpasec_text_input_cb, LV_EVENT_FOCUSED, NULL);
@@ -41054,6 +41136,7 @@ static void wpasec_create_credentials_prompt(tab_context_t *ctx, bool with_ssid)
     lv_obj_set_style_border_color(ctx->wpasec_password_input, COLOR_MATERIAL_PURPLE, 0);
     lv_obj_set_style_border_width(ctx->wpasec_password_input, 1, 0);
     lv_obj_set_style_text_color(ctx->wpasec_password_input, lv_color_hex(0xFFFFFF), 0);
+    app_keyboard_style_cursor(ctx->wpasec_password_input, lv_obj_get_style_text_color(ctx->wpasec_password_input, LV_PART_MAIN));
     lv_obj_set_style_text_font(ctx->wpasec_password_input, &lv_font_montserrat_16, 0);
     lv_obj_add_event_cb(ctx->wpasec_password_input, wpasec_text_input_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_add_event_cb(ctx->wpasec_password_input, wpasec_text_input_cb, LV_EVENT_FOCUSED, NULL);
@@ -41082,13 +41165,13 @@ static void wpasec_create_credentials_prompt(tab_context_t *ctx, bool with_ssid)
         ctx->wpasec_keyboard = NULL;
     }
 
-    ctx->wpasec_keyboard = lv_keyboard_create(ctx->wpasec_popup_overlay);
+    ctx->wpasec_keyboard = app_keyboard_create(ctx->wpasec_popup_overlay);
     lv_obj_set_size(ctx->wpasec_keyboard, lv_pct(100), 260);
     lv_obj_align(ctx->wpasec_keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
     style_on_screen_keyboard(ctx->wpasec_keyboard);
-    lv_keyboard_set_textarea(ctx->wpasec_keyboard, with_ssid ? ssid_input : ctx->wpasec_password_input);
+    app_keyboard_set_textarea(ctx->wpasec_keyboard, with_ssid ? ssid_input : ctx->wpasec_password_input);
     lv_obj_add_event_cb(ctx->wpasec_keyboard, wpasec_keyboard_cb, LV_EVENT_ALL, NULL);
-    lv_obj_add_flag(ctx->wpasec_keyboard, LV_OBJ_FLAG_HIDDEN);
+    app_keyboard_set_visible(ctx->wpasec_keyboard, false);
 }
 
 static void wpasec_upload_task(void *arg)
@@ -41728,6 +41811,7 @@ static void show_wpasec_popup(void)
     lv_obj_set_style_bg_color(close_btn, lv_color_hex(0x555555), LV_STATE_PRESSED);
     lv_obj_set_style_radius(close_btn, 8, 0);
     lv_obj_add_event_cb(close_btn, close_wpasec_popup, LV_EVENT_CLICKED, NULL);
+    app_keyboard_navigation_register_escape(close_btn);
 
     lv_obj_t *close_lbl = lv_label_create(close_btn);
     lv_label_set_text(close_lbl, "Close");
@@ -42022,6 +42106,7 @@ static lv_obj_t *pcap_viewer_add_header(pcap_viewer_state_t *state, lv_obj_t *pa
     lv_obj_set_size(back_btn, 72, 60);
     style_back_nav_button(back_btn);
     lv_obj_add_event_cb(back_btn, pcap_viewer_back_cb, LV_EVENT_CLICKED, state);
+    app_keyboard_navigation_register_escape(back_btn);
     lv_obj_t *back_icon = lv_label_create(back_btn);
     lv_label_set_text(back_icon, LV_SYMBOL_LEFT);
     lv_obj_set_style_text_color(back_icon, lv_color_white(), 0);
@@ -43061,6 +43146,7 @@ static void pcap_viewer_packet_detail_cb(lv_event_t *e)
     lv_obj_set_style_radius(close_btn, 8, 0);
     lv_obj_add_event_cb(close_btn, pcap_viewer_packet_detail_close_cb,
                         LV_EVENT_CLICKED, state);
+    app_keyboard_navigation_register_escape(close_btn);
     lv_obj_t *close_label = lv_label_create(close_btn);
     lv_label_set_text(close_label, "Close");
     lv_obj_set_style_text_color(close_label, lv_color_white(), 0);
@@ -43456,6 +43542,7 @@ static void pcap_viewer_show_summary_popup(pcap_viewer_state_t *state,
     lv_obj_set_style_radius(close_btn, 8, 0);
     lv_obj_add_event_cb(close_btn, pcap_viewer_packet_detail_close_cb,
                         LV_EVENT_CLICKED, state);
+    app_keyboard_navigation_register_escape(close_btn);
     lv_obj_t *close_label = lv_label_create(close_btn);
     lv_label_set_text(close_label, "Close");
     lv_obj_set_style_text_color(close_label, lv_color_white(), 0);
@@ -43679,6 +43766,7 @@ static lv_obj_t *pcap_viewer_create_analysis_list(pcap_viewer_state_t *state,
     lv_obj_set_style_radius(close_btn, 8, 0);
     lv_obj_add_event_cb(close_btn, pcap_viewer_packet_detail_close_cb,
                         LV_EVENT_CLICKED, state);
+    app_keyboard_navigation_register_escape(close_btn);
     lv_obj_t *close_label = lv_label_create(close_btn);
     lv_label_set_text(close_label, "Close");
     lv_obj_center(close_label);
@@ -43967,6 +44055,7 @@ static void pcap_viewer_dns_domain_cb(lv_event_t *e)
     lv_obj_set_style_bg_color(back, COLOR_MATERIAL_BLUE, 0);
     lv_obj_set_style_radius(back, 7, 0);
     lv_obj_add_event_cb(back, pcap_viewer_dns_back_cb, LV_EVENT_CLICKED, state);
+    app_keyboard_navigation_register_escape(back);
     lv_obj_t *back_label = lv_label_create(back);
     lv_label_set_text(back_label, LV_SYMBOL_LEFT " BACK TO DNS");
     lv_obj_center(back_label);
@@ -46369,6 +46458,7 @@ static void pcap_map_show_node_quick_view(pcap_viewer_state_t *state,
     lv_obj_set_style_radius(close, 8, 0);
     lv_obj_add_event_cb(close, pcap_map_node_quick_close_cb,
                         LV_EVENT_CLICKED, state);
+    app_keyboard_navigation_register_escape(close);
     lv_obj_t *close_label = lv_label_create(close);
     lv_label_set_text(close_label, "BACK TO MAP");
     lv_obj_set_style_text_font(close_label, &lv_font_montserrat_10, 0);
@@ -46733,6 +46823,7 @@ static void pcap_viewer_map_cb(lv_event_t *e)
     lv_obj_set_style_radius(close, 8, 0);
     lv_obj_add_event_cb(close, pcap_viewer_packet_detail_close_cb,
                         LV_EVENT_CLICKED, state);
+    app_keyboard_navigation_register_escape(close);
     lv_obj_t *close_label = lv_label_create(close);
     lv_label_set_text(close_label, "CLOSE");
     lv_obj_center(close_label);
@@ -48546,6 +48637,7 @@ static void show_deauth_detector_page(void)
     lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x444444), LV_STATE_PRESSED);
     lv_obj_set_style_radius(back_btn, 8, 0);
     lv_obj_add_event_cb(back_btn, deauth_detector_back_btn_event_cb, LV_EVENT_CLICKED, NULL);
+    app_keyboard_navigation_register_escape(back_btn);
 
     lv_obj_t *back_icon = lv_label_create(back_btn);
     lv_label_set_text(back_icon, LV_SYMBOL_LEFT);
@@ -48706,6 +48798,7 @@ static void show_bluetooth_menu_page(void)
     lv_obj_set_size(back_btn, 72, 60);
     style_back_nav_button(back_btn);
     lv_obj_add_event_cb(back_btn, bt_menu_back_btn_event_cb, LV_EVENT_CLICKED, NULL);
+    app_keyboard_navigation_register_escape(back_btn);
 
     lv_obj_t *back_icon = lv_label_create(back_btn);
     lv_label_set_text(back_icon, LV_SYMBOL_LEFT);
@@ -48925,6 +49018,7 @@ static void show_airtag_scan_page(void)
     lv_obj_set_size(back_btn, 72, 60);
     style_back_nav_button(back_btn);
     lv_obj_add_event_cb(back_btn, airtag_scan_back_btn_event_cb, LV_EVENT_CLICKED, NULL);
+    app_keyboard_navigation_register_escape(back_btn);
 
     lv_obj_t *back_icon = lv_label_create(back_btn);
     lv_label_set_text(back_icon, LV_SYMBOL_LEFT);
@@ -49352,6 +49446,7 @@ static void show_jammer_page(void)
     lv_obj_set_size(back_btn, 72, 60);
     style_back_nav_button(back_btn);
     lv_obj_add_event_cb(back_btn, jammer_back_btn_event_cb, LV_EVENT_CLICKED, NULL);
+    app_keyboard_navigation_register_escape(back_btn);
 
     lv_obj_t *back_icon = lv_label_create(back_btn);
     lv_label_set_text(back_icon, LV_SYMBOL_LEFT);
@@ -49592,6 +49687,7 @@ static void show_bt_scan_page(void)
     lv_obj_set_size(back_btn, 72, 60);
     style_back_nav_button(back_btn);
     lv_obj_add_event_cb(back_btn, bt_scan_back_btn_event_cb, LV_EVENT_CLICKED, NULL);
+    app_keyboard_navigation_register_escape(back_btn);
 
     lv_obj_t *back_icon = lv_label_create(back_btn);
     lv_label_set_text(back_icon, LV_SYMBOL_LEFT);
@@ -50080,6 +50176,7 @@ static void show_ap_radar_page(int network_idx)
     lv_obj_set_size(back_btn, 72, 60);
     style_back_nav_button(back_btn);
     lv_obj_add_event_cb(back_btn, ap_radar_back_btn_event_cb, LV_EVENT_CLICKED, NULL);
+    app_keyboard_navigation_register_escape(back_btn);
 
     lv_obj_t *back_icon = lv_label_create(back_btn);
     lv_label_set_text(back_icon, LV_SYMBOL_LEFT);
@@ -50334,6 +50431,7 @@ static void show_bt_locator_page(int device_idx)
     lv_obj_set_size(back_btn, 72, 60);
     style_back_nav_button(back_btn);
     lv_obj_add_event_cb(back_btn, bt_locator_tracking_back_btn_event_cb, LV_EVENT_CLICKED, NULL);
+    app_keyboard_navigation_register_escape(back_btn);
 
     lv_obj_t *back_icon = lv_label_create(back_btn);
     lv_label_set_text(back_icon, LV_SYMBOL_LEFT);
@@ -50879,7 +50977,7 @@ static void beacon_ssids_keyboard_cb(lv_event_t *e)
 
     tab_context_t *ctx = get_current_ctx();
     if (ctx && ctx->beacon_ssids_keyboard) {
-        lv_obj_add_flag(ctx->beacon_ssids_keyboard, LV_OBJ_FLAG_HIDDEN);
+        app_keyboard_set_visible(ctx->beacon_ssids_keyboard, false);
     }
 }
 
@@ -50889,8 +50987,8 @@ static void beacon_ssids_textarea_focus_cb(lv_event_t *e)
     tab_context_t *ctx = get_current_ctx();
     if (!ctx || !ctx->beacon_ssids_keyboard || !ctx->beacon_ssids_add_textarea) return;
 
-    lv_keyboard_set_textarea(ctx->beacon_ssids_keyboard, ctx->beacon_ssids_add_textarea);
-    lv_obj_clear_flag(ctx->beacon_ssids_keyboard, LV_OBJ_FLAG_HIDDEN);
+    app_keyboard_set_textarea(ctx->beacon_ssids_keyboard, ctx->beacon_ssids_add_textarea);
+    app_keyboard_set_visible(ctx->beacon_ssids_keyboard, true);
 }
 
 static void beacon_ssids_add_popup_cancel_cb(lv_event_t *e)
@@ -50970,6 +51068,7 @@ static void beacon_ssids_add_new_cb(lv_event_t *e)
     lv_obj_set_style_border_width(ctx->beacon_ssids_add_textarea, 1, 0);
     lv_obj_set_style_border_color(ctx->beacon_ssids_add_textarea, ui_border_color(), 0);
     lv_obj_set_style_text_color(ctx->beacon_ssids_add_textarea, ui_text_color(), 0);
+    app_keyboard_style_cursor(ctx->beacon_ssids_add_textarea, lv_obj_get_style_text_color(ctx->beacon_ssids_add_textarea, LV_PART_MAIN));
     lv_obj_set_style_text_font(ctx->beacon_ssids_add_textarea, &lv_font_montserrat_16, 0);
     lv_obj_add_event_cb(ctx->beacon_ssids_add_textarea, beacon_ssids_textarea_focus_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_add_event_cb(ctx->beacon_ssids_add_textarea, beacon_ssids_textarea_focus_cb, LV_EVENT_FOCUSED, NULL);
@@ -50988,6 +51087,7 @@ static void beacon_ssids_add_new_cb(lv_event_t *e)
     lv_obj_set_size(cancel_btn, 130, 44);
     style_neutral_button(cancel_btn);
     lv_obj_add_event_cb(cancel_btn, beacon_ssids_add_popup_cancel_cb, LV_EVENT_CLICKED, NULL);
+    app_keyboard_navigation_register_escape(cancel_btn);
 
     lv_obj_t *cancel_lbl = lv_label_create(cancel_btn);
     lv_label_set_text(cancel_lbl, "Cancel");
@@ -51006,13 +51106,13 @@ static void beacon_ssids_add_new_cb(lv_event_t *e)
     lv_obj_set_style_text_font(save_lbl, &lv_font_montserrat_16, 0);
     lv_obj_center(save_lbl);
 
-    ctx->beacon_ssids_keyboard = lv_keyboard_create(ctx->beacon_ssids_add_overlay);
+    ctx->beacon_ssids_keyboard = app_keyboard_create(ctx->beacon_ssids_add_overlay);
     lv_obj_set_size(ctx->beacon_ssids_keyboard, lv_pct(100), 260);
     lv_obj_align(ctx->beacon_ssids_keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
     style_on_screen_keyboard(ctx->beacon_ssids_keyboard);
     lv_obj_set_style_text_font(ctx->beacon_ssids_keyboard, &lv_font_montserrat_16, LV_PART_ITEMS);
-    lv_keyboard_set_textarea(ctx->beacon_ssids_keyboard, ctx->beacon_ssids_add_textarea);
-    lv_obj_add_flag(ctx->beacon_ssids_keyboard, LV_OBJ_FLAG_HIDDEN);
+    app_keyboard_set_textarea(ctx->beacon_ssids_keyboard, ctx->beacon_ssids_add_textarea);
+    app_keyboard_set_visible(ctx->beacon_ssids_keyboard, false);
     lv_obj_add_event_cb(ctx->beacon_ssids_keyboard, beacon_ssids_keyboard_cb, LV_EVENT_READY, NULL);
     lv_obj_add_event_cb(ctx->beacon_ssids_keyboard, beacon_ssids_keyboard_cb, LV_EVENT_CANCEL, NULL);
 }
@@ -51156,6 +51256,7 @@ static void show_beacon_ssids_page(void)
     lv_obj_set_size(back_btn, 72, 60);
     style_back_nav_button(back_btn);
     lv_obj_add_event_cb(back_btn, beacon_ssids_back_btn_event_cb, LV_EVENT_CLICKED, NULL);
+    app_keyboard_navigation_register_escape(back_btn);
 
     lv_obj_t *back_icon = lv_label_create(back_btn);
     lv_label_set_text(back_icon, LV_SYMBOL_LEFT);
@@ -51288,6 +51389,7 @@ static void show_beacon_spam_page(void)
     lv_obj_set_size(back_btn, 72, 60);
     style_back_nav_button(back_btn);
     lv_obj_add_event_cb(back_btn, beacon_spam_back_btn_event_cb, LV_EVENT_CLICKED, NULL);
+    app_keyboard_navigation_register_escape(back_btn);
 
     lv_obj_t *back_icon = lv_label_create(back_btn);
     lv_label_set_text(back_icon, LV_SYMBOL_LEFT);
@@ -51428,6 +51530,7 @@ static void show_global_attacks_page(void)
     lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x444444), LV_STATE_PRESSED);
     lv_obj_set_style_radius(back_btn, 8, 0);
     lv_obj_add_event_cb(back_btn, back_btn_event_cb, LV_EVENT_CLICKED, NULL);
+    app_keyboard_navigation_register_escape(back_btn);
 
     lv_obj_t *back_icon = lv_label_create(back_btn);
     lv_label_set_text(back_icon, LV_SYMBOL_LEFT);
@@ -52759,6 +52862,7 @@ static void show_version_mismatch_popup(void)
     lv_obj_set_style_bg_color(ok_btn, COLOR_MATERIAL_PURPLE, 0);
     lv_obj_set_style_radius(ok_btn, 8, 0);
     lv_obj_add_event_cb(ok_btn, version_popup_close_cb, LV_EVENT_CLICKED, overlay);
+    app_keyboard_navigation_register_escape(ok_btn);
 
     lv_obj_t *btn_label = lv_label_create(ok_btn);
     lv_label_set_text(btn_label, "OK");
@@ -52917,6 +53021,7 @@ static void show_no_board_popup(void)
     lv_obj_set_style_bg_color(close_btn, COLOR_MATERIAL_PURPLE, 0);
     lv_obj_set_style_radius(close_btn, 8, 0);
     lv_obj_add_event_cb(close_btn, board_detect_popup_close_cb, LV_EVENT_CLICKED, NULL);
+    app_keyboard_navigation_register_escape(close_btn);
 
     lv_obj_t *btn_label = lv_label_create(close_btn);
     lv_label_set_text(btn_label, "Continue Anyway");
@@ -53377,6 +53482,7 @@ static lv_obj_t* create_scan_time_spinbox_row(lv_obj_t *parent, const char *labe
     lv_obj_set_style_border_width(spinbox, 1, 0);
     lv_obj_set_style_border_color(spinbox, ui_border_color(), 0);
     lv_obj_set_style_text_color(spinbox, ui_text_color(), 0);
+    app_keyboard_style_cursor(spinbox, lv_obj_get_style_text_color(spinbox, LV_PART_MAIN));
 
     lv_obj_t *inc_btn = lv_btn_create(spin_cont);
     lv_obj_set_size(inc_btn, 35, 35);
@@ -53550,6 +53656,7 @@ static void show_scan_time_popup(void)
     lv_obj_set_size(cancel_btn, 100, 40);
     style_neutral_button(cancel_btn);
     lv_obj_add_event_cb(cancel_btn, scan_time_popup_close_cb, LV_EVENT_CLICKED, NULL);
+    app_keyboard_navigation_register_escape(cancel_btn);
 
     lv_obj_t *cancel_label = lv_label_create(cancel_btn);
     lv_label_set_text(cancel_label, "Cancel");
@@ -53747,6 +53854,7 @@ static void show_red_team_disclaimer_popup(void)
     lv_obj_set_style_bg_color(cancel_btn, lv_color_hex(0x555555), 0);
     lv_obj_set_style_radius(cancel_btn, 8, 0);
     lv_obj_add_event_cb(cancel_btn, red_team_disclaimer_cancel_cb, LV_EVENT_CLICKED, NULL);
+    app_keyboard_navigation_register_escape(cancel_btn);
 
     lv_obj_t *cancel_label = lv_label_create(cancel_btn);
     lv_label_set_text(cancel_label, "Cancel");
@@ -53859,6 +53967,7 @@ static void show_red_team_settings_page(void)
     lv_obj_align(back_btn, LV_ALIGN_LEFT_MID, 0, 0);
     lv_obj_set_style_bg_color(back_btn, COLOR_MATERIAL_RED, 0);
     lv_obj_add_event_cb(back_btn, red_team_back_cb, LV_EVENT_CLICKED, NULL);
+    app_keyboard_navigation_register_escape(back_btn);
 
     lv_obj_t *back_label = lv_label_create(back_btn);
     lv_label_set_text(back_label, LV_SYMBOL_LEFT " Back");
@@ -54037,6 +54146,7 @@ static void show_screen_timeout_popup(void)
     lv_obj_set_size(close_btn, 100, 40);
     style_neutral_button(close_btn);
     lv_obj_add_event_cb(close_btn, screen_timeout_close_cb, LV_EVENT_CLICKED, NULL);
+    app_keyboard_navigation_register_escape(close_btn);
 
     lv_obj_t *close_label = lv_label_create(close_btn);
     lv_label_set_text(close_label, "Close");
@@ -54198,6 +54308,7 @@ static void show_screen_rotation_popup(void)
     lv_obj_set_size(close_btn, 100, 40);
     style_neutral_button(close_btn);
     lv_obj_add_event_cb(close_btn, screen_rotation_close_cb, LV_EVENT_CLICKED, NULL);
+    app_keyboard_navigation_register_escape(close_btn);
 
     lv_obj_t *close_label = lv_label_create(close_btn);
     lv_label_set_text(close_label, "Close");
@@ -54329,6 +54440,7 @@ static void show_screen_brightness_popup(void)
     lv_obj_set_size(close_btn, 100, 40);
     style_neutral_button(close_btn);
     lv_obj_add_event_cb(close_btn, screen_brightness_close_cb, LV_EVENT_CLICKED, NULL);
+    app_keyboard_navigation_register_escape(close_btn);
 
     lv_obj_t *close_label = lv_label_create(close_btn);
     lv_label_set_text(close_label, "Close");
@@ -54727,6 +54839,7 @@ static void show_time_popup(void)
     lv_obj_set_size(close_btn, 140, 48);
     style_neutral_button(close_btn);
     lv_obj_add_event_cb(close_btn, time_popup_close_cb, LV_EVENT_CLICKED, NULL);
+    app_keyboard_navigation_register_escape(close_btn);
     lv_obj_t *close_lbl = lv_label_create(close_btn);
     lv_label_set_text(close_lbl, "Close");
     lv_obj_set_style_text_font(close_lbl, &lv_font_montserrat_18, 0);
@@ -54865,6 +54978,7 @@ static void show_theme_popup(void)
     lv_obj_set_size(close_btn, 120, 40);
     style_neutral_button(close_btn);
     lv_obj_add_event_cb(close_btn, theme_popup_close_cb, LV_EVENT_CLICKED, NULL);
+    app_keyboard_navigation_register_escape(close_btn);
 
     lv_obj_t *close_label = lv_label_create(close_btn);
     lv_label_set_text(close_label, "Close");
@@ -55023,6 +55137,7 @@ static void show_screen_lock_popup(void)
     lv_obj_set_size(close_btn, 120, 44);
     style_neutral_button(close_btn);
     lv_obj_add_event_cb(close_btn, screen_lock_popup_close_cb, LV_EVENT_CLICKED, NULL);
+    app_keyboard_navigation_register_escape(close_btn);
     lv_obj_t *close_label = lv_label_create(close_btn);
     lv_label_set_text(close_label, "Close");
     lv_obj_set_style_text_font(close_label, &lv_font_montserrat_16, 0);
@@ -55168,6 +55283,7 @@ static void show_ft_baud_popup(void)
     lv_obj_set_size(close_btn, 120, 40);
     style_neutral_button(close_btn);
     lv_obj_add_event_cb(close_btn, ft_baud_popup_close_cb, LV_EVENT_CLICKED, NULL);
+    app_keyboard_navigation_register_escape(close_btn);
     lv_obj_t *close_label = lv_label_create(close_btn);
     lv_label_set_text(close_label, "Close");
     lv_obj_set_style_text_font(close_label, &lv_font_montserrat_16, 0);
@@ -56481,6 +56597,7 @@ static void ota_open_monitor(ota_view_t view, const char *title)
     lv_obj_set_size(g_ota.mon_close_btn, lv_pct(100), 46);
     lv_obj_set_style_radius(g_ota.mon_close_btn, 8, 0);
     lv_obj_add_event_cb(g_ota.mon_close_btn, ota_monitor_close_cb, LV_EVENT_CLICKED, NULL);
+    app_keyboard_navigation_register_escape(g_ota.mon_close_btn);
     g_ota.mon_close_label = lv_label_create(g_ota.mon_close_btn);
     lv_obj_set_style_text_font(g_ota.mon_close_label, &lv_font_montserrat_18, 0);
     ota_monitor_set_close_state(true, COLOR_MATERIAL_ORANGE, "Close");
@@ -56504,7 +56621,7 @@ static void ota_kb_ready_cb(lv_event_t *e)
 {
     lv_event_code_t code = lv_event_get_code(e);
     if ((code == LV_EVENT_READY || code == LV_EVENT_CANCEL) && g_ota.keyboard) {
-        lv_obj_add_flag(g_ota.keyboard, LV_OBJ_FLAG_HIDDEN);
+        app_keyboard_set_visible(g_ota.keyboard, false);
     }
 }
 
@@ -56512,8 +56629,8 @@ static void ota_ta_focus_cb(lv_event_t *e)
 {
     lv_obj_t *ta = lv_event_get_target(e);
     if (g_ota.keyboard) {
-        lv_keyboard_set_textarea(g_ota.keyboard, ta);
-        lv_obj_clear_flag(g_ota.keyboard, LV_OBJ_FLAG_HIDDEN);
+        app_keyboard_set_textarea(g_ota.keyboard, ta);
+        app_keyboard_set_visible(g_ota.keyboard, true);
     }
 }
 
@@ -56763,6 +56880,7 @@ static lv_obj_t *ota_make_textarea(lv_obj_t *parent, const char *placeholder, in
     lv_obj_set_style_border_color(ta, ui_border_color(), 0);
     lv_obj_set_style_border_width(ta, 1, 0);
     lv_obj_set_style_text_color(ta, ui_text_color(), 0);
+    app_keyboard_style_cursor(ta, lv_obj_get_style_text_color(ta, LV_PART_MAIN));
     lv_obj_add_event_cb(ta, ota_ta_focus_cb, LV_EVENT_FOCUSED, NULL);
     lv_obj_add_event_cb(ta, ota_ta_focus_cb, LV_EVENT_CLICKED, NULL);
     return ta;
@@ -57054,6 +57172,7 @@ static void ota_scan_btn_cb(lv_event_t *e)
     lv_obj_set_style_bg_color(close_btn, lv_color_hex(0x555555), 0);
     lv_obj_set_style_radius(close_btn, 8, 0);
     lv_obj_add_event_cb(close_btn, ota_scan_close_cb, LV_EVENT_CLICKED, NULL);
+    app_keyboard_navigation_register_escape(close_btn);
     lv_obj_t *cl = lv_label_create(close_btn);
     lv_label_set_text(cl, "Cancel");
     lv_obj_set_style_text_font(cl, &lv_font_montserrat_18, 0);
@@ -57124,6 +57243,7 @@ static void show_ota_page(void)
     lv_obj_set_style_border_width(back_btn, 1, 0);
     lv_obj_set_style_border_color(back_btn, dark_mode_enabled ? COLOR_LAB5_MAGENTA : ui_border_color(), 0);
     lv_obj_add_event_cb(back_btn, ota_back_cb, LV_EVENT_CLICKED, NULL);
+    app_keyboard_navigation_register_escape(back_btn);
     lv_obj_t *back_lbl = lv_label_create(back_btn);
     lv_label_set_text(back_lbl, LV_SYMBOL_LEFT " Back");
     lv_obj_set_style_text_color(back_lbl, ui_text_color(), 0);
@@ -57314,12 +57434,12 @@ static void show_ota_page(void)
     lv_label_set_long_mode(g_ota.page_status, LV_LABEL_LONG_WRAP);
 
     // On-screen keyboard (floating, hidden until a field is focused)
-    g_ota.keyboard = lv_keyboard_create(g_ota.page);
+    g_ota.keyboard = app_keyboard_create(g_ota.page);
     lv_obj_set_size(g_ota.keyboard, lv_pct(100), 260);
     lv_obj_align(g_ota.keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_add_flag(g_ota.keyboard, LV_OBJ_FLAG_IGNORE_LAYOUT);
     style_on_screen_keyboard(g_ota.keyboard);
-    lv_obj_add_flag(g_ota.keyboard, LV_OBJ_FLAG_HIDDEN);
+    app_keyboard_set_visible(g_ota.keyboard, false);
     lv_obj_add_event_cb(g_ota.keyboard, ota_kb_ready_cb, LV_EVENT_READY, NULL);
     lv_obj_add_event_cb(g_ota.keyboard, ota_kb_ready_cb, LV_EVENT_CANCEL, NULL);
 }
@@ -57405,6 +57525,7 @@ static void show_settings_page(void)
     lv_obj_set_style_border_width(back_btn, 1, 0);
     lv_obj_set_style_border_color(back_btn, dark_mode_enabled ? COLOR_LAB5_MAGENTA : ui_border_color(), 0);
     lv_obj_add_event_cb(back_btn, settings_back_btn_event_cb, LV_EVENT_CLICKED, NULL);
+    app_keyboard_navigation_register_escape(back_btn);
 
     lv_obj_t *back_label = lv_label_create(back_btn);
     lv_label_set_text(back_label, LV_SYMBOL_LEFT " Back");
@@ -57702,8 +57823,8 @@ static void sd_admin_password_focus_cb(lv_event_t *e)
 {
     tab_context_t *ctx = &internal_ctx;
     if (!ctx || !ctx->sd_admin_keyboard) return;
-    lv_keyboard_set_textarea(ctx->sd_admin_keyboard, ctx->sd_admin_password_input);
-    lv_obj_clear_flag(ctx->sd_admin_keyboard, LV_OBJ_FLAG_HIDDEN);
+    app_keyboard_set_textarea(ctx->sd_admin_keyboard, ctx->sd_admin_password_input);
+    app_keyboard_set_visible(ctx->sd_admin_keyboard, true);
     (void)e;
 }
 
@@ -57754,7 +57875,7 @@ static void sd_admin_start_with_password(tab_context_t *ctx, const char *passwor
     snprintf(ctx->sd_admin_active_password, sizeof(ctx->sd_admin_active_password), "%s", password);
     memset(command, 0, sizeof(command));
     sd_admin_hide_qr(ctx);
-    if (ctx->sd_admin_keyboard) lv_obj_add_flag(ctx->sd_admin_keyboard, LV_OBJ_FLAG_HIDDEN);
+    if (ctx->sd_admin_keyboard) app_keyboard_set_visible(ctx->sd_admin_keyboard, false);
     sd_admin_set_status(ctx, SD_ADMIN_STARTING, "Starting portal; waiting for JanOS confirmation...");
     sd_admin_refresh_ui(ctx);
     sd_admin_begin_monitor(ctx);
@@ -57898,6 +58019,7 @@ static void show_sd_admin_page(void)
     lv_obj_set_size(back, 72, 60);
     style_back_nav_button(back);
     lv_obj_add_event_cb(back, sd_admin_back_cb, LV_EVENT_CLICKED, NULL);
+    app_keyboard_navigation_register_escape(back);
     lv_obj_t *back_label = lv_label_create(back);
     lv_label_set_text(back_label, LV_SYMBOL_LEFT);
     lv_obj_center(back_label);
@@ -57929,6 +58051,7 @@ static void show_sd_admin_page(void)
     lv_obj_set_flex_align(form, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
     lv_obj_set_style_pad_row(form, 8, 0);
     ctx->sd_admin_password_input = lv_textarea_create(form);
+    app_keyboard_style_cursor(ctx->sd_admin_password_input, lv_obj_get_style_text_color(ctx->sd_admin_password_input, LV_PART_MAIN));
     lv_obj_set_size(ctx->sd_admin_password_input, 520, 48);
     lv_textarea_set_one_line(ctx->sd_admin_password_input, true);
     lv_textarea_set_max_length(ctx->sd_admin_password_input, 63);
@@ -58029,14 +58152,14 @@ static void show_sd_admin_page(void)
     lv_obj_align(ctx->sd_admin_qr, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_add_flag(ctx->sd_admin_qr_section, LV_OBJ_FLAG_HIDDEN);
 
-    ctx->sd_admin_keyboard = lv_keyboard_create(ctx->sd_admin_page);
+    ctx->sd_admin_keyboard = app_keyboard_create(ctx->sd_admin_page);
     lv_obj_set_size(ctx->sd_admin_keyboard, lv_pct(100), 240);
     lv_obj_add_flag(ctx->sd_admin_keyboard, LV_OBJ_FLAG_FLOATING);
     lv_obj_align(ctx->sd_admin_keyboard, LV_ALIGN_BOTTOM_MID, 0, -8);
     style_on_screen_keyboard(ctx->sd_admin_keyboard);
-    lv_keyboard_set_textarea(ctx->sd_admin_keyboard, ctx->sd_admin_password_input);
+    app_keyboard_set_textarea(ctx->sd_admin_keyboard, ctx->sd_admin_password_input);
     lv_obj_add_event_cb(ctx->sd_admin_keyboard, sd_admin_keyboard_cb, LV_EVENT_ALL, NULL);
-    lv_obj_add_flag(ctx->sd_admin_keyboard, LV_OBJ_FLAG_HIDDEN);
+    app_keyboard_set_visible(ctx->sd_admin_keyboard, false);
     ctx->current_visible_page = ctx->sd_admin_page;
     sd_admin_refresh_ui(ctx);
 }
@@ -69673,6 +69796,7 @@ static void wpa_auditor_show_loading_page(bool task_started)
     lv_obj_set_style_shadow_width(back, 0, 0);
     lv_obj_set_style_radius(back, 12, 0);
     lv_obj_add_event_cb(back, wpa_auditor_back_cb, LV_EVENT_CLICKED, NULL);
+    app_keyboard_navigation_register_escape(back);
     lv_obj_t *back_label = lv_label_create(back);
     lv_label_set_text(back_label, LV_SYMBOL_LEFT);
     lv_obj_set_style_text_color(back_label, ui_text_color(), 0);
@@ -70176,6 +70300,7 @@ static void show_wpa_psk_auditor_page(void)
     lv_obj_set_style_shadow_width(back, 0, 0);
     lv_obj_set_style_radius(back, 12, 0);
     lv_obj_add_event_cb(back, wpa_auditor_back_cb, LV_EVENT_CLICKED, NULL);
+    app_keyboard_navigation_register_escape(back);
     lv_obj_t *back_label = lv_label_create(back);
     lv_label_set_text(back_label, LV_SYMBOL_LEFT);
     lv_obj_set_style_text_color(back_label, ui_text_color(), 0);
@@ -70700,6 +70825,10 @@ void app_main(void)
     // Show splash screen with animation (will transition to main tiles when done)
     bsp_display_lock(0);
     show_splash_screen();
+    esp_err_t keyboard_err = tab5_keyboard_init(keyboard_activity_cb);
+    if (keyboard_err != ESP_OK) {
+        ESP_LOGW(TAG, "Physical keyboard unavailable: %s", esp_err_to_name(keyboard_err));
+    }
     bsp_display_unlock();
 
     ESP_LOGI(TAG, "Application started. Ready to scan.");

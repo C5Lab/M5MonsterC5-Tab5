@@ -1,3 +1,4 @@
+#include "app_keyboard_navigation.h"
 /* Hunter screen — Frequency Analyzer + auto-capture.
  *
  * Sends `subghz_freq_analyzer ... hunt ...` built from NVS RF settings,
@@ -651,6 +652,7 @@ static void show_leave_popup(subghz_tab_state_t *st, int count)
     lv_obj_set_style_bg_color(stay, subghz_host_ui_muted(), 0);
     lv_obj_set_style_radius(stay, 8, 0);
     lv_obj_add_event_cb(stay, on_leave_cancel, LV_EVENT_CLICKED, NULL);
+    app_keyboard_navigation_register_escape(stay);
     lv_obj_t *sl = lv_label_create(stay);
     lv_label_set_text(sl, "Stay");
     lv_obj_set_style_text_color(sl, lv_color_white(), 0);

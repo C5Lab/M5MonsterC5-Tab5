@@ -1,3 +1,5 @@
+#include "app_keyboard.h"
+#include "app_keyboard_navigation.h"
 #include "subghz_host.h"
 #include "subghz_internal.h"
 #include "esp_log.h"
@@ -134,6 +136,7 @@ void subghz_show_text_input_popup(const char *title,
     lv_obj_set_style_text_font(ctx->textarea, &lv_font_montserrat_22, 0);
     lv_obj_set_style_bg_color(ctx->textarea, subghz_host_ui_card(), 0);
     lv_obj_set_style_text_color(ctx->textarea, subghz_host_ui_text(), 0);
+    app_keyboard_style_cursor(ctx->textarea, lv_obj_get_style_text_color(ctx->textarea, LV_PART_MAIN));
     lv_obj_set_style_border_width(ctx->textarea, 1, 0);
     lv_obj_set_style_border_color(ctx->textarea, accent, 0);
 
@@ -163,6 +166,7 @@ void subghz_show_text_input_popup(const char *title,
     lv_obj_set_style_bg_color(cancel, subghz_host_ui_muted(), 0);
     lv_obj_set_style_radius(cancel, 8, 0);
     lv_obj_add_event_cb(cancel, on_cancel_clicked, LV_EVENT_CLICKED, ctx);
+    app_keyboard_navigation_register_escape(cancel);
     lv_obj_t *cl = lv_label_create(cancel);
     lv_label_set_text(cl, "Cancel");
     lv_obj_set_style_text_color(cl, lv_color_white(), 0);
@@ -170,11 +174,11 @@ void subghz_show_text_input_popup(const char *title,
     lv_obj_center(cl);
 
     /* Bottom keyboard */
-    ctx->keyboard = lv_keyboard_create(ctx->overlay);
+    ctx->keyboard = app_keyboard_create(ctx->overlay);
     lv_obj_set_size(ctx->keyboard, lv_pct(100), 320);
     lv_obj_align(ctx->keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_keyboard_set_mode(ctx->keyboard, LV_KEYBOARD_MODE_TEXT_LOWER);
-    lv_keyboard_set_textarea(ctx->keyboard, ctx->textarea);
+    app_keyboard_set_textarea(ctx->keyboard, ctx->textarea);
     lv_obj_add_event_cb(ctx->keyboard, on_kb_event, LV_EVENT_READY, ctx);
     lv_obj_add_event_cb(ctx->keyboard, on_kb_event, LV_EVENT_CANCEL, ctx);
 }

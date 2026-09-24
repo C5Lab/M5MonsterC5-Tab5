@@ -19,6 +19,8 @@ Project Zero (JanOS): https://github.com/C5Lab/projectZero
 
 ## Documentation
 
+- [Tab5 physical keyboard — automatic detection and text input](docs/Tab5_Keyboard.md)
+
 An English, section-by-section introduction to the offline packet-analysis
 workflow is available here:
 
