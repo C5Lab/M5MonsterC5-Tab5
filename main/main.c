@@ -46,6 +46,7 @@
 #include "usb/usb_helpers.h"
 #include "usb/usb_types_ch9.h"
 #include "screens/subghz_host.h"
+#include "screens/nfc_host.h"
 #include "screens/cgw_parser.h"
 #include "scan_filter.h"
 #include "app_power_manager.h"
@@ -1357,6 +1358,8 @@ typedef struct {
     // =====================================================================
     struct subghz_tab_state *subghz;  // owned, allocated in init_tab_context
     lv_obj_t *subghz_tile;            // Sub-GHz tile in home grid (may be NULL)
+    lv_obj_t *nfc_tile;               // NFC tile in home grid (may be NULL)
+    struct nfc_tab_state *nfc;        // NFC pages, allocated on first open
 
     // Transport type for this tab context
     uint8_t transport_kind;  // 0=Grove, 1=USB, 2=MBus, 3=INTERNAL
@@ -1393,6 +1396,7 @@ typedef struct {
     // Captured from "JanOS RF version: X.Y.Z" line printed by JanOS at boot.
     char janos_rf_version[16];
     bool has_subghz;
+    bool has_nfc;
 } tab_context_t;
 
 #define PCAP_VIEWER_ROOT                "/sdcard/lab/pcaps"
@@ -2412,6 +2416,7 @@ static void hide_all_pages(tab_context_t *ctx) {
     if (ctx->sd_admin_page) lv_obj_add_flag(ctx->sd_admin_page, LV_OBJ_FLAG_HIDDEN);
     /* SubGHz pages (menu + sub-pages) */
     if (ctx->subghz) subghz_hide_all_pages(ctx->subghz);
+    if (ctx->nfc) nfc_hide_all_pages(ctx->nfc);
 }
 
 // Initialize tab context - allocate PSRAM for large data arrays
@@ -3236,6 +3241,8 @@ static void check_version_for_tab(tab_id_t tab);
 static void check_all_versions(void);
 static bool check_subghz_status_for_tab(tab_id_t tab);
 static void check_all_subghz_status(void);
+static bool check_nfc_for_tab(tab_id_t tab);
+static void check_all_nfc(void);
 static void janos_feed_bytes(tab_context_t *ctx, const char *uart_name,
                              const uint8_t *data, int len,
                              char *line_buf, int line_buf_sz, int *line_pos);
@@ -5133,8 +5140,9 @@ static __attribute__((unused)) void board_redetect_cb(void *user_data)
     // One SD probe only, and only after the board answered ping.
     check_all_sd_cards();
 
-    // Re-probe Sub-GHz availability so the home tile reflects the new state.
+    // Re-probe Sub-GHz and NFC so the home tiles reflect the new state.
     check_all_subghz_status();
+    check_all_nfc();
     board_probe_in_progress = false;
 
     bool changed = (prev_grove != grove_detected) ||
@@ -7233,6 +7241,7 @@ static void boot_detect_run_probes(void)
     check_all_sd_cards();
     check_all_versions();
     check_all_subghz_status();
+    check_all_nfc();
     board_probe_in_progress = false;
 }
 
@@ -8953,6 +8962,22 @@ subghz_tab_state_t *subghz_host_state(void)
     return subghz_host_state_for_tab((int)current_tab);
 }
 
+nfc_tab_state_t *nfc_host_state_for_tab(int tab_id)
+{
+    tab_context_t *ctx = get_ctx_for_tab((tab_id_t)tab_id);
+    if (!ctx) return NULL;
+    if (!ctx->nfc) {
+        ctx->nfc = nfc_host_alloc_state();
+        if (ctx->nfc) ctx->nfc->tab_id = tab_id;
+    }
+    return ctx->nfc;
+}
+
+nfc_tab_state_t *nfc_host_state(void)
+{
+    return nfc_host_state_for_tab((int)current_tab);
+}
+
 int subghz_host_current_tab(void)
 {
     return (int)current_tab;
@@ -9574,6 +9599,8 @@ static void main_tile_event_cb(lv_event_t *e)
         show_zig_recon_page();
     } else if (strcmp(tile_name, "Sub-GHz") == 0) {
         show_subghz_page();
+    } else if (strcmp(tile_name, "NFC") == 0) {
+        show_nfc_page();
     } else {
         // Placeholder for other tiles - show a message
         ESP_LOGI(TAG, "Feature '%s' not implemented yet", tile_name);
@@ -18121,20 +18148,44 @@ static void update_subghz_tile_visibility(tab_context_t *ctx)
     }
 }
 
+static void update_nfc_tile_visibility(tab_context_t *ctx)
+{
+    if (!ctx) return;
+    if (!ctx->nfc_tile) return;
+
+    if (!lv_obj_is_valid(ctx->nfc_tile)) {
+        ctx->nfc_tile = NULL;
+        return;
+    }
+
+    if (ctx->has_nfc) {
+        lv_obj_clear_flag(ctx->nfc_tile, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(ctx->nfc_tile, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
 // Create tiles for UART tabs inside given container
 static void create_uart_tiles_in_container(lv_obj_t *container, tab_context_t *ctx, lv_obj_t **tiles_ptr)
 {
     if (*tiles_ptr) {
-        // If Sub-GHz became available after the tiles UI was created, rebuild the
-        // tile grid so we can add the missing tile.
-        if (ctx && ctx->has_subghz &&
-            (!ctx->subghz_tile || !lv_obj_is_valid(ctx->subghz_tile))) {
-            ctx->subghz_tile = NULL;
+        // If Sub-GHz or NFC became available after the tiles UI was created,
+        // rebuild the tile grid so we can add the missing tile.
+        bool need_subghz = ctx && ctx->has_subghz &&
+            (!ctx->subghz_tile || !lv_obj_is_valid(ctx->subghz_tile));
+        bool need_nfc = ctx && ctx->has_nfc &&
+            (!ctx->nfc_tile || !lv_obj_is_valid(ctx->nfc_tile));
+        if (need_subghz || need_nfc) {
+            if (ctx) {
+                ctx->subghz_tile = NULL;
+                ctx->nfc_tile = NULL;
+            }
             lv_obj_del(*tiles_ptr);
             *tiles_ptr = NULL;
             // fall through to rebuild
         } else {
             update_subghz_tile_visibility(ctx);
+            update_nfc_tile_visibility(ctx);
             lv_obj_clear_flag(*tiles_ptr, LV_OBJ_FLAG_HIDDEN);
             return;
         }
@@ -18193,6 +18244,12 @@ static void create_uart_tiles_in_container(lv_obj_t *container, tab_context_t *c
                                        COLOR_MATERIAL_PINK, main_tile_event_cb, "Sub-GHz");
     } else if (ctx) {
         ctx->subghz_tile = NULL;
+    }
+    if (ctx && ctx->has_nfc) {
+        ctx->nfc_tile = create_tile(tile_grid, LV_SYMBOL_USB, "NFC",
+                                    COLOR_MATERIAL_CYAN, main_tile_event_cb, "NFC");
+    } else if (ctx) {
+        ctx->nfc_tile = NULL;
     }
 
     if (dashboard_enabled) {
@@ -18427,9 +18484,11 @@ static void show_uart1_tiles(void)
     if (ctx->beacon_ssids_page) lv_obj_add_flag(ctx->beacon_ssids_page, LV_OBJ_FLAG_HIDDEN);
     if (ctx->karma_page) lv_obj_add_flag(ctx->karma_page, LV_OBJ_FLAG_HIDDEN);
     if (ctx->subghz) subghz_hide_all_pages(ctx->subghz);
+    if (ctx->nfc) nfc_hide_all_pages(ctx->nfc);
 
     create_uart_tiles_in_container(container, ctx, &ctx->tiles);
     update_subghz_tile_visibility(ctx);
+    update_nfc_tile_visibility(ctx);
     ctx->current_visible_page = ctx->tiles;
     trigger_home_meta_refresh(ctx, true);
     update_home_dashboard_labels(ctx, battery_percent_from_voltage(current_battery_voltage));
@@ -18454,9 +18513,11 @@ static void show_mbus_tiles(void)
     if (ctx->beacon_ssids_page) lv_obj_add_flag(ctx->beacon_ssids_page, LV_OBJ_FLAG_HIDDEN);
     if (ctx->karma_page) lv_obj_add_flag(ctx->karma_page, LV_OBJ_FLAG_HIDDEN);
     if (ctx->subghz) subghz_hide_all_pages(ctx->subghz);
+    if (ctx->nfc) nfc_hide_all_pages(ctx->nfc);
 
     create_uart_tiles_in_container(mbus_container, ctx, &ctx->tiles);
     update_subghz_tile_visibility(ctx);
+    update_nfc_tile_visibility(ctx);
     ctx->current_visible_page = ctx->tiles;
     trigger_home_meta_refresh(ctx, true);
     update_home_dashboard_labels(ctx, battery_percent_from_voltage(current_battery_voltage));
@@ -52605,6 +52666,95 @@ static void check_all_subghz_status(void)
              mbus_ctx.has_subghz  ? "YES" : "NO");
 }
 
+// Active per-tab probe: send `init_nfc` and look for `[NFC] detected` before
+// `[NFC] END`. `[NFC] not detected` is a miss and ends the wait immediately so
+// a missing module does not burn the full timeout on every tab. Writes
+// ctx->has_nfc. USB uses the same exclusive RX lock as the Sub-GHz probe.
+static bool check_nfc_for_tab(tab_id_t tab)
+{
+    if (tab == TAB_INTERNAL) return false;
+
+    tab_context_t *ctx = get_ctx_for_tab(tab);
+    if (!ctx) return false;
+
+    uart_port_t uart_port = uart_port_for_tab(tab);
+    const char *tab_name = tab_transport_name(tab);
+
+    ESP_LOGI(TAG, "[%s] Probing for NFC module (init_nfc)...", tab_name);
+
+    if (tab == TAB_USB) {
+        usb_rx_exclusive = true;
+        usb_flush_input(100);
+    } else {
+        uart_flush_input(uart_port);
+    }
+
+    const char *cmd = "init_nfc\r\n";
+    transport_write_bytes_tab(tab, uart_port, cmd, strlen(cmd));
+
+    uint8_t rx_chunk[128];
+    char line_buf[160];
+    int line_pos = 0;
+    bool found = false;
+    bool done = false;
+    int64_t start_time = esp_timer_get_time();
+    const int64_t timeout_us = 3000000;
+
+    while (!done && (esp_timer_get_time() - start_time) < timeout_us) {
+        int len = transport_read_bytes_tab(tab, uart_port, rx_chunk,
+                                           sizeof(rx_chunk) - 1, pdMS_TO_TICKS(50));
+        if (len <= 0) continue;
+        for (int i = 0; i < len && !done; i++) {
+            char c = (char)rx_chunk[i];
+            if (c == '\n' || c == '\r') {
+                if (line_pos == 0) continue;
+                line_buf[line_pos] = '\0';
+                if (strstr(line_buf, "[NFC] not detected")) {
+                    found = false;
+                    done = true;
+                } else if (strstr(line_buf, "[NFC] detected")) {
+                    found = true;
+                } else if (strcmp(line_buf, "[NFC] END") == 0) {
+                    done = true;
+                }
+                line_pos = 0;
+            } else if (line_pos < (int)sizeof(line_buf) - 1) {
+                line_buf[line_pos++] = c;
+            }
+        }
+    }
+
+    if (tab == TAB_USB) usb_rx_exclusive = false;
+
+    ctx->has_nfc = found;
+    if (found) {
+        ESP_LOGI(TAG, "[%s] NFC module available", tab_name);
+        return true;
+    }
+
+    ESP_LOGW(TAG, "[%s] NFC module not detected", tab_name);
+    return false;
+}
+
+static void check_all_nfc(void)
+{
+    ESP_LOGI(TAG, "=== Checking NFC availability ===");
+
+    grove_ctx.has_nfc = false;
+    usb_ctx.has_nfc = false;
+    mbus_ctx.has_nfc = false;
+    internal_ctx.has_nfc = false;
+
+    if (grove_detected) check_nfc_for_tab(TAB_GROVE);
+    if (usb_detected)   check_nfc_for_tab(TAB_USB);
+    if (mbus_detected)  check_nfc_for_tab(TAB_MBUS);
+
+    ESP_LOGI(TAG, "=== NFC check complete: Grove=%s, USB=%s, MBus=%s ===",
+             grove_ctx.has_nfc ? "YES" : "NO",
+             usb_ctx.has_nfc   ? "YES" : "NO",
+             mbus_ctx.has_nfc  ? "YES" : "NO");
+}
+
 // Check JanOS firmware version on a specific UART tab.
 //
 // Strategy:
@@ -52946,8 +53096,9 @@ static void board_detect_retry_task(void *arg)
         board_probe_in_progress = true;
         detect_boards();
         check_all_sd_cards();
-        // Re-probe Sub-GHz availability so the home tile reflects the new state.
+        // Re-probe Sub-GHz and NFC so the home tiles reflect the new state.
         check_all_subghz_status();
+        check_all_nfc();
         board_probe_in_progress = false;
 
         if (board_detect_retry_stop) break;
