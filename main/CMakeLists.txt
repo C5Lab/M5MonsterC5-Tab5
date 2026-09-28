@@ -1,6 +1,9 @@
 file(TO_CMAKE_PATH "$ENV{IDF_PATH}" HS_CRACK_IDF_PATH)
 idf_component_register(SRCS
                     "main.c"
+                    "wifi_analyzer.c"
+                    "wifi_analyzer_model.c"
+                    "screens/wifi_analyzer_screen.c"
                     "app_keyboard.c"
                     "app_keyboard_navigation.c"
                     "app_keyboard_rotation.c"

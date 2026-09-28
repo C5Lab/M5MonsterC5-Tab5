@@ -84,6 +84,7 @@ static const char *tab_transport_name(tab_id_t tab)
     return "Grove";
 }
 static bool tab_is_internal(tab_id_t tab) { (void)tab; return false; }
+static bool wa_transport_blocked(tab_id_t tab) { (void)tab; return false; }
 static bool ch34x_set_port_baud(uint32_t rate)
 {
     local_rates[local_rate_count++] = (int)rate;

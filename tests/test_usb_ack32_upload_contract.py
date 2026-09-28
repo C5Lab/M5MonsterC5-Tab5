@@ -478,6 +478,8 @@ static void log_ignore(const char *tag,const char *fmt,...) {(void)tag;(void)fmt
 #define ESP_LOGD log_ignore
 #define ESP_LOGW log_ignore
 static bool usb_transport_ready=true,usb_cdc_connected=true,usb_debug_logs=false;
+#define TAB_USB 1
+static bool wa_transport_blocked(int tab) {(void)tab;return false;}
 static void *usb_cdc_handle=(void *)1;
 static int read_error;
 static size_t available=32;

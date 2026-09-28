@@ -45,6 +45,8 @@
 #include "usb/usb_host.h"
 #include "usb/usb_helpers.h"
 #include "usb/usb_types_ch9.h"
+#include "wifi_analyzer.h"
+#include "screens/wifi_analyzer_screen.h"
 #include "screens/subghz_host.h"
 #include "screens/nfc_host.h"
 #include "screens/cgw_parser.h"
@@ -1356,6 +1358,7 @@ typedef struct {
     // (state struct defined in screens/subghz_host.h, embedded as union of bytes
     // here so we don't need to expose its layout to other parts of main.c)
     // =====================================================================
+    lv_obj_t *wa_page;             // WFA view; session/worker lifetime is independent
     struct subghz_tab_state *subghz;  // owned, allocated in init_tab_context
     lv_obj_t *subghz_tile;            // Sub-GHz tile in home grid (may be NULL)
     lv_obj_t *nfc_tile;               // NFC tile in home grid (may be NULL)
@@ -2197,6 +2200,60 @@ static volatile bool board_probe_in_progress = false;
  * reject accesses from other tasks while the crack coordinator owns a port. */
 static TaskHandle_t crack_transport_owner[3] = {NULL, NULL, NULL};
 static portMUX_TYPE crack_transport_owner_mux = portMUX_INITIALIZER_UNLOCKED;
+static SemaphoreHandle_t transport_console_mutex[3];
+
+/* Reservation covers worker startup as well as active WFA traffic. Let an
+ * incumbent mutex holder finish before the analyzer acquires the stream. */
+static bool wa_transport_blocked(tab_id_t tab)
+{
+    if (tab < TAB_GROVE || tab > TAB_MBUS || !wa_busy_tab((int)tab)) return false;
+    TaskHandle_t task = xTaskGetCurrentTaskHandle();
+    TaskHandle_t owner = crack_transport_owner[tab];
+    if (owner == task) return false;
+    if (!owner && transport_console_mutex[tab] &&
+        xSemaphoreGetMutexHolder(transport_console_mutex[tab]) == task) return false;
+    return true;
+}
+
+static bool wa_any_busy(void)
+{
+    return wa_busy_tab(TAB_GROVE) || wa_busy_tab(TAB_USB) || wa_busy_tab(TAB_MBUS);
+}
+
+/* Legacy direct UART users must respect WFA ownership too. UART1 here is the
+ * physical Grove port; USB is a separate byte stream despite sharing its ID. */
+static int wa_guarded_uart_read(uart_port_t port, void *data, uint32_t len, TickType_t wait)
+{
+    if (wa_transport_blocked(port == UART2_NUM ? TAB_MBUS : TAB_GROVE)) return 0;
+    return uart_read_bytes(port, data, len, wait);
+}
+static int wa_guarded_uart_write(uart_port_t port, const void *data, size_t len)
+{
+    if (wa_transport_blocked(port == UART2_NUM ? TAB_MBUS : TAB_GROVE)) return 0;
+    return uart_write_bytes(port, data, len);
+}
+static esp_err_t wa_guarded_uart_flush(uart_port_t port)
+{
+    if (wa_transport_blocked(port == UART2_NUM ? TAB_MBUS : TAB_GROVE)) return ESP_ERR_INVALID_STATE;
+    return uart_flush_input(port);
+}
+static esp_err_t wa_guarded_usb_flush(usbh_cdc_handle_t handle)
+{
+    if (wa_transport_blocked(TAB_USB)) return ESP_ERR_INVALID_STATE;
+    return usbh_cdc_flush_rx_buffer(handle);
+}
+
+/* File-local aliases also cover legacy console users that bypass transport_*
+ * helpers. Definitions follow the wrappers so their SDK calls remain raw. */
+#define uart_read_bytes(...) wa_guarded_uart_read(__VA_ARGS__)
+#define uart_write_bytes(...) wa_guarded_uart_write(__VA_ARGS__)
+#define uart_flush_input(...) wa_guarded_uart_flush(__VA_ARGS__)
+#ifdef uart_flush
+#undef uart_flush
+#endif
+#define uart_flush(...) wa_guarded_uart_flush(__VA_ARGS__)
+#define usbh_cdc_flush_rx_buffer(...) wa_guarded_usb_flush(__VA_ARGS__)
+
 // Boot-time probe task (runs once, behind the splash).
 static TaskHandle_t boot_detect_task_handle = NULL;
 static lv_obj_t *board_detect_popup = NULL;
@@ -2385,6 +2442,10 @@ static uart_port_t uart_port_for_tab(tab_id_t tab) {
 
 // Helper to hide all pages in a tab's context (call before showing a new page)
 static void hide_all_pages(tab_context_t *ctx) {
+    if (ctx->wa_page) {
+        wa_leave((int)tab_id_for_ctx(ctx));
+        wa_screen_hide((int)tab_id_for_ctx(ctx));
+    }
     if (ctx->tiles) lv_obj_add_flag(ctx->tiles, LV_OBJ_FLAG_HIDDEN);
     if (ctx->scan_page) lv_obj_add_flag(ctx->scan_page, LV_OBJ_FLAG_HIDDEN);
     if (ctx->observer_page) lv_obj_add_flag(ctx->observer_page, LV_OBJ_FLAG_HIDDEN);
@@ -3806,7 +3867,6 @@ static int battery_percent_from_voltage(float voltage_v)
 
 // Forward declaration for USB RX arbitration flag (defined with initializer later).
 static volatile bool usb_rx_exclusive;
-static SemaphoreHandle_t transport_console_mutex[3];
 
 static void format_uptime(char *out, size_t out_len)
 {
@@ -4061,6 +4121,7 @@ static bool home_meta_refresh_allowed(const tab_context_t *ctx)
 {
     if (!ctx) return false;
     if (!ctx->tiles || ctx->current_visible_page != ctx->tiles) return false;
+    if (wa_busy_tab((int)tab_id_for_ctx(ctx))) return false;
     if (ctx->scan_in_progress) return false;
     if (ctx->observer_running || ctx->deauth_detector_running) return false;
     if (ctx->handshaker_monitoring || ctx->global_handshaker_monitoring) return false;
@@ -4729,6 +4790,7 @@ static void lock_status_btn_cb(lv_event_t *e)
 static bool usb_transport_ready = false;
 static bool usb_transport_warned = false;
 static usbh_cdc_handle_t usb_cdc_handle = NULL;
+static uint32_t wa_usb_console_baud = UART_BAUD_RATE;
 static bool usb_cdc_connected = false;
 static bool usb_host_checked = false;
 static bool usb_host_installed = false;
@@ -4885,6 +4947,7 @@ static bool ch34x_read_version(uint8_t *version)
 
 static bool ch34x_set_port_baud(uint32_t baud_rate)
 {
+    if (wa_transport_blocked(TAB_USB)) return false;
     if (!usb_cdc_handle || !usb_cdc_connected || !usb_vcp_config_done ||
         !usb_vcp_is_ch34x(usb_last_vid, usb_last_pid)) {
         return false;
@@ -4898,6 +4961,7 @@ static bool ch34x_set_port_baud(uint32_t baud_rate)
         return false;
     }
     if (!ch34x_send_control_request(&request)) return false;
+    wa_usb_console_baud = baud_rate;
     ESP_LOGI(TAG,
              "[USB][CH34X] Local bridge configured: %lu baud reg=0x%04X version=0x%02X",
              (unsigned long)baud_rate, (unsigned)request.index,
@@ -5485,6 +5549,7 @@ static __attribute__((unused)) void usb_transport_deinit(void)
 
 static int usb_transport_write(const char *data, size_t len)
 {
+    if (wa_transport_blocked(TAB_USB)) return 0;
     if (!usb_transport_ready) {
         ESP_LOGD(TAG, "[USB] Transport not ready, initializing...");
         usb_transport_init();
@@ -5515,6 +5580,7 @@ static int usb_transport_write(const char *data, size_t len)
 
 static int usb_transport_read(void *data, size_t len, TickType_t ticks_to_wait)
 {
+    if (wa_transport_blocked(TAB_USB)) return 0;
     if (!usb_transport_ready) {
         ESP_LOGD(TAG, "[USB] Transport not ready for read, initializing...");
         usb_transport_init();
@@ -5563,6 +5629,7 @@ static int usb_transport_read(void *data, size_t len, TickType_t ticks_to_wait)
 
 static void usb_flush_input(uint32_t max_ms)
 {
+    if (wa_transport_blocked(TAB_USB)) return;
     if (!usb_cdc_handle || !usb_cdc_connected) {
         return;
     }
@@ -5912,6 +5979,7 @@ static void start_usb_gps_drain_task(void)
 
 static int transport_write_bytes_tab(tab_id_t tab, uart_port_t port, const char *data, size_t len)
 {
+    if (wa_transport_blocked(tab)) return 0;
     if (tab >= TAB_GROVE && tab <= TAB_MBUS &&
         crack_transport_owner[tab] != NULL &&
         crack_transport_owner[tab] != xTaskGetCurrentTaskHandle()) return 0;
@@ -5923,6 +5991,7 @@ static int transport_write_bytes_tab(tab_id_t tab, uart_port_t port, const char 
 
 static int transport_read_bytes_tab(tab_id_t tab, uart_port_t port, void *data, size_t len, TickType_t ticks_to_wait)
 {
+    if (wa_transport_blocked(tab)) return 0;
     if (tab >= TAB_GROVE && tab <= TAB_MBUS &&
         crack_transport_owner[tab] != NULL &&
         crack_transport_owner[tab] != xTaskGetCurrentTaskHandle()) return 0;
@@ -9025,9 +9094,9 @@ int subghz_host_uart_read_bytes(int tab_id, void *buf, size_t sz, uint32_t ticks
 
 void subghz_host_uart_flush_input(int tab_id)
 {
-    if (tab_is_internal((tab_id_t)tab_id)) return;
-    uart_port_t port = uart_port_for_tab((tab_id_t)tab_id);
-    uart_flush_input(port);
+    if (tab_is_internal((tab_id_t)tab_id) || wa_transport_blocked((tab_id_t)tab_id)) return;
+    if (tab_id == TAB_USB) usb_flush_input(80);
+    else uart_flush_input(uart_port_for_tab((tab_id_t)tab_id));
 }
 
 void subghz_host_hide_all_pages(void)
@@ -9112,6 +9181,7 @@ static void tab_click_cb(lv_event_t *e)
 
     // *** SAVE current context BEFORE switching ***
     tab_context_t *old_ctx = get_current_ctx();
+    wa_leave((int)current_tab);
     save_globals_to_tab_context(old_ctx);
 
     // Hide current container (don't delete - preserve state)
@@ -9562,13 +9632,48 @@ static void create_tab_bar(void)
              mbus_detected ? "YES" : "NO");
 }
 
+static void wa_page_deleted(lv_event_t *event)
+{
+    tab_context_t *ctx = lv_event_get_user_data(event);
+    if (!ctx) return;
+    wa_leave((int)tab_id_for_ctx(ctx));
+    if (ctx->current_visible_page == ctx->wa_page) ctx->current_visible_page = NULL;
+    ctx->wa_page = NULL;
+}
+
+static void wa_back_to_tiles(int tab)
+{
+    if (tab != (int)current_tab || wa_busy_tab(tab)) return;
+    wa_screen_hide(tab);
+    show_main_tiles();
+}
+
+static void show_wifi_analyzer_page(void)
+{
+    if (tab_is_internal(current_tab)) return;
+    tab_context_t *ctx = get_current_ctx();
+    hide_all_pages(ctx);
+    lv_obj_t *old_page = ctx->wa_page;
+    ctx->wa_page = wa_screen_show(get_current_tab_container(), (int)current_tab, wa_back_to_tiles);
+    if (ctx->wa_page) {
+        if (ctx->wa_page != old_page)
+            lv_obj_add_event_cb(ctx->wa_page, wa_page_deleted, LV_EVENT_DELETE, ctx);
+        ctx->current_visible_page = ctx->wa_page;
+    } else {
+        show_main_tiles();
+    }
+}
+
 // Main tile click handler
 static void main_tile_event_cb(lv_event_t *e)
 {
     const char *tile_name = (const char *)lv_event_get_user_data(e);
     ESP_LOGI(TAG, "Tile clicked: %s", tile_name);
+    if (wa_busy_tab((int)current_tab)) return;
 
-    if (strcmp(tile_name, "WiFi Scan & Attack") == 0) {
+    if (strcmp(tile_name, "WiFi Analyzer") == 0) {
+        show_wifi_analyzer_page();
+    } else if (strcmp(tile_name, "WiFi Scan & Attack") == 0) {
         show_scan_page();
     } else if (strcmp(tile_name, "Global WiFi Attacks") == 0) {
         show_global_attacks_page();
@@ -18252,6 +18357,9 @@ static void create_uart_tiles_in_container(lv_obj_t *container, tab_context_t *c
         ctx->nfc_tile = NULL;
     }
 
+    create_tile(tile_grid, LV_SYMBOL_BARS, "WiFi\nAnalyzer", COLOR_MATERIAL_CYAN,
+                main_tile_event_cb, "WiFi Analyzer");
+
     if (dashboard_enabled) {
         lv_obj_t *footer = lv_obj_create(*tiles_ptr);
         lv_obj_set_size(footer, lv_pct(100), footer_h);
@@ -18467,6 +18575,8 @@ static void rebuild_all_home_tiles(void)
 // Show UART 1 tiles (inside persistent container)
 static void show_uart1_tiles(void)
 {
+    if (wa_busy_tab((int)current_tab)) return;
+    wa_screen_hide((int)current_tab);
     ESP_LOGI(TAG, "Showing %s tiles", tab_transport_name(current_tab));
 
     lv_obj_t *container = get_current_tab_container();
@@ -18497,6 +18607,8 @@ static void show_uart1_tiles(void)
 // Show UART 2 tiles (inside persistent container)
 static void show_mbus_tiles(void)
 {
+    if (wa_busy_tab((int)current_tab)) return;
+    wa_screen_hide((int)current_tab);
     ESP_LOGI(TAG, "Showing UART 2 tiles");
 
     if (!mbus_container) {
@@ -29599,7 +29711,7 @@ static void wardrive_autoup_retry_cb(lv_event_t *e)
 {
     tab_context_t *ctx = (tab_context_t *)lv_event_get_user_data(e);
     if (!ctx) ctx = get_current_ctx();
-    if (ctx->wardrive_autoupload_busy) return;
+    if (ctx->wardrive_autoupload_busy || wa_busy_tab((int)tab_id_for_ctx(ctx))) return;
     close_wardrive_autoup_overlay(ctx);
     xTaskCreate(wardrive_autoupload_task, "wd_autoup", 8192, (void *)ctx, 5,
                 &ctx->wardrive_autoupload_task_handle);
@@ -29642,6 +29754,11 @@ static void wardrive_autoupload_task(void *arg)
 {
     tab_context_t *ctx = (tab_context_t *)arg;
     if (!ctx) { vTaskDelete(NULL); return; }
+    if (wa_busy_tab((int)tab_id_for_ctx(ctx))) {
+        ctx->wardrive_autoupload_task_handle = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
 
     tab_id_t active_tab = tab_id_for_ctx(ctx);
     uart_port_t uart_port = uart_port_for_tab(active_tab);
@@ -30010,7 +30127,7 @@ static void show_wardrive_home_confirm(tab_context_t *ctx, const char *ssid)
 // an un-prompted home SSID, mark it prompted and raise the confirm dialog (once).
 static void wardrive_autoupload_check(tab_context_t *ctx, const wardrive_network_t *net)
 {
-    if (!ctx || !net) return;
+    if (!ctx || !net || wa_busy_tab((int)tab_id_for_ctx(ctx))) return;
     if (!g_wd_autoupload_enabled || !ctx->wardrive_autoupload_ready) return;
     if (ctx->wardrive_autoupload_busy || ctx->wardrive_autoupload_requested) return;
     if (ctx->wardrive_home_confirm_overlay) return;
@@ -52352,6 +52469,7 @@ static bool ping_uart_direct(uart_port_t uart_port, const char *uart_name, tab_c
 // Detect connected boards via ping/pong - 3 independent devices
 static void detect_boards(void)
 {
+    if (wa_any_busy()) return;
     ESP_LOGI(TAG, "=== Starting board detection ===");
 
     // Ensure USB CDC host is started before detection
@@ -52527,6 +52645,7 @@ static bool check_sd_card_for_tab(tab_id_t tab)
 // Check SD cards on all detected UARTs and Tab5 internal
 static void check_all_sd_cards(void)
 {
+    if (wa_any_busy()) return;
     ESP_LOGI(TAG, "=== Checking SD cards ===");
 
     // Check each detected UART
@@ -52649,6 +52768,7 @@ static bool check_subghz_status_for_tab(tab_id_t tab)
 // now only populates ctx->janos_rf_version for diagnostics).
 static void check_all_subghz_status(void)
 {
+    if (wa_any_busy()) return;
     ESP_LOGI(TAG, "=== Checking Sub-GHz availability ===");
 
     grove_ctx.has_subghz = false;
@@ -52738,6 +52858,7 @@ static bool check_nfc_for_tab(tab_id_t tab)
 
 static void check_all_nfc(void)
 {
+    if (wa_any_busy()) return;
     ESP_LOGI(TAG, "=== Checking NFC availability ===");
 
     grove_ctx.has_nfc = false;
@@ -52862,6 +52983,7 @@ static void check_version_for_tab(tab_id_t tab)
 
 static void check_all_versions(void)
 {
+    if (wa_any_busy()) return;
     ESP_LOGI(TAG, "=== Checking JanOS versions ===");
 
     // has_subghz is owned by check_all_subghz_status() and intentionally
@@ -59452,6 +59574,7 @@ static bool janos_transport_baud_supported(tab_id_t tab)
 static bool janos_transport_set_local_baud(tab_id_t tab, uart_port_t port,
                                            int rate)
 {
+    if (wa_transport_blocked(tab)) return false;
     if (tab == TAB_USB) return ch34x_set_port_baud((uint32_t)rate);
     return uart_set_baudrate(port, rate) == ESP_OK;
 }
@@ -60655,6 +60778,7 @@ cleanup:
 
 static bool compromised_transfer_preflight(tab_context_t *ctx, bool sync_mode)
 {
+    if (ctx && wa_busy_tab((int)tab_id_for_ctx(ctx))) return false;
     struct stat sd_stat;
     const char *reason = NULL;
     if (!ctx || stat("/sdcard", &sd_stat) != 0 || !S_ISDIR(sd_stat.st_mode)) {
@@ -61402,6 +61526,7 @@ static bool hs_crack_remote_claim_transport(hs_crack_remote_worker_t *worker)
 {
     if (!worker || worker->tab < TAB_GROVE || worker->tab > TAB_MBUS)
         return false;
+    if (wa_busy_tab((int)worker->tab)) return false;
     TaskHandle_t current = xTaskGetCurrentTaskHandle();
     bool claimed = false;
     portENTER_CRITICAL(&crack_transport_owner_mux);
@@ -66793,7 +66918,7 @@ static lv_obj_t *wpa_auditor_tab_button(tab_id_t tab)
 
 static bool wpa_auditor_switch_transport(tab_id_t tab)
 {
-    if (tab == TAB_INTERNAL || !wpa_auditor_transport_ready(tab)) return false;
+    if (tab == TAB_INTERNAL || wa_busy_tab((int)tab) || !wpa_auditor_transport_ready(tab)) return false;
     if (tab == current_tab) return true;
     lv_obj_t *button = wpa_auditor_tab_button(tab);
     if (!button || !lv_obj_is_valid(button)) return false;
@@ -70827,6 +70952,144 @@ static void compromised_file_copy_cb(lv_event_t *e)
                                  false);
 }
 
+/* Wi-Fi analyzer host adapter. A session is separate from all legacy scan
+ * models; only this worker's captured tab is used for console access. */
+static bool wa_saved_usb_exclusive;
+
+static bool wa_host_connected(int tab)
+{
+    switch (tab) {
+    case TAB_GROVE: return grove_detected;
+    case TAB_USB: return usb_detected && usb_cdc_connected && usb_cdc_handle != NULL;
+    case TAB_MBUS: return mbus_detected && uart2_initialized;
+    default: return false;
+    }
+}
+
+static bool wa_legacy_busy(tab_id_t tab)
+{
+    const tab_context_t *ctx = get_ctx_for_tab(tab);
+    if (!ctx) return true;
+    if (tab == TAB_USB && usb_vcp_config_task_handle) return true;
+    if (board_probe_in_progress || board_detection_popup_open ||
+        board_detect_retry_task_handle || boot_detect_task_handle) return true;
+    if (ctx->scan_in_progress || ctx->inspect_active || ctx->inspect_task ||
+        ctx->observer_inspect_active || ctx->observer_inspect_task ||
+        ctx->popup_focus_active || ctx->popup_focus_task || ctx->deauth_active ||
+        ctx->evil_twin_monitoring || ctx->evil_twin_task ||
+        ctx->handshaker_monitoring || ctx->handshaker_task ||
+        ctx->observer_running || ctx->observer_start_active || ctx->observer_task ||
+        ctx->observer_teardown_active || ctx->blackout_running || ctx->snifferdog_running ||
+        ctx->beacon_spam_active_overlay || ctx->mitm_popup_overlay ||
+        ctx->global_handshaker_monitoring || ctx->global_handshaker_task ||
+        ctx->phishing_portal_monitoring || ctx->phishing_portal_task ||
+        ctx->wardrive_monitoring || ctx->wardrive_task ||
+        ctx->wardrive_upload_menu_loading || ctx->wardrive_upload_menu_task ||
+        ctx->wardrive_wigle_task_running || ctx->wardrive_wigle_task ||
+        ctx->wardrive_setup_applying || ctx->wardrive_setup_task ||
+        ctx->wardrive_gps_debug_running || ctx->wardrive_gps_debug_task ||
+        ctx->home_mgmt_busy || ctx->home_mgmt_scan_task ||
+        ctx->wardrive_autoupload_busy || ctx->wardrive_autoupload_requested ||
+        ctx->wardrive_autoupload_task_handle ||
+        ctx->antisurv_monitoring || ctx->antisurv_task ||
+        ctx->iot_recon_monitoring || ctx->iot_recon_task ||
+        ctx->compromised_cleanup_running || ctx->compromised_cleanup_task ||
+        ctx->compromised_files_loading || ctx->compromised_files_load_task ||
+        ctx->wpasec_task_running || ctx->wpasec_task ||
+        ctx->deauth_detector_running || ctx->deauth_detector_task ||
+        ctx->airtag_scanning || ctx->airtag_task ||
+        ctx->bt_locator_tracking || ctx->bt_locator_task ||
+        ctx->ap_radar_running || ctx->ap_radar_task || ctx->bt_jamming ||
+        ctx->karma_sniffer_running || ctx->karma_monitoring || ctx->karma_task ||
+        ctx->nmap_scanning || ctx->nmap_scan_task ||
+        ctx->rogue_ap_monitoring || ctx->rogue_ap_task ||
+        ctx->sd_admin_state || ctx->sd_admin_task) return true;
+    if (ctx->gitm && (ctx->gitm->session_active || ctx->gitm->session_task ||
+        (ctx->gitm->state != GITM_IDLE && ctx->gitm->state != GITM_FINALIZED))) return true;
+    if (ctx->nfc && (ctx->nfc->busy || ctx->nfc->task || ctx->nfc->emulate_running)) return true;
+    const subghz_tab_state_t *rf = ctx->subghz;
+    if (rf && (rf->radio_probe_running || rf->listen_running || rf->listen_task ||
+        rf->manage_running || rf->manage_task || rf->manage_tx_active || rf->jamming ||
+        rf->jammer_task || rf->hunter_running || rf->hunter_task ||
+        rf->scanner_running || rf->scanner_task || rf->weather_running ||
+        rf->weather_task || rf->settings_query_running || rf->settings_task)) return true;
+    if (g_ota.target_tab == tab && (g_ota.scan_running || g_ota.scan_task ||
+        g_ota.monitoring || g_ota.task)) return true;
+    return false;
+}
+
+static bool wa_host_available(int tab)
+{
+    if (!wa_host_connected(tab) || wa_legacy_busy((tab_id_t)tab)) return false;
+    return crack_transport_owner[tab] == NULL;
+}
+
+static bool wa_host_claim(int tab)
+{
+    if (!wa_host_available(tab)) return false;
+    SemaphoreHandle_t mutex = transport_console_mutex[tab];
+    if (!mutex || xSemaphoreTake(mutex, pdMS_TO_TICKS(100)) != pdTRUE) return false;
+    if (!wa_host_available(tab)) {
+        xSemaphoreGive(mutex);
+        return false;
+    }
+    bool claimed = false;
+    portENTER_CRITICAL(&crack_transport_owner_mux);
+    if (!crack_transport_owner[tab]) {
+        crack_transport_owner[tab] = xTaskGetCurrentTaskHandle();
+        claimed = true;
+    }
+    portEXIT_CRITICAL(&crack_transport_owner_mux);
+    if (!claimed) {
+        xSemaphoreGive(mutex);
+        return false;
+    }
+    if (tab == TAB_USB) {
+        wa_saved_usb_exclusive = usb_rx_exclusive;
+        usb_rx_exclusive = true;
+    }
+    return true;
+}
+
+static void wa_host_release(int tab)
+{
+    if (tab < TAB_GROVE || tab > TAB_MBUS) return;
+    bool released = false;
+    portENTER_CRITICAL(&crack_transport_owner_mux);
+    if (crack_transport_owner[tab] == xTaskGetCurrentTaskHandle()) {
+        if (tab == TAB_USB) usb_rx_exclusive = wa_saved_usb_exclusive;
+        crack_transport_owner[tab] = NULL;
+        released = true;
+    }
+    portEXIT_CRITICAL(&crack_transport_owner_mux);
+    if (released) xSemaphoreGive(transport_console_mutex[tab]);
+}
+
+static int wa_host_read(int tab, void *bytes, size_t length, uint32_t timeout_ms)
+{
+    return transport_read_bytes_tab((tab_id_t)tab, uart_port_for_tab((tab_id_t)tab),
+                                    bytes, length, pdMS_TO_TICKS(timeout_ms));
+}
+
+static int wa_host_write(int tab, const void *bytes, size_t length)
+{
+    return transport_write_bytes_tab((tab_id_t)tab, uart_port_for_tab((tab_id_t)tab),
+                                     bytes, length);
+}
+
+static void wa_host_flush(int tab)
+{
+    if (wa_transport_blocked((tab_id_t)tab)) return;
+    compromised_transport_flush((tab_id_t)tab, uart_port_for_tab((tab_id_t)tab));
+}
+
+static uint32_t wa_host_baud(int tab)
+{
+    uint32_t baud = tab == TAB_USB ? wa_usb_console_baud : UART_BAUD_RATE;
+    if (tab != TAB_USB) (void)uart_get_baudrate(uart_port_for_tab((tab_id_t)tab), &baud);
+    return baud ? baud : UART_BAUD_RATE;
+}
+
 void app_main(void)
 {
     ESP_LOGI(TAG, "M5Stack Tab5 WiFi Scanner");
@@ -70875,6 +71138,13 @@ void app_main(void)
                      tab_transport_name(tab));
         }
     }
+
+    const wa_host_hooks_t analyzer_hooks = {
+        .available = wa_host_available, .claim = wa_host_claim, .release = wa_host_release,
+        .connected = wa_host_connected, .read = wa_host_read, .write = wa_host_write,
+        .flush = wa_host_flush, .baud = wa_host_baud,
+    };
+    wa_init(&analyzer_hooks);
 
     // Initialize RX8130CE RTC and seed the system clock from it
     if (rx8130_init() == ESP_OK) {

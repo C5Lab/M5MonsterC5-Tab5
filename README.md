@@ -20,6 +20,7 @@ Project Zero (JanOS): https://github.com/C5Lab/projectZero
 ## Documentation
 
 - [Tab5 physical keyboard — automatic detection and text input](docs/Tab5_Keyboard.md)
+- [Wi-Fi Analyzer — channel/RSSI view, filters, channel proposals and validation status](docs/wifi-analyzer.md)
 
 An English, section-by-section introduction to the offline packet-analysis
 workflow is available here:

@@ -48,6 +48,9 @@ static unsigned now_ms;
 static unsigned size_queries;
 static unsigned blocking_reads;
 static bool deliver_data;
+#define TAB_USB 1
+static bool analyzer_owns_transport;
+static bool wa_transport_blocked(int tab) { (void)tab; return analyzer_owns_transport; }
 
 static void usb_transport_init(void) {}
 static void usb_log_cdc_state(const char *where) { (void)where; }
@@ -90,6 +93,10 @@ harness += r'''
 int main(void)
 {
     uint8_t bytes[32] = {0};
+    analyzer_owns_transport = true;
+    CHECK(usb_transport_read(bytes, sizeof(bytes), 100) == 0);
+    CHECK(blocking_reads == 0 && now_ms == 0);
+    analyzer_owns_transport = false;
     deliver_data = true;
     CHECK(usb_transport_read(bytes, sizeof(bytes), 100) == 32);
     CHECK(now_ms == 7);
