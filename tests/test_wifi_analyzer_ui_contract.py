@@ -30,6 +30,31 @@ def body(name):
 
 
 class AnalyzerUIContract(unittest.TestCase):
+    def test_dense_traces_do_not_accumulate_filled_rectangles(self):
+        draw = body("chart_draw")
+        self.assertIn("selected ? LV_OPA_10 : LV_OPA_TRANSP", draw)
+        self.assertNotIn("selected ? LV_OPA_30 : LV_OPA_10", draw)
+        self.assertIn("u->selected_only && !selected", draw)
+        self.assertIn('"All APs\\nSelected only"', SOURCE)
+        self.assertIn("Select an AP from the list first", draw)
+
+    def test_overlap_picker_uses_bounded_snapshot_indices_and_shared_selection(self):
+        self.assertIn("overlap_indices[WA_MAX_APS]", SOURCE)
+        self.assertIn("overlap_build(u, distances)", body("chart_tap"))
+        build = body("overlap_build")
+        self.assertIn("distances[i] == INT_MAX", build)
+        self.assertIn("u->overlap_count < WA_MAX_APS", build)
+        self.assertIn("ap->bssid", build)
+        self.assertIn("ap->rssi", build)
+        self.assertIn("select_ap(u, index, true)", body("overlap_event"))
+        self.assertIn("overlap_clear(u)", body("refresh"))
+        for function in ("zoom_event", "pan_event", "fit_event", "chart_band_event", "chart_range_event"):
+            self.assertIn("overlap_clear(u)", body(function))
+        self.assertIn("lv_dropdown_close", body("overlap_clear"))
+        self.assertIn("LV_EVENT_READY", body("wa_screen_show"))
+        self.assertIn("lv_obj_get_width(u->overlap_picker)", body("overlap_open_event"))
+        self.assertIn("u->overlap_box = u->overlap_label = u->overlap_picker = NULL", body("delete_event"))
+
     def test_details_follow_fixed_list_and_have_bounded_scroll_content(self):
         page = body("wa_screen_show")
         self.assertLess(page.index("u->rows = container"), page.index("u->details = container"))

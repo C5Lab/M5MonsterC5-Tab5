@@ -14,7 +14,7 @@
 typedef struct {
     bool initialized, dirty, pending_back, editing_channels;
     int tab, chart_band, sort;
-    bool descending, full_band, motion, details_open;
+    bool descending, full_band, motion, details_open, selected_only;
     unsigned zoom;
     int center_mhz, reveal;
     wa_scan_request_t request;
@@ -32,6 +32,8 @@ typedef struct {
     lv_obj_t *chart_selector, *chart_range, *chart_zoom, *pan_left, *pan_right, *motion_selector;
     lv_obj_t *sort_buttons[3];
     lv_obj_t *advice_panel, *advice_text, *advice_pool, *advice_own;
+    lv_obj_t *trace_mode, *overlap_box, *overlap_label, *overlap_picker;
+    uint16_t overlap_indices[WA_MAX_APS], overlap_count;
     lv_timer_t *timer;
     void (*on_back)(int tab);
     uint16_t indices[WA_MAX_APS], visible_count;
@@ -50,6 +52,8 @@ static void update_details(wa_ui_t *u);
 static void update_channel_counts(wa_ui_t *u);
 static void details_transition(wa_ui_t *u, bool open);
 static void update_advice(wa_ui_t *u);
+static void overlap_clear(wa_ui_t *u);
+static void overlap_sync(wa_ui_t *u);
 
 static lv_obj_t *label(lv_obj_t *parent, const char *text, bool muted)
 {
@@ -340,6 +344,7 @@ static void chart_navigation(wa_ui_t *u)
 static void zoom_event(lv_event_t *e)
 {
     wa_ui_t *u = lv_event_get_user_data(e);
+    overlap_clear(u);
     wa_segment_t base = wa_plot_range(u->snapshot, &u->filter,
                                      (wa_band_t)u->chart_band, u->full_band);
     wa_segment_t window = wa_plot_zoom(base, u->zoom, u->center_mhz);
@@ -351,6 +356,7 @@ static void zoom_event(lv_event_t *e)
 static void pan_event(lv_event_t *e)
 {
     wa_ui_t *u = lv_event_get_user_data(e);
+    overlap_clear(u);
     wa_segment_t base = wa_plot_range(u->snapshot, &u->filter,
                                      (wa_band_t)u->chart_band, u->full_band);
     wa_segment_t window = wa_plot_zoom(base, u->zoom, u->center_mhz);
@@ -365,6 +371,7 @@ static void pan_event(lv_event_t *e)
 static void fit_event(lv_event_t *e)
 {
     wa_ui_t *u = lv_event_get_user_data(e);
+    overlap_clear(u);
     u->zoom = 1; u->center_mhz = 0;
     lv_dropdown_set_selected(u->chart_zoom, 0);
     chart_navigation(u);
@@ -381,6 +388,7 @@ static void motion_event(lv_event_t *e)
 static void chart_band_event(lv_event_t *e)
 {
     wa_ui_t *u = lv_event_get_user_data(e);
+    overlap_clear(u);
     u->chart_band = lv_dropdown_get_selected(u->chart_selector) ? WA_BAND_5 : WA_BAND_24;
     u->zoom = 1; u->center_mhz = 0;
     lv_dropdown_set_selected(u->chart_zoom, 0);
@@ -391,6 +399,7 @@ static void chart_band_event(lv_event_t *e)
 static void chart_range_event(lv_event_t *e)
 {
     wa_ui_t *u = lv_event_get_user_data(e);
+    overlap_clear(u);
     u->full_band = lv_dropdown_get_selected(u->chart_range) != 0;
     u->zoom = 1; u->center_mhz = 0;
     lv_dropdown_set_selected(u->chart_zoom, 0);
@@ -475,6 +484,7 @@ static void select_ap(wa_ui_t *u, unsigned index, bool from_chart)
     bool changed = strcmp(u->selected, ap->bssid) != 0;
     snprintf(u->selected, sizeof(u->selected), "%s", ap->bssid);
     if (!from_chart) {
+        overlap_clear(u);
         u->chart_band = ap->band;
         u->center_mhz = wa_frequency(ap->primary);
         lv_dropdown_set_selected(u->chart_selector, ap->band == WA_BAND_5);
@@ -489,6 +499,83 @@ static void select_ap(wa_ui_t *u, unsigned index, bool from_chart)
     details_transition(u, true);
     chart_navigation(u);
     update_advice(u);
+    overlap_sync(u);
+}
+
+static void overlap_clear(wa_ui_t *u)
+{
+    u->overlap_count = 0;
+    if (u->overlap_picker) {
+        lv_dropdown_close(u->overlap_picker);
+        lv_dropdown_clear_options(u->overlap_picker);
+    }
+    if (u->overlap_box) lv_obj_add_flag(u->overlap_box, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void overlap_sync(wa_ui_t *u)
+{
+    if (!u->snapshot || !u->overlap_picker) return;
+    for (unsigned i = 0; i < u->overlap_count; ++i) {
+        unsigned index = u->overlap_indices[i];
+        if (index < u->snapshot->count && !strcmp(u->snapshot->aps[index].bssid, u->selected)) {
+            lv_dropdown_set_selected(u->overlap_picker, i);
+            return;
+        }
+    }
+}
+
+static void overlap_build(wa_ui_t *u, const int distances[WA_MAX_APS])
+{
+    overlap_clear(u);
+    for (unsigned i = 0; i < u->visible_count && u->overlap_count < WA_MAX_APS; ++i) {
+        if (distances[i] == INT_MAX) continue;
+        unsigned index = u->indices[i];
+        const wa_ap_t *ap = &u->snapshot->aps[index];
+        u->overlap_indices[u->overlap_count++] = index;
+        char option[180];
+        snprintf(option, sizeof(option), "%s | %d dBm | %s", ap->bssid, ap->rssi, ap->ssid_len ? ap->ssid_display : "Hidden SSID");
+        /* SSID text must never inject another dropdown option. */
+        for (char *p = option; *p; ++p) if (*p == '\n' || *p == '\r') *p = ' ';
+        lv_dropdown_add_option(u->overlap_picker, option, LV_DROPDOWN_POS_LAST);
+    }
+    if (u->overlap_count > 1) {
+        lv_label_set_text_fmt(u->overlap_label, "%u APs at this touch - choose a network", u->overlap_count);
+        lv_obj_remove_flag(u->overlap_box, LV_OBJ_FLAG_HIDDEN);
+    }
+    overlap_sync(u);
+}
+
+static void overlap_open_event(lv_event_t *e)
+{
+    wa_ui_t *u = lv_event_get_user_data(e);
+    /* LVGL opens the popup at content width. Cap it to its full-width field
+     * on every opening, including after rotation; long SSIDs stay clipped. */
+    lv_obj_set_style_max_width(lv_dropdown_get_list(u->overlap_picker),
+                              lv_obj_get_width(u->overlap_picker), 0);
+}
+
+static void overlap_event(lv_event_t *e)
+{
+    wa_ui_t *u = lv_event_get_user_data(e);
+    /* Filter/snapshot refresh invalidates the captured index set. */
+    if (u->dirty) { refresh(u); return; }
+    unsigned option = lv_dropdown_get_selected(u->overlap_picker);
+    if (option >= u->overlap_count) return;
+    unsigned index = u->overlap_indices[option];
+    select_ap(u, index, true);
+    for (unsigned i = 0; i < u->visible_count; ++i)
+        if (u->indices[i] == index) {
+            lv_obj_scroll_to_view(lv_obj_get_child(u->rows, i), u->motion ? LV_ANIM_ON : LV_ANIM_OFF);
+            break;
+        }
+}
+
+static void trace_mode_event(lv_event_t *e)
+{
+    wa_ui_t *u = lv_event_get_user_data(e);
+    u->selected_only = lv_dropdown_get_selected(u->trace_mode) != 0;
+    /* Retain the picker to switch between coincident APs in the isolated view. */
+    lv_obj_invalidate(u->chart);
 }
 
 static void update_advice(wa_ui_t *u)
@@ -654,11 +741,13 @@ static void chart_tap(lv_event_t *e)
         const wa_ap_t *ap = &u->snapshot->aps[u->indices[i]];
         distances[i] = INT_MAX;
         if (ap->band != u->chart_band) continue;
+        if (u->selected_only && strcmp(ap->bssid, u->selected)) continue;
         distances[i] = chart_hit_distance(ap, &a, &range, &point, u->reveal);
         if (distances[i] < best) best = distances[i];
         if (!strcmp(ap->bssid, u->selected)) current = (int)i;
     }
     if (best == INT_MAX) return;
+    if (!u->selected_only) overlap_build(u, distances);
     /* Nearly coincident traces cycle in the displayed list order. A new tap
      * elsewhere picks the nearest trace instead of favoring an old selection. */
     if (current >= 0 && distances[current] > best + 4) current = -1;
@@ -738,12 +827,15 @@ static void chart_draw(lv_event_t *e)
              u->chart_band == WA_BAND_5 ? (u->full_band ? " | Full band" : " | Auto") : "", u->zoom);
     draw_text(layer, a.x1, a.y2 + 25, a.x2 - a.x1, axis, muted);
     if (!u->snapshot || !u->snapshot->valid || !u->reveal) return;
+    bool selected_visible = false;
+    unsigned plotted = 0;
     /* Draw selected last so a dense scan cannot obscure its outline. */
     for (int pass = 0; pass < 2; ++pass) {
         for (unsigned i = 0; i < u->visible_count; ++i) {
             const wa_ap_t *ap = &u->snapshot->aps[u->indices[i]];
             bool selected = !strcmp(ap->bssid, u->selected);
             if (ap->band != u->chart_band || selected != (pass == 1)) continue;
+            if (u->selected_only && !selected) continue;
             lv_color_t color = lv_color_hex(wa_ap_color_rgb(ap));
             int y = plot_y(ap->rssi, &a), x = plot_x(wa_frequency(ap->primary), &a, &range);
             y = a.y2 - (a.y2 - y) * u->reveal / 1024;
@@ -753,30 +845,46 @@ static void chart_draw(lv_event_t *e)
             size_t segment_count = wa_ap_segments(ap, segments);
             if (!segment_count) {
                 if (!primary_visible) continue;
+                ++plotted;
+                if (selected) selected_visible = true;
                 draw_line(layer, x, y, x, a.y2, color, selected ? 4 : 2, LV_OPA_COVER);
                 draw_line(layer, x - 4 < a.x1 ? a.x1 : x - 4, y,
                           x + 4 > a.x2 ? a.x2 : x + 4, y, color, 2, LV_OPA_COVER);
                 continue;
             }
+            bool drawn = false;
             for (size_t s = 0; s < segment_count; ++s) {
                 lv_area_t footprint = {plot_x(segments[s].low_mhz, &a, &range), y,
                     plot_x(segments[s].high_mhz, &a, &range), a.y2};
                 if (footprint.x1 < a.x1) footprint.x1 = a.x1;
                 if (footprint.x2 > a.x2) footprint.x2 = a.x2;
                 if (footprint.x2 < footprint.x1) continue;
+                drawn = true;
                 lv_draw_rect_dsc_t d;
                 lv_draw_rect_dsc_init(&d);
                 d.radius = 5;
-                d.bg_color = color; d.bg_opa = selected ? LV_OPA_30 : LV_OPA_10;
-                d.border_color = color; d.border_width = selected ? 3 : 1;
+                /* Repeated alpha fills hid weaker APs in dense blocks. */
+                d.bg_color = color; d.bg_opa = selected ? LV_OPA_10 : LV_OPA_TRANSP;
+                d.border_color = color; d.border_width = selected ? 2 : 1;
                 d.border_opa = selected ? LV_OPA_COVER : LV_OPA_70;
                 lv_draw_rect(layer, &d, &footprint);
+            }
+            if (drawn) {
+                ++plotted;
+                if (selected) selected_visible = true;
             }
             if (primary_visible)
                 draw_line(layer, x, y - 3 < a.y1 ? a.y1 : y - 3, x,
                           y + 5 > a.y2 ? a.y2 : y + 5, color, selected ? 3 : 2, LV_OPA_COVER);
         }
     }
+    char caption[120];
+    if (u->selected_only && !selected_visible)
+        snprintf(caption, sizeof(caption), "%s", u->selected[0] ?
+            "Selected AP outside view or filters" : "Select an AP from the list first");
+    else snprintf(caption, sizeof(caption), "%u AP%s in view%s", plotted, plotted == 1 ? "" : "s",
+                  u->selected_only ? " | Selected only" : " | Tap overlapping traces to choose");
+    draw_text(layer, a.x1 + 8, a.y1 + 4, a.x2 - a.x1 - 16, caption, subghz_host_ui_text());
 }
 
 static void update_details(wa_ui_t *u)
@@ -846,6 +954,7 @@ static void update_channel_counts(wa_ui_t *u)
 
 static void refresh(wa_ui_t *u)
 {
+    overlap_clear(u);
     u->dirty = false;
     if (u->chart_range) {
         lv_obj_t *range_field = lv_obj_get_parent(u->chart_range);
@@ -1005,6 +1114,9 @@ static void delete_event(lv_event_t *e)
     u->chart_selector = u->chart_range = NULL;
     u->chart_zoom = u->pan_left = u->pan_right = u->motion_selector = NULL;
     u->advice_panel = u->advice_text = u->advice_pool = u->advice_own = NULL;
+    u->overlap_box = u->overlap_label = u->overlap_picker = NULL;
+    u->trace_mode = NULL;
+    u->overlap_count = 0;
     u->timer = NULL;
     u->snapshot = NULL;
     memset(u->sort_buttons, 0, sizeof(u->sort_buttons));
@@ -1131,8 +1243,9 @@ lv_obj_t *wa_screen_show(lv_obj_t *parent, int tab, void (*on_back)(int tab))
     lv_obj_t *chart_header = container(u->body, LV_FLEX_FLOW_ROW_WRAP);
     u->chart_selector = dropdown(chart_header, "Channel / RSSI view", "2.4 GHz\n5 GHz", u->chart_band == WA_BAND_5, chart_band_event, u);
     u->chart_range = dropdown(chart_header, "5 GHz range", "Auto\nFull band", u->full_band, chart_range_event, u);
-    lv_obj_t *legend = label(chart_header, "Footprint = reported width; tick = primary channel\nUnknown geometry = marker only. SDK width unverified.", true);
-    lv_obj_set_width(legend, lv_pct(60));
+    u->trace_mode = dropdown(chart_header, "Traces", "All APs\nSelected only", u->selected_only, trace_mode_event, u);
+    lv_obj_t *legend = label(chart_header, "Outline = reported width; tick = primary channel. Fill = selected AP.\nUnknown width = marker only. Tap overlapping traces to choose a network.", true);
+    lv_obj_set_width(legend, lv_pct(100));
     lv_obj_t *navigation = container(u->body, LV_FLEX_FLOW_ROW_WRAP);
     lv_obj_set_flex_align(navigation, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_START);
     u->chart_zoom = dropdown(navigation, "Zoom", "1x\n2x\n4x", u->zoom == 4 ? 2 : u->zoom == 2 ? 1 : 0, zoom_event, u);
@@ -1150,6 +1263,16 @@ lv_obj_t *wa_screen_show(lv_obj_t *parent, int tab, void (*on_back)(int tab))
     lv_obj_add_flag(u->chart, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(u->chart, chart_draw, LV_EVENT_DRAW_MAIN, u);
     lv_obj_add_event_cb(u->chart, chart_tap, LV_EVENT_SHORT_CLICKED, u);
+    u->overlap_box = container(u->body, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(u->overlap_box, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    u->overlap_picker = dropdown(u->overlap_box, "Overlapping APs", "", 0, overlap_event, u);
+    lv_obj_add_event_cb(u->overlap_picker, overlap_open_event, LV_EVENT_READY, u);
+    lv_obj_t *overlap_field = lv_obj_get_parent(u->overlap_picker);
+    lv_obj_set_width(overlap_field, lv_pct(100));
+    u->overlap_label = lv_obj_get_child(overlap_field, 0);
+    lv_obj_set_width(u->overlap_label, lv_pct(100));
+    lv_obj_set_style_max_height(lv_dropdown_get_list(u->overlap_picker), 280, 0);
+    lv_obj_add_flag(u->overlap_box, LV_OBJ_FLAG_HIDDEN);
     u->channel_counts = label(u->body, "Observed APs by primary channel: --", true);
     lv_obj_set_width(u->channel_counts, lv_pct(100));
     u->advice_panel = container(u->body, LV_FLEX_FLOW_COLUMN);
@@ -1231,6 +1354,7 @@ void wa_screen_hide(int tab)
 {
     if (tab < 0 || tab >= 3) return;
     wa_ui_t *u = &views[tab];
+    overlap_clear(u);
     lv_anim_delete(u, chart_anim_exec);
     lv_anim_delete(u, details_anim_exec);
     details_anim_exec(u, u->details_open ? 248 : 0);

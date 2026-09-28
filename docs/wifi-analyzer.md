@@ -211,6 +211,56 @@ Sub-GHz/NFC hardware.
 
 ## Read the chart correctly
 
+### Dense groups and individual AP selection
+
+Unselected APs now draw as **unfilled outlines**. Only the selected AP has a
+light 10% fill and a stronger outline, drawn last. Multiple networks covering
+the same block no longer build up an opaque rectangle through repeated alpha
+blending. Frequency boundaries and measured RSSI are unchanged; APs with equal
+geometry and RSSI can still share an outline, which is intentional.
+
+Tap an overlapping area to reveal **N APs at this touch - choose a network**
+directly beneath the chart. Its dropdown lists every AP hit by that touch,
+including candidates outside the narrow nearest-trace cycling tolerance. It
+shows full BSSID first, then RSSI and SSID (or Hidden SSID), so similar or long
+names do not conceal identity. Selecting an entry highlights that AP, reveals
+its list row and opens its details without recentering the plot. Ordinary
+repeated chart taps continue to cycle the nearest nearly coincident traces.
+The chooser is for the touched geometry, not every AP sharing a primary channel;
+only records matching the current filters, band and plotted region participate.
+
+**Traces → Selected only** hides other traces while leaving the AP list,
+filters, channel counts, recommendations and frequency window unchanged.
+An existing overlap chooser remains available to inspect its members one at a
+time. In this mode chart taps hit only the drawn AP. Choose **All APs** to see
+and select a new overlapping group. If the selected AP is outside the plot or
+filters, an explicit message replaces the trace; with no selection, the chart
+asks for a selection from the AP list.
+
+The chart also reports the number of APs actually drawn in the current window.
+The transient chooser is reset on snapshot/list refresh, band/range/zoom/pan
+changes, row selection, and page hide. It stores at most 128 snapshot indices,
+and is invalidated before a stale dropdown selection can be applied. Newline
+characters in displayed SSIDs cannot inject additional options. The dropdown
+popup height is capped at 280 px and scrolls for large groups. Its width is
+capped to the field on each opening (including after rotation); an overlong
+SSID may clip, while the leading BSSID/RSSI remain identifiable and the full
+SSID is available in details.
+
+Compiler-free validation for this follow-up: **83 analyzer reference/source
+checks** and **34 C grammar checks** passed. The two new source contracts first
+failed against the previous renderer. They guard fill behavior, isolated mode,
+bounded option identity, shared selection and cleanup. They do not execute or
+render LVGL. Firmware/C harness compilation was not run.
+
+Device acceptance: repeat the photographed dense 5 GHz case at 1x and 4x;
+verify weaker outlines remain readable, hidden SSIDs are distinguishable by
+BSSID, each dropdown choice matches the row/details, and Selected only retains
+the zoom window. Check two or more identical RSSI/footprint records, unknown
+width markers, disjoint footprints, clipping, long/non-ASCII SSIDs, empty
+selection, changed filters, a new scan while the picker is open, and leaving/
+reopening the page. Confirm the caption's AP count follows the plotted window.
+
 The chart defaults to **2.4 GHz**. Its selector switches to **5 GHz** independently
 of acquisition and local band filters. Selecting an AP switches the chart to that
 AP's band. A both-band scan therefore retains both bands while displaying one
