@@ -609,7 +609,22 @@ esp_err_t bsp_sdcard_init(char* mount_point, size_t max_files)
     esp_vfs_fat_sdmmc_mount_config_t mount_config = {
         .format_if_mount_failed = false, .max_files = max_files, .allocation_unit_size = 16 * 1024};
 
-    ret_val = esp_vfs_fat_sdmmc_mount(mount_point, &host, &slot_config, &mount_config, &card);
+    // Try high speed (40 MHz) first, then fall back to the default clock
+    // (20 MHz). Marginal cards or longer wiring often fail to initialize at
+    // highspeed but mount reliably at the slower clock; without this fallback a
+    // perfectly good card reads as "NO SD" until the next reboot.
+    static const int sd_freqs_khz[] = {SDMMC_FREQ_HIGHSPEED, SDMMC_FREQ_DEFAULT};
+    const size_t sd_freq_count = sizeof(sd_freqs_khz) / sizeof(sd_freqs_khz[0]);
+    for (size_t i = 0; i < sd_freq_count; i++) {
+        card              = NULL;
+        host.max_freq_khz = sd_freqs_khz[i];
+        ret_val = esp_vfs_fat_sdmmc_mount(mount_point, &host, &slot_config, &mount_config, &card);
+        if (ret_val == ESP_OK) {
+            break;
+        }
+        ESP_LOGW(TAG, "SD mount at %d kHz failed (%s)%s", sd_freqs_khz[i], esp_err_to_name(ret_val),
+                 (i + 1 < sd_freq_count) ? ", retrying at lower clock" : "");
+    }
 
     /* Check for SDMMC mount result. */
     if (ret_val != ESP_OK) {
@@ -638,6 +653,12 @@ esp_err_t bsp_sdcard_deinit(char* mount_point)
         return ESP_ERR_INVALID_STATE;
     }
 
+    /* Nothing mounted: no-op so the remount path can call this unconditionally
+     * without tripping esp_vfs_fat_sdcard_unmount() on a NULL card handle. */
+    if (card == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
     /* Unmount an SD card from the FAT filesystem and release resources acquired */
     esp_err_t ret_val = esp_vfs_fat_sdcard_unmount(mount_point, card);
 
@@ -650,6 +671,16 @@ esp_err_t bsp_sdcard_deinit(char* mount_point)
     card = NULL;
 
     return ret_val;
+}
+
+bool bsp_sdcard_is_present(void)
+{
+    if (card == NULL) {
+        return false;
+    }
+    // CMD13 (SEND_STATUS): a real bus round-trip, so a pulled card fails here
+    // even though cached FatFs state would still look valid.
+    return sdmmc_get_status(card) == ESP_OK;
 }
 
 //==================================================================================

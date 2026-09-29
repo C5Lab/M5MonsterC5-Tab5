@@ -175,6 +175,7 @@ static lv_font_t *ssid_utf8_cached_font = NULL;
 #define INA226_BUS_VOLT_LSB     1.25f   // 1.25mV per LSB for bus voltage
 #define INA226_CURRENT_LSB_A    (INA226_MAX_CURRENT / 32767.0f)
 #define BATTERY_UPDATE_MS       2000    // Update battery status every 2 seconds
+#define SD_MONITOR_INTERVAL_MS  2000    // Poll internal SD presence live (no card-detect line)
 #define BATTERY_CHARGING_THRESHOLD_A 0.05f
 
 // INA226 Calibration (from M5Tab5 official demo)
@@ -2186,6 +2187,11 @@ static bool mbus_detected = false;
 
 // SD card presence on Tab5 itself (checked via /sdcard mount point)
 static bool internal_sd_present = false;
+// Background poller that keeps internal_sd_present live (insert/remove) since
+// the SD slot has no card-detect line wired.
+static TaskHandle_t sd_monitor_task_handle = NULL;
+// Warning icon on the Internal tab; toggled live as the SD is inserted/removed.
+static lv_obj_t *internal_sd_warn_icon = NULL;
 static bool board_detection_popup_open = false;
 // Retry detection runs on its own task, not an LVGL timer: detect_boards()
 // blocks ~3s on UART ping timeouts, and running that from an LVGL timer froze
@@ -3298,6 +3304,7 @@ static void refresh_theme_visuals(bool reopen_internal_settings);
 static void detect_boards(void);
 static bool check_sd_card_for_tab(tab_id_t tab);
 static void check_all_sd_cards(void);
+static void sd_monitor_task(void *arg);
 static void check_version_for_tab(tab_id_t tab);
 static void check_all_versions(void);
 static bool check_subghz_status_for_tab(tab_id_t tab);
@@ -4586,6 +4593,16 @@ static void battery_status_timer_cb(lv_timer_t *timer)
     update_home_dashboard_labels(&usb_ctx, battery_pct);
     update_home_dashboard_labels(&mbus_ctx, battery_pct);
     update_home_dashboard_labels(&internal_ctx, battery_pct);
+
+    // Keep the Internal-tab SD warning in sync with the live monitor. Runs on
+    // the LVGL thread (this timer), so touching the icon here is safe.
+    if (internal_sd_warn_icon && lv_obj_is_valid(internal_sd_warn_icon)) {
+        if (internal_sd_present) {
+            lv_obj_add_flag(internal_sd_warn_icon, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_clear_flag(internal_sd_warn_icon, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
 }
 
 // Get screen timeout in milliseconds based on setting
@@ -8931,6 +8948,14 @@ static void create_status_bar(void)
         ESP_LOGI(TAG, "Battery timer created");
     }
 
+    // Live SD presence monitor: polls the internal card off the UI thread so a
+    // pull or an insert is reflected within ~2 s. There is no card-detect line
+    // wired on this slot, so polling is the only way to notice removal live.
+    if (sd_monitor_task_handle == NULL) {
+        xTaskCreate(sd_monitor_task, "sd_monitor", 4096, NULL, 3, &sd_monitor_task_handle);
+        ESP_LOGI(TAG, "SD monitor task created");
+    }
+
     // Update battery status immediately
     update_battery_status();
     battery_status_timer_cb(NULL);
@@ -9403,6 +9428,7 @@ static void create_tab_bar(void)
 
     // Delete existing tab bar if present
     if (tab_bar) {
+        internal_sd_warn_icon = NULL;  // child of the old bar; cleared before free
         lv_obj_del(tab_bar);
         tab_bar = NULL;
         grove_tab_btn = NULL;
@@ -9614,12 +9640,15 @@ static void create_tab_bar(void)
     lv_obj_set_style_text_font(internal_label, tab_text_font, 0);
     lv_obj_set_style_text_color(internal_label, ui_text_color(), 0);
 
-    // SD card warning icon (if no SD card on Tab5)
-    if (!internal_sd_present) {
-        lv_obj_t *sd_warn = lv_label_create(internal_content);
-        lv_label_set_text(sd_warn, LV_SYMBOL_WARNING);
-        lv_obj_set_style_text_font(sd_warn, tab_text_font, 0);
-        lv_obj_set_style_text_color(sd_warn, lv_color_hex(0xFF5722), 0);  // Orange warning
+    // SD card warning icon. Always created and kept in a global so the live SD
+    // monitor can show/hide it without rebuilding the tab bar; hidden (and, in
+    // a flex layout, taking no space) while the internal card is present.
+    internal_sd_warn_icon = lv_label_create(internal_content);
+    lv_label_set_text(internal_sd_warn_icon, LV_SYMBOL_WARNING);
+    lv_obj_set_style_text_font(internal_sd_warn_icon, tab_text_font, 0);
+    lv_obj_set_style_text_color(internal_sd_warn_icon, lv_color_hex(0xFF5722), 0);  // Orange warning
+    if (internal_sd_present) {
+        lv_obj_add_flag(internal_sd_warn_icon, LV_OBJ_FLAG_HIDDEN);
     }
 
     // Apply active tab styling
@@ -52556,10 +52585,37 @@ static void detect_boards(void)
 static bool check_sd_card_for_tab(tab_id_t tab)
 {
     if (tab == TAB_INTERNAL) {
-        struct stat st;
-        bool mounted = (stat("/sdcard", &st) == 0);
-        ESP_LOGI(TAG, "[INTERNAL] SD card %s", mounted ? "mounted" : "NOT mounted");
-        return mounted;
+        // Liveness must come from a real bus round-trip. esp_vfs_fat_info() /
+        // stat() can't see a removal: the FAT VFS stays registered and FatFs
+        // caches the free-cluster count, so both keep reporting the card as
+        // present after it's pulled. bsp_sdcard_is_present() pings via CMD13.
+        if (bsp_sdcard_is_present()) {
+            return true;
+        }
+
+        // Card is gone or was never mounted. If a stale mount is still around
+        // (card just pulled), tear it down immediately — not throttled — so the
+        // UI flips to "NO SD" within one poll and the handle is freed for a
+        // later remount.
+        bsp_sdcard_deinit(CONFIG_BSP_SD_MOUNT_POINT); // no-op if nothing mounted
+
+        // Try to (re)mount so a boot-time failure or a fresh insertion recovers
+        // without a reboot. Throttled, because a truly empty slot would
+        // otherwise run a full SDMMC init (hundreds of ms) on every poll.
+        static int64_t internal_last_mount_us = 0;
+        int64_t now_us = esp_timer_get_time();
+        if (now_us - internal_last_mount_us < 5000000) { // at most once per 5 s
+            return false;
+        }
+        internal_last_mount_us = now_us;
+
+        esp_err_t mret = bsp_sdcard_init(CONFIG_BSP_SD_MOUNT_POINT, 5);
+        if (mret == ESP_OK) {
+            ESP_LOGI(TAG, "[INTERNAL] SD card (re)mounted");
+            return true;
+        }
+        ESP_LOGW(TAG, "[INTERNAL] SD card not mounted (%s)", esp_err_to_name(mret));
+        return false;
     }
 
     uart_port_t uart_port = uart_port_for_tab(tab);
@@ -52676,6 +52732,33 @@ static void check_all_sd_cards(void)
              usb_ctx.sd_card_present ? "YES" : "NO",
              mbus_ctx.sd_card_present ? "YES" : "NO",
              internal_sd_present ? "YES" : "NO");
+}
+
+// Keeps internal_sd_present live without a card-detect line. Runs off the UI
+// thread so the esp_vfs_fat_info probe and any (re)mount inside
+// check_sd_card_for_tab(TAB_INTERNAL) never block LVGL. The 2 s battery timer
+// re-renders the home tiles from the globals we update here, so a pulled or
+// inserted card shows up within one tick.
+static void sd_monitor_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(SD_MONITOR_INTERVAL_MS));
+
+        // Stay off the bus while a wardrive/analyzer job owns the SD, or while
+        // the board redetect is already probing SD state — either would race
+        // our mount/unmount on the same card.
+        if (wa_any_busy() || board_probe_in_progress) {
+            continue;
+        }
+
+        bool present = check_sd_card_for_tab(TAB_INTERNAL);
+        if (present != internal_sd_present) {
+            ESP_LOGI(TAG, "[INTERNAL] SD presence changed -> %s", present ? "PRESENT" : "ABSENT");
+        }
+        internal_sd_present = present;
+        internal_ctx.sd_card_present = present;
+    }
 }
 
 // Active per-tab probe: send `subghz_status` and look for `[SUBGHZ_STATUS]`
