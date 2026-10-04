@@ -1,6 +1,9 @@
 file(TO_CMAKE_PATH "$ENV{IDF_PATH}" HS_CRACK_IDF_PATH)
 idf_component_register(SRCS
                     "main.c"
+                    "tile_order.c"
+                    "tile_order_store.c"
+                    "screens/tool_order_screen.c"
                     "wifi_analyzer.c"
                     "wifi_analyzer_model.c"
                     "screens/wifi_analyzer_screen.c"
@@ -26,6 +29,7 @@ idf_component_register(SRCS
                     "hs_crack_scheduler.c"
                     "transfer_speed_config.c"
                     "usb_vcp_config.c"
+                    "ota_rf.c"
                     "lv_font_lato_regular_ttf.c"
                     "screens/psram_dynarr.c"
                     "screens/cgw_parser.c"

@@ -497,6 +497,43 @@ fast baud and making the next Crack attempt report `no CRACK/1 worker`.
 python3 tests/test_cancel_transfer_recovery_contract.py
 ```
 
+## Monster OTA / JanOS RF (`ota_rf_test.c`, `test_ota_*.py`)
+
+Covers `main/ota_rf.c` — the pure Monster OTA / JanOS RF logic (version/tag
+parsing and comparison, `ota_info` report parsing, release-list parsing, command
+builders, the install decision, the async line reassembler, and the per-device
+capability cache + single-operation guard). The Python contract tests compile
+that same source through a shared harness (`tests/_ota_rf_harness.py`), so they
+exercise the real parser, not a copy.
+
+```sh
+gcc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -g \
+    -I main -o /tmp/ota_rf_test tests/ota_rf_test.c main/ota_rf.c
+/tmp/ota_rf_test
+
+python3 tests/test_ota_metadata.py   # ota_info parsing; RF-repo line != RF hardware
+python3 tests/test_ota_flow.py       # variant/capability/layout independence, routing, decisions
+python3 tests/test_ota_http.py       # release-list consumption, empty list, fetch errors
+```
+
+What they pin down (see `docs/ota-test-coverage.md` for the full map):
+
+- the RF source line in `ota_info` proves updater capability, never RF hardware;
+- RF layout is compatible only when `ota_info` says so — absent means unknown,
+  never compatible; the classic `0x8000` table is not RF-compatible;
+- RF listing/install always carry the `rf` argument and never fall back to the
+  classic repo;
+- tags parse with or without a leading `v` and are preserved verbatim; reinstall
+  (same version) and downgrade (older) are surfaced as confirmations, never
+  started automatically;
+- incompatible/unknown layout and a missing rf-aware updater block with distinct
+  reasons;
+- the reassembler survives fragmentation, echo, prompt characters and interleaved
+  foreign log lines, drops empty lines, and discards (never truncates) an
+  over-long line; a truncated final line is not emitted;
+- changing the connected device clears cached detection and only one OTA
+  operation runs at a time.
+
 ## Manual distributed-crack smoke test
 
 1. For hardware acceptance, the operator flashes the current JanOS 1.7.5 development build containing
@@ -623,3 +660,47 @@ pings a lost transport no more often than every five seconds, reconciles its
 retired job, reattaches a still-running generation, rebuilds cache after an
 ordered `unknown_job`, or leases the unfinished suffix to an idle worker. When
 no remote can make progress, Tab5 drains every remaining ledger suffix locally.
+
+## Tool Order
+
+Pure ordering/serialization tests (GCC, Linux/WSL):
+
+```sh
+gcc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -I main \
+    tests/tile_order_test.c main/tile_order.c -o /tmp/tile_order_test
+/tmp/tile_order_test
+```
+
+The UI suite builds the production editor against bundled LVGL, with an
+in-memory NVS backend that injects read/commit faults. It covers real pointer
+long-press and reorder, all four display rotations, half-turn gesture
+cancellation, bounded edge scrolling, keyboard activation, Cancel, Save, reset
+and repair of corrupt persisted data. Run from the repository root:
+
+```sh
+mkdir -p .codex-tmp
+cmake -S tests/tile_order_ui -B .codex-tmp/tool-order-ui-build -DCMAKE_BUILD_TYPE=Debug
+cmake --build .codex-tmp/tool-order-ui-build -j 8
+.codex-tmp/tool-order-ui-build/tool_order_ui_test
+```
+
+The harness writes portrait/landscape PPM captures to `.codex-tmp/`. Physical
+Tab5 checks still cover flash persistence, hardware availability changes and
+touch feel. The test backend models commit failure; it does not simulate power
+loss inside the ESP-IDF NVS implementation.
+
+## OTA Force and cross-variant regressions
+
+Run from the repository root on Linux/WSL:
+
+```sh
+python3 tests/test_ota_tab5_regression.py
+gcc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -I main \
+    tests/ota_route_test.c main/ota_rf.c -o /tmp/ota_route_test
+/tmp/ota_route_test
+```
+
+The Python harness executes the production Tab5 precheck, selected-release,
+Force-button and metadata-sync functions with boundary stubs. This protects
+against bypasses outside the pure RF decision module. It does not claim to
+simulate the C5 flash writer or prove the physical type of unidentified hardware.

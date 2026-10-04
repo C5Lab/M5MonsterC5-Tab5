@@ -74,8 +74,10 @@ class AnalyzerIntegrationTests(unittest.TestCase):
     def test_legacy_parser_formatter_and_selection_are_unchanged(self):
         # Baseline HEAD at task entry. Freeze the presentation/selection seams,
         # not unrelated functions that intentionally acquire ownership guards.
+        # Parser baseline includes the MAC-anchored vendor fix; executed wire
+        # regression cases are in test_observer_vendor_features.py.
         expected = {
-            "parse_network_line": "dbc02b8fa2ec4319e815b9f404b918e8cdffc9883a8eae30354e3115af69a295",
+            "parse_network_line": "8caff54e07a5be19aab8e08550d0a8ae2a61d27ef7836e71915dd733fac5a504",
             "format_network_info": "60ae4556fe35b701fa49e92ed19556525158d4f83f7e768873c9b98085e2e9f1",
             "get_scan_view": "69eea3b91f2783ad7b3332ade93a95453b557a0537be3c3e9d67570a66039b40",
         }

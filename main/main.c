@@ -34,6 +34,8 @@
 #include "app_keyboard.h"
 #include "app_keyboard_navigation.h"
 #include "app_keyboard_rotation.h"
+#include "tile_order_store.h"
+#include "screens/tool_order_screen.h"
 #include "tab5_keyboard.h"
 #if LV_USE_TINY_TTF
 #include "src/libs/tiny_ttf/lv_tiny_ttf.h"
@@ -88,6 +90,7 @@
 #include "hs_capture_validation.h"
 #include "transfer_speed_config.h"
 #include "usb_vcp_config.h"
+#include "ota_rf.h"
 #include <stdatomic.h>
 #include "freertos/queue.h"
 
@@ -269,6 +272,7 @@ typedef struct {
     char vendor[48];
     int client_count;
     char clients[MAX_CLIENTS_PER_NETWORK][18];  // MAC addresses of clients
+    char client_vendors[MAX_CLIENTS_PER_NETWORK][48];  // OUI vendor per client ("" = unknown)
     bool mfp_capable;
     char uptime[64];
     bool inspected;
@@ -746,6 +750,8 @@ typedef struct {
     bool scan_last_timed_out;
     bool observer_attack_override_active;
     bool observer_attack_return_to_observer;
+    bool observer_station_return_to_network;
+    int observer_station_return_network_idx;
     wifi_network_t observer_attack_network;
     int observer_attack_override_sel_index;  // always 0; storage for scan_view_t.sel_indices
 
@@ -2754,6 +2760,13 @@ static lv_obj_t *observer_stop_btn = NULL;
 static lv_obj_t *observer_table = NULL;
 static lv_obj_t *observer_status_label = NULL;
 
+// When enabled, the Observer asks JanOS to resolve OUI vendor names for every
+// AP and client station (via the "_vendor" sniffer query). The host persists
+// this choice in NVS and pushes "vendor set on/off" to JanOS when the toggle
+// flips; JanOS persists its own vendor state, so no per-start re-assert.
+static bool observer_resolve_vendors = false;
+static bool observer_log_unknown_vendors = false;
+
 // LVGL UI elements - ESP Modem page
 static lv_obj_t *esp_modem_scan_btn = NULL;
 static lv_obj_t *esp_modem_status_label = NULL;
@@ -3177,8 +3190,12 @@ static void update_observer_table(tab_context_t *ctx);
 static void observer_flush_incremental_ui(tab_context_t *ctx);
 static void observer_export_btn_cb(lv_event_t *e);
 static bool observer_export_csv(tab_context_t *ctx, char *out_path, size_t out_path_sz, char *err_msg, size_t err_msg_sz);
-static bool parse_sniffer_network_line(const char *line, observer_network_t *net);
-static bool parse_sniffer_client_line(const char *line, char *mac_out, size_t mac_size);
+static bool parse_sniffer_network_line(const char *line, observer_network_t *net, bool observer_resolve_vendors);
+static bool parse_sniffer_client_line(const char *line, char *mac_out, size_t mac_size,
+                                      char *vendor_out, size_t vendor_size, bool observer_resolve_vendors);
+static void save_observer_vendor_to_nvs(bool enabled);
+static void save_observer_vendor_log_to_nvs(bool enabled);
+static void load_observer_vendor_from_nvs(void);
 static void show_scan_deauth_popup(void);
 static void scan_deauth_popup_close_cb(lv_event_t *e);
 static void fetch_html_files_from_sd(void);
@@ -6161,12 +6178,12 @@ static int parse_csv_mixed_fields(char *line, char **fields, int max_fields)
     return field_idx;
 }
 
-// Parse a single network line like:
-// "1","SSID","","C4:2B:44:12:29:21","1","WPA2","-53","2.4GHz","Vendor Name"
-// and also handles optional unquoted vendor as 9th field.
+static bool observer_scan_field_is_mac(const char *value);
+
+// Decode both normal vendor CSV and older responses with a split vendor name.
+// Anchor radio fields to the validated BSSID rather than to fixed indexes.
 static bool parse_network_line(const char *line, wifi_network_t *net)
 {
-    // Check if line starts with quote and number
     if (line[0] != '"') return false;
 
     char temp[512];
@@ -6174,39 +6191,64 @@ static bool parse_network_line(const char *line, wifi_network_t *net)
     temp[sizeof(temp) - 1] = '\0';
 
     // Parse CSV with mixed quoted/unquoted fields
-    char *fields[10] = {NULL};
-    int field_idx = parse_csv_mixed_fields(temp, fields, 10);
+    char *fields[16] = {NULL};
+    int field_idx = parse_csv_mixed_fields(temp, fields, 16);
 
     if (field_idx < 8) return false;
 
-    // fields[0] = index, fields[1] = SSID, fields[3] = BSSID, fields[4] = channel, fields[5] = security, fields[6] = RSSI, fields[7] = band
-    net->index = atoi(fields[0]);
+    // Vendor strings containing a comma can be split by older JanOS CSV
+    // quoting, so anchor the remaining fields on the first valid MAC address
+    // instead of assuming that BSSID is always fields[3].
+    int bssid_field = -1;
+    for (int i = 2; i < field_idx; i++) {
+        if (observer_scan_field_is_mac(fields[i])) {
+            bssid_field = i;
+            break;
+        }
+    }
+    if (bssid_field < 0 || bssid_field + 4 >= field_idx) return false;
+
+    net->index = atoi(fields[0]);  // 1-based index for select_networks command
     if (net->index <= 0) return false;
 
     strncpy(net->ssid, fields[1], sizeof(net->ssid) - 1);
     net->ssid[sizeof(net->ssid) - 1] = '\0';
 
-    strncpy(net->bssid, fields[3], sizeof(net->bssid) - 1);
+    strncpy(net->bssid, fields[bssid_field], sizeof(net->bssid) - 1);
     net->bssid[sizeof(net->bssid) - 1] = '\0';
 
-    net->channel = (field_idx >= 5 && fields[4]) ? atoi(fields[4]) : 0;
+    net->channel = atoi(fields[bssid_field + 1]);
 
-    strncpy(net->security, fields[5], sizeof(net->security) - 1);
+    strncpy(net->security, fields[bssid_field + 2], sizeof(net->security) - 1);
     net->security[sizeof(net->security) - 1] = '\0';
 
-    net->rssi = atoi(fields[6]);
+    net->rssi = atoi(fields[bssid_field + 3]);
 
-    strncpy(net->band, fields[7], sizeof(net->band) - 1);
+    strncpy(net->band, fields[bssid_field + 4], sizeof(net->band) - 1);
     net->band[sizeof(net->band) - 1] = '\0';
 
     net->vendor[0] = '\0';
-    // JanOS format in logs: vendor is usually the 3rd field (index 2).
-    if (field_idx >= 3 && fields[2] && fields[2][0] != '\0') {
-        strncpy(net->vendor, fields[2], sizeof(net->vendor) - 1);
-        net->vendor[sizeof(net->vendor) - 1] = '\0';
-    } else if (field_idx >= 9 && fields[8] && fields[8][0] != '\0') {
+    // JanOS normally puts vendor before BSSID. Preserve all pieces when an
+    // older CSV response split a vendor such as "Vendor Name, Inc.".
+    for (int i = 2; i < bssid_field; i++) {
+        if (!fields[i] || fields[i][0] == '\0') continue;
+        char *part = fields[i];
+        while (*part == '"') part++;
+        size_t part_len = strlen(part);
+        while (part_len > 0 && part[part_len - 1] == '"') {
+            part[--part_len] = '\0';
+        }
+        trim_ascii_whitespace(part);
+        if (part[0] == '\0') continue;
+
+        size_t used = strlen(net->vendor);
+        snprintf(net->vendor + used, sizeof(net->vendor) - used,
+                 "%s%s", used > 0 ? ", " : "", part);
+    }
+    if (net->vendor[0] == '\0' && field_idx > bssid_field + 5 &&
+        fields[bssid_field + 5] && fields[bssid_field + 5][0] != '\0') {
         // Fallback for alternate format with vendor as 9th field.
-        strncpy(net->vendor, fields[8], sizeof(net->vendor) - 1);
+        strncpy(net->vendor, fields[bssid_field + 5], sizeof(net->vendor) - 1);
         net->vendor[sizeof(net->vendor) - 1] = '\0';
     }
 
@@ -18300,6 +18342,58 @@ static void update_nfc_tile_visibility(tab_context_t *ctx)
 }
 
 // Create tiles for UART tabs inside given container
+/* Stable tool IDs map to action keys, never to translated display labels. */
+static const char *tool_order_action(uint8_t id)
+{
+    switch (id) {
+    case TO_WIFI_SCAN: return "WiFi Scan & Attack";
+    case TO_GLOBAL_WIFI: return "Global WiFi Attacks";
+    case TO_COMPROMISED: return "Compromised Data";
+    case TO_DEAUTH: return "Deauth Detector";
+    case TO_BLUETOOTH: return "Bluetooth";
+    case TO_OBSERVER: return "Network Observer";
+    case TO_KARMA: return "Karma";
+    case TO_WARDRIVE: return "Wardrive";
+    case TO_ANTISURV: return "Anti-Surv";
+    case TO_MESH: return "IoT";
+    case TO_SUBGHZ: return "Sub-GHz";
+    case TO_NFC: return "NFC";
+    case TO_ANALYZER: return "WiFi Analyzer";
+    case TO_AUDITOR: return "WPA PSK Auditor";
+    case TO_SETTINGS: return "Settings";
+    case TO_ADHOC: return "Ad Hoc Portal";
+    default: return NULL;
+    }
+}
+
+static void apply_tool_order(lv_obj_t *grid, tile_order_group_t group, lv_event_cb_t callback)
+{
+    if (!grid) return;
+    tile_order_t order;
+    esp_err_t err = tile_order_load(group, &order);
+    if (err != ESP_OK) ESP_LOGW(TAG, "Tool order fallback: %s", esp_err_to_name(err));
+    /* Snapshot children before moving them. Missing hardware does not consume
+     * a rendered position, but its ID remains in the persisted order. */
+    lv_obj_t *objects[TILE_ORDER_MAX] = {0};
+    uint32_t count = lv_obj_get_child_count(grid);
+    for (uint32_t child = 0; child < count; ++child) {
+        lv_obj_t *obj = lv_obj_get_child(grid, child);
+        for (uint32_t event = 0; event < lv_obj_get_event_count(obj); ++event) {
+            lv_event_dsc_t *descriptor = lv_obj_get_event_dsc(obj, event);
+            if (lv_event_dsc_get_cb(descriptor) != callback) continue;
+            const char *action = lv_event_dsc_get_user_data(descriptor);
+            if (!action) continue;
+            for (size_t i = 0; i < order.count; ++i) {
+                const char *expected = tool_order_action(order.ids[i]);
+                if (expected && !strcmp(expected, action)) objects[i] = obj;
+            }
+        }
+    }
+    int32_t rendered = 0;
+    for (size_t i = 0; i < order.count; ++i)
+        if (objects[i]) lv_obj_move_to_index(objects[i], rendered++);
+}
+
 static void create_uart_tiles_in_container(lv_obj_t *container, tab_context_t *ctx, lv_obj_t **tiles_ptr)
 {
     if (*tiles_ptr) {
@@ -18388,6 +18482,8 @@ static void create_uart_tiles_in_container(lv_obj_t *container, tab_context_t *c
 
     create_tile(tile_grid, LV_SYMBOL_BARS, "WiFi\nAnalyzer", COLOR_MATERIAL_CYAN,
                 main_tile_event_cb, "WiFi Analyzer");
+
+    apply_tool_order(tile_grid, TO_MONSTER, main_tile_event_cb);
 
     if (dashboard_enabled) {
         lv_obj_t *footer = lv_obj_create(*tiles_ptr);
@@ -18721,6 +18817,8 @@ static void show_internal_tiles(void)
     create_tile(internal_tiles, LV_SYMBOL_SETTINGS, "Settings", COLOR_MATERIAL_PURPLE, internal_tile_event_cb, "Settings");
     create_tile(internal_tiles, LV_SYMBOL_WIFI, "Ad Hoc\nPortal & Karma", COLOR_MATERIAL_ORANGE, internal_tile_event_cb, "Ad Hoc Portal");
 
+    apply_tool_order(internal_tiles, TO_INTERNAL, internal_tile_event_cb);
+
     // Ensure tiles are visible after creation (fixes initial display issue)
     lv_obj_clear_flag(internal_tiles, LV_OBJ_FLAG_HIDDEN);
 }
@@ -18992,6 +19090,29 @@ static void popup_timer_callback(TimerHandle_t xTimer)
     }
 }
 
+// A client row inside the focused network popup was tapped. Mirror the inline
+// client list: leave the popup and open the station deauth popup. Preserve the
+// focused network so STOP/X returns to that view, rather than the broad list.
+static void popup_client_row_click_cb(lv_event_t *e)
+{
+    intptr_t packed = (intptr_t)lv_event_get_user_data(e);
+    int network_idx = (int)(packed >> 16);
+    int client_idx = (int)(packed & 0xFFFF);
+
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx) return;
+
+    close_network_popup();
+
+    if (network_idx >= 0 && network_idx < ctx->observer_network_count &&
+        client_idx >= 0 && client_idx < MAX_CLIENTS_PER_NETWORK) {
+        ctx->observer_station_return_to_network = true;
+        ctx->observer_station_return_network_idx = network_idx;
+        show_deauth_popup(network_idx, client_idx);
+        if (!deauth_popup_obj) ctx->observer_station_return_to_network = false;
+    }
+}
+
 // Update popup content with current network data
 static void update_popup_content(tab_context_t *ctx)
 {
@@ -19010,12 +19131,40 @@ static void update_popup_content(tab_context_t *ctx)
             lv_obj_set_style_text_color(no_clients, lv_color_hex(0x666666), 0);
         } else {
             for (int j = 0; j < net->client_count && j < MAX_CLIENTS_PER_NETWORK; j++) {
-                if (net->clients[j][0] != '\0') {
-                    lv_obj_t *client_label = lv_label_create(ctx->popup_clients_container);
-                    lv_label_set_text_fmt(client_label, "  %s", net->clients[j]);
-                    lv_obj_set_style_text_font(client_label, &lv_font_montserrat_14, 0);
-                    lv_obj_set_style_text_color(client_label, lv_color_hex(0xAAAAAA), 0);
+                if (net->clients[j][0] == '\0') continue;
+
+                // Clickable row so a station can be actioned (deauth) straight
+                // from the popup, exactly like the inline client list.
+                lv_obj_t *client_row = lv_obj_create(ctx->popup_clients_container);
+                lv_obj_set_size(client_row, lv_pct(100), LV_SIZE_CONTENT);
+                lv_obj_set_style_pad_all(client_row, 6, 0);
+                lv_obj_set_style_pad_left(client_row, 10, 0);
+                lv_obj_set_style_bg_color(client_row, lv_color_hex(0x12242A), 0);
+                lv_obj_set_style_bg_color(client_row, lv_color_hex(0x24404A),
+                                          LV_STATE_PRESSED);
+                lv_obj_set_style_border_width(client_row, 0, 0);
+                lv_obj_set_style_radius(client_row, 4, 0);
+                lv_obj_clear_flag(client_row, LV_OBJ_FLAG_SCROLLABLE);
+                lv_obj_add_flag(client_row, LV_OBJ_FLAG_CLICKABLE);
+
+                intptr_t packed = ((intptr_t)ctx->popup_network_idx << 16) |
+                                  (intptr_t)j;
+                lv_obj_add_event_cb(client_row, popup_client_row_click_cb,
+                                    LV_EVENT_CLICKED, (void *)packed);
+
+                lv_obj_t *client_label = lv_label_create(client_row);
+                if (net->client_vendors[j][0]) {
+                    lv_label_set_text_fmt(client_label, "%s   %s",
+                                          net->clients[j], net->client_vendors[j]);
+                } else {
+                    if (observer_resolve_vendors && ctx->home_vendors_present) {
+                        lv_label_set_text_fmt(client_label, "%s   -", net->clients[j]);
+                    } else {
+                        lv_label_set_text(client_label, net->clients[j]);
+                    }
                 }
+                lv_obj_set_style_text_font(client_label, &lv_font_montserrat_14, 0);
+                lv_obj_set_style_text_color(client_label, lv_color_hex(0xCCCCCC), 0);
             }
         }
     }
@@ -19177,10 +19326,30 @@ static void observer_send_command_to_transport(tab_id_t tab, uart_port_t port,
                                                 const char *cmd, const char *purpose)
 {
     if (!cmd || tab_is_internal(tab)) return;
-    transport_write_bytes_tab(tab, port, cmd, strlen(cmd));
-    transport_write_bytes_tab(tab, port, "\r\n", 2);
+    // Write one complete line so LVGL setting changes cannot interleave a
+    // polling query between the command text and its terminator.
+    char wire[128];
+    int len = snprintf(wire, sizeof(wire), "%s\r\n", cmd);
+    if (len < 0 || len >= (int)sizeof(wire)) {
+        ESP_LOGE(TAG, "Observer command too long");
+        return;
+    }
+    transport_write_bytes_tab(tab, port, wire, (size_t)len);
     ESP_LOGI(TAG, "Observer %s command: %s",
              purpose ? purpose : "transition", cmd);
+}
+
+static void observer_apply_vendor_settings(tab_context_t *ctx)
+{
+    if (!ctx) return;
+    tab_id_t tab = tab_id_for_ctx(ctx);
+    uart_port_t port = (tab == TAB_MBUS && uart2_initialized) ? UART2_NUM : UART_NUM;
+    bool resolve = observer_resolve_vendors && ctx->home_vendors_present;
+    observer_send_command_to_transport(tab, port,
+        resolve ? "vendor set on" : "vendor set off", "vendor settings");
+    observer_send_command_to_transport(tab, port,
+        resolve && observer_log_unknown_vendors ? "vendor log on" : "vendor log off",
+        "vendor settings");
 }
 
 static void observer_flush_transport_input(tab_id_t tab, uart_port_t port)
@@ -19839,22 +20008,20 @@ static void show_network_popup(int network_idx)
 }
 
 // Helper: Check if MAC already exists in network's client list
-static bool client_mac_exists(observer_network_t *net, const char *mac)
+// Helper: Add client MAC to network if not already present, returns true if added.
+// NULL preserves the vendor in plain mode; "" explicitly records unresolved.
+// Refresh existing clients without counting them twice.
+static bool add_client_mac(observer_network_t *net, const char *mac, const char *vendor)
 {
+    // Check if already exists; refresh its vendor for a vendor-aware query.
     for (int i = 0; i < MAX_CLIENTS_PER_NETWORK; i++) {
         if (net->clients[i][0] != '\0' && strcmp(net->clients[i], mac) == 0) {
-            return true;
+            if (vendor) {
+                snprintf(net->client_vendors[i], sizeof(net->client_vendors[i]),
+                         "%s", vendor);
+            }
+            return false;
         }
-    }
-    return false;
-}
-
-// Helper: Add client MAC to network if not already present, returns true if added
-static bool add_client_mac(observer_network_t *net, const char *mac)
-{
-    // Check if already exists
-    if (client_mac_exists(net, mac)) {
-        return false;
     }
 
     // Find empty slot
@@ -19862,6 +20029,8 @@ static bool add_client_mac(observer_network_t *net, const char *mac)
         if (net->clients[i][0] == '\0') {
             strncpy(net->clients[i], mac, sizeof(net->clients[i]) - 1);
             net->clients[i][sizeof(net->clients[i]) - 1] = '\0';
+            snprintf(net->client_vendors[i], sizeof(net->client_vendors[i]),
+                     "%s", (vendor && vendor[0]) ? vendor : "");
             net->client_count++;
             return true;
         }
@@ -19900,7 +20069,10 @@ static void popup_poll_task(void *arg)
     uart_port_t uart_port = (task_tab == TAB_MBUS && uart2_initialized) ? UART2_NUM : UART_NUM;
 
     observer_flush_transport_input(task_tab, uart_port);
-    char cmd[] = "show_sniffer_results\r\n";
+    const bool vendor_query = observer_resolve_vendors && ctx->home_vendors_present;
+    const char *cmd = vendor_query
+                          ? "show_sniffer_results_vendor\r\n"
+                          : "show_sniffer_results\r\n";
     transport_write_bytes_tab(task_tab, uart_port, cmd, strlen(cmd));
 
     char *rx_buffer = ctx->observer_rx_buffer;
@@ -19944,7 +20116,7 @@ static void popup_poll_task(void *arg)
                         // Check for network line (doesn't start with space)
                         if (line_buffer[0] != ' ' && line_buffer[0] != '\t') {
                             observer_network_t parsed_net = {0};
-                            if (parse_sniffer_network_line(line_buffer, &parsed_net)) {
+                            if (parse_sniffer_network_line(line_buffer, &parsed_net, vendor_query)) {
                                 saw_result_data = true;
                                 current_network_idx = -1;
                                 observer_network_t *target =
@@ -19952,6 +20124,9 @@ static void popup_poll_task(void *arg)
                                 if (strcmp(target->ssid, parsed_net.ssid) == 0 &&
                                     target->channel == parsed_net.channel) {
                                     current_network_idx = target_network_idx;
+                                    if (vendor_query) {
+                                        snprintf(target->vendor, sizeof(target->vendor), "%s", parsed_net.vendor);
+                                    }
                                 }
                             } else {
                                 current_network_idx = -1;
@@ -19961,10 +20136,12 @@ static void popup_poll_task(void *arg)
                         else if ((line_buffer[0] == ' ' || line_buffer[0] == '\t') && current_network_idx >= 0) {
                             observer_network_t *net = &ctx->observer_networks[current_network_idx];
                             char mac[18];
-                            if (parse_sniffer_client_line(line_buffer, mac, sizeof(mac))) {
+                            char vendor[48];
+                            if (parse_sniffer_client_line(line_buffer, mac, sizeof(mac),
+                                                          vendor, sizeof(vendor), vendor_query)) {
                                 saw_result_data = true;
                                 // Add client if not already present (accumulate)
-                                if (add_client_mac(net, mac)) {
+                                if (add_client_mac(net, mac, vendor_query ? vendor : NULL)) {
                                     ESP_LOGI(TAG, "  -> NEW client: %s for '%s'", mac, net->ssid);
                                 }
                             }
@@ -20116,9 +20293,41 @@ static void observer_add_client_row(tab_context_t *ctx, int network_idx, int cli
                         LV_EVENT_CLICKED, (void *)packed_data);
 
     lv_obj_t *mac_label = lv_label_create(client_row);
-    lv_label_set_text(mac_label, net->clients[client_idx]);
+    if (net->client_vendors[client_idx][0]) {
+        lv_label_set_text_fmt(mac_label, "%s   %s", net->clients[client_idx],
+                              net->client_vendors[client_idx]);
+    } else {
+        if (observer_resolve_vendors && ctx->home_vendors_present) {
+            lv_label_set_text_fmt(mac_label, "%s   -", net->clients[client_idx]);
+        } else {
+            lv_label_set_text(mac_label, net->clients[client_idx]);
+        }
+    }
     lv_obj_set_style_text_font(mac_label, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(mac_label, COLOR_MATERIAL_TEAL, 0);
+}
+
+// Refresh labels in place when a known client acquires (or loses) a vendor.
+static void observer_update_client_vendor_labels(tab_context_t *ctx, int network_idx)
+{
+    observer_network_t *net = &ctx->observer_networks[network_idx];
+    observer_network_ui_t *ui = &ctx->observer_network_ui[network_idx];
+    if (!ui->client_container || !lv_obj_is_valid(ui->client_container)) return;
+    for (int j = 0; j < ui->rendered_client_count && j < MAX_CLIENTS_PER_NETWORK; j++) {
+        lv_obj_t *row = lv_obj_get_child(ui->client_container, j);
+        if (!row) continue;
+        lv_obj_t *label = lv_obj_get_child(row, 0);
+        if (!label) continue;
+        char text[80];
+        if (net->client_vendors[j][0] ||
+            (observer_resolve_vendors && ctx->home_vendors_present)) {
+            snprintf(text, sizeof(text), "%s   %s", net->clients[j],
+                     net->client_vendors[j][0] ? net->client_vendors[j] : "-");
+        } else {
+            snprintf(text, sizeof(text), "%s", net->clients[j]);
+        }
+        if (strcmp(lv_label_get_text(label), text) != 0) lv_label_set_text(label, text);
+    }
 }
 
 // Synchronize only network tiles whose client counts changed. Existing LVGL
@@ -20132,6 +20341,8 @@ static void observer_sync_changed_tiles(tab_context_t *ctx)
         observer_network_t *net = &ctx->observer_networks[i];
         observer_network_ui_t *ui = &ctx->observer_network_ui[i];
         if (!ui->tile || !lv_obj_is_valid(ui->tile)) continue;
+        observer_update_summary_label(ctx, i);
+        observer_update_client_vendor_labels(ctx, i);
         if (ui->rendered_client_count == net->client_count) continue;
 
         int first_new = ui->rendered_client_count;
@@ -20296,6 +20507,7 @@ static void update_observer_table(tab_context_t *ctx)
         lv_obj_set_style_text_color(ssid_label, lv_color_hex(0xFFFFFF), 0);
         lv_obj_set_width(ssid_label, LV_SIZE_CONTENT);
         lv_obj_set_style_max_width(ssid_label, wide_layout ? 320 : 360, 0);
+        lv_obj_set_height(ssid_label, lv_font_montserrat_18.line_height);
         lv_label_set_long_mode(ssid_label, LV_LABEL_LONG_DOT);
         observer_update_ssid_label(ctx, i);
 
@@ -20308,13 +20520,19 @@ static void update_observer_table(tab_context_t *ctx)
         }
 
         ui->client_toggle = lv_btn_create(title_row);
-        lv_obj_set_size(ui->client_toggle, LV_SIZE_CONTENT, 34);
-        lv_obj_set_ext_click_area(ui->client_toggle, 6);
-        lv_obj_set_style_pad_hor(ui->client_toggle, 8, 0);
+        // Keep this a comfortable touch target: a wider pill with a 44px
+        // minimum height and a generous invisible hit zone, so revealing a
+        // network's client list never fights the surrounding row.
+        lv_obj_set_size(ui->client_toggle, LV_SIZE_CONTENT, 44);
+        lv_obj_set_style_min_width(ui->client_toggle, 96, 0);
+        lv_obj_set_ext_click_area(ui->client_toggle, 14);
+        lv_obj_set_style_pad_hor(ui->client_toggle, 16, 0);
         lv_obj_set_style_pad_ver(ui->client_toggle, 0, 0);
         lv_obj_set_style_bg_color(ui->client_toggle, lv_color_hex(0x163534), 0);
-        lv_obj_set_style_bg_opa(ui->client_toggle, LV_OPA_70, 0);
-        lv_obj_set_style_radius(ui->client_toggle, 6, 0);
+        lv_obj_set_style_bg_opa(ui->client_toggle, LV_OPA_COVER, 0);
+        lv_obj_set_style_bg_color(ui->client_toggle, lv_color_hex(0x1F4A48),
+                                  LV_STATE_PRESSED);
+        lv_obj_set_style_radius(ui->client_toggle, 8, 0);
         lv_obj_clear_flag(ui->client_toggle, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_remove_flag(ui->client_toggle, LV_OBJ_FLAG_EVENT_BUBBLE);
         lv_obj_add_flag(ui->client_toggle, LV_OBJ_FLAG_HIDDEN);
@@ -20323,7 +20541,7 @@ static void update_observer_table(tab_context_t *ctx)
 
         ui->client_toggle_label = lv_label_create(ui->client_toggle);
         lv_obj_set_style_text_font(ui->client_toggle_label,
-                                   &lv_font_montserrat_14, 0);
+                                   &lv_font_montserrat_16, 0);
         lv_obj_set_style_text_color(ui->client_toggle_label,
                                     COLOR_MATERIAL_TEAL, 0);
         lv_obj_center(ui->client_toggle_label);
@@ -20344,7 +20562,11 @@ static void update_observer_table(tab_context_t *ctx)
         // uptime/vendor or force the saved badge onto a stray line.
         lv_obj_t *summary_parent = wide_layout ? title_content : header;
         ui->summary_label = lv_label_create(summary_parent);
-        lv_obj_set_width(ui->summary_label, wide_layout ? 300 : lv_pct(100));
+        // Consume the space remaining after SSID/saved in landscape. DOT
+        // requires an explicit one-line height; content height permits wraps.
+        lv_obj_set_width(ui->summary_label, wide_layout ? 0 : lv_pct(100));
+        lv_obj_set_flex_grow(ui->summary_label, wide_layout ? 1 : 0);
+        lv_obj_set_height(ui->summary_label, lv_font_montserrat_12.line_height);
         lv_label_set_long_mode(ui->summary_label, LV_LABEL_LONG_DOT);
         lv_obj_set_style_text_font(ui->summary_label, &lv_font_montserrat_12, 0);
         lv_obj_set_style_text_color(ui->summary_label, lv_color_hex(0xAAAAAA), 0);
@@ -20405,6 +20627,7 @@ static void client_row_click_cb(lv_event_t *e)
     tab_context_t *ctx = get_current_ctx();
     if (ctx && network_idx >= 0 && network_idx < ctx->observer_network_count &&
         client_idx >= 0 && client_idx < MAX_CLIENTS_PER_NETWORK) {
+        ctx->observer_station_return_to_network = false;
         show_deauth_popup(network_idx, client_idx);
     }
 }
@@ -20548,6 +20771,8 @@ static void show_deauth_popup(int network_idx, int client_idx)
 
 static void destroy_deauth_popup_ui(void)
 {
+    tab_context_t *ctx = get_current_ctx();
+    if (ctx) ctx->observer_station_return_to_network = false;
     if (deauth_popup_obj != NULL) {
         lv_obj_del(deauth_popup_obj);
         deauth_popup_obj = NULL;
@@ -20563,8 +20788,17 @@ static void destroy_deauth_popup_ui(void)
 static void stop_and_close_deauth_popup(bool resume_observer)
 {
     tab_context_t *ctx = get_current_ctx();
+    int return_network = (ctx && ctx->observer_station_return_to_network)
+                             ? ctx->observer_station_return_network_idx : -1;
 
     uart_send_command_for_tab("stop");
+    if (resume_observer && ctx && ctx->observer_running &&
+        return_network >= 0 && return_network < ctx->observer_network_count) {
+        destroy_deauth_popup_ui();
+        // Existing focus task restores target selection/sniffing asynchronously.
+        show_network_popup(return_network);
+        return;
+    }
     if (resume_observer) {
         vTaskDelay(pdMS_TO_TICKS(100));
         uart_send_command_for_tab("start_sniffer_noscan");
@@ -20665,9 +20899,43 @@ static void deauth_btn_click_cb(lv_event_t *e)
 }
 
 // Parse sniffer output line - returns true if network line parsed
-static bool parse_sniffer_network_line(const char *line, observer_network_t *net)
+// Pull the trailing "[<Vendor>]" that show_sniffer_results_vendor appends to AP
+// and client lines. Writes "" when the bracket is absent or JanOS reported
+// "Unknown", so the UI shows "-" consistently with format_observer_network_info.
+// Returns true only when a bracket was present (so the plain, no-vendor parse
+// path never clears an existing vendor).
+static bool observer_extract_vendor_bracket(const char *line, char *vendor_out,
+                                            size_t vendor_size)
+{
+    if (!vendor_out || vendor_size == 0) return false;
+    vendor_out[0] = '\0';
+
+    const char *open = strrchr(line, '[');
+    if (!open) return false;
+    const char *close = strrchr(line, ']');
+    if (!close || close <= open + 1) return false;
+    // A vendor tag must be trailing; brackets inside SSIDs are not tags.
+    for (const char *tail = close + 1; *tail; ++tail) {
+        if (!isspace((unsigned char)*tail)) return false;
+    }
+
+    size_t len = (size_t)(close - open - 1);
+    if (len >= vendor_size) len = vendor_size - 1;
+    memcpy(vendor_out, open + 1, len);
+    vendor_out[len] = '\0';
+    trim_ascii_whitespace(vendor_out);
+
+    // Normalise JanOS's "Unknown" sentinel to an empty string.
+    if (strcmp(vendor_out, "Unknown") == 0) {
+        vendor_out[0] = '\0';
+    }
+    return true;
+}
+
+static bool parse_sniffer_network_line(const char *line, observer_network_t *net, bool observer_resolve_vendors)
 {
     // Format: "SSID, CHxx: count" or "Unknown_XXXX, CHxx: count"
+    // With vendor resolution on: "SSID, CHxx: count [<Vendor>]"
     // Line should NOT start with space (those are client MACs)
     if (line[0] == ' ' || line[0] == '\t') return false;
 
@@ -20681,19 +20949,30 @@ static bool parse_sniffer_network_line(const char *line, observer_network_t *net
     strncpy(net->ssid, line, ssid_len);
     net->ssid[ssid_len] = '\0';
 
-    // Parse channel and client count: "CHxx: count"
+    // Parse channel and client count: "CHxx: count" (a trailing "[Vendor]" is
+    // ignored by sscanf and picked up separately below).
     int channel = 0, count = 0;
     if (sscanf(ch_marker, ", CH%d: %d", &channel, &count) == 2) {
         net->channel = channel;
         net->client_count = count;
+        // Only touch vendor when the "_vendor" query is active, so the plain
+        // show_sniffer_results path leaves an inspected vendor intact and never
+        // mistakes brackets inside an SSID (e.g. "[Home]") for a vendor tag.
+        if (observer_resolve_vendors) {
+            char vendor[sizeof(net->vendor)];
+            observer_extract_vendor_bracket(ch_marker, vendor, sizeof(vendor));
+            snprintf(net->vendor, sizeof(net->vendor), "%s", vendor);
+        }
         return true;
     }
 
     return false;
 }
 
-// Parse client MAC line (starts with space)
-static bool parse_sniffer_client_line(const char *line, char *mac_out, size_t mac_size)
+// Parse client MAC line (starts with space). With vendor resolution on the line
+// is " <MAC> [<Vendor>]"; vendor_out may be NULL if the caller does not need it.
+static bool parse_sniffer_client_line(const char *line, char *mac_out, size_t mac_size,
+                                      char *vendor_out, size_t vendor_size, bool observer_resolve_vendors)
 {
     // Line starts with space followed by MAC address
     if (line[0] != ' ') return false;
@@ -20704,13 +20983,17 @@ static bool parse_sniffer_client_line(const char *line, char *mac_out, size_t ma
 
     // Check if it looks like a MAC address (XX:XX:XX:XX:XX:XX)
     if (strlen(p) >= 17 && p[2] == ':' && p[5] == ':') {
-        strncpy(mac_out, p, mac_size - 1);
-        mac_out[mac_size - 1] = '\0';
-        // Trim trailing whitespace/newline
-        char *end = mac_out + strlen(mac_out) - 1;
-        while (end > mac_out && (*end == ' ' || *end == '\n' || *end == '\r')) {
-            *end = '\0';
-            end--;
+        // A MAC is exactly 17 characters; copy only those so a trailing
+        // "[Vendor]" never bleeds into the address field.
+        size_t copy = 17 < mac_size - 1 ? 17 : mac_size - 1;
+        memcpy(mac_out, p, copy);
+        mac_out[copy] = '\0';
+
+        if (vendor_out) {
+            vendor_out[0] = '\0';
+            if (observer_resolve_vendors) {
+                observer_extract_vendor_bracket(p, vendor_out, vendor_size);
+            }
         }
         return true;
     }
@@ -20746,10 +21029,17 @@ static void observer_poll_task(void *arg)
     // Flush UART buffer
     observer_flush_transport_input(task_tab, uart_port);
 
-    // Send show_sniffer_results command to correct UART
-    char cmd[] = "show_sniffer_results\r\n";
+    // Send the sniffer-results query to the correct UART. With vendor
+    // resolution enabled we ask for the "_vendor" variant so AP and client
+    // lines carry a trailing "[<Vendor>]".
+    const bool vendor_query = observer_resolve_vendors && ctx->home_vendors_present;
+    const char *cmd = vendor_query
+                          ? "show_sniffer_results_vendor\r\n"
+                          : "show_sniffer_results\r\n";
     transport_write_bytes_tab(task_tab, uart_port, cmd, strlen(cmd));
-    ESP_LOGD(TAG, "[%s] Sent: show_sniffer_results", uart_name);
+    ESP_LOGD(TAG, "[%s] Sent: %s", uart_name,
+             vendor_query ? "show_sniffer_results_vendor"
+                                      : "show_sniffer_results");
 
     // Use PSRAM-allocated buffers
     char *rx_buffer = ctx->observer_rx_buffer;
@@ -20796,7 +21086,7 @@ static void observer_poll_task(void *arg)
                         // Check for network line (doesn't start with space)
                         if (line_buffer[0] != ' ' && line_buffer[0] != '\t') {
                             observer_network_t parsed_net = {0};
-                            if (parse_sniffer_network_line(line_buffer, &parsed_net)) {
+                            if (parse_sniffer_network_line(line_buffer, &parsed_net, vendor_query)) {
                                 saw_result_data = true;
                                 // Find this network in our existing list by SSID
                                 current_network_idx = -1;
@@ -20804,6 +21094,11 @@ static void observer_poll_task(void *arg)
                                     if (strcmp(ctx->observer_networks[n].ssid, parsed_net.ssid) == 0 &&
                                         ctx->observer_networks[n].channel == parsed_net.channel) {
                                         current_network_idx = n;
+                                        if (vendor_query) {
+                                            snprintf(ctx->observer_networks[n].vendor,
+                                                     sizeof(ctx->observer_networks[n].vendor),
+                                                     "%s", parsed_net.vendor);
+                                        }
                                         // Don't overwrite client_count - we track it via add_client_mac
                                         ESP_LOGD(TAG, "[%s] Found network '%s' at idx %d (count: %d)",
                                                  uart_name, parsed_net.ssid, n, ctx->observer_networks[n].client_count);
@@ -20822,10 +21117,12 @@ static void observer_poll_task(void *arg)
                         else if ((line_buffer[0] == ' ' || line_buffer[0] == '\t') && current_network_idx >= 0) {
                             observer_network_t *net = &ctx->observer_networks[current_network_idx];
                             char mac[18];
-                            if (parse_sniffer_client_line(line_buffer, mac, sizeof(mac))) {
+                            char vendor[48];
+                            if (parse_sniffer_client_line(line_buffer, mac, sizeof(mac),
+                                                          vendor, sizeof(vendor), vendor_query)) {
                                 saw_result_data = true;
                                 // Add client if not already present (accumulate)
-                                if (add_client_mac(net, mac)) {
+                                if (add_client_mac(net, mac, vendor_query ? vendor : NULL)) {
                                     ESP_LOGI(TAG, "  -> NEW client: %s for '%s' (total: %d)", mac, net->ssid, net->client_count);
                                 }
                             } else {
@@ -20905,79 +21202,22 @@ static void observer_timer_callback(TimerHandle_t xTimer)
 // "index","SSID","","BSSID","channel","security","rssi","band","vendor"
 static bool parse_scan_to_observer(const char *line, observer_network_t *net)
 {
-    if (line[0] != '"') return false;
-
-    char temp[512];
-    strncpy(temp, line, sizeof(temp) - 1);
-    temp[sizeof(temp) - 1] = '\0';
-
-    // Parse CSV with mixed quoted/unquoted fields
-    char *fields[10] = {NULL};
-    int field_idx = parse_csv_mixed_fields(temp, fields, 10);
-
-    if (field_idx < 8) return false;
-
-    // Vendor strings containing a comma can be split by older JanOS CSV
-    // quoting, so anchor the remaining fields on the first valid MAC address
-    // instead of assuming that BSSID is always fields[3].
-    int bssid_field = -1;
-    for (int i = 2; i < field_idx; i++) {
-        if (observer_scan_field_is_mac(fields[i])) {
-            bssid_field = i;
-            break;
-        }
-    }
-    if (bssid_field < 0 || bssid_field + 4 >= field_idx) return false;
-
-    net->scan_index = atoi(fields[0]);  // 1-based index for select_networks command
-    if (net->scan_index <= 0) return false;
-
-    strncpy(net->ssid, fields[1], sizeof(net->ssid) - 1);
-    net->ssid[sizeof(net->ssid) - 1] = '\0';
-
-    strncpy(net->bssid, fields[bssid_field], sizeof(net->bssid) - 1);
-    net->bssid[sizeof(net->bssid) - 1] = '\0';
-
-    net->channel = atoi(fields[bssid_field + 1]);
-
-    strncpy(net->security, fields[bssid_field + 2], sizeof(net->security) - 1);
-    net->security[sizeof(net->security) - 1] = '\0';
-
-    net->rssi = atoi(fields[bssid_field + 3]);
-
-    strncpy(net->band, fields[bssid_field + 4], sizeof(net->band) - 1);
-    net->band[sizeof(net->band) - 1] = '\0';
-
-    net->vendor[0] = '\0';
-    // JanOS normally puts vendor before BSSID. Preserve all pieces when an
-    // older CSV response split a vendor such as "Vendor Name, Inc.".
-    for (int i = 2; i < bssid_field; i++) {
-        if (!fields[i] || fields[i][0] == '\0') continue;
-        char *part = fields[i];
-        while (*part == '"') part++;
-        size_t part_len = strlen(part);
-        while (part_len > 0 && part[part_len - 1] == '"') {
-            part[--part_len] = '\0';
-        }
-        trim_ascii_whitespace(part);
-        if (part[0] == '\0') continue;
-
-        size_t used = strlen(net->vendor);
-        snprintf(net->vendor + used, sizeof(net->vendor) - used,
-                 "%s%s", used > 0 ? ", " : "", part);
-    }
-    if (net->vendor[0] == '\0' && field_idx > bssid_field + 5 &&
-        fields[bssid_field + 5] && fields[bssid_field + 5][0] != '\0') {
-        // Fallback for alternate format with vendor as 9th field.
-        strncpy(net->vendor, fields[bssid_field + 5], sizeof(net->vendor) - 1);
-        net->vendor[sizeof(net->vendor) - 1] = '\0';
-    }
-
-    net->client_count = 0;  // No clients initially
+    wifi_network_t scanned = {0};
+    if (!parse_network_line(line, &scanned)) return false;
+    net->scan_index = scanned.index;
+    snprintf(net->ssid, sizeof(net->ssid), "%s", scanned.ssid);
+    snprintf(net->bssid, sizeof(net->bssid), "%s", scanned.bssid);
+    net->channel = scanned.channel;
+    net->rssi = scanned.rssi;
+    snprintf(net->security, sizeof(net->security), "%s", scanned.security);
+    snprintf(net->band, sizeof(net->band), "%s", scanned.band);
+    snprintf(net->vendor, sizeof(net->vendor), "%s", scanned.vendor);
+    net->client_count = 0;
     memset(net->clients, 0, sizeof(net->clients));
-
+    memset(net->client_vendors, 0, sizeof(net->client_vendors));
     return true;
 }
+
 
 static void observer_start_task(void *arg)
 {
@@ -21016,6 +21256,8 @@ static void observer_start_task(void *arg)
 
     // Flush UART buffer
     observer_flush_transport_input(task_tab, uart_port);
+
+    observer_apply_vendor_settings(ctx);
 
     // Step 1: Run scan_networks
     char scan_cmd[] = "scan_networks\r\n";
@@ -21716,6 +21958,20 @@ static void observer_back_btn_event_cb(lv_event_t *e)
     if (ctx->tiles) {
         lv_obj_clear_flag(ctx->tiles, LV_OBJ_FLAG_HIDDEN);
         ctx->current_visible_page = ctx->tiles;
+    }
+}
+
+static void observer_update_other_vendor_contexts(tab_context_t *origin)
+{
+    tab_context_t *const contexts[] = {
+        &grove_ctx, &usb_ctx, &mbus_ctx, &internal_ctx,
+    };
+    for (size_t i = 0; i < sizeof(contexts) / sizeof(contexts[0]); i++) {
+        tab_context_t *ctx = contexts[i];
+        if (ctx == origin) continue;
+        if (ctx->observer_running || ctx->observer_start_active || ctx->popup_open) {
+            observer_apply_vendor_settings(ctx);
+        }
     }
 }
 
@@ -51827,6 +52083,8 @@ static __attribute__((unused)) lv_obj_t *settings_popup_obj = NULL;
 #define NVS_KEY_WD_AUTOUP_POFF  "wd_au_poff"
 #define NVS_KEY_FT_BAUD         "ft_baud"
 #define NVS_KEY_USB_FT_BAUD     "usb_ft_baud"
+#define NVS_KEY_OBS_VENDOR      "obs_vendor"
+#define NVS_KEY_OBS_VENDOR_LOG  "obs_vendor_log"
 
 // Console rate used for JanOS file transfers over the external UARTs.
 //
@@ -51940,6 +52198,57 @@ static void save_red_team_to_nvs(bool enabled)
     } else {
         ESP_LOGE(TAG, "Failed to open NVS for writing Red Team: %s", esp_err_to_name(err));
     }
+}
+
+// Load Network Observer vendor-resolution toggle from NVS (called on startup).
+static void load_observer_vendor_from_nvs(void)
+{
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs);
+    if (err == ESP_OK) {
+        uint8_t v = 0;
+        if (nvs_get_u8(nvs, NVS_KEY_OBS_VENDOR, &v) == ESP_OK) {
+            observer_resolve_vendors = (v != 0);
+            ESP_LOGI(TAG, "Loaded Observer vendor resolution from NVS: %s",
+                     observer_resolve_vendors ? "On" : "Off");
+        } else {
+            ESP_LOGI(TAG, "No Observer vendor setting in NVS, default: Off");
+        }
+        v = 0;
+        if (nvs_get_u8(nvs, NVS_KEY_OBS_VENDOR_LOG, &v) == ESP_OK) {
+            observer_log_unknown_vendors = (v != 0);
+        }
+        nvs_close(nvs);
+    }
+}
+
+// Save Network Observer vendor-resolution toggle to NVS.
+static void save_observer_vendor_to_nvs(bool enabled)
+{
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs);
+    if (err == ESP_OK) {
+        nvs_set_u8(nvs, NVS_KEY_OBS_VENDOR, enabled ? 1 : 0);
+        nvs_commit(nvs);
+        nvs_close(nvs);
+        ESP_LOGI(TAG, "Saved Observer vendor resolution to NVS: %s",
+                 enabled ? "On" : "Off");
+    } else {
+        ESP_LOGE(TAG, "Failed to open NVS for Observer vendor: %s",
+                 esp_err_to_name(err));
+    }
+}
+
+static void save_observer_vendor_log_to_nvs(bool enabled)
+{
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs);
+    if (err == ESP_OK) {
+        err = nvs_set_u8(nvs, NVS_KEY_OBS_VENDOR_LOG, enabled ? 1 : 0);
+        if (err == ESP_OK) err = nvs_commit(nvs);
+        nvs_close(nvs);
+    }
+    if (err != ESP_OK) ESP_LOGE(TAG, "Failed to save Observer vendor log: %s", esp_err_to_name(err));
 }
 
 // Load wardrive auto-upload (home networks) config from NVS (called on startup)
@@ -53488,6 +53797,7 @@ static lv_obj_t *scan_time_mbus_min_spinbox = NULL;
 static lv_obj_t *scan_time_mbus_max_spinbox = NULL;
 static lv_obj_t *scan_time_error_label = NULL;
 static lv_obj_t *scan_setup_vendor_switch = NULL;
+static lv_obj_t *scan_setup_vendor_log_switch = NULL;
 static tab_id_t scan_setup_vendor_tab = TAB_INTERNAL;
 static uart_port_t scan_setup_vendor_uart = UART_NUM;
 static bool scan_setup_vendor_target_valid = false;
@@ -53527,160 +53837,45 @@ static bool scan_setup_resolve_vendor_target(tab_id_t *tab_out, uart_port_t *uar
     return true;
 }
 
-static bool scan_setup_parse_vendor_state(const char *response, bool *enabled_out)
+static void scan_setup_update_vendor_controls(void)
 {
-    if (!response || !enabled_out) return false;
-
-    char buf[512];
-    strncpy(buf, response, sizeof(buf) - 1);
-    buf[sizeof(buf) - 1] = '\0';
-
-    char *line = strtok(buf, "\r\n");
-    while (line) {
-        while (*line == ' ' || *line == '\t') line++;
-        if (*line != '\0') {
-            char lower[256];
-            size_t n = strlen(line);
-            if (n >= sizeof(lower)) n = sizeof(lower) - 1;
-            for (size_t i = 0; i < n; i++) {
-                lower[i] = (char)tolower((unsigned char)line[i]);
-            }
-            lower[n] = '\0';
-
-            if (strcmp(lower, "off") == 0 || strcmp(lower, "0") == 0 ||
-                strcmp(lower, "false") == 0 || strcmp(lower, "disabled") == 0) {
-                *enabled_out = false;
-                return true;
-            }
-
-            if (strcmp(lower, "on") == 0 || strcmp(lower, "1") == 0 ||
-                strcmp(lower, "true") == 0 || strcmp(lower, "enabled") == 0) {
-                *enabled_out = true;
-                return true;
-            }
-
-            if (strstr(lower, "vendor")) {
-                if (strstr(lower, "off")) {
-                    *enabled_out = false;
-                    return true;
-                }
-                if (strstr(lower, "on")) {
-                    *enabled_out = true;
-                    return true;
-                }
-            }
-        }
-        line = strtok(NULL, "\r\n");
-    }
-
-    return false;
-}
-
-static bool scan_setup_vendor_read_from_target(tab_id_t tab, uart_port_t uart_port, bool *enabled_out)
-{
-    if (!enabled_out) return false;
-
-    bool usb_lock_set = false;
-    char rx_buf[512];
-
-    if (tab == TAB_USB) {
-        usb_rx_exclusive = true;
-        usb_lock_set = true;
-        usb_flush_input(120);
-    } else {
-        uart_flush_input(uart_port);
-    }
-
-    transport_write_bytes_tab(tab, uart_port, "vendor read", strlen("vendor read"));
-    transport_write_bytes_tab(tab, uart_port, "\r\n", 2);
-
-    int rx_len = home_collect_uart_response(tab, uart_port, rx_buf, sizeof(rx_buf), 1200);
-    if (usb_lock_set) {
-        usb_rx_exclusive = false;
-    }
-
-    if (rx_len <= 0) {
-        ESP_LOGW(TAG, "[%s] vendor read: no response", tab_transport_name(tab));
-        return false;
-    }
-
-    bool enabled = false;
-    bool ok = scan_setup_parse_vendor_state(rx_buf, &enabled);
-    ESP_LOGI(TAG, "[%s] vendor read response: %s", tab_transport_name(tab), rx_buf);
-    if (!ok) {
-        return false;
-    }
-    *enabled_out = enabled;
-    return true;
-}
-
-static bool scan_setup_vendor_set_on_target(tab_id_t tab, uart_port_t uart_port, bool enable)
-{
-    bool usb_lock_set = false;
-    char cmd[32];
-    snprintf(cmd, sizeof(cmd), "vendor set %s", enable ? "on" : "off");
-
-    if (tab == TAB_USB) {
-        usb_rx_exclusive = true;
-        usb_lock_set = true;
-        usb_flush_input(120);
-    } else {
-        uart_flush_input(uart_port);
-    }
-
-    transport_write_bytes_tab(tab, uart_port, cmd, strlen(cmd));
-    transport_write_bytes_tab(tab, uart_port, "\r\n", 2);
-    ESP_LOGI(TAG, "[%s] Sent command: %s", tab_transport_name(tab), cmd);
-
-    char rx_buf[256];
-    int rx_len = home_collect_uart_response(tab, uart_port, rx_buf, sizeof(rx_buf), 900);
-    if (usb_lock_set) {
-        usb_rx_exclusive = false;
-    }
-
-    if (rx_len > 0) {
-        ESP_LOGI(TAG, "[%s] vendor set response: %s", tab_transport_name(tab), rx_buf);
-    }
-    return true;
+    if (!scan_setup_vendor_switch || !scan_setup_vendor_log_switch) return;
+    tab_context_t *ctx = get_ctx_for_tab(scan_setup_vendor_tab);
+    bool available = scan_setup_vendor_target_valid && ctx && ctx->home_vendors_present;
+    if (observer_resolve_vendors) lv_obj_add_state(scan_setup_vendor_switch, LV_STATE_CHECKED);
+    else lv_obj_remove_state(scan_setup_vendor_switch, LV_STATE_CHECKED);
+    if (observer_log_unknown_vendors) lv_obj_add_state(scan_setup_vendor_log_switch, LV_STATE_CHECKED);
+    else lv_obj_remove_state(scan_setup_vendor_log_switch, LV_STATE_CHECKED);
+    if (available) lv_obj_remove_state(scan_setup_vendor_switch, LV_STATE_DISABLED);
+    else lv_obj_add_state(scan_setup_vendor_switch, LV_STATE_DISABLED);
+    if (available && observer_resolve_vendors) lv_obj_remove_state(scan_setup_vendor_log_switch, LV_STATE_DISABLED);
+    else lv_obj_add_state(scan_setup_vendor_log_switch, LV_STATE_DISABLED);
 }
 
 static void scan_setup_vendor_switch_cb(lv_event_t *e)
 {
     (void)e;
-    if (!scan_setup_vendor_switch || scan_setup_vendor_sync_in_progress) return;
+    if (!scan_setup_vendor_switch || scan_setup_vendor_sync_in_progress ||
+        !scan_setup_vendor_target_valid) return;
+    observer_resolve_vendors = lv_obj_has_state(scan_setup_vendor_switch, LV_STATE_CHECKED);
+    save_observer_vendor_to_nvs(observer_resolve_vendors);
+    scan_setup_update_vendor_controls();
+    tab_context_t *ctx = get_ctx_for_tab(scan_setup_vendor_tab);
+    observer_apply_vendor_settings(ctx);
+    observer_update_other_vendor_contexts(ctx);
+}
 
-    if (!scan_setup_vendor_target_valid) {
-        if (scan_time_error_label) {
-            lv_label_set_text(scan_time_error_label, "Vendor control unavailable");
-        }
-        scan_setup_vendor_sync_in_progress = true;
-        lv_obj_remove_state(scan_setup_vendor_switch, LV_STATE_CHECKED);
-        scan_setup_vendor_sync_in_progress = false;
-        return;
-    }
-
-    bool requested_on = lv_obj_has_state(scan_setup_vendor_switch, LV_STATE_CHECKED);
-    scan_setup_vendor_set_on_target(scan_setup_vendor_tab, scan_setup_vendor_uart, requested_on);
-
-    bool actual_on = requested_on;
-    if (!scan_setup_vendor_read_from_target(scan_setup_vendor_tab, scan_setup_vendor_uart, &actual_on)) {
-        if (scan_time_error_label) {
-            lv_label_set_text(scan_time_error_label, "Vendor state read failed");
-        }
-        return;
-    }
-
-    scan_setup_vendor_sync_in_progress = true;
-    if (actual_on) {
-        lv_obj_add_state(scan_setup_vendor_switch, LV_STATE_CHECKED);
-    } else {
-        lv_obj_remove_state(scan_setup_vendor_switch, LV_STATE_CHECKED);
-    }
-    scan_setup_vendor_sync_in_progress = false;
-
-    if (scan_time_error_label) {
-        lv_label_set_text(scan_time_error_label, "");
-    }
+static void scan_setup_vendor_log_switch_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!scan_setup_vendor_log_switch || scan_setup_vendor_sync_in_progress ||
+        !scan_setup_vendor_target_valid) return;
+    observer_log_unknown_vendors = lv_obj_has_state(scan_setup_vendor_log_switch, LV_STATE_CHECKED);
+    save_observer_vendor_log_to_nvs(observer_log_unknown_vendors);
+    scan_setup_update_vendor_controls();
+    tab_context_t *ctx = get_ctx_for_tab(scan_setup_vendor_tab);
+    observer_apply_vendor_settings(ctx);
+    observer_update_other_vendor_contexts(ctx);
 }
 
 static void scan_time_popup_close_cb(lv_event_t *e)
@@ -53697,6 +53892,7 @@ static void scan_time_popup_close_cb(lv_event_t *e)
         scan_time_mbus_max_spinbox = NULL;
         scan_time_error_label = NULL;
         scan_setup_vendor_switch = NULL;
+        scan_setup_vendor_log_switch = NULL;
         scan_setup_vendor_target_valid = false;
         scan_setup_vendor_sync_in_progress = false;
     }
@@ -53895,16 +54091,8 @@ static void show_scan_time_popup(void)
         if (mbus_max <= 0) mbus_max = 500;
     }
 
-    bool vendor_enabled = false;
+    bool vendor_enabled = observer_resolve_vendors;
     scan_setup_vendor_target_valid = scan_setup_resolve_vendor_target(&scan_setup_vendor_tab, &scan_setup_vendor_uart);
-    if (scan_setup_vendor_target_valid) {
-        scan_setup_vendor_sync_in_progress = true;
-        bool read_ok = scan_setup_vendor_read_from_target(scan_setup_vendor_tab, scan_setup_vendor_uart, &vendor_enabled);
-        scan_setup_vendor_sync_in_progress = false;
-        if (!read_ok) {
-            scan_setup_vendor_target_valid = false;
-        }
-    }
 
     // Create modal overlay
     scan_time_popup_overlay = lv_obj_create(container);
@@ -53912,14 +54100,15 @@ static void show_scan_time_popup(void)
 
     // Create popup - dynamic height based on device count
     scan_time_popup_obj = lv_obj_create(scan_time_popup_overlay);
-    int popup_height = 250 + (device_count * 140);  // Base + vendor row + per-device section
+    int popup_height = 330 + (device_count * 140);  // Base + vendor controls + per-device section
     lv_obj_set_size(scan_time_popup_obj, 420, popup_height);
+    lv_obj_set_style_max_height(scan_time_popup_obj, lv_pct(90), 0);
     lv_obj_center(scan_time_popup_obj);
     style_popup_card(scan_time_popup_obj, 12, ui_tab_icon_color());
     lv_obj_set_style_pad_all(scan_time_popup_obj, 15, 0);
     lv_obj_set_flex_flow(scan_time_popup_obj, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_row(scan_time_popup_obj, 8, 0);
-    lv_obj_clear_flag(scan_time_popup_obj, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(scan_time_popup_obj, LV_DIR_VER);
 
     // Title
     lv_obj_t *title = lv_label_create(scan_time_popup_obj);
@@ -53951,6 +54140,32 @@ static void show_scan_time_popup(void)
         lv_obj_add_state(scan_setup_vendor_switch, LV_STATE_DISABLED);
     } else {
         lv_obj_add_event_cb(scan_setup_vendor_switch, scan_setup_vendor_switch_cb, LV_EVENT_VALUE_CHANGED, NULL);
+    }
+
+    lv_obj_t *vendor_log_row = lv_obj_create(scan_time_popup_obj);
+    lv_obj_set_size(vendor_log_row, lv_pct(100), 42);
+    lv_obj_set_style_bg_opa(vendor_log_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(vendor_log_row, 0, 0);
+    lv_obj_set_style_pad_all(vendor_log_row, 0, 0);
+    lv_obj_set_flex_flow(vendor_log_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(vendor_log_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(vendor_log_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *vendor_log_label = lv_label_create(vendor_log_row);
+    lv_label_set_text(vendor_log_label, "Log unknown vendors");
+    lv_obj_set_style_text_font(vendor_log_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(vendor_log_label, ui_text_color(), 0);
+    scan_setup_vendor_log_switch = lv_switch_create(vendor_log_row);
+    style_theme_switch(scan_setup_vendor_log_switch);
+    lv_obj_add_event_cb(scan_setup_vendor_log_switch, scan_setup_vendor_log_switch_cb,
+                       LV_EVENT_VALUE_CHANGED, NULL);
+    scan_setup_update_vendor_controls();
+    tab_context_t *vendor_ctx = get_ctx_for_tab(scan_setup_vendor_tab);
+    if (scan_setup_vendor_target_valid && vendor_ctx && !vendor_ctx->home_vendors_present) {
+        lv_obj_t *hint = lv_label_create(scan_time_popup_obj);
+        lv_label_set_text(hint, "JanOS SD: /sdcard/lab/oui_wifi.bin missing");
+        lv_obj_set_width(hint, lv_pct(100));
+        lv_obj_set_style_text_font(hint, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(hint, ui_text_color(), 0);
     }
 
     lv_obj_t *scan_time_header = lv_label_create(scan_time_popup_obj);
@@ -53996,7 +54211,7 @@ static void show_scan_time_popup(void)
     if (scan_setup_vendor_target_valid) {
         lv_label_set_text(scan_time_error_label, "");
     } else {
-        lv_label_set_text(scan_time_error_label, "Vendor read unavailable");
+        lv_label_set_text(scan_time_error_label, "Vendor control unavailable");
     }
     lv_obj_set_style_text_font(scan_time_error_label, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(scan_time_error_label, COLOR_MATERIAL_RED, 0);
@@ -55764,6 +55979,29 @@ static struct {
     char          wifi_connected_ssid[33];
     uint8_t       saved_screen_timeout_setting;
 
+    // JanOS RF support (see main/ota_rf.c and docs/ota-rf-implementation-plan.md).
+    ota_rf_state_t   rf_state;       // per-device capability/layout cache + op guard
+    ota_info_report_t info_report;   // latest parsed ota_info output
+    ota_line_asm_t   line_asm;       // real line reassembler used by the monitor task
+    bool  await_info;                // an ota_info precheck is in flight
+    bool  precheck_for_update;       // precheck feeds an install (true) or a list (false)
+    bool  use_rf;                    // the current operation routes to the RF repo
+    bool  subghz_seen;               // [SUBGHZ_STATUS] observed for the target tab
+    char  pending_tag[48];           // confirmed release tag (classic or RF), empty for latest
+    bool  pending_latest;            // the user asked for "latest" explicitly
+    char  pending_wifi_cmd[256];     // wifi_connect command deferred until after precheck
+    char  post_ip_cmd[96];           // command sent once the C5 reports an IP ("" = none)
+    char  rel_tags[8][48];           // exact server release tags, never derived from APP version
+    lv_obj_t *confirm_overlay;       // reinstall/downgrade confirmation modal
+    char  confirm_tag[48];           // tag awaiting confirmation
+
+    // Manual variant override + force reinstall (some RF firmware does not
+    // advertise RF support in ota_info, so auto-detect cannot see it).
+    int   variant_choice;            // 0 = Auto-detect, 1 = Classic, 2 = RF
+    bool  force_update;              // reinstall even when not newer
+    lv_obj_t *variant_dd;            // "Firmware Variant" dropdown
+    lv_obj_t *force_sw;              // "Force update" switch
+
     // Monitor overlay (Status / List / Info)
     ota_view_t view;
     lv_obj_t *mon_overlay;
@@ -55814,6 +56052,12 @@ static bool ota_build_wifi_connect_cmd(char *out, size_t out_sz, const char *ssi
                                        bool start_ota, bool manual,
                                        const char *ip, const char *nm,
                                        const char *gw, const char *dns);
+static void ota_rf_release_row_cb(lv_event_t *e);
+static void ota_rf_confirm_install(const char *tag);
+static void ota_rf_confirm_close(void);
+static void ota_rf_start_tag_install(const char *tag);
+static bool ota_prepare_wifi_command(char *cmd, size_t cmd_sz, bool start_ota);
+static void ota_read_variant_force(void);
 
 // Pick the tab the C5 modem is on. Priority Grove > USB > MBus.
 static tab_id_t ota_pick_target_tab(void)
@@ -56080,6 +56324,21 @@ static void ota_release_list_add_line(const char *line)
     lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
 
+    // In either source list, a row is tappable to install that exact release. An
+    // explicit tag is the only way to reinstall or downgrade, and it is always
+    // confirmed first (requirement 6); latest-only-if-newer stays automatic.
+    int row_slot = g_ota.mon_release_count;
+    ota_release_t release;
+    bool valid_release = ota_release_parse_line(line, &release) && ota_release_tag_valid(release.tag);
+    if (valid_release && row_slot >= 0 &&
+        row_slot < (int)(sizeof(g_ota.rel_tags) / sizeof(g_ota.rel_tags[0]))) {
+        snprintf(g_ota.rel_tags[row_slot], sizeof(g_ota.rel_tags[row_slot]), "%s", release.tag);
+        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_set_style_bg_color(row, ui_card_pressed_color(), LV_STATE_PRESSED);
+        lv_obj_add_event_cb(row, ota_rf_release_row_cb, LV_EVENT_CLICKED,
+                            (void *)(intptr_t)row_slot);
+    }
+
     lv_obj_t *badge = lv_label_create(row);
     lv_label_set_text_fmt(badge, idx == 0 ? LV_SYMBOL_OK " latest" : "#%d", idx);
     lv_obj_set_style_text_font(badge, &lv_font_montserrat_14, 0);
@@ -56342,24 +56601,6 @@ static void ota_info_copy_tail(const char *line, const char *key, char *out, siz
     snprintf(out, out_sz, "%.*s", (int)out_sz - 1, p);
 }
 
-static void ota_info_extract_semver(const char *src, char *out, size_t out_sz)
-{
-    if (!out || out_sz == 0) return;
-    out[0] = '\0';
-    if (!src) return;
-    while (*src == ' ' || *src == '\t') src++;
-    if (*src == 'v' || *src == 'V') src++;
-
-    size_t i = 0;
-    while (src[i] && i + 1 < out_sz) {
-        char c = src[i];
-        if (!((c >= '0' && c <= '9') || c == '.')) break;
-        out[i] = c;
-        i++;
-    }
-    out[i] = '\0';
-}
-
 static void ota_info_sync_running_context(const ota_slot_info_t *slot)
 {
     if (!slot || !slot->is_running) return;
@@ -56374,13 +56615,7 @@ static void ota_info_sync_running_context(const ota_slot_info_t *slot)
         strncpy(tctx->janos_app_version, slot->version, sizeof(tctx->janos_app_version) - 1);
         tctx->janos_app_version[sizeof(tctx->janos_app_version) - 1] = '\0';
 
-        char short_ver[sizeof(tctx->janos_version)];
-        ota_info_extract_semver(slot->version, short_ver, sizeof(short_ver));
-        if (short_ver[0]) {
-            strncpy(tctx->janos_version, short_ver, sizeof(tctx->janos_version) - 1);
-            tctx->janos_version[sizeof(tctx->janos_version) - 1] = '\0';
-            tctx->janos_version_mismatch = (strcmp(tctx->janos_version, JANOS_VERSION_REQUIRED) != 0);
-        }
+        /* APP descriptor metadata is independent of the detected JanOS version. */
     }
     if (slot->build[0]) {
         strncpy(tctx->janos_app_build, slot->build, sizeof(tctx->janos_app_build) - 1);
@@ -56421,7 +56656,7 @@ static void ota_info_update_ui(void)
 {
     if (g_ota.view != OTA_VIEW_INFO) return;
 
-    char summary[160];
+    char summary[320];
     const char *boot = "?";
     const char *running = "?";
     const char *next = "?";
@@ -56434,6 +56669,14 @@ static void ota_info_update_ui(void)
     }
     snprintf(summary, sizeof(summary), "Boot: %s    Running: %s    Next OTA write: %s",
              boot, running, next);
+    tab_context_t *tctx = get_ctx_for_tab(g_ota.target_tab);
+    if (tctx && tctx->janos_version[0] && tctx->janos_app_version[0]) {
+        size_t used = strlen(summary);
+        snprintf(summary + used, sizeof(summary) - used, "\nJanOS: %s | APP metadata: %s%s",
+                 tctx->janos_version, tctx->janos_app_version,
+                 ota_rf_compare_versions(tctx->janos_version, tctx->janos_app_version) == OTA_CMP_SAME
+                     ? "" : " (versions differ)");
+    }
     if (g_ota.info_summary) lv_label_set_text(g_ota.info_summary, summary);
 
     bool have_running = ota_info_has_running_slot();
@@ -56560,17 +56803,26 @@ static void ota_handle_line(const char *line)
                 lv_label_set_text(g_ota.mon_ip, line);
                 lv_obj_set_style_text_color(g_ota.mon_ip, COLOR_MATERIAL_GREEN, 0);
             }
-            if (g_ota.list_after_connect && !g_ota.list_sent_after_connect) {
+            if (g_ota.post_ip_cmd[0] != '\0' && !g_ota.list_sent_after_connect) {
+                // A routed command (ota_list / ota_list rf / ota_check rf ...)
+                // waits for the IP. Classic self-OTA carries the "ota" flag on
+                // wifi_connect instead and leaves post_ip_cmd empty.
                 g_ota.list_sent_after_connect = true;
-                ota_status_set_phase(LV_SYMBOL_WIFI " Online",
-                                     "Connected. Reading available JanOS releases...",
-                                     COLOR_MATERIAL_GREEN, 1, 45);
-                if (g_ota.mon_ota) {
-                    lv_label_set_text(g_ota.mon_ota, LV_SYMBOL_REFRESH " Fetching OTA list...");
-                    lv_obj_set_style_text_color(g_ota.mon_ota, ui_text_color(), 0);
+                if (g_ota.list_after_connect) {
+                    ota_status_set_phase(LV_SYMBOL_WIFI " Online",
+                                         "Connected. Reading available JanOS releases...",
+                                         COLOR_MATERIAL_GREEN, 1, 45);
+                    if (g_ota.mon_ota) {
+                        lv_label_set_text(g_ota.mon_ota, LV_SYMBOL_REFRESH " Fetching OTA list...");
+                        lv_obj_set_style_text_color(g_ota.mon_ota, ui_text_color(), 0);
+                    }
+                } else {
+                    ota_status_set_phase(LV_SYMBOL_DOWNLOAD " Online",
+                                         "Connected. Starting the JanOS RF update.",
+                                         COLOR_MATERIAL_GREEN, 1, 35);
                 }
-                ota_send_cmd("ota_list");
-            } else {
+                ota_send_cmd(g_ota.post_ip_cmd);
+            } else if (g_ota.post_ip_cmd[0] == '\0') {
                 ota_status_set_phase(LV_SYMBOL_WIFI " Online",
                                      "Connected. JanOS will run the OTA update flow.",
                                      COLOR_MATERIAL_GREEN, 1, 35);
@@ -56609,7 +56861,7 @@ static void ota_handle_line(const char *line)
                 ota_release_list_add_line(line);
                 ota_release_list_finish(true);
                 ota_status_set_phase(LV_SYMBOL_LIST " Available releases",
-                                     "Latest JanOS releases received from the C5.",
+                                     "Select a release to install or reinstall, then confirm.",
                                      COLOR_MATERIAL_GREEN, 2, 100);
                 if (g_ota.mon_ota) {
                     lv_label_set_text_fmt(g_ota.mon_ota, "%d release%s available",
@@ -56636,16 +56888,181 @@ static void ota_handle_line(const char *line)
     }
 }
 
-// Reads the C5 UART line-by-line while g_ota.monitoring is set and routes each
-// line to the open monitor overlay. Mirrors handshaker_monitor_task.
+static void ota_start_deferred_connect(void);
+static void ota_precheck_block(const char *phase, const char *detail);
+
+// Prefer the detected JanOS version; APP metadata is a fallback for display
+// comparisons only. Neither is ever used to manufacture a release tag.
+static const char *ota_running_version(void)
+{
+    tab_context_t *tctx = get_ctx_for_tab(g_ota.target_tab);
+    return ota_effective_running_version(tctx ? tctx->janos_version : NULL, &g_ota.info_report);
+}
+
+static void ota_apply_selected_channel(void)
+{
+    if (g_ota.use_rf) return;
+    char command[32];
+    snprintf(command, sizeof(command), "ota_channel %s",
+             !strcmp(g_ota.channel, "dev") ? "dev" : "main");
+    ota_send_cmd(command);
+}
+
+// Decide classic vs RF routing once the offline ota_info precheck has settled,
+// then either start the deferred WiFi connect or block with an explanation.
+// Caller must hold the display lock. See docs/ota-rf-implementation-plan.md.
+static void ota_precheck_decide(void)
+{
+    g_ota.await_info = false;
+
+    // Cache the three independent facts for this device.
+    ota_rf_state_bind_device(&g_ota.rf_state, (int)g_ota.target_tab);
+    g_ota.rf_state.updater_supports_rf = ota_info_supports_rf_commands(&g_ota.info_report);
+    g_ota.rf_state.layout = g_ota.info_report.layout;
+    if (g_ota.subghz_seen) g_ota.rf_state.variant = OTA_VARIANT_RF;
+
+    // Variant: Auto detects; Classic/RF are explicit user overrides. A manual RF
+    // choice, or RF firmware confirmed live via the SUB-GHz tile
+    // ([SUBGHZ_STATUS]), tolerates firmware that does not advertise RF support
+    // in ota_info and an UNKNOWN layout (a positively incompatible layout still
+    // blocks). Classic (1) never routes RF.
+    if (g_ota.variant_choice == 1)      g_ota.use_rf = false;
+    else if (g_ota.variant_choice == 2) g_ota.use_rf = true;
+    else g_ota.use_rf = ota_rf_auto_should_use_rf(&g_ota.info_report, g_ota.subghz_seen);
+    bool manual_rf = (g_ota.variant_choice == 2) ||
+                     (g_ota.variant_choice != 1 && g_ota.subghz_seen);
+
+    // The `rf` keyword is only sent to firmware that advertises it (ota_info RF
+    // source line). A single-source RF build - like the janosrf 1.7.5 that
+    // answers "Usage: ota_check [latest|<tag>]" - has no `rf` argument: its own
+    // plain ota_check already targets the RF repo it was built from, so we send
+    // the plain command. This never drops `rf` on a dual-source firmware (where
+    // that would wrongly select the classic repo).
+    bool rf_keyword = g_ota.use_rf && g_ota.rf_state.updater_supports_rf;
+
+    // Shared gate BEFORE every command route, including old single-source RF
+    // firmware which takes plain ota_check and cannot advertise the rf keyword.
+    if (!ota_install_route_allowed(&g_ota.info_report, g_ota.use_rf, g_ota.subghz_seen)) {
+        ota_precheck_block(LV_SYMBOL_WARNING " Firmware variant blocked",
+            g_ota.use_rf ? "RF update requires a compatible layout or a positively identified RF module. "
+                          "An incompatible partition layout cannot be overridden."
+                        : "Could not verify a classic module. Read Info again. "
+                          "Classic firmware is blocked on modules identified as RF.");
+        return;
+    }
+    ota_apply_selected_channel();
+
+
+    // A list only needs a route; it never installs, so it cannot be "blocked".
+    if (!g_ota.precheck_for_update) {
+        if (rf_keyword) ota_rf_build_list_cmd(g_ota.post_ip_cmd, sizeof(g_ota.post_ip_cmd));
+        else            ota_classic_build_list_cmd(g_ota.post_ip_cmd, sizeof(g_ota.post_ip_cmd));
+        ota_start_deferred_connect();
+        return;
+    }
+
+    const char *current = ota_running_version();
+
+    if (!rf_keyword) {
+        // Plain ota_check: the firmware's own compiled-in source (classic repo
+        // on classic firmware, RF repo on a single-source RF build). No `rf`.
+        if (g_ota.pending_tag[0]) {
+            if (!ota_classic_build_check_cmd(g_ota.post_ip_cmd, sizeof(g_ota.post_ip_cmd), g_ota.pending_tag)) {
+                ota_precheck_block(LV_SYMBOL_WARNING " Invalid release tag", "Choose a valid release from the list.");
+                return;
+            }
+            ota_start_deferred_connect();
+            return;
+        }
+        // Latest keeps the original self-OTA: connect with the "ota" flag so
+        // JanOS auto-starts (no post-IP command), or send ota_check when an
+        // existing connection is reused.
+        g_ota.post_ip_cmd[0] = '\0';
+        if (g_ota.pending_wifi_cmd[0] == '\0') {
+            g_ota.list_sent_after_connect = true;
+            ota_send_cmd("ota_check");
+        } else {
+            char classic_cmd[256];
+            if (ota_prepare_wifi_command(classic_cmd, sizeof(classic_cmd), true)) {
+                snprintf(g_ota.pending_wifi_cmd, sizeof(g_ota.pending_wifi_cmd),
+                         "%s", classic_cmd);
+            }
+            ota_start_deferred_connect();
+        }
+        return;
+    }
+
+    // RF install: gate on the parsed layout and capability before connecting.
+    // Only a user-confirmed release-list tag permits reinstall/downgrade.
+    const char *tag = g_ota.pending_tag[0] ? g_ota.pending_tag : NULL;
+    ota_decision_t d = ota_rf_decide_install(&g_ota.info_report,
+                                             g_ota.rf_state.updater_supports_rf,
+                                             current, tag, g_ota.pending_latest, manual_rf);
+    switch (d) {
+        case OTA_DECIDE_ALLOW_LATEST:
+            ota_rf_build_check_latest_cmd(g_ota.post_ip_cmd, sizeof(g_ota.post_ip_cmd),
+                                          g_ota.pending_latest);
+            ota_start_deferred_connect();
+            break;
+        case OTA_DECIDE_ALLOW_TAG:
+            ota_rf_build_check_tag_cmd(g_ota.post_ip_cmd, sizeof(g_ota.post_ip_cmd), tag);
+            ota_start_deferred_connect();
+            break;
+        case OTA_DECIDE_CONFIRM_REINSTALL:
+        case OTA_DECIDE_CONFIRM_DOWNGRADE:
+            // pending_tag originates only from a confirmed release-list row.
+            // Never create it from the running JanOS or APP version.
+            if (tag) {
+                ota_rf_build_check_tag_cmd(g_ota.post_ip_cmd, sizeof(g_ota.post_ip_cmd), tag);
+                ota_start_deferred_connect();
+            } else {
+                ota_precheck_block(LV_SYMBOL_WARNING " Confirmation required",
+                                   "This release is not newer than the running firmware. "
+                                   "Turn on Force update, or pick it from the RF list, to "
+                                   "reinstall or downgrade on purpose.");
+            }
+            break;
+        case OTA_DECIDE_BLOCK_INCOMPATIBLE:
+            ota_precheck_block(LV_SYMBOL_WARNING " RF layout incompatible",
+                               "This module's flash layout is not the RF layout (table @0x10000). "
+                               "Restore the RF partition layout over USB before an RF update.");
+            break;
+        case OTA_DECIDE_BLOCK_UNKNOWN_LAYOUT:
+            ota_precheck_block(LV_SYMBOL_WARNING " RF layout unknown",
+                               "JanOS did not report RF layout compatibility. "
+                               "Update JanOS first, or restore the RF layout over USB.");
+            break;
+        case OTA_DECIDE_BLOCK_NO_CAPABILITY:
+            ota_precheck_block(LV_SYMBOL_WARNING " RF commands unsupported",
+                               "The running JanOS updater does not understand the RF commands. "
+                               "Install a newer classic JanOS first.");
+            break;
+        case OTA_DECIDE_BLOCK_BAD_TAG:
+            ota_precheck_block(LV_SYMBOL_WARNING " Invalid release tag",
+                               "The selected RF release tag is not a valid version.");
+            break;
+    }
+}
+
+// Reads the C5 UART while g_ota.monitoring is set, reassembles lines with the
+// shared (host-tested) reassembler, and routes each one to the overlay.
+static void ota_monitor_sink(void *user, const char *line)
+{
+    tab_id_t tab = *(tab_id_t *)user;
+    ESP_LOGI(TAG, "[OTA<-%s] %s", tab_transport_name(tab), line);
+    if (g_ota.await_info) ota_info_report_feed_line(&g_ota.info_report, line);
+    if (bsp_display_lock(50)) {
+        ota_handle_line(line);
+        bsp_display_unlock();
+    }
+}
+
 static void ota_monitor_task(void *arg)
 {
     (void)arg;
     tab_id_t tab = g_ota.target_tab;
     uart_port_t port = uart_port_for_tab(tab);
     static char rx[512];
-    static char line[512];
-    int line_pos = 0;
     TickType_t last_rx_tick = xTaskGetTickCount();
 
     ESP_LOGI(TAG, "[OTA] monitor task started (tab %s)", tab_transport_name(tab));
@@ -56653,6 +57070,15 @@ static void ota_monitor_task(void *arg)
     while (g_ota.monitoring) {
         int len = transport_read_bytes_tab(tab, port, rx, sizeof(rx) - 1, pdMS_TO_TICKS(100));
         if (len <= 0) {
+            // The offline ota_info precheck has no terminator of its own; once the
+            // output settles, decide routing and either connect or block.
+            if (g_ota.await_info &&
+                (xTaskGetTickCount() - last_rx_tick) > pdMS_TO_TICKS(1500)) {
+                if (bsp_display_lock(50)) {
+                    if (g_ota.await_info) ota_precheck_decide();
+                    bsp_display_unlock();
+                }
+            }
             if (g_ota.view == OTA_VIEW_STATUS && g_ota.release_list_waiting &&
                 g_ota.list_sent_after_connect &&
                 (xTaskGetTickCount() - last_rx_tick) > pdMS_TO_TICKS(70000)) {
@@ -56677,22 +57103,7 @@ static void ota_monitor_task(void *arg)
         }
         last_rx_tick = xTaskGetTickCount();
         rx[len] = '\0';
-        for (int i = 0; i < len; i++) {
-            char c = rx[i];
-            if (c == '\n' || c == '\r') {
-                if (line_pos > 0) {
-                    line[line_pos] = '\0';
-                    ESP_LOGI(TAG, "[OTA<-%s] %s", tab_transport_name(tab), line);
-                    if (bsp_display_lock(50)) {
-                        ota_handle_line(line);
-                        bsp_display_unlock();
-                    }
-                    line_pos = 0;
-                }
-            } else if (line_pos < (int)sizeof(line) - 1) {
-                line[line_pos++] = c;
-            }
-        }
+        ota_line_asm_feed(&g_ota.line_asm, rx, len, ota_monitor_sink, &tab);
     }
 
     ESP_LOGI(TAG, "[OTA] monitor task ended");
@@ -56702,6 +57113,7 @@ static void ota_monitor_task(void *arg)
 
 static void ota_close_monitor(void)
 {
+    ota_rf_confirm_close();
     ota_restore_screen_timeout();
     if (g_ota.monitoring) {
         g_ota.monitoring = false;
@@ -56746,7 +57158,41 @@ static void ota_close_monitor(void)
     g_ota.list_sent_after_connect = false;
     g_ota.release_list_waiting = false;
     g_ota.mon_release_count = 0;
+    g_ota.await_info = false;
+    g_ota.precheck_for_update = false;
+    g_ota.use_rf = false;
+    g_ota.pending_wifi_cmd[0] = '\0';
+    g_ota.post_ip_cmd[0] = '\0';
+    ota_rf_state_end_op(&g_ota.rf_state);
     g_ota.view = OTA_VIEW_NONE;
+}
+
+// Send the deferred WiFi connect (or, when WiFi is reused, the routed command
+// right away). Caller holds the display lock.
+static void ota_start_deferred_connect(void)
+{
+    if (g_ota.pending_wifi_cmd[0] == '\0') {
+        // WiFi already up and reusable: run the routed command immediately.
+        g_ota.list_sent_after_connect = true;
+        ota_send_cmd(g_ota.post_ip_cmd);
+        return;
+    }
+    ota_send_cmd(g_ota.pending_wifi_cmd);
+    g_ota.pending_wifi_cmd[0] = '\0';
+}
+
+// Refuse to start an RF install, showing why. Caller holds the display lock.
+static void ota_precheck_block(const char *phase, const char *detail)
+{
+    ota_status_set_phase(phase, detail, COLOR_MATERIAL_RED, 0, 0);
+    if (g_ota.mon_ota) {
+        lv_label_set_text(g_ota.mon_ota, detail);
+        lv_obj_set_style_text_color(g_ota.mon_ota, COLOR_MATERIAL_RED, 0);
+    }
+    if (g_ota.release_list_waiting) ota_release_list_finish(false);
+    ota_monitor_finish_close_error();
+    ota_restore_screen_timeout();
+    ota_rf_state_end_op(&g_ota.rf_state);
 }
 
 static void ota_monitor_close_cb(lv_event_t *e)
@@ -56838,6 +57284,17 @@ static void ota_open_monitor(ota_view_t view, const char *title)
     g_ota.list_after_connect = false;
     g_ota.list_sent_after_connect = false;
     g_ota.release_list_waiting = false;
+    g_ota.await_info = false;
+    g_ota.precheck_for_update = false;
+    g_ota.use_rf = false;
+    g_ota.subghz_seen = false;
+    g_ota.pending_wifi_cmd[0] = '\0';
+    g_ota.post_ip_cmd[0] = '\0';
+    g_ota.pending_tag[0] = '\0';
+    g_ota.pending_latest = false;
+    memset(g_ota.rel_tags, 0, sizeof(g_ota.rel_tags));
+    ota_line_asm_reset(&g_ota.line_asm);
+    ota_info_report_reset(&g_ota.info_report);
     if (view == OTA_VIEW_INFO) ota_info_reset_slots();
 
     g_ota.mon_overlay = lv_obj_create(internal_container);
@@ -57186,24 +57643,186 @@ static void ota_slot_activate_cb(lv_event_t *e)
     }
 }
 
+// ---- explicit release install (classic / RF), always confirmed ----
+
+static void ota_rf_confirm_close(void)
+{
+    if (g_ota.confirm_overlay) {
+        lv_obj_del(g_ota.confirm_overlay);
+        g_ota.confirm_overlay = NULL;
+    }
+    g_ota.confirm_tag[0] = '\0';
+}
+
+static void ota_rf_confirm_cancel_cb(lv_event_t *e)
+{
+    (void)e;
+    ota_rf_confirm_close();
+}
+
+static void ota_rf_confirm_go_cb(lv_event_t *e)
+{
+    (void)e;
+    char tag[48];
+    snprintf(tag, sizeof(tag), "%s", g_ota.confirm_tag);
+    ota_rf_confirm_close();
+    if (tag[0]) ota_rf_start_tag_install(tag);
+}
+
+// Reopen for a confirmed release, retaining its literal tag and obtaining a
+// fresh ota_info report before choosing the command route.
+static void ota_rf_start_tag_install(const char *tag)
+{
+    if (!ota_release_tag_valid(tag)) return;
+    // Copy before reopening: ota_open_monitor clears the release rows/tag storage.
+    char selected_tag[48];
+    snprintf(selected_tag, sizeof(selected_tag), "%s", tag);
+    bool reuse = ota_can_reuse_wifi_for_update();
+    char wifi_cmd[256];
+    if (!reuse && !ota_prepare_wifi_command(wifi_cmd, sizeof(wifi_cmd), false)) return;
+    ota_close_monitor();
+    ota_open_monitor(OTA_VIEW_STATUS, "Monster OTA - Updating");
+    ota_rf_state_begin_op(&g_ota.rf_state);
+    tab_context_t *tctx = get_ctx_for_tab(g_ota.target_tab);
+    g_ota.subghz_seen = tctx && tctx->has_subghz;
+    g_ota.install_started = true;
+    g_ota.precheck_for_update = true;
+    g_ota.await_info = true;
+    snprintf(g_ota.pending_tag, sizeof(g_ota.pending_tag), "%s", selected_tag);
+    if (!reuse) snprintf(g_ota.pending_wifi_cmd, sizeof(g_ota.pending_wifi_cmd), "%s", wifi_cmd);
+    ota_suspend_screen_timeout();
+    ota_monitor_lock_close_for_update();
+    ota_status_set_phase(LV_SYMBOL_REFRESH " Checking module", "Verifying firmware variant before installing the selected release...",
+                         COLOR_MATERIAL_ORANGE, 0, 5);
+    ota_send_cmd("ota_info");
+}
+
+static void ota_rf_confirm_install(const char *tag)
+{
+    if (!internal_container || !tag || !tag[0]) return;
+    ota_rf_confirm_close();   // only one confirm at a time
+    snprintf(g_ota.confirm_tag, sizeof(g_ota.confirm_tag), "%s", tag);
+
+    tab_context_t *tctx = get_ctx_for_tab(g_ota.target_tab);
+    const char *current = (tctx && tctx->janos_version[0]) ? tctx->janos_version : NULL;
+    ota_ver_cmp_t cmp = ota_rf_compare_versions(current, tag);
+
+    const char *variant = g_ota.use_rf ? "RF" : "classic";
+    const char *headline;
+    lv_color_t accent;
+    char detail[192];
+    if (cmp == OTA_CMP_OLDER) {
+        headline = LV_SYMBOL_WARNING " Downgrade?";
+        accent = COLOR_MATERIAL_AMBER;
+        snprintf(detail, sizeof(detail),
+                 "Install %s %s over the newer running firmware (%s)? This is a downgrade.",
+                 variant, tag, current ? current : "unknown");
+    } else if (cmp == OTA_CMP_SAME) {
+        headline = LV_SYMBOL_REFRESH " Reinstall?";
+        accent = COLOR_MATERIAL_AMBER;
+        snprintf(detail, sizeof(detail), "Reinstall %s %s (same as the running version)?", variant, tag);
+    } else {
+        headline = LV_SYMBOL_DOWNLOAD " Install RF release?";
+        accent = COLOR_MATERIAL_GREEN;
+        snprintf(detail, sizeof(detail), "Install %s %s?", variant, tag);
+    }
+
+    g_ota.confirm_overlay = lv_obj_create(internal_container);
+    lv_obj_remove_style_all(g_ota.confirm_overlay);
+    lv_obj_set_size(g_ota.confirm_overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(g_ota.confirm_overlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(g_ota.confirm_overlay, LV_OPA_60, 0);
+    lv_obj_clear_flag(g_ota.confirm_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(g_ota.confirm_overlay, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t *box = lv_obj_create(g_ota.confirm_overlay);
+    lv_obj_set_size(box, 560, LV_SIZE_CONTENT);
+    lv_obj_center(box);
+    lv_obj_set_style_bg_color(box, ui_card_color(), 0);
+    lv_obj_set_style_border_color(box, accent, 0);
+    lv_obj_set_style_border_width(box, 2, 0);
+    lv_obj_set_style_radius(box, 16, 0);
+    lv_obj_set_style_pad_all(box, 20, 0);
+    lv_obj_set_flex_flow(box, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(box, 14, 0);
+    lv_obj_clear_flag(box, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *ttl = lv_label_create(box);
+    lv_label_set_text(ttl, headline);
+    lv_obj_set_style_text_font(ttl, &lv_font_montserrat_22, 0);
+    lv_obj_set_style_text_color(ttl, accent, 0);
+
+    lv_obj_t *msg = lv_label_create(box);
+    lv_label_set_text(msg, detail);
+    lv_obj_set_style_text_font(msg, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(msg, ui_text_color(), 0);
+    lv_obj_set_width(msg, lv_pct(100));
+    lv_label_set_long_mode(msg, LV_LABEL_LONG_WRAP);
+
+    lv_obj_t *btns = lv_obj_create(box);
+    lv_obj_remove_style_all(btns);
+    lv_obj_set_width(btns, lv_pct(100));
+    lv_obj_set_height(btns, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(btns, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(btns, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(btns, 12, 0);
+
+    lv_obj_t *go = lv_btn_create(btns);
+    lv_obj_set_size(go, 200, 48);
+    lv_obj_set_style_bg_color(go, accent, 0);
+    lv_obj_set_style_radius(go, 8, 0);
+    lv_obj_add_event_cb(go, ota_rf_confirm_go_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *go_l = lv_label_create(go);
+    lv_label_set_text(go_l, (cmp == OTA_CMP_OLDER) ? "Downgrade" :
+                            (cmp == OTA_CMP_SAME)  ? "Reinstall" : "Install");
+    lv_obj_set_style_text_font(go_l, &lv_font_montserrat_16, 0);
+    lv_obj_center(go_l);
+
+    lv_obj_t *cancel = lv_btn_create(btns);
+    lv_obj_set_size(cancel, 200, 48);
+    lv_obj_set_style_bg_color(cancel, lv_color_hex(0x555555), 0);
+    lv_obj_set_style_radius(cancel, 8, 0);
+    lv_obj_add_event_cb(cancel, ota_rf_confirm_cancel_cb, LV_EVENT_CLICKED, NULL);
+    app_keyboard_navigation_register_escape(cancel);
+    lv_obj_t *cancel_l = lv_label_create(cancel);
+    lv_label_set_text(cancel_l, "Cancel");
+    lv_obj_set_style_text_font(cancel_l, &lv_font_montserrat_16, 0);
+    lv_obj_center(cancel_l);
+}
+
+static void ota_rf_release_row_cb(lv_event_t *e)
+{
+    int slot = (int)(intptr_t)lv_event_get_user_data(e);
+    if (slot < 0 || slot >= (int)(sizeof(g_ota.rel_tags) / sizeof(g_ota.rel_tags[0]))) return;
+    if (!g_ota.rel_tags[slot][0]) return;
+    ota_rf_confirm_install(g_ota.rel_tags[slot]);
+}
+
 static void ota_list_btn_cb(lv_event_t *e)
 {
     (void)e;
+    ota_read_variant_force();
     char cmd[256];
     if (!ota_prepare_wifi_command(cmd, sizeof(cmd), false)) {
         return;
     }
 
     ota_open_monitor(OTA_VIEW_STATUS, "Monster OTA - Available Updates");
+    ota_rf_state_begin_op(&g_ota.rf_state);   // one OTA operation at a time
+    tab_context_t *tctx = get_ctx_for_tab(g_ota.target_tab);
+    g_ota.subghz_seen = tctx && tctx->has_subghz;
+    snprintf(g_ota.pending_wifi_cmd, sizeof(g_ota.pending_wifi_cmd), "%s", cmd);
     g_ota.list_after_connect = true;
     g_ota.list_sent_after_connect = false;
+    g_ota.precheck_for_update = false;
+    g_ota.await_info = true;   // read ota_info (offline) before connecting
     ota_release_list_prepare();
     ota_suspend_screen_timeout();
     ota_monitor_lock_close_for_list();
-    ota_status_set_phase(LV_SYMBOL_WIFI " Connect & list",
-                         "JanOS will connect to WiFi first, then read available releases.",
-                         COLOR_MATERIAL_ORANGE, 0, 10);
-    ota_send_cmd(cmd);
+    ota_status_set_phase(LV_SYMBOL_REFRESH " Checking module",
+                         "Reading OTA capability and partition layout (ota_info)...",
+                         COLOR_MATERIAL_ORANGE, 0, 5);
+    ota_send_cmd("ota_info");
 }
 
 static void ota_info_btn_cb(lv_event_t *e)
@@ -57217,35 +57836,52 @@ static void ota_info_btn_cb(lv_event_t *e)
     ota_send_cmd("ota_info");
 }
 
+static void ota_read_variant_force(void)
+{
+    if (g_ota.variant_dd) g_ota.variant_choice = (int)lv_dropdown_get_selected(g_ota.variant_dd);
+    if (g_ota.force_sw)   g_ota.force_update = lv_obj_has_state(g_ota.force_sw, LV_STATE_CHECKED);
+}
+
 static void ota_check_btn_cb(lv_event_t *e)
 {
     (void)e;
-    char cmd[256];
-    bool start_ota = true;
-    if (!ota_prepare_wifi_command(cmd, sizeof(cmd), start_ota)) {
+    ota_read_variant_force();
+    if (g_ota.force_update) {
+        // Force means choose an actual published release, not guess a tag from
+        // a possibly stale APP descriptor or the JanOS version banner.
+        ota_list_btn_cb(NULL);
         return;
     }
-    bool reuse_wifi = ota_can_reuse_wifi_for_update();
-    if (reuse_wifi) {
-        snprintf(cmd, sizeof(cmd), "ota_check");
+    // Build the connect command WITHOUT the "ota" flag: the precheck decides
+    // classic vs RF and routes the install with a post-IP ota_check[/ rf].
+    char cmd[256];
+    if (!ota_prepare_wifi_command(cmd, sizeof(cmd), false)) {
+        return;
     }
 
     ota_open_monitor(OTA_VIEW_STATUS, "Monster OTA - Updating");
-    g_ota.install_started = start_ota;
-    if (start_ota) {
-        ota_suspend_screen_timeout();
-        ota_monitor_lock_close_for_update();
-        if (reuse_wifi) {
-            ota_status_set_phase(LV_SYMBOL_DOWNLOAD " Reusing WiFi",
-                                 "C5 is already online. Starting JanOS OTA check.",
-                                 COLOR_MATERIAL_GREEN, 1, 35);
-        } else {
-            ota_status_set_phase(LV_SYMBOL_DOWNLOAD " Connect & update",
-                                 "JanOS will start download and flash after WiFi connects.",
-                                 COLOR_MATERIAL_ORANGE, 0, 10);
-        }
-    }
-    ota_send_cmd(cmd);
+    ota_rf_state_begin_op(&g_ota.rf_state);   // one OTA operation at a time
+    tab_context_t *tctx = get_ctx_for_tab(g_ota.target_tab);
+    g_ota.subghz_seen = tctx && tctx->has_subghz;
+
+    bool reuse_wifi = ota_can_reuse_wifi_for_update();
+    if (reuse_wifi) g_ota.pending_wifi_cmd[0] = '\0';   // WiFi already up
+    else            snprintf(g_ota.pending_wifi_cmd, sizeof(g_ota.pending_wifi_cmd), "%s", cmd);
+
+    g_ota.install_started = true;
+    g_ota.list_after_connect = false;
+    g_ota.list_sent_after_connect = false;
+    g_ota.precheck_for_update = true;
+    g_ota.pending_tag[0] = '\0';   // auto path installs latest; explicit tags come from the list
+    g_ota.pending_latest = false;
+    g_ota.await_info = true;       // read ota_info (offline) before connecting
+
+    ota_suspend_screen_timeout();
+    ota_monitor_lock_close_for_update();
+    ota_status_set_phase(LV_SYMBOL_REFRESH " Checking module",
+                         "Reading OTA capability and partition layout (ota_info)...",
+                         COLOR_MATERIAL_ORANGE, 0, 5);
+    ota_send_cmd("ota_info");
 }
 
 // ---- setup page ----
@@ -57316,18 +57952,17 @@ static void ota_scan_task(void *arg)
     (void)arg;
     tab_id_t tab = g_ota.target_tab;
     uart_port_t port = uart_port_for_tab(tab);
+    tab_context_t *tctx = get_ctx_for_tab(tab);
 
     char *rxbuf   = heap_caps_malloc(UART_BUF_SIZE, MALLOC_CAP_SPIRAM);
     char *linebuf = heap_caps_malloc(512, MALLOC_CAP_SPIRAM);
-    char *etbuf   = heap_caps_malloc(512, MALLOC_CAP_SPIRAM);
-    evil_twin_entry_t *et = heap_caps_calloc(EVIL_TWIN_MAX_ENTRIES, sizeof(evil_twin_entry_t), MALLOC_CAP_SPIRAM);
     static wifi_network_t nets[MAX_NETWORKS];
     int net_count = 0, line_pos = 0, empty = 0;
     bool scan_complete = false, background = false, found = false;
     TickType_t start = xTaskGetTickCount();
     TickType_t tmo = pdMS_TO_TICKS(UART_RX_TIMEOUT);
 
-    if (!rxbuf || !linebuf || !etbuf || !et) {
+    if (!rxbuf || !linebuf) {
         ESP_LOGE(TAG, "[OTA] scan: allocation failed");
         goto done;
     }
@@ -57393,6 +58028,15 @@ static void ota_scan_task(void *arg)
 
     if (!g_ota.scan_running) goto done;
 
+    // Refresh this tab's captured-password cache from the C5 while we still own
+    // the transport, so the picker can flag saved networks and connect can reuse
+    // the stored password - the same mechanism as the top-menu scan.
+    if (tctx && !tctx->evil_twin_entries) {
+        tctx->evil_twin_entries = heap_caps_calloc(EVIL_TWIN_MAX_ENTRIES,
+                                                   sizeof(evil_twin_entry_t), MALLOC_CAP_SPIRAM);
+    }
+    if (tctx) creds_fetch(tctx, tab, port);
+
     // Populate the picker list.
     if (bsp_display_lock(50)) {
         if (g_ota.scan_status) {
@@ -57401,6 +58045,7 @@ static void ota_scan_task(void *arg)
         }
         if (g_ota.scan_list) {
             for (int i = 0; i < net_count; i++) {
+                bool saved = tctx && creds_have(tctx, nets[i].ssid);
                 lv_obj_t *row = lv_obj_create(g_ota.scan_list);
                 lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
                 lv_obj_set_style_pad_all(row, 8, 0);
@@ -57411,10 +58056,34 @@ static void ota_scan_task(void *arg)
                 lv_obj_set_flex_flow(row, LV_FLEX_FLOW_COLUMN);
                 lv_obj_set_style_pad_row(row, 2, 0);
                 lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
-                lv_obj_t *s = lv_label_create(row);
+
+                // SSID and, when the C5 already holds a password for it, a green
+                // "saved" badge next to it (same marker as the top-menu scan).
+                lv_obj_t *title_row = lv_obj_create(row);
+                lv_obj_remove_style_all(title_row);
+                lv_obj_set_size(title_row, lv_pct(100), LV_SIZE_CONTENT);
+                lv_obj_set_flex_flow(title_row, LV_FLEX_FLOW_ROW);
+                lv_obj_set_flex_align(title_row, LV_FLEX_ALIGN_START,
+                                      LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+                lv_obj_set_style_pad_column(title_row, 10, 0);
+                lv_obj_clear_flag(title_row, LV_OBJ_FLAG_SCROLLABLE);
+                lv_obj_remove_flag(title_row, LV_OBJ_FLAG_CLICKABLE);
+
+                lv_obj_t *s = lv_label_create(title_row);
                 lv_label_set_text(s, strlen(nets[i].ssid) > 0 ? nets[i].ssid : "(Hidden)");
                 lv_obj_set_style_text_font(s, &lv_font_montserrat_16, 0);
                 lv_obj_set_style_text_color(s, ui_text_color(), 0);
+                lv_obj_set_width(s, LV_SIZE_CONTENT);
+                lv_label_set_long_mode(s, LV_LABEL_LONG_DOT);
+
+                if (saved) {
+                    lv_obj_t *saved_badge = lv_label_create(title_row);
+                    lv_label_set_text(saved_badge, "password saved");
+                    lv_obj_set_width(saved_badge, LV_SIZE_CONTENT);
+                    lv_obj_set_style_text_font(saved_badge, &lv_font_montserrat_12, 0);
+                    lv_obj_set_style_text_color(saved_badge, lv_color_hex(0x55DD99), 0);
+                }
+
                 lv_obj_t *info = lv_label_create(row);
                 lv_label_set_text_fmt(info, "%s | %s | %s | %d dBm",
                                       nets[i].bssid, nets[i].band, nets[i].security, nets[i].rssi);
@@ -57430,43 +58099,9 @@ static void ota_scan_task(void *arg)
     while (!g_ota.scan_selected && g_ota.scan_running) vTaskDelay(pdMS_TO_TICKS(100));
     if (!g_ota.scan_running) goto done;
 
-    // Look up a saved password for the chosen SSID in the eviltwin DB.
-    if (tab == TAB_USB && usb_cdc_handle) usbh_cdc_flush_rx_buffer(usb_cdc_handle);
-    else uart_flush(port);
-    transport_write_bytes_tab(tab, port, "show_pass evil\r\n", 16);
-    vTaskDelay(pdMS_TO_TICKS(200));
-    {
-        int etc = 0, retries = 10, eempty = 0;
-        while (retries-- > 0 && etc < EVIL_TWIN_MAX_ENTRIES && g_ota.scan_running) {
-            int len = transport_read_bytes_tab(tab, port, etbuf, 511, pdMS_TO_TICKS(100));
-            if (len > 0) {
-                etbuf[len] = '\0'; eempty = 0;
-                char *ln = strtok(etbuf, "\n\r");
-                while (ln && etc < EVIL_TWIN_MAX_ENTRIES) {
-                    if (strlen(ln) > 3 && ln[0] == '"') {
-                        char *ss = ln + 1; char *se = strchr(ss, '"');
-                        if (se && se[1] == ',' && se[2] == ' ' && se[3] == '"') {
-                            *se = '\0'; char *ps = se + 4; char *pe = strchr(ps, '"');
-                            if (pe) {
-                                *pe = '\0';
-                                strncpy(et[etc].ssid, ss, 32); et[etc].ssid[32] = '\0';
-                                strncpy(et[etc].password, ps, 64); et[etc].password[64] = '\0';
-                                etc++;
-                            }
-                        }
-                    }
-                    ln = strtok(NULL, "\n\r");
-                }
-            } else if (++eempty >= 3) break;
-            vTaskDelay(pdMS_TO_TICKS(50));
-        }
-        for (int i = 0; i < etc; i++) {
-            if (strcmp(et[i].ssid, g_ota.sel_ssid) == 0) {
-                found = true;
-                break;
-            }
-        }
-    }
+    // A saved password is one the C5 already holds for the chosen SSID; reuse the
+    // cache fetched above (no second show_pass round-trip).
+    found = tctx && creds_have(tctx, g_ota.sel_ssid);
 
     // Fill the page fields and close the picker.
     if (bsp_display_lock(50)) {
@@ -57491,8 +58126,6 @@ static void ota_scan_task(void *arg)
 done:
     if (rxbuf)   heap_caps_free(rxbuf);
     if (linebuf) heap_caps_free(linebuf);
-    if (etbuf)   heap_caps_free(etbuf);
-    if (et)      heap_caps_free(et);
     g_ota.scan_running = false;
     g_ota.scan_task = NULL;
     vTaskDelete(NULL);
@@ -57593,6 +58226,8 @@ static void ota_back_cb(lv_event_t *e)
     g_ota.gw_ta = NULL;
     g_ota.dns_ta = NULL;
     g_ota.channel_dd = NULL;
+    g_ota.variant_dd = NULL;
+    g_ota.force_sw = NULL;
     if (internal_settings_page) lv_obj_clear_flag(internal_settings_page, LV_OBJ_FLAG_HIDDEN);
     else show_settings_page();
 }
@@ -57606,6 +58241,10 @@ static void show_ota_page(void)
     if (g_ota.page) return;   // already open
 
     g_ota.target_tab = ota_pick_target_tab();
+    // Clear any RF capability/layout cached for a previously connected module so
+    // stale detection can never leak across a device swap (requirement 7).
+    ota_rf_state_reset(&g_ota.rf_state);
+    ota_rf_state_bind_device(&g_ota.rf_state, (int)g_ota.target_tab);
     if (g_ota.channel[0] == '\0') strcpy(g_ota.channel, "main");
     g_ota.selected_saved_password = false;
 
@@ -57774,6 +58413,37 @@ static void show_ota_page(void)
     lv_dropdown_set_selected(g_ota.channel_dd, strcmp(g_ota.channel, "dev") == 0 ? 1 : 0);
     lv_obj_add_event_cb(g_ota.channel_dd, ota_channel_changed_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
+    // Firmware variant. Auto-detect uses ota_info; Classic / RF force the repo
+    // for this operation (RF firmware may not advertise RF support in ota_info,
+    // so auto-detect cannot always see it). RF is a per-operation choice, not a
+    // saved channel.
+    ota_make_label(form, "Firmware Variant");
+    g_ota.variant_dd = lv_dropdown_create(form);
+    lv_dropdown_set_options(g_ota.variant_dd, "Auto-detect\nClassic\nRF (Monster RF)");
+    lv_obj_set_width(g_ota.variant_dd, lv_pct(100));
+    lv_dropdown_set_selected(g_ota.variant_dd, g_ota.variant_choice);
+
+    // Force update: reinstall the running version even when it is not newer
+    // (useful to be sure a flash took). Reinstall/downgrade are still explicit.
+    lv_obj_t *force_row = lv_obj_create(form);
+    lv_obj_set_width(force_row, lv_pct(100));
+    lv_obj_set_height(force_row, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(force_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(force_row, 0, 0);
+    lv_obj_set_style_pad_all(force_row, 0, 0);
+    lv_obj_set_flex_flow(force_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(force_row, LV_FLEX_ALIGN_SPACE_BETWEEN,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(force_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *force_lbl = lv_label_create(force_row);
+    lv_label_set_text(force_lbl, "Force update (choose release)");
+    lv_obj_set_style_text_font(force_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(force_lbl, ui_muted_color(), 0);
+    lv_obj_set_flex_grow(force_lbl, 1);
+    lv_label_set_long_mode(force_lbl, LV_LABEL_LONG_WRAP);
+    g_ota.force_sw = lv_switch_create(force_row);
+    if (g_ota.force_update) lv_obj_add_state(g_ota.force_sw, LV_STATE_CHECKED);
+
     // Action row (fixed, below the form)
     lv_obj_t *actions = lv_obj_create(g_ota.page);
     lv_obj_set_size(actions, lv_pct(100), LV_SIZE_CONTENT);
@@ -57835,12 +58505,56 @@ static void show_ota_page(void)
     lv_obj_add_event_cb(g_ota.keyboard, ota_kb_ready_cb, LV_EVENT_CANCEL, NULL);
 }
 
+static void tool_order_saved(void)
+{
+    app_keyboard_navigation_clear_selection();
+    tab_context_t *tabs[] = { &grove_ctx, &usb_ctx, &mbus_ctx };
+    for (size_t i = 0; i < sizeof(tabs) / sizeof(tabs[0]); ++i) {
+        if (tabs[i]->tiles)
+            apply_tool_order(lv_obj_get_child(tabs[i]->tiles, 0), TO_MONSTER, main_tile_event_cb);
+    }
+    apply_tool_order(internal_tiles, TO_INTERNAL, internal_tile_event_cb);
+}
+
+static void show_tool_order_page(void)
+{
+    static tool_order_item_t items[TILE_ORDER_MAX + 3];
+    tool_order_item_t registry[] = {
+        {TO_WIFI_SCAN, LV_SYMBOL_WIFI, enable_red_team ? "WiFi Scan & Attack" : "WiFi Scan & Test", COLOR_MATERIAL_BLUE},
+        {TO_GLOBAL_WIFI, LV_SYMBOL_WARNING, enable_red_team ? "Global WiFi Attacks" : "Global WiFi Tests", COLOR_MATERIAL_RED},
+        {TO_COMPROMISED, LV_SYMBOL_SAVE, "Compromised Data", COLOR_MATERIAL_GREEN},
+        {TO_DEAUTH, LV_SYMBOL_EYE_OPEN, "Deauth Detector", COLOR_MATERIAL_AMBER},
+        {TO_BLUETOOTH, LV_SYMBOL_BLUETOOTH, "Bluetooth", COLOR_MATERIAL_CYAN},
+        {TO_OBSERVER, LV_SYMBOL_LOOP, "Network Observer", COLOR_MATERIAL_TEAL},
+        {TO_KARMA, LV_SYMBOL_WIFI, "Karma", COLOR_MATERIAL_ORANGE},
+        {TO_WARDRIVE, LV_SYMBOL_GPS, "Wardrive", COLOR_MATERIAL_TEAL},
+        {TO_ANTISURV, LV_SYMBOL_EYE_OPEN, "Anti-Surv", COLOR_MATERIAL_PINK},
+        {TO_MESH, LV_SYMBOL_BARS, "Mesh Recon", COLOR_MATERIAL_PURPLE},
+        {TO_SUBGHZ, LV_SYMBOL_BARS, "Sub-GHz", COLOR_MATERIAL_PINK},
+        {TO_NFC, LV_SYMBOL_USB, "NFC", COLOR_MATERIAL_CYAN},
+        {TO_ANALYZER, LV_SYMBOL_BARS, "WiFi Analyzer", COLOR_MATERIAL_CYAN},
+        {TO_AUDITOR, LV_SYMBOL_EYE_OPEN, "WPA PSK Auditor", COLOR_MATERIAL_AMBER},
+        {TO_SETTINGS, LV_SYMBOL_SETTINGS, "Settings", COLOR_MATERIAL_PURPLE},
+        {TO_ADHOC, LV_SYMBOL_WIFI, "Ad Hoc Portal & Karma", COLOR_MATERIAL_ORANGE}
+    };
+    memcpy(items, registry, sizeof(registry));
+    tool_order_screen_config_t config = {
+        .background = ui_bg_color(), .card = ui_card_color(),
+        .text = ui_text_color(), .accent = ui_tab_icon_color(),
+        .items = items, .item_count = sizeof(items) / sizeof(items[0]),
+        .saved = tool_order_saved
+    };
+    tool_order_screen_show(&config);
+}
+
 static void settings_tile_event_cb(lv_event_t *e)
 {
     const char *tile_name = (const char *)lv_event_get_user_data(e);
     ESP_LOGI(TAG, "Settings tile clicked: %s", tile_name);
 
-    if (strcmp(tile_name, "Scan Setup") == 0) {
+    if (strcmp(tile_name, "Tool Order") == 0) {
+        show_tool_order_page();
+    } else if (strcmp(tile_name, "Scan Setup") == 0) {
         show_scan_time_popup();
     } else if (strcmp(tile_name, "Red Team") == 0) {
         show_red_team_settings_page();
@@ -57940,6 +58654,8 @@ static void show_settings_page(void)
     lv_obj_set_style_pad_column(tiles, 20, 0);
     lv_obj_set_style_pad_row(tiles, 20, 0);
     lv_obj_clear_flag(tiles, LV_OBJ_FLAG_SCROLLABLE);
+
+    create_tile(tiles, LV_SYMBOL_SHUFFLE, "Tool\nOrder", COLOR_MATERIAL_TEAL, settings_tile_event_cb, "Tool Order");
 
     // Scan Setup tile
     create_tile(tiles, LV_SYMBOL_REFRESH, "Scan\nSetup", COLOR_MATERIAL_GREEN, settings_tile_event_cb, "Scan Setup");
@@ -71267,6 +71983,7 @@ void app_main(void)
     load_clock_settings_from_nvs();
     load_wd_autoupload_from_nvs();
     load_janos_ft_baud_from_nvs();
+    load_observer_vendor_from_nvs();
 
     // Kick the startup melody off here, the first moment both prerequisites are
     // met: the codec is up and NVS has told us which melody to play. It used to

@@ -18,7 +18,7 @@ from source_index import Source
 src = Source(ROOT / 'main/main.c')
 responses = json.loads((ROOT / 'docs/ui-emulator/neon-district.responses.json').read_text())['responses']
 seed = json.loads((ROOT / 'docs/ui-emulator/neon-district.seed.json').read_text())
-names = ['trim_ascii_whitespace', 'parse_csv_mixed_fields', 'parse_network_line',
+names = ['trim_ascii_whitespace', 'parse_csv_mixed_fields', 'observer_scan_field_is_mac', 'parse_network_line',
          'parse_bt_device_line', 'parse_probes_from_buffer', 'fetch_html_files_from_sd']
 prelude = r'''
 #include <assert.h>
