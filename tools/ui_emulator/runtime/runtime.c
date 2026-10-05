@@ -1,5 +1,6 @@
 #include "runtime.h"
 #include "coordinates.h"
+#include "app_keyboard_navigation.h"
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -123,7 +124,10 @@ static lv_obj_t *focused_textarea(void) {
 void emu_key(int key) {
     if (!display) return;
     lv_obj_t *focused = focused_textarea();
-    if (!focused) return;
+    if (!focused) {
+        if (key == 27) app_keyboard_navigation_escape(NULL);
+        return;
+    }
     if (lv_obj_check_type(focused, &lv_spinbox_class)) {
         if (key == 13 || key == 27) { finish_numeric(key == 13); return; }
         if (key == 8) {
@@ -188,6 +192,15 @@ static void inspect_object(lv_obj_t *obj, uintptr_t parent) {
         text:UTF8ToString($6),clickable:!!$7,state:$8,scrollY:$9}); },
         (uintptr_t)obj, parent, area.x1, area.y1, lv_area_get_width(&area), lv_area_get_height(&area),
         text, lv_obj_has_flag(obj, LV_OBJ_FLAG_CLICKABLE), lv_obj_get_state(obj), lv_obj_get_scroll_y(obj));
+    EM_ASM({ Object.assign(globalThis.emulatorObjects[globalThis.emulatorObjects.length-1],
+        {bg:$0,bgOpa:$1,fg:$2,border:$3,borderWidth:$4,indicatorBg:$5,indicatorBorder:$6}); },
+        lv_color_to_u32(lv_obj_get_style_bg_color(obj, LV_PART_MAIN)),
+        lv_obj_get_style_bg_opa(obj, LV_PART_MAIN),
+        lv_color_to_u32(lv_obj_get_style_text_color(obj, LV_PART_MAIN)),
+        lv_color_to_u32(lv_obj_get_style_border_color(obj, LV_PART_MAIN)),
+        lv_obj_get_style_border_width(obj, LV_PART_MAIN),
+        lv_color_to_u32(lv_obj_get_style_bg_color(obj, LV_PART_INDICATOR)),
+        lv_color_to_u32(lv_obj_get_style_border_color(obj, LV_PART_INDICATOR)));
     for (uint32_t i = 0; i < lv_obj_get_child_count(obj); i++) inspect_object(lv_obj_get_child(obj, i), (uintptr_t)obj);
 }
 

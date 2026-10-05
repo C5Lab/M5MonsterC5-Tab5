@@ -1,5 +1,10 @@
 /* Explicit, cooperative simulator boundaries. This file never opens hardware. */
 #include "runtime.h"
+#undef uart_flush
+#undef uart_flush_input
+#undef uart_write_bytes
+#undef uart_read_bytes
+#undef usbh_cdc_flush_rx_buffer
 static double app_device_ms;
 static void app_system_sync_metadata(void);
 static void app_system_tick(void);
@@ -84,10 +89,35 @@ EM_JS(int,app_load,(const char *key,int fallback),{
 });
 static int app_load_range(const char *key,int fallback,int min,int max) {int value=app_load(key,fallback);return value<min||value>max?fallback:value;}
 static void save_janos_ft_baud_to_nvs(uint32_t rate) {app_store(NVS_KEY_FT_BAUD,(int)rate);}
+static void save_janos_usb_ft_baud_to_nvs(uint32_t rate) {app_store("usb_ft_baud",(int)rate);}
+/* The emulator has no tool-order editor: use the production default model. */
+static int tile_order_load(tile_order_group_t group,tile_order_t *order) {tile_order_default(group,order);return ESP_OK;}
+EM_JS(int,app_blob_load,(const char *key,void *out,size_t *size),{
+ try {
+  const bytes=JSON.parse(localStorage.getItem('tab5.nvs.'+UTF8ToString(key))||'null');
+  if(!Array.isArray(bytes)||bytes.some(b=>!Number.isInteger(b)||b<0||b>255))return -1;
+  const capacity=HEAPU32[size>>2];HEAPU32[size>>2]=bytes.length;
+  if(bytes.length>capacity)return -1;
+  HEAPU8.set(bytes,out);return 0;
+ }catch(e){return -1;}
+});
+EM_JS(int,app_blob_store,(const char *key,const void *bytes,size_t size),{
+ try {localStorage.setItem('tab5.nvs.'+UTF8ToString(key),JSON.stringify(Array.from(HEAPU8.subarray(bytes,bytes+size))));return 0;}
+ catch(e){return -1;}
+});
 static char app_nvs_key[16][64]; static uint8_t app_nvs_value[16]; static int app_nvs_count;
-static int nvs_open(const char *ns,int mode,nvs_handle_t *h) { (void)ns;(void)mode; if(!h)return ESP_FAIL; *h=1;app_nvs_count=0;return ESP_OK; }
+static char app_nvs_namespace[64],app_nvs_blob_key[128];
+static uint8_t app_nvs_blob[256];static size_t app_nvs_blob_size;
+static int nvs_open(const char *ns,int mode,nvs_handle_t *h) { (void)mode; if(!h)return ESP_FAIL; *h=1;app_nvs_count=0;app_nvs_blob_size=0;snprintf(app_nvs_namespace,sizeof(app_nvs_namespace),"%s",ns);return ESP_OK; }
 static int nvs_set_u8(nvs_handle_t h,const char *key,uint8_t val) { if(h!=1 || app_nvs_count>=16)return ESP_FAIL; snprintf(app_nvs_key[app_nvs_count],64,"%s",key);app_nvs_value[app_nvs_count++]=val;return ESP_OK; }
-static int nvs_commit(nvs_handle_t h) { if(h!=1)return ESP_FAIL;for(int i=0;i<app_nvs_count;i++)if(app_store(app_nvs_key[i],app_nvs_value[i])){emu_unsupported("Virtual settings persistence failed");return ESP_FAIL;}return ESP_OK; }
+static int nvs_get_blob(nvs_handle_t h,const char *key,void *out,size_t *size) {
+ if(h!=1||!out||!size)return ESP_FAIL;char full[128];snprintf(full,sizeof(full),"%s.%s",app_nvs_namespace,key);return app_blob_load(full,out,size);
+}
+static int nvs_set_blob(nvs_handle_t h,const char *key,const void *bytes,size_t size) {
+ if(h!=1||!bytes||size>sizeof(app_nvs_blob))return ESP_FAIL;
+ snprintf(app_nvs_blob_key,sizeof(app_nvs_blob_key),"%s.%s",app_nvs_namespace,key);memcpy(app_nvs_blob,bytes,size);app_nvs_blob_size=size;return ESP_OK;
+}
+static int nvs_commit(nvs_handle_t h) { if(h!=1)return ESP_FAIL;for(int i=0;i<app_nvs_count;i++)if(app_store(app_nvs_key[i],app_nvs_value[i])){emu_unsupported("Virtual settings persistence failed");return ESP_FAIL;}if(app_nvs_blob_size&&app_blob_store(app_nvs_blob_key,app_nvs_blob,app_nvs_blob_size))return ESP_FAIL;return ESP_OK; }
 static void nvs_close(nvs_handle_t h) {(void)h;app_nvs_count=0;}
 static void app_bt_stage_scan(int tab);
 static void app_bt_locator_stop(int tab);
@@ -122,6 +152,10 @@ static void app_config_command(int tab,const char *cmd) {
  else if(cmd[0]!='\r' && cmd[0]!='\n')emu_unsupported(cmd);
 }
 static int uart_flush(uart_port_t port) {(void)port;return ESP_OK;}
+static int wa_guarded_uart_flush(uart_port_t port) {(void)port;return ESP_OK;}
+static int wa_guarded_uart_write(uart_port_t port,const void *bytes,size_t count) {(void)port;(void)bytes;return (int)count;}
+static int wa_guarded_uart_read(uart_port_t port,void *data,uint32_t len,TickType_t wait) {(void)port;(void)data;(void)len;(void)wait;return 0;}
+static int wa_guarded_usb_flush(usbh_cdc_handle_t handle) {(void)handle;return ESP_OK;}
 static int uart_write_bytes(uart_port_t port,const void *bytes,size_t count) {char cmd[128];if(count>=sizeof(cmd))return -1;memcpy(cmd,bytes,count);cmd[count]=0;app_config_command(port==UART_NUM_2?TAB_MBUS:TAB_GROVE,cmd);return count;}
 static void uart2_send_command(const char *cmd) {app_config_command(TAB_MBUS,cmd);}
 static void uart_send_command_for_tab(const char *cmd) {app_config_command(current_tab,cmd);}
@@ -159,6 +193,9 @@ static BaseType_t xTaskCreate(TaskFunction_t fn,const char *name,unsigned stack,
     browser thread; anything else stays an advertised unsupported boundary. */
  if(fn==wifi_scan_task){wifi_scan_task(arg);if(handle)*handle=&app_jobs[(int)(uintptr_t)arg];return pdPASS;}
  if(fn==popup_focus_task){if(handle)*handle=NULL;popup_focus_task(arg);return pdPASS;}
+ /* SD presence/files are owned by the browser model, so no hardware polling
+    thread is needed for the retained mount status controls. */
+ if(fn==sd_monitor_task){if(handle)*handle=NULL;return pdPASS;}
  /* The analysis task must not run inside the click that started it: the retained
     loader replaces the page the event target lives on. Run it on the next tick,
     which is what a real task does. */
@@ -221,7 +258,10 @@ static esp_err_t ina226_init(void) {ina226_initialized=true;return ESP_OK;}
 static void update_battery_status(void) {current_battery_voltage=4.0f;if(battery_voltage_label)lv_label_set_text(battery_voltage_label,"4.00V (SIM)");}
 static void battery_status_timer_cb(lv_timer_t *timer) {(void)timer;update_battery_status();}
 void app_init(void) {
- janos_ft_baud=JANOS_FT_BAUD_CHOICES[janos_ft_baud_index((uint32_t)app_load(NVS_KEY_FT_BAUD,JANOS_FT_BAUD_DEFAULT))];
+ janos_ft_baud=janos_ft_baud_choice_at(JANOS_FT_LINK_HARDWARE_UART,
+     janos_ft_baud_index(JANOS_FT_LINK_HARDWARE_UART,(uint32_t)app_load(NVS_KEY_FT_BAUD,JANOS_FT_HARDWARE_DEFAULT)));
+ janos_usb_ft_baud=janos_ft_baud_choice_at(JANOS_FT_LINK_USB_CH34X,
+     janos_ft_baud_index(JANOS_FT_LINK_USB_CH34X,(uint32_t)app_load("usb_ft_baud",JANOS_FT_USB_DEFAULT)));
  rx8130_present=true;
  clock_24h=app_load_range("clock_24h",1,0,1);clock_show=app_load_range("clock_show",1,0,1);clock_dst=app_load_range("clock_dst",0,0,1);
  grove_detected=true;uart1_detected=true;mbus_detected=true;uart2_initialized=true;internal_sd_present=true;usb_detected=false;
@@ -358,8 +398,9 @@ static lv_event_dsc_t *app_bind(lv_obj_t *obj,lv_event_cb_t cb,lv_event_code_t e
  /* Observer rows repeat one template per cached network and client; without an
     entity every row would claim the same identity and be rejected as a duplicate. */
  else if(cb==network_row_click_cb){int i=(int)(intptr_t)data;if(ctx->observer_networks&&i>=0&&i<ctx->observer_network_count)entity=ctx->observer_networks[i].bssid;slot="observe";}
- else if(cb==client_row_click_cb){intptr_t packed=(intptr_t)data;int i=(int)(packed>>16),j=(int)(packed&0xFFFF);
-  if(ctx->observer_networks&&i>=0&&i<ctx->observer_network_count&&j>=0&&j<MAX_CLIENTS_PER_NETWORK)entity=ctx->observer_networks[i].clients[j];slot="client";}
+ else if(cb==observer_client_toggle_cb){int i=(int)(intptr_t)data;if(ctx->observer_networks&&i>=0&&i<ctx->observer_network_count)entity=ctx->observer_networks[i].bssid;slot="clients-toggle";}
+ else if(cb==client_row_click_cb||cb==popup_client_row_click_cb){intptr_t packed=(intptr_t)data;int i=(int)(packed>>16),j=(int)(packed&0xFFFF);
+  if(ctx->observer_networks&&i>=0&&i<ctx->observer_network_count&&j>=0&&j<MAX_CLIENTS_PER_NETWORK)entity=ctx->observer_networks[i].clients[j];slot=cb==popup_client_row_click_cb?"popup-client":"client";}
  else if(cb==main_tile_event_cb||cb==internal_tile_event_cb||cb==settings_tile_event_cb||cb==attack_tile_event_cb||cb==observer_attack_tile_event_cb||cb==observer_station_attack_tile_event_cb||cb==bt_menu_tile_event_cb||cb==global_attack_tile_event_cb||cb==compromised_data_tile_event_cb||cb==beacon_spam_tile_event_cb)slot=data?(const char *)data:"tile";
  /* BT scan rows repeat one template per discovered device; key on the MAC so
     each row is a distinct binding rather than a rejected duplicate. */
@@ -392,6 +433,14 @@ static lv_event_dsc_t *app_bind_adapter(lv_obj_t *obj,lv_event_cb_t cb,lv_event_
  for(int i=0;i<1024;i++)if(app_bindings[i].object&&!strcmp(app_bindings[i].id,full)){emu_unsupported("Duplicate active control binding");return NULL;}
  for(int i=0;i<1024;i++)if(!app_bindings[i].object){app_bindings[i].object=obj;snprintf(app_bindings[i].id,sizeof(app_bindings[i].id),"%s",full);app_bindings[i].generation=++app_binding_generation;lv_obj_add_event_cb(obj,app_binding_delete,LV_EVENT_DELETE,NULL);return lv_obj_add_event_cb(obj,cb,event,data);}
  emu_unsupported("Control binding capacity exceeded");return NULL;
+}
+static lv_event_dsc_t *app_bind_observer_options(lv_obj_t *obj,lv_event_cb_t cb,lv_event_code_t event,void *data) {
+ if(event==LV_EVENT_DELETE)return lv_obj_add_event_cb(obj,cb,event,data);
+ char id[128];uintptr_t key=(uintptr_t)data;
+ if(cb==observer_options_action)snprintf(id,sizeof(id),"emu.observer.options.%s",key==0?"cancel":key==1?"defaults":"apply");
+ else if(cb==observer_options_field_event)snprintf(id,sizeof(id),"emu.observer.options.%s.%u.%s",(key>>8)&1?"clients":"networks",(unsigned)((key>>2)&31),(key&3)==0?"visible":(key&3)==1?"up":"down");
+ else return lv_obj_add_event_cb(obj,cb,event,data);
+ return app_bind_adapter(obj,cb,event,data,id);
 }
 EMSCRIPTEN_KEEPALIVE void emu_inspect_bindings(void) {
  EM_ASM({globalThis.emulatorBindings=[];});

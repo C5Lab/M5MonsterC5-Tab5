@@ -7,7 +7,8 @@ from source_index import ROOT, Source, walk
 from story_contracts import STEPS, NOTES
 
 OUT=ROOT/'docs/ui-emulator'
-paths=[ROOT/'main/main.c',*sorted((ROOT/'main/screens').glob('*.c'))]
+paths=[ROOT/'main/main.c', ROOT/'main/observer_view.inc', ROOT/'main/observer_details.inc',
+       *sorted((ROOT/'main/screens').glob('*.c'))]
 sources=[Source(p) for p in paths if not p.name.startswith('lv_font_')]
 functions={}
 function_nodes={}

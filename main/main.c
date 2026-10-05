@@ -26,6 +26,9 @@
 #include "esp_rom_crc.h"
 #include "nvs_flash.h"
 #include "nvs.h"
+#include "observer_extended.h"
+#include "observer_options.h"
+#include "observer_options_ui.h"
 #include "driver/uart.h"
 #include "driver/gpio.h"
 #include "driver/ledc.h"
@@ -193,7 +196,7 @@ static lv_font_t *ssid_utf8_cached_font = NULL;
 #define MAX_OBSERVER_NETWORKS  100  // More capacity for background scanning
 #define MAX_CLIENTS_PER_NETWORK  20
 #define OBSERVER_POLL_INTERVAL_MS  20000  // 20 seconds
-#define OBSERVER_LINE_BUFFER_SIZE  512
+#define OBSERVER_LINE_BUFFER_SIZE  4096
 
 // Material Design Colors
 #define COLOR_MATERIAL_BG       lv_color_make(18, 18, 18)      // #121212 - dark background
@@ -276,6 +279,16 @@ typedef struct {
     bool mfp_capable;
     char uptime[64];
     bool inspected;
+    observer_extended_t extended;
+    uint32_t extended_received_ms;
+    uint32_t snapshot_clock_ms;
+    bool snapshot_live;
+    char client_extended[MAX_CLIENTS_PER_NETWORK][96];
+    int client_rssi[MAX_CLIENTS_PER_NETWORK];
+    bool client_rssi_known[MAX_CLIENTS_PER_NETWORK];
+    uint32_t client_age_ms[MAX_CLIENTS_PER_NETWORK];
+    uint32_t client_received_ms[MAX_CLIENTS_PER_NETWORK];
+    bool client_age_known[MAX_CLIENTS_PER_NETWORK];
 } observer_network_t;
 
 // LVGL handles for one Observer network tile. The data model lives in
@@ -772,12 +785,16 @@ typedef struct {
     lv_obj_t *network_popup;
     lv_obj_t *popup_title_label;
     lv_obj_t *popup_clients_container;
+    lv_obj_t *observer_details_tabs;
+    lv_obj_t *observer_details_labels[4];
+    lv_obj_t *observer_technical_label;
     int popup_network_idx;
     bool popup_open;
     bool popup_focus_ready;
     volatile bool popup_focus_active;
     volatile bool popup_focus_cancel;
     TaskHandle_t popup_focus_task;
+    TaskHandle_t popup_close_task;
     TimerHandle_t popup_timer;
 
     // Deauth popup
@@ -859,6 +876,8 @@ typedef struct {
     volatile bool observer_teardown_active;   // a stop is already on its way
     char *observer_rx_buffer;       // Per-tab PSRAM UART buffer
     char *observer_line_buffer;     // Per-tab PSRAM line buffer
+    int observer_extended_support; // 0 probing, 1 supported, -1 legacy
+    bool observer_has_new_networks;
 
     // Karma2 (Probes & Karma on Observer)
     lv_obj_t *karma2_probes_popup_overlay;
@@ -1982,35 +2001,8 @@ static void format_network_info(char *out, size_t out_sz,
 
 // Observer keeps radio metadata in one stable row below the title. Uptime and
 // vendor live in the title row and are formatted separately below.
-static void format_observer_network_info(char *out, size_t out_sz,
-                                         const observer_network_t *net)
-{
-    if (!out || out_sz == 0) return;
-    if (!net) {
-        out[0] = '\0';
-        return;
-    }
-
-    const char *rssi_col = net->rssi > -50 ? "#55DD55" :
-                           (net->rssi > -70 ? "#FFAA00" : "#FF5555");
-    const char *band_col = strstr(net->band, "5") ? "#CC66FF" : "#FFAA33";
-    const char *security = net->security[0] ? net->security : "-";
-    const char *sec_col = strstr(security, "WPA3") ? "#55DD55" :
-                          (strstr(security, "WPA2") ? "#00CCCC" : "#FF6666");
-    const char *mfp_text = net->inspected
-                               ? (net->mfp_capable
-                                      ? "#FF5555 MFP On#"
-                                      : "#55DD55 MFP Off#")
-                               : "#888888 MFP ?#";
-    snprintf(out, out_sz,
-             "#5599FF %s#  |  #5599FF CH%d#  |  %s %s#  |  %s %s#  |  "
-             "%s %d dBm#  |  %s",
-             net->bssid[0] ? net->bssid : "-", net->channel,
-             band_col, net->band[0] ? net->band : "-",
-             sec_col, security,
-             rssi_col, net->rssi,
-             mfp_text);
-}
+static bool observer_resolve_vendors = false;
+#include "observer_view.inc"
 
 static void format_observer_summary_info(char *out, size_t out_sz,
                                          const observer_network_t *net)
@@ -2764,7 +2756,7 @@ static lv_obj_t *observer_status_label = NULL;
 // AP and client station (via the "_vendor" sniffer query). The host persists
 // this choice in NVS and pushes "vendor set on/off" to JanOS when the toggle
 // flips; JanOS persists its own vendor state, so no per-start re-assert.
-static bool observer_resolve_vendors = false;
+
 static bool observer_log_unknown_vendors = false;
 
 // LVGL UI elements - ESP Modem page
@@ -3177,6 +3169,7 @@ static void client_row_click_cb(lv_event_t *e);
 static void show_network_popup(int network_idx);
 static void close_network_popup(void);
 static void destroy_network_popup_ui(tab_context_t *ctx);
+static void destroy_network_popup_ui(tab_context_t *ctx);
 static void popup_focus_task(void *arg);
 static void quiesce_observer_for_attack(tab_context_t *ctx);
 static void pause_observer_for_attack(tab_context_t *ctx);
@@ -3188,6 +3181,9 @@ static void close_deauth_popup(void);
 static void deauth_btn_click_cb(lv_event_t *e);
 static void update_observer_table(tab_context_t *ctx);
 static void observer_flush_incremental_ui(tab_context_t *ctx);
+static void observer_add_network_tile(tab_context_t *ctx, int i, bool expanded);
+static void observer_add_client_row(tab_context_t *ctx, int network_idx, int client_idx);
+static void observer_update_client_vendor_labels(tab_context_t *ctx, int network_idx);
 static void observer_export_btn_cb(lv_event_t *e);
 static bool observer_export_csv(tab_context_t *ctx, char *out_path, size_t out_path_sz, char *err_msg, size_t err_msg_sz);
 static bool parse_sniffer_network_line(const char *line, observer_network_t *net, bool observer_resolve_vendors);
@@ -6617,8 +6613,8 @@ static void inspect_observer_task(void *arg)
                     ctx->observer_inspect_info_labels[i] &&
                     lv_obj_is_valid(ctx->observer_inspect_info_labels[i])) {
                     lv_label_set_recolor(ctx->observer_inspect_info_labels[i], true);
-                    char info_buf[NETWORK_INFO_BUF];
-                    format_observer_network_info(info_buf, sizeof(info_buf), net);
+                    char info_buf[1024];
+                    observer_format_fields(net, info_buf, sizeof(info_buf));
                     lv_label_set_text(ctx->observer_inspect_info_labels[i], info_buf);
                     observer_update_summary_label(ctx, i);
                 }
@@ -6683,8 +6679,8 @@ static void inspect_observer_task(void *arg)
                     ctx->observer_inspect_info_labels[i] &&
                     lv_obj_is_valid(ctx->observer_inspect_info_labels[i])) {
                     lv_label_set_recolor(ctx->observer_inspect_info_labels[i], true);
-                    char info_buf[NETWORK_INFO_BUF];
-                    format_observer_network_info(info_buf, sizeof(info_buf), net);
+                    char info_buf[1024];
+                    observer_format_fields(net, info_buf, sizeof(info_buf));
                     lv_label_set_text(ctx->observer_inspect_info_labels[i], info_buf);
                     observer_update_summary_label(ctx, i);
                 }
@@ -19100,9 +19096,11 @@ static void popup_client_row_click_cb(lv_event_t *e)
     int client_idx = (int)(packed & 0xFFFF);
 
     tab_context_t *ctx = get_current_ctx();
-    if (!ctx) return;
+    if (!ctx || ctx->popup_focus_task || !ctx->popup_focus_ready) return;
 
-    close_network_popup();
+    if (!enable_red_team) return;
+    destroy_network_popup_ui(ctx);
+    uart_send_command_for_tab("stop");
 
     if (network_idx >= 0 && network_idx < ctx->observer_network_count &&
         client_idx >= 0 && client_idx < MAX_CLIENTS_PER_NETWORK) {
@@ -19113,6 +19111,10 @@ static void popup_client_row_click_cb(lv_event_t *e)
     }
 }
 
+static bool add_client_mac(observer_network_t *net, const char *mac, const char *vendor);
+#include "observer_receive.inc"
+#include "observer_details.inc"
+
 // Update popup content with current network data
 static void update_popup_content(tab_context_t *ctx)
 {
@@ -19121,8 +19123,10 @@ static void update_popup_content(tab_context_t *ctx)
 
     observer_network_t *net = &ctx->observer_networks[ctx->popup_network_idx];
 
+    observer_update_details(ctx);
     // Update clients container
     if (ctx->popup_clients_container) {
+        lv_coord_t client_scroll = lv_obj_get_scroll_y(ctx->popup_clients_container);
         lv_obj_clean(ctx->popup_clients_container);
 
         if (net->client_count == 0) {
@@ -19153,20 +19157,15 @@ static void update_popup_content(tab_context_t *ctx)
                                     LV_EVENT_CLICKED, (void *)packed);
 
                 lv_obj_t *client_label = lv_label_create(client_row);
-                if (net->client_vendors[j][0]) {
-                    lv_label_set_text_fmt(client_label, "%s   %s",
-                                          net->clients[j], net->client_vendors[j]);
-                } else {
-                    if (observer_resolve_vendors && ctx->home_vendors_present) {
-                        lv_label_set_text_fmt(client_label, "%s   -", net->clients[j]);
-                    } else {
-                        lv_label_set_text(client_label, net->clients[j]);
-                    }
-                }
+                char client_text[240];
+                observer_format_client(net, j, client_text, sizeof(client_text));
+                lv_label_set_text(client_label, client_text);
+                lv_obj_set_width(client_label, lv_pct(100));
                 lv_obj_set_style_text_font(client_label, &lv_font_montserrat_14, 0);
                 lv_obj_set_style_text_color(client_label, lv_color_hex(0xCCCCCC), 0);
             }
         }
+        lv_obj_scroll_to_y(ctx->popup_clients_container, client_scroll, LV_ANIM_OFF);
     }
 }
 
@@ -19193,6 +19192,9 @@ static void destroy_network_popup_ui(tab_context_t *ctx)
         ctx->network_popup = NULL;
         ctx->popup_title_label = NULL;
         ctx->popup_clients_container = NULL;
+        ctx->observer_details_tabs = NULL;
+        memset(ctx->observer_details_labels, 0, sizeof(ctx->observer_details_labels));
+        ctx->observer_technical_label = NULL;
     }
 
     ctx->popup_open = false;
@@ -19246,7 +19248,7 @@ static bool wait_for_observer_uart_idle(tab_context_t *ctx, uint32_t timeout_ms)
     while (ctx->observer_start_active ||
            ctx->observer_task != NULL ||
            ctx->observer_inspect_task != NULL ||
-           ctx->popup_focus_task != NULL) {
+           ctx->popup_focus_task != NULL || ctx->popup_close_task != NULL) {
         if ((xTaskGetTickCount() - start) >= timeout) {
             ESP_LOGE(TAG,
                      "Observer UART idle timeout: start=%d poll=%p inspect=%p focus=%p",
@@ -19571,7 +19573,7 @@ static bool observer_prepare_target_selection(tab_context_t *ctx,
                                               const char *purpose,
                                               volatile bool *cancel)
 {
-    if (!ctx || !target || target->index <= 0) return false;
+    if (!ctx || !target || (target->index <= 0 && !observer_scan_field_is_mac(target->bssid))) return false;
 
     tab_id_t tab = tab_id_for_ctx(ctx);
     uart_port_t port = uart_port_for_tab(tab);
@@ -19596,7 +19598,7 @@ static bool observer_prepare_target_selection(tab_context_t *ctx,
     // normally still valid. Validate it against the expected BSSID and avoid
     // a costly full scan on every popup open. If JanOS rejects it (or the index
     // now points at another BSSID), refresh by BSSID and retry once.
-    if (observer_select_target_and_wait(tab, port, target, purpose, cancel)) {
+    if (target->index > 0 && observer_select_target_and_wait(tab, port, target, purpose, cancel)) {
         ESP_LOGI(TAG, "Observer %s: reused preserved scan_index=%d for '%s'",
                  purpose ? purpose : "transition", target->index, target->ssid);
         return true;
@@ -19762,63 +19764,61 @@ done:
     vTaskDelete(NULL);
 }
 
-// Close network popup and resume normal monitoring
-static void close_network_popup(void)
+// UART transitions run outside the LVGL callback and its display mutex.
+static void popup_close_task(void *arg)
 {
-    tab_context_t *ctx = get_current_ctx();
-    if (!ctx || !ctx->popup_open) return;
-
-    ESP_LOGI(TAG, "Closing network popup");
-
-    destroy_network_popup_ui(ctx);
-
-    // A timer stop only prevents future callbacks. Wait until the in-flight
-    // focus/poll reader has actually released this transport.
+    tab_context_t *ctx = (tab_context_t *)arg;
+    const char *error = NULL;
     TickType_t wait_start = xTaskGetTickCount();
     while ((ctx->popup_focus_task != NULL || ctx->observer_task != NULL) &&
            (xTaskGetTickCount() - wait_start) < pdMS_TO_TICKS(3000)) {
         vTaskDelay(pdMS_TO_TICKS(10));
     }
     if (ctx->popup_focus_task != NULL || ctx->observer_task != NULL) {
-        ESP_LOGE(TAG, "Observer popup close: UART task did not stop in time");
+        error = "Observer stopped - UART task timeout";
+    } else {
+        tab_id_t tab = tab_id_for_ctx(ctx);
+        uart_port_t port = uart_port_for_tab(tab);
+        if (!observer_wait_for_command_prompt(tab, port, "unselect_networks",
+                                              "Popup close", 5000)) {
+            error = "Observer resume failed - restart Observer";
+        } else if (ctx->observer_running && !ctx->observer_teardown_active) {
+            observer_send_command_to_transport(tab, port, "start_sniffer_noscan",
+                                               "Popup close");
+        }
+    }
+
+    bsp_display_lock(0);
+    if (error) {
+        ESP_LOGE(TAG, "%s", error);
         ctx->observer_running = false;
         if (ctx->observer_status_label) {
-            lv_label_set_text(ctx->observer_status_label,
-                              "Observer stopped - UART task timeout");
-            lv_obj_set_style_text_color(ctx->observer_status_label,
-                                        COLOR_MATERIAL_RED, 0);
+            lv_label_set_text(ctx->observer_status_label, error);
+            lv_obj_set_style_text_color(ctx->observer_status_label, COLOR_MATERIAL_RED, 0);
         }
-        return;
+    } else if (ctx->observer_running && !ctx->observer_teardown_active) {
+        if (ctx->observer_timer) xTimerStart(ctx->observer_timer, 0);
+        if (ctx->observer_table) observer_flush_incremental_ui(ctx);
     }
-
-    tab_id_t tab = tab_id_for_ctx(ctx);
-    uart_port_t port = uart_port_for_tab(tab);
-    if (!observer_wait_for_command_prompt(tab, port, "unselect_networks",
-                                          "Popup close", 5000)) {
-        ctx->observer_running = false;
-        if (ctx->observer_status_label) {
-            lv_label_set_text(ctx->observer_status_label,
-                              "Observer resume failed - restart Observer");
-            lv_obj_set_style_text_color(ctx->observer_status_label,
-                                        COLOR_MATERIAL_RED, 0);
-        }
-        return;
-    }
-    observer_send_command_to_transport(tab, port, "start_sniffer_noscan",
-                                       "Popup close");
-
-    // Restart main observer timer (20s) for this context
-    if (ctx->observer_timer != NULL && ctx->observer_running) {
-        xTimerStart(ctx->observer_timer, 0);
-        ESP_LOGI(TAG, "Resumed observer timer for tab %d (20s)", current_tab);
-    }
-
-    if (ctx->observer_table) {
-        observer_flush_incremental_ui(ctx);
-    }
-
     ctx->observer_attack_return_to_observer = false;
     clear_observer_attack_override(ctx);
+    ctx->popup_close_task = NULL;
+    bsp_display_unlock();
+    vTaskDelete(NULL);
+}
+
+static void close_network_popup(void)
+{
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx || !ctx->popup_open || ctx->popup_close_task) return;
+    ESP_LOGI(TAG, "Closing network popup asynchronously");
+    destroy_network_popup_ui(ctx);
+    if (xTaskCreate(popup_close_task, "popup_close", 8192, ctx, 5,
+                    &ctx->popup_close_task) != pdPASS) {
+        ctx->popup_close_task = NULL;
+        ctx->observer_running = false;
+        ESP_LOGE(TAG, "Failed to create Observer popup close task");
+    }
 }
 
 // Show network popup for detailed view
@@ -19828,7 +19828,7 @@ static void show_network_popup(int network_idx)
     if (!ctx) return;
 
     if (network_idx < 0 || network_idx >= ctx->observer_network_count) return;
-    if (ctx->popup_open) return;  // Already showing a popup on this tab
+    if (ctx->popup_open || ctx->popup_close_task) return;  // UART transition in progress
 
     bool opening_during_startup =
         ctx->observer_start_active || ctx->observer_inspect_task != NULL;
@@ -19868,7 +19868,7 @@ static void show_network_popup(int network_idx)
     // 700 px of popup does not fit a 720 px tall landscape screen, and the
     // attack bar inside it is shorter there anyway.
     const lv_coord_t net_popup_h = popup_clamp_h(enable_red_team ? 700 : 640);
-    lv_obj_set_size(ctx->network_popup, 640, net_popup_h);
+    lv_obj_set_size(ctx->network_popup, popup_clamp_w(900), net_popup_h);
     lv_obj_center(ctx->network_popup);
     lv_obj_set_style_bg_color(ctx->network_popup, lv_color_hex(0x1A2A2A), 0);
     lv_obj_set_style_border_color(ctx->network_popup, COLOR_MATERIAL_TEAL, 0);
@@ -19897,7 +19897,8 @@ static void show_network_popup(int network_idx)
     // Title
     lv_obj_t *title = lv_label_create(header);
     ctx->popup_title_label = title;
-    const char *ssid_display = strlen(net->ssid) > 0 ? net->ssid : "Unknown";
+    const char *ssid_display = net->extended.resolved_ssid[0] ? net->extended.resolved_ssid :
+        (net->extended.hidden == 1 ? "(Hidden)" : (net->ssid[0] ? net->ssid : "Unknown"));
     lv_label_set_text_fmt(title, "Preparing %s...", ssid_display);
     lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
     lv_obj_set_style_text_color(title, COLOR_MATERIAL_TEAL, 0);
@@ -19918,65 +19919,46 @@ static void show_network_popup(int network_idx)
     lv_obj_set_style_text_color(close_icon, lv_color_hex(0xFFFFFF), 0);
     lv_obj_center(close_icon);
 
-    // Network info section
-    lv_obj_t *info_container = lv_obj_create(ctx->network_popup);
-    lv_obj_set_size(info_container, lv_pct(100), LV_SIZE_CONTENT);
-    lv_obj_set_style_bg_color(info_container, lv_color_hex(0x0A1A1A), 0);
-    lv_obj_set_style_border_width(info_container, 0, 0);
-    lv_obj_set_style_radius(info_container, 8, 0);
-    lv_obj_set_style_pad_all(info_container, 12, 0);
-    lv_obj_set_flex_flow(info_container, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_pad_row(info_container, 4, 0);
-    lv_obj_clear_flag(info_container, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *tabs = lv_tabview_create(ctx->network_popup);
+    ctx->observer_details_tabs = tabs;
+    lv_obj_set_width(tabs, lv_pct(100));
+    lv_obj_set_height(tabs, 0);
+    lv_obj_set_flex_grow(tabs, 1);
+    lv_obj_t *tab_buttons = lv_tabview_get_tab_bar(tabs);
+    lv_obj_set_height(tab_buttons, 44);
+    const char *names[] = {"Overview", "Security", "WPS", "Clients"};
+    for (int t = 0; t < 4; ++t) {
+        lv_obj_t *page = lv_tabview_add_tab(tabs, names[t]);
+        lv_obj_set_flex_flow(page, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_style_pad_all(page, 12, 0);
+        lv_obj_set_style_pad_row(page, 12, 0);
+        lv_obj_set_style_bg_color(page, lv_color_hex(0x0A1A1A), 0);
+        lv_obj_set_style_text_color(page, lv_color_hex(0xDDDDDD), 0);
+        lv_obj_set_scroll_dir(page, LV_DIR_VER);
+        if (t == 3) {
+            ctx->popup_clients_container = page;
+        } else {
+            lv_obj_t *label = lv_label_create(page);
+            lv_obj_set_width(label, lv_pct(100));
+            lv_obj_set_style_text_font(label, &lv_font_montserrat_16, 0);
+            ctx->observer_details_labels[t] = label;
+            if (t == 1) {
+                lv_obj_t *toggle = lv_btn_create(page);
+                observer_style_button(toggle, 0x455A64);
+                lv_obj_set_size(toggle, 200, 44);
+                lv_obj_t *caption = lv_label_create(toggle);
+                lv_label_set_text(caption, "Technical details");
+                lv_obj_center(caption);
+                ctx->observer_technical_label = lv_label_create(page);
+                lv_obj_set_width(ctx->observer_technical_label, lv_pct(100));
+                lv_obj_set_style_text_font(ctx->observer_technical_label, &lv_font_montserrat_12, 0);
+                lv_obj_add_flag(ctx->observer_technical_label, LV_OBJ_FLAG_HIDDEN);
+                lv_obj_add_event_cb(toggle, observer_technical_toggle, LV_EVENT_CLICKED, ctx->observer_technical_label);
+            }
+        }
+    }
 
-    // SSID
-    lv_obj_t *ssid_label = lv_label_create(info_container);
-    lv_label_set_text_fmt(ssid_label, "SSID: %s", ssid_display);
-    lv_obj_set_style_text_font(ssid_label, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(ssid_label, lv_color_hex(0xFFFFFF), 0);
-
-    // BSSID
-    lv_obj_t *bssid_label = lv_label_create(info_container);
-    lv_label_set_text_fmt(bssid_label, "BSSID: %s", net->bssid);
-    lv_obj_set_style_text_font(bssid_label, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(bssid_label, lv_color_hex(0xCCCCCC), 0);
-
-    // Vendor
-    lv_obj_t *vendor_label = lv_label_create(info_container);
-    lv_label_set_text_fmt(vendor_label, "Vendor: %s", strlen(net->vendor) > 0 ? net->vendor : "-");
-    lv_obj_set_style_text_font(vendor_label, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(vendor_label, lv_color_hex(0xCCCCCC), 0);
-
-    // Channel + Band + RSSI
-    lv_obj_t *channel_label = lv_label_create(info_container);
-    lv_label_set_text_fmt(channel_label, "Channel: %d  |  %s  |  %d dBm", net->channel, net->band, net->rssi);
-    lv_obj_set_style_text_font(channel_label, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(channel_label, lv_color_hex(0xCCCCCC), 0);
-
-    // Clients section header
-    lv_obj_t *clients_header = lv_label_create(ctx->network_popup);
-    lv_label_set_text_fmt(clients_header, "Clients (%d):", net->client_count);
-    lv_obj_set_style_text_font(clients_header, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(clients_header, COLOR_MATERIAL_TEAL, 0);
-
-    // Clients scrollable container
-    ctx->popup_clients_container = lv_obj_create(ctx->network_popup);
-    lv_obj_set_size(ctx->popup_clients_container, lv_pct(100), 170);
-    // The attack bar below is one row now instead of four, which leaves ~230 px
-    // of the card empty. Give it to the client list - it is what the popup is
-    // for - rather than to a hole above the tiles. The 170 px above is only the
-    // starting value: flex_grow sizes this from the parent, and the fixed
-    // children around it (40 + info + 20 + ~80 of bar) leave 300 px or more free
-    // in either orientation.
-    lv_obj_set_flex_grow(ctx->popup_clients_container, 1);
-    lv_obj_set_style_bg_color(ctx->popup_clients_container, lv_color_hex(0x0A1A1A), 0);
-    lv_obj_set_style_border_width(ctx->popup_clients_container, 0, 0);
-    lv_obj_set_style_radius(ctx->popup_clients_container, 8, 0);
-    lv_obj_set_style_pad_all(ctx->popup_clients_container, 8, 0);
-    lv_obj_set_flex_flow(ctx->popup_clients_container, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_pad_row(ctx->popup_clients_container, 4, 0);
-    lv_obj_set_scroll_dir(ctx->popup_clients_container, LV_DIR_VER);
-
+    observer_style_dark_tabs(tabs);
     create_attack_action_bar(ctx->network_popup, observer_attack_tile_event_cb, observer_karma_btn_cb);
 
     // Initial client list
@@ -20070,14 +20052,15 @@ static void popup_poll_task(void *arg)
 
     observer_flush_transport_input(task_tab, uart_port);
     const bool vendor_query = observer_resolve_vendors && ctx->home_vendors_present;
-    const char *cmd = vendor_query
-                          ? "show_sniffer_results_vendor\r\n"
-                          : "show_sniffer_results\r\n";
+    const char *cmd = observer_query_command(ctx, vendor_query);
     transport_write_bytes_tab(task_tab, uart_port, cmd, strlen(cmd));
 
     char *rx_buffer = ctx->observer_rx_buffer;
     char *line_buffer = ctx->observer_line_buffer;
     int line_pos = 0;
+    bool line_overflow = false;
+    bool retried_legacy = false;
+    bool pending_legacy = false;
     int current_network_idx = -1;
     bool saw_result_data = false;
     int empty_reads = 0;
@@ -20086,7 +20069,7 @@ static void popup_poll_task(void *arg)
     // DON'T clear client data - accumulate clients over time
 
     TickType_t start_time = xTaskGetTickCount();
-    TickType_t timeout_ticks = pdMS_TO_TICKS(5000);
+    TickType_t timeout_ticks = pdMS_TO_TICKS(15000);
 
     while (!response_done && (xTaskGetTickCount() - start_time) < timeout_ticks) {
         int len = transport_read_bytes_tab(task_tab, uart_port, (uint8_t*)rx_buffer, UART_BUF_SIZE - 1, pdMS_TO_TICKS(100));
@@ -20099,59 +20082,47 @@ static void popup_poll_task(void *arg)
                 char c = rx_buffer[i];
 
                 if (c == '\n' || c == '\r') {
+                    if (line_overflow) { line_overflow = false; line_pos = 0; current_network_idx = -1; continue; }
                     if (line_pos > 0) {
                         line_buffer[line_pos] = '\0';
 
                         ESP_LOGD(TAG, "POPUP SNIFFER LINE: '%s'", line_buffer);
 
-                        char prompt_check[OBSERVER_LINE_BUFFER_SIZE];
-                        snprintf(prompt_check, sizeof(prompt_check), "%s", line_buffer);
-                        trim_ascii_whitespace(prompt_check);
-                        if (strcmp(prompt_check, ">") == 0) {
-                            response_done = true;
-                            line_pos = 0;
-                            break;
+                        if (observer_is_prompt_line(line_buffer)) {
+                            if (pending_legacy) {
+                                pending_legacy = false;
+                                const char *legacy = observer_query_command(ctx, vendor_query);
+                                transport_write_bytes_tab(task_tab, uart_port, legacy, strlen(legacy));
+                                start_time = xTaskGetTickCount();
+                                current_network_idx = -1; line_pos = 0; continue;
+                            }
+                            response_done = true; line_pos = 0; break;
                         }
-
-                        // Check for network line (doesn't start with space)
+                        if (ctx->observer_extended_support >= 0 && !retried_legacy &&
+                            observer_extended_rejected(line_buffer)) {
+                            ctx->observer_extended_support = -1;
+                            retried_legacy = true;
+                            pending_legacy = true;
+                            current_network_idx = -1; line_pos = 0; continue;
+                        }
+                        if (observer_is_noise_line(line_buffer)) { line_pos = 0; continue; }
                         if (line_buffer[0] != ' ' && line_buffer[0] != '\t') {
-                            observer_network_t parsed_net = {0};
-                            if (parse_sniffer_network_line(line_buffer, &parsed_net, vendor_query)) {
+                            bsp_display_lock(0);
+                            current_network_idx = observer_receive_ap(ctx, line_buffer, vendor_query, target_network_idx);
+                            bsp_display_unlock();
+                            if (current_network_idx >= 0) saw_result_data = true;
+                        } else if (current_network_idx >= 0) {
+                            bsp_display_lock(0);
+                            if (observer_receive_client(&ctx->observer_networks[current_network_idx], line_buffer, vendor_query))
                                 saw_result_data = true;
-                                current_network_idx = -1;
-                                observer_network_t *target =
-                                    &ctx->observer_networks[target_network_idx];
-                                if (strcmp(target->ssid, parsed_net.ssid) == 0 &&
-                                    target->channel == parsed_net.channel) {
-                                    current_network_idx = target_network_idx;
-                                    if (vendor_query) {
-                                        snprintf(target->vendor, sizeof(target->vendor), "%s", parsed_net.vendor);
-                                    }
-                                }
-                            } else {
-                                current_network_idx = -1;
-                            }
-                        }
-                        // Check for client MAC line (starts with space)
-                        else if ((line_buffer[0] == ' ' || line_buffer[0] == '\t') && current_network_idx >= 0) {
-                            observer_network_t *net = &ctx->observer_networks[current_network_idx];
-                            char mac[18];
-                            char vendor[48];
-                            if (parse_sniffer_client_line(line_buffer, mac, sizeof(mac),
-                                                          vendor, sizeof(vendor), vendor_query)) {
-                                saw_result_data = true;
-                                // Add client if not already present (accumulate)
-                                if (add_client_mac(net, mac, vendor_query ? vendor : NULL)) {
-                                    ESP_LOGI(TAG, "  -> NEW client: %s for '%s'", mac, net->ssid);
-                                }
-                            }
+                            bsp_display_unlock();
                         }
 
                         line_pos = 0;
                     }
                 } else if (line_pos < OBSERVER_LINE_BUFFER_SIZE - 1) {
                     line_buffer[line_pos++] = c;
-                }
+                } else { line_overflow = true; }
             }
         } else if (saw_result_data && ++empty_reads >= 10) {
             response_done = true;
@@ -20186,8 +20157,16 @@ static void observer_update_ssid_label(tab_context_t *ctx, int network_idx)
     observer_network_ui_t *ui = &ctx->observer_network_ui[network_idx];
     if (!ui->ssid_label || !lv_obj_is_valid(ui->ssid_label)) return;
 
-    const char *ssid = net->ssid[0] ? net->ssid : "(Hidden)";
-    lv_label_set_text(ui->ssid_label, ssid);
+    char name[160];
+    snprintf(name, sizeof(name), "%s", net->extended.present && net->extended.resolved_ssid[0] ?
+        net->extended.resolved_ssid : (net->extended.hidden == 1 ? "" : net->ssid));
+    observer_plain_text(name);
+    char display[240];
+    if (net->extended.present && net->extended.hidden == 1 && name[0])
+        snprintf(display, sizeof(display), "(Hidden) - #5599FF %s#", name);
+    else snprintf(display, sizeof(display), "%s", name[0] ? name : "(Hidden)");
+    if (strcmp(lv_label_get_text(ui->ssid_label), display))
+        lv_label_set_text(ui->ssid_label, display);
 }
 
 static void observer_update_client_toggle(tab_context_t *ctx, int network_idx)
@@ -20255,6 +20234,12 @@ static void observer_client_toggle_cb(lv_event_t *e)
 
     if (expand_selected) {
         ui->clients_expanded = true;
+        observer_network_t *net = &ctx->observer_networks[network_idx];
+        for (int j = ui->rendered_client_count; j < net->client_count &&
+             j < MAX_CLIENTS_PER_NETWORK; ++j)
+            observer_add_client_row(ctx, network_idx, j);
+        ui->rendered_client_count = net->client_count;
+        observer_update_client_vendor_labels(ctx, network_idx);
         if (ui->client_container && lv_obj_is_valid(ui->client_container)) {
             lv_obj_clear_flag(ui->client_container, LV_OBJ_FLAG_HIDDEN);
         }
@@ -20293,16 +20278,10 @@ static void observer_add_client_row(tab_context_t *ctx, int network_idx, int cli
                         LV_EVENT_CLICKED, (void *)packed_data);
 
     lv_obj_t *mac_label = lv_label_create(client_row);
-    if (net->client_vendors[client_idx][0]) {
-        lv_label_set_text_fmt(mac_label, "%s   %s", net->clients[client_idx],
-                              net->client_vendors[client_idx]);
-    } else {
-        if (observer_resolve_vendors && ctx->home_vendors_present) {
-            lv_label_set_text_fmt(mac_label, "%s   -", net->clients[client_idx]);
-        } else {
-            lv_label_set_text(mac_label, net->clients[client_idx]);
-        }
-    }
+    char client_text[240];
+    observer_format_client(net, client_idx, client_text, sizeof(client_text));
+    lv_label_set_text(mac_label, client_text);
+    lv_obj_set_width(mac_label, lv_pct(100));
     lv_obj_set_style_text_font(mac_label, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(mac_label, COLOR_MATERIAL_TEAL, 0);
 }
@@ -20318,14 +20297,8 @@ static void observer_update_client_vendor_labels(tab_context_t *ctx, int network
         if (!row) continue;
         lv_obj_t *label = lv_obj_get_child(row, 0);
         if (!label) continue;
-        char text[80];
-        if (net->client_vendors[j][0] ||
-            (observer_resolve_vendors && ctx->home_vendors_present)) {
-            snprintf(text, sizeof(text), "%s   %s", net->clients[j],
-                     net->client_vendors[j][0] ? net->client_vendors[j] : "-");
-        } else {
-            snprintf(text, sizeof(text), "%s", net->clients[j]);
-        }
+        char text[240];
+        observer_format_client(net, j, text, sizeof(text));
         if (strcmp(lv_label_get_text(label), text) != 0) lv_label_set_text(label, text);
     }
 }
@@ -20336,12 +20309,28 @@ static void observer_update_client_vendor_labels(tab_context_t *ctx, int network
 static void observer_sync_changed_tiles(tab_context_t *ctx)
 {
     if (!ctx || !ctx->observer_networks || !ctx->observer_network_ui) return;
+    // LVGL can synchronously emit SCROLL_END while changing/cleaning children.
+    // Consume the refresh before touching widgets so that callback cannot
+    // reenter this same refresh and rebuild a table which is being deleted.
+    ctx->observer_ui_refresh_pending = false;
+    ctx->observer_has_new_networks = false;
 
     for (int i = 0; i < ctx->observer_network_count; i++) {
         observer_network_t *net = &ctx->observer_networks[i];
         observer_network_ui_t *ui = &ctx->observer_network_ui[i];
-        if (!ui->tile || !lv_obj_is_valid(ui->tile)) continue;
+        if (!ui->tile) {
+            observer_add_network_tile(ctx, i, false);
+            continue;
+        }
+        if (!lv_obj_is_valid(ui->tile)) continue;
+        observer_update_ssid_label(ctx, i);
+        char fields[1024];
+        observer_format_fields(net, fields, sizeof(fields));
+        if (ui->info_label && strcmp(lv_label_get_text(ui->info_label), fields))
+            lv_label_set_text(ui->info_label, fields);
         observer_update_summary_label(ctx, i);
+        observer_update_client_toggle(ctx, i);
+        if (!ui->clients_expanded) continue;
         observer_update_client_vendor_labels(ctx, i);
         if (ui->rendered_client_count == net->client_count) continue;
 
@@ -20372,6 +20361,8 @@ static void observer_flush_incremental_ui(tab_context_t *ctx)
         ctx->observer_ui_refresh_pending = true;
         return;
     }
+    ctx->observer_ui_refresh_pending = false;
+    ctx->observer_has_new_networks = false;
     observer_sync_changed_tiles(ctx);
 }
 
@@ -20404,10 +20395,176 @@ static void observer_touch_release_cb(lv_event_t *e)
 
 // Build the complete observer table after a fresh network scan. Periodic
 // sniffer polls use observer_sync_changed_tiles() instead.
+static void observer_add_network_tile(tab_context_t *ctx, int i, bool expanded)
+{
+    bool wide_layout = ui_wide_layout();
+    observer_network_t *net = &ctx->observer_networks[i];
+    observer_network_ui_t *ui = &ctx->observer_network_ui[i];
+
+    // The outer tile remains stable for the lifetime of this scan. Client
+    // rows are appended to its child container as they are discovered.
+    lv_obj_t *net_row = lv_obj_create(ctx->observer_table);
+    ui->tile = net_row;
+    lv_obj_set_size(net_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_pad_all(net_row, 8, 0);
+    lv_obj_set_style_bg_color(net_row, lv_color_hex(0x2D2D2D), 0);
+    lv_obj_set_style_bg_color(net_row, lv_color_hex(0x3D3D3D), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(net_row, 0, 0);
+    lv_obj_set_style_radius(net_row, 8, 0);
+    lv_obj_set_flex_flow(net_row, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(net_row, 4, 0);
+    lv_obj_clear_flag(net_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(net_row, LV_OBJ_FLAG_CLICKABLE);
+
+    // Add click event with network index as user data
+    lv_obj_add_event_cb(net_row, network_row_click_cb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
+
+    lv_obj_t *header = lv_obj_create(net_row);
+    lv_obj_set_size(header, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(header, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(header, 0, 0);
+    lv_obj_set_style_pad_all(header, 0, 0);
+    lv_obj_set_flex_flow(header, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(header, 2, 0);
+    lv_obj_clear_flag(header, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(header, LV_OBJ_FLAG_CLICKABLE);
+
+    // First row: identity/status starts at the left and the independent
+    // client-list disclosure remains pinned to the right. Landscape also
+    // keeps uptime/vendor in this row; portrait places it below metadata.
+    lv_obj_t *title_row = lv_obj_create(header);
+    lv_obj_set_size(title_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(title_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(title_row, 0, 0);
+    lv_obj_set_style_pad_all(title_row, 0, 0);
+    lv_obj_set_style_pad_column(title_row, 8, 0);
+    lv_obj_set_flex_flow(title_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(title_row, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(title_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(title_row, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t *title_content = lv_obj_create(title_row);
+    lv_obj_set_size(title_content, 0, LV_SIZE_CONTENT);
+    lv_obj_set_flex_grow(title_content, 1);
+    lv_obj_set_style_bg_opa(title_content, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(title_content, 0, 0);
+    lv_obj_set_style_pad_all(title_content, 0, 0);
+    lv_obj_set_style_pad_column(title_content, 12, 0);
+    lv_obj_set_flex_flow(title_content, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(title_content, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(title_content, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(title_content, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t *ssid_label = lv_label_create(title_content);
+    ui->ssid_label = ssid_label;
+    lv_label_set_recolor(ssid_label, true);
+    lv_obj_set_style_text_font(ssid_label, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_color(ssid_label, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_width(ssid_label, LV_SIZE_CONTENT);
+    lv_obj_set_style_max_width(ssid_label, wide_layout ? 320 : 360, 0);
+    lv_obj_set_height(ssid_label, lv_font_montserrat_18.line_height);
+    lv_label_set_long_mode(ssid_label, LV_LABEL_LONG_DOT);
+    observer_update_ssid_label(ctx, i);
+
+    ui->saved_badge = lv_label_create(title_content);
+    lv_label_set_text(ui->saved_badge, LV_SYMBOL_OK " saved");
+    lv_obj_set_style_text_font(ui->saved_badge, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(ui->saved_badge, lv_color_hex(0x55DD99), 0);
+    if (!creds_have(ctx, net->ssid)) {
+        lv_obj_add_flag(ui->saved_badge, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    ui->client_toggle = lv_btn_create(title_row);
+    // Keep this a comfortable touch target: a wider pill with a 44px
+    // minimum height and a generous invisible hit zone, so revealing a
+    // network's client list never fights the surrounding row.
+    lv_obj_set_size(ui->client_toggle, LV_SIZE_CONTENT, 44);
+    lv_obj_set_style_min_width(ui->client_toggle, 96, 0);
+    lv_obj_set_ext_click_area(ui->client_toggle, 14);
+    lv_obj_set_style_pad_hor(ui->client_toggle, 16, 0);
+    lv_obj_set_style_pad_ver(ui->client_toggle, 0, 0);
+    lv_obj_set_style_bg_color(ui->client_toggle, lv_color_hex(0x163534), 0);
+    lv_obj_set_style_bg_opa(ui->client_toggle, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(ui->client_toggle, lv_color_hex(0x1F4A48),
+                              LV_STATE_PRESSED);
+    lv_obj_set_style_radius(ui->client_toggle, 8, 0);
+    lv_obj_clear_flag(ui->client_toggle, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(ui->client_toggle, LV_OBJ_FLAG_EVENT_BUBBLE);
+    lv_obj_add_flag(ui->client_toggle, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(ui->client_toggle, observer_client_toggle_cb,
+                        LV_EVENT_CLICKED, (void *)(intptr_t)i);
+
+    ui->client_toggle_label = lv_label_create(ui->client_toggle);
+    lv_obj_set_style_text_font(ui->client_toggle_label,
+                               &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(ui->client_toggle_label,
+                                COLOR_MATERIAL_TEAL, 0);
+    lv_obj_center(ui->client_toggle_label);
+
+    // Second row: BSSID | channel | band | security | RSSI | MFP
+    lv_obj_t *info_label = lv_label_create(header);
+    ui->info_label = info_label;
+    lv_label_set_recolor(info_label, true);
+    char info_buf[1024];
+    observer_format_fields(net, info_buf, sizeof(info_buf));
+    lv_label_set_text(info_label, info_buf);
+    lv_obj_set_style_text_font(info_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(info_label, lv_color_hex(0x888888), 0);
+    lv_obj_set_width(info_label, lv_pct(100));
+
+    // Landscape: immediately after SSID/saved, producing a compact two-row
+    // tile. Portrait: full-width third row so long SSIDs never collide with
+    // uptime/vendor or force the saved badge onto a stray line.
+    lv_obj_t *summary_parent = wide_layout ? title_content : header;
+    ui->summary_label = lv_label_create(summary_parent);
+    // Consume the space remaining after SSID/saved in landscape. DOT
+    // requires an explicit one-line height; content height permits wraps.
+    lv_obj_set_width(ui->summary_label, wide_layout ? 0 : lv_pct(100));
+    lv_obj_set_flex_grow(ui->summary_label, wide_layout ? 1 : 0);
+    lv_obj_set_height(ui->summary_label, lv_font_montserrat_12.line_height);
+    lv_label_set_long_mode(ui->summary_label, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_font(ui->summary_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(ui->summary_label, lv_color_hex(0xAAAAAA), 0);
+    lv_obj_set_style_text_align(ui->summary_label, LV_TEXT_ALIGN_LEFT, 0);
+    observer_update_summary_label(ctx, i);
+    lv_obj_add_flag(ui->summary_label, LV_OBJ_FLAG_HIDDEN);
+
+    // Register for async inspect update
+    if (ctx->observer_inspect_info_labels && i < ctx->observer_inspect_label_count) {
+        ctx->observer_inspect_info_labels[i] = info_label;
+    }
+
+    ui->client_container = lv_obj_create(net_row);
+    lv_obj_set_size(ui->client_container, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(ui->client_container, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(ui->client_container, 0, 0);
+    lv_obj_set_style_pad_all(ui->client_container, 0, 0);
+    lv_obj_set_style_pad_row(ui->client_container, 4, 0);
+    lv_obj_set_flex_flow(ui->client_container, LV_FLEX_FLOW_COLUMN);
+    lv_obj_clear_flag(ui->client_container, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(ui->client_container, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(ui->client_container, LV_OBJ_FLAG_HIDDEN);
+
+    for (int j = 0; expanded && j < net->client_count &&
+         j < MAX_CLIENTS_PER_NETWORK; j++) {
+        observer_add_client_row(ctx, i, j);
+    }
+    ui->rendered_client_count = expanded ? net->client_count : 0;
+    ui->clients_expanded = expanded;
+    observer_update_client_toggle(ctx, i);
+}
+
 static void update_observer_table(tab_context_t *ctx)
 {
     if (!ctx || !ctx->observer_table || !ctx->observer_networks ||
         !ctx->observer_network_ui) return;
+
+    // Also protect direct rebuilds (Options/fresh scan): lv_obj_clean scrolls
+    // to zero and can dispatch SCROLL_END before it returns.
+    ctx->observer_ui_refresh_pending = false;
+    ctx->observer_has_new_networks = false;
 
     // Show export button as soon as there are results
     if (ctx->observer_export_btn && ctx->observer_network_count > 0) {
@@ -20424,6 +20581,9 @@ static void update_observer_table(tab_context_t *ctx)
 
     // Save current scroll position before cleaning
     lv_coord_t scroll_y = lv_obj_get_scroll_y(ctx->observer_table);
+    bool expanded[MAX_OBSERVER_NETWORKS];
+    for (int n = 0; n < MAX_OBSERVER_NETWORKS; ++n)
+        expanded[n] = ctx->observer_network_ui[n].clients_expanded;
 
     lv_obj_clean(ctx->observer_table);
     memset(ctx->observer_network_ui, 0,
@@ -20438,164 +20598,8 @@ static void update_observer_table(tab_context_t *ctx)
             ? ctx->observer_network_count : 0;
     }
 
-    bool wide_layout = ui_wide_layout();
-
-    for (int i = 0; i < ctx->observer_network_count; i++) {
-        observer_network_t *net = &ctx->observer_networks[i];
-        observer_network_ui_t *ui = &ctx->observer_network_ui[i];
-
-        // The outer tile remains stable for the lifetime of this scan. Client
-        // rows are appended to its child container as they are discovered.
-        lv_obj_t *net_row = lv_obj_create(ctx->observer_table);
-        ui->tile = net_row;
-        lv_obj_set_size(net_row, lv_pct(100), LV_SIZE_CONTENT);
-        lv_obj_set_style_pad_all(net_row, 8, 0);
-        lv_obj_set_style_bg_color(net_row, lv_color_hex(0x2D2D2D), 0);
-        lv_obj_set_style_bg_color(net_row, lv_color_hex(0x3D3D3D), LV_STATE_PRESSED);
-        lv_obj_set_style_border_width(net_row, 0, 0);
-        lv_obj_set_style_radius(net_row, 8, 0);
-        lv_obj_set_flex_flow(net_row, LV_FLEX_FLOW_COLUMN);
-        lv_obj_set_style_pad_row(net_row, 4, 0);
-        lv_obj_clear_flag(net_row, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_add_flag(net_row, LV_OBJ_FLAG_CLICKABLE);
-
-        // Add click event with network index as user data
-        lv_obj_add_event_cb(net_row, network_row_click_cb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
-
-        lv_obj_t *header = lv_obj_create(net_row);
-        lv_obj_set_size(header, lv_pct(100), LV_SIZE_CONTENT);
-        lv_obj_set_style_bg_opa(header, LV_OPA_TRANSP, 0);
-        lv_obj_set_style_border_width(header, 0, 0);
-        lv_obj_set_style_pad_all(header, 0, 0);
-        lv_obj_set_flex_flow(header, LV_FLEX_FLOW_COLUMN);
-        lv_obj_set_style_pad_row(header, 2, 0);
-        lv_obj_clear_flag(header, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_remove_flag(header, LV_OBJ_FLAG_CLICKABLE);
-
-        // First row: identity/status starts at the left and the independent
-        // client-list disclosure remains pinned to the right. Landscape also
-        // keeps uptime/vendor in this row; portrait places it below metadata.
-        lv_obj_t *title_row = lv_obj_create(header);
-        lv_obj_set_size(title_row, lv_pct(100), LV_SIZE_CONTENT);
-        lv_obj_set_style_bg_opa(title_row, LV_OPA_TRANSP, 0);
-        lv_obj_set_style_border_width(title_row, 0, 0);
-        lv_obj_set_style_pad_all(title_row, 0, 0);
-        lv_obj_set_style_pad_column(title_row, 8, 0);
-        lv_obj_set_flex_flow(title_row, LV_FLEX_FLOW_ROW);
-        lv_obj_set_flex_align(title_row, LV_FLEX_ALIGN_START,
-                              LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-        lv_obj_clear_flag(title_row, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_remove_flag(title_row, LV_OBJ_FLAG_CLICKABLE);
-
-        lv_obj_t *title_content = lv_obj_create(title_row);
-        lv_obj_set_size(title_content, 0, LV_SIZE_CONTENT);
-        lv_obj_set_flex_grow(title_content, 1);
-        lv_obj_set_style_bg_opa(title_content, LV_OPA_TRANSP, 0);
-        lv_obj_set_style_border_width(title_content, 0, 0);
-        lv_obj_set_style_pad_all(title_content, 0, 0);
-        lv_obj_set_style_pad_column(title_content, 12, 0);
-        lv_obj_set_flex_flow(title_content, LV_FLEX_FLOW_ROW);
-        lv_obj_set_flex_align(title_content, LV_FLEX_ALIGN_START,
-                              LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-        lv_obj_clear_flag(title_content, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_remove_flag(title_content, LV_OBJ_FLAG_CLICKABLE);
-
-        lv_obj_t *ssid_label = lv_label_create(title_content);
-        ui->ssid_label = ssid_label;
-        lv_label_set_recolor(ssid_label, true);
-        lv_obj_set_style_text_font(ssid_label, &lv_font_montserrat_18, 0);
-        lv_obj_set_style_text_color(ssid_label, lv_color_hex(0xFFFFFF), 0);
-        lv_obj_set_width(ssid_label, LV_SIZE_CONTENT);
-        lv_obj_set_style_max_width(ssid_label, wide_layout ? 320 : 360, 0);
-        lv_obj_set_height(ssid_label, lv_font_montserrat_18.line_height);
-        lv_label_set_long_mode(ssid_label, LV_LABEL_LONG_DOT);
-        observer_update_ssid_label(ctx, i);
-
-        ui->saved_badge = lv_label_create(title_content);
-        lv_label_set_text(ui->saved_badge, LV_SYMBOL_OK " saved");
-        lv_obj_set_style_text_font(ui->saved_badge, &lv_font_montserrat_14, 0);
-        lv_obj_set_style_text_color(ui->saved_badge, lv_color_hex(0x55DD99), 0);
-        if (!creds_have(ctx, net->ssid)) {
-            lv_obj_add_flag(ui->saved_badge, LV_OBJ_FLAG_HIDDEN);
-        }
-
-        ui->client_toggle = lv_btn_create(title_row);
-        // Keep this a comfortable touch target: a wider pill with a 44px
-        // minimum height and a generous invisible hit zone, so revealing a
-        // network's client list never fights the surrounding row.
-        lv_obj_set_size(ui->client_toggle, LV_SIZE_CONTENT, 44);
-        lv_obj_set_style_min_width(ui->client_toggle, 96, 0);
-        lv_obj_set_ext_click_area(ui->client_toggle, 14);
-        lv_obj_set_style_pad_hor(ui->client_toggle, 16, 0);
-        lv_obj_set_style_pad_ver(ui->client_toggle, 0, 0);
-        lv_obj_set_style_bg_color(ui->client_toggle, lv_color_hex(0x163534), 0);
-        lv_obj_set_style_bg_opa(ui->client_toggle, LV_OPA_COVER, 0);
-        lv_obj_set_style_bg_color(ui->client_toggle, lv_color_hex(0x1F4A48),
-                                  LV_STATE_PRESSED);
-        lv_obj_set_style_radius(ui->client_toggle, 8, 0);
-        lv_obj_clear_flag(ui->client_toggle, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_remove_flag(ui->client_toggle, LV_OBJ_FLAG_EVENT_BUBBLE);
-        lv_obj_add_flag(ui->client_toggle, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_add_event_cb(ui->client_toggle, observer_client_toggle_cb,
-                            LV_EVENT_CLICKED, (void *)(intptr_t)i);
-
-        ui->client_toggle_label = lv_label_create(ui->client_toggle);
-        lv_obj_set_style_text_font(ui->client_toggle_label,
-                                   &lv_font_montserrat_16, 0);
-        lv_obj_set_style_text_color(ui->client_toggle_label,
-                                    COLOR_MATERIAL_TEAL, 0);
-        lv_obj_center(ui->client_toggle_label);
-
-        // Second row: BSSID | channel | band | security | RSSI | MFP
-        lv_obj_t *info_label = lv_label_create(header);
-        ui->info_label = info_label;
-        lv_label_set_recolor(info_label, true);
-        char info_buf[NETWORK_INFO_BUF];
-        format_observer_network_info(info_buf, sizeof(info_buf), net);
-        lv_label_set_text(info_label, info_buf);
-        lv_obj_set_style_text_font(info_label, &lv_font_montserrat_12, 0);
-        lv_obj_set_style_text_color(info_label, lv_color_hex(0x888888), 0);
-        lv_obj_set_width(info_label, lv_pct(100));
-
-        // Landscape: immediately after SSID/saved, producing a compact two-row
-        // tile. Portrait: full-width third row so long SSIDs never collide with
-        // uptime/vendor or force the saved badge onto a stray line.
-        lv_obj_t *summary_parent = wide_layout ? title_content : header;
-        ui->summary_label = lv_label_create(summary_parent);
-        // Consume the space remaining after SSID/saved in landscape. DOT
-        // requires an explicit one-line height; content height permits wraps.
-        lv_obj_set_width(ui->summary_label, wide_layout ? 0 : lv_pct(100));
-        lv_obj_set_flex_grow(ui->summary_label, wide_layout ? 1 : 0);
-        lv_obj_set_height(ui->summary_label, lv_font_montserrat_12.line_height);
-        lv_label_set_long_mode(ui->summary_label, LV_LABEL_LONG_DOT);
-        lv_obj_set_style_text_font(ui->summary_label, &lv_font_montserrat_12, 0);
-        lv_obj_set_style_text_color(ui->summary_label, lv_color_hex(0xAAAAAA), 0);
-        lv_obj_set_style_text_align(ui->summary_label, LV_TEXT_ALIGN_LEFT, 0);
-        observer_update_summary_label(ctx, i);
-
-        // Register for async inspect update
-        if (ctx->observer_inspect_info_labels && i < ctx->observer_inspect_label_count) {
-            ctx->observer_inspect_info_labels[i] = info_label;
-        }
-
-        ui->client_container = lv_obj_create(net_row);
-        lv_obj_set_size(ui->client_container, lv_pct(100), LV_SIZE_CONTENT);
-        lv_obj_set_style_bg_opa(ui->client_container, LV_OPA_TRANSP, 0);
-        lv_obj_set_style_border_width(ui->client_container, 0, 0);
-        lv_obj_set_style_pad_all(ui->client_container, 0, 0);
-        lv_obj_set_style_pad_row(ui->client_container, 4, 0);
-        lv_obj_set_flex_flow(ui->client_container, LV_FLEX_FLOW_COLUMN);
-        lv_obj_clear_flag(ui->client_container, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_remove_flag(ui->client_container, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_add_flag(ui->client_container, LV_OBJ_FLAG_HIDDEN);
-
-        for (int j = 0; j < net->client_count &&
-             j < MAX_CLIENTS_PER_NETWORK; j++) {
-            observer_add_client_row(ctx, i, j);
-        }
-        ui->rendered_client_count = net->client_count;
-        observer_update_client_toggle(ctx, i);
-    }
+    for (int i = 0; i < ctx->observer_network_count; ++i)
+        observer_add_network_tile(ctx, i, expanded[i]);
 
     // Restore scroll position after rebuild
     lv_obj_scroll_to_y(ctx->observer_table, scroll_y, LV_ANIM_OFF);
@@ -20636,7 +20640,7 @@ static void client_row_click_cb(lv_event_t *e)
 static void show_deauth_popup(int network_idx, int client_idx)
 {
     tab_context_t *ctx = get_current_ctx();
-    if (!ctx) return;
+    if (!ctx || ctx->popup_close_task) return;
 
     // Block deauth if Red Team mode is disabled
     if (!enable_red_team) {
@@ -20797,6 +20801,8 @@ static void stop_and_close_deauth_popup(bool resume_observer)
         destroy_deauth_popup_ui();
         // Existing focus task restores target selection/sniffing asynchronously.
         show_network_popup(return_network);
+        if (ctx->observer_details_tabs)
+            lv_tabview_set_active(ctx->observer_details_tabs, 3, LV_ANIM_OFF);
         return;
     }
     if (resume_observer) {
@@ -20865,6 +20871,11 @@ static void deauth_btn_click_cb(lv_event_t *e)
 
             observer_network_t *net = &ctx->observer_networks[deauth_network_idx];
             const char *client_mac = net->clients[deauth_client_idx];
+            if (net->scan_index <= 0) {
+                if (ctx->observer_status_label)
+                    lv_label_set_text(ctx->observer_status_label, "Open this AP first to resolve its scan index.");
+                return;
+            }
 
             ESP_LOGI(TAG, "Starting deauth: network=%d (scan_idx=%d), client=%s",
                      deauth_network_idx, net->scan_index, client_mac);
@@ -20901,7 +20912,7 @@ static void deauth_btn_click_cb(lv_event_t *e)
 // Parse sniffer output line - returns true if network line parsed
 // Pull the trailing "[<Vendor>]" that show_sniffer_results_vendor appends to AP
 // and client lines. Writes "" when the bracket is absent or JanOS reported
-// "Unknown", so the UI shows "-" consistently with format_observer_network_info.
+// "Unknown", so the UI shows "-" consistently with the Observer metadata view.
 // Returns true only when a bracket was present (so the plain, no-vendor parse
 // path never clears an existing vendor).
 static bool observer_extract_vendor_bracket(const char *line, char *vendor_out,
@@ -20940,7 +20951,11 @@ static bool parse_sniffer_network_line(const char *line, observer_network_t *net
     if (line[0] == ' ' || line[0] == '\t') return false;
 
     // Find ", CH" marker
-    const char *ch_marker = strstr(line, ", CH");
+    const char *ch_marker = NULL;
+    const char *candidate = line;
+    while ((candidate = strstr(candidate, ", CH")) != NULL) {
+        ch_marker = candidate++;
+    }
     if (!ch_marker) return false;
 
     // Extract SSID (everything before ", CH")
@@ -21033,9 +21048,7 @@ static void observer_poll_task(void *arg)
     // resolution enabled we ask for the "_vendor" variant so AP and client
     // lines carry a trailing "[<Vendor>]".
     const bool vendor_query = observer_resolve_vendors && ctx->home_vendors_present;
-    const char *cmd = vendor_query
-                          ? "show_sniffer_results_vendor\r\n"
-                          : "show_sniffer_results\r\n";
+    const char *cmd = observer_query_command(ctx, vendor_query);
     transport_write_bytes_tab(task_tab, uart_port, cmd, strlen(cmd));
     ESP_LOGD(TAG, "[%s] Sent: %s", uart_name,
              vendor_query ? "show_sniffer_results_vendor"
@@ -21045,6 +21058,9 @@ static void observer_poll_task(void *arg)
     char *rx_buffer = ctx->observer_rx_buffer;
     char *line_buffer = ctx->observer_line_buffer;
     int line_pos = 0;
+    bool line_overflow = false;
+    bool retried_legacy = false;
+    bool pending_legacy = false;
     bool saw_result_data = false;
     int empty_reads = 0;
     bool response_done = false;
@@ -21055,7 +21071,7 @@ static void observer_poll_task(void *arg)
     // DON'T clear client data - accumulate clients over time
 
     TickType_t start_time = xTaskGetTickCount();
-    TickType_t timeout_ticks = pdMS_TO_TICKS(5000);  // 5 second timeout for response
+    TickType_t timeout_ticks = pdMS_TO_TICKS(15000);  // 5 second timeout for response
 
     while (!response_done && (xTaskGetTickCount() - start_time) < timeout_ticks) {
         int len = transport_read_bytes_tab(task_tab, uart_port, rx_buffer, UART_BUF_SIZE - 1, pdMS_TO_TICKS(100));
@@ -21068,73 +21084,48 @@ static void observer_poll_task(void *arg)
                 char c = rx_buffer[i];
 
                 if (c == '\n' || c == '\r') {
+                    if (line_overflow) { line_overflow = false; line_pos = 0; current_network_idx = -1; continue; }
                     if (line_pos > 0) {
                         line_buffer[line_pos] = '\0';
                         ESP_LOGD(TAG, "Observer line: %s", line_buffer);
 
                         ESP_LOGD(TAG, "SNIFFER LINE: '%s'", line_buffer);
 
-                        char prompt_check[OBSERVER_LINE_BUFFER_SIZE];
-                        snprintf(prompt_check, sizeof(prompt_check), "%s", line_buffer);
-                        trim_ascii_whitespace(prompt_check);
-                        if (strcmp(prompt_check, ">") == 0) {
-                            response_done = true;
-                            line_pos = 0;
-                            break;
+                        if (observer_is_prompt_line(line_buffer)) {
+                            if (pending_legacy) {
+                                pending_legacy = false;
+                                const char *legacy = observer_query_command(ctx, vendor_query);
+                                transport_write_bytes_tab(task_tab, uart_port, legacy, strlen(legacy));
+                                start_time = xTaskGetTickCount();
+                                current_network_idx = -1; line_pos = 0; continue;
+                            }
+                            response_done = true; line_pos = 0; break;
                         }
-
-                        // Check for network line (doesn't start with space)
+                        if (ctx->observer_extended_support >= 0 && !retried_legacy &&
+                            observer_extended_rejected(line_buffer)) {
+                            ctx->observer_extended_support = -1;
+                            retried_legacy = true;
+                            pending_legacy = true;
+                            current_network_idx = -1; line_pos = 0; continue;
+                        }
+                        if (observer_is_noise_line(line_buffer)) { line_pos = 0; continue; }
                         if (line_buffer[0] != ' ' && line_buffer[0] != '\t') {
-                            observer_network_t parsed_net = {0};
-                            if (parse_sniffer_network_line(line_buffer, &parsed_net, vendor_query)) {
+                            bsp_display_lock(0);
+                            current_network_idx = observer_receive_ap(ctx, line_buffer, vendor_query, -1);
+                            bsp_display_unlock();
+                            if (current_network_idx >= 0) saw_result_data = true;
+                        } else if (current_network_idx >= 0) {
+                            bsp_display_lock(0);
+                            if (observer_receive_client(&ctx->observer_networks[current_network_idx], line_buffer, vendor_query))
                                 saw_result_data = true;
-                                // Find this network in our existing list by SSID
-                                current_network_idx = -1;
-                                for (int n = 0; n < ctx->observer_network_count; n++) {
-                                    if (strcmp(ctx->observer_networks[n].ssid, parsed_net.ssid) == 0 &&
-                                        ctx->observer_networks[n].channel == parsed_net.channel) {
-                                        current_network_idx = n;
-                                        if (vendor_query) {
-                                            snprintf(ctx->observer_networks[n].vendor,
-                                                     sizeof(ctx->observer_networks[n].vendor),
-                                                     "%s", parsed_net.vendor);
-                                        }
-                                        // Don't overwrite client_count - we track it via add_client_mac
-                                        ESP_LOGD(TAG, "[%s] Found network '%s' at idx %d (count: %d)",
-                                                 uart_name, parsed_net.ssid, n, ctx->observer_networks[n].client_count);
-                                        break;
-                                    }
-                                }
-                                if (current_network_idx < 0) {
-                                    ESP_LOGW(TAG, "[%s] Network '%s' not in scan list, skipping", uart_name, parsed_net.ssid);
-                                }
-                            } else {
-                                // Not a network line (could be command echo, prompt, etc.)
-                                current_network_idx = -1;
-                            }
-                        }
-                        // Check for client MAC line (starts with space)
-                        else if ((line_buffer[0] == ' ' || line_buffer[0] == '\t') && current_network_idx >= 0) {
-                            observer_network_t *net = &ctx->observer_networks[current_network_idx];
-                            char mac[18];
-                            char vendor[48];
-                            if (parse_sniffer_client_line(line_buffer, mac, sizeof(mac),
-                                                          vendor, sizeof(vendor), vendor_query)) {
-                                saw_result_data = true;
-                                // Add client if not already present (accumulate)
-                                if (add_client_mac(net, mac, vendor_query ? vendor : NULL)) {
-                                    ESP_LOGI(TAG, "  -> NEW client: %s for '%s' (total: %d)", mac, net->ssid, net->client_count);
-                                }
-                            } else {
-                                ESP_LOGW(TAG, "  -> Failed to parse as client MAC");
-                            }
+                            bsp_display_unlock();
                         }
 
                         line_pos = 0;
                     }
                 } else if (line_pos < OBSERVER_LINE_BUFFER_SIZE - 1) {
                     line_buffer[line_pos++] = c;
-                }
+                } else { line_overflow = true; }
             }
         } else if (saw_result_data && ++empty_reads >= 10) {
             response_done = true;
@@ -21171,7 +21162,8 @@ static void observer_poll_task(void *arg)
         bsp_display_lock(0);
 
         if (ctx->observer_status_label) {
-            lv_label_set_text_fmt(ctx->observer_status_label, "Found %d networks", ctx->observer_network_count);
+            lv_label_set_text_fmt(ctx->observer_status_label, "Found %d networks | %s", ctx->observer_network_count,
+                ctx->observer_extended_support == 1 ? "Extended" : (ctx->observer_extended_support < 0 ? "Extended unavailable" : "Waiting for Extended"));
         }
 
         observer_flush_incremental_ui(ctx);
@@ -21228,6 +21220,8 @@ static void observer_start_task(void *arg)
         return;
     }
 
+    ctx->observer_extended_support = 0;
+    ctx->observer_has_new_networks = false;
     // Determine UART from context
     tab_id_t task_tab = tab_id_for_ctx(ctx);
     uart_port_t uart_port = (task_tab == TAB_MBUS && uart2_initialized) ? UART2_NUM : UART_NUM;
@@ -21298,13 +21292,13 @@ static void observer_start_task(void *arg)
 
                         // Parse network line from scan
                         if (line_buffer[0] == '"' && scanned_count < MAX_OBSERVER_NETWORKS) {
-                            observer_network_t net = {0};
-                            if (parse_scan_to_observer(line_buffer, &net)) {
-                                ctx->observer_networks[scanned_count] = net;
+                            observer_network_t *net = &ctx->observer_networks[scanned_count];
+                            memset(net, 0, sizeof(*net));
+                            if (parse_scan_to_observer(line_buffer, net)) {
                                 scanned_count++;
                                 ESP_LOGI(TAG, "[%s] Parsed network #%d: '%s' BSSID=%s CH%d %s %s %ddBm",
-                                         uart_name, net.scan_index, net.ssid, net.bssid,
-                                         net.channel, net.security, net.band, net.rssi);
+                                         uart_name, net->scan_index, net->ssid, net->bssid,
+                                         net->channel, net->security, net->band, net->rssi);
                             }
                         }
 
@@ -21471,7 +21465,8 @@ static void close_observer_exit_confirm(void)
 static bool observer_session_busy(tab_context_t *ctx)
 {
     return ctx && (ctx->observer_running || ctx->observer_start_active ||
-                   ctx->observer_inspect_active || ctx->observer_inspect_task != NULL);
+                   ctx->observer_inspect_active || ctx->observer_inspect_task != NULL ||
+                   ctx->popup_close_task != NULL);
 }
 
 static void observer_teardown_task(void *arg)
@@ -21488,12 +21483,14 @@ static void observer_teardown_task(void *arg)
 
     // Then wait for them to be gone, so nothing can transmit after our stop.
     int waited = 0;
-    while (waited < 4000 &&
-           (ctx->observer_start_active || ctx->observer_inspect_task != NULL)) {
+    while (waited < 10000 &&
+           (ctx->observer_start_active || ctx->observer_inspect_task != NULL ||
+            ctx->popup_close_task != NULL)) {
         vTaskDelay(pdMS_TO_TICKS(20));
         waited += 20;
     }
-    if (ctx->observer_start_active || ctx->observer_inspect_task != NULL) {
+    if (ctx->observer_start_active || ctx->observer_inspect_task != NULL ||
+            ctx->popup_close_task != NULL) {
         ESP_LOGW(TAG, "[%s] Observer teardown: workers still alive after %d ms, "
                       "sending stop anyway", uart_name, waited);
     } else {
@@ -21517,6 +21514,12 @@ static void observer_teardown_task(void *arg)
     ESP_LOGI(TAG, "[%s] Observer teardown: transport idle", uart_name);
 
     if (bsp_display_lock(0)) {
+        uint32_t stopped_at = observer_clock_ms();
+        for (int i = 0; i < ctx->observer_network_count; ++i) {
+            ctx->observer_networks[i].snapshot_clock_ms = stopped_at;
+            ctx->observer_networks[i].snapshot_live = false;
+        }
+        observer_sync_changed_tiles(ctx);
         close_observer_exit_confirm();
 
         if (a->leave_page) {
@@ -21537,7 +21540,7 @@ static void observer_teardown_task(void *arg)
                 lv_obj_add_state(ctx->observer_stop_btn, LV_STATE_DISABLED);
             }
             if (ctx->observer_status_label) {
-                lv_label_set_text(ctx->observer_status_label, "Stopped");
+                lv_label_set_text(ctx->observer_status_label, "Stopped - snapshot frozen");
             }
         }
         bsp_display_unlock();
@@ -21699,7 +21702,7 @@ static void observer_start_btn_cb(lv_event_t *e)
     tab_context_t *ctx = get_current_ctx();
     if (!ctx) return;
 
-    if (ctx->observer_running || ctx->observer_start_active) {
+    if (ctx->observer_running || ctx->observer_start_active || ctx->popup_close_task) {
         ESP_LOGW(TAG, "Observer already running on tab %d", current_tab);
         return;
     }
@@ -21847,7 +21850,12 @@ static bool observer_export_csv(tab_context_t *ctx, char *out_path, size_t out_p
         return false;
     }
 
-    fprintf(f, "scan_index,ssid,bssid,channel,rssi,band,vendor,client_count,clients\n");
+    char *scratch = heap_caps_malloc(23000, MALLOC_CAP_SPIRAM);
+    if (!scratch) { fclose(f); if (err_msg && err_msg_sz) snprintf(err_msg, err_msg_sz, "Not enough memory for export"); return false; }
+    char *extended_esc = scratch;
+    char *client_meta = scratch + 5000;
+    char *client_meta_esc = scratch + 11000;
+    fprintf(f, "scan_index,ssid,bssid,channel,rssi,band,vendor,client_count,clients,extended,client_metadata\n");
 
     for (int i = 0; i < ctx->observer_network_count; i++) {
         observer_network_t *net = &ctx->observer_networks[i];
@@ -21868,7 +21876,20 @@ static bool observer_export_csv(tab_context_t *ctx, char *out_path, size_t out_p
         }
         observer_csv_escape(clients_joined, clients_esc, sizeof(clients_esc));
 
-        fprintf(f, "%d,\"%s\",\"%s\",%d,%d,\"%s\",\"%s\",%d,\"%s\"\n",
+
+        observer_csv_escape(net->extended.raw, extended_esc, 5000);
+        client_meta[0] = 0;
+        for (int j = 0; j < net->client_count && j < MAX_CLIENTS_PER_NETWORK; ++j) {
+            size_t n = strlen(client_meta);
+            char rssi[24], age[24];
+            if (net->client_rssi_known[j]) snprintf(rssi, sizeof(rssi), "%d", net->client_rssi[j]);
+            else snprintf(rssi, sizeof(rssi), "unknown");
+            if (net->client_age_known[j]) snprintf(age, sizeof(age), "%lu", (unsigned long)net->client_age_ms[j]);
+            else snprintf(age, sizeof(age), "unknown");
+            snprintf(client_meta+n, 6000-n, "%s%s vendor=%s rssi=%s age_ms=%s {%s}", n ? ";" : "", net->clients[j], net->client_vendors[j], rssi, age, net->client_extended[j]);
+        }
+        observer_csv_escape(client_meta, client_meta_esc, 12000);
+        fprintf(f, "%d,\"%s\",\"%s\",%d,%d,\"%s\",\"%s\",%d,\"%s\",\"%s\",\"%s\"\n",
                 net->scan_index,
                 ssid_esc,
                 bssid_esc,
@@ -21877,9 +21898,10 @@ static bool observer_export_csv(tab_context_t *ctx, char *out_path, size_t out_p
                 band_esc,
                 vendor_esc,
                 net->client_count,
-                clients_esc);
+                clients_esc, extended_esc, client_meta_esc);
     }
 
+    free(scratch);
     fclose(f);
     return true;
 }
@@ -21920,6 +21942,10 @@ static void observer_export_btn_cb(lv_event_t *e)
 static void observer_back_btn_event_cb(lv_event_t *e)
 {
     (void)e;
+    if (observer_options_modal) {
+        observer_options_close();
+        return;
+    }
     tab_context_t *ctx = get_current_ctx();
     if (!ctx) return;
 
@@ -21973,6 +21999,22 @@ static void observer_update_other_vendor_contexts(tab_context_t *origin)
             observer_apply_vendor_settings(ctx);
         }
     }
+}
+
+static void observer_options_applied(void)
+{
+    tab_context_t *contexts[] = { &grove_ctx, &usb_ctx, &mbus_ctx, &internal_ctx };
+    for (size_t i = 0; i < sizeof(contexts) / sizeof(contexts[0]); ++i) {
+        tab_context_t *ctx = contexts[i];
+        if (ctx->observer_table) update_observer_table(ctx);
+        if (ctx->network_popup) update_popup_content(ctx);
+    }
+}
+
+static void observer_options_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    observer_options_open(get_current_tab_container(), observer_options_applied);
 }
 
 // Show Network Observer page (inside current tab's container)
@@ -22048,6 +22090,7 @@ static void show_observer_page(void)
     // Title - positioned after back button
     lv_obj_t *title = lv_label_create(header);
     lv_label_set_text(title, "Network Observer");
+    if (!ui_wide_layout()) lv_obj_set_width(title, lv_pct(85));
     lv_obj_set_style_text_font(title, &lv_font_montserrat_24, 0);
     lv_obj_set_style_text_color(title, COLOR_MATERIAL_TEAL, 0);
     lv_obj_align_to(title, back_btn, LV_ALIGN_OUT_RIGHT_MID, 12, 0);
@@ -22100,6 +22143,39 @@ static void show_observer_page(void)
     lv_obj_set_style_text_font(export_label, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(export_label, lv_color_hex(0x000000), 0);
     lv_obj_center(export_label);
+
+    lv_obj_t *options = lv_btn_create(header);
+    lv_obj_set_size(options, 110, 44);
+    lv_obj_set_style_bg_color(options, lv_color_hex(0x1A3333), 0);
+    lv_obj_set_style_bg_color(options, lv_color_hex(0x2A4444), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(options, 8, 0);
+    lv_obj_t *options_label = lv_label_create(options);
+    lv_label_set_text(options_label, "Options");
+    lv_obj_set_style_text_color(options_label, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_font(options_label, &lv_font_montserrat_16, 0);
+    lv_obj_center(options_label);
+    lv_obj_add_event_cb(options, observer_options_btn_cb, LV_EVENT_CLICKED, NULL);
+    // Flex owns placement: portrait wraps instead of overlapping controls.
+    lv_obj_set_height(header, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(header, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_style_pad_column(header, 8, 0);
+    lv_obj_set_style_pad_row(header, 8, 0);
+    lv_obj_set_flex_align(header, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(header, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *actions = lv_obj_create(header);
+    lv_obj_set_size(actions, ui_wide_layout() ? LV_SIZE_CONTENT : lv_pct(100), 44);
+    if (ui_wide_layout()) lv_obj_set_flex_grow(actions, 1);
+    lv_obj_set_style_bg_opa(actions, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(actions, 0, 0);
+    lv_obj_set_style_pad_all(actions, 0, 0);
+    lv_obj_set_style_pad_column(actions, 8, 0);
+    lv_obj_clear_flag(actions, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(actions, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(actions, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_parent(options, actions);
+    lv_obj_set_parent(ctx->observer_export_btn, actions);
+    lv_obj_set_parent(ctx->observer_start_btn, actions);
+    lv_obj_set_parent(ctx->observer_stop_btn, actions);
 
     // Status label - store in ctx
     ctx->observer_status_label = lv_label_create(ctx->observer_page);
@@ -71774,7 +71850,7 @@ static bool wa_legacy_busy(tab_id_t tab)
         board_detect_retry_task_handle || boot_detect_task_handle) return true;
     if (ctx->scan_in_progress || ctx->inspect_active || ctx->inspect_task ||
         ctx->observer_inspect_active || ctx->observer_inspect_task ||
-        ctx->popup_focus_active || ctx->popup_focus_task || ctx->deauth_active ||
+        ctx->popup_focus_active || ctx->popup_focus_task || ctx->popup_close_task || ctx->deauth_active ||
         ctx->evil_twin_monitoring || ctx->evil_twin_task ||
         ctx->handshaker_monitoring || ctx->handshaker_task ||
         ctx->observer_running || ctx->observer_start_active || ctx->observer_task ||
@@ -71984,6 +72060,7 @@ void app_main(void)
     load_wd_autoupload_from_nvs();
     load_janos_ft_baud_from_nvs();
     load_observer_vendor_from_nvs();
+    observer_options_load();
 
     // Kick the startup melody off here, the first moment both prerequisites are
     // met: the codec is up and NVS has told us which melody to play. It used to

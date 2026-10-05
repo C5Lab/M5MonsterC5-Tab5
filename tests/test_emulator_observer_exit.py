@@ -18,6 +18,7 @@ class ObserverExitBrowser(unittest.TestCase):
                 self.load(rotation)
                 click_text(p,'Network\nObserver');click_text(p,'Start')
                 self.assertEqual(len([o for o in objects(p) if o['binding'].endswith('/observe')]),12)
+                click_object(p,next(o for o in objects(p) if o['binding'].endswith('/clients-toggle')))
                 self.assertTrue(any(o['binding'].endswith('/client') for o in objects(p)))
                 self.assertEqual(p.evaluate('emulator.device.snapshot(0).networks'),[])
                 self.assertIsNone(p.evaluate('emulator.device.snapshot(0).selected'))

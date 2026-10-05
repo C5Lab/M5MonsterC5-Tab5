@@ -19,6 +19,7 @@
 #include "app_keyboard.h"
 #include "app_keyboard_navigation.h"
 #include "app_keyboard_rotation.h"
+#include "tile_order.h"
 #include "pcap_reader.h"
 #include "pcap_summary.h"
 #include "pcap_flow.h"
@@ -97,6 +98,9 @@ static void esp_restart(void);
 #define NVS_READWRITE 1
 static int nvs_open(const char *,int,nvs_handle_t *);
 static int nvs_set_u8(nvs_handle_t,const char *,uint8_t);
+static int nvs_get_blob(nvs_handle_t,const char *,void *,size_t *);
+static int nvs_set_blob(nvs_handle_t,const char *,const void *,size_t);
+static int tile_order_load(tile_order_group_t, tile_order_t *);
 static int nvs_commit(nvs_handle_t);
 static void nvs_close(nvs_handle_t);
 
@@ -105,5 +109,12 @@ static lv_event_dsc_t *app_bind(lv_obj_t *,lv_event_cb_t,lv_event_code_t,void *,
 #define lv_obj_add_event_cb(o,c,e,u) app_bind(o,c,e,u,__LINE__)
 
 struct subghz_tab_state;
+struct nfc_tab_state;
+static void wa_leave(int tab) {(void)tab;}
+static bool wa_busy_tab(int tab) {(void)tab;return false;}
+static void wa_screen_hide(int tab) {(void)tab;}
+static void nfc_hide_all_pages(struct nfc_tab_state *state) {(void)state;}
+static void show_nfc_page(void) {emu_unsupported("NFC is deferred");}
+static bool app_power_manager_is_screen_dimmed(void) {return false;}
 static void subghz_hide_all_pages(struct subghz_tab_state *state) {if(state)emu_unsupported("SubGHz is deferred");}
 static void show_subghz_page(void) {emu_unsupported("SubGHz is deferred");}

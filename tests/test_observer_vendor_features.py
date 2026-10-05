@@ -28,8 +28,9 @@ class VendorIntegration(unittest.TestCase):
     def test_ap_vendor_reaches_stored_network_in_both_polls(self):
         for task in ("popup_poll_task", "observer_poll_task"):
             body = function_body(SOURCE, "static void " + task)
-            self.assertIn("parsed_net.vendor", body)
-            self.assertIn("vendor_query", body)
+            self.assertIn("observer_receive_ap(ctx, line_buffer, vendor_query", body)
+        receiver = (Path(__file__).resolve().parents[1] / "main/observer_receive.inc").read_text()
+        self.assertIn("if (vendor) snprintf(net->vendor", receiver)
 
     def test_vendor_updates_refresh_existing_rows_without_rebuilding(self):
         body = function_body(SOURCE, "static void observer_sync_changed_tiles")

@@ -43,7 +43,7 @@ class ObserverIncrementalUiContractTests(unittest.TestCase):
                         stop.index('"start_sniffer_noscan"'))
 
     def test_saved_badge_and_long_vendor_do_not_expand_the_title_row(self):
-        table = function_body(read("main/main.c"), "static void update_observer_table")
+        table = function_body(read("main/main.c"), "static void observer_add_network_tile")
         self.assertIn("lv_obj_set_height(ssid_label, lv_font_montserrat_18.line_height)", table)
         self.assertIn("lv_obj_set_width(ui->summary_label, wide_layout ? 0 : lv_pct(100))", table)
         self.assertIn("lv_obj_set_flex_grow(ui->summary_label, wide_layout ? 1 : 0)", table)
@@ -51,28 +51,27 @@ class ObserverIncrementalUiContractTests(unittest.TestCase):
 
     def test_observer_metadata_uses_responsive_two_or_three_row_layout(self):
         source = read("main/main.c")
-        formatter_signature = "static void format_observer_network_info"
+        formatter_signature = "static void observer_format_fields"
+        view_source = read("main/observer_view.inc")
         summary_signature = "static void format_observer_summary_info"
 
-        self.assertIn(formatter_signature, source)
+        self.assertIn(formatter_signature, view_source)
         self.assertIn(summary_signature, source)
 
-        formatter = function_body(source, formatter_signature)
+        formatter = function_body(view_source, formatter_signature)
         summary = function_body(source, summary_signature)
-        table = function_body(source, "static void update_observer_table")
+        table = function_body(source, "static void observer_add_network_tile")
         inspect = function_body(source, "static void inspect_observer_task")
         ssid_update = function_body(source, "static void observer_update_ssid_label")
 
-        self.assertIn("net->security", formatter)
-        self.assertIn("sec_col", formatter)
-        self.assertIn('dBm#  |  %s"', formatter)
+        self.assertIn("observer_view_prefs.ap_order", formatter)
+        self.assertIn("observer_view_prefs.ap_visible", formatter)
+        self.assertIn("observer_field_text", formatter)
         self.assertNotIn("\\n", formatter)
-        self.assertNotIn("Uptime:", formatter)
-        self.assertNotIn("Vendor:", formatter)
         self.assertIn('"Uptime: %s  |  Vendor: %s"', summary)
         self.assertNotIn("\\n", summary)
         self.assertNotIn("badge", formatter)
-        self.assertIn("format_observer_network_info", table)
+        self.assertIn("observer_format_fields", table)
         self.assertIn("summary_label", table)
         self.assertIn("LV_LABEL_LONG_DOT", table)
         self.assertIn("bool wide_layout = ui_wide_layout()", table)
@@ -83,7 +82,7 @@ class ObserverIncrementalUiContractTests(unittest.TestCase):
         self.assertIn('LV_SYMBOL_OK " saved"', table)
         self.assertIn("creds_have(ctx, net->ssid)", table)
         self.assertNotIn("style_network_row_text(header", table)
-        self.assertEqual(2, inspect.count("format_observer_network_info"))
+        self.assertEqual(2, inspect.count("observer_format_fields"))
         self.assertEqual(2, inspect.count("observer_update_summary_label(ctx, i)"))
         self.assertNotIn("format_network_info", inspect)
         self.assertNotIn("creds_have(ctx, net->ssid)", ssid_update)
@@ -107,7 +106,7 @@ class ObserverIncrementalUiContractTests(unittest.TestCase):
         toggle = function_body(source, toggle_signature)
         add_client = function_body(source, "static void observer_add_client_row")
         sync = function_body(source, "static void observer_sync_changed_tiles")
-        table = function_body(source, "static void update_observer_table")
+        table = function_body(source, "static void observer_add_network_tile")
 
         self.assertIn("clients_expanded", source)
         self.assertIn("client_toggle_label", source)
@@ -179,8 +178,10 @@ class ObserverVendorResolutionContractTests(unittest.TestCase):
         for poll in (observer_poll, popup_poll):
             # Both the plain and the vendor query must remain reachable so the
             # non-vendor path still works when the toggle is off.
-            self.assertIn("show_sniffer_results_vendor\\r\\n", poll)
-            self.assertIn("show_sniffer_results\\r\\n", poll)
+            self.assertIn("observer_query_command(ctx, vendor_query)", poll)
+            receiver = read("main/observer_receive.inc")
+            self.assertIn("show_sniffer_results_vendor extended", receiver)
+            self.assertIn("show_sniffer_results extended", receiver)
             self.assertIn("observer_resolve_vendors", poll)
 
     def test_client_parse_carries_vendor_into_the_data_model(self):

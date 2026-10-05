@@ -18,8 +18,10 @@ def name(src,n):
     return src.text(n) if n else None
 
 def write_changed(path,text):
+    # Keep source line directives and event registrations identical on Windows.
+    text=text.replace('\r\n','\n')
     if not path.exists() or path.read_text(encoding="utf-8")!=text:
-        path.write_text(text,encoding="utf-8")
+        path.write_text(text,encoding="utf-8",newline='\n')
 
 def generate():
     src=Source(ROOT/'main/main.c'); policy=json.loads((BASE/'slice-policy.json').read_text())
@@ -48,7 +50,9 @@ def generate():
     row=src.tree.root_node.descendant_for_byte_range(match.start(1),match.start(1)+2)
     while row.type!='if_statement': row=row.parent
     runtime=''.join(p.read_text() for p in sorted((BASE/'runtime').glob('*.c')) if p.name!='runtime.c')
-    used=words(runtime) | words(src.text(row)) | set(policy['roots'])
+    observer_helpers=ROOT/'main/observer_view.inc'
+    observer_details=ROOT/'main/observer_details.inc'
+    used=words(runtime) | words(src.text(row)) | words(observer_helpers.read_text()) | words(observer_details.read_text()) | set(policy['roots'])
     full=set(); boundary=set(); selected=set()
     while True:
         old=(len(full),len(boundary),len(selected),len(used))
@@ -63,7 +67,15 @@ def generate():
             if names[i] & used: selected.add(i); used |= words(src.text(n))
         if old==(len(full),len(boundary),len(selected),len(used)): break
     out=BASE/'generated'; out.mkdir(exist_ok=True)
-    parts=['#include "host.h"']; records=[]
+    parts=['#include "host.h"', '#include <stdatomic.h>', '#include "scan_filter.h"',
+           '#include "transfer_speed_config.h"', '#include "ota_rf.h"', '#include "tile_order.h"',
+           '#include "observer_extended.h"',
+           'static lv_event_dsc_t *app_bind_observer_options(lv_obj_t *,lv_event_cb_t,lv_event_code_t,void *);',
+           '#undef lv_obj_add_event_cb',
+           '#define lv_obj_add_event_cb(o,c,e,u) app_bind_observer_options(o,c,e,u)',
+           '#include "observer_options_ui.h"',
+           '#undef lv_obj_add_event_cb',
+           '#define lv_obj_add_event_cb(o,c,e,u) app_bind(o,c,e,u,__LINE__)']; records=[]
     contracts=json.loads((BASE/'control-contracts.json').read_text())
     if contracts['sources']['main/main.c']!=policy['source_sha256']:
         raise ValueError('Frozen control contracts do not match slice source')
@@ -83,6 +95,8 @@ def generate():
         if i in selected: emit(n,'declaration')
     for fn in sorted(full|boundary):
         n=src.functions[fn]; parts.append(src.data[n.start_byte:n.child_by_field_name('body').start_byte].decode().strip()+';')
+    parts.append('#include "observer_view.inc"')
+    parts.append('#include "observer_details.inc"')
     for fn in sorted(full): emit(src.functions[fn],'function:'+fn)
     for fn in sorted(boundary):
         if policy['functions'][fn]=='adapter': continue
@@ -97,6 +111,10 @@ def generate():
     write_changed(out/'browser.c','\n\n'.join(parts))
     write_changed(out/'manifest.json',json.dumps({'source_sha256':hashlib.sha256(src.data).hexdigest(),'retained':sorted(full),'boundaries':{f:policy['functions'][f] for f in sorted(boundary)},'provenance':records},indent=2))
     conf=(ROOT/'lv_conf.h').read_text(); conf=re.sub(r'#define LV_MEM_SIZE[^\n]+','#define LV_MEM_SIZE (32 * 1024 * 1024U)',conf); conf=re.sub(r'#define LV_USE_SDL\s+\d+','#define LV_USE_SDL 0',conf)
+    # Match the firmware theme: hardcoded emulator dark defaults used to hide
+    # missing explicit styles on new Observer controls in native light builds.
+    dark_theme = int('CONFIG_LV_THEME_DEFAULT_DARK=y' in (ROOT/'sdkconfig').read_text())
+    conf=re.sub(r'#define LV_THEME_DEFAULT_DARK\s+\d+', f'#define LV_THEME_DEFAULT_DARK {dark_theme}', conf)
     conf=conf.replace('LV_FS_DEFAULT_DRIVE_LETTER','LV_FS_DEFAULT_DRIVER_LETTER')
     write_changed(out/'lv_conf.h',conf)
     for f in ('freertos/FreeRTOS.h','freertos/task.h','freertos/semphr.h','esp_log.h','esp_heap_caps.h','esp_timer.h','nvs.h','bsp/m5stack_tab5.h'):
