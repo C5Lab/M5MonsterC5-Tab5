@@ -271,3 +271,90 @@ Monster OTA on the P4 side consists of:
 All OTA logic (WiFi, HTTPS, verification, partition write, reboot, anti-rollback) stays
 **entirely on the C5 / JanOS side**. The P4 contains no flashing logic — it is a remote and a
 status display.
+
+## Monster RF (JanOS RF)
+
+Monster RF is a second firmware variant with the same version numbers but a
+different partition layout (partition table at `0x10000` instead of the classic
+`0x8000`) and RF releases in a separate repository
+(`elpadrino26/janosrf-web-flasher`). A shared version like 1.7.5 does **not**
+identify the variant, and an RF board can physically carry classic firmware.
+
+The Tab5 keeps **three facts independent** — none proves the others:
+
+- **firmware variant** — `subghz_status` returning `[SUBGHZ_STATUS] ...` proves
+  RF firmware is running; silence or `Unrecognized command` does **not** prove
+  classic hardware;
+- **command support** — `ota_info` printing `OTA RF source:` proves the updater
+  understands the `rf` argument (a classic build with the new updater prints it
+  too, so it is **not** proof of RF hardware); `ota_list rf` is **not** a safe
+  capability probe because an older parser may ignore the extra argument;
+- **partition layout** — only `ota_info`'s `OTA RF layout: compatible` line
+  proves RF-compatibility; an absent line means unknown, never compatible.
+
+`ota_info` needs no WiFi, so the Tab5 runs it as an **offline pre-check** before
+connecting, then routes automatically using RF command support and compatible
+layout, or positive Sub-GHz identification for legacy single-source RF builds.
+The `rf` argument is used only when advertised by the updater. A positively
+identified legacy RF build uses its own RF source through the plain command;
+there is no retry to a classic repository after an RF failure.
+
+**Force update opens the release list** for both classic and RF. Select a
+published release and confirm it; its literal tag (including `v`, when present)
+is sent unchanged. No tag is guessed from the running firmware version. The
+selected classic main/dev channel is applied before fetching releases/updates.
+The detected JanOS version and APP descriptor version stay separate and Info
+shows both when available.
+
+Every install repeats the `ota_info` precheck and passes the shared route gate.
+RF is blocked on an incompatible/non-RF offset, classic is blocked on an RF
+layout or positively identified RF firmware, and an empty precheck is blocked.
+Older classic firmware with a recognized running APP report remains supported
+even if it lacks explicit source/layout metadata; physical hardware identity
+cannot be guaranteed from missing metadata alone. The C5 updater remains
+responsible for validating the actual image before writing flash.
+
+RF commands (see the source of truth `projectZero/ESP32C5/main/main.c`):
+
+| Purpose | Command | Notes |
+|---|---|---|
+| List RF releases | `ota_list rf` | no installation |
+| Install latest RF (if newer) | `ota_check rf` / `ota_check rf latest` | firmware skips if not newer |
+| Install a specific RF release | `ota_check rf <tag>` | permits reinstall / downgrade; confirmed on the Tab5 first |
+
+`ota_channel main/dev` stays classic-only — RF is a per-operation choice, not a
+saved channel. The RF flow connects with a plain `wifi_connect` (no `ota` flag)
+and sends the routed command after IP; the `ota` flag is used only for classic.
+
+Before an RF install the Tab5 gates on the pre-checked layout: `incompatible` is
+blocked with an explanation to restore the RF partition layout over USB;
+`unknown` requires positive RF identification and a recognized legacy report;
+otherwise it is blocked. `compatible` proceeds, and the
+firmware still verifies the release files. The Tab5 never migrates partitions or
+bypasses these checks.
+
+```mermaid
+flowchart TD
+    Start["Download & Flash / List"] --> Info["ota_info (offline pre-check)"]
+    Info --> Parse["Parse: RF source? RF layout? offset"]
+    Parse --> Route{"updater supports rf<br/>AND layout compatible?"}
+
+    Route -->|"no"| Classic["Classic path<br/>wifi_connect -> ota_check / ota_list"]
+    Route -->|"yes"| RFlayout{"RF layout"}
+
+    RFlayout -->|"incompatible"| BlockI["Block: restore RF<br/>layout over USB"]
+    RFlayout -->|"unknown"| BlockU["Block: read Info /<br/>update first"]
+    RFlayout -->|"compatible"| RFop{"list or install?"}
+
+    RFop -->|"list"| RFlist["wifi_connect -> ota_list rf"]
+    RFop -->|"install latest"| RFlatest["wifi_connect -> ota_check rf"]
+    RFlist -->|"tap a release"| Confirm{"newer / same / older?"}
+    Confirm -->|"newer"| RFtag["ota_check rf &lt;tag&gt;"]
+    Confirm -->|"same"| ConfR["Confirm reinstall"] --> RFtag
+    Confirm -->|"older"| ConfD["Confirm downgrade"] --> RFtag
+```
+
+The Tab5-side RF logic is a pure, host-tested module
+([`main/ota_rf.c`](../main/ota_rf.c)); see
+[ota-rf-implementation-plan.md](ota-rf-implementation-plan.md) and
+[ota-test-coverage.md](ota-test-coverage.md).

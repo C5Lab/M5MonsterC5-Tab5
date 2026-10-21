@@ -278,6 +278,17 @@ esp_err_t bsp_sdcard_init(char *mount_point, size_t max_files);
  */
 esp_err_t bsp_sdcard_deinit(char *mount_point);
 
+/**
+ * @brief Live presence check for the internal SD card.
+ *
+ * Pings the mounted card with a status command (CMD13), so it detects a
+ * physical removal that cached filesystem state (e.g. esp_vfs_fat_info) would
+ * miss. Returns false when nothing is mounted.
+ *
+ * @return true if a card is mounted and answering, false otherwise
+ */
+bool bsp_sdcard_is_present(void);
+
 /**************************************************************************************************
  *
  * LCD interface

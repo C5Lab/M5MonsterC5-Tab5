@@ -3,6 +3,24 @@
 Pure-logic pieces that carry no LVGL or ESP-IDF dependency are tested on the
 host, so they can be verified without flashing a Tab5.
 
+## `test_wpa_psk_auditor_contract.py`
+
+Pins the first INTERNAL-tab `WPA PSK Auditor` dashboard integration without
+building firmware. It verifies that the tile opens the dedicated page, the page
+reads the durable multi-session A/B catalog and bounded audit history, and each
+row's Resume/confirmed Start over routes through the existing crack launcher.
+It also preserves the
+legacy handshake browser as the current catalog entry point and requires clear
+empty/offline states. Resume must preselect the saved wordlist and sync controls
+from its stable fingerprint; a missing or changed list must not be silently
+substituted. The distributed-resume contract also pins ALL-mode catalog
+reordering so a newly inserted earlier filename cannot tombstone valid progress.
+Starting a different capture must preserve prior resumable sessions.
+
+```sh
+python tests/test_wpa_psk_auditor_contract.py
+```
+
 Run any of them with a host compiler. On a Windows workstation without one, the
 same commands work inside WSL against the `/mnt/c/...` checkout.
 
@@ -127,3 +145,562 @@ report says `[report truncated]`.
 When a deliberate wording change breaks the baseline, the test prints the actual
 report between `----8<----` markers so the new text can be reviewed and pasted
 into `reference_report[]`.
+
+## `hs_crack_cache_test.c`
+
+Exercises the handshake cracker's persistent attempt cache, quoted CSV
+round-trips, capture/wordlist fingerprints, resume records, deterministic
+wordlist ordering, byte progress, ETA, and checkpoint policy.
+
+```sh
+gcc -std=c17 -Wall -Wextra -Werror -I main \
+    tests/hs_crack_cache_test.c main/hs_crack_cache.c \
+    -o /tmp/hs_crack_cache_test
+/tmp/hs_crack_cache_test
+```
+
+The cache test also verifies the persistent full-file CRC used to identify
+wordlists copied to distributed JanOS workers. An entry is reused only when the
+path, size, modification time, head CRC, and tail CRC still match.
+
+## WPA PSK Auditor foundation tests
+
+The Auditor foundation stays independent of LVGL and ESP-IDF so malformed or
+stale SD/serial data can be checked under ASan/UBSan before device flashing.
+
+```sh
+gcc -std=c17 -Wall -Wextra -Werror -fsanitize=address,undefined \
+    -I main -I components/pcap_reader/include \
+    tests/hs_capture_analyzer_test.c main/hs_capture_analyzer.c \
+    components/pcap_reader/pcap_reader.c -o /tmp/hs_capture_analyzer_test
+/tmp/hs_capture_analyzer_test
+
+gcc -std=c17 -Wall -Wextra -Werror -fsanitize=address,undefined -I main \
+    tests/hs_capture_validation_test.c main/hs_capture_validation.c \
+    -o /tmp/hs_capture_validation_test
+/tmp/hs_capture_validation_test
+
+gcc -std=c17 -Wall -Wextra -Werror -fsanitize=address,undefined -I main \
+    tests/hs_crack_session_test.c main/hs_crack_session.c \
+    -o /tmp/hs_crack_session_test
+/tmp/hs_crack_session_test
+
+gcc -std=c17 -Wall -Wextra -Werror -fsanitize=address,undefined -I main \
+    tests/hs_session_catalog_test.c main/hs_session_catalog.c \
+    main/hs_crack_session.c -o /tmp/hs_session_catalog_test
+/tmp/hs_session_catalog_test
+
+gcc -std=c17 -Wall -Wextra -Werror -fsanitize=address,undefined -I main \
+    tests/hs_audit_history_test.c main/hs_audit_history.c \
+    -o /tmp/hs_audit_history_test
+/tmp/hs_audit_history_test
+
+gcc -std=c17 -Wall -Wextra -Werror -fsanitize=address,undefined -I main \
+    tests/hs_artifact_inventory_test.c main/hs_artifact_inventory.c \
+    -o /tmp/hs_artifact_inventory_test
+/tmp/hs_artifact_inventory_test
+
+gcc -std=c17 -Wall -Wextra -Werror -fsanitize=address,undefined -I main \
+    tests/hs_audit_queue_test.c main/hs_audit_queue.c \
+    -o /tmp/hs_audit_queue_test
+/tmp/hs_audit_queue_test
+
+gcc -std=c17 -Wall -Wextra -Werror -fsanitize=address,undefined -I main \
+    tests/hs_crack_state_test.c main/hs_crack_state.c \
+    -o /tmp/hs_crack_state_test
+/tmp/hs_crack_state_test
+```
+
+These pin structured PCAP qualification, the versioned A/B session codec,
+independent per-session stores with legacy checkpoint compatibility,
+immutable bounded history, strict fragmented `ARTIFACT/1` parsing, request and
+snapshot correlation, legacy inventory rows and exact/provisional catalog
+identity. The queue suite also pins whole-batch cancellation without deleting
+terminal results or resume metadata, plus controlled reactivation of only a
+Cancelled item as a Paused resumable item. It also covers explicit recovery of
+a terminal mixed batch: matching checkpoint items become Paused, unfinished
+items without checkpoints restart as Queued, and completed/invalid results stay
+terminal. The dashboard contract additionally requires every persisted
+`session_id` to be reloaded and identity-checked before terminal recovery; a
+deleted or mismatched checkpoint is cleared and the item restarts as Queued.
+The crack-state suite pins legacy-row
+compatibility and lossless quoted CSV fields containing commas, quotes and
+embedded line breaks, including recovery of an interrupted `.bak` publish.
+They do not compile firmware.
+
+`python tests/test_wpa_psk_auditor_contract.py` additionally pins the LVGL
+integration: LOCAL/Grove/USB/M-BUS discovery stays serialized behind per-link
+console ownership, `ARTIFACT/1` falls back to `list_dir -s`, and catalog rows
+expose their source plus `Audit` and resumable `Sync to Tab5` actions.
+It also requires already queued captures to be labelled and disabled in the
+catalog, skipped by bulk selection and rejected again by the append boundary.
+An exact Resume may reactivate its existing Cancelled row in place, while a new
+local or remotely synchronized row must carry its selected session ID into the
+batch journal.
+The catalog contract also separates transport ownership from queue editing: a
+running batch may accept another validated LOCAL capture at its tail, while
+remote-only work that first needs Sync remains blocked until transports are
+free. Multi-selection actions live in a fixed footer outside the scrollable
+dashboard body, so selecting a capture at the end of a long catalog does not
+require returning to the top before enqueueing it. The footer's enabled state
+is reconciled when catalog scans start and finish even when the selection itself
+did not change, and handled taps emit an `ADD_SELECTED` diagnostic instead of
+failing silently. The queue unit suite pins
+that this append preserves the current Running item and scheduler index.
+It also pins the catalog-wide `Sync all to Tab5` queue: invalid captures are
+excluded, exact remote duplicates share one transfer, provisional duplicates
+with matching name/size/format are coalesced, and every worker path is indexed
+to the canonical local file. Existing local/indexed copies are skipped,
+conflicting known CRC values remain separate, transfers stay sequential, and
+the catalog is refreshed after a successful batch.
+The former full-width source status block is replaced by a compact connected-
+source dropdown. Its selection filters both rendered catalog rows and the
+catalog-wide synchronization queue.
+The default dropdown state stays collapsed and renders no capture rows until a
+worker (or the explicit `All sources` option) is selected.
+
+Variant A extends this gate with a durable 32-item batch journal. The queue
+test covers guarded state transitions, duplicate rejection, remove semantics,
+interrupted RUNNING/SYNCING reconciliation, canonical encoding, CRC rejection,
+and alternating A/B recovery. The Python dashboard contract additionally pins
+multi-select and state filters, selected-only remote synchronization, the
+shared single-audit coordinator, pause/cancel/remove controls, aggregate
+progress, and save-before-advance completion ordering.
+
+## `hs_crack_remote_core_test.c`
+
+Exercises `CRACK/1` capability response parsing, password/SSID hex decoding,
+malformed messages, deterministic gap-free byte sharding, three-strike lease
+loss, monotonic safe checkpoints, and fallback range selection. Also covers
+the non-terminal `CANCELLING job=...` acknowledgement without mistaking it for
+a completed cancellation. It additionally covers
+USB `ack32` receive negotiation, `READY ack_size`, ACK32 validation and diagnostic
+reasons (length, magic/version, reserved bytes, status and CRC), stale ACKs,
+and NAK/CAN frames that must never satisfy ACK matching. Protocol 4 tests cover
+mandatory capability tokens, READY timing validation, persistent fragmented
+ACK32 accumulation, current/stale ACK classification, and the three-send limit.
+
+```sh
+gcc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -I main \
+    tests/hs_crack_remote_core_test.c main/hs_crack_remote_core.c main/hs_crack_cache.c \
+    -o /tmp/hs_crack_remote_core_test
+/tmp/hs_crack_remote_core_test
+```
+
+## `hs_crack_scheduler_test.c`
+
+Exercises the transport-independent shard ledger used by distributed worker
+recovery. It verifies monotonic safe offsets, lease loss without lost coverage,
+same-generation reattachment, migration of only the unfinished suffix, refusal
+of a retired generation to reclaim migrated work, completion at the immutable
+range end, explicit local ownership of the final suffix, and independent
+`checked` accounting for replacement jobs.
+
+```sh
+gcc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -I main \
+    tests/hs_crack_scheduler_test.c main/hs_crack_scheduler.c \
+    -o /tmp/hs_crack_scheduler_test
+/tmp/hs_crack_scheduler_test
+```
+
+## `test_distributed_resume_contract.py`
+
+Guards the Tab5 orchestration for durable Cancel -> Start resume. It requires
+the A/B session store, exact capture and wordlist identity matching, terminal
+cancel offsets to advance the worker ledger, drained local checkpoints, exact
+local/remote shard restoration, and tombstoning only after a terminal result.
+
+```sh
+python3 tests/test_distributed_resume_contract.py
+```
+
+## `test_worker_auto_recovery_contract.py`
+
+Host-compiles the production lost-worker liveness and retired-job status
+helpers. It verifies that boot noise may precede `pong`, waits are bounded,
+status is correlated to the retired job, and only an ordered `unknown_job`
+response proves that a reboot discarded the job. Global board detection is
+never called from the cracker-owned transport.
+
+```sh
+python3 tests/test_worker_auto_recovery_contract.py
+```
+
+## `test_worker_reassignment_contract.py`
+
+Checks and host-compiles the production scheduler tick and reassignment path.
+It pins active-worker polling before recovery, the five-second recovery rate
+limit, leasing an unfinished suffix to an idle different worker, use of the
+same tick during local and remote phases, cancel-gated leasing, and final local
+drain from the authoritative ledger rather than `worker->failed`.
+
+```sh
+python3 tests/test_worker_reassignment_contract.py
+```
+
+## `transfer_speed_config_test.c`
+
+Exercises the shared transfer-speed model used by Settings > Transfer Speed.
+It pins separate Grove/M-BUS and USB (CH34x) choice lists, their defaults,
+invalid stored-value fallback, and selection of the correct link-specific rate.
+The USB list stops at the exactly representable 3 MBaud value.
+
+```sh
+gcc -std=c11 -Wall -Wextra -Werror -I main \
+    tests/transfer_speed_config_test.c main/transfer_speed_config.c \
+    -o /tmp/transfer_speed_config_test
+/tmp/transfer_speed_config_test
+```
+
+## `usb_vcp_config_test.c`
+
+Exercises the pure CH34x USB-UART configuration helpers used before USB board
+detection. It pins the supported CH340/CH341 VID/PID set, the fixed 115200 baud
+register for both the inverted-short-packet `0x27` revision (`0xCC03`) and newer
+revisions (`0xCC83`), the 921600/1500000/2000000/3000000 encodings, the reason
+4 MBaud is omitted from USB settings, 8N1 line control,
+and the SERIAL_INIT -> baud/LCR -> MODEM_CTRL request sequence used by the
+Linux driver.
+
+```sh
+gcc -std=c11 -Wall -Wextra -Werror -I main \
+    tests/usb_vcp_config_test.c main/usb_vcp_config.c \
+    -o /tmp/usb_vcp_config_test
+/tmp/usb_vcp_config_test
+```
+
+## `test_usb_cdc_transfer_config.py`
+
+Checks that both the active configuration and clean-build defaults request a
+32-byte USB CDC BULK IN transfer. This matches the CH34x endpoint MPS, allowing
+one full ACK32 packet to complete the host transfer instead of remaining inside
+the component's former 512-byte request until a later short packet arrives.
+
+```sh
+python3 tests/test_usb_cdc_transfer_config.py
+```
+
+## `test_usb_blocking_read_contract.py`
+
+Host-compiles the production USB transport reader against a deterministic CDC
+ring-buffer fixture. It verifies that a read with a 100 ms limit wakes as soon
+as data arrives instead of polling the buffered size and sleeping for the full
+interval. It also pins timeout and disconnected-device behavior.
+
+```sh
+python3 tests/test_usb_blocking_read_contract.py
+```
+
+## `test_usb_ack32_upload_contract.py`
+
+Host-compiles the actual `main.c` upload loop and USB reader with deterministic
+transport, clock, and SD-read fixtures. The production C code performs all
+retry, parsing, FIN, deadline, and recovery decisions. Fixtures exercise the
+recorded block-79 ACK loss, a 12+20-byte reply split across a deadline, repeated
+stale replies, immutable data/FIN replay, transport errors, partial forward
+writes, PREPARING expiry, prefix reset, terminal prompt gating, and the full
+12000 ms completion timeout. No ESP-IDF build or device is needed.
+
+```sh
+python3 tests/test_usb_ack32_upload_contract.py
+```
+
+## `test_usb_probe_recovery_contract.py`
+
+Host-compiles the production command sender and worker probe path. It verifies
+that each CLI command, including its CRLF terminator, is submitted as one write;
+that every silent FILE probe times out after 5 seconds; and that Tab5 performs
+one DIAG-assisted USB CLI recovery before retrying. The separate size-scaled
+timeout remains in the receive path while JanOS validates a resumable prefix
+before sending `READY`.
+
+```sh
+python3 tests/test_usb_probe_recovery_contract.py
+```
+
+## `test_fast_uart_sync_fallback_contract.py`
+
+Host-compiles the production Grove/M-BUS/USB file-sync wrapper. It verifies
+that a warm-cache hit completes entirely at 115200 without set/restore calls,
+while a cache miss makes USB select its configured CH34x rate and hardware UART
+links retain their independently configured fast rate. A probe error never
+enters raw receive mode or changes baud. A failed fast sync restores the console
+to 115200 and uses the remaining attempts through the existing resumable upload path.
+Disabled sync and a cancelled operation do not trigger another upload. A failed
+115200 restore rejects an otherwise successful fast upload, so the worker
+cannot be marked ready with an unusable control channel. If the CLI boundary is
+lost, Tab5 restores only its local UART and abandons that worker without sending
+another peer command.
+
+```sh
+python3 tests/test_fast_uart_sync_fallback_contract.py
+```
+
+## `test_usb_fast_baud_contract.py`
+
+Host-compiles the production JanOS baud handshake and CH34x control path. It
+verifies that only a supported CH34x USB adapter negotiates 921600, that the
+bridge changes rate between the JanOS acknowledgement and confirmation, and
+that success, negotiation failure, restore, and unsafe-boundary abandonment
+all return the local USB bridge to 115200 without sending peer commands after
+the boundary is lost. A missing confirmation response is treated as ambiguous:
+Tab5 retries confirmation and queries the machine-readable baud status at the
+fast rate. It starts a 115200 transfer only after JanOS explicitly reports
+`rate=115200 pending=no`; otherwise the worker is rejected instead of sending
+commands at a guessed rate.
+
+```sh
+python3 tests/test_usb_fast_baud_contract.py
+```
+
+## `test_usb_start_recovery_contract.py`
+
+Host-compiles the production remote-worker start path. It verifies that a
+missing `ACCEPTED` response is reconciled with a correlated `status` command
+before local fallback. A matching `STARTED`, `STATUS`, or `DONE` record adopts
+the existing job; only an ordered `unknown_job` response permits another start,
+up to the shared three-attempt budget, with the identical job ID and byte range
+on USB, Grove, and M-BUS. An ambiguous state is never treated as permission to
+start a duplicate job. Uncorrelated `REJECTED` records are ignored during start, while a
+terminal `found` recovered through status is retained in Tab5 memory and
+consumed before the next transport operation so its password cannot be skipped
+by a later fallback.
+
+```sh
+python3 tests/test_usb_start_recovery_contract.py
+```
+
+## `test_usb_ready_line_budget_contract.py`
+
+Host-compiles the production CRACK text-message reader and reproduces a long
+USB `READY` line arriving after part of the per-call wait budget was spent on
+JanOS preparation. Waiting for the first byte remains sliced at 500 ms, but an
+observed first byte starts a separate, bounded two-second line-completion
+window. Otherwise the partial `READY` is discarded and the following `END` is
+misidentified as the response to `receive`. Short callers retain their original
+limit while no line has started.
+
+```sh
+python3 tests/test_usb_ready_line_budget_contract.py
+```
+
+## `test_cancel_transfer_recovery_contract.py`
+
+Host-compiles the production `hs_crack_remote_wait_end()` cleanup path and
+starts it with the UI cancellation flag already set. It proves that mandatory
+raw-transfer recovery does not use the normal cancel-aware reader: the bounded
+forced reader must still drain the worker's terminal `END` and prompt. This
+prevents a cancelled Grove or M-BUS synchronization from stranding JanOS at the
+fast baud and making the next Crack attempt report `no CRACK/1 worker`.
+
+```sh
+python3 tests/test_cancel_transfer_recovery_contract.py
+```
+
+## Monster OTA / JanOS RF (`ota_rf_test.c`, `test_ota_*.py`)
+
+Covers `main/ota_rf.c` — the pure Monster OTA / JanOS RF logic (version/tag
+parsing and comparison, `ota_info` report parsing, release-list parsing, command
+builders, the install decision, the async line reassembler, and the per-device
+capability cache + single-operation guard). The Python contract tests compile
+that same source through a shared harness (`tests/_ota_rf_harness.py`), so they
+exercise the real parser, not a copy.
+
+```sh
+gcc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -g \
+    -I main -o /tmp/ota_rf_test tests/ota_rf_test.c main/ota_rf.c
+/tmp/ota_rf_test
+
+python3 tests/test_ota_metadata.py   # ota_info parsing; RF-repo line != RF hardware
+python3 tests/test_ota_flow.py       # variant/capability/layout independence, routing, decisions
+python3 tests/test_ota_http.py       # release-list consumption, empty list, fetch errors
+```
+
+What they pin down (see `docs/ota-test-coverage.md` for the full map):
+
+- the RF source line in `ota_info` proves updater capability, never RF hardware;
+- RF layout is compatible only when `ota_info` says so — absent means unknown,
+  never compatible; the classic `0x8000` table is not RF-compatible;
+- RF listing/install always carry the `rf` argument and never fall back to the
+  classic repo;
+- tags parse with or without a leading `v` and are preserved verbatim; reinstall
+  (same version) and downgrade (older) are surfaced as confirmations, never
+  started automatically;
+- incompatible/unknown layout and a missing rf-aware updater block with distinct
+  reasons;
+- the reassembler survives fragmentation, echo, prompt characters and interleaved
+  foreign log lines, drops empty lines, and discards (never truncates) an
+  over-long line; a truncated final line is not emitted;
+- changing the connected device clears cached detection and only one OTA
+  operation runs at a time.
+
+## Manual distributed-crack smoke test
+
+1. For hardware acceptance, the operator flashes the current JanOS 1.7.5 development build containing
+   `crack_worker` capability protocol 4 to the Monsters, then Tab5, and puts an
+   SD card in each worker. Capability protocol 4 must advertise `sync=ftb1`,
+   `frame32` membership in `ack=byte,frame32`, `replay=last_block`, and
+   `finish=fin32`. Tab5 rejects protocol 3 and missing mandatory semantics.
+2. Connect workers through any combination of Grove, USB, and M-BUS, then boot
+   Tab5 and confirm those transports are detected.
+3. Put a small known wordlist in `/lab/wordlist` on the Tab5 SD card. The file
+   does not need to exist on worker SD cards.
+4. Start dictionary cracking. The popup must say `Preparing workers...` while
+   checking or copying worker files; it must not claim to be trying passwords
+   during this phase. An older worker cache without a `.verified` marker is
+   untrusted and must be transferred once more. Later boots with the unchanged
+   list should answer the probe immediately and skip the file copy.
+5. During cracking verify the popup shows separate `done` and `fallback`
+   counts, and that JanOS answers `STATUS` with a monotonic `safe_offset`. A
+   password found by any participant must cancel the others and be saved by
+   the normal Tab5 result path.
+6. Disconnect one worker during a run. The first two missed polls must keep it
+   active; the third must mark it for fallback. Tab5 must resume from the last
+   confirmed `safe_offset` and must not mark the wordlist exhausted until the
+   fallback completes.
+
+### USB CDC sync check
+
+For CH34x adapters, USB switches the Monster console and local bridge to
+921600 during file synchronization. Unsupported USB serial adapters remain at
+115200. To exercise the upload path, connect only the USB worker and select a
+handshake or change a wordlist so the worker answers `state=missing` rather
+than `state=present`. The log must show:
+
+- `[USB] CDC driver config: ... in_xfer=32` and a descriptor with BULK IN
+  `wMaxPacketSize 32`;
+- `Console running at 921600 baud` before a missing-file transfer and
+  `Console back at 115200 baud` after it;
+- `[HS-DBG] USB: READY ... bsize=1024 ... rx_ms=... ack_size=32
+  ack_wait_ms=2000 next_header_ms=7000 prepare_ms=... finish_linger_ms=7000`;
+- an ACK32 for every block (`ACK32 status=0x06 blk=... offset=...`), with the
+  sent block index and the committed offset at the end of that block;
+- `FIN blk=... transmission=1`, its exact ACK32, then
+  `FIN acknowledged, waiting SYNCED`, followed by `SYNCED`, END, the CLI prompt,
+  and the USB worker becoming ready.
+
+Repeat the same job and confirm a cache hit skips the upload. Interrupt a USB
+copy, restart it, and confirm the validated partial offset resumes with ACK32
+without the old eight-second ACK timeout. A timeout or current-block NAK
+(`status=0x15`, previous committed offset) retransmits identical bytes, at most
+three transmissions total. Every attempt has one absolute 2000 ms deadline;
+partial ACK bytes survive it. Valid ACKs for the immediately previous block
+are ignored, even repeatedly, without extending that deadline. JanOS logs a
+duplicate data block and re-ACKs it without advancing progress a second time.
+
+If the 921600 negotiation fails before binary transfer starts, Tab5 waits for
+JanOS's unconfirmed-baud timeout, restores the CH34x bridge to 115200, and uses
+the slow resumable upload path. If the raw/CLI boundary is lost during fast
+transfer, Tab5 changes only the local bridge back to 115200 and abandons that
+worker; it does not risk sending another command into an unknown stream.
+
+The final data block remains replayable until the FIN exchange. FIN uses the
+next block index and zero length/CRC, with the same three-send limit. A replayed
+FIN must not publish the file twice. Duplicate FIN ACKs can appear before text
+and are logged as discarded residual ACK32 frames. Expect about 7000 ms of
+quiet after the last FIN; Tab5 waits through quiet reads for up to
+`7000 + 2000 + 3000 = 12000` ms after accepting its FIN ACK.
+
+JanOS calculates `prepare_ms = 10000 + ceil(resume_offset / 262144) * 1000`,
+within 10000..600000 ms; an excessive resume restarts at zero. Tab5 reserves
+1000 ms for the first header, checking the budget during prefix scanning and
+immediately before the first FTB write. An expired budget emits no late FTB.
+
+CAN (`0x18`), malformed/impossible ACK tuples, hard transport errors, and retry
+exhaustion fail synchronization. Tab5 sends CAN only at a known header boundary
+before the receiver deadline, then drains through END and the actual prompt
+before issuing `[HS-DIAG]`. Partial forward writes and hard read errors suppress
+CAN. If no terminal boundary appears within the receiver state deadline plus
+3000 ms, DIAG is suppressed and the worker is lost for local fallback. Malformed
+frames log a printable validation reason. Prefix mismatch resets only after a
+safe terminal drain; interrupted uploads retain the existing resume path.
+
+An abandoned `.part` up to 1 MiB may resume after prefix validation. A larger
+partial must restart from offset zero instead of blocking the JanOS console on
+a long CRC scan.
+
+Grove and M-BUS should negotiate `bsize=8192` after switching their hardware
+UART to the configured fast transfer rate (the log prints the selected
+`Console running at ... baud` value). They continue using one-byte replies
+(`got=1 reply=0x06`), accept `ack_size=0` or `1` (a missing field defaults to
+`1`), and reject `ack_size=32`. If their control probe or transfer fails at the
+fast rate, Tab5 restores 115200 before retrying; a partial copy continues from
+its validated resume offset. USB rejects any ACK size other than `32` before
+sending binary blocks.
+
+Worker preparation is reported per transport as `capabilities`, `capture`,
+`wordlist`, and `start`, with `attempt=N/3` in serial logs and the compact UI.
+Each stage has at most three top-level attempts with 250 ms then 1000 ms
+backoff. This does not multiply the separate three-transmission ACK/FIN retry
+budget. USB retries only after its END/prompt recovery boundary; Grove and
+M-BUS also drain END/prompt after CAN so delayed `[CRACK/1]` text cannot be
+misread as one-byte ACKs. A missing boundary immediately marks that worker
+lost and leaves its unconfirmed suffix for local fallback.
+
+If the user presses Cancel during a Grove or M-BUS raw transfer, cleanup still
+finishes the bounded END/prompt drain despite the UI cancellation flag. Only
+after that confirmed protocol boundary may Tab5 restore the console to 115200
+and finish closing the cracker. Reopening Crack without a reboot must therefore
+discover the same worker, and the retained `.part` file may resume at a
+validated non-zero offset.
+
+Distributed cancellation logs the request, the non-terminal correlated
+`CANCELLING` acknowledgement, and the terminal confirmation for every worker.
+`CANCELLING` never completes cancellation by itself. A user-requested Cancel is
+silent; warning and success chimes remain reserved for actual terminal results.
+
+`start` keeps one job ID and range for all attempts. A missing confirmation is
+reconciled with `status <job>` first; `start` is resent only after an ordered
+`unknown_job`. JanOS 1.7.5 may answer an identical replay with
+`ACCEPTED ... replay=1 state=...` without creating another task. During work,
+`STATUS` may add `phase` and `progress_age_ms`; three consecutive missed status
+responses are shown as `1/3`, `2/3`, then `lost, probing`, while any valid
+correlated response resets the miss counter. The two-second scheduler tick
+pings a lost transport no more often than every five seconds, reconciles its
+retired job, reattaches a still-running generation, rebuilds cache after an
+ordered `unknown_job`, or leases the unfinished suffix to an idle worker. When
+no remote can make progress, Tab5 drains every remaining ledger suffix locally.
+
+## Tool Order
+
+Pure ordering/serialization tests (GCC, Linux/WSL):
+
+```sh
+gcc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -I main \
+    tests/tile_order_test.c main/tile_order.c -o /tmp/tile_order_test
+/tmp/tile_order_test
+```
+
+The UI suite builds the production editor against bundled LVGL, with an
+in-memory NVS backend that injects read/commit faults. It covers real pointer
+long-press and reorder, all four display rotations, half-turn gesture
+cancellation, bounded edge scrolling, keyboard activation, Cancel, Save, reset
+and repair of corrupt persisted data. Run from the repository root:
+
+```sh
+mkdir -p .codex-tmp
+cmake -S tests/tile_order_ui -B .codex-tmp/tool-order-ui-build -DCMAKE_BUILD_TYPE=Debug
+cmake --build .codex-tmp/tool-order-ui-build -j 8
+.codex-tmp/tool-order-ui-build/tool_order_ui_test
+```
+
+The harness writes portrait/landscape PPM captures to `.codex-tmp/`. Physical
+Tab5 checks still cover flash persistence, hardware availability changes and
+touch feel. The test backend models commit failure; it does not simulate power
+loss inside the ESP-IDF NVS implementation.
+
+## OTA Force and cross-variant regressions
+
+Run from the repository root on Linux/WSL:
+
+```sh
+python3 tests/test_ota_tab5_regression.py
+gcc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -I main \
+    tests/ota_route_test.c main/ota_rf.c -o /tmp/ota_route_test
+/tmp/ota_route_test
+```
+
+The Python harness executes the production Tab5 precheck, selected-release,
+Force-button and metadata-sync functions with boundary stubs. This protects
+against bypasses outside the pure RF decision module. It does not claim to
+simulate the C5 flash writer or prove the physical type of unidentified hardware.

@@ -1,3 +1,4 @@
+#include "app_keyboard_navigation.h"
 /* SD Signals (Manage) screen.
  *
  * Lists signals stored on SD (subghz_list sd) and exposes per-row
@@ -539,6 +540,7 @@ static void show_delete_confirm(subghz_tab_state_t *st, int idx, const char *nam
     lv_obj_set_style_bg_color(can, subghz_host_ui_muted(), 0);
     lv_obj_set_style_radius(can, 8, 0);
     lv_obj_add_event_cb(can, on_delete_cancel, LV_EVENT_CLICKED, NULL);
+    app_keyboard_navigation_register_escape(can);
     lv_obj_t *cl = lv_label_create(can);
     lv_label_set_text(cl, "Cancel");
     lv_obj_set_style_text_color(cl, lv_color_white(), 0);
@@ -715,6 +717,7 @@ static void show_tx_count_popup(subghz_tab_state_t *st, int idx)
     lv_obj_set_style_bg_color(cn, subghz_host_ui_muted(), 0);
     lv_obj_set_style_radius(cn, 8, 0);
     lv_obj_add_event_cb(cn, on_tx_count_cancel, LV_EVENT_CLICKED, NULL);
+    app_keyboard_navigation_register_escape(cn);
     lv_obj_t *cnl = lv_label_create(cn);
     lv_label_set_text(cnl, "Cancel");
     lv_obj_set_style_text_color(cnl, lv_color_white(), 0);

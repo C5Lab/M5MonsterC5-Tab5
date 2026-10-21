@@ -1,3 +1,4 @@
+#include "app_keyboard_navigation.h"
 #include "subghz_host.h"
 #include "subghz_internal.h"
 #include "subghz_parser.h"
@@ -991,6 +992,7 @@ static void on_freq_tap(lv_event_t *e)
     lv_obj_set_style_bg_color(cancel_btn, subghz_host_ui_muted(), 0);
     lv_obj_set_style_radius(cancel_btn, 8, 0);
     lv_obj_add_event_cb(cancel_btn, on_freq_cancel, LV_EVENT_CLICKED, st);
+    app_keyboard_navigation_register_escape(cancel_btn);
     lv_obj_t *cl = lv_label_create(cancel_btn);
     lv_label_set_text(cl, "Cancel");
     lv_obj_set_style_text_color(cl, lv_color_white(), 0);
@@ -1445,6 +1447,7 @@ static void show_leave_popup(subghz_tab_state_t *st, size_t count)
     lv_obj_set_style_bg_color(stay_btn, subghz_host_ui_muted(), 0);
     lv_obj_set_style_radius(stay_btn, 8, 0);
     lv_obj_add_event_cb(stay_btn, on_leave_cancel, LV_EVENT_CLICKED, NULL);
+    app_keyboard_navigation_register_escape(stay_btn);
     lv_obj_t *sl2 = lv_label_create(stay_btn);
     lv_label_set_text(sl2, "Stay");
     lv_obj_set_style_text_color(sl2, lv_color_white(), 0);

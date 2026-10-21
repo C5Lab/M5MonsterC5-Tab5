@@ -4,9 +4,19 @@ CONFIG_IDF_TARGET="esp32p4"
 CONFIG_ESP32P4_REV_MIN_1=y
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_360=y
 
-# Power-manager profiles and performance locks. Automatic light sleep stays
-# disabled because MIPI-DSI and touch remain active while the backlight is off.
-CONFIG_PM_ENABLE=y
+# Power management (DFS) is deliberately OFF: run the CPU at a flat 360 MHz.
+#
+# esp_pm's DFS does not scale with CPU load - min_freq_mhz is "the frequency to
+# use when no locks are taken" (esp_pm.h). Nothing in the UI path takes an
+# ESP_PM_CPU_FREQ_MAX lock; only WPA cracking did. So with PM enabled the board
+# spent normal operation at APP_POWER_CPU_MIN_MHZ (40 MHz) - nine times below
+# what it can do - and the whole GUI rendered at that speed. Measured on the
+# same build: building the boot splash took 9 ms with PM off versus 190 ms with
+# PM on. That was the cause of the "laggy GUI", not USB.
+#
+# Re-enabling this needs a CPU_FREQ_MAX lock held while the screen is on,
+# otherwise the "interactive" profile is the slowest configuration available.
+# CONFIG_PM_ENABLE=y
 
 # Increase watchdog timeout for LCD init
 CONFIG_ESP_TASK_WDT_TIMEOUT_S=30
@@ -17,8 +27,27 @@ CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_COMPILER_OPTIMIZATION_PERF=y
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_SPEED_200M=y
-CONFIG_SPIRAM_XIP_FROM_PSRAM=y
 CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=0
+
+# Run code and rodata from flash (via the L2 cache), NOT XIP from PSRAM.
+#
+# The MIPI-DSI panel continuously scans its framebuffer out of PSRAM at roughly
+# 110 MB/s (720x1280x2 @ 60 Hz). With SPIRAM_XIP_FROM_PSRAM / FETCH_INSTRUCTIONS
+# / RODATA enabled, every LVGL instruction fetch also went through PSRAM and
+# competed for that bus. Attaching a Monster over USB-A added its periodic host
+# DMA on the same bus and tipped it over: building the status bar took 119 ms of
+# LVGL time with USB vs 9 ms without (CPU was 99% idle - it was pure memory-bus
+# contention, not compute, not console spam). Moving code to flash took LVGL off
+# the PSRAM bus and restored 9 ms with USB attached.
+#
+# Side benefits: ~4 MB more PSRAM heap (flash no longer mirrored into it) and a
+# faster boot. Trade-off to watch: runtime flash writes (NVS, Monster OTA) can
+# briefly stall code execution now that code lives in flash - if new hitches
+# appear specifically during flash/NVS writes, that is the cause.
+# CONFIG_SPIRAM_FETCH_INSTRUCTIONS is not set
+# CONFIG_SPIRAM_RODATA is not set
+# CONFIG_SPIRAM_XIP_FROM_PSRAM is not set
+# CONFIG_SPIRAM_FLASH_LOAD_TO_PSRAM is not set
 CONFIG_CACHE_L2_CACHE_256KB=y
 CONFIG_CACHE_L2_CACHE_LINE_128B=y
 CONFIG_FREERTOS_HZ=1000
@@ -36,7 +65,30 @@ CONFIG_LV_DISP_DEF_REFR_PERIOD=25
 CONFIG_LV_USE_LOG=y
 CONFIG_LV_LOG_PRINTF=y
 CONFIG_LV_USE_PERF_MONITOR=y
+# LV_ATTRIBUTE_FAST_MEM_USE_IRAM would put LVGL's hot drawing code
+# (lv_draw_sw_blend, lv_draw_label/rect/line/mask) in internal RAM instead of
+# running it XIP from PSRAM, so rendering would stop competing for the PSRAM
+# bus - the reason the UI crawls while a Monster is attached over USB-A (status
+# bar builds in 24 ms without USB, 138 ms with it, DFS already off). M5Stack's
+# own M5Tab5-UserDemo enables it.
+#
+# It does not fit here. Enabling it fails to link with "Total discarded sections
+# size is 46856 bytes", and the discarded sections are libc .sbss/.sdata - the
+# shortfall is in internal *data*, since the P4 shares one internal SRAM between
+# instructions and data. Tried freeing it by turning off the P4-side esp_wifi
+# IRAM optimizations (Wi-Fi runs on the C6 over SDIO, so they looked free): the
+# shortfall stayed at exactly 46856 bytes, because with ESP_HOST_WIFI_ENABLED
+# off the native esp_wifi library is not linked at all and those options were
+# already costing nothing.
+#
+# This firmware simply carries far more in internal RAM than the M5Stack demo:
+# USB CDC host DMA, ESP-Hosted SDIO, the audio codec pipeline and SD. Do not
+# retry without first finding ~47 KB of real internal-RAM savings.
 # CONFIG_LV_ATTRIBUTE_FAST_MEM_USE_IRAM is not set
+# CH34X uses a 32-byte BULK IN endpoint.  Keep the submitted host transfer at
+# one endpoint packet so a full 32-byte ACK32 completes immediately instead of
+# waiting for a short packet or for the component's default 512-byte request.
+CONFIG_IN_TRANSFER_BUFFER_SIZE=32
 CONFIG_LV_FONT_MONTSERRAT_8=y
 CONFIG_LV_FONT_MONTSERRAT_10=y
 CONFIG_LV_FONT_MONTSERRAT_12=y
@@ -118,7 +170,6 @@ CONFIG_FATFS_FAST_SEEK_BUFFER_SIZE=256
 
 # HTTP server - increase header buffer for modern browsers
 CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
-
 
 
 

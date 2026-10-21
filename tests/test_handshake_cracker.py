@@ -14,6 +14,20 @@ import tempfile
 import unittest
 
 
+def extract_function(source, signature):
+    start = source.index(signature)
+    opening = source.index("{", start)
+    depth = 0
+    for end in range(opening, len(source)):
+        if source[end] == "{":
+            depth += 1
+        elif source[end] == "}":
+            depth -= 1
+            if depth == 0:
+                return source[start:end + 1] + "\n"
+    raise ValueError(f"unterminated function: {signature}")
+
+
 def capture(password=b"lab-passphrase", ssid=b"Lab fixture", keyver=2):
     ap, sta = bytes.fromhex("020000000001"), bytes.fromhex("020000000002")
     anonce, snonce = bytes(range(32)), bytes(range(32, 64))
@@ -33,39 +47,44 @@ class VerifierTests(unittest.TestCase):
         cls.tmp = tempfile.TemporaryDirectory(prefix="tab5-cracker-")
         cls.folder = Path(cls.tmp.name)
         source = (Path(__file__).resolve().parents[1] / "main/main.c").read_text()
-        types = source[source.index("#define HCCAPX_SIGNATURE"):source.index("typedef struct {\n    volatile bool active;", source.index("#define HCCAPX_SIGNATURE"))]
-        core = source[source.index("static void hs_crack_compute_kck") if "static void hs_crack_compute_kck" in source else source.index("static bool hs_crack_compute_kck"):source.index("static void hs_crack_set_stage")]
+        types_start = source.index("#define HCCAPX_SIGNATURE")
+        types = source[types_start:source.index("typedef struct hs_crack_run", types_start)]
+        function_signatures = [
+            "static bool hs_crack_compute_kck",
+            "static bool hs_crack_record_valid",
+            "static int hs_crack_test_pmk",
+            "static int hs_crack_verify_candidate",
+            "static bool hs_crack_test_password",
+            "static int hs_crack_read_word",
+            "static bool hs_crack_worker_uses_usb_icon",
+        ]
+        core = "".join(
+            extract_function(source, signature).replace("static ", "", 1)
+            for signature in function_signatures
+        )
         # Compile production functions directly, exposing static functions to ctypes.
-        code = '#include <stdio.h>\n#include <stdint.h>\n#include <stdbool.h>\n#include <string.h>\n#include <errno.h>\n#include "mbedtls/md.h"\n#include "mbedtls/pkcs5.h"\n'
-        code += types + core.replace("static ", "")
+        code = '#include <stdio.h>\n#include <stdint.h>\n#include <stdbool.h>\n#include <string.h>\n#include <errno.h>\n#include "mbedtls/md.h"\n#include "mbedtls/pkcs5.h"\n#define TAB_USB 1\n'
+        code += types + core
         code = '#include "hs_crack_crypto.h"\n#include "mbedtls/platform_util.h"\n' + code
-        wordlist = source[source.index('    FILE *wl = fopen(HS_CRACK_WORDLIST'):source.index('\ndone:', source.index('    FILE *wl = fopen(HS_CRACK_WORDLIST'))]
         code += r'''
-#undef HS_CRACK_WORDLIST
-#define HS_CRACK_WORDLIST path
-static FILE *observed;
-#define vTaskDelay(ticks) ((void)(ticks))
-static struct { bool cancel_requested; } hs_crack_ui;
-static bool hs_crack_step(const char *pw, const hccapx_record_t *recs, int nrecs,
-                         uint32_t *tried, int64_t t0, int *found_idx, char *found_pw, size_t size) {
-    (void)recs; (void)nrecs; (void)tried; (void)t0; (void)found_idx; (void)found_pw; (void)size;
-    size_t len = strlen(pw);
-    if (len >= 8 && len <= 63) fprintf(observed, "%s\n", pw);
-    return false;
+int hs_crack_try_candidate(const char *pw, const hccapx_record_t *recs, int nrecs) {
+    int rc = hs_crack_verify_candidate(pw, recs, nrecs, NULL, NULL);
+    return rc >= 0 ? rc : -1;
 }
 void read_words(const char *path, const char *out) {
-    hccapx_record_t *recs = NULL;
-    int nrecs = 0, found_idx = -1;
-    uint32_t tried = 0;
-    int64_t t0 = 0;
-    char found_pw[64] = {0}, final_detail[256] = {0};
-    bool sd_wordlist_used = false;
-    (void)final_detail;
-    (void)hs_crack_ui;
-    observed = fopen(out, "w");
-''' + wordlist + r'''
-    (void)sd_wordlist_used;
-    fclose(observed);
+    FILE *wordlist = fopen(path, "rb");
+    FILE *observed = fopen(out, "wb");
+    volatile bool cancel = false;
+    char word[65];
+    if (!wordlist || !observed) goto done;
+    for (;;) {
+        int status = hs_crack_read_word(wordlist, word, &cancel);
+        if (status < 0) break;
+        if (status > 0) fprintf(observed, "%s\n", word);
+    }
+done:
+    if (wordlist) fclose(wordlist);
+    if (observed) fclose(observed);
 }
 '''
         (cls.folder / "core.c").write_text(code)
@@ -83,11 +102,12 @@ void read_words(const char *path, const char *out) {
         cls.lib = ctypes.CDLL(str(cls.folder / "core.so"))
         cls.lib.hs_crack_test_password.argtypes = [ctypes.c_char_p, ctypes.c_void_p]
         cls.lib.hs_crack_test_password.restype = ctypes.c_bool
-        cls.lib.hs_crack_load_records.argtypes = [ctypes.c_char_p, ctypes.c_void_p, ctypes.c_int]
         cls.lib.hs_crack_try_candidate.argtypes = [ctypes.c_char_p, ctypes.c_void_p, ctypes.c_int]
         cls.lib.read_words.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
-        cls.lib.hs_crack_eta_seconds.argtypes = [ctypes.c_uint64, ctypes.c_uint32, ctypes.c_int64]
-        cls.lib.hs_crack_eta_seconds.restype = ctypes.c_uint64
+        cls.lib.hs_crack_record_valid.argtypes = [ctypes.c_void_p]
+        cls.lib.hs_crack_record_valid.restype = ctypes.c_bool
+        cls.lib.hs_crack_worker_uses_usb_icon.argtypes = [ctypes.c_int]
+        cls.lib.hs_crack_worker_uses_usb_icon.restype = ctypes.c_bool
         cls.checkpoint_type = ctypes.CFUNCTYPE(ctypes.c_bool, ctypes.c_void_p)
         cls.lib.hs_crack_verify_candidate.argtypes = [ctypes.c_char_p, ctypes.c_void_p,
             ctypes.c_int, cls.checkpoint_type, ctypes.c_void_p]
@@ -150,20 +170,13 @@ void read_words(const char *path, const char *out) {
                 b"lab-passphrase", records, 2, callback, None), 1)
             self.assertEqual(calls[0], expected_calls)
 
-    def load(self, data):
-        path = self.folder / "fixture.hccapx"
-        path.write_bytes(data)
-        return self.lib.hs_crack_load_records(str(path).encode(), ctypes.create_string_buffer(393 * 16), 16)
-
     def test_rejects_malformed_and_unsupported_records(self):
         for offset, value in [(0, 0), (4, 99), (9, 33), (42, 3), (135, 1)]:
             with self.subTest(offset=offset):
                 record = bytearray(capture())
                 record[offset] = value
-                self.assertLess(self.load(record), 0)
-        self.assertLess(self.load(capture() + b"truncated"), 0)
-        self.assertLess(self.load(capture() * 17), 0)
-        self.assertEqual(self.load(capture() * 2), 2)
+                self.assertFalse(self.lib.hs_crack_record_valid(bytes(record)))
+        self.assertTrue(self.lib.hs_crack_record_valid(capture()))
 
     def test_wordlist_preserves_spaces_and_skips_entire_long_lines(self):
         path, output = self.folder / 'words.txt', self.folder / 'observed.txt'
@@ -179,14 +192,10 @@ void read_words(const char *path, const char *out) {
         self.lib.read_words(str(path).encode(), str(output).encode())
         self.assertEqual(output.read_bytes(), b'x' * 63 + b'\n' + b'x' * 8 + b'\n')
 
-    def test_eta_uses_remaining_candidates_and_rounds_up(self):
-        # Six checks in 25 seconds; 64 left require 266.66... seconds.
-        self.assertEqual(self.lib.hs_crack_eta_seconds(70, 6, 25000000), 267)
-        self.assertEqual(self.lib.hs_crack_eta_seconds(1000, 10, 40000000), 3960)
-        self.assertEqual(self.lib.hs_crack_eta_seconds(70, 70, 25000000), 0)
-        self.assertEqual(self.lib.hs_crack_eta_seconds(70, 71, 25000000), 0)
-        self.assertEqual(self.lib.hs_crack_eta_seconds(70, 0, 0), 2**64 - 1)
-
+    def test_only_usb_transport_uses_the_usb_icon(self):
+        self.assertFalse(self.lib.hs_crack_worker_uses_usb_icon(0))
+        self.assertTrue(self.lib.hs_crack_worker_uses_usb_icon(1))
+        self.assertFalse(self.lib.hs_crack_worker_uses_usb_icon(2))
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

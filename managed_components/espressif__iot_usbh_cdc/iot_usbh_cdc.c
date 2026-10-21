@@ -77,6 +77,7 @@ typedef struct usbh_cdc_s {
     size_t in_ringbuf_size;
     RingbufHandle_t out_ringbuf_handle;    /*!< out ringbuffer handle of corresponding interface */
     size_t out_ringbuf_size;
+    usbh_cdc_debug_stats_t debug_stats;
     cdc_parsed_info_t info;                // Parsed interface descriptor
     SLIST_ENTRY(usbh_cdc_s) list_entry;
 } usbh_cdc_t;
@@ -90,6 +91,62 @@ static esp_err_t _cdc_close(usbh_cdc_t *cdc);
 static void _cdc_transfers_free(usbh_cdc_t *cdc);
 
 static void _cdc_tx_xfer_submit(usb_transfer_t *out_xfer);
+
+static void _cdc_debug_rx_complete(usbh_cdc_t *cdc, size_t bytes)
+{
+    CDC_ENTER_CRITICAL();
+    cdc->debug_stats.last_rx_status = USB_TRANSFER_STATUS_COMPLETED;
+    cdc->debug_stats.rx_completed++;
+    cdc->debug_stats.rx_bytes += bytes;
+    CDC_EXIT_CRITICAL();
+}
+
+static void _cdc_debug_tx_complete(usbh_cdc_t *cdc, size_t bytes)
+{
+    CDC_ENTER_CRITICAL();
+    cdc->debug_stats.last_tx_status = USB_TRANSFER_STATUS_COMPLETED;
+    cdc->debug_stats.tx_completed++;
+    cdc->debug_stats.tx_bytes += bytes;
+    CDC_EXIT_CRITICAL();
+}
+
+static void _cdc_debug_rx_status(usbh_cdc_t *cdc, usb_transfer_status_t status)
+{
+    CDC_ENTER_CRITICAL();
+    cdc->debug_stats.last_rx_status = (int32_t)status;
+    if (status != USB_TRANSFER_STATUS_NO_DEVICE &&
+        status != USB_TRANSFER_STATUS_CANCELED) {
+        cdc->debug_stats.rx_errors++;
+    }
+    CDC_EXIT_CRITICAL();
+}
+
+static void _cdc_debug_tx_status(usbh_cdc_t *cdc, usb_transfer_status_t status)
+{
+    CDC_ENTER_CRITICAL();
+    cdc->debug_stats.last_tx_status = (int32_t)status;
+    if (status != USB_TRANSFER_STATUS_NO_DEVICE &&
+        status != USB_TRANSFER_STATUS_CANCELED) {
+        cdc->debug_stats.tx_errors++;
+    }
+    CDC_EXIT_CRITICAL();
+}
+
+static void _cdc_debug_rx_submit(usbh_cdc_t *cdc, esp_err_t result)
+{
+    CDC_ENTER_CRITICAL();
+    cdc->debug_stats.last_rx_submit_error = (int32_t)result;
+    if (result != ESP_OK) cdc->debug_stats.rx_submit_errors++;
+    CDC_EXIT_CRITICAL();
+}
+
+static void _cdc_debug_tx_submit(usbh_cdc_t *cdc, esp_err_t result)
+{
+    CDC_ENTER_CRITICAL();
+    cdc->debug_stats.last_tx_submit_error = (int32_t)result;
+    if (result != ESP_OK) cdc->debug_stats.tx_submit_errors++;
+    CDC_EXIT_CRITICAL();
+}
 
 /*--------------------------------- CDC Buffer Handle Code [RINGBUF_TYPE_BYTEBUF] --------------------------------------*/
 static size_t _get_ringbuf_len(RingbufHandle_t ringbuf_hdl)
@@ -460,6 +517,7 @@ static void in_xfer_cb(usb_transfer_t *in_xfer)
 
     switch (in_xfer->status) {
     case USB_TRANSFER_STATUS_COMPLETED: {
+        _cdc_debug_rx_complete(cdc, in_xfer->actual_num_bytes);
         if (cdc->in_ringbuf_handle) {
             size_t data_len = _get_ringbuf_len(cdc->in_ringbuf_handle);
             if (data_len + in_xfer->actual_num_bytes >= cdc->in_ringbuf_size) {
@@ -478,14 +536,21 @@ static void in_xfer_cb(usb_transfer_t *in_xfer)
             cdc->cbs.recv_data((usbh_cdc_handle_t)cdc, cdc->cbs.user_data);
         }
 
-        usb_host_transfer_submit(in_xfer);
+        esp_err_t submit_result = usb_host_transfer_submit(in_xfer);
+        _cdc_debug_rx_submit(cdc, submit_result);
+        if (submit_result != ESP_OK) {
+            ESP_LOGE(TAG, "RX xfer resubmit failed: %s",
+                     esp_err_to_name(submit_result));
+        }
         return;
     }
     case USB_TRANSFER_STATUS_NO_DEVICE:
     case USB_TRANSFER_STATUS_CANCELED:
+        _cdc_debug_rx_status(cdc, in_xfer->status);
         return;
     default:
         // Any other error
+        _cdc_debug_rx_status(cdc, in_xfer->status);
         break;
     }
 
@@ -503,6 +568,7 @@ static void out_xfer_cb(usb_transfer_t *out_xfer)
 
     switch (out_xfer->status) {
     case USB_TRANSFER_STATUS_COMPLETED: {
+        _cdc_debug_tx_complete(cdc, out_xfer->actual_num_bytes);
         if (cdc->out_ringbuf_handle) {
             _cdc_tx_xfer_submit(out_xfer);
         } else {
@@ -514,9 +580,11 @@ static void out_xfer_cb(usb_transfer_t *out_xfer)
     case USB_TRANSFER_STATUS_CANCELED:
         // User is notified about device disconnection from usb_event_cb
         // No need to do anything
+        _cdc_debug_tx_status(cdc, out_xfer->status);
         return;
     default:
         // Any other error, add the transfer to free list
+        _cdc_debug_tx_status(cdc, out_xfer->status);
         break;
     }
     ESP_LOGE(TAG, "TX Transfer failed, status %d", out_xfer->status);
@@ -536,12 +604,22 @@ static void _cdc_tx_xfer_submit(usb_transfer_t *out_xfer)
             size_t actual_num_bytes = 0;
             _ringbuf_pop(cdc->out_ringbuf_handle, out_xfer->data_buffer, data_len, &actual_num_bytes, 0);
             out_xfer->num_bytes = actual_num_bytes;
-            usb_host_transfer_submit(out_xfer);
+            esp_err_t submit_result = usb_host_transfer_submit(out_xfer);
+            _cdc_debug_tx_submit(cdc, submit_result);
+            if (submit_result != ESP_OK) {
+                ESP_LOGE(TAG, "TX xfer submit failed: %s",
+                         esp_err_to_name(submit_result));
+            }
         } else {
             xSemaphoreGive(cdc->data.out_xfer_free_sem);
         }
     } else {
-        usb_host_transfer_submit(out_xfer);
+        esp_err_t submit_result = usb_host_transfer_submit(out_xfer);
+        _cdc_debug_tx_submit(cdc, submit_result);
+        if (submit_result != ESP_OK) {
+            ESP_LOGE(TAG, "TX xfer submit failed: %s",
+                     esp_err_to_name(submit_result));
+        }
     }
 }
 
@@ -853,6 +931,9 @@ esp_err_t usbh_cdc_create(const usbh_cdc_device_config_t *config, usbh_cdc_handl
     usbh_cdc_t *cdc = (usbh_cdc_t *) calloc(1, sizeof(usbh_cdc_t));
     ESP_RETURN_ON_FALSE(cdc != NULL, ESP_ERR_NO_MEM, TAG, "calloc failed");
 
+    cdc->debug_stats.last_rx_status = -1;
+    cdc->debug_stats.last_tx_status = -1;
+
     cdc->vid = config->vid;
     cdc->pid = config->pid;
     cdc->intf_idx = config->itf_num;
@@ -1054,7 +1135,7 @@ esp_err_t usbh_cdc_read_bytes(usbh_cdc_handle_t cdc_handle, uint8_t *buf, size_t
 
         ret = _ringbuf_pop(cdc->in_ringbuf_handle, buf, data_len, length, ticks_to_wait);
         if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "cdc read failed");
+            ESP_LOGD(TAG, "cdc read empty");
             *length = 0;
             return ret;
         }
@@ -1094,12 +1175,33 @@ esp_err_t usbh_cdc_flush_tx_buffer(usbh_cdc_handle_t cdc_handle)
 esp_err_t usbh_cdc_get_rx_buffer_size(usbh_cdc_handle_t cdc_handle, size_t *size)
 {
     ESP_RETURN_ON_FALSE(cdc_handle != NULL, ESP_ERR_INVALID_ARG, TAG, "cdc_handle is NULL");
+    ESP_RETURN_ON_FALSE(size != NULL, ESP_ERR_INVALID_ARG, TAG, "size is NULL");
     usbh_cdc_t *cdc = (usbh_cdc_t *) cdc_handle;
     if (cdc->in_ringbuf_handle) {
         *size = _get_ringbuf_len(cdc->in_ringbuf_handle);
     } else {
         *size = cdc->data.in_xfer->actual_num_bytes;
     }
+    return ESP_OK;
+}
+
+esp_err_t usbh_cdc_get_debug_stats(usbh_cdc_handle_t cdc_handle,
+                                   usbh_cdc_debug_stats_t *stats)
+{
+    ESP_RETURN_ON_FALSE(cdc_handle != NULL, ESP_ERR_INVALID_ARG, TAG,
+                        "cdc_handle is NULL");
+    ESP_RETURN_ON_FALSE(stats != NULL, ESP_ERR_INVALID_ARG, TAG,
+                        "stats is NULL");
+    usbh_cdc_t *cdc = (usbh_cdc_t *)cdc_handle;
+
+    CDC_ENTER_CRITICAL();
+    *stats = cdc->debug_stats;
+    CDC_EXIT_CRITICAL();
+    stats->rx_buffered = cdc->in_ringbuf_handle ?
+                         _get_ringbuf_len(cdc->in_ringbuf_handle) :
+                         (cdc->data.in_xfer ? cdc->data.in_xfer->actual_num_bytes : 0);
+    stats->tx_buffered = cdc->out_ringbuf_handle ?
+                         _get_ringbuf_len(cdc->out_ringbuf_handle) : 0;
     return ESP_OK;
 }
 

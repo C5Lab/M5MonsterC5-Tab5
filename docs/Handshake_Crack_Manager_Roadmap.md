@@ -1,0 +1,256 @@
+# Handshake Cracker — dalsza mapa prac
+
+Stan zapisany: 2026-09-22
+
+Ten dokument utrwala uzgodnione etapy, aby plan nie zależał od historii czatu.
+Nie oznacza, że wszystkie punkty są już zaimplementowane.
+
+## Stan obecny
+
+Gotowa jest podstawa pojedynczego zadania crackowania:
+
+- przygotowanie lokalnego pliku HCCAPX,
+- lokalny worker na Tab5,
+- zdalni workerzy Grove, USB i M-BUS,
+- synchronizacja capture i wordlisty z cache po CRC,
+- trwałe markery zweryfikowanych plików po stronie JanOS,
+- podział słownika na zakresy i zbieranie wyniku,
+- ekran postępu z osobnymi stanami workerów,
+- zachowanie dotychczasowych akcji `Crack` przy pliku i `Crack latest`.
+
+USB poprawnie negocjuje obecnie 921600 dla synchronizacji, używa bloków 1024 B
+z ACK32/FIN32 i wraca do konsoli 115200. Pierwsze logi sprzętowe potwierdziły
+skrócenie czasu odpowiedzi ACK, ale Etap 0 pozostaje otwarty do zakończenia
+pełnej macierzy cold-cache, warm-cache, resume, multi-worker, fallback i cancel.
+
+Plan odbioru: `docs/superpowers/plans/2026-09-21-stage-0-transport-closure.md`.
+
+Macierz wyników: `docs/Handshake_Crack_Stage0_Acceptance.md`.
+
+Zaimplementowano rozpoznanie nieterminalnego komunikatu `CANCELLING` oraz probe
+cache na 115200 przed ewentualną negocjacją szybkiego baud. Log sprzętowy
+potwierdził warm-cache bez zmiany prędkości dla Grove, USB i M-BUS. Kolejny
+firmware dodaje jawne potwierdzenia każdego etapu Cancel i nie odtwarza dźwięku
+ostrzeżenia po świadomym anulowaniu. Plan techniczny:
+`docs/superpowers/plans/2026-09-21-cancelling-and-warm-cache-probe.md`.
+
+Koordynator Tab5 ma również hostowo przetestowany ledger shardów i automatyczne
+recovery utraconego workera. Po trzech brakujących STATUS zachowuje ostatni
+potwierdzony `safe_offset`, okresowo wykonuje `ping`, odpytuje stary job,
+reattachuje go po przejściowym zerwaniu albo po `unknown_job` przygotowuje
+workera i uruchamia nową generację. Wolny Monster może przejąć niedokończony
+suffix, a końcowy fallback lokalny konsumuje ten sam ledger. Odbiór sprzętowy
+restartu Grove/USB/M-BUS pozostaje otwarty; plan i specyfikacja znajdują się w
+`docs/superpowers/plans/2026-09-21-worker-auto-recovery.md` oraz
+`docs/superpowers/specs/2026-09-21-worker-auto-recovery-design.md`.
+
+`WPA PSK Auditor` jest dostępny jako osobny kafel w zakładce INTERNAL.
+Dashboard przechowuje niezależny checkpoint A/B dla każdej sesji i pokazuje do
+ośmiu ostatnio aktualizowanych, resumowalnych audytów wraz z capture, wordlistą,
+bezpiecznym postępem, liczbą prób, workerami i ETA. Nowy audyt nie usuwa
+poprzednich; `Resume` wybiera dokładny `session_id`, a `Start over` po
+potwierdzeniu wycofuje tylko wskazaną sesję. Stary globalny checkpoint A/B jest
+nadal odczytywany. Oba flow korzystają z tego samego launchera i silnika.
+Widok pokazuje również stan źródeł, ostatnie wpisy historii i połączony katalog
+LOCAL/GROVE/USB/M-BUS. Skan jest serializowany per transport, używa `ARTIFACT/1`
+z fallbackiem `list_dir -s`, pokazuje badge źródeł oraz akcje `Audit` i
+`Sync to Tab5`. Sync korzysta ze wspólnego resumowalnego transferu i po
+opublikowaniu lokalnego pliku uruchamia ten sam walidator PCAP/HCCAPX co cracker.
+Raport jest zapisywany w ukrytym sidecarze związanym z pełnym `size+CRC32` oraz
+wersją walidatora. Zmiana pliku lub wersji unieważnia cache. Materiał wadliwy
+pozostaje na SD i w katalogu jako `Needs investigation`, ale nie można uruchomić
+na nim audytu.
+Katalog ma również `Sync all to Tab5`: buduje ograniczoną kolejkę brakujących
+capture'ów ze wszystkich dostępnych workerów, pomija wpisy niepoprawne oraz już
+lokalne/zaindeksowane, kopiuje kolejno z zachowaniem `.part` i resume, a po
+udanym batchu automatycznie odświeża widok. Dokładne zdalne duplikaty są scalane
+po rozmiarze i CRC32. Gdy starszy/fallbackowy wpis nie ma fingerprintu, batch
+ostrożnie scala zgodną nazwę, rozmiar i format, kopiuje tylko jedną kanoniczną
+sztukę, a wszystkie lokalizacje workerów zapisuje jako aliasy w indeksie sync.
+Różne znane CRC nigdy nie są scalane, nawet przy tej samej nazwie.
+Osobna wysoka sekcja źródeł została zastąpiona kompaktowym dropdownem w nagłówku
+katalogu. Pokazuje wyłącznie dostępne LOCAL/GROVE/USB/M-BUS, filtruje wiersze i
+ogranicza batch sync do wybranego źródła; `All sources` zachowuje widok zbiorczy.
+Katalog startuje zwinięty jako `Workers (N) - tap to browse`, więc długa lista
+nie rozciąga dashboardu dopóki operator nie wybierze workera albo świadomie
+nie przełączy się na `All sources`.
+
+Wariant A managera batch jest zaimplementowany. Katalog ma checkboxy, filtry
+`All/New/Resumable/Found/Not found/Error/Invalid`, wybór widocznych pozycji i
+akcję `Add to queue`. Plik istniejący wyłącznie na Monsterze jest najpierw
+kopiowany i walidowany na Tab5. Kolejka do 32 pozycji korzysta z jednego
+wspólnego źródła kandydatów i istniejącego koordynatora crackera, więc nigdy nie
+uruchamia dwóch audytów równolegle. Stan każdej pozycji oraz metryki są zapisane
+w naprzemiennym, CRC-protected journalu A/B. Po restarcie aktywne `Running` lub
+`Syncing` wraca jako `Paused`; `Resume batch` najpierw podejmuje przerwany wpis.
+`Skip current` przechodzi do kolejnego elementu. `Cancel batch` ma osobne
+potwierdzenie, zatrzymuje aktywny koordynator, oznacza wszystkie pozostałe
+niezakończone wpisy jako Cancelled i nie uruchamia następnego. `Remove` usuwa
+tylko wpis managera. Żadna z tych akcji nie kasuje capture, sidecarów, sesji,
+historii ani cache workerów.
+
+Dodanie audytu z sekcji `Resumable audits` zachowuje dokładny `session_id` także
+po asynchronicznym Sync to Tab5. Jeżeli ten capture jest już w bieżącej kolejce
+jako `Cancelled`, nie powstaje duplikat: istniejący wiersz wraca atomowo do
+`Paused`, zachowuje metryki i staje się dostępny przez `Resume batch`. Wyniki
+końcowe (`Found`, `Not found`, `Invalid`, `Error`) nie są automatycznie
+reaktywowane.
+
+Do działającego batcha można dopisywać kolejne, już zwalidowane lokalne capture.
+Bieżący wpis i jego indeks pozostają `Running`, nowa praca trafia na koniec jako
+`Queued`, a journal A/B jest zapisany przed potwierdzeniem w UI. Operacje
+wymagające współdzielonych transportów (`Audit`, `Sync`, `Delete` oraz
+remote-only bez lokalnej kopii) pozostają zablokowane do końca bieżącego cracka.
+
+Terminalna kolejka zawierająca `Cancelled` lub `Error` nie jest już ślepą
+uliczką. Jawne `Recover batch` dopasowuje najnowsze sesje po tożsamości capture,
+metodzie i fingerprintcie wordlisty. Dopasowane wpisy wracają jako `Paused`, a
+pozostałe niedokończone wpisy jako `Queued`; `Found`, `Not found` i `Invalid`
+pozostają nienaruszone. Odzyskanie jest zawsze ręczne, więc świadome
+`Cancel batch` nie uruchamia pracy samoczynnie. Odczyt journalu loguje slot A/B,
+sequence, stan batcha oraz stan, sesję i postęp każdego wiersza. Zapisane
+`session_id` jest przed odzyskaniem ponownie ładowane z katalogu i sprawdzane
+względem capture, metody oraz wordlisty. Usunięty albo niepasujący checkpoint
+jest czyszczony, a wpis bezpiecznie wraca do `Queued` od początku.
+
+Każdy wiersz `Resumable audits` ma potwierdzaną akcję `Delete audit`. Wycofuje
+ona tylko wskazany checkpoint Tab5 i próbuje zatrzymać pasujące joby na
+dostępnych workerach; nie usuwa z Monsterów współdzielonego cache capture ani
+wordlist. `Sync all to Tab5` pozostaje dostępny po pełnej synchronizacji i przy
+każdym kolejnym użyciu najpierw odświeża źródła, a dopiero potem buduje kolejkę
+brakujących plików.
+
+## Punkt wznowienia na następną sesję
+
+Ostatnia zakończona implementacja to wielosesyjny Resume oraz pierwszy zbiorczy
+katalog w `WPA PSK Auditor`. Kod i kontrakty hostowe są gotowe, ale firmware nie
+został przez agenta kompilowany ani sprawdzony na urządzeniu. Następną sesję
+zaczynamy od:
+
+0. [Zrobione, czeka na test sprzętowy] Arbitraż konsoli podczas skanu katalogu.
+   Grove, USB i M-BUS mają osobne mutexy własności konsoli współdzielone przez
+   odświeżanie metadanych, stare listy plików, transfery i nowy katalog. Skan
+   źródeł odbywa się kolejno i publikuje do UI dopiero kompletny snapshot.
+
+1. Skompilowania i wgrania Tab5 przez operatora. JanOS pozostaje `1.7.5`; obecny
+   build zawiera już wymagane `artifact_inventory=1`.
+2. Testu sprzętowego dwóch sesji: uruchom A -> Cancel, uruchom B -> Cancel,
+   sprawdź dwa wiersze w kaflu, Resume A -> Cancel, następnie Resume B.
+3. Testu izolacji: `Start over` albo ukończenie A nie może usunąć B. Po restarcie
+   Tab5 oba nieukończone checkpointy muszą nadal istnieć.
+4. Testu starego flow `Compromised Data -> Handshakes -> Crack`: ma wybrać
+   najnowszy dokładnie pasujący capture+wordlist, również gdy checkpoint nie
+   mieści się w ośmiu wierszach dashboardu.
+5. Zebrania logów `RESUME session=...`, bezpiecznych offsetów i listy katalogów
+   `/sdcard/lab/handshakes/.crack_audit/active/` przed i po `Start over`.
+
+Po odbiorze multi-resume i katalogu kolejność dalszych prac:
+
+1. Test sprzętowy `Scan all sources`: jeden snapshot ma zawierać wpisy z
+   LOCAL/GROVE/USB/M-BUS bez odpowiedzi `/lab` lub `/vendors` przypisanych do
+   listy handshake'ów.
+2. [Zrobione, czeka na test sprzętowy] Task 6: `Sync to Tab5`, `Sync all` i skan
+   LOCAL uruchamiają lokalną walidację, zapisują wersjonowany raport oraz pełny
+   fingerprint i blokują audyt materiału oznaczonego jako niepoprawny.
+3. [Zrobione, czeka na test sprzętowy] Manager wielu handshake'ów: filtrowanie,
+   multi-select, trwała kolejka, resume po restarcie i historia stanu pozycji.
+4. [Zrobione, czeka na test sprzętowy] Sekwencyjny silnik batch nad istniejącym
+   koordynatorem, wraz z automatycznym sync wybranych zdalnych capture'ów.
+5. [Zrobione, czeka na test sprzętowy] Cytowanie `crack_state.csv`: nowy
+   host-testowany moduł czyta stare niecytowane wiersze, zapisuje poprawne pola
+   CSV, odzyskuje przerwany publish z `.bak` i zachowuje przecinki, cudzysłowy
+   oraz końce linii. Pozostaje końcowa
+   macierz regresji Grove/USB/M-BUS oraz smoke test `Cancel batch`.
+
+Pozostałe ograniczenie testowe: `hs_session_catalog_test.c` przeszedł ścisłe
+sprawdzenie składni kompilatorem RISC-V, ale natywny test runtime z ASan/UBSan
+czeka na dostępny hostowy kompilator. Nie blokuje to kompilacji wykonywanej przez
+operatora, lecz pozostaje bramką przed finalnym zamknięciem etapu.
+
+## Etap 0 — stabilizacja transportów
+
+- Potwierdzić dwa pełne transfery capture oraz dużej wordlisty przez USB.
+- Zachować osobne traktowanie USB: konsola 115200, synchronizacja 921600,
+  bloki 1024 B i potwierdzony powrót do 115200; przy błędzie bezpieczny resumowalny
+  fallback 115200.
+- Zweryfikować cache hit po ponownym uruchomieniu: worker nie może ponownie kopiować
+  poprawnie oznaczonego capture ani wordlisty.
+- Kryterium odbioru: Grove, USB i M-BUS przechodzą `probe -> receive -> SYNCED`, a
+  następne uruchomienie przechodzi przez `state=present`.
+
+## Etap 1 — przygotowanie danych i sterowania
+
+- [Zrobione, czeka na test sprzętowy] Zbiorczy `crack_state.csv` używa
+  prawidłowo cytowanych pól z podwajaniem cudzysłowów, akceptuje stare
+  niecytowane rekordy i nie stosuje już stratnego sanitizowania.
+- Dodać jawne akcje dla istniejącego zadania:
+  - `Resume`,
+  - `Force re-run` / `Start over`.
+- Opcjonalny blob HCCAPX w PSRAM pozostaje optymalizacją, nie warunkiem managera.
+
+## Etap 2 — ekran Crack Manager
+
+Dwa wejścia korzystają z tego samego modelu sesji i silnika:
+
+- istniejąca akcja `Crack` przy pliku w `Compromised Data -> Handshakes`,
+- kafel `WPA PSK Auditor` w zakładce INTERNAL.
+
+Ekran ma zawierać hybrydowy katalog plików lokalnych i plików widocznych na
+Monsterach:
+
+- checkboxy do wyboru wielu handshake'ów,
+- oznaczenie źródła pliku,
+- badge `generic` / nazwa wordlisty,
+- stan: nowe, w toku, nieznalezione, znalezione, błąd,
+- sekcję `Cracked`,
+- popup pokazujący znalezione hasło,
+- wybór źródła pliku i workerów przy konflikcie lub braku lokalnej kopii.
+
+Manager ma korzystać z istniejących wierszy workerów i obecnego modelu wyboru
+źródła, zamiast tworzyć drugi, rozbieżny mechanizm.
+
+## Etap 3 — silnik batch
+
+Status: zaimplementowany jako trwała kolejka `hs_audit_queue` oraz cienka
+warstwa uruchamiająca istniejący pojedynczy coordinator. Odbiór sprzętowy jest
+opisany w `docs/WPA_PSK_Auditor_Acceptance.md`.
+
+Wyodrębnić wielokrotnego użytku warstwę uruchamiania:
+
+- `hs_crack_run_records` dla jednego zestawu rekordów,
+- `hs_crack_batch_task` dla kolejki wybranych plików.
+
+Przepływ dla pliku dostępnego tylko na Monsterze:
+
+- `Copy & crack`,
+- `Crack local only` — gdy istnieje lokalna kopia,
+- `Cancel`.
+
+Batch ma zapewniać:
+
+- postęp całej kolejki i bieżącego pliku,
+- anulowanie między plikami i podczas aktywnego zadania,
+- użycie lokalnego workera oraz dostępnych workerów zdalnych,
+- zapis wyniku po każdym pliku,
+- brak równoległego uruchomienia dwóch zadań crackera.
+
+Blokada transportu powinna obejmować tylko operacje, które rzeczywiście korzystają
+z konsoli (kopiowanie, komendy workera, `save_pass`). Długie liczenie CPU nie może
+bez potrzeby blokować pozostałych ekranów komunikacyjnych.
+
+## Etap 4 — odbiór całości
+
+- Test pojedynczego pliku ze starego przycisku `Crack`.
+- Test `Crack latest`.
+- Test wielu zaznaczonych plików z managera.
+- Test pliku lokalnego, zdalnego i dostępnego w obu miejscach.
+- Test `Resume`, `Force re-run`, znalezienia hasła, braku hasła i anulowania.
+- Test restartu Tab5 i Monsterów z zachowaniem stanu i cache.
+- Test Grove, USB i M-BUS osobno oraz razem.
+
+## Ustalenia zachowane
+
+- Nie usuwamy szybkich dotychczasowych wejść do crackowania.
+- Manager jest warstwą nad wspólnym silnikiem, nie osobną implementacją crackera.
+- Cache identyfikujemy rozmiarem i CRC, a zaufanie daje trwały marker weryfikacji.
+- WPA2/PMKID pozostaje bieżącym zakresem. SAE/WPA3 nie wchodzi do tej fazy.

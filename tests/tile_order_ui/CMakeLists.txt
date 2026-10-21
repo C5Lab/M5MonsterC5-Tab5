@@ -1,0 +1,13 @@
+cmake_minimum_required(VERSION 3.20)
+project(tool_order_ui_test C)
+set(CMAKE_C_STANDARD 11)
+get_filename_component(ROOT "../.." ABSOLUTE)
+set(LV_BUILD_CONF_PATH "${CMAKE_CURRENT_SOURCE_DIR}/lv_conf.h" CACHE FILEPATH "" FORCE)
+set(CONFIG_LV_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(CONFIG_LV_BUILD_DEMOS OFF CACHE BOOL "" FORCE)
+add_subdirectory("${ROOT}/managed_components/lvgl__lvgl" lvgl)
+add_executable(tool_order_ui_test test.c "${ROOT}/main/tile_order.c"
+    "${ROOT}/main/tile_order_store.c" "${ROOT}/main/app_keyboard_navigation.c")
+target_include_directories(tool_order_ui_test PRIVATE . "${ROOT}/main" "${ROOT}/main/screens")
+target_compile_options(tool_order_ui_test PRIVATE -Wall -Wextra -Werror)
+target_link_libraries(tool_order_ui_test PRIVATE lvgl m)
