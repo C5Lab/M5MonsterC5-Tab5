@@ -10,6 +10,8 @@ idf_component_register(SRCS
                     "app_keyboard.c"
                     "app_keyboard_navigation.c"
                     "app_keyboard_rotation.c"
+                    "sta_mac_setup_model.c"
+                    "sta_mac_setup_response.c"
                     "tab5_keyboard.c"
                     "tab5_keyboard_protocol.c"
                     "app_power_manager.c"

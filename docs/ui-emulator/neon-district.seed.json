@@ -219,7 +219,7 @@
     "Variant entries are behavior requirements, not executable scenario overrides.",
     "SubGHz is excluded by user decision; its empty schema slot is reserved for a later stage.",
     "Demo mode proposes 10x device-job time with deadlines on the same virtual clock; realistic mode uses 1x. UI animation time stays independent.",
-    "Grove, MBus and Internal are the default available profiles. USB transport support does not require an additional visible duplicate device in the default seed."
+    "Grove, MBus and Internal are the default available profiles. The USB JanOS profile starts disconnected and can be enabled for transport demos."
   ],
   "modules": [
     {
@@ -233,6 +233,19 @@
         "wifi",
         "ble",
         "gps",
+        "sd"
+      ]
+    },
+    {
+      "id": "usb",
+      "transport": "usb",
+      "connected": false,
+      "sd_present": true,
+      "radio_mode": "wifi",
+      "producer": "janos",
+      "capabilities": [
+        "wifi",
+        "ble",
         "sd"
       ]
     },

@@ -352,6 +352,19 @@ jobs:
           set -euo pipefail
           python -c "import os, json; from pathlib import Path; version=os.getenv('FW_VERSION') or os.getenv('BUILD_TAG'); build=os.getenv('BUILD_TAG','manual'); manifest={'name':'M5MonsterC5-Tab5 ESP32-P4','version':version,'build':build,'chipFamily':'ESP32-P4','parts':[{'path':'firmware/bootloader.bin','offset':8192},{'path':'firmware/partition-table.bin','offset':32768},{'path':'firmware/M5MonsterC5-Tab5.bin','offset':65536}]}; Path('docs/manifest.json').write_text(json.dumps(manifest, indent=2))"
 
+      - name: Build browser emulator
+        run: bash tools/ui_emulator/build.sh
+
+      - name: Stage browser emulator
+        run: |
+          set -euo pipefail
+          test -s tools/ui_emulator/dist/index.html
+          test -s tools/ui_emulator/dist/emulator.wasm
+          mkdir -p docs/emulator
+          cp -R tools/ui_emulator/dist/. docs/emulator/
+          test -s docs/emulator/index.html
+          test -s docs/emulator/emulator.wasm
+
       - name: Delete stale github-pages artifact (if re-run)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

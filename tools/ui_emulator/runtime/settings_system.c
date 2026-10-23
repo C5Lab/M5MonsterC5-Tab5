@@ -15,6 +15,10 @@ EM_JS(int,app_system_reboot,(int tab,char *error,int size),{
  try{return emulatorDevice.device.systemStart(emulatorDevice.module(tab),'reboot');}
  catch(e){stringToUTF8(e.message,error,size);return 0;}
 });
+EM_JS(int,app_system_connected,(int tab),{
+ try{return emulatorDevice.device.systemStatus(emulatorDevice.module(tab)).connected?1:0;}
+ catch(e){return 0;}
+});
 EM_JS(void,app_system_metadata,(int tab,int *values,char *version,int size),{
  const s=emulatorDevice.device.systemStatus(emulatorDevice.module(tab));
  HEAP32[values>>2]=s.connected?1:0;HEAP32[(values>>2)+1]=s.sdPresent?1:0;
@@ -51,7 +55,8 @@ static void app_system_reboot_cb(lv_event_t *e){
 static void app_system_tick(void){
  app_system_sync_metadata();
  if(!app_system_page)return;
- for(int tab=0;tab<=2;tab+=2){
+ for(int tab=0;tab<=2;tab++){
+  if(!app_system_labels[tab])continue;
   char text[640];app_system_status_text(tab,app_system_jobs[tab],text,sizeof(text));
   if(app_system_errors[tab][0]){strncat(text,"\n",sizeof(text)-strlen(text)-1);strncat(text,app_system_errors[tab],sizeof(text)-strlen(text)-1);}
   lv_label_set_text(app_system_labels[tab],text);
@@ -72,14 +77,16 @@ static void app_system_show(void){
  label=lv_label_create(app_system_page);lv_label_set_text(label,"Module Status - offline simulation");
  lv_obj_set_width(label,lv_pct(100));lv_label_set_long_mode(label,LV_LABEL_LONG_WRAP);
  lv_obj_set_style_text_font(label,&lv_font_montserrat_20,0);
- for(int tab=0;tab<=2;tab+=2){
+ for(int tab=0;tab<=2;tab++){
+  if(tab==1&&!app_system_connected(tab))continue;
   lv_obj_t *card=lv_obj_create(app_system_page);lv_obj_set_size(card,lv_pct(100),LV_SIZE_CONTENT);style_surface_panel(card,12);
   lv_obj_set_flex_flow(card,LV_FLEX_FLOW_COLUMN);lv_obj_set_style_pad_all(card,14,0);
   app_system_labels[tab]=lv_label_create(card);lv_obj_set_width(app_system_labels[tab],lv_pct(100));
   lv_label_set_long_mode(app_system_labels[tab],LV_LABEL_LONG_WRAP);
   lv_obj_set_style_text_font(app_system_labels[tab],&lv_font_montserrat_16,0);
   lv_obj_t *button=lv_btn_create(card);app_system_buttons[tab]=button;lv_obj_set_size(button,220,48);
-  app_bind_adapter(button,app_system_reboot_cb,LV_EVENT_CLICKED,(void *)(intptr_t)tab,tab==0?"emu.phase46.system.reboot.grove":"emu.phase46.system.reboot.mbus");
+  app_bind_adapter(button,app_system_reboot_cb,LV_EVENT_CLICKED,(void *)(intptr_t)tab,
+                   tab==0?"emu.phase46.system.reboot.grove":tab==1?"emu.phase46.system.reboot.usb":"emu.phase46.system.reboot.mbus");
   label=lv_label_create(button);lv_label_set_text(label,"Simulate reboot");lv_obj_center(label);
  }
  app_system_tick();

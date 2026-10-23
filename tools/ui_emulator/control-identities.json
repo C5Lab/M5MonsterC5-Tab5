@@ -1,7 +1,7 @@
 {
   "version": 1,
   "reviewed_sources": {
-    "main/main.c": "52bcfe5f2b932e65501bbe6b7bc04806aa85fe965c69cb7a4d2cd31677e31c97",
+    "main/main.c": "d7eb7c463670c1229f3074211a13f09a57dbe6945bd13c5b1e461531b1676137",
     "main/observer_view.inc": "35dcb29c03ca465d411c35a4f27d4b9fd447483e67a4b9800eb04c299978a2d7",
     "main/observer_details.inc": "50dba33e051626b6fead5c812132e458d2aa324c7d838a6fc3c792de879d6f2d",
     "main/screens/cgw_parser.c": "65309137e1b643147a16286bd946e3b10ab61ae1b8a3135f9f522b10c048655d",
@@ -541,6 +541,15 @@
     "[\"main/screens/wifi_analyzer_screen.c::wa_screen_show\",\"u->chart\",\"chart_tap\",\"LV_EVENT_SHORT_CLICKED\",\"u\",[]]": "ui.wa_screen_show.u--chart.short_clicked.2976a793bba0",
     "[\"main/screens/wifi_analyzer_screen.c::wa_screen_show\",\"u->overlap_picker\",\"overlap_open_event\",\"LV_EVENT_READY\",\"u\",[]]": "ui.wa_screen_show.u--overlap_picker.ready.b06b3b4d730b",
     "[\"main/main.c::observer_add_network_tile\",\"net_row\",\"network_row_click_cb\",\"LV_EVENT_CLICKED\",\"(void*)(intptr_t)i\",[]]": "ui.update_observer_table.net_row.clicked.59a92367a4bb",
-    "[\"main/main.c::observer_add_network_tile\",\"ui->client_toggle\",\"observer_client_toggle_cb\",\"LV_EVENT_CLICKED\",\"(void *)(intptr_t)i\",[]]": "ui.update_observer_table.ui--client_toggle.clicked.ab7428079dcc"
+    "[\"main/main.c::observer_add_network_tile\",\"ui->client_toggle\",\"observer_client_toggle_cb\",\"LV_EVENT_CLICKED\",\"(void *)(intptr_t)i\",[]]": "ui.update_observer_table.ui--client_toggle.clicked.ab7428079dcc",
+    "[\"main/main.c::show_sta_mac_settings_page\",\"back\",\"sta_mac_ui_back_clicked\",\"LV_EVENT_CLICKED\",\"NULL\",[]]": "ui.show_sta_mac_settings_page.back.clicked.cc7089606129",
+    "[\"main/main.c::show_sta_mac_settings_page\",\"sta_mac_ui.target_dropdown\",\"sta_mac_ui_target_changed\",\"LV_EVENT_VALUE_CHANGED\",\"NULL\",[]]": "ui.show_sta_mac_settings_page.sta_mac_ui.target_dropdown.value_changed.5b8ed4923ca5",
+    "[\"main/main.c::show_sta_mac_settings_page\",\"sta_mac_ui.refresh_button\",\"sta_mac_ui_refresh_clicked\",\"LV_EVENT_CLICKED\",\"NULL\",[]]": "ui.show_sta_mac_settings_page.sta_mac_ui.refresh_button.clicked.e53455966ba5",
+    "[\"main/main.c::show_sta_mac_settings_page\",\"sta_mac_ui.mode_dropdown\",\"sta_mac_ui_mode_changed\",\"LV_EVENT_VALUE_CHANGED\",\"NULL\",[]]": "ui.show_sta_mac_settings_page.sta_mac_ui.mode_dropdown.value_changed.dab00ede80b0",
+    "[\"main/main.c::show_sta_mac_settings_page\",\"sta_mac_ui.fixed_input\",\"sta_mac_ui_fixed_focus\",\"LV_EVENT_FOCUSED\",\"NULL\",[]]": "ui.show_sta_mac_settings_page.sta_mac_ui.fixed_input.focused.a5f66bc4de3d",
+    "[\"main/main.c::show_sta_mac_settings_page\",\"sta_mac_ui.fixed_input\",\"sta_mac_ui_fixed_focus\",\"LV_EVENT_CLICKED\",\"NULL\",[]]": "ui.show_sta_mac_settings_page.sta_mac_ui.fixed_input.clicked.50e4a19f0c3f",
+    "[\"main/main.c::show_sta_mac_settings_page\",\"sta_mac_ui.apply_button\",\"sta_mac_ui_apply_clicked\",\"LV_EVENT_CLICKED\",\"NULL\",[]]": "ui.show_sta_mac_settings_page.sta_mac_ui.apply_button.clicked.772b4eb90308",
+    "[\"main/main.c::show_sta_mac_settings_page\",\"sta_mac_ui.keyboard\",\"sta_mac_ui_keyboard_done\",\"LV_EVENT_READY\",\"NULL\",[[\"(sta_mac_ui.keyboard)\",\"then\"]]]": "ui.show_sta_mac_settings_page.sta_mac_ui.keyboard.ready.48d66c058679",
+    "[\"main/main.c::show_sta_mac_settings_page\",\"sta_mac_ui.keyboard\",\"sta_mac_ui_keyboard_done\",\"LV_EVENT_CANCEL\",\"NULL\",[[\"(sta_mac_ui.keyboard)\",\"then\"]]]": "ui.show_sta_mac_settings_page.sta_mac_ui.keyboard.cancel.d9c2288fa9b6"
   }
 }

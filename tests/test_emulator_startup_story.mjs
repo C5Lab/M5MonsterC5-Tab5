@@ -9,12 +9,22 @@ function run(condition){
  if(condition==='version-mismatch'){send({versionWarning:true});send({groveHome:true});}
  send({groveHome:true});
  if(condition==='missing-sd'){send({sdWarning:true,wardriveWarning:true});send({groveHome:true});}
- send({mbusHome:true});send({internalHome:true});send({status:true});
+ if(condition!=='grove-only')send({mbusHome:true});
+ send({internalHome:true});send({status:true});
  send({status:true,groveCard:true},0);send({status:true,groveCard:true},500);send({status:true,groveCard:true},1000);
- send({status:true,mbusCard:true},1100);send({status:true,mbusCard:true},1600);send({status:true,mbusCard:true},2100);
+ if(condition!=='grove-only'){
+  send({status:true,mbusCard:true},1100);send({status:true,mbusCard:true},1600);send({status:true,mbusCard:true},2100);
+ }
  assert.equal(g.complete,false);send({internalHome:true},2200);assert.equal(g.complete,true);
 }
-for(const condition of ['normal','missing-board','missing-sd','version-mismatch'])test(`ordered startup tour: ${condition}`,()=>run(condition));
+for(const condition of ['normal','missing-board','missing-sd','version-mismatch','grove-only'])test(`ordered startup tour: ${condition}`,()=>run(condition));
+
+test('Grove-only tour describes one connected Monster',()=>{
+ const story=startupStory('grove-only');
+ assert.equal(story.steps.some(step=>['mbusHome','mbusCard'].includes(step.key)),false);
+ assert.match(story.completion,/GROVE and INTERNAL/);
+ assert.doesNotMatch(story.completion,/explored GROVE, MBUS/);
+});
 
 test('wrong screen, unseen warning, stale session and hidden document cannot advance',()=>{
  const g=new StartupGuide(startupStory('missing-board'));g.start();

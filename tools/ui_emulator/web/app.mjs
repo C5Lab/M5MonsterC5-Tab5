@@ -1,5 +1,6 @@
 import { canvasPoint, createPointerState, rgb565ToRgba } from './display.mjs';
 import { BrowserDevice } from './model/bridge.mjs';
+import { StaMacStore, attachStaMacPersistence } from './model/sta_mac.mjs';
 import { SettingsStore } from './persistence.mjs';
 import { mountBluetoothGuide } from './stories.mjs';
 import { wifiDemoSeed } from './wifi-stories.mjs';
@@ -18,6 +19,7 @@ let disk, session;
 try { disk = globalThis.localStorage; } catch { /* Browser denied storage. */ }
 try { session = globalThis.sessionStorage; } catch { /* Browser denied storage. */ }
 const settings = globalThis.emulatorSettings = new SettingsStore(disk, session);
+const staMacStore = new StaMacStore(disk, session);
 const startupUrl = new URL(location.href);
 const moduleCondition = document.querySelector('#module-condition');
 const wifiCondition = document.querySelector('#wifi-condition');
@@ -30,7 +32,7 @@ wifiCondition.addEventListener('change',()=>{
   location.assign(url);
 });
 const conditionValue = startupUrl.searchParams.get('moduleCondition');
-moduleCondition.value = ['missing-board','missing-sd','version-mismatch'].includes(conditionValue)?conditionValue:'normal';
+moduleCondition.value = ['missing-board','grove-only','missing-sd','version-mismatch'].includes(conditionValue)?conditionValue:'normal';
 moduleCondition.addEventListener('change',()=>{
   const url=new URL(location.href);
   if(moduleCondition.value==='normal')url.searchParams.delete('moduleCondition');
@@ -39,9 +41,10 @@ moduleCondition.addEventListener('change',()=>{
 });
 if (startupUrl.searchParams.get('reset') === '1') {
   settings.reset();
+  staMacStore.reset();
   // If both storage tiers refuse writes, keep the reset intent in the URL so
   // reload cannot resurrect a readable but stale settings record.
-  if (settings.mode !== 'memory') {
+  if (settings.mode !== 'memory' && staMacStore.mode !== 'memory') {
     startupUrl.searchParams.delete('reset');
     history.replaceState(null, '', startupUrl);
   }
@@ -67,6 +70,7 @@ rotation.addEventListener('change', () => {
 });
 document.querySelector('#reset').addEventListener('click', () => {
   settings.reset();
+  staMacStore.reset();
   const url = new URL(location.href);
   url.searchParams.set('rotation', '0');
   url.searchParams.set('reset', '1');
@@ -108,6 +112,7 @@ try {
   const scenarioResponse = await fetch(new URL('./scenario.json',import.meta.url));
   if (!scenarioResponse.ok) throw new Error('Scenario could not be loaded');
   const device = new BrowserDevice(wifiDemoSeed(await scenarioResponse.json(),wifiCondition.value));
+  attachStaMacPersistence(device.device,staMacStore);
   globalThis.emulatorDevice = device;
   const wasmBinary = await downloadWasm();
   const module = await globalThis.createEmulator({
