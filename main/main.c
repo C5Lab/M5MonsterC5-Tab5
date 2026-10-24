@@ -29,6 +29,7 @@
 #include "observer_extended.h"
 #include "observer_options.h"
 #include "observer_options_ui.h"
+#include "janos_sniffer_session.h"
 #include "driver/uart.h"
 #include "driver/gpio.h"
 #include "driver/ledc.h"
@@ -880,6 +881,13 @@ typedef struct {
     char *observer_line_buffer;     // Per-tab PSRAM line buffer
     int observer_extended_support; // 0 probing, 1 supported, -1 legacy
     bool observer_has_new_networks;
+    JsSession observer_js;
+    SemaphoreHandle_t observer_js_mutex;
+    volatile bool observer_js_busy;
+    TaskHandle_t observer_js_task;
+    bool observer_pending_start;
+    char observer_pending_bssid[18];
+    char observer_pending_station[18];
 
     // Karma2 (Probes & Karma on Observer)
     lv_obj_t *karma2_probes_popup_overlay;
@@ -2531,6 +2539,9 @@ static void init_tab_context(tab_context_t *ctx) {
             ESP_LOGE(TAG, "Failed to allocate observer line buffer in PSRAM");
         }
     }
+    if (!ctx->observer_js_mutex) {
+        ctx->observer_js_mutex = xSemaphoreCreateMutex();
+    }
 
     // Deauth detector entries
     if (!ctx->deauth_entries) {
@@ -3186,6 +3197,7 @@ static void pause_observer_for_attack(tab_context_t *ctx);
 static bool wait_for_observer_uart_idle(tab_context_t *ctx, uint32_t timeout_ms);
 static bool observer_handshaker_prepare_selection(tab_context_t *ctx, wifi_network_t *target);
 static void show_deauth_popup(int network_idx, int client_idx);
+static void observer_js_request(tab_context_t *ctx, bool start_after);
 static void destroy_deauth_popup_ui(void);
 static void close_deauth_popup(void);
 static void deauth_btn_click_cb(lv_event_t *e);
@@ -19092,7 +19104,7 @@ static void popup_timer_callback(TimerHandle_t xTimer)
 {
     tab_context_t *ctx = (tab_context_t *)pvTimerGetTimerID(xTimer);
     if (!ctx || !ctx->popup_open || !ctx->popup_focus_ready ||
-        !ctx->observer_running) return;
+        !ctx->observer_running || ctx->observer_js_busy || deauth_active) return;
 
     // Only start new poll if previous one finished
     if (ctx->observer_task == NULL) {
@@ -19857,6 +19869,7 @@ static void show_network_popup(int network_idx)
     ctx->popup_network_idx = network_idx;
     ctx->popup_focus_ready = false;
     ctx->popup_focus_cancel = false;
+    observer_js_request(ctx, false);
 
     if (opening_during_startup) {
         ESP_LOGI(TAG,
@@ -20879,42 +20892,21 @@ static void deauth_btn_click_cb(lv_event_t *e)
     if (!ctx) return;
 
     if (!deauth_active) {
-        // Start deauth
         if (deauth_network_idx >= 0 && deauth_network_idx < ctx->observer_network_count &&
             deauth_client_idx >= 0 && deauth_client_idx < MAX_CLIENTS_PER_NETWORK) {
 
             observer_network_t *net = &ctx->observer_networks[deauth_network_idx];
             const char *client_mac = net->clients[deauth_client_idx];
-            if (net->scan_index <= 0) {
+            if (!net->bssid[0] || !client_mac[0]) {
                 if (ctx->observer_status_label)
-                    lv_label_set_text(ctx->observer_status_label, "Open this AP first to resolve its scan index.");
+                    lv_label_set_text(ctx->observer_status_label, "Missing BSSID or station MAC.");
                 return;
             }
 
-            ESP_LOGI(TAG, "Starting deauth: network=%d (scan_idx=%d), client=%s",
-                     deauth_network_idx, net->scan_index, client_mac);
-
-            // Send UART commands to current tab's UART
-            uart_send_command_for_tab("stop");
-            vTaskDelay(pdMS_TO_TICKS(100));
-
-            char cmd[64];
-            snprintf(cmd, sizeof(cmd), "select_networks %d", net->scan_index);
-            uart_send_command_for_tab(cmd);
-            vTaskDelay(pdMS_TO_TICKS(100));
-
-            snprintf(cmd, sizeof(cmd), "select_stations %s", client_mac);
-            uart_send_command_for_tab(cmd);
-            vTaskDelay(pdMS_TO_TICKS(100));
-
-            uart_send_command_for_tab("start_deauth");
-
-            // Change button to STOP
-            deauth_active = true;
-            if (deauth_btn_label != NULL) {
-                lv_label_set_text(deauth_btn_label, "STOP");
-            }
-            ESP_LOGI(TAG, "Deauth started");
+            snprintf(ctx->observer_pending_bssid, sizeof(ctx->observer_pending_bssid), "%s", net->bssid);
+            snprintf(ctx->observer_pending_station, sizeof(ctx->observer_pending_station), "%s", client_mac);
+            if (deauth_btn_label) lv_label_set_text(deauth_btn_label, "Starting...");
+            observer_js_request(ctx, true);
         }
     } else {
         // Stop deauth and return to sniffer
@@ -21028,6 +21020,167 @@ static bool parse_sniffer_client_line(const char *line, char *mac_out, size_t ma
     }
 
     return false;
+}
+
+static bool tab5_js_send(void *ctx_void, const char *command)
+{
+    tab_context_t *ctx = (tab_context_t *)ctx_void;
+    if (!ctx || !command) return false;
+    tab_id_t tab = tab_id_for_ctx(ctx);
+    if (tab_is_internal(tab)) return false;
+    uart_port_t port = uart_port_for_tab(tab);
+    transport_write_bytes_tab(tab, port, command, strlen(command));
+    transport_write_bytes_tab(tab, port, "\r\n", 2);
+    ESP_LOGI(TAG, "[%s] JS TX: %s", tab_transport_name(tab), command);
+    return true;
+}
+
+static uint32_t tab5_now_ms(void)
+{
+    return (uint32_t)(esp_timer_get_time() / 1000);
+}
+
+static void observer_js_started_ui(void *arg)
+{
+    (void)arg;
+    deauth_active = true;
+    if (deauth_btn_label) lv_label_set_text(deauth_btn_label, "STOP");
+}
+
+static void observer_js_failed_ui(void *arg)
+{
+    tab_context_t *ctx = (tab_context_t *)arg;
+    if (deauth_btn_label) lv_label_set_text(deauth_btn_label, "Retry");
+    if (ctx && ctx->observer_status_label && ctx->observer_js.error[0]) {
+        lv_label_set_text(ctx->observer_status_label, ctx->observer_js.error);
+    }
+}
+
+static bool observer_js_find_client(tab_context_t *ctx, const char *bssid, const char *station, unsigned *index)
+{
+    uint8_t ap[6], sta[6];
+    if (!ctx || !index || !sc_parse_mac(bssid, ap) || !sc_parse_mac(station, sta)) return false;
+    if (ctx->observer_js.phase != JS_READY || !ctx->observer_js.model.complete) return false;
+    for (unsigned i = 0; i < ctx->observer_js.model.client_count; ++i) {
+        const sc_client_t *client = &ctx->observer_js.model.clients[i];
+        const sc_ap_t *net = &ctx->observer_js.model.aps[client->ap];
+        if (!memcmp(net->bssid, ap, 6) && !memcmp(client->mac, sta, 6)) {
+            *index = i;
+            return true;
+        }
+    }
+    return false;
+}
+
+static void observer_js_feed_until(tab_context_t *ctx, JsPhase done_a, JsPhase done_b)
+{
+    tab_id_t tab = tab_id_for_ctx(ctx);
+    uart_port_t port = uart_port_for_tab(tab);
+    char *rx_buffer = ctx->observer_rx_buffer;
+    char *line_buffer = ctx->observer_line_buffer;
+    if (!rx_buffer || !line_buffer) return;
+
+    int line_pos = 0;
+    bool line_overflow = false;
+    TickType_t start_time = xTaskGetTickCount();
+    TickType_t timeout_ticks = pdMS_TO_TICKS(300000);
+
+    while ((xTaskGetTickCount() - start_time) < timeout_ticks) {
+        JsPhase phase = ctx->observer_js.phase;
+        if (phase == done_a || phase == done_b || phase == JS_ERROR || phase == JS_RELOAD_REQUIRED) break;
+        int len = transport_read_bytes_tab(tab, port, rx_buffer, UART_BUF_SIZE - 1, pdMS_TO_TICKS(100));
+        if (len > 0) {
+            for (int i = 0; i < len; i++) {
+                char c = rx_buffer[i];
+                if (c == '\n' || c == '\r') {
+                    if (line_overflow) {
+                        line_overflow = false;
+                        line_pos = 0;
+                        continue;
+                    }
+                    if (line_pos > 0) {
+                        line_buffer[line_pos] = '\0';
+                        js_line(&ctx->observer_js, line_buffer, tab5_now_ms());
+                        line_pos = 0;
+                    }
+                } else if (line_pos < 1023) {
+                    line_buffer[line_pos++] = c;
+                } else {
+                    line_overflow = true;
+                }
+            }
+        }
+        js_tick(&ctx->observer_js, tab5_now_ms());
+        if (!ctx->observer_running && ctx->observer_js.phase == JS_LOADING) break;
+    }
+}
+
+static void observer_clients_task(void *arg)
+{
+    tab_context_t *ctx = (tab_context_t *)arg;
+    if (!ctx) {
+        vTaskDelete(NULL);
+        return;
+    }
+    ctx->observer_js_busy = true;
+    while (ctx->observer_task != NULL || ctx->observer_inspect_task != NULL ||
+           ctx->observer_start_active) {
+        vTaskDelay(pdMS_TO_TICKS(40));
+    }
+
+    if (!ctx->observer_js.send) js_init(&ctx->observer_js, tab5_js_send, ctx);
+
+    bool need_load = (ctx->observer_js.phase != JS_READY) || ctx->observer_pending_start;
+    unsigned index = 0;
+    bool found = false;
+    if (ctx->observer_js.phase == JS_READY) {
+        found = observer_js_find_client(ctx, ctx->observer_pending_bssid, ctx->observer_pending_station, &index);
+        if (found) need_load = false;
+    }
+
+    tab_id_t tab = tab_id_for_ctx(ctx);
+    uart_port_t port = uart_port_for_tab(tab);
+    observer_flush_transport_input(tab, port);
+
+    if (need_load) {
+        if (!js_load(&ctx->observer_js, tab5_now_ms())) {
+            lv_async_call(observer_js_failed_ui, ctx);
+            ctx->observer_pending_start = false;
+            ctx->observer_js_busy = false;
+            ctx->observer_js_task = NULL;
+            vTaskDelete(NULL);
+            return;
+        }
+        observer_js_feed_until(ctx, JS_READY, JS_ERROR);
+    }
+
+    if (ctx->observer_pending_start) {
+        ctx->observer_pending_start = false;
+        if (!observer_js_find_client(ctx, ctx->observer_pending_bssid, ctx->observer_pending_station, &index) ||
+            !js_start(&ctx->observer_js, index, tab5_now_ms())) {
+            lv_async_call(observer_js_failed_ui, ctx);
+        } else {
+            observer_js_feed_until(ctx, JS_ACTIVE, JS_READY);
+            if (ctx->observer_js.phase == JS_ACTIVE) lv_async_call(observer_js_started_ui, ctx);
+            else lv_async_call(observer_js_failed_ui, ctx);
+        }
+    }
+
+    ctx->observer_js_busy = false;
+    ctx->observer_js_task = NULL;
+    vTaskDelete(NULL);
+}
+
+static void observer_js_request(tab_context_t *ctx, bool start_after)
+{
+    if (!ctx) return;
+    ctx->observer_pending_start = start_after || ctx->observer_pending_start;
+    if (ctx->observer_js_task) return;
+    ctx->observer_js_busy = true;
+    if (xTaskCreate(observer_clients_task, "obs_js", 8192, ctx, 5, &ctx->observer_js_task) != pdPASS) {
+        ctx->observer_js_busy = false;
+        ctx->observer_js_task = NULL;
+    }
 }
 
 // Observer poll task - runs show_sniffer_results and parses output
@@ -21195,7 +21348,7 @@ static void observer_timer_callback(TimerHandle_t xTimer)
 {
     // Get ctx from timer ID
     tab_context_t *ctx = (tab_context_t *)pvTimerGetTimerID(xTimer);
-    if (!ctx || !ctx->observer_running) return;
+    if (!ctx || !ctx->observer_running || ctx->observer_js_busy || deauth_active) return;
 
     // Only start new poll if previous one finished
     if (ctx->observer_task == NULL) {
@@ -21404,6 +21557,8 @@ static void observer_start_task(void *arg)
         return;
     }
     observer_flush_transport_input(task_tab, uart_port);
+    observer_send_command_to_transport(task_tab, uart_port, "unselect_networks", "Observer");
+    vTaskDelay(pdMS_TO_TICKS(50));
     char sniffer_cmd[] = "start_sniffer_noscan\r\n";
     transport_write_bytes_tab(task_tab, uart_port, sniffer_cmd, strlen(sniffer_cmd));
     ESP_LOGI(TAG, "[%s] Sent: start_sniffer_noscan", uart_name);
@@ -21435,8 +21590,9 @@ static void observer_start_task(void *arg)
         if (ctx->observer_timer != NULL) {
             xTimerStart(ctx->observer_timer, 0);
 
-            // Do first poll immediately, pass ctx
+            // Dashboard poll plus a one-shot JSON client snapshot for D.
             xTaskCreate(observer_poll_task, "obs_poll", 8192, (void*)ctx, 5, &ctx->observer_task);
+            observer_js_request(ctx, false);
         }
     }
 
@@ -21480,7 +21636,8 @@ static bool observer_session_busy(tab_context_t *ctx)
 {
     return ctx && (ctx->observer_running || ctx->observer_start_active ||
                    ctx->observer_inspect_active || ctx->observer_inspect_task != NULL ||
-                   ctx->popup_close_task != NULL);
+                   ctx->popup_close_task != NULL || ctx->observer_js_busy ||
+                   ctx->observer_js_task != NULL);
 }
 
 static void observer_teardown_task(void *arg)
@@ -21499,12 +21656,12 @@ static void observer_teardown_task(void *arg)
     int waited = 0;
     while (waited < 10000 &&
            (ctx->observer_start_active || ctx->observer_inspect_task != NULL ||
-            ctx->popup_close_task != NULL)) {
+            ctx->popup_close_task != NULL || ctx->observer_js_task != NULL)) {
         vTaskDelay(pdMS_TO_TICKS(20));
         waited += 20;
     }
     if (ctx->observer_start_active || ctx->observer_inspect_task != NULL ||
-            ctx->popup_close_task != NULL) {
+            ctx->popup_close_task != NULL || ctx->observer_js_task != NULL) {
         ESP_LOGW(TAG, "[%s] Observer teardown: workers still alive after %d ms, "
                       "sending stop anyway", uart_name, waited);
     } else {
@@ -21515,6 +21672,9 @@ static void observer_teardown_task(void *arg)
         xTimerStop(ctx->observer_timer, 0);
     }
 
+    js_free(&ctx->observer_js);
+    ctx->observer_js.send = tab5_js_send;
+    ctx->observer_js.send_context = ctx;
     observer_flush_transport_input(tab, port);
     const char *stop_cmd = "stop\r\n";
     transport_write_bytes_tab(tab, port, stop_cmd, strlen(stop_cmd));
