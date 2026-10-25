@@ -52,8 +52,9 @@ static void attack_tile_event_cb(lv_event_t *e){handle_selected_attack(lv_event_
 static void observer_station_attack_tile_event_cb(lv_event_t *e){
  tab_context_t *ctx=get_current_ctx();if(!ctx)return;
  if(ctx->deauth_network_idx<0||ctx->deauth_network_idx>=ctx->observer_network_count)return;
- app_da_cancel(ctx);prepare_observer_attack_override(ctx,ctx->deauth_network_idx);
  const char *action=lv_event_get_user_data(e);
+ int network_idx=ctx->deauth_network_idx;
+ app_da_cancel(ctx);destroy_deauth_popup_ui();prepare_observer_attack_override(ctx,network_idx);
  ctx->observer_attack_return_to_observer=action&&(!strcmp(action,"ARP Poison")||!strcmp(action,"Rogue AP")||!strcmp(action,"Nmap"));
  handle_selected_attack(action);
 }

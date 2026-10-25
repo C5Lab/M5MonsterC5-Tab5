@@ -9,7 +9,16 @@ on:
   push:
     branches: [main, master]
     paths:
-      - "main/main.c"
+      - "main/**"
+      - "components/**"
+      - "managed_components/**"
+      - "dependencies/**"
+      - "CMakeLists.txt"
+      - "post_build.cmake"
+      - "dependencies.lock"
+      - "lv_conf.h"
+      - "partitions.csv"
+      - "sdkconfig*"
       - ".github/scripts/**"
       - ".github/workflows/esp32p4-build-master.yml"
   release:
@@ -42,7 +51,10 @@ jobs:
             base="$(git rev-parse HEAD~1 2>/dev/null || git rev-parse HEAD)"
           fi
 
-          if git diff --name-only "$base" "$head" | grep -qE '^\.github/workflows/'; then
+          changed="$(git diff --name-only "$base" "$head")"
+          if grep -qE '^(main/|components/|managed_components/|dependencies/|\.github/scripts/|CMakeLists\.txt$|post_build\.cmake$|dependencies\.lock$|lv_conf\.h$|partitions\.csv$|sdkconfig[^/]*$)' <<< "$changed"; then
+            echo "workflow_changed=false" >> "$GITHUB_OUTPUT"
+          elif grep -qE '^\.github/workflows/' <<< "$changed"; then
             echo "workflow_changed=true" >> "$GITHUB_OUTPUT"
           else
             echo "workflow_changed=false" >> "$GITHUB_OUTPUT"
@@ -308,9 +320,9 @@ jobs:
           echo "Using tag: $TAG"
 
       - name: Download release assets
-        id: download
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FW_VERSION: ${{ needs.firmware.outputs.fw_version }}
         run: |
           set -euo pipefail
           TAG="${{ steps.meta.outputs.tag }}"
@@ -324,12 +336,12 @@ jobs:
 
           ls -lh docs/firmware
 
-          if [ ! -f docs/firmware/M5MonsterC5-Tab5.bin ]; then
-            alt=$(ls docs/firmware/M5MonsterC5-Tab5-*.bin 2>/dev/null | head -n1 || true)
-            if [ -n "$alt" ]; then
-              cp "$alt" docs/firmware/M5MonsterC5-Tab5.bin
-            fi
+          app_bin="docs/firmware/M5MonsterC5-Tab5-${FW_VERSION}.bin"
+          if [ ! -f "$app_bin" ]; then
+            echo "Missing app-only firmware $app_bin in release assets for tag ${TAG}" >&2
+            exit 1
           fi
+          cp "$app_bin" docs/firmware/M5MonsterC5-Tab5.bin
 
           for f in bootloader.bin partition-table.bin M5MonsterC5-Tab5.bin; do
             if [ ! -f "docs/firmware/$f" ]; then
@@ -338,15 +350,9 @@ jobs:
             fi
           done
 
-          fw_version=$(ls docs/firmware/M5MonsterC5-Tab5-*.bin 2>/dev/null | head -n1 | xargs -n1 basename | sed -E 's/^M5MonsterC5-Tab5-([^.]*)\\.bin$/\\1/')
-          if [ -z "$fw_version" ]; then
-            fw_version="${TAG}"
-          fi
-          echo "fw_version=$fw_version" >> "$GITHUB_OUTPUT"
-
       - name: Build manifest.json
         env:
-          FW_VERSION: ${{ steps.download.outputs.fw_version }}
+          FW_VERSION: ${{ needs.firmware.outputs.fw_version }}
           BUILD_TAG: ${{ steps.meta.outputs.tag }}
         run: |
           set -euo pipefail

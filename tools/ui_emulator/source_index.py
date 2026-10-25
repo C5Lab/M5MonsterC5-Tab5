@@ -6,6 +6,10 @@ import tree_sitter_c
 
 ROOT = Path(__file__).resolve().parents[2]
 
+def source_bytes(path):
+    # Git stores LF, but autocrlf can produce CRLF in a Windows worktree.
+    return Path(path).read_bytes().replace(b'\r\n', b'\n')
+
 def walk(node):
     yield node
     for child in node.named_children:
@@ -14,7 +18,7 @@ def walk(node):
 class Source:
     def __init__(self, path, *, mask_embedded_js=False):
         self.path = Path(path)
-        self.data = self.path.read_bytes()
+        self.data = source_bytes(self.path)
         parsed=self.data
         if mask_embedded_js:
             # Runtime EM_JS declarations end at a line-ending });. Preserve

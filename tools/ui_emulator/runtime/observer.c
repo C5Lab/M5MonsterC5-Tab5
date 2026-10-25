@@ -37,6 +37,89 @@ EM_JS(int,app_observer_client_mac,(int tab,int index,int client,char *out,int si
  stringToUTF8(c?.mac||'',out,size);return c?1:0;
 });
 
+/* The firmware's JSON client snapshot is fed through its production parser.
+ * The browser transport accepts only these local simulation commands. */
+static bool app_observer_js_send(void *opaque,const char *command) {
+ (void)opaque;
+ return command && (!strcmp(command,"show_sniffer_clients") || !strcmp(command,"stop") ||
+                    !strncmp(command,"start_deauth_station ",21));
+}
+static bool app_observer_js_snapshot(tab_context_t *ctx) {
+ if(!ctx->observer_js.send)js_init(&ctx->observer_js,app_observer_js_send,ctx);
+ if(!js_load(&ctx->observer_js,(uint32_t)app_device_ms))return false;
+ unsigned aps=0,clients=0;
+ for(int i=0;i<ctx->observer_network_count;i++)if(ctx->observer_networks[i].bssid[0]) {
+  aps++;clients+=ctx->observer_networks[i].client_count;
+ }
+ char line[256];
+ snprintf(line,sizeof(line),"{\"schema_version\":1,\"record_type\":\"sniffer_clients_begin\",\"aps\":%u,\"clients\":%u}",aps,clients);
+ js_line(&ctx->observer_js,line,(uint32_t)app_device_ms);
+ for(int i=0;i<ctx->observer_network_count && ctx->observer_js.phase==JS_LOADING;i++) {
+  observer_network_t *net=&ctx->observer_networks[i];if(!net->bssid[0])continue;
+  char hex[65];size_t size=strlen(net->ssid);if(size>32)size=32;
+  for(size_t n=0;n<size;n++)snprintf(hex+2*n,sizeof(hex)-2*n,"%02X",(unsigned char)net->ssid[n]);
+  hex[2*size]=0;
+  snprintf(line,sizeof(line),"{\"schema_version\":1,\"record_type\":\"sniffer_ap\",\"bssid\":\"%s\",\"channel\":%d,\"ssid_hex\":\"%s\"}",net->bssid,net->channel,hex);
+  js_line(&ctx->observer_js,line,(uint32_t)app_device_ms);
+  for(int j=0;j<net->client_count && ctx->observer_js.phase==JS_LOADING;j++) {
+   snprintf(line,sizeof(line),"{\"schema_version\":1,\"record_type\":\"sniffer_client\",\"bssid\":\"%s\",\"station\":\"%s\"}",net->bssid,net->clients[j]);
+   js_line(&ctx->observer_js,line,(uint32_t)app_device_ms);
+  }
+ }
+ if(ctx->observer_js.phase==JS_LOADING) {
+  snprintf(line,sizeof(line),"{\"schema_version\":1,\"record_type\":\"sniffer_clients_end\",\"aps\":%u,\"clients\":%u}",aps,clients);
+  js_line(&ctx->observer_js,line,(uint32_t)app_device_ms);
+ }
+ return ctx->observer_js.phase==JS_READY;
+}
+static bool app_observer_js_find(tab_context_t *ctx,unsigned *index) {
+ uint8_t ap[6],station[6];
+ if(!sc_parse_mac(ctx->observer_pending_bssid,ap) || !sc_parse_mac(ctx->observer_pending_station,station))return false;
+ for(unsigned i=0;i<ctx->observer_js.model.client_count;i++) {
+  sc_client_t *client=&ctx->observer_js.model.clients[i];
+  if(!memcmp(ctx->observer_js.model.aps[client->ap].bssid,ap,6) && !memcmp(client->mac,station,6)) {
+   *index=i;return true;
+  }
+ }
+ return false;
+}
+static bool app_da_begin(tab_context_t *ctx,const char *kind,const char *mac,const char *single);
+static void app_da_stop(tab_context_t *ctx);
+static void destroy_deauth_popup_ui(void);
+static void app_observer_js_cancel(tab_context_t *ctx) {
+ if(ctx && (ctx->observer_js.phase==JS_STARTING || ctx->observer_js.phase==JS_ACTIVE))
+  js_cancel(&ctx->observer_js);
+}
+static void observer_js_request(tab_context_t *ctx,bool start_after) {
+ if(!ctx)return;
+ unsigned index=0;
+ if(ctx->observer_js.phase!=JS_READY || (start_after && !app_observer_js_find(ctx,&index))) {
+  if(!app_observer_js_snapshot(ctx)) {
+   if(ctx->observer_status_label)lv_label_set_text(ctx->observer_status_label,ctx->observer_js.error);
+   return;
+  }
+ }
+ if(!start_after)return;
+ if(!app_observer_js_find(ctx,&index) || !js_start(&ctx->observer_js,index,(uint32_t)app_device_ms)) {
+  if(ctx->deauth_btn_label)lv_label_set_text(ctx->deauth_btn_label,"Retry");
+  if(ctx->observer_status_label)lv_label_set_text(ctx->observer_status_label,"Client unavailable; refresh Observer.");
+  return;
+ }
+ if(!app_da_begin(ctx,"deauth",ctx->observer_pending_station,ctx->observer_pending_bssid)) {
+  if(ctx->observer_js.phase!=JS_READY)js_set_error(&ctx->observer_js,JS_READY,"Simulation attack unavailable");
+  if(ctx->observer_status_label)lv_label_set_text(ctx->observer_status_label,ctx->observer_js.error);
+  if(ctx->deauth_btn_label)lv_label_set_text(ctx->deauth_btn_label,"Retry");
+  return;
+ }
+ char line[180];
+ snprintf(line,sizeof(line),"{\"schema_version\":1,\"record_type\":\"station_deauth\",\"status\":\"started\",\"bssid\":\"%s\",\"station\":\"%s\"}",ctx->observer_pending_bssid,ctx->observer_pending_station);
+ js_line(&ctx->observer_js,line,(uint32_t)app_device_ms);
+ if(ctx->observer_js.phase==JS_ACTIVE) {
+  ctx->deauth_active=true;
+  if(ctx->deauth_btn_label)lv_label_set_text(ctx->deauth_btn_label,"STOP");
+ }
+}
+
 static void cancel_observer_inspect_task(tab_context_t *ctx) {
     if (ctx) { ctx->observer_inspect_task=NULL; ctx->observer_inspect_active=false; }
 }
@@ -46,6 +129,10 @@ static void close_network_popup(void) {
 }
 static void observer_stop_btn_cb(lv_event_t *e) {
     (void)e; tab_context_t *ctx=get_current_ctx(); if (!ctx) return;
+    if(ctx->observer_js.phase==JS_STARTING || ctx->observer_js.phase==JS_ACTIVE)app_da_stop(ctx);
+    if(ctx->deauth_popup)destroy_deauth_popup_ui();
+    js_free(&ctx->observer_js);
+    js_init(&ctx->observer_js,app_observer_js_send,ctx);
     ctx->observer_running=false; ctx->observer_start_active=false;
     for(int i=0;i<ctx->observer_network_count;i++) {
         ctx->observer_networks[i].snapshot_clock_ms=observer_clock_ms();

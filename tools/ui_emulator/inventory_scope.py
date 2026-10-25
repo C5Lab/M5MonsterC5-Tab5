@@ -5,7 +5,7 @@ import json
 import re
 from collections import Counter
 from pathlib import Path
-from source_index import ROOT, Source, walk
+from source_index import ROOT, Source, walk, source_bytes
 import audit_coverage as audit
 
 OUT=ROOT/'docs/ui-emulator'
@@ -14,7 +14,7 @@ manifest=json.loads((ROOT/'tools/ui_emulator/generated/manifest.json').read_text
 retained=set(manifest['retained']);boundaries=manifest['boundaries']
 result=audit.compute()
 contracts={c['source_registration']:c for c in json.loads((ROOT/'tools/ui_emulator/control-contracts.json').read_text())['controls']}
-drift=[p for p,h in coverage['sources'].items() if hashlib.sha256((ROOT/p).read_bytes()).hexdigest()!=h]
+drift=[p for p,h in coverage['sources'].items() if hashlib.sha256(source_bytes(ROOT/p)).hexdigest()!=h]
 assert not drift, f'Refresh structural inventory before scope generation: {drift}'
 
 def status(name):return 'retained' if name in retained else boundaries.get(name,'not-wired')

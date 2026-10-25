@@ -67,7 +67,7 @@ def generate():
             if names[i] & used: selected.add(i); used |= words(src.text(n))
         if old==(len(full),len(boundary),len(selected),len(used)): break
     out=BASE/'generated'; out.mkdir(exist_ok=True)
-    parts=['#include "host.h"', '#include <stdatomic.h>', '#include "scan_filter.h"',
+    parts=['#include "host.h"', '#include <stdatomic.h>', '#include "janos_sniffer_session.h"', '#include "scan_filter.h"',
            '#include "transfer_speed_config.h"', '#include "ota_rf.h"', '#include "tile_order.h"',
            '#include "sta_mac_setup_model.h"', '#include "sta_mac_setup_response.h"',
            '#include "observer_extended.h"',
