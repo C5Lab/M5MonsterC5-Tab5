@@ -5,6 +5,8 @@ import hashlib
 import json
 import sys
 import jsonschema
+sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'tools/ui_emulator'))
+from source_index import source_bytes
 ROOT=Path(__file__).resolve().parents[1]
 def read(path):return json.loads((ROOT/path).read_text(encoding='utf-8'))
 schema=read('tools/ui_emulator/scenario.schema.json')
@@ -41,7 +43,7 @@ except jsonschema.ValidationError:pass
 else:raise AssertionError('invalid rotation accepted')
 x=read('tools/ui_emulator/coverage.json')
 assert not x['syntax_diagnostics']
-for path,digest in x['sources'].items():assert hashlib.sha256((ROOT/path).read_bytes()).hexdigest()==digest,path
+for path,digest in x['sources'].items():assert hashlib.sha256(source_bytes(ROOT/path)).hexdigest()==digest,path
 ids=[c['id'] for c in x['controls']];assert len(ids)==len(set(ids))
 for c in x['controls']:
     assert c['callback_candidates'],c['id']

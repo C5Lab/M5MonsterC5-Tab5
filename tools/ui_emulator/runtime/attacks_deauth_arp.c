@@ -14,10 +14,11 @@ EM_JS(int,app_da_poll_js,(int id,char *out,int size),{
 static int app_arp_story_jobs[4][4];
 static struct {int id,prep,action;lv_obj_t *owner,*status,*page,*attack_page;} app_da[4];
 static void app_da_cancel(tab_context_t *ctx){
+ app_observer_js_cancel(ctx);
  int t=tab_id_for_ctx(ctx);if(app_da[t].id)app_model_cancel(app_da[t].id);if(app_da[t].prep)app_model_cancel(app_da[t].prep);
  app_da[t].id=app_da[t].prep=0;ctx->deauth_active=false;
 }
-static void app_da_stop(tab_context_t *ctx){int t=tab_id_for_ctx(ctx);if(app_da[t].id)app_da_stop_js(app_da[t].id);app_da[t].id=0;ctx->deauth_active=false;}
+static void app_da_stop(tab_context_t *ctx){app_observer_js_cancel(ctx);int t=tab_id_for_ctx(ctx);if(app_da[t].id)app_da_stop_js(app_da[t].id);app_da[t].id=0;ctx->deauth_active=false;}
 static void app_da_deleted(lv_event_t *e){
  lv_obj_t *o=lv_event_get_target(e);tab_context_t *ctx=lv_event_get_user_data(e);int t=tab_id_for_ctx(ctx);
  if(o==app_da[t].owner){app_da_cancel(ctx);app_da[t].owner=app_da[t].status=app_da[t].attack_page=NULL;}
@@ -29,12 +30,22 @@ static void app_da_deleted(lv_event_t *e){
 }
 static bool app_da_begin(tab_context_t *ctx,const char *kind,const char *mac,const char *single){
  char bssids[2048]={0},error[192]={0};int t=tab_id_for_ctx(ctx);
- if(app_da[t].id||app_da[t].prep)return false;
+ if(app_da[t].id||app_da[t].prep){
+  if(ctx->deauth_popup)js_set_error(&ctx->observer_js,JS_READY,"Another simulation is active");
+  return false;
+ }
  if(single&&single[0])snprintf(bssids,sizeof(bssids),"%s",single);
  else {scan_view_t v=get_scan_view(ctx);for(int i=0;i<v.sel_count;i++){int n=v.sel_indices[i];if(n>=0&&n<v.net_count){if(bssids[0])strncat(bssids,",",sizeof(bssids)-strlen(bssids)-1);strncat(bssids,v.nets[n].bssid,sizeof(bssids)-strlen(bssids)-1);}}}
  app_da[t].id=app_da_start_js(t,kind,bssids,mac?mac:"",error,sizeof(error));
  if(!strcmp(kind,"arp"))app_arp_story_jobs[t][3]=app_da[t].id;
- if(!app_da[t].id){lv_obj_t *label=!strcmp(kind,"arp")?ctx->arp_status_label:ctx->popup_open?ctx->observer_status_label:ctx->scan_status_label;if(label)lv_label_set_text(label,error);return false;}return true;
+ if(!app_da[t].id){
+  const char *reason=error[0]?error:"Simulation attack unavailable";
+  if(ctx->deauth_popup)js_set_error(&ctx->observer_js,JS_READY,reason);
+  lv_obj_t *label=!strcmp(kind,"arp")?ctx->arp_status_label:(ctx->deauth_popup||ctx->popup_open)?ctx->observer_status_label:ctx->scan_status_label;
+  if(label)lv_label_set_text(label,reason);
+  return false;
+ }
+ return true;
 }
 static void app_da_watch(tab_context_t *ctx,lv_obj_t *owner,lv_obj_t *status){int t=tab_id_for_ctx(ctx);app_da[t].owner=owner;app_da[t].status=status;app_da[t].attack_page=ctx->current_visible_page;lv_obj_add_event_cb(owner,app_da_deleted,LV_EVENT_DELETE,ctx);}
 static void show_scan_deauth_popup(void)
@@ -158,6 +169,19 @@ static void scan_deauth_popup_close_cb(lv_event_t *e)
     }
 }
 
+/* A nested client row must not also activate its parent network row. */
+static void client_row_click_cb(lv_event_t *e)
+{
+    lv_event_stop_bubbling(e);
+    intptr_t packed = (intptr_t)lv_event_get_user_data(e);
+    int network_idx = (int)(packed >> 16);
+    int client_idx = (int)(packed & 0xFFFF);
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx || network_idx < 0 || network_idx >= ctx->observer_network_count ||
+        client_idx < 0 || client_idx >= MAX_CLIENTS_PER_NETWORK) return;
+    ctx->observer_station_return_to_network = false;
+    show_deauth_popup(network_idx, client_idx);
+}
 static void show_deauth_popup(int network_idx, int client_idx)
 {
     tab_context_t *ctx = get_current_ctx();
@@ -313,7 +337,7 @@ static void destroy_deauth_popup_ui(void)
 
 static void stop_and_close_deauth_popup(bool resume_observer){tab_context_t *ctx=get_current_ctx();if(!ctx)return;app_da_stop(ctx);destroy_deauth_popup_ui();(void)resume_observer;}
 static void close_deauth_popup(void){stop_and_close_deauth_popup(true);}
-static void deauth_btn_click_cb(lv_event_t *e){tab_context_t *ctx=get_current_ctx();if(!ctx)return;if((intptr_t)lv_event_get_user_data(e)==1||ctx->deauth_active){close_deauth_popup();return;}int n=ctx->deauth_network_idx,c=ctx->deauth_client_idx;if(n<0||n>=ctx->observer_network_count||c<0||c>=MAX_CLIENTS_PER_NETWORK)return;observer_network_t *net=&ctx->observer_networks[n];if(app_da_begin(ctx,"deauth",net->clients[c],net->bssid)){ctx->deauth_active=true;lv_label_set_text(ctx->deauth_btn_label,"STOP");}}
+static void deauth_btn_click_cb(lv_event_t *e){tab_context_t *ctx=get_current_ctx();if(!ctx)return;if((intptr_t)lv_event_get_user_data(e)==1||ctx->deauth_active){close_deauth_popup();return;}int n=ctx->deauth_network_idx,c=ctx->deauth_client_idx;if(n<0||n>=ctx->observer_network_count||c<0||c>=MAX_CLIENTS_PER_NETWORK)return;observer_network_t *net=&ctx->observer_networks[n];snprintf(ctx->observer_pending_bssid,sizeof(ctx->observer_pending_bssid),"%s",net->bssid);snprintf(ctx->observer_pending_station,sizeof(ctx->observer_pending_station),"%s",net->clients[c]);observer_js_request(ctx,true);}
 
 
 static void arp_keyboard_cb(lv_event_t *e)
@@ -968,7 +992,7 @@ static void app_attacks_deauth_arp_tick(void){
   }
   if(app_da[t].id){int state=app_da_poll_js(app_da[t].id,reply,sizeof(reply));
    if(app_da[t].status&&lv_obj_is_valid(app_da[t].status)&&app_da[t].status!=ctx->deauth_btn_label)lv_label_set_text(app_da[t].status,reply);
-   if(state){app_da[t].id=0;ctx->deauth_active=false;if(ctx->deauth_btn_label)lv_label_set_text(ctx->deauth_btn_label,state<0?reply:"Deauth Station");}
+   if(state){app_observer_js_cancel(ctx);app_da[t].id=0;ctx->deauth_active=false;if(ctx->deauth_btn_label)lv_label_set_text(ctx->deauth_btn_label,state<0?reply:"Deauth Station");}
   }
   if(app_da[t].prep){int state=app_arp_reply_js(app_da[t].prep,reply,sizeof(reply));if(!state)continue;int action=app_da[t].action;app_da[t].prep=0;
    if(!app_da[t].page||!lv_obj_is_valid(app_da[t].page))continue;

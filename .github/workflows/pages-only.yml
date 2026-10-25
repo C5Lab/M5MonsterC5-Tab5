@@ -12,11 +12,15 @@ on:
       - "docs/**"
       - "main/**"
       - "tools/ui_emulator/**"
-      - "components/pcap_*/**"
-      - "components/*/include/**"
-      - "managed_components/lvgl__lvgl/**"
+      - "components/**"
+      - "managed_components/**"
+      - "dependencies/**"
+      - "CMakeLists.txt"
+      - "post_build.cmake"
+      - "dependencies.lock"
       - "lv_conf.h"
-      - "sdkconfig"
+      - "partitions.csv"
+      - "sdkconfig*"
       - ".github/workflows/pages-only.yml"
       - ".github/workflows/esp32p4-build-master.yml"
 
@@ -28,8 +32,11 @@ jobs:
   route:
     name: Select Pages publisher
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
     outputs:
       deploy: ${{ steps.select.outputs.deploy }}
+      tag: ${{ steps.select.outputs.tag }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -41,6 +48,7 @@ jobs:
         env:
           BASE_SHA: ${{ github.event.before }}
           HEAD_SHA: ${{ github.sha }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           if [ "$GITHUB_EVENT_NAME" != "push" ]; then
@@ -52,14 +60,37 @@ jobs:
             base="$(git rev-parse HEAD~1 2>/dev/null || git rev-parse HEAD)"
           fi
           changed="$(git diff --name-only "$base" "$HEAD_SHA")"
-          if grep -qE '^\.github/workflows/' <<< "$changed"; then
-            echo "deploy=true" >> "$GITHUB_OUTPUT"
-          elif grep -qE '^(main/main\.c$|\.github/scripts/)' <<< "$changed"; then
+          if grep -qE '^(main/|components/|managed_components/|dependencies/|\.github/scripts/|CMakeLists\.txt$|post_build\.cmake$|dependencies\.lock$|lv_conf\.h$|partitions\.csv$|sdkconfig[^/]*$)' <<< "$changed"; then
             echo "deploy=false" >> "$GITHUB_OUTPUT"
             echo "Firmware workflow will publish Pages after its release."
-          else
-            echo "deploy=true" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
+
+          source_version="$(python3 - <<'PY'
+          from pathlib import Path
+          import re
+          source = Path('main/main.c').read_text(encoding='utf-8')
+          match = re.search(r'^\s*#define\s+JANOS_TAB_VERSION\s+"([^"]+)"', source, re.MULTILINE)
+          if not match:
+              raise SystemExit('JANOS_TAB_VERSION not found in main/main.c')
+          print(match.group(1))
+          PY
+          )"
+          latest_tag="$(gh api "/repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name)" || {
+            echo "::error::Failed to resolve the latest GitHub release tag." >&2
+            exit 1
+          }
+          if [ -z "$latest_tag" ]; then
+            echo "::error::Latest GitHub release has no tag." >&2
+            exit 1
+          fi
+          if [ "$latest_tag" != "v${source_version}" ]; then
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Skipping Pages-only publish: source version v${source_version} differs from latest release ${latest_tag}. Publish the matching firmware release first."
+            exit 0
+          fi
+          echo "tag=$latest_tag" >> "$GITHUB_OUTPUT"
+          echo "deploy=true" >> "$GITHUB_OUTPUT"
 
   pages:
     name: Deploy Pages Only
@@ -89,11 +120,20 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           INPUT_TAG: ${{ inputs.release_tag }}
+          ROUTE_TAG: ${{ needs.route.outputs.tag }}
         run: |
           set -euo pipefail
-          TAG="${INPUT_TAG:-}"
-          if [ -z "$TAG" ]; then
-            TAG="$(gh api "/repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name)"
+          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            TAG="$ROUTE_TAG"
+            if [ -z "$TAG" ]; then
+              echo "Push has no validated release tag" >&2
+              exit 1
+            fi
+          else
+            TAG="${INPUT_TAG:-}"
+            if [ -z "$TAG" ]; then
+              TAG="$(gh api "/repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name)"
+            fi
           fi
           if [ -z "$TAG" ]; then
             echo "Failed to resolve release tag" >&2
@@ -120,12 +160,13 @@ jobs:
 
           ls -lh docs/firmware
 
-          if [ ! -f docs/firmware/M5MonsterC5-Tab5.bin ]; then
-            alt="$(ls docs/firmware/M5MonsterC5-Tab5-*.bin 2>/dev/null | head -n1 || true)"
-            if [ -n "$alt" ]; then
-              cp "$alt" docs/firmware/M5MonsterC5-Tab5.bin
-            fi
+          fw_version="${TAG#v}"
+          app_bin="docs/firmware/M5MonsterC5-Tab5-${fw_version}.bin"
+          if [ ! -f "$app_bin" ]; then
+            echo "Missing app-only firmware $app_bin in release assets for tag ${TAG}" >&2
+            exit 1
           fi
+          cp "$app_bin" docs/firmware/M5MonsterC5-Tab5.bin
 
           for f in bootloader.bin partition-table.bin M5MonsterC5-Tab5.bin; do
             if [ ! -f "docs/firmware/$f" ]; then
@@ -134,10 +175,6 @@ jobs:
             fi
           done
 
-          fw_version="$(ls docs/firmware/M5MonsterC5-Tab5-*.bin 2>/dev/null | head -n1 | xargs -n1 basename | sed -E 's/^M5MonsterC5-Tab5-([^.]*)\.bin$/\1/')"
-          if [ -z "$fw_version" ]; then
-            fw_version="${TAG}"
-          fi
           echo "fw_version=$fw_version" >> "$GITHUB_OUTPUT"
 
       - name: Build manifest.json
