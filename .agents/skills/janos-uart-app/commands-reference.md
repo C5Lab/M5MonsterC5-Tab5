@@ -524,6 +524,22 @@ Found 6 file(s) in /sdcard/lab/handshakes
 
 ## Settings
 
+### `sta_mac`
+- **Syntax**:
+  - `sta_mac status`
+  - `sta_mac set factory`
+  - `sta_mac set random`
+  - `sta_mac set fixed 02:11:22:33:44:55`
+- **Description**: Reads or selects the Wi-Fi STA MAC policy stored by JanOS. This is the STA identity; it does not configure SoftAP, BLE, or 802.15.4 addresses.
+- **Policies**: `factory` uses the factory STA MAC. `random` chooses a locally administered unicast MAC once per JanOS application start and keeps it through Wi-Fi driver reinitialization. `fixed` uses the given MAC on every JanOS start.
+- **Fixed address**: Exactly six pairs of hexadecimal digits separated by colons, with the locally administered bit set and multicast bit clear. JanOS rejects invalid input without changing NVS.
+- **Apply timing**: `set` commits to NVS for the **next JanOS start**. It does not change the running radio or reboot JanOS. The stored policy survives OTA.
+- **Status**: Read-only in JanOS, including during WPS or analyzer activity. It reports the saved policy for the next start, policy in force for this start, effective STA MAC selected at this start, currently reported STA MAC (`null` if the Wi-Fi driver is unavailable), NVS record state, and whether a restart is required. A WPS session may temporarily change the current MAC; the effective start MAC and policy do not change.
+- **NVS state**: A missing record means `factory`. An invalid or unsupported record is reported and falls back to `factory` for the current start without overwriting NVS. A read error is distinct from a missing record.
+- **Admission**: `set` can be refused while the shared radio has an active owner or is quarantined. Treat that as a failed save. WPS returns the STA MAC to the effective start MAC after its temporary session address.
+- **Tab5 UI**: Settings → Wi-Fi MAC automatically selects a single connected, recognized JanOS device on Grove, USB, or MBus and reads `status` on opening. With multiple detected devices, the user selects the port; selecting it reads status. Refresh retries the read. The page offers Factory, Random, or Fixed. If another Tab5 task owns that port's console (for example, Tab5 Wi-Fi Analyzer), the page reports the local console as busy; retry after that task ends. JanOS read admission and Tab5 console availability are separate checks. See [Sta_MAC_Setup.md](../../../docs/Sta_MAC_Setup.md).
+- **Response parsing**: JanOS emits a bare JSON status record with `record_type: "sta_mac_status"` and a bare JSON set result with `record_type: "sta_mac_result"`. Determine save success from the result record, never from a command echo or timeout.
+
 ### `channel_time`
 - **Syntax**: `channel_time set <min|max> <ms>` or `channel_time read <min|max>`
 - **Description**: Sets or reads scan dwell time per channel.

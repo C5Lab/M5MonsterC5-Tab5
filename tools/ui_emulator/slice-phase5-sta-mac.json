@@ -1,0 +1,18 @@
+{
+  "sta_mac_ui_port_connected": "adapter",
+  "sta_mac_ui_start_request": "adapter",
+  "sta_mac_ui_notice": "retain",
+  "sta_mac_ui_clear_status": "retain",
+  "sta_mac_ui_display_status": "retain",
+  "sta_mac_ui_dropdown_tab": "retain",
+  "sta_mac_ui_target_changed": "retain",
+  "sta_mac_ui_mode_changed": "retain",
+  "sta_mac_ui_fixed_focus": "retain",
+  "sta_mac_ui_keyboard_done": "retain",
+  "sta_mac_ui_auto_read_detected": "retain",
+  "sta_mac_ui_refresh_clicked": "retain",
+  "sta_mac_ui_apply_clicked": "retain",
+  "sta_mac_ui_back_clicked": "retain",
+  "sta_mac_ui_status_row": "retain",
+  "show_sta_mac_settings_page": "retain"
+}

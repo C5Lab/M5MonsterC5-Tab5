@@ -1,6 +1,6 @@
 import { SimulatedDevice } from './device.mjs';
 
-const modules = {0:'grove', 2:'mbus', 3:'internal'};
+const modules = {0:'grove', 1:'usb', 2:'mbus', 3:'internal'};
 const states = {running:1, completed:2, cancelled:3, failed:4};
 
 /** Synchronous boundary used by the retained C interface on the browser thread. */

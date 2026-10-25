@@ -69,6 +69,7 @@ def generate():
     out=BASE/'generated'; out.mkdir(exist_ok=True)
     parts=['#include "host.h"', '#include <stdatomic.h>', '#include "scan_filter.h"',
            '#include "transfer_speed_config.h"', '#include "ota_rf.h"', '#include "tile_order.h"',
+           '#include "sta_mac_setup_model.h"', '#include "sta_mac_setup_response.h"',
            '#include "observer_extended.h"',
            'static lv_event_dsc_t *app_bind_observer_options(lv_obj_t *,lv_event_cb_t,lv_event_code_t,void *);',
            '#undef lv_obj_add_event_cb',

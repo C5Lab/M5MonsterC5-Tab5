@@ -29,6 +29,7 @@
 #include "observer_extended.h"
 #include "observer_options.h"
 #include "observer_options_ui.h"
+#include "janos_sniffer_session.h"
 #include "driver/uart.h"
 #include "driver/gpio.h"
 #include "driver/ledc.h"
@@ -94,6 +95,8 @@
 #include "transfer_speed_config.h"
 #include "usb_vcp_config.h"
 #include "ota_rf.h"
+#include "sta_mac_setup_model.h"
+#include "sta_mac_setup_response.h"
 #include <stdatomic.h>
 #include "freertos/queue.h"
 
@@ -115,8 +118,8 @@ extern void pthread_internal_local_storage_destructor_callback(TaskHandle_t hand
 #endif
 
 
-#define JANOS_TAB_VERSION "1.5.5"
-#define JANOS_VERSION_REQUIRED "1.7.5"
+#define JANOS_TAB_VERSION "1.5.6"
+#define JANOS_VERSION_REQUIRED "1.7.6"
 #define USB_CH34X_BULK_MPS 32
 
 _Static_assert(CONFIG_IN_TRANSFER_BUFFER_SIZE == USB_CH34X_BULK_MPS,
@@ -878,6 +881,13 @@ typedef struct {
     char *observer_line_buffer;     // Per-tab PSRAM line buffer
     int observer_extended_support; // 0 probing, 1 supported, -1 legacy
     bool observer_has_new_networks;
+    JsSession observer_js;
+    SemaphoreHandle_t observer_js_mutex;
+    volatile bool observer_js_busy;
+    TaskHandle_t observer_js_task;
+    bool observer_pending_start;
+    char observer_pending_bssid[18];
+    char observer_pending_station[18];
 
     // Karma2 (Probes & Karma on Observer)
     lv_obj_t *karma2_probes_popup_overlay;
@@ -2180,6 +2190,10 @@ static bool uart2_initialized = false;
 // Board detection state - 3 independent devices
 static bool grove_detected = false;
 static bool usb_detected = false;
+/* Boot detection remains visible in the tab layout after USB unplug. The MAC
+ * page binds recognition and each request to one USB connection generation. */
+static atomic_uint sta_mac_usb_generation = ATOMIC_VAR_INIT(1);
+static atomic_uint sta_mac_usb_recognized_generation = ATOMIC_VAR_INIT(0);
 static bool uart1_detected = false;  // Derived: Grove or USB
 static bool mbus_detected = false;
 
@@ -2295,6 +2309,7 @@ static lv_obj_t *internal_container = NULL;
 // INTERNAL tab page objects
 static lv_obj_t *internal_tiles = NULL;
 static lv_obj_t *internal_settings_page = NULL;
+static lv_obj_t *sta_mac_settings_page = NULL;
 static lv_obj_t *wpa_auditor_page = NULL;
 static lv_obj_t *wpa_auditor_status_label = NULL;
 static lv_obj_t *wpa_auditor_confirm_overlay = NULL;
@@ -2479,6 +2494,8 @@ static void hide_all_pages(tab_context_t *ctx) {
     if (ctx->antisurv_page) lv_obj_add_flag(ctx->antisurv_page, LV_OBJ_FLAG_HIDDEN);
     if (ctx->iot_page) lv_obj_add_flag(ctx->iot_page, LV_OBJ_FLAG_HIDDEN);
     if (ctx->sd_admin_page) lv_obj_add_flag(ctx->sd_admin_page, LV_OBJ_FLAG_HIDDEN);
+    if (ctx == &internal_ctx && sta_mac_settings_page)
+        lv_obj_add_flag(sta_mac_settings_page, LV_OBJ_FLAG_HIDDEN);
     /* SubGHz pages (menu + sub-pages) */
     if (ctx->subghz) subghz_hide_all_pages(ctx->subghz);
     if (ctx->nfc) nfc_hide_all_pages(ctx->nfc);
@@ -2521,6 +2538,9 @@ static void init_tab_context(tab_context_t *ctx) {
         if (!ctx->observer_line_buffer) {
             ESP_LOGE(TAG, "Failed to allocate observer line buffer in PSRAM");
         }
+    }
+    if (!ctx->observer_js_mutex) {
+        ctx->observer_js_mutex = xSemaphoreCreateMutex();
     }
 
     // Deauth detector entries
@@ -3099,6 +3119,7 @@ static void show_scan_page(void);
 static void show_observer_page(void);
 static void show_esp_modem_page(void);
 static void show_settings_page(void);
+static void show_sta_mac_settings_page(void);
 static void show_wpa_psk_auditor_page(void);
 static void show_time_popup(void);
 static void main_tile_event_cb(lv_event_t *e);
@@ -3176,6 +3197,7 @@ static void pause_observer_for_attack(tab_context_t *ctx);
 static bool wait_for_observer_uart_idle(tab_context_t *ctx, uint32_t timeout_ms);
 static bool observer_handshaker_prepare_selection(tab_context_t *ctx, wifi_network_t *target);
 static void show_deauth_popup(int network_idx, int client_idx);
+static void observer_js_request(tab_context_t *ctx, bool start_after);
 static void destroy_deauth_popup_ui(void);
 static void close_deauth_popup(void);
 static void deauth_btn_click_cb(lv_event_t *e);
@@ -5303,6 +5325,7 @@ static void usb_check_host_installed(void)
 static void usb_cdc_connect_cb(usbh_cdc_handle_t cdc_handle, void *user_data)
 {
     (void)user_data;
+    atomic_fetch_add(&sta_mac_usb_generation, 1);
     usb_cdc_handle = cdc_handle;
     usb_cdc_connected = true;
     usb_nmea_device_seen = false;
@@ -5341,6 +5364,8 @@ static void usb_cdc_disconnect_cb(usbh_cdc_handle_t cdc_handle, void *user_data)
 {
     (void)cdc_handle;
     (void)user_data;
+    atomic_fetch_add(&sta_mac_usb_generation, 1);
+    atomic_store(&sta_mac_usb_recognized_generation, 0);
     if (usb_cdc_handle == cdc_handle) {
         usb_cdc_handle = NULL;
     }
@@ -18784,6 +18809,7 @@ static void show_internal_tiles(void)
 
     // Hide settings page if visible, show tiles
     if (internal_settings_page) lv_obj_add_flag(internal_settings_page, LV_OBJ_FLAG_HIDDEN);
+    if (sta_mac_settings_page) lv_obj_add_flag(sta_mac_settings_page, LV_OBJ_FLAG_HIDDEN);
 
     if (internal_tiles) {
         // Already exists, just show it
@@ -19078,7 +19104,7 @@ static void popup_timer_callback(TimerHandle_t xTimer)
 {
     tab_context_t *ctx = (tab_context_t *)pvTimerGetTimerID(xTimer);
     if (!ctx || !ctx->popup_open || !ctx->popup_focus_ready ||
-        !ctx->observer_running) return;
+        !ctx->observer_running || ctx->observer_js_busy || deauth_active) return;
 
     // Only start new poll if previous one finished
     if (ctx->observer_task == NULL) {
@@ -19843,6 +19869,7 @@ static void show_network_popup(int network_idx)
     ctx->popup_network_idx = network_idx;
     ctx->popup_focus_ready = false;
     ctx->popup_focus_cancel = false;
+    observer_js_request(ctx, false);
 
     if (opening_during_startup) {
         ESP_LOGI(TAG,
@@ -20865,42 +20892,21 @@ static void deauth_btn_click_cb(lv_event_t *e)
     if (!ctx) return;
 
     if (!deauth_active) {
-        // Start deauth
         if (deauth_network_idx >= 0 && deauth_network_idx < ctx->observer_network_count &&
             deauth_client_idx >= 0 && deauth_client_idx < MAX_CLIENTS_PER_NETWORK) {
 
             observer_network_t *net = &ctx->observer_networks[deauth_network_idx];
             const char *client_mac = net->clients[deauth_client_idx];
-            if (net->scan_index <= 0) {
+            if (!net->bssid[0] || !client_mac[0]) {
                 if (ctx->observer_status_label)
-                    lv_label_set_text(ctx->observer_status_label, "Open this AP first to resolve its scan index.");
+                    lv_label_set_text(ctx->observer_status_label, "Missing BSSID or station MAC.");
                 return;
             }
 
-            ESP_LOGI(TAG, "Starting deauth: network=%d (scan_idx=%d), client=%s",
-                     deauth_network_idx, net->scan_index, client_mac);
-
-            // Send UART commands to current tab's UART
-            uart_send_command_for_tab("stop");
-            vTaskDelay(pdMS_TO_TICKS(100));
-
-            char cmd[64];
-            snprintf(cmd, sizeof(cmd), "select_networks %d", net->scan_index);
-            uart_send_command_for_tab(cmd);
-            vTaskDelay(pdMS_TO_TICKS(100));
-
-            snprintf(cmd, sizeof(cmd), "select_stations %s", client_mac);
-            uart_send_command_for_tab(cmd);
-            vTaskDelay(pdMS_TO_TICKS(100));
-
-            uart_send_command_for_tab("start_deauth");
-
-            // Change button to STOP
-            deauth_active = true;
-            if (deauth_btn_label != NULL) {
-                lv_label_set_text(deauth_btn_label, "STOP");
-            }
-            ESP_LOGI(TAG, "Deauth started");
+            snprintf(ctx->observer_pending_bssid, sizeof(ctx->observer_pending_bssid), "%s", net->bssid);
+            snprintf(ctx->observer_pending_station, sizeof(ctx->observer_pending_station), "%s", client_mac);
+            if (deauth_btn_label) lv_label_set_text(deauth_btn_label, "Starting...");
+            observer_js_request(ctx, true);
         }
     } else {
         // Stop deauth and return to sniffer
@@ -21014,6 +21020,167 @@ static bool parse_sniffer_client_line(const char *line, char *mac_out, size_t ma
     }
 
     return false;
+}
+
+static bool tab5_js_send(void *ctx_void, const char *command)
+{
+    tab_context_t *ctx = (tab_context_t *)ctx_void;
+    if (!ctx || !command) return false;
+    tab_id_t tab = tab_id_for_ctx(ctx);
+    if (tab_is_internal(tab)) return false;
+    uart_port_t port = uart_port_for_tab(tab);
+    transport_write_bytes_tab(tab, port, command, strlen(command));
+    transport_write_bytes_tab(tab, port, "\r\n", 2);
+    ESP_LOGI(TAG, "[%s] JS TX: %s", tab_transport_name(tab), command);
+    return true;
+}
+
+static uint32_t tab5_now_ms(void)
+{
+    return (uint32_t)(esp_timer_get_time() / 1000);
+}
+
+static void observer_js_started_ui(void *arg)
+{
+    (void)arg;
+    deauth_active = true;
+    if (deauth_btn_label) lv_label_set_text(deauth_btn_label, "STOP");
+}
+
+static void observer_js_failed_ui(void *arg)
+{
+    tab_context_t *ctx = (tab_context_t *)arg;
+    if (deauth_btn_label) lv_label_set_text(deauth_btn_label, "Retry");
+    if (ctx && ctx->observer_status_label && ctx->observer_js.error[0]) {
+        lv_label_set_text(ctx->observer_status_label, ctx->observer_js.error);
+    }
+}
+
+static bool observer_js_find_client(tab_context_t *ctx, const char *bssid, const char *station, unsigned *index)
+{
+    uint8_t ap[6], sta[6];
+    if (!ctx || !index || !sc_parse_mac(bssid, ap) || !sc_parse_mac(station, sta)) return false;
+    if (ctx->observer_js.phase != JS_READY || !ctx->observer_js.model.complete) return false;
+    for (unsigned i = 0; i < ctx->observer_js.model.client_count; ++i) {
+        const sc_client_t *client = &ctx->observer_js.model.clients[i];
+        const sc_ap_t *net = &ctx->observer_js.model.aps[client->ap];
+        if (!memcmp(net->bssid, ap, 6) && !memcmp(client->mac, sta, 6)) {
+            *index = i;
+            return true;
+        }
+    }
+    return false;
+}
+
+static void observer_js_feed_until(tab_context_t *ctx, JsPhase done_a, JsPhase done_b)
+{
+    tab_id_t tab = tab_id_for_ctx(ctx);
+    uart_port_t port = uart_port_for_tab(tab);
+    char *rx_buffer = ctx->observer_rx_buffer;
+    char *line_buffer = ctx->observer_line_buffer;
+    if (!rx_buffer || !line_buffer) return;
+
+    int line_pos = 0;
+    bool line_overflow = false;
+    TickType_t start_time = xTaskGetTickCount();
+    TickType_t timeout_ticks = pdMS_TO_TICKS(300000);
+
+    while ((xTaskGetTickCount() - start_time) < timeout_ticks) {
+        JsPhase phase = ctx->observer_js.phase;
+        if (phase == done_a || phase == done_b || phase == JS_ERROR || phase == JS_RELOAD_REQUIRED) break;
+        int len = transport_read_bytes_tab(tab, port, rx_buffer, UART_BUF_SIZE - 1, pdMS_TO_TICKS(100));
+        if (len > 0) {
+            for (int i = 0; i < len; i++) {
+                char c = rx_buffer[i];
+                if (c == '\n' || c == '\r') {
+                    if (line_overflow) {
+                        line_overflow = false;
+                        line_pos = 0;
+                        continue;
+                    }
+                    if (line_pos > 0) {
+                        line_buffer[line_pos] = '\0';
+                        js_line(&ctx->observer_js, line_buffer, tab5_now_ms());
+                        line_pos = 0;
+                    }
+                } else if (line_pos < 1023) {
+                    line_buffer[line_pos++] = c;
+                } else {
+                    line_overflow = true;
+                }
+            }
+        }
+        js_tick(&ctx->observer_js, tab5_now_ms());
+        if (!ctx->observer_running && ctx->observer_js.phase == JS_LOADING) break;
+    }
+}
+
+static void observer_clients_task(void *arg)
+{
+    tab_context_t *ctx = (tab_context_t *)arg;
+    if (!ctx) {
+        vTaskDelete(NULL);
+        return;
+    }
+    ctx->observer_js_busy = true;
+    while (ctx->observer_task != NULL || ctx->observer_inspect_task != NULL ||
+           ctx->observer_start_active) {
+        vTaskDelay(pdMS_TO_TICKS(40));
+    }
+
+    if (!ctx->observer_js.send) js_init(&ctx->observer_js, tab5_js_send, ctx);
+
+    bool need_load = (ctx->observer_js.phase != JS_READY) || ctx->observer_pending_start;
+    unsigned index = 0;
+    bool found = false;
+    if (ctx->observer_js.phase == JS_READY) {
+        found = observer_js_find_client(ctx, ctx->observer_pending_bssid, ctx->observer_pending_station, &index);
+        if (found) need_load = false;
+    }
+
+    tab_id_t tab = tab_id_for_ctx(ctx);
+    uart_port_t port = uart_port_for_tab(tab);
+    observer_flush_transport_input(tab, port);
+
+    if (need_load) {
+        if (!js_load(&ctx->observer_js, tab5_now_ms())) {
+            lv_async_call(observer_js_failed_ui, ctx);
+            ctx->observer_pending_start = false;
+            ctx->observer_js_busy = false;
+            ctx->observer_js_task = NULL;
+            vTaskDelete(NULL);
+            return;
+        }
+        observer_js_feed_until(ctx, JS_READY, JS_ERROR);
+    }
+
+    if (ctx->observer_pending_start) {
+        ctx->observer_pending_start = false;
+        if (!observer_js_find_client(ctx, ctx->observer_pending_bssid, ctx->observer_pending_station, &index) ||
+            !js_start(&ctx->observer_js, index, tab5_now_ms())) {
+            lv_async_call(observer_js_failed_ui, ctx);
+        } else {
+            observer_js_feed_until(ctx, JS_ACTIVE, JS_READY);
+            if (ctx->observer_js.phase == JS_ACTIVE) lv_async_call(observer_js_started_ui, ctx);
+            else lv_async_call(observer_js_failed_ui, ctx);
+        }
+    }
+
+    ctx->observer_js_busy = false;
+    ctx->observer_js_task = NULL;
+    vTaskDelete(NULL);
+}
+
+static void observer_js_request(tab_context_t *ctx, bool start_after)
+{
+    if (!ctx) return;
+    ctx->observer_pending_start = start_after || ctx->observer_pending_start;
+    if (ctx->observer_js_task) return;
+    ctx->observer_js_busy = true;
+    if (xTaskCreate(observer_clients_task, "obs_js", 8192, ctx, 5, &ctx->observer_js_task) != pdPASS) {
+        ctx->observer_js_busy = false;
+        ctx->observer_js_task = NULL;
+    }
 }
 
 // Observer poll task - runs show_sniffer_results and parses output
@@ -21181,7 +21348,7 @@ static void observer_timer_callback(TimerHandle_t xTimer)
 {
     // Get ctx from timer ID
     tab_context_t *ctx = (tab_context_t *)pvTimerGetTimerID(xTimer);
-    if (!ctx || !ctx->observer_running) return;
+    if (!ctx || !ctx->observer_running || ctx->observer_js_busy || deauth_active) return;
 
     // Only start new poll if previous one finished
     if (ctx->observer_task == NULL) {
@@ -21390,6 +21557,8 @@ static void observer_start_task(void *arg)
         return;
     }
     observer_flush_transport_input(task_tab, uart_port);
+    observer_send_command_to_transport(task_tab, uart_port, "unselect_networks", "Observer");
+    vTaskDelay(pdMS_TO_TICKS(50));
     char sniffer_cmd[] = "start_sniffer_noscan\r\n";
     transport_write_bytes_tab(task_tab, uart_port, sniffer_cmd, strlen(sniffer_cmd));
     ESP_LOGI(TAG, "[%s] Sent: start_sniffer_noscan", uart_name);
@@ -21421,8 +21590,9 @@ static void observer_start_task(void *arg)
         if (ctx->observer_timer != NULL) {
             xTimerStart(ctx->observer_timer, 0);
 
-            // Do first poll immediately, pass ctx
+            // Dashboard poll plus a one-shot JSON client snapshot for D.
             xTaskCreate(observer_poll_task, "obs_poll", 8192, (void*)ctx, 5, &ctx->observer_task);
+            observer_js_request(ctx, false);
         }
     }
 
@@ -21466,7 +21636,8 @@ static bool observer_session_busy(tab_context_t *ctx)
 {
     return ctx && (ctx->observer_running || ctx->observer_start_active ||
                    ctx->observer_inspect_active || ctx->observer_inspect_task != NULL ||
-                   ctx->popup_close_task != NULL);
+                   ctx->popup_close_task != NULL || ctx->observer_js_busy ||
+                   ctx->observer_js_task != NULL);
 }
 
 static void observer_teardown_task(void *arg)
@@ -21485,12 +21656,12 @@ static void observer_teardown_task(void *arg)
     int waited = 0;
     while (waited < 10000 &&
            (ctx->observer_start_active || ctx->observer_inspect_task != NULL ||
-            ctx->popup_close_task != NULL)) {
+            ctx->popup_close_task != NULL || ctx->observer_js_task != NULL)) {
         vTaskDelay(pdMS_TO_TICKS(20));
         waited += 20;
     }
     if (ctx->observer_start_active || ctx->observer_inspect_task != NULL ||
-            ctx->popup_close_task != NULL) {
+            ctx->popup_close_task != NULL || ctx->observer_js_task != NULL) {
         ESP_LOGW(TAG, "[%s] Observer teardown: workers still alive after %d ms, "
                       "sending stop anyway", uart_name, waited);
     } else {
@@ -21501,6 +21672,9 @@ static void observer_teardown_task(void *arg)
         xTimerStop(ctx->observer_timer, 0);
     }
 
+    js_free(&ctx->observer_js);
+    ctx->observer_js.send = tab5_js_send;
+    ctx->observer_js.send_context = ctx;
     observer_flush_transport_input(tab, port);
     const char *stop_cmd = "stop\r\n";
     transport_write_bytes_tab(tab, port, stop_cmd, strlen(stop_cmd));
@@ -52915,6 +53089,8 @@ static void detect_boards(void)
     // so a slow-booting Monster is still caught. Stop early once it is a GPS
     // (NMEA stream), which is not a board and never pongs.
     usb_detected = false;
+    atomic_store(&sta_mac_usb_recognized_generation, 0);
+    unsigned usb_probe_generation = atomic_load(&sta_mac_usb_generation);
     if (usb_cdc_connected) {
         for (int attempt = 0; attempt < 6 && !usb_detected; attempt++) {
             if (attempt > 0) {
@@ -52943,6 +53119,9 @@ static void detect_boards(void)
     if (usb_nmea_device_seen || usb_is_known_gps) {
         ESP_LOGI(TAG, "[USB] GPS accessory detected (NMEA stream)");
     }
+    if (usb_detected && usb_cdc_connected && usb_cdc_handle != NULL &&
+        atomic_load(&sta_mac_usb_generation) == usb_probe_generation)
+        atomic_store(&sta_mac_usb_recognized_generation, usb_probe_generation);
     uart1_detected = (grove_detected || usb_detected);  // For legacy compatibility
     mbus_detected = ping_uart(UART2_NUM, "MBus", &mbus_ctx);
 
@@ -58632,6 +58811,8 @@ static void settings_tile_event_cb(lv_event_t *e)
         show_tool_order_page();
     } else if (strcmp(tile_name, "Scan Setup") == 0) {
         show_scan_time_popup();
+    } else if (strcmp(tile_name, "Wi-Fi MAC") == 0) {
+        show_sta_mac_settings_page();
     } else if (strcmp(tile_name, "Red Team") == 0) {
         show_red_team_settings_page();
     } else if (strcmp(tile_name, "Screen Timeout") == 0) {
@@ -58665,6 +58846,7 @@ static void show_settings_page(void)
 
     // Hide internal tiles, show settings page
     if (internal_tiles) lv_obj_add_flag(internal_tiles, LV_OBJ_FLAG_HIDDEN);
+    if (sta_mac_settings_page) lv_obj_add_flag(sta_mac_settings_page, LV_OBJ_FLAG_HIDDEN);
 
     // If settings page already exists, just show it
     if (internal_settings_page) {
@@ -58735,6 +58917,10 @@ static void show_settings_page(void)
 
     // Scan Setup tile
     create_tile(tiles, LV_SYMBOL_REFRESH, "Scan\nSetup", COLOR_MATERIAL_GREEN, settings_tile_event_cb, "Scan Setup");
+
+    // JanOS Wi-Fi STA identity for the selected external module.
+    create_tile(tiles, LV_SYMBOL_WIFI, "Wi-Fi\nMAC", COLOR_MATERIAL_CYAN,
+                settings_tile_event_cb, "Wi-Fi MAC");
 
     // Red Team tile
     create_tile(tiles, LV_SYMBOL_WARNING, "Red\nTeam", COLOR_MATERIAL_RED, settings_tile_event_cb, "Red Team");
@@ -71963,6 +72149,611 @@ static uint32_t wa_host_baud(int tab)
     uint32_t baud = tab == TAB_USB ? wa_usb_console_baud : UART_BAUD_RATE;
     if (tab != TAB_USB) (void)uart_get_baudrate(uart_port_for_tab((tab_id_t)tab), &baud);
     return baud ? baud : UART_BAUD_RATE;
+}
+
+/* Settings lives on INTERNAL, but these commands always address one explicitly
+ * selected external JanOS console. A worker owns the complete request/reply
+ * exchange so LVGL never waits for UART or USB data. */
+typedef struct {
+    lv_obj_t *target_dropdown;
+    lv_obj_t *mode_dropdown;
+    lv_obj_t *fixed_row;
+    lv_obj_t *fixed_input;
+    lv_obj_t *keyboard;
+    lv_obj_t *refresh_button;
+    lv_obj_t *apply_button;
+    lv_obj_t *notice;
+    lv_obj_t *values[7];
+    tab_id_t target;
+    bool busy;
+    bool refresh_after_busy;
+} sta_mac_settings_ui_t;
+
+typedef struct {
+    tab_id_t tab;
+    unsigned usb_generation;
+    bool set_policy;
+    char command[STA_MAC_SETUP_SET_COMMAND_BUFFER_SIZE];
+} sta_mac_settings_request_t;
+
+static sta_mac_settings_ui_t sta_mac_ui = {.target = TAB_INTERNAL};
+
+static bool sta_mac_ui_port_connected(tab_id_t tab)
+{
+    if (tab != TAB_USB) return wa_host_connected((int)tab);
+    unsigned generation = atomic_load(&sta_mac_usb_generation);
+    return generation != 0 &&
+           generation == atomic_load(&sta_mac_usb_recognized_generation) &&
+           wa_host_connected((int)tab) &&
+           generation == atomic_load(&sta_mac_usb_generation);
+}
+
+static bool sta_mac_ui_request_connected(const sta_mac_settings_request_t *request)
+{
+    return request && sta_mac_ui_port_connected(request->tab) &&
+           (request->tab != TAB_USB ||
+            request->usb_generation == atomic_load(&sta_mac_usb_generation));
+}
+
+static void sta_mac_ui_notice(const char *message, bool error)
+{
+    if (!sta_mac_ui.notice) return;
+    lv_label_set_text(sta_mac_ui.notice, message);
+    lv_obj_set_style_text_color(sta_mac_ui.notice,
+                                error ? COLOR_MATERIAL_RED : COLOR_MATERIAL_CYAN, 0);
+}
+
+static void sta_mac_ui_set_busy(bool busy)
+{
+    sta_mac_ui.busy = busy;
+    lv_obj_t *controls[] = {
+        sta_mac_ui.target_dropdown, sta_mac_ui.mode_dropdown,
+        sta_mac_ui.fixed_input, sta_mac_ui.refresh_button,
+        sta_mac_ui.apply_button,
+    };
+    for (size_t i = 0; i < sizeof(controls) / sizeof(controls[0]); ++i) {
+        if (!controls[i]) continue;
+        if (busy) lv_obj_add_state(controls[i], LV_STATE_DISABLED);
+        else lv_obj_remove_state(controls[i], LV_STATE_DISABLED);
+    }
+    if (!busy && sta_mac_ui.apply_button && sta_mac_ui.mode_dropdown &&
+        lv_dropdown_get_selected(sta_mac_ui.mode_dropdown) == 0)
+        lv_obj_add_state(sta_mac_ui.apply_button, LV_STATE_DISABLED);
+}
+
+static void sta_mac_ui_clear_status(void)
+{
+    for (size_t i = 0; i < sizeof(sta_mac_ui.values) / sizeof(sta_mac_ui.values[0]); ++i) {
+        if (sta_mac_ui.values[i]) lv_label_set_text(sta_mac_ui.values[i], "Not loaded");
+    }
+}
+
+static void sta_mac_ui_display_status(const sta_mac_setup_status_t *status)
+{
+    if (!status) return;
+    lv_label_set_text(sta_mac_ui.values[0], status->saved_policy);
+    lv_label_set_text(sta_mac_ui.values[1], status->boot_policy);
+    lv_label_set_text(sta_mac_ui.values[2], status->effective_mac);
+    lv_label_set_text(sta_mac_ui.values[3], status->current_mac_is_null
+                      ? "null (Wi-Fi driver stopped)" : status->current_mac);
+    lv_label_set_text(sta_mac_ui.values[4], status->nvs_state);
+    lv_label_set_text(sta_mac_ui.values[5], status->restart_required ? "Yes" : "No");
+    lv_label_set_text(sta_mac_ui.values[6], status->identity_ready ? "Yes" : "No");
+}
+
+static tab_id_t sta_mac_ui_dropdown_tab(uint16_t selected)
+{
+    switch (selected) {
+        case 1: return TAB_GROVE;
+        case 2: return TAB_USB;
+        case 3: return TAB_MBUS;
+        default: return TAB_INTERNAL;
+    }
+}
+
+static void sta_mac_ui_start_request(bool set_policy);
+
+static void sta_mac_ui_target_changed(lv_event_t *event)
+{
+    if (sta_mac_ui.busy) return;
+    sta_mac_ui.target = sta_mac_ui_dropdown_tab(
+        lv_dropdown_get_selected(lv_event_get_target(event)));
+    sta_mac_ui_clear_status();
+    if (sta_mac_ui.target == TAB_INTERNAL) {
+        sta_mac_ui_notice("Select a detected JanOS port.", false);
+    } else if (!sta_mac_ui_port_connected(sta_mac_ui.target)) {
+        sta_mac_ui_notice("This port has no detected JanOS device.", true);
+    } else {
+        sta_mac_ui_start_request(false);
+    }
+}
+
+static void sta_mac_ui_mode_changed(lv_event_t *event)
+{
+    uint16_t selected = lv_dropdown_get_selected(lv_event_get_target(event));
+    bool fixed = selected == 3;
+    if (sta_mac_ui.apply_button && !sta_mac_ui.busy) {
+        if (selected == 0) lv_obj_add_state(sta_mac_ui.apply_button, LV_STATE_DISABLED);
+        else lv_obj_remove_state(sta_mac_ui.apply_button, LV_STATE_DISABLED);
+    }
+    if (fixed) lv_obj_remove_flag(sta_mac_ui.fixed_row, LV_OBJ_FLAG_HIDDEN);
+    else {
+        lv_obj_add_flag(sta_mac_ui.fixed_row, LV_OBJ_FLAG_HIDDEN);
+        if (sta_mac_ui.keyboard) app_keyboard_set_visible(sta_mac_ui.keyboard, false);
+    }
+}
+
+static void sta_mac_ui_fixed_focus(lv_event_t *event)
+{
+    if (!sta_mac_ui.keyboard) return;
+    app_keyboard_set_textarea(sta_mac_ui.keyboard, lv_event_get_target(event));
+    app_keyboard_set_visible(sta_mac_ui.keyboard, true);
+}
+
+static void sta_mac_ui_keyboard_done(lv_event_t *event)
+{
+    lv_event_code_t code = lv_event_get_code(event);
+    if ((code == LV_EVENT_READY || code == LV_EVENT_CANCEL) && sta_mac_ui.keyboard)
+        app_keyboard_set_visible(sta_mac_ui.keyboard, false);
+}
+
+static bool sta_mac_ui_send_line(const sta_mac_settings_request_t *request,
+                                 const char *command)
+{
+    if (!sta_mac_ui_request_connected(request)) return false;
+    size_t command_len = strlen(command);
+    if (wa_host_write((int)request->tab, command, command_len) != (int)command_len ||
+        !sta_mac_ui_request_connected(request)) return false;
+    return wa_host_write((int)request->tab, "\r\n", 2) == 2 &&
+           sta_mac_ui_request_connected(request);
+}
+
+/* Only a complete, identified JSON reply may complete a request. Console
+ * echoes, progress messages and lines from older commands are ignored. */
+static bool sta_mac_ui_wait_reply(const sta_mac_settings_request_t *request,
+                                  bool set_policy,
+                                  const char *expected_command,
+                                  sta_mac_setup_status_t *status,
+                                  bool *set_ok, char *set_error, size_t error_size)
+{
+    char line[1024];
+    size_t used = 0;
+    bool overflow = false;
+    TickType_t started = xTaskGetTickCount();
+    const TickType_t timeout = pdMS_TO_TICKS(5000);
+
+    while ((xTaskGetTickCount() - started) < timeout) {
+        if (!sta_mac_ui_request_connected(request)) return false;
+        char bytes[128];
+        int got = wa_host_read((int)request->tab, bytes, sizeof(bytes), 100);
+        if (got < 0) return false;
+        if (!sta_mac_ui_request_connected(request)) return false;
+        for (int i = 0; i < got; ++i) {
+            char ch = bytes[i];
+            if (ch == '\r' || ch == '\n') {
+                if (used && !overflow) {
+                    line[used] = '\0';
+                    bool matched = set_policy
+                        ? sta_mac_setup_parse_set_line(line, expected_command,
+                                                        set_ok, set_error, error_size)
+                        : sta_mac_setup_parse_status_line(line, status);
+                    if (matched) return sta_mac_ui_request_connected(request);
+                }
+                used = 0;
+                overflow = false;
+            } else if (!overflow) {
+                if (used < sizeof(line) - 1) line[used++] = ch;
+                else overflow = true;
+            }
+        }
+    }
+    if (used && !overflow && sta_mac_ui_request_connected(request)) {
+        line[used] = '\0';
+        bool matched = set_policy
+            ? sta_mac_setup_parse_set_line(line, expected_command,
+                                            set_ok, set_error, error_size)
+            : sta_mac_setup_parse_status_line(line, status);
+        return matched && sta_mac_ui_request_connected(request);
+    }
+    return false;
+}
+
+static void sta_mac_ui_auto_read_detected(void);
+
+static void sta_mac_ui_worker(void *arg)
+{
+    sta_mac_settings_request_t *request = arg;
+    if (!request) { vTaskDelete(NULL); return; }
+
+    sta_mac_setup_status_t status = {0};
+    bool set_ok = false;
+    bool confirmed_set = false;
+    bool confirmed_status = false;
+    bool status_matches_request = true;
+    bool connection_changed = false;
+    char set_error[128] = {0};
+    bool claimed = !wa_busy_tab((int)request->tab) && wa_host_claim((int)request->tab);
+    if (claimed && (wa_busy_tab((int)request->tab) ||
+                    !sta_mac_ui_request_connected(request))) {
+        connection_changed = !sta_mac_ui_request_connected(request);
+        wa_host_release((int)request->tab);
+        claimed = false;
+    }
+    bool write_failed = false;
+
+    if (claimed) {
+        wa_host_flush((int)request->tab);
+        if (!sta_mac_ui_send_line(request, request->command)) {
+            write_failed = true;
+        } else if (request->set_policy) {
+            confirmed_set = sta_mac_ui_wait_reply(request, true, request->command,
+                                                   NULL,
+                                                   &set_ok, set_error, sizeof(set_error));
+            if (confirmed_set && set_ok) {
+                wa_host_flush((int)request->tab);
+                if (sta_mac_ui_send_line(request, sta_mac_setup_status_command))
+                    confirmed_status = sta_mac_ui_wait_reply(request, false, NULL,
+                                                              &status, NULL, NULL, 0);
+                if (confirmed_status) {
+                    static const char prefix[] = "sta_mac set ";
+                    status_matches_request =
+                        strncmp(request->command, prefix, sizeof(prefix) - 1) == 0 &&
+                        strcmp(status.saved_policy,
+                               request->command + sizeof(prefix) - 1) == 0;
+                }
+            }
+        } else {
+            confirmed_status = sta_mac_ui_wait_reply(request, false, NULL,
+                                                      &status, NULL, NULL, 0);
+        }
+        connection_changed = !sta_mac_ui_request_connected(request);
+        wa_host_release((int)request->tab);
+    }
+
+    while (!bsp_display_lock(200)) vTaskDelay(1);
+    if (sta_mac_settings_page && lv_obj_is_valid(sta_mac_settings_page)) {
+        if (!sta_mac_ui_request_connected(request)) connection_changed = true;
+        if (connection_changed) {
+            sta_mac_ui_clear_status();
+            sta_mac_ui_notice(!claimed
+                ? "JanOS connection changed before the command; nothing was sent."
+                : request->set_policy
+                    ? "JanOS connection changed; save result is unknown. Reconnect and Refresh."
+                    : "JanOS connection changed; status discarded. Reconnect and Refresh.", true);
+        } else if (!claimed) {
+            sta_mac_ui_clear_status();
+            sta_mac_ui_notice("Console busy or device unavailable. Stop the active Tab5 task and retry.", true);
+        } else if (write_failed) {
+            sta_mac_ui_clear_status();
+            sta_mac_ui_notice("Command write failed; result is unknown. Tap Refresh before retrying.", true);
+        } else if (request->set_policy && !confirmed_set) {
+            sta_mac_ui_clear_status();
+            sta_mac_ui_notice("No valid JanOS set reply; result is unknown. Tap Refresh before retrying.", true);
+        } else if (request->set_policy && !set_ok) {
+            sta_mac_ui_notice(set_error[0] ? set_error : "JanOS rejected the MAC policy change.", true);
+        } else if (confirmed_status && !status_matches_request) {
+            sta_mac_ui_display_status(&status);
+            sta_mac_ui_notice("JanOS status differs from the requested policy; verify before retrying.", true);
+        } else if (confirmed_status) {
+            sta_mac_ui_display_status(&status);
+            if (!status.identity_ready)
+                sta_mac_ui_notice("JanOS reports STA identity unavailable; Wi-Fi start is blocked.", true);
+            else
+                sta_mac_ui_notice(request->set_policy
+                                      ? "Policy saved. JanOS restart is needed if shown above."
+                                      : "Status read from the selected JanOS device.", false);
+        } else if (request->set_policy && confirmed_set && set_ok) {
+            sta_mac_ui_clear_status();
+            sta_mac_ui_notice("Save confirmed, but status refresh failed. Tap Refresh.", true);
+        } else {
+            sta_mac_ui_clear_status();
+            sta_mac_ui_notice("No valid JanOS status reply. Check firmware and retry.", true);
+        }
+        sta_mac_ui_set_busy(false);
+        if (sta_mac_ui.refresh_after_busy) {
+            sta_mac_ui.refresh_after_busy = false;
+            if (!lv_obj_has_flag(sta_mac_settings_page, LV_OBJ_FLAG_HIDDEN))
+                sta_mac_ui_auto_read_detected();
+        }
+    }
+    bsp_display_unlock();
+    free(request);
+    vTaskDelete(NULL);
+}
+
+static void sta_mac_ui_start_request(bool set_policy)
+{
+    if (sta_mac_ui.busy) return;
+    tab_id_t tab = sta_mac_ui.target;
+    unsigned usb_generation = tab == TAB_USB
+        ? atomic_load(&sta_mac_usb_generation) : 0;
+    if (tab == TAB_INTERNAL) {
+        sta_mac_ui_notice("Select Grove, USB or MBus first.", true);
+        return;
+    }
+    if (!sta_mac_ui_port_connected(tab) ||
+        (tab == TAB_USB && usb_generation != atomic_load(&sta_mac_usb_generation))) {
+        sta_mac_ui_clear_status();
+        sta_mac_ui_notice("No JanOS device is detected on this port.", true);
+        return;
+    }
+
+    sta_mac_settings_request_t *request = calloc(1, sizeof(*request));
+    if (!request) {
+        sta_mac_ui_notice("Out of memory; command was not sent.", true);
+        return;
+    }
+    request->tab = tab;
+    request->usb_generation = usb_generation;
+    request->set_policy = set_policy;
+    if (set_policy) {
+        uint16_t selected = lv_dropdown_get_selected(sta_mac_ui.mode_dropdown);
+        if (selected == 0 || selected > 3) {
+            sta_mac_ui_notice("Choose Factory, Random or Fixed before saving.", true);
+            free(request);
+            return;
+        }
+        sta_mac_setup_mode_t mode = (sta_mac_setup_mode_t)(selected - 1);
+        const char *fixed_mac = lv_textarea_get_text(sta_mac_ui.fixed_input);
+        if (!sta_mac_setup_build_set_command(mode, fixed_mac, request->command,
+                                              sizeof(request->command))) {
+            sta_mac_ui_notice("Use exactly XX:XX:XX:XX:XX:XX; first octet must be local and unicast (for example 02).", true);
+            free(request);
+            return;
+        }
+    } else {
+        snprintf(request->command, sizeof(request->command), "%s",
+                 sta_mac_setup_status_command);
+    }
+
+    sta_mac_ui_clear_status();
+    sta_mac_ui_set_busy(true);
+    sta_mac_ui_notice(set_policy ? "Saving policy on JanOS..." : "Reading JanOS status...", false);
+    if (xTaskCreate(sta_mac_ui_worker, "sta_mac_setup", 8192,
+                    request, 7, NULL) != pdPASS) {
+        sta_mac_ui_set_busy(false);
+        sta_mac_ui_notice("Could not start console request task; command was not sent.", true);
+        free(request);
+    }
+}
+
+static void sta_mac_ui_auto_read_detected(void)
+{
+    if (sta_mac_ui.busy) {
+        sta_mac_ui.refresh_after_busy = true;
+        return;
+    }
+    if (!sta_mac_ui.target_dropdown) return;
+
+    bool grove = sta_mac_ui_port_connected(TAB_GROVE);
+    bool usb = sta_mac_ui_port_connected(TAB_USB);
+    bool mbus = sta_mac_ui_port_connected(TAB_MBUS);
+    sta_mac_setup_port_t selected = sta_mac_setup_single_detected_port(grove, usb, mbus);
+    sta_mac_ui.target = sta_mac_ui_dropdown_tab((uint16_t)selected);
+    lv_dropdown_set_selected(sta_mac_ui.target_dropdown, (uint16_t)selected);
+    sta_mac_ui_clear_status();
+
+    if (selected != STA_MAC_SETUP_PORT_NONE) {
+        sta_mac_ui_start_request(false);
+    } else if (grove || usb || mbus) {
+        sta_mac_ui_notice("Multiple JanOS devices detected. Select a port to read its status.", false);
+    } else {
+        sta_mac_ui_notice("No connected JanOS device detected on Grove, USB or MBus.", false);
+    }
+}
+
+static void sta_mac_ui_refresh_clicked(lv_event_t *event)
+{
+    (void)event;
+    sta_mac_ui_start_request(false);
+}
+
+static void sta_mac_ui_apply_clicked(lv_event_t *event)
+{
+    (void)event;
+    sta_mac_ui_start_request(true);
+}
+
+static void sta_mac_ui_back_clicked(lv_event_t *event)
+{
+    (void)event;
+    if (sta_mac_ui.keyboard) app_keyboard_set_visible(sta_mac_ui.keyboard, false);
+    if (sta_mac_settings_page) lv_obj_add_flag(sta_mac_settings_page, LV_OBJ_FLAG_HIDDEN);
+    if (internal_settings_page) lv_obj_clear_flag(internal_settings_page, LV_OBJ_FLAG_HIDDEN);
+}
+
+static lv_obj_t *sta_mac_ui_status_row(lv_obj_t *parent, const char *heading)
+{
+    lv_obj_t *row = lv_obj_create(parent);
+    lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(row, 0, 0);
+    lv_obj_set_style_pad_all(row, 3, 0);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(row, 12, 0);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *key = lv_label_create(row);
+    lv_obj_set_width(key, 205);
+    lv_label_set_text(key, heading);
+    lv_obj_set_style_text_font(key, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(key, ui_muted_color(), 0);
+
+    lv_obj_t *value = lv_label_create(row);
+    lv_obj_set_flex_grow(value, 1);
+    lv_label_set_long_mode(value, LV_LABEL_LONG_WRAP);
+    lv_label_set_text(value, "Not loaded");
+    lv_obj_set_style_text_font(value, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(value, ui_text_color(), 0);
+    return value;
+}
+
+static void show_sta_mac_settings_page(void)
+{
+    if (!internal_container) return;
+    if (internal_settings_page) lv_obj_add_flag(internal_settings_page, LV_OBJ_FLAG_HIDDEN);
+    if (internal_tiles) lv_obj_add_flag(internal_tiles, LV_OBJ_FLAG_HIDDEN);
+    if (sta_mac_settings_page) {
+        if (sta_mac_ui.keyboard) app_keyboard_set_visible(sta_mac_ui.keyboard, false);
+        lv_obj_clear_flag(sta_mac_settings_page, LV_OBJ_FLAG_HIDDEN);
+        sta_mac_ui_auto_read_detected();
+        return;
+    }
+
+    sta_mac_settings_page = lv_obj_create(internal_container);
+    lv_obj_set_size(sta_mac_settings_page, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(sta_mac_settings_page, ui_bg_color(), 0);
+    lv_obj_set_style_border_width(sta_mac_settings_page, 0, 0);
+    lv_obj_set_style_pad_all(sta_mac_settings_page, 16, 0);
+    lv_obj_set_flex_flow(sta_mac_settings_page, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(sta_mac_settings_page, 12, 0);
+    lv_obj_set_scroll_dir(sta_mac_settings_page, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(sta_mac_settings_page, LV_SCROLLBAR_MODE_AUTO);
+
+    lv_obj_t *header = lv_obj_create(sta_mac_settings_page);
+    lv_obj_set_size(header, lv_pct(100), 50);
+    lv_obj_set_style_bg_opa(header, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(header, 0, 0);
+    lv_obj_clear_flag(header, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *back = lv_btn_create(header);
+    lv_obj_set_size(back, 88, 40);
+    lv_obj_align(back, LV_ALIGN_LEFT_MID, 0, 0);
+    style_back_nav_button(back);
+    lv_obj_add_event_cb(back, sta_mac_ui_back_clicked, LV_EVENT_CLICKED, NULL);
+    app_keyboard_navigation_register_escape(back);
+    lv_obj_t *back_text = lv_label_create(back);
+    lv_label_set_text(back_text, LV_SYMBOL_LEFT " Back");
+    lv_obj_center(back_text);
+    lv_obj_t *title = lv_label_create(header);
+    lv_label_set_text(title, LV_SYMBOL_WIFI " Wi-Fi STA MAC");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_CYAN, 0);
+    lv_obj_align(title, LV_ALIGN_CENTER, 0, 0);
+
+    lv_obj_t *intro = lv_label_create(sta_mac_settings_page);
+    lv_obj_set_width(intro, lv_pct(100));
+    lv_label_set_long_mode(intro, LV_LABEL_LONG_WRAP);
+    lv_label_set_text(intro,
+        "Configure JanOS Wi-Fi STA identity. A saved change takes effect after the next JanOS restart; this screen never restarts the device.");
+    lv_obj_set_style_text_font(intro, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(intro, ui_muted_color(), 0);
+
+    lv_obj_t *target_card = lv_obj_create(sta_mac_settings_page);
+    lv_obj_set_size(target_card, lv_pct(100), LV_SIZE_CONTENT);
+    style_surface_panel(target_card, 10);
+    lv_obj_set_style_pad_all(target_card, 12, 0);
+    lv_obj_set_flex_flow(target_card, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_flex_align(target_card, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_gap(target_card, 12, 0);
+    lv_obj_t *target_title = lv_label_create(target_card);
+    lv_label_set_text(target_title, "JanOS port");
+    lv_obj_set_style_text_color(target_title, ui_text_color(), 0);
+    sta_mac_ui.target_dropdown = lv_dropdown_create(target_card);
+    lv_dropdown_set_options(sta_mac_ui.target_dropdown, "Select port\nGrove\nUSB\nMBus");
+    lv_obj_set_width(sta_mac_ui.target_dropdown, 220);
+    lv_obj_add_event_cb(sta_mac_ui.target_dropdown, sta_mac_ui_target_changed,
+                        LV_EVENT_VALUE_CHANGED, NULL);
+
+    lv_obj_t *status_card = lv_obj_create(sta_mac_settings_page);
+    lv_obj_set_size(status_card, lv_pct(100), LV_SIZE_CONTENT);
+    style_surface_panel(status_card, 10);
+    lv_obj_set_style_pad_all(status_card, 12, 0);
+    lv_obj_set_flex_flow(status_card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(status_card, 6, 0);
+    lv_obj_t *status_heading = lv_label_create(status_card);
+    lv_label_set_text(status_heading, "This JanOS device");
+    lv_obj_set_style_text_font(status_heading, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_color(status_heading, COLOR_MATERIAL_CYAN, 0);
+    static const char *const headings[] = {
+        "Saved for next start", "Policy this start", "Effective start MAC",
+        "Current STA MAC", "NVS record", "Restart required", "Identity ready",
+    };
+    for (size_t i = 0; i < sizeof(headings) / sizeof(headings[0]); ++i)
+        sta_mac_ui.values[i] = sta_mac_ui_status_row(status_card, headings[i]);
+    lv_obj_t *wps_hint = lv_label_create(status_card);
+    lv_obj_set_width(wps_hint, lv_pct(100));
+    lv_label_set_long_mode(wps_hint, LV_LABEL_LONG_WRAP);
+    lv_label_set_text(wps_hint,
+        "WPS/Pixie/JWPS may temporarily change the current STA MAC. The effective start MAC above remains the restore target.");
+    lv_obj_set_style_text_font(wps_hint, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(wps_hint, ui_muted_color(), 0);
+    sta_mac_ui.refresh_button = lv_btn_create(status_card);
+    lv_obj_set_size(sta_mac_ui.refresh_button, 150, 40);
+    style_neutral_button(sta_mac_ui.refresh_button);
+    lv_obj_add_event_cb(sta_mac_ui.refresh_button, sta_mac_ui_refresh_clicked,
+                        LV_EVENT_CLICKED, NULL);
+    lv_obj_t *refresh_text = lv_label_create(sta_mac_ui.refresh_button);
+    lv_label_set_text(refresh_text, LV_SYMBOL_REFRESH " Refresh");
+    lv_obj_center(refresh_text);
+
+    lv_obj_t *set_card = lv_obj_create(sta_mac_settings_page);
+    lv_obj_set_size(set_card, lv_pct(100), LV_SIZE_CONTENT);
+    style_surface_panel(set_card, 10);
+    lv_obj_set_style_pad_all(set_card, 12, 0);
+    lv_obj_set_flex_flow(set_card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(set_card, 8, 0);
+    lv_obj_t *set_heading = lv_label_create(set_card);
+    lv_label_set_text(set_heading, "Save policy for next start");
+    lv_obj_set_style_text_font(set_heading, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_color(set_heading, COLOR_MATERIAL_CYAN, 0);
+    sta_mac_ui.mode_dropdown = lv_dropdown_create(set_card);
+    lv_dropdown_set_options(sta_mac_ui.mode_dropdown, "Choose policy\nFactory\nRandom\nFixed");
+    lv_obj_set_width(sta_mac_ui.mode_dropdown, 220);
+    lv_obj_add_event_cb(sta_mac_ui.mode_dropdown, sta_mac_ui_mode_changed,
+                        LV_EVENT_VALUE_CHANGED, NULL);
+    sta_mac_ui.fixed_row = lv_obj_create(set_card);
+    lv_obj_set_size(sta_mac_ui.fixed_row, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(sta_mac_ui.fixed_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(sta_mac_ui.fixed_row, 0, 0);
+    lv_obj_set_style_pad_all(sta_mac_ui.fixed_row, 0, 0);
+    lv_obj_set_flex_flow(sta_mac_ui.fixed_row, LV_FLEX_FLOW_COLUMN);
+    lv_obj_t *fixed_label = lv_label_create(sta_mac_ui.fixed_row);
+    lv_label_set_text(fixed_label, "Local unicast MAC (XX:XX:XX:XX:XX:XX)");
+    lv_obj_set_style_text_color(fixed_label, ui_muted_color(), 0);
+    sta_mac_ui.fixed_input = lv_textarea_create(sta_mac_ui.fixed_row);
+    lv_obj_set_width(sta_mac_ui.fixed_input, 280);
+    lv_textarea_set_one_line(sta_mac_ui.fixed_input, true);
+    /* Keep excess input visible so validation rejects it; never truncate an
+     * overlong address into an apparently valid 17-character MAC. */
+    lv_textarea_set_max_length(sta_mac_ui.fixed_input, 64);
+    lv_textarea_set_placeholder_text(sta_mac_ui.fixed_input, "02:11:22:33:44:55");
+    lv_obj_set_style_bg_color(sta_mac_ui.fixed_input, ui_bg_color(), 0);
+    lv_obj_set_style_text_color(sta_mac_ui.fixed_input, ui_text_color(), 0);
+    app_keyboard_style_cursor(sta_mac_ui.fixed_input, ui_text_color());
+    lv_obj_add_event_cb(sta_mac_ui.fixed_input, sta_mac_ui_fixed_focus,
+                        LV_EVENT_FOCUSED, NULL);
+    lv_obj_add_event_cb(sta_mac_ui.fixed_input, sta_mac_ui_fixed_focus,
+                        LV_EVENT_CLICKED, NULL);
+    lv_obj_add_flag(sta_mac_ui.fixed_row, LV_OBJ_FLAG_HIDDEN);
+    sta_mac_ui.apply_button = lv_btn_create(set_card);
+    lv_obj_set_size(sta_mac_ui.apply_button, 200, 42);
+    lv_obj_set_style_bg_color(sta_mac_ui.apply_button, COLOR_MATERIAL_CYAN, 0);
+    lv_obj_add_event_cb(sta_mac_ui.apply_button, sta_mac_ui_apply_clicked,
+                        LV_EVENT_CLICKED, NULL);
+    lv_obj_add_state(sta_mac_ui.apply_button, LV_STATE_DISABLED);
+    lv_obj_t *apply_text = lv_label_create(sta_mac_ui.apply_button);
+    lv_label_set_text(apply_text, LV_SYMBOL_SAVE " Save on JanOS");
+    lv_obj_center(apply_text);
+
+    sta_mac_ui.notice = lv_label_create(sta_mac_settings_page);
+    lv_obj_set_width(sta_mac_ui.notice, lv_pct(100));
+    lv_label_set_long_mode(sta_mac_ui.notice, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(sta_mac_ui.notice, &lv_font_montserrat_14, 0);
+    sta_mac_ui_notice("Checking detected JanOS devices...", false);
+
+    sta_mac_ui.keyboard = app_keyboard_create(sta_mac_settings_page);
+    if (sta_mac_ui.keyboard) {
+        app_keyboard_set_textarea(sta_mac_ui.keyboard, sta_mac_ui.fixed_input);
+        lv_obj_add_event_cb(sta_mac_ui.keyboard, sta_mac_ui_keyboard_done,
+                            LV_EVENT_READY, NULL);
+        lv_obj_add_event_cb(sta_mac_ui.keyboard, sta_mac_ui_keyboard_done,
+                            LV_EVENT_CANCEL, NULL);
+        app_keyboard_set_visible(sta_mac_ui.keyboard, false);
+    }
+    sta_mac_ui_auto_read_detected();
 }
 
 void app_main(void)

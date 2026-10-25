@@ -74,10 +74,12 @@ EM_JS(int,app_dialog_condition,(),{
  const value=new URL(location.href).searchParams.get('moduleCondition');
  if(value==='missing-board'||value==='missing-sd')for(const tab of [0,2])
   emulatorDevice.device.setModule(emulatorDevice.module(tab),value==='missing-board'?{connected:false}:{sdPresent:false});
- return ['normal','missing-board','missing-sd','version-mismatch'].indexOf(value);
+ if(value==='grove-only')emulatorDevice.device.setModule('mbus',{connected:false});
+ return ['normal','missing-board','missing-sd','version-mismatch','grove-only'].indexOf(value);
 });
 static void app_dialog_init(void) {
  int condition=app_dialog_condition();app_system_sync_metadata();
  if(condition==1){grove_detected=uart1_detected=mbus_detected=false;show_no_board_popup();}
  if(condition==3){grove_ctx.janos_version_mismatch=true;mbus_ctx.janos_version_mismatch=true;show_version_mismatch_popup();}
+ if(condition==4){mbus_detected=false;uart2_initialized=false;}
 }

@@ -2,10 +2,13 @@ import { syntheticPcap } from './pcap.mjs';
 import { pcapFixtures } from './pcap-deep.mjs';
 import { toolOptions, toolResult } from './nettools.mjs';
 import { attackOptions, attackResult, observerResult } from './attacks.mjs';
+import { createStaMacState, bootStaMac, staMacCommand,
+  staMacSnapshot as snapshotStaMac, restoreStaMacSnapshot as restoreStaMac } from './sta_mac.mjs';
 
 /** Deterministic virtual device. No network, timers, filesystem or hardware I/O. */
 export class SimulatedDevice {
   #seed; #modules; #jobs=new Map(); #nextId=1; #now=0; #capacity;
+  #staMacChangeHandler=null;
 
   constructor(seed,{sdCapacityBytes=8*1024*1024}={}) {
     if(seed.schema_version!==1) throw new Error('Unsupported scenario version');
@@ -25,13 +28,16 @@ export class SimulatedDevice {
     this.#now=0;this.#jobs.clear();
     // Operation IDs never repeat, including across reset. Planned HTML seed
     // entries have no bytes yet and are intentionally not advertised as files.
-    this.#modules=new Map(this.#seed.modules.map(module=>[module.id,{
+    this.#modules=new Map(this.#seed.modules.map((module,index)=>[module.id,{
       connected:module.connected,sdPresent:module.sd_present,networks:[],selected:null,
+      staMac:createStaMacState(module.id,index,this.#seed.seed>>>0),
       version:'demo-main-1',activeSlot:0,slots:['demo-main-1','demo-backup-1'],boardName:`Offline demo ${module.id}`,bootedAt:0,reboots:0,revision:1,
       active:null,files:new Map(),sequence:0,gpsEnabled:true,wardriveSecond:1,wardrivePoints:0,wardriveBlacklist:[],
       observer:{running:false,networks:[],packets:0,elapsedMs:0,error:null},observerStarted:0,observerIds:[],
       wardrive:{running:false,gps:{fix:false,lat:0,lon:0,satellites:0,distanceM:0},wifiCount:0,btCount:0,rows:[],track:[],sessions:[],error:null,upload:null}
     }]));
+    for(const module of this.#modules.values())bootStaMac(module.staMac);
+    this.#staMacChangeHandler?.();
   }
 
   #module(id) {
@@ -65,6 +71,38 @@ export class SimulatedDevice {
     return structuredClone({connected:module.connected,sdPresent:module.sdPresent,
       version:module.version,activeSlot:module.activeSlot,slots:module.slots,boardName:module.boardName,uptimeMs:this.#now-module.bootedAt,
       reboots:module.reboots,active:module.active,sdUsedBytes:this.#used(module),sdCapacityBytes:this.#capacity});
+  }
+
+  staMacCommand(moduleId,command) {
+    const module=this.#module(moduleId);
+    const line=staMacCommand(module.staMac,command,{connected:module.connected,active:module.active});
+    if(JSON.parse(line).result==='set')this.#staMacChangeHandler?.();
+    return line;
+  }
+
+  staMacSnapshot() {
+    return Object.fromEntries(this.#seed.modules.filter(module=>module.producer==='janos')
+      .map(module=>[module.id,snapshotStaMac(this.#module(module.id).staMac)]));
+  }
+
+  restoreStaMacSnapshot(snapshot) {
+    if(snapshot===null||typeof snapshot!=='object'||Array.isArray(snapshot)||
+       Object.getPrototypeOf(snapshot)!==Object.prototype)return false;
+    const ids=this.#seed.modules.filter(module=>module.producer==='janos').map(module=>module.id);
+    if(Object.keys(snapshot).sort().join('|')!==ids.sort().join('|'))return false;
+    const restored=new Map();
+    for(const id of ids) {
+      const state=restoreStaMac(this.#module(id).staMac,snapshot[id]);
+      if(!state)return false;
+      restored.set(id,state);
+    }
+    for(const [id,state] of restored)this.#module(id).staMac=state;
+    return true;
+  }
+
+  setStaMacChangeHandler(handler) {
+    if(handler!==null&&typeof handler!=='function')throw new Error('Invalid STA MAC change handler');
+    this.#staMacChangeHandler=handler;
   }
 
   systemActivateSlot(moduleId,slot) {
@@ -102,6 +140,8 @@ export class SimulatedDevice {
       if(job.operation==='update'){module.version=`demo-${job.options.channel}-${++module.revision}`;module.slots[module.activeSlot]=module.version;}
       if(job.slot!==undefined){module.activeSlot=job.slot;module.version=module.slots[job.slot];}
       module.reboots++;module.bootedAt=job.started+job.duration;module.connected=true;
+      bootStaMac(module.staMac);
+      this.#staMacChangeHandler?.();
       module.networks=[];module.selected=null;
       module.observer={running:false,networks:[],packets:0,elapsedMs:0,error:null};
       module.observerIds=[];module.observerStarted=module.bootedAt;

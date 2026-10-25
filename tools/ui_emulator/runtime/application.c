@@ -462,6 +462,7 @@ EMSCRIPTEN_KEEPALIVE void emu_inspect_bindings(void) {
 #include "pcap_files.c"
 #include "clock.c"
 #include "settings_system.c"
+#include "settings_sta_mac.c"
 #include "settings_ota.c"
 #include "settings_sd_admin.c"
 #include "nettools_gitm.c"

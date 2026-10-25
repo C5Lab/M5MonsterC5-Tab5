@@ -288,3 +288,23 @@ configuration demonstration; virtual file operations do not measure UART speed.
 Back from a running Observer now asks **Keep running** or **Stop and exit**.
 Run `tests/verify_emulator_settings_followup.py` after building; the full Phase 5
 settings gate includes these cases. See `docs/ui-emulator/Settings_Followup_Report.md`.
+
+### Wi-Fi STA MAC policy
+
+Open **INTERNAL → Settings → Wi-Fi MAC**. The default demo has virtual Grove and
+MBus Monsters, so select the one whose status you want to inspect. To see the
+automatic read, choose **Grove only · MBus disconnected** under **Module
+condition**; the demo restarts and selects Grove when you open Wi-Fi MAC.
+**Refresh** repeats the read. Choose **Factory**, **Random**, or **Fixed** (for example,
+`02:11:22:33:44:55`) and save to the selected virtual module. The saved policy
+appears separately from the policy and effective MAC for its current boot. Open
+**INTERNAL → Module Status** and simulate that module's reboot when **Restart
+required** says **Yes**; Tab5 does not reboot it when you save.
+
+The status and MAC addresses are synthetic, isolated per virtual module. This
+virtual policy and the current boot MAC survive an ordinary browser reload when
+browser storage is available. **Reset demo** clears them; virtual SD files
+remain ephemeral. The browser demo does not read a connected physical Monster
+or exercise its Wi-Fi radio. See the [Tab5 Wi-Fi MAC instructions](../../docs/Sta_MAC_Setup.md)
+for the real JanOS workflow and the distinction between the STA policy and a
+temporary WPS session MAC.

@@ -3,6 +3,27 @@
 Pure-logic pieces that carry no LVGL or ESP-IDF dependency are tested on the
 host, so they can be verified without flashing a Tab5.
 
+## Wi-Fi STA MAC setup
+
+`sta_mac_setup_model_test.c` checks the exact JanOS commands, strict local
+unicast MAC validation, and automatic selection only when one JanOS port is
+detected. `sta_mac_setup_response_test.c` checks the current
+JanOS JSON status and set replies, NVS error states, radio admission errors,
+null current MAC, malformed output, and a set acknowledgement for the wrong
+policy. These tests do not exercise UART timing, the LVGL screen, firmware, or
+the radio.
+
+```sh
+cc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -g \
+  -I main tests/sta_mac_setup_model_test.c main/sta_mac_setup_model.c \
+  -o /tmp/sta_mac_setup_model_test
+/tmp/sta_mac_setup_model_test
+cc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -g \
+  -I main tests/sta_mac_setup_response_test.c main/sta_mac_setup_response.c \
+  -o /tmp/sta_mac_setup_response_test
+/tmp/sta_mac_setup_response_test
+```
+
 ## `test_wpa_psk_auditor_contract.py`
 
 Pins the first INTERNAL-tab `WPA PSK Auditor` dashboard integration without

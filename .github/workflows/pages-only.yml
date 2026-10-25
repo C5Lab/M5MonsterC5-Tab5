@@ -10,15 +10,61 @@ on:
     branches: [main, master]
     paths:
       - "docs/**"
+      - "main/**"
+      - "tools/ui_emulator/**"
+      - "components/pcap_*/**"
+      - "components/*/include/**"
+      - "managed_components/lvgl__lvgl/**"
+      - "lv_conf.h"
+      - "sdkconfig"
       - ".github/workflows/pages-only.yml"
+      - ".github/workflows/esp32p4-build-master.yml"
 
 concurrency:
   group: github-pages-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
+  route:
+    name: Select Pages publisher
+    runs-on: ubuntu-24.04
+    outputs:
+      deploy: ${{ steps.select.outputs.deploy }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Skip when firmware workflow publishes this push
+        id: select
+        env:
+          BASE_SHA: ${{ github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" != "push" ]; then
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          base="$BASE_SHA"
+          if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ]; then
+            base="$(git rev-parse HEAD~1 2>/dev/null || git rev-parse HEAD)"
+          fi
+          changed="$(git diff --name-only "$base" "$HEAD_SHA")"
+          if grep -qE '^\.github/workflows/' <<< "$changed"; then
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+          elif grep -qE '^(main/main\.c$|\.github/scripts/)' <<< "$changed"; then
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+            echo "Firmware workflow will publish Pages after its release."
+          else
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+          fi
+
   pages:
     name: Deploy Pages Only
+    needs: route
+    if: needs.route.outputs.deploy == 'true'
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -101,6 +147,19 @@ jobs:
         run: |
           set -euo pipefail
           python -c "import os, json; from pathlib import Path; version=os.getenv('FW_VERSION') or os.getenv('BUILD_TAG'); build=os.getenv('BUILD_TAG', 'manual'); manifest={'name':'M5MonsterC5-Tab5 ESP32-P4','version':version,'build':build,'chipFamily':'ESP32-P4','parts':[{'path':'firmware/bootloader.bin','offset':8192},{'path':'firmware/partition-table.bin','offset':32768},{'path':'firmware/M5MonsterC5-Tab5.bin','offset':65536}]}; Path('docs/manifest.json').write_text(json.dumps(manifest, indent=2), encoding='utf-8')"
+
+      - name: Build browser emulator
+        run: bash tools/ui_emulator/build.sh
+
+      - name: Stage browser emulator
+        run: |
+          set -euo pipefail
+          test -s tools/ui_emulator/dist/index.html
+          test -s tools/ui_emulator/dist/emulator.wasm
+          mkdir -p docs/emulator
+          cp -R tools/ui_emulator/dist/. docs/emulator/
+          test -s docs/emulator/index.html
+          test -s docs/emulator/emulator.wasm
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
