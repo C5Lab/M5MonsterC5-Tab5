@@ -118,8 +118,8 @@ extern void pthread_internal_local_storage_destructor_callback(TaskHandle_t hand
 #endif
 
 
-#define JANOS_TAB_VERSION "1.5.5"
-#define JANOS_VERSION_REQUIRED "1.7.5"
+#define JANOS_TAB_VERSION "1.5.6"
+#define JANOS_VERSION_REQUIRED "1.7.6"
 #define USB_CH34X_BULK_MPS 32
 
 _Static_assert(CONFIG_IN_TRANSFER_BUFFER_SIZE == USB_CH34X_BULK_MPS,
