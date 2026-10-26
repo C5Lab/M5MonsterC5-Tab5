@@ -16,7 +16,7 @@ test('system status is detached and module-local',()=>{
   d.advance(3000);
   assert.equal(d.systemStatus('grove').version,'demo-dev-2');
   assert.equal(d.systemStatus('grove').reboots,1);
-  assert.equal(d.systemStatus('mbus').version,'demo-main-1');
+  assert.equal(d.systemStatus('mbus').version,'demo-rf-main-1');
   assert.equal(d.systemStatus('mbus').reboots,0);
 });
 
@@ -83,7 +83,7 @@ test('system inputs use a strict whitelist and never retain credentials',()=>{
   }
   assert.throws(()=>d.systemStart('grove','reboot',{channel:'main'}),/options/);
   const options={channel:'dev'},id=d.systemStart('grove','update',options);options.password='secret';
-  assert.deepEqual(d.job(id).options,{channel:'dev',outcome:'success'});
+  assert.deepEqual(d.job(id).options,{channel:'dev',outcome:'success',variant:'classic',force:false,release:null});
 });
 
 test('SD admin reserves a module until stopped and fails immediately on SD removal',()=>{

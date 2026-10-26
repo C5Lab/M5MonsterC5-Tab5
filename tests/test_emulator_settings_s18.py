@@ -15,7 +15,14 @@ class SettingsS18Browser(unittest.TestCase):
         self.load(rotation)
         self.page.locator('#queue2-story').select_option(id)
         self.page.locator('#guide-queue2').click()
-        click_text(self.page,'INTERNAL');click_text(self.page,'Settings')
+        click_text(self.page,'INTERNAL')
+        self.page.evaluate('emulator.module._emu_tick(100)')
+        self.page.evaluate('emulator.module._emu_tick(100)')
+        click_text(self.page,'Settings')
+        self.page.wait_for_function('''() => {
+            emulator.module._emu_inspect();
+            return emulatorObjects.some(o => o.text === 'Tool\\nOrder');
+        }''')
     def title(self,text):self.page.wait_for_function('(t)=>document.querySelector("#guide-title").textContent===t',arg=text,timeout=8000)
     def finish(self):
         self.page.wait_for_function('document.querySelector("#guide-leave").textContent==="Back to stories"',timeout=8000)
@@ -33,6 +40,8 @@ class SettingsS18Browser(unittest.TestCase):
         for r in range(4):
             with self.subTest(rotation=r):
                 self.begin('s18-scan',r);click_text(p,'Scan\nSetup');self.title('Change GROVE scan settings')
+                vendor=next(o for o in objects(p) if 'show_scan_time_popup.scan_setup_vendor_switch.' in o['binding'])
+                self.assertFalse(vendor['state'] & 128, 'Virtual vendor database should enable Show Vendors')
                 s=self.snapshot();self.number(s['minInput'],200);self.number(s['maxInput'],500)
                 self.click('show_scan_time_popup.scan_setup_vendor_switch.')
                 self.title('Save the scan timings');click_text(p,'Save');self.title('Reopen and verify settings')
@@ -50,6 +59,20 @@ class SettingsS18Browser(unittest.TestCase):
                 self.title('Verify the original timings');click_text(p,'Scan\nSetup');self.title('Return to Settings')
                 click_text(p,'Cancel');self.finish()
                 self.assertEqual([self.snapshot()['min'],self.snapshot()['max']],[baseline['min'],baseline['max']])
+    def test_vendor_and_unknown_vendor_log_survive_reload(self):
+        p=self.page;self.begin('s18-scan',0);click_text(p,'Scan\nSetup')
+        self.click('show_scan_time_popup.scan_setup_vendor_switch.')
+        self.click('show_scan_time_popup.scan_setup_vendor_log_switch.')
+        self.assertEqual(p.evaluate('[emulatorSettings.get("obs_vendor",null),emulatorSettings.get("obs_vendor_log",null)]'),[1,1])
+        p.reload();self.ready();click_text(p,'INTERNAL')
+        p.evaluate('emulator.module._emu_tick(100)');p.evaluate('emulator.module._emu_tick(100)')
+        click_text(p,'Settings')
+        p.wait_for_function('''() => {emulator.module._emu_inspect();return emulatorObjects.some(o => o.text === 'Tool\\nOrder')}''')
+        click_text(p,'Scan\nSetup')
+        for name in ['scan_setup_vendor_switch','scan_setup_vendor_log_switch']:
+            switch=next(o for o in objects(p) if f'show_scan_time_popup.{name}.' in o['binding'])
+            self.assertTrue(switch['state']&1,name)
+        self.assertTrue(self.snapshot()['vendor']);self.clean()
     def test_red_team_both_choices_all_rotations(self):
         p=self.page
         for r in range(4):

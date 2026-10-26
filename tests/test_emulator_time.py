@@ -16,7 +16,9 @@ class TimeTests(unittest.TestCase):
     def ready(self):self.page.wait_for_function('globalThis.emulator?.measurements.frames>2')
     def text(self):return '\n'.join(o['text'] for o in objects(self.page))
     def open(self):
-        click_text(self.page,'INTERNAL');click_text(self.page,'Settings');click_text(self.page,'Time')
+        click_text(self.page,'INTERNAL');self.page.evaluate('emulator.module._emu_tick(10)')
+        click_text(self.page,'Settings');self.page.evaluate('emulator.module._emu_tick(10)')
+        click_text(self.page,'Time')
     def load(self,rotation=0,date='2028-02-29T23:45:00Z'):
         p=self.page;p.goto(f'{self.url}/?rotation={rotation}');self.ready()
         p.evaluate('(s)=>emulatorSettings.set("rtc_offset",Date.parse(s)-Date.now())',date)

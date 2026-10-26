@@ -31,8 +31,11 @@ class ReconStoriesBrowser(unittest.TestCase):
             with self.subTest(rotation=rotation):
                 self.begin('observer',rotation);self.title('Open NEON-BAZAAR')
                 self.assertEqual(p.evaluate('emulator.device.snapshot(0).networks'),[])
-                self.assertTrue(any(o['binding'].endswith('/client') for o in objects(p)))
+                self.assertTrue(any(o['binding'].endswith('/observe') for o in objects(p)))
                 self.tap('02:20:77:00:00:01/observe');self.title('Save a synthetic capture')
+                clients=p.evaluate("emulator.device.device.observer('grove').networks.find(n=>n.id==='net-1').clients.map(c=>c.mac)")
+                rendered=[o['text'] for o in objects(p)]
+                self.assertTrue(all(any(mac in text for text in rendered) for mac in clients))
                 self.tap('emu.phase3.observer.synthetic_capture');self.tap('emu.phase3.capture.generate')
                 self.title('Return to Observer')
                 files=p.evaluate("emulator.device.device.files('grove')")

@@ -3,11 +3,11 @@
   "status": "structural-inventory-not-semantic-signoff",
   "summary": {
     "source_files": 30,
-    "functions": 2124,
+    "functions": 2132,
     "event_registration_sites": 518,
     "resolved_callback_sites": 518,
     "boundary_call_sites": 2095,
-    "global_declarations": 1155,
+    "global_declarations": 1156,
     "routes": 110,
     "story_steps": 44,
     "syntax_diagnostics": 0
@@ -22,25 +22,25 @@
     "main/screens/nfc_list_screen.c": "b71522b10f333ed688ffa0ef9d968cf24b3b951b778da9c3d2bf95a57d5bc028",
     "main/screens/nfc_parser.c": "b35b82bb4c3452e585af6f61f3bdc7166b21b98b5b9ff25104d097ff4f496f92",
     "main/screens/nfc_read_screen.c": "1438c8887ac0cac6e44bb595f97a2f33c823936a9212524fc23d6643488ddce5",
-    "main/screens/nfc_screen.c": "3bd14e4e73230cc8f418b326a5b776c4ae962f6ef05fb1189e78e772fa719594",
-    "main/screens/nfc_uart.c": "edee974bf9271005c10a18bcc0a96a81d77a569c77a992201559faf87597b2b9",
+    "main/screens/nfc_screen.c": "d17f723e42175b179169a0049a17563df78aee471fa843988c5fb364b7fececd",
+    "main/screens/nfc_uart.c": "b9338899073d9362ac23e0dde90b8381e19ff251acb220a8eb6aacdf2b9a6259",
     "main/screens/psram_dynarr.c": "4aaa8f12da0366512e8f2db52efb57332b2c1c09ad5cab774ad138c5b7b1b289",
-    "main/screens/subghz_hunter_screen.c": "7e3cee6eb7a9c50d90addd41ede91adae7fab2d3a19c14e79c2892b2000e4712",
+    "main/screens/subghz_hunter_screen.c": "f744453e00a8858a374bad70a639b99c9e1b8034850b33daa4887f70d5652f47",
     "main/screens/subghz_hunter_settings_screen.c": "c5f5a97fece2a5e3fc33bf73f94f6110c94f5f0c63bdfc18c99842a9ebc80d4e",
     "main/screens/subghz_jammer_screen.c": "f3a60925c1db4482a92284facf6c2d56d879ac93e528bf3c4083cc1dec747a12",
-    "main/screens/subghz_listen_screen.c": "a3b4ee0fbaa91431aa908d88e12fccb8d2941d733a0fe67b9b52cb4586c0cb23",
+    "main/screens/subghz_listen_screen.c": "a6ddafd112731470539cb1b2a31214495115596af127594e0626aec7e306fa9b",
     "main/screens/subghz_listen_settings_screen.c": "9510abf5a03ee304b72f3d1800de0d6cfed17ab9158118c4757a934a09797526",
-    "main/screens/subghz_manage_screen.c": "944acc53cd5ef5d8bab2af446b1db667804dc54be4418a740690b29c6b028bff",
+    "main/screens/subghz_manage_screen.c": "678e6dae6aaa871ad269d2dfc81bb1ff85a45578e4d0b7dc42364aa8dd97293f",
     "main/screens/subghz_parser.c": "89b86b822afd3493e5aaa8d08e36fb6c94cb3b77fdbefb91e8ed60f8bd23f30f",
     "main/screens/subghz_rf_settings.c": "78a0998f4b159fb6e640df70c7a84a48e9e72a41b7bf4197f333363389456a03",
-    "main/screens/subghz_scanner_screen.c": "319760dc0788e657876390f7cf5294570c9cb0cffe4e837ceb7155ad6ccc5d4a",
+    "main/screens/subghz_scanner_screen.c": "622d4c3c0f5bd37b9ba9b955b75a6916d44446c1ee2ff7d823ff25ffd64b6433",
     "main/screens/subghz_scanner_settings_screen.c": "cc60f4de2b747ed2dae5f6ebc6116d841f1ae96f2a445f31353d117748426a2d",
     "main/screens/subghz_screen.c": "85f21ed45df51d21220905786c48a6c87ff2e1e4cffc0400103e84ae17e27660",
-    "main/screens/subghz_settings_screen.c": "fcced444b05abacd3c3b71392be450dd73050acf2490ddbd45639d8dea05b36d",
+    "main/screens/subghz_settings_screen.c": "b69bf4e89e04d73af276a289c172801d0226516256e8b4fd16e54b288a8d0e75",
     "main/screens/subghz_signal_list.c": "bb481e26cb65d92f23b3cb11b4fb685028a356753570dd030fdcf42df0be8451",
     "main/screens/subghz_tesla_screen.c": "3e4e1f8f381ba7b75945230ac0a70073163e7139063f87070492ad340d96282a",
     "main/screens/subghz_text_input_popup.c": "88bb5eb011e46245b7f95d8314c1551eb3c1129b8de1ad70f742d21e02a5337a",
-    "main/screens/subghz_weather_screen.c": "89e506f89ce4edd43a6097e7e798052fa959af07f188f0ed5f80ef1c921eaeff",
+    "main/screens/subghz_weather_screen.c": "d192622321de952d3e1450b2dbc9fc4f2e14df1e020e48d530adcd17c5e49910",
     "main/screens/tool_order_screen.c": "a650ac0b9654e6bdfc42c34e232a55d501cbf5ab6bedc331ff4b2483a030b928",
     "main/screens/wifi_analyzer_screen.c": "55beedc43ffc40cad71bfa0e08661c6137566b9aa6cf94d309d77bb0d8e5cf42"
   },
@@ -1652,16 +1652,21 @@
         "main/observer_view.inc::observer_plain_text",
         "main/screens/cgw_parser.c::cgw_snapshot_reset",
         "main/screens/nfc_parser.c::nfc_card_reset",
+        "main/screens/nfc_parser.c::nfc_line_is_end",
+        "main/screens/nfc_parser.c::nfc_parse_card_line",
         "main/screens/nfc_screen.c::destroy_page",
         "main/screens/nfc_screen.c::nfc_create_tile",
         "main/screens/nfc_screen.c::nfc_hide_all_pages",
         "main/screens/nfc_screen.c::nfc_make_page",
         "main/screens/nfc_screen.c::nfc_set_btn_enabled",
         "main/screens/nfc_screen.c::show_nfc_page",
+        "main/screens/nfc_uart.c::nfc_emulator_dispatch",
         "main/screens/nfc_uart.c::nfc_ensure_timer",
         "main/screens/nfc_uart.c::nfc_host_alloc_state",
+        "main/screens/nfc_uart.c::nfc_set_live",
         "main/screens/nfc_uart.c::nfc_uart_cancel",
         "main/screens/nfc_uart.c::nfc_uart_start",
+        "main/screens/nfc_uart.c::push_line",
         "main/screens/subghz_screen.c::show_subghz_page",
         "main/screens/subghz_screen.c::subghz_create_header",
         "main/screens/subghz_screen.c::subghz_create_tile",
@@ -1744,6 +1749,8 @@
         "vTaskDelay",
         "xSemaphoreCreateMutex",
         "xSemaphoreGetMutexHolder",
+        "xSemaphoreGive",
+        "xSemaphoreTake",
         "xTaskCreate",
         "xTaskCreateWithCaps",
         "xTaskGetCurrentTaskHandle",
@@ -2081,16 +2088,21 @@
           "main/observer_view.inc::observer_plain_text",
           "main/screens/cgw_parser.c::cgw_snapshot_reset",
           "main/screens/nfc_parser.c::nfc_card_reset",
+          "main/screens/nfc_parser.c::nfc_line_is_end",
+          "main/screens/nfc_parser.c::nfc_parse_card_line",
           "main/screens/nfc_screen.c::destroy_page",
           "main/screens/nfc_screen.c::nfc_create_tile",
           "main/screens/nfc_screen.c::nfc_hide_all_pages",
           "main/screens/nfc_screen.c::nfc_make_page",
           "main/screens/nfc_screen.c::nfc_set_btn_enabled",
           "main/screens/nfc_screen.c::show_nfc_page",
+          "main/screens/nfc_uart.c::nfc_emulator_dispatch",
           "main/screens/nfc_uart.c::nfc_ensure_timer",
           "main/screens/nfc_uart.c::nfc_host_alloc_state",
+          "main/screens/nfc_uart.c::nfc_set_live",
           "main/screens/nfc_uart.c::nfc_uart_cancel",
           "main/screens/nfc_uart.c::nfc_uart_start",
+          "main/screens/nfc_uart.c::push_line",
           "main/screens/subghz_screen.c::show_subghz_page",
           "main/screens/subghz_screen.c::subghz_create_header",
           "main/screens/subghz_screen.c::subghz_create_tile",
@@ -2445,16 +2457,21 @@
           "main/observer_view.inc::observer_plain_text",
           "main/screens/cgw_parser.c::cgw_snapshot_reset",
           "main/screens/nfc_parser.c::nfc_card_reset",
+          "main/screens/nfc_parser.c::nfc_line_is_end",
+          "main/screens/nfc_parser.c::nfc_parse_card_line",
           "main/screens/nfc_screen.c::destroy_page",
           "main/screens/nfc_screen.c::nfc_create_tile",
           "main/screens/nfc_screen.c::nfc_hide_all_pages",
           "main/screens/nfc_screen.c::nfc_make_page",
           "main/screens/nfc_screen.c::nfc_set_btn_enabled",
           "main/screens/nfc_screen.c::show_nfc_page",
+          "main/screens/nfc_uart.c::nfc_emulator_dispatch",
           "main/screens/nfc_uart.c::nfc_ensure_timer",
           "main/screens/nfc_uart.c::nfc_host_alloc_state",
+          "main/screens/nfc_uart.c::nfc_set_live",
           "main/screens/nfc_uart.c::nfc_uart_cancel",
           "main/screens/nfc_uart.c::nfc_uart_start",
+          "main/screens/nfc_uart.c::push_line",
           "main/screens/subghz_screen.c::show_subghz_page",
           "main/screens/subghz_screen.c::subghz_create_header",
           "main/screens/subghz_screen.c::subghz_create_tile",
@@ -93493,14 +93510,21 @@
         "main/screens/nfc_detail_screen.c::close_confirm",
         "main/screens/nfc_detail_screen.c::on_delete_confirmed",
         "main/screens/nfc_parser.c::nfc_card_reset",
+        "main/screens/nfc_parser.c::nfc_line_is_end",
+        "main/screens/nfc_parser.c::nfc_parse_card_line",
+        "main/screens/nfc_uart.c::nfc_emulator_dispatch",
         "main/screens/nfc_uart.c::nfc_ensure_timer",
         "main/screens/nfc_uart.c::nfc_host_alloc_state",
+        "main/screens/nfc_uart.c::nfc_set_live",
         "main/screens/nfc_uart.c::nfc_uart_cancel",
-        "main/screens/nfc_uart.c::nfc_uart_start"
+        "main/screens/nfc_uart.c::nfc_uart_start",
+        "main/screens/nfc_uart.c::push_line"
       ],
       "device_and_scheduler_dependencies": [
         "vTaskDelay",
         "xSemaphoreCreateMutex",
+        "xSemaphoreGive",
+        "xSemaphoreTake",
         "xTaskCreate"
       ],
       "contract": {
@@ -93517,10 +93541,15 @@
           "main/screens/nfc_detail_screen.c::close_confirm",
           "main/screens/nfc_detail_screen.c::on_delete_confirmed",
           "main/screens/nfc_parser.c::nfc_card_reset",
+          "main/screens/nfc_parser.c::nfc_line_is_end",
+          "main/screens/nfc_parser.c::nfc_parse_card_line",
+          "main/screens/nfc_uart.c::nfc_emulator_dispatch",
           "main/screens/nfc_uart.c::nfc_ensure_timer",
           "main/screens/nfc_uart.c::nfc_host_alloc_state",
+          "main/screens/nfc_uart.c::nfc_set_live",
           "main/screens/nfc_uart.c::nfc_uart_cancel",
-          "main/screens/nfc_uart.c::nfc_uart_start"
+          "main/screens/nfc_uart.c::nfc_uart_start",
+          "main/screens/nfc_uart.c::push_line"
         ],
         "data_owner_evidence": [
           "main/main.c::get_ctx_for_tab",
@@ -93530,10 +93559,15 @@
           "main/screens/nfc_detail_screen.c::close_confirm",
           "main/screens/nfc_detail_screen.c::on_delete_confirmed",
           "main/screens/nfc_parser.c::nfc_card_reset",
+          "main/screens/nfc_parser.c::nfc_line_is_end",
+          "main/screens/nfc_parser.c::nfc_parse_card_line",
+          "main/screens/nfc_uart.c::nfc_emulator_dispatch",
           "main/screens/nfc_uart.c::nfc_ensure_timer",
           "main/screens/nfc_uart.c::nfc_host_alloc_state",
+          "main/screens/nfc_uart.c::nfc_set_live",
           "main/screens/nfc_uart.c::nfc_uart_cancel",
-          "main/screens/nfc_uart.c::nfc_uart_start"
+          "main/screens/nfc_uart.c::nfc_uart_start",
+          "main/screens/nfc_uart.c::push_line"
         ],
         "status": "static contract; guards, writes and calls in referenced function records; runtime validation belongs to later phases",
         "callback_guards": {
@@ -93756,13 +93790,18 @@
         "main/screens/nfc_detail_screen.c::on_emulate",
         "main/screens/nfc_emulate_screen.c::show_nfc_emulate_page",
         "main/screens/nfc_parser.c::nfc_card_reset",
+        "main/screens/nfc_parser.c::nfc_line_is_end",
+        "main/screens/nfc_parser.c::nfc_parse_card_line",
         "main/screens/nfc_screen.c::destroy_page",
         "main/screens/nfc_screen.c::nfc_hide_all_pages",
         "main/screens/nfc_screen.c::nfc_make_page",
+        "main/screens/nfc_uart.c::nfc_emulator_dispatch",
         "main/screens/nfc_uart.c::nfc_ensure_timer",
         "main/screens/nfc_uart.c::nfc_host_alloc_state",
+        "main/screens/nfc_uart.c::nfc_set_live",
         "main/screens/nfc_uart.c::nfc_uart_cancel",
         "main/screens/nfc_uart.c::nfc_uart_start",
+        "main/screens/nfc_uart.c::push_line",
         "main/screens/subghz_screen.c::subghz_create_header",
         "main/screens/subghz_screen.c::subghz_hide_all_pages",
         "main/screens/wifi_analyzer_screen.c::button_text",
@@ -93790,6 +93829,8 @@
         "vTaskDelay",
         "xSemaphoreCreateMutex",
         "xSemaphoreGetMutexHolder",
+        "xSemaphoreGive",
+        "xSemaphoreTake",
         "xTaskCreate",
         "xTaskGetCurrentTaskHandle"
       ],
@@ -93830,13 +93871,18 @@
           "main/screens/nfc_detail_screen.c::on_emulate",
           "main/screens/nfc_emulate_screen.c::show_nfc_emulate_page",
           "main/screens/nfc_parser.c::nfc_card_reset",
+          "main/screens/nfc_parser.c::nfc_line_is_end",
+          "main/screens/nfc_parser.c::nfc_parse_card_line",
           "main/screens/nfc_screen.c::destroy_page",
           "main/screens/nfc_screen.c::nfc_hide_all_pages",
           "main/screens/nfc_screen.c::nfc_make_page",
+          "main/screens/nfc_uart.c::nfc_emulator_dispatch",
           "main/screens/nfc_uart.c::nfc_ensure_timer",
           "main/screens/nfc_uart.c::nfc_host_alloc_state",
+          "main/screens/nfc_uart.c::nfc_set_live",
           "main/screens/nfc_uart.c::nfc_uart_cancel",
           "main/screens/nfc_uart.c::nfc_uart_start",
+          "main/screens/nfc_uart.c::push_line",
           "main/screens/subghz_screen.c::subghz_create_header",
           "main/screens/subghz_screen.c::subghz_hide_all_pages",
           "main/screens/wifi_analyzer_screen.c::button_text",
@@ -93876,13 +93922,18 @@
           "main/screens/nfc_detail_screen.c::on_emulate",
           "main/screens/nfc_emulate_screen.c::show_nfc_emulate_page",
           "main/screens/nfc_parser.c::nfc_card_reset",
+          "main/screens/nfc_parser.c::nfc_line_is_end",
+          "main/screens/nfc_parser.c::nfc_parse_card_line",
           "main/screens/nfc_screen.c::destroy_page",
           "main/screens/nfc_screen.c::nfc_hide_all_pages",
           "main/screens/nfc_screen.c::nfc_make_page",
+          "main/screens/nfc_uart.c::nfc_emulator_dispatch",
           "main/screens/nfc_uart.c::nfc_ensure_timer",
           "main/screens/nfc_uart.c::nfc_host_alloc_state",
+          "main/screens/nfc_uart.c::nfc_set_live",
           "main/screens/nfc_uart.c::nfc_uart_cancel",
           "main/screens/nfc_uart.c::nfc_uart_start",
+          "main/screens/nfc_uart.c::push_line",
           "main/screens/subghz_screen.c::subghz_create_header",
           "main/screens/subghz_screen.c::subghz_hide_all_pages",
           "main/screens/wifi_analyzer_screen.c::button_text",
@@ -94204,14 +94255,19 @@
         "main/screens/nfc_detail_screen.c::show_nfc_detail_page",
         "main/screens/nfc_list_screen.c::on_row_tap",
         "main/screens/nfc_parser.c::nfc_card_reset",
+        "main/screens/nfc_parser.c::nfc_line_is_end",
+        "main/screens/nfc_parser.c::nfc_parse_card_line",
         "main/screens/nfc_screen.c::destroy_page",
         "main/screens/nfc_screen.c::nfc_hide_all_pages",
         "main/screens/nfc_screen.c::nfc_make_page",
         "main/screens/nfc_screen.c::nfc_set_btn_enabled",
+        "main/screens/nfc_uart.c::nfc_emulator_dispatch",
         "main/screens/nfc_uart.c::nfc_ensure_timer",
         "main/screens/nfc_uart.c::nfc_host_alloc_state",
+        "main/screens/nfc_uart.c::nfc_set_live",
         "main/screens/nfc_uart.c::nfc_uart_cancel",
         "main/screens/nfc_uart.c::nfc_uart_start",
+        "main/screens/nfc_uart.c::push_line",
         "main/screens/subghz_screen.c::subghz_create_header",
         "main/screens/subghz_screen.c::subghz_hide_all_pages",
         "main/screens/wifi_analyzer_screen.c::button_text",
@@ -94239,6 +94295,8 @@
         "vTaskDelay",
         "xSemaphoreCreateMutex",
         "xSemaphoreGetMutexHolder",
+        "xSemaphoreGive",
+        "xSemaphoreTake",
         "xTaskCreate",
         "xTaskGetCurrentTaskHandle"
       ],
@@ -94281,14 +94339,19 @@
           "main/screens/nfc_detail_screen.c::show_nfc_detail_page",
           "main/screens/nfc_list_screen.c::on_row_tap",
           "main/screens/nfc_parser.c::nfc_card_reset",
+          "main/screens/nfc_parser.c::nfc_line_is_end",
+          "main/screens/nfc_parser.c::nfc_parse_card_line",
           "main/screens/nfc_screen.c::destroy_page",
           "main/screens/nfc_screen.c::nfc_hide_all_pages",
           "main/screens/nfc_screen.c::nfc_make_page",
           "main/screens/nfc_screen.c::nfc_set_btn_enabled",
+          "main/screens/nfc_uart.c::nfc_emulator_dispatch",
           "main/screens/nfc_uart.c::nfc_ensure_timer",
           "main/screens/nfc_uart.c::nfc_host_alloc_state",
+          "main/screens/nfc_uart.c::nfc_set_live",
           "main/screens/nfc_uart.c::nfc_uart_cancel",
           "main/screens/nfc_uart.c::nfc_uart_start",
+          "main/screens/nfc_uart.c::push_line",
           "main/screens/subghz_screen.c::subghz_create_header",
           "main/screens/subghz_screen.c::subghz_hide_all_pages",
           "main/screens/wifi_analyzer_screen.c::button_text",
@@ -94330,14 +94393,19 @@
           "main/screens/nfc_detail_screen.c::show_nfc_detail_page",
           "main/screens/nfc_list_screen.c::on_row_tap",
           "main/screens/nfc_parser.c::nfc_card_reset",
+          "main/screens/nfc_parser.c::nfc_line_is_end",
+          "main/screens/nfc_parser.c::nfc_parse_card_line",
           "main/screens/nfc_screen.c::destroy_page",
           "main/screens/nfc_screen.c::nfc_hide_all_pages",
           "main/screens/nfc_screen.c::nfc_make_page",
           "main/screens/nfc_screen.c::nfc_set_btn_enabled",
+          "main/screens/nfc_uart.c::nfc_emulator_dispatch",
           "main/screens/nfc_uart.c::nfc_ensure_timer",
           "main/screens/nfc_uart.c::nfc_host_alloc_state",
+          "main/screens/nfc_uart.c::nfc_set_live",
           "main/screens/nfc_uart.c::nfc_uart_cancel",
           "main/screens/nfc_uart.c::nfc_uart_start",
+          "main/screens/nfc_uart.c::push_line",
           "main/screens/subghz_screen.c::subghz_create_header",
           "main/screens/subghz_screen.c::subghz_hide_all_pages",
           "main/screens/wifi_analyzer_screen.c::button_text",
@@ -94397,17 +94465,24 @@
         "main/main.c::nfc_host_state_for_tab",
         "main/main.c::subghz_host_color_cyan",
         "main/screens/nfc_parser.c::nfc_card_reset",
+        "main/screens/nfc_parser.c::nfc_line_is_end",
+        "main/screens/nfc_parser.c::nfc_parse_card_line",
         "main/screens/nfc_read_screen.c::on_read",
         "main/screens/nfc_read_screen.c::set_labels",
         "main/screens/nfc_screen.c::nfc_set_btn_enabled",
+        "main/screens/nfc_uart.c::nfc_emulator_dispatch",
         "main/screens/nfc_uart.c::nfc_ensure_timer",
         "main/screens/nfc_uart.c::nfc_host_alloc_state",
+        "main/screens/nfc_uart.c::nfc_set_live",
         "main/screens/nfc_uart.c::nfc_uart_cancel",
-        "main/screens/nfc_uart.c::nfc_uart_start"
+        "main/screens/nfc_uart.c::nfc_uart_start",
+        "main/screens/nfc_uart.c::push_line"
       ],
       "device_and_scheduler_dependencies": [
         "vTaskDelay",
         "xSemaphoreCreateMutex",
+        "xSemaphoreGive",
+        "xSemaphoreTake",
         "xTaskCreate"
       ],
       "contract": {
@@ -94422,13 +94497,18 @@
           "main/main.c::nfc_host_state_for_tab",
           "main/main.c::subghz_host_color_cyan",
           "main/screens/nfc_parser.c::nfc_card_reset",
+          "main/screens/nfc_parser.c::nfc_line_is_end",
+          "main/screens/nfc_parser.c::nfc_parse_card_line",
           "main/screens/nfc_read_screen.c::on_read",
           "main/screens/nfc_read_screen.c::set_labels",
           "main/screens/nfc_screen.c::nfc_set_btn_enabled",
+          "main/screens/nfc_uart.c::nfc_emulator_dispatch",
           "main/screens/nfc_uart.c::nfc_ensure_timer",
           "main/screens/nfc_uart.c::nfc_host_alloc_state",
+          "main/screens/nfc_uart.c::nfc_set_live",
           "main/screens/nfc_uart.c::nfc_uart_cancel",
-          "main/screens/nfc_uart.c::nfc_uart_start"
+          "main/screens/nfc_uart.c::nfc_uart_start",
+          "main/screens/nfc_uart.c::push_line"
         ],
         "data_owner_evidence": [
           "main/main.c::get_ctx_for_tab",
@@ -94436,13 +94516,18 @@
           "main/main.c::nfc_host_state_for_tab",
           "main/main.c::subghz_host_color_cyan",
           "main/screens/nfc_parser.c::nfc_card_reset",
+          "main/screens/nfc_parser.c::nfc_line_is_end",
+          "main/screens/nfc_parser.c::nfc_parse_card_line",
           "main/screens/nfc_read_screen.c::on_read",
           "main/screens/nfc_read_screen.c::set_labels",
           "main/screens/nfc_screen.c::nfc_set_btn_enabled",
+          "main/screens/nfc_uart.c::nfc_emulator_dispatch",
           "main/screens/nfc_uart.c::nfc_ensure_timer",
           "main/screens/nfc_uart.c::nfc_host_alloc_state",
+          "main/screens/nfc_uart.c::nfc_set_live",
           "main/screens/nfc_uart.c::nfc_uart_cancel",
-          "main/screens/nfc_uart.c::nfc_uart_start"
+          "main/screens/nfc_uart.c::nfc_uart_start",
+          "main/screens/nfc_uart.c::push_line"
         ],
         "status": "static contract; guards, writes and calls in referenced function records; runtime validation belongs to later phases",
         "callback_guards": {
@@ -94699,6 +94784,8 @@
         "main/main.c::wa_transport_blocked",
         "main/screens/nfc_list_screen.c::show_nfc_list_page",
         "main/screens/nfc_parser.c::nfc_card_reset",
+        "main/screens/nfc_parser.c::nfc_line_is_end",
+        "main/screens/nfc_parser.c::nfc_parse_card_line",
         "main/screens/nfc_read_screen.c::show_nfc_read_page",
         "main/screens/nfc_screen.c::destroy_page",
         "main/screens/nfc_screen.c::nfc_hide_all_pages",
@@ -94706,10 +94793,13 @@
         "main/screens/nfc_screen.c::nfc_set_btn_enabled",
         "main/screens/nfc_screen.c::on_list",
         "main/screens/nfc_screen.c::on_read",
+        "main/screens/nfc_uart.c::nfc_emulator_dispatch",
         "main/screens/nfc_uart.c::nfc_ensure_timer",
         "main/screens/nfc_uart.c::nfc_host_alloc_state",
+        "main/screens/nfc_uart.c::nfc_set_live",
         "main/screens/nfc_uart.c::nfc_uart_cancel",
         "main/screens/nfc_uart.c::nfc_uart_start",
+        "main/screens/nfc_uart.c::push_line",
         "main/screens/subghz_screen.c::subghz_create_header",
         "main/screens/subghz_screen.c::subghz_hide_all_pages",
         "main/screens/wifi_analyzer_screen.c::button_text",
@@ -94737,6 +94827,8 @@
         "vTaskDelay",
         "xSemaphoreCreateMutex",
         "xSemaphoreGetMutexHolder",
+        "xSemaphoreGive",
+        "xSemaphoreTake",
         "xTaskCreate",
         "xTaskGetCurrentTaskHandle"
       ],
@@ -94778,6 +94870,8 @@
           "main/main.c::wa_transport_blocked",
           "main/screens/nfc_list_screen.c::show_nfc_list_page",
           "main/screens/nfc_parser.c::nfc_card_reset",
+          "main/screens/nfc_parser.c::nfc_line_is_end",
+          "main/screens/nfc_parser.c::nfc_parse_card_line",
           "main/screens/nfc_read_screen.c::show_nfc_read_page",
           "main/screens/nfc_screen.c::destroy_page",
           "main/screens/nfc_screen.c::nfc_hide_all_pages",
@@ -94785,10 +94879,13 @@
           "main/screens/nfc_screen.c::nfc_set_btn_enabled",
           "main/screens/nfc_screen.c::on_list",
           "main/screens/nfc_screen.c::on_read",
+          "main/screens/nfc_uart.c::nfc_emulator_dispatch",
           "main/screens/nfc_uart.c::nfc_ensure_timer",
           "main/screens/nfc_uart.c::nfc_host_alloc_state",
+          "main/screens/nfc_uart.c::nfc_set_live",
           "main/screens/nfc_uart.c::nfc_uart_cancel",
           "main/screens/nfc_uart.c::nfc_uart_start",
+          "main/screens/nfc_uart.c::push_line",
           "main/screens/subghz_screen.c::subghz_create_header",
           "main/screens/subghz_screen.c::subghz_hide_all_pages",
           "main/screens/wifi_analyzer_screen.c::button_text",
@@ -94828,6 +94925,8 @@
           "main/main.c::wa_transport_blocked",
           "main/screens/nfc_list_screen.c::show_nfc_list_page",
           "main/screens/nfc_parser.c::nfc_card_reset",
+          "main/screens/nfc_parser.c::nfc_line_is_end",
+          "main/screens/nfc_parser.c::nfc_parse_card_line",
           "main/screens/nfc_read_screen.c::show_nfc_read_page",
           "main/screens/nfc_screen.c::destroy_page",
           "main/screens/nfc_screen.c::nfc_hide_all_pages",
@@ -94835,10 +94934,13 @@
           "main/screens/nfc_screen.c::nfc_set_btn_enabled",
           "main/screens/nfc_screen.c::on_list",
           "main/screens/nfc_screen.c::on_read",
+          "main/screens/nfc_uart.c::nfc_emulator_dispatch",
           "main/screens/nfc_uart.c::nfc_ensure_timer",
           "main/screens/nfc_uart.c::nfc_host_alloc_state",
+          "main/screens/nfc_uart.c::nfc_set_live",
           "main/screens/nfc_uart.c::nfc_uart_cancel",
           "main/screens/nfc_uart.c::nfc_uart_start",
+          "main/screens/nfc_uart.c::push_line",
           "main/screens/subghz_screen.c::subghz_create_header",
           "main/screens/subghz_screen.c::subghz_hide_all_pages",
           "main/screens/wifi_analyzer_screen.c::button_text",
@@ -94866,7 +94968,7 @@
             {
               "name": "nfc_host_state",
               "args": [],
-              "line": 146
+              "line": 150
             },
             {
               "name": "ESP_LOGI",
@@ -94874,19 +94976,19 @@
                 "TAG",
                 "\"List\""
               ],
-              "line": 148
+              "line": 152
             },
             {
               "name": "show_nfc_list_page",
               "args": [],
-              "line": 149
+              "line": 153
             }
           ],
           "main/screens/nfc_screen.c::on_read": [
             {
               "name": "nfc_host_state",
               "args": [],
-              "line": 136
+              "line": 140
             },
             {
               "name": "lv_obj_has_state",
@@ -94894,7 +94996,7 @@
                 "st->hub_read_tile",
                 "LV_STATE_DISABLED"
               ],
-              "line": 138
+              "line": 142
             },
             {
               "name": "ESP_LOGI",
@@ -94902,12 +95004,12 @@
                 "TAG",
                 "\"Read\""
               ],
-              "line": 139
+              "line": 143
             },
             {
               "name": "show_nfc_read_page",
               "args": [],
-              "line": 140
+              "line": 144
             }
           ]
         },
@@ -95052,8 +95154,8 @@
       "callback": "bs[i].cb",
       "event": "LV_EVENT_CLICKED",
       "user_data": "NULL",
-      "line": 558,
-      "end_line": 558,
+      "line": 595,
+      "end_line": 595,
       "construction_path": [],
       "evidence_kind": "registration site; loops may create multiple controls",
       "callback_function": null,
@@ -95220,28 +95322,28 @@
             {
               "name": "subghz_host_state",
               "args": [],
-              "line": 503
+              "line": 540
             },
             {
               "name": "close_action_popup",
               "args": [
                 "st"
               ],
-              "line": 504
+              "line": 541
             }
           ],
           "main/screens/subghz_hunter_screen.c::on_action_save": [
             {
               "name": "subghz_host_state",
               "args": [],
-              "line": 475
+              "line": 512
             },
             {
               "name": "close_action_popup",
               "args": [
                 "st"
               ],
-              "line": 478
+              "line": 515
             },
             {
               "name": "snprintf",
@@ -95251,14 +95353,14 @@
                 "\"subghz_save %d\"",
                 "idx"
               ],
-              "line": 481
+              "line": 518
             },
             {
               "name": "subghz_host_uart_send",
               "args": [
                 "cmd"
               ],
-              "line": 482
+              "line": 519
             },
             {
               "name": "set_status",
@@ -95268,21 +95370,21 @@
                 "\"Saving #%d...\"",
                 "idx"
               ],
-              "line": 483
+              "line": 520
             }
           ],
           "main/screens/subghz_hunter_screen.c::on_action_tx": [
             {
               "name": "subghz_host_state",
               "args": [],
-              "line": 489
+              "line": 526
             },
             {
               "name": "close_action_popup",
               "args": [
                 "st"
               ],
-              "line": 492
+              "line": 529
             },
             {
               "name": "snprintf",
@@ -95292,14 +95394,14 @@
                 "\"subghz_tx %d mem\"",
                 "idx"
               ],
-              "line": 495
+              "line": 532
             },
             {
               "name": "subghz_host_uart_send",
               "args": [
                 "cmd"
               ],
-              "line": 496
+              "line": 533
             },
             {
               "name": "set_status",
@@ -95309,7 +95411,7 @@
                 "\"Transmitting #%d...\"",
                 "idx"
               ],
-              "line": 497
+              "line": 534
             }
           ]
         },
@@ -95323,8 +95425,8 @@
       "callback": "on_leave_confirm",
       "event": "LV_EVENT_CLICKED",
       "user_data": "NULL",
-      "line": 643,
-      "end_line": 643,
+      "line": 680,
+      "end_line": 680,
       "construction_path": [],
       "evidence_kind": "registration site; loops may create multiple controls",
       "callback_function": "main/screens/subghz_hunter_screen.c::on_leave_confirm",
@@ -95568,21 +95670,21 @@
             {
               "name": "subghz_host_state",
               "args": [],
-              "line": 581
+              "line": 618
             },
             {
               "name": "close_leave_popup",
               "args": [
                 "st"
               ],
-              "line": 583
+              "line": 620
             },
             {
               "name": "perform_back",
               "args": [
                 "st"
               ],
-              "line": 584
+              "line": 621
             }
           ]
         },
@@ -95596,8 +95698,8 @@
       "callback": "on_leave_cancel",
       "event": "LV_EVENT_CLICKED",
       "user_data": "NULL",
-      "line": 654,
-      "end_line": 654,
+      "line": 691,
+      "end_line": 691,
       "construction_path": [],
       "evidence_kind": "registration site; loops may create multiple controls",
       "callback_function": "main/screens/subghz_hunter_screen.c::on_leave_cancel",
@@ -95649,14 +95751,14 @@
             {
               "name": "subghz_host_state",
               "args": [],
-              "line": 590
+              "line": 627
             },
             {
               "name": "close_leave_popup",
               "args": [
                 "st"
               ],
-              "line": 591
+              "line": 628
             }
           ]
         },
@@ -95670,8 +95772,8 @@
       "callback": "on_stop",
       "event": "LV_EVENT_CLICKED",
       "user_data": "NULL",
-      "line": 782,
-      "end_line": 782,
+      "line": 819,
+      "end_line": 819,
       "construction_path": [],
       "evidence_kind": "registration site; loops may create multiple controls",
       "callback_function": "main/screens/subghz_hunter_screen.c::on_stop",
@@ -101793,6 +101895,7 @@
         "main/screens/psram_dynarr.c::psram_dynarr_free",
         "main/screens/subghz_hunter_screen.c::build_page_and_start",
         "main/screens/subghz_hunter_screen.c::clear_history",
+        "main/screens/subghz_hunter_screen.c::emulator_render_rows",
         "main/screens/subghz_hunter_screen.c::history_count",
         "main/screens/subghz_hunter_screen.c::hunter_start_uart",
         "main/screens/subghz_hunter_screen.c::rebuild_rows",
@@ -101974,6 +102077,7 @@
           "main/screens/psram_dynarr.c::psram_dynarr_free",
           "main/screens/subghz_hunter_screen.c::build_page_and_start",
           "main/screens/subghz_hunter_screen.c::clear_history",
+          "main/screens/subghz_hunter_screen.c::emulator_render_rows",
           "main/screens/subghz_hunter_screen.c::history_count",
           "main/screens/subghz_hunter_screen.c::hunter_start_uart",
           "main/screens/subghz_hunter_screen.c::rebuild_rows",
@@ -102106,6 +102210,7 @@
           "main/screens/psram_dynarr.c::psram_dynarr_free",
           "main/screens/subghz_hunter_screen.c::build_page_and_start",
           "main/screens/subghz_hunter_screen.c::clear_history",
+          "main/screens/subghz_hunter_screen.c::emulator_render_rows",
           "main/screens/subghz_hunter_screen.c::history_count",
           "main/screens/subghz_hunter_screen.c::hunter_start_uart",
           "main/screens/subghz_hunter_screen.c::rebuild_rows",
@@ -102466,6 +102571,8 @@
         "main/screens/nfc_list_screen.c::on_back",
         "main/screens/nfc_list_screen.c::show_nfc_list_page",
         "main/screens/nfc_parser.c::nfc_card_reset",
+        "main/screens/nfc_parser.c::nfc_line_is_end",
+        "main/screens/nfc_parser.c::nfc_parse_card_line",
         "main/screens/nfc_read_screen.c::on_back",
         "main/screens/nfc_screen.c::destroy_page",
         "main/screens/nfc_screen.c::nfc_create_tile",
@@ -102474,15 +102581,19 @@
         "main/screens/nfc_screen.c::nfc_set_btn_enabled",
         "main/screens/nfc_screen.c::on_back",
         "main/screens/nfc_screen.c::show_nfc_page",
+        "main/screens/nfc_uart.c::nfc_emulator_dispatch",
         "main/screens/nfc_uart.c::nfc_ensure_timer",
         "main/screens/nfc_uart.c::nfc_host_alloc_state",
+        "main/screens/nfc_uart.c::nfc_set_live",
         "main/screens/nfc_uart.c::nfc_uart_cancel",
         "main/screens/nfc_uart.c::nfc_uart_start",
+        "main/screens/nfc_uart.c::push_line",
         "main/screens/psram_dynarr.c::psram_dynarr_free",
         "main/screens/subghz_hunter_screen.c::build_page_and_start",
         "main/screens/subghz_hunter_screen.c::clear_history",
         "main/screens/subghz_hunter_screen.c::close_action_popup",
         "main/screens/subghz_hunter_screen.c::close_leave_popup",
+        "main/screens/subghz_hunter_screen.c::emulator_render_rows",
         "main/screens/subghz_hunter_screen.c::history_count",
         "main/screens/subghz_hunter_screen.c::hunter_start_uart",
         "main/screens/subghz_hunter_screen.c::on_back",
@@ -102611,6 +102722,8 @@
         "vTaskDelay",
         "xSemaphoreCreateMutex",
         "xSemaphoreGetMutexHolder",
+        "xSemaphoreGive",
+        "xSemaphoreTake",
         "xTaskCreate",
         "xTaskGetCurrentTaskHandle"
       ],
@@ -102739,6 +102852,8 @@
           "main/screens/nfc_list_screen.c::on_back",
           "main/screens/nfc_list_screen.c::show_nfc_list_page",
           "main/screens/nfc_parser.c::nfc_card_reset",
+          "main/screens/nfc_parser.c::nfc_line_is_end",
+          "main/screens/nfc_parser.c::nfc_parse_card_line",
           "main/screens/nfc_read_screen.c::on_back",
           "main/screens/nfc_screen.c::destroy_page",
           "main/screens/nfc_screen.c::nfc_create_tile",
@@ -102747,15 +102862,19 @@
           "main/screens/nfc_screen.c::nfc_set_btn_enabled",
           "main/screens/nfc_screen.c::on_back",
           "main/screens/nfc_screen.c::show_nfc_page",
+          "main/screens/nfc_uart.c::nfc_emulator_dispatch",
           "main/screens/nfc_uart.c::nfc_ensure_timer",
           "main/screens/nfc_uart.c::nfc_host_alloc_state",
+          "main/screens/nfc_uart.c::nfc_set_live",
           "main/screens/nfc_uart.c::nfc_uart_cancel",
           "main/screens/nfc_uart.c::nfc_uart_start",
+          "main/screens/nfc_uart.c::push_line",
           "main/screens/psram_dynarr.c::psram_dynarr_free",
           "main/screens/subghz_hunter_screen.c::build_page_and_start",
           "main/screens/subghz_hunter_screen.c::clear_history",
           "main/screens/subghz_hunter_screen.c::close_action_popup",
           "main/screens/subghz_hunter_screen.c::close_leave_popup",
+          "main/screens/subghz_hunter_screen.c::emulator_render_rows",
           "main/screens/subghz_hunter_screen.c::history_count",
           "main/screens/subghz_hunter_screen.c::hunter_start_uart",
           "main/screens/subghz_hunter_screen.c::on_back",
@@ -102943,6 +103062,8 @@
           "main/screens/nfc_list_screen.c::on_back",
           "main/screens/nfc_list_screen.c::show_nfc_list_page",
           "main/screens/nfc_parser.c::nfc_card_reset",
+          "main/screens/nfc_parser.c::nfc_line_is_end",
+          "main/screens/nfc_parser.c::nfc_parse_card_line",
           "main/screens/nfc_read_screen.c::on_back",
           "main/screens/nfc_screen.c::destroy_page",
           "main/screens/nfc_screen.c::nfc_create_tile",
@@ -102951,15 +103072,19 @@
           "main/screens/nfc_screen.c::nfc_set_btn_enabled",
           "main/screens/nfc_screen.c::on_back",
           "main/screens/nfc_screen.c::show_nfc_page",
+          "main/screens/nfc_uart.c::nfc_emulator_dispatch",
           "main/screens/nfc_uart.c::nfc_ensure_timer",
           "main/screens/nfc_uart.c::nfc_host_alloc_state",
+          "main/screens/nfc_uart.c::nfc_set_live",
           "main/screens/nfc_uart.c::nfc_uart_cancel",
           "main/screens/nfc_uart.c::nfc_uart_start",
+          "main/screens/nfc_uart.c::push_line",
           "main/screens/psram_dynarr.c::psram_dynarr_free",
           "main/screens/subghz_hunter_screen.c::build_page_and_start",
           "main/screens/subghz_hunter_screen.c::clear_history",
           "main/screens/subghz_hunter_screen.c::close_action_popup",
           "main/screens/subghz_hunter_screen.c::close_leave_popup",
+          "main/screens/subghz_hunter_screen.c::emulator_render_rows",
           "main/screens/subghz_hunter_screen.c::history_count",
           "main/screens/subghz_hunter_screen.c::hunter_start_uart",
           "main/screens/subghz_hunter_screen.c::on_back",
@@ -103180,21 +103305,21 @@
             {
               "name": "subghz_host_show_main_tiles",
               "args": [],
-              "line": 130
+              "line": 134
             }
           ],
           "main/screens/subghz_hunter_screen.c::on_back": [
             {
               "name": "subghz_host_state",
               "args": [],
-              "line": 696
+              "line": 733
             },
             {
               "name": "history_count",
               "args": [
                 "st"
               ],
-              "line": 698
+              "line": 735
             },
             {
               "name": "show_leave_popup",
@@ -103202,14 +103327,14 @@
                 "st",
                 "count"
               ],
-              "line": 700
+              "line": 737
             },
             {
               "name": "perform_back",
               "args": [
                 "st"
               ],
-              "line": 703
+              "line": 740
             }
           ],
           "main/screens/subghz_hunter_settings_screen.c::on_back": [
@@ -103774,19 +103899,19 @@
             {
               "name": "subghz_host_state",
               "args": [],
-              "line": 709
+              "line": 746
             },
             {
               "name": "subghz_hunter_cleanup",
               "args": [
                 "st"
               ],
-              "line": 711
+              "line": 748
             },
             {
               "name": "show_subghz_hunter_settings_page",
               "args": [],
-              "line": 712
+              "line": 749
             }
           ],
           "main/screens/subghz_listen_screen.c::on_settings": [
@@ -414025,54 +414150,62 @@
           "line": 93
         },
         {
+          "name": "nfc_emulator_send",
+          "args": [
+            "st->tab_id",
+            "\"stop\""
+          ],
+          "line": 97
+        },
+        {
           "name": "subghz_host_uart_send_for_tab",
           "args": [
             "st->tab_id",
             "\"stop\""
           ],
-          "line": 96
+          "line": 99
         },
         {
           "name": "lv_obj_delete",
           "args": [
             "st->confirm_popup"
           ],
-          "line": 100
+          "line": 104
         },
         {
           "name": "destroy_page",
           "args": [
             "&st->hub_page"
           ],
-          "line": 105
+          "line": 109
         },
         {
           "name": "destroy_page",
           "args": [
             "&st->read_page"
           ],
-          "line": 106
+          "line": 110
         },
         {
           "name": "destroy_page",
           "args": [
             "&st->list_page"
           ],
-          "line": 107
+          "line": 111
         },
         {
           "name": "destroy_page",
           "args": [
             "&st->detail_page"
           ],
-          "line": 108
+          "line": 112
         },
         {
           "name": "destroy_page",
           "args": [
             "&st->emulate_page"
           ],
-          "line": 109
+          "line": 113
         }
       ],
       "guards": [
@@ -414108,82 +414241,82 @@
         {
           "target": "st->confirm_popup",
           "value": "NULL",
-          "line": 101
+          "line": 105
         },
         {
           "target": "st->text_input_open",
           "value": "false",
-          "line": 103
+          "line": 107
         },
         {
           "target": "st->hub_status",
           "value": "NULL",
-          "line": 111
+          "line": 115
         },
         {
           "target": "st->hub_read_tile",
           "value": "NULL",
-          "line": 112
+          "line": 116
         },
         {
           "target": "st->hub_list_tile",
           "value": "NULL",
-          "line": 113
+          "line": 117
         },
         {
           "target": "st->read_status",
           "value": "NULL",
-          "line": 114
+          "line": 118
         },
         {
           "target": "st->read_detail",
           "value": "NULL",
-          "line": 115
+          "line": 119
         },
         {
           "target": "st->read_btn",
           "value": "NULL",
-          "line": 116
+          "line": 120
         },
         {
           "target": "st->save_btn",
           "value": "NULL",
-          "line": 117
+          "line": 121
         },
         {
           "target": "st->list_status",
           "value": "NULL",
-          "line": 118
+          "line": 122
         },
         {
           "target": "st->list_obj",
           "value": "NULL",
-          "line": 119
+          "line": 123
         },
         {
           "target": "st->detail_status",
           "value": "NULL",
-          "line": 120
+          "line": 124
         },
         {
           "target": "st->detail_lbl",
           "value": "NULL",
-          "line": 121
+          "line": 125
         },
         {
           "target": "st->detail_emu_btn",
           "value": "NULL",
-          "line": 122
+          "line": 126
         },
         {
           "target": "st->emu_status",
           "value": "NULL",
-          "line": 123
+          "line": 127
         },
         {
           "target": "st->emu_detail",
           "value": "NULL",
-          "line": 124
+          "line": 128
         }
       ],
       "role": "logic"
@@ -414191,12 +414324,12 @@
     "main/screens/nfc_screen.c::on_back": {
       "name": "on_back",
       "file": "main/screens/nfc_screen.c",
-      "line": 127,
+      "line": 131,
       "calls": [
         {
           "name": "subghz_host_show_main_tiles",
           "args": [],
-          "line": 130
+          "line": 134
         }
       ],
       "guards": [],
@@ -414207,12 +414340,12 @@
     "main/screens/nfc_screen.c::on_read": {
       "name": "on_read",
       "file": "main/screens/nfc_screen.c",
-      "line": 133,
+      "line": 137,
       "calls": [
         {
           "name": "nfc_host_state",
           "args": [],
-          "line": 136
+          "line": 140
         },
         {
           "name": "lv_obj_has_state",
@@ -414220,7 +414353,7 @@
             "st->hub_read_tile",
             "LV_STATE_DISABLED"
           ],
-          "line": 138
+          "line": 142
         },
         {
           "name": "ESP_LOGI",
@@ -414228,12 +414361,12 @@
             "TAG",
             "\"Read\""
           ],
-          "line": 139
+          "line": 143
         },
         {
           "name": "show_nfc_read_page",
           "args": [],
-          "line": 140
+          "line": 144
         }
       ],
       "guards": [
@@ -414247,12 +414380,12 @@
     "main/screens/nfc_screen.c::on_list": {
       "name": "on_list",
       "file": "main/screens/nfc_screen.c",
-      "line": 143,
+      "line": 147,
       "calls": [
         {
           "name": "nfc_host_state",
           "args": [],
-          "line": 146
+          "line": 150
         },
         {
           "name": "ESP_LOGI",
@@ -414260,12 +414393,12 @@
             "TAG",
             "\"List\""
           ],
-          "line": 148
+          "line": 152
         },
         {
           "name": "show_nfc_list_page",
           "args": [],
-          "line": 149
+          "line": 153
         }
       ],
       "guards": [
@@ -414278,7 +414411,7 @@
     "main/screens/nfc_screen.c::apply_init": {
       "name": "apply_init",
       "file": "main/screens/nfc_screen.c",
-      "line": 152,
+      "line": 156,
       "calls": [
         {
           "name": "nfc_set_btn_enabled",
@@ -414286,7 +414419,7 @@
             "st->hub_read_tile",
             "detected"
           ],
-          "line": 154
+          "line": 158
         },
         {
           "name": "nfc_set_btn_enabled",
@@ -414294,7 +414427,7 @@
             "st->hub_list_tile",
             "true"
           ],
-          "line": 155
+          "line": 159
         },
         {
           "name": "lv_label_set_text",
@@ -414302,7 +414435,7 @@
             "st->hub_status",
             "\"NFC ready\""
           ],
-          "line": 158
+          "line": 162
         },
         {
           "name": "lv_obj_set_style_text_color",
@@ -414311,12 +414444,12 @@
             "subghz_host_color_green()",
             "0"
           ],
-          "line": 159
+          "line": 163
         },
         {
           "name": "subghz_host_color_green",
           "args": [],
-          "line": 159
+          "line": 163
         },
         {
           "name": "lv_label_set_text",
@@ -414324,7 +414457,7 @@
             "st->hub_status",
             "\"NFC not detected\""
           ],
-          "line": 161
+          "line": 165
         },
         {
           "name": "lv_obj_set_style_text_color",
@@ -414333,12 +414466,12 @@
             "subghz_host_color_red()",
             "0"
           ],
-          "line": 162
+          "line": 166
         },
         {
           "name": "subghz_host_color_red",
           "args": [],
-          "line": 162
+          "line": 166
         }
       ],
       "guards": [
@@ -414352,7 +414485,7 @@
     "main/screens/nfc_screen.c::nfc_hub_on_init": {
       "name": "nfc_hub_on_init",
       "file": "main/screens/nfc_screen.c",
-      "line": 166,
+      "line": 170,
       "calls": [
         {
           "name": "apply_init",
@@ -414360,7 +414493,7 @@
             "st",
             "detected"
           ],
-          "line": 172
+          "line": 176
         }
       ],
       "guards": [
@@ -414373,17 +414506,17 @@
     "main/screens/nfc_screen.c::show_nfc_page": {
       "name": "show_nfc_page",
       "file": "main/screens/nfc_screen.c",
-      "line": 175,
+      "line": 179,
       "calls": [
         {
           "name": "nfc_host_state",
           "args": [],
-          "line": 177
+          "line": 181
         },
         {
           "name": "subghz_host_current_container",
           "args": [],
-          "line": 178
+          "line": 182
         },
         {
           "name": "ESP_LOGE",
@@ -414391,19 +414524,19 @@
             "TAG",
             "\"show_nfc_page: no state or container\""
           ],
-          "line": 180
+          "line": 184
         },
         {
           "name": "subghz_host_hide_all_pages",
           "args": [],
-          "line": 184
+          "line": 188
         },
         {
           "name": "nfc_make_page",
           "args": [
             "container"
           ],
-          "line": 186
+          "line": 190
         },
         {
           "name": "subghz_create_header",
@@ -414413,19 +414546,19 @@
             "subghz_host_color_cyan()",
             "on_back"
           ],
-          "line": 187
+          "line": 191
         },
         {
           "name": "subghz_host_color_cyan",
           "args": [],
-          "line": 187
+          "line": 191
         },
         {
           "name": "lv_label_create",
           "args": [
             "st->hub_page"
           ],
-          "line": 189
+          "line": 193
         },
         {
           "name": "lv_obj_set_width",
@@ -414433,14 +414566,14 @@
             "st->hub_status",
             "lv_pct(100)"
           ],
-          "line": 190
+          "line": 194
         },
         {
           "name": "lv_pct",
           "args": [
             "100"
           ],
-          "line": 190
+          "line": 194
         },
         {
           "name": "lv_obj_set_style_text_align",
@@ -414449,7 +414582,7 @@
             "LV_TEXT_ALIGN_CENTER",
             "0"
           ],
-          "line": 191
+          "line": 195
         },
         {
           "name": "lv_obj_set_style_text_font",
@@ -414458,7 +414591,7 @@
             "&lv_font_montserrat_16",
             "0"
           ],
-          "line": 192
+          "line": 196
         },
         {
           "name": "lv_obj_set_style_text_color",
@@ -414467,12 +414600,12 @@
             "subghz_host_ui_muted()",
             "0"
           ],
-          "line": 193
+          "line": 197
         },
         {
           "name": "subghz_host_ui_muted",
           "args": [],
-          "line": 193
+          "line": 197
         },
         {
           "name": "lv_label_set_text",
@@ -414480,14 +414613,14 @@
             "st->hub_status",
             "\"Probing...\""
           ],
-          "line": 194
+          "line": 198
         },
         {
           "name": "lv_obj_create",
           "args": [
             "st->hub_page"
           ],
-          "line": 196
+          "line": 200
         },
         {
           "name": "lv_obj_set_size",
@@ -414496,14 +414629,14 @@
             "lv_pct(100)",
             "LV_SIZE_CONTENT"
           ],
-          "line": 197
+          "line": 201
         },
         {
           "name": "lv_pct",
           "args": [
             "100"
           ],
-          "line": 197
+          "line": 201
         },
         {
           "name": "lv_obj_set_flex_grow",
@@ -414511,7 +414644,7 @@
             "tiles",
             "1"
           ],
-          "line": 198
+          "line": 202
         },
         {
           "name": "lv_obj_set_style_bg_opa",
@@ -414520,7 +414653,7 @@
             "LV_OPA_TRANSP",
             "0"
           ],
-          "line": 199
+          "line": 203
         },
         {
           "name": "lv_obj_set_style_border_width",
@@ -414529,7 +414662,7 @@
             "0",
             "0"
           ],
-          "line": 200
+          "line": 204
         },
         {
           "name": "lv_obj_set_style_pad_all",
@@ -414538,7 +414671,7 @@
             "2",
             "0"
           ],
-          "line": 201
+          "line": 205
         },
         {
           "name": "lv_obj_set_style_pad_gap",
@@ -414547,7 +414680,7 @@
             "10",
             "0"
           ],
-          "line": 202
+          "line": 206
         },
         {
           "name": "lv_obj_set_flex_flow",
@@ -414555,7 +414688,7 @@
             "tiles",
             "LV_FLEX_FLOW_ROW_WRAP"
           ],
-          "line": 203
+          "line": 207
         },
         {
           "name": "lv_obj_set_flex_align",
@@ -414565,14 +414698,14 @@
             "LV_FLEX_ALIGN_START",
             "LV_FLEX_ALIGN_START"
           ],
-          "line": 204
+          "line": 208
         },
         {
           "name": "subghz_grid_scrollable",
           "args": [
             "tiles"
           ],
-          "line": 205
+          "line": 209
         },
         {
           "name": "nfc_create_tile",
@@ -414583,12 +414716,12 @@
             "subghz_host_color_cyan()",
             "on_read"
           ],
-          "line": 207
+          "line": 211
         },
         {
           "name": "subghz_host_color_cyan",
           "args": [],
-          "line": 208
+          "line": 212
         },
         {
           "name": "nfc_create_tile",
@@ -414599,12 +414732,12 @@
             "subghz_host_color_orange()",
             "on_list"
           ],
-          "line": 209
+          "line": 213
         },
         {
           "name": "subghz_host_color_orange",
           "args": [],
-          "line": 210
+          "line": 214
         },
         {
           "name": "nfc_set_btn_enabled",
@@ -414612,7 +414745,7 @@
             "st->hub_read_tile",
             "false"
           ],
-          "line": 211
+          "line": 215
         },
         {
           "name": "nfc_set_btn_enabled",
@@ -414620,7 +414753,7 @@
             "st->hub_list_tile",
             "false"
           ],
-          "line": 212
+          "line": 216
         },
         {
           "name": "nfc_uart_start",
@@ -414630,7 +414763,7 @@
             "\"init_nfc\"",
             "NFC_INIT_TIMEOUT_MS"
           ],
-          "line": 214
+          "line": 218
         },
         {
           "name": "ESP_LOGI",
@@ -414638,7 +414771,7 @@
             "TAG",
             "\"NFC hub ready\""
           ],
-          "line": 215
+          "line": 219
         }
       ],
       "guards": [
@@ -414654,22 +414787,22 @@
         {
           "target": "st->hub_page",
           "value": "nfc_make_page(container)",
-          "line": 186
+          "line": 190
         },
         {
           "target": "st->hub_status",
           "value": "lv_label_create(st->hub_page)",
-          "line": 189
+          "line": 193
         },
         {
           "target": "st->hub_read_tile",
           "value": "nfc_create_tile(tiles, LV_SYMBOL_DOWNLOAD, \"Read\",\n                                        subghz_host_color_cyan(), on_read)",
-          "line": 207
+          "line": 211
         },
         {
           "target": "st->hub_list_tile",
           "value": "nfc_create_tile(tiles, LV_SYMBOL_LIST, \"List\",\n                                        subghz_host_color_orange(), on_list)",
-          "line": 209
+          "line": 213
         }
       ],
       "role": "screen_constructor"
@@ -414958,17 +415091,115 @@
       ],
       "role": "logic"
     },
+    "main/screens/nfc_uart.c::nfc_emulator_dispatch": {
+      "name": "nfc_emulator_dispatch",
+      "file": "main/screens/nfc_uart.c",
+      "line": 85,
+      "calls": [
+        {
+          "name": "nfc_emulator_flush",
+          "args": [
+            "st->tab_id"
+          ],
+          "line": 87
+        },
+        {
+          "name": "nfc_emulator_send",
+          "args": [
+            "st->tab_id",
+            "st->cmd"
+          ],
+          "line": 88
+        },
+        {
+          "name": "nfc_emulator_read",
+          "args": [
+            "st->tab_id",
+            "line",
+            "sizeof(line)"
+          ],
+          "line": 92
+        },
+        {
+          "name": "nfc_line_is_end",
+          "args": [
+            "line"
+          ],
+          "line": 98
+        },
+        {
+          "name": "push_line",
+          "args": [
+            "st",
+            "line"
+          ],
+          "line": 99
+        }
+      ],
+      "guards": [
+        "(len <= 0)",
+        "(len >= (int)sizeof(line))",
+        "(nfc_line_is_end(line))"
+      ],
+      "writes": [
+        "got_end",
+        "len",
+        "line[--len]",
+        "line[len]",
+        "st->result_op",
+        "st->result_ready",
+        "st->result_timeout"
+      ],
+      "assignments": [
+        {
+          "target": "len",
+          "value": "sizeof(line) - 1",
+          "line": 94
+        },
+        {
+          "target": "line[len]",
+          "value": "'\\0'",
+          "line": 95
+        },
+        {
+          "target": "line[--len]",
+          "value": "'\\0'",
+          "line": 97
+        },
+        {
+          "target": "got_end",
+          "value": "true",
+          "line": 98
+        },
+        {
+          "target": "st->result_op",
+          "value": "st->op",
+          "line": 101
+        },
+        {
+          "target": "st->result_timeout",
+          "value": "!got_end",
+          "line": 102
+        },
+        {
+          "target": "st->result_ready",
+          "value": "true",
+          "line": 103
+        }
+      ],
+      "role": "logic"
+    },
     "main/screens/nfc_uart.c::nfc_ui_timer_cb": {
       "name": "nfc_ui_timer_cb",
       "file": "main/screens/nfc_uart.c",
-      "line": 84,
+      "line": 107,
       "calls": [
         {
           "name": "lv_timer_get_user_data",
           "args": [
             "t"
           ],
-          "line": 86
+          "line": 109
         },
         {
           "name": "xSemaphoreTake",
@@ -414976,7 +415207,7 @@
             "st->lock",
             "0"
           ],
-          "line": 90
+          "line": 113
         },
         {
           "name": "snprintf",
@@ -414986,7 +415217,7 @@
             "\"%s\"",
             "st->live_status"
           ],
-          "line": 93
+          "line": 116
         },
         {
           "name": "snprintf",
@@ -414996,14 +415227,14 @@
             "\"%s\"",
             "st->live_detail"
           ],
-          "line": 94
+          "line": 117
         },
         {
           "name": "xSemaphoreGive",
           "args": [
             "st->lock"
           ],
-          "line": 96
+          "line": 119
         },
         {
           "name": "nfc_read_on_live",
@@ -415012,63 +415243,63 @@
             "status",
             "detail"
           ],
-          "line": 98
+          "line": 121
         },
         {
           "name": "nfc_hub_on_init",
           "args": [
             "st"
           ],
-          "line": 106
+          "line": 129
         },
         {
           "name": "nfc_read_on_result",
           "args": [
             "st"
           ],
-          "line": 107
+          "line": 130
         },
         {
           "name": "nfc_read_on_save",
           "args": [
             "st"
           ],
-          "line": 108
+          "line": 131
         },
         {
           "name": "nfc_list_on_result",
           "args": [
             "st"
           ],
-          "line": 109
+          "line": 132
         },
         {
           "name": "nfc_detail_on_load",
           "args": [
             "st"
           ],
-          "line": 110
+          "line": 133
         },
         {
           "name": "nfc_detail_on_rename",
           "args": [
             "st"
           ],
-          "line": 111
+          "line": 134
         },
         {
           "name": "nfc_detail_on_delete",
           "args": [
             "st"
           ],
-          "line": 112
+          "line": 135
         },
         {
           "name": "nfc_emulate_on_result",
           "args": [
             "st"
           ],
-          "line": 113
+          "line": 136
         }
       ],
       "guards": [
@@ -415086,17 +415317,17 @@
         {
           "target": "st->live_dirty",
           "value": "false",
-          "line": 95
+          "line": 118
         },
         {
           "target": "st->result_ready",
           "value": "false",
-          "line": 102
+          "line": 125
         },
         {
           "target": "st->busy",
           "value": "false",
-          "line": 103
+          "line": 126
         }
       ],
       "role": "logic"
@@ -415104,7 +415335,7 @@
     "main/screens/nfc_uart.c::nfc_ensure_timer": {
       "name": "nfc_ensure_timer",
       "file": "main/screens/nfc_uart.c",
-      "line": 118,
+      "line": 141,
       "calls": [
         {
           "name": "lv_timer_create",
@@ -415113,7 +415344,7 @@
             "100",
             "st"
           ],
-          "line": 121
+          "line": 144
         }
       ],
       "guards": [
@@ -415126,7 +415357,7 @@
         {
           "target": "st->ui_timer",
           "value": "lv_timer_create(nfc_ui_timer_cb, 100, st)",
-          "line": 121
+          "line": 144
         }
       ],
       "role": "logic"
@@ -415134,7 +415365,7 @@
     "main/screens/nfc_uart.c::nfc_host_alloc_state": {
       "name": "nfc_host_alloc_state",
       "file": "main/screens/nfc_uart.c",
-      "line": 124,
+      "line": 147,
       "calls": [
         {
           "name": "heap_caps_calloc",
@@ -415143,7 +415374,7 @@
             "sizeof(*st)",
             "MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT"
           ],
-          "line": 126
+          "line": 149
         },
         {
           "name": "ESP_LOGE",
@@ -415151,12 +415382,12 @@
             "TAG",
             "\"Failed to allocate nfc_tab_state\""
           ],
-          "line": 129
+          "line": 152
         },
         {
           "name": "xSemaphoreCreateMutex",
           "args": [],
-          "line": 132
+          "line": 155
         }
       ],
       "guards": [
@@ -415170,12 +415401,12 @@
         {
           "target": "st->lock",
           "value": "xSemaphoreCreateMutex()",
-          "line": 132
+          "line": 155
         },
         {
           "target": "st->detail_idx",
           "value": "-1",
-          "line": 133
+          "line": 156
         }
       ],
       "role": "logic"
@@ -415183,21 +415414,21 @@
     "main/screens/nfc_uart.c::nfc_uart_cancel": {
       "name": "nfc_uart_cancel",
       "file": "main/screens/nfc_uart.c",
-      "line": 137,
+      "line": 160,
       "calls": [
         {
           "name": "vTaskDelay",
           "args": [
             "pdMS_TO_TICKS(20)"
           ],
-          "line": 143
+          "line": 166
         },
         {
           "name": "pdMS_TO_TICKS",
           "args": [
             "20"
           ],
-          "line": 143
+          "line": 166
         }
       ],
       "guards": [
@@ -415215,32 +415446,32 @@
         {
           "target": "st->cancel",
           "value": "true",
-          "line": 141
+          "line": 164
         },
         {
           "target": "st->cancel",
           "value": "false",
-          "line": 144
+          "line": 167
         },
         {
           "target": "st->result_ready",
           "value": "false",
-          "line": 146
+          "line": 169
         },
         {
           "target": "st->live_dirty",
           "value": "false",
-          "line": 147
+          "line": 170
         },
         {
           "target": "st->busy",
           "value": "false",
-          "line": 148
+          "line": 171
         },
         {
           "target": "st->op",
           "value": "NFC_OP_NONE",
-          "line": 149
+          "line": 172
         }
       ],
       "role": "logic"
@@ -415248,28 +415479,28 @@
     "main/screens/nfc_uart.c::nfc_uart_start": {
       "name": "nfc_uart_start",
       "file": "main/screens/nfc_uart.c",
-      "line": 152,
+      "line": 175,
       "calls": [
         {
           "name": "nfc_uart_cancel",
           "args": [
             "st"
           ],
-          "line": 155
+          "line": 178
         },
         {
           "name": "nfc_ensure_timer",
           "args": [
             "st"
           ],
-          "line": 156
+          "line": 179
         },
         {
           "name": "nfc_card_reset",
           "args": [
             "&st->result_card"
           ],
-          "line": 166
+          "line": 189
         },
         {
           "name": "snprintf",
@@ -415279,7 +415510,14 @@
             "\"%s\"",
             "cmd"
           ],
-          "line": 167
+          "line": 190
+        },
+        {
+          "name": "nfc_emulator_dispatch",
+          "args": [
+            "st"
+          ],
+          "line": 193
         },
         {
           "name": "xTaskCreate",
@@ -415291,7 +415529,7 @@
             "5",
             "&st->task"
           ],
-          "line": 169
+          "line": 195
         },
         {
           "name": "ESP_LOGW",
@@ -415299,7 +415537,7 @@
             "TAG",
             "\"Failed to start NFC reader\""
           ],
-          "line": 173
+          "line": 199
         }
       ],
       "guards": [
@@ -415321,57 +415559,57 @@
         {
           "target": "st->op",
           "value": "op",
-          "line": 158
+          "line": 181
         },
         {
           "target": "st->timeout_ms",
           "value": "timeout_ms ? timeout_ms : 5000",
-          "line": 159
+          "line": 182
         },
         {
           "target": "st->busy",
           "value": "true",
-          "line": 160
+          "line": 183
         },
         {
           "target": "st->result_ready",
           "value": "false",
-          "line": 161
+          "line": 184
         },
         {
           "target": "st->result_timeout",
           "value": "false",
-          "line": 162
+          "line": 185
         },
         {
           "target": "st->result_op",
           "value": "NFC_OP_NONE",
-          "line": 163
+          "line": 186
         },
         {
           "target": "st->line_count",
           "value": "0",
-          "line": 164
+          "line": 187
         },
         {
           "target": "st->cancel",
           "value": "false",
-          "line": 165
+          "line": 188
         },
         {
           "target": "st->task",
           "value": "NULL",
-          "line": 170
+          "line": 196
         },
         {
           "target": "st->busy",
           "value": "false",
-          "line": 171
+          "line": 197
         },
         {
           "target": "st->op",
           "value": "NFC_OP_NONE",
-          "line": 172
+          "line": 198
         }
       ],
       "role": "logic"
@@ -415379,7 +415617,7 @@
     "main/screens/nfc_uart.c::nfc_lines_contain": {
       "name": "nfc_lines_contain",
       "file": "main/screens/nfc_uart.c",
-      "line": 177,
+      "line": 204,
       "calls": [
         {
           "name": "strstr",
@@ -415387,7 +415625,7 @@
             "st->lines[i]",
             "needle"
           ],
-          "line": 181
+          "line": 208
         }
       ],
       "guards": [
@@ -417069,23 +417307,14 @@
       ],
       "role": "logic"
     },
-    "main/screens/subghz_hunter_screen.c::ui_tick_cb": {
-      "name": "ui_tick_cb",
+    "main/screens/subghz_hunter_screen.c::emulator_render_rows": {
+      "name": "emulator_render_rows",
       "file": "main/screens/subghz_hunter_screen.c",
-      "line": 444,
+      "line": 448,
       "calls": [
         {
-          "name": "lv_timer_get_user_data",
-          "args": [
-            "t"
-          ],
-          "line": 446
-        },
-        {
-          "name": "subghz_refresh_radio_badge",
-          "args": [
-            "st"
-          ],
+          "name": "subghz_host_current_tab",
+          "args": [],
           "line": 450
         },
         {
@@ -417093,21 +417322,179 @@
           "args": [
             "st"
           ],
-          "line": 453
+          "line": 452
+        },
+        {
+          "name": "lv_label_create",
+          "args": [
+            "st->hunter_sig_list"
+          ],
+          "line": 454
+        },
+        {
+          "name": "lv_label_set_text",
+          "args": [
+            "st->hunter_empty_lbl",
+            "\"No signals captured yet\""
+          ],
+          "line": 455
+        },
+        {
+          "name": "lv_obj_delete",
+          "args": [
+            "st->hunter_empty_lbl"
+          ],
+          "line": 458
+        },
+        {
+          "name": "lv_btn_create",
+          "args": [
+            "st->hunter_sig_list"
+          ],
+          "line": 463
+        },
+        {
+          "name": "lv_obj_set_size",
+          "args": [
+            "row",
+            "lv_pct(95)",
+            "56"
+          ],
+          "line": 464
+        },
+        {
+          "name": "lv_pct",
+          "args": [
+            "95"
+          ],
+          "line": 464
+        },
+        {
+          "name": "lv_obj_set_user_data",
+          "args": [
+            "row",
+            "(void *)(intptr_t)signal.idx"
+          ],
+          "line": 465
+        },
+        {
+          "name": "subghz_emulator_bind_row",
+          "args": [
+            "row",
+            "on_row_click"
+          ],
+          "line": 466
+        },
+        {
+          "name": "lv_label_create",
+          "args": [
+            "row"
+          ],
+          "line": 467
+        },
+        {
+          "name": "lv_label_set_text_fmt",
+          "args": [
+            "label",
+            "\"#%d  %s  %.2f MHz\"",
+            "signal.idx",
+            "signal.type",
+            "signal.freq"
+          ],
+          "line": 468
+        },
+        {
+          "name": "lv_obj_center",
+          "args": [
+            "label"
+          ],
+          "line": 469
+        },
+        {
+          "name": "lv_label_set_text_fmt",
+          "args": [
+            "st->hunter_capt_count_lbl",
+            "\"Captures: %d\"",
+            "n"
+          ],
+          "line": 473
+        }
+      ],
+      "guards": [
+        "(!st || !st->hunter_sig_list || tab < 0 || tab >= 4)",
+        "(n == 0 && !st->hunter_empty_lbl)",
+        "(n > 0 && st->hunter_empty_lbl)",
+        "(st->hunter_capt_count_lbl)"
+      ],
+      "writes": [
+        "s_emulator_rendered[tab]",
+        "st->hunter_empty_lbl"
+      ],
+      "assignments": [
+        {
+          "target": "st->hunter_empty_lbl",
+          "value": "lv_label_create(st->hunter_sig_list)",
+          "line": 454
+        },
+        {
+          "target": "st->hunter_empty_lbl",
+          "value": "NULL",
+          "line": 459
+        },
+        {
+          "target": "s_emulator_rendered[tab]",
+          "value": "n < 16 ? n : 16",
+          "line": 471
+        }
+      ],
+      "role": "logic"
+    },
+    "main/screens/subghz_hunter_screen.c::ui_tick_cb": {
+      "name": "ui_tick_cb",
+      "file": "main/screens/subghz_hunter_screen.c",
+      "line": 477,
+      "calls": [
+        {
+          "name": "lv_timer_get_user_data",
+          "args": [
+            "t"
+          ],
+          "line": 479
+        },
+        {
+          "name": "subghz_refresh_radio_badge",
+          "args": [
+            "st"
+          ],
+          "line": 483
+        },
+        {
+          "name": "history_count",
+          "args": [
+            "st"
+          ],
+          "line": 486
+        },
+        {
+          "name": "emulator_render_rows",
+          "args": [
+            "st"
+          ],
+          "line": 490
         },
         {
           "name": "rebuild_rows",
           "args": [
             "st"
           ],
-          "line": 456
+          "line": 492
         },
         {
           "name": "apply_status",
           "args": [
             "st"
           ],
-          "line": 458
+          "line": 495
         }
       ],
       "guards": [
@@ -417123,12 +417510,12 @@
         {
           "target": "st->radio_status_dirty",
           "value": "false",
-          "line": 449
+          "line": 482
         },
         {
           "target": "s_last_count",
           "value": "n",
-          "line": 455
+          "line": 488
         }
       ],
       "role": "logic"
@@ -417136,14 +417523,14 @@
     "main/screens/subghz_hunter_screen.c::close_action_popup": {
       "name": "close_action_popup",
       "file": "main/screens/subghz_hunter_screen.c",
-      "line": 465,
+      "line": 502,
       "calls": [
         {
           "name": "lv_obj_delete",
           "args": [
             "st->hunter_action_popup"
           ],
-          "line": 468
+          "line": 505
         }
       ],
       "guards": [
@@ -417156,7 +417543,7 @@
         {
           "target": "st->hunter_action_popup",
           "value": "NULL",
-          "line": 469
+          "line": 506
         }
       ],
       "role": "logic"
@@ -417164,19 +417551,19 @@
     "main/screens/subghz_hunter_screen.c::on_action_save": {
       "name": "on_action_save",
       "file": "main/screens/subghz_hunter_screen.c",
-      "line": 473,
+      "line": 510,
       "calls": [
         {
           "name": "subghz_host_state",
           "args": [],
-          "line": 475
+          "line": 512
         },
         {
           "name": "close_action_popup",
           "args": [
             "st"
           ],
-          "line": 478
+          "line": 515
         },
         {
           "name": "snprintf",
@@ -417186,14 +417573,14 @@
             "\"subghz_save %d\"",
             "idx"
           ],
-          "line": 481
+          "line": 518
         },
         {
           "name": "subghz_host_uart_send",
           "args": [
             "cmd"
           ],
-          "line": 482
+          "line": 519
         },
         {
           "name": "set_status",
@@ -417203,7 +417590,7 @@
             "\"Saving #%d...\"",
             "idx"
           ],
-          "line": 483
+          "line": 520
         }
       ],
       "guards": [
@@ -417217,19 +417604,19 @@
     "main/screens/subghz_hunter_screen.c::on_action_tx": {
       "name": "on_action_tx",
       "file": "main/screens/subghz_hunter_screen.c",
-      "line": 487,
+      "line": 524,
       "calls": [
         {
           "name": "subghz_host_state",
           "args": [],
-          "line": 489
+          "line": 526
         },
         {
           "name": "close_action_popup",
           "args": [
             "st"
           ],
-          "line": 492
+          "line": 529
         },
         {
           "name": "snprintf",
@@ -417239,14 +417626,14 @@
             "\"subghz_tx %d mem\"",
             "idx"
           ],
-          "line": 495
+          "line": 532
         },
         {
           "name": "subghz_host_uart_send",
           "args": [
             "cmd"
           ],
-          "line": 496
+          "line": 533
         },
         {
           "name": "set_status",
@@ -417256,7 +417643,7 @@
             "\"Transmitting #%d...\"",
             "idx"
           ],
-          "line": 497
+          "line": 534
         }
       ],
       "guards": [
@@ -417270,19 +417657,19 @@
     "main/screens/subghz_hunter_screen.c::on_action_cancel": {
       "name": "on_action_cancel",
       "file": "main/screens/subghz_hunter_screen.c",
-      "line": 501,
+      "line": 538,
       "calls": [
         {
           "name": "subghz_host_state",
           "args": [],
-          "line": 503
+          "line": 540
         },
         {
           "name": "close_action_popup",
           "args": [
             "st"
           ],
-          "line": 504
+          "line": 541
         }
       ],
       "guards": [
@@ -417295,14 +417682,14 @@
     "main/screens/subghz_hunter_screen.c::show_action_popup": {
       "name": "show_action_popup",
       "file": "main/screens/subghz_hunter_screen.c",
-      "line": 508,
+      "line": 545,
       "calls": [
         {
           "name": "close_action_popup",
           "args": [
             "st"
           ],
-          "line": 510
+          "line": 547
         },
         {
           "name": "history_find_by_idx",
@@ -417310,26 +417697,26 @@
             "idx",
             "&s"
           ],
-          "line": 513
+          "line": 550
         },
         {
           "name": "lv_obj_create",
           "args": [
             "lv_scr_act()"
           ],
-          "line": 515
+          "line": 552
         },
         {
           "name": "lv_scr_act",
           "args": [],
-          "line": 515
+          "line": 552
         },
         {
           "name": "lv_obj_remove_style_all",
           "args": [
             "overlay"
           ],
-          "line": 516
+          "line": 553
         },
         {
           "name": "lv_obj_set_size",
@@ -417338,21 +417725,21 @@
             "lv_pct(100)",
             "lv_pct(100)"
           ],
-          "line": 517
+          "line": 554
         },
         {
           "name": "lv_pct",
           "args": [
             "100"
           ],
-          "line": 517
+          "line": 554
         },
         {
           "name": "lv_pct",
           "args": [
             "100"
           ],
-          "line": 517
+          "line": 554
         },
         {
           "name": "lv_obj_set_style_bg_color",
@@ -417361,14 +417748,14 @@
             "lv_color_hex(0x000000)",
             "0"
           ],
-          "line": 518
+          "line": 555
         },
         {
           "name": "lv_color_hex",
           "args": [
             "0x000000"
           ],
-          "line": 518
+          "line": 555
         },
         {
           "name": "lv_obj_set_style_bg_opa",
@@ -417377,7 +417764,7 @@
             "LV_OPA_50",
             "0"
           ],
-          "line": 519
+          "line": 556
         },
         {
           "name": "lv_obj_clear_flag",
@@ -417385,7 +417772,7 @@
             "overlay",
             "LV_OBJ_FLAG_SCROLLABLE"
           ],
-          "line": 520
+          "line": 557
         },
         {
           "name": "lv_obj_add_flag",
@@ -417393,14 +417780,14 @@
             "overlay",
             "LV_OBJ_FLAG_CLICKABLE"
           ],
-          "line": 521
+          "line": 558
         },
         {
           "name": "lv_obj_create",
           "args": [
             "overlay"
           ],
-          "line": 524
+          "line": 561
         },
         {
           "name": "lv_obj_set_size",
@@ -417409,14 +417796,14 @@
             "540",
             "260"
           ],
-          "line": 525
+          "line": 562
         },
         {
           "name": "lv_obj_center",
           "args": [
             "popup"
           ],
-          "line": 526
+          "line": 563
         },
         {
           "name": "subghz_style_popup_card",
@@ -417425,12 +417812,12 @@
             "12",
             "subghz_host_color_pink()"
           ],
-          "line": 527
+          "line": 564
         },
         {
           "name": "subghz_host_color_pink",
           "args": [],
-          "line": 527
+          "line": 564
         },
         {
           "name": "lv_obj_set_flex_flow",
@@ -417438,7 +417825,7 @@
             "popup",
             "LV_FLEX_FLOW_COLUMN"
           ],
-          "line": 528
+          "line": 565
         },
         {
           "name": "lv_obj_set_flex_align",
@@ -417448,7 +417835,7 @@
             "LV_FLEX_ALIGN_CENTER",
             "LV_FLEX_ALIGN_CENTER"
           ],
-          "line": 529
+          "line": 566
         },
         {
           "name": "lv_obj_set_style_pad_all",
@@ -417457,7 +417844,7 @@
             "18",
             "0"
           ],
-          "line": 530
+          "line": 567
         },
         {
           "name": "lv_obj_set_style_pad_gap",
@@ -417466,7 +417853,7 @@
             "12",
             "0"
           ],
-          "line": 531
+          "line": 568
         },
         {
           "name": "lv_obj_clear_flag",
@@ -417474,14 +417861,14 @@
             "popup",
             "LV_OBJ_FLAG_SCROLLABLE"
           ],
-          "line": 532
+          "line": 569
         },
         {
           "name": "lv_label_create",
           "args": [
             "popup"
           ],
-          "line": 534
+          "line": 571
         },
         {
           "name": "lv_label_set_text_fmt",
@@ -417491,7 +417878,7 @@
             "idx",
             "found && s.type[0] ? s.type : \"--\""
           ],
-          "line": 535
+          "line": 572
         },
         {
           "name": "lv_obj_set_style_text_color",
@@ -417500,12 +417887,12 @@
             "subghz_host_ui_text()",
             "0"
           ],
-          "line": 537
+          "line": 574
         },
         {
           "name": "subghz_host_ui_text",
           "args": [],
-          "line": 537
+          "line": 574
         },
         {
           "name": "lv_obj_set_style_text_font",
@@ -417514,14 +417901,14 @@
             "&lv_font_montserrat_22",
             "0"
           ],
-          "line": 538
+          "line": 575
         },
         {
           "name": "lv_obj_create",
           "args": [
             "popup"
           ],
-          "line": 540
+          "line": 577
         },
         {
           "name": "lv_obj_set_size",
@@ -417530,14 +417917,14 @@
             "lv_pct(100)",
             "60"
           ],
-          "line": 541
+          "line": 578
         },
         {
           "name": "lv_pct",
           "args": [
             "100"
           ],
-          "line": 541
+          "line": 578
         },
         {
           "name": "lv_obj_set_flex_flow",
@@ -417545,7 +417932,7 @@
             "brow",
             "LV_FLEX_FLOW_ROW"
           ],
-          "line": 542
+          "line": 579
         },
         {
           "name": "lv_obj_set_flex_align",
@@ -417555,7 +417942,7 @@
             "LV_FLEX_ALIGN_CENTER",
             "LV_FLEX_ALIGN_CENTER"
           ],
-          "line": 543
+          "line": 580
         },
         {
           "name": "lv_obj_set_style_bg_opa",
@@ -417564,7 +417951,7 @@
             "LV_OPA_TRANSP",
             "0"
           ],
-          "line": 544
+          "line": 581
         },
         {
           "name": "lv_obj_set_style_border_width",
@@ -417573,7 +417960,7 @@
             "0",
             "0"
           ],
-          "line": 545
+          "line": 582
         },
         {
           "name": "lv_obj_clear_flag",
@@ -417581,29 +417968,29 @@
             "brow",
             "LV_OBJ_FLAG_SCROLLABLE"
           ],
-          "line": 546
+          "line": 583
         },
         {
           "name": "subghz_host_color_green",
           "args": [],
-          "line": 549
+          "line": 586
         },
         {
           "name": "subghz_host_color_orange",
           "args": [],
-          "line": 550
+          "line": 587
         },
         {
           "name": "subghz_host_ui_muted",
           "args": [],
-          "line": 551
+          "line": 588
         },
         {
           "name": "lv_btn_create",
           "args": [
             "brow"
           ],
-          "line": 554
+          "line": 591
         },
         {
           "name": "lv_obj_set_size",
@@ -417612,7 +417999,7 @@
             "150",
             "50"
           ],
-          "line": 555
+          "line": 592
         },
         {
           "name": "lv_obj_set_style_bg_color",
@@ -417621,7 +418008,7 @@
             "bs[i].c",
             "0"
           ],
-          "line": 556
+          "line": 593
         },
         {
           "name": "lv_obj_set_style_radius",
@@ -417630,7 +418017,7 @@
             "8",
             "0"
           ],
-          "line": 557
+          "line": 594
         },
         {
           "name": "lv_obj_add_event_cb",
@@ -417640,14 +418027,14 @@
             "LV_EVENT_CLICKED",
             "NULL"
           ],
-          "line": 558
+          "line": 595
         },
         {
           "name": "lv_label_create",
           "args": [
             "b"
           ],
-          "line": 559
+          "line": 596
         },
         {
           "name": "lv_label_set_text",
@@ -417655,7 +418042,7 @@
             "lab",
             "bs[i].l"
           ],
-          "line": 560
+          "line": 597
         },
         {
           "name": "lv_obj_set_style_text_color",
@@ -417664,12 +418051,12 @@
             "lv_color_white()",
             "0"
           ],
-          "line": 561
+          "line": 598
         },
         {
           "name": "lv_color_white",
           "args": [],
-          "line": 561
+          "line": 598
         },
         {
           "name": "lv_obj_set_style_text_font",
@@ -417678,14 +418065,14 @@
             "&lv_font_montserrat_18",
             "0"
           ],
-          "line": 562
+          "line": 599
         },
         {
           "name": "lv_obj_center",
           "args": [
             "lab"
           ],
-          "line": 563
+          "line": 600
         }
       ],
       "guards": [],
@@ -417697,12 +418084,12 @@
         {
           "target": "st->hunter_pending_action_idx",
           "value": "idx",
-          "line": 511
+          "line": 548
         },
         {
           "target": "st->hunter_action_popup",
           "value": "overlay",
-          "line": 522
+          "line": 559
         }
       ],
       "role": "screen_constructor"
@@ -417710,14 +418097,14 @@
     "main/screens/subghz_hunter_screen.c::close_leave_popup": {
       "name": "close_leave_popup",
       "file": "main/screens/subghz_hunter_screen.c",
-      "line": 571,
+      "line": 608,
       "calls": [
         {
           "name": "lv_obj_delete",
           "args": [
             "st->hunter_leave_popup"
           ],
-          "line": 574
+          "line": 611
         }
       ],
       "guards": [
@@ -417730,7 +418117,7 @@
         {
           "target": "st->hunter_leave_popup",
           "value": "NULL",
-          "line": 575
+          "line": 612
         }
       ],
       "role": "logic"
@@ -417738,26 +418125,26 @@
     "main/screens/subghz_hunter_screen.c::on_leave_confirm": {
       "name": "on_leave_confirm",
       "file": "main/screens/subghz_hunter_screen.c",
-      "line": 579,
+      "line": 616,
       "calls": [
         {
           "name": "subghz_host_state",
           "args": [],
-          "line": 581
+          "line": 618
         },
         {
           "name": "close_leave_popup",
           "args": [
             "st"
           ],
-          "line": 583
+          "line": 620
         },
         {
           "name": "perform_back",
           "args": [
             "st"
           ],
-          "line": 584
+          "line": 621
         }
       ],
       "guards": [
@@ -417770,19 +418157,19 @@
     "main/screens/subghz_hunter_screen.c::on_leave_cancel": {
       "name": "on_leave_cancel",
       "file": "main/screens/subghz_hunter_screen.c",
-      "line": 588,
+      "line": 625,
       "calls": [
         {
           "name": "subghz_host_state",
           "args": [],
-          "line": 590
+          "line": 627
         },
         {
           "name": "close_leave_popup",
           "args": [
             "st"
           ],
-          "line": 591
+          "line": 628
         }
       ],
       "guards": [
@@ -417795,33 +418182,33 @@
     "main/screens/subghz_hunter_screen.c::show_leave_popup": {
       "name": "show_leave_popup",
       "file": "main/screens/subghz_hunter_screen.c",
-      "line": 595,
+      "line": 632,
       "calls": [
         {
           "name": "close_leave_popup",
           "args": [
             "st"
           ],
-          "line": 597
+          "line": 634
         },
         {
           "name": "lv_obj_create",
           "args": [
             "lv_scr_act()"
           ],
-          "line": 598
+          "line": 635
         },
         {
           "name": "lv_scr_act",
           "args": [],
-          "line": 598
+          "line": 635
         },
         {
           "name": "lv_obj_remove_style_all",
           "args": [
             "overlay"
           ],
-          "line": 599
+          "line": 636
         },
         {
           "name": "lv_obj_set_size",
@@ -417830,21 +418217,21 @@
             "lv_pct(100)",
             "lv_pct(100)"
           ],
-          "line": 600
+          "line": 637
         },
         {
           "name": "lv_pct",
           "args": [
             "100"
           ],
-          "line": 600
+          "line": 637
         },
         {
           "name": "lv_pct",
           "args": [
             "100"
           ],
-          "line": 600
+          "line": 637
         },
         {
           "name": "lv_obj_set_style_bg_color",
@@ -417853,14 +418240,14 @@
             "lv_color_hex(0x000000)",
             "0"
           ],
-          "line": 601
+          "line": 638
         },
         {
           "name": "lv_color_hex",
           "args": [
             "0x000000"
           ],
-          "line": 601
+          "line": 638
         },
         {
           "name": "lv_obj_set_style_bg_opa",
@@ -417869,7 +418256,7 @@
             "LV_OPA_50",
             "0"
           ],
-          "line": 602
+          "line": 639
         },
         {
           "name": "lv_obj_clear_flag",
@@ -417877,7 +418264,7 @@
             "overlay",
             "LV_OBJ_FLAG_SCROLLABLE"
           ],
-          "line": 603
+          "line": 640
         },
         {
           "name": "lv_obj_add_flag",
@@ -417885,14 +418272,14 @@
             "overlay",
             "LV_OBJ_FLAG_CLICKABLE"
           ],
-          "line": 604
+          "line": 641
         },
         {
           "name": "lv_obj_create",
           "args": [
             "overlay"
           ],
-          "line": 607
+          "line": 644
         },
         {
           "name": "lv_obj_set_size",
@@ -417901,14 +418288,14 @@
             "540",
             "240"
           ],
-          "line": 608
+          "line": 645
         },
         {
           "name": "lv_obj_center",
           "args": [
             "popup"
           ],
-          "line": 609
+          "line": 646
         },
         {
           "name": "subghz_style_popup_card",
@@ -417917,12 +418304,12 @@
             "12",
             "subghz_host_color_red()"
           ],
-          "line": 610
+          "line": 647
         },
         {
           "name": "subghz_host_color_red",
           "args": [],
-          "line": 610
+          "line": 647
         },
         {
           "name": "lv_obj_set_flex_flow",
@@ -417930,7 +418317,7 @@
             "popup",
             "LV_FLEX_FLOW_COLUMN"
           ],
-          "line": 611
+          "line": 648
         },
         {
           "name": "lv_obj_set_flex_align",
@@ -417940,7 +418327,7 @@
             "LV_FLEX_ALIGN_CENTER",
             "LV_FLEX_ALIGN_CENTER"
           ],
-          "line": 612
+          "line": 649
         },
         {
           "name": "lv_obj_set_style_pad_all",
@@ -417949,7 +418336,7 @@
             "18",
             "0"
           ],
-          "line": 613
+          "line": 650
         },
         {
           "name": "lv_obj_set_style_pad_gap",
@@ -417958,7 +418345,7 @@
             "12",
             "0"
           ],
-          "line": 614
+          "line": 651
         },
         {
           "name": "lv_obj_clear_flag",
@@ -417966,14 +418353,14 @@
             "popup",
             "LV_OBJ_FLAG_SCROLLABLE"
           ],
-          "line": 615
+          "line": 652
         },
         {
           "name": "lv_label_create",
           "args": [
             "popup"
           ],
-          "line": 617
+          "line": 654
         },
         {
           "name": "lv_label_set_text",
@@ -417981,7 +418368,7 @@
             "title",
             "\"Leave Hunter?\""
           ],
-          "line": 618
+          "line": 655
         },
         {
           "name": "lv_obj_set_style_text_color",
@@ -417990,12 +418377,12 @@
             "subghz_host_ui_text()",
             "0"
           ],
-          "line": 619
+          "line": 656
         },
         {
           "name": "subghz_host_ui_text",
           "args": [],
-          "line": 619
+          "line": 656
         },
         {
           "name": "lv_obj_set_style_text_font",
@@ -418004,14 +418391,14 @@
             "&lv_font_montserrat_22",
             "0"
           ],
-          "line": 620
+          "line": 657
         },
         {
           "name": "lv_label_create",
           "args": [
             "popup"
           ],
-          "line": 621
+          "line": 658
         },
         {
           "name": "lv_obj_set_width",
@@ -418019,14 +418406,14 @@
             "body",
             "lv_pct(100)"
           ],
-          "line": 622
+          "line": 659
         },
         {
           "name": "lv_pct",
           "args": [
             "100"
           ],
-          "line": 622
+          "line": 659
         },
         {
           "name": "lv_label_set_long_mode",
@@ -418034,7 +418421,7 @@
             "body",
             "LV_LABEL_LONG_WRAP"
           ],
-          "line": 623
+          "line": 660
         },
         {
           "name": "lv_label_set_text_fmt",
@@ -418044,7 +418431,7 @@
             "count",
             "count == 1 ? \"\" : \"s\""
           ],
-          "line": 624
+          "line": 661
         },
         {
           "name": "lv_obj_set_style_text_color",
@@ -418053,12 +418440,12 @@
             "subghz_host_ui_muted()",
             "0"
           ],
-          "line": 627
+          "line": 664
         },
         {
           "name": "subghz_host_ui_muted",
           "args": [],
-          "line": 627
+          "line": 664
         },
         {
           "name": "lv_obj_set_style_text_font",
@@ -418067,7 +418454,7 @@
             "&lv_font_montserrat_18",
             "0"
           ],
-          "line": 628
+          "line": 665
         },
         {
           "name": "lv_obj_set_style_text_align",
@@ -418076,14 +418463,14 @@
             "LV_TEXT_ALIGN_CENTER",
             "0"
           ],
-          "line": 629
+          "line": 666
         },
         {
           "name": "lv_obj_create",
           "args": [
             "popup"
           ],
-          "line": 631
+          "line": 668
         },
         {
           "name": "lv_obj_set_size",
@@ -418092,14 +418479,14 @@
             "lv_pct(100)",
             "60"
           ],
-          "line": 632
+          "line": 669
         },
         {
           "name": "lv_pct",
           "args": [
             "100"
           ],
-          "line": 632
+          "line": 669
         },
         {
           "name": "lv_obj_set_flex_flow",
@@ -418107,7 +418494,7 @@
             "brow",
             "LV_FLEX_FLOW_ROW"
           ],
-          "line": 633
+          "line": 670
         },
         {
           "name": "lv_obj_set_flex_align",
@@ -418117,7 +418504,7 @@
             "LV_FLEX_ALIGN_CENTER",
             "LV_FLEX_ALIGN_CENTER"
           ],
-          "line": 634
+          "line": 671
         },
         {
           "name": "lv_obj_set_style_bg_opa",
@@ -418126,7 +418513,7 @@
             "LV_OPA_TRANSP",
             "0"
           ],
-          "line": 635
+          "line": 672
         },
         {
           "name": "lv_obj_set_style_border_width",
@@ -418135,7 +418522,7 @@
             "0",
             "0"
           ],
-          "line": 636
+          "line": 673
         },
         {
           "name": "lv_obj_clear_flag",
@@ -418143,14 +418530,14 @@
             "brow",
             "LV_OBJ_FLAG_SCROLLABLE"
           ],
-          "line": 637
+          "line": 674
         },
         {
           "name": "lv_btn_create",
           "args": [
             "brow"
           ],
-          "line": 639
+          "line": 676
         },
         {
           "name": "lv_obj_set_size",
@@ -418159,7 +418546,7 @@
             "200",
             "50"
           ],
-          "line": 640
+          "line": 677
         },
         {
           "name": "lv_obj_set_style_bg_color",
@@ -418168,12 +418555,12 @@
             "subghz_host_color_red()",
             "0"
           ],
-          "line": 641
+          "line": 678
         },
         {
           "name": "subghz_host_color_red",
           "args": [],
-          "line": 641
+          "line": 678
         },
         {
           "name": "lv_obj_set_style_radius",
@@ -418182,7 +418569,7 @@
             "8",
             "0"
           ],
-          "line": 642
+          "line": 679
         },
         {
           "name": "lv_obj_add_event_cb",
@@ -418192,14 +418579,14 @@
             "LV_EVENT_CLICKED",
             "NULL"
           ],
-          "line": 643
+          "line": 680
         },
         {
           "name": "lv_label_create",
           "args": [
             "leave"
           ],
-          "line": 644
+          "line": 681
         },
         {
           "name": "lv_label_set_text",
@@ -418207,7 +418594,7 @@
             "ll",
             "\"Leave\""
           ],
-          "line": 645
+          "line": 682
         },
         {
           "name": "lv_obj_set_style_text_color",
@@ -418216,12 +418603,12 @@
             "lv_color_white()",
             "0"
           ],
-          "line": 646
+          "line": 683
         },
         {
           "name": "lv_color_white",
           "args": [],
-          "line": 646
+          "line": 683
         },
         {
           "name": "lv_obj_set_style_text_font",
@@ -418230,21 +418617,21 @@
             "&lv_font_montserrat_18",
             "0"
           ],
-          "line": 647
+          "line": 684
         },
         {
           "name": "lv_obj_center",
           "args": [
             "ll"
           ],
-          "line": 648
+          "line": 685
         },
         {
           "name": "lv_btn_create",
           "args": [
             "brow"
           ],
-          "line": 650
+          "line": 687
         },
         {
           "name": "lv_obj_set_size",
@@ -418253,7 +418640,7 @@
             "200",
             "50"
           ],
-          "line": 651
+          "line": 688
         },
         {
           "name": "lv_obj_set_style_bg_color",
@@ -418262,12 +418649,12 @@
             "subghz_host_ui_muted()",
             "0"
           ],
-          "line": 652
+          "line": 689
         },
         {
           "name": "subghz_host_ui_muted",
           "args": [],
-          "line": 652
+          "line": 689
         },
         {
           "name": "lv_obj_set_style_radius",
@@ -418276,7 +418663,7 @@
             "8",
             "0"
           ],
-          "line": 653
+          "line": 690
         },
         {
           "name": "lv_obj_add_event_cb",
@@ -418286,21 +418673,21 @@
             "LV_EVENT_CLICKED",
             "NULL"
           ],
-          "line": 654
+          "line": 691
         },
         {
           "name": "app_keyboard_navigation_register_escape",
           "args": [
             "stay"
           ],
-          "line": 655
+          "line": 692
         },
         {
           "name": "lv_label_create",
           "args": [
             "stay"
           ],
-          "line": 656
+          "line": 693
         },
         {
           "name": "lv_label_set_text",
@@ -418308,7 +418695,7 @@
             "sl",
             "\"Stay\""
           ],
-          "line": 657
+          "line": 694
         },
         {
           "name": "lv_obj_set_style_text_color",
@@ -418317,12 +418704,12 @@
             "lv_color_white()",
             "0"
           ],
-          "line": 658
+          "line": 695
         },
         {
           "name": "lv_color_white",
           "args": [],
-          "line": 658
+          "line": 695
         },
         {
           "name": "lv_obj_set_style_text_font",
@@ -418331,14 +418718,14 @@
             "&lv_font_montserrat_18",
             "0"
           ],
-          "line": 659
+          "line": 696
         },
         {
           "name": "lv_obj_center",
           "args": [
             "sl"
           ],
-          "line": 660
+          "line": 697
         }
       ],
       "guards": [],
@@ -418349,7 +418736,7 @@
         {
           "target": "st->hunter_leave_popup",
           "value": "overlay",
-          "line": 605
+          "line": 642
         }
       ],
       "role": "screen_constructor"
@@ -418357,56 +418744,56 @@
     "main/screens/subghz_hunter_screen.c::subghz_hunter_cleanup": {
       "name": "subghz_hunter_cleanup",
       "file": "main/screens/subghz_hunter_screen.c",
-      "line": 667,
+      "line": 704,
       "calls": [
         {
           "name": "stop_hunting",
           "args": [
             "st"
           ],
-          "line": 670
+          "line": 707
         },
         {
           "name": "vTaskDelay",
           "args": [
             "pdMS_TO_TICKS(20)"
           ],
-          "line": 672
+          "line": 709
         },
         {
           "name": "pdMS_TO_TICKS",
           "args": [
             "20"
           ],
-          "line": 672
+          "line": 709
         },
         {
           "name": "lv_timer_delete",
           "args": [
             "st->hunter_ui_timer"
           ],
-          "line": 673
+          "line": 710
         },
         {
           "name": "close_action_popup",
           "args": [
             "st"
           ],
-          "line": 674
+          "line": 711
         },
         {
           "name": "close_leave_popup",
           "args": [
             "st"
           ],
-          "line": 675
+          "line": 712
         },
         {
           "name": "lv_obj_delete",
           "args": [
             "st->hunter_page"
           ],
-          "line": 676
+          "line": 713
         }
       ],
       "guards": [
@@ -418430,52 +418817,52 @@
         {
           "target": "s_hunter_page_alive",
           "value": "false",
-          "line": 671
+          "line": 708
         },
         {
           "target": "st->hunter_ui_timer",
           "value": "NULL",
-          "line": 673
+          "line": 710
         },
         {
           "target": "st->hunter_page",
           "value": "NULL",
-          "line": 676
+          "line": 713
         },
         {
           "target": "st->hunter_spinner",
           "value": "NULL",
-          "line": 677
+          "line": 714
         },
         {
           "target": "st->hunter_status_lbl",
           "value": "NULL",
-          "line": 678
+          "line": 715
         },
         {
           "target": "st->hunter_btn_stop",
           "value": "NULL",
-          "line": 679
+          "line": 716
         },
         {
           "target": "st->hunter_capt_count_lbl",
           "value": "NULL",
-          "line": 680
+          "line": 717
         },
         {
           "target": "st->hunter_sig_list",
           "value": "NULL",
-          "line": 681
+          "line": 718
         },
         {
           "target": "st->hunter_sig_spacer",
           "value": "NULL",
-          "line": 682
+          "line": 719
         },
         {
           "target": "st->hunter_empty_lbl",
           "value": "NULL",
-          "line": 683
+          "line": 720
         }
       ],
       "role": "logic"
@@ -418483,26 +418870,26 @@
     "main/screens/subghz_hunter_screen.c::perform_back": {
       "name": "perform_back",
       "file": "main/screens/subghz_hunter_screen.c",
-      "line": 686,
+      "line": 723,
       "calls": [
         {
           "name": "subghz_hunter_cleanup",
           "args": [
             "st"
           ],
-          "line": 688
+          "line": 725
         },
         {
           "name": "clear_history",
           "args": [
             "st"
           ],
-          "line": 689
+          "line": 726
         },
         {
           "name": "show_subghz_page",
           "args": [],
-          "line": 690
+          "line": 727
         }
       ],
       "guards": [],
@@ -418513,19 +418900,19 @@
     "main/screens/subghz_hunter_screen.c::on_back": {
       "name": "on_back",
       "file": "main/screens/subghz_hunter_screen.c",
-      "line": 693,
+      "line": 730,
       "calls": [
         {
           "name": "subghz_host_state",
           "args": [],
-          "line": 696
+          "line": 733
         },
         {
           "name": "history_count",
           "args": [
             "st"
           ],
-          "line": 698
+          "line": 735
         },
         {
           "name": "show_leave_popup",
@@ -418533,14 +418920,14 @@
             "st",
             "count"
           ],
-          "line": 700
+          "line": 737
         },
         {
           "name": "perform_back",
           "args": [
             "st"
           ],
-          "line": 703
+          "line": 740
         }
       ],
       "guards": [
@@ -418554,24 +418941,24 @@
     "main/screens/subghz_hunter_screen.c::on_settings": {
       "name": "on_settings",
       "file": "main/screens/subghz_hunter_screen.c",
-      "line": 706,
+      "line": 743,
       "calls": [
         {
           "name": "subghz_host_state",
           "args": [],
-          "line": 709
+          "line": 746
         },
         {
           "name": "subghz_hunter_cleanup",
           "args": [
             "st"
           ],
-          "line": 711
+          "line": 748
         },
         {
           "name": "show_subghz_hunter_settings_page",
           "args": [],
-          "line": 712
+          "line": 749
         }
       ],
       "guards": [
@@ -418584,43 +418971,43 @@
     "main/screens/subghz_hunter_screen.c::build_page_and_start": {
       "name": "build_page_and_start",
       "file": "main/screens/subghz_hunter_screen.c",
-      "line": 719,
+      "line": 756,
       "calls": [
         {
           "name": "subghz_host_state",
           "args": [],
-          "line": 721
+          "line": 758
         },
         {
           "name": "subghz_host_current_container",
           "args": [],
-          "line": 722
+          "line": 759
         },
         {
           "name": "subghz_host_hide_all_pages",
           "args": [],
-          "line": 725
+          "line": 762
         },
         {
           "name": "lv_obj_delete",
           "args": [
             "st->hunter_page"
           ],
-          "line": 726
+          "line": 763
         },
         {
           "name": "clear_history",
           "args": [
             "st"
           ],
-          "line": 728
+          "line": 765
         },
         {
           "name": "lv_obj_create",
           "args": [
             "container"
           ],
-          "line": 730
+          "line": 767
         },
         {
           "name": "lv_obj_set_size",
@@ -418629,21 +419016,21 @@
             "lv_pct(100)",
             "lv_pct(100)"
           ],
-          "line": 731
+          "line": 768
         },
         {
           "name": "lv_pct",
           "args": [
             "100"
           ],
-          "line": 731
+          "line": 768
         },
         {
           "name": "lv_pct",
           "args": [
             "100"
           ],
-          "line": 731
+          "line": 768
         },
         {
           "name": "lv_obj_set_style_bg_color",
@@ -418652,12 +419039,12 @@
             "subghz_host_ui_bg()",
             "0"
           ],
-          "line": 732
+          "line": 769
         },
         {
           "name": "subghz_host_ui_bg",
           "args": [],
-          "line": 732
+          "line": 769
         },
         {
           "name": "lv_obj_set_style_border_width",
@@ -418666,7 +419053,7 @@
             "0",
             "0"
           ],
-          "line": 733
+          "line": 770
         },
         {
           "name": "lv_obj_set_style_pad_all",
@@ -418675,7 +419062,7 @@
             "10",
             "0"
           ],
-          "line": 734
+          "line": 771
         },
         {
           "name": "lv_obj_set_flex_flow",
@@ -418683,7 +419070,7 @@
             "st->hunter_page",
             "LV_FLEX_FLOW_COLUMN"
           ],
-          "line": 735
+          "line": 772
         },
         {
           "name": "lv_obj_set_style_pad_row",
@@ -418692,7 +419079,7 @@
             "8",
             "0"
           ],
-          "line": 736
+          "line": 773
         },
         {
           "name": "lv_obj_clear_flag",
@@ -418700,7 +419087,7 @@
             "st->hunter_page",
             "LV_OBJ_FLAG_SCROLLABLE"
           ],
-          "line": 737
+          "line": 774
         },
         {
           "name": "subghz_create_header",
@@ -418710,19 +419097,19 @@
             "subghz_host_color_pink()",
             "on_back"
           ],
-          "line": 739
+          "line": 776
         },
         {
           "name": "subghz_host_color_pink",
           "args": [],
-          "line": 740
+          "line": 777
         },
         {
           "name": "lv_obj_create",
           "args": [
             "header"
           ],
-          "line": 742
+          "line": 779
         },
         {
           "name": "lv_obj_set_flex_grow",
@@ -418730,7 +419117,7 @@
             "spacer",
             "1"
           ],
-          "line": 743
+          "line": 780
         },
         {
           "name": "lv_obj_set_style_bg_opa",
@@ -418739,7 +419126,7 @@
             "LV_OPA_TRANSP",
             "0"
           ],
-          "line": 744
+          "line": 781
         },
         {
           "name": "lv_obj_set_style_border_width",
@@ -418748,7 +419135,7 @@
             "0",
             "0"
           ],
-          "line": 745
+          "line": 782
         },
         {
           "name": "lv_obj_set_height",
@@ -418756,7 +419143,7 @@
             "spacer",
             "1"
           ],
-          "line": 746
+          "line": 783
         },
         {
           "name": "subghz_add_header_action",
@@ -418766,7 +419153,7 @@
             "on_settings",
             "NULL"
           ],
-          "line": 747
+          "line": 784
         },
         {
           "name": "subghz_add_radio_badge",
@@ -418774,14 +419161,14 @@
             "header",
             "st"
           ],
-          "line": 748
+          "line": 785
         },
         {
           "name": "lv_obj_create",
           "args": [
             "st->hunter_page"
           ],
-          "line": 751
+          "line": 788
         },
         {
           "name": "lv_obj_set_size",
@@ -418790,14 +419177,14 @@
             "lv_pct(100)",
             "60"
           ],
-          "line": 752
+          "line": 789
         },
         {
           "name": "lv_pct",
           "args": [
             "100"
           ],
-          "line": 752
+          "line": 789
         },
         {
           "name": "lv_obj_set_flex_flow",
@@ -418805,7 +419192,7 @@
             "row",
             "LV_FLEX_FLOW_ROW"
           ],
-          "line": 753
+          "line": 790
         },
         {
           "name": "lv_obj_set_flex_align",
@@ -418815,7 +419202,7 @@
             "LV_FLEX_ALIGN_CENTER",
             "LV_FLEX_ALIGN_CENTER"
           ],
-          "line": 754
+          "line": 791
         },
         {
           "name": "lv_obj_set_style_pad_all",
@@ -418824,7 +419211,7 @@
             "6",
             "0"
           ],
-          "line": 755
+          "line": 792
         },
         {
           "name": "lv_obj_set_style_pad_gap",
@@ -418833,7 +419220,7 @@
             "12",
             "0"
           ],
-          "line": 756
+          "line": 793
         },
         {
           "name": "lv_obj_set_style_bg_color",
@@ -418842,12 +419229,12 @@
             "subghz_host_ui_panel()",
             "0"
           ],
-          "line": 757
+          "line": 794
         },
         {
           "name": "subghz_host_ui_panel",
           "args": [],
-          "line": 757
+          "line": 794
         },
         {
           "name": "lv_obj_set_style_bg_opa",
@@ -418856,7 +419243,7 @@
             "LV_OPA_COVER",
             "0"
           ],
-          "line": 758
+          "line": 795
         },
         {
           "name": "lv_obj_set_style_border_width",
@@ -418865,7 +419252,7 @@
             "0",
             "0"
           ],
-          "line": 759
+          "line": 796
         },
         {
           "name": "lv_obj_clear_flag",
@@ -418873,14 +419260,14 @@
             "row",
             "LV_OBJ_FLAG_SCROLLABLE"
           ],
-          "line": 760
+          "line": 797
         },
         {
           "name": "lv_spinner_create",
           "args": [
             "row"
           ],
-          "line": 762
+          "line": 799
         },
         {
           "name": "lv_obj_set_size",
@@ -418889,7 +419276,7 @@
             "40",
             "40"
           ],
-          "line": 763
+          "line": 800
         },
         {
           "name": "lv_obj_set_style_arc_color",
@@ -418898,19 +419285,19 @@
             "subghz_host_color_pink()",
             "LV_PART_INDICATOR"
           ],
-          "line": 764
+          "line": 801
         },
         {
           "name": "subghz_host_color_pink",
           "args": [],
-          "line": 764
+          "line": 801
         },
         {
           "name": "lv_label_create",
           "args": [
             "row"
           ],
-          "line": 766
+          "line": 803
         },
         {
           "name": "lv_obj_set_flex_grow",
@@ -418918,7 +419305,7 @@
             "st->hunter_status_lbl",
             "1"
           ],
-          "line": 767
+          "line": 804
         },
         {
           "name": "lv_label_set_long_mode",
@@ -418926,7 +419313,7 @@
             "st->hunter_status_lbl",
             "LV_LABEL_LONG_DOT"
           ],
-          "line": 768
+          "line": 805
         },
         {
           "name": "lv_label_set_text",
@@ -418934,7 +419321,7 @@
             "st->hunter_status_lbl",
             "\"Hunting...\""
           ],
-          "line": 769
+          "line": 806
         },
         {
           "name": "lv_obj_set_style_text_color",
@@ -418943,12 +419330,12 @@
             "subghz_host_color_pink()",
             "0"
           ],
-          "line": 770
+          "line": 807
         },
         {
           "name": "subghz_host_color_pink",
           "args": [],
-          "line": 770
+          "line": 807
         },
         {
           "name": "lv_obj_set_style_text_font",
@@ -418957,14 +419344,14 @@
             "&lv_font_montserrat_18",
             "0"
           ],
-          "line": 771
+          "line": 808
         },
         {
           "name": "lv_label_create",
           "args": [
             "row"
           ],
-          "line": 773
+          "line": 810
         },
         {
           "name": "lv_label_set_text",
@@ -418972,7 +419359,7 @@
             "st->hunter_capt_count_lbl",
             "\"Captures: 0\""
           ],
-          "line": 774
+          "line": 811
         },
         {
           "name": "lv_obj_set_style_text_color",
@@ -418981,12 +419368,12 @@
             "subghz_host_color_cyan()",
             "0"
           ],
-          "line": 775
+          "line": 812
         },
         {
           "name": "subghz_host_color_cyan",
           "args": [],
-          "line": 775
+          "line": 812
         },
         {
           "name": "lv_obj_set_style_text_font",
@@ -418995,14 +419382,14 @@
             "&lv_font_montserrat_18",
             "0"
           ],
-          "line": 776
+          "line": 813
         },
         {
           "name": "lv_btn_create",
           "args": [
             "row"
           ],
-          "line": 778
+          "line": 815
         },
         {
           "name": "lv_obj_set_size",
@@ -419011,7 +419398,7 @@
             "100",
             "50"
           ],
-          "line": 779
+          "line": 816
         },
         {
           "name": "lv_obj_set_style_bg_color",
@@ -419020,12 +419407,12 @@
             "subghz_host_color_red()",
             "0"
           ],
-          "line": 780
+          "line": 817
         },
         {
           "name": "subghz_host_color_red",
           "args": [],
-          "line": 780
+          "line": 817
         },
         {
           "name": "lv_obj_set_style_radius",
@@ -419034,7 +419421,7 @@
             "8",
             "0"
           ],
-          "line": 781
+          "line": 818
         },
         {
           "name": "lv_obj_add_event_cb",
@@ -419044,14 +419431,14 @@
             "LV_EVENT_CLICKED",
             "NULL"
           ],
-          "line": 782
+          "line": 819
         },
         {
           "name": "lv_label_create",
           "args": [
             "st->hunter_btn_stop"
           ],
-          "line": 783
+          "line": 820
         },
         {
           "name": "lv_label_set_text",
@@ -419059,7 +419446,7 @@
             "sl",
             "\"Stop\""
           ],
-          "line": 784
+          "line": 821
         },
         {
           "name": "lv_obj_set_style_text_color",
@@ -419068,12 +419455,12 @@
             "lv_color_white()",
             "0"
           ],
-          "line": 785
+          "line": 822
         },
         {
           "name": "lv_color_white",
           "args": [],
-          "line": 785
+          "line": 822
         },
         {
           "name": "lv_obj_set_style_text_font",
@@ -419082,21 +419469,21 @@
             "&lv_font_montserrat_18",
             "0"
           ],
-          "line": 786
+          "line": 823
         },
         {
           "name": "lv_obj_center",
           "args": [
             "sl"
           ],
-          "line": 787
+          "line": 824
         },
         {
           "name": "lv_obj_create",
           "args": [
             "st->hunter_page"
           ],
-          "line": 790
+          "line": 827
         },
         {
           "name": "lv_obj_set_size",
@@ -419105,21 +419492,21 @@
             "lv_pct(100)",
             "lv_pct(100)"
           ],
-          "line": 791
+          "line": 828
         },
         {
           "name": "lv_pct",
           "args": [
             "100"
           ],
-          "line": 791
+          "line": 828
         },
         {
           "name": "lv_pct",
           "args": [
             "100"
           ],
-          "line": 791
+          "line": 828
         },
         {
           "name": "lv_obj_set_flex_grow",
@@ -419127,7 +419514,7 @@
             "st->hunter_sig_list",
             "1"
           ],
-          "line": 792
+          "line": 829
         },
         {
           "name": "lv_obj_set_flex_flow",
@@ -419135,7 +419522,7 @@
             "st->hunter_sig_list",
             "LV_FLEX_FLOW_COLUMN"
           ],
-          "line": 793
+          "line": 830
         },
         {
           "name": "lv_obj_set_style_pad_all",
@@ -419144,7 +419531,7 @@
             "4",
             "0"
           ],
-          "line": 794
+          "line": 831
         },
         {
           "name": "lv_obj_set_style_pad_row",
@@ -419153,7 +419540,7 @@
             "4",
             "0"
           ],
-          "line": 795
+          "line": 832
         },
         {
           "name": "lv_obj_set_style_bg_color",
@@ -419162,12 +419549,12 @@
             "subghz_host_ui_bg()",
             "0"
           ],
-          "line": 796
+          "line": 833
         },
         {
           "name": "subghz_host_ui_bg",
           "args": [],
-          "line": 796
+          "line": 833
         },
         {
           "name": "lv_obj_set_style_bg_opa",
@@ -419176,7 +419563,7 @@
             "LV_OPA_COVER",
             "0"
           ],
-          "line": 797
+          "line": 834
         },
         {
           "name": "lv_obj_set_style_border_width",
@@ -419185,7 +419572,7 @@
             "0",
             "0"
           ],
-          "line": 798
+          "line": 835
         },
         {
           "name": "lv_obj_set_scrollbar_mode",
@@ -419193,19 +419580,31 @@
             "st->hunter_sig_list",
             "LV_SCROLLBAR_MODE_AUTO"
           ],
-          "line": 799
+          "line": 836
+        },
+        {
+          "name": "subghz_host_current_tab",
+          "args": [],
+          "line": 839
+        },
+        {
+          "name": "emulator_render_rows",
+          "args": [
+            "st"
+          ],
+          "line": 840
         },
         {
           "name": "rebuild_rows",
           "args": [
             "st"
           ],
-          "line": 801
+          "line": 842
         },
         {
           "name": "subghz_host_current_tab",
           "args": [],
-          "line": 804
+          "line": 846
         },
         {
           "name": "xTaskCreate",
@@ -419217,7 +419616,7 @@
             "5",
             "&st->hunter_task"
           ],
-          "line": 807
+          "line": 849
         },
         {
           "name": "lv_timer_create",
@@ -419226,14 +419625,14 @@
             "200",
             "st"
           ],
-          "line": 809
+          "line": 851
         },
         {
           "name": "hunter_start_uart",
           "args": [
             "st"
           ],
-          "line": 811
+          "line": 853
         },
         {
           "name": "ESP_LOGI",
@@ -419242,7 +419641,7 @@
             "\"Hunter page ready (resume=%d)\"",
             "(int)resume"
           ],
-          "line": 813
+          "line": 855
         }
       ],
       "guards": [
@@ -419253,6 +419652,7 @@
         "(!st->hunter_ui_timer)"
       ],
       "writes": [
+        "s_emulator_rendered[subghz_host_current_tab()]",
         "s_hunter_page_alive",
         "st->hunter_btn_stop",
         "st->hunter_capt_count_lbl",
@@ -419267,52 +419667,57 @@
         {
           "target": "st->hunter_page",
           "value": "NULL",
-          "line": 726
+          "line": 763
         },
         {
           "target": "st->hunter_page",
           "value": "lv_obj_create(container)",
-          "line": 730
+          "line": 767
         },
         {
           "target": "st->hunter_spinner",
           "value": "lv_spinner_create(row)",
-          "line": 762
+          "line": 799
         },
         {
           "target": "st->hunter_status_lbl",
           "value": "lv_label_create(row)",
-          "line": 766
+          "line": 803
         },
         {
           "target": "st->hunter_capt_count_lbl",
           "value": "lv_label_create(row)",
-          "line": 773
+          "line": 810
         },
         {
           "target": "st->hunter_btn_stop",
           "value": "lv_btn_create(row)",
-          "line": 778
+          "line": 815
         },
         {
           "target": "st->hunter_sig_list",
           "value": "lv_obj_create(st->hunter_page)",
-          "line": 790
+          "line": 827
+        },
+        {
+          "target": "s_emulator_rendered[subghz_host_current_tab()]",
+          "value": "0",
+          "line": 839
         },
         {
           "target": "st->hunter_task_tab_id",
           "value": "subghz_host_current_tab()",
-          "line": 804
+          "line": 846
         },
         {
           "target": "s_hunter_page_alive",
           "value": "true",
-          "line": 805
+          "line": 847
         },
         {
           "target": "st->hunter_ui_timer",
           "value": "lv_timer_create(ui_tick_cb, 200, st)",
-          "line": 809
+          "line": 851
         }
       ],
       "role": "logic"
@@ -419320,14 +419725,14 @@
     "main/screens/subghz_hunter_screen.c::show_subghz_hunter_page": {
       "name": "show_subghz_hunter_page",
       "file": "main/screens/subghz_hunter_screen.c",
-      "line": 816,
+      "line": 858,
       "calls": [
         {
           "name": "build_page_and_start",
           "args": [
             "false"
           ],
-          "line": 816
+          "line": 858
         }
       ],
       "guards": [],
@@ -419338,20 +419743,47 @@
     "main/screens/subghz_hunter_screen.c::show_subghz_hunter_page_resume": {
       "name": "show_subghz_hunter_page_resume",
       "file": "main/screens/subghz_hunter_screen.c",
-      "line": 817,
+      "line": 859,
       "calls": [
         {
           "name": "build_page_and_start",
           "args": [
             "true"
           ],
-          "line": 817
+          "line": 859
         }
       ],
       "guards": [],
       "writes": [],
       "assignments": [],
       "role": "screen_constructor"
+    },
+    "main/screens/subghz_hunter_screen.c::subghz_hunter_emulator_feed": {
+      "name": "subghz_hunter_emulator_feed",
+      "file": "main/screens/subghz_hunter_screen.c",
+      "line": 862,
+      "calls": [
+        {
+          "name": "subghz_note_radio_line",
+          "args": [
+            "st",
+            "line"
+          ],
+          "line": 864
+        },
+        {
+          "name": "process_event_line",
+          "args": [
+            "st",
+            "line"
+          ],
+          "line": 865
+        }
+      ],
+      "guards": [],
+      "writes": [],
+      "assignments": [],
+      "role": "logic"
     },
     "main/screens/subghz_hunter_settings_screen.c::create_setting_block": {
       "name": "create_setting_block",
@@ -431175,6 +431607,25 @@
       ],
       "role": "screen_constructor"
     },
+    "main/screens/subghz_listen_screen.c::subghz_listen_emulator_feed": {
+      "name": "subghz_listen_emulator_feed",
+      "file": "main/screens/subghz_listen_screen.c",
+      "line": 1788,
+      "calls": [
+        {
+          "name": "process_subghz_line",
+          "args": [
+            "st",
+            "line"
+          ],
+          "line": 1790
+        }
+      ],
+      "guards": [],
+      "writes": [],
+      "assignments": [],
+      "role": "logic"
+    },
     "main/screens/subghz_listen_settings_screen.c::on_rssi_changed": {
       "name": "on_rssi_changed",
       "file": "main/screens/subghz_listen_settings_screen.c",
@@ -436517,6 +436968,25 @@
       ],
       "role": "screen_constructor"
     },
+    "main/screens/subghz_manage_screen.c::subghz_manage_emulator_feed": {
+      "name": "subghz_manage_emulator_feed",
+      "file": "main/screens/subghz_manage_screen.c",
+      "line": 960,
+      "calls": [
+        {
+          "name": "process_event_line",
+          "args": [
+            "st",
+            "line"
+          ],
+          "line": 962
+        }
+      ],
+      "guards": [],
+      "writes": [],
+      "assignments": [],
+      "role": "logic"
+    },
     "main/screens/subghz_parser.c::find_next_key": {
       "name": "find_next_key",
       "file": "main/screens/subghz_parser.c",
@@ -439862,6 +440332,33 @@
         }
       ],
       "role": "screen_constructor"
+    },
+    "main/screens/subghz_scanner_screen.c::subghz_scanner_emulator_feed": {
+      "name": "subghz_scanner_emulator_feed",
+      "file": "main/screens/subghz_scanner_screen.c",
+      "line": 383,
+      "calls": [
+        {
+          "name": "subghz_note_radio_line",
+          "args": [
+            "st",
+            "line"
+          ],
+          "line": 385
+        },
+        {
+          "name": "process_line",
+          "args": [
+            "st",
+            "line"
+          ],
+          "line": 386
+        }
+      ],
+      "guards": [],
+      "writes": [],
+      "assignments": [],
+      "role": "logic"
     },
     "main/screens/subghz_scanner_settings_screen.c::create_setting_block": {
       "name": "create_setting_block",
@@ -444702,6 +445199,25 @@
       ],
       "role": "screen_constructor"
     },
+    "main/screens/subghz_settings_screen.c::subghz_settings_emulator_feed": {
+      "name": "subghz_settings_emulator_feed",
+      "file": "main/screens/subghz_settings_screen.c",
+      "line": 291,
+      "calls": [
+        {
+          "name": "process_line",
+          "args": [
+            "st",
+            "line"
+          ],
+          "line": 293
+        }
+      ],
+      "guards": [],
+      "writes": [],
+      "assignments": [],
+      "role": "logic"
+    },
     "main/screens/subghz_signal_list.c::fill_signal": {
       "name": "fill_signal",
       "file": "main/screens/subghz_signal_list.c",
@@ -448974,6 +449490,33 @@
         }
       ],
       "role": "screen_constructor"
+    },
+    "main/screens/subghz_weather_screen.c::subghz_weather_emulator_feed": {
+      "name": "subghz_weather_emulator_feed",
+      "file": "main/screens/subghz_weather_screen.c",
+      "line": 459,
+      "calls": [
+        {
+          "name": "subghz_note_radio_line",
+          "args": [
+            "st",
+            "line"
+          ],
+          "line": 461
+        },
+        {
+          "name": "process_line",
+          "args": [
+            "st",
+            "line"
+          ],
+          "line": 462
+        }
+      ],
+      "guards": [],
+      "writes": [],
+      "assignments": [],
+      "role": "logic"
     },
     "main/screens/tool_order_screen.c::item": {
       "name": "item",
@@ -478208,7 +478751,7 @@
         "st->lock",
         "0"
       ],
-      "line": 90
+      "line": 113
     },
     {
       "owner": "main/screens/nfc_uart.c::nfc_ui_timer_cb",
@@ -478217,14 +478760,14 @@
       "args": [
         "st->lock"
       ],
-      "line": 96
+      "line": 119
     },
     {
       "owner": "main/screens/nfc_uart.c::nfc_host_alloc_state",
       "category": "scheduler_adapter",
       "name": "xSemaphoreCreateMutex",
       "args": [],
-      "line": 132
+      "line": 155
     },
     {
       "owner": "main/screens/nfc_uart.c::nfc_uart_cancel",
@@ -478233,7 +478776,7 @@
       "args": [
         "pdMS_TO_TICKS(20)"
       ],
-      "line": 143
+      "line": 166
     },
     {
       "owner": "main/screens/nfc_uart.c::nfc_uart_start",
@@ -478247,7 +478790,7 @@
         "5",
         "&st->task"
       ],
-      "line": 169
+      "line": 195
     },
     {
       "owner": "main/screens/subghz_hunter_screen.c::hunter_reader_task",
@@ -478274,7 +478817,7 @@
       "args": [
         "pdMS_TO_TICKS(20)"
       ],
-      "line": 672
+      "line": 709
     },
     {
       "owner": "main/screens/subghz_hunter_screen.c::build_page_and_start",
@@ -478288,7 +478831,7 @@
         "5",
         "&st->hunter_task"
       ],
-      "line": 807
+      "line": 849
     },
     {
       "owner": "main/screens/subghz_jammer_screen.c::subghz_jammer_reader_task",
@@ -485188,6 +485731,12 @@
       "file": "main/screens/subghz_hunter_screen.c",
       "line": 81,
       "declaration": "static void clear_history(subghz_tab_state_t *st);",
+      "lifetime": "translation-unit; reset/persistence ownership requires review"
+    },
+    {
+      "file": "main/screens/subghz_hunter_screen.c",
+      "line": 447,
+      "declaration": "static int s_emulator_rendered[4];",
       "lifetime": "translation-unit; reset/persistence ownership requires review"
     },
     {

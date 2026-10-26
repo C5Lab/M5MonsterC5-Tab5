@@ -8,12 +8,28 @@ static void pause_observer_for_attack(tab_context_t *ctx) {
  /* The passive scenario feed shares no radio; only native inspection must stop. */
  if(ctx){cancel_observer_inspect_task(ctx);ctx->observer_start_active=false;}
 }
+static void app_rogue_gitm_open(tab_context_t *ctx,int victim_index);
 static void handle_selected_attack(const char *action) {
  tab_context_t *ctx=get_current_ctx();if(!ctx||!action)return;
  scan_view_t view=get_scan_view(ctx);
  if(!strcmp(action,"Capture GW")){show_gitm_page_from_scan();return;}
  if(!strcmp(action,"Karma")){show_karma_page();return;}
  if(!strcmp(action,"Handshaker")){show_handshaker_popup();return;}
+ if(!strcmp(action,"Rogue GITM")){
+  if(ctx->observer_attack_override_active){
+   if(ctx->observer_status_label)lv_label_set_text(ctx->observer_status_label,
+    "Rogue GITM: open it from WiFi Scan & Attack (needs the full scan).");
+   if(ctx->popup_title_label)lv_label_set_text(ctx->popup_title_label,
+    "Rogue GITM: open it from WiFi Scan & Attack (needs the full scan).");
+   return;
+  }
+  if(view.sel_count!=1){
+   if(ctx->scan_status_label)lv_label_set_text(ctx->scan_status_label,
+    "Select exactly 1 network for Rogue GITM");
+   return;
+  }
+  app_rogue_gitm_open(ctx,view.sel_indices[0]);return;
+ }
  bool multi=!strcmp(action,"Deauth")||!strcmp(action,"Evil Twin");
  if(view.sel_count<1||(!multi&&view.sel_count!=1)){
   if(!strcmp(action,"Radar")&&!ctx->popup_open){

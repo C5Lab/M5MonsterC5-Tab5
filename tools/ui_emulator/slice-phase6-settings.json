@@ -1,0 +1,15 @@
+{
+  "show_tool_order_page": "retain",
+  "tool_order_saved": "retain",
+  "show_screen_lock_popup": "retain",
+  "screen_lock_popup_close_cb": "retain",
+  "screen_lock_switch_cb": "retain",
+  "auto_lock_switch_cb": "retain",
+  "screen_lock_now_cb": "retain",
+  "save_screen_lock_to_nvs": "retain",
+  "save_auto_lock_to_nvs": "retain",
+  "lock_screen_activate": "retain",
+  "lock_slider_value_cb": "retain",
+  "lock_slider_release_cb": "retain",
+  "lock_status_btn_cb": "retain"
+}

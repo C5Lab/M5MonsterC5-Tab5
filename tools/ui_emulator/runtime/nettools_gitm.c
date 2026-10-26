@@ -21,6 +21,10 @@ EM_JS(int,app_gitm_poll,(int id,int *values,char *file,int size,char *error,int 
  stringToUTF8(j.file||r.file||"",file,size);stringToUTF8(j.error||'Operation cancelled.',error,error_size);
  return j.state==='completed'?2:j.state==='running'?1:-1;
 });
+EM_JS(int,app_gitm_rogue_stage,(int id),{
+ const stage=emulatorDevice.device.job(id)?.result?.stage;
+ return stage==='connecting'?0:stage==='mirror_ready'?1:2;
+});
 EM_JS(void,app_gitm_network,(int id,int row,char *ssid,char *bssid,char *security,int *values),{
  const n=emulatorDevice.device.job(id)?.result?.networks?.[row];if(!n)return;
  stringToUTF8(n.ssid||"",ssid,33);stringToUTF8(n.bssid||"",bssid,18);stringToUTF8(n.security||n.auth||'OPEN',security,32);
@@ -49,6 +53,7 @@ static void gitm_session_task(void *arg){app_gitm_stage(arg,2);}
 static void gitm_attach_task(void *arg) {
  tab_context_t *ctx=arg;if(!ctx||!ctx->gitm)return;
  int tab=tab_id_for_ctx(ctx);
+ ctx->gitm->rogue=false;
  app_gitm_story_entry[tab]=ctx->gitm->preselect_ssid[0]?1:2;
  if(app_gitm_pages[tab]!=ctx->gitm->page){app_gitm_pages[tab]=ctx->gitm->page;(lv_obj_add_event_cb)(ctx->gitm->page,app_gitm_deleted,LV_EVENT_DELETE,ctx);}
  gitm_set_hint(ctx,"Simulated JanOS is idle. SCAN to choose an upstream.",lv_color_hex(0xCCCCCC));
@@ -78,7 +83,9 @@ static void app_gitm_tick(void) {
   int data[4]={0};char file[128]={0},error[180]={0};
   int state=job->id?app_gitm_poll(job->id,data,file,sizeof(file),error,sizeof(error)):-1;
   if(job->kind==2&&state>0) {
-   cgw_snapshot_t *s=&g->snap;s->complete=true;s->active=s->capture_active=state==1;s->upstream=true;s->napt=true;s->dns_proxy=true;s->channel=6;
+   int rogue_stage=g->rogue?app_gitm_rogue_stage(job->id):2;
+   cgw_snapshot_t *s=&g->snap;s->complete=true;s->active=s->capture_active=state==1&&rogue_stage==2;s->upstream=!g->rogue||rogue_stage>=1;
+   s->napt=s->dns_proxy=s->active;s->channel=g->rogue?g->victim_channel:6;
    snprintf(s->ssid,sizeof(s->ssid),"%s",g->ap_ssid);snprintf(s->security,sizeof(s->security),"%s",g->ap_wpa2?"wpa2":"open");
    snprintf(s->upstream_ssid,sizeof(s->upstream_ssid),"%s",g->up_ssid);
    snprintf(s->sta_ip,sizeof(s->sta_ip),"192.0.2.2");snprintf(s->dns,sizeof(s->dns),"192.0.2.1");
@@ -86,7 +93,15 @@ static void app_gitm_tick(void) {
    s->packets=data[0];s->file_bytes=data[1];s->reported_clients=data[3];s->client_count=data[3]>CGW_MAX_CLIENTS?CGW_MAX_CLIENTS:data[3];s->clients_truncated=data[3]>CGW_MAX_CLIENTS;
    for(int i=0;i<s->client_count;i++)app_gitm_client(job->id,i,s->clients[i].mac,s->clients[i].ip);
    s->queue_capacity=64;s->rate_limit_kbps=s->rate_effective_kbps=1000;gitm_render_live(ctx);
-   if(state==1)gitm_set_state(ctx,GITM_RUNNING,"Simulated capture running. STOP to save the PCAP.",COLOR_MATERIAL_GREEN);
+   if(state==1){
+    if(g->rogue&&rogue_stage==0)gitm_set_state(ctx,GITM_CONNECTING,
+      "Simulated Rogue GITM: connecting the uplink...",COLOR_MATERIAL_AMBER);
+    else if(g->rogue&&rogue_stage==1)gitm_set_state(ctx,GITM_STARTING,
+      "Simulated Rogue GITM: preparing the mirror...",COLOR_MATERIAL_AMBER);
+    else gitm_set_state(ctx,GITM_RUNNING,g->rogue?
+      "Simulated Rogue GITM capture running. STOP to save the PCAP.":
+      "Simulated capture running. STOP to save the PCAP.",COLOR_MATERIAL_GREEN);
+   }
   }
   if(state==1)continue;
   g->session_active=false;g->session_task=NULL;
@@ -113,7 +128,11 @@ static void app_gitm_tick(void) {
    g->final.valid=file[0]!=0;g->final.frames=data[0];snprintf(g->final.file,sizeof(g->final.file),"%s",file);
    if(g->stop_btn)lv_obj_add_flag(g->stop_btn,LV_OBJ_FLAG_HIDDEN);
    if(g->copy_btn&&g->final.valid)lv_obj_clear_flag(g->copy_btn,LV_OBJ_FLAG_HIDDEN);
-   app_model_sync_files(tab);gitm_set_state(ctx,GITM_IDLE,"Simulated PCAP finalized. COPY TO TAB5 opens ESPShark.",COLOR_MATERIAL_GREEN);
+   app_model_sync_files(tab);
+   gitm_set_state(ctx,GITM_IDLE,g->final.valid?
+     "Simulated PCAP finalized. COPY TO TAB5 opens ESPShark.":
+     "Stopped before capture. No PCAP saved.",
+     g->final.valid?COLOR_MATERIAL_GREEN:COLOR_MATERIAL_AMBER);
   }
   bool leaving=job->leaving;memset(job,0,sizeof(*job));
   if(leaving){close_gitm_exit_confirm();gitm_leave_page(ctx);}

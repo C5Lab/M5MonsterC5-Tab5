@@ -441,6 +441,39 @@ static void rebuild_rows(subghz_tab_state_t *st)
         lv_label_set_text_fmt(st->hunter_capt_count_lbl, "Captures: %d", n);
 }
 
+#ifdef EMULATOR_NATIVE_SUBGHZ
+/* The browser feeds only three bounded fixtures. Add rows once instead of
+ * repeatedly deleting and rebuilding the whole flex tree during an LVGL tick. */
+static int s_emulator_rendered[4];
+static void emulator_render_rows(subghz_tab_state_t *st)
+{
+    int tab = subghz_host_current_tab();
+    if (!st || !st->hunter_sig_list || tab < 0 || tab >= 4) return;
+    int n = history_count(st);
+    if (n == 0 && !st->hunter_empty_lbl) {
+        st->hunter_empty_lbl = lv_label_create(st->hunter_sig_list);
+        lv_label_set_text(st->hunter_empty_lbl, "No signals captured yet");
+    }
+    if (n > 0 && st->hunter_empty_lbl) {
+        lv_obj_delete(st->hunter_empty_lbl);
+        st->hunter_empty_lbl = NULL;
+    }
+    for (int i = s_emulator_rendered[tab]; i < n && i < 16; i++) {
+        hunter_sig_t signal = s_hist.items[i];
+        lv_obj_t *row = lv_btn_create(st->hunter_sig_list);
+        lv_obj_set_size(row, lv_pct(95), 56);
+        lv_obj_set_user_data(row, (void *)(intptr_t)signal.idx);
+        subghz_emulator_bind_row(row, on_row_click);
+        lv_obj_t *label = lv_label_create(row);
+        lv_label_set_text_fmt(label, "#%d  %s  %.2f MHz", signal.idx, signal.type, signal.freq);
+        lv_obj_center(label);
+    }
+    s_emulator_rendered[tab] = n < 16 ? n : 16;
+    if (st->hunter_capt_count_lbl)
+        lv_label_set_text_fmt(st->hunter_capt_count_lbl, "Captures: %d", n);
+}
+#endif
+
 static void ui_tick_cb(lv_timer_t *t)
 {
     subghz_tab_state_t *st = (subghz_tab_state_t *)lv_timer_get_user_data(t);
@@ -453,7 +486,11 @@ static void ui_tick_cb(lv_timer_t *t)
     int n = history_count(st);
     if (n != s_last_count) {
         s_last_count = n;
+#ifdef EMULATOR_NATIVE_SUBGHZ
+        emulator_render_rows(st);
+#else
         rebuild_rows(st);
+#endif
     }
     apply_status(st);
 }
@@ -798,7 +835,12 @@ static void build_page_and_start(bool resume)
     lv_obj_set_style_border_width(st->hunter_sig_list, 0, 0);
     lv_obj_set_scrollbar_mode(st->hunter_sig_list, LV_SCROLLBAR_MODE_AUTO);
 
+#ifdef EMULATOR_NATIVE_SUBGHZ
+    s_emulator_rendered[subghz_host_current_tab()] = 0;
+    emulator_render_rows(st);
+#else
     rebuild_rows(st);
+#endif
 
     /* Start reader task + tick */
     st->hunter_task_tab_id = subghz_host_current_tab();
@@ -815,3 +857,11 @@ static void build_page_and_start(bool resume)
 
 void show_subghz_hunter_page(void)        { build_page_and_start(false); }
 void show_subghz_hunter_page_resume(void) { build_page_and_start(true);  }
+
+#ifdef EMULATOR_NATIVE_SUBGHZ
+void subghz_hunter_emulator_feed(subghz_tab_state_t *st, const char *line)
+{
+    subghz_note_radio_line(st, line);
+    process_event_line(st, line);
+}
+#endif

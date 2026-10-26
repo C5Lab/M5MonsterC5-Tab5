@@ -37,5 +37,6 @@
   "wardrive_wigle_load_file_list": "adapter",
   "wardrive_upload_menu_load_task": "adapter",
   "wardrive_wigle_start_upload": "adapter",
+  "wardrive_autoup_make_btn": "adapter",
   "wardrive_tab_has_sd_card": "adapter"
 }

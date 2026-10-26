@@ -1,6 +1,6 @@
 {
-  "version": 2,
-  "scope": "Acceptance budgets for the static emulator bundle served over HTTP. The download byte limits scale with full-application (Phase 4) coverage; the live per-profile timing budgets below are the real UX guardrails and are unchanged.",
+  "version": 4,
+  "scope": "Acceptance budgets for the static emulator bundle served over HTTP. The download byte limits include the full feature-parity native application; the live per-profile timing budgets below remain unchanged.",
   "notes": {
     "first_frame_ms": "globalThis.emulator.measurements.startupMs: module script start to the first painted frame, including the WebAssembly download and instantiation.",
     "page_load_to_first_frame_ms": "Harness wall clock from navigation until three frames are painted; includes browser navigation and document parsing.",
@@ -10,9 +10,9 @@
     "throttling": "Chromium DevTools Protocol Emulation.setCPUThrottlingRate and Network.emulateNetworkConditions. This approximates a mid-range phone on a mobile network; it is not a measurement on physical hardware."
   },
   "download": {
-    "comment": "Raw uncompressed file sizes. HTTP transfer is gzipped to roughly 40% of these (emulator.wasm ~1.03 MB raw is ~0.41 MB on the wire). Limits carry headroom for the remaining Phase 4 domain slices; runaway growth still trips the mobile first_frame_ms and page_load budgets.",
-    "total_bytes_max": 2200000,
-    "largest_file_bytes_max": 1800000
+    "comment": "Raw uncompressed file sizes include nested model modules. The desktop and throttled-mobile startup, render, and memory limits remain unchanged.",
+    "total_bytes_max": 2350000,
+    "largest_file_bytes_max": 2100000
   },
   "profiles": {
     "desktop": {

@@ -42,7 +42,6 @@ def instance_id(template,screen,module,entity,slot):
     return '/'.join(quote(x,safe='') for x in values)
 
 def build_contract(c,functions):
-    deferred='subghz' in c['owner'].lower()
     handlers=[]
     for fid in c['callback_candidates']:
         f=functions[fid]
@@ -52,11 +51,10 @@ def build_contract(c,functions):
     lifecycle=('Destroy only this UI binding and its owned timers/user data; preserve original delete callback order.'
                if event=='LV_EVENT_DELETE' else
                'Dispatch only while the binding and its screen generation are alive; queued device results carry their own operation generation.')
-    return {'scope':'deferred_subghz' if deferred else 'current',
+    return {'scope':'current',
             'preconditions':['The concrete object/input device belongs to the live UI session.',
                              'The event matches the original registration filter; LV_EVENT_ALL retains its internal dispatch.',
-                             'Retain original constructor visibility/enable conditions and handler guard order.',
-                             'SubGHz actions are not exposed in this milestone.'],
+                             'Retain original constructor visibility/enable conditions and handler guard order.'],
             'event':event,'callback_expression':c['callback'],'user_data_expression':c['user_data'],
             'construction_path':c.get('construction_path',[]),
             'handler_policy':'retain_original_body_and_branch_order','allow_noop_substitution':False,
@@ -87,7 +85,7 @@ def main():
                        'source_line':c['line'],'source_end_line':c.get('end_line',c['line']),'source_owner':c['owner'],
                        'contract':build_contract(c,x['functions'])})
     out={'status':'phase-1-source-preservation-contracts','sources':x['sources'],'controls':result,
-         'scope_rule':'Defer SubGHz constructors and filter SubGHz dashboard actions; shared helpers remain available for other actions.'}
+         'scope_rule':'All native SubGHz controls are included; hardware commands use the virtual radio and SD adapters.'}
     (ROOT/'tools/ui_emulator/control-contracts.json').write_text(json.dumps(out,indent=2)+'\n',encoding='utf-8')
     print(f'{len(result)} permanent templates: '+str(sum(c['contract']['scope']=='current' for c in result))+' current, '+str(sum(c['contract']['scope']!='current' for c in result))+' deferred')
 

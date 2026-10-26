@@ -1,6 +1,6 @@
 ﻿"""Phase 4.3 native PCAP acceptance. Run only after rebuilding the emulator."""
 import json, unittest
-from emulator_browser import ROOT, browser_session, objects, click_object
+from emulator_browser import ROOT, browser_session, objects, click_object, click_text
 
 
 class PcapDeepBrowser(unittest.TestCase):
@@ -93,6 +93,17 @@ class PcapDeepBrowser(unittest.TestCase):
 
     def close_analysis(self):
         self.click('pcap_viewer_create_analysis_list.close_btn')
+
+    def test_mbus_examples_have_no_unsupported_wpa_capture(self):
+        self.page.goto(self.url)
+        self.page.wait_for_function('globalThis.emulator?.measurements.frames > 2')
+        self.page.evaluate("globalThis.unavailable=[];addEventListener('emulator-unavailable',e=>unavailable.push(e.detail))")
+        click_text(self.page, 'MBUS')
+        self.page.locator('#pcap-examples').click()
+        self.assertEqual(self.page.locator('#notice').inner_text(),
+                         'Loaded offline HTTP, DNS, ICMP examples plus an invalid-file example.')
+        self.assertEqual(self.page.evaluate(
+            "emulator.device.device.compromisedPcapFiles('mbus','handshake').length"), 0)
 
     def test_native_deep_views(self):
         self.open_capture()

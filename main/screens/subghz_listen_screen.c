@@ -1783,3 +1783,10 @@ void show_subghz_listen_page_at(float mhz, bool autostart)
     }
     show_subghz_listen_page();
 }
+
+#ifdef EMULATOR_NATIVE_SUBGHZ
+void subghz_listen_emulator_feed(subghz_tab_state_t *st, const char *line)
+{
+    process_subghz_line(st, line);
+}
+#endif

@@ -87,6 +87,7 @@ void emu_tick(double elapsed_ms) {
     lv_tick_inc(whole);
     app_tick(elapsed);
     lv_timer_handler();
+    app_radio_sd_status_tick();
 }
 
 void emu_pointer(int x, int y, int pressed) {
@@ -172,11 +173,18 @@ void emu_wheel(int x, int y, int delta) {
     lv_obj_t *obj = lv_indev_search_obj(lv_layer_top(), &point);
     if (!obj) obj = lv_indev_search_obj(lv_screen_active(), &point);
     while (obj) {
-        if (lv_obj_has_flag(obj, LV_OBJ_FLAG_SCROLLABLE) &&
-            ((delta > 0 && lv_obj_get_scroll_bottom(obj) > 0) ||
-             (delta < 0 && lv_obj_get_scroll_top(obj) > 0))) {
-            lv_obj_scroll_by(obj, 0, -delta, LV_ANIM_OFF);
-            return;
+        if (lv_obj_has_flag(obj, LV_OBJ_FLAG_SCROLLABLE)) {
+            if ((delta > 0 && lv_obj_get_scroll_bottom(obj) > 0) ||
+                (delta < 0 && lv_obj_get_scroll_top(obj) > 0)) {
+                lv_obj_scroll_by(obj, 0, -delta, LV_ANIM_OFF);
+                return;
+            }
+            /* Firmware action strips scroll horizontally on portrait screens. */
+            if ((delta > 0 && lv_obj_get_scroll_right(obj) > 0) ||
+                (delta < 0 && lv_obj_get_scroll_left(obj) > 0)) {
+                lv_obj_scroll_by(obj, -delta, 0, LV_ANIM_OFF);
+                return;
+            }
         }
         obj = lv_obj_get_parent(obj);
     }

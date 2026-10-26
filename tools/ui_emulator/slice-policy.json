@@ -86,7 +86,7 @@
     "create_small_tile": "retain",
     "create_attack_bar_row": "retain",
     "create_attack_action_bar": "retain",
-    "screenshot_click_cb": "unsupported",
+    "screenshot_click_cb": "adapter",
     "create_status_bar": "retain",
     "switch_to_internal_settings_page": "retain",
     "header_settings_click_cb": "retain",

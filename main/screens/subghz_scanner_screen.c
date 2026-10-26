@@ -378,3 +378,11 @@ void show_subghz_scanner_page(void)
 
     ESP_LOGI(TAG, "Scanner page ready");
 }
+
+#ifdef EMULATOR_NATIVE_SUBGHZ
+void subghz_scanner_emulator_feed(subghz_tab_state_t *st, const char *line)
+{
+    subghz_note_radio_line(st, line);
+    process_line(st, line);
+}
+#endif

@@ -28,7 +28,9 @@ class PersistenceTests(unittest.TestCase):
 
     def brightness(self, expected):
         click_text(self.page, 'INTERNAL')
+        self.page.evaluate('emulator.module._emu_tick(10)')
         click_text(self.page, 'Settings')
+        self.page.evaluate('emulator.module._emu_tick(10)')
         click_text(self.page, 'Screen\nBrightness')
         self.assertTrue(any(o['text'] == f'{expected}%' for o in objects(self.page)))
 
@@ -65,14 +67,17 @@ class PersistenceTests(unittest.TestCase):
         p = self.page
         p.goto(self.url); self.ready()
         self.assertIn('session', p.locator('#storage-status').inner_text().lower())
-        click_text(p, 'INTERNAL'); click_text(p, 'Settings')
+        click_text(p, 'INTERNAL'); p.evaluate('emulator.module._emu_tick(10)')
+        click_text(p, 'Settings')
+        p.evaluate('emulator.module._emu_tick(10)')
         click_text(p, 'Screen\nBrightness')
         from test_emulator_phase2 import bound, position
         slider = bound(p, 'show_screen_brightness_popup.screen_brightness_slider.value_changed')
         p.mouse.click(*position(p, slider, .3))
         value = p.evaluate('emulatorSettings.get("scr_bright", 80)')
         self.assertLess(value, 50)
-        click_text(p, 'Close'); click_text(p, 'Screen\nBrightness')
+        click_text(p, 'Close'); p.evaluate('emulator.module._emu_tick(10)')
+        click_text(p, 'Screen\nBrightness')
         self.assertTrue(any(o['text'] == f'{value}%' for o in objects(p)))
         p.reload(); self.ready()
         self.brightness(value)

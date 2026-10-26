@@ -4,6 +4,8 @@ import { toolOptions, toolResult } from './nettools.mjs';
 import { attackOptions, attackResult, observerResult } from './attacks.mjs';
 import { createStaMacState, bootStaMac, staMacCommand,
   staMacSnapshot as snapshotStaMac, restoreStaMacSnapshot as restoreStaMac } from './sta_mac.mjs';
+import {analyzerRequest, analyzerLines} from './analyzer.mjs';
+import {wpaFixtureBytes} from './wpa_auditor.mjs';
 
 /** Deterministic virtual device. No network, timers, filesystem or hardware I/O. */
 export class SimulatedDevice {
@@ -31,7 +33,11 @@ export class SimulatedDevice {
     this.#modules=new Map(this.#seed.modules.map((module,index)=>[module.id,{
       connected:module.connected,sdPresent:module.sd_present,networks:[],selected:null,
       staMac:createStaMacState(module.id,index,this.#seed.seed>>>0),
-      version:'demo-main-1',activeSlot:0,slots:['demo-main-1','demo-backup-1'],boardName:`Offline demo ${module.id}`,bootedAt:0,reboots:0,revision:1,
+      version:module.capabilities.includes('subghz')?'demo-rf-main-1':'demo-main-1',
+      firmwareVariant:module.capabilities.includes('subghz')?'rf':'classic',rfCapable:module.capabilities.includes('subghz'),
+      activeSlot:0,slots:module.capabilities.includes('subghz')?
+        ['demo-rf-main-1','demo-rf-backup-1']:['demo-main-1','demo-backup-1'],
+      boardName:`Offline demo ${module.id}`,bootedAt:0,reboots:0,
       active:null,files:new Map(),sequence:0,gpsEnabled:true,wardriveSecond:1,wardrivePoints:0,wardriveBlacklist:[],
       observer:{running:false,networks:[],packets:0,elapsedMs:0,error:null},observerStarted:0,observerIds:[],
       wardrive:{running:false,gps:{fix:false,lat:0,lon:0,satellites:0,distanceM:0},wifiCount:0,btCount:0,rows:[],track:[],sessions:[],error:null,upload:null}
@@ -69,7 +75,8 @@ export class SimulatedDevice {
   systemStatus(moduleId) {
     const module=this.#module(moduleId);
     return structuredClone({connected:module.connected,sdPresent:module.sdPresent,
-      version:module.version,activeSlot:module.activeSlot,slots:module.slots,boardName:module.boardName,uptimeMs:this.#now-module.bootedAt,
+      version:module.version,firmwareVariant:module.firmwareVariant,rfCapable:module.rfCapable,
+      activeSlot:module.activeSlot,slots:module.slots,boardName:module.boardName,uptimeMs:this.#now-module.bootedAt,
       reboots:module.reboots,active:module.active,sdUsedBytes:this.#used(module),sdCapacityBytes:this.#capacity});
   }
 
@@ -110,20 +117,39 @@ export class SimulatedDevice {
     const id=this.systemStart(moduleId,'reboot');this.#jobs.get(id).slot=slot;return id;
   }
 
+  systemReleases(moduleId,{channel='main',variant='classic'}={}) {
+    this.#module(moduleId);
+    if(!['main','dev'].includes(channel)||!['classic','rf'].includes(variant))
+      throw new Error('Invalid release catalog');
+    const prefix=variant==='rf'?'rf-':'';
+    return [2,1].map(revision=>({tag:`demo-${prefix}${channel}-${revision}`,channel,variant}));
+  }
+
   systemStart(moduleId,operation,options={}) {
     const module=this.#available(moduleId);
     if(!['update','reboot','sd_admin'].includes(operation))throw new Error('Invalid system operation');
     if(!options||typeof options!=='object'||Array.isArray(options)||
       ![Object.prototype,null].includes(Object.getPrototypeOf(options))||
-      Reflect.ownKeys(options).some(key=>!['channel','outcome'].includes(key)||operation!=='update'))
+      Reflect.ownKeys(options).some(key=>!['channel','outcome','variant','force','release'].includes(key)||operation!=='update'))
       throw new Error('Invalid system options');
     const channel=options.channel===undefined?'main':options.channel,outcome=options.outcome===undefined?'success':options.outcome;
-    if(!['main','dev'].includes(channel)||!['success','failure'].includes(outcome))
+    const variant=options.variant===undefined?(module.rfCapable?'rf':'classic'):options.variant;
+    const force=options.force===undefined?false:options.force;
+    const release=options.release===undefined?null:options.release;
+    if(!['main','dev'].includes(channel)||!['success','failure'].includes(outcome)||
+       !['classic','rf'].includes(variant)||typeof force!=='boolean')
       throw new Error('Invalid system options');
-    const retained=operation==='update'?{channel,outcome}:{};
+    // The seed capability is the simulator's positive RF identity/layout signal.
+    // The real Tab5 obtains this from live ota_info and SUBGHZ_STATUS responses.
+    if(operation==='update'&&(variant==='rf')!==module.rfCapable)
+      throw new Error('Firmware variant blocked for simulated module');
+    if(force&&!release)throw new Error('Explicit release required for force update');
+    if(release!==null&&!this.systemReleases(moduleId,{channel,variant}).some(item=>item.tag===release))
+      throw new Error('Release unavailable for selected variant and channel');
+    const retained=operation==='update'?{channel,outcome,variant,force,release}:{};
     if(operation==='sd_admin'&&!module.sdPresent)throw new Error('SD missing');
     return this.#start('system',moduleId,operation==='sd_admin'?Infinity:operation==='update'?3000:1000,
-      {operation,options:retained,result:{stage:operation==='sd_admin'?'running':operation==='update'?'preparing':'restarting',simulated:true,...(operation==='update'?{channel}:{})}});
+      {operation,options:retained,result:{stage:operation==='sd_admin'?'running':operation==='update'?'preparing':'restarting',simulated:true,...(operation==='update'?{channel,variant,release}:{})}});
   }
 
   #advanceSystem(module,job) {
@@ -137,8 +163,19 @@ export class SimulatedDevice {
     if(job.operation==='update'&&job.options.outcome==='failure') {
       job.error='simulated_update_failed';job.result.stage='failed';job.state='failed';
     } else {
-      if(job.operation==='update'){module.version=`demo-${job.options.channel}-${++module.revision}`;module.slots[module.activeSlot]=module.version;}
-      if(job.slot!==undefined){module.activeSlot=job.slot;module.version=module.slots[job.slot];}
+      if(job.operation==='update'){
+        const release=job.options.release||this.systemReleases(job.moduleId,job.options)[0].tag;
+        if(!job.options.release&&module.version===release){
+          job.result.stage='up_to_date';job.state='completed';module.active=null;return;
+        }
+        module.version=release;
+        module.firmwareVariant=job.options.variant;
+        module.slots[module.activeSlot]=module.version;
+      }
+      if(job.slot!==undefined){
+        module.activeSlot=job.slot;module.version=module.slots[job.slot];
+        module.firmwareVariant=module.version.includes('-rf-')?'rf':'classic';
+      }
       module.reboots++;module.bootedAt=job.started+job.duration;module.connected=true;
       bootStaMac(module.staMac);
       this.#staMacChangeHandler?.();
@@ -155,6 +192,14 @@ export class SimulatedDevice {
     if(!Number.isFinite(duration)||duration<=0) throw new Error('Invalid scan duration');
     const id=this.#start('scan',moduleId,duration);
     const module=this.#module(moduleId);module.networks=[];module.selected=null;
+    return id;
+  }
+
+  analyzerStart(moduleId, request) {
+    const options = analyzerRequest(request);
+    const duration = options.profile === 'quick' ? 1200 : options.profile === 'detailed' ? 1800 : 2400;
+    const id = this.#start('analyzer', moduleId, duration, {request: options, result: null});
+    this.#jobs.get(id).result = {lines: analyzerLines(this.#seed.networks, request, id, this.#now, duration)};
     return id;
   }
 
@@ -193,8 +238,9 @@ export class SimulatedDevice {
   toolStart(moduleId,kind,input={}) {
     const module=this.#available(moduleId);
     const options=toolOptions(kind,input,this.#seed.networks);
-    if((kind==='gitm'||kind==='wpasec')&&!module.sdPresent)throw new Error('SD missing');
-    return this.#start('tool',moduleId,2000,{tool:kind,options,result:null});
+    if((['gitm','rogue_gitm','wpasec'].includes(kind))&&!module.sdPresent)throw new Error('SD missing');
+    const result=kind==='rogue_gitm'?toolResult(kind,options,this.#seed.networks,0,this.#seed.clients):null;
+    return this.#start('tool',moduleId,2000,{tool:kind,options,result});
   }
 
   attackTemplates(moduleId) {
@@ -208,7 +254,7 @@ export class SimulatedDevice {
   attackStart(moduleId,kind,input={}) {
     const module=this.#available(moduleId);
     const options=attackOptions(kind,input,this.#seed.networks,this.#seed.clients);
-    if(['mitm','evil_twin','rogue_ap'].includes(kind)&&!module.sdPresent)throw new Error('SD missing');
+    if((['mitm','evil_twin','rogue_ap'].includes(kind)||(kind==='portal_demo'&&moduleId!=='internal'))&&!module.sdPresent)throw new Error('SD missing');
     if(options.portal&&!this.attackTemplates(moduleId).some(p=>p.path===options.portal||p.name===options.portal))throw new Error('Unknown demo portal');
     return this.#start('attack',moduleId,2000,{operation:kind,options,
       result:attackResult(kind,options,0,this.#seed.networks,this.#seed.clients)});
@@ -234,6 +280,24 @@ export class SimulatedDevice {
     job.progress=1;job.state=job.error?'failed':'completed';module.active=null;return true;
   }
 
+  #recordSubmittedDemo(module,job) {
+    if(job.recordedDemo||job.result?.demo?.stage!=='submitted')return;
+    job.recordedDemo=true;
+    if(!module.sdPresent)return;
+    const path=job.operation==='evil_twin'?'/sdcard/lab/eviltwin.txt':
+      job.operation==='portal_demo'?'/sdcard/lab/portals.txt':null;
+    if(!path)return;
+    const demo=job.result.demo;
+    const quoted=value=>'"'+String(value).replace(/["\r\n]/g,'_')+'"';
+    const row=job.operation==='evil_twin'
+      ?[demo.ssid,demo.password]
+      :[demo.ssid,`client=${demo.client?.mac||'offline-demo'}`,`password=${demo.password}`];
+    const previous=module.files.get(path)?.bytes||new Uint8Array();
+    const next=new Uint8Array([...previous,...new TextEncoder().encode(row.map(quoted).join(', ')+"\n")]);
+    if(this.#used(module)-previous.length+next.length>this.#capacity)return;
+    module.files.set(path,{path,moduleId:job.moduleId,kind:'compromised',bytes:next});
+  }
+
   observerStart(moduleId,ids) {
     const module=this.#available(moduleId);
     const requested=ids??this.#seed.networks.map(n=>n.id);
@@ -252,15 +316,26 @@ export class SimulatedDevice {
 
   toolStop(id) {
     const job=this.#jobs.get(id);
-    if(!job||job.kind!=='tool'||job.tool!=='gitm'||job.state!=='running')return false;
+    if(!job||job.kind!=='tool'||!['gitm','rogue_gitm'].includes(job.tool)||job.state!=='running')return false;
     const module=this.#module(job.moduleId);
-    const bytes=pcapFixtures()[0].bytes;
+    if(job.tool==='rogue_gitm'&&job.result.packets===0&&module.sdPresent){
+      job.result={...job.result,stage:'stopped_before_capture',bytes:0};
+      job.state='completed';job.progress=1;module.active=null;
+      return true;
+    }
+    const victim=this.#seed.networks.find(n=>n.id===job.options.victimId);
+    const clients=job.tool==='rogue_gitm'?this.#seed.clients.filter(c=>c.network_id===victim.id):[];
+    const bytes=job.tool==='rogue_gitm'?syntheticPcap(victim,clients,1700000000+Math.floor(job.started/1000)):pcapFixtures()[0].bytes;
     if(!module.sdPresent)job.error='sd_missing';
     else if(this.#used(module)+bytes.length>this.#capacity)job.error='storage_full';
     else {
       const path=`/sdcard/lab/pcaps/${job.moduleId}/${job.options.prefix}-${++module.sequence}.pcap`;
-      module.files.set(path,{path,moduleId:job.moduleId,kind:'gitm',packetCount:14,bytes:bytes.slice()});
-      job.file=path;job.result={...this.#gitmResult(),file:path};
+      module.files.set(path,{path,moduleId:job.moduleId,kind:job.tool,
+        ...(job.tool==='rogue_gitm'?{networkId:victim.id,upstreamId:job.options.upstreamId}:{}),
+        packetCount:job.tool==='rogue_gitm'?clients.length:14,bytes:bytes.slice()});
+      job.file=path;job.result=job.tool==='rogue_gitm'
+        ?{...job.result,stage:'finalized',file:path,packets:clients.length,bytes:bytes.length}
+        :{...this.#gitmResult(),file:path};
     }
     job.state=job.error?'failed':'completed';job.progress=1;module.active=null;
     return true;
@@ -301,6 +376,7 @@ export class SimulatedDevice {
       if(job.kind==='attack') {
         job.progress=Math.min(.95,(this.#now-job.started)/job.duration);
         job.result=attackResult(job.operation,job.options,this.#now-job.started,this.#seed.networks,this.#seed.clients);
+        this.#recordSubmittedDemo(module,job);
         continue;
       }
       if(job.kind==='wardrive') {this.#advanceWardrive(module,job);continue;}
@@ -312,6 +388,12 @@ export class SimulatedDevice {
       if(job.kind==='tool'&&job.tool==='gitm') {
         job.progress=Math.min(.95,(this.#now-job.started)/job.duration);
         if(this.#now-job.started>=500)job.result=this.#gitmResult();
+        continue;
+      }
+      if(job.kind==='tool'&&job.tool==='rogue_gitm') {
+        job.progress=Math.min(.95,(this.#now-job.started)/job.duration);
+        job.result=toolResult(job.tool,job.options,this.#seed.networks,
+          this.#now-job.started,this.#seed.clients);
         continue;
       }
       job.progress=Math.min(1,(this.#now-job.started)/job.duration);
@@ -355,11 +437,28 @@ export class SimulatedDevice {
       structuredClone({...metadata,sizeBytes:bytes.length}));
   }
 
-  installPcapFixtures(moduleId) {
+  compromisedPcapFiles(moduleId,kind) {
+    const dirs=kind==='handshake'
+      ? ['/sdcard/lab/handshakes','/lab/handshakes','/sdcard/handshakes','/handshakes']
+      : kind==='pcap'
+        ? ['/sdcard/lab/pcaps','/lab/pcaps','/sdcard/pcaps','/pcaps']
+        : null;
+    if(!dirs)throw new Error('Unknown compromised file kind');
+    const files=this.files(moduleId).filter(file=>/\.pcap$/i.test(file.path));
+    for(const dir of dirs) {
+      const inDirectory=files.filter(file=>file.path.startsWith(dir+'/'));
+      if(inDirectory.length)return inDirectory;
+    }
+    return [];
+  }
+
+  installPcapFixtures(moduleId,{includeHandshake=false}={}) {
     const module=this.#available(moduleId);
     if(!module.sdPresent)throw new Error('SD missing');
     const files=pcapFixtures().map(file=>({...file,moduleId,
       path:`/sdcard/lab/pcaps/${moduleId}/example-${file.fixtureId}.pcap`}));
+    if(includeHandshake&&['grove','usb'].includes(moduleId))files.push({moduleId,kind:'handshake',fixtureId:'neon-handshake',
+      path:'/sdcard/lab/handshakes/neon-bazaar-4way.pcap',bytes:wpaFixtureBytes('capture-neon')});
     const replaced=files.reduce((sum,f)=>sum+(module.files.get(f.path)?.bytes.length||0),0);
     if(this.#used(module)-replaced+files.reduce((sum,f)=>sum+f.bytes.length,0)>this.#capacity)
       throw new Error('storage_full');
@@ -546,6 +645,13 @@ export class SimulatedDevice {
   // connected module surfaces it. A disconnected module sees no devices.
   bluetooth(moduleId) {
     return this.#module(moduleId).connected ? structuredClone(this.#seed.bluetooth||[]) : [];
+  }
+
+  bluetoothTagCounts(moduleId, elapsedMs) {
+    if (!this.#module(moduleId).connected) return {airtags:0, smarttags:0};
+    const seen=(this.#seed.bluetooth_tags||[]).filter(tag=>elapsedMs>=tag.detected_at_ms);
+    return {airtags:seen.filter(tag=>tag.kind==='airtag').length,
+            smarttags:seen.filter(tag=>tag.kind==='smarttag').length};
   }
 
   nearbyNetworks(moduleId) {

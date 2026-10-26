@@ -1,8 +1,18 @@
 # Live Emulator TODO and Progress
 
-Last reviewed: 2026-09-13.
+Last reviewed: 2026-10-26. The phase notes below preserve earlier checkpoints;
+the [2026-10-26 feature parity handoff](ui-emulator/Feature_Parity_Handoff_2026-10-26.md)
+and [current control audit](ui-emulator/phase4-coverage-audit.json) describe the
+present implementation and verification boundary.
 
-**Current checkpoint (2026-09-13):** Queue 1 and Queue 2 are complete. S18-S20 add 15 settings variants; all 47 Queue 2 variants passed the integrated gate. S08 and S15 now run in the main gate too. **72 scripts PASS, 0 failures, 1155.20 s** ([summary](ui-emulator/test-runs/20260913-201748-ac7773/summary.json), [integration report](ui-emulator/S18_S20_Integration_Report.md)). Next: **S22 global Portal and additional Karma2**. Local development/testing only; no deployment.
+**Current checkpoint (2026-10-26):** Wi-Fi Analyzer, WPA PSK Auditor, full
+Sub-GHz, NFC and the remaining visible Tab5 workflows have been implemented
+in the local browser emulator. The complete host/Chromium acceptance gate is
+18/18 checks and 89 scripts PASS (0 failures). Running
+`tests/verify_emulator_feature_parity.py` writes its local verification report.
+No firmware, physical-device or live Pages result is claimed here.
+
+**Historical checkpoint (2026-09-13):** Queue 1 and Queue 2 are complete. S18-S20 add 15 settings variants; all 47 Queue 2 variants passed the integrated gate. S08 and S15 now run in the main gate too. **72 scripts PASS, 0 failures, 1155.20 s** ([summary](ui-emulator/test-runs/20260913-201748-ac7773/summary.json), [integration report](ui-emulator/S18_S20_Integration_Report.md)). Next at that checkpoint: **S22 global Portal and additional Karma2**. Local development/testing only; no deployment.
 
 **Previous checkpoint (before S01/S27):** First guided Bluetooth story and all eight open dialog controls are implemented. The focused gate passed 18 cases across four scripts, including all four orientations ([run](ui-emulator/test-runs/20260912-211801-f03ebf/summary.json)). The audit covers 353/452 controls, with 0 open candidates and 93 explicitly deferred controls. The previous full user run passed 49 scripts; the new full run stopped at an unrelated browser startup timeout ([run](ui-emulator/test-runs/20260912-211423-66ac5d/summary.json)); no new full PASS is claimed. See [Bluetooth guide](ui-emulator/Guided_Bluetooth_Report.md) and [native dialogs](ui-emulator/native-dialogs-20260912-report.md).
 
@@ -28,7 +38,7 @@ Last reviewed: 2026-09-13.
 
 **Earlier checkpoint (2026-09-12):** Initial detector and settings runs had intermittent localhost startup failures. Those historical attempts were superseded by the user-confirmed 49-script cumulative pass recorded below. Routed native tests still do not constitute validation of every HTTP transfer path.
 
-**Accepted scope:** [User decisions](ui-emulator/Accepted_Decisions.md): SubGHz deferred; shortened demo timing with a realistic option; required virtual modules available by default. No further user preference is needed for Phase 1.
+**Accepted scope:** [User decisions](ui-emulator/Accepted_Decisions.md): full Sub-GHz simulation; shortened demo timing with a realistic option; required virtual modules available by default. The earlier phase sections below describe their historical scope.
 
 ## Status rules
 
@@ -150,7 +160,7 @@ client/network activity and signal drift over time, consumed by Observer live
 activity, Bluetooth and Wardrive. Land the minimum each slice needs; do not build
 it speculatively.
 
-**SubGHz** module, signal and operation simulation is deferred by user decision and is not a gate for this milestone.
+**Historical Phase 4 scope:** Sub-GHz was deferred at this checkpoint. The 2026-10-26 user decision and implementation include the full virtual module.
 
 - [x] Record the user-supplied SubGHz UART reference (2026-09-10), storage/lifecycle implications and unresolved contradictions. Evidence: [SubGHz protocol notes](ui-emulator/SubGHz_Protocol_Notes.md). Protocol intake only; no SubGHz runtime implementation or producer verification is claimed.
 
@@ -333,10 +343,10 @@ Playwright, so this is not a claim that every HTTP transfer path is fixed.
 Continue Phase 6 browser/mobile acceptance. All eight former open dialog controls are
 now wired and verified. Virtual SD remains session-only by user decision.
 
-**Known limitations:** Intermittent localhost HTTP resets have occurred in
-unrouted browser tests. They did not block the accepted full run. SubGHz stays
-deferred by user decision. Physical-device and cross-browser validation remain
-Phase 6 work.
+**Known limitations at that historical checkpoint:** Intermittent localhost HTTP
+resets occurred in unrouted browser tests. They did not block the accepted full
+run. Sub-GHz was deferred then and is included in the current checkpoint above.
+Physical-device and cross-browser validation remain Phase 6 work.
 
 **Historical task boundary (before S01-S03/S27, 2026-09-12):** First guided Bluetooth story and the
 eight dialog controls have focused acceptance (18 cases, 4 scripts, 39.13 s).

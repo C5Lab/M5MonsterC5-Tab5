@@ -36,7 +36,8 @@ class PortalDemoBrowser(unittest.TestCase):
         click_object(self.page,next(o for o in objects(self.page) if o['binding'].endswith(bssid+'/select')))
         self.page.evaluate('emulator.module._emu_set_timing(1)')
     def portal(self):
-        p=self.page;click_text(p,'INTERNAL');click_text(p,'Ad Hoc\nPortal & Karma')
+        p=self.page;click_text(p,'INTERNAL');p.evaluate('emulator.module._emu_tick(10)')
+        click_text(p,'Ad Hoc\nPortal & Karma')
         click_text(p,'\uf00b Show Probes');click_text(p,'1. NEON-BAZAAR')
         click_text(p,'\uf04b Start')
     def test_evil_and_rogue_sequence_all_rotations(self):

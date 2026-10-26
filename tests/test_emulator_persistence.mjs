@@ -19,6 +19,15 @@ test('transfer baud accepts only firmware choices, survives reload and resets',(
  assert.equal(bad.get('ft_baud',460800),460800);assert.equal(bad.recovered,true);
 });
 
+test('USB transfer baud accepts only CH34x choices and survives reload',()=>{
+ const disk=storage(),settings=new SettingsStore(disk);
+ for(const rate of [115200,230400,460800,921600,1000000,1500000,2000000,3000000]){
+  settings.set('usb_ft_baud',rate);
+  assert.equal(new SettingsStore(disk).get('usb_ft_baud',921600),rate);
+ }
+ for(const rate of [0,115201,4000000,'921600'])assert.throws(()=>settings.set('usb_ft_baud',rate));
+});
+
 test('settings survive reconstruction; reset restores defaults without clearing unrelated storage', () => {
   const disk = storage({unrelated: 'keep'});
   const settings = new SettingsStore(disk);

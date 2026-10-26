@@ -6,6 +6,23 @@ import { syntheticPcap } from '../tools/ui_emulator/model/pcap.mjs';
 
 const seed = JSON.parse(await readFile(new URL('../docs/ui-emulator/neon-district.seed.json', import.meta.url), 'utf8'));
 
+test('compromised PCAP lists keep Handshakes separate and use firmware directory priority',()=>{
+  const device=new SimulatedDevice(seed),bytes=new Uint8Array([1]);
+  device.commitFileChanges('grove',[
+    {path:'/sdcard/lab/handshakes/canonical.pcap',bytes},
+    {path:'/sdcard/handshakes/legacy.pcap',bytes},
+    {path:'/sdcard/lab/handshakes/ignored.pcapng',bytes},
+    {path:'/sdcard/lab/pcaps/grove/general.pcap',bytes}
+  ]);
+  assert.deepEqual(device.compromisedPcapFiles('grove','handshake').map(f=>f.path),
+    ['/sdcard/lab/handshakes/canonical.pcap']);
+  assert.deepEqual(device.compromisedPcapFiles('grove','pcap').map(f=>f.path),
+    ['/sdcard/lab/pcaps/grove/general.pcap']);
+  device.deleteFile('grove','/sdcard/lab/handshakes/canonical.pcap');
+  assert.deepEqual(device.compromisedPcapFiles('grove','handshake').map(f=>f.path),
+    ['/sdcard/handshakes/legacy.pcap']);
+});
+
 test('module captures have distinct paths when copied to the shared analysis filesystem',()=>{
   const device=new SimulatedDevice(seed);
   for(const id of ['grove','mbus']) {
@@ -13,6 +30,51 @@ test('module captures have distinct paths when copied to the shared analysis fil
     device.capture(id);device.advance(2000);
   }
   assert.notEqual(device.files('grove')[0].path,device.files('mbus')[0].path);
+});
+
+test('OTA variant and explicit release choices change only the simulated module',()=>{
+  const rfSeed=structuredClone(seed);
+  rfSeed.modules.find(module=>module.id==='mbus').capabilities.push('subghz');
+  const device=new SimulatedDevice(rfSeed);
+  assert.deepEqual(device.systemReleases('grove',{channel:'main',variant:'rf'}).map(r=>r.tag),
+    ['demo-rf-main-2','demo-rf-main-1']);
+  assert.throws(()=>device.systemStart('grove','update',{variant:'rf'}),/variant blocked/i);
+  assert.throws(()=>device.systemStart('mbus','update',{variant:'classic'}),/variant blocked/i);
+  assert.throws(()=>device.systemStart('mbus','update',{variant:'rf',force:true}),/release/i);
+  assert.throws(()=>device.systemStart('mbus','update',{variant:'rf',release:'demo-main-2'}),/release/i);
+  const initial=device.systemStatus('mbus');
+  assert.equal(initial.version,'demo-rf-main-1');
+  const id=device.systemStart('mbus','update',{channel:'main',variant:'rf'});
+  assert.equal(device.job(id).options.variant,'rf');
+  device.advance(3000);
+  assert.equal(device.systemStatus('mbus').version,'demo-rf-main-2');
+  assert.equal(device.systemStatus('grove').version,'demo-main-1');
+  const reinstall=device.systemStart('mbus','update',
+    {channel:'main',variant:'rf',force:true,release:'demo-rf-main-2'});
+  device.advance(3000);
+  assert.equal(device.systemStatus('mbus').version,'demo-rf-main-2');
+  assert.equal(device.systemStatus('mbus').reboots,initial.reboots+2);
+  assert.equal(device.job(reinstall).options.release,'demo-rf-main-2');
+  const downgrade=device.systemStart('mbus','update',
+    {channel:'main',variant:'rf',release:'demo-rf-main-1'});
+  device.advance(3000);
+  assert.equal(device.systemStatus('mbus').version,'demo-rf-main-1');
+  device.systemActivateSlot('mbus',1);
+  device.advance(1000);
+  assert.equal(device.systemStatus('mbus').version,'demo-rf-backup-1');
+  assert.equal(device.systemStatus('mbus').firmwareVariant,'rf');
+});
+
+test('OTA latest stays on the published catalog head after repeat checks',()=>{
+  const device=new SimulatedDevice(seed);
+  const first=device.systemStart('grove','update');device.advance(3000);
+  assert.equal(device.systemStatus('grove').version,'demo-main-2');
+  const rebootCount=device.systemStatus('grove').reboots;
+  const second=device.systemStart('grove','update');device.advance(3000);
+  assert.equal(device.systemStatus('grove').version,'demo-main-2');
+  assert.equal(device.systemStatus('grove').reboots,rebootCount);
+  assert.equal(device.job(second).result.stage,'up_to_date');
+  assert.equal(device.job(first).result.stage,'completed');
 });
 
 test('PCAP packet timestamps carry into seconds rather than overflowing microseconds',()=>{

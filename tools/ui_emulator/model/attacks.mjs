@@ -9,8 +9,10 @@ export function attackOptions(kind,input,networks,clients) {
    const n=networks.find(n=>n.id===id||n.bssid===id);
    if(!n)throw new Error('Choose a scenario network');return n.id;
  }))];
- if(!global&&!['karma','beacon'].includes(kind)&&!ids.length)throw new Error('Select a network');
- if(['arp','rogue_ap','mitm','sae_overflow','portal_demo','ap_radar'].includes(kind)&&ids.length!==1)throw new Error('Select exactly one network');
+ const typedPortal=kind==='portal_demo'&&!ids.length&&input.ssid!==undefined;
+ if(!global&&!['karma','beacon'].includes(kind)&&!ids.length&&!typedPortal)throw new Error('Select a network or enter a demo SSID');
+ if(['arp','rogue_ap','mitm','sae_overflow','ap_radar'].includes(kind)&&ids.length!==1)throw new Error('Select exactly one network');
+ if(kind==='portal_demo'&&ids.length>1)throw new Error('Select exactly one network');
  const options={networkIds:ids};
  if(input.targetMac) {
    const demoArpHost=kind==='arp'&&['02:00:00:00:00:10','02:00:00:00:00:20'].includes(input.targetMac);
@@ -22,7 +24,7 @@ export function attackOptions(kind,input,networks,clients) {
    options.customSSIDs=[...new Set(input.customSSIDs)];
  }
  if(input.ssid!==undefined) {
-   if(typeof input.ssid!=='string'||new TextEncoder().encode(input.ssid).length>32)throw new Error('Invalid demo SSID');
+   if(typeof input.ssid!=='string'||(kind==='portal_demo'&&!input.ssid.trim())||new TextEncoder().encode(input.ssid).length>32)throw new Error('Invalid demo SSID');
    options.ssid=input.ssid;
  }
  if(input.portal)options.portal=String(input.portal);
@@ -30,7 +32,8 @@ export function attackOptions(kind,input,networks,clients) {
 }
 
 export function attackResult(kind,options,elapsed,networks,clients) {
- const step=Math.floor(elapsed/1000),ids=options.networkIds.length?options.networkIds:networks.map(n=>n.id);
+ const step=Math.floor(elapsed/1000),ids=options.networkIds.length?options.networkIds:
+   kind==='portal_demo'?[]:networks.map(n=>n.id);
  const candidates=clients.filter(c=>ids.includes(c.network_id)&&(!options.targetMac||c.mac===options.targetMac));
  const visible=step?candidates.slice(0,Math.min(step,candidates.length)):[];
  const packets=Math.min(2147483647,step*24);
@@ -45,12 +48,13 @@ export function attackResult(kind,options,elapsed,networks,clients) {
  const radarNetwork=networks.find(n=>n.id===ids[0]);
  const radar=kind==='ap_radar'?{signal:{bssid:radarNetwork.bssid,ssid:radarNetwork.ssid,
    rssi:Math.max(-100,Math.min(-20,radarNetwork.rssi+Math.round(8*Math.sin(elapsed/3000))))}}:{};
+ const portalNetwork=kind==='portal_demo'&&!options.networkIds.length?{id:'typed-portal',ssid:options.ssid}:networks.find(n=>n.id===ids[0]);
  const portalDemo=['evil_twin','rogue_ap','portal_demo'].includes(kind)?{
-   demo:portalStory(elapsed,networks.find(n=>n.id===ids[0]),candidates.find(c=>c.network_id===ids[0]))
+   demo:portalStory(elapsed,portalNetwork,candidates.find(c=>c.network_id===ids[0]))
  }:{};
  return {simulated:true,elapsedMs:Math.floor(elapsed),packets,...handshakeResults,...portalDemo,...radar,
    clients:visible.map((c,i)=>({...c,ip:`192.0.2.${10+i}`,vendor:c.vendor||'Scenario device'})),events,
-   ssids:options.customSSIDs??networks.filter(n=>ids.includes(n.id)).map(n=>n.ssid).filter(Boolean)};
+   ssids:options.customSSIDs??(kind==='portal_demo'&&!options.networkIds.length?[options.ssid]:networks.filter(n=>ids.includes(n.id)).map(n=>n.ssid).filter(Boolean))};
 }
 
 function portalStory(elapsed,network,client) {

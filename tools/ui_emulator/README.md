@@ -60,6 +60,84 @@ Close** during generation discards the pending capture. **Reset demo** reloads
 the scenario and clears virtual files and saved settings. Reload also discards
 virtual files; virtual SD has no persistent storage.
 
+## WPA PSK Auditor demo
+
+Open **INTERNAL → WPA PSK Auditor** to inspect four fixed, synthetic capture
+records. NEON-BAZAAR appears once with Grove and USB sources; GHOST-LINE is
+remote only; CHROME-CLINIC is intentionally invalid; SYNAPSE-RELAY starts in
+the local catalogue. Source filtering, idempotent **Sync all to Tab5**, two
+demo wordlists, individual audits, safe pause/resume, Start over/Delete audit
+confirmation, a sequential batch queue, history and recovered demo credentials
+are interactive native LVGL controls. Paused checkpoints, history and recovered
+demo credentials survive browser reload when browser storage is available.
+Synced virtual SD copies return to their seed state on reload. **Reset demo**
+clears the saved audit state.
+
+**Load PCAP examples** also installs a synthetic NEON-BAZAAR WPA capture in
+GROVE's **Compromised Data → Handshakes** list. Its file actions and **CRACK**
+route can be tried there. The capture bytes are an offline fixture marker, not
+radio data or a parseable PCAP.
+
+The fixture catalogue contains metadata only. Sync changes synthetic catalogue
+state; it does not copy handshake bytes. Candidate counts and outcomes are
+scripted, with no packet parsing, password verification, radio use, JanOS
+commands or physical storage. **Handshaker → Crack latest** opens a matching
+fixture in the auditor. **Compromised Data → Handshakes** retains the volatile
+virtual file list; its **Open WPA Auditor** link opens the catalogue. A file's
+**CRACK** button recognizes only exact offline fixture content at its expected
+path; an imported PCAP with a matching name alone cannot select a scripted
+result.
+
+Focused checks after rebuilding:
+
+```bat
+node --test tests\test_emulator_wpa_auditor.mjs
+tools\ui_emulator\.venv\Scripts\python.exe -u tests\test_emulator_wpa_auditor.py -v
+```
+
+## Global Portal and Observer Probes & Karma
+
+On Grove or MBus, open **Global WiFi Attacks → Portal**. The native popup
+accepts a demo SSID and a virtual HTML template. **Start Portal** shows the
+same staged synthetic client, visit and submitted demo password used by the
+INTERNAL portal. **Background** hides the popup while the local job continues;
+opening Portal again shows its current state. **Stop Portal** releases the
+module. A virtual SD card is required for the external module's template list.
+
+In **Network Observer**, start the observer, open a network row, scroll the
+action strip sideways to **Karma**, select a synthetic probe and a virtual
+template, then start or stop the same offline portal story. The action strip
+supports horizontal wheel scrolling in portrait mode. These flows create no
+AP, DNS or HTTP service, radio traffic, captured form or real credential.
+
+Focused checks after rebuilding:
+
+```bat
+node --test tests\test_emulator_portal_flows.mjs
+tools\ui_emulator\.venv\Scripts\python.exe -u tests\test_emulator_portal_flows.py -v
+```
+
+## Rogue GITM offline flow
+
+On **WiFi Scan & Attack**, select one named scenario victim and scroll the
+action strip sideways to **Rogue GITM**. The setup popup lists only different,
+named uplinks on the victim's channel. It accepts a local demo mirror pass of
+8–63 characters and an optional demo uplink pass. Passwords are validated and
+discarded; they are absent from the job, its result and saved file metadata.
+
+**Start** opens the native Capture Gateway live view with simulated uplink,
+mirror preparation and capture stages. **STOP GITM** writes a synthetic
+Ethernet/ARP PCAP for local inspection. No deauthentication, mirror AP, real
+uplink, credential verification or radio capture occurs. Observer's single
+network popup directs this flow to the full WiFi Scan list.
+
+Focused checks after rebuilding:
+
+```bat
+node --test tests\test_emulator_rogue_gitm.mjs
+tools\ui_emulator\.venv\Scripts\python.exe -u tests\test_emulator_rogue_gitm.py -v
+```
+
 ## Try Bluetooth discovery and locate (Phase 4.1)
 
 1. On Grove, open **Bluetooth**, then **BT Scan & Locate**.
@@ -70,7 +148,8 @@ virtual files; virtual SD has no persistent storage.
    locator displays **No signal**.
 
 All four screen rotations are covered. AirTag scanning and the nRF24 jammer
-remain visibly unsupported; this workflow uses no physical Bluetooth radio.
+also run as deterministic offline demos; this workflow uses no physical
+Bluetooth radio.
 
 ## Guided Bluetooth story and condition dialogs
 
@@ -97,6 +176,17 @@ tools\ui_emulator\.venv\Scripts\python.exe -u tests\verify_emulator_guided_dialo
 
 The verified slice adds Wardrive recording, the original Tab5 **Setup**, **GPS Debug**, **Home Networks**, **MAC Blacklist**
 and **Upload** dialogs. Data and upload results remain simulated.
+WiGLE upload uses an offline sync adapter; its firmware Wi-Fi scan and credential
+prompts are outside the emulator route. See the [WiGLE prompt audit](../../docs/ui-emulator/WiGLE_Upload_Prompt_Audit.md)
+for the call paths and verification.
+With automatic upload and a saved Home Network enabled, **Home → Yes** stops
+the local recording and shows the upload result. A failed result offers
+**Retry**, **Resume** and **Close**. A successful result with Power off enabled
+shows a demo countdown and **Stay on**; it never powers off the browser or a
+device. **Archive** moves completed virtual sessions to `/uploaded/` only after
+a successful automatic upload. The five automatic-upload switches restore on
+reload. The focused browser check is
+`tests/test_emulator_wardrive_autoup.py`.
 Rebuild after changing sources to update the preview. Build, acceptance
 commands and the manual walkthrough are in the [Phase 4.2 handoff](../../docs/ui-emulator/Phase_4_2_Report.md).
 
@@ -158,7 +248,7 @@ tools\ui_emulator\.venv\Scripts\python.exe -u tests\verify_emulator_phase4_setti
 4.7 is the Phase 4 closeout. It reconciles the coverage ledger against the built
 emulator: every visible control is `retained`, an `adapter`, an inert
 `unsupported` boundary, or a catalogued open item; every back route is covered
-or an explicitly deferred (SubGHz) screen. Details: [4.7 report](../../docs/ui-emulator/Phase_4_7_Report.md).
+or an explicitly deferred screen. Details: [4.7 report](../../docs/ui-emulator/Phase_4_7_Report.md).
 
 **How to compile and then run it (Windows Command Prompt, from the repo root):**
 
@@ -169,9 +259,9 @@ or an explicitly deferred (SubGHz) screen. Details: [4.7 report](../../docs/ui-e
    powershell -ExecutionPolicy Bypass -File tools\ui_emulator\build.ps1 -Jobs 8
    ```
 
-2. Run the standalone coverage audit. This one needs **no browser and no
-   rebuild** ? it is pure Python over the ledger and manifest, so it is the
-   quickest way to check coverage after any slice change:
+2. Run the standalone coverage audit. It needs no browser, but source changes
+   require refreshed inventory, control contracts, and a rebuilt manifest.
+   The audit rejects stale source hashes:
 
    ```bat
    tools\ui_emulator\.venv\Scripts\python.exe -u tests\test_emulator_phase4_audit.py -v
@@ -278,14 +368,60 @@ Grove and MBus own independent radar jobs. Disconnect/Cancel stops readings.
 After building, run `tests/verify_emulator_radar.py`; the full Phase 5 settings gate
 includes it. Acceptance evidence: `docs/ui-emulator/Radar_Report.md`.
 
+### Wi-Fi Analyzer
+
+On GROVE or MBUS, open **WiFi Analyzer** and press **Scan**. The native Tab5
+screen parses a complete synthetic WFA/1 transaction generated from the demo
+networks. Its channel chart, AP details, display filters, sort controls, zoom,
+acquisition settings, and channel proposal use the production LVGL screen and
+model. Scan jobs and last complete snapshots are separate for each module.
+**Stop** cancels the current job and retains the last complete snapshot.
+
+Under **More guided stories**, choose **Wi-Fi Analyzer** to follow a scan,
+inspect NEON-BAZAAR, view the channel proposal, and return to GROVE. The
+proposal is a relative heuristic over synthetic observations; it does not
+measure the local spectrum or change a router. Run `node --test
+tests/test_emulator_analyzer.mjs tests/test_emulator_analyzer_guide.mjs` and
+`tools/ui_emulator/.venv/Scripts/python.exe tests/test_emulator_analyzer.py`
+after building. These checks use an offline browser model and Chromium, not
+a JanOS board or radio.
+
+### Saved Evil Twin passwords and Portal Data
+
+Open **Compromised Data → Evil Twin Passwords** or **Portal Data** on a virtual
+GROVE, MBUS, or INTERNAL module. The production pages parse `show_pass evil`
+and `show_pass portal` text from that module's volatile SD model. They begin
+empty. A submitted offline Evil Twin story writes one demo password entry;
+a submitted Ad Hoc Portal story writes one demo portal entry. The native
+password row opens its Connect confirmation and routes to the offline ARP
+page. Cancel, Back, Clean, and confirmed Delete use the native controls;
+deleting the virtual file empties its list on refresh. Reset demo clears the
+entries. Run `node --test tests/test_emulator_compromised_model.mjs` and
+`tools/ui_emulator/.venv/Scripts/python.exe tests/test_emulator_compromised_passwords.py`
+after building. These records are synthetic; no module SD card or Wi-Fi
+network is read.
+
 ### Transfer Speed and Observer exit
 
-Settings > Transfer Speed now saves any of the nine firmware baud choices
-(115200 through 4000000), restores the selection after reload and returns to
-460800 after demo reset. Invalid stored rates recover to the default. This is a
-configuration demonstration; virtual file operations do not measure UART speed.
+Settings > Transfer Speed saves nine GROVE/M-BUS rates (115200 through 4000000)
+and eight CH34x USB rates (115200 through 3000000) independently. Both restore
+after reload; demo reset returns them to 460800 and 921600 respectively.
+Invalid stored rates recover to those defaults. This is a configuration
+demonstration; virtual file operations do not measure UART speed.
+
+Settings > Scan Setup saves **Show Vendors** and **Log unknown vendors** across
+reloads. The default virtual SD exposes a synthetic vendor capability; the
+browser does not read an `oui_wifi.bin` file.
 
 Back from a running Observer now asks **Keep running** or **Stop and exit**.
+After **Stop**, **Export** writes the native Observer CSV columns to the selected
+module's volatile SD model at a deterministic path such as
+`/sdcard/lab/observer/observer_grove_0001.csv`. Export while running asks you
+to stop first; absent virtual SD reports an error without creating a file.
+Options and network details close before leaving Observer. Run
+`tools/ui_emulator/.venv/Scripts/python.exe tests/test_emulator_observer_export.py`
+after building to check the CSV bytes, per-module paths and navigation. The
+export contains synthetic scenario observations, not a physical RF capture.
 Run `tests/verify_emulator_settings_followup.py` after building; the full Phase 5
 settings gate includes these cases. See `docs/ui-emulator/Settings_Followup_Report.md`.
 
@@ -308,3 +444,35 @@ remain ephemeral. The browser demo does not read a connected physical Monster
 or exercise its Wi-Fi radio. See the [Tab5 Wi-Fi MAC instructions](../../docs/Sta_MAC_Setup.md)
 for the real JanOS workflow and the distinction between the STA policy and a
 temporary WPS session MAC.
+
+### Browser screenshots
+
+Tap the LAB5 title in the device status bar to request a PNG of the virtual
+display as a browser download. This does not write to virtual or physical SD.
+
+### Sub-GHz virtual module
+
+Choose **MBus → Sub-GHz**. The retained LVGL screens cover Quick Scan, Hunter,
+Listen, SD Signals, Weather, Jammer, Tesla and Settings, including the three
+scanner/listener settings pages. Three fixed scenario signals drive scan,
+capture and weather displays. Hunter and Listen can save to a per-tab virtual
+SD list; rename, delete and replay controls act on that in-memory list. Jammer
+and Tesla show simulated status only. Reload or **Reset demo** clears captures
+and virtual SD signals. GROVE remains the classic module profile for OTA
+Auto-detect; MBus has the virtual Sub-GHz capability.
+
+After building, run `node --test tests/test_emulator_subghz_model.mjs` and
+`tools\ui_emulator\.venv\Scripts\python.exe tests\test_emulator_subghz.py`.
+These checks exercise the browser model and native Wasm UI, not RF hardware.
+
+### NFC virtual module
+
+Choose **MBus → NFC** to open the retained hub, Read, List, card detail and
+Emulate pages. Two scenario cards cycle on successive reads. Save, rename and
+delete use a per-tab virtual SD list that clears on reload or **Reset demo**.
+Emulation reports full NTAG page support for the NTAG fixture and UID-only
+support for the Classic fixture; it sends no NFC signal. Back from Emulate
+stops the virtual session.
+
+After building, run `node --test tests/test_emulator_nfc_model.mjs` and
+`tools\ui_emulator\.venv\Scripts\python.exe tests\test_emulator_nfc.py`.

@@ -31,7 +31,8 @@ def check(failures, profile, name, value, limit):
 
 
 def download_measurements(failures):
-    sizes = {p.name: p.stat().st_size for p in DIST.glob('*') if p.is_file()}
+    sizes = {p.relative_to(DIST).as_posix(): p.stat().st_size
+             for p in sorted(DIST.rglob('*')) if p.is_file()}
     budget = BUDGETS['download']
     return {'file_bytes': sizes,
             'total_bytes': check(failures, 'download', 'total_bytes',

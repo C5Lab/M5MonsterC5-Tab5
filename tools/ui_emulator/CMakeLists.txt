@@ -23,6 +23,8 @@ file(GLOB COMPONENT_INCLUDES "${REPO_ROOT}/components/*/include")
 # Extraction uses the production component with a vendored portable SHA-256
 # compatibility subset, so the build needs no host ESP-IDF or TLS library.
 file(GLOB PCAP_COMPONENT_SOURCES "${REPO_ROOT}/components/pcap_*/*.c")
+file(GLOB SUBGHZ_SCREEN_SOURCES "${REPO_ROOT}/main/screens/subghz_*.c")
+file(GLOB NFC_SCREEN_SOURCES "${REPO_ROOT}/main/screens/nfc_*.c")
 add_executable(emulator
     "${REPO_ROOT}/main/app_keyboard.c"
     "${REPO_ROOT}/main/app_keyboard_navigation.c"
@@ -34,16 +36,28 @@ add_executable(emulator
     "${REPO_ROOT}/main/sniffer_clients_model.c"
     "${REPO_ROOT}/main/ota_rf.c"
     "${REPO_ROOT}/main/tile_order.c"
+    "${REPO_ROOT}/main/screens/tool_order_screen.c"
+    "${REPO_ROOT}/main/wifi_analyzer_model.c"
+    "${REPO_ROOT}/main/screens/wifi_analyzer_screen.c"
     generated/browser.c
     runtime/runtime.c
     vendor/sha256.c
     "${REPO_ROOT}/main/screens/cgw_parser.c"
+    "${REPO_ROOT}/main/screens/psram_dynarr.c"
+    ${SUBGHZ_SCREEN_SOURCES}
+    ${NFC_SCREEN_SOURCES}
     ${PCAP_COMPONENT_SOURCES}
     "${REPO_ROOT}/main/lv_font_lato_regular_ttf.c")
+set_source_files_properties("${REPO_ROOT}/main/screens/wifi_analyzer_screen.c"
+    PROPERTIES COMPILE_DEFINITIONS EMU_NATIVE_ANALYZER_SCREEN)
 target_include_directories(emulator PRIVATE
     generated generated/shims runtime
     "${REPO_ROOT}/main"
     "${REPO_ROOT}/main/screens" ${COMPONENT_INCLUDES})
+set_source_files_properties(${SUBGHZ_SCREEN_SOURCES} "${REPO_ROOT}/main/screens/psram_dynarr.c"
+    PROPERTIES COMPILE_DEFINITIONS EMULATOR_NATIVE_SUBGHZ=1)
+set_source_files_properties(${NFC_SCREEN_SOURCES}
+    PROPERTIES COMPILE_DEFINITIONS EMULATOR_NATIVE_NFC=1)
 target_compile_options(emulator PRIVATE -ffunction-sections -fdata-sections)
 target_link_libraries(emulator PRIVATE lvgl m)
 # Browser entry points carry EMSCRIPTEN_KEEPALIVE in runtime.c. No pthreads or

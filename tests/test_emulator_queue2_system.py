@@ -16,7 +16,16 @@ class Queue2SystemBrowser(unittest.TestCase):
     def finish(self):
         self.page.wait_for_function('document.querySelector("#guide-leave").textContent==="Back to stories"',timeout=9000)
         self.page.locator('#guide-leave').click();self.assertTrue(self.page.locator('#queue2-story').is_visible());self.clean()
-    def settings(self):click_text(self.page,'INTERNAL');click_text(self.page,'Settings')
+    def settings(self):
+        click_text(self.page,'INTERNAL')
+        for _ in range(3):
+            self.click('/Settings')
+            for _ in range(20):
+                if any('/Monster OTA' in obj['binding'] for obj in objects(self.page)):
+                    return
+                self.tick()
+                self.page.wait_for_timeout(20)
+        self.fail('Settings did not open')
     def test_detectors_stop_restart_and_back_all_rotations(self):
         p=self.page
         for r in range(4):
@@ -34,7 +43,14 @@ class Queue2SystemBrowser(unittest.TestCase):
         for r in range(4):
             for target in ['grove','mbus']:
                 with self.subTest(rotation=r,target=target):
-                    self.begin('s21-reboot-'+target,r);click_text(p,'INTERNAL');click_text(p,'Module\nStatus')
+                    self.begin('s21-reboot-'+target,r);click_text(p,'INTERNAL')
+                    p.evaluate('emulator.module._emu_tick(100)')
+                    p.evaluate('emulator.module._emu_tick(100)')
+                    p.wait_for_function('''() => {
+                        emulator.module._emu_inspect();
+                        return emulatorObjects.some(o => o.text === 'Module\\nStatus');
+                    }''')
+                    click_text(p,'Module\nStatus')
                     self.title('Reboot '+target.upper());self.click('emu.phase46.system.reboot.'+target);self.advance(3000)
                     self.title('Return to INTERNAL');self.click('emu.phase46.system.back');self.finish()
                     states=p.evaluate("[emulator.device.device.systemStatus('grove').reboots,emulator.device.device.systemStatus('mbus').reboots]")

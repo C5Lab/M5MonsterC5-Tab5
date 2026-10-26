@@ -8,7 +8,7 @@ path=ROOT/'docs/ui-emulator/phase4-attacks-verification.json'
 report={'status':'running','recorded_at':datetime.now(timezone.utc).isoformat(),'checks':[],
         'limitations':['Offline deterministic simulations only; no transmitted frames, credentials acquired or network service',
                        'Chromium acceptance only; real hardware and cross-browser checks remain pending',
-                       'Unlisted attack actions and Rogue GITM are explicit unsupported boundaries']}
+                       'Unlisted attack actions remain explicit unsupported boundaries; Rogue GITM has a separate focused emulator gate']}
 try:
     fingerprint=artifact_fingerprint();report.update(fingerprint)
     for command in [[sys.executable,'tests/verify_emulator_phase4_nettools.py'],

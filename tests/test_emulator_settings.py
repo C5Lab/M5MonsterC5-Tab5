@@ -14,7 +14,8 @@ class SettingsTests(unittest.TestCase):
             addEventListener('emulator-unavailable', e=>unavailable.push(e.detail));''')
         self.page.goto(self.url)
         self.page.wait_for_function('globalThis.emulator?.measurements.frames>2')
-        click_text(self.page,'INTERNAL');click_text(self.page,'Settings')
+        click_text(self.page,'INTERNAL');self.page.evaluate('emulator.module._emu_tick(10)')
+        click_text(self.page,'Settings');self.page.evaluate('emulator.module._emu_tick(10)')
 
     def tearDown(self):
         unavailable=self.page.evaluate('unavailable')
@@ -35,7 +36,9 @@ class SettingsTests(unittest.TestCase):
         # A legitimate persisted value from the production slider's 1..100 range.
         p.evaluate('emulatorSettings.set("scr_bright",1)')
         p.reload();p.wait_for_function('globalThis.emulator?.measurements.frames>2')
-        click_text(p,'INTERNAL');click_text(p,'Settings');click_text(p,'Screen\nBrightness')
+        click_text(p,'INTERNAL');p.evaluate('emulator.module._emu_tick(10)')
+        click_text(p,'Settings');p.evaluate('emulator.module._emu_tick(10)')
+        click_text(p,'Screen\nBrightness')
         self.assertTrue(any(o['text']=='1%' for o in objects(p)))
 
     def test_saved_rotation_applies_when_opening_base_preview(self):

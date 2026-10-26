@@ -3,13 +3,12 @@ import hashlib
 import json
 import re
 from collections import Counter
+from inventory_inputs import inventory_source_paths
 from source_index import ROOT, Source, walk
 from story_contracts import STEPS, NOTES
 
 OUT=ROOT/'docs/ui-emulator'
-paths=[ROOT/'main/main.c', ROOT/'main/observer_view.inc', ROOT/'main/observer_details.inc',
-       *sorted((ROOT/'main/screens').glob('*.c'))]
-sources=[Source(p) for p in paths if not p.name.startswith('lv_font_')]
+sources=[Source(p) for p in inventory_source_paths(ROOT)]
 functions={}
 function_nodes={}
 controls=[]

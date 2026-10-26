@@ -19,7 +19,11 @@
 #include "app_keyboard.h"
 #include "app_keyboard_navigation.h"
 #include "app_keyboard_rotation.h"
+#include "wifi_analyzer.h"
+#include "wifi_analyzer_screen.h"
 #include "tile_order.h"
+#include "esp_err.h"
+#include "tool_order_screen.h"
 #include "pcap_reader.h"
 #include "pcap_summary.h"
 #include "pcap_flow.h"
@@ -33,7 +37,6 @@ typedef void *SemaphoreHandle_t;
 typedef void *TimerHandle_t;
 typedef void *EventGroupHandle_t;
 typedef int uart_port_t;
-typedef int esp_err_t;
 typedef int gpio_num_t;
 typedef void *esp_netif_t;
 typedef void *i2c_master_dev_handle_t;
@@ -49,10 +52,6 @@ typedef struct { char ssid[33]; uint8_t bssid[6]; int rssi, primary, authmode; }
 typedef void (*TaskFunction_t)(void *);
 #define IRAM_ATTR
 #define DRAM_ATTR
-#define ESP_OK 0
-#define ESP_FAIL -1
-#define ESP_ERR_NO_MEM 0x101
-#define ESP_ERR_INVALID_ARG 0x102
 #define ESP_LOGI(...) ((void)0)
 #define ESP_LOGW(...) ((void)0)
 #define ESP_LOGE(...) ((void)0)
@@ -76,15 +75,23 @@ typedef void (*TaskFunction_t)(void *);
 #define heap_caps_calloc(n,s,c) calloc(n,s)
 #define heap_caps_realloc(p,n,c) realloc(p,n)
 #define heap_caps_free(p) free(p)
+#define portENTER_CRITICAL(mux) ((void)(mux))
+#define portEXIT_CRITICAL(mux) ((void)(mux))
+/* NFC's reply handoff runs on the browser thread. */
+static inline SemaphoreHandle_t xSemaphoreCreateMutex(void) { return (void *)1; }
+static inline BaseType_t xSemaphoreTake(SemaphoreHandle_t lock, TickType_t wait)
+{ (void)lock; (void)wait; return pdTRUE; }
+static inline BaseType_t xSemaphoreGive(SemaphoreHandle_t lock)
+{ (void)lock; return pdTRUE; }
 /* Display access is serialized on the browser main thread. */
 #define bsp_display_lock(...) 1
 #define bsp_display_unlock(...) ((void)0)
 static void emu_unsupported(const char *name);
-static BaseType_t xTaskCreate(TaskFunction_t fn,const char *name,unsigned stack,void *arg,unsigned priority,TaskHandle_t *handle);
-static TickType_t xTaskGetTickCount(void);
-static int64_t esp_timer_get_time(void);
-static void vTaskDelay(TickType_t ticks);
-static void vTaskDelete(TaskHandle_t task);
+BaseType_t xTaskCreate(TaskFunction_t fn,const char *name,unsigned stack,void *arg,unsigned priority,TaskHandle_t *handle);
+TickType_t xTaskGetTickCount(void);
+int64_t esp_timer_get_time(void);
+void vTaskDelay(TickType_t ticks);
+void vTaskDelete(TaskHandle_t task);
 /* Software timers exist so retained popup code keeps its original shape. The
    browser owns the clock, so these hold the callback and never fire by themselves. */
 static TimerHandle_t xTimerCreate(const char *name,TickType_t period,BaseType_t reload,void *id,void (*cb)(TimerHandle_t));
@@ -96,25 +103,34 @@ static int uart_write_bytes(uart_port_t port,const void *bytes,size_t count);
 static void esp_restart(void);
 #define NVS_READONLY 0
 #define NVS_READWRITE 1
-static int nvs_open(const char *,int,nvs_handle_t *);
-static int nvs_set_u8(nvs_handle_t,const char *,uint8_t);
+int nvs_open(const char *,int,nvs_handle_t *);
+int nvs_set_u8(nvs_handle_t,const char *,uint8_t);
+int nvs_set_i8(nvs_handle_t,const char *,int8_t);
+int nvs_set_u16(nvs_handle_t,const char *,uint16_t);
+int nvs_get_u8(nvs_handle_t,const char *,uint8_t *);
+int nvs_get_i8(nvs_handle_t,const char *,int8_t *);
+int nvs_get_u16(nvs_handle_t,const char *,uint16_t *);
 static int nvs_get_blob(nvs_handle_t,const char *,void *,size_t *);
 static int nvs_set_blob(nvs_handle_t,const char *,const void *,size_t);
-static int tile_order_load(tile_order_group_t, tile_order_t *);
-static int nvs_commit(nvs_handle_t);
-static void nvs_close(nvs_handle_t);
+esp_err_t tile_order_load(tile_order_group_t, tile_order_t *);
+int nvs_commit(nvs_handle_t);
+void nvs_close(nvs_handle_t);
 
 typedef struct {int line;const char *id;} app_template_t;
 static lv_event_dsc_t *app_bind(lv_obj_t *,lv_event_cb_t,lv_event_code_t,void *,int);
+#if !defined(EMU_NATIVE_ANALYZER_SCREEN) && !defined(EMULATOR_NATIVE_SUBGHZ) && !defined(EMULATOR_NATIVE_NFC)
 #define lv_obj_add_event_cb(o,c,e,u) app_bind(o,c,e,u,__LINE__)
+#endif
+#ifdef EMULATOR_NATIVE_SUBGHZ
+static inline lv_event_dsc_t *subghz_emulator_bind_row(lv_obj_t *row, lv_event_cb_t callback)
+{
+    return lv_obj_add_event_cb(row, callback, LV_EVENT_CLICKED, NULL);
+}
+#endif
 
 struct subghz_tab_state;
 struct nfc_tab_state;
-static void wa_leave(int tab) {(void)tab;}
-static bool wa_busy_tab(int tab) {(void)tab;return false;}
-static void wa_screen_hide(int tab) {(void)tab;}
-static void nfc_hide_all_pages(struct nfc_tab_state *state) {(void)state;}
-static void show_nfc_page(void) {emu_unsupported("NFC is deferred");}
+void nfc_hide_all_pages(struct nfc_tab_state *state);
+void show_nfc_page(void);
 static bool app_power_manager_is_screen_dimmed(void) {return false;}
-static void subghz_hide_all_pages(struct subghz_tab_state *state) {if(state)emu_unsupported("SubGHz is deferred");}
-static void show_subghz_page(void) {emu_unsupported("SubGHz is deferred");}
+#include "subghz_host.h"

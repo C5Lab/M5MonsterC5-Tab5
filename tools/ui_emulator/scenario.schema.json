@@ -36,9 +36,7 @@
           "const": "available-virtual-modules"
         },
         "excluded_features": {
-          "const": [
-            "subghz"
-          ]
+          "const": []
         }
       },
       "required": [
@@ -232,6 +230,39 @@
           "name",
           "mac",
           "rssi"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "bluetooth_tags": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "kind": {
+            "enum": [
+              "airtag",
+              "smarttag"
+            ]
+          },
+          "mac": {
+            "type": "string",
+            "pattern": "^(?:[0-9A-F]{2}:){5}[0-9A-F]{2}$"
+          },
+          "detected_at_ms": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "id",
+          "kind",
+          "mac",
+          "detected_at_ms"
         ],
         "additionalProperties": false
       }
@@ -430,6 +461,47 @@
         "additionalProperties": false
       }
     },
+    "nfc_cards": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "label": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string"
+          },
+          "uid": {
+            "type": "string"
+          },
+          "atqa": {
+            "type": "string"
+          },
+          "sak": {
+            "type": "string"
+          },
+          "data_bytes": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "id",
+          "label",
+          "type",
+          "uid",
+          "atqa",
+          "sak",
+          "data_bytes"
+        ],
+        "additionalProperties": false
+      }
+    },
     "files": {
       "type": "array",
       "items": {
@@ -588,6 +660,7 @@
     "clients",
     "lan",
     "bluetooth",
+    "bluetooth_tags",
     "probe_network_ids",
     "portal_filenames",
     "notes",
@@ -595,6 +668,7 @@
     "settings",
     "gps",
     "subghz_signals",
+    "nfc_cards",
     "files",
     "jobs",
     "variants"

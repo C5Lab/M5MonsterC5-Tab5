@@ -14,7 +14,7 @@ seed=read('docs/ui-emulator/neon-district.seed.json')
 validator=jsonschema.Draft202012Validator(schema,format_checker=jsonschema.FormatChecker())
 def validate(s):
     validator.validate(s)
-    for key in ['networks','clients','bluetooth','modules','subghz_signals','files','jobs','variants']:
+    for key in ['networks','clients','bluetooth','modules','subghz_signals','nfc_cards','files','jobs','variants']:
         ids=[x['id'] for x in s[key]];assert len(ids)==len(set(ids)),key
     nets={n['id']:n for n in s['networks']}
     assert all(c['network_id'] in nets for c in s['clients'])
@@ -27,10 +27,13 @@ def validate(s):
     for kind,field in [('networks','bssid'),('clients','mac'),('bluetooth','mac')]:
         addresses=[x[field] for x in s[kind]];assert len(addresses)==len(set(addresses))
     assert len({f['path'] for f in s['files']})==len(s['files'])
-    assert not s['subghz_signals'], 'SubGHz is excluded from the current scope'
-    assert all(m['producer']!='subghz-separate' and 'subghz' not in m['capabilities'] for m in s['modules'])
-    assert all(v['domain']!='subghz' for v in s['variants'])
-    assert all(f['kind']!='subghz' for f in s['files'])
+    assert len(s['subghz_signals']) >= 3
+    assert len({signal['frequency_hz'] for signal in s['subghz_signals']}) == len(s['subghz_signals'])
+    assert 'subghz' not in s['experience']['excluded_features']
+    assert {m['id'] for m in s['modules'] if 'subghz' in m['capabilities']} == {'mbus'}
+    assert len(s['nfc_cards']) >= 2
+    assert len({card['uid'] for card in s['nfc_cards']}) == len(s['nfc_cards'])
+    assert {m['id'] for m in s['modules'] if 'nfc' in m['capabilities']} == {'mbus'}
     assert s['lan']['network_id'] in nets and s['lan']['module_id'] in modules
 validate(seed)
 bad=copy.deepcopy(seed);bad['clients'][0]['network_id']='missing'

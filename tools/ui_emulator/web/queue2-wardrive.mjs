@@ -81,23 +81,23 @@ function fileStory(kind,action){
  const files=s=>wardrive?s.sessions||[]:(s.files||[]).filter(f=>/\.pcap(?:ng)?$/i.test(f.path));
  const hasTarget=(s,g)=>files(s).some(f=>f.path===g.memory.path);
  const steps=wardrive&&action!=='empty'?[startRecording(),observeRecording(),saveRecording()]:[];
- steps.push(step('Open '+(wardrive?'Wardrive Files':'Handshakes'),action==='empty'?'Start from a reset demo. On GROVE open Compromised Data → '+(wardrive?'Wardrive Files':'Handshakes')+'.':wardrive?'Use Back, then Compromised Data → Wardrive Files.':'Load PCAP examples if needed using the browser control, then return to GROVE → Compromised Data → Handshakes. Use example-http-dns-icmp.pcap.',(s,g)=>{
+ steps.push(step('Open '+(wardrive?'Wardrive Files':'Handshakes'),action==='empty'?'Start from a reset demo. On GROVE open Compromised Data → '+(wardrive?'Wardrive Files':'Handshakes')+'.':wardrive?'Use Back, then Compromised Data → Wardrive Files.':'Use Load PCAP examples to install the synthetic WPA capture, then return to GROVE → Compromised Data → Handshakes. Use neon-bazaar-4way.pcap.',(s,g)=>{
   if(!page(s)||!s.loaded)return false;
   if(action==='empty')return files(s).length===0;
   if(wardrive){g.memory.peers=files(s).filter(f=>f.path!==g.memory.path).map(f=>f.path);return hasTarget(s,g);}
-  const target=files(s).find(f=>f.path.endsWith('/example-http-dns-icmp.pcap'));
+  const target=files(s).find(f=>f.path.endsWith('/neon-bazaar-4way.pcap'));
   if(!target)return false;g.memory.path=target.path;g.memory.peers=files(s).filter(f=>f.path!==target.path).map(f=>f.path);return true;
  }));
  if(action==='empty')steps.push(step('Return from the empty list','Use the native Back arrow. No files should have been created.',s=>!page(s)&&files(s).length===0));
  else if(action==='delete')steps.push(
-  step('Ask to delete the target','Select the new recording and Delete, or use the HTTP/DNS fixture trash button.',(s,g)=>s.deleteConfirm&&s.confirmPath===g.memory.path&&hasTarget(s,g)),
+  step('Ask to delete the target','Select the new recording and Delete, or use the synthetic WPA capture trash button.',(s,g)=>s.deleteConfirm&&s.confirmPath===g.memory.path&&hasTarget(s,g)),
   step('Cancel deletion','Choose No. The exact file must still exist.',(s,g)=>page(s)&&!s.deleteConfirm&&hasTarget(s,g)),
   step('Confirm the same target again','Open Delete for the same file again.',(s,g)=>s.deleteConfirm&&s.confirmPath===g.memory.path&&hasTarget(s,g)),
   step('Delete and verify','Choose Yes. Only the requested target should disappear.',(s,g)=>!s.deleteConfirm&&s.deleted>(g.baseline.deleted||0)&&s.deletePath===g.memory.path&&!hasTarget(s,g)&&(g.memory.peers||[]).every(p=>files(s).some(f=>f.path===p))),
   step('Close the result','Close the deletion result and return from the file list.',s=>!page(s)&&!s.cleanup)
  );
  else if(wardrive)steps.push(step('Select this recording','Tick the checkbox for the new session file, then return through GROVE → Wardrive → Upload → WiGLE.',(s,g)=>s.wardriveFiles&&s.selected===1&&s.selectedPaths?.some(p=>p.includes(g.memory.path+'/select'))),...providerSteps('wigle'));
- else steps.push(step('Copy the HTTP/DNS fixture','Use Copy on example-http-dns-icmp.pcap. Wait for the native transfer result.',(s,g)=>s.copied>(g.baseline.copied||0)&&s.copyPath===g.memory.path&&hasTarget(s,g)),
+ else steps.push(step('Copy the WPA capture','Use Copy on neon-bazaar-4way.pcap. Wait for the native transfer result.',(s,g)=>s.copied>(g.baseline.copied||0)&&s.copyPath===g.memory.path&&hasTarget(s,g)),
   step('Close the transfer and return','Close the transfer result and use the native file-list Back arrow.',s=>!page(s)&&!s.transferActive));
  return story('s16-'+kind+(action==='normal'?'':'-'+action),(wardrive?'Wardrive Files':'Handshakes')+': '+action,steps);
 }

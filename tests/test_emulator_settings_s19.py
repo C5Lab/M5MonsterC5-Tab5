@@ -14,7 +14,14 @@ class SettingsS19Browser(unittest.TestCase):
     def tick(self):self.page.evaluate('emulator.module._emu_tick(10)')
     def begin(self,kind,r):
         self.load(r);self.page.locator('#queue2-story').select_option('s19-'+kind);self.page.locator('#guide-queue2').click()
-        click_text(self.page,'INTERNAL');click_text(self.page,'Settings')
+        click_text(self.page,'INTERNAL')
+        self.page.evaluate('emulator.module._emu_tick(100)')
+        self.page.evaluate('emulator.module._emu_tick(100)')
+        click_text(self.page,'Settings')
+        self.page.wait_for_function('''() => {
+            emulator.module._emu_inspect();
+            return emulatorObjects.some(o => o.text === 'Tool\\nOrder');
+        }''')
     def title(self,text):self.page.wait_for_function('(t)=>document.querySelector("#guide-title").textContent===t',arg=text,timeout=6000)
     def finish(self):
         self.page.wait_for_function('document.querySelector("#guide-leave").textContent==="Back to stories"',timeout=6000)
@@ -81,7 +88,15 @@ class SettingsS19Browser(unittest.TestCase):
                 self.ready();self.title('Check applied orientation');self.assertNotIn('emu-story-once',p.url)
                 expected=[1280,720] if target%2 else [720,1280]
                 self.assertEqual(p.evaluate('[emulator.module._emu_width(),emulator.module._emu_height()]'),expected)
-                click_text(p,'INTERNAL');click_text(p,'Settings');self.click('/Screen Rotation');self.title('Close rotation')
+                click_text(p,'INTERNAL')
+                p.evaluate('emulator.module._emu_tick(100)')
+                p.evaluate('emulator.module._emu_tick(100)')
+                click_text(p,'Settings')
+                p.wait_for_function('''() => {
+                    emulator.module._emu_inspect();
+                    return emulatorObjects.some(o => o.text === 'Tool\\nOrder');
+                }''')
+                self.click('/Screen Rotation');self.title('Close rotation')
                 self.assertTrue(any(o['text']=='Currently active' for o in objects(p)));click_text(p,'Close');self.finish()
                 p.reload();self.ready();self.assertTrue(p.locator('#queue2-story').is_visible());self.assertTrue(p.locator('#guide-panel').is_hidden())
     def test_close_without_change_restart_guide_and_wrong_tab(self):

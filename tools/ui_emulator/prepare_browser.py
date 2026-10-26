@@ -112,6 +112,11 @@ def generate():
     write_changed(out/'browser.c','\n\n'.join(parts))
     write_changed(out/'manifest.json',json.dumps({'source_sha256':hashlib.sha256(src.data).hexdigest(),'retained':sorted(full),'boundaries':{f:policy['functions'][f] for f in sorted(boundary)},'provenance':records},indent=2))
     conf=(ROOT/'lv_conf.h').read_text(); conf=re.sub(r'#define LV_MEM_SIZE[^\n]+','#define LV_MEM_SIZE (32 * 1024 * 1024U)',conf); conf=re.sub(r'#define LV_USE_SDL\s+\d+','#define LV_USE_SDL 0',conf)
+    # The retained Sub-GHz screens format MHz values through lv_label_set_text_fmt.
+    # LVGL's builtin formatter omits floating point values; Emscripten's C
+    # library formatter preserves the native screen text without changing it.
+    conf=conf.replace('#define LV_USE_STDLIB_SPRINTF   LV_STDLIB_BUILTIN',
+                      '#define LV_USE_STDLIB_SPRINTF   LV_STDLIB_CLIB')
     # Match the firmware theme: hardcoded emulator dark defaults used to hide
     # missing explicit styles on new Observer controls in native light builds.
     dark_theme = int('CONFIG_LV_THEME_DEFAULT_DARK=y' in (ROOT/'sdkconfig').read_text())

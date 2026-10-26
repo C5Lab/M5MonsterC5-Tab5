@@ -1,0 +1,14 @@
+{
+  "wa_page_deleted": "retain",
+  "wa_back_to_tiles": "retain",
+  "show_wifi_analyzer_page": "retain",
+  "subghz_host_color_cyan": "adapter",
+  "subghz_host_color_orange": "adapter",
+  "subghz_host_ui_bg": "adapter",
+  "subghz_host_ui_card": "adapter",
+  "subghz_host_ui_card_pressed": "adapter",
+  "subghz_host_ui_panel": "adapter",
+  "subghz_host_ui_text": "adapter",
+  "subghz_host_ui_muted": "adapter",
+  "subghz_host_ui_border": "adapter"
+}

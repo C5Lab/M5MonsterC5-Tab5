@@ -32,7 +32,7 @@ test('all Wardrive and file variants have observable predicates',()=>{
  }
 });
 
-const fixture={path:'/sdcard/lab/pcaps/grove/example-http-dns-icmp.pcap'};
+const fixture={path:'/sdcard/lab/handshakes/neon-bazaar-4way.pcap'};
 const peer={path:'/sdcard/lab/pcaps/grove/example-dns-icmp.pcap'};
 test('copy accepts an existing fixture but requires a fresh successful native copy of that exact file',()=>{
  const g=begin('s16-handshakes',{...sample,files:[fixture,peer],copied:3});

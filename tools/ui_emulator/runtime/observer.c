@@ -146,11 +146,82 @@ static void observer_stop_btn_cb(lv_event_t *e) {
 }
 static void observer_back_btn_event_cb(lv_event_t *e) {
     tab_context_t *ctx=get_current_ctx(); if(!ctx)return;
+    if(observer_options_modal){observer_options_close();return;}
+    if(ctx->network_popup){close_network_popup();return;}
     if(ctx->observer_running||ctx->observer_start_active){
         close_observer_exit_confirm();show_observer_exit_confirm();return;
     }
     observer_stop_btn_cb(e); ctx->observer_page_visible=false;
     show_main_tiles();
+}
+
+/* Export the same native Observer snapshot and column order as the firmware.
+ * The only substituted boundary is the destination: a per-module volatile SD
+ * file with a deterministic sequence instead of a wall-clock filename. */
+EM_JS(int,app_observer_export_store_js,(int tab,const char *data,size_t length,char *path,int path_size,char *error,int error_size),{
+ try{
+  const id=emulatorDevice.module(tab),device=emulatorDevice.device;
+  if(!device.systemStatus(id).sdPresent)throw new Error('SD card not mounted');
+  const paths=new Set(device.files(id).map(file=>file.path));
+  let candidate="";
+  for(let n=1;n<=9999;n++){
+   candidate=`/sdcard/lab/observer/observer_${id}_${String(n).padStart(4,'0')}.csv`;
+   if(!paths.has(candidate))break;
+   candidate="";
+  }
+  if(!candidate)throw new Error('Observer export slots full');
+  device.commitFileChanges(id,[{path:candidate,bytes:HEAPU8.slice(data,data+length)}]);
+  stringToUTF8(candidate,path,path_size);
+  return 1;
+ }catch(e){stringToUTF8(e.message,error,error_size);return 0;}
+});
+
+extern FILE *open_memstream(char **buffer,size_t *size);
+static bool observer_export_csv(tab_context_t *ctx,char *out_path,size_t out_path_sz,char *err_msg,size_t err_msg_sz){
+ if(!ctx||!out_path||out_path_sz<8)return false;
+ out_path[0]=0;if(err_msg&&err_msg_sz)err_msg[0]=0;
+ char *csv=NULL;size_t csv_size=0;
+ FILE *f=open_memstream(&csv,&csv_size);
+ if(!f){snprintf(err_msg,err_msg_sz,"Not enough memory for export");return false;}
+ char *scratch=malloc(23000);
+ if(!scratch){fclose(f);free(csv);snprintf(err_msg,err_msg_sz,"Not enough memory for export");return false;}
+ char *extended_esc=scratch,*client_meta=scratch+5000,*client_meta_esc=scratch+11000;
+ fprintf(f,"scan_index,ssid,bssid,channel,rssi,band,vendor,client_count,clients,extended,client_metadata\n");
+ for(int i=0;i<ctx->observer_network_count;i++){
+  observer_network_t *net=&ctx->observer_networks[i];
+  char ssid_esc[96],bssid_esc[32],band_esc[24],vendor_esc[96],clients_esc[640];
+  observer_csv_escape(net->ssid,ssid_esc,sizeof(ssid_esc));
+  observer_csv_escape(net->bssid,bssid_esc,sizeof(bssid_esc));
+  observer_csv_escape(net->band,band_esc,sizeof(band_esc));
+  observer_csv_escape(net->vendor,vendor_esc,sizeof(vendor_esc));
+  char joined[512]="";
+  for(int j=0;j<MAX_CLIENTS_PER_NETWORK;j++)if(net->clients[j][0]){
+   if(joined[0])strncat(joined,";",sizeof(joined)-strlen(joined)-1);
+   strncat(joined,net->clients[j],sizeof(joined)-strlen(joined)-1);
+  }
+  observer_csv_escape(joined,clients_esc,sizeof(clients_esc));
+  observer_csv_escape(net->extended.raw,extended_esc,5000);
+  client_meta[0]=0;
+  for(int j=0;j<net->client_count&&j<MAX_CLIENTS_PER_NETWORK;j++){
+   size_t n=strlen(client_meta);if(n>=5999)break;
+   char rssi[24],age[24];
+   if(net->client_rssi_known[j])snprintf(rssi,sizeof(rssi),"%d",net->client_rssi[j]);else snprintf(rssi,sizeof(rssi),"unknown");
+   if(net->client_age_known[j])snprintf(age,sizeof(age),"%lu",(unsigned long)net->client_age_ms[j]);else snprintf(age,sizeof(age),"unknown");
+   snprintf(client_meta+n,6000-n,"%s%s vendor=%s rssi=%s age_ms=%s {%s}",n?";":"",net->clients[j],net->client_vendors[j],rssi,age,net->client_extended[j]);
+  }
+  observer_csv_escape(client_meta,client_meta_esc,12000);
+  fprintf(f,"%d,\"%s\",\"%s\",%d,%d,\"%s\",\"%s\",%d,\"%s\",\"%s\",\"%s\"\n",
+   net->scan_index,ssid_esc,bssid_esc,net->channel,net->rssi,band_esc,vendor_esc,
+   net->client_count,clients_esc,extended_esc,client_meta_esc);
+ }
+ free(scratch);
+ bool written=!ferror(f);
+ if(fclose(f)!=0)written=false;
+ if(!written){free(csv);snprintf(err_msg,err_msg_sz,"Could not write CSV");return false;}
+ int tab=tab_id_for_ctx(ctx);
+ bool saved=app_observer_export_store_js(tab,csv,csv_size,out_path,(int)out_path_sz,err_msg,(int)err_msg_sz);
+ free(csv);
+ return saved;
 }
 static void observer_exit_confirm_cb(lv_event_t *e) {
     tab_context_t *ctx=get_current_ctx();
@@ -317,7 +388,8 @@ static void app_observer_live_tick(tab_context_t *ctx,int tab) {
   bool active=app_observer_live_client(tab,mac);
   lv_obj_set_style_text_color(label,active?COLOR_MATERIAL_TEAL:lv_color_hex(0x888888),0);
  }
- if(ctx->observer_status_label)lv_label_set_text_fmt(ctx->observer_status_label,"Simulation: %d packets | %d/%d clients active",values[0],values[1],values[2]);
+ if(ctx->observer_status_label && strcmp(lv_label_get_text(ctx->observer_status_label),"Stop observer before export"))
+  lv_label_set_text_fmt(ctx->observer_status_label,"Simulation: %d packets | %d/%d clients active",values[0],values[1],values[2]);
 }
 /* Rewrite the popup only when the model state actually changes: an unconditional
    per-frame lv_label_set_text invalidates the card on every rendered frame. */

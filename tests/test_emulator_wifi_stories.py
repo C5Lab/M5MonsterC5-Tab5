@@ -16,6 +16,13 @@ class WiFiStoriesBrowser(unittest.TestCase):
     def begin(self,kind,variant='normal',rotation=0):
         self.page.goto(f'{self.url}/?rotation={rotation}&wifiDemo={variant}');self.ready()
         self.page.locator('#guide-'+kind).click();click_text(self.page,'WiFi Scan\n& Attack')
+
+    def test_empty_preset_starts_emulator(self):
+        self.page.goto(f'{self.url}/?rotation=0&wifiDemo=empty')
+        self.ready()
+        self.assertEqual(self.page.locator('#wifi-condition').input_value(), 'empty')
+        self.clean()
+
     def test_scan_variants_all_rotations(self):
         p=self.page
         for rotation in range(4):

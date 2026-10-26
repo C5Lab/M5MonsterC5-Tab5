@@ -139,7 +139,9 @@ class EmulatorLifecycleTests(unittest.TestCase):
         # This refusal is intentional; no later action may report another one.
         self.page.evaluate('emulatorModelErrors.length = 0')
         click_text(self.page, 'INTERNAL')
+        self.page.evaluate('emulator.module._emu_tick(10)')
         click_text(self.page, 'Settings')
+        self.page.evaluate('emulator.module._emu_tick(10)')
         self.assertTrue(any(o['text'] == 'Scan\nSetup' for o in objects(self.page)))
 
     def test_module_switch_keeps_capture_and_scan_independent(self):

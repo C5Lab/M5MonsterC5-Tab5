@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { SimulatedDevice } from '../tools/ui_emulator/model/device.mjs';
+import { WpaAuditorModel } from '../tools/ui_emulator/model/wpa_auditor.mjs';
 const seed=JSON.parse(await readFile(new URL('../docs/ui-emulator/neon-district.seed.json',import.meta.url),'utf8'));
 
 test('example installation is explicit, deterministic, isolated and idempotent',()=>{
@@ -17,6 +18,30 @@ test('example installation is explicit, deterministic, isolated and idempotent',
     bytes.fill(0);assert.equal(d.readFile('grove',f.path)[0],0xd4);
   }
   d.reset();assert.deepEqual(d.files('grove'),[]);
+});
+
+test('optional WPA example installs a real Handshakes route atomically',()=>{
+  const d=new SimulatedDevice(seed);
+  const files=d.installPcapFixtures('grove',{includeHandshake:true});
+  const handshake=d.compromisedPcapFiles('grove','handshake');
+  assert.equal(files.length,4);
+  assert.deepEqual(handshake.map(file=>file.path),['/sdcard/lab/handshakes/neon-bazaar-4way.pcap']);
+  assert.equal(new TextDecoder().decode(d.readFile('grove',handshake[0].path)),
+    'OFFLINE WPA AUDIT FIXTURE capture-neon\n');
+  assert.equal(new WpaAuditorModel(seed).captureForFile('grove',handshake[0].path,
+    d.readFile('grove',handshake[0].path)).id,'capture-neon');
+  assert.deepEqual(d.installPcapFixtures('grove',{includeHandshake:true}),files);
+  const tooSmall=new SimulatedDevice(seed,{sdCapacityBytes:1591});
+  assert.throws(()=>tooSmall.installPcapFixtures('grove',{includeHandshake:true}),/storage_full/);
+  assert.deepEqual(tooSmall.files('grove'),[]);
+});
+
+test('MBUS PCAP examples omit WPA capture unsupported by its auditor catalog',()=>{
+  const d=new SimulatedDevice(seed);
+  const files=d.installPcapFixtures('mbus',{includeHandshake:true});
+  assert.equal(files.length,3);
+  assert.deepEqual(d.compromisedPcapFiles('mbus','handshake'),[]);
+  assert.equal(files.every(file=>file.kind!=='handshake'),true);
 });
 
 test('fixture storage guards never partially install files',()=>{

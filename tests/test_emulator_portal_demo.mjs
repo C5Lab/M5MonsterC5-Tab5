@@ -5,6 +5,17 @@ import {SimulatedDevice} from '../tools/ui_emulator/model/device.mjs';
 const seed=JSON.parse(await readFile(new URL('../docs/ui-emulator/neon-district.seed.json',import.meta.url),'utf8'));
 const target={networkIds:['net-1']};
 
+function assertRecordedSubmission(device,kind,moduleId,ssid){
+ const path=kind==='evil_twin'?'/sdcard/lab/eviltwin.txt':
+   kind==='portal_demo'?'/sdcard/lab/portals.txt':null;
+ assert.deepEqual(device.files(moduleId).map(file=>file.path),path?[path]:[]);
+ if(path){
+  const text=new TextDecoder().decode(device.readFile(moduleId,path));
+  assert.ok(text.includes(`"${ssid}"`));
+  assert.ok(text.includes('DEMO-only-2026!'));
+ }
+}
+
 test('portal story reveals connection, page visit and synthetic submission in order',()=>{
  for(const kind of ['evil_twin','rogue_ap','portal_demo']){
   const d=new SimulatedDevice(seed),id=d.attackStart(kind==='portal_demo'?'internal':'grove',kind,target);
@@ -17,7 +28,7 @@ test('portal story reveals connection, page visit and synthetic submission in or
   assert.equal(result.stage,'submitted');assert.equal(result.password,'DEMO-only-2026!');
   assert.equal(result.ssid,'NEON-BAZAAR');
   assert.ok(seed.clients.some(c=>c.mac===result.client.mac&&c.network_id==='net-1'));
-  assert.deepEqual(d.files('grove'),[]);
+  assertRecordedSubmission(d,kind,kind==='portal_demo'?'internal':'grove',result.ssid);
  }
 });
 
@@ -38,6 +49,7 @@ test('every selectable network completes the demo even without a seeded client',
   d.advance(80000);const demo=d.job(id).result.demo;
   assert.equal(demo.stage,'submitted',network.ssid+' '+kind);
   assert.equal(demo.ssid,network.ssid);assert.equal(demo.password,'DEMO-only-2026!');
-  assert.ok(demo.client);assert.deepEqual(d.files('internal'),[]);
+  assert.ok(demo.client);
+  assertRecordedSubmission(d,kind,kind==='portal_demo'?'internal':'grove',demo.ssid);
  }
 });

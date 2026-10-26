@@ -1,9 +1,11 @@
 /* Native file cards, confirmations and transfer/cleanup popups; virtual I/O only. */
 static unsigned app_pf_story_copied[4],app_pf_story_deleted[4];
 static char app_pf_story_copy_path[4][WARDRIVE_WIGLE_PATH_MAX],app_pf_story_delete_path[4][WARDRIVE_WIGLE_PATH_MAX];
-EM_JS(int,app_pf_count,(int tab),{return emulatorDevice.device.files(emulatorDevice.module(tab)).filter(f=>/[.]pcap(?:ng)?$/i.test(f.path)).length;});
-EM_JS(void,app_pf_file,(int tab,int index,char *path,int size,int *values),{
- const id=emulatorDevice.module(tab),f=emulatorDevice.device.files(id).filter(f=>/[.]pcap(?:ng)?$/i.test(f.path))[index];if(!f)return;
+EM_JS(int,app_pf_count,(int tab,const char *kind),{
+ return emulatorDevice.device.compromisedPcapFiles(emulatorDevice.module(tab),UTF8ToString(kind)).length;
+});
+EM_JS(void,app_pf_file,(int tab,const char *kind,int index,char *path,int size,int *values),{
+ const id=emulatorDevice.module(tab),f=emulatorDevice.device.compromisedPcapFiles(id,UTF8ToString(kind))[index];if(!f)return;
  stringToUTF8(f.path,path,size);HEAP32[values>>2]=f.sizeBytes||f.size||emulatorDevice.device.readFile(id,f.path).length;
  let synced=false;try{const bytes=emulatorDevice.device.readFile(id,f.path),local=FS.readFile(f.path);synced=local.length===bytes.length&&local.every((v,i)=>v===bytes[i]);}catch{}
  HEAP32[(values>>2)+1]=synced?1:0;
@@ -26,10 +28,12 @@ static void compromised_files_load_task(void *arg){
  if(ctx->compromised_files_load_kind==COMPROMISED_FILE_KIND_WARDRIVE)wardrive_wigle_load_file_list(ctx,tab,uart_port_for_tab(tab));
  else {
   free(ctx->wardrive_wigle_files);ctx->wardrive_wigle_files=NULL;ctx->wardrive_wigle_file_count=0;
-  int count=app_wdu_sd(tab)?app_pf_count(tab):0;if(count>WARDRIVE_WIGLE_MAX_FILES)count=WARDRIVE_WIGLE_MAX_FILES;
+  const char *kind=ctx->compromised_files_load_kind==COMPROMISED_FILE_KIND_HANDSHAKE?"handshake":
+                   ctx->compromised_files_load_kind==COMPROMISED_FILE_KIND_PCAP_CAPTURE?"pcap":NULL;
+  int count=kind&&app_wdu_sd(tab)?app_pf_count(tab,kind):0;if(count>WARDRIVE_WIGLE_MAX_FILES)count=WARDRIVE_WIGLE_MAX_FILES;
   ctx->wardrive_wigle_files=calloc(count?count:1,sizeof(wardrive_wigle_file_t));
   if(ctx->wardrive_wigle_files)for(int i=0;i<count;i++){
-   wardrive_wigle_file_t *f=&ctx->wardrive_wigle_files[i];int v[2]={0};app_pf_file(tab,i,f->path,sizeof(f->path),v);
+   wardrive_wigle_file_t *f=&ctx->wardrive_wigle_files[i];int v[2]={0};app_pf_file(tab,kind,i,f->path,sizeof(f->path),v);
    const char *base=strrchr(f->path,'/');snprintf(f->name,sizeof(f->name),"%s",base?base+1:f->path);f->size_bytes=v[0];f->tab5_synced=v[1];ctx->wardrive_wigle_file_count++;
   }
  }
@@ -54,7 +58,12 @@ static void wardrive_cleanup_close_cb(lv_event_t *e){
  tab_context_t *ctx=lv_event_get_user_data(e);if(!ctx)ctx=get_current_ctx();if(!ctx||ctx->compromised_cleanup_running)return;
  compromised_file_kind_t kind=ctx->compromised_cleanup_kind;lv_obj_t **slot=compromised_page_slot_for_kind(ctx,kind);
  bool visible=tab_id_for_ctx(ctx)==current_tab&&slot&&*slot&&ctx->current_visible_page==*slot;
- close_compromised_cleanup_popup(ctx);if(visible){ctx->compromised_files_loaded=false;show_compromised_file_page(kind);}
+ close_compromised_cleanup_popup(ctx);if(visible){
+  ctx->compromised_files_loaded=false;
+  if(kind==COMPROMISED_FILE_KIND_EVIL_TWIN)show_evil_twin_passwords_page();
+  else if(kind==COMPROMISED_FILE_KIND_PORTAL)show_portal_data_page();
+  else show_compromised_file_page(kind);
+ }
 }
 /* Transfer advances one file per tick so Cancel can stop before another write. */
 static struct {bool pending;int tab,count,index;double due;char paths[WARDRIVE_WIGLE_MAX_FILES][WARDRIVE_WIGLE_PATH_MAX];} app_pf_transfer;

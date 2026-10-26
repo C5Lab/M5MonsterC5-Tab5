@@ -79,15 +79,28 @@ try:
             assert page.evaluate('[emulator.module._emu_network_count(0),emulator.module._emu_network_count(2)]') == [12,12]
             assert not ({o['binding'] for o in objects(page) if '/select' in o['binding']} & {o['binding'] for o in row_bindings})
             click_text(page,'INTERNAL')
+            page.evaluate('emulator.module._emu_tick(10)')
             click_text(page,'Settings')
+            page.evaluate('emulator.module._emu_tick(10)')
             assert any(o['text']=='Scan\nSetup' for o in objects(page)), dump(page)
             # Save a real production Settings change and reopen the dialog.
             click_text(page, 'Scan\nSetup')
+            page.evaluate('emulator.module._emu_tick(10)')
             increment = next(o for o in objects(page) if
                 'inc_btn.clicked' in o['binding'] and '/Grove/static/Min time:' in o['binding'])
             click_object(page, increment)
+            page.evaluate('emulator.module._emu_tick(10)')
+            assert any(o['text']=='0150' for o in objects(page)), ('increment', dump(page))
+            if rotation % 2:
+                # The modal is capped at 90% display height in landscape.
+                # Its action row is clipped until the popup scrolls.
+                page.evaluate('emulator.module._emu_wheel(640, 530, 280)')
+                page.evaluate('emulator.module._emu_tick(10)')
             click_text(page, 'Save')
+            page.evaluate('emulator.module._emu_tick(10)')
+            assert not any(o['text']=='Channel Scan Time (ms)' for o in objects(page)), ('save', dump(page))
             click_text(page, 'Scan\nSetup')
+            page.evaluate('emulator.module._emu_tick(10)')
             assert any(o['text']=='0150' for o in objects(page)), dump(page)
             click_text(page, 'Cancel')
             print('Navigation, scan and Settings passed:',rotation,viewport['width'],flush=True)

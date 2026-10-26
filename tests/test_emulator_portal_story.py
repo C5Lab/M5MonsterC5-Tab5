@@ -36,7 +36,10 @@ class PortalStoryBrowser(unittest.TestCase):
         self.begin(story_id,rotation)
         if story_id=='internal-portal':
             self.page.evaluate('emulator.module._emu_set_timing(1)')
-            click_text(self.page,'INTERNAL');click_text(self.page,'Ad Hoc\nPortal & Karma');self.stage(1)
+            click_text(self.page,'INTERNAL')
+            self.page.evaluate('emulator.module._emu_tick(100)')
+            self.page.evaluate('emulator.module._emu_tick(100)')
+            click_text(self.page,'Ad Hoc\nPortal & Karma');self.stage(1)
             click_text(self.page,' Show Probes');click_text(self.page,'1. NEON-BAZAAR');click_text(self.page,' Start');self.stage(2)
             self.sequence();click_text(self.page,'STOP PORTAL',contains=True)
         else:

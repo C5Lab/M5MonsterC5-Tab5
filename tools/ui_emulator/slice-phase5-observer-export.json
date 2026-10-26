@@ -1,0 +1,5 @@
+{
+  "observer_csv_escape": "retain",
+  "observer_export_csv": "adapter",
+  "observer_export_btn_cb": "retain"
+}

@@ -21,6 +21,7 @@
   "ota_scan_close": "adapter",
   "ota_scan_row_click_cb": "adapter",
   "ota_channel_changed_cb": "adapter",
+  "ota_read_variant_force": "adapter",
   "ota_check_btn_cb": "adapter",
   "ota_list_btn_cb": "adapter",
   "ota_info_btn_cb": "adapter"

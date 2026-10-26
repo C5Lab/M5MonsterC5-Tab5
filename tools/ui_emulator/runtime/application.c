@@ -9,18 +9,32 @@ static double app_device_ms;
 static void app_system_sync_metadata(void);
 static void app_system_tick(void);
 static void app_dialog_init(void);
+static int app_demo_condition;
+EM_JS(int,app_dialog_condition,(),{
+ const value=new URL(location.href).searchParams.get('moduleCondition');
+ if(value==='missing-board'||value==='missing-sd')for(const tab of [0,2])
+  emulatorDevice.device.setModule(emulatorDevice.module(tab),value==='missing-board'?{connected:false}:{sdPresent:false});
+ if(value==='grove-only')emulatorDevice.device.setModule('mbus',{connected:false});
+ return ['normal','missing-board','missing-sd','version-mismatch','grove-only'].indexOf(value);
+});
 static void app_settings_ota_tick(double now);
 static void app_sd_admin_tick(void);
 static void app_portal_tick(void);
+static void app_portal_flow_tick(void);
+static void app_global_portal_show(void);
 static void app_radar_tick(double ms);
+static void app_analyzer_tick(void);
+static void app_wpa_tick(double ms);
 static double app_speed=10;
 static int app_restart;
 static unsigned app_generation=1;
 typedef struct { tab_context_t *ctx; unsigned generation; int model_id,next_row,state; } app_job_t;
 static app_job_t app_jobs[4];
+static void app_subghz_task_tick(void);
 static lv_obj_t *app_scan_pages[4];
 static int app_min[4]={100,100,100,100},app_max[4]={300,300,300,300};
-static bool app_vendor[4]={true,true,true,true};
+static bool app_vendor[4];
+static bool app_vendor_log[4];
 static uint8_t app_brightness=80;
 static bool app_audio_muted;
 EM_JS(int,app_model_scan,(int tab),{
@@ -57,13 +71,24 @@ EM_JS(int,app_model_sync_files,(int tab),{
  }catch(e){dispatchEvent(new CustomEvent('emulator-model-error',{detail:e.message}));return -1;}
 });
 static void emu_unsupported(const char *name) { emu_unavailable(name); }
-static TickType_t xTaskGetTickCount(void) { return (TickType_t)app_device_ms; }
-static int64_t esp_timer_get_time(void) { return (int64_t)(app_device_ms*1000); }
+/* The retained status-bar registrations request a browser-local canvas PNG.
+   The firmware SD screenshot routine remains outside the Wasm slice. */
+static void screenshot_click_cb(lv_event_t *event) {
+ (void)event;
+ static bool have_recent;
+ static uint32_t last_tick;
+ uint32_t now=lv_tick_get();
+ if(have_recent && (uint32_t)(now-last_tick)<500)return;
+ have_recent=true;last_tick=now;
+ EM_ASM({dispatchEvent(new CustomEvent('emulator-screenshot-request'));});
+}
+TickType_t xTaskGetTickCount(void) { return (TickType_t)app_device_ms; }
+int64_t esp_timer_get_time(void) { return (int64_t)(app_device_ms*1000); }
 /* These delays only separate already synchronous configuration writes. Scan jobs
    never call this adapter: their consumer and reply clock is app_device_ms. */
-static void vTaskDelay(TickType_t ticks) { (void)ticks; }
+void vTaskDelay(TickType_t ticks) { (void)ticks; }
 /* Retained tasks run inline here, so "delete the running task" is a return. */
-static void vTaskDelete(TaskHandle_t task) { (void)task; }
+void vTaskDelete(TaskHandle_t task) { (void)task; }
 static void esp_restart(void) { app_restart=(screen_rotation_setting & 3)+1; }
 /* One virtual timer slot per tab context. Nothing schedules them: the retained
    popup poll they used to drive is an explicit boundary in this build. */
@@ -90,26 +115,54 @@ EM_JS(int,app_load,(const char *key,int fallback),{
 static int app_load_range(const char *key,int fallback,int min,int max) {int value=app_load(key,fallback);return value<min||value>max?fallback:value;}
 static void save_janos_ft_baud_to_nvs(uint32_t rate) {app_store(NVS_KEY_FT_BAUD,(int)rate);}
 static void save_janos_usb_ft_baud_to_nvs(uint32_t rate) {app_store("usb_ft_baud",(int)rate);}
-/* The emulator has no tool-order editor: use the production default model. */
-static int tile_order_load(tile_order_group_t group,tile_order_t *order) {tile_order_default(group,order);return ESP_OK;}
 EM_JS(int,app_blob_load,(const char *key,void *out,size_t *size),{
  try {
-  const bytes=JSON.parse(localStorage.getItem('tab5.nvs.'+UTF8ToString(key))||'null');
-  if(!Array.isArray(bytes)||bytes.some(b=>!Number.isInteger(b)||b<0||b>255))return -1;
+  const name='tab5.nvs.'+UTF8ToString(key);
+  let raw=globalThis.__tab5Nvs?.[name];
+  if(raw===undefined){try{raw=sessionStorage.getItem(name);}catch(e){}}
+  if(raw===undefined||raw===null){try{raw=localStorage.getItem(name);}catch(e){}}
+  if(raw===undefined||raw===null)return 0x1102;
+  const bytes=typeof raw==='string'?JSON.parse(raw):raw;
+  if(!Array.isArray(bytes)||bytes.some(b=>!Number.isInteger(b)||b<0||b>255))return 0x103;
   const capacity=HEAPU32[size>>2];HEAPU32[size>>2]=bytes.length;
-  if(bytes.length>capacity)return -1;
+  if(bytes.length>capacity)return 0x103;
   HEAPU8.set(bytes,out);return 0;
- }catch(e){return -1;}
+ }catch(e){return 0x103;}
 });
 EM_JS(int,app_blob_store,(const char *key,const void *bytes,size_t size),{
- try {localStorage.setItem('tab5.nvs.'+UTF8ToString(key),JSON.stringify(Array.from(HEAPU8.subarray(bytes,bytes+size))));return 0;}
- catch(e){return -1;}
+ const name='tab5.nvs.'+UTF8ToString(key),value=Array.from(HEAPU8.subarray(bytes,bytes+size));
+ if(!globalThis.__tab5Nvs)globalThis.__tab5Nvs={};
+ globalThis.__tab5Nvs[name]=value;
+ try{localStorage.setItem(name,JSON.stringify(value));try{sessionStorage.removeItem(name);}catch(e){}return 0;}catch(e){}
+ try{sessionStorage.setItem(name,JSON.stringify(value));return 0;}catch(e){}
+ return 0;
 });
-static char app_nvs_key[16][64]; static uint8_t app_nvs_value[16]; static int app_nvs_count;
+EM_JS(int,app_blob_erase,(const char *key),{
+ const name='tab5.nvs.'+UTF8ToString(key);
+ if(globalThis.__tab5Nvs)delete globalThis.__tab5Nvs[name];
+ try{localStorage.removeItem(name);}catch(e){}
+ try{sessionStorage.removeItem(name);}catch(e){}
+ return 0;
+});
+static char app_nvs_key[16][64]; static int app_nvs_value[16]; static int app_nvs_count;
 static char app_nvs_namespace[64],app_nvs_blob_key[128];
 static uint8_t app_nvs_blob[256];static size_t app_nvs_blob_size;
-static int nvs_open(const char *ns,int mode,nvs_handle_t *h) { (void)mode; if(!h)return ESP_FAIL; *h=1;app_nvs_count=0;app_nvs_blob_size=0;snprintf(app_nvs_namespace,sizeof(app_nvs_namespace),"%s",ns);return ESP_OK; }
-static int nvs_set_u8(nvs_handle_t h,const char *key,uint8_t val) { if(h!=1 || app_nvs_count>=16)return ESP_FAIL; snprintf(app_nvs_key[app_nvs_count],64,"%s",key);app_nvs_value[app_nvs_count++]=val;return ESP_OK; }
+int nvs_open(const char *ns,int mode,nvs_handle_t *h) { (void)mode; if(!h)return ESP_FAIL; *h=1;app_nvs_count=0;app_nvs_blob_size=0;snprintf(app_nvs_namespace,sizeof(app_nvs_namespace),"%s",ns);return ESP_OK; }
+static int app_nvs_set_int(nvs_handle_t h,const char *key,int value) {
+ if(h!=1 || app_nvs_count>=16)return ESP_FAIL;
+ snprintf(app_nvs_key[app_nvs_count],64,"%s%s%s",strcmp(app_nvs_namespace,"subghz_rf")==0?"subghz_rf.":"",key,"");
+ app_nvs_value[app_nvs_count++]=value;return ESP_OK;
+}
+int nvs_set_u8(nvs_handle_t h,const char *key,uint8_t val) { return app_nvs_set_int(h,key,val); }
+int nvs_set_i8(nvs_handle_t h,const char *key,int8_t val) { return app_nvs_set_int(h,key,val); }
+int nvs_set_u16(nvs_handle_t h,const char *key,uint16_t val) { return app_nvs_set_int(h,key,val); }
+static int app_nvs_get_int(nvs_handle_t h,const char *key,int *out) {
+ if(h!=1 || !out)return ESP_FAIL;char full[64];snprintf(full,sizeof(full),"%s.%s",app_nvs_namespace,key);
+ int value=app_load(strcmp(app_nvs_namespace,"settings")==0?key:full,INT_MIN);if(value==INT_MIN)return ESP_FAIL;*out=value;return ESP_OK;
+}
+int nvs_get_u8(nvs_handle_t h,const char *key,uint8_t *out) { int n;if(!out||app_nvs_get_int(h,key,&n)||n<0||n>UINT8_MAX)return ESP_FAIL;*out=(uint8_t)n;return ESP_OK; }
+int nvs_get_i8(nvs_handle_t h,const char *key,int8_t *out) { int n;if(!out||app_nvs_get_int(h,key,&n)||n<INT8_MIN||n>INT8_MAX)return ESP_FAIL;*out=(int8_t)n;return ESP_OK; }
+int nvs_get_u16(nvs_handle_t h,const char *key,uint16_t *out) { int n;if(!out||app_nvs_get_int(h,key,&n)||n<0||n>UINT16_MAX)return ESP_FAIL;*out=(uint16_t)n;return ESP_OK; }
 static int nvs_get_blob(nvs_handle_t h,const char *key,void *out,size_t *size) {
  if(h!=1||!out||!size)return ESP_FAIL;char full[128];snprintf(full,sizeof(full),"%s.%s",app_nvs_namespace,key);return app_blob_load(full,out,size);
 }
@@ -117,9 +170,14 @@ static int nvs_set_blob(nvs_handle_t h,const char *key,const void *bytes,size_t 
  if(h!=1||!bytes||size>sizeof(app_nvs_blob))return ESP_FAIL;
  snprintf(app_nvs_blob_key,sizeof(app_nvs_blob_key),"%s.%s",app_nvs_namespace,key);memcpy(app_nvs_blob,bytes,size);app_nvs_blob_size=size;return ESP_OK;
 }
-static int nvs_commit(nvs_handle_t h) { if(h!=1)return ESP_FAIL;for(int i=0;i<app_nvs_count;i++)if(app_store(app_nvs_key[i],app_nvs_value[i])){emu_unsupported("Virtual settings persistence failed");return ESP_FAIL;}if(app_nvs_blob_size&&app_blob_store(app_nvs_blob_key,app_nvs_blob,app_nvs_blob_size))return ESP_FAIL;return ESP_OK; }
-static void nvs_close(nvs_handle_t h) {(void)h;app_nvs_count=0;}
+int nvs_commit(nvs_handle_t h) { if(h!=1)return ESP_FAIL;for(int i=0;i<app_nvs_count;i++)if(app_store(app_nvs_key[i],app_nvs_value[i])){emu_unsupported("Virtual settings persistence failed");return ESP_FAIL;}if(app_nvs_blob_size&&app_blob_store(app_nvs_blob_key,app_nvs_blob,app_nvs_blob_size))return ESP_FAIL;return ESP_OK; }
+static int nvs_erase_key(nvs_handle_t h,const char *key) {if(h!=1||!key)return ESP_ERR_INVALID_ARG;char full[128];snprintf(full,sizeof(full),"%s.%s",app_nvs_namespace,key);return app_blob_erase(full);}
+void nvs_close(nvs_handle_t h) {(void)h;app_nvs_count=0;}
+#include "../../../main/tile_order_store.c"
 static void app_bt_stage_scan(int tab);
+static void app_bt_airtag_start(tab_context_t *ctx);
+static void app_bt_jammer_probe_start(tab_context_t *ctx);
+static void app_bt_jammer_start(tab_context_t *ctx);
 static void app_bt_locator_stop(int tab);
 static void app_bt_locator_start(tab_context_t *ctx);
 static void app_bt_tick(void);
@@ -137,10 +195,19 @@ static void app_global_stop(int tab);
 static void app_global_tick(void);
 static void app_wardrive_tick(void);
 static void app_wd_upload_tick(double now);
+static void app_compromised_stage(int tab,const char *kind);
+static int app_compromised_read(int tab,void *data,size_t len);
+static void app_compromised_clear(int tab);
 static void app_config_command(int tab,const char *cmd) {
  int value;if(sscanf(cmd,"channel_time set min %d",&value)==1)app_min[tab]=value;
  else if(sscanf(cmd,"channel_time set max %d",&value)==1)app_max[tab]=value;
+ else if(strcmp(cmd,"vendor set on")==0)app_vendor[tab]=true;
+ else if(strcmp(cmd,"vendor set off")==0)app_vendor[tab]=false;
+ else if(strcmp(cmd,"vendor log on")==0)app_vendor_log[tab]=true;
+ else if(strcmp(cmd,"vendor log off")==0)app_vendor_log[tab]=false;
  else if(strcmp(cmd,"scan_bt")==0)app_bt_stage_scan(tab);
+ else if(strcmp(cmd,"scan_airtag")==0){/* AirTag counts come from the virtual Bluetooth model. */}
+ else if(strcmp(cmd,"init_nrf24")==0||strncmp(cmd,"start_jammer24 ",15)==0){/* nRF24 status comes from the offline adapter. */}
  else if(strncmp(cmd,"scan_bt ",8)==0){/* locator start is handled in xTaskCreate */}
  else if(strcmp(cmd,"stop")==0){app_bt_locator_stop(tab);app_antisurv_on_stop(tab);app_handshaker_on_stop(tab);app_sae_stop(tab);app_global_stop(tab);}
  else if(strcmp(cmd,"deauth_detector")==0){/* detection driven from xTaskCreate + app_deauth_tick */}
@@ -149,11 +216,25 @@ static void app_config_command(int tab,const char *cmd) {
  else if(strcmp(cmd,"start_handshake")==0){/* driven from xTaskCreate + app_handshaker_tick */}
  else if(!strcmp(cmd,"start_blackout")||!strcmp(cmd,"start_sniffer_dog")||!strcmp(cmd,"unselect_networks")){/* global confirmation owns the offline job; no hardware I/O */}
  else if(strncmp(cmd,"select_networks",15)==0){/* selection is implicit in the model */}
+ else if(!strcmp(cmd,"show_pass evil"))app_compromised_stage(tab,"evil");
+ else if(!strcmp(cmd,"show_pass portal"))app_compromised_stage(tab,"portal");
  else if(cmd[0]!='\r' && cmd[0]!='\n')emu_unsupported(cmd);
+}
+static void observer_send_command_to_transport(tab_id_t tab,uart_port_t port,
+                                                const char *cmd,const char *purpose) {
+ (void)port;(void)purpose;
+ if(cmd && tab>=TAB_GROVE && tab<=TAB_MBUS)app_config_command(tab,cmd);
 }
 static int uart_flush(uart_port_t port) {(void)port;return ESP_OK;}
 static int wa_guarded_uart_flush(uart_port_t port) {(void)port;return ESP_OK;}
-static int wa_guarded_uart_write(uart_port_t port,const void *bytes,size_t count) {(void)port;(void)bytes;return (int)count;}
+static int wa_guarded_uart_write(uart_port_t port,const void *bytes,size_t count) {
+ /* The retained Analyzer guard macro also wraps later Scan Setup callbacks.
+    Preserve the virtual channel_time write while keeping other raw UART calls inert. */
+ if(bytes&&count>=17&&count<64&&
+    !strncmp((const char *)bytes,"channel_time set ",17))
+  return uart_write_bytes(port,bytes,count);
+ return (int)count;
+}
 static int wa_guarded_uart_read(uart_port_t port,void *data,uint32_t len,TickType_t wait) {(void)port;(void)data;(void)len;(void)wait;return 0;}
 static int wa_guarded_usb_flush(usbh_cdc_handle_t handle) {(void)handle;return ESP_OK;}
 static int uart_write_bytes(uart_port_t port,const void *bytes,size_t count) {char cmd[128];if(count>=sizeof(cmd))return -1;memcpy(cmd,bytes,count);cmd[count]=0;app_config_command(port==UART_NUM_2?TAB_MBUS:TAB_GROVE,cmd);return count;}
@@ -187,8 +268,13 @@ static void app_nettools_nmap_iot_tick(void);
 static void app_attacks_deauth_arp_tick(void);
 static void app_attacks_karma_beacon_tick(void);
 static void app_rogue_evil_mitm_tick(void);
-static BaseType_t xTaskCreate(TaskFunction_t fn,const char *name,unsigned stack,void *arg,unsigned priority,TaskHandle_t *handle) {
+BaseType_t xTaskCreate(TaskFunction_t fn,const char *name,unsigned stack,void *arg,unsigned priority,TaskHandle_t *handle) {
  (void)stack;(void)priority;
+ if(name && strncmp(name,"sg_",3)==0){
+  /* The browser dispatches complete synthetic lines to native parsers on its
+     UI tick. Native infinite reader tasks therefore need no host threads. */
+  (void)fn;(void)arg;if(handle)*handle=NULL;return pdPASS;
+ }
  /* The two tasks with an explicit simulator implementation run inline on the
     browser thread; anything else stays an advertised unsupported boundary. */
  if(fn==wifi_scan_task){wifi_scan_task(arg);if(handle)*handle=&app_jobs[(int)(uintptr_t)arg];return pdPASS;}
@@ -205,6 +291,9 @@ static BaseType_t xTaskCreate(TaskFunction_t fn,const char *name,unsigned stack,
  /* The BT locator task is an infinite UART loop; drive its RSSI label from
     app_bt_tick() instead of running the body. */
  if(fn==bt_locator_tracking_task){app_bt_locator_start((tab_context_t *)arg);if(handle)*handle=NULL;return pdPASS;}
+ if(fn==airtag_scan_task){app_bt_airtag_start((tab_context_t *)arg);if(handle)*handle=NULL;return pdPASS;}
+ if(fn==bt_jammer_probe_task){app_bt_jammer_probe_start((tab_context_t *)arg);if(handle)*handle=NULL;return pdPASS;}
+ if(fn==bt_jammer_task){app_bt_jammer_start((tab_context_t *)arg);if(handle)*handle=NULL;return pdPASS;}
  /* The deauth detector task is an infinite UART loop; drive its table from
     app_deauth_tick() instead of running the body. */
  if(fn==deauth_detector_task){app_deauth_start((tab_context_t *)arg);if(handle)*handle=NULL;return pdPASS;}
@@ -247,7 +336,7 @@ EMSCRIPTEN_KEEPALIVE void emu_show(int page,int tab) {
  if(page==1){switch_to_internal_settings_page();}
  else if(page==2)show_scan_page();else show_main_tiles();
 }
-static void init_tab_context(tab_context_t *ctx) { if(!ctx->networks)ctx->networks=calloc(MAX_NETWORKS,sizeof(wifi_network_t));if(!ctx->networks)abort();ctx->sd_card_present=true;ctx->has_subghz=false; }
+static void init_tab_context(tab_context_t *ctx) { if(!ctx->networks)ctx->networks=calloc(MAX_NETWORKS,sizeof(wifi_network_t));if(!ctx->networks)abort();ctx->sd_card_present=true;ctx->has_subghz=(ctx==&mbus_ctx&&mbus_detected);ctx->has_nfc=(ctx==&mbus_ctx&&mbus_detected); }
 static void trigger_home_meta_refresh(tab_context_t *ctx,bool force) {(void)force;if(ctx)app_system_sync_metadata();}
 static uint32_t home_quote_rand_u32(void) {static uint32_t seed=0xC5AB1234;seed=seed*1664525u+1013904223u;return seed;}
 static bool usb_gps_get_fix(double *lat,double *lon,uint32_t wait) {(void)wait;if(lat)*lat=52.23;if(lon)*lon=21.01;return true;}
@@ -265,10 +354,23 @@ void app_init(void) {
  rx8130_present=true;
  clock_24h=app_load_range("clock_24h",1,0,1);clock_show=app_load_range("clock_show",1,0,1);clock_dst=app_load_range("clock_dst",0,0,1);
  grove_detected=true;uart1_detected=true;mbus_detected=true;uart2_initialized=true;internal_sd_present=true;usb_detected=false;
+ app_demo_condition=app_dialog_condition();
+ if(app_demo_condition==1)grove_detected=uart1_detected=mbus_detected=false;
+ if(app_demo_condition==4){mbus_detected=false;uart2_initialized=false;}
  enable_red_team=app_load_range(NVS_KEY_RED_TEAM,1,0,1);dark_mode_enabled=app_load_range(NVS_KEY_DARK_MODE,1,0,1);dashboard_enabled=app_load_range(NVS_KEY_DASHBOARD,1,0,1);
  screen_rotation_setting=lv_display_get_rotation(NULL);screen_brightness_setting=app_load_range(NVS_KEY_SCREEN_BRIGHT,80,1,100);screen_timeout_setting=app_load_range(NVS_KEY_SCREEN_TIMEOUT,4,0,4);
  boot_sound_mode=(boot_sound_mode_t)app_load_range(NVS_KEY_BOOT_SOUND,BOOT_SOUND_MODE_NOKIA,0,BOOT_SOUND_MODE_STAR_WARS);
  alert_sound_enabled=app_load_range(NVS_KEY_ALERT_SOUND,1,0,1);
+ screen_lock_enabled=app_load_range(NVS_KEY_SCREEN_LOCK,1,0,1);
+ screen_auto_lock_enabled=app_load_range(NVS_KEY_AUTO_LOCK,0,0,1);
+ g_wd_autoupload_enabled=app_load_range("wd_auto",0,0,1);
+ g_wd_autoupload_wigle=app_load_range("wd_wigle",1,0,1);
+ g_wd_autoupload_wdgwars=app_load_range("wd_wars",0,0,1);
+ g_wd_autoupload_archive=app_load_range("wd_archive",0,0,1);
+ g_wd_autoupload_poweroff=app_load_range("wd_power",0,0,1);
+ observer_resolve_vendors=app_load_range(NVS_KEY_OBS_VENDOR,0,0,1);
+ observer_log_unknown_vendors=app_load_range(NVS_KEY_OBS_VENDOR_LOG,0,0,1);
+ for(int tab=0;tab<4;tab++){app_vendor[tab]=observer_resolve_vendors;app_vendor_log[tab]=observer_log_unknown_vendors;}
  set_brightness_gamma(screen_brightness_setting);
  init_tab_context(&grove_ctx);init_tab_context(&mbus_ctx);init_tab_context(&internal_ctx);init_tab_context(&usb_ctx);
  create_tab_containers();grove_ctx.container=grove_container;mbus_ctx.container=mbus_container;internal_ctx.container=internal_container;
@@ -279,6 +381,7 @@ void app_tick(double elapsed_ms) {
  update_status_clock();
  if(elapsed_ms<0)return;double delta=elapsed_ms*app_speed;app_device_ms+=delta;
  app_model_advance(delta);
+ app_subghz_task_tick();
  app_run_pending_task();
  app_observer_tick();
  app_bt_tick();
@@ -300,7 +403,10 @@ void app_tick(double elapsed_ms) {
  app_settings_ota_tick(app_device_ms);
  app_sd_admin_tick();
  app_portal_tick();
+ app_portal_flow_tick();
  app_radar_tick(elapsed_ms);
+ app_analyzer_tick();
+ app_wpa_tick(elapsed_ms);
  for(int tab=0;tab<4;tab++) {
   app_job_t *job=&app_jobs[tab];if(job->state!=1)continue;
   if(job->generation!=app_generation){app_model_cancel(job->model_id);app_scan_finish(tab,true);continue;}
@@ -375,6 +481,7 @@ static lv_event_dsc_t *app_bind(lv_obj_t *obj,lv_event_cb_t cb,lv_event_code_t e
  if(cb==wardrive_files_select_all_cb)slot="select-all";
  if(cb==wardrive_files_select_none_cb)slot="select-none";
  if(cb==nmap_scan_type_cb){if(data)entity=data;slot="scan-level";}
+ if(cb==jammer_band_event_cb){int i=(int)(intptr_t)data;if(i>=0&&i<5)entity=k_jam_bands[i];slot="band";}
  if(cb==iot_recon_pan_click_cb){iot_recon_pan_t *pan=data;if(pan)entity=pan->pan_id;slot="pan";}
  if(cb==iot_recon_node_click_cb){iot_recon_node_t *node=data;if(node){snprintf(entity_key,sizeof(entity_key),"%s:%s",node->pan_id,node->addr);entity=entity_key;}slot="node";}
  if(cb==gitm_net_row_cb){int i=(int)(intptr_t)data;if(ctx->gitm&&i>=0&&i<ctx->gitm->net_count)entity=ctx->gitm->nets[i].bssid;slot="network";}
@@ -390,6 +497,8 @@ static lv_event_dsc_t *app_bind(lv_obj_t *obj,lv_event_cb_t cb,lv_event_code_t e
  else if(cb==network_item_event_cb){int index=lv_obj_get_index(obj);if(index>=0&&index<ctx->network_count)entity=ctx->networks[index].bssid;slot="toggle";}
  else if(cb==pcap_viewer_file_open_cb){pcap_viewer_file_t *file=data;if(file)entity=file->path;slot="open";}
  else if(cb==wardrive_wigle_file_checkbox_cb){wardrive_wigle_file_t *file=data;if(file)entity=file->path;slot="select";}
+ else if(cb==hs_crack_file_cb){int i=compromised_index_from_user_data(data);
+  if(i>=0&&i<ctx->wardrive_wigle_file_count)entity=ctx->wardrive_wigle_files[i].path;slot="crack";}
  else if(cb==home_mgmt_delete_cb){int i=(int)(intptr_t)data;if(i>=0&&i<ctx->wardrive_home_count)entity=ctx->wardrive_home[i].ssid;slot="remove";}
  else if(cb==wardrive_blacklist_scan_pick_cb||cb==wardrive_blacklist_scan_pick_del_cb){wardrive_bl_scan_pick_t *pick=data;if(pick)entity=pick->mac;slot=cb==wardrive_blacklist_scan_pick_cb?"pick":"delete";}
  else if(cb==wardrive_fix_file_cb){snprintf(entity_key,sizeof(entity_key),"file-%u",(unsigned)(uintptr_t)data);entity=entity_key;slot="fix";}
@@ -405,18 +514,23 @@ static lv_event_dsc_t *app_bind(lv_obj_t *obj,lv_event_cb_t cb,lv_event_code_t e
  /* BT scan rows repeat one template per discovered device; key on the MAC so
     each row is a distinct binding rather than a rejected duplicate. */
  else if(cb==bt_scan_device_click_cb){int i=(int)(intptr_t)data;if(i>=0&&i<bt_device_count)entity=bt_devices[i].mac;slot="locate";}
+ else if(cb==evil_twin_row_click_cb){int i=(int)(intptr_t)data;if(i>=0&&i<EVIL_TWIN_MAX_ENTRIES&&evil_twin_entries[i].ssid[0])entity=evil_twin_entries[i].ssid;slot="connect";}
  else if(cb==spinbox_increment_event_cb||cb==spinbox_decrement_event_cb){
   lv_obj_t *row=lv_obj_get_parent(lv_obj_get_parent(obj));lv_obj_t *label=lv_obj_get_child(row,0);
   slot=lv_label_get_text(label);lv_obj_t *popup=lv_obj_get_parent(row);
   for(int index=lv_obj_get_index(row)-1;index>=0;index--){lv_obj_t *prior=lv_obj_get_child(popup,index);if(!lv_obj_check_type(prior,&lv_label_class))continue;const char *heading=lv_label_get_text(prior);if(!strcmp(heading,"Grove")){ctx=&grove_ctx;break;}if(!strcmp(heading,"MBus")){ctx=&mbus_ctx;break;}if(!strcmp(heading,"USB")){ctx=&usb_ctx;break;}}
  }
  else if(cb==espshark_action_btn_event_cb)slot=data?(const char *)data:"action";
+ else if(cb==ft_baud_hardware_dropdown_cb)slot="hardware";
+ else if(cb==ft_baud_usb_dropdown_cb)slot="usb";
  else if(cb==tab_click_cb){ctx=get_ctx_for_tab((tab_id_t)(uintptr_t)data);slot="tab";screen="navigation";}
  static const struct {lv_event_cb_t cb;const char *slot;} deep_actions[]={{pcap_viewer_detail_action_cb,"pcap_viewer_detail_action_cb"},{pcap_viewer_device_filter_cb,"pcap_viewer_device_filter_cb"},{pcap_viewer_device_profile_cb,"pcap_viewer_device_profile_cb"},{pcap_viewer_investigation_finding_filter_cb,"pcap_viewer_investigation_finding_filter_cb"},{pcap_viewer_investigation_mode_cb,"pcap_viewer_investigation_mode_cb"},{pcap_viewer_application_filter_cb,"pcap_viewer_application_filter_cb"},{pcap_map_mode_cb,"pcap_map_mode_cb"},{pcap_map_node_click_cb,"pcap_map_node_click_cb"},{pcap_map_node_quick_dossier_cb,"pcap_map_node_quick_dossier_cb"},{pcap_map_node_quick_filter_cb,"pcap_map_node_quick_filter_cb"},{pcap_viewer_connection_filter_cb,"pcap_viewer_connection_filter_cb"},{pcap_viewer_connection_follow_cb,"pcap_viewer_connection_follow_cb"},{pcap_viewer_connection_hex_cb,"pcap_viewer_connection_hex_cb"},{pcap_viewer_object_preview_cb,"pcap_viewer_object_preview_cb"},{pcap_viewer_object_filter_cb,"pcap_viewer_object_filter_cb"},{pcap_viewer_object_delete_cb,"pcap_viewer_object_delete_cb"},{pcap_viewer_tool_action_cb,"pcap_viewer_tool_action_cb"}};
  for(unsigned i=0;i<sizeof(deep_actions)/sizeof(deep_actions[0]);i++)if(cb==deep_actions[i].cb){snprintf(entity_key,sizeof(entity_key),"%lu:%.130s",(unsigned long)(uintptr_t)data,ctx->pcap_viewer?ctx->pcap_viewer->selected_path:"");entity=entity_key;slot=deep_actions[i].slot;screen="analysis";}
  if(cb==pcap_viewer_devices_cb)slot="local";else if(cb==pcap_viewer_remote_endpoints_cb)slot="remote";
  if(cb==wardrive_files_checkbox_cb){wardrive_wigle_file_t *file=data;if(file)entity=file->path;slot="select";}
  if(cb==compromised_file_copy_cb||cb==compromised_file_delete_cb||cb==wardrive_fix_file_cb){int i=compromised_index_from_user_data(data);if(i>=0&&i<ctx->wardrive_wigle_file_count)entity=ctx->wardrive_wigle_files[i].path;slot=cb==compromised_file_copy_cb?"copy":cb==compromised_file_delete_cb?"delete":"fix";}
+ if(cb==hs_crack_file_cb){int i=compromised_index_from_user_data(data);
+  if(i>=0&&i<ctx->wardrive_wigle_file_count)entity=ctx->wardrive_wigle_files[i].path;slot="crack";}
  char id[320];snprintf(id,sizeof(id),"%s/%s/%s/%s/%s",tid,screen,tab_transport_name(tab_id_for_ctx(ctx)),entity,slot);
  for(int i=0;i<1024;i++)if(app_bindings[i].object&&!strcmp(app_bindings[i].id,id)){emu_unsupported("Duplicate active control binding");return NULL;}
  for(int i=0;i<1024;i++)if(!app_bindings[i].object){app_bindings[i].object=obj;snprintf(app_bindings[i].id,sizeof(app_bindings[i].id),"%s",id);app_bindings[i].generation=++app_binding_generation;lv_obj_add_event_cb(obj,app_binding_delete,LV_EVENT_DELETE,NULL);return lv_obj_add_event_cb(obj,cb,event,data);}
@@ -453,6 +567,7 @@ EMSCRIPTEN_KEEPALIVE void emu_inspect_bindings(void) {
    lv_obj_add_event_cb, both of which are only available past the #undef above. */
 #include "observer.c"
 #include "bluetooth.c"
+#include "compromised_data.c"
 #include "detectors.c"
 #include "wardrive.c"
 #include "wardrive_setup.c"
@@ -462,6 +577,7 @@ EMSCRIPTEN_KEEPALIVE void emu_inspect_bindings(void) {
 #include "pcap_files.c"
 #include "clock.c"
 #include "settings_system.c"
+#include "wpa_auditor.c"
 #include "settings_sta_mac.c"
 #include "settings_ota.c"
 #include "settings_sd_admin.c"
@@ -473,10 +589,13 @@ EMSCRIPTEN_KEEPALIVE void emu_inspect_bindings(void) {
 #include "attacks_karma_beacon.c"
 #include "attacks_rogue_evil_mitm.c"
 #include "portal_demo.c"
+#include "portal_flows.c"
 #include "sae.c"
 #include "global_attacks.c"
 #include "radar.c"
+#include "analyzer.c"
 #include "attacks_routes.c"
+#include "rogue_gitm.c"
 
 #include "dialogs.c"
 #include "startup_story.c"
@@ -489,3 +608,54 @@ EMSCRIPTEN_KEEPALIVE void emu_inspect_bindings(void) {
 #include "settings_s18_story.c"
 #include "settings_s19_story.c"
 #include "settings_s20_story.c"
+#include "subghz_host.inc"
+#include "nfc_host.inc"
+
+/* Native list screens format an empty result without a storage error. Keep
+   their firmware code intact and surface the live virtual-SD state here. */
+static void app_radio_sd_placeholder(lv_obj_t *list) {
+    if (!list) return;
+    if (lv_obj_get_child_count(list) == 1) {
+        lv_obj_t *child = lv_obj_get_child(list, 0);
+        if (lv_obj_check_type(child, &lv_label_class) &&
+            strcmp(lv_label_get_text(child), "SD unavailable") == 0) return;
+    }
+    lv_obj_clean(list);
+    lv_obj_t *label = lv_label_create(list);
+    lv_label_set_text(label, "SD unavailable");
+    lv_obj_set_style_text_color(label, COLOR_MATERIAL_RED, 0);
+    lv_obj_set_style_text_font(label, &lv_font_montserrat_16, 0);
+}
+
+void app_radio_sd_status_tick(void) {
+    static bool was_missing[3];
+    for (int tab = 0; tab < 3; tab++) {
+        tab_context_t *ctx = get_ctx_for_tab((tab_id_t)tab);
+        if (!ctx) continue;
+        bool missing = !ctx->sd_card_present;
+        nfc_tab_state_t *nfc = ctx->nfc;
+        subghz_tab_state_t *radio = ctx->subghz;
+        bool nfc_list = nfc && nfc->list_page &&
+            !lv_obj_has_flag(nfc->list_page, LV_OBJ_FLAG_HIDDEN);
+        bool sd_signals = radio && radio->manage_page &&
+            !lv_obj_has_flag(radio->manage_page, LV_OBJ_FLAG_HIDDEN);
+        if (missing) {
+            if (nfc_list && nfc->list_status &&
+                strcmp(lv_label_get_text(nfc->list_status), "SD unavailable") != 0) {
+                lv_label_set_text(nfc->list_status, "SD unavailable");
+                lv_obj_set_style_text_color(nfc->list_status, COLOR_MATERIAL_RED, 0);
+            }
+            if (sd_signals && radio->status_lbl &&
+                strcmp(lv_label_get_text(radio->status_lbl), "SD unavailable") != 0) {
+                lv_label_set_text(radio->status_lbl, "SD unavailable");
+                lv_obj_set_style_text_color(radio->status_lbl, COLOR_MATERIAL_RED, 0);
+            }
+            if (nfc_list) app_radio_sd_placeholder(nfc->list_obj);
+            if (sd_signals) app_radio_sd_placeholder(radio->sig_list_obj);
+        } else if (was_missing[tab]) {
+            if (nfc_list) nfc_uart_start(nfc, NFC_OP_LIST, "nfc_list", 5000);
+            if (sd_signals) radio->manage_relist_pending = true;
+        }
+        was_missing[tab] = missing;
+    }
+}

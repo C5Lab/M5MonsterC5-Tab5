@@ -286,3 +286,10 @@ void show_subghz_settings_page(void)
 
     ESP_LOGI(TAG, "SubGHz settings page ready");
 }
+
+#ifdef EMULATOR_NATIVE_SUBGHZ
+void subghz_settings_emulator_feed(subghz_tab_state_t *st, const char *line)
+{
+    process_line(st, line);
+}
+#endif

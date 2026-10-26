@@ -118,6 +118,12 @@ void nfc_detail_on_rename(nfc_tab_state_t *st);
 void nfc_detail_on_delete(nfc_tab_state_t *st);
 void nfc_emulate_on_result(nfc_tab_state_t *st);
 
+#ifdef EMULATOR_NATIVE_NFC
+void nfc_emulator_send(int tab, const char *command);
+void nfc_emulator_flush(int tab);
+int nfc_emulator_read(int tab, void *buffer, size_t size);
+#endif
+
 #ifdef __cplusplus
 }
 #endif

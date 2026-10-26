@@ -1,0 +1,6 @@
+{
+  "apply_tool_order": "retain",
+  "handshaker_crack_cb": "adapter",
+  "show_handshakes_page": "retain",
+  "hs_crack_file_cb": "adapter"
+}

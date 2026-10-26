@@ -83,7 +83,9 @@ class Phase2Tests(unittest.TestCase):
 
     def settings(self):
         click_text(self.page, 'INTERNAL')
+        self.page.evaluate('emulator.module._emu_tick(10)')
         click_text(self.page, 'Settings')
+        self.page.evaluate('emulator.module._emu_tick(10)')
 
     def test_cancelled_pointer_does_not_activate_tile(self):
         p = self.page

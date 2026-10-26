@@ -81,6 +81,29 @@ static void nfc_reader_task(void *arg)
     vTaskDelete(NULL);
 }
 
+#ifdef EMULATOR_NATIVE_NFC
+static void nfc_emulator_dispatch(nfc_tab_state_t *st)
+{
+    nfc_emulator_flush(st->tab_id);
+    nfc_emulator_send(st->tab_id, st->cmd);
+    bool got_end = false;
+    for (int i = 0; i < NFC_LINE_CAP + 1; i++) {
+        char line[NFC_LINE_LEN];
+        int len = nfc_emulator_read(st->tab_id, line, sizeof(line));
+        if (len <= 0) break;
+        if (len >= (int)sizeof(line)) len = sizeof(line) - 1;
+        line[len] = '\0';
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
+            line[--len] = '\0';
+        if (nfc_line_is_end(line)) { got_end = true; break; }
+        push_line(st, line);
+    }
+    st->result_op = st->op;
+    st->result_timeout = !got_end;
+    st->result_ready = true;
+}
+#endif
+
 static void nfc_ui_timer_cb(lv_timer_t *t)
 {
     nfc_tab_state_t *st = (nfc_tab_state_t *)lv_timer_get_user_data(t);
@@ -166,12 +189,16 @@ void nfc_uart_start(nfc_tab_state_t *st, nfc_op_t op, const char *cmd, uint32_t 
     nfc_card_reset(&st->result_card);
     snprintf(st->cmd, sizeof(st->cmd), "%s", cmd);
 
+#ifdef EMULATOR_NATIVE_NFC
+    nfc_emulator_dispatch(st);
+#else
     if (xTaskCreate(nfc_reader_task, "nfc_rx", 5120, st, 5, &st->task) != pdPASS) {
         st->task = NULL;
         st->busy = false;
         st->op = NFC_OP_NONE;
         ESP_LOGW(TAG, "Failed to start NFC reader");
     }
+#endif
 }
 
 bool nfc_lines_contain(const nfc_tab_state_t *st, const char *needle)

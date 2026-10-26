@@ -6,6 +6,10 @@ static int app_ota_slot_job;
 static int app_queue2_ota_update,app_queue2_ota_slot;
 static void app_ota_slots_refresh(void);
 static char app_ota_networks[MAX_NETWORKS][33];
+static char app_ota_release_tags[2][48],app_ota_selected_release[48];
+static lv_obj_t *app_ota_confirm,*app_ota_bound_page;
+static void app_ota_confirm_close(void);
+static void ota_read_variant_force(void);
 EM_JS(int, app_ota_connected, (int tab), {
  return emulatorDevice.device.systemStatus(emulatorDevice.module(tab)).connected?1:0;
 });
@@ -19,10 +23,30 @@ static tab_id_t ota_pick_target_tab(void) {
  return TAB_INTERNAL;
 }
 EM_JS(void, app_ota_cancel, (int id), { emulatorDevice.device.cancel(id); });
-EM_JS(int, app_ota_start, (int tab,int dev,char *error,int size), {
+EM_JS(int, app_ota_start, (int tab,int dev,int rf,int force,const char *release,char *error,int size), {
+ const selected=UTF8ToString(release);
  try { return emulatorDevice.device.systemStart(emulatorDevice.module(tab),'update',
-  {channel:dev?'dev':'main',outcome:globalThis.emulatorSystemOutcome||'success'}); }
+  {channel:dev?'dev':'main',variant:rf?'rf':'classic',force:!!force,
+   ...(selected?{release:selected}:{}),outcome:globalThis.emulatorSystemOutcome||'success'}); }
  catch(e){stringToUTF8('Simulated update: '+e.message,error,size);return 0;}
+});
+EM_JS(int,app_ota_effective_rf,(int tab,int choice),{
+ return choice===2||(choice===0&&emulatorDevice.device.systemStatus(emulatorDevice.module(tab)).rfCapable)?1:0;
+});
+EM_JS(int,app_ota_variant_allowed,(int tab,int rf),{
+ return +!!emulatorDevice.device.systemStatus(emulatorDevice.module(tab)).rfCapable===+!!rf;
+});
+EM_JS(int,app_ota_release_count,(int tab,int dev,int rf),{
+ return emulatorDevice.device.systemReleases(emulatorDevice.module(tab),
+  {channel:dev?'dev':'main',variant:rf?'rf':'classic'}).length;
+});
+EM_JS(void,app_ota_release_tag,(int tab,int dev,int rf,int index,char *out,int size),{
+ const releases=emulatorDevice.device.systemReleases(emulatorDevice.module(tab),
+  {channel:dev?'dev':'main',variant:rf?'rf':'classic'});
+ stringToUTF8(releases[index]&&releases[index].tag||"",out,size);
+});
+EM_JS(void,app_ota_current_version,(int tab,char *out,int size),{
+ stringToUTF8(emulatorDevice.device.systemStatus(emulatorDevice.module(tab)).version,out,size);
 });
 EM_JS(int, app_ota_poll, (int id,char *text,int size,int *progress), {
  const j=emulatorDevice.device.job(id);
@@ -34,10 +58,12 @@ EM_JS(int, app_ota_poll, (int id,char *text,int size,int *progress), {
 EM_JS(void, app_ota_info, (int tab,char *text,int size), {
  const s=emulatorDevice.device.systemStatus(emulatorDevice.module(tab));
  stringToUTF8('Offline simulation\nBoard: '+s.boardName+'\nVersion: '+s.version+
- '\nConnected: '+s.connected+'\nReboots: '+s.reboots,text,size);
+ '\nConnected: '+s.connected+'\nVariant: '+s.firmwareVariant+
+ '\nRF capable: '+s.rfCapable+'\nReboots: '+s.reboots,text,size);
 });
 static void ota_close_monitor(void)
 {
+    app_ota_confirm_close();
     if (app_ota_slot_job) app_ota_cancel(app_ota_slot_job);
     app_ota_slot_job=0;
     if (app_ota_job) app_ota_cancel(app_ota_job);
@@ -330,19 +356,112 @@ static void ota_channel_changed_cb(lv_event_t *e) {
  (void)e;snprintf(g_ota.channel,sizeof(g_ota.channel),"%s",lv_dropdown_get_selected(g_ota.channel_dd)?"dev":"main");
  if(g_ota.page_status)lv_label_set_text_fmt(g_ota.page_status,"Simulated channel: %s",g_ota.channel);
 }
-static void ota_check_btn_cb(lv_event_t *e) {
- (void)e;
- if(g_ota.target_tab==TAB_INTERNAL){lv_label_set_text(g_ota.page_status,"No simulated module connected");return;}
+static void ota_read_variant_force(void) {
+ if(g_ota.variant_dd)g_ota.variant_choice=(int)lv_dropdown_get_selected(g_ota.variant_dd);
+ if(g_ota.force_sw)g_ota.force_update=lv_obj_has_state(g_ota.force_sw,LV_STATE_CHECKED);
+}
+static void app_ota_choice_changed(lv_event_t *e) {
+ (void)e;ota_read_variant_force();
+ if(g_ota.page_status)lv_label_set_text_fmt(g_ota.page_status,"Offline OTA: %s variant; %s.",
+  app_ota_effective_rf(g_ota.target_tab,g_ota.variant_choice)?"RF":"Classic",
+  g_ota.force_update?"choose a release before installing":"latest release selected");
+}
+static void app_ota_page_deleted(lv_event_t *e){(void)e;app_ota_bound_page=NULL;}
+static void app_ota_confirm_close(void) {
+ if(app_ota_confirm&&lv_obj_is_valid(app_ota_confirm))lv_obj_del(app_ota_confirm);
+ app_ota_confirm=NULL;
+}
+static void app_ota_begin_update(const char *release) {
+ if(g_ota.target_tab==TAB_INTERNAL){
+  if(g_ota.page_status)lv_label_set_text(g_ota.page_status,"No simulated module connected");return;
+ }
+ int rf=app_ota_effective_rf(g_ota.target_tab,g_ota.variant_choice);
+ if(!app_ota_variant_allowed(g_ota.target_tab,rf)){
+  if(g_ota.page_status)lv_label_set_text(g_ota.page_status,
+    "Firmware variant blocked: selected release is incompatible with the simulated module.");
+  return;
+ }
  ota_open_monitor(OTA_VIEW_STATUS,"Monster OTA - Offline simulation");
- char error[256]={0};app_ota_job=app_ota_start(g_ota.target_tab,!strcmp(g_ota.channel,"dev"),error,sizeof(error));
+ char error[256]={0};
+ app_ota_job=app_ota_start(g_ota.target_tab,!strcmp(g_ota.channel,"dev"),rf,
+                            g_ota.force_update,release?release:"",error,sizeof(error));
  if(!app_ota_job){ota_status_set_phase("Simulated update unavailable",error,COLOR_MATERIAL_RED,0,0);return;}
  app_queue2_ota_update=app_ota_job;
- ota_status_set_phase("Simulated update starting","Demo firmware only; no network or hardware access.",COLOR_MATERIAL_ORANGE,0,0);
+ char detail[180];snprintf(detail,sizeof(detail),"%s variant%s%s. Demo firmware only; no hardware access.",
+     rf?"RF":"Classic",release&&release[0]?" release ":" latest",
+     release&&release[0]?release:"");
+ ota_status_set_phase("Simulated update starting",detail,COLOR_MATERIAL_ORANGE,0,0);
  ota_monitor_set_close_state(true,COLOR_MATERIAL_ORANGE,"Cancel simulated update");
 }
+static void app_ota_confirm_cancel_cb(lv_event_t *e){(void)e;app_ota_confirm_close();}
+static void app_ota_confirm_yes_cb(lv_event_t *e) {
+ (void)e;char release[48];snprintf(release,sizeof(release),"%s",app_ota_selected_release);
+ app_ota_confirm_close();app_ota_begin_update(release);
+}
+static void app_ota_release_row_cb(lv_event_t *e) {
+ int index=(int)(intptr_t)lv_event_get_user_data(e);if(index<0||index>=2)return;
+ snprintf(app_ota_selected_release,sizeof(app_ota_selected_release),"%s",app_ota_release_tags[index]);
+ char current[48];app_ota_current_version(g_ota.target_tab,current,sizeof(current));
+ const char *action="Install";
+ if(!strcmp(current,app_ota_selected_release))action="Reinstall";
+ else {
+  const char *a=strrchr(current,'-'),*b=strrchr(app_ota_selected_release,'-');
+  if(a&&b&&(size_t)(a-current)==(size_t)(b-app_ota_selected_release)&&
+     !strncmp(current,app_ota_selected_release,(size_t)(a-current))&&atoi(b+1)<atoi(a+1))
+   action="Downgrade";
+ }
+ app_ota_confirm_close();
+ app_ota_confirm=lv_obj_create(internal_container);
+ lv_obj_set_size(app_ota_confirm,lv_pct(100),lv_pct(100));
+ lv_obj_set_style_bg_color(app_ota_confirm,lv_color_black(),0);
+ lv_obj_set_style_bg_opa(app_ota_confirm,LV_OPA_60,0);
+ lv_obj_clear_flag(app_ota_confirm,LV_OBJ_FLAG_SCROLLABLE);
+ lv_obj_t *box=lv_obj_create(app_ota_confirm);lv_obj_set_size(box,550,200);lv_obj_center(box);
+ lv_obj_set_style_bg_color(box,ui_card_color(),0);lv_obj_set_style_pad_all(box,18,0);
+ lv_obj_set_flex_flow(box,LV_FLEX_FLOW_COLUMN);lv_obj_set_style_pad_row(box,14,0);
+ lv_obj_t *title=lv_label_create(box);lv_label_set_text_fmt(title,"%s %s?",action,app_ota_selected_release);
+ lv_obj_set_style_text_font(title,&lv_font_montserrat_20,0);
+ lv_obj_t *detail=lv_label_create(box);
+ lv_label_set_text_fmt(detail,"Current: %s. This changes only the offline simulated module.",current);
+ lv_obj_set_width(detail,lv_pct(100));lv_label_set_long_mode(detail,LV_LABEL_LONG_WRAP);
+ lv_obj_t *row=lv_obj_create(box);lv_obj_set_size(row,lv_pct(100),56);
+ lv_obj_set_style_bg_opa(row,LV_OPA_TRANSP,0);lv_obj_set_style_border_width(row,0,0);
+ lv_obj_set_flex_flow(row,LV_FLEX_FLOW_ROW);lv_obj_set_style_pad_all(row,0,0);
+ lv_obj_t *yes=lv_btn_create(row);lv_obj_set_size(yes,200,48);
+ app_bind_adapter(yes,app_ota_confirm_yes_cb,LV_EVENT_CLICKED,NULL,"emu.ota.confirm.yes");
+ lv_obj_t *yes_label=lv_label_create(yes);lv_label_set_text(yes_label,action);lv_obj_center(yes_label);
+ lv_obj_t *cancel=lv_btn_create(row);lv_obj_set_size(cancel,200,48);
+ app_bind_adapter(cancel,app_ota_confirm_cancel_cb,LV_EVENT_CLICKED,NULL,"emu.ota.confirm.cancel");
+ lv_obj_t *cancel_label=lv_label_create(cancel);lv_label_set_text(cancel_label,"Cancel");lv_obj_center(cancel_label);
+}
 static void ota_list_btn_cb(lv_event_t *e) {
- (void)e;ota_open_monitor(OTA_VIEW_LIST,"Monster OTA - Simulated releases");
- ota_append_log("Offline demo releases\nmain: demo-main-2\ndev: demo-dev-2\nClose and use Download & Flash to simulate an update.");
+ (void)e;ota_read_variant_force();
+ if(g_ota.target_tab==TAB_INTERNAL){
+  if(g_ota.page_status)lv_label_set_text(g_ota.page_status,"No simulated module connected");return;
+ }
+ int dev=!strcmp(g_ota.channel,"dev"),rf=app_ota_effective_rf(g_ota.target_tab,g_ota.variant_choice);
+ if(!app_ota_variant_allowed(g_ota.target_tab,rf)){
+  if(g_ota.page_status)lv_label_set_text(g_ota.page_status,
+    "Firmware variant blocked: selected release is incompatible with the simulated module.");
+  return;
+ }
+ ota_open_monitor(OTA_VIEW_LIST,"Monster OTA - Simulated releases");
+ ota_append_log("Offline demo releases. Select a published tag to inspect and confirm the update.");
+ lv_obj_set_flex_flow(g_ota.mon_log_container,LV_FLEX_FLOW_COLUMN);
+ int count=app_ota_release_count(g_ota.target_tab,dev,rf);if(count>2)count=2;
+ for(int i=0;i<count;i++){
+  app_ota_release_tag(g_ota.target_tab,dev,rf,i,app_ota_release_tags[i],sizeof(app_ota_release_tags[i]));
+  lv_obj_t *button=lv_btn_create(g_ota.mon_log_container);lv_obj_set_size(button,lv_pct(100),52);
+  char binding[96];snprintf(binding,sizeof(binding),"emu.ota.release.%s",app_ota_release_tags[i]);
+  app_bind_adapter(button,app_ota_release_row_cb,LV_EVENT_CLICKED,(void *)(intptr_t)i,binding);
+  lv_obj_t *label=lv_label_create(button);lv_label_set_text_fmt(label,"Select %s",app_ota_release_tags[i]);
+  lv_obj_center(label);
+ }
+}
+static void ota_check_btn_cb(lv_event_t *e) {
+ (void)e;ota_read_variant_force();
+ if(g_ota.force_update){ota_list_btn_cb(NULL);return;}
+ app_ota_begin_update("");
 }
 static void ota_info_btn_cb(lv_event_t *e) {
  (void)e;if(g_ota.target_tab==TAB_INTERNAL){lv_label_set_text(g_ota.page_status,"No simulated module connected");return;}
@@ -363,6 +482,14 @@ static void app_settings_ota_tick(double now) {
  (void)now;
  if(g_ota.page && !lv_obj_is_valid(g_ota.page)) {
   ota_close_monitor();ota_scan_close();memset(&g_ota,0,sizeof(g_ota));return;
+ }
+ if(g_ota.page&&g_ota.page!=app_ota_bound_page){
+  app_ota_bound_page=g_ota.page;
+  lv_obj_add_event_cb(g_ota.page,app_ota_page_deleted,LV_EVENT_DELETE,NULL);
+  if(g_ota.variant_dd)app_bind_adapter(g_ota.variant_dd,app_ota_choice_changed,
+                                  LV_EVENT_VALUE_CHANGED,NULL,"emu.ota.variant");
+  if(g_ota.force_sw)app_bind_adapter(g_ota.force_sw,app_ota_choice_changed,
+                                LV_EVENT_VALUE_CHANGED,NULL,"emu.ota.force");
  }
  if(app_ota_scan_job && g_ota.scan_list && app_model_state(app_ota_scan_job)!=1) {
   int state=app_model_state(app_ota_scan_job);app_ota_scan_job=0;g_ota.scan_running=false;

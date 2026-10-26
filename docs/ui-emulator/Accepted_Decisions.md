@@ -4,18 +4,17 @@ The user confirmed the following scope and experience preferences after the init
 
 ## Current scope
 
-- SubGHz is excluded from the current emulator milestone. Do not request its firmware repository to close Phase 1.
+- Full Sub-GHz feature parity is included in the current emulator work (user decision on 2026-10-26). Simulate the module and radio operations locally.
 - Default to the available virtual modules needed by supported workflows. The current seed uses Grove, MBus and Internal; it does not require physical hardware.
 - Missing modules, disconnections and missing SD cards are alternate scenarios, not the default opening experience.
 - Use cyberpunk names for synthetic networks and devices.
 - Keep generated Markdown documentation in English.
 
-The complete source inventory may still contain SubGHz references because it records the firmware. Those references are deferred scope, not a requirement for the current simulator. The seed contains no SubGHz module, signals, files or variants. Its empty signal schema slot is reserved for later compatibility.
+The source inventory and acceptance checks now include Sub-GHz screens and scenarios. Synthetic signals and virtual SD files remain browser-session data.
 
 On 2026-09-10 the user supplied a SubGHz UART command reference. Its
 [protocol intake notes](SubGHz_Protocol_Notes.md) preserve implementation
-implications and inconsistencies to resolve. This is new reference material;
-the user has not yet explicitly replaced the deferred implementation decision.
+implications and inconsistencies to resolve. The 2026-10-26 decision replaces the earlier deferral.
 
 ## Volatile demo data (2026-09-12)
 

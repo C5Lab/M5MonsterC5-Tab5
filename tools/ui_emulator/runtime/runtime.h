@@ -6,6 +6,7 @@
 
 void app_init(void);
 void app_tick(double elapsed_ms);
+void app_radio_sd_status_tick(void);
 void emu_unavailable(const char *name);
 EMSCRIPTEN_KEEPALIVE int emu_init(int rotation);
 EMSCRIPTEN_KEEPALIVE void emu_tick(double elapsed_ms);

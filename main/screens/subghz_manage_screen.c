@@ -955,3 +955,10 @@ void show_subghz_manage_page(void)
 
     ESP_LOGI(TAG, "SD Signals page ready");
 }
+
+#ifdef EMULATOR_NATIVE_SUBGHZ
+void subghz_manage_emulator_feed(subghz_tab_state_t *st, const char *line)
+{
+    process_event_line(st, line);
+}
+#endif

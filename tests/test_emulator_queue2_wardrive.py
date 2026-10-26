@@ -135,7 +135,7 @@ class Queue2WardriveBrowser(unittest.TestCase):
                             self.at('Return from the empty list');self.click('show_compromised_file_page.back_btn');self.complete();continue
                         if action=='delete':
                             self.at('Ask to delete the target')
-                            target='session-' if wardrive else 'example-http-dns-icmp.pcap'
+                            target='session-' if wardrive else 'neon-bazaar-4way.pcap'
                             self.file_control('delete_btn',target)
                             self.at('Cancel deletion');self.click('show_compromised_delete_confirm.no_btn')
                             self.at('Confirm the same target again');self.file_control('delete_btn',target)
@@ -151,7 +151,7 @@ class Queue2WardriveBrowser(unittest.TestCase):
                             self.at('Return to GROVE');self.click('show_wardrive_upload_popup.close_btn')
                             self.click('show_wardrive_upload_menu.close_btn');self.wdback()
                         else:
-                            self.at('Copy the HTTP/DNS fixture');self.file_control('copy_btn','example-http-dns-icmp.pcap')
+                            self.at('Copy the WPA capture');self.file_control('copy_btn','neon-bazaar-4way.pcap')
                             self.at('Close the transfer and return');self.click('compromised_transfer_show_popup.compromised_transfer_ui.action_btn')
                             self.click('show_compromised_file_page.back_btn')
                         self.complete()
@@ -229,6 +229,10 @@ class Queue2WardriveBrowser(unittest.TestCase):
         self.open_wd();self.click('show_wardrive_page.ctx--wardrive_start_btn')
         self.page.wait_for_function("emulator.device.device.wardrive('grove').wifiCount>0")
         self.click('show_wardrive_page.ctx--wardrive_stop_btn');self.wdback();self.files(True)
+        # The native file page first renders disabled controls, then enables
+        # them after its asynchronous module listing has populated the cache.
+        self.page.wait_for_function("""()=>{emulator.module._emu_inspect();return emulatorObjects.some(o=>
+            emulator.module.UTF8ToString(emulator.module._emu_binding_id(o.id)).includes('/select-uploaded') && !(o.state & 128))}""")
         for slot,want in [('select-uploaded',1),('select-all',2),('select-none',0)]:
             self.click('/'+slot)
             self.assertEqual(self.page.evaluate('emulator.module._emu_queue2_wardrive_state(0,19)'),want)

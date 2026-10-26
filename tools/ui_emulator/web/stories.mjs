@@ -11,9 +11,10 @@ import {pcapStories} from './pcap-story.mjs';
 import {settingsS18} from './settings-s18.mjs';
 import {settingsS19} from './settings-s19.mjs';
 import {settingsS20} from './settings-s20.mjs';
+import {analyzerStories} from './analyzer-story.mjs';
 export const queue2Stories=[...queue2System,...queue2Attacks,...queue2Nettools,...queue2Wardrive];
 // All families share the observed-state guide engine and join the full gate.
-export const guidedStories=[...portalStories,...pcapStories,...settingsS18,...settingsS19,...settingsS20,...queue2Stories];
+export const guidedStories=[...analyzerStories,...portalStories,...pcapStories,...settingsS18,...settingsS19,...settingsS20,...queue2Stories];
 export const bluetoothStory=Object.freeze({
   id:'bluetooth-locator',title:'Find a Bluetooth device',
   target:Object.freeze({name:'NEURODECK-07',mac:'02:20:77:02:00:01'}),

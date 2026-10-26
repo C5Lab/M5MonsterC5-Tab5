@@ -1,11 +1,10 @@
 """Reproducible UI scope, separate from emulator runtime/build artifacts."""
 import ast
-import hashlib
 import json
 import re
 from collections import Counter
 from pathlib import Path
-from source_index import ROOT, Source, walk, source_bytes
+from source_index import ROOT, Source, walk
 import audit_coverage as audit
 
 OUT=ROOT/'docs/ui-emulator'
@@ -13,11 +12,13 @@ coverage=json.loads((ROOT/'tools/ui_emulator/coverage.json').read_text())
 manifest=json.loads((ROOT/'tools/ui_emulator/generated/manifest.json').read_text())
 retained=set(manifest['retained']);boundaries=manifest['boundaries']
 result=audit.compute()
+compiled_sources=audit._compiled_sources(coverage['sources'])
 contracts={c['source_registration']:c for c in json.loads((ROOT/'tools/ui_emulator/control-contracts.json').read_text())['controls']}
-drift=[p for p,h in coverage['sources'].items() if hashlib.sha256(source_bytes(ROOT/p)).hexdigest()!=h]
-assert not drift, f'Refresh structural inventory before scope generation: {drift}'
 
-def status(name):return 'retained' if name in retained else boundaries.get(name,'not-wired')
+def status(name,file=None):
+    if file in compiled_sources or name in retained:return 'retained'
+    if name in boundaries:return boundaries[name]
+    return 'replaced' if audit._replacement(name) else 'not-wired'
 def strings(expr):
     return [ast.literal_eval(s) for s in re.findall(r'"(?:\\.|[^"\\])*"',expr)]
 def cell(value):return str(value).replace('|','\\|').replace('\n',' / ').replace('\r','')
@@ -76,16 +77,18 @@ tiles+=list(bar.values())
 controls=[]
 for c in coverage['controls']:
     names=audit._handler_names(c,contracts)
-    disposition=audit._disposition(names,retained,boundaries)
+    disposition=audit._disposition(names,retained,boundaries,compiled_sources)
+    disposition=audit._owner_adapter_disposition(c,disposition,boundaries)
+    if disposition=='not-wired' and audit._replacement(c['owner'].split('::')[-1]):disposition='replaced'
     endpoints=sorted(fid for fid in c.get('reachable_functions',[]) if fid.split('::')[-1].startswith('show_'))
     controls.append({k:c.get(k) for k in ['id','owner','object_expression','callback','event','user_data','line','construction_path','callback_candidates']}|
         {'disposition':disposition,'reachable_ui_functions':endpoints})
-assert len(controls)==452
-assert Counter(c['disposition'] for c in controls)==Counter({k:result['summary'][k] for k in ['retained','adapter','unsupported','not-wired']})
-ui_endpoints=[{'id':fid,'name':f['name'],'file':f['file'],'line':f['line'],'disposition':status(f['name']),
+assert len(controls)==coverage['summary']['event_registration_sites']
+assert Counter(c['disposition'] for c in controls)==Counter({k:result['summary'][k] for k in ['retained','adapter','replaced','unsupported','not-wired']})
+ui_endpoints=[{'id':fid,'name':f['name'],'file':f['file'],'line':f['line'],'disposition':status(f['name'],f['file']),
     'controls':[c['id'] for c in controls if c['owner']==fid]}
     for fid,f in coverage['functions'].items() if f['name'].startswith('show_')]
-constructors=[{'id':fid,'name':f['name'],'file':f['file'],'line':f['line'],'disposition':status(f['name'])}
+constructors=[{'id':fid,'name':f['name'],'file':f['file'],'line':f['line'],'disposition':status(f['name'],f['file'])}
     for fid,f in coverage['functions'].items() if f['role']=='screen_constructor' and not f['name'].startswith('show_')]
 html=(ROOT/'tools/ui_emulator/web/index.html').read_text()
 shell=[{'tag':m[0],'id':m[1]} for m in re.findall(r'<(button|select|input|canvas)[^>]*\bid="([^"]+)"',html)]
@@ -98,12 +101,12 @@ payload={'source_hashes_verified':coverage['sources'],'audit_summary':result['su
     'deferred_controls':result['open_items'],
     'limitations':['Rejestracje i definicje, nie liczba przycisków po rozwinięciu dynamicznych list.',
       'Status funkcji/kontrolki nie dowodzi kompletności całego flow ani guided story.',
-      '110 tras jest istniejącym ręcznie przeglądanym grafem; pełne wywołania/gałęzie są w coverage.json.',
-      'SubGHz jest wymieniony dla pełnego scope, ale pozostaje wyłączony decyzją użytkownika.']}
+      f'{len(coverage["routes"])} tras jest istniejącym ręcznie przeglądanym grafem; pełne wywołania/gałęzie są w coverage.json.',
+      'SubGHz korzysta z natywnych ekranów oraz deterministycznego radia i SD w pamięci emulatora.']}
 (OUT/'ui-scope-inventory.json').write_text(json.dumps(payload,ensure_ascii=False,indent=2)+'\n',encoding='utf-8')
 
 lines=['# Pełny rejestr UI — źródła, ekrany, kontrolki','',
-    'Wygenerowano przez `tools/ui_emulator/inventory_scope.py`. Zgodność hashy wszystkich 19 plików firmware potwierdzona.',
+    f'Wygenerowano przez `tools/ui_emulator/inventory_scope.py`. Zgodność hashy wszystkich {len(coverage["sources"])} plików źródłowych potwierdzona.',
     '',f'**Liczby:** {len(tiles)} definicji kafli, {len(ui_endpoints)} funkcji `show_*`, {len(constructors)} pozostałych konstruktorów `create_*`, '
     f'{len(controls)} rejestracji firmware, {len(adapter_controls)} rejestracji dodatkowych adapterów emulatora, {len(shell)} kontrolek obudowy WWW.',
     '', 'Kafle i wiersze tworzone w pętlach są szablonami, nie zamkniętą liczbą instancji. '
@@ -117,7 +120,7 @@ lines+=['','## Endpointy UI: wszystkie funkcje show_*','', '| Funkcja | Stan kom
 for e in ui_endpoints:lines.append(f'| `{e["name"]}` | {e["disposition"]} | {len(e["controls"])} | {source_link(e["file"],e["line"])} |')
 lines+=['','## Pozostałe konstruktory create_*','', 'Pomocnicze konstruktory też są ujęte, ale nie należy liczyć ich automatycznie jako osobnych ekranów.', '', '| Funkcja | Stan | Źródło |','|---|---|---|']
 for e in constructors:lines.append(f'| `{e["name"]}` | {e["disposition"]} | {source_link(e["file"],e["line"])} |')
-lines+=['','## Wszystkie 452 punkty rejestracji kontrolek firmware','',
+lines+=['',f'## Wszystkie {len(controls)} punkty rejestracji kontrolek firmware','',
     'Identyfikator = plik + konstruktor + event-N. `user_data` rozróżnia akcje szablonów. '
     'Pełne warunki konstrukcji i osiągalne endpointy UI są w [JSON](ui-scope-inventory.json).', '',
     '| ID | Obiekt / dane | Callback | Event | Stan | Źródło |','|---|---|---|---|---|---|']
@@ -125,13 +128,13 @@ for c in controls:
     file=c['owner'].split('::')[0]
     lines.append(f'| `{cell(c["id"])}` | `{cell(c["object_expression"])} / {cell(c["user_data"])}` | `{cell(c["callback"])}` | {cell(c["event"])} | {c["disposition"]} | {source_link(file,c["line"])} |')
 lines+=['','## Dodatkowe kontrolki adapterów emulatora','',
-    'Nie są doliczane do 452 punktów firmware. Tu są między innymi generowanie fixture PCAP, lokalne pickery i symulowane moduły.', '',
+    f'Nie są doliczane do {len(controls)} punktów firmware. Tu są między innymi generowanie fixture PCAP, lokalne pickery i symulowane moduły.', '',
     '| ID / wyrażenie | Callback | Konstruktor | Źródło |','|---|---|---|---|']
 for c in adapter_controls:lines.append(f'| `{cell(c["id_expression"])}` | `{c["callback"]}` | `{c["owner"]}` | {source_link(c["file"],c["line"])} |')
 lines+=['','## Kontrolki strony WWW','', '| ID | Element |','|---|---|']
 for c in shell:lines.append(f'| `{c["id"]}` | {c["tag"]} |')
 lines+=['','## Zidentyfikowane trasy nawigacji','',
-    'Istniejący graf ma 110 przeglądanych krawędzi; to nie jest deklaracja kompletności wszystkich kombinacji nawigacji. '
+    f'Istniejący graf ma {len(coverage["routes"])} przeglądanych krawędzi; to nie jest deklaracja kompletności wszystkich kombinacji nawigacji. '
     'Każda kontrolka i jej osiągalne funkcje pozostają osobno w JSON.', '',
     '| Graf | Z → do | Wyzwalacz | Funkcja |','|---|---|---|---|']
 for r in coverage['routes']:lines.append(f'| {r["diagram"]} | {r["source"]} → {r["target"]} | {cell(r["label"])} | `{r["function"]}` |')

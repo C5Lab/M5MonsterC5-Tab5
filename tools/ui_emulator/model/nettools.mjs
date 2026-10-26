@@ -2,7 +2,7 @@
 export function toolOptions(kind,input,networks) {
   if(!input||typeof input!=='object'||Array.isArray(input))throw new Error('Invalid tool options');
   const options={};
-  if(!['nmap','iot','gitm_scan','gitm_connect','gitm','wpasec'].includes(kind))throw new Error('Unknown simulated tool');
+  if(!['nmap','iot','gitm_scan','gitm_connect','gitm','rogue_gitm','wpasec'].includes(kind))throw new Error('Unknown simulated tool');
   if(kind==='nmap') {
     options.action=input.action??'hosts';
     if(!['connect','hosts','scan'].includes(options.action))throw new Error('Invalid nmap action');
@@ -22,6 +22,22 @@ export function toolOptions(kind,input,networks) {
     options.prefix=input.prefix||'gitm-demo';
     if(typeof options.prefix!=='string'||! /^[A-Za-z0-9_-][A-Za-z0-9_.-]{0,62}$/.test(options.prefix))throw new Error('Invalid capture prefix');
   }
+  if(kind==='rogue_gitm') {
+    const victim=networks.find(n=>n.id===input.victimId||n.bssid===input.victimId);
+    const upstream=networks.find(n=>n.id===input.upstreamId||n.bssid===input.upstreamId);
+    const victimSsid=victim?.ssid||input.resolvedVictimSsid;
+    if(!victim||typeof victimSsid!=='string'||!victimSsid||new TextEncoder().encode(victimSsid).length>32)
+      throw new Error('Select or resolve a named scenario victim');
+    if(!upstream||!upstream.ssid)throw new Error('Choose a named scenario uplink');
+    if(victim.id===upstream.id||victim.bssid===upstream.bssid)throw new Error('Choose a different uplink');
+    if(victim.channel!==upstream.channel)throw new Error('Victim and uplink must share a channel');
+    const mirror=input.mirrorPass,home=input.upstreamPass??'';
+    if(typeof mirror!=='string'||mirror.length<8||mirror.length>63)throw new Error('The demo mirror password must be 8-63 characters');
+    if(typeof home!=='string'||home.length>63)throw new Error('Invalid demo uplink password');
+    if([victimSsid,upstream.ssid,mirror,home].some(value=>value.includes('"')))throw new Error('Double quote is not allowed');
+    options.victimId=victim.id;options.upstreamId=upstream.id;options.prefix='rogue-gitm-demo';
+    if(!victim.ssid)options.victimSsid=victimSsid;
+  }
   if(kind==='wpasec') {
     options.outcome=input.outcome??'success';
     if(!['success','partial','failure'].includes(options.outcome))throw new Error('Invalid simulated upload outcome');
@@ -30,7 +46,15 @@ export function toolOptions(kind,input,networks) {
   return options;
 }
 
-export function toolResult(kind,options,networks,elapsed=30000) {
+export function toolResult(kind,options,networks,elapsed=30000,clients=[]) {
+  if(kind==='rogue_gitm') {
+    const victim=networks.find(n=>n.id===options.victimId),upstream=networks.find(n=>n.id===options.upstreamId);
+    const stage=elapsed<2000?'connecting':elapsed<5000?'mirror_ready':'capturing';
+    const visible=stage==='capturing'?clients.filter(c=>c.network_id===victim.id):[];
+    return {simulated:true,stage,victimSsid:options.victimSsid||victim.ssid,upstreamSsid:upstream.ssid,
+      packets:stage==='capturing'?Math.floor(elapsed/1000)*visible.length:0,bytes:0,
+      clients:visible.map(c=>({mac:c.mac,ip:c.ip}))};
+  }
   if(kind==='gitm_scan')return {networks:networks.map(n=>({...n,auth:n.security}))};
   if(kind==='gitm_connect')return {connected:true,ssid:options.ssid,ip:'192.0.2.2'};
   if(kind==='nmap') {

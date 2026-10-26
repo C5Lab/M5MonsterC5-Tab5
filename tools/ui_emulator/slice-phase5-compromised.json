@@ -1,0 +1,13 @@
+{
+  "compromised_primary_file_name_for_kind": "retain",
+  "compromised_primary_file_path_for_kind": "retain",
+  "compromised_listing_reset_files": "retain",
+  "compromised_seed_single_file_listing": "retain",
+  "compromised_add_single_file_controls": "retain",
+  "show_evil_twin_passwords_page": "retain",
+  "evil_twin_row_click_cb": "retain",
+  "show_evil_twin_connect_popup": "retain",
+  "evil_twin_connect_popup_cancel_cb": "retain",
+  "evil_twin_connect_popup_yes_cb": "adapter",
+  "show_portal_data_page": "retain"
+}

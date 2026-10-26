@@ -93,7 +93,11 @@ void nfc_hide_all_pages(nfc_tab_state_t *st)
     nfc_uart_cancel(st);
     if (need_stop) {
         st->emulate_running = false;
+#ifdef EMULATOR_NATIVE_NFC
+        nfc_emulator_send(st->tab_id, "stop");
+#else
         subghz_host_uart_send_for_tab(st->tab_id, "stop");
+#endif
     }
 
     if (st->confirm_popup) {

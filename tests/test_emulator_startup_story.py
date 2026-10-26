@@ -74,7 +74,15 @@ class StartupStoryBrowser(unittest.TestCase):
         self.title('Explore MBUS');click_text(p,'MBUS')
         self.title('Explore INTERNAL');click_text(p,'INTERNAL')
         p.evaluate("emulator.device.device.setModule('grove',{connected:true,sdPresent:true});emulator.device.device.setModule('mbus',{connected:false,sdPresent:false})")
-        click_text(p,'Module\nStatus');self.title('Read GROVE status')
+        p.evaluate('emulator.module._emu_tick(100)')
+        p.evaluate('emulator.module._emu_tick(100)')
+        click_text(p,'Module\nStatus')
+        # The one-second GROVE viewing step may finish before Playwright reads
+        # its title on a loaded host. Reaching MBUS proves it completed.
+        p.wait_for_function('''() => {
+            const title=document.querySelector('#guide-title').textContent;
+            return title==='Read GROVE status'||title==='Read MBUS status';
+        }''',timeout=6000)
         texts=[o['text'] for o in objects(p)]
         self.assertTrue(any(t.startswith('GROVE - Connected') and 'SD: present' in t for t in texts))
         self.assertTrue(any(t.startswith('MBUS - Disconnected') and 'SD: missing' in t for t in texts))

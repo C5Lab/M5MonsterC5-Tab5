@@ -1,6 +1,7 @@
 import { canvasPoint, createPointerState, rgb565ToRgba } from './display.mjs';
 import { BrowserDevice } from './model/bridge.mjs';
 import { StaMacStore, attachStaMacPersistence } from './model/sta_mac.mjs';
+import { WpaAuditorModel, WpaAuditorStore } from './model/wpa_auditor.mjs';
 import { SettingsStore } from './persistence.mjs';
 import { mountBluetoothGuide } from './stories.mjs';
 import { wifiDemoSeed } from './wifi-stories.mjs';
@@ -20,6 +21,14 @@ try { disk = globalThis.localStorage; } catch { /* Browser denied storage. */ }
 try { session = globalThis.sessionStorage; } catch { /* Browser denied storage. */ }
 const settings = globalThis.emulatorSettings = new SettingsStore(disk, session);
 const staMacStore = new StaMacStore(disk, session);
+function resetVirtualNvs() {
+  for (const key of ['tab5.nvs.tool_order.monster', 'tab5.nvs.tool_order.internal']) {
+    try { disk?.removeItem(key); } catch { /* Storage may be denied. */ }
+    try { session?.removeItem(key); } catch { /* Storage may be denied. */ }
+  }
+  delete globalThis.__tab5Nvs;
+}
+const wpaAuditorStore = new WpaAuditorStore(disk, session);
 const startupUrl = new URL(location.href);
 const moduleCondition = document.querySelector('#module-condition');
 const wifiCondition = document.querySelector('#wifi-condition');
@@ -42,9 +51,11 @@ moduleCondition.addEventListener('change',()=>{
 if (startupUrl.searchParams.get('reset') === '1') {
   settings.reset();
   staMacStore.reset();
+  resetVirtualNvs();
+  wpaAuditorStore.reset();
   // If both storage tiers refuse writes, keep the reset intent in the URL so
   // reload cannot resurrect a readable but stale settings record.
-  if (settings.mode !== 'memory' && staMacStore.mode !== 'memory') {
+  if (settings.mode !== 'memory' && staMacStore.mode !== 'memory' && wpaAuditorStore.mode !== 'memory') {
     startupUrl.searchParams.delete('reset');
     history.replaceState(null, '', startupUrl);
   }
@@ -71,6 +82,8 @@ rotation.addEventListener('change', () => {
 document.querySelector('#reset').addEventListener('click', () => {
   settings.reset();
   staMacStore.reset();
+  resetVirtualNvs();
+  wpaAuditorStore.reset();
   const url = new URL(location.href);
   url.searchParams.set('rotation', '0');
   url.searchParams.set('reset', '1');
@@ -93,6 +106,36 @@ globalThis.addEventListener('emulator-model-error', event => {
   globalThis.emulatorModelErrors.push(event.detail);
   notice.textContent = `Simulated device refused the operation: ${event.detail}`;
 });
+function screenshotUnavailable() {
+  notice.textContent = 'Screenshot download is unavailable in this browser. Nothing was saved to SD.';
+}
+globalThis.addEventListener('emulator-screenshot-request', () => {
+  if (typeof canvas.toBlob !== 'function' || typeof URL.createObjectURL !== 'function') {
+    screenshotUnavailable();
+    return;
+  }
+  try {
+    canvas.toBlob(blob => {
+      if (!blob) { screenshotUnavailable(); return; }
+      let url;
+      try {
+        url = URL.createObjectURL(blob);
+        const filename = `tab5-emulator-${new Date().toISOString().replace(/[:.]/g, '-')}.png`;
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = filename;
+        document.body.append(link);
+        link.click();
+        link.remove();
+        notice.textContent = `Browser download requested: ${filename}. Nothing was saved to SD.`;
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+      } catch {
+        if (url) URL.revokeObjectURL(url);
+        screenshotUnavailable();
+      }
+    }, 'image/png');
+  } catch { screenshotUnavailable(); }
+});
 
 async function downloadWasm() {
   for (let attempt = 1; attempt <= 3; attempt++) {
@@ -111,8 +154,36 @@ async function downloadWasm() {
 try {
   const scenarioResponse = await fetch(new URL('./scenario.json',import.meta.url));
   if (!scenarioResponse.ok) throw new Error('Scenario could not be loaded');
-  const device = new BrowserDevice(wifiDemoSeed(await scenarioResponse.json(),wifiCondition.value));
+  const scenario=await scenarioResponse.json();
+  const seed=wifiDemoSeed(scenario,wifiCondition.value);
+  const device = new BrowserDevice(seed);
+  const radioAvailability = tab => {
+    try {
+      const state = device.device.systemStatus(device.module(tab));
+      return {connected: state.connected, sdPresent: state.sdPresent};
+    } catch { return {connected: false, sdPresent: false}; }
+  };
+  device.subghz.setAvailability(radioAvailability);
+  device.nfc.setAvailability(radioAvailability);
   attachStaMacPersistence(device.device,staMacStore);
+  const wpaLocalPath=capture=>`/sdcard/lab/handshakes/${capture.name}`;
+  // Scan-story presets can hide every radio result; the independent WPA demo
+  // catalogue still needs its fixed capture fixtures from the base scenario.
+  device.wpa=new WpaAuditorModel(scenario,{available:source=>{
+    const status=device.device.systemStatus(source);
+    return status.connected&&status.sdPresent;
+  },localFiles:{
+    write:capture=>device.device.commitFileChanges('internal',[{
+      path:wpaLocalPath(capture),
+      bytes:new TextEncoder().encode(`OFFLINE WPA AUDIT FIXTURE ${capture.id}\n`)
+    }]),
+    remove:capture=>device.device.commitFileChanges('internal',[],[wpaLocalPath(capture)])
+  }});
+  if(wpaAuditorStore.load()&&!device.wpa.restore(wpaAuditorStore.load()))
+    wpaAuditorStore.recovered=true;
+  device.wpa.reconcileLocalFiles();
+  device.wpa.setChangeHandler(state=>wpaAuditorStore.save(state));
+  wpaAuditorStore.save(device.wpa.snapshot());
   globalThis.emulatorDevice = device;
   const wasmBinary = await downloadWasm();
   const module = await globalThis.createEmulator({
@@ -195,9 +266,11 @@ try {
   document.querySelector('#pcap-examples').addEventListener('click', () => {
     try {
       const tab=module._emu_current_tab();
-      device.device.installPcapFixtures(device.module(tab));
+      const installed=device.device.installPcapFixtures(device.module(tab),{includeHandshake:true});
       if(!module._emu_load_pcap_examples())throw new Error('Could not open local PCAP files');
-      notice.textContent='Loaded offline HTTP, DNS and ICMP examples plus an invalid-file example.';
+      notice.textContent='Loaded offline HTTP, DNS, ICMP'+
+        (installed.some(file=>file.kind==='handshake')?' and synthetic WPA capture':'')+
+        ' examples plus an invalid-file example.';
     } catch(error) { notice.textContent=error.message; }
   });
   // Read-only diagnostics and C entry points for the acceptance harness.

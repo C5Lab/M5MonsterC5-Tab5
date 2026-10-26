@@ -26,10 +26,12 @@ EM_JS(void,app_system_metadata,(int tab,int *values,char *version,int size),{
  stringToUTF8(s.version,version,size);
 });
 static void app_system_sync_metadata(void) {
- for(int tab=0;tab<=2;tab+=2){
+ for(int tab=0;tab<=2;tab++){
   int v[4]={0};char version[48];app_system_metadata(tab,v,version,sizeof(version));
   tab_context_t *ctx=get_ctx_for_tab(tab);
   ctx->sd_card_present=v[0]&&v[1];ctx->home_sd_stats_valid=v[0]&&v[1];
+  /* The default virtual SD includes synthetic vendor data for Scan Setup. */
+  ctx->home_vendors_present=ctx->sd_card_present;
   ctx->home_sd_total_bytes=(uint32_t)v[3];ctx->home_sd_free_bytes=(uint32_t)(v[3]-v[2]);
   snprintf(ctx->janos_version,sizeof(ctx->janos_version),"%s",version);
   snprintf(ctx->janos_app_version,sizeof(ctx->janos_app_version),"%s",version);
@@ -135,6 +137,7 @@ static void show_internal_tiles(void)
     create_tile(internal_tiles, LV_SYMBOL_WIFI, "Ad Hoc\nPortal & Karma", COLOR_MATERIAL_ORANGE, internal_tile_event_cb, "Ad Hoc Portal");
 
     create_tile(internal_tiles, LV_SYMBOL_LIST, "Module\nStatus", COLOR_MATERIAL_CYAN, internal_tile_event_cb, "Module Status");
+    apply_tool_order(internal_tiles, TO_INTERNAL, internal_tile_event_cb);
 
     // Ensure tiles are visible after creation (fixes initial display issue)
     lv_obj_clear_flag(internal_tiles, LV_OBJ_FLAG_HIDDEN);

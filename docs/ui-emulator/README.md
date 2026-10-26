@@ -13,7 +13,7 @@ Reviewed: 2026-09-09. Source checkout: `C:/Users/mati/Documents/GitHub/projectZe
 
 The scenario now drives the browser's scan, Observer, clients and synthetic PCAP workflow. The response examples remain test fixtures rather than a complete protocol recording. Five response families are exercised through actual Tab5 parsing code; see the [Phase 1 report](Phase_1_Report.md). Full hardware Wi-Fi/BLE receive-task execution is outside the emulator.
 
-Phase 1 is complete for the accepted scope without SubGHz. [Control and Adapter Contracts](Control_Adapter_Contracts.md) define the behavior/ownership decisions and stable identities; [phase1-verification.json](phase1-verification.json) records the passing specification gate. Live browser execution begins in Phase 2.
+Phase 1 was completed under the initial scope without Sub-GHz. Full Sub-GHz simulation was added to the current scope on 2026-10-26; see the [accepted decisions](Accepted_Decisions.md) and [feature parity plan](2026-10-26-feature-parity-plan.md). [Control and Adapter Contracts](Control_Adapter_Contracts.md) define the original behavior/ownership decisions and stable identities; [phase1-verification.json](phase1-verification.json) records that historical specification gate. Live browser execution begins in Phase 2.
 
 Cyberpunk naming is the user-selected convention. All addresses and names are synthetic. Locally administered Wi-Fi MAC addresses deliberately have empty vendor fields; fictional device labels do not imply real vendor lookup results. Client labels are scenario metadata because the inspected `list_hosts` response does not carry hostnames. Documentation IP addresses identify the virtual LAN.
 
@@ -55,7 +55,7 @@ The response file contains result bodies for `show_scan_results`, `scan_bt`, `li
 - Implement the completed control/adapter contracts, preserving independent Grove/MBus context and transport semantics.
 - Map Observer/client detail, connection state, operation progress/results, captured-data formats and upload outcomes.
 - Map Wardrive/GPS, capture gateway, file listing/download and virtual file contents.
-- SubGHz producer research is deferred by user decision and is outside the current milestone.
+- At this historical checkpoint, Sub-GHz producer research was deferred. The later user decision includes the full Sub-GHz UI and local radio simulation in the current emulator milestone; see the [accepted decisions](Accepted_Decisions.md).
 - Expand to large lists, hidden/escaped SSIDs, unnamed devices, disconnects and timeouts after parser compatibility is established.
 - Add schema validation and repeatable protocol fixture generation as implementation work; do not maintain unrelated hand-edited copies of the same model.
 

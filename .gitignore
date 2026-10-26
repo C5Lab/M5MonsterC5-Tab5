@@ -24,3 +24,7 @@ skill-observations/checkpoints.log
 
 # Scratch artifacts from the codex tool/tile-order emulator runs
 .codex-tmp/
+
+# Local emulator acceptance output; keep test sources and committed baselines.
+/docs/ui-emulator/test-runs/
+/docs/ui-emulator/feature-parity-verification.json

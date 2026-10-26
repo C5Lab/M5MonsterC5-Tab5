@@ -203,6 +203,11 @@
       "rssi": -79
     }
   ],
+  "bluetooth_tags": [
+    {"id": "tag-1", "kind": "airtag", "mac": "02:20:77:03:00:01", "detected_at_ms": 300},
+    {"id": "tag-2", "kind": "smarttag", "mac": "02:20:77:03:00:02", "detected_at_ms": 700},
+    {"id": "tag-3", "kind": "airtag", "mac": "02:20:77:03:00:03", "detected_at_ms": 1100}
+  ],
   "probe_network_ids": [
     "net-1",
     "net-2",
@@ -217,7 +222,7 @@
     "Client labels are scenario metadata, not additional fields in JanOS host output.",
     "Timing and remaining domains require further protocol mapping.",
     "Variant entries are behavior requirements, not executable scenario overrides.",
-    "SubGHz is excluded by user decision; its empty schema slot is reserved for a later stage.",
+    "Sub-GHz signals and NFC cards are synthetic; no RF transmission or reception occurs.",
     "Demo mode proposes 10x device-job time with deadlines on the same virtual clock; realistic mode uses 1x. UI animation time stays independent.",
     "Grove, MBus and Internal are the default available profiles. The USB JanOS profile starts disconnected and can be enabled for transport demos."
   ],
@@ -259,7 +264,9 @@
       "capabilities": [
         "wifi",
         "ble",
-        "sd"
+        "sd",
+        "subghz",
+        "nfc"
       ]
     },
     {
@@ -289,7 +296,15 @@
     "speed_kmh": 0,
     "route": []
   },
-  "subghz_signals": [],
+  "subghz_signals": [
+    { "id": "gate-433", "label": "Gate_433", "frequency_hz": 433920000, "rssi": -48, "protocol": "Princeton" },
+    { "id": "sensor-315", "label": "Sensor_315", "frequency_hz": 315000000, "rssi": -63, "protocol": "EV1527" },
+    { "id": "weather-868", "label": "Weather_868", "frequency_hz": 868350000, "rssi": -57, "protocol": "Acurite" }
+  ],
+  "nfc_cards": [
+    { "id": "ntag-demo", "label": "NTAG Demo", "type": "NTAG213", "uid": "04 A1 B2 C3 D4 E5 F6", "atqa": "00 44", "sak": "00", "data_bytes": 144 },
+    { "id": "classic-demo", "label": "Classic Demo", "type": "MIFARE Classic 1K", "uid": "12 34 56 78", "atqa": "00 04", "sak": "08", "data_bytes": 1024 }
+  ],
   "files": [
     {
       "id": "portal-1",
@@ -502,8 +517,6 @@
     "demo_clock_scale": 10,
     "realistic_clock_scale": 1,
     "default_module_profile": "available-virtual-modules",
-    "excluded_features": [
-      "subghz"
-    ]
+    "excluded_features": []
   }
 }

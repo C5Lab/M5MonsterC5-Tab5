@@ -20,7 +20,16 @@ class SettingsS20Browser(unittest.TestCase):
         self.page.evaluate('emulatorSettings.set("rtc_offset",Date.parse("2027-01-31T13:05:00Z")-Date.now())')
         self.page.locator('#queue2-story').select_option(id);self.page.locator('#guide-queue2').click()
         if id=='s20-baud':baud_native.TransferSpeedBrowser.open(self)
-        else:click_text(self.page,'INTERNAL');click_text(self.page,'Settings');click_text(self.page,'Time')
+        else:
+            click_text(self.page,'INTERNAL')
+            self.page.evaluate('emulator.module._emu_tick(100)')
+            self.page.evaluate('emulator.module._emu_tick(100)')
+            click_text(self.page,'Settings')
+            self.page.wait_for_function('''() => {
+                emulator.module._emu_inspect();
+                return emulatorObjects.some(o => o.text === 'Tool\\nOrder');
+            }''')
+            click_text(self.page,'Time')
     def title(self,text):self.page.wait_for_function('(t)=>document.querySelector("#guide-title").textContent===t',arg=text,timeout=6000)
     def finish(self):
         self.page.wait_for_function('document.querySelector("#guide-leave").textContent==="Back to stories"',timeout=6000)

@@ -51,7 +51,10 @@ class NativeDialogs(unittest.TestCase):
             rows=[o for o in objects(self.page) if 'emu.phase4.wardrive.home.' in o['binding']]
             self.click_binding(rows[0]['binding']);self.click_binding('show_home_mgmt_overlay.add_btn')
             self.click_binding('show_home_mgmt_overlay.close_btn')
-            self.click_binding('wardrive_setup_btn_cb.ctx--wardrive_setup_autoup_sw')
+            auto_switch=next(o for o in objects(self.page)
+                             if 'wardrive_setup_btn_cb.ctx--wardrive_setup_autoup_sw' in o['binding'])
+            if not auto_switch['state'] & 1:
+                self.click_binding('wardrive_setup_btn_cb.ctx--wardrive_setup_autoup_sw')
             self.click_binding('wardrive_setup_btn_cb.ctx--wardrive_setup_close_btn')
             self.click_binding('show_wardrive_page.ctx--wardrive_start_btn');self.advance(1000)
             self.assertIn('Home network detected',self.text());self.shot('home-network',rotation)
@@ -66,7 +69,9 @@ class NativeDialogs(unittest.TestCase):
             self.clean()
     def test_ota_slot_activation_all_rotations(self):
         for rotation in range(4):
-            self.load(rotation);click_text(self.page,'INTERNAL');click_text(self.page,'Settings');self.click_binding('/Monster OTA')
+            self.load(rotation);click_text(self.page,'INTERNAL');self.page.evaluate('emulator.module._emu_tick(10)')
+            click_text(self.page,'Settings');self.page.evaluate('emulator.module._emu_tick(10)')
+            self.click_binding('/Monster OTA')
             self.click_binding('show_ota_page.info_btn')
             self.assertIn('Slot ota_0',self.text());self.assertIn('Slot ota_1',self.text());self.shot('ota-slots',rotation)
             self.click_binding('/ota_1/activate')

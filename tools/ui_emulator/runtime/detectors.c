@@ -178,8 +178,7 @@ static void app_handshaker_start(tab_context_t *ctx) {
  int id=app_hs_begin_js(tab,targets);app_hs[tab].ctx=ctx;
  if(!id){ctx->handshaker_monitoring=false;append_handshaker_log("Unavailable: check connection, selection and busy operation",HS_LOG_PROGRESS);return;}
  app_hs[tab].id=id;app_hs[tab].run=id;app_hs[tab].active=true;app_hs[tab].step=0;app_hs[tab].last_ms=app_device_ms;
- int index=v.sel_count?v.sel_indices[0]:0;
- snprintf(app_hs[tab].target,sizeof(app_hs[tab].target),"%s",index>=0&&index<v.net_count?v.nets[index].ssid:"target");
+ app_hs[tab].target[0]='\0';
 }
 static void app_handshaker_on_stop(int tab){if(tab>=0&&tab<4){if(app_hs[tab].id&&app_hs_state_js(app_hs[tab].id)==1){app_hs_stop_js(app_hs[tab].id);app_hs[tab].stopped=app_hs[tab].run;}app_hs[tab].id=0;app_hs[tab].active=false;}}
 static void app_handshaker_tick(void){
@@ -193,8 +192,11 @@ static void app_handshaker_tick(void){
   if(step==0)append_handshaker_log("Deauthenticating clients...",HS_LOG_PROGRESS);
   else if(step==1)append_handshaker_log("Waiting for handshake...",HS_LOG_PROGRESS);
   else if(step==2){char msg[128],ssid[64];
-   if(app_hs_result_js(app_hs[tab].id,ssid,sizeof(ssid))>0){snprintf(msg,sizeof(msg),"Handshake captured: %s",ssid);append_handshaker_log(msg,HS_LOG_SUCCESS);ctx->handshaker_capture_success=true;}
-   else {append_handshaker_log("No synthetic handshake available for this selection",HS_LOG_PROGRESS);ctx->handshaker_capture_success=false;}
+   if(app_hs_result_js(app_hs[tab].id,ssid,sizeof(ssid))>0){
+    snprintf(app_hs[tab].target,sizeof(app_hs[tab].target),"%s",ssid);
+    snprintf(msg,sizeof(msg),"Handshake captured: %s",ssid);append_handshaker_log(msg,HS_LOG_SUCCESS);ctx->handshaker_capture_success=true;
+   }
+   else {app_hs[tab].target[0]='\0';append_handshaker_log("No synthetic handshake available for this selection",HS_LOG_PROGRESS);ctx->handshaker_capture_success=false;}
   }
   else {handshaker_set_done_state(ctx,ctx->handshaker_capture_success);app_hs[tab].active=false;}
  }

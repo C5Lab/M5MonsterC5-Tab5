@@ -4,6 +4,11 @@ Static closeout for Phase 4. It reconciles the coverage ledger against the
 built emulator so that every ledger item has behaviour evidence or is a clearly
 identified open item, and it rolls the per-domain sub-gates into one gate.
 
+This report records the 2026-09-12 Phase 4.7 checkpoint. Its counts and
+deferred routes are historical; for current dispositions, run
+`tools/ui_emulator/audit_coverage.py` against a rebuilt emulator and consult
+`phase4-coverage-baseline.json`.
+
 ## Wired in 4.7: Deauth Detector, Anti-surveillance, Handshaker
 
 Three previously-inert features were made live, all as offline simulations that
@@ -59,7 +64,7 @@ not-wired). Follow-up: [SAE Overflow is now wired](SAE_Report.md), adding one re
   Phase 2) on one static build, then the coverage audit. Writes
   `docs/ui-emulator/phase4-verification.json`.
 
-## Coverage ledger result (from the current build artifacts)
+## Historical coverage ledger result (2026-09-12 checkpoint)
 
 | Disposition | Controls |
 | --- | --- |
