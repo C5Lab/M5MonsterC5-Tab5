@@ -18,9 +18,12 @@ export class BrowserDevice {
   advance(ms) { this.device.advance(ms); this.subghz.advance(ms); this.nfc.advance(ms); }
   snapshot(tab) { return this.device.snapshot(this.module(tab)); }
   rows(tab) {
+    // Match JanOS scan_networks CSV: one pair of quotes, and a quote inside a
+    // field is written as "" (RFC 4180). Commas stay inside the field.
+    const quote = value => '"' + String(value).replace(/"/g, '""') + '"';
     return this.snapshot(tab).networks.map(n =>
       [n.index,n.ssid,n.vendor,n.bssid,n.channel,n.security,n.rssi,n.band]
-        .map(value => '"'+String(value)+'"').join(','));
+        .map(quote).join(','));
   }
   select(tab,bssid) {
     const id=[...this.snapshot(tab).networks,...this.device.observer(this.module(tab)).networks].find(n=>n.bssid===bssid)?.id;

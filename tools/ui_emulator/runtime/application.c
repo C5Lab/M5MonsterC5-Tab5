@@ -420,7 +420,7 @@ void app_tick(double elapsed_ms) {
    continue;
   }
   while(job->next_row<MAX_NETWORKS && job->next_row<app_model_rows(tab)) {
-   int row=job->next_row++;char line[256];app_model_network(tab,row,line,sizeof(line));
+   int row=job->next_row++;char line[512];app_model_network(tab,row,line,sizeof(line));
    tab_context_t *ctx=job->ctx;wifi_network_t *net=&ctx->networks[ctx->network_count];memset(net,0,sizeof(*net));if(parse_network_line(line,net))ctx->network_count++;
   }
   if(state==2)app_scan_finish(tab,false);

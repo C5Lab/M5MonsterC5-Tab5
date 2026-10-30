@@ -21,7 +21,7 @@ EM_JS(int,app_wd_home_scan_count,(int tab),{
 });
 EM_JS(void,app_wd_home_scan_row,(int tab,int index,char *out,int size),{
  const n=emulatorDevice.device.nearbyNetworks(emulatorDevice.module(tab))[index];
- const quote=v=>'"'+String(v).replaceAll('"'," ")+'"';
+ const quote=v=>'"'+String(v).replaceAll('"','""')+'"';
  const line=n?[n.index,n.ssid,n.vendor,n.bssid,n.channel,n.security,n.rssi,n.band].map(quote).join(','):"";
  stringToUTF8(line,out,size);
 });
