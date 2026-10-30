@@ -11,6 +11,7 @@ import {wpaFixtureBytes} from './wpa_auditor.mjs';
 export class SimulatedDevice {
   #seed; #modules; #jobs=new Map(); #nextId=1; #now=0; #capacity;
   #staMacChangeHandler=null;
+  #wpsQueues=new Map(); #wpsLastVerified=new Map();
 
   constructor(seed,{sdCapacityBytes=8*1024*1024}={}) {
     if(seed.schema_version!==1) throw new Error('Unsupported scenario version');
@@ -28,10 +29,12 @@ export class SimulatedDevice {
 
   reset() {
     this.#now=0;this.#jobs.clear();
+    this.#wpsQueues.clear();this.#wpsLastVerified.clear();
     // Operation IDs never repeat, including across reset. Planned HTML seed
     // entries have no bytes yet and are intentionally not advertised as files.
     this.#modules=new Map(this.#seed.modules.map((module,index)=>[module.id,{
       connected:module.connected,sdPresent:module.sd_present,networks:[],selected:null,
+      wpsQuarantined:false,wpsRunId:null,
       staMac:createStaMacState(module.id,index,this.#seed.seed>>>0),
       version:module.capabilities.includes('subghz')?'demo-rf-main-1':'demo-main-1',
       firmwareVariant:module.capabilities.includes('subghz')?'rf':'classic',rfCapable:module.capabilities.includes('subghz'),
@@ -43,6 +46,7 @@ export class SimulatedDevice {
       wardrive:{running:false,gps:{fix:false,lat:0,lon:0,satellites:0,distanceM:0},wifiCount:0,btCount:0,rows:[],track:[],sessions:[],error:null,upload:null}
     }]));
     for(const module of this.#modules.values())bootStaMac(module.staMac);
+    for(const id of this.#modules.keys())this.#wpsQueues.set(id,[]);
     this.#staMacChangeHandler?.();
   }
 
@@ -55,6 +59,7 @@ export class SimulatedDevice {
   #available(id) {
     const module=this.#module(id);
     if(!module.connected) throw new Error('Module disconnected');
+    if(module.wpsQuarantined) throw new Error('Module radio quarantined');
     if(module.active!==null) throw new Error('Module radio busy');
     return module;
   }
@@ -190,8 +195,13 @@ export class SimulatedDevice {
   scan(moduleId) {
     const duration=this.#seed.settings?.scan_time_ms ?? 1000;
     if(!Number.isFinite(duration)||duration<=0) throw new Error('Invalid scan duration');
+    const module=this.#module(moduleId);
+    if(this.#jobs.get(module.active)?.kind==='wps_pixie') {
+      // A refused refresh must not pass the previous AP catalogue as new data.
+      module.networks=[];module.selected=null;
+    }
     const id=this.#start('scan',moduleId,duration);
-    const module=this.#module(moduleId);module.networks=[];module.selected=null;
+    module.networks=[];module.selected=null;
     return id;
   }
 
@@ -207,6 +217,81 @@ export class SimulatedDevice {
     const module=this.#available(moduleId);
     if(![...module.networks,...module.observer.networks].some(n=>n.id===networkId)) throw new Error('Network not discovered');
     module.selected=networkId;
+  }
+
+  /** Line-oriented, offline JanOS WPS/Pixie fixture for the retained Tab5 UART UI. */
+  wpsCommand(moduleId,command) {
+    const module=this.#module(moduleId);
+    const queue=this.#wpsQueues.get(moduleId);
+    const cmd=String(command).trim();
+    const emit=record=>queue.push(JSON.stringify(record));
+    const active=this.#jobs.get(module.active);
+    if(cmd==='wps status') {
+      emit({schema_version:1,record_type:'wps_status',phase:module.wpsQuarantined?'quarantined'
+        :active?.kind==='wps_pixie'?active.stopPending?'cleanup':'running':'idle',
+        run_id:active?.kind==='wps_pixie'?active.id:module.wpsRunId});
+      return;
+    }
+    if(cmd==='wps stop') {
+      if(active?.kind==='wps_pixie'&&active.state==='running') {
+        if(!active.stopPending){active.stopPending=true;active.stopAt=this.#now;}
+        emit({schema_version:1,record_type:'wps_stop',result:'stop_pending',run_id:active.id});
+      } else emit({schema_version:1,record_type:'wps_stop',result:module.wpsQuarantined?'quarantined':'stopped',
+        run_id:module.wpsRunId});
+      return;
+    }
+    if(cmd==='secret reveal') {
+      const vault=this.#wpsLastVerified.get(moduleId);
+      this.#wpsLastVerified.delete(moduleId);
+      if(vault&&this.#now<=vault.expires)
+        queue.push(`SENSITIVE operation_id=${vault.id} recovered_pin=12345670 network_key="example-key"`);
+      else emit({schema_version:1,record_type:'secret_reveal',result:vault?'expired':'empty'});
+      return;
+    }
+    const match=/^wps pixie ([0-9a-f]{2}(?::[0-9a-f]{2}){5})$/i.exec(cmd);
+    if(!match)throw new Error('Unsupported WPS command');
+    if(!module.connected)throw new Error('Module disconnected');
+    const target=module.networks.find(network=>network.bssid.toLowerCase()===match[1].toLowerCase());
+    if(!target)throw new Error('Select one discovered access point');
+    const id=this.#start('wps_pixie',moduleId,3000,{target:target.id,targetBssid:target.bssid,
+      stageIndex:0,stopPending:false,stopAt:null});
+    module.wpsRunId=id;
+    this.#wpsLastVerified.delete(moduleId);
+    emit({schema_version:1,record_type:'accepted',run_id:id,operation:'wps_pixie'});
+  }
+
+  wpsRead(moduleId) {
+    this.#module(moduleId);
+    return this.#wpsQueues.get(moduleId).shift()??null;
+  }
+
+  #advanceWps(module,job) {
+    const queue=this.#wpsQueues.get(job.moduleId);
+    const emit=record=>queue.push(JSON.stringify(record));
+    if(job.stopPending) {
+      if(this.#now-job.stopAt<300)return;
+      job.state='cancelled';job.progress=1;module.active=null;
+      emit({schema_version:1,record_type:'wps_stop',result:'stopped',run_id:job.id});
+      emit({schema_version:1,record_type:'terminal',run_id:job.id,
+        operation_result:'cancelled',cleanup_result:'restored',lease_state:'released'});
+      return;
+    }
+    const stages=['pixie_capture_start','pixie_capture','pixie_done','pixie_verify_attempt','pixie_verify'];
+    const elapsed=this.#now-job.started;
+    const due=elapsed>=2000?4:elapsed>=1500?3:elapsed>=1000?2:elapsed>=500?1:0;
+    const found=job.target===this.#seed.networks[0].id;
+    while(job.stageIndex<=due) {
+      const stage=stages[job.stageIndex++];
+      emit({schema:1,type:'wps_stage',operation_id:job.id,stage,
+        ...(stage==='pixie_done'?{found}:{})});
+    }
+    job.progress=Math.min(1,elapsed/job.duration);
+    if(elapsed<job.duration)return;
+    job.state='completed';module.active=null;
+    if(found)this.#wpsLastVerified.set(job.moduleId,{id:job.id,expires:this.#now+300000});
+    emit({schema_version:1,record_type:'terminal',run_id:job.id,
+      operation_result:found?'pixie_pin_and_m7_verified':'no_match',
+      cleanup_result:'restored',lease_state:'released'});
   }
 
   clients(moduleId) {
@@ -351,7 +436,16 @@ export class SimulatedDevice {
     if(connected!==undefined) {
       if(typeof connected!=='boolean') throw new Error('Invalid connection state');
       module.connected=connected;
-      if(!connected){this.cancel(module.active);module.observer.running=false;module.observer.error='disconnected';}
+      if(!connected){
+        const active=this.#jobs.get(module.active);
+        if(active?.kind==='wps_pixie') {
+          active.state='failed';active.error='disconnected';module.active=null;
+          module.wpsQuarantined=true;this.#wpsLastVerified.delete(moduleId);
+          this.#wpsQueues.get(moduleId).push(JSON.stringify({schema_version:1,record_type:'terminal',
+            run_id:active.id,operation_result:'disconnected',cleanup_result:'unknown',lease_state:'quarantined'}));
+        } else this.cancel(module.active);
+        module.observer.running=false;module.observer.error='disconnected';
+      }
     }
     if(sdPresent!==undefined) {
       if(typeof sdPresent!=='boolean') throw new Error('Invalid SD state');
@@ -373,6 +467,7 @@ export class SimulatedDevice {
       if(module.active===null)continue;
       const job=this.#jobs.get(module.active);
       if(job.kind==='system') {this.#advanceSystem(module,job);continue;}
+      if(job.kind==='wps_pixie') {this.#advanceWps(module,job);continue;}
       if(job.kind==='attack') {
         job.progress=Math.min(.95,(this.#now-job.started)/job.duration);
         job.result=attackResult(job.operation,job.options,this.#now-job.started,this.#seed.networks,this.#seed.clients);

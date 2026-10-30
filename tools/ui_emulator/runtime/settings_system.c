@@ -33,7 +33,9 @@ static void app_system_sync_metadata(void) {
   /* The default virtual SD includes synthetic vendor data for Scan Setup. */
   ctx->home_vendors_present=ctx->sd_card_present;
   ctx->home_sd_total_bytes=(uint32_t)v[3];ctx->home_sd_free_bytes=(uint32_t)(v[3]-v[2]);
-  snprintf(ctx->janos_version,sizeof(ctx->janos_version),"%s",version);
+  /* The release-catalog fixture is not a JanOS protocol version. The
+     synthetic console implements the 1.7.7 confirmed-stop contract. */
+  snprintf(ctx->janos_version,sizeof(ctx->janos_version),"%s",v[0]?"1.7.7":"");
   snprintf(ctx->janos_app_version,sizeof(ctx->janos_app_version),"%s",version);
   snprintf(ctx->janos_app_project,sizeof(ctx->janos_app_project),"JanOS demo");
   ctx->home_meta_last_update_ms=(uint32_t)app_device_ms+1;

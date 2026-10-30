@@ -60,6 +60,26 @@ Close** during generation discards the pending capture. **Reset demo** reloads
 the scenario and clears virtual files and saved settings. Reload also discards
 virtual files; virtual SD has no persistent storage.
 
+## Pixie Dust demo
+
+On GROVE or MBus, open **WiFi Scan & Attack**, wait for the scan to finish,
+select exactly one access point, and choose **Pixie Dust** in the action bar.
+The native Tab5 page consumes an offline JanOS-shaped command stream. The
+NEON-BAZAAR fixture reaches a verified demo result and reveals a one-time
+synthetic PIN and network key on that page. Other access points produce a
+bounded no-match result. **ESC / Stop and back** waits for the simulated
+`wps stop` completion before closing. A missing/disconnected module and a
+second concurrent operation are refused by the local model. No WPS packets,
+radio commands, credential recovery, or JanOS device communication occur.
+
+After rebuilding, run the focused model and Chromium tests from the repository
+root:
+
+```bat
+node --test tools\ui_emulator\tests\test_wps_pixie.mjs
+tools\ui_emulator\.venv\Scripts\python.exe -u tools\ui_emulator\tests\test_wps_pixie_browser.py -v
+```
+
 ## WPA PSK Auditor demo
 
 Open **INTERNAL → WPA PSK Auditor** to inspect four fixed, synthetic capture

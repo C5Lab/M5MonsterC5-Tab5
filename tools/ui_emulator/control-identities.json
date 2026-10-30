@@ -1,7 +1,7 @@
 {
   "version": 1,
   "reviewed_sources": {
-    "main/main.c": "694a00b1c39b8b378bb517ebe4294737ad7399b2ffb7ecc62ed9fe03f517e1fe",
+    "main/main.c": "548e6c27765a55da0e833d3ffc0597ced1382499ee436e5b0d1efbf0d914dea2",
     "main/observer_view.inc": "a9cfc99c228f9bd033e218f07829214806a6fdd95cebdd24953031a9321fae46",
     "main/observer_details.inc": "525ce30632c279983e65460c6ab91ce412870c37af3ea92ece8dbcbaeb679ef5",
     "main/screens/cgw_parser.c": "fb14c2c40a5129332c620adab9ab5f477beb8833950130a18a172b70980803a0",
@@ -550,6 +550,9 @@
     "[\"main/main.c::show_sta_mac_settings_page\",\"sta_mac_ui.fixed_input\",\"sta_mac_ui_fixed_focus\",\"LV_EVENT_CLICKED\",\"NULL\",[]]": "ui.show_sta_mac_settings_page.sta_mac_ui.fixed_input.clicked.50e4a19f0c3f",
     "[\"main/main.c::show_sta_mac_settings_page\",\"sta_mac_ui.apply_button\",\"sta_mac_ui_apply_clicked\",\"LV_EVENT_CLICKED\",\"NULL\",[]]": "ui.show_sta_mac_settings_page.sta_mac_ui.apply_button.clicked.772b4eb90308",
     "[\"main/main.c::show_sta_mac_settings_page\",\"sta_mac_ui.keyboard\",\"sta_mac_ui_keyboard_done\",\"LV_EVENT_READY\",\"NULL\",[[\"(sta_mac_ui.keyboard)\",\"then\"]]]": "ui.show_sta_mac_settings_page.sta_mac_ui.keyboard.ready.48d66c058679",
-    "[\"main/main.c::show_sta_mac_settings_page\",\"sta_mac_ui.keyboard\",\"sta_mac_ui_keyboard_done\",\"LV_EVENT_CANCEL\",\"NULL\",[[\"(sta_mac_ui.keyboard)\",\"then\"]]]": "ui.show_sta_mac_settings_page.sta_mac_ui.keyboard.cancel.d9c2288fa9b6"
+    "[\"main/main.c::show_sta_mac_settings_page\",\"sta_mac_ui.keyboard\",\"sta_mac_ui_keyboard_done\",\"LV_EVENT_CANCEL\",\"NULL\",[[\"(sta_mac_ui.keyboard)\",\"then\"]]]": "ui.show_sta_mac_settings_page.sta_mac_ui.keyboard.cancel.d9c2288fa9b6",
+    "[\"main/main.c::show_pixie_page\",\"g_pixie.retry_button\",\"pixie_retry_cb\",\"LV_EVENT_CLICKED\",\"NULL\",[]]": "ui.show_pixie_page.g_pixie.retry_button.clicked.7bfde9e38b56",
+    "[\"main/main.c::show_pixie_page\",\"back\",\"pixie_back_cb\",\"LV_EVENT_CLICKED\",\"NULL\",[]]": "ui.show_pixie_page.back.clicked.811502ab68d1",
+    "[\"main/main.c::show_wps_active_popup\",\"ok\",\"version_popup_close_cb\",\"LV_EVENT_CLICKED\",\"overlay\",[]]": "ui.show_wps_active_popup.ok.clicked.ab89b99cf008"
   }
 }

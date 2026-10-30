@@ -1,0 +1,11 @@
+{
+  "show_pixie_page": "retain",
+  "pixie_ui_tick": "retain",
+  "pixie_close_ui": "retain",
+  "pixie_back_cb": "retain",
+  "pixie_retry_cb": "retain",
+  "pixie_now_ms": "retain",
+  "pixie_uart_task": "adapter",
+  "janos_version_has_confirmed_wps_stop": "retain",
+  "janos_version_is_confirmed_stop_capable": "retain"
+}

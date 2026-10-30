@@ -12,6 +12,20 @@ static void app_rogue_gitm_open(tab_context_t *ctx,int victim_index);
 static void handle_selected_attack(const char *action) {
  tab_context_t *ctx=get_current_ctx();if(!ctx||!action)return;
  scan_view_t view=get_scan_view(ctx);
+ if(!strcmp(action,"Pixie Dust")){
+  if(ctx->observer_attack_override_active||ctx->current_visible_page!=ctx->scan_page||
+     ctx->scan_in_progress||ctx->scan_last_timed_out||view.sel_count!=1||!view.nets||
+     view.sel_indices[0]<0||view.sel_indices[0]>=view.net_count){
+   if(ctx->scan_status_label)lv_label_set_text(ctx->scan_status_label,
+    "Select exactly one AP from a finished scan for Pixie Dust");
+   return;
+  }
+  if(g_pixie.active){
+   if(ctx->scan_status_label)lv_label_set_text(ctx->scan_status_label,"A Pixie Dust session is already active");
+   return;
+  }
+  show_pixie_page(ctx,&view.nets[view.sel_indices[0]]);return;
+ }
  if(!strcmp(action,"Capture GW")){show_gitm_page_from_scan();return;}
  if(!strcmp(action,"Karma")){show_karma_page();return;}
  if(!strcmp(action,"Handshaker")){show_handshaker_popup();return;}

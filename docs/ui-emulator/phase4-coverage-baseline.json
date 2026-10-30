@@ -1,13 +1,13 @@
 {
   "note": "Phase 4.7 coverage-ledger baseline. Regenerate with python tools/ui_emulator/audit_coverage.py --write-baseline after a deliberate slice-policy change.",
   "summary": {
-    "retained": 371,
+    "retained": 374,
     "adapter": 98,
     "replaced": 33,
     "unsupported": 0,
     "not-wired": 16,
-    "total": 518,
-    "covered": 469,
+    "total": 521,
+    "covered": 472,
     "open": 0,
     "deferred": 16,
     "uncategorized": 0,

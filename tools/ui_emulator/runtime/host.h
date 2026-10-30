@@ -19,6 +19,7 @@
 #include "app_keyboard.h"
 #include "app_keyboard_navigation.h"
 #include "app_keyboard_rotation.h"
+#include "pixie_dust_session.h"
 #include "wifi_analyzer.h"
 #include "wifi_analyzer_screen.h"
 #include "tile_order.h"
@@ -83,6 +84,7 @@ static inline BaseType_t xSemaphoreTake(SemaphoreHandle_t lock, TickType_t wait)
 { (void)lock; (void)wait; return pdTRUE; }
 static inline BaseType_t xSemaphoreGive(SemaphoreHandle_t lock)
 { (void)lock; return pdTRUE; }
+static inline void vSemaphoreDelete(SemaphoreHandle_t lock) { (void)lock; }
 /* Display access is serialized on the browser main thread. */
 #define bsp_display_lock(...) 1
 #define bsp_display_unlock(...) ((void)0)

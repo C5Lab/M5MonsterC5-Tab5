@@ -3,6 +3,20 @@
 Pure-logic pieces that carry no LVGL or ESP-IDF dependency are tested on the
 host, so they can be verified without flashing a Tab5.
 
+## Pixie Dust JanOS session
+
+`pixie_dust_session_test.c` exercises the captured Grove/USB/MBus target,
+fragmented CR/LF records, ACK and stop timing, run ID filtering, explicit
+global stop after an unknown start, cleanup/quarantine, and one-shot reveal
+matching without including PIN or network key in logs.
+
+```sh
+cc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -g \
+  -I main tests/pixie_dust_session_test.c main/pixie_dust_session.c \
+  -o /tmp/pixie_dust_session_test
+/tmp/pixie_dust_session_test
+```
+
 ## Wi-Fi STA MAC setup
 
 `sta_mac_setup_model_test.c` checks the exact JanOS commands, strict local

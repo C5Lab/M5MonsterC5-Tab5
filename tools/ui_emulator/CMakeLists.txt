@@ -33,6 +33,7 @@ add_executable(emulator
     "${REPO_ROOT}/main/transfer_speed_config.c"
     "${REPO_ROOT}/main/sta_mac_setup_model.c"
     "${REPO_ROOT}/main/sta_mac_setup_response.c"
+    "${REPO_ROOT}/main/pixie_dust_session.c"
     "${REPO_ROOT}/main/sniffer_clients_model.c"
     "${REPO_ROOT}/main/ota_rf.c"
     "${REPO_ROOT}/main/tile_order.c"

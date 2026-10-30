@@ -97,6 +97,7 @@
 #include "ota_rf.h"
 #include "sta_mac_setup_model.h"
 #include "sta_mac_setup_response.h"
+#include "pixie_dust_session.h"
 #include <stdatomic.h>
 #include "freertos/queue.h"
 
@@ -119,7 +120,7 @@ extern void pthread_internal_local_storage_destructor_callback(TaskHandle_t hand
 
 
 #define JANOS_TAB_VERSION "1.5.6"
-#define JANOS_VERSION_REQUIRED "1.7.6"
+#define JANOS_VERSION_REQUIRED "1.7.7"
 #define USB_CH34X_BULK_MPS 32
 
 _Static_assert(CONFIG_IN_TRANSFER_BUFFER_SIZE == USB_CH34X_BULK_MPS,
@@ -764,6 +765,7 @@ typedef struct {
     int selected_count;
     bool scan_in_progress;
     bool scan_last_timed_out;
+    bool scan_radio_busy;
     bool observer_attack_override_active;
     bool observer_attack_return_to_observer;
     bool observer_station_return_to_network;
@@ -1430,6 +1432,9 @@ typedef struct {
     char janos_app_build[80];
     bool janos_version_mismatch;
     bool janos_board_ready;
+    bool janos_wps_status_known;
+    bool janos_wps_active;
+    char janos_wps_phase[16];
 
     // JanOS RF (Sub-GHz) firmware version - "" when not detected.
     // Captured from "JanOS RF version: X.Y.Z" line printed by JanOS at boot.
@@ -3132,6 +3137,12 @@ static void attack_tile_event_cb(lv_event_t *e);
 static void observer_attack_tile_event_cb(lv_event_t *e);
 static void observer_station_attack_tile_event_cb(lv_event_t *e);
 static void create_attack_action_bar(lv_obj_t *parent, lv_event_cb_t callback, lv_event_cb_t karma_callback);
+static bool wa_host_claim(int tab);
+static void wa_host_release(int tab);
+static void wa_host_flush(int tab);
+static bool janos_version_has_confirmed_wps_stop(tab_id_t tab);
+static bool janos_scan_line_is_busy(const char *line);
+static bool janos_console_occupied(tab_id_t tab);
 static void create_status_bar(void);
 static void header_settings_click_cb(lv_event_t *e);
 static void switch_to_internal_settings_page(void);
@@ -3337,6 +3348,9 @@ static void save_dark_mode_to_nvs(bool enabled);
 static void load_dashboard_from_nvs(void);
 static void refresh_theme_visuals(bool reopen_internal_settings);
 static void detect_boards(void);
+static bool check_wps_status_for_tab(tab_id_t tab);
+static void check_all_wps_statuses(void);
+static void show_wps_active_popup(void);
 static bool check_sd_card_for_tab(tab_id_t tab);
 static void check_all_sd_cards(void);
 static void sd_monitor_task(void *arg);
@@ -5252,8 +5266,10 @@ static __attribute__((unused)) void board_redetect_cb(void *user_data)
 
     board_probe_in_progress = true;
     detect_boards();
+    check_all_versions();
+    check_all_wps_statuses();
 
-    // One SD probe only, and only after the board answered ping.
+    // Probe the other capabilities after learning whether WPS owns the radio.
     check_all_sd_cards();
 
     // Re-probe Sub-GHz and NFC so the home tiles reflect the new state.
@@ -5279,6 +5295,7 @@ static __attribute__((unused)) void board_redetect_cb(void *user_data)
         ESP_LOGI(TAG, "Redetect: calling reload_gui_for_detection + show_main_tiles");
         reload_gui_for_detection();
         show_main_tiles();
+        show_wps_active_popup();
     } else if (changed) {
         ESP_LOGW(TAG, "Redetect: changed but conditions not met for reload");
     }
@@ -5664,21 +5681,7 @@ static int usb_transport_read(void *data, size_t len, TickType_t ticks_to_wait)
         }
         return 0;
     }
-    if (read_len > 0) {
-        // Log raw bytes received from USB (hex + ASCII for debugging)
-        char hex_buf[128];
-        char ascii_buf[64];
-        size_t log_len = read_len > 32 ? 32 : read_len;  // Limit to 32 bytes in log
-        for (size_t i = 0; i < log_len; i++) {
-            uint8_t b = ((uint8_t*)data)[i];
-            snprintf(hex_buf + i*3, 4, "%02X ", b);
-            ascii_buf[i] = (b >= 32 && b < 127) ? (char)b : '.';
-        }
-        hex_buf[log_len * 3] = '\0';
-        ascii_buf[log_len] = '\0';
-        ESP_LOGD(TAG, "[USB] Read %zu bytes: [%s] \"%s\"%s",
-                 read_len, hex_buf, ascii_buf, read_len > 32 ? "..." : "");
-    }
+    /* UART responses may contain one-shot secrets; never log payload bytes. */
     return (int)read_len;
 }
 
@@ -6748,9 +6751,16 @@ static void wifi_scan_task(void *arg)
     uart_port_t uart_port = uart_port_for_tab(scan_tab);
 
     ESP_LOGI(TAG, "[%s] Using transport on port %d for scan", uart_name, uart_port);
+    bool scan_busy = janos_console_occupied(scan_tab);
+    if (!scan_busy) {
+        (void)check_wps_status_for_tab(scan_tab);
+        scan_busy = janos_console_occupied(scan_tab) || ctx->janos_wps_active;
+    }
 
     // Flush buffer before scan
-    if (scan_tab == TAB_USB && usb_cdc_handle) {
+    if (scan_busy) {
+        ESP_LOGW(TAG, "[%s] Radio or console owned; scan not sent", uart_name);
+    } else if (scan_tab == TAB_USB && usb_cdc_handle) {
         usbh_cdc_flush_rx_buffer(usb_cdc_handle);
         ESP_LOGI(TAG, "[USB] Flushed RX buffer before scan");
     } else {
@@ -6758,9 +6768,11 @@ static void wifi_scan_task(void *arg)
     }
 
     // Send scan command to the correct transport
-    log_memory_stats("TX-scan");
-    transport_write_bytes_tab(scan_tab, uart_port, "scan_networks\r\n", 15);
-    ESP_LOGI(TAG, "[%s] Sent command: scan_networks", tab_transport_name(scan_tab));
+    if (!scan_busy) {
+        log_memory_stats("TX-scan");
+        transport_write_bytes_tab(scan_tab, uart_port, "scan_networks\r\n", 15);
+        ESP_LOGI(TAG, "[%s] Sent command: scan_networks", tab_transport_name(scan_tab));
+    }
 
     // Buffer for receiving data
     static char rx_buffer[UART_BUF_SIZE];
@@ -6771,7 +6783,8 @@ static void wifi_scan_task(void *arg)
     TickType_t start_time = xTaskGetTickCount();
     TickType_t timeout_ticks = pdMS_TO_TICKS(UART_RX_TIMEOUT);
 
-    while (!scan_complete && (xTaskGetTickCount() - start_time) < timeout_ticks) {
+    while (!scan_complete && !scan_busy &&
+           (xTaskGetTickCount() - start_time) < timeout_ticks) {
         int len = transport_read_bytes_tab(scan_tab, uart_port, rx_buffer, UART_BUF_SIZE - 1, pdMS_TO_TICKS(100));
 
         if (len > 0) {
@@ -6791,6 +6804,11 @@ static void wifi_scan_task(void *arg)
                         if (strstr(line_buffer, "Scan results printed") != NULL) {
                             scan_complete = true;
                             ESP_LOGI(TAG, "Scan complete marker received");
+                            break;
+                        }
+                        if (janos_scan_line_is_busy(line_buffer)) {
+                            scan_busy = true;
+                            ESP_LOGW(TAG, "[%s] Scan refused: %s", uart_name, line_buffer);
                             break;
                         }
 
@@ -6815,7 +6833,13 @@ static void wifi_scan_task(void *arg)
     }
 
     if (!scan_complete) {
-        ESP_LOGW(TAG, "[%s] Scan timed out", uart_name);
+        // Rows received without this scan's completion marker are provisional.
+        // A WPS-owned radio may refuse the command while JanOS still holds old
+        // scan data, so never publish partial or stale rows as a fresh scan.
+        ctx->network_count = 0;
+        memset(ctx->networks, 0, sizeof(wifi_network_t) * MAX_NETWORKS);
+        ESP_LOGW(TAG, "[%s] Scan %s", uart_name,
+                 scan_busy ? "refused by busy radio" : "timed out");
     }
 
     log_memory_stats("RX-scan");
@@ -6835,6 +6859,8 @@ static void wifi_scan_task(void *arg)
     if (ctx->scan_status_label) {
         if (scan_complete) {
             lv_label_set_text_fmt(ctx->scan_status_label, "Found %d networks", ctx->network_count);
+        } else if (scan_busy) {
+            lv_label_set_text(ctx->scan_status_label, "Radio busy - scan not started");
         } else {
             lv_label_set_text(ctx->scan_status_label, "Scan timed out");
         }
@@ -6979,6 +7005,7 @@ static void wifi_scan_task(void *arg)
 
     ctx->scan_in_progress = false;
     ctx->scan_last_timed_out = !scan_complete;
+    ctx->scan_radio_busy = scan_busy;
     scan_filter_apply_view(ctx);
     ESP_LOGI(TAG, "[%s] Stored %d scan results in tab %d context",
              uart_name, ctx->network_count, scan_tab);
@@ -7387,8 +7414,9 @@ static void boot_detect_run_probes(void)
 {
     board_probe_in_progress = true;
     detect_boards();
-    check_all_sd_cards();
     check_all_versions();
+    check_all_wps_statuses();
+    check_all_sd_cards();
     check_all_subghz_status();
     check_all_nfc();
     board_probe_in_progress = false;
@@ -7423,6 +7451,9 @@ static void boot_detection_done_async(void *user_data)
                  usb_detected ? " USB" : "");
         intro_log_push(intro_link_buf);
     }
+    if (grove_ctx.janos_wps_active || usb_ctx.janos_wps_active ||
+        mbus_ctx.janos_wps_active)
+        intro_log_push("> WPS SESSION STILL ACTIVE ON MONSTER");
     intro_log_push("> SYSTEM READY");
 
     // Build the real UI *behind* the still-visible splash so the fade reveals it.
@@ -7433,6 +7464,7 @@ static void boot_detection_done_async(void *user_data)
         ESP_LOGI(TAG, "Board(s) detected - showing main tiles");
         show_main_tiles();
         show_version_mismatch_popup();
+        show_wps_active_popup();
     }
     if (splash_screen) lv_obj_move_foreground(splash_screen);
 
@@ -7940,6 +7972,7 @@ static void scan_btn_click_cb(lv_event_t *e)
 
     ctx->scan_in_progress = true;
     ctx->scan_last_timed_out = false;
+    ctx->scan_radio_busy = false;
 
     // Clear previous selections (rescan = fresh selection)
     ctx->selected_count = 0;
@@ -8053,12 +8086,16 @@ static void scan_filter_apply_view(tab_context_t *ctx)
     }
 
     if (ctx->scan_status_label && !ctx->scan_in_progress) {
-        char status[160];
-        scan_filter_format_status(status, sizeof(status), count, shown,
-                                  ctx->selected_count, hidden_selected,
-                                  scan_filter_active_group_count(&ctx->scan_filter) > 0,
-                                  ctx->scan_last_timed_out);
-        lv_label_set_text(ctx->scan_status_label, status);
+        if (ctx->scan_radio_busy) {
+            lv_label_set_text(ctx->scan_status_label, "Radio busy - scan not started");
+        } else {
+            char status[160];
+            scan_filter_format_status(status, sizeof(status), count, shown,
+                                      ctx->selected_count, hidden_selected,
+                                      scan_filter_active_group_count(&ctx->scan_filter) > 0,
+                                      ctx->scan_last_timed_out);
+            lv_label_set_text(ctx->scan_status_label, status);
+        }
     }
     scan_filter_update_button(ctx);
 }
@@ -8560,8 +8597,11 @@ static void create_attack_action_bar(lv_obj_t *parent, lv_event_cb_t callback, l
         const char   *action;
     } bar_tile_t;
 
-    bar_tile_t tiles[11];
+    bar_tile_t tiles[12];
     int count = 0;
+    tab_context_t *bar_ctx = get_current_ctx();
+    const bool scan_actions = bar_ctx && parent == bar_ctx->scan_page &&
+                              callback == attack_tile_event_cb;
 
     if (enable_red_team) {
         tiles[count++] = (bar_tile_t){ LV_SYMBOL_CHARGE,   "Deauth",       COLOR_MATERIAL_RED,    callback, "Deauth" };
@@ -8584,6 +8624,10 @@ static void create_attack_action_bar(lv_obj_t *parent, lv_event_cb_t callback, l
         // Last in the strip and the only magenta tile, so it still reads as the
         // loud one without costing a row of its own.
         tiles[count++] = (bar_tile_t){ LV_SYMBOL_LOOP, "Rogue GITM", COLOR_LAB5_MAGENTA, callback, "Rogue GITM" };
+        if (scan_actions) {
+            tiles[count++] = (bar_tile_t){ LV_SYMBOL_WIFI, "Pixie Dust",
+                                           COLOR_MATERIAL_AMBER, callback, "Pixie Dust" };
+        }
     } else {
         // Non-red-team: ARP + Nmap (+ Karma if requested)
         tiles[count++] = (bar_tile_t){ LV_SYMBOL_SHUFFLE, "ARP",  COLOR_MATERIAL_PURPLE, callback, "ARP Poison" };
@@ -10223,6 +10267,312 @@ static void hidden_ssid_wpasec_confirm_cb(const char *ssid)
     ctx->wpasec_selected_ssid[sizeof(ctx->wpasec_selected_ssid) - 1] = '\0';
 }
 
+/* Pixie owns one captured console for its whole lifetime. The worker only
+ * changes the pure session model; LVGL is touched by pixie_ui_tick. */
+typedef struct {
+    pixie_session_t model;
+    SemaphoreHandle_t mutex;
+    TaskHandle_t task;
+    lv_timer_t *timer;
+    lv_obj_t *overlay;
+    lv_obj_t *status_label;
+    lv_obj_t *secret_label;
+    lv_obj_t *retry_button;
+    lv_obj_t *retry_label;
+    lv_obj_t *back_label;
+    char ssid[33];
+    char secret_display[104];
+    bool active;
+    bool worker_done;
+} pixie_ui_session_t;
+
+static pixie_ui_session_t g_pixie;
+
+static uint64_t pixie_now_ms(void)
+{
+    return (uint64_t)(esp_timer_get_time() / 1000);
+}
+
+static bool pixie_write_line(const pixie_outgoing_t *out)
+{
+    char framed[48];
+    int size = snprintf(framed, sizeof(framed), "%s\r\n", out->text);
+    if (size <= 0 || size >= (int)sizeof(framed)) return false;
+    size_t sent = 0;
+    while (sent < (size_t)size) {
+        int written = transport_write_bytes_tab((tab_id_t)out->tab,
+                                                (uart_port_t)out->port,
+                                                framed + sent,
+                                                (size_t)size - sent);
+        if (written <= 0) return false;
+        sent += (size_t)written;
+    }
+    return true;
+}
+
+static void pixie_uart_task(void *arg)
+{
+    pixie_ui_session_t *ui = arg;
+    const tab_id_t tab = (tab_id_t)ui->model.tab;
+    const uart_port_t port = (uart_port_t)ui->model.port;
+    if (!wa_host_claim((int)tab)) {
+        xSemaphoreTake(ui->mutex, portMAX_DELAY);
+        ui->model.start_queued = false;
+        ui->model.start_refused = true;
+        ui->model.phase = PIXIE_ERROR;
+        snprintf(ui->model.stage, sizeof(ui->model.stage), "Console busy");
+        snprintf(ui->model.result, sizeof(ui->model.result),
+                 "Finish the scan or other UART reader first");
+        ui->worker_done = true;
+        ui->task = NULL;
+        xSemaphoreGive(ui->mutex);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    wa_host_flush((int)tab);
+    char bytes[192];
+    while (true) {
+        pixie_outgoing_t outgoing = {0};
+        xSemaphoreTake(ui->mutex, portMAX_DELAY);
+        pixie_command_t kind = pixie_session_take_command(&ui->model,
+                                                           &outgoing,
+                                                           pixie_now_ms());
+        bool close = ui->model.close_ready;
+        xSemaphoreGive(ui->mutex);
+        if (kind != PIXIE_CMD_NONE) {
+            bool complete = pixie_write_line(&outgoing);
+            xSemaphoreTake(ui->mutex, portMAX_DELAY);
+            pixie_session_write_result(&ui->model, kind, complete,
+                                       pixie_now_ms());
+            xSemaphoreGive(ui->mutex);
+        }
+        if (close) break;
+
+        int received = transport_read_bytes_tab(tab, port, bytes,
+                                                 sizeof(bytes),
+                                                 pdMS_TO_TICKS(50));
+        if (received > 0) {
+            /* Never log raw lines: secret reveal carries PIN and network key. */
+            xSemaphoreTake(ui->mutex, portMAX_DELAY);
+            pixie_session_feed(&ui->model, bytes, (size_t)received,
+                               pixie_now_ms());
+            xSemaphoreGive(ui->mutex);
+        }
+    }
+
+    wa_host_release((int)tab);
+    xSemaphoreTake(ui->mutex, portMAX_DELAY);
+    ui->worker_done = true;
+    ui->task = NULL;
+    xSemaphoreGive(ui->mutex);
+    vTaskDelete(NULL);
+}
+
+static void pixie_close_ui(void)
+{
+    if (g_pixie.timer) {
+        lv_timer_del(g_pixie.timer);
+        g_pixie.timer = NULL;
+    }
+    if (g_pixie.secret_label)
+        lv_label_set_text_static(g_pixie.secret_label, "");
+    if (g_pixie.overlay) lv_obj_del(g_pixie.overlay);
+    volatile unsigned char *secret = (volatile unsigned char *)g_pixie.secret_display;
+    for (size_t i = 0; i < sizeof(g_pixie.secret_display); i++) secret[i] = 0;
+    g_pixie.overlay = NULL;
+    g_pixie.status_label = NULL;
+    g_pixie.secret_label = NULL;
+    g_pixie.retry_button = NULL;
+    g_pixie.retry_label = NULL;
+    g_pixie.back_label = NULL;
+    pixie_session_clear_secret(&g_pixie.model);
+    if (g_pixie.mutex) {
+        vSemaphoreDelete(g_pixie.mutex);
+        g_pixie.mutex = NULL;
+    }
+    g_pixie.active = false;
+}
+
+static void pixie_ui_tick(lv_timer_t *timer)
+{
+    (void)timer;
+    if (!g_pixie.active || !g_pixie.mutex) return;
+    char stage[sizeof(g_pixie.model.stage)];
+    char result[sizeof(g_pixie.model.result)];
+    char pin[sizeof(g_pixie.model.pin)];
+    char key[sizeof(g_pixie.model.network_key)];
+    bool has_secret, accepted, refused, close_ready, worker_done, stop_confirmed;
+    pixie_phase_t phase;
+    xSemaphoreTake(g_pixie.mutex, portMAX_DELAY);
+    snprintf(stage, sizeof(stage), "%s", g_pixie.model.stage);
+    snprintf(result, sizeof(result), "%s", g_pixie.model.result);
+    snprintf(pin, sizeof(pin), "%s", g_pixie.model.pin);
+    snprintf(key, sizeof(key), "%s", g_pixie.model.network_key);
+    has_secret = g_pixie.model.has_secret;
+    accepted = g_pixie.model.accepted;
+    refused = g_pixie.model.start_refused;
+    close_ready = g_pixie.model.close_ready;
+    stop_confirmed = g_pixie.model.stop_confirmed;
+    worker_done = g_pixie.worker_done;
+    phase = g_pixie.model.phase;
+    xSemaphoreGive(g_pixie.mutex);
+
+    if (close_ready && worker_done) {
+        pixie_close_ui();
+    } else {
+        lv_label_set_text_fmt(g_pixie.status_label, "%s\n%s", stage, result);
+        if (has_secret) {
+            snprintf(g_pixie.secret_display, sizeof(g_pixie.secret_display),
+                     "PIN: %s\nKey: %s", pin, key);
+            lv_label_set_text_static(g_pixie.secret_label, g_pixie.secret_display);
+        }
+        bool retry = phase == PIXIE_UNKNOWN || phase == PIXIE_ERROR ||
+                     phase == PIXIE_QUARANTINED;
+        if (retry) {
+            lv_obj_clear_flag(g_pixie.retry_button, LV_OBJ_FLAG_HIDDEN);
+            lv_label_set_text(g_pixie.retry_label,
+                              stop_confirmed ? "Retry secret reveal" :
+                              (accepted ? "Check status / retry stop" : "Force WPS stop"));
+        } else {
+            lv_obj_add_flag(g_pixie.retry_button, LV_OBJ_FLAG_HIDDEN);
+        }
+        lv_label_set_text(g_pixie.back_label,
+                          refused ? "Back" : "ESC / Stop and back");
+    }
+    /* The snapshots are short-lived and must never reach a log sink. */
+    memset(pin, 0, sizeof(pin));
+    memset(key, 0, sizeof(key));
+}
+
+static void pixie_back_cb(lv_event_t *event)
+{
+    (void)event;
+    if (!g_pixie.active || !g_pixie.mutex) return;
+    xSemaphoreTake(g_pixie.mutex, portMAX_DELAY);
+    pixie_session_request_exit(&g_pixie.model, pixie_now_ms());
+    xSemaphoreGive(g_pixie.mutex);
+}
+
+static void pixie_retry_cb(lv_event_t *event)
+{
+    (void)event;
+    if (!g_pixie.active || !g_pixie.mutex) return;
+    xSemaphoreTake(g_pixie.mutex, portMAX_DELAY);
+    pixie_session_request_retry(&g_pixie.model, pixie_now_ms());
+    xSemaphoreGive(g_pixie.mutex);
+}
+
+static void show_pixie_page(tab_context_t *ctx, const wifi_network_t *network)
+{
+    if (!ctx || !network || g_pixie.active) return;
+    const tab_id_t tab = tab_id_for_ctx(ctx);
+    const uart_port_t port = uart_port_for_tab(tab);
+    lv_obj_t *container = get_container_for_tab(tab);
+    if (!container) return;
+
+    if (!janos_version_has_confirmed_wps_stop(tab)) {
+        if (ctx->scan_status_label)
+            lv_label_set_text(ctx->scan_status_label,
+                              "Pixie Dust requires JanOS 1.7.7+ for confirmed stop");
+        return;
+    }
+
+    memset(&g_pixie, 0, sizeof(g_pixie));
+    if (!pixie_session_init(&g_pixie.model, (int)tab, (int)port,
+                            network->bssid,
+                            janos_version_has_confirmed_wps_stop(tab))) {
+        if (ctx->scan_status_label)
+            lv_label_set_text(ctx->scan_status_label, "Invalid Pixie target BSSID");
+        return;
+    }
+    snprintf(g_pixie.ssid, sizeof(g_pixie.ssid), "%s",
+             network->ssid[0] ? network->ssid : "[Hidden]");
+    g_pixie.mutex = xSemaphoreCreateMutex();
+    if (!g_pixie.mutex) return;
+    g_pixie.active = true;
+
+    g_pixie.overlay = lv_obj_create(container);
+    lv_obj_set_size(g_pixie.overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(g_pixie.overlay, ui_bg_color(), 0);
+    lv_obj_set_style_border_width(g_pixie.overlay, 0, 0);
+    lv_obj_set_style_pad_all(g_pixie.overlay, 14, 0);
+    lv_obj_set_flex_flow(g_pixie.overlay, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(g_pixie.overlay, 12, 0);
+    lv_obj_clear_flag(g_pixie.overlay, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(g_pixie.overlay);
+    lv_label_set_text(title, "Pixie Dust");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_color(title, COLOR_LAB5_MAGENTA, 0);
+
+    lv_obj_t *target = lv_label_create(g_pixie.overlay);
+    lv_label_set_text_fmt(target, "%s\n%s  |  %s", g_pixie.ssid,
+                          g_pixie.model.bssid, tab_transport_name(tab));
+    lv_obj_set_width(target, lv_pct(100));
+    lv_label_set_long_mode(target, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_color(target, ui_text_color(), 0);
+
+    lv_obj_t *version = lv_label_create(g_pixie.overlay);
+    lv_label_set_text(version, g_pixie.model.confirmed_stop_supported
+        ? "JanOS 1.7.7+: confirmed stop available"
+        : "JanOS version unknown/older: stop cannot be confirmed; update Monster");
+    lv_obj_set_width(version, lv_pct(100));
+    lv_label_set_long_mode(version, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_color(version,
+        g_pixie.model.confirmed_stop_supported ? COLOR_MATERIAL_GREEN : COLOR_MATERIAL_AMBER, 0);
+
+    g_pixie.status_label = lv_label_create(g_pixie.overlay);
+    lv_label_set_text(g_pixie.status_label, "Starting");
+    lv_obj_set_width(g_pixie.status_label, lv_pct(100));
+    lv_label_set_long_mode(g_pixie.status_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(g_pixie.status_label, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(g_pixie.status_label, ui_text_color(), 0);
+
+    g_pixie.secret_label = lv_label_create(g_pixie.overlay);
+    lv_label_set_text_static(g_pixie.secret_label, "");
+    lv_obj_set_width(g_pixie.secret_label, lv_pct(100));
+    lv_label_set_long_mode(g_pixie.secret_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_color(g_pixie.secret_label, COLOR_MATERIAL_GREEN, 0);
+
+    lv_obj_t *spacer = lv_obj_create(g_pixie.overlay);
+    lv_obj_set_width(spacer, 1);
+    lv_obj_set_flex_grow(spacer, 1);
+    lv_obj_set_style_bg_opa(spacer, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(spacer, 0, 0);
+
+    g_pixie.retry_button = lv_btn_create(g_pixie.overlay);
+    lv_obj_set_size(g_pixie.retry_button, lv_pct(100), 48);
+    lv_obj_set_style_bg_color(g_pixie.retry_button, COLOR_MATERIAL_AMBER, 0);
+    lv_obj_add_event_cb(g_pixie.retry_button, pixie_retry_cb, LV_EVENT_CLICKED, NULL);
+    g_pixie.retry_label = lv_label_create(g_pixie.retry_button);
+    lv_label_set_text(g_pixie.retry_label, "Check status / retry stop");
+    lv_obj_center(g_pixie.retry_label);
+    lv_obj_add_flag(g_pixie.retry_button, LV_OBJ_FLAG_HIDDEN);
+
+    lv_obj_t *back = lv_btn_create(g_pixie.overlay);
+    lv_obj_set_size(back, lv_pct(100), 48);
+    lv_obj_set_style_bg_color(back, COLOR_MATERIAL_RED, 0);
+    lv_obj_add_event_cb(back, pixie_back_cb, LV_EVENT_CLICKED, NULL);
+    app_keyboard_navigation_register_escape(back);
+    g_pixie.back_label = lv_label_create(back);
+    lv_label_set_text(g_pixie.back_label, "ESC / Stop and back");
+    lv_obj_center(g_pixie.back_label);
+
+    g_pixie.timer = lv_timer_create(pixie_ui_tick, 100, NULL);
+    if (xTaskCreate(pixie_uart_task, "pixie_uart_task", 8192,
+                    &g_pixie, 5, &g_pixie.task) != pdPASS) {
+        xSemaphoreTake(g_pixie.mutex, portMAX_DELAY);
+        g_pixie.model.start_queued = false;
+        g_pixie.model.start_refused = true;
+        g_pixie.model.phase = PIXIE_ERROR;
+        snprintf(g_pixie.model.result, sizeof(g_pixie.model.result),
+                 "Could not start UART session");
+        g_pixie.worker_done = true;
+        xSemaphoreGive(g_pixie.mutex);
+    }
+}
+
 static void handle_selected_attack(const char *attack_name)
 {
     if (!attack_name) return;
@@ -10240,7 +10590,31 @@ static void handle_selected_attack(const char *attack_name)
     scan_view_t v = get_scan_view(ctx);
 
     if (v.sel_count == 0) {
+        if (strcmp(attack_name, "Pixie Dust") == 0 && ctx->scan_status_label)
+            lv_label_set_text(ctx->scan_status_label,
+                              "Select exactly one AP for Pixie Dust");
         ESP_LOGW(TAG, "No networks selected for attack");
+        return;
+    }
+
+    if (strcmp(attack_name, "Pixie Dust") == 0) {
+        if (ctx->observer_attack_override_active ||
+            ctx->current_visible_page != ctx->scan_page ||
+            ctx->scan_in_progress || ctx->scan_last_timed_out ||
+            v.sel_count != 1 || !v.nets ||
+            v.sel_indices[0] < 0 || v.sel_indices[0] >= v.net_count) {
+            if (ctx->scan_status_label)
+                lv_label_set_text(ctx->scan_status_label,
+                                  "Select exactly one AP from a finished scan for Pixie Dust");
+            return;
+        }
+        if (g_pixie.active) {
+            if (ctx->scan_status_label)
+                lv_label_set_text(ctx->scan_status_label,
+                                  "A Pixie Dust session is already active");
+            return;
+        }
+        show_pixie_page(ctx, &v.nets[v.sel_indices[0]]);
         return;
     }
 
@@ -21415,15 +21789,23 @@ static void observer_start_task(void *arg)
     ctx->observer_network_count = 0;
     memset(ctx->observer_networks, 0, sizeof(observer_network_t) * MAX_OBSERVER_NETWORKS);
 
-    // Flush UART buffer
-    observer_flush_transport_input(task_tab, uart_port);
+    bool scan_busy = janos_console_occupied(task_tab);
+    if (!scan_busy) {
+        (void)check_wps_status_for_tab(task_tab);
+        scan_busy = janos_console_occupied(task_tab) || ctx->janos_wps_active;
+    }
 
-    observer_apply_vendor_settings(ctx);
+    // Flush UART buffer
+    if (!scan_busy) observer_flush_transport_input(task_tab, uart_port);
+
+    if (!scan_busy) observer_apply_vendor_settings(ctx);
 
     // Step 1: Run scan_networks
     char scan_cmd[] = "scan_networks\r\n";
-    transport_write_bytes_tab(task_tab, uart_port, scan_cmd, strlen(scan_cmd));
-    ESP_LOGI(TAG, "[%s] Sent: scan_networks", uart_name);
+    if (!scan_busy) {
+        transport_write_bytes_tab(task_tab, uart_port, scan_cmd, strlen(scan_cmd));
+        ESP_LOGI(TAG, "[%s] Sent: scan_networks", uart_name);
+    }
 
     // Wait for scan to complete - use PSRAM buffers
     char *rx_buffer = ctx->observer_rx_buffer;
@@ -21435,7 +21817,8 @@ static void observer_start_task(void *arg)
     TickType_t start_time = xTaskGetTickCount();
     TickType_t timeout_ticks = pdMS_TO_TICKS(UART_RX_TIMEOUT);
 
-    while (!scan_complete && (xTaskGetTickCount() - start_time) < timeout_ticks && ctx->observer_running) {
+    while (!scan_complete && !scan_busy &&
+           (xTaskGetTickCount() - start_time) < timeout_ticks && ctx->observer_running) {
         int len = transport_read_bytes_tab(task_tab, uart_port, rx_buffer, UART_BUF_SIZE - 1, pdMS_TO_TICKS(100));
 
         if (len > 0) {
@@ -21454,6 +21837,12 @@ static void observer_start_task(void *arg)
                         if (strstr(line_buffer, "Scan results printed") != NULL) {
                             scan_complete = true;
                             ESP_LOGI(TAG, "Network scan complete marker found");
+                            break;
+                        }
+                        if (janos_scan_line_is_busy(line_buffer)) {
+                            scan_busy = true;
+                            ESP_LOGW(TAG, "[%s] Observer scan refused: %s",
+                                     uart_name, line_buffer);
                             break;
                         }
 
@@ -21476,6 +21865,34 @@ static void observer_start_task(void *arg)
                 }
             }
         }
+    }
+
+    if (!ctx->observer_running) {
+        ctx->observer_start_active = false;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    if (!scan_complete) {
+        ctx->observer_network_count = 0;
+        memset(ctx->observer_networks, 0,
+               sizeof(observer_network_t) * MAX_OBSERVER_NETWORKS);
+        ctx->observer_running = false;
+        ctx->observer_start_active = false;
+        if (bsp_display_lock(0)) {
+            update_observer_table(ctx);
+            if (ctx->observer_status_label)
+                lv_label_set_text(ctx->observer_status_label,
+                                  scan_busy ? "Radio busy - observer scan not started"
+                                            : "Observer scan incomplete - retry");
+            if (ctx->observer_start_btn)
+                lv_obj_clear_state(ctx->observer_start_btn, LV_STATE_DISABLED);
+            if (ctx->observer_stop_btn)
+                lv_obj_add_state(ctx->observer_stop_btn, LV_STATE_DISABLED);
+            bsp_display_unlock();
+        }
+        vTaskDelete(NULL);
+        return;
     }
 
     // Save count of scanned networks directly to context
@@ -21556,14 +21973,81 @@ static void observer_start_task(void *arg)
         vTaskDelete(NULL);
         return;
     }
-    observer_flush_transport_input(task_tab, uart_port);
-    observer_send_command_to_transport(task_tab, uart_port, "unselect_networks", "Observer");
-    vTaskDelay(pdMS_TO_TICKS(50));
+    bool sniffer_busy = janos_console_occupied(task_tab);
+    if (!sniffer_busy) {
+        (void)check_wps_status_for_tab(task_tab);
+        sniffer_busy = janos_console_occupied(task_tab) || ctx->janos_wps_active;
+    }
+    if (!sniffer_busy) {
+        observer_flush_transport_input(task_tab, uart_port);
+        observer_send_command_to_transport(task_tab, uart_port, "unselect_networks", "Observer");
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
     char sniffer_cmd[] = "start_sniffer_noscan\r\n";
-    transport_write_bytes_tab(task_tab, uart_port, sniffer_cmd, strlen(sniffer_cmd));
-    ESP_LOGI(TAG, "[%s] Sent: start_sniffer_noscan", uart_name);
+    if (!sniffer_busy) {
+        transport_write_bytes_tab(task_tab, uart_port, sniffer_cmd, strlen(sniffer_cmd));
+        ESP_LOGI(TAG, "[%s] Sent: start_sniffer_noscan", uart_name);
+    }
 
-    vTaskDelay(pdMS_TO_TICKS(1000));  // Wait for sniffer to start
+    // JanOS can reject this transition if WPS acquired the radio after the
+    // scan. Wait for its success line instead of reporting "Observing" on a
+    // timer while an old sniffer snapshot is still on the Monster.
+    bool sniffer_started = false;
+    char sniffer_line[256];
+    size_t sniffer_line_pos = 0;
+    TickType_t sniffer_started_at = xTaskGetTickCount();
+    while (ctx->observer_running && !sniffer_started && !sniffer_busy &&
+           xTaskGetTickCount() - sniffer_started_at < pdMS_TO_TICKS(1800)) {
+        int len = transport_read_bytes_tab(task_tab, uart_port, rx_buffer,
+                                           UART_BUF_SIZE - 1, pdMS_TO_TICKS(100));
+        for (int i = 0; i < len; i++) {
+            char c = rx_buffer[i];
+            if (c == '\r' || c == '\n') {
+                if (sniffer_line_pos > 0) {
+                    sniffer_line[sniffer_line_pos] = '\0';
+                    if (strstr(sniffer_line, "Sniffer: Now monitoring"))
+                        sniffer_started = true;
+                    else if (janos_scan_line_is_busy(sniffer_line))
+                        sniffer_busy = true;
+                    sniffer_line_pos = 0;
+                }
+            } else if (sniffer_line_pos < sizeof(sniffer_line) - 1) {
+                sniffer_line[sniffer_line_pos++] = c;
+            } else {
+                sniffer_line_pos = 0;
+            }
+        }
+    }
+
+    if (!ctx->observer_running) {
+        ctx->observer_start_active = false;
+        vTaskDelete(NULL);
+        return;
+    }
+    if (!sniffer_started) {
+        ctx->observer_network_count = 0;
+        memset(ctx->observer_networks, 0,
+               sizeof(observer_network_t) * MAX_OBSERVER_NETWORKS);
+        // A positive refusal means our session never started. A missing reply
+        // leaves the Monster state uncertain, so keep Stop available to the
+        // user while avoiding any automatic stop of a possible WPS session.
+        if (sniffer_busy) ctx->observer_running = false;
+        if (bsp_display_lock(0)) {
+            update_observer_table(ctx);
+            if (ctx->observer_status_label)
+                lv_label_set_text(ctx->observer_status_label,
+                                  sniffer_busy ? "Radio busy - sniffer not started"
+                                               : "Sniffer start unconfirmed - use Stop");
+            if (ctx->observer_start_btn && sniffer_busy)
+                lv_obj_clear_state(ctx->observer_start_btn, LV_STATE_DISABLED);
+            if (ctx->observer_stop_btn && sniffer_busy)
+                lv_obj_add_state(ctx->observer_stop_btn, LV_STATE_DISABLED);
+            bsp_display_unlock();
+        }
+        ctx->observer_start_active = false;
+        vTaskDelete(NULL);
+        return;
+    }
 
     // Step 3: Start periodic timer for polling sniffer results
     if (ctx->observer_running) {
@@ -52888,6 +53372,84 @@ static __attribute__((unused)) void deinit_uart2(void)
 // Board Detection via ping/pong protocol
 //==================================================================================
 
+// A confirmed WPS stop is part of the JanOS 1.7.7 contract. Unknown versions,
+// prereleases and malformed banners must not be treated as capable.
+static bool janos_version_is_confirmed_stop_capable(const char *version)
+{
+    if (!version || !*version) return false;
+    unsigned long parts[3] = {0};
+    const char *cursor = version;
+    for (int i = 0; i < 3; i++) {
+        if (!isdigit((unsigned char)*cursor)) return false;
+        while (isdigit((unsigned char)*cursor)) {
+            parts[i] = parts[i] * 10 + (unsigned)(*cursor++ - '0');
+            if (parts[i] > 9999) return false;
+        }
+        if (i < 2) {
+            if (*cursor++ != '.') return false;
+        } else if (*cursor != '\0') {
+            return false;
+        }
+    }
+    return parts[0] > 1 ||
+           (parts[0] == 1 && (parts[1] > 7 ||
+                              (parts[1] == 7 && parts[2] >= 7)));
+}
+
+static bool janos_version_has_confirmed_wps_stop(tab_id_t tab)
+{
+    if (tab == TAB_INTERNAL) return false;
+    tab_context_t *ctx = get_ctx_for_tab(tab);
+    return ctx && janos_version_is_confirmed_stop_capable(ctx->janos_version);
+}
+
+// JanOS emits compact schema-v1 JSON on one line for `wps status`. Require the
+// record type and a known phase so a terminal event or unrelated log cannot
+// accidentally turn a port into an active WPS session.
+static bool janos_parse_wps_status_line(const char *line, char *phase, size_t phase_size)
+{
+    if (!line || !phase || phase_size < 12) return false;
+    phase[0] = '\0';
+    if (!strstr(line, "\"schema_version\":1,") ||
+        !strstr(line, "\"record_type\":\"wps_status\"")) return false;
+    const char *start = strstr(line, "\"phase\":\"");
+    if (!start) return false;
+    start += strlen("\"phase\":\"");
+    const char *end = strchr(start, '"');
+    if (!end || (size_t)(end - start) >= phase_size) return false;
+    size_t length = (size_t)(end - start);
+    memcpy(phase, start, length);
+    phase[length] = '\0';
+    if (strcmp(phase, "idle") && strcmp(phase, "preparing") &&
+        strcmp(phase, "running") && strcmp(phase, "cleanup") &&
+        strcmp(phase, "quarantined")) {
+        phase[0] = '\0';
+        return false;
+    }
+    return true;
+}
+
+static bool janos_wps_phase_is_active(const char *phase)
+{
+    return phase && phase[0] && strcmp(phase, "idle") != 0;
+}
+
+static bool janos_scan_line_is_busy(const char *line)
+{
+    if (!line || line[0] == '"') return false;
+    return strstr(line, "radio busy") || strstr(line, "radio_lease") ||
+           strstr(line, "radio lease") || strstr(line, "WPS owns") ||
+           strstr(line, "WiFi init failed") ||
+           strstr(line, "Scan already in progress") ||
+           strstr(line, "Wardrive is active") ||
+           strstr(line, "Cannot scan while Capture Gateway") ||
+           strstr(line, "Failed to start scan") ||
+           strstr(line, "Please scan_networks first") ||
+           strstr(line, "Sniffer already active") ||
+           strstr(line, "Capture Gateway owns") ||
+           strstr(line, "WiFi Analyzer owns");
+}
+
 // Copy a JanOS version token starting at `src` (right after the colon, possibly
 // preceded by spaces) into `dst[16]`. Stops at whitespace/CR/LF or 15 chars.
 static void janos_copy_version_token(const char *src, char *dst)
@@ -53055,6 +53617,26 @@ static bool ping_uart_direct(uart_port_t uart_port, const char *uart_name, tab_c
 }
 
 // Detect connected boards via ping/pong - 3 independent devices
+static bool janos_recover_busy_board(tab_id_t tab)
+{
+    // A long-running WPS worker can suppress pong after Tab5 restarts. Query
+    // only read-only commands; a valid JanOS version or WPS status proves the
+    // Monster is present without cancelling the operation on the C5.
+    check_version_for_tab(tab);
+    tab_context_t *ctx = get_ctx_for_tab(tab);
+    bool version_seen = ctx && ctx->janos_version[0] &&
+                        strcmp(ctx->janos_version, "unknown") != 0 &&
+                        strcmp(ctx->janos_version, "<1.5.8") != 0;
+    bool wps_seen = check_wps_status_for_tab(tab);
+    if (version_seen || wps_seen) {
+        ESP_LOGI(TAG, "[%s] Monster recovered after missed pong (version=%s, wps=%s)",
+                 tab_transport_name(tab),
+                 version_seen ? ctx->janos_version : "unknown",
+                 wps_seen ? ctx->janos_wps_phase : "unknown");
+    }
+    return version_seen || wps_seen;
+}
+
 static void detect_boards(void)
 {
     if (wa_any_busy()) return;
@@ -53070,17 +53652,27 @@ static void detect_boards(void)
     janos_clear_app_identity(&grove_ctx);
     grove_ctx.janos_rf_version[0] = '\0';
     grove_ctx.janos_board_ready = false;
+    grove_ctx.janos_wps_status_known = false;
+    grove_ctx.janos_wps_active = false;
+    grove_ctx.janos_wps_phase[0] = '\0';
     usb_ctx.janos_version[0] = '\0';
     janos_clear_app_identity(&usb_ctx);
     usb_ctx.janos_rf_version[0] = '\0';
     usb_ctx.janos_board_ready = false;
+    usb_ctx.janos_wps_status_known = false;
+    usb_ctx.janos_wps_active = false;
+    usb_ctx.janos_wps_phase[0] = '\0';
     mbus_ctx.janos_version[0] = '\0';
     janos_clear_app_identity(&mbus_ctx);
     mbus_ctx.janos_rf_version[0] = '\0';
     mbus_ctx.janos_board_ready = false;
+    mbus_ctx.janos_wps_status_known = false;
+    mbus_ctx.janos_wps_active = false;
+    mbus_ctx.janos_wps_phase[0] = '\0';
 
     // Detect each device independently using ping/pong (also snoops JanOS boot banner)
     grove_detected = ping_uart_direct(UART_NUM, "Grove", &grove_ctx);
+    if (!grove_detected) grove_detected = janos_recover_busy_board(TAB_GROVE);
 
     // A Monster on USB-A powers up together with the Tab5 and can still be in
     // its own boot/OTA phase when this first probe runs - the port is open and
@@ -53112,6 +53704,8 @@ static void detect_boards(void)
                 break;  // GPS accessory, not a Monster - no point pinging again
             }
         }
+        if (!usb_detected && !usb_nmea_device_seen && !usb_is_known_gps)
+            usb_detected = janos_recover_busy_board(TAB_USB);
     }
     if (usb_cdc_connected && !usb_detected && usb_debug_logs && !usb_nmea_device_seen && !usb_is_known_gps) {
         usb_log_cdc_state("detect_boards_usb_ping_failed");
@@ -53124,6 +53718,7 @@ static void detect_boards(void)
         atomic_store(&sta_mac_usb_recognized_generation, usb_probe_generation);
     uart1_detected = (grove_detected || usb_detected);  // For legacy compatibility
     mbus_detected = ping_uart(UART2_NUM, "MBus", &mbus_ctx);
+    if (!mbus_detected) mbus_detected = janos_recover_busy_board(TAB_MBUS);
 
     // Log detection results (ping functions already log success)
     if (grove_detected) {
@@ -53547,7 +54142,7 @@ static void check_version_for_tab(tab_id_t tab)
 
     // Fast path: boot-banner snoop during ping already captured the version.
     if (ctx->janos_version[0] != '\0') {
-        ctx->janos_version_mismatch = (strcmp(ctx->janos_version, JANOS_VERSION_REQUIRED) != 0);
+        ctx->janos_version_mismatch = !janos_version_has_confirmed_wps_stop(tab);
         ESP_LOGI(TAG, "[%s] JanOS version (from boot snoop): %s (mismatch=%d, rf=%s)",
                  tab_name, ctx->janos_version, ctx->janos_version_mismatch,
                  ctx->janos_rf_version[0] ? ctx->janos_rf_version : "n/a");
@@ -53606,7 +54201,7 @@ static void check_version_for_tab(tab_id_t tab)
     if (tab == TAB_USB) usb_rx_exclusive = false;
 
     if (ctx->janos_version[0] != '\0') {
-        ctx->janos_version_mismatch = (strcmp(ctx->janos_version, JANOS_VERSION_REQUIRED) != 0);
+        ctx->janos_version_mismatch = !janos_version_has_confirmed_wps_stop(tab);
         ESP_LOGI(TAG, "[%s] JanOS version: %s (mismatch=%d, rf=%s)",
                  tab_name, ctx->janos_version, ctx->janos_version_mismatch,
                  ctx->janos_rf_version[0] ? ctx->janos_rf_version : "n/a");
@@ -53626,6 +54221,94 @@ static void check_version_for_tab(tab_id_t tab)
     ctx->janos_version[sizeof(ctx->janos_version) - 1] = '\0';
     ctx->janos_version_mismatch = true;
     ESP_LOGW(TAG, "[%s] Could not detect JanOS version (timeout)", tab_name);
+}
+
+static bool janos_console_occupied(tab_id_t tab)
+{
+    if (tab < TAB_GROVE || tab > TAB_MBUS) return true;
+    SemaphoreHandle_t mutex = transport_console_mutex[(size_t)tab];
+    return crack_transport_owner[tab] != NULL ||
+           (mutex && xSemaphoreGetMutexHolder(mutex) != NULL);
+}
+
+static bool check_wps_status_for_tab(tab_id_t tab)
+{
+    if (tab == TAB_INTERNAL) return false;
+    tab_context_t *ctx = get_ctx_for_tab(tab);
+    if (!ctx) return false;
+    if (tab == TAB_USB && (!usb_cdc_connected || !usb_cdc_handle)) return false;
+    SemaphoreHandle_t mutex = transport_console_mutex[(size_t)tab];
+    if (!mutex || xSemaphoreTake(mutex, 0) != pdTRUE) return false;
+    if (crack_transport_owner[tab] != NULL) {
+        xSemaphoreGive(mutex);
+        return false;
+    }
+
+    uart_port_t port = uart_port_for_tab(tab);
+    if (tab == TAB_USB) {
+        usb_rx_exclusive = true;
+        usb_flush_input(50);
+    } else {
+        uart_flush_input(port);
+    }
+
+    const char *command = "wps status\r\n";
+    transport_write_bytes_tab(tab, port, command, strlen(command));
+    char chunk[192];
+    char line[768];
+    char phase[16] = {0};
+    bool known = false;
+    size_t line_pos = 0;
+    int64_t started_us = esp_timer_get_time();
+    while (esp_timer_get_time() - started_us < 1800000) {
+        int len = transport_read_bytes_tab(tab, port, chunk, sizeof(chunk),
+                                           pdMS_TO_TICKS(80));
+        for (int i = 0; i < len; i++) {
+            char c = chunk[i];
+            if (c == '\r' || c == '\n') {
+                if (line_pos > 0) {
+                    line[line_pos] = '\0';
+                    if (janos_parse_wps_status_line(line, phase, sizeof(phase))) {
+                        known = true;
+                        break;
+                    }
+                    line_pos = 0;
+                }
+            } else if (line_pos < sizeof(line) - 1) {
+                line[line_pos++] = c;
+            } else {
+                line_pos = 0;
+            }
+        }
+        if (known) break;
+    }
+    if (!known && line_pos > 0) {
+        line[line_pos] = '\0';
+        known = janos_parse_wps_status_line(line, phase, sizeof(phase));
+    }
+    if (known) {
+        snprintf(ctx->janos_wps_phase, sizeof(ctx->janos_wps_phase), "%s", phase);
+        ctx->janos_wps_status_known = true;
+        ctx->janos_wps_active = janos_wps_phase_is_active(phase);
+    }
+    if (tab == TAB_USB) usb_rx_exclusive = false;
+    xSemaphoreGive(mutex);
+    ESP_LOGI(TAG, "[%s] WPS status: %s", tab_transport_name(tab),
+             known ? phase : "unavailable");
+    return known;
+}
+
+static void check_all_wps_statuses(void)
+{
+    if (wa_any_busy()) return;
+    // A no-pong recovery just received a valid status; keep that snapshot
+    // instead of issuing a second probe that could time out under load.
+    if (grove_detected && !grove_ctx.janos_wps_status_known)
+        check_wps_status_for_tab(TAB_GROVE);
+    if (usb_detected && !usb_ctx.janos_wps_status_known)
+        check_wps_status_for_tab(TAB_USB);
+    if (mbus_detected && !mbus_ctx.janos_wps_status_known)
+        check_wps_status_for_tab(TAB_MBUS);
 }
 
 static void check_all_versions(void)
@@ -53708,19 +54391,19 @@ static void show_version_mismatch_popup(void)
     char msg[512] = "";
     if (grove_detected && grove_ctx.janos_version_mismatch) {
         snprintf(msg + strlen(msg), sizeof(msg) - strlen(msg),
-                 "Grove monster is on JanOS version: %s while %s expected.\n",
+                 "Grove JanOS %s: confirmed WPS stop requires %s or later.\n",
                  grove_ctx.janos_version[0] ? grove_ctx.janos_version : "unknown",
                  JANOS_VERSION_REQUIRED);
     }
     if (usb_detected && usb_ctx.janos_version_mismatch) {
         snprintf(msg + strlen(msg), sizeof(msg) - strlen(msg),
-                 "USB   monster is on JanOS version: %s while %s expected.\n",
+                 "USB JanOS %s: confirmed WPS stop requires %s or later.\n",
                  usb_ctx.janos_version[0] ? usb_ctx.janos_version : "unknown",
                  JANOS_VERSION_REQUIRED);
     }
     if (mbus_detected && mbus_ctx.janos_version_mismatch) {
         snprintf(msg + strlen(msg), sizeof(msg) - strlen(msg),
-                 "MBus  monster is on JanOS version: %s while %s expected.\n",
+                 "MBus JanOS %s: confirmed WPS stop requires %s or later.\n",
                  mbus_ctx.janos_version[0] ? mbus_ctx.janos_version : "unknown",
                  JANOS_VERSION_REQUIRED);
     }
@@ -53758,7 +54441,7 @@ static void show_version_mismatch_popup(void)
     lv_obj_set_style_text_color(icon, lv_color_hex(0xF44336), 0);
 
     lv_obj_t *title = lv_label_create(popup);
-    lv_label_set_text(title, "JanOS Version Mismatch");
+    lv_label_set_text(title, "JanOS Compatibility Warning");
     lv_obj_set_style_text_font(title, &lv_font_montserrat_22, 0);
     lv_obj_set_style_text_color(title, lv_color_hex(0xFFFFFF), 0);
 
@@ -53791,6 +54474,66 @@ static void show_version_mismatch_popup(void)
     lv_label_set_text(btn_label, "OK");
     lv_obj_set_style_text_font(btn_label, &lv_font_montserrat_16, 0);
     lv_obj_center(btn_label);
+}
+
+static void show_wps_active_popup(void)
+{
+    if (!grove_ctx.janos_wps_active && !usb_ctx.janos_wps_active &&
+        !mbus_ctx.janos_wps_active) return;
+
+    char message[384] = "WPS state is still active on the Monster:\n";
+    if (grove_ctx.janos_wps_active)
+        snprintf(message + strlen(message), sizeof(message) - strlen(message),
+                 "Grove: %s\n", grove_ctx.janos_wps_phase);
+    if (usb_ctx.janos_wps_active)
+        snprintf(message + strlen(message), sizeof(message) - strlen(message),
+                 "USB: %s\n", usb_ctx.janos_wps_phase);
+    if (mbus_ctx.janos_wps_active)
+        snprintf(message + strlen(message), sizeof(message) - strlen(message),
+                 "MBus: %s\n", mbus_ctx.janos_wps_phase);
+    snprintf(message + strlen(message), sizeof(message) - strlen(message),
+             "Tab5 restarted without stopping it. Open the WPS controls to inspect it.");
+
+    lv_obj_t *overlay = lv_obj_create(lv_scr_act());
+    lv_obj_remove_style_all(overlay);
+    lv_obj_set_size(overlay, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(overlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(overlay, LV_OPA_70, 0);
+    lv_obj_add_flag(overlay, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t *popup = lv_obj_create(overlay);
+    lv_obj_set_size(popup, 590, 330);
+    lv_obj_center(popup);
+    lv_obj_set_style_bg_color(popup, lv_color_hex(0x2D2D2D), 0);
+    lv_obj_set_style_border_color(popup, COLOR_MATERIAL_AMBER, 0);
+    lv_obj_set_style_border_width(popup, 3, 0);
+    lv_obj_set_style_radius(popup, 16, 0);
+    lv_obj_set_style_pad_all(popup, 24, 0);
+    lv_obj_set_flex_flow(popup, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(popup, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(popup, 16, 0);
+
+    lv_obj_t *title = lv_label_create(popup);
+    lv_label_set_text(title, LV_SYMBOL_WARNING " WPS still active");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_22, 0);
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_AMBER, 0);
+
+    lv_obj_t *detail = lv_label_create(popup);
+    lv_label_set_text(detail, message);
+    lv_obj_set_width(detail, lv_pct(100));
+    lv_label_set_long_mode(detail, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(detail, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(detail, lv_color_hex(0xFFFFFF), 0);
+
+    lv_obj_t *ok = lv_btn_create(popup);
+    lv_obj_set_size(ok, 140, 46);
+    lv_obj_set_style_bg_color(ok, COLOR_MATERIAL_PURPLE, 0);
+    lv_obj_add_event_cb(ok, version_popup_close_cb, LV_EVENT_CLICKED, overlay);
+    app_keyboard_navigation_register_escape(ok);
+    lv_obj_t *label = lv_label_create(ok);
+    lv_label_set_text(label, "OK");
+    lv_obj_center(label);
 }
 
 // Forward declarations for popup
@@ -53841,6 +54584,8 @@ static void board_detect_found_async(void *user_data)
     // Reload GUI to reflect detected config and show main tiles
     reload_gui_for_detection();
     show_main_tiles();
+    show_version_mismatch_popup();
+    show_wps_active_popup();
 }
 
 // Retry board detection while the popup is open. Runs on its own task because
@@ -53864,6 +54609,8 @@ static void board_detect_retry_task(void *arg)
         ESP_LOGI(TAG, "Retrying board detection...");
         board_probe_in_progress = true;
         detect_boards();
+        check_all_versions();
+        check_all_wps_statuses();
         check_all_sd_cards();
         // Re-probe Sub-GHz and NFC so the home tiles reflect the new state.
         check_all_subghz_status();

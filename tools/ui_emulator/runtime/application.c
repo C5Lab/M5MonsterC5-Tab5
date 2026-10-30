@@ -25,6 +25,7 @@ static void app_global_portal_show(void);
 static void app_radar_tick(double ms);
 static void app_analyzer_tick(void);
 static void app_wpa_tick(double ms);
+static void app_pixie_tick(void);
 static double app_speed=10;
 static int app_restart;
 static unsigned app_generation=1;
@@ -278,6 +279,7 @@ BaseType_t xTaskCreate(TaskFunction_t fn,const char *name,unsigned stack,void *a
  /* The two tasks with an explicit simulator implementation run inline on the
     browser thread; anything else stays an advertised unsupported boundary. */
  if(fn==wifi_scan_task){wifi_scan_task(arg);if(handle)*handle=&app_jobs[(int)(uintptr_t)arg];return pdPASS;}
+ if(fn==pixie_uart_task){if(handle)*handle=arg;return pdPASS;}
  if(fn==popup_focus_task){if(handle)*handle=NULL;popup_focus_task(arg);return pdPASS;}
  /* SD presence/files are owned by the browser model, so no hardware polling
     thread is needed for the retained mount status controls. */
@@ -381,6 +383,7 @@ void app_tick(double elapsed_ms) {
  update_status_clock();
  if(elapsed_ms<0)return;double delta=elapsed_ms*app_speed;app_device_ms+=delta;
  app_model_advance(delta);
+ app_pixie_tick();
  app_subghz_task_tick();
  app_run_pending_task();
  app_observer_tick();
@@ -594,6 +597,7 @@ EMSCRIPTEN_KEEPALIVE void emu_inspect_bindings(void) {
 #include "global_attacks.c"
 #include "radar.c"
 #include "analyzer.c"
+#include "pixie.c"
 #include "attacks_routes.c"
 #include "rogue_gitm.c"
 
