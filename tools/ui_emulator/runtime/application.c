@@ -15,7 +15,7 @@ EM_JS(int,app_dialog_condition,(),{
  if(value==='missing-board'||value==='missing-sd')for(const tab of [0,2])
   emulatorDevice.device.setModule(emulatorDevice.module(tab),value==='missing-board'?{connected:false}:{sdPresent:false});
  if(value==='grove-only')emulatorDevice.device.setModule('mbus',{connected:false});
- return ['normal','missing-board','missing-sd','version-mismatch','grove-only'].indexOf(value);
+ return ['normal','missing-board','missing-sd','version-mismatch','grove-only','otadata-invalid'].indexOf(value);
 });
 static void app_settings_ota_tick(double now);
 static void app_sd_admin_tick(void);
@@ -338,7 +338,7 @@ EMSCRIPTEN_KEEPALIVE void emu_show(int page,int tab) {
  if(page==1){switch_to_internal_settings_page();}
  else if(page==2)show_scan_page();else show_main_tiles();
 }
-static void init_tab_context(tab_context_t *ctx) { if(!ctx->networks)ctx->networks=calloc(MAX_NETWORKS,sizeof(wifi_network_t));if(!ctx->networks)abort();ctx->sd_card_present=true;ctx->has_subghz=(ctx==&mbus_ctx&&mbus_detected);ctx->has_nfc=(ctx==&mbus_ctx&&mbus_detected); }
+static void init_tab_context(tab_context_t *ctx) { if(!ctx->networks)ctx->networks=calloc(MAX_NETWORKS,sizeof(wifi_network_t));if(!ctx->networks)abort();if(!ctx->deauth_entries)ctx->deauth_entries=calloc(DEAUTH_DETECTOR_MAX_ENTRIES,sizeof(deauth_entry_t));if(!ctx->deauth_entries)abort();ctx->sd_card_present=true;ctx->has_subghz=(ctx==&mbus_ctx&&mbus_detected);ctx->has_nfc=(ctx==&mbus_ctx&&mbus_detected); }
 static void trigger_home_meta_refresh(tab_context_t *ctx,bool force) {(void)force;if(ctx)app_system_sync_metadata();}
 static uint32_t home_quote_rand_u32(void) {static uint32_t seed=0xC5AB1234;seed=seed*1664525u+1013904223u;return seed;}
 static bool usb_gps_get_fix(double *lat,double *lon,uint32_t wait) {(void)wait;if(lat)*lat=52.23;if(lon)*lon=21.01;return true;}
@@ -359,6 +359,7 @@ void app_init(void) {
  app_demo_condition=app_dialog_condition();
  if(app_demo_condition==1)grove_detected=uart1_detected=mbus_detected=false;
  if(app_demo_condition==4){mbus_detected=false;uart2_initialized=false;}
+ if(app_demo_condition==5){grove_detected=false;uart1_detected=false;}
  enable_red_team=app_load_range(NVS_KEY_RED_TEAM,1,0,1);dark_mode_enabled=app_load_range(NVS_KEY_DARK_MODE,1,0,1);dashboard_enabled=app_load_range(NVS_KEY_DASHBOARD,1,0,1);
  screen_rotation_setting=lv_display_get_rotation(NULL);screen_brightness_setting=app_load_range(NVS_KEY_SCREEN_BRIGHT,80,1,100);screen_timeout_setting=app_load_range(NVS_KEY_SCREEN_TIMEOUT,4,0,4);
  boot_sound_mode=(boot_sound_mode_t)app_load_range(NVS_KEY_BOOT_SOUND,BOOT_SOUND_MODE_NOKIA,0,BOOT_SOUND_MODE_STAR_WARS);

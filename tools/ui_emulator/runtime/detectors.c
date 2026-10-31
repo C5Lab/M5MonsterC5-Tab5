@@ -42,18 +42,18 @@ static void app_deauth_tick(void) {
   if(!app_deauth[tab].active)continue;
   tab_context_t *ctx=app_deauth[tab].ctx;
   if(!ctx||!ctx->deauth_detector_running){app_deauth[tab].active=false;continue;}
-  if(current_tab!=tab)continue;           /* the shared table belongs to the visible module */
-  if(!deauth_table||!lv_obj_is_valid(deauth_table))continue;
+  if(!ctx->deauth_entries || !ctx->deauth_detector_table ||
+     !lv_obj_is_valid(ctx->deauth_detector_table))continue;
   if(app_device_ms-app_deauth[tab].last_ms<1200)continue;
   app_deauth[tab].last_ms=app_device_ms;
   char line[256];
   if(app_deauth_line_js(tab,app_deauth[tab].seq++,line,sizeof(line))<=0)continue;
-  deauth_entry_t entry;
-  if(!parse_deauth_line(line,&entry))continue;
-  if(deauth_entry_count<DEAUTH_DETECTOR_MAX_ENTRIES)deauth_entry_count++;
-  memmove(&deauth_entries[1],&deauth_entries[0],(deauth_entry_count-1)*sizeof(deauth_entry_t));
-  deauth_entries[0]=entry;
-  update_deauth_table();
+  deauth_entry_t entry={0};
+  if(!parse_csa_line(line,&entry) && !parse_deauth_line(line,&entry))continue;
+  if(ctx->deauth_entry_count<DEAUTH_DETECTOR_MAX_ENTRIES)ctx->deauth_entry_count++;
+  memmove(&ctx->deauth_entries[1],&ctx->deauth_entries[0],(ctx->deauth_entry_count-1)*sizeof(deauth_entry_t));
+  ctx->deauth_entries[0]=entry;
+  update_deauth_table(ctx);
  }
 }
 

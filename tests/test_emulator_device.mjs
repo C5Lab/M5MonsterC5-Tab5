@@ -70,11 +70,82 @@ test('OTA latest stays on the published catalog head after repeat checks',()=>{
   const first=device.systemStart('grove','update');device.advance(3000);
   assert.equal(device.systemStatus('grove').version,'demo-main-2');
   const rebootCount=device.systemStatus('grove').reboots;
-  const second=device.systemStart('grove','update');device.advance(3000);
+  const second=device.systemStart('grove','update');
+  assert.equal(device.job(second).result.stage,'checking');
+  device.advance(1200);
+  assert.equal(device.job(second).result.stage,'checking');
+  assert.equal(device.job(second).progress,0);
+  device.advance(1200);
+  assert.equal(device.job(second).result.stage,'checking');
+  assert.equal(device.job(second).progress,0);
+  device.advance(600);
   assert.equal(device.systemStatus('grove').version,'demo-main-2');
   assert.equal(device.systemStatus('grove').reboots,rebootCount);
   assert.equal(device.job(second).result.stage,'up_to_date');
   assert.equal(device.job(first).result.stage,'completed');
+});
+
+test('OTA metadata status is module scoped and remains invalid across simulated jobs',()=>{
+  const metadataSeed=structuredClone(seed);
+  metadataSeed.modules.find(module=>module.id==='mbus').ota_metadata_invalid=true;
+  const device=new SimulatedDevice(metadataSeed);
+  assert.equal(device.systemStatus('grove').otaDataStatus,'valid');
+  assert.equal(device.systemStatus('mbus').otaDataStatus,'invalid');
+  device.systemStart('mbus','update');device.advance(3000);
+  assert.equal(device.systemStatus('mbus').otaDataStatus,'invalid');
+  device.systemActivateSlot('mbus',1);device.advance(1000);
+  assert.equal(device.systemStatus('mbus').otaDataStatus,'invalid');
+  assert.equal(device.systemStatus('grove').otaDataStatus,'valid');
+  device.reset();
+  assert.equal(device.systemStatus('mbus').otaDataStatus,'invalid');
+});
+
+test('OTA future RF demo version does not downgrade on check but allows explicit and cross-channel updates',()=>{
+  const rfSeed=structuredClone(seed);
+  const mbus=rfSeed.modules.find(module=>module.id==='mbus');
+  mbus.capabilities.push('subghz');
+  mbus.demo_version='demo-rf-main-3';
+  const device=new SimulatedDevice(rfSeed);
+  const initial=device.systemStatus('mbus');
+  assert.equal(initial.version,'demo-rf-main-3');
+  assert.deepEqual(initial.slots,['demo-rf-main-3','demo-rf-main-3']);
+
+  const check=device.systemStart('mbus','update',{channel:'main',variant:'rf'});
+  device.advance(2000);
+  assert.equal(device.job(check).result.stage,'checking');
+  assert.equal(device.job(check).progress,0);
+  device.advance(1000);
+  const afterCheck=device.systemStatus('mbus');
+  assert.equal(device.job(check).result.stage,'up_to_date');
+  assert.equal(afterCheck.version,initial.version);
+  assert.deepEqual(afterCheck.slots,initial.slots);
+  assert.equal(afterCheck.reboots,initial.reboots);
+
+  const downgrade=device.systemStart('mbus','update',
+    {channel:'main',variant:'rf',force:true,release:'demo-rf-main-2'});
+  device.advance(3000);
+  assert.equal(device.job(downgrade).result.stage,'completed');
+  assert.equal(device.systemStatus('mbus').version,'demo-rf-main-2');
+  const reinstall=device.systemStart('mbus','update',
+    {channel:'main',variant:'rf',force:true,release:'demo-rf-main-2'});
+  device.advance(3000);
+  assert.equal(device.job(reinstall).result.stage,'completed');
+  assert.equal(device.systemStatus('mbus').reboots,2);
+
+  const otherChannel=new SimulatedDevice(rfSeed);
+  const devUpdate=otherChannel.systemStart('mbus','update',{channel:'dev',variant:'rf'});
+  otherChannel.advance(3000);
+  assert.equal(otherChannel.job(devUpdate).result.stage,'completed');
+  assert.equal(otherChannel.systemStatus('mbus').version,'demo-rf-dev-2');
+  assert.equal(otherChannel.systemStatus('mbus').reboots,1);
+
+  const unknownSeed=structuredClone(rfSeed);
+  unknownSeed.modules.find(module=>module.id==='mbus').demo_version='demo-rf-main-3-preview';
+  const unknown=new SimulatedDevice(unknownSeed);
+  const unknownCheck=unknown.systemStart('mbus','update',{channel:'main',variant:'rf'});
+  unknown.advance(3000);
+  assert.equal(unknown.job(unknownCheck).result.stage,'completed');
+  assert.equal(unknown.systemStatus('mbus').version,'demo-rf-main-2');
 });
 
 test('PCAP packet timestamps carry into seconds rather than overflowing microseconds',()=>{

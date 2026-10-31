@@ -11,14 +11,14 @@ class OtaVariantBrowser(unittest.TestCase):
 
     def setUp(self):
         self.session = browser_session()
-        self.browser, url = self.session.__enter__()
+        self.browser, self.url = self.session.__enter__()
         self.addCleanup(self.session.__exit__, None, None, None)
         self.context = self.browser.new_context()
         self.addCleanup(self.context.close)
         self.page = self.context.new_page()
         self.errors = []
         self.page.on('pageerror', lambda e: self.errors.append(str(e)))
-        self.page.goto(url)
+        self.page.goto(self.url)
         self.page.wait_for_function('globalThis.emulator?.measurements.frames>2')
         self.page.evaluate("globalThis.unavailable=[];addEventListener('emulator-unavailable',e=>unavailable.push(e.detail))")
         click_text(self.page, 'INTERNAL')
@@ -82,6 +82,79 @@ class OtaVariantBrowser(unittest.TestCase):
         mbus=self.page.evaluate("emulator.device.device.systemStatus('mbus')")
         self.assertEqual(grove['version'],'demo-main-1')
         self.assertEqual((mbus['version'],mbus['firmwareVariant']),('demo-rf-main-2','rf'))
+
+    def test_second_rf_check_shows_no_newer_release_without_transfer(self):
+        self.use_rf_module()
+        self.click('show_ota_page.check_btn')
+        self.advance(4000)
+        before=self.page.evaluate("emulator.device.device.systemStatus('mbus')")
+        self.assertEqual((before['version'],before['reboots']),('demo-rf-main-2',1))
+        self.assertIn('Simulated OTA: completed',self.text())
+
+        bars=[row for row in objects(self.page) if row['height']==8 and row['width']>=500]
+        self.assertEqual(len(bars),1)
+        bar=bars[0]
+        right=[bar['x']+bar['width']-9,bar['y']+bar['height']//2]
+        def right_pixel():
+            return self.page.evaluate('''([x,y]) => Array.from(
+                document.querySelector('#display').getContext('2d').getImageData(x,y,1,1).data
+            ).slice(0,3)''',right)
+        filled_color=right_pixel()
+
+        self.click('emu.phase46.ota.monitor.close')
+        self.assertEqual(self.page.evaluate('emulator.module._emu_set_timing(1)'),1)
+        self.click('show_ota_page.check_btn')
+        job_id=self.page.evaluate("emulator.device.device.systemStatus('mbus').active")
+        self.page.wait_for_timeout(80)
+        self.assertNotEqual(right_pixel(),filled_color)
+        self.advance(1500)
+        checking=self.page.evaluate('(id)=>emulator.device.device.job(id)',job_id)
+        self.assertEqual((checking['state'],checking['result']['stage'],checking['progress']),
+                         ('running','checking',0))
+        self.assertIn('Simulated OTA: checking',self.text())
+        self.assertNotEqual(right_pixel(),filled_color)
+
+        self.advance(2500)
+        job=self.page.evaluate('(id)=>emulator.device.device.job(id)',job_id)
+        after=self.page.evaluate("emulator.device.device.systemStatus('mbus')")
+        self.assertEqual((job['state'],job['result']['stage']),('completed','up_to_date'))
+        self.assertEqual((after['version'],after['reboots']),(before['version'],before['reboots']))
+        self.assertIn('No newer release',self.text())
+        self.assertIn('current=demo-rf-main-2, latest=demo-rf-main-2',self.text())
+        self.assertIn('No firmware transferred.',self.text())
+        self.assertNotIn('\uf00c Flash',self.text())
+        self.assertNotEqual(right_pixel(),filled_color)
+        self.assertTrue(any(row['text']=='Done - Close' for row in objects(self.page)))
+
+    def test_newer_rf_demo_version_reports_current_and_catalog_head(self):
+        self.page.goto(self.url+'/?moduleCondition=otadata-invalid')
+        self.page.wait_for_function('globalThis.emulator?.measurements.frames>2')
+        self.page.evaluate("globalThis.unavailable=[];addEventListener('emulator-unavailable',e=>unavailable.push(e.detail))")
+        click_text(self.page,'INTERNAL')
+        self.tick()
+        self.tick()
+        self.click('/Settings')
+        self.tick()
+        self.click('/Monster OTA')
+        before=self.page.evaluate("emulator.device.device.systemStatus('mbus')")
+        self.assertEqual((before['version'],before['reboots']),('demo-rf-main-3',0))
+
+        self.assertEqual(self.page.evaluate('emulator.module._emu_set_timing(1)'),1)
+        self.click('show_ota_page.check_btn')
+        job_id=self.page.evaluate("emulator.device.device.systemStatus('mbus').active")
+        self.advance(1500)
+        checking=self.page.evaluate('(id)=>emulator.device.device.job(id)',job_id)
+        self.assertEqual((checking['state'],checking['result']['stage'],checking['progress']),
+                         ('running','checking',0))
+        self.assertIn('Simulated OTA: checking',self.text())
+        self.advance(2500)
+        after=self.page.evaluate("emulator.device.device.systemStatus('mbus')")
+        self.assertEqual((after['version'],after['reboots']),(before['version'],before['reboots']))
+        self.assertIn('No newer release',self.text())
+        self.assertIn('current=demo-rf-main-3, latest=demo-rf-main-2',self.text())
+        self.assertIn('No firmware transferred.',self.text())
+        self.assertNotIn('\uf00c Flash',self.text())
+        self.assertTrue(any(row['text']=='Done - Close' for row in objects(self.page)))
 
     def test_rf_choice_on_classic_module_is_blocked_before_install(self):
         self.click('emu.ota.variant')

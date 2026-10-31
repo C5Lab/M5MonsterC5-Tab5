@@ -41,7 +41,7 @@ wifiCondition.addEventListener('change',()=>{
   location.assign(url);
 });
 const conditionValue = startupUrl.searchParams.get('moduleCondition');
-moduleCondition.value = ['missing-board','grove-only','missing-sd','version-mismatch'].includes(conditionValue)?conditionValue:'normal';
+moduleCondition.value = ['missing-board','grove-only','missing-sd','version-mismatch','otadata-invalid'].includes(conditionValue)?conditionValue:'normal';
 moduleCondition.addEventListener('change',()=>{
   const url=new URL(location.href);
   if(moduleCondition.value==='normal')url.searchParams.delete('moduleCondition');
@@ -156,6 +156,17 @@ try {
   if (!scenarioResponse.ok) throw new Error('Scenario could not be loaded');
   const scenario=await scenarioResponse.json();
   const seed=wifiDemoSeed(scenario,wifiCondition.value);
+  if (moduleCondition.value === 'otadata-invalid') {
+    // RF fixture mirrors the reported version relationship and OTA warning.
+    // GROVE is absent so the native OTA page chooses MBUS without test hooks.
+    const grove=seed.modules.find(module=>module.id==='grove');
+    const mbus=seed.modules.find(module=>module.id==='mbus');
+    if (!grove||!mbus) throw new Error('RF OTA fixture requires GROVE and MBUS');
+    grove.connected=false;
+    if (!mbus.capabilities.includes('subghz')) mbus.capabilities.push('subghz');
+    mbus.demo_version='demo-rf-main-3';
+    mbus.ota_metadata_invalid=true;
+  }
   const device = new BrowserDevice(seed);
   const radioAvailability = tab => {
     try {

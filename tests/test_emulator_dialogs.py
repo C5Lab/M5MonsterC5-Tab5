@@ -35,11 +35,11 @@ class NativeDialogs(unittest.TestCase):
     def test_version_actions_all_rotations(self):
         for rotation in range(4):
             self.condition('version-mismatch',rotation)
-            self.assertIn('JanOS Version Mismatch',self.text());self.shot('version-mismatch',rotation)
-            click_text(self.page,'OK');self.assertNotIn('JanOS Version Mismatch',self.text())
+            self.assertIn('JanOS Compatibility Warning',self.text());self.shot('version-mismatch',rotation)
+            click_text(self.page,'OK');self.assertNotIn('JanOS Compatibility Warning',self.text())
             self.condition('version-mismatch',rotation)
             click_text(self.page,'Monster OTA',contains=True)
-            self.assertNotIn('JanOS Version Mismatch',self.text())
+            self.assertNotIn('JanOS Compatibility Warning',self.text())
             self.assertIn('Download & Flash',self.text());self.clean()
     click_binding=wd.WardriveBrowser.click
     def test_home_confirmation_no_yes_and_reopen(self):

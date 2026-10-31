@@ -50,16 +50,21 @@ EM_JS(void,app_ota_current_version,(int tab,char *out,int size),{
 });
 EM_JS(int, app_ota_poll, (int id,char *text,int size,int *progress), {
  const j=emulatorDevice.device.job(id);
- HEAP32[progress>>2]=Math.round((j?.progress||0)*100);
- stringToUTF8('Simulated OTA: '+(j?(j.state==='running'?j.result?.stage:j.state):'reset')+
+ const noUpdate=j?.result?.stage==='up_to_date';
+ HEAP32[progress>>2]=noUpdate?0:Math.round((j?.progress||0)*100);
+ stringToUTF8(noUpdate?'No newer release':'Simulated OTA: '+(j?(j.state==='running'?j.result?.stage:j.state):'reset')+
    (j?.error?' - '+j.error:""),text,size);
- return j?.state==='running'?0:1;
+ return j?.state==='running'?0:noUpdate?2:1;
 });
 EM_JS(void, app_ota_info, (int tab,char *text,int size), {
  const s=emulatorDevice.device.systemStatus(emulatorDevice.module(tab));
  stringToUTF8('Offline simulation\nBoard: '+s.boardName+'\nVersion: '+s.version+
  '\nConnected: '+s.connected+'\nVariant: '+s.firmwareVariant+
- '\nRF capable: '+s.rfCapable+'\nReboots: '+s.reboots,text,size);
+  '\nRF capable: '+s.rfCapable+'\nReboots: '+s.reboots+
+  (s.otaDataStatus==='invalid'
+    ?'\nSimulated ESP-IDF diagnostic: esp_ota_ops: ota data invalid, no current app. Assuming factory'+
+     '\nState unavailable (-1); this fixture cannot verify or repair flash.'
+    :String()),text,size);
 });
 static void ota_close_monitor(void)
 {
@@ -390,7 +395,8 @@ static void app_ota_begin_update(const char *release) {
  char detail[180];snprintf(detail,sizeof(detail),"%s variant%s%s. Demo firmware only; no hardware access.",
      rf?"RF":"Classic",release&&release[0]?" release ":" latest",
      release&&release[0]?release:"");
- ota_status_set_phase("Simulated update starting",detail,COLOR_MATERIAL_ORANGE,0,0);
+ ota_status_set_phase(release&&release[0]?"Simulated update starting":"Checking for newer release",
+                      detail,COLOR_MATERIAL_ORANGE,0,0);
  ota_monitor_set_close_state(true,COLOR_MATERIAL_ORANGE,"Cancel simulated update");
 }
 static void app_ota_confirm_cancel_cb(lv_event_t *e){(void)e;app_ota_confirm_close();}
@@ -508,24 +514,37 @@ static void app_settings_ota_tick(double now) {
  if(!app_ota_job)return;
  if(!g_ota.mon_overlay){app_ota_cancel(app_ota_job);app_ota_job=0;return;}
  char text[256];int pct=0;int done=app_ota_poll(app_ota_job,text,sizeof(text),&pct);
- ota_status_set_phase(text,"Offline simulation. No hardware flashed.",COLOR_MATERIAL_ORANGE,done?4:pct/25,pct);
- if(done){app_ota_job=0;ota_monitor_set_close_state(true,COLOR_MATERIAL_ORANGE,"Close");
+ if(done==2){
+  char current[48],latest[48],detail[180];
+  int dev=!strcmp(g_ota.channel,"dev"),rf=app_ota_effective_rf(g_ota.target_tab,g_ota.variant_choice);
+  app_ota_current_version(g_ota.target_tab,current,sizeof(current));
+  app_ota_release_tag(g_ota.target_tab,dev,rf,0,latest,sizeof(latest));
+  snprintf(detail,sizeof(detail),"current=%s, latest=%s. No firmware transferred.",current,latest);
+  ota_status_set_phase(text,detail,COLOR_MATERIAL_GREEN,1,pct);
+ }else
+  ota_status_set_phase(text,"Offline simulation. No hardware flashed.",COLOR_MATERIAL_ORANGE,done?4:pct/25,pct);
+ if(done){app_ota_job=0;ota_monitor_set_close_state(true,done==2?COLOR_MATERIAL_GREEN:COLOR_MATERIAL_ORANGE,
+                                                     done==2?"Done - Close":"Close");
   char info[384];app_ota_info(g_ota.target_tab,info,sizeof(info));ota_append_log(info);}
 }
 
 EM_JS(int,app_ota_slot_snapshot,(int tab,int index,char *out,int size),{
  const s=emulatorDevice.device.systemStatus(emulatorDevice.module(tab));if(out)stringToUTF8(s.slots[index],out,size);return s.activeSlot;
 });
+EM_JS(int,app_ota_metadata_invalid,(int tab),{
+ return emulatorDevice.device.systemStatus(emulatorDevice.module(tab)).otaDataStatus==='invalid'?1:0;
+});
 EM_JS(int,app_ota_slot_start,(int tab,int slot,char *error,int size),{
  try{return emulatorDevice.device.systemActivateSlot(emulatorDevice.module(tab),slot);}catch(e){stringToUTF8(e.message,error,size);return 0;}
 });
 static void app_ota_slots_refresh(void) {
  int active=app_ota_slot_snapshot(g_ota.target_tab,-1,NULL,0);
+ int metadata_invalid=app_ota_metadata_invalid(g_ota.target_tab);
  for(int i=0;i<2;i++) {
   ota_slot_info_t *s=&g_ota.info_slots[i];if(!s->card)return;
   lv_label_set_text_fmt(s->title_label,"Slot ota_%d",i);
   lv_label_set_text(s->role_label,i==active?"Running / boot slot":"Standby image");
-  lv_label_set_text(s->meta_label,"Offline simulated partition");
+  lv_label_set_text(s->meta_label,metadata_invalid?"State unavailable (-1)":"Offline simulated partition");
   char version[48];app_ota_slot_snapshot(g_ota.target_tab,i,version,sizeof(version));lv_label_set_text(s->version_label,version);
   if(app_ota_slot_job)lv_obj_add_state(s->activate_btn,LV_STATE_DISABLED);else lv_obj_remove_state(s->activate_btn,LV_STATE_DISABLED);
   lv_label_set_text(s->build_label,"Demo firmware only");

@@ -1,10 +1,10 @@
 {
   "source_files": 30,
-  "functions": 2150,
+  "functions": 2153,
   "event_registration_sites": 521,
   "resolved_callback_sites": 521,
-  "boundary_call_sites": 2143,
-  "global_declarations": 1166,
+  "boundary_call_sites": 2151,
+  "global_declarations": 1158,
   "routes": 110,
   "story_steps": 44,
   "syntax_diagnostics": 0

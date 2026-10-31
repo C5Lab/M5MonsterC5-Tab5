@@ -35,9 +35,9 @@ class Queue2NettoolsBrowser(unittest.TestCase):
     if scroll_parent:
      left=max(0,scroll_parent['x']);top=max(0,scroll_parent['y']);right=min(w,scroll_parent['x']+scroll_parent['width']);bottom=min(h,scroll_parent['y']+scroll_parent['height'])
     if x>=w or x<0:
-     self.page.evaluate('([x,y,d])=>emulator.module._emu_wheel(x,y,d)',[w//2,max(20,min(h-20,int(y))),220 if x>=w else -220])
-     box=self.page.locator('#display').bounding_box();sy=box['y']+max(20,min(h-20,y))*box['height']/h
-     self.page.mouse.move(box['x']+box['width']*.75,sy);self.page.mouse.down();self.page.mouse.move(box['x']+box['width']*.25,sy,steps=10);self.page.mouse.up()
+     # One bounded wheel step keeps the horizontal strip from overshooting
+     # a target when LVGL adds inertia to a pointer drag.
+     self.page.evaluate('([x,y,d])=>emulator.module._emu_wheel(x,y,d)',[w//2,max(20,min(h-20,int(y))),120 if x>=w else -120])
     else:self.page.evaluate('([x,y,d])=>emulator.module._emu_wheel(x,y,d)',[max(10,min(w-10,int((left+right)/2))),max(10,min(h-10,int((top+bottom)/2))),180 if y>=bottom else -180])
    else:
     self.page.evaluate('emulator.module._emu_wheel(350,500,250)')
@@ -55,6 +55,13 @@ class Queue2NettoolsBrowser(unittest.TestCase):
   self.page.wait_for_function("document.querySelector('#guide-progress').textContent.endsWith('complete')",timeout=3000)
   self.assertEqual(self.page.locator('#guide-title').inner_text(),self.kind.upper()+' complete')
   self.assertEqual(self.errors,[])
+ def test_mitm_tile_is_reachable_in_portrait_rotations(self):
+  for rotation in (0,2):
+   with self.subTest(rotation=rotation):
+    self.open('mitm',rotation);self.scan();self.click('MITM')
+    self.assertTrue(any(o['text']=='Connect & Start' for o in objects(self.page)))
+    self.assertEqual(self.errors,[])
+    self.context.close()
  def test_s13_all_rotations(self):
   for rotation in range(4):
    for kind in ['arp','mitm','nmap']:

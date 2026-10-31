@@ -192,7 +192,7 @@
     "show_settings_page": "retain",
     "show_sd_admin_page": "unsupported"
   },
-  "source_sha256": "548e6c27765a55da0e833d3ffc0597ced1382499ee436e5b0d1efbf0d914dea2",
+  "source_sha256": "cf9e50800bb86eecdb3bcfa1faa514d551de0364d9bb6dc5a3939da1c42f3be4",
   "notes": {
     "retain": "Byte-exact firmware function; event registration wrapper records frozen IDs without replacing callbacks.",
     "adapter": "Explicit cooperative or virtual state implementation in runtime/application.c.",

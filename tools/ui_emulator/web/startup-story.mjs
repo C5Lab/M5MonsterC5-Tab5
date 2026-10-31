@@ -4,7 +4,7 @@ export function startupStory(condition='normal'){
  const add=(key,title,instruction,flow)=>steps.push({key,title,instruction,flow});
  const groveOnly=condition==='grove-only';
  if(condition==='missing-board')add('noBoard','No external boards','Read No Board Detected, then choose Continue Anyway. If already dismissed, reload this page and start this tour again.','show_no_board_popup');
- if(condition==='version-mismatch')add('versionWarning','Check the version warning','Read JanOS Version Mismatch and choose OK. If you chose Monster OTA, return to GROVE. If already dismissed, reload this page and start this tour again.','show_version_mismatch_popup');
+ if(condition==='version-mismatch')add('versionWarning','Check the version warning','Read JanOS Compatibility Warning and choose OK. If you chose Monster OTA, return to GROVE. If already dismissed, reload this page and start this tour again.','show_version_mismatch_popup');
  if(condition!=='missing-board')add('groveHome','Explore GROVE','Select GROVE and view its home tiles. This module has its own connection and operation state.','show_uart1_tiles');
  if(condition==='missing-sd'){
   add('sdWarning','Check the SD warning','On GROVE, open Wardrive to see the missing SD warning.','show_sd_warning_popup');

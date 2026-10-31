@@ -115,6 +115,30 @@ node --test tests\test_emulator_wpa_auditor.mjs
 tools\ui_emulator\.venv\Scripts\python.exe -u tests\test_emulator_wpa_auditor.py -v
 ```
 
+## Monster OTA offline demo
+
+Open **INTERNAL → Settings → Monster OTA**. **Info** shows simulated boot
+slots; **Check** installs a newer demo release when one exists. Checking again
+shows **No newer release**, with no download or flash progress. **Force** opens
+the demo release list for an explicit reinstall or downgrade.
+
+Under **Demo module conditions**, choose **RF OTA: newer firmware, invalid
+metadata** to reproduce the reported diagnostic relationship. This fixture
+disconnects GROVE so Monster OTA selects the RF module on MBUS, starts both
+slots at `demo-rf-main-3` while the latest demo release is `demo-rf-main-2`,
+and shows the simulated `ota data invalid` warning in **Info**. **Check**
+leaves the newer version and reboot count unchanged. The metadata warning
+remains a diagnostic fixture after simulated operations; this demo does not
+read, repair, or write C5 flash. **Reset demo** restores the normal condition.
+
+Focused checks after rebuilding:
+
+```bat
+node --test tests\test_emulator_device.mjs
+tools\ui_emulator\.venv\Scripts\python.exe -u tests\test_emulator_ota_variant.py -v
+tools\ui_emulator\.venv\Scripts\python.exe -u tests\test_emulator_ota_metadata.py -v
+```
+
 ## Global Portal and Observer Probes & Karma
 
 On Grove or MBus, open **Global WiFi Attacks → Portal**. The native popup

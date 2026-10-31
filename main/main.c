@@ -318,6 +318,13 @@ typedef struct {
     char ap_name[33];
     char bssid[18];
     int rssi;
+    bool is_csa;
+    int target_channel;
+    char claimed_tx[18];
+    char csa_via[7];
+    int csa_count;
+    int csa_mode;
+    int csa_class;  // -1 when no operating class was announced
 } deauth_entry_t;
 
 // BT device storage
@@ -1254,6 +1261,7 @@ typedef struct {
     // =====================================================================
     lv_obj_t *deauth_detector_page;
     lv_obj_t *deauth_detector_table;
+    lv_obj_t *deauth_detector_count_label;
     lv_obj_t *deauth_detector_start_btn;
     lv_obj_t *deauth_detector_stop_btn;
 
@@ -3027,16 +3035,6 @@ static const char *default_portal_html =
     "</div>"
     "</body></html>";
 
-// Deauth Detector (global legacy - type defined earlier)
-static deauth_entry_t deauth_entries[DEAUTH_DETECTOR_MAX_ENTRIES];
-static int deauth_entry_count = 0;
-static lv_obj_t *deauth_detector_page = NULL;
-static lv_obj_t *deauth_table = NULL;
-static lv_obj_t *deauth_start_btn = NULL;
-static lv_obj_t *deauth_stop_btn = NULL;
-static volatile bool deauth_detector_running = false;
-static TaskHandle_t deauth_detector_task_handle = NULL;
-
 // Bluetooth menu
 static lv_obj_t *bt_menu_page = NULL;
 static lv_obj_t *bt_airtag_page = NULL;
@@ -3571,7 +3569,7 @@ static void deauth_detector_back_btn_event_cb(lv_event_t *e);
 static void deauth_detector_start_cb(lv_event_t *e);
 static void deauth_detector_stop_cb(lv_event_t *e);
 static void deauth_detector_task(void *arg);
-static void update_deauth_table(void);
+static void update_deauth_table(tab_context_t *ctx);
 static void show_bluetooth_menu_page(void);
 static void bt_menu_tile_event_cb(lv_event_t *e);
 static void bt_menu_back_btn_event_cb(lv_event_t *e);
@@ -49495,17 +49493,19 @@ static void pcap_viewer_render_capture_page(pcap_viewer_state_t *state)
 //==================================================================================
 
 // Update the deauth table UI with current entries
-static void update_deauth_table(void)
+static void update_deauth_table(tab_context_t *ctx)
 {
-    if (!deauth_table) return;
+    if (!ctx || !ctx->deauth_detector_table || !ctx->deauth_entries) return;
+    lv_obj_t *deauth_table = ctx->deauth_detector_table;
 
     // Save scroll position
     lv_coord_t scroll_y = lv_obj_get_scroll_y(deauth_table);
 
     lv_obj_clean(deauth_table);
 
-    for (int i = 0; i < deauth_entry_count; i++) {
-        deauth_entry_t *entry = &deauth_entries[i];
+    int csa_events = 0;
+    for (int i = 0; i < ctx->deauth_entry_count; i++) {
+        deauth_entry_t *entry = &ctx->deauth_entries[i];
 
         lv_obj_t *row = lv_obj_create(deauth_table);
         lv_obj_set_size(row, lv_pct(100), LV_SIZE_CONTENT);
@@ -49516,6 +49516,38 @@ static void update_deauth_table(void)
         lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
         lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
         lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+        if (entry->is_csa) {
+            csa_events++;
+            lv_obj_set_flex_flow(row, LV_FLEX_FLOW_COLUMN);
+            lv_obj_set_style_pad_row(row, 4, 0);
+            lv_obj_t *summary = lv_label_create(row);
+            lv_label_set_text_fmt(summary, "CSA | %s | RX CH%d -> TO CH%d",
+                                  entry->ap_name, entry->channel, entry->target_channel);
+            lv_obj_set_style_text_font(summary, &lv_font_montserrat_14, 0);
+            lv_obj_set_style_text_color(summary, COLOR_MATERIAL_AMBER, 0);
+            lv_obj_set_width(summary, lv_pct(100));
+            lv_label_set_long_mode(summary, LV_LABEL_LONG_WRAP);
+            lv_obj_t *identity = lv_label_create(row);
+            lv_label_set_text_fmt(identity, "BSSID: %s | Claimed TX: %s",
+                                  entry->bssid, entry->claimed_tx);
+            lv_obj_set_style_text_font(identity, &lv_font_montserrat_12, 0);
+            lv_obj_set_style_text_color(identity, lv_color_hex(0xCCCCCC), 0);
+            lv_obj_set_width(identity, lv_pct(100));
+            lv_label_set_long_mode(identity, LV_LABEL_LONG_WRAP);
+            lv_obj_t *detail = lv_label_create(row);
+            char operating_class[8];
+            if (entry->csa_class < 0) snprintf(operating_class, sizeof(operating_class), "-");
+            else snprintf(operating_class, sizeof(operating_class), "%d", entry->csa_class);
+            lv_label_set_text_fmt(detail, "%s | Count: %d | %d dBm | Mode: %d | Class: %s",
+                                  entry->csa_via, entry->csa_count, entry->rssi,
+                                  entry->csa_mode, operating_class);
+            lv_obj_set_style_text_font(detail, &lv_font_montserrat_12, 0);
+            lv_obj_set_style_text_color(detail, lv_color_hex(0xCCCCCC), 0);
+            lv_obj_set_width(detail, lv_pct(100));
+            lv_label_set_long_mode(detail, LV_LABEL_LONG_WRAP);
+            continue;
+        }
 
         // Channel
         lv_obj_t *ch_lbl = lv_label_create(row);
@@ -49553,35 +49585,124 @@ static void update_deauth_table(void)
         lv_obj_set_width(rssi_lbl, 45);
     }
 
+    if (ctx->deauth_detector_count_label) {
+        lv_label_set_text_fmt(ctx->deauth_detector_count_label,
+                              "Stored: %d deauth | %d CSA announcements",
+                              ctx->deauth_entry_count - csa_events, csa_events);
+    }
+
     // Restore scroll position
     lv_obj_scroll_to_y(deauth_table, scroll_y, LV_ANIM_OFF);
+}
+
+// Parse CSA event fields in wire order, leaving SSID as the final opaque value.
+// Raw channel/mode/class bytes are observations, not a regulatory validation.
+static bool csa_parse_number(const char **cursor, const char *key, int minimum,
+                             int maximum, int *value)
+{
+    size_t key_len = strlen(key);
+    if (strncmp(*cursor, key, key_len)) return false;
+    const char *p = *cursor + key_len;
+    bool negative = *p == '-';
+    if (negative) p++;
+    if (!isdigit((unsigned char)*p)) return false;
+    int number = 0;
+    while (isdigit((unsigned char)*p)) {
+        if (number > 255) return false;
+        number = number * 10 + (*p++ - '0');
+    }
+    if (negative) number = -number;
+    if (number < minimum || number > maximum || strncmp(p, " | ", 3)) return false;
+    *value = number;
+    *cursor = p + 3;
+    return true;
+}
+
+static bool csa_parse_mac(const char **cursor, const char *key, char out[18])
+{
+    size_t key_len = strlen(key);
+    if (strncmp(*cursor, key, key_len)) return false;
+    const char *p = *cursor + key_len;
+    if (strlen(p) < 20) return false;
+    for (int i = 0; i < 17; i++) {
+        if (i % 3 == 2 ? p[i] != ':' : !isxdigit((unsigned char)p[i])) return false;
+    }
+    if (strncmp(p + 17, " | ", 3)) return false;
+    memcpy(out, p, 17);
+    out[17] = '\0';
+    *cursor = p + 20;
+    return true;
+}
+
+static bool parse_csa_line(const char *line, deauth_entry_t *entry)
+{
+    if (!line || !entry) return false;
+    size_t length = 0;
+    while (length < 256 && line[length]) length++;
+    if (length == 256) return false;
+    const char *p = strstr(line, "[CSA] ");
+    if (!p) return false;
+    p += 6;
+    deauth_entry_t parsed = { .is_csa = true, .csa_class = -1 };
+    if (!csa_parse_number(&p, "RX: ", 0, 255, &parsed.channel) ||
+        !csa_parse_number(&p, "TO: ", 0, 255, &parsed.target_channel) ||
+        !csa_parse_mac(&p, "BSSID: ", parsed.bssid) ||
+        !csa_parse_mac(&p, "TX: ", parsed.claimed_tx) ||
+        !csa_parse_number(&p, "RSSI: ", -128, 127, &parsed.rssi)) return false;
+    const char *types[] = { "beacon", "probe", "action" };
+    bool found = false;
+    for (size_t i = 0; i < sizeof(types) / sizeof(types[0]); i++) {
+        char field[24];
+        snprintf(field, sizeof(field), "VIA: %s | ", types[i]);
+        size_t size = strlen(field);
+        if (!strncmp(p, field, size)) {
+            snprintf(parsed.csa_via, sizeof(parsed.csa_via), "%s", types[i]);
+            p += size;
+            found = true;
+            break;
+        }
+    }
+    if (!found || !csa_parse_number(&p, "COUNT: ", 0, 255, &parsed.csa_count) ||
+        !csa_parse_number(&p, "MODE: ", 0, 255, &parsed.csa_mode)) return false;
+    if (!strncmp(p, "CLASS: - | ", 11)) p += 11;
+    else if (!csa_parse_number(&p, "CLASS: ", 0, 255, &parsed.csa_class)) return false;
+    if (strncmp(p, "SSID: ", 6)) return false;
+    p += 6;
+    size_t ssid_len = strlen(p);
+    if (!ssid_len || ssid_len >= sizeof(parsed.ap_name)) return false;
+    for (size_t i = 0; i < ssid_len; i++) {
+        if ((unsigned char)p[i] < 32 || (unsigned char)p[i] == 127) return false;
+    }
+    memcpy(parsed.ap_name, p, ssid_len + 1);
+    *entry = parsed;
+    return true;
 }
 
 // Parse deauth line and add to entries
 // Format: [DEAUTH] CH: <channel> | AP: <ap_name> (<bssid>) | RSSI: <rssi>
 static bool parse_deauth_line(const char *line, deauth_entry_t *entry)
 {
-    if (strstr(line, "[DEAUTH]") == NULL) return false;
+    if (!line || !entry) return false;
+    const char *cursor = strstr(line, "[DEAUTH] ");
+    if (!cursor) return false;
+    cursor += sizeof("[DEAUTH] ") - 1;
 
-    // Parse channel
-    const char *ch_ptr = strstr(line, "CH:");
-    if (!ch_ptr) return false;
-    entry->channel = atoi(ch_ptr + 3);
+    deauth_entry_t parsed = {0};
+    if (!csa_parse_number(&cursor, "CH: ", 0, 255, &parsed.channel) ||
+        strncmp(cursor, "AP:", 3)) return false;
 
     // Parse AP name - between "AP: " and " ("
-    const char *ap_ptr = strstr(line, "AP:");
-    if (!ap_ptr) return false;
-    ap_ptr += 3;
+    const char *ap_ptr = cursor + 3;
     while (*ap_ptr == ' ') ap_ptr++;
 
-    const char *paren = strchr(ap_ptr, '(');
+    const char *paren = strrchr(ap_ptr, '(');
     if (!paren) return false;
 
     size_t ap_len = paren - ap_ptr;
     while (ap_len > 0 && ap_ptr[ap_len - 1] == ' ') ap_len--;
-    if (ap_len >= sizeof(entry->ap_name)) ap_len = sizeof(entry->ap_name) - 1;
-    memcpy(entry->ap_name, ap_ptr, ap_len);
-    entry->ap_name[ap_len] = '\0';
+    if (ap_len >= sizeof(parsed.ap_name)) ap_len = sizeof(parsed.ap_name) - 1;
+    memcpy(parsed.ap_name, ap_ptr, ap_len);
+    parsed.ap_name[ap_len] = '\0';
 
     // Parse BSSID - between "(" and ")"
     paren++;
@@ -49589,15 +49710,26 @@ static bool parse_deauth_line(const char *line, deauth_entry_t *entry)
     if (!paren_end) return false;
 
     size_t bssid_len = paren_end - paren;
-    if (bssid_len >= sizeof(entry->bssid)) bssid_len = sizeof(entry->bssid) - 1;
-    memcpy(entry->bssid, paren, bssid_len);
-    entry->bssid[bssid_len] = '\0';
+    if (bssid_len != 17) return false;
+    for (size_t i = 0; i < bssid_len; i++) {
+        if (i % 3 == 2 ? paren[i] != ':' : !isxdigit((unsigned char)paren[i])) return false;
+    }
+    memcpy(parsed.bssid, paren, bssid_len);
+    parsed.bssid[bssid_len] = '\0';
 
     // Parse RSSI
-    const char *rssi_ptr = strstr(line, "RSSI:");
-    if (!rssi_ptr) return false;
-    entry->rssi = atoi(rssi_ptr + 5);
+    const char *rssi_ptr = paren_end + 1;
+    if (strncmp(rssi_ptr, " | RSSI: ", 9)) return false;
+    rssi_ptr += 9;
+    const char *rssi_number = rssi_ptr;
+    if (*rssi_ptr == '-') rssi_ptr++;
+    if (!isdigit((unsigned char)*rssi_ptr)) return false;
+    char *end = NULL;
+    long rssi = strtol(rssi_number, &end, 10);
+    if (rssi < -128 || rssi > 127 || (*end != '\0' && *end != '\x1b')) return false;
+    parsed.rssi = (int)rssi;
 
+    *entry = parsed;
     return true;
 }
 
@@ -49614,13 +49746,16 @@ static void deauth_detector_task(void *arg)
 
     ESP_LOGI(TAG, "[%s] Deauth detector task started for tab %d", uart_name, task_tab);
 
-    static char rx_buffer[512];
-    static char line_buffer[256];
+    char rx_buffer[512];
+    char line_buffer[256];
     int line_pos = 0;
+    bool line_overflow = false;
+    bool csa_ui_dirty = false;
+    int64_t last_csa_ui_us = esp_timer_get_time() - 1000000;
 
     // Use context's flag
     while (ctx && ctx->deauth_detector_running) {
-        int len = transport_read_bytes(uart_port, rx_buffer, sizeof(rx_buffer) - 1, pdMS_TO_TICKS(100));
+        int len = transport_read_bytes_tab(task_tab, uart_port, rx_buffer, sizeof(rx_buffer) - 1, pdMS_TO_TICKS(100));
 
         if (len > 0) {
             rx_buffer[len] = '\0';
@@ -49629,44 +49764,67 @@ static void deauth_detector_task(void *arg)
                 char c = rx_buffer[i];
 
                 if (c == '\n' || c == '\r') {
-                    if (line_pos > 0) {
+                    if (line_pos > 0 && !line_overflow) {
                         line_buffer[line_pos] = '\0';
 
-                        deauth_entry_t entry;
-                        if (parse_deauth_line(line_buffer, &entry)) {
-                            ESP_LOGI(TAG, "Deauth detected: CH%d %s (%s) RSSI=%d",
-                                     entry.channel, entry.ap_name, entry.bssid, entry.rssi);
+                        deauth_entry_t entry = {0};
+                        bool is_csa = parse_csa_line(line_buffer, &entry);
+                        if (ctx->deauth_entries && (is_csa || parse_deauth_line(line_buffer, &entry))) {
+                            ESP_LOGI(TAG, "%s observed: CH%d %s (%s) RSSI=%d",
+                                     is_csa ? "CSA announcement" : "Deauth", entry.channel,
+                                     entry.ap_name, entry.bssid, entry.rssi);
                             // A flood is hundreds of frames a minute; the 15 s
                             // cooldown on ALARM is what makes this survivable.
-                            alert_chime_play(ALERT_TONE_ALARM);
+                            if (!is_csa) alert_chime_play(ALERT_TONE_ALARM);
 
                             // Shift entries down (newest first)
-                            if (deauth_entry_count < DEAUTH_DETECTOR_MAX_ENTRIES) {
-                                deauth_entry_count++;
+                            if (ctx->deauth_entry_count < DEAUTH_DETECTOR_MAX_ENTRIES) {
+                                ctx->deauth_entry_count++;
                             }
-                            memmove(&deauth_entries[1], &deauth_entries[0],
-                                    (deauth_entry_count - 1) * sizeof(deauth_entry_t));
-                            deauth_entries[0] = entry;
+                            memmove(&ctx->deauth_entries[1], &ctx->deauth_entries[0],
+                                    (ctx->deauth_entry_count - 1) * sizeof(deauth_entry_t));
+                            ctx->deauth_entries[0] = entry;
 
-                            // Update UI
-                            bsp_display_lock(0);
-                            update_deauth_table();
-                            bsp_display_unlock();
+                            // Keep every event, but batch CSA-only refreshes to 1 Hz.
+                            // Legacy deauth rows and their alert still update immediately.
+                            csa_ui_dirty = is_csa;
+                            if (!is_csa) {
+                                bsp_display_lock(0);
+                                update_deauth_table(ctx);
+                                bsp_display_unlock();
+                                last_csa_ui_us = esp_timer_get_time();
+                            }
                         }
 
-                        line_pos = 0;
                     }
-                } else if (line_pos < (int)sizeof(line_buffer) - 1) {
+                    line_pos = 0;
+                    line_overflow = false;
+                } else if (!line_overflow && line_pos < (int)sizeof(line_buffer) - 1) {
                     line_buffer[line_pos++] = c;
+                } else {
+                    line_overflow = true;
                 }
             }
         }
 
+        if (csa_ui_dirty && (esp_timer_get_time() - last_csa_ui_us >= 1000000 ||
+                             !ctx->deauth_detector_running)) {
+            bsp_display_lock(0);
+            update_deauth_table(ctx);
+            bsp_display_unlock();
+            csa_ui_dirty = false;
+            last_csa_ui_us = esp_timer_get_time();
+        }
         vTaskDelay(pdMS_TO_TICKS(50));
     }
 
+    if (csa_ui_dirty) {
+        bsp_display_lock(0);
+        update_deauth_table(ctx);
+        bsp_display_unlock();
+    }
     ESP_LOGI(TAG, "Deauth detector task ended");
-    deauth_detector_task_handle = NULL;
+    if (ctx) ctx->deauth_detector_task = NULL;
     vTaskDelete(NULL);
 }
 
@@ -49674,80 +49832,55 @@ static void deauth_detector_task(void *arg)
 static void deauth_detector_start_cb(lv_event_t *e)
 {
     (void)e;
-    if (deauth_detector_running) return;
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx || ctx->deauth_detector_running || ctx->deauth_detector_task || !ctx->deauth_entries) return;
 
     ESP_LOGI(TAG, "Starting deauth detector");
     uart_send_command_for_tab("deauth_detector");
 
-    deauth_detector_running = true;
+    ctx->deauth_detector_running = true;
 
-    // Also mark in context
-    tab_context_t *ctx = get_current_ctx();
-    if (ctx) {
-        ctx->deauth_detector_running = true;
+    if (xTaskCreate(deauth_detector_task, "deauth_det", 4096, (void*)ctx, 5,
+                    &ctx->deauth_detector_task) != pdPASS) {
+        ctx->deauth_detector_running = false;
+        ctx->deauth_detector_task = NULL;
+        uart_send_command_for_tab("stop");
+        ESP_LOGE(TAG, "Failed to create detector monitor task");
+        return;
     }
 
-    xTaskCreate(deauth_detector_task, "deauth_det", 4096, (void*)ctx, 5, &deauth_detector_task_handle);
-
     // Update button states
-    lv_obj_add_state(deauth_start_btn, LV_STATE_DISABLED);
-    lv_obj_clear_state(deauth_stop_btn, LV_STATE_DISABLED);
+    lv_obj_add_state(ctx->deauth_detector_start_btn, LV_STATE_DISABLED);
+    lv_obj_clear_state(ctx->deauth_detector_stop_btn, LV_STATE_DISABLED);
 }
 
 // Stop button callback
 static void deauth_detector_stop_cb(lv_event_t *e)
 {
     (void)e;
-    if (!deauth_detector_running) return;
+    tab_context_t *ctx = get_current_ctx();
+    if (!ctx || !ctx->deauth_detector_running) return;
 
     ESP_LOGI(TAG, "Stopping deauth detector");
     uart_send_command_for_tab("stop");
 
-    deauth_detector_running = false;
-
-    // Also clear in context
-    tab_context_t *stop_ctx = get_current_ctx();
-    if (stop_ctx) {
-        stop_ctx->deauth_detector_running = false;
-    }
-
-    if (deauth_detector_task_handle != NULL) {
+    ctx->deauth_detector_running = false;
+    if (ctx->deauth_detector_task != NULL) {
         vTaskDelay(pdMS_TO_TICKS(100));
-        deauth_detector_task_handle = NULL;
     }
 
     // Update button states
-    lv_obj_clear_state(deauth_start_btn, LV_STATE_DISABLED);
-    lv_obj_add_state(deauth_stop_btn, LV_STATE_DISABLED);
+    lv_obj_clear_state(ctx->deauth_detector_start_btn, LV_STATE_DISABLED);
+    lv_obj_add_state(ctx->deauth_detector_stop_btn, LV_STATE_DISABLED);
 }
 
 // Back button callback - hide page and show tiles
 static void deauth_detector_back_btn_event_cb(lv_event_t *e)
 {
     (void)e;
-
-    // Stop detector if running
-    if (deauth_detector_running) {
-        uart_send_command_for_tab("stop");
-        deauth_detector_running = false;
-
-        // Also clear in context
-        tab_context_t *back_ctx = get_current_ctx();
-        if (back_ctx) {
-            back_ctx->deauth_detector_running = false;
-        }
-
-        if (deauth_detector_task_handle != NULL) {
-            vTaskDelay(pdMS_TO_TICKS(100));
-            deauth_detector_task_handle = NULL;
-        }
-
-        // Sync button states after force-stop via Back
-        if (deauth_start_btn) lv_obj_clear_state(deauth_start_btn, LV_STATE_DISABLED);
-        if (deauth_stop_btn)  lv_obj_add_state(deauth_stop_btn, LV_STATE_DISABLED);
-    }
-
     tab_context_t *ctx = get_current_ctx();
+    if (!ctx) return;
+    deauth_detector_stop_cb(NULL);
 
     // Hide deauth detector page
     if (ctx->deauth_detector_page) {
@@ -49772,6 +49905,8 @@ static void show_deauth_detector_page(void)
         return;
     }
 
+    if (!ctx) return;
+
     // Hide all other pages
     hide_all_pages(ctx);
 
@@ -49779,15 +49914,14 @@ static void show_deauth_detector_page(void)
     if (ctx->deauth_detector_page) {
         lv_obj_clear_flag(ctx->deauth_detector_page, LV_OBJ_FLAG_HIDDEN);
         ctx->current_visible_page = ctx->deauth_detector_page;
-        deauth_detector_page = ctx->deauth_detector_page;
         // Sync button states with actual running state
-        if (deauth_start_btn && deauth_stop_btn) {
-            if (deauth_detector_running) {
-                lv_obj_add_state(deauth_start_btn, LV_STATE_DISABLED);
-                lv_obj_clear_state(deauth_stop_btn, LV_STATE_DISABLED);
+        if (ctx->deauth_detector_start_btn && ctx->deauth_detector_stop_btn) {
+            if (ctx->deauth_detector_running) {
+                lv_obj_add_state(ctx->deauth_detector_start_btn, LV_STATE_DISABLED);
+                lv_obj_clear_state(ctx->deauth_detector_stop_btn, LV_STATE_DISABLED);
             } else {
-                lv_obj_clear_state(deauth_start_btn, LV_STATE_DISABLED);
-                lv_obj_add_state(deauth_stop_btn, LV_STATE_DISABLED);
+                lv_obj_clear_state(ctx->deauth_detector_start_btn, LV_STATE_DISABLED);
+                lv_obj_add_state(ctx->deauth_detector_stop_btn, LV_STATE_DISABLED);
             }
         }
         ESP_LOGI(TAG, "Showing existing deauth detector page for tab %d", current_tab);
@@ -49798,16 +49932,15 @@ static void show_deauth_detector_page(void)
 
     // Create page container inside tab container
     ctx->deauth_detector_page = lv_obj_create(container);
-    deauth_detector_page = ctx->deauth_detector_page;
-    lv_obj_set_size(deauth_detector_page, lv_pct(100), lv_pct(100));
-    lv_obj_set_style_bg_color(deauth_detector_page, lv_color_hex(0x1A1A1A), 0);
-    lv_obj_set_style_border_width(deauth_detector_page, 0, 0);
-    lv_obj_set_style_pad_all(deauth_detector_page, 10, 0);
-    lv_obj_set_flex_flow(deauth_detector_page, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_pad_row(deauth_detector_page, 8, 0);
+    lv_obj_set_size(ctx->deauth_detector_page, lv_pct(100), lv_pct(100));
+    lv_obj_set_style_bg_color(ctx->deauth_detector_page, lv_color_hex(0x1A1A1A), 0);
+    lv_obj_set_style_border_width(ctx->deauth_detector_page, 0, 0);
+    lv_obj_set_style_pad_all(ctx->deauth_detector_page, 10, 0);
+    lv_obj_set_flex_flow(ctx->deauth_detector_page, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(ctx->deauth_detector_page, 8, 0);
 
     // Header with back button, title, and start/stop buttons
-    lv_obj_t *header = lv_obj_create(deauth_detector_page);
+    lv_obj_t *header = lv_obj_create(ctx->deauth_detector_page);
     lv_obj_set_size(header, lv_pct(100), LV_SIZE_CONTENT);
     lv_obj_set_style_bg_opa(header, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(header, 0, 0);
@@ -49859,7 +49992,8 @@ static void show_deauth_detector_page(void)
     lv_obj_clear_flag(btn_cont, LV_OBJ_FLAG_SCROLLABLE);
 
     // Start button
-    deauth_start_btn = lv_btn_create(btn_cont);
+    lv_obj_t *deauth_start_btn = lv_btn_create(btn_cont);
+    ctx->deauth_detector_start_btn = deauth_start_btn;
     lv_obj_set_size(deauth_start_btn, 90, 40);
     lv_obj_set_style_bg_color(deauth_start_btn, COLOR_MATERIAL_GREEN, 0);
     lv_obj_set_style_bg_color(deauth_start_btn, lv_color_hex(0x555555), LV_STATE_DISABLED);
@@ -49872,7 +50006,8 @@ static void show_deauth_detector_page(void)
     lv_obj_center(start_label);
 
     // Stop button
-    deauth_stop_btn = lv_btn_create(btn_cont);
+    lv_obj_t *deauth_stop_btn = lv_btn_create(btn_cont);
+    ctx->deauth_detector_stop_btn = deauth_stop_btn;
     lv_obj_set_size(deauth_stop_btn, 90, 40);
     lv_obj_set_style_bg_color(deauth_stop_btn, COLOR_MATERIAL_RED, 0);
     lv_obj_set_style_bg_color(deauth_stop_btn, lv_color_hex(0x555555), LV_STATE_DISABLED);
@@ -49886,24 +50021,24 @@ static void show_deauth_detector_page(void)
     lv_obj_center(stop_label);
 
     // Status/count label
-    lv_obj_t *count_label = lv_label_create(deauth_detector_page);
-    lv_label_set_text_fmt(count_label, "Detected: %d deauth events", deauth_entry_count);
+    lv_obj_t *count_label = lv_label_create(ctx->deauth_detector_page);
+    ctx->deauth_detector_count_label = count_label;
     lv_obj_set_style_text_font(count_label, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(count_label, lv_color_hex(0x888888), 0);
 
     // Scrollable table container
-    deauth_table = lv_obj_create(deauth_detector_page);
-    lv_obj_set_size(deauth_table, lv_pct(100), LV_SIZE_CONTENT);
-    lv_obj_set_flex_grow(deauth_table, 1);
-    lv_obj_set_style_bg_color(deauth_table, lv_color_hex(0x252525), 0);
-    lv_obj_set_style_border_width(deauth_table, 0, 0);
-    lv_obj_set_style_radius(deauth_table, 8, 0);
-    lv_obj_set_style_pad_all(deauth_table, 8, 0);
-    lv_obj_set_flex_flow(deauth_table, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_pad_row(deauth_table, 6, 0);
+    ctx->deauth_detector_table = lv_obj_create(ctx->deauth_detector_page);
+    lv_obj_set_size(ctx->deauth_detector_table, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_flex_grow(ctx->deauth_detector_table, 1);
+    lv_obj_set_style_bg_color(ctx->deauth_detector_table, lv_color_hex(0x252525), 0);
+    lv_obj_set_style_border_width(ctx->deauth_detector_table, 0, 0);
+    lv_obj_set_style_radius(ctx->deauth_detector_table, 8, 0);
+    lv_obj_set_style_pad_all(ctx->deauth_detector_table, 8, 0);
+    lv_obj_set_flex_flow(ctx->deauth_detector_table, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(ctx->deauth_detector_table, 6, 0);
 
     // Populate table with existing entries (if any from previous session)
-    update_deauth_table();
+    update_deauth_table(ctx);
 
     // Set current visible page
     ctx->current_visible_page = ctx->deauth_detector_page;

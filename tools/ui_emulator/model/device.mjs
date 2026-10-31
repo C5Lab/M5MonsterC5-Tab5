@@ -7,6 +7,12 @@ import { createStaMacState, bootStaMac, staMacCommand,
 import {analyzerRequest, analyzerLines} from './analyzer.mjs';
 import {wpaFixtureBytes} from './wpa_auditor.mjs';
 
+function demoRevision(tag,{channel,variant}) {
+  const match=/^demo-(rf-)?(main|dev)-([1-9]\d*)$/.exec(tag);
+  if(!match||(match[1]?'rf':'classic')!==variant||match[2]!==channel)return null;
+  return BigInt(match[3]);
+}
+
 /** Deterministic virtual device. No network, timers, filesystem or hardware I/O. */
 export class SimulatedDevice {
   #seed; #modules; #jobs=new Map(); #nextId=1; #now=0; #capacity;
@@ -32,19 +38,22 @@ export class SimulatedDevice {
     this.#wpsQueues.clear();this.#wpsLastVerified.clear();
     // Operation IDs never repeat, including across reset. Planned HTML seed
     // entries have no bytes yet and are intentionally not advertised as files.
-    this.#modules=new Map(this.#seed.modules.map((module,index)=>[module.id,{
+    this.#modules=new Map(this.#seed.modules.map((module,index)=>{
+      const rfCapable=module.capabilities.includes('subghz');
+      const version=module.demo_version ?? (rfCapable?'demo-rf-main-1':'demo-main-1');
+      return [module.id,{
       connected:module.connected,sdPresent:module.sd_present,networks:[],selected:null,
       wpsQuarantined:false,wpsRunId:null,
       staMac:createStaMacState(module.id,index,this.#seed.seed>>>0),
-      version:module.capabilities.includes('subghz')?'demo-rf-main-1':'demo-main-1',
-      firmwareVariant:module.capabilities.includes('subghz')?'rf':'classic',rfCapable:module.capabilities.includes('subghz'),
-      activeSlot:0,slots:module.capabilities.includes('subghz')?
-        ['demo-rf-main-1','demo-rf-backup-1']:['demo-main-1','demo-backup-1'],
+      version,otaDataStatus:module.ota_metadata_invalid===true?'invalid':'valid',
+      firmwareVariant:rfCapable?'rf':'classic',rfCapable,
+      activeSlot:0,slots:module.demo_version===undefined?
+        (rfCapable?['demo-rf-main-1','demo-rf-backup-1']:['demo-main-1','demo-backup-1']):[version,version],
       boardName:`Offline demo ${module.id}`,bootedAt:0,reboots:0,
       active:null,files:new Map(),sequence:0,gpsEnabled:true,wardriveSecond:1,wardrivePoints:0,wardriveBlacklist:[],
       observer:{running:false,networks:[],packets:0,elapsedMs:0,error:null},observerStarted:0,observerIds:[],
       wardrive:{running:false,gps:{fix:false,lat:0,lon:0,satellites:0,distanceM:0},wifiCount:0,btCount:0,rows:[],track:[],sessions:[],error:null,upload:null}
-    }]));
+    }];}));
     for(const module of this.#modules.values())bootStaMac(module.staMac);
     for(const id of this.#modules.keys())this.#wpsQueues.set(id,[]);
     this.#staMacChangeHandler?.();
@@ -81,6 +90,7 @@ export class SimulatedDevice {
     const module=this.#module(moduleId);
     return structuredClone({connected:module.connected,sdPresent:module.sdPresent,
       version:module.version,firmwareVariant:module.firmwareVariant,rfCapable:module.rfCapable,
+      otaDataStatus:module.otaDataStatus,
       activeSlot:module.activeSlot,slots:module.slots,boardName:module.boardName,uptimeMs:this.#now-module.bootedAt,
       reboots:module.reboots,active:module.active,sdUsedBytes:this.#used(module),sdCapacityBytes:this.#capacity});
   }
@@ -152,14 +162,28 @@ export class SimulatedDevice {
     if(release!==null&&!this.systemReleases(moduleId,{channel,variant}).some(item=>item.tag===release))
       throw new Error('Release unavailable for selected variant and channel');
     const retained=operation==='update'?{channel,outcome,variant,force,release}:{};
+    const latest=operation==='update'&&!release?
+      this.systemReleases(moduleId,{channel,variant})[0].tag:null;
+    const currentRevision=latest?demoRevision(module.version,{channel,variant}):null;
+    const latestRevision=latest?demoRevision(latest,{channel,variant}):null;
+    const checkOnly=operation==='update'&&outcome==='success'&&!release&&
+      currentRevision!==null&&latestRevision!==null&&currentRevision>=latestRevision;
     if(operation==='sd_admin'&&!module.sdPresent)throw new Error('SD missing');
     return this.#start('system',moduleId,operation==='sd_admin'?Infinity:operation==='update'?3000:1000,
-      {operation,options:retained,result:{stage:operation==='sd_admin'?'running':operation==='update'?'preparing':'restarting',simulated:true,...(operation==='update'?{channel,variant,release}:{})}});
+      {operation,options:retained,checkOnly,
+       result:{stage:operation==='sd_admin'?'running':operation==='update'?(checkOnly?'checking':'preparing'):'restarting',
+               simulated:true,...(operation==='update'?{channel,variant,release}:{})}});
   }
 
   #advanceSystem(module,job) {
     if(job.operation==='sd_admin') {
       job.progress=Math.min(.95,(this.#now-job.started)/1000);
+      return;
+    }
+    if(job.checkOnly) {
+      if(this.#now-job.started>=job.duration) {
+        job.result.stage='up_to_date';job.state='completed';module.active=null;
+      }
       return;
     }
     job.progress=Math.min(1,(this.#now-job.started)/job.duration);
@@ -170,9 +194,6 @@ export class SimulatedDevice {
     } else {
       if(job.operation==='update'){
         const release=job.options.release||this.systemReleases(job.moduleId,job.options)[0].tag;
-        if(!job.options.release&&module.version===release){
-          job.result.stage='up_to_date';job.state='completed';module.active=null;return;
-        }
         module.version=release;
         module.firmwareVariant=job.options.variant;
         module.slots[module.activeSlot]=module.version;

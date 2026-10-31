@@ -1,4 +1,4 @@
-"""Acceptance gate for the 2026-10-26 Tab5 emulator feature-parity work.
+"""Acceptance gate for Tab5 emulator feature parity.
 
 Build ``tools/ui_emulator/dist`` first. This runs the new offline feature
 journeys and the cumulative Phase 5 gate against one unchanged browser bundle.
@@ -33,6 +33,7 @@ BROWSER_SUITES = [
     'tests/test_emulator_nfc.py',
     'tests/test_emulator_observer_export.py',
     'tests/test_emulator_observer_exit.py',
+    'tests/test_emulator_ota_metadata.py',
     'tests/test_emulator_ota_variant.py',
     'tests/test_emulator_portal_flows.py',
     'tests/test_emulator_radio_availability.py',

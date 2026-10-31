@@ -1,7 +1,7 @@
 {
   "version": 1,
   "reviewed_sources": {
-    "main/main.c": "548e6c27765a55da0e833d3ffc0597ced1382499ee436e5b0d1efbf0d914dea2",
+    "main/main.c": "cf9e50800bb86eecdb3bcfa1faa514d551de0364d9bb6dc5a3939da1c42f3be4",
     "main/observer_view.inc": "a9cfc99c228f9bd033e218f07829214806a6fdd95cebdd24953031a9321fae46",
     "main/observer_details.inc": "525ce30632c279983e65460c6ab91ce412870c37af3ea92ece8dbcbaeb679ef5",
     "main/screens/cgw_parser.c": "fb14c2c40a5129332c620adab9ab5f477beb8833950130a18a172b70980803a0",
