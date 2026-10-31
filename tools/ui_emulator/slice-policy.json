@@ -129,6 +129,14 @@
     "show_compromised_data_page": "unsupported",
     "show_adhoc_portal_page": "unsupported",
     "deauth_detector_task": "unsupported",
+    "deauth_v2_parse_reason": "retain",
+    "parse_deauth_v2_line": "retain",
+    "detector_watch_build_named_command": "retain",
+    "detector_watch_build_v2_command": "retain",
+    "detector_watch_begin_start_details": "retain",
+    "detector_watch_emergency_stop": "retain",
+    "detector_watch_stop_unconfirmed": "retain",
+    "detector_watch_is_unrecognized_command": "retain",
     "show_deauth_detector_page": "unsupported",
     "show_bluetooth_menu_page": "unsupported",
     "show_global_attacks_page": "unsupported",
@@ -192,7 +200,7 @@
     "show_settings_page": "retain",
     "show_sd_admin_page": "unsupported"
   },
-  "source_sha256": "cf9e50800bb86eecdb3bcfa1faa514d551de0364d9bb6dc5a3939da1c42f3be4",
+  "source_sha256": "39224ff37b32f71daada292a49e1ee9d37cda6c0689e1eaa11afd0cc6d26a22f",
   "notes": {
     "retain": "Byte-exact firmware function; event registration wrapper records frozen IDs without replacing callbacks.",
     "adapter": "Explicit cooperative or virtual state implementation in runtime/application.c.",

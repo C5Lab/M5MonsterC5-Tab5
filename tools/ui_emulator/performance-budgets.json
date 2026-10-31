@@ -1,6 +1,6 @@
 {
-  "version": 4,
-  "scope": "Acceptance budgets for the static emulator bundle served over HTTP. The download byte limits include the full feature-parity native application; the live per-profile timing budgets below remain unchanged.",
+  "version": 5,
+  "scope": "Acceptance budgets for the static emulator bundle served over HTTP. The download byte limits include the full feature-parity native application and Deauth Detector V2 Trace model; the live per-profile timing budgets below remain unchanged.",
   "notes": {
     "first_frame_ms": "globalThis.emulator.measurements.startupMs: module script start to the first painted frame, including the WebAssembly download and instantiation.",
     "page_load_to_first_frame_ms": "Harness wall clock from navigation until three frames are painted; includes browser navigation and document parsing.",
@@ -11,7 +11,7 @@
   },
   "download": {
     "comment": "Raw uncompressed file sizes include nested model modules. The desktop and throttled-mobile startup, render, and memory limits remain unchanged.",
-    "total_bytes_max": 2350000,
+    "total_bytes_max": 2400000,
     "largest_file_bytes_max": 2100000
   },
   "profiles": {

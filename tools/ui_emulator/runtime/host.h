@@ -14,6 +14,8 @@
 #include <time.h>
 #include <sys/time.h>
 #include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include <dirent.h>
 #include "lvgl.h"
 #include "app_keyboard.h"

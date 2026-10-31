@@ -1,7 +1,7 @@
 {
   "version": 1,
   "reviewed_sources": {
-    "main/main.c": "cf9e50800bb86eecdb3bcfa1faa514d551de0364d9bb6dc5a3939da1c42f3be4",
+    "main/main.c": "39224ff37b32f71daada292a49e1ee9d37cda6c0689e1eaa11afd0cc6d26a22f",
     "main/observer_view.inc": "a9cfc99c228f9bd033e218f07829214806a6fdd95cebdd24953031a9321fae46",
     "main/observer_details.inc": "525ce30632c279983e65460c6ab91ce412870c37af3ea92ece8dbcbaeb679ef5",
     "main/screens/cgw_parser.c": "fb14c2c40a5129332c620adab9ab5f477beb8833950130a18a172b70980803a0",
@@ -343,9 +343,6 @@
     "[\"main/main.c::pcap_viewer_render_capture_page\",\"button\",\"pcap_viewer_filter_cb\",\"LV_EVENT_CLICKED\",\"(void *)(uintptr_t)(filter + 1U)\",[]]": "ui.pcap_viewer_render_capture_page.button.clicked.52b30639e639",
     "[\"main/main.c::pcap_viewer_render_capture_page\",\"state->prev_btn\",\"pcap_viewer_page_change_cb\",\"LV_EVENT_CLICKED\",\"state\",[]]": "ui.pcap_viewer_render_capture_page.state--prev_btn.clicked.ee616d217d24",
     "[\"main/main.c::pcap_viewer_render_capture_page\",\"state->next_btn\",\"pcap_viewer_page_change_cb\",\"LV_EVENT_CLICKED\",\"state\",[]]": "ui.pcap_viewer_render_capture_page.state--next_btn.clicked.9c99ec327bcb",
-    "[\"main/main.c::show_deauth_detector_page\",\"back_btn\",\"deauth_detector_back_btn_event_cb\",\"LV_EVENT_CLICKED\",\"NULL\",[]]": "ui.show_deauth_detector_page.back_btn.clicked.23a24b08435f",
-    "[\"main/main.c::show_deauth_detector_page\",\"deauth_start_btn\",\"deauth_detector_start_cb\",\"LV_EVENT_CLICKED\",\"NULL\",[]]": "ui.show_deauth_detector_page.deauth_start_btn.clicked.ad709c81e8c9",
-    "[\"main/main.c::show_deauth_detector_page\",\"deauth_stop_btn\",\"deauth_detector_stop_cb\",\"LV_EVENT_CLICKED\",\"NULL\",[]]": "ui.show_deauth_detector_page.deauth_stop_btn.clicked.aedaedabbb1a",
     "[\"main/main.c::show_bluetooth_menu_page\",\"back_btn\",\"bt_menu_back_btn_event_cb\",\"LV_EVENT_CLICKED\",\"NULL\",[]]": "ui.show_bluetooth_menu_page.back_btn.clicked.a38eea4fc9af",
     "[\"main/main.c::show_airtag_scan_page\",\"back_btn\",\"airtag_scan_back_btn_event_cb\",\"LV_EVENT_CLICKED\",\"NULL\",[]]": "ui.show_airtag_scan_page.back_btn.clicked.5007aec0bccb",
     "[\"main/main.c::show_jammer_page\",\"back_btn\",\"jammer_back_btn_event_cb\",\"LV_EVENT_CLICKED\",\"NULL\",[]]": "ui.show_jammer_page.back_btn.clicked.e2f0ca0a3023",
@@ -553,6 +550,19 @@
     "[\"main/main.c::show_sta_mac_settings_page\",\"sta_mac_ui.keyboard\",\"sta_mac_ui_keyboard_done\",\"LV_EVENT_CANCEL\",\"NULL\",[[\"(sta_mac_ui.keyboard)\",\"then\"]]]": "ui.show_sta_mac_settings_page.sta_mac_ui.keyboard.cancel.d9c2288fa9b6",
     "[\"main/main.c::show_pixie_page\",\"g_pixie.retry_button\",\"pixie_retry_cb\",\"LV_EVENT_CLICKED\",\"NULL\",[]]": "ui.show_pixie_page.g_pixie.retry_button.clicked.7bfde9e38b56",
     "[\"main/main.c::show_pixie_page\",\"back\",\"pixie_back_cb\",\"LV_EVENT_CLICKED\",\"NULL\",[]]": "ui.show_pixie_page.back.clicked.811502ab68d1",
-    "[\"main/main.c::show_wps_active_popup\",\"ok\",\"version_popup_close_cb\",\"LV_EVENT_CLICKED\",\"overlay\",[]]": "ui.show_wps_active_popup.ok.clicked.ab89b99cf008"
+    "[\"main/main.c::show_wps_active_popup\",\"ok\",\"version_popup_close_cb\",\"LV_EVENT_CLICKED\",\"overlay\",[]]": "ui.show_wps_active_popup.ok.clicked.ab89b99cf008",
+    "[\"main/main.c::show_deauth_detector_page\",\"back_btn\",\"deauth_detector_back_btn_event_cb\",\"LV_EVENT_CLICKED\",\"ctx\",[]]": "ui.show_deauth_detector_page.back_btn.clicked.23a24b08435f",
+    "[\"main/main.c::show_deauth_detector_page\",\"deauth_start_btn\",\"deauth_detector_start_cb\",\"LV_EVENT_CLICKED\",\"ctx\",[]]": "ui.show_deauth_detector_page.deauth_start_btn.clicked.ad709c81e8c9",
+    "[\"main/main.c::show_deauth_detector_page\",\"deauth_stop_btn\",\"deauth_detector_stop_cb\",\"LV_EVENT_CLICKED\",\"ctx\",[]]": "ui.show_deauth_detector_page.deauth_stop_btn.clicked.aedaedabbb1a",
+    "[\"main/main.c::deauth_detector_render_networks\",\"checkbox\",\"deauth_detector_network_cb\",\"LV_EVENT_VALUE_CHANGED\",\"(void *)key\",[]]": "ui.deauth_detector_render_networks.checkbox.value_changed.4204acd65a63",
+    "[\"main/main.c::show_deauth_detector_page\",\"deauth_all_btn\",\"deauth_detector_all_cb\",\"LV_EVENT_CLICKED\",\"ctx\",[]]": "ui.show_deauth_detector_page.deauth_all_btn.clicked.d39f5b16a4d0",
+    "[\"main/main.c::show_deauth_detector_page\",\"deauth_selected_btn\",\"deauth_detector_selected_cb\",\"LV_EVENT_CLICKED\",\"ctx\",[]]": "ui.show_deauth_detector_page.deauth_selected_btn.clicked.483c53a2b17c",
+    "[\"main/main.c::show_deauth_detector_page\",\"scan_btn\",\"deauth_detector_scan_cb\",\"LV_EVENT_CLICKED\",\"ctx\",[]]": "ui.show_deauth_detector_page.scan_btn.clicked.a0cd497f83c1",
+    "[\"main/main.c::deauth_detector_picker_open\",\"rescan\",\"deauth_detector_scan_cb\",\"LV_EVENT_CLICKED\",\"ctx\",[]]": "ui.deauth_detector_picker_open.rescan.clicked.60e5704a4f92",
+    "[\"main/main.c::deauth_detector_picker_open\",\"cancel\",\"deauth_detector_picker_cancel_cb\",\"LV_EVENT_CLICKED\",\"ctx\",[]]": "ui.deauth_detector_picker_open.cancel.clicked.752b5c03dada",
+    "[\"main/main.c::deauth_detector_picker_open\",\"done\",\"deauth_detector_picker_done_cb\",\"LV_EVENT_CLICKED\",\"ctx\",[]]": "ui.deauth_detector_picker_open.done.clicked.fe040881c92a",
+    "[\"main/main.c::show_deauth_detector_page\",\"save_btn\",\"deauth_detector_save_cb\",\"LV_EVENT_CLICKED\",\"ctx\",[]]": "ui.show_deauth_detector_page.save_btn.clicked.4552d816be74",
+    "[\"main/main.c::show_deauth_detector_page\",\"clear_btn\",\"deauth_detector_clear_cb\",\"LV_EVENT_CLICKED\",\"ctx\",[]]": "ui.show_deauth_detector_page.clear_btn.clicked.a13851846a16",
+    "[\"main/main.c::show_deauth_detector_page\",\"trace_checkbox\",\"deauth_detector_trace_cb\",\"LV_EVENT_VALUE_CHANGED\",\"ctx\",[]]": "ui.show_deauth_detector_page.trace_checkbox.value_changed.b484781a4862"
   }
 }

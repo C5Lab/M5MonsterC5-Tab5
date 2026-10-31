@@ -6,6 +6,11 @@
 #undef uart_read_bytes
 #undef usbh_cdc_flush_rx_buffer
 static double app_device_ms;
+/* Tab5 owns this local, volatile SD mount; JanOS module SD flags are separate. */
+EM_JS(void,app_tab5_sd_mount,(),{
+ if(!FS.analyzePath('/sdcard').exists)FS.mkdir('/sdcard');
+});
+static detector_export_job_t *app_pending_detector_export;
 static void app_system_sync_metadata(void);
 static void app_system_tick(void);
 static void app_dialog_init(void);
@@ -199,6 +204,11 @@ static void app_wd_upload_tick(double now);
 static void app_compromised_stage(int tab,const char *kind);
 static int app_compromised_read(int tab,void *data,size_t len);
 static void app_compromised_clear(int tab);
+static bool app_deauth_scan_session[4];
+EM_JS(int,app_deauth_command_js,(int tab,const char *cmd),{
+ try{return emulatorDevice.detectorWrite(tab,UTF8ToString(cmd))?1:0;}
+ catch(e){dispatchEvent(new CustomEvent('emulator-model-error',{detail:e.message}));return 0;}
+});
 static void app_config_command(int tab,const char *cmd) {
  int value;if(sscanf(cmd,"channel_time set min %d",&value)==1)app_min[tab]=value;
  else if(sscanf(cmd,"channel_time set max %d",&value)==1)app_max[tab]=value;
@@ -210,8 +220,11 @@ static void app_config_command(int tab,const char *cmd) {
  else if(strcmp(cmd,"scan_airtag")==0){/* AirTag counts come from the virtual Bluetooth model. */}
  else if(strcmp(cmd,"init_nrf24")==0||strncmp(cmd,"start_jammer24 ",15)==0){/* nRF24 status comes from the offline adapter. */}
  else if(strncmp(cmd,"scan_bt ",8)==0){/* locator start is handled in xTaskCreate */}
- else if(strcmp(cmd,"stop")==0){app_bt_locator_stop(tab);app_antisurv_on_stop(tab);app_handshaker_on_stop(tab);app_sae_stop(tab);app_global_stop(tab);}
- else if(strcmp(cmd,"deauth_detector")==0){/* detection driven from xTaskCreate + app_deauth_tick */}
+ else if(strcmp(cmd,"stop")==0){app_deauth_command_js(tab,cmd);app_bt_locator_stop(tab);app_antisurv_on_stop(tab);app_handshaker_on_stop(tab);app_sae_stop(tab);app_global_stop(tab);}
+ else if(strcmp(cmd,"scan_networks")==0&&app_deauth_scan_session[tab]){
+  app_deauth_scan_session[tab]=false;app_deauth_command_js(tab,cmd);
+ }
+ else if(strncmp(cmd,"deauth_detector",15)==0){app_deauth_command_js(tab,cmd);}
  else if(strcmp(cmd,"start_antisurveillance")==0){/* driven from xTaskCreate + app_antisurv_tick */}
  else if(strncmp(cmd,"set_antisurv_sensitivity",24)==0){/* sensitivity is UI-only in the emulator */}
  else if(strcmp(cmd,"start_handshake")==0){/* driven from xTaskCreate + app_handshaker_tick */}
@@ -296,9 +309,24 @@ BaseType_t xTaskCreate(TaskFunction_t fn,const char *name,unsigned stack,void *a
  if(fn==airtag_scan_task){app_bt_airtag_start((tab_context_t *)arg);if(handle)*handle=NULL;return pdPASS;}
  if(fn==bt_jammer_probe_task){app_bt_jammer_probe_start((tab_context_t *)arg);if(handle)*handle=NULL;return pdPASS;}
  if(fn==bt_jammer_task){app_bt_jammer_start((tab_context_t *)arg);if(handle)*handle=NULL;return pdPASS;}
- /* The deauth detector task is an infinite UART loop; drive its table from
-    app_deauth_tick() instead of running the body. */
- if(fn==deauth_detector_task){app_deauth_start((tab_context_t *)arg);if(handle)*handle=NULL;return pdPASS;}
+ /* Detector scan and monitor wait on UART; app_deauth_tick() advances their
+    retained poll helpers without blocking the browser event loop. */
+ if(fn==deauth_detector_scan_task||fn==deauth_detector_task){
+  tab_context_t *ctx=(tab_context_t *)arg;
+  int tab=tab_id_for_ctx(ctx);
+  if(fn==deauth_detector_scan_task&&tab>=TAB_GROVE&&tab<=TAB_MBUS)
+   app_deauth_scan_session[tab]=true;
+  app_deauth_start(ctx);
+  if(handle)*handle=arg;
+  return pdPASS;
+ }
+ /* CSV I/O runs after the click callback, as a real FreeRTOS writer would. */
+ if(fn==deauth_detector_export_task){
+  if(app_pending_detector_export)return pdFALSE;
+  app_pending_detector_export=(detector_export_job_t *)arg;
+  if(handle)*handle=NULL;
+  return pdPASS;
+ }
  /* Anti-surveillance and handshaker monitor tasks are infinite UART loops;
     drive their UI from app_antisurv_tick()/app_handshaker_tick() instead. */
  if(fn==antisurv_monitor_task){app_antisurv_start((tab_context_t *)arg);if(handle)*handle=NULL;return pdPASS;}
@@ -311,6 +339,9 @@ BaseType_t xTaskCreate(TaskFunction_t fn,const char *name,unsigned stack,void *a
  emu_unsupported(name);if(handle)*handle=NULL;return pdFALSE;
 }
 static void app_run_pending_task(void) {
+ detector_export_job_t *detector_export=app_pending_detector_export;
+ app_pending_detector_export=NULL;
+ if(detector_export)deauth_detector_export_task(detector_export);
  void *arg=app_pending_load;app_pending_load=NULL;if(arg)pcap_viewer_load_task(arg);
  for(int tab=0;tab<4;tab++){pcap_viewer_state_t *state=app_pending_artifact[tab];if(state){app_pending_artifact[tab]=NULL;app_pcap_artifact_run(state);}}
 }
@@ -338,7 +369,18 @@ EMSCRIPTEN_KEEPALIVE void emu_show(int page,int tab) {
  if(page==1){switch_to_internal_settings_page();}
  else if(page==2)show_scan_page();else show_main_tiles();
 }
-static void init_tab_context(tab_context_t *ctx) { if(!ctx->networks)ctx->networks=calloc(MAX_NETWORKS,sizeof(wifi_network_t));if(!ctx->networks)abort();if(!ctx->deauth_entries)ctx->deauth_entries=calloc(DEAUTH_DETECTOR_MAX_ENTRIES,sizeof(deauth_entry_t));if(!ctx->deauth_entries)abort();ctx->sd_card_present=true;ctx->has_subghz=(ctx==&mbus_ctx&&mbus_detected);ctx->has_nfc=(ctx==&mbus_ctx&&mbus_detected); }
+static void init_tab_context(tab_context_t *ctx) {
+ if(!ctx->networks)ctx->networks=calloc(MAX_NETWORKS,sizeof(wifi_network_t));
+ if(!ctx->networks)abort();
+ if(!ctx->deauth_entries)ctx->deauth_entries=calloc(DEAUTH_DETECTOR_MAX_ENTRIES,sizeof(deauth_entry_t));
+ if(!ctx->deauth_entries)abort();
+ if(!ctx->detector_watch.networks)
+  ctx->detector_watch.networks=calloc(DETECTOR_WATCH_MAX,sizeof(detector_watch_network_t));
+ detector_watch_reset(&ctx->detector_watch);
+ ctx->sd_card_present=true;
+ ctx->has_subghz=(ctx==&mbus_ctx&&mbus_detected);
+ ctx->has_nfc=(ctx==&mbus_ctx&&mbus_detected);
+}
 static void trigger_home_meta_refresh(tab_context_t *ctx,bool force) {(void)force;if(ctx)app_system_sync_metadata();}
 static uint32_t home_quote_rand_u32(void) {static uint32_t seed=0xC5AB1234;seed=seed*1664525u+1013904223u;return seed;}
 static bool usb_gps_get_fix(double *lat,double *lon,uint32_t wait) {(void)wait;if(lat)*lat=52.23;if(lon)*lon=21.01;return true;}
@@ -349,6 +391,7 @@ static esp_err_t ina226_init(void) {ina226_initialized=true;return ESP_OK;}
 static void update_battery_status(void) {current_battery_voltage=4.0f;if(battery_voltage_label)lv_label_set_text(battery_voltage_label,"4.00V (SIM)");}
 static void battery_status_timer_cb(lv_timer_t *timer) {(void)timer;update_battery_status();}
 void app_init(void) {
+ app_tab5_sd_mount();
  janos_ft_baud=janos_ft_baud_choice_at(JANOS_FT_LINK_HARDWARE_UART,
      janos_ft_baud_index(JANOS_FT_LINK_HARDWARE_UART,(uint32_t)app_load(NVS_KEY_FT_BAUD,JANOS_FT_HARDWARE_DEFAULT)));
  janos_usb_ft_baud=janos_ft_baud_choice_at(JANOS_FT_LINK_USB_CH34X,
@@ -376,6 +419,7 @@ void app_init(void) {
  for(int tab=0;tab<4;tab++){app_vendor[tab]=observer_resolve_vendors;app_vendor_log[tab]=observer_log_unknown_vendors;}
  set_brightness_gamma(screen_brightness_setting);
  init_tab_context(&grove_ctx);init_tab_context(&mbus_ctx);init_tab_context(&internal_ctx);init_tab_context(&usb_ctx);
+ for(int tab=TAB_GROVE;tab<=TAB_MBUS;tab++)transport_console_mutex[tab]=xSemaphoreCreateMutex();
  create_tab_containers();grove_ctx.container=grove_container;mbus_ctx.container=mbus_container;internal_ctx.container=internal_container;
  show_main_tiles();update_tab_styles();update_battery_status();app_dialog_init();
 }
@@ -498,6 +542,9 @@ static lv_event_dsc_t *app_bind(lv_obj_t *obj,lv_event_cb_t cb,lv_event_code_t e
  if(cb==gitm_copy_cb)slot="copy";
  if(cb==ota_slot_activate_cb){entity=data?(const char *)data:"slot";slot="activate";}
  if(cb==network_checkbox_event_cb){int i=(int)(intptr_t)data;if(i>=0&&i<ctx->network_count)entity=ctx->networks[i].bssid;slot="select";}
+ else if(cb==deauth_detector_network_cb){int index=(int)((uintptr_t)data>>2);const char *bssid="unknown";
+  for(int i=0;i<ctx->detector_watch.count;i++)if(ctx->detector_watch.networks[i].index==index){bssid=ctx->detector_watch.networks[i].bssid;break;}
+  snprintf(entity_key,sizeof(entity_key),"%d-%s",index,bssid);entity=entity_key;slot="select";}
  else if(cb==network_item_event_cb){int index=lv_obj_get_index(obj);if(index>=0&&index<ctx->network_count)entity=ctx->networks[index].bssid;slot="toggle";}
  else if(cb==pcap_viewer_file_open_cb){pcap_viewer_file_t *file=data;if(file)entity=file->path;slot="open";}
  else if(cb==wardrive_wigle_file_checkbox_cb){wardrive_wigle_file_t *file=data;if(file)entity=file->path;slot="select";}

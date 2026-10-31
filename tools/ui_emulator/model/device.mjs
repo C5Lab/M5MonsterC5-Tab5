@@ -7,6 +7,51 @@ import { createStaMacState, bootStaMac, staMacCommand,
 import {analyzerRequest, analyzerLines} from './analyzer.mjs';
 import {wpaFixtureBytes} from './wpa_auditor.mjs';
 
+const DETECTOR_TRACE_CONFIRM_MS=1000;
+const DETECTOR_TRACE_IDLE_RELEASE_MS=20000;
+const DETECTOR_CHANNELS=[
+  1,2,3,4,5,6,7,8,9,10,11,12,13,14,
+  36,40,44,48,52,56,60,64,100,104,108,112,116,120,124,128,
+  132,136,140,144,149,153,157,161,165
+];
+
+const newDetectorState=()=>({
+  scanJob:null,scanReady:false,running:false,mode:'idle',details:false,
+  watchBssids:[],channels:[],queue:[],traceRequested:false,traceState:'off',
+  traceChannel:null,traceLockFailed:null,traceBssid:null,traceFirstChannel:null,
+  traceCachedChannel:null,traceDeadline:null,traceCandidates:[],
+  traceLockedBssid:null,traceLastActivity:null,
+  traceReleasedChannel:null,traceReleaseIdleMs:null
+});
+
+const clearTraceConfirmation=detector=>{
+  detector.traceBssid=null;detector.traceFirstChannel=null;
+  detector.traceCachedChannel=null;detector.traceDeadline=null;
+  detector.traceCandidates=[];
+};
+
+const resetDetectorTrace=detector=>{
+  detector.traceRequested=false;detector.traceState='off';
+  detector.traceChannel=null;detector.traceLockFailed=null;
+  detector.traceLockedBssid=null;detector.traceLastActivity=null;
+  detector.traceReleasedChannel=null;detector.traceReleaseIdleMs=null;
+  clearTraceConfirmation(detector);
+};
+
+const validMac=value=>typeof value==='string'&&
+  /^(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$/.test(value);
+
+const traceCandidateChannels=firstChannel=>{
+  if(firstChannel>=1&&firstChannel<=14){
+    const first=Math.max(1,firstChannel-2),last=Math.min(14,firstChannel+2);
+    return Array.from({length:last-first+1},(_,index)=>first+index);
+  }
+  const index=DETECTOR_CHANNELS.indexOf(firstChannel);
+  if(index<0)return [firstChannel];
+  return [DETECTOR_CHANNELS[index-1],firstChannel,DETECTOR_CHANNELS[index+1]]
+    .filter(channel=>Number.isInteger(channel)&&channel>14);
+};
+
 function demoRevision(tag,{channel,variant}) {
   const match=/^demo-(rf-)?(main|dev)-([1-9]\d*)$/.exec(tag);
   if(!match||(match[1]?'rf':'classic')!==variant||match[2]!==channel)return null;
@@ -43,6 +88,13 @@ export class SimulatedDevice {
       const version=module.demo_version ?? (rfCapable?'demo-rf-main-1':'demo-main-1');
       return [module.id,{
       connected:module.connected,sdPresent:module.sd_present,networks:[],selected:null,
+      detector:newDetectorState(),
+      detectorV2Supported:module.detector_v2_supported!==false,
+      detectorTraceSupported:module.detector_trace_supported!==false,
+      detectorTraceFailChannels:Array.isArray(module.detector_trace_fail_channels)
+        ?module.detector_trace_fail_channels.filter(channel=>Number.isInteger(channel)&&channel>=1&&channel<=255):[],
+      detectorTraceError:typeof module.detector_trace_error==='string'&&module.detector_trace_error
+        ?module.detector_trace_error:'ESP_FAIL',
       wpsQuarantined:false,wpsRunId:null,
       staMac:createStaMacState(module.id,index,this.#seed.seed>>>0),
       version,otaDataStatus:module.ota_metadata_invalid===true?'invalid':'valid',
@@ -206,6 +258,7 @@ export class SimulatedDevice {
       bootStaMac(module.staMac);
       this.#staMacChangeHandler?.();
       module.networks=[];module.selected=null;
+      module.detector=newDetectorState();
       module.observer={running:false,networks:[],packets:0,elapsedMs:0,error:null};
       module.observerIds=[];module.observerStarted=module.bootedAt;
       job.result.stage='completed';job.state='completed';
@@ -217,13 +270,230 @@ export class SimulatedDevice {
     const duration=this.#seed.settings?.scan_time_ms ?? 1000;
     if(!Number.isFinite(duration)||duration<=0) throw new Error('Invalid scan duration');
     const module=this.#module(moduleId);
+    if(module.detector.running)throw new Error('Module radio busy');
     if(this.#jobs.get(module.active)?.kind==='wps_pixie') {
       // A refused refresh must not pass the previous AP catalogue as new data.
       module.networks=[];module.selected=null;
     }
     const id=this.#start('scan',moduleId,duration);
     module.networks=[];module.selected=null;
+    module.detector.scanReady=false;
+    module.detector.watchBssids=[];
     return id;
+  }
+
+  scanCsvRows(moduleId) {
+    const quote=value=>'"'+String(value).replace(/"/g,'""')+'"';
+    return this.#module(moduleId).networks.map((n,i)=>
+      [i+1,n.ssid,n.vendor,n.bssid,n.channel,n.security,n.rssi,n.band]
+        .map(quote).join(','));
+  }
+
+  /** Offline JanOS detector command stream, scoped to the selected UART module. */
+  detectorCommand(moduleId,command) {
+    const module=this.#module(moduleId);
+    if(!module.connected)return false;
+    const detector=module.detector;
+    const cmd=String(command).trim();
+    const emit=line=>detector.queue.push(line);
+    if(cmd==='scan_networks') {
+      if(detector.running) {emit('Deauth detector already active. Use \'stop\' to stop it first.');return true;}
+      detector.queue.length=0;
+      try {
+        detector.scanJob=this.scan(moduleId);
+        emit('Background scan started (min: 20 ms, max: 40 ms per channel)');
+      } catch(error) {emit(`Failed to start scan: ${error.message}`);}
+      return true;
+    }
+    if(cmd==='stop') {
+      const detectorWasRunning=detector.running;
+      if(detector.scanJob!==null && this.#jobs.get(detector.scanJob)?.state==='running') {
+        this.cancel(detector.scanJob);
+        emit('Scan cancelled by user.');
+      }
+      detector.scanJob=null;detector.scanReady=false;
+      emit(detectorWasRunning?'Deauth Detector stopped.':'All operations stopped.');
+      detector.running=false;detector.mode='idle';detector.details=false;
+      detector.watchBssids=[];detector.channels=[];
+      resetDetectorTrace(detector);
+      return true;
+    }
+    const variant=cmd.split(/\s+/)[0];
+    if(!['deauth_detector','deauth_detector_v2'].includes(variant))
+      throw new Error('Unsupported detector command');
+    if(detector.running){emit('Deauth detector already active. Use \'stop\' to stop it first.');return true;}
+    const originalArgs=cmd.split(/\s+/).slice(1);
+    const details=variant==='deauth_detector_v2';
+    if(details&&!module.detectorV2Supported){
+      emit('Unrecognized command');return true;
+    }
+    const traceToken=details&&originalArgs.at(-1)==='trace';
+    if(traceToken&&!module.detectorTraceSupported){
+      const only=originalArgs[0]==='--only';
+      const maximum=module.networks.length||this.#seed.networks.length;
+      emit(`${only?'Invalid watch':'Invalid detector'} index 'trace' (valid: 1-${maximum}). Detector not started.`);
+      return true;
+    }
+    const trace=traceToken;
+    const args=trace?originalArgs.slice(0,-1):originalArgs;
+    const only=args[0]==='--only';
+    if(only && args.length<2){emit(`Usage: ${variant} --only <scan-index> [scan-index ...]`);return true;}
+    if(args.some((arg,i)=>arg.startsWith('--')&&(!only||i!==0))){
+      emit('Invalid detector option; use --only before scan indices.');return true;
+    }
+    const indices=only?args.slice(1):args;
+    if(indices.length && (!detector.scanReady || !module.networks.length ||
+       (only&&module.networks.length>64))) {
+      emit(only?'No completed scan results available. Run \'scan_networks\' first.'
+        :'No scan results available. Run \'scan_networks\' first.');
+      return true;
+    }
+    if(module.active!==null){emit('Scan already in progress. Please wait or use \'stop\'.');return true;}
+    const selected=[];
+    for(const arg of indices) {
+      if(!/^[1-9]\d*$/.test(arg)||+arg>module.networks.length) {
+        emit(only?`Invalid watch index '${arg}' (valid: 1-${module.networks.length}). Detector not started.`
+          :details?`Invalid detector index '${arg}' (valid: 1-${module.networks.length}). Detector not started.`
+          :`Invalid index ${arg} (valid: 1-${module.networks.length}). Detector not started.`);
+        return true;
+      }
+      const network=module.networks[+arg-1];
+      if(!selected.some(item=>item.bssid.toLowerCase()===network.bssid.toLowerCase()))selected.push(network);
+    }
+    if(only && selected.length>64){emit('Too many APs selected (maximum 64). Detector not started.');return true;}
+    if(!only && !indices.length && !this.#seed.networks.length){
+      emit('No scan results available. Try \'scan_networks\' first.');return true;
+    }
+    detector.running=true;
+    detector.mode=only?'only':indices.length?'channels':'all';
+    detector.details=details;
+    resetDetectorTrace(detector);
+    detector.traceRequested=trace;
+    detector.traceState=trace?'armed':'off';
+    detector.watchBssids=only?selected.map(item=>item.bssid.toUpperCase()):[];
+    detector.channels=[...new Set(selected.map(item=>item.channel))];
+    emit(indices.length?'Deauth Detector started - monitoring selected channels for deauth frames...'
+      :'Deauth Detector started - scanning all channels for deauth frames...');
+    emit('[DETECTOR_INFO] CSA/ECSA announcements enabled.');
+    if(only)selected.forEach((item,j)=>emit(
+      `[DETECTOR_WATCH] count=${selected.length} ap=${j+1}/${selected.length} CH=${item.channel} BSSID=${item.bssid.toUpperCase()} SSID=${item.ssid}`));
+    emit(details
+      ?'Output: [DEAUTH_V2] CH: <ch> | BSSID: <bssid> | TX: <tx> | DA: <da> | RSSI: <rssi> | REASON: <reason> | SSID: <ssid>'
+      :'Output: [DEAUTH] CH: <ch> | AP: <name> (<bssid>) | RSSI: <rssi>');
+    emit("Use 'stop' to stop.");
+    if(details){
+      emit('[DETECTOR_INFO] format=deauth_v2');
+      if(trace)emit('[DETECTOR_TRACE] armed');
+    }
+    return true;
+  }
+
+  detectorRead(moduleId) {
+    return this.#module(moduleId).detector.queue.shift()??null;
+  }
+
+  detectorStatus(moduleId) {
+    const {scanJob,scanReady,running,mode,details,watchBssids,channels,
+      traceRequested,traceState,traceChannel,traceLockFailed,traceBssid,
+      traceFirstChannel,traceDeadline,traceCandidates,traceLockedBssid,
+      traceLastActivity,traceReleasedChannel,traceReleaseIdleMs}=
+      this.#module(moduleId).detector;
+    return structuredClone({scanJob,scanReady,running,mode,details,watchBssids,channels,
+      traceRequested,traceState,traceLocked:traceState==='locked',traceChannel,
+      traceLockFailed,traceBssid,traceFirstChannel,traceLockedBssid,
+      traceLastActivity,traceReleasedChannel,traceReleaseIdleMs,
+      traceWindowMs:traceDeadline===null?null:Math.max(0,traceDeadline-this.#now),
+      traceCandidates});
+  }
+
+  /** Apply JanOS passive trace confirmation after filtering and before wire output. */
+  detectorTraceForEvent(moduleId,event) {
+    const module=this.#module(moduleId);
+    const detector=module.detector;
+    if(!event||event.type!=='deauth'||!detector.running||!detector.details||
+       !detector.traceRequested||
+       !validMac(event.bssid)||!Number.isInteger(event.channel)||event.channel<1||
+       event.channel>255||!Number.isFinite(event.rssi))return null;
+    const bssid=event.bssid.toUpperCase();
+    if(detector.mode==='only'&&!detector.watchBssids.includes(bssid))return null;
+    if(detector.traceState==='locked'){
+      if(bssid===detector.traceLockedBssid)detector.traceLastActivity=this.#now;
+      return null;
+    }
+    if(detector.traceState==='armed'||detector.traceState==='retry_ready'){
+      const cached=[...module.networks,...this.#seed.networks]
+        .find(network=>network.bssid.toUpperCase()===bssid)?.channel??null;
+      detector.traceState='confirming';detector.traceBssid=bssid;
+      detector.traceFirstChannel=event.channel;detector.traceCachedChannel=cached;
+      detector.traceDeadline=this.#now+DETECTOR_TRACE_CONFIRM_MS;
+      detector.traceCandidates=traceCandidateChannels(event.channel)
+        .map(channel=>({channel,count:0,rssiTotal:0}));
+      detector.traceLastActivity=this.#now;
+      detector.traceReleasedChannel=null;detector.traceReleaseIdleMs=null;
+      detector.traceLockFailed=null;detector.traceChannel=null;
+      const candidate=detector.traceCandidates.find(item=>item.channel===event.channel);
+      if(candidate){candidate.count=1;candidate.rssiTotal=event.rssi;}
+      return `[DETECTOR_TRACE] confirming_bssid=${bssid} first_channel=${event.channel} window_ms=${DETECTOR_TRACE_CONFIRM_MS}`;
+    }
+    if(detector.traceState==='confirming'&&detector.traceBssid===bssid){
+      detector.traceLastActivity=this.#now;
+      const candidate=detector.traceCandidates.find(item=>item.channel===event.channel);
+      if(candidate&&candidate.count<65535){
+        candidate.count++;candidate.rssiTotal+=event.rssi;
+      }
+    }
+    return null;
+  }
+
+  #finishDetectorTrace(module) {
+    const detector=module.detector;
+    if(!detector.running||!detector.traceRequested||
+       detector.traceState!=='confirming'||detector.traceDeadline===null||
+       this.#now<detector.traceDeadline)return;
+    let best=null;
+    for(const candidate of detector.traceCandidates){
+      if(!candidate.count)continue;
+      if(!best||candidate.count>best.count||
+         (candidate.count===best.count&&candidate.rssiTotal>best.rssiTotal)||
+         (candidate.count===best.count&&candidate.rssiTotal===best.rssiTotal&&
+          candidate.channel===detector.traceCachedChannel&&
+          best.channel!==detector.traceCachedChannel)||
+         (candidate.count===best.count&&candidate.rssiTotal===best.rssiTotal&&
+          candidate.channel!==detector.traceCachedChannel&&
+          best.channel!==detector.traceCachedChannel&&
+          candidate.channel===detector.traceFirstChannel))best=candidate;
+    }
+    const channel=best?.channel??detector.traceFirstChannel;
+    const lockedBssid=detector.traceBssid;
+    clearTraceConfirmation(detector);
+    if(module.detectorTraceFailChannels.includes(channel)){
+      detector.traceState='retry_ready';
+      detector.traceLockedBssid=null;detector.traceLastActivity=null;
+      detector.traceLockFailed={channel,error:module.detectorTraceError};
+      detector.queue.push(
+        `[DETECTOR_TRACE] lock_failed_channel=${channel} error=${module.detectorTraceError}`);
+      return;
+    }
+    detector.traceState='locked';detector.traceChannel=channel;
+    detector.traceLockedBssid=lockedBssid;
+    detector.traceLockFailed=null;
+    detector.queue.push(`[DETECTOR_TRACE] locked_channel=${channel}`);
+  }
+
+  #releaseDetectorTraceIfIdle(module) {
+    const detector=module.detector;
+    if(!detector.running||!detector.traceRequested||detector.traceState!=='locked'||
+       detector.traceChannel===null||detector.traceLastActivity===null||
+       this.#now-detector.traceLastActivity<DETECTOR_TRACE_IDLE_RELEASE_MS)return;
+    const channel=detector.traceChannel;
+    detector.traceState='armed';detector.traceChannel=null;
+    detector.traceLockedBssid=null;detector.traceLastActivity=null;
+    detector.traceReleasedChannel=channel;
+    detector.traceReleaseIdleMs=DETECTOR_TRACE_IDLE_RELEASE_MS;
+    clearTraceConfirmation(detector);
+    detector.queue.push(
+      `[DETECTOR_TRACE] released_channel=${channel} reason=idle idle_ms=${DETECTOR_TRACE_IDLE_RELEASE_MS}`,
+      '[DETECTOR_TRACE] armed');
   }
 
   analyzerStart(moduleId, request) {
@@ -337,6 +607,7 @@ export class SimulatedDevice {
     const job=this.#jobs.get(id);
     if(!job||job.state!=='running') return false;
     job.state='cancelled';const module=this.#module(job.moduleId);module.active=null;
+    if(module.detector.scanJob===id){module.detector.scanJob=null;module.detector.scanReady=false;}
     if(job.kind==='wardrive') {module.wardrive.running=false;module.wardrive.error='cancelled';module.wardrive.gps.fix=false;module.wardrive.gps.satellites=0;}
     return true;
   }
@@ -458,6 +729,7 @@ export class SimulatedDevice {
       if(typeof connected!=='boolean') throw new Error('Invalid connection state');
       module.connected=connected;
       if(!connected){
+        module.detector=newDetectorState();
         const active=this.#jobs.get(module.active);
         if(active?.kind==='wps_pixie') {
           active.state='failed';active.error='disconnected';module.active=null;
@@ -485,6 +757,8 @@ export class SimulatedDevice {
     // At most one operation per module, with bounded scenario cardinalities.
     for(const [moduleId,module] of this.#modules) {
       if(module.observer.running)module.observer=observerResult(module.observerIds,this.#now-module.observerStarted,this.#seed.networks,this.#seed.clients);
+      this.#finishDetectorTrace(module);
+      this.#releaseDetectorTraceIfIdle(module);
       if(module.active===null)continue;
       const job=this.#jobs.get(module.active);
       if(job.kind==='system') {this.#advanceSystem(module,job);continue;}
@@ -537,6 +811,12 @@ export class SimulatedDevice {
         }
       }
       job.state=job.error?'failed':'completed';module.active=null;
+      if(job.kind==='scan' && module.detector.scanJob===job.id) {
+        module.detector.scanJob=null;
+        module.detector.scanReady=!job.error;
+        if(!job.error)module.detector.queue.push(...this.scanCsvRows(moduleId),'Scan results printed.');
+        else module.detector.queue.push('Scan failed.');
+      }
     }
   }
 
@@ -788,12 +1068,20 @@ export class SimulatedDevice {
   // the discovered networks and drifts RSSI so the table changes over time. A
   // disconnected module or an empty scenario yields null (nothing detected).
   deauthEvent(moduleId,seq) {
-    if(!this.#module(moduleId).connected)return null;
+    const module=this.#module(moduleId);
+    if(!module.connected)return null;
     const nets=this.#seed.networks;
     if(!nets.length)return null;
     const n=nets[((seq%nets.length)+nets.length)%nets.length];
+    if(module.detector.running && module.detector.mode==='channels' &&
+       !module.detector.channels.includes(n.channel))return null;
+    if(module.detector.running && module.detector.mode==='only' &&
+       !module.detector.watchBssids.some(bssid=>bssid.toLowerCase()===n.bssid.toLowerCase()))return null;
     const drift=Math.round(6*Math.sin((seq+1)/1.7));
-    return {channel:n.channel,ssid:n.ssid,bssid:n.bssid,
+    const directed=this.#seed.clients?.[seq%this.#seed.clients.length]?.mac;
+    return {type:seq%4===2?'csa':'deauth',channel:n.channel,ssid:n.ssid,bssid:n.bssid,
+            tx:'02:11:22:33:44:55',da:seq%2===0?'FF:FF:FF:FF:FF:FF':directed||'FF:FF:FF:FF:FF:FF',
+            reason:seq%2===0?7:null,
             rssi:Math.max(-90,Math.min(-30,n.rssi+drift))};
   }
 

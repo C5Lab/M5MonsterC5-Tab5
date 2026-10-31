@@ -340,8 +340,48 @@ tools\ui_emulator\.venv\Scripts\python.exe tools\ui_emulator\audit_coverage.py -
 
 Three previously-inert features now work as offline simulations (no real radio):
 
-- **Deauth Detector** tile (main WiFi menu): Start begins a simulated deauth
-  flood from the scenario networks (newest row first); Stop freezes, Back returns.
+- **Deauth Detector** tile (main WiFi menu): Start requests
+  `deauth_detector_v2`. **Selected networks** runs a fresh JanOS-shaped
+  scan; select one or more BSSIDs, then Start requests
+  `deauth_detector_v2 --only <indices>`. The model confirms the format
+  with `[DETECTOR_INFO] format=deauth_v2` and emits one self-contained
+  `[DEAUTH_V2]` record per DEAUTH observation, including claimed transmitter
+  (`TX`), frame destination (`DA`) and reason code. `REASON: -` simulates a
+  protected/encrypted unicast reason that is unavailable rather than numeric
+  zero. **Channel trace (passive)** is off by default. When enabled, the model
+  accepts `deauth_detector_v2 trace` and
+  `deauth_detector_v2 --only <indices> trace`, emits `armed`, and emits
+  `confirming_bssid=... first_channel=... window_ms=1000` before the first
+  eligible V2 record. It then scores only that BSSID for 1000 ms, using frame
+  count, average RSSI, scan-cache channel, and first-channel tie breaks. The
+  candidates are RX +/-2 clamped to 1..14 on 2.4 GHz, or the previous/current/
+  next entries in the JanOS detector list on 5 GHz, before the model queues the
+  final lock or tune-failure marker. Other accepted V2 records stay
+  visible during confirmation; CSA, malformed events, unrelated BSSIDs, and
+  BSSIDs filtered by `--only` cannot start or score it. A tune failure returns
+  Trace to the armed/retry state. While locked, only an eligible DEAUTH for the
+  locked BSSID refreshes activity. At exactly 20000 ms idle, the model queues
+  `released_channel=... reason=idle idle_ms=20000` followed by `armed`, resumes
+  hopping, and allows a later confirmation/lock cycle; other BSSIDs and CSA do
+  not refresh that deadline. Stop clears confirmation, lock, and idle timing. Each
+  Grove/USB/MBus state and pending record queue is independent. A scenario module
+  with `detector_trace_supported: false` reproduces the older invalid `trace`
+  index response. The old command and its
+  exact `[DEAUTH]` output remain available; a scenario module with
+  `detector_v2_supported: false` rejects the unknown V2 command so the UI can
+  exercise its explicit legacy fallback. Selected mode becomes running only
+  after strict ACK, V2-format, and complete WATCH proof; the WATCH timeout gets
+  its own full window after ACK+format. WATCH replies and DEAUTH/CSA events
+  remain filtered by BSSID. Repeated
+  observations are grouped with counts and first/last times. Stop freezes the
+  list; Clear removes it. Save CSV writes a snapshot to the emulator's volatile
+  Tab5-local `/sdcard/lab/detector/` mount, separate from either JanOS module's
+  SD card. Back waits on the detector page for Stop confirmation; press Back
+  again to return. CSA rows are passive announcements, not proof that an AP
+  changed channel or that an attack occurred. TX is a claimed address and does
+  not identify an attacker; broadcast DA does not identify one victim. Trace
+  only stops detector-initiated hopping; connected Wi-Fi may still control the
+  physical channel.
 - **Anti-Surv** tile (main WiFi menu): Start flags "followers" from the scenario;
   Stop shows the devices/followers summary; Back returns.
 - **Handshaker**: open **WiFi Scan & Attack**, select a network, tap **Handshake**;
@@ -352,7 +392,14 @@ browser test):
 
 ```bat
 powershell -ExecutionPolicy Bypass -File tools\ui_emulator\build.ps1 -Jobs 8
+tools\ui_emulator\.venv\Scripts\python.exe -m unittest tests.test_deauth_detector_csa tests.test_detector_history tests.test_detector_watch_logic
+node --test tests\test_emulator_detectors.mjs
 tools\ui_emulator\.venv\Scripts\python.exe -u tests\test_emulator_phase4_detectors.py -v
+tools\ui_emulator\.venv\Scripts\python.exe -u tests\test_deauth_detector_history_browser.py -v
+tools\ui_emulator\.venv\Scripts\python.exe -u tests\test_deauth_detector_v2_browser.py -v
+tools\ui_emulator\.venv\Scripts\python.exe -u tests\test_deauth_detector_watch_browser.py -v
+tools\ui_emulator\.venv\Scripts\python.exe -u tests\test_deauth_detector_csa_browser.py -v
+tools\ui_emulator\.venv\Scripts\python.exe -u tests\test_deauth_detector_header_browser.py -v
 tools\ui_emulator\.venv\Scripts\python.exe -u tests\verify_emulator_phase4_detectors.py
 ```
 

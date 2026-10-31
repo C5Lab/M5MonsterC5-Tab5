@@ -195,7 +195,8 @@ static void inspect_object(lv_obj_t *obj, uintptr_t parent) {
     lv_area_t area;
     lv_obj_get_coords(obj, &area);
     const char *text = lv_obj_check_type(obj, &lv_label_class) ? lv_label_get_text(obj) :
-        lv_obj_check_type(obj, &lv_textarea_class) ? lv_textarea_get_text(obj) : "";
+        lv_obj_check_type(obj, &lv_textarea_class) ? lv_textarea_get_text(obj) :
+        lv_obj_check_type(obj, &lv_checkbox_class) ? lv_checkbox_get_text(obj) : "";
     EM_ASM({ globalThis.emulatorObjects.push({id:$0,parent:$1,x:$2,y:$3,width:$4,height:$5,
         text:UTF8ToString($6),clickable:!!$7,state:$8,scrollY:$9}); },
         (uintptr_t)obj, parent, area.x1, area.y1, lv_area_get_width(&area), lv_area_get_height(&area),

@@ -13,8 +13,17 @@ report = {'status': 'running', 'recorded_at': datetime.now(timezone.utc).isoform
 try:
     fingerprint = artifact_fingerprint(); report.update(fingerprint)
     for command in [[sys.executable, 'tests/verify_emulator_phase4_settings_sys.py'],
+                    [sys.executable, '-m', 'unittest',
+                     'tests.test_deauth_detector_csa',
+                     'tests.test_detector_history',
+                     'tests.test_detector_watch_logic'],
                     ['node', '--test', 'tests/test_emulator_detectors.mjs'],
-                    [sys.executable, 'tests/test_emulator_phase4_detectors.py']]:
+                    [sys.executable, 'tests/test_emulator_phase4_detectors.py'],
+                    [sys.executable, 'tests/test_deauth_detector_v2_browser.py', '-q'],
+                    [sys.executable, 'tests/test_deauth_detector_watch_browser.py', '-q'],
+                    [sys.executable, 'tests/test_deauth_detector_history_browser.py', '-q'],
+                    [sys.executable, 'tests/test_deauth_detector_csa_browser.py', '-q'],
+                    [sys.executable, 'tests/test_deauth_detector_header_browser.py', '-q']]:
         print('RUN ' + ' '.join(command[1:]), flush=True)
         result = run_logged(command, cwd=ROOT, capture_output=True, text=True, encoding='utf-8', errors='replace')
         report['checks'].append({'command': command, 'exit_code': result.returncode, 'output': result.stdout + result.stderr})

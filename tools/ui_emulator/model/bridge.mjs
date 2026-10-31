@@ -7,7 +7,12 @@ const states = {running:1, completed:2, cancelled:3, failed:4};
 
 /** Synchronous boundary used by the retained C interface on the browser thread. */
 export class BrowserDevice {
-  constructor(seed) { this.device=new SimulatedDevice(seed); this.subghz=new SubghzRadio(seed.subghz_signals); this.nfc=new NfcDevice(seed.nfc_cards); }
+  constructor(seed) {
+    this.device=new SimulatedDevice(seed);
+    this.subghz=new SubghzRadio(seed.subghz_signals);
+    this.nfc=new NfcDevice(seed.nfc_cards);
+    this.detectorPending=new Map();
+  }
   module(tab) {
     if (!modules[tab]) throw new Error('This module is not available in the scenario');
     return modules[tab];
@@ -18,12 +23,7 @@ export class BrowserDevice {
   advance(ms) { this.device.advance(ms); this.subghz.advance(ms); this.nfc.advance(ms); }
   snapshot(tab) { return this.device.snapshot(this.module(tab)); }
   rows(tab) {
-    // Match JanOS scan_networks CSV: one pair of quotes, and a quote inside a
-    // field is written as "" (RFC 4180). Commas stay inside the field.
-    const quote = value => '"' + String(value).replace(/"/g, '""') + '"';
-    return this.snapshot(tab).networks.map(n =>
-      [n.index,n.ssid,n.vendor,n.bssid,n.channel,n.security,n.rssi,n.band]
-        .map(quote).join(','));
+    return this.device.scanCsvRows(this.module(tab));
   }
   select(tab,bssid) {
     const id=[...this.snapshot(tab).networks,...this.device.observer(this.module(tab)).networks].find(n=>n.bssid===bssid)?.id;
@@ -57,12 +57,39 @@ export class BrowserDevice {
     try{return new TextDecoder().decode(this.device.readFile(module,path));}
     catch(error){if(error.message==='File not found')return '';throw error;}
   }
-  // The retained deauth_detector_task parses "[DEAUTH] CH: .. | AP: .. (..) |
-  // RSSI: .." lines. The emulator intercepts that task and feeds one synthesized
-  // line per detection tick, parsed by the production parse_deauth_line().
+  detectorWrite(tab,command) {
+    const module=this.module(tab);
+    const cmd=String(command).trim();
+    if(cmd==='stop'||cmd==='scan_networks'||cmd.startsWith('deauth_detector'))
+      this.detectorPending.delete(module);
+    return this.device.detectorCommand(module,command);
+  }
+  detectorRead(tab) {
+    return this.device.detectorRead(this.module(tab));
+  }
+  detectorHasPendingObservation(tab) {
+    return (this.detectorPending.get(this.module(tab))?.length??0)>0;
+  }
+  // The retained parser consumes one JanOS-shaped observation per tick.
   deauthDetectorLine(tab,seq) {
-    const e=this.device.deauthEvent(this.module(tab),seq);
-    return e?`[DEAUTH] CH: ${e.channel} | AP: ${e.ssid} (${e.bssid}) | RSSI: ${e.rssi}`:'';
+    const module=this.module(tab);
+    const status=this.device.detectorStatus(module);
+    if(!status.running){this.detectorPending.delete(module);return '';}
+    const pending=this.detectorPending.get(module);
+    if(pending?.length)return pending.shift();
+    const e=this.device.deauthEvent(module,seq);
+    if(!e)return '';
+    let line='';
+    if(e.type==='csa'){
+      const to=e.channel<=11?e.channel+5:e.channel<165?e.channel+4:149;
+      line=`[CSA] RX: ${e.channel} | TO: ${to} | BSSID: ${e.bssid} | TX: 02:11:22:33:44:55 | RSSI: ${e.rssi} | VIA: beacon | COUNT: 3 | MODE: 1 | CLASS: - | SSID: ${e.ssid}`;
+    } else if(status.details){
+      const ssid=String(e.ssid||'<Unknown>').slice(0,32).replace(/[^\x20-\x7E]|\|/g,'?');
+      line=`[DEAUTH_V2] CH: ${e.channel} | BSSID: ${e.bssid} | TX: ${e.tx} | DA: ${e.da} | RSSI: ${e.rssi} | REASON: ${e.reason??'-'} | SSID: ${ssid}`;
+    } else line=`[DEAUTH] CH: ${e.channel} | AP: ${e.ssid} (${e.bssid}) | RSSI: ${e.rssi}`;
+    const marker=this.device.detectorTraceForEvent(module,e);
+    if(marker){this.detectorPending.set(module,[line]);return marker;}
+    return line;
   }
   // "MAC|name" for one flagged follower, or '' when nothing is detected.
   antisurvFollowerLine(tab,seq) {

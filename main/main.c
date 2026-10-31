@@ -129,6 +129,7 @@ _Static_assert(CONFIG_IN_TRANSFER_BUFFER_SIZE == USB_CH34X_BULK_MPS,
 #include "lwip/netdb.h"
 #include <dirent.h>
 #include <sys/stat.h>
+#include <fcntl.h>
 #include <unistd.h>
 #include <time.h>
 #include <sys/time.h>
@@ -318,14 +319,931 @@ typedef struct {
     char ap_name[33];
     char bssid[18];
     int rssi;
+    uint32_t occurrences;
+    int64_t first_seen_epoch_s;
+    int64_t last_seen_epoch_s;
+    uint64_t first_seen_uptime_s;
+    uint64_t last_seen_uptime_s;
     bool is_csa;
+    bool is_deauth_v2;
     int target_channel;
     char claimed_tx[18];
+    char frame_da[18];
+    int reason_code;
+    bool reason_known;
     char csa_via[7];
     int csa_count;
     int csa_mode;
     int csa_class;  // -1 when no operating class was announced
 } deauth_entry_t;
+
+static inline bool detector_history_mac_equal(const char a[18], const char b[18])
+{
+    for (int i = 0; i < 18; ++i) {
+        char left = a[i], right = b[i];
+        if (left >= 'a' && left <= 'f') left -= 'a' - 'A';
+        if (right >= 'a' && right <= 'f') right -= 'a' - 'A';
+        if (left != right) return false;
+        if (left == '\0') return true;
+    }
+    return true;
+}
+
+static inline bool detector_history_same_key(const deauth_entry_t *a,
+                                             const deauth_entry_t *b)
+{
+    if (a->is_csa != b->is_csa || !detector_history_mac_equal(a->bssid, b->bssid))
+        return false;
+    if (!a->is_csa) {
+        if (a->is_deauth_v2 != b->is_deauth_v2) return false;
+        return !a->is_deauth_v2 ||
+               (detector_history_mac_equal(a->claimed_tx, b->claimed_tx) &&
+                detector_history_mac_equal(a->frame_da, b->frame_da) &&
+                a->reason_known == b->reason_known &&
+                (!a->reason_known || a->reason_code == b->reason_code));
+    }
+    return a->channel == b->channel && a->target_channel == b->target_channel &&
+           detector_history_mac_equal(a->claimed_tx, b->claimed_tx) &&
+           strcmp(a->csa_via, b->csa_via) == 0 &&
+           a->csa_mode == b->csa_mode && a->csa_class == b->csa_class;
+}
+
+// Keep the most recently observed BSSID/event groups at the front. COUNT in a
+// CSA announcement is JanOS data, not the number of observations in this list.
+static inline bool detector_history_add(deauth_entry_t *entries, int *count,
+                                        int capacity, const deauth_entry_t *incoming,
+                                        int64_t epoch_s, uint64_t uptime_s)
+{
+    if (!entries || !count || !incoming || !incoming->bssid[0] ||
+        capacity <= 0 || *count < 0 || *count > capacity) return false;
+    int match = -1;
+    for (int i = 0; i < *count; ++i) {
+        if (detector_history_same_key(&entries[i], incoming)) {
+            match = i;
+            break;
+        }
+    }
+    deauth_entry_t updated = *incoming;
+    if (match >= 0) {
+        const deauth_entry_t *old = &entries[match];
+        updated.occurrences = old->occurrences == UINT32_MAX
+                                  ? UINT32_MAX : old->occurrences + 1;
+        updated.first_seen_epoch_s = old->first_seen_epoch_s;
+        updated.first_seen_uptime_s = old->first_seen_uptime_s;
+        updated.last_seen_epoch_s = epoch_s;
+        updated.last_seen_uptime_s = uptime_s;
+        if (match > 0) memmove(&entries[1], &entries[0], (size_t)match * sizeof(*entries));
+    } else {
+        updated.occurrences = 1;
+        updated.first_seen_epoch_s = epoch_s;
+        updated.last_seen_epoch_s = epoch_s;
+        updated.first_seen_uptime_s = uptime_s;
+        updated.last_seen_uptime_s = uptime_s;
+        int shifted = *count < capacity ? *count : capacity - 1;
+        if (shifted > 0) memmove(&entries[1], &entries[0], (size_t)shifted * sizeof(*entries));
+        if (*count < capacity) ++*count;
+    }
+    entries[0] = updated;
+    return true;
+}
+
+static inline bool detector_history_local_time(int64_t epoch_s, char out[32])
+{
+    out[0] = '\0';
+    if (epoch_s <= 0) return false;
+    time_t seconds = (time_t)epoch_s;
+    struct tm local;
+    if (!localtime_r(&seconds, &local)) return false;
+    return strftime(out, 32, "%Y-%m-%d %H:%M:%S", &local) != 0;
+}
+
+static inline bool detector_history_csv_ssid(FILE *file, const char *ssid)
+{
+    if (fputc('"', file) == EOF) return false;
+    // A wireless name is untrusted; prefix spreadsheet formula leaders.
+    if (ssid[0] == '=' || ssid[0] == '+' || ssid[0] == '-' || ssid[0] == '@') {
+        if (fputc('\'', file) == EOF) return false;
+    }
+    for (const char *p = ssid; *p; ++p) {
+        if (*p == '"' && fputc('"', file) == EOF) return false;
+        if (fputc(*p == '\r' || *p == '\n' ? ' ' : *p, file) == EOF) return false;
+    }
+    return fputc('"', file) != EOF;
+}
+
+static inline bool detector_history_write_csv(FILE *file, const deauth_entry_t *entries,
+                                              int count)
+{
+    if (!file || !entries || count < 0) return false;
+    if (fprintf(file, "type,ssid,bssid,rx_channel,to_channel,claimed_tx,"
+                      "rssi_dbm,via,janos_csa_count,mode,operating_class,"
+                      "observations,first_seen_local,last_seen_local,"
+                      "first_seen_uptime_s,last_seen_uptime_s,frame_da,reason_code,reason_status\n") < 0) return false;
+    for (int i = 0; i < count; ++i) {
+        const deauth_entry_t *entry = &entries[i];
+        char first[32], last[32];
+        detector_history_local_time(entry->first_seen_epoch_s, first);
+        detector_history_local_time(entry->last_seen_epoch_s, last);
+        if (fprintf(file, "%s,", entry->is_csa ? "CSA" : "DEAUTH") < 0 ||
+            !detector_history_csv_ssid(file, entry->ap_name) ||
+            fprintf(file, ",%s,%d,", entry->bssid, entry->channel) < 0) return false;
+        if (entry->is_csa && fprintf(file, "%d", entry->target_channel) < 0) return false;
+        if (fprintf(file, ",%s,%d,",
+                    entry->is_csa || entry->is_deauth_v2 ? entry->claimed_tx : "",
+                    entry->rssi) < 0)
+            return false;
+        if (entry->is_csa) {
+            if (fprintf(file, "%s,%d,%d,", entry->csa_via, entry->csa_count,
+                        entry->csa_mode) < 0) return false;
+            if (entry->csa_class >= 0 && fprintf(file, "%d", entry->csa_class) < 0)
+                return false;
+        } else if (fputs(",,,", file) == EOF) return false;
+        if (fprintf(file, ",%u,%s,%s,%llu,%llu,%s,", (unsigned)entry->occurrences,
+                    first, last, (unsigned long long)entry->first_seen_uptime_s,
+                    (unsigned long long)entry->last_seen_uptime_s,
+                    entry->is_deauth_v2 ? entry->frame_da : "") < 0) return false;
+        if (entry->is_deauth_v2 && entry->reason_known &&
+            fprintf(file, "%d", entry->reason_code) < 0) return false;
+        if (fputc(',', file) == EOF) return false;
+        if (entry->is_deauth_v2 &&
+            fputs(entry->reason_known ? "known" : "unknown_encrypted", file) == EOF)
+            return false;
+        if (fputc('\n', file) == EOF) return false;
+    }
+    return !ferror(file);
+}
+
+// Detector watch model begin
+#define DETECTOR_WATCH_MAX 64
+typedef enum {
+    DETECTOR_WATCH_STOPPED,
+    DETECTOR_WATCH_SCANNING,
+    DETECTOR_WATCH_READY,
+    DETECTOR_WATCH_STARTING,
+    DETECTOR_WATCH_RUNNING,
+    DETECTOR_WATCH_STOPPING,
+    DETECTOR_WATCH_ERROR
+} detector_watch_phase_t;
+typedef enum {
+    DETECTOR_TRACE_OFF,
+    DETECTOR_TRACE_WAITING_ARM,
+    DETECTOR_TRACE_ARMED,
+    DETECTOR_TRACE_CONFIRMING,
+    DETECTOR_TRACE_LOCKED,
+    DETECTOR_TRACE_RELEASED,
+    DETECTOR_TRACE_RETRY_READY,
+    DETECTOR_TRACE_UNSUPPORTED,
+    DETECTOR_TRACE_LEGACY_DROPPED
+} detector_trace_state_t;
+typedef struct {
+    int index;                         // JanOS 1-based index, never a UI row number
+    char ssid[33];
+    char bssid[18];
+    int channel;
+    bool selected;
+    bool confirmed;
+} detector_watch_network_t;
+typedef struct {
+    detector_watch_phase_t phase;
+    detector_watch_network_t *networks;  // PSRAM, owned by the tab context
+    int count;
+    int selected_count;
+    int watched_count;
+    uint32_t scan_generation;
+    bool scan_complete;
+    bool scan_ack_seen;
+    bool scan_invalid;
+    bool selected_mode;
+    bool running;
+    bool remote_state_unknown;
+    bool watch_verified;
+    bool details_requested;
+    bool details_confirmed;
+    bool start_ack_seen;
+    bool legacy_retry_pending;
+    bool legacy_fallback;
+    bool trace_requested;
+    detector_trace_state_t trace_state;
+    char trace_confirming_bssid[18];
+    int trace_first_channel;
+    int trace_window_ms;
+    int trace_channel;
+    int trace_released_channel;
+    int trace_release_idle_ms;
+    int trace_failed_channel;
+    char trace_error[64];
+    char error[128];
+} detector_watch_session_t;
+// Detector watch model end
+
+// Detector watch logic begin
+static bool detector_watch_mac_valid(const char *mac)
+{
+    if (!mac || strlen(mac) != 17) return false;
+    for (int i = 0; i < 17; ++i) {
+        if (i % 3 == 2 ? mac[i] != ':' : !isxdigit((unsigned char)mac[i])) return false;
+    }
+    return true;
+}
+
+static bool detector_watch_mac_equal(const char *left, const char *right)
+{
+    if (!detector_watch_mac_valid(left) || !detector_watch_mac_valid(right)) return false;
+    for (int i = 0; i < 17; ++i) {
+        if (toupper((unsigned char)left[i]) != toupper((unsigned char)right[i])) return false;
+    }
+    return true;
+}
+
+static void detector_watch_reset(detector_watch_session_t *session)
+{
+    if (!session) return;
+    detector_watch_network_t *networks = session->networks;
+    if (networks) memset(networks, 0, DETECTOR_WATCH_MAX * sizeof(*networks));
+    memset(session, 0, sizeof(*session));
+    session->networks = networks;
+    session->phase = networks ? DETECTOR_WATCH_STOPPED : DETECTOR_WATCH_ERROR;
+    if (!networks)
+        snprintf(session->error, sizeof(session->error), "Detector network storage unavailable (PSRAM)");
+}
+
+static void detector_watch_begin_scan(detector_watch_session_t *session, uint32_t generation)
+{
+    if (!session || session->remote_state_unknown) return;
+    detector_watch_reset(session);
+    if (!session->networks) return;
+    session->phase = DETECTOR_WATCH_SCANNING;
+    session->scan_generation = generation;
+}
+
+static bool detector_watch_ack_scan(detector_watch_session_t *session, const char *line)
+{
+    if (!session || session->phase != DETECTOR_WATCH_SCANNING || !line ||
+        !strstr(line, "Background scan started (")) return false;
+    session->scan_ack_seen = true;
+    return true;
+}
+
+static bool detector_watch_add_network(detector_watch_session_t *session, int index,
+                                       const char *ssid, const char *bssid, int channel)
+{
+    if (!session || !session->networks || !session->scan_ack_seen) return false;
+    if (session->phase != DETECTOR_WATCH_SCANNING || !ssid ||
+        strlen(ssid) > 32 || !detector_watch_mac_valid(bssid) ||
+        channel < 1 || channel > 255 || index != session->count + 1 ||
+        session->count >= DETECTOR_WATCH_MAX) {
+        if (session && session->phase == DETECTOR_WATCH_SCANNING) session->scan_invalid = true;
+        return false;
+    }
+    detector_watch_network_t *network = &session->networks[session->count++];
+    network->index = index;
+    snprintf(network->ssid, sizeof(network->ssid), "%s", ssid);
+    snprintf(network->bssid, sizeof(network->bssid), "%s", bssid);
+    network->channel = channel;
+    return true;
+}
+
+static bool detector_watch_finish_scan(detector_watch_session_t *session, const char *line)
+{
+    if (!session || session->phase != DETECTOR_WATCH_SCANNING ||
+        !session->scan_ack_seen || !line) return false;
+    const char *marker = "Scan results printed.";
+    bool exact = strcmp(line, marker) == 0;
+    for (const char *prefix = strstr(line, ": "); !exact && prefix;
+         prefix = strstr(prefix + 2, ": ")) {
+        exact = strcmp(prefix + 2, marker) == 0;
+    }
+    if (!exact) return false;
+    if (session->scan_invalid || session->count == 0) {
+        session->phase = DETECTOR_WATCH_ERROR;
+        snprintf(session->error, sizeof(session->error), "%s",
+                 session->scan_invalid ? "Invalid/incomplete scan list" : "No networks in completed scan");
+        return false;
+    }
+    session->scan_complete = true;
+    session->phase = DETECTOR_WATCH_READY;
+    return true;
+}
+
+static bool detector_watch_select(detector_watch_session_t *session, int index, bool selected)
+{
+    if (!session || !session->networks || session->phase != DETECTOR_WATCH_READY ||
+        !session->scan_complete) return false;
+    for (int i = 0; i < session->count; ++i) {
+        detector_watch_network_t *network = &session->networks[i];
+        if (network->index != index) continue;
+        network->selected = selected;
+        session->selected_count = 0;
+        for (int j = 0; j < session->count; ++j) {
+            if (!session->networks[j].selected) continue;
+            bool already_counted = false;
+            for (int k = 0; k < j; ++k) {
+                if (session->networks[k].selected &&
+                    detector_watch_mac_equal(session->networks[k].bssid,
+                                             session->networks[j].bssid)) {
+                    already_counted = true;
+                    break;
+                }
+            }
+            if (!already_counted) session->selected_count++;
+        }
+        return true;
+    }
+    return false;
+}
+
+static bool detector_watch_build_named_command(const detector_watch_session_t *session,
+                                                bool selected_mode, uint32_t generation,
+                                                const char *name, char *out,
+                                                size_t out_size)
+{
+    if (!session || !session->networks || !name || !out || !out_size) return false;
+    int used = snprintf(out, out_size, "%s", name);
+    if (used < 0 || (size_t)used >= out_size) return false;
+    if (!selected_mode) return true;
+    if ((session->phase != DETECTOR_WATCH_READY &&
+         !(session->phase == DETECTOR_WATCH_STARTING && session->legacy_retry_pending)) ||
+        !session->scan_complete ||
+        session->scan_generation != generation || session->selected_count < 1 ||
+        session->selected_count > DETECTOR_WATCH_MAX) return false;
+    int added = snprintf(out + used, out_size - (size_t)used, " --only");
+    if (added < 0 || (size_t)added >= out_size - (size_t)used) return false;
+    used += added;
+    for (int i = 0; i < session->count; ++i) {
+        if (!session->networks[i].selected) continue;
+        added = snprintf(out + used, out_size - (size_t)used, " %d", session->networks[i].index);
+        if (added < 0 || (size_t)added >= out_size - (size_t)used) return false;
+        used += added;
+    }
+    return true;
+}
+
+static bool detector_watch_build_command(const detector_watch_session_t *session,
+                                          bool selected_mode, uint32_t generation,
+                                          char *out, size_t out_size)
+{
+    return detector_watch_build_named_command(session, selected_mode, generation,
+                                              "deauth_detector", out, out_size);
+}
+
+static bool detector_watch_build_v2_command(const detector_watch_session_t *session,
+                                             bool selected_mode, uint32_t generation,
+                                             bool trace,
+                                             char *out, size_t out_size)
+{
+    if (!detector_watch_build_named_command(session, selected_mode, generation,
+                                            "deauth_detector_v2", out, out_size))
+        return false;
+    if (!trace) return true;
+    size_t used = strlen(out);
+    int added = snprintf(out + used, out_size - used, " trace");
+    return added >= 0 && (size_t)added < out_size - used;
+}
+
+static bool detector_watch_is_unrecognized_command(const char *line)
+{
+    if (!line) return false;
+    while (*line == ' ' || *line == '\t') ++line;
+    if (line[0] == '>' && line[1] == ' ') line += 2;
+    while (*line == ' ' || *line == '\t') ++line;
+    return strcmp(line, "Unrecognized command") == 0;
+}
+
+static void detector_watch_set_trace_state(detector_watch_session_t *session,
+                                           detector_trace_state_t state)
+{
+    if (!session) return;
+    session->trace_state = state;
+    session->trace_confirming_bssid[0] = '\0';
+    session->trace_first_channel = 0;
+    session->trace_window_ms = 0;
+    session->trace_channel = 0;
+    session->trace_failed_channel = 0;
+    session->trace_error[0] = '\0';
+}
+
+static void detector_watch_clear_trace_release(detector_watch_session_t *session)
+{
+    if (!session) return;
+    session->trace_released_channel = 0;
+    session->trace_release_idle_ms = 0;
+}
+
+static void detector_watch_begin_start_mode(detector_watch_session_t *session,
+                                            bool selected_mode, bool details,
+                                            bool trace)
+{
+    if (!session) return;
+    if (!session->networks) {
+        detector_watch_reset(session);
+        return;
+    }
+    session->phase = DETECTOR_WATCH_STARTING;
+    session->selected_mode = selected_mode;
+    session->running = false;
+    session->watch_verified = false;
+    session->watched_count = 0;
+    bool legacy_fallback = !details && session->legacy_retry_pending;
+    bool trace_dropped_for_legacy = legacy_fallback && session->trace_requested;
+    session->details_requested = details;
+    session->details_confirmed = false;
+    session->start_ack_seen = false;
+    session->legacy_retry_pending = false;
+    session->legacy_fallback = legacy_fallback;
+    session->trace_requested = details && trace;
+    detector_watch_set_trace_state(
+        session, trace_dropped_for_legacy ? DETECTOR_TRACE_LEGACY_DROPPED :
+                 session->trace_requested ? DETECTOR_TRACE_WAITING_ARM :
+                                            DETECTOR_TRACE_OFF);
+    detector_watch_clear_trace_release(session);
+    session->error[0] = '\0';
+    for (int i = 0; i < session->count; ++i) session->networks[i].confirmed = false;
+}
+
+static void detector_watch_begin_start_details(detector_watch_session_t *session,
+                                               bool selected_mode, bool details)
+{
+    detector_watch_begin_start_mode(session, selected_mode, details, false);
+}
+
+static void detector_watch_begin_start_v2(detector_watch_session_t *session,
+                                          bool selected_mode, bool trace)
+{
+    detector_watch_begin_start_mode(session, selected_mode, true, trace);
+}
+
+static void detector_watch_begin_start(detector_watch_session_t *session, bool selected_mode)
+{
+    detector_watch_begin_start_details(session, selected_mode, false);
+}
+
+static void detector_watch_stop(detector_watch_session_t *session);
+
+static const char *detector_watch_status_payload(const char *line)
+{
+    if (!line) return NULL;
+    while (*line == ' ' || *line == '\t') ++line;
+    if (strncmp(line, "I JanOS: ", 9) == 0) {
+        line += 9;
+        while (*line == ' ' || *line == '\t') ++line;
+    }
+    if (line[0] == '>' && line[1] == ' ') {
+        line += 2;
+        while (*line == ' ' || *line == '\t') ++line;
+    }
+    return line;
+}
+
+static bool detector_watch_payload_starts(const char *payload, const char *prefix)
+{
+    return payload && prefix && strncmp(payload, prefix, strlen(prefix)) == 0;
+}
+
+static bool detector_watch_payload_exact(const char *payload, const char *expected)
+{
+    if (!payload || !expected) return false;
+    size_t length = strlen(expected);
+    return strncmp(payload, expected, length) == 0 &&
+           (payload[length] == '\0' || payload[length] == '\x1b');
+}
+
+static bool detector_watch_payload_ends(const char *payload, const char *suffix)
+{
+    if (!payload || !suffix) return false;
+    const char *ansi = strchr(payload, '\x1b');
+    size_t length = ansi ? (size_t)(ansi - payload) : strlen(payload);
+    size_t suffix_length = strlen(suffix);
+    return length >= suffix_length &&
+           memcmp(payload + length - suffix_length, suffix, suffix_length) == 0;
+}
+
+static bool detector_watch_is_stop_ack_line(const char *line)
+{
+    const char *payload = detector_watch_status_payload(line);
+    return detector_watch_payload_exact(payload, "Deauth Detector stopped.") ||
+           detector_watch_payload_exact(payload, "All operations stopped.");
+}
+
+static bool detector_watch_is_start_status_line(const char *line)
+{
+    return detector_watch_payload_starts(detector_watch_status_payload(line),
+                                         "Deauth Detector started -");
+}
+
+static bool detector_watch_is_start_ack_line(const char *line, bool selected_mode)
+{
+    const char *expected = selected_mode
+        ? "Deauth Detector started - monitoring selected channels for deauth frames..."
+        : "Deauth Detector started - scanning all channels for deauth frames...";
+    return detector_watch_payload_exact(detector_watch_status_payload(line), expected);
+}
+
+static bool detector_watch_is_watch_status_line(const char *line)
+{
+    return detector_watch_payload_starts(detector_watch_status_payload(line),
+                                         "[DETECTOR_WATCH] ");
+}
+
+static void detector_watch_confirm_start_if_ready(detector_watch_session_t *session)
+{
+    if (!session || session->phase != DETECTOR_WATCH_STARTING ||
+        !session->start_ack_seen ||
+        (session->details_requested && !session->details_confirmed) ||
+        (session->selected_mode && !session->watch_verified)) return;
+    session->phase = DETECTOR_WATCH_RUNNING;
+    session->running = true;
+    session->remote_state_unknown = false;
+}
+
+// A selected session gets its full WATCH verification window only after JanOS
+// has supplied the command acknowledgement and, for V2, the format marker.
+// Keeping the timestamp outside the wire model lets duplicate status lines be
+// harmless without mixing wall-clock policy into the parser.
+static bool detector_watch_start_watch_deadline(
+    const detector_watch_session_t *session, int64_t now_us,
+    int64_t *started_us)
+{
+    if (!session || !started_us || *started_us > 0 || now_us <= 0 ||
+        session->phase != DETECTOR_WATCH_STARTING || !session->selected_mode ||
+        !session->start_ack_seen ||
+        (session->details_requested && !session->details_confirmed) ||
+        session->watch_verified) return false;
+    *started_us = now_us;
+    return true;
+}
+
+static bool detector_watch_is_trace_status_line(const char *line)
+{
+    const char *payload = detector_watch_status_payload(line);
+    return payload && strncmp(payload, "[DETECTOR_TRACE] ",
+                              sizeof("[DETECTOR_TRACE] ") - 1) == 0;
+}
+
+static void detector_watch_clear_trace_lock(detector_watch_session_t *session)
+{
+    detector_watch_set_trace_state(session, DETECTOR_TRACE_OFF);
+    detector_watch_clear_trace_release(session);
+}
+
+// Trace records describe detector session state only. They are deliberately
+// consumed before event parsing so they cannot enter history, CSV, counters,
+// or the alarm path.
+static bool detector_watch_trace_status_line(detector_watch_session_t *session,
+                                             const char *line)
+{
+    const char *payload = detector_watch_status_payload(line);
+    const char *prefix = "[DETECTOR_TRACE] ";
+    if (!payload || strncmp(payload, prefix, strlen(prefix)) != 0) return false;
+    bool active = session && !session->remote_state_unknown &&
+                  (session->phase == DETECTOR_WATCH_RUNNING ||
+                   session->phase == DETECTOR_WATCH_STARTING) &&
+                  session->details_confirmed && session->trace_requested;
+    if (!active) return true;
+    payload += strlen(prefix);
+    if ((!strcmp(payload, "armed") ||
+         (!strncmp(payload, "armed", 5) && payload[5] == '\x1b')) &&
+        (session->trace_state == DETECTOR_TRACE_WAITING_ARM ||
+         session->trace_state == DETECTOR_TRACE_ARMED ||
+         session->trace_state == DETECTOR_TRACE_RELEASED ||
+         session->trace_state == DETECTOR_TRACE_RETRY_READY)) {
+        detector_watch_set_trace_state(session, DETECTOR_TRACE_ARMED);
+        return true;
+    }
+    const char *confirming = "confirming_bssid=";
+    if (strncmp(payload, confirming, strlen(confirming)) == 0 &&
+        session->trace_state != DETECTOR_TRACE_LOCKED) {
+        const char *bssid = payload + strlen(confirming);
+        char parsed_bssid[18] = {0};
+        if (strlen(bssid) < 18 || bssid[17] != ' ') return true;
+        memcpy(parsed_bssid, bssid, 17);
+        if (!detector_watch_mac_valid(parsed_bssid)) return true;
+        const char *first = bssid + 18;
+        const char *first_prefix = "first_channel=";
+        if (strncmp(first, first_prefix, strlen(first_prefix)) != 0) return true;
+        char *end = NULL;
+        long channel = strtol(first + strlen(first_prefix), &end, 10);
+        if (end == first + strlen(first_prefix) || channel < 1 || channel > 255 ||
+            strncmp(end, " window_ms=", 11) != 0) return true;
+        const char *window = end + 11;
+        long window_ms = strtol(window, &end, 10);
+        if (end == window || window_ms != 1000 ||
+            (*end != '\0' && *end != '\x1b')) return true;
+        detector_watch_set_trace_state(session, DETECTOR_TRACE_CONFIRMING);
+        detector_watch_clear_trace_release(session);
+        memcpy(session->trace_confirming_bssid, parsed_bssid,
+               sizeof(session->trace_confirming_bssid));
+        session->trace_first_channel = (int)channel;
+        session->trace_window_ms = (int)window_ms;
+        return true;
+    }
+    const char *released = "released_channel=";
+    const char *locked = "locked_channel=";
+    const char *failed = "lock_failed_channel=";
+    if (strncmp(payload, released, strlen(released)) == 0) {
+        char *end = NULL;
+        long channel = strtol(payload + strlen(released), &end, 10);
+        const char *idle_prefix = " reason=idle idle_ms=";
+        if (end == payload + strlen(released) || channel < 1 || channel > 255 ||
+            strncmp(end, idle_prefix, strlen(idle_prefix)) != 0) return true;
+        const char *idle = end + strlen(idle_prefix);
+        long idle_ms = strtol(idle, &end, 10);
+        if (end == idle || idle_ms != 20000 ||
+            (*end != '\0' && *end != '\x1b')) return true;
+        detector_watch_set_trace_state(session, DETECTOR_TRACE_RELEASED);
+        session->trace_released_channel = (int)channel;
+        session->trace_release_idle_ms = (int)idle_ms;
+        return true;
+    }
+    if (strncmp(payload, locked, strlen(locked)) == 0) {
+        char *end = NULL;
+        long channel = strtol(payload + strlen(locked), &end, 10);
+        if (end == payload + strlen(locked) || channel < 1 || channel > 255 ||
+            (*end != '\0' && *end != '\x1b')) return true;
+        detector_watch_set_trace_state(session, DETECTOR_TRACE_LOCKED);
+        detector_watch_clear_trace_release(session);
+        session->trace_channel = (int)channel;
+        return true;
+    }
+    if (strncmp(payload, failed, strlen(failed)) == 0) {
+        char *end = NULL;
+        long channel = strtol(payload + strlen(failed), &end, 10);
+        if (end == payload + strlen(failed) || channel < 1 || channel > 255 ||
+            strncmp(end, " error=", 7) != 0) return true;
+        const char *error = end + 7;
+        size_t length = 0;
+        while (error[length] && error[length] != '\x1b') {
+            unsigned char c = (unsigned char)error[length];
+            if (c < 32 || c > 126 || ++length >= sizeof(session->trace_error))
+                return true;
+        }
+        if (length == 0) return true;
+        detector_watch_set_trace_state(session, DETECTOR_TRACE_RETRY_READY);
+        detector_watch_clear_trace_release(session);
+        session->trace_failed_channel = (int)channel;
+        memcpy(session->trace_error, error, length);
+        session->trace_error[length] = '\0';
+        return true;
+    }
+    return true;
+}
+
+static void detector_watch_status_line(detector_watch_session_t *session, const char *line)
+{
+    if (!session || !line) return;
+    if (detector_watch_trace_status_line(session, line)) return;
+    const char *payload = detector_watch_status_payload(line);
+    if ((session->phase == DETECTOR_WATCH_STOPPING ||
+         (session->phase == DETECTOR_WATCH_ERROR && session->running)) &&
+        detector_watch_is_stop_ack_line(line)) {
+        bool preserve_error = session->phase == DETECTOR_WATCH_ERROR;
+        session->running = false;
+        session->remote_state_unknown = false;
+        session->trace_requested = false;
+        detector_watch_clear_trace_lock(session);
+        if (!preserve_error) detector_watch_stop(session);
+        return;
+    }
+    const char *format_prefix = "[DETECTOR_INFO] format=";
+    if (detector_watch_payload_starts(payload, format_prefix) &&
+        session->phase == DETECTOR_WATCH_STARTING && session->details_requested) {
+        const char *format = payload + strlen(format_prefix);
+        const char *after = format + sizeof("deauth_v2") - 1;
+        if (strncmp(format, "deauth_v2", sizeof("deauth_v2") - 1) ||
+            (*after != '\0' && *after != '\x1b')) {
+            session->phase = DETECTOR_WATCH_ERROR;
+            session->remote_state_unknown = session->start_ack_seen;
+            snprintf(session->error, sizeof(session->error),
+                     "JanOS confirmed an unexpected detector format");
+            return;
+        }
+        session->details_confirmed = true;
+        if (!session->selected_mode) session->watch_verified = true;
+        detector_watch_confirm_start_if_ready(session);
+        return;
+    }
+    if (detector_watch_payload_starts(payload, "[DETECTOR_INFO]")) return;
+    if (session->phase == DETECTOR_WATCH_STARTING &&
+        detector_watch_is_start_status_line(line)) {
+        if (!detector_watch_is_start_ack_line(line, session->selected_mode)) {
+            session->phase = DETECTOR_WATCH_ERROR;
+            snprintf(session->error, sizeof(session->error),
+                     "JanOS confirmed a different detector mode");
+            return;
+        }
+        session->start_ack_seen = true;
+        if (!session->selected_mode) session->watch_verified = true;
+        detector_watch_confirm_start_if_ready(session);
+        return;
+    }
+    if (session->phase == DETECTOR_WATCH_STARTING &&
+        detector_watch_is_unrecognized_command(line)) {
+        if (session->details_requested && !session->start_ack_seen &&
+            !session->details_confirmed) {
+            session->legacy_retry_pending = true;
+        } else {
+            session->phase = DETECTOR_WATCH_ERROR;
+            session->remote_state_unknown = session->start_ack_seen;
+            snprintf(session->error, sizeof(session->error), "JanOS did not recognize detector command");
+        }
+        return;
+    }
+    if (session->phase == DETECTOR_WATCH_STARTING && session->trace_requested &&
+        (detector_watch_payload_starts(payload, "Invalid detector index 'trace'") ||
+         detector_watch_payload_starts(payload, "Invalid watch index 'trace'")) &&
+        detector_watch_payload_ends(payload, "Detector not started.")) {
+        session->phase = DETECTOR_WATCH_ERROR;
+        session->running = false;
+        session->remote_state_unknown = false;
+        session->legacy_retry_pending = false;
+        detector_watch_set_trace_state(session, DETECTOR_TRACE_UNSUPPORTED);
+        snprintf(session->error, sizeof(session->error),
+                 "Trace unsupported by this JanOS; detector not started");
+        return;
+    }
+    if (session->phase == DETECTOR_WATCH_STARTING &&
+        detector_watch_payload_exact(
+            payload, "Invalid detector option; use --only before scan indices.")) {
+        session->phase = DETECTOR_WATCH_ERROR;
+        session->remote_state_unknown = session->start_ack_seen;
+        snprintf(session->error, sizeof(session->error), "JanOS rejected detector command");
+        return;
+    }
+    if (session->phase == DETECTOR_WATCH_STARTING &&
+        payload[0] != '[' && strncmp(payload, "Output:", 7) != 0 &&
+        (strstr(payload, "Detector not started") || strstr(payload, "already active") ||
+         strstr(payload, "No completed scan results") || strstr(payload, "Invalid watch index") ||
+         strstr(payload, "No valid channels selected") || strstr(payload, "receiver setup failed") ||
+         strstr(payload, "initial channel") || strstr(payload, "Failed to create Deauth Detector") ||
+         strstr(payload, "Scan timed out") || strstr(payload, "Scan already in progress") ||
+         strstr(payload, "No scan results available"))) {
+        session->phase = DETECTOR_WATCH_ERROR;
+        if (strstr(payload, "already active")) session->remote_state_unknown = true;
+        snprintf(session->error, sizeof(session->error), "%.127s", payload);
+        return;
+    }
+    const char *watch = detector_watch_is_watch_status_line(line) ? payload : NULL;
+    bool verifying_during_start = session->phase == DETECTOR_WATCH_STARTING &&
+                                  session->start_ack_seen;
+    if (!watch || !session->selected_mode ||
+        (session->phase != DETECTOR_WATCH_RUNNING && !verifying_during_start)) return;
+    unsigned count = 0, ordinal = 0, total = 0, channel = 0;
+    char bssid[18] = {0};
+    int parsed_length = 0;
+    if (sscanf(watch,
+               "[DETECTOR_WATCH] count=%u ap=%u/%u CH=%u BSSID=%17[0-9A-Fa-f:]%n",
+               &count, &ordinal, &total, &channel, bssid, &parsed_length) != 5 ||
+        parsed_length <= 0 ||
+        strncmp(watch + parsed_length, " SSID=", sizeof(" SSID=") - 1) != 0 ||
+        count != (unsigned)session->selected_count || total != count ||
+        ordinal != (unsigned)session->watched_count + 1 ||
+        ordinal > count || !detector_watch_mac_valid(bssid)) {
+        session->phase = DETECTOR_WATCH_ERROR;
+        snprintf(session->error, sizeof(session->error), "WATCH response malformed or count mismatch");
+        return;
+    }
+    detector_watch_network_t *matching = NULL;
+    detector_watch_network_t *first_scan_row = NULL;
+    for (int i = 0; i < session->count; ++i) {
+        detector_watch_network_t *candidate = &session->networks[i];
+        if (!first_scan_row && detector_watch_mac_equal(candidate->bssid, bssid))
+            first_scan_row = candidate;
+        if (candidate->selected && detector_watch_mac_equal(candidate->bssid, bssid)) {
+            matching = candidate;
+            break;
+        }
+    }
+    if (!matching || !first_scan_row || first_scan_row->channel != (int)channel ||
+        matching->confirmed) {
+        session->phase = DETECTOR_WATCH_ERROR;
+        snprintf(session->error, sizeof(session->error), "WATCH BSSID/channel mismatch");
+        return;
+    }
+    for (int i = 0; i < session->count; ++i) {
+        if (session->networks[i].selected &&
+            detector_watch_mac_equal(session->networks[i].bssid, bssid))
+            session->networks[i].confirmed = true;
+    }
+    session->watched_count++;
+    session->watch_verified = session->watched_count == session->selected_count;
+    detector_watch_confirm_start_if_ready(session);
+}
+
+static bool detector_watch_accept_event(const detector_watch_session_t *session,
+                                         const char *bssid)
+{
+    if (!session || !session->networks || session->phase != DETECTOR_WATCH_RUNNING || !session->running ||
+        !detector_watch_mac_valid(bssid)) return false;
+    if (!session->selected_mode) return true;
+    if (!session->watch_verified) return false;
+    for (int i = 0; i < session->count; ++i) {
+        if (session->networks[i].selected &&
+            detector_watch_mac_equal(session->networks[i].bssid, bssid)) return true;
+    }
+    return false;
+}
+
+static void detector_watch_connection_lost(detector_watch_session_t *session)
+{
+    if (!session) return;
+    detector_watch_session_t previous = *session;
+    bool remote_may_run = previous.running || previous.remote_state_unknown ||
+                          previous.phase == DETECTOR_WATCH_STARTING ||
+                          previous.phase == DETECTOR_WATCH_RUNNING ||
+                          previous.phase == DETECTOR_WATCH_STOPPING;
+    detector_watch_reset(session);
+    session->phase = DETECTOR_WATCH_ERROR;
+    if (remote_may_run) {
+        session->remote_state_unknown = true;
+        session->details_requested = previous.details_requested;
+        session->details_confirmed = previous.details_confirmed;
+        session->legacy_fallback = previous.legacy_fallback;
+        session->trace_requested = previous.trace_requested;
+        session->trace_state = previous.trace_state;
+        memcpy(session->trace_confirming_bssid, previous.trace_confirming_bssid,
+               sizeof(session->trace_confirming_bssid));
+        session->trace_first_channel = previous.trace_first_channel;
+        session->trace_window_ms = previous.trace_window_ms;
+        session->trace_channel = previous.trace_channel;
+        session->trace_released_channel = previous.trace_released_channel;
+        session->trace_release_idle_ms = previous.trace_release_idle_ms;
+        session->trace_failed_channel = previous.trace_failed_channel;
+        memcpy(session->trace_error, previous.trace_error,
+               sizeof(session->trace_error));
+    }
+    snprintf(session->error, sizeof(session->error),
+             "Detector UART disconnected; scan selection cleared");
+}
+
+static void detector_watch_timeout(detector_watch_session_t *session)
+{
+    if (!session || (session->phase != DETECTOR_WATCH_STARTING &&
+                     session->phase != DETECTOR_WATCH_STOPPING)) return;
+    bool stop_timeout = session->phase == DETECTOR_WATCH_STOPPING;
+    session->phase = DETECTOR_WATCH_ERROR;
+    session->remote_state_unknown = true;
+    session->legacy_retry_pending = false;
+    if (!stop_timeout) session->running = false;
+    snprintf(session->error, sizeof(session->error), "%s",
+             stop_timeout ? "No stop confirmation from JanOS; remote state unknown" :
+                            "No start confirmation from JanOS (or V2 format); remote state unknown");
+}
+
+static void detector_watch_watch_timeout(detector_watch_session_t *session)
+{
+    if (!session ||
+        (session->phase != DETECTOR_WATCH_STARTING &&
+         session->phase != DETECTOR_WATCH_RUNNING) ||
+        !session->selected_mode || session->watch_verified) return;
+    session->phase = DETECTOR_WATCH_ERROR;
+    session->remote_state_unknown = true;
+    snprintf(session->error, sizeof(session->error),
+             "JanOS did not confirm selected BSSID watch; remote state unknown");
+}
+
+static void detector_watch_emergency_stop(detector_watch_session_t *session)
+{
+    if (!session) return;
+    session->phase = DETECTOR_WATCH_ERROR;
+    session->remote_state_unknown = true;
+    session->watch_verified = false;
+}
+
+static void detector_watch_stop_unconfirmed(detector_watch_session_t *session)
+{
+    if (!session) return;
+    session->phase = DETECTOR_WATCH_ERROR;
+    session->remote_state_unknown = true;
+    session->watch_verified = false;
+    snprintf(session->error, sizeof(session->error),
+             "No stop confirmation from JanOS; remote state unknown");
+}
+
+static void detector_watch_begin_stop(detector_watch_session_t *session)
+{
+    if (!session) return;
+    session->phase = DETECTOR_WATCH_STOPPING;
+    session->watch_verified = false;
+    session->error[0] = '\0';
+}
+
+static void detector_watch_stop(detector_watch_session_t *session)
+{
+    if (!session) return;
+    session->phase = DETECTOR_WATCH_STOPPED;
+    session->running = false;
+    session->remote_state_unknown = false;
+    session->watch_verified = false;
+    session->scan_complete = false;
+    session->selected_count = 0;
+    session->watched_count = 0;
+    session->trace_requested = false;
+    detector_watch_clear_trace_lock(session);
+    for (int i = 0; i < session->count; ++i) {
+        session->networks[i].selected = false;
+        session->networks[i].confirmed = false;
+    }
+}
+// Detector watch logic end
 
 // BT device storage
 #define BT_MAX_DEVICES 50
@@ -1262,13 +2180,56 @@ typedef struct {
     lv_obj_t *deauth_detector_page;
     lv_obj_t *deauth_detector_table;
     lv_obj_t *deauth_detector_count_label;
+    lv_obj_t *deauth_detector_storage_label;
+    lv_obj_t *deauth_detector_save_btn;
+    lv_obj_t *deauth_detector_clear_btn;
     lv_obj_t *deauth_detector_start_btn;
     lv_obj_t *deauth_detector_stop_btn;
+    lv_obj_t *deauth_detector_status_label;
+    lv_obj_t *deauth_detector_watch_label;
+    lv_obj_t *deauth_detector_scan_btn;
+    lv_obj_t *deauth_detector_network_list;
+    lv_obj_t *deauth_detector_picker_overlay;
+    lv_obj_t *deauth_detector_picker_popup;
+    lv_obj_t *deauth_detector_picker_status;
+    lv_obj_t *deauth_detector_picker_count;
+    lv_obj_t *deauth_detector_picker_done_btn;
+    lv_obj_t *deauth_detector_picker_rescan_btn;
+    lv_obj_t *deauth_detector_all_btn;
+    lv_obj_t *deauth_detector_selected_btn;
+    lv_obj_t *deauth_detector_trace_checkbox;
 
     deauth_entry_t *deauth_entries;  // PSRAM
     int deauth_entry_count;
+    uint64_t deauth_total_deauth;
+    uint64_t deauth_total_csa;
+    bool deauth_detector_export_active;
+    bool deauth_detector_storage_error;
+    char deauth_detector_storage_message[180];
     volatile bool deauth_detector_running;
+    volatile bool deauth_detector_task_active;
+    volatile bool deauth_detector_scan_active;
+    bool deauth_detector_selected_mode;
+    bool deauth_detector_trace_enabled;
+    bool deauth_detector_stop_requested;
+    bool deauth_detector_scan_sent;
+    bool deauth_detector_start_sent;
+    bool deauth_detector_console_claimed;
+    bool deauth_detector_ui_dirty;
+    volatile bool deauth_detector_link_lost;
+    int deauth_detector_bound_tab; // tab_id_t is declared after tab_context_t
+    uart_port_t deauth_detector_bound_port;
+    uint32_t deauth_detector_bound_link_generation;
+    char deauth_detector_command[320];
+    char deauth_detector_line[512];
+    int deauth_detector_line_pos;
+    bool deauth_detector_line_overflow;
+    int64_t deauth_detector_phase_started_us;
+    int64_t deauth_detector_watch_started_us;
+    int64_t deauth_detector_last_ui_us;
+    detector_watch_session_t detector_watch;
     TaskHandle_t deauth_detector_task;
+    TaskHandle_t deauth_detector_scan_task;
 
     // =====================================================================
     // BLUETOOTH - Menu and sub-pages
@@ -2212,6 +3173,9 @@ static bool mbus_detected = false;
 
 // SD card presence on Tab5 itself (checked via /sdcard mount point)
 static bool internal_sd_present = false;
+// Serializes the Tab5 SD mount probe with detector CSV export. Physical card
+// removal can still interrupt a write and is reported by the writer.
+static atomic_flag detector_sd_export_probe_lock = ATOMIC_FLAG_INIT;
 // Background poller that keeps internal_sd_present live (insert/remove) since
 // the SD slot has no card-detect line wired.
 static TaskHandle_t sd_monitor_task_handle = NULL;
@@ -2232,6 +3196,8 @@ static volatile bool board_probe_in_progress = false;
 static TaskHandle_t crack_transport_owner[3] = {NULL, NULL, NULL};
 static portMUX_TYPE crack_transport_owner_mux = portMUX_INITIALIZER_UNLOCKED;
 static SemaphoreHandle_t transport_console_mutex[3];
+// Every JanOS scan invalidates detector indices on that same byte stream.
+static atomic_uint detector_scan_epoch[3];
 
 /* Reservation covers worker startup as well as active WFA traffic. Let an
  * incumbent mutex holder finish before the analyzer acquires the stream. */
@@ -2563,6 +3529,14 @@ static void init_tab_context(tab_context_t *ctx) {
             ESP_LOGE(TAG, "Failed to allocate deauth_entries in PSRAM");
         }
     }
+    if (!ctx->detector_watch.networks) {
+        ctx->detector_watch.networks = heap_caps_calloc(
+            DETECTOR_WATCH_MAX, sizeof(detector_watch_network_t), MALLOC_CAP_SPIRAM);
+        if (!ctx->detector_watch.networks) {
+            ESP_LOGE(TAG, "Failed to allocate detector watch networks in PSRAM");
+        }
+    }
+    detector_watch_reset(&ctx->detector_watch);
 
     // BT devices
     if (!ctx->bt_devices) {
@@ -3568,6 +4542,16 @@ static void show_deauth_detector_page(void);
 static void deauth_detector_back_btn_event_cb(lv_event_t *e);
 static void deauth_detector_start_cb(lv_event_t *e);
 static void deauth_detector_stop_cb(lv_event_t *e);
+static void deauth_detector_all_cb(lv_event_t *e);
+static void deauth_detector_selected_cb(lv_event_t *e);
+static void deauth_detector_scan_cb(lv_event_t *e);
+static void deauth_detector_network_cb(lv_event_t *e);
+static void deauth_detector_picker_done_cb(lv_event_t *e);
+static void deauth_detector_picker_cancel_cb(lv_event_t *e);
+static void deauth_detector_scan_task(void *arg);
+static void deauth_detector_scan_poll(tab_context_t *ctx);
+static void deauth_detector_poll(tab_context_t *ctx);
+static void deauth_detector_disconnect_ui(void *user_data);
 static void deauth_detector_task(void *arg);
 static void update_deauth_table(tab_context_t *ctx);
 static void show_bluetooth_menu_page(void);
@@ -5390,6 +6374,11 @@ static void usb_cdc_disconnect_cb(usbh_cdc_handle_t cdc_handle, void *user_data)
         alert_chime_play(ALERT_TONE_WARN);
     }
     usb_cdc_connected = false;
+    if (usb_ctx.detector_watch.scan_complete || usb_ctx.deauth_detector_scan_active ||
+        usb_ctx.deauth_detector_task_active) {
+        usb_ctx.deauth_detector_link_lost = true;
+        if (lvgl_ready) lv_async_call(deauth_detector_disconnect_ui, &usb_ctx);
+    }
     usb_vcp_config_done = false;
     usb_transport_ready = false;
     usb_transport_warned = false;
@@ -6039,10 +7028,15 @@ static int transport_write_bytes_tab(tab_id_t tab, uart_port_t port, const char 
     if (tab >= TAB_GROVE && tab <= TAB_MBUS &&
         crack_transport_owner[tab] != NULL &&
         crack_transport_owner[tab] != xTaskGetCurrentTaskHandle()) return 0;
-    if (port == UART_NUM && tab == TAB_USB) {
-        return usb_transport_write(data, len);
+    int written = (port == UART_NUM && tab == TAB_USB)
+                      ? usb_transport_write(data, len)
+                      : uart_write_bytes(port, data, len);
+    if (written == (int)len && tab >= TAB_GROVE && tab <= TAB_MBUS &&
+        len >= 13 && !memcmp(data, "scan_networks", 13) &&
+        (len == 13 || data[13] == '\r' || data[13] == '\n')) {
+        atomic_fetch_add(&detector_scan_epoch[(size_t)tab], 1);
     }
-    return uart_write_bytes(port, data, len);
+    return written;
 }
 
 static int transport_read_bytes_tab(tab_id_t tab, uart_port_t port, void *data, size_t len, TickType_t ticks_to_wait)
@@ -49492,7 +50486,59 @@ static void pcap_viewer_render_capture_page(pcap_viewer_state_t *state)
 // Deauth Detector Page
 //==================================================================================
 
-// Update the deauth table UI with current entries
+static void detector_history_display_time(int64_t epoch_s, uint64_t uptime_s,
+                                          char *out, size_t out_size)
+{
+    char local[32];
+    if (detector_history_local_time(epoch_s, local)) {
+        snprintf(out, out_size, "%s", local);
+    } else {
+        snprintf(out, out_size, "uptime %lluh %02llum %02llus",
+                 (unsigned long long)(uptime_s / 3600),
+                 (unsigned long long)((uptime_s / 60) % 60),
+                 (unsigned long long)(uptime_s % 60));
+    }
+}
+
+static void detector_history_add_seen_label(lv_obj_t *row, const deauth_entry_t *entry)
+{
+    char first[48], last[48];
+    detector_history_display_time(entry->first_seen_epoch_s,
+                                  entry->first_seen_uptime_s, first, sizeof(first));
+    detector_history_display_time(entry->last_seen_epoch_s,
+                                  entry->last_seen_uptime_s, last, sizeof(last));
+    lv_obj_t *seen = lv_label_create(row);
+    lv_label_set_text_fmt(seen, "Seen: %u | First: %s | Last: %s",
+                          (unsigned)entry->occurrences, first, last);
+    lv_obj_set_style_text_font(seen, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(seen, lv_color_hex(0xCCCCCC), 0);
+    lv_obj_set_width(seen, lv_pct(100));
+    lv_label_set_long_mode(seen, LV_LABEL_LONG_WRAP);
+}
+
+static void deauth_detector_render_storage_status(tab_context_t *ctx)
+{
+    if (!ctx) return;
+    if (ctx->deauth_detector_storage_label) {
+        lv_label_set_text(ctx->deauth_detector_storage_label,
+                          ctx->deauth_detector_storage_message);
+        lv_obj_set_style_text_color(ctx->deauth_detector_storage_label,
+                                    ctx->deauth_detector_storage_error
+                                        ? COLOR_MATERIAL_RED : lv_color_hex(0xCCCCCC), 0);
+    }
+    if (ctx->deauth_detector_save_btn) {
+        if (ctx->deauth_detector_export_active || ctx->deauth_entry_count == 0)
+            lv_obj_add_state(ctx->deauth_detector_save_btn, LV_STATE_DISABLED);
+        else lv_obj_clear_state(ctx->deauth_detector_save_btn, LV_STATE_DISABLED);
+    }
+    if (ctx->deauth_detector_clear_btn) {
+        if (ctx->deauth_entry_count == 0)
+            lv_obj_add_state(ctx->deauth_detector_clear_btn, LV_STATE_DISABLED);
+        else lv_obj_clear_state(ctx->deauth_detector_clear_btn, LV_STATE_DISABLED);
+    }
+}
+
+// Update the deauth table UI with current grouped observations
 static void update_deauth_table(tab_context_t *ctx)
 {
     if (!ctx || !ctx->deauth_detector_table || !ctx->deauth_entries) return;
@@ -49503,7 +50549,6 @@ static void update_deauth_table(tab_context_t *ctx)
 
     lv_obj_clean(deauth_table);
 
-    int csa_events = 0;
     for (int i = 0; i < ctx->deauth_entry_count; i++) {
         deauth_entry_t *entry = &ctx->deauth_entries[i];
 
@@ -49513,13 +50558,15 @@ static void update_deauth_table(tab_context_t *ctx)
         lv_obj_set_style_border_width(row, 0, 0);
         lv_obj_set_style_radius(row, 6, 0);
         lv_obj_set_style_pad_all(row, 8, 0);
+        lv_obj_set_style_pad_column(row, 8, 0);
         lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
         lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
         lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
 
         if (entry->is_csa) {
-            csa_events++;
             lv_obj_set_flex_flow(row, LV_FLEX_FLOW_COLUMN);
+            lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START,
+                                  LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
             lv_obj_set_style_pad_row(row, 4, 0);
             lv_obj_t *summary = lv_label_create(row);
             lv_label_set_text_fmt(summary, "CSA | %s | RX CH%d -> TO CH%d",
@@ -49536,25 +50583,29 @@ static void update_deauth_table(tab_context_t *ctx)
             lv_obj_set_width(identity, lv_pct(100));
             lv_label_set_long_mode(identity, LV_LABEL_LONG_WRAP);
             lv_obj_t *detail = lv_label_create(row);
-            char operating_class[8];
+            char operating_class[12];
             if (entry->csa_class < 0) snprintf(operating_class, sizeof(operating_class), "-");
             else snprintf(operating_class, sizeof(operating_class), "%d", entry->csa_class);
-            lv_label_set_text_fmt(detail, "%s | Count: %d | %d dBm | Mode: %d | Class: %s",
+            lv_label_set_text_fmt(detail, "%s | JanOS COUNT: %d | %d dBm | Mode: %d | Class: %s",
                                   entry->csa_via, entry->csa_count, entry->rssi,
                                   entry->csa_mode, operating_class);
             lv_obj_set_style_text_font(detail, &lv_font_montserrat_12, 0);
             lv_obj_set_style_text_color(detail, lv_color_hex(0xCCCCCC), 0);
             lv_obj_set_width(detail, lv_pct(100));
             lv_label_set_long_mode(detail, LV_LABEL_LONG_WRAP);
+            detector_history_add_seen_label(row, entry);
             continue;
         }
+
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW_WRAP);
+        lv_obj_set_style_pad_row(row, 4, 0);
 
         // Channel
         lv_obj_t *ch_lbl = lv_label_create(row);
         lv_label_set_text_fmt(ch_lbl, "CH%d", entry->channel);
         lv_obj_set_style_text_font(ch_lbl, &lv_font_montserrat_14, 0);
         lv_obj_set_style_text_color(ch_lbl, COLOR_MATERIAL_AMBER, 0);
-        lv_obj_set_width(ch_lbl, 50);
+        lv_obj_set_width(ch_lbl, 124);
 
         // AP Name
         lv_obj_t *ap_lbl = lv_label_create(row);
@@ -49569,7 +50620,7 @@ static void update_deauth_table(tab_context_t *ctx)
         lv_label_set_text(bssid_lbl, entry->bssid);
         lv_obj_set_style_text_font(bssid_lbl, &lv_font_montserrat_12, 0);
         lv_obj_set_style_text_color(bssid_lbl, lv_color_hex(0x888888), 0);
-        lv_obj_set_width(bssid_lbl, 140);
+        lv_obj_set_width(bssid_lbl, 150);
 
         // RSSI
         lv_obj_t *rssi_lbl = lv_label_create(row);
@@ -49582,14 +50633,40 @@ static void update_deauth_table(tab_context_t *ctx)
         } else {
             lv_obj_set_style_text_color(rssi_lbl, COLOR_MATERIAL_RED, 0);
         }
-        lv_obj_set_width(rssi_lbl, 45);
+        lv_obj_set_width(rssi_lbl, 90);
+        if (entry->is_deauth_v2) {
+            lv_obj_t *frame_detail = lv_label_create(row);
+            bool broadcast = detector_history_mac_equal(entry->frame_da,
+                                                         "FF:FF:FF:FF:FF:FF");
+            if (entry->reason_known) {
+                lv_label_set_text_fmt(frame_detail,
+                                      "Claimed TX: %s | Frame recipient (DA): %s%s | Reason: %d",
+                                      entry->claimed_tx, entry->frame_da,
+                                      broadcast ? " (broadcast; no single recipient)" : "",
+                                      entry->reason_code);
+            } else {
+                lv_label_set_text_fmt(frame_detail,
+                                      "Claimed TX: %s | Frame recipient (DA): %s%s | "
+                                      "Reason: unknown (protected/encrypted frame)",
+                                      entry->claimed_tx, entry->frame_da,
+                                      broadcast ? " (broadcast; no single recipient)" : "");
+            }
+            lv_obj_set_style_text_font(frame_detail, &lv_font_montserrat_12, 0);
+            lv_obj_set_style_text_color(frame_detail, lv_color_hex(0xCCCCCC), 0);
+            lv_obj_set_width(frame_detail, lv_pct(100));
+            lv_label_set_long_mode(frame_detail, LV_LABEL_LONG_WRAP);
+        }
+        detector_history_add_seen_label(row, entry);
     }
 
     if (ctx->deauth_detector_count_label) {
         lv_label_set_text_fmt(ctx->deauth_detector_count_label,
-                              "Stored: %d deauth | %d CSA announcements",
-                              ctx->deauth_entry_count - csa_events, csa_events);
+                              "Observed: %llu DEAUTH | %llu CSA | Latest groups: %d/%d",
+                              (unsigned long long)ctx->deauth_total_deauth,
+                              (unsigned long long)ctx->deauth_total_csa,
+                              ctx->deauth_entry_count, DEAUTH_DETECTOR_MAX_ENTRIES);
     }
+    deauth_detector_render_storage_status(ctx);
 
     // Restore scroll position
     lv_obj_scroll_to_y(deauth_table, scroll_y, LV_ANIM_OFF);
@@ -49685,6 +50762,8 @@ static bool parse_deauth_line(const char *line, deauth_entry_t *entry)
     if (!line || !entry) return false;
     const char *cursor = strstr(line, "[DEAUTH] ");
     if (!cursor) return false;
+    const char *instruction = strstr(line, "Output: ");
+    if (instruction && instruction < cursor) return false;
     cursor += sizeof("[DEAUTH] ") - 1;
 
     deauth_entry_t parsed = {0};
@@ -49733,154 +50812,1295 @@ static bool parse_deauth_line(const char *line, deauth_entry_t *entry)
     return true;
 }
 
-// Deauth detector monitor task
-static void deauth_detector_task(void *arg)
+static bool deauth_v2_parse_reason(const char **cursor, int *reason,
+                                   bool *reason_known)
 {
-    // Get context passed to task
-    tab_context_t *ctx = (tab_context_t *)arg;
+    const char *p = *cursor;
+    if (!reason || !reason_known || strncmp(p, "REASON: ", 8)) return false;
+    p += 8;
+    if (*p == '-' && strncmp(p + 1, " | ", 3) == 0) {
+        *reason = 0;
+        *reason_known = false;
+        *cursor = p + 4;
+        return true;
+    }
+    if (!isdigit((unsigned char)*p)) return false;
+    unsigned value = 0;
+    int digits = 0;
+    while (isdigit((unsigned char)*p)) {
+        if (++digits > 5) return false;
+        value = value * 10U + (unsigned)(*p++ - '0');
+    }
+    if (value > 65535U || strncmp(p, " | ", 3)) return false;
+    *reason = (int)value;
+    *reason_known = true;
+    *cursor = p + 3;
+    return true;
+}
 
-    // Determine UART from context
-    tab_id_t task_tab = tab_id_for_ctx(ctx);
-    uart_port_t uart_port = (task_tab == TAB_MBUS && uart2_initialized) ? UART2_NUM : UART_NUM;
-    const char *uart_name = tab_transport_name(task_tab);
+static bool parse_deauth_v2_line(const char *line, deauth_entry_t *entry)
+{
+    if (!line || !entry) return false;
+    size_t length = 0;
+    while (length < 512 && line[length]) ++length;
+    if (length == 512) return false;
+    const char *p = line;
+    while (*p == ' ' || *p == '\t') ++p;
+    if (strncmp(p, "> ", 2) == 0) p += 2;
+    else if (strncmp(p, "I JanOS: ", 9) == 0) p += 9;
+    if (strncmp(p, "[DEAUTH_V2] ", sizeof("[DEAUTH_V2] ") - 1)) return false;
+    p += sizeof("[DEAUTH_V2] ") - 1;
+    deauth_entry_t parsed = { .is_deauth_v2 = true };
+    if (!csa_parse_number(&p, "CH: ", 0, 255, &parsed.channel) ||
+        !csa_parse_mac(&p, "BSSID: ", parsed.bssid) ||
+        !csa_parse_mac(&p, "TX: ", parsed.claimed_tx) ||
+        !csa_parse_mac(&p, "DA: ", parsed.frame_da) ||
+        !csa_parse_number(&p, "RSSI: ", -128, 127, &parsed.rssi) ||
+        !deauth_v2_parse_reason(&p, &parsed.reason_code, &parsed.reason_known) ||
+        strncmp(p, "SSID: ", 6)) return false;
+    p += 6;
+    size_t ssid_length = strlen(p);
+    if (ssid_length == 0 || ssid_length >= sizeof(parsed.ap_name)) return false;
+    for (size_t i = 0; i < ssid_length; ++i) {
+        unsigned char c = (unsigned char)p[i];
+        if (c < 32 || c == 127) return false;
+    }
+    memcpy(parsed.ap_name, p, ssid_length + 1);
+    *entry = parsed;
+    return true;
+}
 
-    ESP_LOGI(TAG, "[%s] Deauth detector task started for tab %d", uart_name, task_tab);
+// Deauth detector monitor task
+static bool deauth_detector_bound_transport_available(const tab_context_t *ctx)
+{
+    if (!ctx) return false;
+    tab_id_t tab = ctx->deauth_detector_bound_tab;
+    if (tab < TAB_GROVE || tab > TAB_MBUS ||
+        ctx->deauth_detector_bound_port != uart_port_for_tab(tab)) return false;
+    if (tab == TAB_USB) {
+        return usb_cdc_connected && usb_transport_ready && usb_cdc_handle &&
+               ctx->deauth_detector_bound_link_generation ==
+                   atomic_load(&sta_mac_usb_generation);
+    }
+    return tab == TAB_GROVE ? grove_detected : (mbus_detected && uart2_initialized);
+}
 
-    char rx_buffer[512];
-    char line_buffer[256];
-    int line_pos = 0;
-    bool line_overflow = false;
-    bool csa_ui_dirty = false;
-    int64_t last_csa_ui_us = esp_timer_get_time() - 1000000;
+static bool deauth_detector_link_ready(const tab_context_t *ctx)
+{
+    return ctx && !ctx->deauth_detector_link_lost &&
+           deauth_detector_bound_transport_available(ctx);
+}
 
-    // Use context's flag
-    while (ctx && ctx->deauth_detector_running) {
-        int len = transport_read_bytes_tab(task_tab, uart_port, rx_buffer, sizeof(rx_buffer) - 1, pdMS_TO_TICKS(100));
+static bool deauth_detector_claim_console(tab_context_t *ctx)
+{
+    if (!ctx || !deauth_detector_link_ready(ctx) ||
+        janos_console_occupied(ctx->deauth_detector_bound_tab) ||
+        ctx->janos_wps_active || ctx->scan_in_progress) return false;
+    SemaphoreHandle_t mutex = transport_console_mutex[(size_t)ctx->deauth_detector_bound_tab];
+    if (!mutex || xSemaphoreTake(mutex, 0) != pdTRUE) return false;
+    ctx->deauth_detector_console_claimed = true;
+    if (ctx->deauth_detector_bound_tab == TAB_USB) {
+        usb_rx_exclusive = true;
+        usb_flush_input(80);
+    } else {
+        uart_flush_input(ctx->deauth_detector_bound_port);
+    }
+    return true;
+}
 
-        if (len > 0) {
-            rx_buffer[len] = '\0';
+static void deauth_detector_release_console(tab_context_t *ctx)
+{
+    if (!ctx || !ctx->deauth_detector_console_claimed) return;
+    if (ctx->deauth_detector_bound_tab == TAB_USB) usb_rx_exclusive = false;
+    SemaphoreHandle_t mutex = transport_console_mutex[(size_t)ctx->deauth_detector_bound_tab];
+    ctx->deauth_detector_console_claimed = false;
+    if (mutex) xSemaphoreGive(mutex);
+}
 
-            for (int i = 0; i < len; i++) {
-                char c = rx_buffer[i];
+static bool deauth_detector_send_bound(tab_context_t *ctx, const char *command)
+{
+    if (!ctx || !command || !deauth_detector_link_ready(ctx)) return false;
+    size_t length = strlen(command);
+    tab_id_t tab = ctx->deauth_detector_bound_tab;
+    uart_port_t port = ctx->deauth_detector_bound_port;
+    int written = transport_write_bytes_tab(tab, port, command, length);
+    int newline = written == (int)length
+                      ? transport_write_bytes_tab(tab, port, "\r\n", 2) : 0;
+    if (written != (int)length || newline != 2) return false;
+    ESP_LOGI(TAG, "[%s] Detector TX: %s", tab_transport_name(tab), command);
+    return true;
+}
 
-                if (c == '\n' || c == '\r') {
-                    if (line_pos > 0 && !line_overflow) {
-                        line_buffer[line_pos] = '\0';
-
-                        deauth_entry_t entry = {0};
-                        bool is_csa = parse_csa_line(line_buffer, &entry);
-                        if (ctx->deauth_entries && (is_csa || parse_deauth_line(line_buffer, &entry))) {
-                            ESP_LOGI(TAG, "%s observed: CH%d %s (%s) RSSI=%d",
-                                     is_csa ? "CSA announcement" : "Deauth", entry.channel,
-                                     entry.ap_name, entry.bssid, entry.rssi);
-                            // A flood is hundreds of frames a minute; the 15 s
-                            // cooldown on ALARM is what makes this survivable.
-                            if (!is_csa) alert_chime_play(ALERT_TONE_ALARM);
-
-                            // Shift entries down (newest first)
-                            if (ctx->deauth_entry_count < DEAUTH_DETECTOR_MAX_ENTRIES) {
-                                ctx->deauth_entry_count++;
-                            }
-                            memmove(&ctx->deauth_entries[1], &ctx->deauth_entries[0],
-                                    (ctx->deauth_entry_count - 1) * sizeof(deauth_entry_t));
-                            ctx->deauth_entries[0] = entry;
-
-                            // Keep every event, but batch CSA-only refreshes to 1 Hz.
-                            // Legacy deauth rows and their alert still update immediately.
-                            csa_ui_dirty = is_csa;
-                            if (!is_csa) {
-                                bsp_display_lock(0);
-                                update_deauth_table(ctx);
-                                bsp_display_unlock();
-                                last_csa_ui_us = esp_timer_get_time();
-                            }
-                        }
-
+static void deauth_detector_render_status(tab_context_t *ctx)
+{
+    if (!ctx || !ctx->deauth_detector_page) return;
+    const detector_watch_session_t *watch = &ctx->detector_watch;
+    const char *status = "Stopped";
+    switch (watch->phase) {
+        case DETECTOR_WATCH_SCANNING: status = "Scanning JanOS... waiting for complete list"; break;
+        case DETECTOR_WATCH_READY:
+            status = ctx->deauth_detector_selected_mode
+                         ? (watch->selected_count > 0 ? "Selection ready; press Start"
+                                                      : "Scan complete; choose BSSID and press Start")
+                         : "Ready for all channels; press Start";
+            break;
+        case DETECTOR_WATCH_STARTING:
+            status = watch->selected_mode && watch->start_ack_seen &&
+                             (!watch->details_requested || watch->details_confirmed) &&
+                             !watch->watch_verified
+                         ? "Start acknowledged; waiting for BSSID WATCH confirmation"
+                         : watch->legacy_fallback
+                               ? "Starting legacy detector on older JanOS"
+                               : watch->start_ack_seen && !watch->details_confirmed
+                                     ? "Start acknowledged; waiting for V2 format confirmation"
+                                     : "Starting... waiting for JanOS confirmation";
+            break;
+        case DETECTOR_WATCH_RUNNING:
+            status = watch->selected_mode && !watch->watch_verified
+                         ? "Start acknowledged; waiting for BSSID WATCH confirmation"
+                         : "Detector running";
+            break;
+        case DETECTOR_WATCH_STOPPING: status = "Stopping... waiting for JanOS confirmation"; break;
+        case DETECTOR_WATCH_ERROR: status = watch->error[0] ? watch->error : "Detector response error"; break;
+        default: break;
+    }
+    if (ctx->deauth_detector_status_label) lv_label_set_text(ctx->deauth_detector_status_label, status);
+    const char *format = watch->details_confirmed ? "V2 details" :
+                         watch->legacy_fallback ? "Legacy fallback (older JanOS)" :
+                         watch->details_requested ? "V2 pending" : "V2 on next Start";
+    char trace_status[256];
+    bool session_trace_requested = watch->trace_requested ||
+                                   watch->trace_state == DETECTOR_TRACE_LEGACY_DROPPED;
+    const char *requested = session_trace_requested ? "yes" : "no";
+    const char *uncertain = watch->remote_state_unknown
+                                ? " (remote state uncertain)" : "";
+    if (!session_trace_requested && ctx->deauth_detector_trace_enabled &&
+        watch->phase == DETECTOR_WATCH_STOPPED) {
+        snprintf(trace_status, sizeof(trace_status),
+                 "Trace requested: no (enabled for next Start) | Trace lock: off");
+    } else if (watch->trace_state == DETECTOR_TRACE_UNSUPPORTED) {
+        snprintf(trace_status, sizeof(trace_status),
+                 "Trace requested: yes | Trace unsupported by this JanOS");
+    } else if (watch->trace_state == DETECTOR_TRACE_LEGACY_DROPPED) {
+        snprintf(trace_status, sizeof(trace_status),
+                 "Trace requested: yes | Trace lock: unavailable in legacy fallback");
+    } else if (watch->trace_state == DETECTOR_TRACE_LOCKED) {
+        snprintf(trace_status, sizeof(trace_status),
+                 "Trace requested: %s | Trace lock: channel %d%s", requested,
+                 watch->trace_channel, uncertain);
+    } else if (watch->trace_state == DETECTOR_TRACE_RELEASED) {
+        snprintf(trace_status, sizeof(trace_status),
+                 "Trace requested: %s | Trace: released CH %d after %d ms idle; "
+                 "resuming channel hopping%s",
+                 requested, watch->trace_released_channel,
+                 watch->trace_release_idle_ms, uncertain);
+    } else if (watch->trace_state == DETECTOR_TRACE_RETRY_READY) {
+        snprintf(trace_status, sizeof(trace_status),
+                 "Trace requested: %s | Trace: tune failed on channel %d (%s); "
+                 "armed for retry%s",
+                 requested, watch->trace_failed_channel,
+                 watch->trace_error[0] ? watch->trace_error : "unknown error",
+                 uncertain);
+    } else if (watch->trace_state == DETECTOR_TRACE_CONFIRMING) {
+        snprintf(trace_status, sizeof(trace_status),
+                 "Trace requested: %s | Trace: confirming %s from CH %d (%d ms)%s",
+                 requested,
+                 watch->trace_confirming_bssid[0] ? watch->trace_confirming_bssid : "unknown BSSID",
+                 watch->trace_first_channel, watch->trace_window_ms, uncertain);
+    } else if (watch->trace_state == DETECTOR_TRACE_ARMED) {
+        if (watch->trace_released_channel > 0 && watch->trace_release_idle_ms > 0) {
+            snprintf(trace_status, sizeof(trace_status),
+                     "Trace requested: yes | Trace: armed after idle release of CH %d "
+                     "(%d ms); waiting for first eligible DEAUTH%s",
+                     watch->trace_released_channel, watch->trace_release_idle_ms,
+                     uncertain);
+        } else {
+            snprintf(trace_status, sizeof(trace_status),
+                     "Trace requested: yes | Trace: armed; waiting for first eligible DEAUTH%s",
+                     uncertain);
+        }
+    } else if (watch->trace_state == DETECTOR_TRACE_WAITING_ARM) {
+        snprintf(trace_status, sizeof(trace_status),
+                 "Trace requested: yes | Trace: waiting for JanOS arm confirmation%s",
+                 uncertain);
+    } else {
+        snprintf(trace_status, sizeof(trace_status),
+                 "Trace requested: no | Trace lock: off");
+    }
+    if (ctx->deauth_detector_watch_label) {
+        if (ctx->deauth_detector_selected_mode) {
+            char bssids[96] = {0};
+            int shown = 0;
+            for (int i = 0; watch->networks && i < watch->count && shown < 2; ++i) {
+                const detector_watch_network_t *network = &watch->networks[i];
+                if (!network->selected) continue;
+                bool duplicate = false;
+                for (int previous = 0; previous < i; ++previous) {
+                    if (watch->networks[previous].selected &&
+                        detector_watch_mac_equal(watch->networks[previous].bssid,
+                                                 network->bssid)) {
+                        duplicate = true;
+                        break;
                     }
-                    line_pos = 0;
-                    line_overflow = false;
-                } else if (!line_overflow && line_pos < (int)sizeof(line_buffer) - 1) {
-                    line_buffer[line_pos++] = c;
-                } else {
-                    line_overflow = true;
                 }
+                if (duplicate) continue;
+                size_t used = strlen(bssids);
+                snprintf(bssids + used, sizeof(bssids) - used, "%s%s%s",
+                         shown ? ", " : "", network->bssid,
+                         network->confirmed ? " (WATCH)" : "");
+                shown++;
+            }
+            lv_label_set_text_fmt(ctx->deauth_detector_watch_label,
+                                  "Selected networks | BSSID: %d selected, %d/%d WATCH confirmed%s | Format: %s\n"
+                                  "Watching: %s%s\n%s",
+                                  watch->selected_count, watch->watched_count,
+                                  watch->selected_count,
+                                  watch->running && !watch->watch_verified ? " (unverified)" : "",
+                                  format, shown ? bssids : "None",
+                                  watch->selected_count > shown ? " ... (tap Selected networks for all)" : "",
+                                  trace_status);
+        } else {
+            lv_label_set_text_fmt(ctx->deauth_detector_watch_label,
+                                  "All networks | all channels | Format: %s\n%s",
+                                  format, trace_status);
+        }
+    }
+    if (ctx->deauth_detector_all_btn) {
+        lv_obj_set_style_bg_color(ctx->deauth_detector_all_btn,
+                                  ctx->deauth_detector_selected_mode ? lv_color_hex(0x333333) : COLOR_MATERIAL_GREEN, 0);
+    }
+    if (ctx->deauth_detector_selected_btn) {
+        lv_obj_set_style_bg_color(ctx->deauth_detector_selected_btn,
+                                  ctx->deauth_detector_selected_mode ? COLOR_MATERIAL_GREEN : lv_color_hex(0x333333), 0);
+    }
+    bool busy = ctx->deauth_detector_scan_active || ctx->deauth_detector_task_active ||
+                ctx->deauth_detector_scan_task || ctx->deauth_detector_task;
+    bool selection_ready = watch->phase == DETECTOR_WATCH_READY &&
+                           watch->scan_complete && watch->selected_count > 0;
+    if (ctx->deauth_detector_all_btn) {
+        if (busy || watch->remote_state_unknown)
+            lv_obj_add_state(ctx->deauth_detector_all_btn, LV_STATE_DISABLED);
+        else lv_obj_clear_state(ctx->deauth_detector_all_btn, LV_STATE_DISABLED);
+    }
+    if (ctx->deauth_detector_selected_btn) {
+        if (watch->remote_state_unknown ||
+            (busy && !(ctx->deauth_detector_selected_mode && watch->scan_complete &&
+                       !ctx->deauth_detector_scan_active)))
+            lv_obj_add_state(ctx->deauth_detector_selected_btn, LV_STATE_DISABLED);
+        else lv_obj_clear_state(ctx->deauth_detector_selected_btn, LV_STATE_DISABLED);
+    }
+    if (ctx->deauth_detector_start_btn) {
+        if (busy || watch->remote_state_unknown || !watch->networks ||
+            (ctx->deauth_detector_selected_mode && !selection_ready))
+            lv_obj_add_state(ctx->deauth_detector_start_btn, LV_STATE_DISABLED);
+        else lv_obj_clear_state(ctx->deauth_detector_start_btn, LV_STATE_DISABLED);
+    }
+    if (ctx->deauth_detector_stop_btn) {
+        if ((ctx->deauth_detector_task_active && !ctx->deauth_detector_stop_requested) ||
+            (watch->remote_state_unknown && !ctx->deauth_detector_task_active))
+            lv_obj_clear_state(ctx->deauth_detector_stop_btn, LV_STATE_DISABLED);
+        else lv_obj_add_state(ctx->deauth_detector_stop_btn, LV_STATE_DISABLED);
+    }
+    if (ctx->deauth_detector_scan_btn) {
+        if (ctx->deauth_detector_selected_mode)
+            lv_obj_clear_flag(ctx->deauth_detector_scan_btn, LV_OBJ_FLAG_HIDDEN);
+        else
+            lv_obj_add_flag(ctx->deauth_detector_scan_btn, LV_OBJ_FLAG_HIDDEN);
+        if (busy || watch->remote_state_unknown || !watch->networks)
+            lv_obj_add_state(ctx->deauth_detector_scan_btn, LV_STATE_DISABLED);
+        else lv_obj_clear_state(ctx->deauth_detector_scan_btn, LV_STATE_DISABLED);
+    }
+    if (ctx->deauth_detector_trace_checkbox) {
+        if (ctx->deauth_detector_trace_enabled)
+            lv_obj_add_state(ctx->deauth_detector_trace_checkbox, LV_STATE_CHECKED);
+        else
+            lv_obj_clear_state(ctx->deauth_detector_trace_checkbox, LV_STATE_CHECKED);
+        bool trace_frozen = ctx->deauth_detector_task_active ||
+                            watch->remote_state_unknown ||
+                            watch->phase == DETECTOR_WATCH_STARTING ||
+                            watch->phase == DETECTOR_WATCH_RUNNING ||
+                            watch->phase == DETECTOR_WATCH_STOPPING;
+        if (trace_frozen)
+            lv_obj_add_state(ctx->deauth_detector_trace_checkbox, LV_STATE_DISABLED);
+        else
+            lv_obj_clear_state(ctx->deauth_detector_trace_checkbox, LV_STATE_DISABLED);
+    }
+    if (ctx->deauth_detector_picker_status)
+        lv_label_set_text(ctx->deauth_detector_picker_status, status);
+    if (ctx->deauth_detector_picker_count)
+        lv_label_set_text_fmt(ctx->deauth_detector_picker_count, "%d BSSID selected",
+                              watch->selected_count);
+    if (ctx->deauth_detector_picker_done_btn) {
+        if (busy || watch->remote_state_unknown || !selection_ready)
+            lv_obj_add_state(ctx->deauth_detector_picker_done_btn, LV_STATE_DISABLED);
+        else lv_obj_clear_state(ctx->deauth_detector_picker_done_btn, LV_STATE_DISABLED);
+    }
+    if (ctx->deauth_detector_picker_rescan_btn) {
+        if (busy || watch->remote_state_unknown || !watch->networks)
+            lv_obj_add_state(ctx->deauth_detector_picker_rescan_btn, LV_STATE_DISABLED);
+        else lv_obj_clear_state(ctx->deauth_detector_picker_rescan_btn, LV_STATE_DISABLED);
+    }
+    if (ctx->deauth_detector_network_list) {
+        bool show_network_list = ctx->deauth_detector_picker_overlay &&
+                                 ctx->deauth_detector_selected_mode &&
+                                 watch->scan_complete &&
+                                 (watch->phase == DETECTOR_WATCH_READY ||
+                                  watch->phase == DETECTOR_WATCH_STARTING ||
+                                  watch->phase == DETECTOR_WATCH_RUNNING ||
+                                  watch->phase == DETECTOR_WATCH_ERROR);
+        if (show_network_list)
+            lv_obj_clear_flag(ctx->deauth_detector_network_list, LV_OBJ_FLAG_HIDDEN);
+        else
+            lv_obj_add_flag(ctx->deauth_detector_network_list, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void deauth_detector_render_networks(tab_context_t *ctx)
+{
+    if (!ctx || !ctx->deauth_detector_network_list) return;
+    lv_obj_clean(ctx->deauth_detector_network_list);
+    const detector_watch_session_t *watch = &ctx->detector_watch;
+    if (!watch->networks || !watch->scan_complete) return;
+    for (int i = 0; i < watch->count; ++i) {
+        const detector_watch_network_t *network = &watch->networks[i];
+        lv_obj_t *checkbox = lv_checkbox_create(ctx->deauth_detector_network_list);
+        char text[112];
+        snprintf(text, sizeof(text), "%d. %s | %s | CH %d%s", network->index,
+                 network->ssid[0] ? network->ssid : "<hidden>", network->bssid,
+                 network->channel, network->confirmed ? " | WATCH confirmed" : "");
+        lv_checkbox_set_text(checkbox, text);
+        lv_obj_set_width(checkbox, lv_pct(100));
+        lv_obj_set_style_text_color(checkbox, lv_color_hex(0xE6E6E6), 0);
+        if (network->selected) lv_obj_add_state(checkbox, LV_STATE_CHECKED);
+        if (ctx->deauth_detector_task_active || ctx->detector_watch.remote_state_unknown)
+            lv_obj_add_state(checkbox, LV_STATE_DISABLED);
+        uintptr_t key = ((uintptr_t)network->index << 2) |
+                        (uintptr_t)ctx->deauth_detector_bound_tab;
+        lv_obj_add_event_cb(checkbox, deauth_detector_network_cb,
+                            LV_EVENT_VALUE_CHANGED, (void *)key);
+    }
+}
+
+static void deauth_detector_picker_close(tab_context_t *ctx)
+{
+    if (!ctx || !ctx->deauth_detector_picker_overlay) return;
+    lv_obj_del(ctx->deauth_detector_picker_overlay);
+    ctx->deauth_detector_picker_overlay = NULL;
+    ctx->deauth_detector_picker_popup = NULL;
+    ctx->deauth_detector_picker_status = NULL;
+    ctx->deauth_detector_picker_count = NULL;
+    ctx->deauth_detector_picker_done_btn = NULL;
+    ctx->deauth_detector_picker_rescan_btn = NULL;
+    ctx->deauth_detector_network_list = NULL;
+}
+
+static bool deauth_detector_picker_open(tab_context_t *ctx)
+{
+    if (!ctx || !ctx->deauth_detector_page) return false;
+    if (ctx->deauth_detector_picker_overlay) return true;
+    lv_obj_t *container = lv_obj_get_parent(ctx->deauth_detector_page);
+    if (!container) return false;
+
+    lv_obj_t *overlay = lv_obj_create(container);
+    ctx->deauth_detector_picker_overlay = overlay;
+    style_modal_overlay(overlay, LV_OPA_50);
+    lv_obj_add_flag(overlay, LV_OBJ_FLAG_FLOATING);
+    lv_obj_move_foreground(overlay);
+
+    lv_obj_t *popup = lv_obj_create(overlay);
+    ctx->deauth_detector_picker_popup = popup;
+    lv_obj_set_size(popup, popup_clamp_w(760), popup_clamp_h(520));
+    lv_obj_center(popup);
+    style_popup_card(popup, 16, COLOR_MATERIAL_AMBER);
+    lv_obj_set_style_bg_color(popup, lv_color_hex(0x1A1A1A), 0);
+    lv_obj_set_style_pad_all(popup, 16, 0);
+    lv_obj_set_style_pad_row(popup, 10, 0);
+    lv_obj_set_flex_flow(popup, LV_FLEX_FLOW_COLUMN);
+    lv_obj_clear_flag(popup, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(popup);
+    lv_label_set_text(title, ctx->deauth_detector_task_active ||
+                             ctx->detector_watch.remote_state_unknown
+                                 ? "Watched networks" : "Select networks to monitor");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_AMBER, 0);
+
+    ctx->deauth_detector_picker_status = lv_label_create(popup);
+    lv_obj_set_width(ctx->deauth_detector_picker_status, lv_pct(100));
+    lv_label_set_long_mode(ctx->deauth_detector_picker_status, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(ctx->deauth_detector_picker_status, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(ctx->deauth_detector_picker_status, lv_color_hex(0xFFFFFF), 0);
+
+    ctx->deauth_detector_picker_count = lv_label_create(popup);
+    lv_obj_set_style_text_font(ctx->deauth_detector_picker_count, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(ctx->deauth_detector_picker_count, lv_color_hex(0xE6E6E6), 0);
+
+    ctx->deauth_detector_network_list = lv_obj_create(popup);
+    lv_obj_set_size(ctx->deauth_detector_network_list, lv_pct(100), 0);
+    lv_obj_set_flex_grow(ctx->deauth_detector_network_list, 1);
+    lv_obj_set_style_bg_color(ctx->deauth_detector_network_list, lv_color_hex(0x252525), 0);
+    lv_obj_set_style_border_width(ctx->deauth_detector_network_list, 0, 0);
+    lv_obj_set_style_radius(ctx->deauth_detector_network_list, 8, 0);
+    lv_obj_set_style_pad_all(ctx->deauth_detector_network_list, 8, 0);
+    lv_obj_set_flex_flow(ctx->deauth_detector_network_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(ctx->deauth_detector_network_list, 8, 0);
+    lv_obj_set_scroll_dir(ctx->deauth_detector_network_list, LV_DIR_VER);
+
+    lv_obj_t *actions = lv_obj_create(popup);
+    lv_obj_set_size(actions, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(actions, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(actions, 0, 0);
+    lv_obj_set_style_pad_all(actions, 0, 0);
+    lv_obj_set_flex_flow(actions, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(actions, LV_FLEX_ALIGN_SPACE_BETWEEN,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(actions, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *rescan = lv_btn_create(actions);
+    ctx->deauth_detector_picker_rescan_btn = rescan;
+    lv_obj_set_size(rescan, 110, 42);
+    lv_obj_set_style_bg_color(rescan, lv_color_hex(0x3A4651), 0);
+    lv_obj_set_style_bg_color(rescan, lv_color_hex(0x555555), LV_STATE_DISABLED);
+    lv_obj_add_event_cb(rescan, deauth_detector_scan_cb, LV_EVENT_CLICKED, ctx);
+    lv_obj_t *rescan_label = lv_label_create(rescan);
+    lv_label_set_text(rescan_label, "Rescan");
+    lv_obj_set_style_text_color(rescan_label, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_center(rescan_label);
+
+    lv_obj_t *cancel = lv_btn_create(actions);
+    lv_obj_set_size(cancel, 110, 42);
+    lv_obj_set_style_bg_color(cancel, lv_color_hex(0x3A4651), 0);
+    lv_obj_add_event_cb(cancel, deauth_detector_picker_cancel_cb, LV_EVENT_CLICKED, ctx);
+    app_keyboard_navigation_register_escape(cancel);
+    lv_obj_t *cancel_label = lv_label_create(cancel);
+    lv_label_set_text(cancel_label, "Cancel");
+    lv_obj_set_style_text_color(cancel_label, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_center(cancel_label);
+
+    lv_obj_t *done = lv_btn_create(actions);
+    ctx->deauth_detector_picker_done_btn = done;
+    lv_obj_set_size(done, 170, 42);
+    lv_obj_set_style_bg_color(done, COLOR_MATERIAL_GREEN, 0);
+    lv_obj_set_style_bg_color(done, lv_color_hex(0x555555), LV_STATE_DISABLED);
+    lv_obj_add_event_cb(done, deauth_detector_picker_done_cb, LV_EVENT_CLICKED, ctx);
+    lv_obj_t *done_label = lv_label_create(done);
+    lv_label_set_text(done_label, "Use selection");
+    lv_obj_set_style_text_color(done_label, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_center(done_label);
+
+    if (ctx->deauth_detector_task_active || ctx->detector_watch.remote_state_unknown) {
+        lv_obj_add_flag(rescan, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(done, LV_OBJ_FLAG_HIDDEN);
+        lv_label_set_text(cancel_label, "Close");
+    }
+
+    deauth_detector_render_networks(ctx);
+    deauth_detector_render_status(ctx);
+    return true;
+}
+
+static void deauth_detector_set_error(tab_context_t *ctx, const char *reason)
+{
+    if (!ctx) return;
+    ctx->detector_watch.phase = DETECTOR_WATCH_ERROR;
+    ctx->detector_watch.running = false;
+    ctx->deauth_detector_running = false;
+    snprintf(ctx->detector_watch.error, sizeof(ctx->detector_watch.error), "%s",
+             reason ? reason : "Detector error");
+    bsp_display_lock(0);
+    deauth_detector_render_status(ctx);
+    bsp_display_unlock();
+}
+
+static void deauth_detector_disconnect_ui(void *user_data)
+{
+    tab_context_t *ctx = (tab_context_t *)user_data;
+    if (!ctx || !ctx->deauth_detector_link_lost) return;
+    detector_watch_connection_lost(&ctx->detector_watch);
+    ctx->deauth_detector_running = false;
+    ctx->deauth_detector_scan_active = false;
+    ctx->deauth_detector_task_active = false;
+    deauth_detector_picker_close(ctx);
+    if (ctx->deauth_detector_ui_dirty) {
+        update_deauth_table(ctx);
+        ctx->deauth_detector_ui_dirty = false;
+    }
+    deauth_detector_render_networks(ctx);
+    deauth_detector_render_status(ctx);
+}
+
+static void deauth_detector_scan_process_line(tab_context_t *ctx, const char *line)
+{
+    detector_watch_session_t *watch = &ctx->detector_watch;
+    if (janos_scan_line_is_busy(line) || strstr(line, "Failed to start scan")) {
+        ctx->deauth_detector_scan_active = false;
+        deauth_detector_set_error(ctx, "JanOS rejected detector scan");
+        return;
+    }
+    if (detector_watch_ack_scan(watch, line) || !watch->scan_ack_seen) return;
+    if (detector_watch_finish_scan(watch, line)) {
+        ctx->deauth_detector_scan_active = false;
+        bsp_display_lock(0);
+        deauth_detector_render_networks(ctx);
+        deauth_detector_render_status(ctx);
+        bsp_display_unlock();
+        return;
+    }
+    if (watch->phase == DETECTOR_WATCH_ERROR) {
+        ctx->deauth_detector_scan_active = false;
+        bsp_display_lock(0);
+        deauth_detector_render_status(ctx);
+        bsp_display_unlock();
+        return;
+    }
+    const char *csv = line;
+    if (*csv != '"') {
+        const char *prefix = strstr(line, ": \"");
+        if (prefix) csv = prefix + 2;
+    }
+    if (*csv == '"') {
+        wifi_network_t network = {0};
+        if (!parse_network_line(csv, &network) ||
+            !detector_watch_add_network(watch, network.index, network.ssid,
+                                        network.bssid, network.channel)) {
+            watch->scan_invalid = true;
+        }
+    }
+}
+
+static void deauth_detector_scan_poll(tab_context_t *ctx)
+{
+    if (!ctx || !ctx->deauth_detector_scan_active) return;
+    if (!deauth_detector_link_ready(ctx)) {
+        ctx->deauth_detector_link_lost = true;
+        bsp_display_lock(0);
+        deauth_detector_disconnect_ui(ctx);
+        bsp_display_unlock();
+        deauth_detector_release_console(ctx);
+        return;
+    }
+    if (!ctx->deauth_detector_scan_sent) {
+        if (!deauth_detector_claim_console(ctx)) {
+            ctx->deauth_detector_scan_active = false;
+            deauth_detector_set_error(ctx, "Detector scan UART console unavailable");
+            deauth_detector_release_console(ctx);
+            return;
+        }
+        if (!deauth_detector_send_bound(ctx, "scan_networks")) {
+            ctx->deauth_detector_scan_active = false;
+            ctx->detector_watch.remote_state_unknown = true;
+            deauth_detector_set_error(ctx,
+                "Detector scan command write incomplete; remote state unknown");
+            deauth_detector_release_console(ctx);
+            return;
+        }
+        detector_watch_begin_scan(&ctx->detector_watch,
+                                  atomic_load(&detector_scan_epoch[(size_t)ctx->deauth_detector_bound_tab]));
+        ctx->deauth_detector_scan_sent = true;
+        ctx->deauth_detector_phase_started_us = esp_timer_get_time();
+        return;
+    }
+    if (ctx->detector_watch.scan_generation !=
+        atomic_load(&detector_scan_epoch[(size_t)ctx->deauth_detector_bound_tab])) {
+        ctx->deauth_detector_scan_active = false;
+        deauth_detector_set_error(ctx, "Another scan replaced detector scan");
+    } else {
+        char bytes[256];
+        int length = transport_read_bytes_tab(ctx->deauth_detector_bound_tab,
+                                              ctx->deauth_detector_bound_port, bytes,
+                                              sizeof(bytes), pdMS_TO_TICKS(100));
+        for (int i = 0; i < length && ctx->deauth_detector_scan_active; ++i) {
+            char c = bytes[i];
+            if (c == '\r' || c == '\n') {
+                if (ctx->deauth_detector_line_pos > 0 && !ctx->deauth_detector_line_overflow) {
+                    ctx->deauth_detector_line[ctx->deauth_detector_line_pos] = '\0';
+                    deauth_detector_scan_process_line(ctx, ctx->deauth_detector_line);
+                }
+                ctx->deauth_detector_line_pos = 0;
+                ctx->deauth_detector_line_overflow = false;
+            } else if (!ctx->deauth_detector_line_overflow &&
+                       ctx->deauth_detector_line_pos < (int)sizeof(ctx->deauth_detector_line) - 1) {
+                ctx->deauth_detector_line[ctx->deauth_detector_line_pos++] = c;
+            } else {
+                ctx->deauth_detector_line_overflow = true;
+                ctx->detector_watch.scan_invalid = true;
             }
         }
+    }
+    if (ctx->deauth_detector_scan_active &&
+        esp_timer_get_time() - ctx->deauth_detector_phase_started_us > 30000000) {
+        ctx->deauth_detector_scan_active = false;
+        deauth_detector_set_error(ctx, "Detector scan timed out before complete list");
+    }
+    if (!ctx->deauth_detector_scan_active) deauth_detector_release_console(ctx);
+}
 
-        if (csa_ui_dirty && (esp_timer_get_time() - last_csa_ui_us >= 1000000 ||
-                             !ctx->deauth_detector_running)) {
-            bsp_display_lock(0);
-            update_deauth_table(ctx);
-            bsp_display_unlock();
-            csa_ui_dirty = false;
-            last_csa_ui_us = esp_timer_get_time();
-        }
+static void deauth_detector_scan_task(void *arg)
+{
+    tab_context_t *ctx = (tab_context_t *)arg;
+    while (ctx && ctx->deauth_detector_scan_active) {
+        deauth_detector_scan_poll(ctx);
         vTaskDelay(pdMS_TO_TICKS(50));
     }
-
-    if (csa_ui_dirty) {
+    if (ctx) {
+        deauth_detector_release_console(ctx);
+        ctx->deauth_detector_scan_task = NULL;
         bsp_display_lock(0);
-        update_deauth_table(ctx);
+        deauth_detector_render_status(ctx);
         bsp_display_unlock();
     }
-    ESP_LOGI(TAG, "Deauth detector task ended");
-    if (ctx) ctx->deauth_detector_task = NULL;
+    vTaskDelete(NULL);
+}
+
+static void deauth_detector_process_line(tab_context_t *ctx, const char *line)
+{
+    detector_watch_session_t *watch = &ctx->detector_watch;
+    detector_watch_phase_t before = watch->phase;
+    bool was_running = watch->running;
+    bool had_start_ack = watch->start_ack_seen;
+    bool had_details_confirmation = watch->details_confirmed;
+    bool trace_status = detector_watch_is_trace_status_line(line);
+    bool watch_status = detector_watch_is_watch_status_line(line);
+    bool start_status = detector_watch_is_start_status_line(line);
+    bool stop_ack = detector_watch_is_stop_ack_line(line);
+    if (ctx->deauth_detector_stop_requested && stop_ack &&
+        watch->phase == DETECTOR_WATCH_ERROR) {
+        watch->running = false;
+        watch->remote_state_unknown = false;
+        watch->trace_requested = false;
+        detector_watch_clear_trace_lock(watch);
+        ctx->deauth_detector_task_active = false;
+        bsp_display_lock(0);
+        deauth_detector_render_status(ctx); // Preserve the reason for the failed start/watch.
+        bsp_display_unlock();
+        return;
+    }
+    detector_watch_status_line(watch, line);
+    (void)detector_watch_start_watch_deadline(
+        watch, esp_timer_get_time(), &ctx->deauth_detector_watch_started_us);
+    if (watch->legacy_retry_pending) {
+        char legacy_command[sizeof(ctx->deauth_detector_command)];
+        uint32_t generation =
+            atomic_load(&detector_scan_epoch[(size_t)ctx->deauth_detector_bound_tab]);
+        if (!deauth_detector_link_ready(ctx) ||
+            !detector_watch_build_command(watch, ctx->deauth_detector_selected_mode,
+                                          generation, legacy_command,
+                                          sizeof(legacy_command)) ||
+            !deauth_detector_send_bound(ctx, legacy_command)) {
+            watch->legacy_retry_pending = false;
+            watch->phase = DETECTOR_WATCH_ERROR;
+            watch->remote_state_unknown = true;
+            snprintf(watch->error, sizeof(watch->error),
+                     "Legacy detector retry could not be confirmed; remote state unknown");
+            ctx->deauth_detector_task_active = false;
+        } else {
+            snprintf(ctx->deauth_detector_command,
+                     sizeof(ctx->deauth_detector_command), "%s", legacy_command);
+            detector_watch_begin_start(watch, ctx->deauth_detector_selected_mode);
+            ctx->deauth_detector_phase_started_us = esp_timer_get_time();
+            ctx->deauth_detector_watch_started_us = 0;
+        }
+        bsp_display_lock(0);
+        deauth_detector_render_status(ctx);
+        bsp_display_unlock();
+        return;
+    }
+    bool start_confirmed = before == DETECTOR_WATCH_STARTING &&
+                           watch->phase == DETECTOR_WATCH_RUNNING;
+    if (start_confirmed) {
+        ctx->deauth_detector_phase_started_us = esp_timer_get_time();
+        ctx->deauth_detector_watch_started_us = 0;
+    }
+    if (watch->phase != before || watch->running != was_running || trace_status ||
+        watch_status || watch->start_ack_seen != had_start_ack ||
+        watch->details_confirmed != had_details_confirmation) {
+        ctx->deauth_detector_running = watch->phase == DETECTOR_WATCH_RUNNING;
+        if (before == DETECTOR_WATCH_RUNNING && watch->phase == DETECTOR_WATCH_ERROR &&
+            watch->running && !ctx->deauth_detector_stop_requested) {
+            // JanOS confirmed a different watch set. Stop that session on its own UART.
+            detector_watch_emergency_stop(watch);
+            ctx->deauth_detector_stop_requested = true;
+            ctx->deauth_detector_phase_started_us = esp_timer_get_time();
+            (void)deauth_detector_send_bound(ctx, "stop");
+        }
+        if (before == DETECTOR_WATCH_STARTING && watch->phase == DETECTOR_WATCH_ERROR &&
+            (watch->start_ack_seen || start_status) &&
+            !ctx->deauth_detector_stop_requested) {
+            detector_watch_emergency_stop(watch);
+            ctx->deauth_detector_stop_requested = true;
+            ctx->deauth_detector_phase_started_us = esp_timer_get_time();
+            (void)deauth_detector_send_bound(ctx, "stop");
+        }
+        if (watch->phase == DETECTOR_WATCH_STOPPED ||
+            (watch->phase == DETECTOR_WATCH_ERROR && !watch->running &&
+             !ctx->deauth_detector_stop_requested)) {
+            ctx->deauth_detector_task_active = false;
+        }
+        bsp_display_lock(0);
+        if (start_confirmed) {
+            // Keep stopped observations for review; begin a confirmed session with an empty list.
+            ctx->deauth_entry_count = 0;
+            ctx->deauth_total_deauth = 0;
+            ctx->deauth_total_csa = 0;
+            ctx->deauth_detector_ui_dirty = false;
+            ctx->deauth_detector_last_ui_us = esp_timer_get_time();
+            ctx->deauth_detector_storage_message[0] = '\0';
+            ctx->deauth_detector_storage_error = false;
+            update_deauth_table(ctx);
+            if (ctx->deauth_detector_table)
+                lv_obj_scroll_to_y(ctx->deauth_detector_table, 0, LV_ANIM_OFF);
+        }
+        deauth_detector_render_status(ctx);
+        if (watch_status ||
+            watch->phase == DETECTOR_WATCH_STOPPED) deauth_detector_render_networks(ctx);
+        bsp_display_unlock();
+        return;
+    }
+    if (trace_status) return;
+    if (watch->phase != DETECTOR_WATCH_RUNNING || ctx->deauth_detector_stop_requested ||
+        !ctx->deauth_entries) return;
+    deauth_entry_t entry = {0};
+    bool is_csa = parse_csa_line(line, &entry);
+    if (!is_csa) {
+        bool parsed = watch->details_confirmed
+                          ? parse_deauth_v2_line(line, &entry)
+                          : parse_deauth_line(line, &entry);
+        if (!parsed) return;
+    }
+    if (!detector_watch_accept_event(watch, entry.bssid)) return;
+    ESP_LOGI(TAG, "%s observed: CH%d %s (%s) RSSI=%d",
+             is_csa ? "CSA announcement" : "Deauth", entry.channel,
+             entry.ap_name, entry.bssid, entry.rssi);
+    if (!is_csa) alert_chime_play(ALERT_TONE_ALARM);
+    time_t wall = time(NULL);
+    struct tm local;
+    if (wall <= 0 || !localtime_r(&wall, &local) || local.tm_year + 1900 < 2024)
+        wall = 0;
+    uint64_t uptime_s = (uint64_t)(esp_timer_get_time() / 1000000LL);
+    bsp_display_lock(0);
+    if (!detector_history_add(ctx->deauth_entries, &ctx->deauth_entry_count,
+                              DEAUTH_DETECTOR_MAX_ENTRIES, &entry,
+                              (int64_t)wall, uptime_s)) {
+        bsp_display_unlock();
+        return;
+    }
+    if (is_csa) {
+        if (ctx->deauth_total_csa < UINT64_MAX) ctx->deauth_total_csa++;
+    } else if (ctx->deauth_total_deauth < UINT64_MAX) {
+        ctx->deauth_total_deauth++;
+    }
+    ctx->deauth_detector_ui_dirty = true;
+    bsp_display_unlock();
+}
+
+static void deauth_detector_poll(tab_context_t *ctx)
+{
+    if (!ctx || !ctx->deauth_detector_task_active) return;
+    if (!deauth_detector_link_ready(ctx)) {
+        ctx->deauth_detector_link_lost = true;
+        bsp_display_lock(0);
+        deauth_detector_disconnect_ui(ctx);
+        bsp_display_unlock();
+        deauth_detector_release_console(ctx);
+        return;
+    }
+    if (ctx->deauth_detector_selected_mode && ctx->detector_watch.scan_complete &&
+        ctx->detector_watch.scan_generation !=
+            atomic_load(&detector_scan_epoch[(size_t)ctx->deauth_detector_bound_tab])) {
+        if (ctx->deauth_detector_start_sent && !ctx->deauth_detector_stop_requested)
+            (void)deauth_detector_send_bound(ctx, "stop");
+        ctx->deauth_detector_task_active = false;
+        detector_watch_connection_lost(&ctx->detector_watch);
+        deauth_detector_set_error(ctx, "Detector selection invalidated by a new scan");
+        bsp_display_lock(0);
+        deauth_detector_render_networks(ctx);
+        bsp_display_unlock();
+        deauth_detector_release_console(ctx);
+        return;
+    }
+    if (!ctx->deauth_detector_start_sent) {
+        if (!deauth_detector_claim_console(ctx)) {
+            ctx->deauth_detector_task_active = false;
+            deauth_detector_set_error(ctx, "Detector UART console unavailable");
+            deauth_detector_release_console(ctx);
+            return;
+        }
+        if (!deauth_detector_send_bound(ctx, ctx->deauth_detector_command)) {
+            ctx->deauth_detector_task_active = false;
+            ctx->detector_watch.remote_state_unknown = true;
+            deauth_detector_set_error(ctx,
+                "Detector command write incomplete; remote state unknown");
+            deauth_detector_release_console(ctx);
+            return;
+        }
+        ctx->deauth_detector_start_sent = true;
+        ctx->deauth_detector_phase_started_us = esp_timer_get_time();
+        return;
+    }
+    char bytes[256];
+    int length = transport_read_bytes_tab(ctx->deauth_detector_bound_tab,
+                                          ctx->deauth_detector_bound_port, bytes,
+                                          sizeof(bytes), pdMS_TO_TICKS(100));
+    for (int i = 0; i < length && ctx->deauth_detector_task_active; ++i) {
+        char c = bytes[i];
+        if (c == '\r' || c == '\n') {
+            if (ctx->deauth_detector_line_pos > 0 && !ctx->deauth_detector_line_overflow) {
+                ctx->deauth_detector_line[ctx->deauth_detector_line_pos] = '\0';
+                deauth_detector_process_line(ctx, ctx->deauth_detector_line);
+            }
+            ctx->deauth_detector_line_pos = 0;
+            ctx->deauth_detector_line_overflow = false;
+        } else if (!ctx->deauth_detector_line_overflow &&
+                   ctx->deauth_detector_line_pos < (int)sizeof(ctx->deauth_detector_line) - 1) {
+            ctx->deauth_detector_line[ctx->deauth_detector_line_pos++] = c;
+        } else {
+            ctx->deauth_detector_line_overflow = true;
+        }
+    }
+    int64_t now = esp_timer_get_time();
+    if (ctx->detector_watch.phase == DETECTOR_WATCH_STARTING &&
+        ctx->deauth_detector_watch_started_us > 0 &&
+        now - ctx->deauth_detector_watch_started_us > 5000000) {
+        detector_watch_watch_timeout(&ctx->detector_watch);
+        detector_watch_emergency_stop(&ctx->detector_watch);
+        ctx->deauth_detector_running = false;
+        ctx->deauth_detector_stop_requested = true;
+        ctx->deauth_detector_phase_started_us = now;
+        (void)deauth_detector_send_bound(ctx, "stop");
+        bsp_display_lock(0);
+        deauth_detector_render_status(ctx);
+        bsp_display_unlock();
+    }
+    if (ctx->detector_watch.phase == DETECTOR_WATCH_STARTING &&
+        ctx->deauth_detector_watch_started_us == 0 &&
+        now - ctx->deauth_detector_phase_started_us > 30000000) {
+        detector_watch_timeout(&ctx->detector_watch);
+        ctx->deauth_detector_stop_requested = true;
+        ctx->deauth_detector_phase_started_us = now;
+        (void)deauth_detector_send_bound(ctx, "stop");
+        bsp_display_lock(0);
+        deauth_detector_render_status(ctx);
+        bsp_display_unlock();
+    }
+    if (ctx->deauth_detector_stop_requested &&
+        now - ctx->deauth_detector_phase_started_us > 5000000) {
+        if (ctx->detector_watch.phase == DETECTOR_WATCH_STOPPING ||
+            ctx->detector_watch.phase == DETECTOR_WATCH_ERROR)
+            detector_watch_stop_unconfirmed(&ctx->detector_watch);
+        ctx->deauth_detector_task_active = false;
+        bsp_display_lock(0);
+        deauth_detector_render_status(ctx);
+        bsp_display_unlock();
+    }
+    bsp_display_lock(0);
+    if (ctx->deauth_detector_ui_dirty &&
+        (now - ctx->deauth_detector_last_ui_us >= 250000 ||
+         !ctx->deauth_detector_task_active)) {
+        update_deauth_table(ctx);
+        ctx->deauth_detector_ui_dirty = false;
+        ctx->deauth_detector_last_ui_us = now;
+    }
+    bsp_display_unlock();
+    if (!ctx->deauth_detector_task_active) deauth_detector_release_console(ctx);
+}
+
+static void deauth_detector_task(void *arg)
+{
+    tab_context_t *ctx = (tab_context_t *)arg;
+    ESP_LOGI(TAG, "[%s] Detector session started on port %d",
+             tab_transport_name(ctx->deauth_detector_bound_tab),
+             ctx->deauth_detector_bound_port);
+    while (ctx && ctx->deauth_detector_task_active) {
+        deauth_detector_poll(ctx);
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    if (ctx) {
+        deauth_detector_release_console(ctx);
+        ctx->deauth_detector_task = NULL;
+        bsp_display_lock(0);
+        deauth_detector_render_status(ctx);
+        bsp_display_unlock();
+    }
     vTaskDelete(NULL);
 }
 
 // Start button callback
 static void deauth_detector_start_cb(lv_event_t *e)
 {
-    (void)e;
-    tab_context_t *ctx = get_current_ctx();
-    if (!ctx || ctx->deauth_detector_running || ctx->deauth_detector_task || !ctx->deauth_entries) return;
-
-    ESP_LOGI(TAG, "Starting deauth detector");
-    uart_send_command_for_tab("deauth_detector");
-
-    ctx->deauth_detector_running = true;
-
-    if (xTaskCreate(deauth_detector_task, "deauth_det", 4096, (void*)ctx, 5,
-                    &ctx->deauth_detector_task) != pdPASS) {
-        ctx->deauth_detector_running = false;
-        ctx->deauth_detector_task = NULL;
-        uart_send_command_for_tab("stop");
-        ESP_LOGE(TAG, "Failed to create detector monitor task");
+    tab_context_t *ctx = e ? lv_event_get_user_data(e) : get_current_ctx();
+    if (!ctx || ctx->deauth_detector_task_active || ctx->deauth_detector_scan_active ||
+        ctx->detector_watch.remote_state_unknown ||
+        ctx->deauth_detector_task || ctx->deauth_detector_scan_task || !ctx->deauth_entries ||
+        !ctx->detector_watch.networks) return;
+    tab_id_t tab = tab_id_for_ctx(ctx);
+    if (!ctx->deauth_detector_selected_mode) {
+        ctx->deauth_detector_bound_tab = tab;
+        ctx->deauth_detector_bound_port = uart_port_for_tab(tab);
+        ctx->deauth_detector_link_lost = false;
+        ctx->deauth_detector_bound_link_generation =
+            tab == TAB_USB ? atomic_load(&sta_mac_usb_generation) : 0;
+    }
+    if (!deauth_detector_link_ready(ctx)) {
+        deauth_detector_set_error(ctx, "Detector UART connection unavailable");
         return;
     }
-
-    // Update button states
-    lv_obj_add_state(ctx->deauth_detector_start_btn, LV_STATE_DISABLED);
-    lv_obj_clear_state(ctx->deauth_detector_stop_btn, LV_STATE_DISABLED);
+    uint32_t generation = atomic_load(&detector_scan_epoch[(size_t)tab]);
+    bool trace = ctx->deauth_detector_trace_enabled;
+    if (!detector_watch_build_v2_command(&ctx->detector_watch,
+                                         ctx->deauth_detector_selected_mode, generation,
+                                         trace, ctx->deauth_detector_command,
+                                         sizeof(ctx->deauth_detector_command))) {
+        deauth_detector_set_error(ctx, "Select BSSID from a fresh completed JanOS scan");
+        return;
+    }
+    detector_watch_begin_start_v2(&ctx->detector_watch,
+                                  ctx->deauth_detector_selected_mode, trace);
+    ctx->deauth_detector_watch_started_us = 0;
+    ctx->deauth_detector_start_sent = false;
+    ctx->deauth_detector_stop_requested = false;
+    ctx->deauth_detector_line_pos = 0;
+    ctx->deauth_detector_line_overflow = false;
+    ctx->deauth_detector_ui_dirty = false;
+    ctx->deauth_detector_task_active = true;
+    ctx->deauth_detector_running = false; // Only JanOS success changes this.
+    if (xTaskCreate(deauth_detector_task, "deauth_det", 6144, ctx, 5,
+                    &ctx->deauth_detector_task) != pdPASS) {
+        ctx->deauth_detector_task_active = false;
+        ctx->deauth_detector_task = NULL;
+        deauth_detector_set_error(ctx, "Could not create detector monitor task");
+    }
+    deauth_detector_render_status(ctx);
 }
 
-// Stop button callback
+static void deauth_detector_request_stop(tab_context_t *ctx)
+{
+    if (!ctx) return;
+    if (ctx->deauth_detector_scan_active) {
+        if (ctx->deauth_detector_scan_sent) (void)deauth_detector_send_bound(ctx, "stop");
+        ctx->deauth_detector_scan_active = false;
+        deauth_detector_set_error(ctx, "Detector scan cancelled");
+    } else if (ctx->deauth_detector_task_active && !ctx->deauth_detector_stop_requested) {
+        if (!ctx->deauth_detector_start_sent) {
+            ctx->deauth_detector_task_active = false;
+            detector_watch_stop(&ctx->detector_watch);
+        } else {
+            ctx->deauth_detector_stop_requested = true;
+            detector_watch_begin_stop(&ctx->detector_watch);
+            ctx->deauth_detector_phase_started_us = esp_timer_get_time();
+            if (!deauth_detector_send_bound(ctx, "stop")) {
+                ctx->deauth_detector_task_active = false;
+                ctx->detector_watch.remote_state_unknown = true;
+                deauth_detector_set_error(ctx, "Stop could not be sent on detector UART");
+            }
+        }
+    } else if (ctx->detector_watch.remote_state_unknown &&
+               !ctx->deauth_detector_task_active && !ctx->deauth_detector_task) {
+        if (!deauth_detector_bound_transport_available(ctx)) {
+            deauth_detector_set_error(
+                ctx, "Bound detector transport unavailable; Stop retry not sent");
+        } else {
+            // A physical reconnect may restore the exact captured Grove/MBus
+            // transport. USB additionally requires the captured generation,
+            // so a different USB connection cannot receive this session's Stop.
+            ctx->deauth_detector_link_lost = false;
+            if (!deauth_detector_claim_console(ctx) ||
+                !deauth_detector_send_bound(ctx, "stop")) {
+                deauth_detector_release_console(ctx);
+                deauth_detector_set_error(ctx, "Stop retry could not be sent on detector UART");
+            } else {
+                detector_watch_begin_stop(&ctx->detector_watch);
+                ctx->deauth_detector_stop_requested = true;
+                ctx->deauth_detector_start_sent = true;
+                ctx->deauth_detector_phase_started_us = esp_timer_get_time();
+                ctx->deauth_detector_task_active = true;
+                if (xTaskCreate(deauth_detector_task, "deauth_det", 6144, ctx, 5,
+                                &ctx->deauth_detector_task) != pdPASS) {
+                    ctx->deauth_detector_task_active = false;
+                    ctx->deauth_detector_task = NULL;
+                    deauth_detector_release_console(ctx);
+                    deauth_detector_set_error(ctx,
+                                              "Cannot monitor Stop retry on detector UART");
+                }
+            }
+        }
+    }
+    deauth_detector_render_status(ctx);
+}
+
+// Stop always targets the connection that started this detector session.
 static void deauth_detector_stop_cb(lv_event_t *e)
 {
-    (void)e;
-    tab_context_t *ctx = get_current_ctx();
-    if (!ctx || !ctx->deauth_detector_running) return;
+    tab_context_t *ctx = e ? lv_event_get_user_data(e) : get_current_ctx();
+    deauth_detector_request_stop(ctx);
+}
 
-    ESP_LOGI(TAG, "Stopping deauth detector");
-    uart_send_command_for_tab("stop");
+typedef struct {
+    tab_context_t *ctx;
+    tab_id_t tab;
+    int count;
+    deauth_entry_t entries[];
+} detector_export_job_t;
 
-    ctx->deauth_detector_running = false;
-    if (ctx->deauth_detector_task != NULL) {
-        vTaskDelay(pdMS_TO_TICKS(100));
+static void deauth_detector_export_task(void *arg)
+{
+    detector_export_job_t *job = (detector_export_job_t *)arg;
+    char path[160] = "";
+    char error[120] = "";
+    struct stat sd_stat;
+    bool saved = false;
+    while (atomic_flag_test_and_set_explicit(&detector_sd_export_probe_lock,
+                                              memory_order_acquire))
+        vTaskDelay(pdMS_TO_TICKS(10));
+    if (stat("/sdcard", &sd_stat) != 0 || !S_ISDIR(sd_stat.st_mode)) {
+        snprintf(error, sizeof(error), "Tab5 SD card is not mounted");
+    } else if (!observer_ensure_dir("/sdcard/lab", error, sizeof(error)) ||
+               !observer_ensure_dir("/sdcard/lab/detector", error, sizeof(error))) {
+        // Keep the directory error visible in the detector page.
+    } else {
+        char stamp[24] = "uptime";
+        time_t wall = time(NULL);
+        struct tm local;
+        if (wall > 0 && localtime_r(&wall, &local) && local.tm_year + 1900 >= 2024)
+            strftime(stamp, sizeof(stamp), "%Y%m%d_%H%M%S", &local);
+        int length = snprintf(path, sizeof(path),
+                              "/sdcard/lab/detector/detector_%s_%s_%llu.csv",
+                              tab_transport_name(job->tab), stamp,
+                              (unsigned long long)(esp_timer_get_time()));
+        if (length < 0 || length >= (int)sizeof(path)) {
+            snprintf(error, sizeof(error), "Detector CSV path is too long");
+            path[0] = '\0';
+        } else {
+            int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0644);
+            if (fd < 0) {
+                snprintf(error, sizeof(error), "Cannot create CSV: %s", strerror(errno));
+            } else {
+                FILE *file = fdopen(fd, "w");
+                if (!file) {
+                    snprintf(error, sizeof(error), "Cannot open CSV stream: %s", strerror(errno));
+                    close(fd);
+                } else {
+                    bool wrote = detector_history_write_csv(file, job->entries, job->count);
+                    if (wrote) wrote = fflush(file) == 0;
+                    if (wrote) {
+                        int file_fd = fileno(file);
+                        wrote = file_fd >= 0 && fsync(file_fd) == 0;
+                    }
+                    if (!wrote)
+                        snprintf(error, sizeof(error), "CSV write failed: %s", strerror(errno));
+                    if (fclose(file) != 0) {
+                        wrote = false;
+                        snprintf(error, sizeof(error), "CSV close failed: %s", strerror(errno));
+                    }
+                    saved = wrote;
+                }
+                if (!saved) (void)remove(path); // Remove an incomplete new file only.
+            }
+        }
     }
+    atomic_flag_clear_explicit(&detector_sd_export_probe_lock, memory_order_release);
+    bsp_display_lock(0);
+    job->ctx->deauth_detector_export_active = false;
+    job->ctx->deauth_detector_storage_error = !saved;
+    if (saved) {
+        snprintf(job->ctx->deauth_detector_storage_message,
+                 sizeof(job->ctx->deauth_detector_storage_message),
+                 "Saved snapshot of %d groups to Tab5 SD: %s", job->count, path);
+    } else {
+        snprintf(job->ctx->deauth_detector_storage_message,
+                 sizeof(job->ctx->deauth_detector_storage_message),
+                 "Save failed: %s", error[0] ? error : "unknown SD error");
+    }
+    deauth_detector_render_storage_status(job->ctx);
+    bsp_display_unlock();
+    free(job);
+    vTaskDelete(NULL);
+}
 
-    // Update button states
-    lv_obj_clear_state(ctx->deauth_detector_start_btn, LV_STATE_DISABLED);
-    lv_obj_add_state(ctx->deauth_detector_stop_btn, LV_STATE_DISABLED);
+static void deauth_detector_save_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = e ? lv_event_get_user_data(e) : get_current_ctx();
+    if (!ctx || !ctx->deauth_entries || ctx->deauth_entry_count <= 0 ||
+        ctx->deauth_detector_export_active) return;
+    size_t bytes = sizeof(detector_export_job_t) +
+                   (size_t)ctx->deauth_entry_count * sizeof(deauth_entry_t);
+    detector_export_job_t *job = heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM);
+    if (!job) {
+        ctx->deauth_detector_storage_error = true;
+        snprintf(ctx->deauth_detector_storage_message,
+                 sizeof(ctx->deauth_detector_storage_message),
+                 "Save failed: not enough memory for snapshot");
+        deauth_detector_render_storage_status(ctx);
+        return;
+    }
+    job->ctx = ctx;
+    job->tab = tab_id_for_ctx(ctx);
+    job->count = ctx->deauth_entry_count;
+    memcpy(job->entries, ctx->deauth_entries,
+           (size_t)job->count * sizeof(deauth_entry_t));
+    ctx->deauth_detector_export_active = true;
+    ctx->deauth_detector_storage_error = false;
+    snprintf(ctx->deauth_detector_storage_message,
+             sizeof(ctx->deauth_detector_storage_message),
+             "Saving %d groups to Tab5 SD...", job->count);
+    deauth_detector_render_storage_status(ctx);
+    if (xTaskCreate(deauth_detector_export_task, "det_csv", 6144, job, 3,
+                    NULL) != pdPASS) {
+        ctx->deauth_detector_export_active = false;
+        ctx->deauth_detector_storage_error = true;
+        snprintf(ctx->deauth_detector_storage_message,
+                 sizeof(ctx->deauth_detector_storage_message),
+                 "Save failed: could not start SD writer");
+        deauth_detector_render_storage_status(ctx);
+        free(job);
+    }
+}
+
+static void deauth_detector_clear_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = e ? lv_event_get_user_data(e) : get_current_ctx();
+    if (!ctx || !ctx->deauth_entries || ctx->deauth_entry_count == 0) return;
+    ctx->deauth_entry_count = 0;
+    ctx->deauth_total_deauth = 0;
+    ctx->deauth_total_csa = 0;
+    ctx->deauth_detector_ui_dirty = false;
+    ctx->deauth_detector_storage_error = false;
+    snprintf(ctx->deauth_detector_storage_message,
+             sizeof(ctx->deauth_detector_storage_message), "List cleared");
+    update_deauth_table(ctx);
+    if (ctx->deauth_detector_table)
+        lv_obj_scroll_to_y(ctx->deauth_detector_table, 0, LV_ANIM_OFF);
+}
+
+static void deauth_detector_picker_done_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = lv_event_get_user_data(e);
+    if (!ctx || !ctx->deauth_detector_picker_overlay ||
+        ctx->detector_watch.phase != DETECTOR_WATCH_READY ||
+        !ctx->detector_watch.scan_complete ||
+        ctx->detector_watch.selected_count < 1 ||
+        ctx->deauth_detector_scan_active || ctx->deauth_detector_scan_task) return;
+    deauth_detector_picker_close(ctx);
+    deauth_detector_render_status(ctx);
+}
+
+static void deauth_detector_picker_cancel_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = lv_event_get_user_data(e);
+    if (!ctx) return;
+    if (ctx->deauth_detector_task_active || ctx->detector_watch.remote_state_unknown) {
+        deauth_detector_picker_close(ctx);
+        deauth_detector_render_status(ctx);
+        return;
+    }
+    if (ctx->deauth_detector_scan_active) deauth_detector_request_stop(ctx);
+    deauth_detector_picker_close(ctx);
+    ctx->deauth_detector_selected_mode = false;
+    deauth_detector_render_status(ctx);
+}
+
+static void deauth_detector_trace_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = lv_event_get_user_data(e);
+    if (!ctx || !ctx->deauth_detector_trace_checkbox) return;
+    const detector_watch_session_t *watch = &ctx->detector_watch;
+    bool frozen = ctx->deauth_detector_task_active || watch->remote_state_unknown ||
+                  watch->phase == DETECTOR_WATCH_STARTING ||
+                  watch->phase == DETECTOR_WATCH_RUNNING ||
+                  watch->phase == DETECTOR_WATCH_STOPPING;
+    if (!frozen) {
+        ctx->deauth_detector_trace_enabled =
+            lv_obj_has_state(ctx->deauth_detector_trace_checkbox, LV_STATE_CHECKED);
+    }
+    deauth_detector_render_status(ctx);
+}
+
+static void deauth_detector_all_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = lv_event_get_user_data(e);
+    if (!ctx || ctx->detector_watch.remote_state_unknown ||
+        ctx->deauth_detector_task_active || ctx->deauth_detector_scan_active ||
+        ctx->deauth_detector_task || ctx->deauth_detector_scan_task) return;
+    deauth_detector_picker_close(ctx);
+    ctx->deauth_detector_selected_mode = false;
+    deauth_detector_render_status(ctx);
+}
+
+static void deauth_detector_selected_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = lv_event_get_user_data(e);
+    if (ctx && !ctx->detector_watch.remote_state_unknown &&
+        ctx->deauth_detector_selected_mode &&
+        ctx->detector_watch.scan_complete && !ctx->deauth_detector_scan_active &&
+        ctx->deauth_detector_task_active) {
+        (void)deauth_detector_picker_open(ctx);
+        return;
+    }
+    if (!ctx || ctx->detector_watch.remote_state_unknown ||
+        ctx->deauth_detector_task_active || ctx->deauth_detector_scan_active ||
+        ctx->deauth_detector_task || ctx->deauth_detector_scan_task) return;
+    ctx->deauth_detector_selected_mode = true;
+    deauth_detector_render_status(ctx);
+    deauth_detector_scan_cb(e); // Each entry into selected mode gets a fresh JanOS scan.
+}
+
+static void deauth_detector_scan_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = lv_event_get_user_data(e);
+    if (!ctx || !ctx->deauth_detector_selected_mode ||
+        ctx->detector_watch.remote_state_unknown || ctx->deauth_detector_task_active ||
+        ctx->deauth_detector_scan_active || ctx->deauth_detector_task ||
+        ctx->deauth_detector_scan_task || !ctx->detector_watch.networks) return;
+    if (!deauth_detector_picker_open(ctx)) {
+        deauth_detector_set_error(ctx, "Could not open network selection");
+        return;
+    }
+    tab_id_t tab = tab_id_for_ctx(ctx);
+    ctx->deauth_detector_bound_tab = tab;
+    ctx->deauth_detector_bound_port = uart_port_for_tab(tab);
+    ctx->deauth_detector_link_lost = false;
+    ctx->deauth_detector_bound_link_generation =
+        tab == TAB_USB ? atomic_load(&sta_mac_usb_generation) : 0;
+    detector_watch_begin_scan(&ctx->detector_watch, 0);
+    ctx->deauth_detector_scan_sent = false;
+    ctx->deauth_detector_line_pos = 0;
+    ctx->deauth_detector_line_overflow = false;
+    ctx->deauth_detector_scan_active = true;
+    deauth_detector_render_networks(ctx);
+    if (xTaskCreate(deauth_detector_scan_task, "det_scan", 6144, ctx, 5,
+                    &ctx->deauth_detector_scan_task) != pdPASS) {
+        ctx->deauth_detector_scan_active = false;
+        ctx->deauth_detector_scan_task = NULL;
+        deauth_detector_set_error(ctx, "Could not create detector scan task");
+    }
+    deauth_detector_render_status(ctx);
+}
+
+static void deauth_detector_network_cb(lv_event_t *e)
+{
+    uintptr_t key = (uintptr_t)lv_event_get_user_data(e);
+    tab_id_t tab = (tab_id_t)(key & 3);
+    int index = (int)(key >> 2);
+    tab_context_t *ctx = get_ctx_for_tab(tab);
+    if (!ctx || ctx->detector_watch.remote_state_unknown ||
+        ctx->deauth_detector_task_active || ctx->deauth_detector_scan_active) return;
+    lv_obj_t *checkbox = lv_event_get_target(e);
+    bool selected = lv_obj_has_state(checkbox, LV_STATE_CHECKED);
+    if (detector_watch_select(&ctx->detector_watch, index, selected))
+        deauth_detector_render_status(ctx);
 }
 
 // Back button callback - hide page and show tiles
 static void deauth_detector_back_btn_event_cb(lv_event_t *e)
 {
-    (void)e;
-    tab_context_t *ctx = get_current_ctx();
+    tab_context_t *ctx = e ? lv_event_get_user_data(e) : get_current_ctx();
     if (!ctx) return;
-    deauth_detector_stop_cb(NULL);
+    if (ctx->deauth_detector_task_active || ctx->deauth_detector_scan_active ||
+        ctx->detector_watch.remote_state_unknown) {
+        deauth_detector_request_stop(ctx);
+        return; // Keep the response/error visible until JanOS confirms Stop.
+    }
+
+    deauth_detector_picker_close(ctx);
 
     // Hide deauth detector page
     if (ctx->deauth_detector_page) {
@@ -49914,16 +52134,8 @@ static void show_deauth_detector_page(void)
     if (ctx->deauth_detector_page) {
         lv_obj_clear_flag(ctx->deauth_detector_page, LV_OBJ_FLAG_HIDDEN);
         ctx->current_visible_page = ctx->deauth_detector_page;
-        // Sync button states with actual running state
-        if (ctx->deauth_detector_start_btn && ctx->deauth_detector_stop_btn) {
-            if (ctx->deauth_detector_running) {
-                lv_obj_add_state(ctx->deauth_detector_start_btn, LV_STATE_DISABLED);
-                lv_obj_clear_state(ctx->deauth_detector_stop_btn, LV_STATE_DISABLED);
-            } else {
-                lv_obj_clear_state(ctx->deauth_detector_start_btn, LV_STATE_DISABLED);
-                lv_obj_add_state(ctx->deauth_detector_stop_btn, LV_STATE_DISABLED);
-            }
-        }
+        deauth_detector_render_status(ctx);
+        deauth_detector_render_networks(ctx);
         ESP_LOGI(TAG, "Showing existing deauth detector page for tab %d", current_tab);
         return;
     }
@@ -49939,7 +52151,7 @@ static void show_deauth_detector_page(void)
     lv_obj_set_flex_flow(ctx->deauth_detector_page, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_row(ctx->deauth_detector_page, 8, 0);
 
-    // Header with back button, title, and start/stop buttons
+    // Header with title, mode selection, and start/stop buttons
     lv_obj_t *header = lv_obj_create(ctx->deauth_detector_page);
     lv_obj_set_size(header, lv_pct(100), LV_SIZE_CONTENT);
     lv_obj_set_style_bg_opa(header, LV_OPA_TRANSP, 0);
@@ -49950,15 +52162,17 @@ static void show_deauth_detector_page(void)
     lv_obj_set_style_pad_column(header, 10, 0);
     lv_obj_clear_flag(header, LV_OBJ_FLAG_SCROLLABLE);
 
-    // Left side: Back + Title
+    // Left side: Back + Title + modes; the mode group wraps below on narrow displays.
     lv_obj_t *left_cont = lv_obj_create(header);
-    lv_obj_set_size(left_cont, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_size(left_cont, 0, LV_SIZE_CONTENT);
+    lv_obj_set_flex_grow(left_cont, 1);
     lv_obj_set_style_bg_opa(left_cont, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(left_cont, 0, 0);
     lv_obj_set_style_pad_all(left_cont, 0, 0);
-    lv_obj_set_flex_flow(left_cont, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_flow(left_cont, LV_FLEX_FLOW_ROW_WRAP);
     lv_obj_set_flex_align(left_cont, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_column(left_cont, 10, 0);
+    lv_obj_set_style_pad_row(left_cont, 8, 0);
     lv_obj_clear_flag(left_cont, LV_OBJ_FLAG_SCROLLABLE);
 
     // Back button (arrow style)
@@ -49967,7 +52181,7 @@ static void show_deauth_detector_page(void)
     lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x333333), 0);
     lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x444444), LV_STATE_PRESSED);
     lv_obj_set_style_radius(back_btn, 8, 0);
-    lv_obj_add_event_cb(back_btn, deauth_detector_back_btn_event_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(back_btn, deauth_detector_back_btn_event_cb, LV_EVENT_CLICKED, ctx);
     app_keyboard_navigation_register_escape(back_btn);
 
     lv_obj_t *back_icon = lv_label_create(back_btn);
@@ -49981,7 +52195,7 @@ static void show_deauth_detector_page(void)
     lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
     lv_obj_set_style_text_color(title, COLOR_MATERIAL_AMBER, 0);
 
-    // Right side: Start/Stop buttons
+    // Right side: history actions and detector controls
     lv_obj_t *btn_cont = lv_obj_create(header);
     lv_obj_set_size(btn_cont, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
     lv_obj_set_style_bg_opa(btn_cont, LV_OPA_TRANSP, 0);
@@ -49998,7 +52212,7 @@ static void show_deauth_detector_page(void)
     lv_obj_set_style_bg_color(deauth_start_btn, COLOR_MATERIAL_GREEN, 0);
     lv_obj_set_style_bg_color(deauth_start_btn, lv_color_hex(0x555555), LV_STATE_DISABLED);
     lv_obj_set_style_radius(deauth_start_btn, 8, 0);
-    lv_obj_add_event_cb(deauth_start_btn, deauth_detector_start_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(deauth_start_btn, deauth_detector_start_cb, LV_EVENT_CLICKED, ctx);
 
     lv_obj_t *start_label = lv_label_create(deauth_start_btn);
     lv_label_set_text(start_label, LV_SYMBOL_PLAY " Start");
@@ -50012,7 +52226,7 @@ static void show_deauth_detector_page(void)
     lv_obj_set_style_bg_color(deauth_stop_btn, COLOR_MATERIAL_RED, 0);
     lv_obj_set_style_bg_color(deauth_stop_btn, lv_color_hex(0x555555), LV_STATE_DISABLED);
     lv_obj_set_style_radius(deauth_stop_btn, 8, 0);
-    lv_obj_add_event_cb(deauth_stop_btn, deauth_detector_stop_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(deauth_stop_btn, deauth_detector_stop_cb, LV_EVENT_CLICKED, ctx);
     lv_obj_add_state(deauth_stop_btn, LV_STATE_DISABLED);  // Initially disabled
 
     lv_obj_t *stop_label = lv_label_create(deauth_stop_btn);
@@ -50020,11 +52234,130 @@ static void show_deauth_detector_page(void)
     lv_obj_set_style_text_font(stop_label, &lv_font_montserrat_14, 0);
     lv_obj_center(stop_label);
 
+    lv_obj_t *save_btn = lv_btn_create(btn_cont);
+    ctx->deauth_detector_save_btn = save_btn;
+    lv_obj_set_size(save_btn, 106, 40);
+    lv_obj_set_style_bg_color(save_btn, lv_color_hex(0x28678A), 0);
+    lv_obj_set_style_bg_color(save_btn, lv_color_hex(0x555555), LV_STATE_DISABLED);
+    lv_obj_set_style_radius(save_btn, 8, 0);
+    lv_obj_add_event_cb(save_btn, deauth_detector_save_cb, LV_EVENT_CLICKED, ctx);
+    lv_obj_t *save_label = lv_label_create(save_btn);
+    lv_label_set_text(save_label, "Save CSV");
+    lv_obj_set_style_text_font(save_label, &lv_font_montserrat_14, 0);
+    lv_obj_center(save_label);
+
+    lv_obj_t *clear_btn = lv_btn_create(btn_cont);
+    ctx->deauth_detector_clear_btn = clear_btn;
+    lv_obj_set_size(clear_btn, 76, 40);
+    lv_obj_set_style_bg_color(clear_btn, lv_color_hex(0x555555), 0);
+    lv_obj_set_style_bg_color(clear_btn, lv_color_hex(0x3D3D3D), LV_STATE_DISABLED);
+    lv_obj_set_style_radius(clear_btn, 8, 0);
+    lv_obj_add_event_cb(clear_btn, deauth_detector_clear_cb, LV_EVENT_CLICKED, ctx);
+    lv_obj_t *clear_label = lv_label_create(clear_btn);
+    lv_label_set_text(clear_label, "Clear");
+    lv_obj_set_style_text_font(clear_label, &lv_font_montserrat_14, 0);
+    lv_obj_center(clear_label);
+
+    lv_obj_t *mode_row = lv_obj_create(left_cont);
+    lv_obj_set_size(mode_row, ui_wide_layout() ? LV_SIZE_CONTENT : lv_pct(100),
+                    LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(mode_row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(mode_row, 0, 0);
+    lv_obj_set_style_pad_all(mode_row, 0, 0);
+    lv_obj_set_flex_flow(mode_row, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_style_pad_column(mode_row, 8, 0);
+    lv_obj_set_style_pad_row(mode_row, 6, 0);
+    lv_obj_clear_flag(mode_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *deauth_all_btn = lv_btn_create(mode_row);
+    ctx->deauth_detector_all_btn = deauth_all_btn;
+    lv_obj_set_size(deauth_all_btn, LV_SIZE_CONTENT, 38);
+    lv_obj_add_event_cb(deauth_all_btn, deauth_detector_all_cb, LV_EVENT_CLICKED, ctx);
+    lv_obj_t *all_label = lv_label_create(deauth_all_btn);
+    lv_label_set_text(all_label, "All networks");
+    lv_obj_center(all_label);
+    lv_obj_t *deauth_selected_btn = lv_btn_create(mode_row);
+    ctx->deauth_detector_selected_btn = deauth_selected_btn;
+    lv_obj_set_size(deauth_selected_btn, LV_SIZE_CONTENT, 38);
+    lv_obj_add_event_cb(deauth_selected_btn, deauth_detector_selected_cb, LV_EVENT_CLICKED, ctx);
+    lv_obj_t *selected_label = lv_label_create(deauth_selected_btn);
+    lv_label_set_text(selected_label, "Selected networks");
+    lv_obj_center(selected_label);
+
+    lv_obj_t *scan_btn = lv_btn_create(mode_row);
+    ctx->deauth_detector_scan_btn = scan_btn;
+    lv_obj_set_size(scan_btn, LV_SIZE_CONTENT, 38);
+    lv_obj_add_event_cb(scan_btn, deauth_detector_scan_cb, LV_EVENT_CLICKED, ctx);
+    lv_obj_t *scan_label = lv_label_create(scan_btn);
+    lv_label_set_text(scan_label, "Scan again");
+    lv_obj_center(scan_label);
+
+    lv_obj_t *trace_checkbox = lv_checkbox_create(ctx->deauth_detector_page);
+    ctx->deauth_detector_trace_checkbox = trace_checkbox;
+    lv_checkbox_set_text(trace_checkbox, "Channel trace (passive)");
+    lv_obj_set_size(trace_checkbox, LV_SIZE_CONTENT, 30);
+    lv_obj_set_style_text_color(trace_checkbox, lv_color_hex(0xE6E6E6), 0);
+    lv_obj_add_event_cb(trace_checkbox, deauth_detector_trace_cb,
+                        LV_EVENT_VALUE_CHANGED, ctx);
+
+    ctx->deauth_detector_status_label = lv_label_create(ctx->deauth_detector_page);
+    lv_obj_set_width(ctx->deauth_detector_status_label, lv_pct(100));
+    lv_label_set_long_mode(ctx->deauth_detector_status_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(ctx->deauth_detector_status_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(ctx->deauth_detector_status_label, lv_color_hex(0xFFFFFF), 0);
+    ctx->deauth_detector_watch_label = lv_label_create(ctx->deauth_detector_page);
+    lv_obj_set_width(ctx->deauth_detector_watch_label, lv_pct(100));
+    lv_label_set_long_mode(ctx->deauth_detector_watch_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(ctx->deauth_detector_watch_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(ctx->deauth_detector_watch_label, lv_color_hex(0xCCCCCC), 0);
+
     // Status/count label
     lv_obj_t *count_label = lv_label_create(ctx->deauth_detector_page);
     ctx->deauth_detector_count_label = count_label;
     lv_obj_set_style_text_font(count_label, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(count_label, lv_color_hex(0x888888), 0);
+
+    ctx->deauth_detector_storage_label = lv_label_create(ctx->deauth_detector_page);
+    lv_obj_set_width(ctx->deauth_detector_storage_label, lv_pct(100));
+    lv_label_set_long_mode(ctx->deauth_detector_storage_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(ctx->deauth_detector_storage_label, &lv_font_montserrat_12, 0);
+
+    lv_obj_t *csa_note = lv_label_create(ctx->deauth_detector_page);
+    lv_label_set_text(csa_note,
+                      "CSA is an observed channel-change announcement only, not proof of an attack or AP channel change. "
+                      "Channel trace is passive: it stops detector-initiated hopping only; connected Wi-Fi may still control the physical channel. "
+                      "A DEAUTH record does not prove an attack or a client disconnection.");
+    lv_obj_set_width(csa_note, lv_pct(100));
+    lv_label_set_long_mode(csa_note, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(csa_note, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(csa_note, lv_color_hex(0xAAAAAA), 0);
+
+    // Fixed column key stays visible while the observations below scroll.
+    lv_obj_t *table_header = lv_obj_create(ctx->deauth_detector_page);
+    lv_obj_set_size(table_header, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_color(table_header, lv_color_hex(0x343B43), 0);
+    lv_obj_set_style_border_width(table_header, 0, 0);
+    lv_obj_set_style_radius(table_header, 6, 0);
+    lv_obj_set_style_pad_left(table_header, 16, 0);
+    lv_obj_set_style_pad_right(table_header, 16, 0);
+    lv_obj_set_style_pad_top(table_header, 8, 0);
+    lv_obj_set_style_pad_bottom(table_header, 8, 0);
+    lv_obj_set_style_pad_column(table_header, 8, 0);
+    lv_obj_set_flex_flow(table_header, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(table_header, LV_FLEX_ALIGN_SPACE_BETWEEN,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_clear_flag(table_header, LV_OBJ_FLAG_SCROLLABLE);
+    static const char *const column_titles[] = {
+        "CHANNEL / EVENT", "NETWORK / SSID", "BSSID", "RSSI (dBm)"
+    };
+    const lv_coord_t column_widths[] = {124, 0, 150, 90};
+    for (size_t i = 0; i < sizeof(column_titles) / sizeof(column_titles[0]); ++i) {
+        lv_obj_t *column = lv_label_create(table_header);
+        lv_label_set_text(column, column_titles[i]);
+        lv_obj_set_style_text_font(column, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(column, lv_color_hex(0xE3E9EF), 0);
+        if (i == 1) lv_obj_set_flex_grow(column, 1);
+        else lv_obj_set_width(column, column_widths[i]);
+    }
 
     // Scrollable table container
     ctx->deauth_detector_table = lv_obj_create(ctx->deauth_detector_page);
@@ -50039,6 +52372,7 @@ static void show_deauth_detector_page(void)
 
     // Populate table with existing entries (if any from previous session)
     update_deauth_table(ctx);
+    deauth_detector_render_status(ctx);
 
     // Set current visible page
     ctx->current_visible_page = ctx->deauth_detector_page;
@@ -54046,12 +56380,16 @@ static void sd_monitor_task(void *arg)
             continue;
         }
 
+        if (atomic_flag_test_and_set_explicit(&detector_sd_export_probe_lock,
+                                              memory_order_acquire)) continue;
+
         bool present = check_sd_card_for_tab(TAB_INTERNAL);
         if (present != internal_sd_present) {
             ESP_LOGI(TAG, "[INTERNAL] SD presence changed -> %s", present ? "PRESENT" : "ABSENT");
         }
         internal_sd_present = present;
         internal_ctx.sd_card_present = present;
+        atomic_flag_clear_explicit(&detector_sd_export_probe_lock, memory_order_release);
     }
 }
 

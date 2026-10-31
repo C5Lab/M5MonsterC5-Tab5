@@ -1,17 +1,65 @@
-/* Browser-only Deauth Detector boundary. Included after the model bridge in
- * application.c. The page comes byte-exact from main/main.c: the retained
- * show_deauth_detector_page() renders it, and its Start callback sends
- * "deauth_detector" and xTaskCreate()s an infinite UART reader task.
- *
- * That task is intercepted in xTaskCreate() (see application.c); instead of
- * running its UART loop we synthesize one detected frame per interval from the
- * scenario, format it as the firmware's "[DEAUTH] ..." line and let the
- * production parse_deauth_line() build the entry, so the retained
- * update_deauth_table() draws exactly what the device would. Stop/Back clear
- * ctx->deauth_detector_running and the tick deactivates. */
+/* Browser-only JanOS detector transport. The retained Tab5 controls write to
+ * their captured tab and port; the model keeps scan rows, command replies and
+ * selected BSSIDs separate for each simulated module. */
+
+EM_JS(int,app_deauth_read_js,(int tab,char *out,int size),{
+ const line=emulatorDevice.detectorRead(tab);
+ if(line===null)return 0;
+ stringToUTF8(line+'\n',out,size);
+ return 1;
+});
+EM_JS(int,app_deauth_connected_js,(int tab),{
+ return emulatorDevice.device.systemStatus(emulatorDevice.module(tab)).connected?1:0;
+});
+
+static char app_deauth_tx[4][512];
+static size_t app_deauth_tx_len[4];
+static char app_deauth_rx[4][1024];
+static size_t app_deauth_rx_len[4],app_deauth_rx_pos[4];
+
+/* The browser runs all retained callbacks on one thread. The detector's
+ * context and task flags still own its console lease, and the synthetic
+ * FreeRTOS mutex below is initialized for each external tab in app_init(). */
+static bool janos_console_occupied(tab_id_t tab) {
+ if(tab<TAB_GROVE||tab>TAB_MBUS)return true;
+ tab_context_t *ctx=get_ctx_for_tab(tab);
+ return ctx && ctx->deauth_detector_console_claimed;
+}
+
+/* The firmware can write the command and CRLF separately. Commit a full line
+ * only at a terminator, preserving the module chosen when the job began. */
+static int transport_write_bytes_tab(tab_id_t tab,uart_port_t port,const char *data,size_t len) {
+ (void)port;
+ int i=(int)tab;
+ if(i<0||i>=4||!data)return 0;
+ if(i<=TAB_MBUS&&!app_deauth_connected_js(i))return 0;
+ for(size_t n=0;n<len;n++){
+  char ch=data[n];
+  if(ch=='\r'||ch=='\n') {
+   if(app_deauth_tx_len[i]) {
+    app_deauth_tx[i][app_deauth_tx_len[i]]='\0';
+    if(!strcmp(app_deauth_tx[i],"scan_networks"))
+     atomic_fetch_add(&detector_scan_epoch[i],1);
+    app_config_command(i,app_deauth_tx[i]);
+    app_deauth_tx_len[i]=0;
+   }
+   continue;
+  }
+  if(app_deauth_tx_len[i]+1>=sizeof(app_deauth_tx[i])){
+   app_deauth_tx_len[i]=0;
+   emu_unsupported("UART command exceeds emulator buffer");
+   return 0;
+  }
+  app_deauth_tx[i][app_deauth_tx_len[i]++]=ch;
+ }
+ return (int)len;
+}
 
 EM_JS(int, app_deauth_line_js, (int tab, int seq, char *out, int size), {
  return stringToUTF8(emulatorDevice.deauthDetectorLine(tab, seq), out, size);
+});
+EM_JS(int, app_deauth_pending_js, (int tab), {
+ return emulatorDevice.detectorHasPendingObservation(tab) ? 1 : 0;
 });
 
 static struct {
@@ -22,8 +70,8 @@ static struct {
  double last_ms;
 } app_deauth[4];
 
-/* Reached from the intercepted xTaskCreate(deauth_detector_task, ...). The
- * retained start callback has already set ctx->deauth_detector_running. */
+/* Reached from the intercepted scan or monitor task. Poll helpers below run
+ * the retained state machine without blocking the browser event loop. */
 static void app_deauth_start(tab_context_t *ctx) {
  if(!ctx)return;
  int tab=tab_id_for_ctx(ctx);
@@ -35,25 +83,53 @@ static void app_deauth_start(tab_context_t *ctx) {
  app_deauth[tab].last_ms=0;
 }
 
-/* Mirror the detector task's single job: append one synthesized deauth frame at
- * a steady cadence while running, newest first, capped like the firmware. */
+/* Drive the real Tab5 scan/start/stop parsers with per-module JanOS lines.
+ * Synthetic observations enter the same production parser after start ACK. */
 static void app_deauth_tick(void) {
  for(int tab=0;tab<4;tab++) {
+  /* Hardware discovery keeps these flags current outside a detector task on
+   * Tab5. Mirror that here so reconnect + bound Stop retry is testable. */
+  if(tab==TAB_GROVE)grove_detected=app_deauth_connected_js(tab);
+  if(tab==TAB_MBUS)mbus_detected=app_deauth_connected_js(tab);
   if(!app_deauth[tab].active)continue;
   tab_context_t *ctx=app_deauth[tab].ctx;
-  if(!ctx||!ctx->deauth_detector_running){app_deauth[tab].active=false;continue;}
-  if(!ctx->deauth_entries || !ctx->deauth_detector_table ||
-     !lv_obj_is_valid(ctx->deauth_detector_table))continue;
+  if(!ctx){app_deauth[tab].active=false;continue;}
+  if(ctx->deauth_detector_scan_active)deauth_detector_scan_poll(ctx);
+  if(ctx->deauth_detector_task_active)deauth_detector_poll(ctx);
+  bool task_released=false;
+  if(!ctx->deauth_detector_scan_active){
+   task_released=ctx->deauth_detector_scan_task!=NULL;
+   ctx->deauth_detector_scan_task=NULL;
+   app_deauth_scan_session[tab]=false;
+  }
+  if(!ctx->deauth_detector_task_active){
+   task_released=task_released||ctx->deauth_detector_task!=NULL;
+   ctx->deauth_detector_task=NULL;
+  }
+  if(task_released)deauth_detector_render_status(ctx);
+  if(!ctx->deauth_detector_scan_active&&!ctx->deauth_detector_task_active){
+   app_deauth[tab].active=false;continue;
+  }
+  if(!ctx->deauth_detector_running||!ctx->deauth_entries||
+     !ctx->deauth_detector_table||!lv_obj_is_valid(ctx->deauth_detector_table))continue;
+  /* JanOS publishes Trace armed before it can report the first confirming
+   * marker. Do not let the synthetic event source overtake that queued status. */
+  if(ctx->detector_watch.trace_requested &&
+     (ctx->detector_watch.trace_state==DETECTOR_TRACE_WAITING_ARM ||
+      ctx->detector_watch.trace_state==DETECTOR_TRACE_RELEASED))continue;
   if(app_device_ms-app_deauth[tab].last_ms<1200)continue;
   app_deauth[tab].last_ms=app_device_ms;
   char line[256];
   if(app_deauth_line_js(tab,app_deauth[tab].seq++,line,sizeof(line))<=0)continue;
-  deauth_entry_t entry={0};
-  if(!parse_csa_line(line,&entry) && !parse_deauth_line(line,&entry))continue;
-  if(ctx->deauth_entry_count<DEAUTH_DETECTOR_MAX_ENTRIES)ctx->deauth_entry_count++;
-  memmove(&ctx->deauth_entries[1],&ctx->deauth_entries[0],(ctx->deauth_entry_count-1)*sizeof(deauth_entry_t));
-  ctx->deauth_entries[0]=entry;
-  update_deauth_table(ctx);
+  deauth_detector_process_line(ctx,line);
+  /* The bridge queues the triggering V2 record behind its confirming marker.
+   * Drain that one pending record in the same tick so the 1000 ms deadline
+   * cannot overtake the observation that opened the confirmation window. */
+  if(!strncmp(line,"[DETECTOR_TRACE] confirming_bssid=",
+              sizeof("[DETECTOR_TRACE] confirming_bssid=")-1) &&
+     app_deauth_pending_js(tab) &&
+     app_deauth_line_js(tab,app_deauth[tab].seq,line,sizeof(line))>0)
+   deauth_detector_process_line(ctx,line);
  }
 }
 
@@ -81,6 +157,18 @@ static struct { bool active; tab_context_t *ctx; int seq, followers, devices; un
 static int transport_read_bytes_tab(tab_id_t tab, uart_port_t port, void *data, size_t len, TickType_t ticks_to_wait) {
  (void)port; (void)ticks_to_wait;
  int i=(int)tab; if(i<0||i>=4)return 0;
+ if(app_deauth_rx_pos[i]>=app_deauth_rx_len[i]){
+  app_deauth_rx_pos[i]=app_deauth_rx_len[i]=0;
+  if(app_deauth_read_js(i,app_deauth_rx[i],sizeof(app_deauth_rx[i])))
+   app_deauth_rx_len[i]=strlen(app_deauth_rx[i]);
+ }
+ if(app_deauth_rx_len[i]>app_deauth_rx_pos[i]){
+  size_t avail=app_deauth_rx_len[i]-app_deauth_rx_pos[i];
+  size_t count=len<avail?len:avail;
+  memcpy(data,app_deauth_rx[i]+app_deauth_rx_pos[i],count);
+  app_deauth_rx_pos[i]+=count;
+  return (int)count;
+ }
  int avail=app_as_len[i]-app_as_read[i]; if(avail<=0)return 0;
  int n=(int)len<avail?(int)len:avail;
  memcpy(data, app_as_buf[i]+app_as_read[i], n); app_as_read[i]+=n; return n;

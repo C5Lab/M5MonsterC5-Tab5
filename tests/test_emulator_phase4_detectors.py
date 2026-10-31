@@ -1,8 +1,9 @@
 """Phase 4.7 Deauth Detector browser acceptance. Run only after rebuilding.
 
-The detector page renders byte-exact from firmware; Start sends "deauth_detector"
-and its infinite UART task is intercepted, so app_deauth_tick() feeds synthesized
-"[DEAUTH] ..." lines through the production parse_deauth_line() into the table.
+The detector page renders byte-exact from firmware; Start sends
+"deauth_detector_v2" and its UART task is intercepted, so
+app_deauth_tick() feeds synthesized "[DEAUTH_V2] ..." lines through the
+production parser into the table.
 """
 import re
 import unittest
@@ -22,8 +23,14 @@ class DeauthDetectorBrowser(unittest.TestCase):
         click_object(page, matches[0])
 
     def rows(self, page):
-        # Each detected entry renders a "CH<n>" channel label in the table.
+        # Each distinct DEAUTH group renders a "CH<n>" label in the table.
         return [o['text'] for o in objects(page) if re.match(r'^CH\d', o['text'])]
+
+    def observations(self, page):
+        match = re.search(r'Observed: (\d+) DEAUTH \| (\d+) CSA \| Latest groups: (\d+)/200',
+                          self.text(page))
+        self.assertIsNotNone(match)
+        return int(match.group(1)) + int(match.group(2))
 
     def open_detector(self, page):
         page.wait_for_function('globalThis.emulator?.measurements.frames>2')
@@ -43,16 +50,17 @@ class DeauthDetectorBrowser(unittest.TestCase):
                 self.advance(page)
                 detected = self.rows(page)
                 self.assertGreater(len(detected), 0)
+                observed = self.observations(page)
                 # The scenario's first network drives the first detected frame.
                 self.assertIn('NEON-BAZAAR', self.text(page))
-                # Detection keeps adding rows while running.
+                # Repeated detections update group counts while running.
                 self.advance(page)
-                self.assertGreater(len(self.rows(page)), len(detected))
+                self.assertGreater(self.observations(page), observed)
                 # Stop freezes the list.
                 self.click_binding(page, 'deauth_stop_btn')
-                frozen = len(self.rows(page))
+                frozen = self.observations(page)
                 self.advance(page)
-                self.assertEqual(len(self.rows(page)), frozen)
+                self.assertEqual(self.observations(page), frozen)
                 # Back returns to the tiles.
                 self.click_binding(page, 'show_deauth_detector_page.back_btn')
                 self.assertIn('Deauth\nDetector', self.text(page))
@@ -72,11 +80,15 @@ class DeauthDetectorBrowser(unittest.TestCase):
                 self.assertGreater(len(self.rows(page)), 0)
                 self.click_binding(page, 'show_deauth_detector_page.back_btn')
                 self.advance(page)
+                # Back keeps the status visible until JanOS confirms Stop.
+                self.assertIn('Stopped', self.text(page))
+                self.click_binding(page, 'show_deauth_detector_page.back_btn')
+                self.advance(page)
                 # Detection is stopped: reopening shows no growth beyond the frozen list.
                 click_text(page, 'Deauth\nDetector')
-                frozen = len(self.rows(page))
+                frozen = self.observations(page)
                 self.advance(page)
-                self.assertEqual(len(self.rows(page)), frozen)
+                self.assertEqual(self.observations(page), frozen)
             finally:
                 page.close()
 

@@ -1,5 +1,11 @@
-/* Physical speaker is absent; retain native success UI without an unavailable error. */
-static void alert_chime_play(alert_tone_t tone){(void)tone;}
+/* Physical speaker is absent. Keep a browser-visible invocation ledger so
+ * acceptance can prove that status-only records never reach the alarm path. */
+static void alert_chime_play(alert_tone_t tone){
+ EM_ASM({
+  if(!globalThis.emulatorAlertChimes)globalThis.emulatorAlertChimes=[];
+  globalThis.emulatorAlertChimes.push($0);
+ },(int)tone);
+}
 /* Read-only evidence: native surfaces and offline operation handles. */
 EMSCRIPTEN_KEEPALIVE void emu_queue2_attacks_state(void){
  tab_context_t *c=&grove_ctx;int t=0;

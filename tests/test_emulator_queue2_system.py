@@ -37,7 +37,14 @@ class Queue2SystemBrowser(unittest.TestCase):
                     self.title('Read new detector events');self.advance(3000);self.title('Stop detection')
                     self.click(prefix+'_stop_btn');self.title('Check stopped results');self.title('Restart detection')
                     self.click(prefix+'_start_btn');self.title('Read the restarted session');self.advance(3000)
-                    self.title('Leave and stop detection');self.click('show_antisurv_page.back_btn' if anti else 'show_deauth_detector_page.back_btn');self.finish()
+                    self.title('Leave and stop detection');self.click('show_antisurv_page.back_btn' if anti else 'show_deauth_detector_page.back_btn')
+                    if not anti:
+                        p.wait_for_function('''() => {
+                            emulator.module._emu_inspect();
+                            return emulatorObjects.some(item => item.text === 'Stopped');
+                        }''')
+                        self.click('show_deauth_detector_page.back_btn')
+                    self.finish()
     def test_each_module_reboot_all_rotations(self):
         p=self.page
         for r in range(4):
@@ -101,5 +108,10 @@ class Queue2SystemBrowser(unittest.TestCase):
         self.title('Read new detector events');self.advance(100000);self.title('Stop detection')
         self.click('deauth_stop_btn');self.title('Restart detection');self.click('deauth_start_btn')
         self.title('Read the restarted session');self.advance(3000);self.title('Leave and stop detection')
+        self.click('show_deauth_detector_page.back_btn')
+        p.wait_for_function('''() => {
+            emulator.module._emu_inspect();
+            return emulatorObjects.some(item => item.text === 'Stopped');
+        }''')
         self.click('show_deauth_detector_page.back_btn');self.finish()
 if __name__=='__main__':unittest.main(verbosity=2)
