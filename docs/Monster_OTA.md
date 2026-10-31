@@ -196,7 +196,12 @@ Syntax notes:
 
 ## Return-log prefixes (C5 -> P4)
 
-The Status screen and the List/Info screens are built by parsing the start of each UART line:
+The Status screen and the List/Info screens parse known response prefixes.
+JanOS may leave a `> ` shell prompt in front of an asynchronous response. The
+Tab5 ignores that prompt for parsing and keeps the original line in the Status
+screen's raw UART log.
+
+Recognized prefixes:
 
 | Prefix | Meaning | Screen |
 |---|---|---|
@@ -224,7 +229,9 @@ For an installation, the UI state transitions are intentionally strict:
 - generic `restart` or `reboot` text is informational and is not a success marker;
 - only `OTA: update applied, restarting` confirms that the image was finished and the boot slot
   was switched; this moves progress to 100% and enables `Done - Close`;
-- `no update` / `up to date` remains a valid terminal result because no flash operation is needed.
+- `no update` / `up to date` is a terminal release-check result. The screen shows
+  the result and any reported current/latest versions, enables `Done - Close`,
+  and hides the download/flash steps and transfer bar because no image was written.
 
 The **OTA List** screen — up to 5 `OTA[n]:` lines with the latest releases.
 

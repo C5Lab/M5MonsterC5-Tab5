@@ -1,9 +1,11 @@
 # Monster OTA / JanOS RF — test coverage
 
-All tests exercise the real parser and decision logic in
-[`main/ota_rf.c`](../main/ota_rf.c) (host-compiled, no copy). The Python
+The RF decision tests exercise the real parser and decision logic in
+[`main/ota_rf.c`](../main/ota_rf.c) (host-compiled, no copy). Their Python
 contract tests compile that exact source with a small C harness
-(`tests/_ota_rf_harness.py`); the C test links it directly.
+(`tests/_ota_rf_harness.py`); the C test links it directly. The Tab5 status
+and monitor regressions compile the unchanged OTA functions extracted from
+`main/main.c` with display and LVGL boundary stubs.
 
 ## Running
 
@@ -17,6 +19,8 @@ gcc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -g \
 python3 tests/test_ota_metadata.py
 python3 tests/test_ota_flow.py
 python3 tests/test_ota_http.py
+python3 tests/test_ota_status_terminal.py
+python3 tests/test_ota_monitor_sink.py
 ```
 
 On a Windows workstation without a host compiler, run the same commands inside
@@ -39,6 +43,8 @@ WSL against the `/mnt/c/...` checkout (see [../tests/README.md](../tests/README.
 | UART fragmentation / echo / prompt / foreign logs / restart | `ota_rf_test` (`test_line_asm`), `test_ota_http` (fragmented list, truncated tail), `test_ota_metadata` (interleaved noise) |
 | Re-detect after restart | `test_ota_flow` (re-detect after reboot) |
 | Device change clears cache; parallel operations refused | `test_ota_flow` (state), `ota_rf_test` (`test_state`) |
+| `no update (current=..., latest=...)`, with or without a leading `> ` prompt, ends the Tab5 check without download/flash progress; `current=..., target=...` stays nonterminal | `test_ota_status_terminal` |
+| A temporary display-lock miss does not discard a terminal UART line after it was logged | `test_ota_monitor_sink` |
 
 ## Firmware compile check (no full build, no flash)
 
@@ -66,6 +72,14 @@ also completed a full ESP-IDF 5.4.1 build for ESP32-P4. No device flashing was r
 - Existing flow, HTTP, metadata and RF C suites continue to pass.
 - The user confirmed the earlier RF 1.7.5 reinstall on hardware. The corrected
   Force/list and shared gate changes still require device acceptance testing.
+
+## No-update status follow-up (2026-10-30)
+
+`test_ota_status_terminal.py` and `test_ota_monitor_sink.py` compile the
+production status and monitor functions with UI/transport boundary stubs. This
+change has host validation only; no full firmware build or device test was run.
+The 2026-10-31 follow-up covers a prompt-prefixed `> OTA: no update` line and
+checks that the Status log still shows the original UART bytes.
 
 ## Hardware acceptance (to be run on a device — not yet performed)
 

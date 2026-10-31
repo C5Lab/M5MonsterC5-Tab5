@@ -57156,12 +57156,13 @@ static const char *ota_status_pretty(const char *line)
 {
     if (ota_ci_contains(line, "asset size"))       return LV_SYMBOL_DOWNLOAD " Update found on server";
     if (ota_ci_contains(line, "asset updated_at")) return LV_SYMBOL_REFRESH " Release metadata loaded";
+    if (ota_ci_contains(line, "no update") ||
+        ota_ci_contains(line, "up to date"))        return LV_SYMBOL_OK " No newer release";
     if (ota_ci_contains(line, "current="))         return LV_SYMBOL_REFRESH " Preparing selected release";
     if (ota_ci_contains(line, "image project"))    return LV_SYMBOL_SD_CARD " Verifying firmware image";
     if (ota_ci_contains(line, "progress"))         return LV_SYMBOL_DOWNLOAD " Downloading firmware...";
     if (ota_ci_contains(line, "download complete")) return LV_SYMBOL_OK " Download complete";
     if (ota_ci_contains(line, "download stalled")) return LV_SYMBOL_WARNING " Download stalled";
-    if (ota_ci_contains(line, "no update"))        return LV_SYMBOL_OK " Already up to date";
     if (ota_ci_contains(line, "updating to"))      return LV_SYMBOL_DOWNLOAD " Downloading & flashing...";
     if (ota_ci_contains(line, "target partition")) return LV_SYMBOL_SD_CARD " Writing new firmware...";
     if (ota_ci_contains(line, "update applied"))   return LV_SYMBOL_OK " Applied - rebooting the C5...";
@@ -57405,7 +57406,22 @@ static void ota_status_from_ota_line(const char *line)
     // that silence itself as a successful installation.
     if (!g_ota.terminal_status_seen) g_ota.reboot_wait_shown = false;
 
-    if (ota_ci_contains(line, "asset size")) {
+    if (ota_ci_contains(line, "no update") || ota_ci_contains(line, "up to date")) {
+        char detail[192];
+        snprintf(detail, sizeof(detail), "No newer release is available. %s", line);
+        ota_status_set_phase(LV_SYMBOL_OK " No newer release", detail,
+                             COLOR_MATERIAL_GREEN, 2, 0);
+        // The release check completed without downloading or flashing an image.
+        if (g_ota.mon_progress) lv_obj_add_flag(g_ota.mon_progress, LV_OBJ_FLAG_HIDDEN);
+        for (int i = 2; i < 4; i++) {
+            if (g_ota.mon_steps[i]) lv_obj_add_flag(g_ota.mon_steps[i], LV_OBJ_FLAG_HIDDEN);
+        }
+        g_ota.flash_progress_seen = false;
+        g_ota.byte_progress_seen = false;
+        if (g_ota.release_list_waiting) ota_release_list_finish(true);
+        if (g_ota.install_started) ota_monitor_finish_close_ok();
+        ota_restore_screen_timeout();
+    } else if (ota_ci_contains(line, "asset size")) {
         g_ota.flash_progress_seen = true;
         ota_status_set_phase(LV_SYMBOL_DOWNLOAD " Package found",
                              "JanOS found the firmware asset. Download/flash has started.",
@@ -57472,13 +57488,6 @@ static void ota_status_from_ota_line(const char *line)
         }
         if (g_ota.release_list_waiting) ota_release_list_finish(false);
         if (g_ota.install_started) ota_monitor_finish_close_error();
-        ota_restore_screen_timeout();
-    } else if (ota_ci_contains(line, "no update") || ota_ci_contains(line, "up to date")) {
-        ota_status_set_phase(LV_SYMBOL_OK " Already up to date",
-                             "No newer release is available for this channel.",
-                             COLOR_MATERIAL_GREEN, 3, 100);
-        if (g_ota.release_list_waiting) ota_release_list_finish(true);
-        if (g_ota.install_started) ota_monitor_finish_close_ok();
         ota_restore_screen_timeout();
     } else if (ota_ci_contains(line, "update applied") &&
                (ota_ci_contains(line, "restarting") ||
@@ -57774,11 +57783,15 @@ static void ota_info_parse_line(const char *line)
     ota_info_update_ui();
 }
 
-// Parse one line from the C5 and update the open monitor overlay.
+// Parse one line from the C5 and update the open monitor overlay. `line` is
+// prompt-normalized for protocol checks; `raw_line` is kept for the UART log.
 // Caller must hold the display lock.
-static void ota_handle_line(const char *line)
+static void ota_handle_line(const char *line, const char *raw_line)
 {
-    if (line[0] == '\0') return;
+    if (line[0] == '\0') {
+        if (g_ota.view == OTA_VIEW_STATUS) ota_append_log(raw_line);
+        return;
+    }
 
     if (g_ota.view == OTA_VIEW_STATUS) {
         // WiFi status: "Wi-Fi: connected...", "Connecting to AP...", "SUCCESS: Connected...".
@@ -57874,10 +57887,10 @@ static void ota_handle_line(const char *line)
             }
         }
 
-        ota_append_log(line);
+        ota_append_log(raw_line);
     } else if (g_ota.view == OTA_VIEW_LIST) {
         // Release entries ("OTA[n]:") plus any "OTA: not connected/..." notice.
-        if (!strncmp(line, "OTA", 3)) ota_append_log(line);
+        if (!strncmp(line, "OTA", 3)) ota_append_log(raw_line);
     } else if (g_ota.view == OTA_VIEW_INFO) {
         if (!strncmp(line, "OTA boot", 8)    || !strncmp(line, "OTA running", 11) ||
             !strncmp(line, "OTA next", 8)    || !strncmp(line, "OTA channel", 11) ||
@@ -58052,10 +58065,24 @@ static void ota_monitor_sink(void *user, const char *line)
 {
     tab_id_t tab = *(tab_id_t *)user;
     ESP_LOGI(TAG, "[OTA<-%s] %s", tab_transport_name(tab), line);
-    if (g_ota.await_info) ota_info_report_feed_line(&g_ota.info_report, line);
-    if (bsp_display_lock(50)) {
-        ota_handle_line(line);
-        bsp_display_unlock();
+    // JanOS can print its shell prompt without a newline, leaving "> " before
+    // an asynchronous OTA result. Keep the raw serial log, but parse the result.
+    const char *record = line;
+    while (*record == ' ' || *record == '\t') record++;
+    if (*record == '>') {
+        record++;
+        while (*record == ' ' || *record == '\t') record++;
+    }
+    if (g_ota.await_info) ota_info_report_feed_line(&g_ota.info_report, record);
+    // A terminal result must not be lost after it was read from UART just
+    // because another LVGL operation held the display lock for 50 ms.
+    while (g_ota.monitoring) {
+        if (bsp_display_lock(50)) {
+            if (g_ota.monitoring) ota_handle_line(record, line);
+            bsp_display_unlock();
+            break;
+        }
+        vTaskDelay(1);
     }
 }
 
