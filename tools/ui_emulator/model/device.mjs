@@ -21,7 +21,11 @@ const newDetectorState=()=>({
   traceChannel:null,traceLockFailed:null,traceBssid:null,traceFirstChannel:null,
   traceCachedChannel:null,traceDeadline:null,traceCandidates:[],
   traceLockedBssid:null,traceLastActivity:null,
-  traceReleasedChannel:null,traceReleaseIdleMs:null
+  traceReleasedChannel:null,traceReleaseIdleMs:null,
+  defenceRequested:false,pmkidDecoy:false,defenceObservations:0,
+  defenceTxPairs:0,defencePmkidM1:0,defenceResponses:0,
+  defenceSatisfied:0,defenceErrors:0,defenceDropped:0,defenceSuppressed:0,
+  defenceLastResponse:null
 });
 
 const clearTraceConfirmation=detector=>{
@@ -36,6 +40,15 @@ const resetDetectorTrace=detector=>{
   detector.traceLockedBssid=null;detector.traceLastActivity=null;
   detector.traceReleasedChannel=null;detector.traceReleaseIdleMs=null;
   clearTraceConfirmation(detector);
+};
+
+const resetDetectorDefence=detector=>{
+  detector.defenceRequested=false;detector.pmkidDecoy=false;
+  detector.defenceObservations=0;detector.defenceTxPairs=0;
+  detector.defencePmkidM1=0;detector.defenceResponses=0;
+  detector.defenceSatisfied=0;detector.defenceErrors=0;
+  detector.defenceDropped=0;detector.defenceSuppressed=0;
+  detector.defenceLastResponse=null;
 };
 
 const validMac=value=>typeof value==='string'&&
@@ -91,6 +104,8 @@ export class SimulatedDevice {
       detector:newDetectorState(),
       detectorV2Supported:module.detector_v2_supported!==false,
       detectorTraceSupported:module.detector_trace_supported!==false,
+      detectorDefenceSupported:module.detector_defence_supported!==false,
+      detectorForensicsSupported:module.detector_forensics_supported===true,
       detectorTraceFailChannels:Array.isArray(module.detector_trace_fail_channels)
         ?module.detector_trace_fail_channels.filter(channel=>Number.isInteger(channel)&&channel>=1&&channel<=255):[],
       detectorTraceError:typeof module.detector_trace_error==='string'&&module.detector_trace_error
@@ -312,10 +327,14 @@ export class SimulatedDevice {
         emit('Scan cancelled by user.');
       }
       detector.scanJob=null;detector.scanReady=false;
-      emit(detectorWasRunning?'Deauth Detector stopped.':'All operations stopped.');
+      if(detectorWasRunning&&detector.defenceRequested)emit(
+        `[DETECTOR_DEFENCE] stopped observations=${detector.defenceObservations} tx_pairs=${detector.defenceTxPairs} pmkid_m1=${detector.defencePmkidM1} responses=${detector.defenceResponses} satisfied=${detector.defenceSatisfied} errors=${detector.defenceErrors} dropped=${detector.defenceDropped} outcome=${detector.defenceResponses?'responded':detector.defenceObservations?'observed':'idle'}`);
+      if(detectorWasRunning)emit('Deauth Detector stopped.');
+      emit('All operations stopped.');
       detector.running=false;detector.mode='idle';detector.details=false;
       detector.watchBssids=[];detector.channels=[];
       resetDetectorTrace(detector);
+      resetDetectorDefence(detector);
       return true;
     }
     const variant=cmd.split(/\s+/)[0];
@@ -327,16 +346,35 @@ export class SimulatedDevice {
     if(details&&!module.detectorV2Supported){
       emit('Unrecognized command');return true;
     }
-    const traceToken=details&&originalArgs.at(-1)==='trace';
+    const args=[...originalArgs];
+    const pmkidToken=details&&args.at(-1)==='pmkid-decoy';
+    if(pmkidToken)args.pop();
+    const defenceToken=details&&args.at(-1)==='defence';
+    if(defenceToken)args.pop();
+    const traceToken=details&&args.at(-1)==='trace';
+    if(traceToken)args.pop();
+    if(defenceToken&&!module.detectorDefenceSupported){
+      emit('Unrecognized command');return true;
+    }
+    if(pmkidToken&&!defenceToken){
+      const maximum=module.networks.length||this.#seed.networks.length;
+      emit(`Invalid watch index 'pmkid-decoy' (valid: 1-${maximum}). Detector not started.`);
+      return true;
+    }
+    if(defenceToken&&!traceToken){
+      emit('Invalid detector option; use --only before scan indices.');return true;
+    }
     if(traceToken&&!module.detectorTraceSupported){
-      const only=originalArgs[0]==='--only';
+      const only=args[0]==='--only';
       const maximum=module.networks.length||this.#seed.networks.length;
       emit(`${only?'Invalid watch':'Invalid detector'} index 'trace' (valid: 1-${maximum}). Detector not started.`);
       return true;
     }
     const trace=traceToken;
-    const args=trace?originalArgs.slice(0,-1):originalArgs;
     const only=args[0]==='--only';
+    if(defenceToken&&!only){
+      emit('Defence requires --only protected scan indices.');return true;
+    }
     if(only && args.length<2){emit(`Usage: ${variant} --only <scan-index> [scan-index ...]`);return true;}
     if(args.some((arg,i)=>arg.startsWith('--')&&(!only||i!==0))){
       emit('Invalid detector option; use --only before scan indices.');return true;
@@ -368,15 +406,20 @@ export class SimulatedDevice {
     detector.mode=only?'only':indices.length?'channels':'all';
     detector.details=details;
     resetDetectorTrace(detector);
+    resetDetectorDefence(detector);
     detector.traceRequested=trace;
     detector.traceState=trace?'armed':'off';
+    detector.defenceRequested=defenceToken;
+    detector.pmkidDecoy=defenceToken&&pmkidToken;
     detector.watchBssids=only?selected.map(item=>item.bssid.toUpperCase()):[];
     detector.channels=[...new Set(selected.map(item=>item.channel))];
+    const emitWatch=()=>selected.forEach((item,j)=>emit(
+      `[DETECTOR_WATCH] count=${selected.length} ap=${j+1}/${selected.length} CH=${item.channel} BSSID=${item.bssid.toUpperCase()} SSID=${item.ssid}`));
+    if(only&&defenceToken)emitWatch();
     emit(indices.length?'Deauth Detector started - monitoring selected channels for deauth frames...'
       :'Deauth Detector started - scanning all channels for deauth frames...');
     emit('[DETECTOR_INFO] CSA/ECSA announcements enabled.');
-    if(only)selected.forEach((item,j)=>emit(
-      `[DETECTOR_WATCH] count=${selected.length} ap=${j+1}/${selected.length} CH=${item.channel} BSSID=${item.bssid.toUpperCase()} SSID=${item.ssid}`));
+    if(only&&!defenceToken)emitWatch();
     emit(details
       ?'Output: [DEAUTH_V2] CH: <ch> | BSSID: <bssid> | TX: <tx> | DA: <da> | RSSI: <rssi> | REASON: <reason> | SSID: <ssid>'
       :'Output: [DEAUTH] CH: <ch> | AP: <name> (<bssid>) | RSSI: <rssi>');
@@ -384,6 +427,8 @@ export class SimulatedDevice {
     if(details){
       emit('[DETECTOR_INFO] format=deauth_v2');
       if(trace)emit('[DETECTOR_TRACE] armed');
+      if(defenceToken)emit(
+        `[DETECTOR_DEFENCE] armed targets=${selected.length} trace=fast pmkid=${pmkidToken?'decoy':'monitor'}`);
     }
     return true;
   }
@@ -396,14 +441,85 @@ export class SimulatedDevice {
     const {scanJob,scanReady,running,mode,details,watchBssids,channels,
       traceRequested,traceState,traceChannel,traceLockFailed,traceBssid,
       traceFirstChannel,traceDeadline,traceCandidates,traceLockedBssid,
-      traceLastActivity,traceReleasedChannel,traceReleaseIdleMs}=
+      traceLastActivity,traceReleasedChannel,traceReleaseIdleMs,
+      defenceRequested,pmkidDecoy,defenceObservations,defenceTxPairs,
+      defencePmkidM1,defenceResponses,defenceSatisfied,defenceErrors,
+      defenceDropped,defenceSuppressed}=
       this.#module(moduleId).detector;
     return structuredClone({scanJob,scanReady,running,mode,details,watchBssids,channels,
       traceRequested,traceState,traceLocked:traceState==='locked',traceChannel,
       traceLockFailed,traceBssid,traceFirstChannel,traceLockedBssid,
       traceLastActivity,traceReleasedChannel,traceReleaseIdleMs,
       traceWindowMs:traceDeadline===null?null:Math.max(0,traceDeadline-this.#now),
-      traceCandidates});
+      traceCandidates,defenceRequested,pmkidDecoy,defenceObservations,
+      defenceTxPairs,defencePmkidM1,defenceResponses,defenceSatisfied,
+      defenceErrors,defenceDropped,defenceSuppressed});
+  }
+
+  /** Deterministic JanOS Defence records for controlled emulator fixtures. */
+  detectorDefenceForEvent(moduleId,event) {
+    const detector=this.#module(moduleId).detector;
+    if(!event||!detector.running||!detector.details||!detector.defenceRequested||
+       !['deauth','disassoc','csa','pmkid_probe'].includes(event.type)||
+       !validMac(event.bssid)||!validMac(event.sta)||
+       !Number.isInteger(event.channel)||event.channel<1||event.channel>255)return [];
+    const bssid=event.bssid.toUpperCase(),sta=event.sta.toUpperCase();
+    if(!detector.watchBssids.includes(bssid))return [];
+    detector.defenceObservations++;
+    detector.defenceLastResponse=null;
+    if(event.type==='pmkid_probe'&&!detector.pmkidDecoy)return [
+      `[DETECTOR_DEFENCE] trigger=pmkid_probe BSSID=${bssid} STA=${sta} RX=${event.channel} decision=observe reason=monitor_only`
+    ];
+    const response=event.type==='pmkid_probe'?'decoy_pmkid':'decoy_4way';
+    const stage=event.type==='pmkid_probe'?'m1_pmkid':'m1_m2';
+    const frames=event.type==='pmkid_probe'?1:2;
+    const trigger=
+      `[DETECTOR_DEFENCE] trigger=${event.type} BSSID=${bssid} STA=${sta} RX=${event.channel} decision=${response} reason=eligible`;
+    if(event.suppressedCount!==undefined){
+      if(!Number.isSafeInteger(event.suppressedCount)||event.suppressedCount<0||
+         typeof event.suppressedReason!=='string'||
+         !/^[A-Za-z0-9_:-]{1,31}$/.test(event.suppressedReason))return [];
+      detector.defenceSuppressed=event.suppressedCount;
+      return [trigger,
+        `[DETECTOR_DEFENCE] suppressed=${event.suppressedCount} reason=${event.suppressedReason} BSSID=${bssid} window_ms=1000`];
+    }
+    if(event.txError!==undefined){
+      if(typeof event.txError!=='string'||
+         !/^[A-Za-z0-9_:-]{1,63}$/.test(event.txError)||event.txError==='none')return [];
+      detector.defenceErrors++;
+      detector.defenceLastResponse=response;
+      return [trigger,
+        `[DETECTOR_DEFENCE] provisional_bssid=${bssid} channel=${event.channel}`,
+        `[DETECTOR_DEFENCE] tx=${response} stage=${stage} result=error frames=0 latency_us=900 error=${event.txError}`];
+    }
+    if(event.type==='pmkid_probe')detector.defencePmkidM1++;
+    else detector.defenceTxPairs++;
+    detector.defenceResponses++;
+    detector.defenceLastResponse=response;
+    return [
+      trigger,
+      `[DETECTOR_DEFENCE] provisional_bssid=${bssid} channel=${event.channel}`,
+      `[DETECTOR_DEFENCE] tx=${response} stage=${stage} result=ok frames=${frames} latency_us=900 error=none`
+    ];
+  }
+
+  /** Optional v1 forensic telemetry. This is a deterministic protocol fixture. */
+  detectorForensicForEvent(moduleId,event,sequence=0) {
+    const module=this.#module(moduleId),detector=module.detector;
+    if(!module.detectorForensicsSupported||!detector.running||!detector.details||
+       !event||!['deauth','disassoc'].includes(event.type)||!validMac(event.bssid)||
+       !validMac(event.tx)||!validMac(event.da)||!Number.isInteger(event.channel)||
+       event.channel<1||event.channel>233)return null;
+    const seq=((Number(sequence)%4096)+4096)%4096;
+    const reason=Number.isInteger(event.reason)&&event.reason>=0&&event.reason<=65535
+      ?event.reason:'-';
+    const rssi=Number.isInteger(event.rssi)&&event.rssi>=-127&&event.rssi<=0
+      ?event.rssi:'-';
+    const timestamp=BigInt(Math.max(0,Math.trunc(this.#now)))*1000n+BigInt(seq);
+    return `[DEAUTH_FORENSIC/1] FRAME=${event.type} CH=${event.channel} `+
+      `BSSID=${event.bssid.toUpperCase()} TX=${event.tx.toUpperCase()} `+
+      `DA=${event.da.toUpperCase()} RSSI=${rssi} REASON=${reason} SEQ=${seq} `+
+      `RETRY=${seq%5===0?1:0} PROTECTED=0 FC=0x00C0 TS_US=${timestamp}`;
   }
 
   /** Apply JanOS passive trace confirmation after filtering and before wire output. */
@@ -486,14 +602,26 @@ export class SimulatedDevice {
        detector.traceChannel===null||detector.traceLastActivity===null||
        this.#now-detector.traceLastActivity<DETECTOR_TRACE_IDLE_RELEASE_MS)return;
     const channel=detector.traceChannel;
+    const lockedBssid=detector.traceLockedBssid;
+    const release=[];
+    if(detector.defenceRequested&&lockedBssid&&detector.defenceLastResponse){
+      const startupChannel=module.networks.find(network=>
+        network.bssid.toUpperCase()===lockedBssid)?.channel??channel;
+      release.push(
+        `[DETECTOR_DEFENCE] released_bssid=${lockedBssid} channel=${startupChannel} reason=idle idle_ms=${DETECTOR_TRACE_IDLE_RELEASE_MS} response=${detector.defenceLastResponse} suppressed=${detector.defenceSuppressed}`);
+    }
     detector.traceState='armed';detector.traceChannel=null;
     detector.traceLockedBssid=null;detector.traceLastActivity=null;
     detector.traceReleasedChannel=channel;
     detector.traceReleaseIdleMs=DETECTOR_TRACE_IDLE_RELEASE_MS;
     clearTraceConfirmation(detector);
-    detector.queue.push(
+    release.push(
       `[DETECTOR_TRACE] released_channel=${channel} reason=idle idle_ms=${DETECTOR_TRACE_IDLE_RELEASE_MS}`,
       '[DETECTOR_TRACE] armed');
+    if(detector.defenceRequested){
+      detector.defenceLastResponse=null;detector.defenceSuppressed=0;
+    }
+    detector.queue.push(...release);
   }
 
   analyzerStart(moduleId, request) {

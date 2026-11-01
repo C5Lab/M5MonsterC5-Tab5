@@ -1,7 +1,7 @@
 {
   "version": 1,
   "reviewed_sources": {
-    "main/main.c": "39224ff37b32f71daada292a49e1ee9d37cda6c0689e1eaa11afd0cc6d26a22f",
+    "main/main.c": "525d93a2f3f702c336e02a4b2c901791c7a0c42d0e74b29fd6d49ed623866089",
     "main/observer_view.inc": "a9cfc99c228f9bd033e218f07829214806a6fdd95cebdd24953031a9321fae46",
     "main/observer_details.inc": "525ce30632c279983e65460c6ab91ce412870c37af3ea92ece8dbcbaeb679ef5",
     "main/screens/cgw_parser.c": "fb14c2c40a5129332c620adab9ab5f477beb8833950130a18a172b70980803a0",
@@ -563,6 +563,16 @@
     "[\"main/main.c::deauth_detector_picker_open\",\"done\",\"deauth_detector_picker_done_cb\",\"LV_EVENT_CLICKED\",\"ctx\",[]]": "ui.deauth_detector_picker_open.done.clicked.fe040881c92a",
     "[\"main/main.c::show_deauth_detector_page\",\"save_btn\",\"deauth_detector_save_cb\",\"LV_EVENT_CLICKED\",\"ctx\",[]]": "ui.show_deauth_detector_page.save_btn.clicked.4552d816be74",
     "[\"main/main.c::show_deauth_detector_page\",\"clear_btn\",\"deauth_detector_clear_cb\",\"LV_EVENT_CLICKED\",\"ctx\",[]]": "ui.show_deauth_detector_page.clear_btn.clicked.a13851846a16",
-    "[\"main/main.c::show_deauth_detector_page\",\"trace_checkbox\",\"deauth_detector_trace_cb\",\"LV_EVENT_VALUE_CHANGED\",\"ctx\",[]]": "ui.show_deauth_detector_page.trace_checkbox.value_changed.b484781a4862"
+    "[\"main/main.c::show_deauth_detector_page\",\"trace_checkbox\",\"deauth_detector_trace_cb\",\"LV_EVENT_VALUE_CHANGED\",\"ctx\",[]]": "ui.show_deauth_detector_page.trace_checkbox.value_changed.b484781a4862",
+    "[\"main/main.c::deauth_detector_pmkid_warning_open\",\"cancel\",\"deauth_detector_pmkid_cancel_cb\",\"LV_EVENT_CLICKED\",\"ctx\",[]]": "ui.deauth_detector_pmkid_warning_open.cancel.clicked.5c3323630818",
+    "[\"main/main.c::deauth_detector_pmkid_warning_open\",\"confirm\",\"deauth_detector_pmkid_confirm_cb\",\"LV_EVENT_CLICKED\",\"ctx\",[]]": "ui.deauth_detector_pmkid_warning_open.confirm.clicked.16de4c9da506",
+    "[\"main/main.c::show_deauth_detector_page\",\"defence_checkbox\",\"deauth_detector_defence_cb\",\"LV_EVENT_VALUE_CHANGED\",\"ctx\",[]]": "ui.show_deauth_detector_page.defence_checkbox.value_changed.2c7709d0950f",
+    "[\"main/main.c::show_deauth_detector_page\",\"pmkid_checkbox\",\"deauth_detector_pmkid_cb\",\"LV_EVENT_VALUE_CHANGED\",\"ctx\",[]]": "ui.show_deauth_detector_page.pmkid_checkbox.value_changed.b6c36d7d470b",
+    "[\"main/main.c::deauth_forensic_open_cb\",\"close\",\"deauth_forensic_close_cb\",\"LV_EVENT_CLICKED\",\"ctx\",[]]": "ui.deauth_forensic_open_cb.close.clicked.a1bfbcc02e9c",
+    "[\"main/main.c::deauth_forensic_open_cb\",\"ctx->deauth_forensic_bssid_dropdown\",\"deauth_forensic_filter_cb\",\"LV_EVENT_VALUE_CHANGED\",\"ctx\",[]]": "ui.deauth_forensic_open_cb.ctx--deauth_forensic_bssid_dropdown.value_changed.0802f5d5fc6c",
+    "[\"main/main.c::deauth_forensic_open_cb\",\"ctx->deauth_forensic_da_dropdown\",\"deauth_forensic_filter_cb\",\"LV_EVENT_VALUE_CHANGED\",\"ctx\",[]]": "ui.deauth_forensic_open_cb.ctx--deauth_forensic_da_dropdown.value_changed.6b7bbcd00158",
+    "[\"main/main.c::deauth_forensic_open_cb\",\"ctx->deauth_forensic_reason_dropdown\",\"deauth_forensic_filter_cb\",\"LV_EVENT_VALUE_CHANGED\",\"ctx\",[]]": "ui.deauth_forensic_open_cb.ctx--deauth_forensic_reason_dropdown.value_changed.f5923030b06e",
+    "[\"main/main.c::deauth_forensic_open_cb\",\"ctx->deauth_forensic_frame_dropdown\",\"deauth_forensic_filter_cb\",\"LV_EVENT_VALUE_CHANGED\",\"ctx\",[]]": "ui.deauth_forensic_open_cb.ctx--deauth_forensic_frame_dropdown.value_changed.216a88cfd85e",
+    "[\"main/main.c::show_deauth_detector_page\",\"forensic_open\",\"deauth_forensic_open_cb\",\"LV_EVENT_CLICKED\",\"ctx\",[]]": "ui.show_deauth_detector_page.forensic_open.clicked.8ecc963dd33c"
   }
 }

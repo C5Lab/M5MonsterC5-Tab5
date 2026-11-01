@@ -88,7 +88,15 @@ export class BrowserDevice {
       line=`[DEAUTH_V2] CH: ${e.channel} | BSSID: ${e.bssid} | TX: ${e.tx} | DA: ${e.da} | RSSI: ${e.rssi} | REASON: ${e.reason??'-'} | SSID: ${ssid}`;
     } else line=`[DEAUTH] CH: ${e.channel} | AP: ${e.ssid} (${e.bssid}) | RSSI: ${e.rssi}`;
     const marker=this.device.detectorTraceForEvent(module,e);
-    if(marker){this.detectorPending.set(module,[line]);return marker;}
+    const defence=this.device.detectorDefenceForEvent(module,{...e,sta:e.sta??e.da});
+    const forensic=this.device.detectorForensicForEvent(module,e,seq);
+    const forensicRecords=forensic?[forensic]:[];
+    if(marker){this.detectorPending.set(module,[...defence,...forensicRecords,line]);return marker;}
+    if(defence.length){
+      this.detectorPending.set(module,[...defence.slice(1),...forensicRecords,line]);
+      return defence[0];
+    }
+    if(forensic){this.detectorPending.set(module,[line]);return forensic;}
     return line;
   }
   // "MAC|name" for one flagged follower, or '' when nothing is detected.

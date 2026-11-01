@@ -4,6 +4,25 @@ The emulator runs a retained slice of the real C/LVGL interface in WebAssembly,
 with synthetic networks, clients and an in-memory SD card. No device is required.
 See [progress and scope](../../docs/Live_Emulator_TODO.md).
 
+## Deauth Detector Defence and Forensics
+
+The native Deauth Detector slice includes selected-network Defence, its strict
+status/Stop semantics, and the optional `[DEAUTH_FORENSIC/1]` evidence UI. The
+JS device/bridge can inject deterministic versioned forensic records before the
+corresponding V2 event. Leaving that fixture option disabled emits no forensic
+marker and exercises the compatible **Forensics unavailable for this firmware**
+state used with current JanOS.
+
+The browser still runs the production C parser, ownership checks, bounded model,
+statistics, filters, and LVGL rendering. The JS stream is protocol-shaped test
+data only: it does not simulate RF physics, identify a transmitter, communicate
+with JanOS, or prove device/UART behavior. Focused checks are:
+
+```bat
+node --test tools\ui_emulator\tests\*.test.mjs
+tools\ui_emulator\.venv\Scripts\python.exe -u tests\test_deauth_detector_v2_browser.py -v
+```
+
 ## Windows: build and run manually
 
 Run commands in Windows Command Prompt from the repository root:
@@ -371,8 +390,10 @@ Three previously-inert features now work as offline simulations (no real radio):
   `detector_v2_supported: false` rejects the unknown V2 command so the UI can
   exercise its explicit legacy fallback. Selected mode becomes running only
   after strict ACK, V2-format, and complete WATCH proof; the WATCH timeout gets
-  its own full window after ACK+format. WATCH replies and DEAUTH/CSA events
-  remain filtered by BSSID. Repeated
+  its own full window after ACK+format. The Defence fixture mirrors current
+  JanOS by emitting strict WATCH proof before its start ACK; the native session
+  retains that proof without claiming running early. WATCH replies and
+  DEAUTH/CSA events remain filtered by BSSID. Repeated
   observations are grouped with counts and first/last times. Stop freezes the
   list; Clear removes it. Save CSV writes a snapshot to the emulator's volatile
   Tab5-local `/sdcard/lab/detector/` mount, separate from either JanOS module's

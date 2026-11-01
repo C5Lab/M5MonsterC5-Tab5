@@ -19,6 +19,55 @@ V2_EVENT = (
     "RSSI: -42 | REASON: 7 | SSID: Lab (east)"
 )
 
+FORENSIC_ROWS = (
+    "[DEAUTH_FORENSIC/1] FRAME=deauth CH=1 BSSID=02:20:77:00:00:01 "
+    "TX=AA:BB:CC:DD:EE:01 DA=12:34:56:78:9A:01 RSSI=-80 REASON=6 "
+    "SEQ=10 RETRY=0 PROTECTED=0 FC=0x00C0 TS_US=1000",
+    "[DEAUTH_FORENSIC/1] FRAME=deauth CH=1 BSSID=02:20:77:00:00:01 "
+    "TX=AA:BB:CC:DD:EE:01 DA=12:34:56:78:9A:01 RSSI=-82 REASON=6 "
+    "SEQ=10 RETRY=1 PROTECTED=0 FC=0x00C0 TS_US=2000",
+    "[DEAUTH_FORENSIC/1] FRAME=disassoc CH=6 BSSID=02:20:77:00:00:02 "
+    "TX=AA:BB:CC:DD:EE:02 DA=12:34:56:78:9A:02 RSSI=-87 REASON=7 "
+    "SEQ=- RETRY=- PROTECTED=- FC=- TS_US=20000002",
+)
+
+
+def long_forensic_rows():
+    sizes = (2, 2, 3, 2, 3, 1, 1, 3, 3, 2, 1)
+    timestamp = 0
+    sequence = 0
+    rows = []
+    for burst, size in enumerate(sizes):
+        if burst:
+            timestamp += 20_000_001
+        for _ in range(size):
+            tx = f"AA:BB:CC:DD:EE:{burst:02X}"
+            rows.append(
+                "[DEAUTH_FORENSIC/1] FRAME=deauth CH=6 "
+                "BSSID=00:11:22:33:44:55 "
+                f"TX={tx} DA=12:34:56:78:9A:BC "
+                f"RSSI={-80 - sequence % 8} REASON=6 SEQ={sequence % 4096} "
+                f"RETRY={1 if sequence % 5 == 0 else 0} PROTECTED=1 "
+                f"FC=0x00C0 TS_US={timestamp}"
+            )
+            timestamp += 1
+            sequence += 1
+    return rows
+
+
+def rollover_forensic_rows():
+    rows = []
+    for index in range(128):
+        bssid = f"02:30:00:00:{index >> 8:02X}:{index & 0xFF:02X}"
+        recipient = f"12:40:00:00:{index >> 8:02X}:{index & 0xFF:02X}"
+        rows.append(
+            "[DEAUTH_FORENSIC/1] FRAME=deauth CH=6 "
+            f"BSSID={bssid} TX=AA:BB:CC:DD:EE:01 DA={recipient} "
+            f"RSSI=-80 REASON=7 SEQ={index} RETRY=0 PROTECTED=0 "
+            f"FC=0x00C0 TS_US={100_000_000 + index}"
+        )
+    return rows
+
 
 class DeauthV2Browser(unittest.TestCase):
     @staticmethod
@@ -826,6 +875,9 @@ class DeauthV2Browser(unittest.TestCase):
                 shown = self.labels(page)
                 self.assertIn("Observed: 1 DEAUTH | 0 CSA | Latest groups: 1/200", shown)
                 self.assertNotIn("Detector running", shown)
+                joined = "\n".join(shown)
+                self.assertIn("safety stop confirmed", joined)
+                self.assertNotIn("remote state unknown", joined)
             finally:
                 page.close()
 
@@ -1014,6 +1066,10 @@ class DeauthV2Browser(unittest.TestCase):
                 }""", timeout=30000)
                 page.evaluate("""() => {
                     v2Wire.push('[DETECTOR_TRACE] locked_channel=1');
+                    v2Wire.push('[DEAUTH_FORENSIC/1] FRAME=deauth CH=1 '
+                        + 'BSSID=02:20:77:00:00:01 TX=AA:BB:CC:DD:EE:01 '
+                        + 'DA=12:34:56:78:9A:01 RSSI=-80 REASON=6 SEQ=10 '
+                        + 'RETRY=0 PROTECTED=0 FC=0x00C0 TS_US=1000');
                     const read = emulator.device.detectorRead.bind(emulator.device);
                     let injectedStopLikeEvent = false;
                     emulator.device.detectorRead = (tab) => {
@@ -1035,7 +1091,9 @@ class DeauthV2Browser(unittest.TestCase):
                     for (let i = 0; i < 12; i++) emulator.module._emu_tick(100);
                     emulator.module._emu_inspect();
                     return emulatorObjects.some(item =>
-                        item.text.includes('Trace lock: channel 1'));
+                        item.text.includes('Trace lock: channel 1')) &&
+                           emulatorObjects.some(item =>
+                        item.text.includes('Rows: 1 retained 1'));
                 }""", timeout=30000)
                 self.click_binding(page, "deauth_stop_btn")
                 self.advance(page, 80)
@@ -1051,6 +1109,7 @@ class DeauthV2Browser(unittest.TestCase):
                 trace = next(item for item in objects(page)
                              if item["text"] == "Channel trace (passive)")
                 self.assertTrue(trace["state"] & 0x80)
+                self.assertIn("Rows: 1 retained 1", "\n".join(self.labels(page)))
             finally:
                 page.close()
 
@@ -1108,6 +1167,453 @@ class DeauthV2Browser(unittest.TestCase):
                 }""", timeout=30000)
                 self.assertIn({"tab": 0, "command": "stop"},
                               page.evaluate("detectorWrites"))
+            finally:
+                page.close()
+
+    def test_defence_requires_selection_keeps_markers_out_of_v2_counts_and_stops_globally(self):
+        with browser_session() as (browser, url):
+            page = browser.new_page(viewport={"width": 1440, "height": 1100})
+            try:
+                page.goto(url)
+                self.open_detector(page)
+                click_object(page, next(item for item in objects(page)
+                                        if item["text"] == "Defence"))
+                page.wait_for_function("""() => {
+                    emulator.module._emu_inspect();
+                    return emulatorObjects.some(item =>
+                        item.text === 'Scan complete; choose BSSID and press Start');
+                }""", timeout=30000)
+                shown = "\n".join(self.labels(page))
+                self.assertIn("Defence: enabled for next Start", shown)
+                trace = next(item for item in objects(page)
+                             if item["text"] == "Channel trace (passive)")
+                self.assertTrue(trace["state"] & 0x01)
+                self.assertTrue(trace["state"] & 0x80, trace)
+                network = next(item for item in objects(page)
+                               if "deauth_detector_render_networks.checkbox" in
+                               item["binding"])
+                click_object(page, {**network, "width": 24})
+                click_text(page, "Use selection")
+                self.click_binding(page, "deauth_start_btn")
+                page.wait_for_function("""() => detectorWrites.some(item =>
+                    item.tab === 0 && item.command ===
+                    'deauth_detector_v2 --only 1 trace defence')
+                """, timeout=5000)
+                page.wait_for_function("""() => {
+                    for (let i = 0; i < 10; i++) emulator.module._emu_tick(100);
+                    emulator.module._emu_inspect();
+                    return emulatorObjects.some(item =>
+                        item.text.includes('Defence: armed for 1 protected BSSID'));
+                }""", timeout=30000)
+                page.evaluate("""() => v2Wire.push(
+                    '[DETECTOR_DEFENCE] trigger=deauth BSSID=02:20:77:00:00:01 '
+                        + 'STA=AA:BB:CC:DD:EE:FF RX=1 decision=decoy_4way reason=eligible')
+                """)
+                page.wait_for_function("""() => {
+                    for (let i = 0; i < 4; i++) emulator.module._emu_tick(50);
+                    emulator.module._emu_inspect();
+                    return emulatorObjects.some(item =>
+                        item.text.includes('responding for 02:20:77:00:00:01'));
+                }""", timeout=5000)
+                page.evaluate("""() => v2Wire.push(
+                    '[DETECTOR_DEFENCE] provisional_bssid=02:20:77:00:00:01 channel=1',
+                    '[DETECTOR_DEFENCE] tx=decoy_4way stage=m1_m2 result=ok '
+                        + 'frames=2 latency_us=900 error=none')
+                """)
+                page.wait_for_function("""() => {
+                    for (let i = 0; i < 12; i++) emulator.module._emu_tick(100);
+                    emulator.module._emu_inspect();
+                    return emulatorObjects.some(item =>
+                        item.text.includes('decoy TX confirmed by JanOS'));
+                }""", timeout=30000)
+                shown = "\n".join(self.labels(page))
+                self.assertIn("responses: 1", shown)
+                self.assertIn("Observed: 0 DEAUTH | 0 CSA | Latest groups: 0/200", shown)
+                page.evaluate("line => v2Wire.push(line)", V2_EVENT)
+                page.wait_for_function("""() => {
+                    for (let i = 0; i < 12; i++) emulator.module._emu_tick(100);
+                    emulator.module._emu_inspect();
+                    return emulatorObjects.some(item =>
+                        item.text.includes('Observed: 1 DEAUTH | 0 CSA'));
+                }""", timeout=30000)
+                click_text(page, "MBUS")
+                self.advance(page, 4)
+                click_text(page, "GROVE")
+                self.click_binding(page, "deauth_stop_btn")
+                page.wait_for_function("""() => {
+                    for (let i = 0; i < 10; i++) emulator.module._emu_tick(100);
+                    emulator.module._emu_inspect();
+                    return emulatorObjects.some(item => item.text === 'Stopped');
+                }""", timeout=30000)
+                self.assertFalse(any(item["tab"] != 0 for item in
+                                     page.evaluate("detectorWrites")))
+                self.assertNotIn("remote state uncertain", "\n".join(self.labels(page)))
+            finally:
+                page.close()
+
+    def test_defence_release_observe_and_second_response_keep_confirmed_state(self):
+        with browser_session() as (browser, url):
+            page = browser.new_page(viewport={"width": 1440, "height": 1100})
+            try:
+                page.goto(url)
+                self.open_detector(page)
+                click_object(page, next(item for item in objects(page)
+                                        if item["text"] == "Defence"))
+                page.wait_for_function("""() => {
+                    emulator.module._emu_inspect();
+                    return emulatorObjects.some(item =>
+                        item.text === 'Scan complete; choose BSSID and press Start');
+                }""", timeout=30000)
+                network = next(item for item in objects(page)
+                               if "deauth_detector_render_networks.checkbox" in
+                               item["binding"])
+                click_object(page, {**network, "width": 24})
+                click_text(page, "Use selection")
+                self.click_binding(page, "deauth_start_btn")
+                page.wait_for_function("""() => {
+                    for (let i = 0; i < 10; i++) emulator.module._emu_tick(100);
+                    emulator.module._emu_inspect();
+                    return emulatorObjects.some(item =>
+                        item.text.includes('Defence: armed for 1 protected BSSID'));
+                }""", timeout=30000)
+
+                page.evaluate("""() => v2Wire.push(
+                    '[DETECTOR_DEFENCE] trigger=deauth BSSID=02:20:77:00:00:01 '
+                        + 'STA=- RX=1 decision=decoy_4way reason=selected_wpa2',
+                    '[DETECTOR_DEFENCE] provisional_bssid=02:20:77:00:00:01 channel=1',
+                    '[DETECTOR_DEFENCE] tx=decoy_4way stage=m1_m2 result=ok '
+                        + 'frames=2 latency_us=9681 error=none',
+                    '[DETECTOR_DEFENCE] released_bssid=02:20:77:00:00:01 '
+                        + 'channel=1 reason=idle idle_ms=20000 '
+                        + 'response=decoy_4way suppressed=299')
+                """)
+                page.wait_for_function("""() => {
+                    for (let i = 0; i < 24; i++) emulator.module._emu_tick(100);
+                    emulator.module._emu_inspect();
+                    return v2Wire.length === 0 && emulatorObjects.some(item => item.text.includes(
+                        'released 02:20:77:00:00:01 from channel 1 after idle; suppressed: 299'));
+                }""", timeout=30000)
+
+                page.evaluate("""() => v2Wire.push(
+                    '[DETECTOR_DEFENCE] trigger=pmkid_probe '
+                        + 'BSSID=02:20:77:00:00:01 STA=02:61:E8:69:3E:4F RX=1 '
+                        + 'decision=observe reason=pmkid_monitor')
+                """)
+                page.wait_for_function("""() => {
+                    emulator.module._emu_tick(100);
+                    emulator.module._emu_inspect();
+                    return v2Wire.length === 0;
+                }""", timeout=30000)
+                shown = "\n".join(self.labels(page))
+                self.assertIn(
+                    "released 02:20:77:00:00:01 from channel 1 after idle; suppressed: 299",
+                    shown)
+                self.assertNotIn("Defence: observing", shown)
+
+                page.evaluate("""() => v2Wire.push(
+                    '[DETECTOR_DEFENCE] trigger=deauth BSSID=02:20:77:00:00:01 '
+                        + 'STA=- RX=1 decision=decoy_4way reason=selected_wpa2',
+                    '[DETECTOR_DEFENCE] provisional_bssid=02:20:77:00:00:01 channel=1',
+                    '[DETECTOR_DEFENCE] tx=decoy_4way stage=m1_m2 result=ok '
+                        + 'frames=2 latency_us=9218 error=none')
+                """)
+                page.wait_for_function("""() => {
+                    emulator.module._emu_tick(100);
+                    emulator.module._emu_inspect();
+                    return v2Wire.length === 0 && emulatorObjects.some(item =>
+                        item.text.includes('decoy TX confirmed by JanOS | responses: 2'));
+                }""", timeout=30000)
+
+                page.evaluate("""() => v2Wire.push(
+                    '[DETECTOR_DEFENCE] released_bssid=02:20:77:00:00:01 '
+                        + 'channel=1 reason=idle idle_ms=20000 '
+                        + 'response=decoy_4way suppressed=608',
+                    '[DETECTOR_DEFENCE] stopped observations=910 tx_pairs=2 '
+                        + 'pmkid_m1=0 responses=2 satisfied=907 errors=0 dropped=0 '
+                        + 'outcome=responded')
+                """)
+                page.wait_for_function("""() => {
+                    for (let i = 0; i < 16; i++) emulator.module._emu_tick(100);
+                    emulator.module._emu_inspect();
+                    return v2Wire.length === 0 && emulatorObjects.some(item => item.text.includes(
+                        'released 02:20:77:00:00:01 from channel 1 after idle; suppressed: 608'));
+                }""", timeout=30000)
+                self.assertIn("Observed: 0 DEAUTH | 0 CSA | Latest groups: 0/200",
+                              "\n".join(self.labels(page)))
+            finally:
+                page.close()
+
+    def test_unsupported_defence_never_retries_legacy(self):
+        with browser_session() as (browser, url):
+            page = browser.new_page(viewport={"width": 1440, "height": 1000})
+            try:
+                page.goto(url)
+                self.open_detector(page)
+                page.evaluate("""() => {
+                    let rejectDefence = false;
+                    const write = emulator.device.detectorWrite;
+                    const read = emulator.device.detectorRead.bind(emulator.device);
+                    emulator.device.detectorWrite = (tab, command) => {
+                        if (tab === 0 && command ===
+                            'deauth_detector_v2 --only 1 trace defence') {
+                            detectorWrites.push({tab, command});
+                            rejectDefence = true;
+                            return true;
+                        }
+                        return write(tab, command);
+                    };
+                    emulator.device.detectorRead = tab => {
+                        if (tab === 0 && rejectDefence) {
+                            rejectDefence = false;
+                            return 'Unrecognized command';
+                        }
+                        return read(tab);
+                    };
+                }""")
+                click_object(page, next(item for item in objects(page)
+                                        if item["text"] == "Defence"))
+                page.wait_for_function("""() => {
+                    emulator.module._emu_inspect();
+                    return emulatorObjects.some(item =>
+                        item.text === 'Scan complete; choose BSSID and press Start');
+                }""", timeout=30000)
+                network = next(item for item in objects(page)
+                               if "deauth_detector_render_networks.checkbox" in
+                               item["binding"])
+                click_object(page, {**network, "width": 24})
+                click_text(page, "Use selection")
+                self.click_binding(page, "deauth_start_btn")
+                page.wait_for_function("""() => {
+                    for (let i = 0; i < 10; i++) emulator.module._emu_tick(100);
+                    emulator.module._emu_inspect();
+                    return emulatorObjects.some(item =>
+                        item.text.includes('Defence unsupported by this JanOS'));
+                }""", timeout=30000)
+                commands = [item["command"] for item in page.evaluate("detectorWrites")]
+                defence_commands = [command for command in commands
+                                    if command.startswith("deauth_detector")]
+                self.assertEqual(defence_commands,
+                                 ["deauth_detector_v2 --only 1 trace defence"])
+                self.assertNotIn("Detector running", self.labels(page))
+            finally:
+                page.close()
+
+    def test_pmkid_lab_requires_confirmation_and_appends_exact_command_token(self):
+        with browser_session() as (browser, url):
+            page = browser.new_page(viewport={"width": 1440, "height": 1100})
+            try:
+                page.goto(url)
+                self.open_detector(page)
+                click_object(page, next(item for item in objects(page)
+                                        if item["text"] == "Defence"))
+                page.wait_for_function("""() => {
+                    emulator.module._emu_inspect();
+                    return emulatorObjects.some(item =>
+                        item.text === 'Scan complete; choose BSSID and press Start');
+                }""", timeout=30000)
+                network = next(item for item in objects(page)
+                               if "deauth_detector_render_networks.checkbox" in
+                               item["binding"])
+                click_object(page, {**network, "width": 24})
+                click_text(page, "Use selection")
+                pmkid = next(item for item in objects(page)
+                             if item["text"] == "PMKID Lab (advanced)")
+                self.assertFalse(pmkid["state"] & 0x80, pmkid)
+                click_object(page, pmkid)
+                page.wait_for_function("""() => {
+                    emulator.module._emu_inspect();
+                    return emulatorObjects.some(item =>
+                        item.text === 'Enable PMKID Lab?');
+                }""", timeout=5000)
+                warning = "\n".join(self.labels(page))
+                self.assertIn("controlled RF laboratory", warning)
+                self.assertIn("not attack prevention", warning)
+                click_object(page, next(item for item in objects(page)
+                                        if item["text"] == "Enable PMKID Lab"))
+                self.click_binding(page, "deauth_start_btn")
+                page.wait_for_function("""() => detectorWrites.some(item =>
+                    item.tab === 0 && item.command ===
+                    'deauth_detector_v2 --only 1 trace defence pmkid-decoy')
+                """, timeout=5000)
+                page.wait_for_function("""() => {
+                    emulator.module._emu_inspect();
+                    return emulatorObjects.some(item =>
+                        item.text.includes('PMKID Lab: enabled'));
+                }""", timeout=30000)
+                commands = [item["command"] for item in page.evaluate("detectorWrites")]
+                self.assertEqual(
+                    [command for command in commands if command.startswith("deauth_detector")],
+                    ["deauth_detector_v2 --only 1 trace defence pmkid-decoy"])
+            finally:
+                page.close()
+
+    def test_forensics_summary_evidence_and_filters_do_not_change_v2_history(self):
+        with browser_session() as (browser, url):
+            for rotation in (1, 0):
+                with self.subTest(rotation=rotation):
+                    page = browser.new_page(viewport={"width": 1440, "height": 1400})
+                    try:
+                        page.goto(f"{url}/?rotation={rotation}")
+                        self.open_detector(page)
+                        page.evaluate("globalThis.emulatorAlertChimes = []")
+                        self.click_binding(page, "deauth_start_btn")
+                        page.wait_for_function("""() => {
+                            emulator.module._emu_inspect();
+                            return emulatorObjects.some(item => item.text === 'Detector running');
+                        }""", timeout=30000)
+                        page.evaluate("rows => v2Wire.push(...rows)", list(FORENSIC_ROWS))
+                        page.wait_for_function("""() => {
+                            for (let i = 0; i < 16; i++) emulator.module._emu_tick(100);
+                            emulator.module._emu_inspect();
+                            return emulatorObjects.some(item =>
+                                item.text.includes('Rows: 3 retained 3'));
+                        }""", timeout=30000)
+                        shown = "\n".join(self.labels(page))
+                        self.assertIn("Bursts: 2 | Largest: 2", shown)
+                        self.assertIn("Unique BSSID/DA: 2/2", shown)
+                        self.assertIn("RSSI min/avg/max: -87/-83/-80 dBm", shown)
+                        self.assertIn("Evidence only - not transmitter attribution", shown)
+                        self.assertNotIn("Evidence only — not transmitter attribution", shown)
+                        self.assertIn("Observed: 0 DEAUTH | 0 CSA | Latest groups: 0/200", shown)
+                        self.assertNotIn("Lab (east)", shown)
+                        self.assertEqual(page.evaluate("emulatorAlertChimes.length"), 0)
+
+                        click_text(page, "View evidence")
+                        page.wait_for_function("""() => {
+                            emulator.module._emu_inspect();
+                            return emulatorObjects.some(item =>
+                                item.text.includes('Retransmission'));
+                        }""", timeout=30000)
+                        evidence = "\n".join(self.labels(page))
+                        self.assertIn("Claimed TX AA:BB:CC:DD:EE:01", evidence)
+                        self.assertIn("Frame recipient 12:34:56:78:9A:01", evidence)
+                        self.assertIn("Insufficient sequence data", evidence)
+                        self.assertNotIn("Attacker MAC", evidence)
+                        self.assertNotIn("Attack prevented", evidence)
+                        self.assertEqual(
+                            page.evaluate("emulator.module._emu_forensic_filter(0, 1)"), 1)
+                        self.assertEqual(
+                            page.evaluate("emulator.module._emu_forensic_filter(3, 2)"), 1)
+                        page.wait_for_function("""() => {
+                            emulator.module._emu_inspect();
+                            return emulatorObjects.some(item => item.text ===
+                                'All forensic rows are hidden by the current filters');
+                        }""", timeout=5000)
+                        self.assertEqual(
+                            page.evaluate("emulator.module._emu_forensic_filter(0, 0)"), 1)
+                        self.assertEqual(
+                            page.evaluate("emulator.module._emu_forensic_filter(3, 0)"), 1)
+                        self.assertEqual(
+                            page.evaluate("emulator.module._emu_forensic_filter(1, 2)"), 1)
+                        page.wait_for_function("""() => {
+                            emulator.module._emu_inspect();
+                            return emulatorObjects.some(item =>
+                                item.text.startsWith('Disassoc | CH 6'));
+                        }""", timeout=5000)
+                        self.assertEqual(
+                            page.evaluate("emulator.module._emu_forensic_filter(2, 2)"), 1)
+                        page.wait_for_function("""() => {
+                            emulator.module._emu_inspect();
+                            return emulatorObjects.some(item => item.text ===
+                                'All forensic rows are hidden by the current filters');
+                        }""", timeout=5000)
+                        title = next(item for item in objects(page)
+                                     if item["text"] == "Forensic evidence")
+                        display = (1280, 720) if rotation == 1 else (720, 1280)
+                        self.assertGreaterEqual(title["x"], 0)
+                        self.assertGreaterEqual(title["y"], 0)
+                        self.assertLessEqual(title["x"] + title["width"], display[0])
+                        self.assertLessEqual(title["y"] + title["height"], display[1])
+                        click_text(page, "Close")
+                    finally:
+                        page.close()
+
+    def test_forensics_absence_and_late_marker_keep_compatibility_state(self):
+        with browser_session() as (browser, url):
+            page = browser.new_page(viewport={"width": 1440, "height": 1000})
+            try:
+                page.goto(url)
+                self.open_detector(page)
+                self.assertIn("Forensics unavailable for this firmware",
+                              "\n".join(self.labels(page)))
+                self.click_binding(page, "deauth_start_btn")
+                page.wait_for_function("""() => {
+                    emulator.module._emu_inspect();
+                    return emulatorObjects.some(item => item.text === 'Detector running') &&
+                           emulatorObjects.some(item =>
+                               item.text === 'No forensic records yet - waiting for optional frame details from JanOS');
+                }""", timeout=30000)
+                self.click_binding(page, "deauth_stop_btn")
+                page.wait_for_function("""() => {
+                    for (let i = 0; i < 10; i++) emulator.module._emu_tick(100);
+                    emulator.module._emu_inspect();
+                    return emulatorObjects.some(item => item.text === 'Stopped') &&
+                           emulatorObjects.some(item =>
+                               item.text === 'Forensics unavailable for this firmware');
+                }""", timeout=30000)
+                page.evaluate("line => v2Wire.push(line)", FORENSIC_ROWS[0])
+                self.advance(page, 8)
+                shown = "\n".join(self.labels(page))
+                self.assertIn("Forensics unavailable for this firmware", shown)
+                self.assertIn("Observed: 0 DEAUTH | 0 CSA | Latest groups: 0/200", shown)
+            finally:
+                page.close()
+
+    def test_forensics_long_run_fixture_has_exact_bursts_and_no_v2_side_effects(self):
+        with browser_session() as (browser, url):
+            page = browser.new_page(viewport={"width": 1440, "height": 1000})
+            try:
+                page.goto(url)
+                self.open_detector(page)
+                page.evaluate("globalThis.emulatorAlertChimes = []")
+                self.click_binding(page, "deauth_start_btn")
+                page.wait_for_function("""() => {
+                    emulator.module._emu_inspect();
+                    return emulatorObjects.some(item => item.text === 'Detector running');
+                }""", timeout=30000)
+                click_text(page, "View evidence")
+                page.wait_for_function("""() => {
+                    emulator.module._emu_inspect();
+                    return emulatorObjects.some(item =>
+                        item.text === 'No forensic records yet - waiting for optional frame details from JanOS');
+                }""", timeout=5000)
+                page.evaluate("rows => v2Wire.push(...rows)", long_forensic_rows())
+                page.wait_for_function("""() => {
+                    for (let i = 0; i < 48; i++) emulator.module._emu_tick(100);
+                    emulator.module._emu_inspect();
+                    return emulatorObjects.some(item =>
+                        item.text.includes('Rows: 23 retained 23')) &&
+                           emulatorObjects.some(item =>
+                        item.text.startsWith('Deauth | CH 6'));
+                }""", timeout=30000)
+                shown = "\n".join(self.labels(page))
+                self.assertIn("Bursts: 11 | Largest: 3", shown)
+                self.assertIn("Unique BSSID/DA: 1/1", shown)
+                self.assertIn("RSSI min/avg/max: -87/-83/-80 dBm", shown)
+                self.assertIn("Observed: 0 DEAUTH | 0 CSA | Latest groups: 0/200", shown)
+                self.assertEqual(page.evaluate("emulatorAlertChimes.length"), 0)
+                self.assertEqual(
+                    page.evaluate("emulator.module._emu_forensic_filter(0, 1)"), 1)
+                self.assertEqual(
+                    page.evaluate("emulator.module._emu_forensic_filter(1, 1)"), 1)
+                self.assertEqual(
+                    page.evaluate("emulator.module._emu_forensic_filter(2, 2)"), 1)
+                self.assertEqual(
+                    page.evaluate("emulator.module._emu_forensic_filter(2, 0)"), 1)
+                self.assertEqual(
+                    page.evaluate("emulator.module._emu_forensic_filter(0, 1)"), 1)
+                page.evaluate("rows => v2Wire.push(...rows)",
+                              rollover_forensic_rows())
+                page.wait_for_function("""() => {
+                    for (let i = 0; i < 180; i++) emulator.module._emu_tick(100);
+                    emulator.module._emu_inspect();
+                    return emulatorObjects.some(item =>
+                        item.text.includes('Rows: 151 retained 128'));
+                }""", timeout=30000)
+                rollover = "\n".join(self.labels(page))
+                self.assertNotIn(
+                    "All forensic rows are hidden by the current filters", rollover)
+                self.assertIn("BSSID 02:30:00:00:00:00", rollover)
             finally:
                 page.close()
 

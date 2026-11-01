@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { SimulatedDevice } from '../tools/ui_emulator/model/device.mjs';
 import { BrowserDevice } from '../tools/ui_emulator/model/bridge.mjs';
+import {ForensicModel,longRunForensicFixture,parseForensicLine}
+  from '../tools/ui_emulator/model/forensics.mjs';
 
 const seed=JSON.parse(await readFile(new URL('../docs/ui-emulator/neon-district.seed.json',import.meta.url),'utf8'));
 
@@ -268,6 +270,194 @@ test('older V2 reports trace as an unsupported index instead of starting',()=>{
   assert.equal(d.detectorStatus('grove').running,false);
   assert.match(drainDetector(d,'grove').join('\n'),
     /Invalid watch index 'trace'.*Detector not started/);
+});
+
+test('Defence requires selected networks and emits exact normal and PMKID commands',()=>{
+  const d=new SimulatedDevice(seed);
+  d.detectorCommand('grove','deauth_detector_v2 trace defence');
+  assert.equal(d.detectorStatus('grove').running,false);
+  assert.deepEqual(drainDetector(d,'grove'),
+    ['Defence requires --only protected scan indices.']);
+  d.detectorCommand('grove','scan_networks');d.advance(seed.settings.scan_time_ms);
+  drainDetector(d,'grove');
+  d.detectorCommand('grove','deauth_detector_v2 --only 1 trace defence');
+  let lines=drainDetector(d,'grove');
+  assert.equal(d.detectorStatus('grove').defenceRequested,true);
+  assert.equal(d.detectorStatus('grove').pmkidDecoy,false);
+  assert.ok(lines.findIndex(line=>line.startsWith('[DETECTOR_WATCH] '))<
+    lines.findIndex(line=>line.startsWith('Deauth Detector started -')));
+  assert.ok(lines.includes('[DETECTOR_DEFENCE] armed targets=1 trace=fast pmkid=monitor'));
+  d.detectorCommand('grove','stop');drainDetector(d,'grove');
+  d.detectorCommand('grove','scan_networks');d.advance(seed.settings.scan_time_ms);
+  drainDetector(d,'grove');
+  d.detectorCommand('grove',
+    'deauth_detector_v2 --only 1 trace defence pmkid-decoy');
+  lines=drainDetector(d,'grove');
+  assert.equal(d.detectorStatus('grove').pmkidDecoy,true);
+  assert.ok(lines.includes('[DETECTOR_DEFENCE] armed targets=1 trace=fast pmkid=decoy'));
+});
+
+test('Defence records TX success separately from trigger and Stop ends globally',()=>{
+  const d=new SimulatedDevice(seed);
+  d.detectorCommand('grove','scan_networks');d.advance(seed.settings.scan_time_ms);
+  drainDetector(d,'grove');
+  d.detectorCommand('grove','deauth_detector_v2 --only 1 trace defence');
+  drainDetector(d,'grove');
+  const records=d.detectorDefenceForEvent('grove',{
+    type:'deauth',bssid:'02:20:77:00:00:01',channel:1,
+    sta:'AA:BB:CC:DD:EE:FF',rssi:-70
+  });
+  assert.deepEqual(records,[
+    '[DETECTOR_DEFENCE] trigger=deauth BSSID=02:20:77:00:00:01 STA=AA:BB:CC:DD:EE:FF RX=1 decision=decoy_4way reason=eligible',
+    '[DETECTOR_DEFENCE] provisional_bssid=02:20:77:00:00:01 channel=1',
+    '[DETECTOR_DEFENCE] tx=decoy_4way stage=m1_m2 result=ok frames=2 latency_us=900 error=none'
+  ]);
+  assert.equal(d.detectorStatus('grove').defenceResponses,1);
+  d.detectorCommand('grove','stop');
+  const stopped=drainDetector(d,'grove');
+  assert.match(stopped[0],/^\[DETECTOR_DEFENCE\] stopped observations=1 /);
+  assert.deepEqual(stopped.slice(-2),[
+    'Deauth Detector stopped.','All operations stopped.'
+  ]);
+  assert.equal(d.detectorStatus('grove').running,false);
+  assert.equal(d.detectorStatus('grove').defenceRequested,false);
+});
+
+test('Defence device emits deterministic error suppression and release rearm sequences',()=>{
+  const errorDevice=new SimulatedDevice(seed);
+  errorDevice.detectorCommand('grove','scan_networks');
+  errorDevice.advance(seed.settings.scan_time_ms);drainDetector(errorDevice,'grove');
+  errorDevice.detectorCommand('grove','deauth_detector_v2 --only 1 trace defence');
+  drainDetector(errorDevice,'grove');
+  const event={type:'deauth',bssid:'02:20:77:00:00:01',channel:1,
+    sta:'AA:BB:CC:DD:EE:FF',rssi:-70};
+  assert.deepEqual(errorDevice.detectorDefenceForEvent('grove',
+    {...event,txError:'ESP_FAIL'}),[
+    '[DETECTOR_DEFENCE] trigger=deauth BSSID=02:20:77:00:00:01 STA=AA:BB:CC:DD:EE:FF RX=1 decision=decoy_4way reason=eligible',
+    '[DETECTOR_DEFENCE] provisional_bssid=02:20:77:00:00:01 channel=1',
+    '[DETECTOR_DEFENCE] tx=decoy_4way stage=m1_m2 result=error frames=0 latency_us=900 error=ESP_FAIL'
+  ]);
+  assert.equal(errorDevice.detectorStatus('grove').defenceResponses,0);
+  assert.equal(errorDevice.detectorStatus('grove').defenceErrors,1);
+
+  assert.deepEqual(errorDevice.detectorDefenceForEvent('grove',
+    {...event,suppressedCount:3,suppressedReason:'rate_limit'}),[
+    '[DETECTOR_DEFENCE] trigger=deauth BSSID=02:20:77:00:00:01 STA=AA:BB:CC:DD:EE:FF RX=1 decision=decoy_4way reason=eligible',
+    '[DETECTOR_DEFENCE] suppressed=3 reason=rate_limit BSSID=02:20:77:00:00:01 window_ms=1000'
+  ]);
+  assert.equal(errorDevice.detectorStatus('grove').defenceSuppressed,3);
+
+  const releaseDevice=new SimulatedDevice(seed);
+  releaseDevice.detectorCommand('grove','scan_networks');
+  releaseDevice.advance(seed.settings.scan_time_ms);drainDetector(releaseDevice,'grove');
+  releaseDevice.detectorCommand('grove','deauth_detector_v2 --only 1 trace defence');
+  drainDetector(releaseDevice,'grove');
+  releaseDevice.detectorDefenceForEvent('grove',event);
+  assert.match(releaseDevice.detectorTraceForEvent('grove',event),
+    /^\[DETECTOR_TRACE\] confirming_bssid=/);
+  releaseDevice.advance(1000);drainDetector(releaseDevice,'grove');
+  releaseDevice.advance(20000);
+  assert.deepEqual(drainDetector(releaseDevice,'grove'),[
+    '[DETECTOR_DEFENCE] released_bssid=02:20:77:00:00:01 channel=1 reason=idle idle_ms=20000 response=decoy_4way suppressed=0',
+    '[DETECTOR_TRACE] released_channel=1 reason=idle idle_ms=20000',
+    '[DETECTOR_TRACE] armed'
+  ]);
+});
+
+test('Defence bridge preserves causal marker order before the V2 observation',()=>{
+  const b=new BrowserDevice(seed);
+  b.detectorWrite(0,'scan_networks');b.advance(seed.settings.scan_time_ms);
+  drainDetector(b.device,'grove');
+  b.detectorWrite(0,'deauth_detector_v2 --only 1 trace defence');
+  drainDetector(b.device,'grove');
+  assert.match(b.deauthDetectorLine(0,0),/^\[DETECTOR_TRACE\] confirming_bssid=/);
+  assert.match(b.deauthDetectorLine(0,1),
+    /^\[DETECTOR_DEFENCE\] trigger=deauth BSSID=02:20:77:00:00:01 /);
+  assert.equal(b.deauthDetectorLine(0,2),
+    '[DETECTOR_DEFENCE] provisional_bssid=02:20:77:00:00:01 channel=1');
+  assert.match(b.deauthDetectorLine(0,3),
+    /^\[DETECTOR_DEFENCE\] tx=decoy_4way .* result=ok /);
+  assert.match(b.deauthDetectorLine(0,4),/^\[DEAUTH_V2\] CH: 1 /);
+  assert.equal(b.device.detectorStatus('grove').defenceResponses,1);
+});
+
+test('unsupported Defence never starts or falls back to legacy',()=>{
+  const old=structuredClone(seed);
+  old.modules.find(module=>module.id==='grove').detector_defence_supported=false;
+  const d=new SimulatedDevice(old);
+  d.detectorCommand('grove','scan_networks');d.advance(seed.settings.scan_time_ms);
+  drainDetector(d,'grove');
+  d.detectorCommand('grove','deauth_detector_v2 --only 1 trace defence');
+  assert.deepEqual(drainDetector(d,'grove'),['Unrecognized command']);
+  assert.equal(d.detectorStatus('grove').running,false);
+});
+
+test('Forensics parser model and long-run fixture match the bounded v1 contract',()=>{
+  const valid='[DEAUTH_FORENSIC/1] FRAME=deauth CH=6 BSSID=00:11:22:33:44:55 '+
+    'TX=AA:BB:CC:DD:EE:FF DA=12:34:56:78:9A:BC RSSI=-82 REASON=6 '+
+    'SEQ=4095 RETRY=1 PROTECTED=0 FC=0x00C0 TS_US=18446744073709551615';
+  assert.equal(parseForensicLine(valid).timestampUs,(1n<<64n)-1n);
+  const padded=valid.replace('CH=6','CH=006').replace('REASON=6','REASON=0006')
+    .replace('TS_US=18446744073709551615','TS_US=0001');
+  assert.equal(parseForensicLine(padded).timestampUs,1n);
+  assert.equal(parseForensicLine(valid.replace('RSSI=-82','RSSI=-0')),null);
+  assert.equal(parseForensicLine('prefix '+valid),null);
+  assert.equal(parseForensicLine('> > '+valid),null);
+  assert.equal(parseForensicLine(valid.replace('CH=6','CH=234')),null);
+  assert.equal(parseForensicLine(valid+' EXTRA=1'),null);
+  const owner={tab:0,port:1,transport:'grove',linkGeneration:0,
+    commandGeneration:4,scanGeneration:2};
+  const model=new ForensicModel();model.begin(owner);
+  for(const line of longRunForensicFixture())assert.equal(model.acceptLine(line,owner),true);
+  assert.deepEqual([model.rows.length,model.accepted,model.burstCount,model.largestBurst],
+    [23,23n,11n,3n]);
+  assert.deepEqual(model.stats(),{uniqueBssid:1,uniqueDa:1,rssiMin:-87,
+    rssiAverage:-83,rssiMax:-80,retry:5,protected:23,unprotected:0,
+    protectedUnknown:0,retryUnknown:0,reasonUnknown:0,
+    reasonDistribution:{'6':23}});
+  const reorderedOwner={scanGeneration:2,commandGeneration:4,linkGeneration:0,
+    transport:'grove',port:1,tab:0};
+  assert.equal(model.acceptLine(valid,reorderedOwner),true);
+  assert.equal(model.acceptLine(valid,{...owner,tab:2}),false);
+  model.finalize();assert.equal(model.acceptLine(valid,owner),false);
+
+  const rounding=new ForensicModel();rounding.begin(owner);
+  assert.equal(rounding.acceptLine(valid.replace('RSSI=-82','RSSI=-80')
+    .replace('TS_US=18446744073709551615','TS_US=1'),owner),true);
+  assert.equal(rounding.acceptLine(valid.replace('RSSI=-82','RSSI=-81')
+    .replace('SEQ=4095','SEQ=0')
+    .replace('TS_US=18446744073709551615','TS_US=2'),owner),true);
+  assert.equal(rounding.stats().rssiAverage,-81);
+
+  const unknowns=new ForensicModel();unknowns.begin(owner);
+  assert.equal(unknowns.acceptLine(valid.replace('REASON=6','REASON=-')
+    .replace('RETRY=1','RETRY=-')
+    .replace('TS_US=18446744073709551615','TS_US=3'),owner),true);
+  assert.deepEqual(unknowns.stats().reasonDistribution,{});
+  assert.equal(unknowns.stats().reasonUnknown,1);
+  assert.equal(unknowns.stats().retryUnknown,1);
+
+  const rollover=new ForensicModel(2);rollover.begin(owner);
+  for(const [sequence,timestamp] of [[10,1],[11,2],[12,3]]){
+    const line=valid.replace('SEQ=4095',`SEQ=${sequence}`)
+      .replace('TS_US=18446744073709551615',`TS_US=${timestamp}`);
+    assert.equal(rollover.acceptLine(line,owner),true);
+  }
+  assert.deepEqual(rollover.rows.map(row=>[row.sequence,row.sequenceState,row.sequenceDelta]),[
+    [11,'Insufficient sequence data',null],[12,'Delta',1]
+  ]);
+});
+
+test('Forensics bridge is optional bounded and precedes its V2 observation',()=>{
+  const supported=structuredClone(seed);
+  supported.modules.find(module=>module.id==='grove').detector_forensics_supported=true;
+  const b=new BrowserDevice(supported);
+  b.detectorWrite(0,'deauth_detector_v2');drainDetector(b.device,'grove');
+  assert.match(b.deauthDetectorLine(0,0),/^\[DEAUTH_FORENSIC\/1\] FRAME=deauth /);
+  assert.match(b.deauthDetectorLine(0,1),/^\[DEAUTH_V2\] /);
+  const absent=new BrowserDevice(seed);
+  absent.detectorWrite(0,'deauth_detector_v2');drainDetector(absent.device,'grove');
+  assert.match(absent.deauthDetectorLine(0,0),/^\[DEAUTH_V2\] /);
 });
 
 test('V2 bridge emits an explicit unknown reason for protected unicast fixtures',()=>{

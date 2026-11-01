@@ -495,6 +495,23 @@ typedef enum {
     DETECTOR_TRACE_UNSUPPORTED,
     DETECTOR_TRACE_LEGACY_DROPPED
 } detector_trace_state_t;
+typedef enum {
+    DETECTOR_DEFENCE_OFF,
+    DETECTOR_DEFENCE_WAITING_ARM,
+    DETECTOR_DEFENCE_ARMED,
+    DETECTOR_DEFENCE_TRIGGERED,
+    DETECTOR_DEFENCE_PROVISIONAL,
+    DETECTOR_DEFENCE_TX_OK,
+    DETECTOR_DEFENCE_TX_ERROR,
+    DETECTOR_DEFENCE_RELEASED,
+    DETECTOR_DEFENCE_UNSUPPORTED
+} detector_defence_state_t;
+typedef enum {
+    DETECTOR_DEFENCE_DECISION_NONE,
+    DETECTOR_DEFENCE_DECISION_DECOY_4WAY,
+    DETECTOR_DEFENCE_DECISION_DECOY_PMKID,
+    DETECTOR_DEFENCE_DECISION_OBSERVE
+} detector_defence_decision_t;
 typedef struct {
     int index;                         // JanOS 1-based index, never a UI row number
     char ssid[33];
@@ -532,6 +549,23 @@ typedef struct {
     int trace_release_idle_ms;
     int trace_failed_channel;
     char trace_error[64];
+    bool defence_requested;
+    bool pmkid_decoy_requested;
+    detector_defence_state_t defence_state;
+    detector_defence_decision_t defence_decision;
+    detector_defence_decision_t defence_response;
+    int defence_targets;
+    int defence_channel;
+    char defence_bssid[18];
+    char defence_sta[18];
+    uint64_t defence_observations;
+    uint64_t defence_tx_pairs;
+    uint64_t defence_pmkid_m1;
+    uint64_t defence_responses;
+    uint64_t defence_satisfied;
+    uint64_t defence_errors;
+    uint64_t defence_dropped;
+    uint64_t defence_suppressed;
     char error[128];
 } detector_watch_session_t;
 // Detector watch model end
@@ -700,6 +734,24 @@ static bool detector_watch_build_v2_command(const detector_watch_session_t *sess
     return added >= 0 && (size_t)added < out_size - used;
 }
 
+static bool detector_watch_build_mode_command(const detector_watch_session_t *session,
+                                               bool selected_mode,
+                                               uint32_t generation,
+                                               bool trace, bool defence,
+                                               bool pmkid_decoy, char *out,
+                                               size_t out_size)
+{
+    if (pmkid_decoy && !defence) return false;
+    if (defence && (!selected_mode || !trace)) return false;
+    if (!detector_watch_build_v2_command(session, selected_mode, generation,
+                                         trace, out, out_size)) return false;
+    if (!defence) return true;
+    size_t used = strlen(out);
+    int added = snprintf(out + used, out_size - used, " defence%s",
+                         pmkid_decoy ? " pmkid-decoy" : "");
+    return added >= 0 && (size_t)added < out_size - used;
+}
+
 static bool detector_watch_is_unrecognized_command(const char *line)
 {
     if (!line) return false;
@@ -729,6 +781,28 @@ static void detector_watch_clear_trace_release(detector_watch_session_t *session
     session->trace_release_idle_ms = 0;
 }
 
+static void detector_watch_clear_defence(detector_watch_session_t *session)
+{
+    if (!session) return;
+    session->defence_requested = false;
+    session->pmkid_decoy_requested = false;
+    session->defence_state = DETECTOR_DEFENCE_OFF;
+    session->defence_decision = DETECTOR_DEFENCE_DECISION_NONE;
+    session->defence_response = DETECTOR_DEFENCE_DECISION_NONE;
+    session->defence_targets = 0;
+    session->defence_channel = 0;
+    session->defence_bssid[0] = '\0';
+    session->defence_sta[0] = '\0';
+    session->defence_observations = 0;
+    session->defence_tx_pairs = 0;
+    session->defence_pmkid_m1 = 0;
+    session->defence_responses = 0;
+    session->defence_satisfied = 0;
+    session->defence_errors = 0;
+    session->defence_dropped = 0;
+    session->defence_suppressed = 0;
+}
+
 static void detector_watch_begin_start_mode(detector_watch_session_t *session,
                                             bool selected_mode, bool details,
                                             bool trace)
@@ -756,6 +830,7 @@ static void detector_watch_begin_start_mode(detector_watch_session_t *session,
                  session->trace_requested ? DETECTOR_TRACE_WAITING_ARM :
                                             DETECTOR_TRACE_OFF);
     detector_watch_clear_trace_release(session);
+    detector_watch_clear_defence(session);
     session->error[0] = '\0';
     for (int i = 0; i < session->count; ++i) session->networks[i].confirmed = false;
 }
@@ -766,10 +841,17 @@ static void detector_watch_begin_start_details(detector_watch_session_t *session
     detector_watch_begin_start_mode(session, selected_mode, details, false);
 }
 
-static void detector_watch_begin_start_v2(detector_watch_session_t *session,
-                                          bool selected_mode, bool trace)
+static void detector_watch_begin_start_v2_mode(detector_watch_session_t *session,
+                                                bool selected_mode, bool trace,
+                                                bool defence, bool pmkid_decoy)
 {
-    detector_watch_begin_start_mode(session, selected_mode, true, trace);
+    detector_watch_begin_start_mode(session, selected_mode, true,
+                                    trace || defence);
+    if (!session) return;
+    session->defence_requested = defence;
+    session->pmkid_decoy_requested = defence && pmkid_decoy;
+    session->defence_state = defence ? DETECTOR_DEFENCE_WAITING_ARM :
+                                       DETECTOR_DEFENCE_OFF;
 }
 
 static void detector_watch_begin_start(detector_watch_session_t *session, bool selected_mode)
@@ -803,8 +885,16 @@ static bool detector_watch_payload_exact(const char *payload, const char *expect
 {
     if (!payload || !expected) return false;
     size_t length = strlen(expected);
-    return strncmp(payload, expected, length) == 0 &&
-           (payload[length] == '\0' || payload[length] == '\x1b');
+    if (strncmp(payload, expected, length) != 0) return false;
+    const char *suffix = payload + length;
+    while (*suffix) {
+        if (suffix[0] != '\x1b' || suffix[1] != '[') return false;
+        suffix += 2;
+        while (isdigit((unsigned char)*suffix) || *suffix == ';') ++suffix;
+        if (*suffix != 'm') return false;
+        ++suffix;
+    }
+    return true;
 }
 
 static bool detector_watch_payload_ends(const char *payload, const char *suffix)
@@ -820,8 +910,13 @@ static bool detector_watch_payload_ends(const char *payload, const char *suffix)
 static bool detector_watch_is_stop_ack_line(const char *line)
 {
     const char *payload = detector_watch_status_payload(line);
-    return detector_watch_payload_exact(payload, "Deauth Detector stopped.") ||
-           detector_watch_payload_exact(payload, "All operations stopped.");
+    return detector_watch_payload_exact(payload, "All operations stopped.");
+}
+
+static bool detector_watch_is_partial_stop_line(const char *line)
+{
+    return detector_watch_payload_exact(detector_watch_status_payload(line),
+                                        "Deauth Detector stopped.");
 }
 
 static bool detector_watch_is_start_status_line(const char *line)
@@ -877,6 +972,287 @@ static bool detector_watch_is_trace_status_line(const char *line)
     const char *payload = detector_watch_status_payload(line);
     return payload && strncmp(payload, "[DETECTOR_TRACE] ",
                               sizeof("[DETECTOR_TRACE] ") - 1) == 0;
+}
+
+static bool detector_watch_parse_literal(const char **cursor, const char *literal)
+{
+    if (!cursor || !*cursor || !literal) return false;
+    size_t length = strlen(literal);
+    if (strncmp(*cursor, literal, length) != 0) return false;
+    *cursor += length;
+    return true;
+}
+
+static bool detector_watch_parse_u64(const char **cursor, uint64_t maximum,
+                                     uint64_t *value)
+{
+    if (!cursor || !*cursor || !value || !isdigit((unsigned char)**cursor)) return false;
+    uint64_t parsed = 0;
+    do {
+        unsigned digit = (unsigned)(**cursor - '0');
+        if (parsed > maximum / 10U ||
+            (parsed == maximum / 10U && digit > maximum % 10U)) return false;
+        parsed = parsed * 10U + digit;
+        ++*cursor;
+    } while (isdigit((unsigned char)**cursor));
+    *value = parsed;
+    return true;
+}
+
+static bool detector_watch_parse_token(const char **cursor, char *out,
+                                       size_t out_size)
+{
+    if (!cursor || !*cursor || !out || out_size < 2) return false;
+    size_t length = 0;
+    while ((*cursor)[length] && (*cursor)[length] != ' ') {
+        unsigned char c = (unsigned char)(*cursor)[length];
+        if (!(isalnum(c) || c == '_' || c == '-' || c == ':') ||
+            length + 1 >= out_size) return false;
+        ++length;
+    }
+    if (!length) return false;
+    memcpy(out, *cursor, length);
+    out[length] = '\0';
+    *cursor += length;
+    return true;
+}
+
+static bool detector_watch_parse_mac_value(const char **cursor, bool allow_dash,
+                                           char out[18])
+{
+    if (!cursor || !*cursor || !out) return false;
+    if (allow_dash && (*cursor)[0] == '-' &&
+        ((*cursor)[1] == ' ' || (*cursor)[1] == '\0')) {
+        out[0] = '-';
+        out[1] = '\0';
+        ++*cursor;
+        return true;
+    }
+    if (strlen(*cursor) < 17) return false;
+    memcpy(out, *cursor, 17);
+    out[17] = '\0';
+    if (!detector_watch_mac_valid(out) ||
+        ((*cursor)[17] != ' ' && (*cursor)[17] != '\0')) return false;
+    *cursor += 17;
+    return true;
+}
+
+static bool detector_watch_is_defence_status_line(const char *line)
+{
+    const char *payload = detector_watch_status_payload(line);
+    return payload && strncmp(payload, "[DETECTOR_DEFENCE] ",
+                              sizeof("[DETECTOR_DEFENCE] ") - 1) == 0;
+}
+
+static bool detector_watch_defence_bssid_selected(
+    const detector_watch_session_t *session, const char *bssid)
+{
+    if (!session || !session->selected_mode || !session->watch_verified) return false;
+    for (int i = 0; i < session->count; ++i) {
+        if (session->networks[i].selected &&
+            detector_watch_mac_equal(session->networks[i].bssid, bssid)) return true;
+    }
+    return false;
+}
+
+// Defence records are session state only. A recognized marker is consumed even
+// when malformed or late so it can never reach history, CSV, counters, or alarms.
+static bool detector_watch_defence_status_line(detector_watch_session_t *session,
+                                               const char *line)
+{
+    if (!detector_watch_is_defence_status_line(line)) return false;
+    const char *payload = detector_watch_status_payload(line);
+    const char *prefix = "[DETECTOR_DEFENCE] ";
+    if (!payload || strncmp(payload, prefix, strlen(prefix)) != 0) return false;
+    bool active = session && session->defence_requested &&
+                  !session->remote_state_unknown && session->details_confirmed &&
+                  (session->phase == DETECTOR_WATCH_STARTING ||
+                   session->phase == DETECTOR_WATCH_RUNNING ||
+                   session->phase == DETECTOR_WATCH_STOPPING);
+    if (!active) return true;
+    const char *p = payload + strlen(prefix);
+    uint64_t a = 0, b = 0, c = 0, d = 0, e = 0, f = 0, g = 0;
+    char first[32] = {0}, second[32] = {0}, third[64] = {0};
+    char error_token[64] = {0};
+    char bssid[18] = {0}, sta[18] = {0};
+
+    if (detector_watch_parse_literal(&p, "armed targets=") &&
+        detector_watch_parse_u64(&p, DETECTOR_WATCH_MAX, &a) &&
+        detector_watch_parse_literal(&p, " trace=fast pmkid=") &&
+        detector_watch_parse_token(&p, first, sizeof(first)) && *p == '\0' &&
+        a == (uint64_t)session->selected_count &&
+        ((!session->pmkid_decoy_requested && !strcmp(first, "monitor")) ||
+         (session->pmkid_decoy_requested && !strcmp(first, "decoy")))) {
+        session->defence_targets = (int)a;
+        session->defence_state = DETECTOR_DEFENCE_ARMED;
+        session->defence_decision = DETECTOR_DEFENCE_DECISION_NONE;
+        session->defence_response = DETECTOR_DEFENCE_DECISION_NONE;
+        session->defence_channel = 0;
+        session->defence_bssid[0] = '\0';
+        session->defence_sta[0] = '\0';
+        return true;
+    }
+
+    p = payload + strlen(prefix);
+    if (detector_watch_parse_literal(&p, "trigger=") &&
+        detector_watch_parse_token(&p, first, sizeof(first)) &&
+        detector_watch_parse_literal(&p, " BSSID=") &&
+        detector_watch_parse_mac_value(&p, false, bssid) &&
+        detector_watch_parse_literal(&p, " STA=") &&
+        detector_watch_parse_mac_value(&p, true, sta) &&
+        detector_watch_parse_literal(&p, " RX=") &&
+        detector_watch_parse_u64(&p, 255, &a) && a >= 1 &&
+        detector_watch_parse_literal(&p, " decision=") &&
+        detector_watch_parse_token(&p, second, sizeof(second)) &&
+        detector_watch_parse_literal(&p, " reason=") &&
+        detector_watch_parse_token(&p, third, sizeof(third)) && *p == '\0' &&
+        (!strcmp(first, "deauth") || !strcmp(first, "disassoc") ||
+         !strcmp(first, "csa") || !strcmp(first, "pmkid_probe")) &&
+        (!strcmp(second, "observe") ||
+         (!strcmp(second, "decoy_4way") && strcmp(first, "pmkid_probe")) ||
+         (!strcmp(second, "decoy_pmkid") && !strcmp(first, "pmkid_probe") &&
+          session->pmkid_decoy_requested)) &&
+        detector_watch_defence_bssid_selected(session, bssid)) {
+        // Monitor-only observations are telemetry, not a new response campaign.
+        // Keep the last JanOS-confirmed success/release visible until another
+        // decoy decision actually starts a campaign.
+        if (!strcmp(second, "observe") &&
+            (session->defence_state == DETECTOR_DEFENCE_TX_OK ||
+             session->defence_state == DETECTOR_DEFENCE_RELEASED)) return true;
+        memcpy(session->defence_bssid, bssid, sizeof(bssid));
+        memcpy(session->defence_sta, sta, sizeof(sta));
+        session->defence_channel = (int)a;
+        session->defence_decision = !strcmp(second, "decoy_4way")
+            ? DETECTOR_DEFENCE_DECISION_DECOY_4WAY
+            : !strcmp(second, "decoy_pmkid")
+                ? DETECTOR_DEFENCE_DECISION_DECOY_PMKID
+                : DETECTOR_DEFENCE_DECISION_OBSERVE;
+        session->defence_response = DETECTOR_DEFENCE_DECISION_NONE;
+        session->defence_state = DETECTOR_DEFENCE_TRIGGERED;
+        return true;
+    }
+
+    p = payload + strlen(prefix);
+    if (detector_watch_parse_literal(&p, "provisional_bssid=") &&
+        detector_watch_parse_mac_value(&p, false, bssid) &&
+        detector_watch_parse_literal(&p, " channel=") &&
+        detector_watch_parse_u64(&p, 255, &a) && a >= 1 && *p == '\0' &&
+        session->defence_state == DETECTOR_DEFENCE_TRIGGERED &&
+        (session->defence_decision == DETECTOR_DEFENCE_DECISION_DECOY_4WAY ||
+         session->defence_decision == DETECTOR_DEFENCE_DECISION_DECOY_PMKID) &&
+        detector_watch_mac_equal(session->defence_bssid, bssid) &&
+        detector_watch_defence_bssid_selected(session, bssid)) {
+        memcpy(session->defence_bssid, bssid, sizeof(bssid));
+        session->defence_channel = (int)a;
+        session->defence_state = DETECTOR_DEFENCE_PROVISIONAL;
+        return true;
+    }
+
+    p = payload + strlen(prefix);
+    if (detector_watch_parse_literal(&p, "tx=") &&
+        detector_watch_parse_token(&p, first, sizeof(first)) &&
+        detector_watch_parse_literal(&p, " stage=") &&
+        detector_watch_parse_token(&p, second, sizeof(second)) &&
+        detector_watch_parse_literal(&p, " result=") &&
+        detector_watch_parse_token(&p, third, sizeof(third)) &&
+        detector_watch_parse_literal(&p, " frames=") &&
+        detector_watch_parse_u64(&p, 2, &a) &&
+        detector_watch_parse_literal(&p, " latency_us=") &&
+        detector_watch_parse_u64(&p, UINT64_MAX, &b) &&
+        detector_watch_parse_literal(&p, " error=") &&
+        detector_watch_parse_token(&p, error_token, sizeof(error_token)) && *p == '\0' &&
+        session->defence_state == DETECTOR_DEFENCE_PROVISIONAL &&
+        ((!strcmp(first, "decoy_4way") && !strcmp(second, "m1_m2") &&
+          session->defence_decision == DETECTOR_DEFENCE_DECISION_DECOY_4WAY) ||
+         (!strcmp(first, "decoy_pmkid") && !strcmp(second, "m1_pmkid") &&
+          session->pmkid_decoy_requested &&
+          session->defence_decision == DETECTOR_DEFENCE_DECISION_DECOY_PMKID)) &&
+        (!strcmp(third, "ok") || !strcmp(third, "error")) &&
+        ((!strcmp(third, "ok") && !strcmp(error_token, "none")) ||
+         (!strcmp(third, "error") && strcmp(error_token, "none")))) {
+        (void)b;
+        session->defence_response = session->defence_decision;
+        session->defence_decision = DETECTOR_DEFENCE_DECISION_NONE;
+        if (!strcmp(third, "ok")) {
+            if (session->defence_responses < UINT64_MAX) ++session->defence_responses;
+            session->defence_state = DETECTOR_DEFENCE_TX_OK;
+        } else {
+            if (session->defence_errors < UINT64_MAX) ++session->defence_errors;
+            session->defence_state = DETECTOR_DEFENCE_TX_ERROR;
+        }
+        return true;
+    }
+
+    p = payload + strlen(prefix);
+    if (detector_watch_parse_literal(&p, "suppressed=") &&
+        detector_watch_parse_u64(&p, UINT64_MAX, &a) &&
+        detector_watch_parse_literal(&p, " reason=") &&
+        detector_watch_parse_token(&p, first, sizeof(first)) &&
+        detector_watch_parse_literal(&p, " BSSID=") &&
+        detector_watch_parse_mac_value(&p, false, bssid) &&
+        detector_watch_parse_literal(&p, " window_ms=") &&
+        detector_watch_parse_u64(&p, 1000, &b) && b == 1000 && *p == '\0' &&
+        detector_watch_defence_bssid_selected(session, bssid)) {
+        session->defence_suppressed = a;
+        return true;
+    }
+
+    p = payload + strlen(prefix);
+    if (detector_watch_parse_literal(&p, "released_bssid=") &&
+        detector_watch_parse_mac_value(&p, false, bssid) &&
+        detector_watch_parse_literal(&p, " channel=") &&
+        detector_watch_parse_u64(&p, 255, &a) && a >= 1 &&
+        detector_watch_parse_literal(&p, " reason=idle idle_ms=") &&
+        detector_watch_parse_u64(&p, 20000, &b) && b == 20000 &&
+        detector_watch_parse_literal(&p, " response=") &&
+        detector_watch_parse_token(&p, first, sizeof(first)) &&
+        detector_watch_parse_literal(&p, " suppressed=") &&
+        detector_watch_parse_u64(&p, UINT64_MAX, &c) && *p == '\0' &&
+        (session->defence_state == DETECTOR_DEFENCE_TX_OK ||
+         session->defence_state == DETECTOR_DEFENCE_TX_ERROR) &&
+        detector_watch_mac_equal(session->defence_bssid, bssid) &&
+        ((!strcmp(first, "decoy_4way") &&
+          session->defence_response == DETECTOR_DEFENCE_DECISION_DECOY_4WAY) ||
+         (!strcmp(first, "decoy_pmkid") && session->pmkid_decoy_requested &&
+          session->defence_response == DETECTOR_DEFENCE_DECISION_DECOY_PMKID)) &&
+        detector_watch_defence_bssid_selected(session, bssid)) {
+        memcpy(session->defence_bssid, bssid, sizeof(bssid));
+        session->defence_channel = (int)a;
+        session->defence_suppressed = c;
+        session->defence_response = DETECTOR_DEFENCE_DECISION_NONE;
+        session->defence_state = DETECTOR_DEFENCE_RELEASED;
+        return true;
+    }
+
+    p = payload + strlen(prefix);
+    if (detector_watch_parse_literal(&p, "stopped observations=") &&
+        detector_watch_parse_u64(&p, UINT64_MAX, &a) &&
+        detector_watch_parse_literal(&p, " tx_pairs=") &&
+        detector_watch_parse_u64(&p, UINT64_MAX, &b) &&
+        detector_watch_parse_literal(&p, " pmkid_m1=") &&
+        detector_watch_parse_u64(&p, UINT64_MAX, &c) &&
+        detector_watch_parse_literal(&p, " responses=") &&
+        detector_watch_parse_u64(&p, UINT64_MAX, &d) &&
+        detector_watch_parse_literal(&p, " satisfied=") &&
+        detector_watch_parse_u64(&p, UINT64_MAX, &e) &&
+        detector_watch_parse_literal(&p, " errors=") &&
+        detector_watch_parse_u64(&p, UINT64_MAX, &f) &&
+        detector_watch_parse_literal(&p, " dropped=") &&
+        detector_watch_parse_u64(&p, UINT64_MAX, &g) &&
+        detector_watch_parse_literal(&p, " outcome=") &&
+        detector_watch_parse_token(&p, first, sizeof(first)) && *p == '\0' &&
+        (!strcmp(first, "responded") || !strcmp(first, "observed") ||
+         !strcmp(first, "idle"))) {
+        session->defence_observations = a;
+        session->defence_tx_pairs = b;
+        session->defence_pmkid_m1 = c;
+        session->defence_responses = d;
+        session->defence_satisfied = e;
+        session->defence_errors = f;
+        session->defence_dropped = g;
+        return true;
+    }
+    return true;
 }
 
 static void detector_watch_clear_trace_lock(detector_watch_session_t *session)
@@ -990,8 +1366,17 @@ static bool detector_watch_trace_status_line(detector_watch_session_t *session,
 static void detector_watch_status_line(detector_watch_session_t *session, const char *line)
 {
     if (!session || !line) return;
+    if (detector_watch_defence_status_line(session, line)) return;
     if (detector_watch_trace_status_line(session, line)) return;
     const char *payload = detector_watch_status_payload(line);
+    if ((session->phase == DETECTOR_WATCH_STOPPING ||
+         (session->phase == DETECTOR_WATCH_ERROR && session->running)) &&
+        detector_watch_is_partial_stop_line(line)) {
+        session->remote_state_unknown = true;
+        snprintf(session->error, sizeof(session->error),
+                 "JanOS reported detector task stopped without final global acknowledgement");
+        return;
+    }
     if ((session->phase == DETECTOR_WATCH_STOPPING ||
          (session->phase == DETECTOR_WATCH_ERROR && session->running)) &&
         detector_watch_is_stop_ack_line(line)) {
@@ -1000,6 +1385,7 @@ static void detector_watch_status_line(detector_watch_session_t *session, const 
         session->remote_state_unknown = false;
         session->trace_requested = false;
         detector_watch_clear_trace_lock(session);
+        detector_watch_clear_defence(session);
         if (!preserve_error) detector_watch_stop(session);
         return;
     }
@@ -1037,6 +1423,16 @@ static void detector_watch_status_line(detector_watch_session_t *session, const 
     }
     if (session->phase == DETECTOR_WATCH_STARTING &&
         detector_watch_is_unrecognized_command(line)) {
+        if (session->defence_requested) {
+            session->phase = DETECTOR_WATCH_ERROR;
+            session->running = false;
+            session->remote_state_unknown = false;
+            session->legacy_retry_pending = false;
+            session->defence_state = DETECTOR_DEFENCE_UNSUPPORTED;
+            snprintf(session->error, sizeof(session->error),
+                     "Defence unsupported by this JanOS; detector not started");
+            return;
+        }
         if (session->details_requested && !session->start_ack_seen &&
             !session->details_confirmed) {
             session->legacy_retry_pending = true;
@@ -1056,16 +1452,58 @@ static void detector_watch_status_line(detector_watch_session_t *session, const 
         session->remote_state_unknown = false;
         session->legacy_retry_pending = false;
         detector_watch_set_trace_state(session, DETECTOR_TRACE_UNSUPPORTED);
+        if (session->defence_requested) {
+            session->defence_state = DETECTOR_DEFENCE_UNSUPPORTED;
+            snprintf(session->error, sizeof(session->error),
+                     "Defence unsupported by this JanOS; detector not started");
+        } else {
+            snprintf(session->error, sizeof(session->error),
+                     "Trace unsupported by this JanOS; detector not started");
+        }
+        return;
+    }
+    if (session->phase == DETECTOR_WATCH_STARTING && session->defence_requested &&
+        ((detector_watch_payload_starts(payload, "Invalid detector index 'defence'") ||
+          detector_watch_payload_starts(payload, "Invalid watch index 'defence'") ||
+          detector_watch_payload_starts(payload, "Invalid detector index 'pmkid-decoy'") ||
+          detector_watch_payload_starts(payload, "Invalid watch index 'pmkid-decoy'")) &&
+         detector_watch_payload_ends(payload, "Detector not started."))) {
+        session->phase = DETECTOR_WATCH_ERROR;
+        session->running = false;
+        session->remote_state_unknown = false;
+        session->legacy_retry_pending = false;
+        session->defence_state = DETECTOR_DEFENCE_UNSUPPORTED;
         snprintf(session->error, sizeof(session->error),
-                 "Trace unsupported by this JanOS; detector not started");
+                 "Defence unsupported by this JanOS; detector not started");
+        return;
+    }
+    if (session->phase == DETECTOR_WATCH_STARTING && session->defence_requested &&
+        detector_watch_payload_exact(
+            payload, "Defence requires --only protected scan indices.")) {
+        session->phase = DETECTOR_WATCH_ERROR;
+        session->running = false;
+        session->remote_state_unknown = false;
+        session->legacy_retry_pending = false;
+        session->defence_state = DETECTOR_DEFENCE_UNSUPPORTED;
+        snprintf(session->error, sizeof(session->error),
+                 "Defence requires selected protected networks");
         return;
     }
     if (session->phase == DETECTOR_WATCH_STARTING &&
         detector_watch_payload_exact(
             payload, "Invalid detector option; use --only before scan indices.")) {
         session->phase = DETECTOR_WATCH_ERROR;
-        session->remote_state_unknown = session->start_ack_seen;
-        snprintf(session->error, sizeof(session->error), "JanOS rejected detector command");
+        session->remote_state_unknown = session->defence_requested
+                                            ? false : session->start_ack_seen;
+        session->legacy_retry_pending = false;
+        if (session->defence_requested) {
+            session->defence_state = DETECTOR_DEFENCE_UNSUPPORTED;
+            snprintf(session->error, sizeof(session->error),
+                     "Defence unsupported by this JanOS; detector not started");
+        } else {
+            snprintf(session->error, sizeof(session->error),
+                     "JanOS rejected detector command");
+        }
         return;
     }
     if (session->phase == DETECTOR_WATCH_STARTING &&
@@ -1082,8 +1520,7 @@ static void detector_watch_status_line(detector_watch_session_t *session, const 
         return;
     }
     const char *watch = detector_watch_is_watch_status_line(line) ? payload : NULL;
-    bool verifying_during_start = session->phase == DETECTOR_WATCH_STARTING &&
-                                  session->start_ack_seen;
+    bool verifying_during_start = session->phase == DETECTOR_WATCH_STARTING;
     if (!watch || !session->selected_mode ||
         (session->phase != DETECTOR_WATCH_RUNNING && !verifying_during_start)) return;
     unsigned count = 0, ordinal = 0, total = 0, channel = 0;
@@ -1169,6 +1606,25 @@ static void detector_watch_connection_lost(detector_watch_session_t *session)
         session->trace_failed_channel = previous.trace_failed_channel;
         memcpy(session->trace_error, previous.trace_error,
                sizeof(session->trace_error));
+        session->defence_requested = previous.defence_requested;
+        session->pmkid_decoy_requested = previous.pmkid_decoy_requested;
+        session->defence_state = previous.defence_state;
+        session->defence_decision = previous.defence_decision;
+        session->defence_response = previous.defence_response;
+        session->defence_targets = previous.defence_targets;
+        session->defence_channel = previous.defence_channel;
+        memcpy(session->defence_bssid, previous.defence_bssid,
+               sizeof(session->defence_bssid));
+        memcpy(session->defence_sta, previous.defence_sta,
+               sizeof(session->defence_sta));
+        session->defence_observations = previous.defence_observations;
+        session->defence_tx_pairs = previous.defence_tx_pairs;
+        session->defence_pmkid_m1 = previous.defence_pmkid_m1;
+        session->defence_responses = previous.defence_responses;
+        session->defence_satisfied = previous.defence_satisfied;
+        session->defence_errors = previous.defence_errors;
+        session->defence_dropped = previous.defence_dropped;
+        session->defence_suppressed = previous.defence_suppressed;
     }
     snprintf(session->error, sizeof(session->error),
              "Detector UART disconnected; scan selection cleared");
@@ -1238,12 +1694,466 @@ static void detector_watch_stop(detector_watch_session_t *session)
     session->watched_count = 0;
     session->trace_requested = false;
     detector_watch_clear_trace_lock(session);
+    detector_watch_clear_defence(session);
     for (int i = 0; i < session->count; ++i) {
         session->networks[i].selected = false;
         session->networks[i].confirmed = false;
     }
 }
 // Detector watch logic end
+
+// Detector forensic model begin
+#define DETECTOR_FORENSIC_CAPACITY 128
+#define DETECTOR_FORENSIC_MAX_LINE 512
+#define DETECTOR_FORENSIC_BURST_GAP_US 20000000ULL
+
+typedef enum {
+    DETECTOR_FORENSIC_DEAUTH,
+    DETECTOR_FORENSIC_DISASSOC
+} detector_forensic_frame_t;
+
+typedef enum {
+    DETECTOR_FORENSIC_INSUFFICIENT_SEQUENCE,
+    DETECTOR_FORENSIC_SEQUENCE_DELTA,
+    DETECTOR_FORENSIC_RETRANSMISSION,
+    DETECTOR_FORENSIC_REPEATED_SEQUENCE
+} detector_forensic_sequence_state_t;
+
+typedef struct {
+    detector_forensic_frame_t frame;
+    bool channel_known;
+    uint16_t channel;
+    char bssid[18];
+    char tx[18];
+    char da[18];
+    bool rssi_known;
+    int16_t rssi;
+    bool reason_known;
+    uint16_t reason;
+    bool seq_known;
+    uint16_t seq;
+    bool retry_known;
+    uint8_t retry;
+    bool protected_known;
+    uint8_t protected_value;
+    bool fc_known;
+    uint16_t fc;
+    uint64_t ts_us;
+    bool gap_known;
+    uint64_t gap_us;
+    detector_forensic_sequence_state_t sequence_state;
+    uint16_t sequence_delta;
+} detector_forensic_row_t;
+
+typedef struct {
+    detector_forensic_row_t *rows;
+    size_t capacity;
+    size_t count;
+    bool active;
+    bool finalized;
+    bool marker_seen;
+    int owner_tab;
+    int owner_port;
+    uint32_t owner_link_generation;
+    uint32_t owner_command_generation;
+    uint32_t owner_scan_generation;
+    uint64_t accepted;
+    uint64_t local_dropped;
+    uint64_t burst_count;
+    uint64_t largest_burst;
+    uint64_t current_burst;
+    bool has_last;
+    detector_forensic_frame_t last_frame;
+    char last_bssid[18];
+    char last_tx[18];
+    char last_da[18];
+    uint64_t last_ts_us;
+} detector_forensic_session_t;
+
+typedef struct {
+    size_t unique_bssid;
+    size_t unique_da;
+    uint64_t rssi_known;
+    int rssi_min;
+    int rssi_average;
+    int rssi_max;
+    uint64_t protected_count;
+    uint64_t unprotected_count;
+    uint64_t protected_unknown;
+    uint64_t retry_count;
+    uint64_t retry_unknown;
+} detector_forensic_stats_t;
+
+static void detector_forensic_increment(uint64_t *value)
+{
+    if (value && *value < UINT64_MAX) ++*value;
+}
+
+static bool detector_forensic_same_stream(const detector_forensic_row_t *left,
+                                          const detector_forensic_row_t *right)
+{
+    return left && right && left->frame == right->frame &&
+           strcmp(left->bssid, right->bssid) == 0 &&
+           strcmp(left->tx, right->tx) == 0 &&
+           strcmp(left->da, right->da) == 0;
+}
+
+static void detector_forensic_reset(detector_forensic_session_t *session,
+                                    detector_forensic_row_t *rows,
+                                    size_t capacity)
+{
+    if (!session) return;
+    memset(session, 0, sizeof(*session));
+    session->rows = rows;
+    session->capacity = capacity > DETECTOR_FORENSIC_CAPACITY
+                            ? DETECTOR_FORENSIC_CAPACITY
+                            : capacity;
+    if (rows && session->capacity)
+        memset(rows, 0, session->capacity * sizeof(*rows));
+}
+
+static void detector_forensic_recompute_sequences(
+    detector_forensic_session_t *session)
+{
+    if (!session || !session->rows) return;
+    for (size_t i = 0; i < session->count; ++i) {
+        detector_forensic_row_t *row = &session->rows[i];
+        row->sequence_state = DETECTOR_FORENSIC_INSUFFICIENT_SEQUENCE;
+        row->sequence_delta = 0;
+        if (!row->seq_known) continue;
+        for (size_t j = i; j > 0; --j) {
+            const detector_forensic_row_t *previous = &session->rows[j - 1];
+            if (!previous->seq_known ||
+                !detector_forensic_same_stream(previous, row)) continue;
+            row->sequence_delta =
+                (uint16_t)((row->seq + 4096U - previous->seq) & 0x0FFFU);
+            if (row->sequence_delta == 0 && row->retry_known && row->retry)
+                row->sequence_state = DETECTOR_FORENSIC_RETRANSMISSION;
+            else if (row->sequence_delta == 0 && row->retry_known && !row->retry)
+                row->sequence_state = DETECTOR_FORENSIC_REPEATED_SEQUENCE;
+            else
+                row->sequence_state = DETECTOR_FORENSIC_SEQUENCE_DELTA;
+            break;
+        }
+    }
+}
+
+static bool detector_forensic_accept(detector_forensic_session_t *session,
+                                     detector_forensic_row_t *row)
+{
+    if (!session || !row || !session->rows || session->capacity == 0) return false;
+
+    detector_forensic_row_t last = {0};
+    if (session->has_last) {
+        last.frame = session->last_frame;
+        memcpy(last.bssid, session->last_bssid, sizeof(last.bssid));
+        memcpy(last.tx, session->last_tx, sizeof(last.tx));
+        memcpy(last.da, session->last_da, sizeof(last.da));
+        row->gap_known = row->ts_us >= session->last_ts_us;
+        row->gap_us = row->gap_known ? row->ts_us - session->last_ts_us : 0;
+    } else {
+        row->gap_known = false;
+        row->gap_us = 0;
+    }
+    bool new_burst = !session->has_last ||
+                     !detector_forensic_same_stream(&last, row) ||
+                     !row->gap_known || row->gap_us > DETECTOR_FORENSIC_BURST_GAP_US;
+    if (new_burst) {
+        detector_forensic_increment(&session->burst_count);
+        session->current_burst = 1;
+    } else {
+        detector_forensic_increment(&session->current_burst);
+    }
+    if (session->current_burst > session->largest_burst)
+        session->largest_burst = session->current_burst;
+
+    if (session->count == session->capacity) {
+        memmove(session->rows, session->rows + 1,
+                (session->capacity - 1) * sizeof(*session->rows));
+        --session->count;
+        detector_forensic_increment(&session->local_dropped);
+    }
+    session->rows[session->count++] = *row;
+    detector_forensic_recompute_sequences(session);
+    row->sequence_state = session->rows[session->count - 1].sequence_state;
+    row->sequence_delta = session->rows[session->count - 1].sequence_delta;
+    detector_forensic_increment(&session->accepted);
+    session->has_last = true;
+    session->last_frame = row->frame;
+    memcpy(session->last_bssid, row->bssid, sizeof(session->last_bssid));
+    memcpy(session->last_tx, row->tx, sizeof(session->last_tx));
+    memcpy(session->last_da, row->da, sizeof(session->last_da));
+    session->last_ts_us = row->ts_us;
+    return true;
+}
+
+static void detector_forensic_begin_session(
+    detector_forensic_session_t *session, detector_forensic_row_t *rows,
+    size_t capacity, int owner_tab, int owner_port, uint32_t link_generation,
+    uint32_t command_generation, uint32_t scan_generation)
+{
+    detector_forensic_reset(session, rows, capacity);
+    if (!session || !rows || session->capacity == 0) return;
+    session->active = true;
+    session->owner_tab = owner_tab;
+    session->owner_port = owner_port;
+    session->owner_link_generation = link_generation;
+    session->owner_command_generation = command_generation;
+    session->owner_scan_generation = scan_generation;
+}
+
+static bool detector_forensic_accept_owned(
+    detector_forensic_session_t *session, detector_forensic_row_t *row,
+    int tab, int port, uint32_t link_generation, uint32_t command_generation,
+    uint32_t scan_generation, bool bssid_allowed)
+{
+    if (!session || !session->active || session->finalized || !bssid_allowed ||
+        session->owner_tab != tab || session->owner_port != port ||
+        session->owner_link_generation != link_generation ||
+        session->owner_command_generation != command_generation ||
+        session->owner_scan_generation != scan_generation) return false;
+    if (!detector_forensic_accept(session, row)) return false;
+    session->marker_seen = true;
+    return true;
+}
+
+static void detector_forensic_finalize(detector_forensic_session_t *session)
+{
+    if (!session || !session->active) return;
+    session->active = false;
+    session->finalized = true;
+}
+
+static void detector_forensic_compute_stats(
+    const detector_forensic_session_t *session, detector_forensic_stats_t *stats)
+{
+    if (!stats) return;
+    memset(stats, 0, sizeof(*stats));
+    if (!session || !session->rows) return;
+    int64_t rssi_sum = 0;
+    for (size_t i = 0; i < session->count; ++i) {
+        const detector_forensic_row_t *row = &session->rows[i];
+        bool new_bssid = true, new_da = true;
+        for (size_t j = 0; j < i; ++j) {
+            if (!strcmp(session->rows[j].bssid, row->bssid)) new_bssid = false;
+            if (!strcmp(session->rows[j].da, row->da)) new_da = false;
+        }
+        if (new_bssid) ++stats->unique_bssid;
+        if (new_da) ++stats->unique_da;
+        if (row->rssi_known) {
+            if (stats->rssi_known == 0 || row->rssi < stats->rssi_min)
+                stats->rssi_min = row->rssi;
+            if (stats->rssi_known == 0 || row->rssi > stats->rssi_max)
+                stats->rssi_max = row->rssi;
+            rssi_sum += row->rssi;
+            detector_forensic_increment(&stats->rssi_known);
+        }
+        if (!row->protected_known) detector_forensic_increment(&stats->protected_unknown);
+        else if (row->protected_value) detector_forensic_increment(&stats->protected_count);
+        else detector_forensic_increment(&stats->unprotected_count);
+        if (!row->retry_known) detector_forensic_increment(&stats->retry_unknown);
+        else if (row->retry) detector_forensic_increment(&stats->retry_count);
+    }
+    if (stats->rssi_known) {
+        int64_t magnitude = rssi_sum < 0 ? -rssi_sum : rssi_sum;
+        int64_t rounded = (magnitude + (int64_t)stats->rssi_known / 2) /
+                          (int64_t)stats->rssi_known;
+        stats->rssi_average = (int)(rssi_sum < 0 ? -rounded : rounded);
+    }
+}
+// Detector forensic model end
+
+// Detector forensic logic begin
+static bool detector_forensic_literal(const char **cursor, const char *literal)
+{
+    size_t length = strlen(literal);
+    if (!cursor || !*cursor || strncmp(*cursor, literal, length) != 0) return false;
+    *cursor += length;
+    return true;
+}
+
+static bool detector_forensic_u64(const char **cursor, uint64_t maximum,
+                                  uint64_t *value)
+{
+    if (!cursor || !*cursor || !value || **cursor < '0' || **cursor > '9') return false;
+    uint64_t parsed = 0;
+    const char *p = *cursor;
+    while (*p >= '0' && *p <= '9') {
+        uint64_t digit = (uint64_t)(*p - '0');
+        if (parsed > maximum / 10 ||
+            (parsed == maximum / 10 && digit > maximum % 10)) return false;
+        parsed = parsed * 10 + digit;
+        ++p;
+    }
+    *cursor = p;
+    *value = parsed;
+    return true;
+}
+
+static bool detector_forensic_optional_u16(const char **cursor, uint16_t maximum,
+                                           bool minimum_one, bool *known,
+                                           uint16_t *value)
+{
+    if (!cursor || !*cursor || !known || !value) return false;
+    if (**cursor == '-' && ((*cursor)[1] == ' ' || (*cursor)[1] == '\0')) {
+        ++*cursor;
+        *known = false;
+        *value = 0;
+        return true;
+    }
+    uint64_t parsed = 0;
+    if (!detector_forensic_u64(cursor, maximum, &parsed) ||
+        (minimum_one && parsed == 0)) return false;
+    *known = true;
+    *value = (uint16_t)parsed;
+    return true;
+}
+
+static bool detector_forensic_optional_bit(const char **cursor, bool *known,
+                                           uint8_t *value)
+{
+    uint16_t parsed = 0;
+    if (!detector_forensic_optional_u16(cursor, 1, false, known, &parsed)) return false;
+    *value = (uint8_t)parsed;
+    return true;
+}
+
+static int detector_forensic_hex(char value)
+{
+    if (value >= '0' && value <= '9') return value - '0';
+    if (value >= 'A' && value <= 'F') return value - 'A' + 10;
+    if (value >= 'a' && value <= 'f') return value - 'a' + 10;
+    return -1;
+}
+
+static bool detector_forensic_mac(const char **cursor, char output[18])
+{
+    if (!cursor || !*cursor || !output) return false;
+    const char *p = *cursor;
+    if (strlen(p) < 17) return false;
+    for (int octet = 0; octet < 6; ++octet) {
+        int high = detector_forensic_hex(p[0]);
+        int low = detector_forensic_hex(p[1]);
+        if (high < 0 || low < 0) return false;
+        static const char digits[] = "0123456789ABCDEF";
+        output[octet * 3] = digits[high];
+        output[octet * 3 + 1] = digits[low];
+        if (octet < 5) {
+            if (p[2] != ':') return false;
+            output[octet * 3 + 2] = ':';
+            p += 3;
+        } else {
+            p += 2;
+        }
+    }
+    if (*p != ' ' && *p != '\0') return false;
+    output[17] = '\0';
+    *cursor = p;
+    return true;
+}
+
+static bool detector_forensic_rssi(const char **cursor, bool *known, int16_t *value)
+{
+    if (!cursor || !*cursor || !known || !value) return false;
+    if ((*cursor)[0] == '-' && ((*cursor)[1] == ' ' || (*cursor)[1] == '\0')) {
+        ++*cursor;
+        *known = false;
+        *value = 0;
+        return true;
+    }
+    bool negative = **cursor == '-';
+    if (negative) ++*cursor;
+    uint64_t parsed = 0;
+    if (!detector_forensic_u64(cursor, negative ? 127 : 0, &parsed) ||
+        (negative && parsed == 0)) return false;
+    *known = true;
+    *value = (int16_t)(negative ? -(int)parsed : 0);
+    return true;
+}
+
+static bool detector_forensic_fc(const char **cursor, bool *known, uint16_t *value)
+{
+    if (!cursor || !*cursor || !known || !value) return false;
+    if ((*cursor)[0] == '-' && ((*cursor)[1] == ' ' || (*cursor)[1] == '\0')) {
+        ++*cursor;
+        *known = false;
+        *value = 0;
+        return true;
+    }
+    if (strlen(*cursor) < 6 || (*cursor)[0] != '0' || (*cursor)[1] != 'x')
+        return false;
+    uint16_t parsed = 0;
+    for (int i = 0; i < 4; ++i) {
+        int digit = detector_forensic_hex((*cursor)[2 + i]);
+        if (digit < 0) return false;
+        parsed = (uint16_t)((parsed << 4) | (uint16_t)digit);
+    }
+    if ((*cursor)[6] != ' ' && (*cursor)[6] != '\0') return false;
+    *cursor += 6;
+    *known = true;
+    *value = parsed;
+    return true;
+}
+
+static bool detector_forensic_parse_line(const char *line,
+                                         detector_forensic_row_t *row)
+{
+    if (!line || !row) return false;
+    size_t length = 0;
+    while (length < DETECTOR_FORENSIC_MAX_LINE && line[length]) ++length;
+    if (length == 0 || length >= DETECTOR_FORENSIC_MAX_LINE) return false;
+    const char *p = detector_watch_status_payload(line);
+    const char *prefix = "[DEAUTH_FORENSIC/1] ";
+    if (strncmp(p, prefix, strlen(prefix)) != 0) return false;
+    p += strlen(prefix);
+    detector_forensic_row_t parsed = {0};
+    if (!detector_forensic_literal(&p, "FRAME=")) return false;
+    if (!strncmp(p, "deauth", 6) && p[6] == ' ') {
+        parsed.frame = DETECTOR_FORENSIC_DEAUTH;
+        p += 6;
+    } else if (!strncmp(p, "disassoc", 8) && p[8] == ' ') {
+        parsed.frame = DETECTOR_FORENSIC_DISASSOC;
+        p += 8;
+    } else return false;
+    if (!detector_forensic_literal(&p, " CH=") ||
+        !detector_forensic_optional_u16(&p, 233, true,
+                                       &parsed.channel_known, &parsed.channel) ||
+        !detector_forensic_literal(&p, " BSSID=") ||
+        !detector_forensic_mac(&p, parsed.bssid) ||
+        !detector_forensic_literal(&p, " TX=") ||
+        !detector_forensic_mac(&p, parsed.tx) ||
+        !detector_forensic_literal(&p, " DA=") ||
+        !detector_forensic_mac(&p, parsed.da) ||
+        !detector_forensic_literal(&p, " RSSI=") ||
+        !detector_forensic_rssi(&p, &parsed.rssi_known, &parsed.rssi) ||
+        !detector_forensic_literal(&p, " REASON=") ||
+        !detector_forensic_optional_u16(&p, UINT16_MAX, false,
+                                       &parsed.reason_known, &parsed.reason) ||
+        !detector_forensic_literal(&p, " SEQ=") ||
+        !detector_forensic_optional_u16(&p, 4095, false,
+                                       &parsed.seq_known, &parsed.seq) ||
+        !detector_forensic_literal(&p, " RETRY=") ||
+        !detector_forensic_optional_bit(&p, &parsed.retry_known, &parsed.retry) ||
+        !detector_forensic_literal(&p, " PROTECTED=") ||
+        !detector_forensic_optional_bit(&p, &parsed.protected_known,
+                                        &parsed.protected_value) ||
+        !detector_forensic_literal(&p, " FC=") ||
+        !detector_forensic_fc(&p, &parsed.fc_known, &parsed.fc) ||
+        !detector_forensic_literal(&p, " TS_US=") ||
+        !detector_forensic_u64(&p, UINT64_MAX, &parsed.ts_us) || *p != '\0')
+        return false;
+    *row = parsed;
+    return true;
+}
+
+static bool detector_forensic_is_candidate_line(const char *line)
+{
+    if (!line) return false;
+    const char *p = detector_watch_status_payload(line);
+    return strncmp(p, "[DEAUTH_FORENSIC/1] ",
+                   sizeof("[DEAUTH_FORENSIC/1] ") - 1) == 0;
+}
+// Detector forensic logic end
 
 // BT device storage
 #define BT_MAX_DEVICES 50
@@ -2198,8 +3108,20 @@ typedef struct {
     lv_obj_t *deauth_detector_all_btn;
     lv_obj_t *deauth_detector_selected_btn;
     lv_obj_t *deauth_detector_trace_checkbox;
+    lv_obj_t *deauth_detector_defence_checkbox;
+    lv_obj_t *deauth_detector_pmkid_checkbox;
+    lv_obj_t *deauth_detector_pmkid_overlay;
+    lv_obj_t *deauth_forensic_summary_label;
+    lv_obj_t *deauth_forensic_evidence_overlay;
+    lv_obj_t *deauth_forensic_evidence_list;
+    lv_obj_t *deauth_forensic_bssid_dropdown;
+    lv_obj_t *deauth_forensic_da_dropdown;
+    lv_obj_t *deauth_forensic_reason_dropdown;
+    lv_obj_t *deauth_forensic_frame_dropdown;
 
     deauth_entry_t *deauth_entries;  // PSRAM
+    detector_forensic_row_t *deauth_forensic_rows;  // PSRAM
+    detector_forensic_session_t deauth_forensic;
     int deauth_entry_count;
     uint64_t deauth_total_deauth;
     uint64_t deauth_total_csa;
@@ -2211,6 +3133,8 @@ typedef struct {
     volatile bool deauth_detector_scan_active;
     bool deauth_detector_selected_mode;
     bool deauth_detector_trace_enabled;
+    bool deauth_detector_defence_enabled;
+    bool deauth_detector_pmkid_enabled;
     bool deauth_detector_stop_requested;
     bool deauth_detector_scan_sent;
     bool deauth_detector_start_sent;
@@ -2220,6 +3144,14 @@ typedef struct {
     int deauth_detector_bound_tab; // tab_id_t is declared after tab_context_t
     uart_port_t deauth_detector_bound_port;
     uint32_t deauth_detector_bound_link_generation;
+    uint32_t deauth_detector_command_generation;
+    int64_t deauth_forensic_started_local_us;
+    int64_t deauth_forensic_ended_local_us;
+    char deauth_forensic_filter_bssid[18];
+    char deauth_forensic_filter_da[18];
+    int deauth_forensic_filter_reason;
+    bool deauth_forensic_filter_reason_unknown;
+    int deauth_forensic_filter_frame;
     char deauth_detector_command[320];
     char deauth_detector_line[512];
     int deauth_detector_line_pos;
@@ -3529,6 +4461,16 @@ static void init_tab_context(tab_context_t *ctx) {
             ESP_LOGE(TAG, "Failed to allocate deauth_entries in PSRAM");
         }
     }
+    if (!ctx->deauth_forensic_rows) {
+        ctx->deauth_forensic_rows = heap_caps_calloc(
+            DETECTOR_FORENSIC_CAPACITY, sizeof(detector_forensic_row_t),
+            MALLOC_CAP_SPIRAM);
+        if (!ctx->deauth_forensic_rows) {
+            ESP_LOGE(TAG, "Failed to allocate detector forensic rows in PSRAM");
+        }
+    }
+    detector_forensic_reset(&ctx->deauth_forensic, ctx->deauth_forensic_rows,
+                            DETECTOR_FORENSIC_CAPACITY);
     if (!ctx->detector_watch.networks) {
         ctx->detector_watch.networks = heap_caps_calloc(
             DETECTOR_WATCH_MAX, sizeof(detector_watch_network_t), MALLOC_CAP_SPIRAM);
@@ -4542,6 +5484,12 @@ static void show_deauth_detector_page(void);
 static void deauth_detector_back_btn_event_cb(lv_event_t *e);
 static void deauth_detector_start_cb(lv_event_t *e);
 static void deauth_detector_stop_cb(lv_event_t *e);
+static void deauth_detector_defence_cb(lv_event_t *e);
+static void deauth_detector_pmkid_cb(lv_event_t *e);
+static void deauth_forensic_open_cb(lv_event_t *e);
+static void deauth_forensic_filter_cb(lv_event_t *e);
+static void deauth_forensic_close_cb(lv_event_t *e);
+static void deauth_forensic_refresh_filter_options(tab_context_t *ctx);
 static void deauth_detector_all_cb(lv_event_t *e);
 static void deauth_detector_selected_cb(lv_event_t *e);
 static void deauth_detector_scan_cb(lv_event_t *e);
@@ -50931,6 +51879,153 @@ static bool deauth_detector_send_bound(tab_context_t *ctx, const char *command)
     return true;
 }
 
+static bool deauth_forensic_row_matches(const tab_context_t *ctx,
+                                        const detector_forensic_row_t *row)
+{
+    if (!ctx || !row) return false;
+    if (ctx->deauth_forensic_filter_bssid[0] &&
+        strcmp(ctx->deauth_forensic_filter_bssid, row->bssid)) return false;
+    if (ctx->deauth_forensic_filter_da[0] &&
+        strcmp(ctx->deauth_forensic_filter_da, row->da)) return false;
+    if (ctx->deauth_forensic_filter_frame >= 0 &&
+        ctx->deauth_forensic_filter_frame != (int)row->frame) return false;
+    if (ctx->deauth_forensic_filter_reason_unknown) return !row->reason_known;
+    if (ctx->deauth_forensic_filter_reason >= 0 &&
+        (!row->reason_known || row->reason != ctx->deauth_forensic_filter_reason))
+        return false;
+    return true;
+}
+
+static void deauth_forensic_add_empty(lv_obj_t *list, const char *text)
+{
+    if (!list || !text) return;
+    lv_obj_t *label = lv_label_create(list);
+    lv_label_set_text(label, text);
+    lv_obj_set_width(label, lv_pct(100));
+    lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_color(label, ui_muted_color(), 0);
+    lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
+}
+
+static void deauth_forensic_render_evidence(tab_context_t *ctx)
+{
+    if (!ctx || !ctx->deauth_forensic_evidence_list) return;
+    lv_obj_t *list = ctx->deauth_forensic_evidence_list;
+    lv_obj_clean(list);
+    const detector_forensic_session_t *session = &ctx->deauth_forensic;
+    if (!session->marker_seen && !session->active) {
+        deauth_forensic_add_empty(list, "Forensics unavailable for this firmware");
+        return;
+    }
+    if (session->count == 0) {
+        deauth_forensic_add_empty(
+            list, "No forensic records yet - waiting for optional frame details from JanOS");
+        return;
+    }
+    size_t shown = 0;
+    for (size_t i = 0; i < session->count; ++i) {
+        const detector_forensic_row_t *row = &session->rows[i];
+        if (!deauth_forensic_row_matches(ctx, row)) continue;
+        char channel[8], rssi[8], reason[12], sequence[48], retry[12];
+        char protected_text[12], fc[12], gap[32];
+        snprintf(channel, sizeof(channel), row->channel_known ? "%u" : "-", row->channel);
+        snprintf(rssi, sizeof(rssi), row->rssi_known ? "%d" : "-", row->rssi);
+        snprintf(reason, sizeof(reason), row->reason_known ? "%u" : "-", row->reason);
+        if (!row->seq_known ||
+            row->sequence_state == DETECTOR_FORENSIC_INSUFFICIENT_SEQUENCE)
+            snprintf(sequence, sizeof(sequence), "%s",
+                     row->seq_known ? "Insufficient sequence data" : "SEQ - | Insufficient sequence data");
+        else if (row->sequence_state == DETECTOR_FORENSIC_RETRANSMISSION)
+            snprintf(sequence, sizeof(sequence), "SEQ %u | Retransmission", row->seq);
+        else if (row->sequence_state == DETECTOR_FORENSIC_REPEATED_SEQUENCE)
+            snprintf(sequence, sizeof(sequence), "SEQ %u | Repeated sequence", row->seq);
+        else
+            snprintf(sequence, sizeof(sequence), "SEQ %u | delta %u",
+                     row->seq, row->sequence_delta);
+        snprintf(retry, sizeof(retry), row->retry_known ? (row->retry ? "yes" : "no") : "-");
+        snprintf(protected_text, sizeof(protected_text),
+                 row->protected_known ? (row->protected_value ? "yes" : "no") : "-");
+        snprintf(fc, sizeof(fc), row->fc_known ? "0x%04X" : "-", row->fc);
+        snprintf(gap, sizeof(gap), row->gap_known ? "%llu us" : "-",
+                 (unsigned long long)row->gap_us);
+        lv_obj_t *card = lv_obj_create(list);
+        lv_obj_set_width(card, lv_pct(100));
+        lv_obj_set_height(card, LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_color(card, ui_card_color(), 0);
+        lv_obj_set_style_border_color(card, ui_border_color(), 0);
+        lv_obj_set_style_border_width(card, 1, 0);
+        lv_obj_set_style_radius(card, 8, 0);
+        lv_obj_set_style_pad_all(card, 10, 0);
+        lv_obj_t *label = lv_label_create(card);
+        lv_label_set_text_fmt(
+            label,
+            "%s | CH %s | RSSI %s | reason %s\n"
+            "BSSID %s | Claimed TX %s | Frame recipient %s\n"
+            "%s | Retry %s | Protected %s | FC %s | Gap %s",
+            row->frame == DETECTOR_FORENSIC_DEAUTH ? "Deauth" : "Disassoc",
+            channel, rssi, reason, row->bssid, row->tx, row->da,
+            sequence, retry, protected_text, fc, gap);
+        lv_obj_set_width(label, lv_pct(100));
+        lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_text_color(label, ui_text_color(), 0);
+        ++shown;
+    }
+    if (!shown) deauth_forensic_add_empty(list, "All forensic rows are hidden by the current filters");
+}
+
+static void deauth_forensic_render_summary(tab_context_t *ctx)
+{
+    if (!ctx || !ctx->deauth_forensic_summary_label) return;
+    deauth_forensic_refresh_filter_options(ctx);
+    const detector_forensic_session_t *session = &ctx->deauth_forensic;
+    if (!session->marker_seen) {
+        lv_label_set_text(ctx->deauth_forensic_summary_label,
+            session->active ?
+                "No forensic records yet - waiting for optional frame details from JanOS" :
+                              "Forensics unavailable for this firmware");
+        deauth_forensic_render_evidence(ctx);
+        return;
+    }
+    detector_forensic_stats_t stats = {0};
+    detector_forensic_compute_stats(session, &stats);
+    int64_t end = session->active ? esp_timer_get_time() :
+                  ctx->deauth_forensic_ended_local_us;
+    uint64_t duration_s = end > ctx->deauth_forensic_started_local_us &&
+                          ctx->deauth_forensic_started_local_us > 0
+        ? (uint64_t)((end - ctx->deauth_forensic_started_local_us) / 1000000LL) : 0;
+    if (stats.rssi_known) {
+        lv_label_set_text_fmt(
+            ctx->deauth_forensic_summary_label,
+            "Local duration: %llus | Rows: %llu retained %u | Bursts: %llu | Largest: %llu\n"
+            "Unique BSSID/DA: %u/%u | RSSI min/avg/max: %d/%d/%d dBm\n"
+            "Retry: %llu | Protected/unprotected/unknown: %llu/%llu/%llu | Local drops: %llu",
+            (unsigned long long)duration_s, (unsigned long long)session->accepted,
+            (unsigned)session->count, (unsigned long long)session->burst_count,
+            (unsigned long long)session->largest_burst, (unsigned)stats.unique_bssid,
+            (unsigned)stats.unique_da, stats.rssi_min, stats.rssi_average,
+            stats.rssi_max, (unsigned long long)stats.retry_count,
+            (unsigned long long)stats.protected_count,
+            (unsigned long long)stats.unprotected_count,
+            (unsigned long long)stats.protected_unknown,
+            (unsigned long long)session->local_dropped);
+    } else {
+        lv_label_set_text_fmt(
+            ctx->deauth_forensic_summary_label,
+            "Local duration: %llus | Rows: %llu retained %u | Bursts: %llu | Largest: %llu\n"
+            "Unique BSSID/DA: %u/%u | RSSI min/avg/max: -/-/-\n"
+            "Retry: %llu | Protected/unprotected/unknown: %llu/%llu/%llu | Local drops: %llu",
+            (unsigned long long)duration_s, (unsigned long long)session->accepted,
+            (unsigned)session->count, (unsigned long long)session->burst_count,
+            (unsigned long long)session->largest_burst, (unsigned)stats.unique_bssid,
+            (unsigned)stats.unique_da, (unsigned long long)stats.retry_count,
+            (unsigned long long)stats.protected_count,
+            (unsigned long long)stats.unprotected_count,
+            (unsigned long long)stats.protected_unknown,
+            (unsigned long long)session->local_dropped);
+    }
+    deauth_forensic_render_evidence(ctx);
+}
+
 static void deauth_detector_render_status(tab_context_t *ctx)
 {
     if (!ctx || !ctx->deauth_detector_page) return;
@@ -50969,13 +52064,13 @@ static void deauth_detector_render_status(tab_context_t *ctx)
                          watch->legacy_fallback ? "Legacy fallback (older JanOS)" :
                          watch->details_requested ? "V2 pending" : "V2 on next Start";
     char trace_status[256];
+    char defence_status[256];
     bool session_trace_requested = watch->trace_requested ||
                                    watch->trace_state == DETECTOR_TRACE_LEGACY_DROPPED;
     const char *requested = session_trace_requested ? "yes" : "no";
     const char *uncertain = watch->remote_state_unknown
                                 ? " (remote state uncertain)" : "";
-    if (!session_trace_requested && ctx->deauth_detector_trace_enabled &&
-        watch->phase == DETECTOR_WATCH_STOPPED) {
+    if (!session_trace_requested && ctx->deauth_detector_trace_enabled) {
         snprintf(trace_status, sizeof(trace_status),
                  "Trace requested: no (enabled for next Start) | Trace lock: off");
     } else if (watch->trace_state == DETECTOR_TRACE_UNSUPPORTED) {
@@ -51027,6 +52122,56 @@ static void deauth_detector_render_status(tab_context_t *ctx)
         snprintf(trace_status, sizeof(trace_status),
                  "Trace requested: no | Trace lock: off");
     }
+    if (watch->defence_state == DETECTOR_DEFENCE_UNSUPPORTED) {
+        snprintf(defence_status, sizeof(defence_status),
+                 "Defence unsupported by this JanOS; no passive fallback started");
+    } else if (watch->defence_state == DETECTOR_DEFENCE_WAITING_ARM) {
+        snprintf(defence_status, sizeof(defence_status),
+                 "Defence: waiting for JanOS arm confirmation%s", uncertain);
+    } else if (watch->defence_state == DETECTOR_DEFENCE_ARMED) {
+        snprintf(defence_status, sizeof(defence_status),
+                 "Defence: armed for %d protected BSSID%s | PMKID Lab: %s%s",
+                 watch->defence_targets, watch->defence_targets == 1 ? "" : "s",
+                 watch->pmkid_decoy_requested ? "enabled" : "monitor only", uncertain);
+    } else if (watch->defence_state == DETECTOR_DEFENCE_TRIGGERED) {
+        if (watch->defence_decision == DETECTOR_DEFENCE_DECISION_OBSERVE) {
+            snprintf(defence_status, sizeof(defence_status),
+                     "Defence: observing %s on RX channel %d; no response TX requested%s",
+                     watch->defence_bssid[0] ? watch->defence_bssid : "unknown BSSID",
+                     watch->defence_channel, uncertain);
+        } else {
+            snprintf(defence_status, sizeof(defence_status),
+                     "Defence: responding for %s on RX channel %d; TX not confirmed%s",
+                     watch->defence_bssid[0] ? watch->defence_bssid : "unknown BSSID",
+                     watch->defence_channel, uncertain);
+        }
+    } else if (watch->defence_state == DETECTOR_DEFENCE_PROVISIONAL) {
+        snprintf(defence_status, sizeof(defence_status),
+                 "Defence: provisional RX channel %d for %s; TX not confirmed%s",
+                 watch->defence_channel,
+                 watch->defence_bssid[0] ? watch->defence_bssid : "unknown BSSID",
+                 uncertain);
+    } else if (watch->defence_state == DETECTOR_DEFENCE_TX_OK) {
+        snprintf(defence_status, sizeof(defence_status),
+                 "Defence: decoy TX confirmed by JanOS | responses: %llu%s",
+                 (unsigned long long)watch->defence_responses, uncertain);
+    } else if (watch->defence_state == DETECTOR_DEFENCE_TX_ERROR) {
+        snprintf(defence_status, sizeof(defence_status),
+                 "Defence: JanOS reported a TX error | errors: %llu%s",
+                 (unsigned long long)watch->defence_errors, uncertain);
+    } else if (watch->defence_state == DETECTOR_DEFENCE_RELEASED) {
+        snprintf(defence_status, sizeof(defence_status),
+                 "Defence: released %s from channel %d after idle; suppressed: %llu%s",
+                 watch->defence_bssid[0] ? watch->defence_bssid : "unknown BSSID",
+                 watch->defence_channel,
+                 (unsigned long long)watch->defence_suppressed, uncertain);
+    } else if (ctx->deauth_detector_defence_enabled &&
+               !watch->defence_requested) {
+        snprintf(defence_status, sizeof(defence_status),
+                 "Defence: enabled for next Start | Select protected networks first");
+    } else {
+        snprintf(defence_status, sizeof(defence_status), "Defence: off");
+    }
     if (ctx->deauth_detector_watch_label) {
         if (ctx->deauth_detector_selected_mode) {
             char bssids[96] = {0};
@@ -51052,17 +52197,17 @@ static void deauth_detector_render_status(tab_context_t *ctx)
             }
             lv_label_set_text_fmt(ctx->deauth_detector_watch_label,
                                   "Selected networks | BSSID: %d selected, %d/%d WATCH confirmed%s | Format: %s\n"
-                                  "Watching: %s%s\n%s",
+                                  "Watching: %s%s\n%s\n%s",
                                   watch->selected_count, watch->watched_count,
                                   watch->selected_count,
                                   watch->running && !watch->watch_verified ? " (unverified)" : "",
                                   format, shown ? bssids : "None",
                                   watch->selected_count > shown ? " ... (tap Selected networks for all)" : "",
-                                  trace_status);
+                                  trace_status, defence_status);
         } else {
             lv_label_set_text_fmt(ctx->deauth_detector_watch_label,
-                                  "All networks | all channels | Format: %s\n%s",
-                                  format, trace_status);
+                                  "All networks | all channels | Format: %s\n%s\n%s",
+                                  format, trace_status, defence_status);
         }
     }
     if (ctx->deauth_detector_all_btn) {
@@ -51078,7 +52223,7 @@ static void deauth_detector_render_status(tab_context_t *ctx)
     bool selection_ready = watch->phase == DETECTOR_WATCH_READY &&
                            watch->scan_complete && watch->selected_count > 0;
     if (ctx->deauth_detector_all_btn) {
-        if (busy || watch->remote_state_unknown)
+        if (busy || watch->remote_state_unknown || ctx->deauth_detector_defence_enabled)
             lv_obj_add_state(ctx->deauth_detector_all_btn, LV_STATE_DISABLED);
         else lv_obj_clear_state(ctx->deauth_detector_all_btn, LV_STATE_DISABLED);
     }
@@ -51091,7 +52236,9 @@ static void deauth_detector_render_status(tab_context_t *ctx)
     }
     if (ctx->deauth_detector_start_btn) {
         if (busy || watch->remote_state_unknown || !watch->networks ||
-            (ctx->deauth_detector_selected_mode && !selection_ready))
+            (ctx->deauth_detector_selected_mode && !selection_ready) ||
+            (ctx->deauth_detector_defence_enabled &&
+             (!ctx->deauth_detector_selected_mode || !selection_ready)))
             lv_obj_add_state(ctx->deauth_detector_start_btn, LV_STATE_DISABLED);
         else lv_obj_clear_state(ctx->deauth_detector_start_btn, LV_STATE_DISABLED);
     }
@@ -51111,11 +52258,12 @@ static void deauth_detector_render_status(tab_context_t *ctx)
         else lv_obj_clear_state(ctx->deauth_detector_scan_btn, LV_STATE_DISABLED);
     }
     if (ctx->deauth_detector_trace_checkbox) {
-        if (ctx->deauth_detector_trace_enabled)
+        if (ctx->deauth_detector_trace_enabled || ctx->deauth_detector_defence_enabled)
             lv_obj_add_state(ctx->deauth_detector_trace_checkbox, LV_STATE_CHECKED);
         else
             lv_obj_clear_state(ctx->deauth_detector_trace_checkbox, LV_STATE_CHECKED);
         bool trace_frozen = ctx->deauth_detector_task_active ||
+                            ctx->deauth_detector_defence_enabled ||
                             watch->remote_state_unknown ||
                             watch->phase == DETECTOR_WATCH_STARTING ||
                             watch->phase == DETECTOR_WATCH_RUNNING ||
@@ -51124,6 +52272,31 @@ static void deauth_detector_render_status(tab_context_t *ctx)
             lv_obj_add_state(ctx->deauth_detector_trace_checkbox, LV_STATE_DISABLED);
         else
             lv_obj_clear_state(ctx->deauth_detector_trace_checkbox, LV_STATE_DISABLED);
+    }
+    bool mode_frozen = ctx->deauth_detector_task_active ||
+                       watch->remote_state_unknown ||
+                       watch->phase == DETECTOR_WATCH_STARTING ||
+                       watch->phase == DETECTOR_WATCH_RUNNING ||
+                       watch->phase == DETECTOR_WATCH_STOPPING;
+    if (ctx->deauth_detector_defence_checkbox) {
+        if (ctx->deauth_detector_defence_enabled)
+            lv_obj_add_state(ctx->deauth_detector_defence_checkbox, LV_STATE_CHECKED);
+        else
+            lv_obj_clear_state(ctx->deauth_detector_defence_checkbox, LV_STATE_CHECKED);
+        if (mode_frozen)
+            lv_obj_add_state(ctx->deauth_detector_defence_checkbox, LV_STATE_DISABLED);
+        else
+            lv_obj_clear_state(ctx->deauth_detector_defence_checkbox, LV_STATE_DISABLED);
+    }
+    if (ctx->deauth_detector_pmkid_checkbox) {
+        if (ctx->deauth_detector_pmkid_enabled)
+            lv_obj_add_state(ctx->deauth_detector_pmkid_checkbox, LV_STATE_CHECKED);
+        else
+            lv_obj_clear_state(ctx->deauth_detector_pmkid_checkbox, LV_STATE_CHECKED);
+        if (mode_frozen || !ctx->deauth_detector_defence_enabled)
+            lv_obj_add_state(ctx->deauth_detector_pmkid_checkbox, LV_STATE_DISABLED);
+        else
+            lv_obj_clear_state(ctx->deauth_detector_pmkid_checkbox, LV_STATE_DISABLED);
     }
     if (ctx->deauth_detector_picker_status)
         lv_label_set_text(ctx->deauth_detector_picker_status, status);
@@ -51140,6 +52313,7 @@ static void deauth_detector_render_status(tab_context_t *ctx)
             lv_obj_add_state(ctx->deauth_detector_picker_rescan_btn, LV_STATE_DISABLED);
         else lv_obj_clear_state(ctx->deauth_detector_picker_rescan_btn, LV_STATE_DISABLED);
     }
+    deauth_forensic_render_summary(ctx);
     if (ctx->deauth_detector_network_list) {
         bool show_network_list = ctx->deauth_detector_picker_overlay &&
                                  ctx->deauth_detector_selected_mode &&
@@ -51323,6 +52497,7 @@ static void deauth_detector_disconnect_ui(void *user_data)
     deauth_detector_picker_close(ctx);
     if (ctx->deauth_detector_ui_dirty) {
         update_deauth_table(ctx);
+        deauth_forensic_render_summary(ctx);
         ctx->deauth_detector_ui_dirty = false;
     }
     deauth_detector_render_networks(ctx);
@@ -51455,27 +52630,65 @@ static void deauth_detector_scan_task(void *arg)
 static void deauth_detector_process_line(tab_context_t *ctx, const char *line)
 {
     detector_watch_session_t *watch = &ctx->detector_watch;
+    if (detector_forensic_is_candidate_line(line)) {
+        detector_forensic_row_t forensic = {0};
+        if (detector_forensic_parse_line(line, &forensic)) {
+            tab_id_t owner_tab = (tab_id_t)ctx->deauth_detector_bound_tab;
+            uint32_t link_generation = owner_tab == TAB_USB
+                ? atomic_load(&sta_mac_usb_generation) : 0;
+            bool bssid_allowed = detector_watch_accept_event(watch, forensic.bssid);
+            bsp_display_lock(0);
+            if (watch->phase == DETECTOR_WATCH_RUNNING &&
+                !ctx->deauth_detector_stop_requested &&
+                detector_forensic_accept_owned(
+                    &ctx->deauth_forensic, &forensic, owner_tab,
+                    ctx->deauth_detector_bound_port, link_generation,
+                    ctx->deauth_detector_command_generation,
+                    watch->scan_generation, bssid_allowed)) {
+                ctx->deauth_detector_ui_dirty = true;
+            }
+            bsp_display_unlock();
+        }
+        return;
+    }
     detector_watch_phase_t before = watch->phase;
     bool was_running = watch->running;
     bool had_start_ack = watch->start_ack_seen;
     bool had_details_confirmation = watch->details_confirmed;
     bool trace_status = detector_watch_is_trace_status_line(line);
+    bool defence_status = detector_watch_is_defence_status_line(line);
     bool watch_status = detector_watch_is_watch_status_line(line);
     bool start_status = detector_watch_is_start_status_line(line);
     bool stop_ack = detector_watch_is_stop_ack_line(line);
     if (ctx->deauth_detector_stop_requested && stop_ack &&
         watch->phase == DETECTOR_WATCH_ERROR) {
+        bsp_display_lock(0);
+        if (ctx->deauth_forensic.active)
+            ctx->deauth_forensic_ended_local_us = esp_timer_get_time();
+        detector_forensic_finalize(&ctx->deauth_forensic);
         watch->running = false;
         watch->remote_state_unknown = false;
         watch->trace_requested = false;
         detector_watch_clear_trace_lock(watch);
+        detector_watch_clear_defence(watch);
+        if (strcmp(watch->error,
+                   "JanOS did not confirm selected BSSID watch; remote state unknown") == 0) {
+            snprintf(watch->error, sizeof(watch->error), "%s",
+                     "JanOS did not confirm selected BSSID watch; safety stop confirmed");
+        }
         ctx->deauth_detector_task_active = false;
-        bsp_display_lock(0);
         deauth_detector_render_status(ctx); // Preserve the reason for the failed start/watch.
         bsp_display_unlock();
         return;
     }
     detector_watch_status_line(watch, line);
+    if (stop_ack) {
+        bsp_display_lock(0);
+        if (ctx->deauth_forensic.active)
+            ctx->deauth_forensic_ended_local_us = esp_timer_get_time();
+        detector_forensic_finalize(&ctx->deauth_forensic);
+        bsp_display_unlock();
+    }
     (void)detector_watch_start_watch_deadline(
         watch, esp_timer_get_time(), &ctx->deauth_detector_watch_started_us);
     if (watch->legacy_retry_pending) {
@@ -51510,8 +52723,19 @@ static void deauth_detector_process_line(tab_context_t *ctx, const char *line)
     if (start_confirmed) {
         ctx->deauth_detector_phase_started_us = esp_timer_get_time();
         ctx->deauth_detector_watch_started_us = 0;
+        bsp_display_lock(0);
+        detector_forensic_begin_session(
+            &ctx->deauth_forensic, ctx->deauth_forensic_rows,
+            DETECTOR_FORENSIC_CAPACITY, ctx->deauth_detector_bound_tab,
+            ctx->deauth_detector_bound_port,
+            ctx->deauth_detector_bound_link_generation,
+            ctx->deauth_detector_command_generation, watch->scan_generation);
+        ctx->deauth_forensic_started_local_us = ctx->deauth_detector_phase_started_us;
+        ctx->deauth_forensic_ended_local_us = 0;
+        bsp_display_unlock();
     }
     if (watch->phase != before || watch->running != was_running || trace_status ||
+        defence_status ||
         watch_status || watch->start_ack_seen != had_start_ack ||
         watch->details_confirmed != had_details_confirmation) {
         ctx->deauth_detector_running = watch->phase == DETECTOR_WATCH_RUNNING;
@@ -51556,7 +52780,7 @@ static void deauth_detector_process_line(tab_context_t *ctx, const char *line)
         bsp_display_unlock();
         return;
     }
-    if (trace_status) return;
+    if (trace_status || defence_status) return;
     if (watch->phase != DETECTOR_WATCH_RUNNING || ctx->deauth_detector_stop_requested ||
         !ctx->deauth_entries) return;
     deauth_entry_t entry = {0};
@@ -51697,6 +52921,7 @@ static void deauth_detector_poll(tab_context_t *ctx)
         (now - ctx->deauth_detector_last_ui_us >= 250000 ||
          !ctx->deauth_detector_task_active)) {
         update_deauth_table(ctx);
+        deauth_forensic_render_summary(ctx);
         ctx->deauth_detector_ui_dirty = false;
         ctx->deauth_detector_last_ui_us = now;
     }
@@ -51745,16 +52970,25 @@ static void deauth_detector_start_cb(lv_event_t *e)
         return;
     }
     uint32_t generation = atomic_load(&detector_scan_epoch[(size_t)tab]);
-    bool trace = ctx->deauth_detector_trace_enabled;
-    if (!detector_watch_build_v2_command(&ctx->detector_watch,
-                                         ctx->deauth_detector_selected_mode, generation,
-                                         trace, ctx->deauth_detector_command,
-                                         sizeof(ctx->deauth_detector_command))) {
-        deauth_detector_set_error(ctx, "Select BSSID from a fresh completed JanOS scan");
+    bool defence = ctx->deauth_detector_defence_enabled;
+    bool trace = ctx->deauth_detector_trace_enabled || defence;
+    if (!detector_watch_build_mode_command(&ctx->detector_watch,
+                                           ctx->deauth_detector_selected_mode,
+                                           generation, trace, defence,
+                                           ctx->deauth_detector_pmkid_enabled,
+                                           ctx->deauth_detector_command,
+                                           sizeof(ctx->deauth_detector_command))) {
+        deauth_detector_set_error(ctx, defence
+            ? "Select protected networks first"
+            : "Select BSSID from a fresh completed JanOS scan");
         return;
     }
-    detector_watch_begin_start_v2(&ctx->detector_watch,
-                                  ctx->deauth_detector_selected_mode, trace);
+    if (++ctx->deauth_detector_command_generation == 0)
+        ++ctx->deauth_detector_command_generation;
+    detector_watch_begin_start_v2_mode(&ctx->detector_watch,
+                                       ctx->deauth_detector_selected_mode,
+                                       trace, defence,
+                                       ctx->deauth_detector_pmkid_enabled);
     ctx->deauth_detector_watch_started_us = 0;
     ctx->deauth_detector_start_sent = false;
     ctx->deauth_detector_stop_requested = false;
@@ -52003,7 +53237,8 @@ static void deauth_detector_trace_cb(lv_event_t *e)
     tab_context_t *ctx = lv_event_get_user_data(e);
     if (!ctx || !ctx->deauth_detector_trace_checkbox) return;
     const detector_watch_session_t *watch = &ctx->detector_watch;
-    bool frozen = ctx->deauth_detector_task_active || watch->remote_state_unknown ||
+    bool frozen = ctx->deauth_detector_task_active ||
+                  ctx->deauth_detector_defence_enabled || watch->remote_state_unknown ||
                   watch->phase == DETECTOR_WATCH_STARTING ||
                   watch->phase == DETECTOR_WATCH_RUNNING ||
                   watch->phase == DETECTOR_WATCH_STOPPING;
@@ -52014,14 +53249,370 @@ static void deauth_detector_trace_cb(lv_event_t *e)
     deauth_detector_render_status(ctx);
 }
 
+static void deauth_detector_pmkid_close(tab_context_t *ctx)
+{
+    if (!ctx || !ctx->deauth_detector_pmkid_overlay) return;
+    lv_obj_del(ctx->deauth_detector_pmkid_overlay);
+    ctx->deauth_detector_pmkid_overlay = NULL;
+}
+
+static void deauth_detector_pmkid_cancel_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = lv_event_get_user_data(e);
+    if (!ctx) return;
+    ctx->deauth_detector_pmkid_enabled = false;
+    deauth_detector_pmkid_close(ctx);
+    deauth_detector_render_status(ctx);
+}
+
+static void deauth_detector_pmkid_confirm_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = lv_event_get_user_data(e);
+    if (!ctx || !ctx->deauth_detector_defence_enabled ||
+        ctx->deauth_detector_task_active || ctx->detector_watch.remote_state_unknown)
+        return;
+    ctx->deauth_detector_pmkid_enabled = true;
+    deauth_detector_pmkid_close(ctx);
+    deauth_detector_render_status(ctx);
+}
+
+static bool deauth_detector_pmkid_warning_open(tab_context_t *ctx)
+{
+    if (!ctx || !ctx->deauth_detector_page) return false;
+    if (ctx->deauth_detector_pmkid_overlay) return true;
+    lv_obj_t *container = lv_obj_get_parent(ctx->deauth_detector_page);
+    if (!container) return false;
+    lv_obj_t *overlay = lv_obj_create(container);
+    ctx->deauth_detector_pmkid_overlay = overlay;
+    style_modal_overlay(overlay, LV_OPA_50);
+    lv_obj_add_flag(overlay, LV_OBJ_FLAG_FLOATING);
+    lv_obj_move_foreground(overlay);
+    lv_obj_t *popup = lv_obj_create(overlay);
+    lv_obj_set_size(popup, popup_clamp_w(650), popup_clamp_h(330));
+    lv_obj_center(popup);
+    style_popup_card(popup, 16, COLOR_MATERIAL_AMBER);
+    lv_obj_set_style_bg_color(popup, ui_card_color(), 0);
+    lv_obj_set_flex_flow(popup, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(popup, 14, 0);
+
+    lv_obj_t *title = lv_label_create(popup);
+    lv_label_set_text(title, "Enable PMKID Lab?");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, COLOR_MATERIAL_AMBER, 0);
+    lv_obj_t *warning = lv_label_create(popup);
+    lv_label_set_text(warning,
+        "PMKID Lab is experimental. Legitimate joins are indistinguishable from harvesting at this layer. "
+        "Enable it only for controlled networks in a controlled RF laboratory. This is evidence and deception, not attack prevention.");
+    lv_obj_set_width(warning, lv_pct(100));
+    lv_label_set_long_mode(warning, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_color(warning, ui_text_color(), 0);
+
+    lv_obj_t *actions = lv_obj_create(popup);
+    lv_obj_set_size(actions, lv_pct(100), 52);
+    lv_obj_set_style_bg_opa(actions, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(actions, 0, 0);
+    lv_obj_set_style_pad_all(actions, 0, 0);
+    lv_obj_set_flex_flow(actions, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(actions, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(actions, 12, 0);
+    lv_obj_t *cancel = lv_btn_create(actions);
+    lv_obj_set_size(cancel, 120, 44);
+    lv_obj_set_style_bg_color(cancel, lv_color_hex(0x4A4A4A), 0);
+    lv_obj_add_event_cb(cancel, deauth_detector_pmkid_cancel_cb,
+                        LV_EVENT_CLICKED, ctx);
+    lv_obj_t *cancel_label = lv_label_create(cancel);
+    lv_label_set_text(cancel_label, "Cancel");
+    lv_obj_center(cancel_label);
+    lv_obj_t *confirm = lv_btn_create(actions);
+    lv_obj_set_size(confirm, 190, 44);
+    lv_obj_set_style_bg_color(confirm, COLOR_MATERIAL_AMBER, 0);
+    lv_obj_add_event_cb(confirm, deauth_detector_pmkid_confirm_cb,
+                        LV_EVENT_CLICKED, ctx);
+    lv_obj_t *confirm_label = lv_label_create(confirm);
+    lv_label_set_text(confirm_label, "Enable PMKID Lab");
+    lv_obj_center(confirm_label);
+    return true;
+}
+
+static void deauth_detector_defence_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = lv_event_get_user_data(e);
+    if (!ctx || !ctx->deauth_detector_defence_checkbox) return;
+    const detector_watch_session_t *watch = &ctx->detector_watch;
+    bool frozen = ctx->deauth_detector_task_active || watch->remote_state_unknown ||
+                  watch->phase == DETECTOR_WATCH_STARTING ||
+                  watch->phase == DETECTOR_WATCH_RUNNING ||
+                  watch->phase == DETECTOR_WATCH_STOPPING;
+    if (frozen) {
+        deauth_detector_render_status(ctx);
+        return;
+    }
+    bool enabled = lv_obj_has_state(ctx->deauth_detector_defence_checkbox,
+                                    LV_STATE_CHECKED);
+    ctx->deauth_detector_defence_enabled = enabled;
+    if (!enabled) {
+        ctx->deauth_detector_pmkid_enabled = false;
+        deauth_detector_pmkid_close(ctx);
+    } else {
+        ctx->deauth_detector_trace_enabled = true;
+        if (!ctx->deauth_detector_selected_mode) {
+            ctx->deauth_detector_selected_mode = true;
+            deauth_detector_render_status(ctx);
+            deauth_detector_scan_cb(e);
+            return;
+        }
+    }
+    deauth_detector_render_status(ctx);
+}
+
+static void deauth_detector_pmkid_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = lv_event_get_user_data(e);
+    if (!ctx || !ctx->deauth_detector_pmkid_checkbox) return;
+    if (!ctx->deauth_detector_defence_enabled || ctx->deauth_detector_task_active ||
+        ctx->detector_watch.remote_state_unknown) {
+        deauth_detector_render_status(ctx);
+        return;
+    }
+    bool checked = lv_obj_has_state(ctx->deauth_detector_pmkid_checkbox,
+                                    LV_STATE_CHECKED);
+    if (!checked) {
+        ctx->deauth_detector_pmkid_enabled = false;
+        deauth_detector_pmkid_close(ctx);
+        deauth_detector_render_status(ctx);
+        return;
+    }
+    lv_obj_clear_state(ctx->deauth_detector_pmkid_checkbox, LV_STATE_CHECKED);
+    ctx->deauth_detector_pmkid_enabled = false;
+    if (!deauth_detector_pmkid_warning_open(ctx))
+        deauth_detector_set_error(ctx, "Could not open PMKID Lab confirmation");
+    deauth_detector_render_status(ctx);
+}
+
+static void deauth_forensic_close_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = e ? lv_event_get_user_data(e) : NULL;
+    if (!ctx || !ctx->deauth_forensic_evidence_overlay) return;
+    lv_obj_del(ctx->deauth_forensic_evidence_overlay);
+    ctx->deauth_forensic_evidence_overlay = NULL;
+    ctx->deauth_forensic_evidence_list = NULL;
+    ctx->deauth_forensic_bssid_dropdown = NULL;
+    ctx->deauth_forensic_da_dropdown = NULL;
+    ctx->deauth_forensic_reason_dropdown = NULL;
+    ctx->deauth_forensic_frame_dropdown = NULL;
+}
+
+static void deauth_forensic_filter_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = lv_event_get_user_data(e);
+    lv_obj_t *target = lv_event_get_target(e);
+    if (!ctx || !target) return;
+    char selected[48] = {0};
+    lv_dropdown_get_selected_str(target, selected, sizeof(selected));
+    if (target == ctx->deauth_forensic_bssid_dropdown) {
+        snprintf(ctx->deauth_forensic_filter_bssid,
+                 sizeof(ctx->deauth_forensic_filter_bssid), "%s",
+                 !strcmp(selected, "All BSSIDs") ? "" : selected);
+    } else if (target == ctx->deauth_forensic_da_dropdown) {
+        snprintf(ctx->deauth_forensic_filter_da,
+                 sizeof(ctx->deauth_forensic_filter_da), "%s",
+                 !strcmp(selected, "All recipients") ? "" : selected);
+    } else if (target == ctx->deauth_forensic_reason_dropdown) {
+        ctx->deauth_forensic_filter_reason_unknown = !strcmp(selected, "Unknown");
+        ctx->deauth_forensic_filter_reason = !strncmp(selected, "Reason ", 7)
+            ? atoi(selected + 7) : -1;
+    } else if (target == ctx->deauth_forensic_frame_dropdown) {
+        ctx->deauth_forensic_filter_frame = !strcmp(selected, "Deauth")
+            ? DETECTOR_FORENSIC_DEAUTH : !strcmp(selected, "Disassoc")
+            ? DETECTOR_FORENSIC_DISASSOC : -1;
+    }
+    deauth_forensic_render_evidence(ctx);
+}
+
+static void deauth_forensic_append_option(char *options, size_t capacity,
+                                          const char *value)
+{
+    if (!options || !capacity || !value || !value[0]) return;
+    size_t used = strlen(options);
+    if (used >= capacity - 1) return;
+    snprintf(options + used, capacity - used, "%s%s", used ? "\n" : "", value);
+}
+
+static bool deauth_forensic_restore_option(lv_obj_t *dropdown, const char *value)
+{
+    if (!dropdown || !value || !value[0]) return false;
+    int32_t index = lv_dropdown_get_option_index(dropdown, value);
+    if (index < 0) return false;
+    lv_dropdown_set_selected(dropdown, (uint32_t)index);
+    return true;
+}
+
+static void deauth_forensic_refresh_filter_options(tab_context_t *ctx)
+{
+    if (!ctx || !ctx->deauth_forensic_bssid_dropdown ||
+        !ctx->deauth_forensic_da_dropdown || !ctx->deauth_forensic_reason_dropdown)
+        return;
+    const size_t mac_options_capacity = 2600;
+    const size_t reason_options_capacity = 1800;
+    char *bssid_options = heap_caps_calloc(mac_options_capacity, 1, MALLOC_CAP_SPIRAM);
+    char *da_options = heap_caps_calloc(mac_options_capacity, 1, MALLOC_CAP_SPIRAM);
+    char *reason_options = heap_caps_calloc(reason_options_capacity, 1, MALLOC_CAP_SPIRAM);
+    if (bssid_options) snprintf(bssid_options, mac_options_capacity, "All BSSIDs");
+    if (da_options) snprintf(da_options, mac_options_capacity, "All recipients");
+    if (reason_options)
+        snprintf(reason_options, reason_options_capacity, "All reasons\nUnknown");
+    const detector_forensic_session_t *session = &ctx->deauth_forensic;
+    for (size_t i = 0; i < session->count; ++i) {
+        bool bssid_seen = false, da_seen = false, reason_seen = false;
+        for (size_t j = 0; j < i; ++j) {
+            if (!strcmp(session->rows[j].bssid, session->rows[i].bssid)) bssid_seen = true;
+            if (!strcmp(session->rows[j].da, session->rows[i].da)) da_seen = true;
+            if (session->rows[i].reason_known && session->rows[j].reason_known &&
+                session->rows[j].reason == session->rows[i].reason) reason_seen = true;
+        }
+        if (bssid_options && !bssid_seen)
+            deauth_forensic_append_option(bssid_options, mac_options_capacity,
+                                          session->rows[i].bssid);
+        if (da_options && !da_seen)
+            deauth_forensic_append_option(da_options, mac_options_capacity,
+                                          session->rows[i].da);
+        if (reason_options && session->rows[i].reason_known && !reason_seen) {
+            char reason[24];
+            snprintf(reason, sizeof(reason), "Reason %u", session->rows[i].reason);
+            deauth_forensic_append_option(reason_options, reason_options_capacity, reason);
+        }
+    }
+    lv_dropdown_set_options(ctx->deauth_forensic_bssid_dropdown,
+                            bssid_options ? bssid_options : "All BSSIDs");
+    lv_dropdown_set_options(ctx->deauth_forensic_da_dropdown,
+                            da_options ? da_options : "All recipients");
+    lv_dropdown_set_options(ctx->deauth_forensic_reason_dropdown,
+                            reason_options ? reason_options : "All reasons\nUnknown");
+    if (ctx->deauth_forensic_filter_bssid[0] &&
+        !deauth_forensic_restore_option(ctx->deauth_forensic_bssid_dropdown,
+                                        ctx->deauth_forensic_filter_bssid))
+        ctx->deauth_forensic_filter_bssid[0] = '\0';
+    if (ctx->deauth_forensic_filter_da[0] &&
+        !deauth_forensic_restore_option(ctx->deauth_forensic_da_dropdown,
+                                        ctx->deauth_forensic_filter_da))
+        ctx->deauth_forensic_filter_da[0] = '\0';
+    if (ctx->deauth_forensic_filter_reason_unknown) {
+        if (!deauth_forensic_restore_option(ctx->deauth_forensic_reason_dropdown,
+                                            "Unknown"))
+            ctx->deauth_forensic_filter_reason_unknown = false;
+    } else if (ctx->deauth_forensic_filter_reason >= 0) {
+        char selected_reason[24];
+        snprintf(selected_reason, sizeof(selected_reason), "Reason %d",
+                 ctx->deauth_forensic_filter_reason);
+        if (!deauth_forensic_restore_option(ctx->deauth_forensic_reason_dropdown,
+                                            selected_reason))
+            ctx->deauth_forensic_filter_reason = -1;
+    }
+    if (bssid_options) heap_caps_free(bssid_options);
+    if (da_options) heap_caps_free(da_options);
+    if (reason_options) heap_caps_free(reason_options);
+}
+
+static void deauth_forensic_open_cb(lv_event_t *e)
+{
+    tab_context_t *ctx = lv_event_get_user_data(e);
+    if (!ctx || !ctx->deauth_detector_page || ctx->deauth_forensic_evidence_overlay)
+        return;
+    ctx->deauth_forensic_filter_bssid[0] = '\0';
+    ctx->deauth_forensic_filter_da[0] = '\0';
+    ctx->deauth_forensic_filter_reason = -1;
+    ctx->deauth_forensic_filter_reason_unknown = false;
+    ctx->deauth_forensic_filter_frame = -1;
+
+    lv_obj_t *container = lv_obj_get_parent(ctx->deauth_detector_page);
+    if (!container) return;
+    lv_obj_t *overlay = lv_obj_create(container);
+    ctx->deauth_forensic_evidence_overlay = overlay;
+    style_modal_overlay(overlay, LV_OPA_60);
+    lv_obj_add_flag(overlay, LV_OBJ_FLAG_FLOATING);
+    lv_obj_move_foreground(overlay);
+    lv_obj_t *popup = lv_obj_create(overlay);
+    lv_obj_set_size(popup, popup_clamp_w(1080), popup_clamp_h(680));
+    lv_obj_center(popup);
+    style_popup_card(popup, 14, COLOR_MATERIAL_BLUE);
+    lv_obj_set_style_bg_color(popup, ui_panel_color(), 0);
+    lv_obj_set_flex_flow(popup, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(popup, 10, 0);
+
+    lv_obj_t *header = lv_obj_create(popup);
+    lv_obj_set_size(header, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(header, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(header, 0, 0);
+    lv_obj_set_style_pad_all(header, 0, 0);
+    lv_obj_set_flex_flow(header, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(header, LV_FLEX_ALIGN_SPACE_BETWEEN,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_t *title = lv_label_create(header);
+    lv_label_set_text(title, "Forensic evidence");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, ui_text_color(), 0);
+    lv_obj_t *close = lv_btn_create(header);
+    lv_obj_set_size(close, 100, 42);
+    style_neutral_button(close);
+    lv_obj_add_event_cb(close, deauth_forensic_close_cb, LV_EVENT_CLICKED, ctx);
+    lv_obj_t *close_label = lv_label_create(close);
+    lv_label_set_text(close_label, "Close");
+    lv_obj_center(close_label);
+
+    lv_obj_t *filters = lv_obj_create(popup);
+    lv_obj_set_size(filters, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(filters, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(filters, 0, 0);
+    lv_obj_set_style_pad_all(filters, 0, 0);
+    lv_obj_set_flex_flow(filters, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_style_pad_column(filters, 8, 0);
+    lv_obj_set_style_pad_row(filters, 6, 0);
+    ctx->deauth_forensic_bssid_dropdown = lv_dropdown_create(filters);
+    lv_obj_set_width(ctx->deauth_forensic_bssid_dropdown, 210);
+    ctx->deauth_forensic_da_dropdown = lv_dropdown_create(filters);
+    lv_obj_set_width(ctx->deauth_forensic_da_dropdown, 210);
+    ctx->deauth_forensic_reason_dropdown = lv_dropdown_create(filters);
+    lv_obj_set_width(ctx->deauth_forensic_reason_dropdown, 160);
+    deauth_forensic_refresh_filter_options(ctx);
+    ctx->deauth_forensic_frame_dropdown = lv_dropdown_create(filters);
+    lv_obj_set_width(ctx->deauth_forensic_frame_dropdown, 150);
+    lv_dropdown_set_options(ctx->deauth_forensic_frame_dropdown,
+                            "All frames\nDeauth\nDisassoc");
+    lv_obj_add_event_cb(ctx->deauth_forensic_bssid_dropdown,
+                        deauth_forensic_filter_cb, LV_EVENT_VALUE_CHANGED, ctx);
+    lv_obj_add_event_cb(ctx->deauth_forensic_da_dropdown,
+                        deauth_forensic_filter_cb, LV_EVENT_VALUE_CHANGED, ctx);
+    lv_obj_add_event_cb(ctx->deauth_forensic_reason_dropdown,
+                        deauth_forensic_filter_cb, LV_EVENT_VALUE_CHANGED, ctx);
+    lv_obj_add_event_cb(ctx->deauth_forensic_frame_dropdown,
+                        deauth_forensic_filter_cb, LV_EVENT_VALUE_CHANGED, ctx);
+
+    lv_obj_t *note = lv_label_create(popup);
+    lv_label_set_text(note, "Evidence only - not transmitter attribution");
+    lv_obj_set_width(note, lv_pct(100));
+    lv_obj_set_style_text_color(note, ui_muted_color(), 0);
+    ctx->deauth_forensic_evidence_list = lv_obj_create(popup);
+    lv_obj_set_size(ctx->deauth_forensic_evidence_list, lv_pct(100), 0);
+    lv_obj_set_flex_grow(ctx->deauth_forensic_evidence_list, 1);
+    lv_obj_set_style_bg_opa(ctx->deauth_forensic_evidence_list, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(ctx->deauth_forensic_evidence_list, 0, 0);
+    lv_obj_set_style_pad_all(ctx->deauth_forensic_evidence_list, 0, 0);
+    lv_obj_set_style_pad_row(ctx->deauth_forensic_evidence_list, 8, 0);
+    lv_obj_set_flex_flow(ctx->deauth_forensic_evidence_list, LV_FLEX_FLOW_COLUMN);
+    deauth_forensic_render_evidence(ctx);
+}
+
 static void deauth_detector_all_cb(lv_event_t *e)
 {
     tab_context_t *ctx = lv_event_get_user_data(e);
-    if (!ctx || ctx->detector_watch.remote_state_unknown ||
+    if (!ctx || ctx->deauth_detector_defence_enabled ||
+        ctx->detector_watch.remote_state_unknown ||
         ctx->deauth_detector_task_active || ctx->deauth_detector_scan_active ||
         ctx->deauth_detector_task || ctx->deauth_detector_scan_task) return;
     deauth_detector_picker_close(ctx);
-    ctx->deauth_detector_selected_mode = false;
+    if (!ctx->deauth_detector_defence_enabled)
+        ctx->deauth_detector_selected_mode = false;
     deauth_detector_render_status(ctx);
 }
 
@@ -52094,6 +53685,17 @@ static void deauth_detector_back_btn_event_cb(lv_event_t *e)
 {
     tab_context_t *ctx = e ? lv_event_get_user_data(e) : get_current_ctx();
     if (!ctx) return;
+    if (ctx->deauth_forensic_evidence_overlay) {
+        lv_obj_del(ctx->deauth_forensic_evidence_overlay);
+        ctx->deauth_forensic_evidence_overlay = NULL;
+        ctx->deauth_forensic_evidence_list = NULL;
+        ctx->deauth_forensic_bssid_dropdown = NULL;
+        ctx->deauth_forensic_da_dropdown = NULL;
+        ctx->deauth_forensic_reason_dropdown = NULL;
+        ctx->deauth_forensic_frame_dropdown = NULL;
+        return;
+    }
+    deauth_detector_pmkid_close(ctx);
     if (ctx->deauth_detector_task_active || ctx->deauth_detector_scan_active ||
         ctx->detector_watch.remote_state_unknown) {
         deauth_detector_request_stop(ctx);
@@ -52291,12 +53893,41 @@ static void show_deauth_detector_page(void)
     lv_label_set_text(scan_label, "Scan again");
     lv_obj_center(scan_label);
 
-    lv_obj_t *trace_checkbox = lv_checkbox_create(ctx->deauth_detector_page);
+    lv_obj_t *detector_modes = lv_obj_create(ctx->deauth_detector_page);
+    lv_obj_set_size(detector_modes, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(detector_modes, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(detector_modes, 0, 0);
+    lv_obj_set_style_pad_all(detector_modes, 0, 0);
+    lv_obj_set_flex_flow(detector_modes, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_flex_align(detector_modes, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(detector_modes, 22, 0);
+    lv_obj_set_style_pad_row(detector_modes, 8, 0);
+    lv_obj_clear_flag(detector_modes, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *trace_checkbox = lv_checkbox_create(detector_modes);
     ctx->deauth_detector_trace_checkbox = trace_checkbox;
     lv_checkbox_set_text(trace_checkbox, "Channel trace (passive)");
     lv_obj_set_size(trace_checkbox, LV_SIZE_CONTENT, 30);
     lv_obj_set_style_text_color(trace_checkbox, lv_color_hex(0xE6E6E6), 0);
     lv_obj_add_event_cb(trace_checkbox, deauth_detector_trace_cb,
+                        LV_EVENT_VALUE_CHANGED, ctx);
+
+    lv_obj_t *defence_checkbox = lv_checkbox_create(detector_modes);
+    ctx->deauth_detector_defence_checkbox = defence_checkbox;
+    lv_checkbox_set_text(defence_checkbox, "Defence");
+    lv_obj_set_size(defence_checkbox, LV_SIZE_CONTENT, 30);
+    lv_obj_set_style_text_color(defence_checkbox, lv_color_hex(0xE6E6E6), 0);
+    lv_obj_add_event_cb(defence_checkbox, deauth_detector_defence_cb,
+                        LV_EVENT_VALUE_CHANGED, ctx);
+
+    lv_obj_t *pmkid_checkbox = lv_checkbox_create(detector_modes);
+    ctx->deauth_detector_pmkid_checkbox = pmkid_checkbox;
+    lv_checkbox_set_text(pmkid_checkbox, "PMKID Lab (advanced)");
+    lv_obj_set_size(pmkid_checkbox, LV_SIZE_CONTENT, 30);
+    lv_obj_set_style_text_color(pmkid_checkbox, lv_color_hex(0xE6E6E6), 0);
+    lv_obj_add_state(pmkid_checkbox, LV_STATE_DISABLED);
+    lv_obj_add_event_cb(pmkid_checkbox, deauth_detector_pmkid_cb,
                         LV_EVENT_VALUE_CHANGED, ctx);
 
     ctx->deauth_detector_status_label = lv_label_create(ctx->deauth_detector_page);
@@ -52309,6 +53940,45 @@ static void show_deauth_detector_page(void)
     lv_label_set_long_mode(ctx->deauth_detector_watch_label, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_font(ctx->deauth_detector_watch_label, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(ctx->deauth_detector_watch_label, lv_color_hex(0xCCCCCC), 0);
+
+    lv_obj_t *forensic_card = lv_obj_create(ctx->deauth_detector_page);
+    lv_obj_set_width(forensic_card, lv_pct(100));
+    lv_obj_set_height(forensic_card, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_color(forensic_card, ui_card_color(), 0);
+    lv_obj_set_style_border_color(forensic_card, ui_border_color(), 0);
+    lv_obj_set_style_border_width(forensic_card, 1, 0);
+    lv_obj_set_style_radius(forensic_card, 10, 0);
+    lv_obj_set_style_pad_all(forensic_card, 10, 0);
+    lv_obj_set_flex_flow(forensic_card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(forensic_card, 6, 0);
+    lv_obj_t *forensic_header = lv_obj_create(forensic_card);
+    lv_obj_set_size(forensic_header, lv_pct(100), LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(forensic_header, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(forensic_header, 0, 0);
+    lv_obj_set_style_pad_all(forensic_header, 0, 0);
+    lv_obj_set_flex_flow(forensic_header, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(forensic_header, LV_FLEX_ALIGN_SPACE_BETWEEN,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_t *forensic_title = lv_label_create(forensic_header);
+    lv_label_set_text(forensic_title, "Forensics");
+    lv_obj_set_style_text_font(forensic_title, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(forensic_title, ui_text_color(), 0);
+    lv_obj_t *forensic_open = lv_btn_create(forensic_header);
+    lv_obj_set_size(forensic_open, LV_SIZE_CONTENT, 38);
+    style_neutral_button(forensic_open);
+    lv_obj_add_event_cb(forensic_open, deauth_forensic_open_cb,
+                        LV_EVENT_CLICKED, ctx);
+    lv_obj_t *forensic_open_label = lv_label_create(forensic_open);
+    lv_label_set_text(forensic_open_label, "View evidence");
+    lv_obj_center(forensic_open_label);
+    lv_obj_t *forensic_note = lv_label_create(forensic_card);
+    lv_label_set_text(forensic_note, "Evidence only - not transmitter attribution");
+    lv_obj_set_width(forensic_note, lv_pct(100));
+    lv_obj_set_style_text_color(forensic_note, ui_muted_color(), 0);
+    ctx->deauth_forensic_summary_label = lv_label_create(forensic_card);
+    lv_obj_set_width(ctx->deauth_forensic_summary_label, lv_pct(100));
+    lv_label_set_long_mode(ctx->deauth_forensic_summary_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_color(ctx->deauth_forensic_summary_label, ui_text_color(), 0);
 
     // Status/count label
     lv_obj_t *count_label = lv_label_create(ctx->deauth_detector_page);

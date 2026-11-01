@@ -478,7 +478,7 @@ class SelectedDeauthDetectorBrowser(unittest.TestCase):
                         item.text.includes('1 selected, 1/1 WATCH confirmed'));
                 }""", timeout=30000)
 
-                # Consume and hold JanOS's first Stop reply at the UART boundary.
+                # Hold both partial and exact-final Stop replies at the UART boundary.
                 page.evaluate("""() => {
                     globalThis.heldStopReplies = [];
                     globalThis.holdStopReply = true;
@@ -487,7 +487,9 @@ class SelectedDeauthDetectorBrowser(unittest.TestCase):
                         if (!holdStopReply && heldStopReplies.length)
                             return heldStopReplies.shift();
                         const line = read(tab);
-                        if (tab === 0 && holdStopReply && line?.includes('Deauth Detector stopped.')) {
+                        if (tab === 0 && holdStopReply &&
+                            (line === 'Deauth Detector stopped.' ||
+                             line === 'All operations stopped.')) {
                             heldStopReplies.push(line);
                             return null;
                         }
@@ -498,7 +500,7 @@ class SelectedDeauthDetectorBrowser(unittest.TestCase):
                 self.assertIn("Deauth Detector", self.text(page))
                 self.assertIn("Stopping... waiting for JanOS confirmation", self.text(page))
                 self.advance(page, 8)
-                self.assertEqual(page.evaluate("heldStopReplies.length"), 1)
+                self.assertEqual(page.evaluate("heldStopReplies.length"), 2)
                 self.assertIn("No stop confirmation from JanOS", self.text(page))
                 self.assertIn("Deauth Detector", self.text(page))
                 start = next(item for item in objects(page)

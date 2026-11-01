@@ -34,7 +34,11 @@ mode, running additionally requires every strict `[DETECTOR_WATCH]` proof: the
 count/order, channel, complete MAC, and mandatory `SSID=` field are checked
 against the fresh scan. The five-second WATCH window starts once the start ACK
 and required V2 format marker are both present, so their own latency cannot
-consume the WATCH verification time; duplicate markers do not extend it.
+consume the WATCH verification time; duplicate markers do not extend it. A
+strict WATCH proof may arrive before the start ACK, as it does in current JanOS
+Defence startup. Tab5 retains that proof for the same captured session but still
+does not report running until ACK, V2 format, and the complete WATCH set all
+agree.
 
 An older JanOS may reply with the exact line `Unrecognized command` to
 `deauth_detector_v2`. Only that explicit rejection permits a single retry on
@@ -110,6 +114,53 @@ firmware may parse the final `trace` token as an invalid detector/watch index;
 Tab5 reports **Trace unsupported** and does not pretend the detector is running
 or retry legacy in that case.
 
+## Defence
+
+**Defence** is an opt-in controller mode for selected networks only. It forces
+Trace on and locks that control until Defence is disabled, then sends this exact
+command on the captured connection:
+
+```text
+deauth_detector_v2 --only <fresh one-based indices> trace defence
+```
+
+**PMKID Lab** is a separate, explicitly confirmed lab opt-in and appends the
+single final token `pmkid-decoy`. It cannot be enabled without Defence. All
+networks mode, an empty/stale selection, or an unconfirmed PMKID opt-in is
+rejected locally.
+
+Defence has no active legacy fallback. Exact `Unrecognized command` and explicit
+Defence-option rejection produce **Defence unsupported by this JanOS; no passive
+fallback started**. A timeout, disconnect, write failure, partial Stop text, or
+generation mismatch remains visibly uncertain; none of these responses permits
+another start command on a different tab or transport.
+
+Strict `[DETECTOR_DEFENCE]` records describe armed, trigger, provisional,
+transmit result, suppression, release, and stopped state. Fields must appear in
+their defined order with valid values and no extras. The selected BSSID set is
+checked for BSSID-bearing records. These records are always consumed before
+event parsing and never enter V2/CSA history, CSV, sound, alarms, or normal
+counters. Trigger/provisional state is not proof of transmission. Only an exact
+`tx=... result=ok ... error=none` record increments confirmed responses; an
+exact error record increments errors. A transmit result must follow a matching
+trigger and same-BSSID provisional record; it consumes that decision. Release
+must then match the accepted response and BSSID. Duplicate, stale, cross-BSSID,
+wrong-stage, or unauthorized PMKID sequences are consumed without changing
+Defence state or counters.
+
+A monitor-only `decision=observe` record remains telemetry. After a confirmed
+decoy TX or its idle release, it does not replace the last successful campaign
+state; only a later `decoy_4way` or authorized `decoy_pmkid` decision begins a
+new response campaign. This matches JanOS runs where a monitored PMKID probe is
+reported between two independent four-way decoy responses.
+
+The session owns the captured `tab_id_t`, UART port, Grove/USB/MBus transport,
+USB link generation, command generation, scan generation, and selected BSSIDs.
+Only exact `All operations stopped.` finalizes Stop and clears active Defence
+state. `Deauth Detector stopped.` is partial information only. If final Stop is
+missing, Tab5 preserves the last Defence state and labels the remote state as
+uncertain.
+
 ## Wire record and interpretation
 
 ```text
@@ -153,6 +204,56 @@ address, or a DEAUTH observation is not proof of an attacker or a client
 disconnection. An idle release resumes detector-initiated hopping and permits a
 later eligible DEAUTH to begin a fresh confirmation and lock cycle.
 
+## Optional forensic evidence stream
+
+Tab5 accepts the following versioned record in exactly this order:
+
+```text
+[DEAUTH_FORENSIC/1] FRAME=<deauth|disassoc> CH=<1..233|-> BSSID=<mac> TX=<mac> DA=<mac> RSSI=<-127..0|-> REASON=<0..65535|-> SEQ=<0..4095|-> RETRY=<0|1|-> PROTECTED=<0|1|-> FC=<0x0000..0xFFFF|-> TS_US=<0..UINT64_MAX>
+```
+
+Raw records are accepted after the detector's existing normalization: an
+optional single `I JanOS: ` log envelope followed by an optional single `> `
+serial-prompt prefix. The parser rejects substring matches,
+duplicate/reordered/missing/extra fields, repeated or different prefixes,
+structurally truncated records, lines of 512 bytes or more, invalid MAC
+addresses, numeric overflow, and out-of-range values. `-` means unknown and is
+never inferred from another record.
+
+Forensics is a separate, bounded evidence model. A context retains at most 128
+rows in PSRAM; overflow evicts the oldest row and increments `local_dropped`.
+Accepted and burst totals saturate rather than wrap. A burst keeps consecutive
+`(FRAME, BSSID, TX, DA)` identity and ends on an identity change or a gap greater
+than 20,000,000 microseconds; exactly 20,000,000 remains in the current burst.
+Sequence deltas are modulo 4096 and per stream. Equal sequence with `RETRY=1` is
+shown as retransmission, equal sequence with `RETRY=0` as repeated sequence, and
+missing or non-comparable values as insufficient sequence data. Retained-row
+statistics also track reason-code distribution plus retry/protection unknowns;
+they never manufacture values for `-` fields.
+
+The summary reports duration, accepted/retained rows, bursts and largest burst,
+unique BSSID/recipient counts, retained-row RSSI min/rounded-average/max, retry,
+protected/unprotected/unknown counts, and local drops. **View evidence** provides
+BSSID, recipient, reason, and frame filters. It always states **Evidence only —
+not transmitter attribution** and uses neutral labels such as **Claimed TX** and
+**Frame recipient**. The data does not prove an attacker, disconnection, or a
+successful Defence action. If bounded-row eviction removes the selected BSSID,
+recipient, or reason, that vanished filter returns to **All** instead of leaving
+an invisible stale predicate active.
+
+Rows are accepted only for the confirmed active detector session and its
+captured tab, port, transport/link generation, command generation, scan
+generation, and allowed BSSID set. They bypass normal history, CSV, V2/CSA
+counters, latest groups, sound, and alarm paths. A new confirmed Start resets
+the forensic session. Stop pending or an uncertain Stop preserves it; exact
+`All operations stopped.` freezes it and late markers cannot revive it.
+
+Current JanOS does not yet emit `[DEAUTH_FORENSIC/1]`. Until it does, the screen
+continues to operate normally and shows **Forensics unavailable for this
+firmware** after an inactive/finished session with no accepted marker. During a
+confirmed active run it shows **No forensic observations**. Host and emulator
+tests use deterministic fixture records to exercise this optional path.
+
 ## History and SD export
 
 V2 observations group by BSSID, TX, DA, and reason identity. Numeric reason
@@ -172,8 +273,10 @@ and leaves DA and reason empty. Saving does not clear the on-screen history.
 
 ## Validation boundary
 
-The host parser, history, watch-state, transport-binding, and emulator tests can
-check the wire contract, UI state transitions, and CSV serialization. Browser
-tests exercise the Tab5 emulator. These checks do not establish firmware build
-success, radio behavior, physical UART operation, SD-card writes on hardware,
+The host parser, history, watch-state, transport-binding, Defence, Forensics,
+and emulator tests can check the wire contract, bounded statistics, UI state
+transitions, isolation, and CSV serialization. Browser tests exercise the native
+Tab5 C/LVGL slice through deterministic JS device/bridge streams. These checks
+do not establish ESP-IDF firmware build success, JanOS emission of the forensic
+marker, radio behavior, physical UART routing/timing, SD-card writes on hardware,
 or behavior on a flashed device.

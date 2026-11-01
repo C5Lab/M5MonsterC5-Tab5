@@ -362,6 +362,17 @@ EMSCRIPTEN_KEEPALIVE int emu_scan_state(int tab) {return tab>=0&&tab<4?app_jobs[
 EMSCRIPTEN_KEEPALIVE int emu_network_count(int tab) {return tab>=0&&tab<4?get_ctx_for_tab(tab)->network_count:-1;}
 EMSCRIPTEN_KEEPALIVE int emu_selected_count(int tab) {return tab>=0&&tab<4?get_ctx_for_tab(tab)->selected_count:-1;}
 EMSCRIPTEN_KEEPALIVE int emu_current_tab(void) {return current_tab;}
+EMSCRIPTEN_KEEPALIVE int emu_forensic_filter(int filter,int selected) {
+ tab_context_t *ctx=get_current_ctx();lv_obj_t *dropdown=NULL;
+ if(!ctx||selected<0)return 0;
+ if(filter==0)dropdown=ctx->deauth_forensic_bssid_dropdown;
+ else if(filter==1)dropdown=ctx->deauth_forensic_da_dropdown;
+ else if(filter==2)dropdown=ctx->deauth_forensic_reason_dropdown;
+ else if(filter==3)dropdown=ctx->deauth_forensic_frame_dropdown;
+ if(!dropdown||!lv_obj_is_valid(dropdown)||selected>=lv_dropdown_get_option_count(dropdown))return 0;
+ lv_dropdown_set_selected(dropdown,(uint32_t)selected);
+ lv_obj_send_event(dropdown,LV_EVENT_VALUE_CHANGED,NULL);return 1;
+}
 EMSCRIPTEN_KEEPALIVE void emu_show(int page,int tab) {
  if(tab!=TAB_GROVE&&tab!=TAB_MBUS&&tab!=TAB_INTERNAL)return;
  lv_obj_t *old=get_current_tab_container();if(old)lv_obj_add_flag(old,LV_OBJ_FLAG_HIDDEN);
@@ -374,6 +385,11 @@ static void init_tab_context(tab_context_t *ctx) {
  if(!ctx->networks)abort();
  if(!ctx->deauth_entries)ctx->deauth_entries=calloc(DEAUTH_DETECTOR_MAX_ENTRIES,sizeof(deauth_entry_t));
  if(!ctx->deauth_entries)abort();
+ if(!ctx->deauth_forensic_rows)
+  ctx->deauth_forensic_rows=calloc(DETECTOR_FORENSIC_CAPACITY,sizeof(detector_forensic_row_t));
+ if(!ctx->deauth_forensic_rows)abort();
+ detector_forensic_reset(&ctx->deauth_forensic,ctx->deauth_forensic_rows,
+                         DETECTOR_FORENSIC_CAPACITY);
  if(!ctx->detector_watch.networks)
   ctx->detector_watch.networks=calloc(DETECTOR_WATCH_MAX,sizeof(detector_watch_network_t));
  detector_watch_reset(&ctx->detector_watch);

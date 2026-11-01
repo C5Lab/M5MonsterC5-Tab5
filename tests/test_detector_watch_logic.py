@@ -30,12 +30,15 @@ class DetectorWatchLogicTests(unittest.TestCase):
                                 "cc -std=c11 -Wall -Wextra -Werror /work/test.c -o /work/test && /work/test"],
                                check=True)
 
-    def test_scan_start_and_stop_keep_captured_tab_and_port(self):
+    def test_scan_start_and_stop_keep_captured_transport_and_generation(self):
         source = (ROOT / "main/main.c").read_text(encoding="utf-8")
+        availability = source[
+            source.index("static bool deauth_detector_bound_transport_available("):
+            source.index("static bool deauth_detector_claim_console(")]
         send = source[source.index("static bool deauth_detector_send_bound("):
-                      source.index("static void deauth_detector_render_status(")]
+                      source.index("static bool deauth_forensic_row_matches(")]
         harness = (ROOT / "tests/detector_transport_binding_test.c").read_text(encoding="utf-8")
-        harness = harness.replace("/* SEND */", send)
+        harness = harness.replace("/* SEND */", availability + "\n" + send)
         with tempfile.TemporaryDirectory() as temp:
             test = Path(temp) / "test.c"
             test.write_text(harness, encoding="utf-8")

@@ -245,6 +245,9 @@ static void test_emergency_stop_and_unconfirmed_stop_keep_remote_state_uncertain
     assert(mbus.phase == DETECTOR_WATCH_RUNNING && mbus.running &&
            !mbus.remote_state_unknown);
     detector_watch_status_line(&grove, "Deauth Detector stopped.");
+    assert(grove.phase == DETECTOR_WATCH_ERROR && grove.running &&
+           grove.remote_state_unknown);
+    detector_watch_status_line(&grove, "All operations stopped.");
     assert(grove.phase == DETECTOR_WATCH_ERROR && !grove.running &&
            !grove.remote_state_unknown);
 
@@ -271,8 +274,439 @@ static void test_already_active_requires_confirmed_stop_before_new_start(void)
            session.remote_state_unknown && !session.legacy_retry_pending);
     detector_watch_begin_stop(&session);
     detector_watch_status_line(&session, "Deauth Detector stopped.");
+    assert(session.phase == DETECTOR_WATCH_STOPPING && session.remote_state_unknown);
+    detector_watch_status_line(&session, "All operations stopped.");
     assert(session.phase == DETECTOR_WATCH_STOPPED && !session.running &&
            !session.remote_state_unknown);
+}
+
+static void test_defence_commands_state_and_no_legacy_fallback(void)
+{
+    detector_watch_session_t session = {0};
+    detector_watch_network_t networks[DETECTOR_WATCH_MAX] = {0};
+    session.networks = networks;
+    detector_watch_reset(&session);
+    char command[320];
+
+    assert(!detector_watch_build_mode_command(&session, false, 0,
+                                               true, true, false,
+                                               command, sizeof(command)));
+    detector_watch_begin_scan(&session, 21);
+    assert(detector_watch_ack_scan(&session,
+        "Background scan started (min: 20 ms, max: 40 ms per channel)"));
+    network(&session, 1, "Office", "00:11:22:33:44:55", 6);
+    assert(detector_watch_finish_scan(&session, "Scan results printed."));
+    assert(detector_watch_select(&session, 1, true));
+    assert(detector_watch_build_mode_command(&session, true, 21,
+                                              true, true, false,
+                                              command, sizeof(command)));
+    assert(!strcmp(command, "deauth_detector_v2 --only 1 trace defence"));
+    assert(detector_watch_build_mode_command(&session, true, 21,
+                                              true, true, true,
+                                              command, sizeof(command)));
+    assert(!strcmp(command,
+                   "deauth_detector_v2 --only 1 trace defence pmkid-decoy"));
+    assert(!detector_watch_build_mode_command(&session, true, 21,
+                                               false, false, true,
+                                               command, sizeof(command)));
+
+    detector_watch_begin_start_v2_mode(&session, true, true, true, false);
+    assert(session.defence_requested && !session.pmkid_decoy_requested &&
+           session.trace_requested &&
+           session.defence_state == DETECTOR_DEFENCE_WAITING_ARM);
+    detector_watch_status_line(&session, "Unrecognized command");
+    assert(session.phase == DETECTOR_WATCH_ERROR &&
+           session.defence_state == DETECTOR_DEFENCE_UNSUPPORTED &&
+           !session.legacy_retry_pending && !session.running &&
+           !session.remote_state_unknown);
+
+    detector_watch_begin_start_v2_mode(&session, true, true, true, false);
+    detector_watch_status_line(
+        &session,
+        "Invalid detector index 'trace' (valid: 1-48). Detector not started.");
+    assert(session.phase == DETECTOR_WATCH_ERROR &&
+           session.defence_state == DETECTOR_DEFENCE_UNSUPPORTED &&
+           !session.legacy_retry_pending && !session.running &&
+           !session.remote_state_unknown &&
+           strstr(session.error, "Defence unsupported") != NULL);
+}
+
+static void test_defence_accepts_watch_proof_before_start_ack(void)
+{
+    detector_watch_session_t session = {0};
+    detector_watch_network_t networks[DETECTOR_WATCH_MAX] = {0};
+    session.networks = networks;
+    detector_watch_reset(&session);
+    detector_watch_begin_scan(&session, 22);
+    assert(detector_watch_ack_scan(&session,
+        "Background scan started (min: 20 ms, max: 40 ms per channel)"));
+    network(&session, 1, "Office", "00:11:22:33:44:55", 6);
+    assert(detector_watch_finish_scan(&session, "Scan results printed."));
+    assert(detector_watch_select(&session, 1, true));
+    detector_watch_begin_start_v2_mode(&session, true, true, true, true);
+
+    detector_watch_status_line(&session,
+        "[DETECTOR_WATCH] count=1 ap=1/1 CH=6 BSSID=00:11:22:33:44:55 SSID=Office");
+    assert(session.phase == DETECTOR_WATCH_STARTING &&
+           session.watch_verified && session.watched_count == 1 &&
+           !session.start_ack_seen && !session.details_confirmed);
+    detector_watch_status_line(&session,
+        "Deauth Detector started - monitoring selected channels for deauth frames...");
+    assert(session.phase == DETECTOR_WATCH_STARTING && session.start_ack_seen);
+    detector_watch_status_line(&session, "[DETECTOR_INFO] format=deauth_v2");
+    assert(session.phase == DETECTOR_WATCH_RUNNING && session.running &&
+           session.watch_verified);
+}
+
+static void test_defence_strict_records_and_exact_final_stop(void)
+{
+    detector_watch_session_t session = {0};
+    detector_watch_network_t networks[DETECTOR_WATCH_MAX] = {0};
+    session.networks = networks;
+    detector_watch_reset(&session);
+    detector_watch_begin_scan(&session, 22);
+    assert(detector_watch_ack_scan(&session,
+        "Background scan started (min: 20 ms, max: 40 ms per channel)"));
+    network(&session, 1, "Office", "00:11:22:33:44:55", 6);
+    assert(detector_watch_finish_scan(&session, "Scan results printed."));
+    assert(detector_watch_select(&session, 1, true));
+    detector_watch_begin_start_v2_mode(&session, true, true, true, false);
+    detector_watch_status_line(&session,
+        "Deauth Detector started - monitoring selected channels for deauth frames...");
+    detector_watch_status_line(&session, "[DETECTOR_INFO] format=deauth_v2");
+    detector_watch_status_line(&session,
+        "[DETECTOR_WATCH] count=1 ap=1/1 CH=6 BSSID=00:11:22:33:44:55 SSID=Office");
+    assert(session.phase == DETECTOR_WATCH_RUNNING);
+
+    detector_watch_status_line(&session,
+        "[DETECTOR_DEFENCE] armed targets=1 trace=fast pmkid=monitor");
+    assert(session.defence_state == DETECTOR_DEFENCE_ARMED &&
+           session.defence_targets == 1);
+    detector_watch_status_line(&session,
+        "[DETECTOR_DEFENCE] trigger=pmkid_probe BSSID=00:11:22:33:44:55 STA=AA:BB:CC:DD:EE:FF RX=6 decision=decoy_pmkid reason=eligible");
+    assert(session.defence_state == DETECTOR_DEFENCE_ARMED &&
+           session.defence_decision == DETECTOR_DEFENCE_DECISION_NONE);
+    detector_watch_status_line(&session,
+        "[DETECTOR_DEFENCE] trigger=deauth BSSID=00:11:22:33:44:55 STA=AA:BB:CC:DD:EE:FF RX=6 decision=decoy_4way reason=eligible");
+    assert(session.defence_state == DETECTOR_DEFENCE_TRIGGERED &&
+           session.defence_decision == DETECTOR_DEFENCE_DECISION_DECOY_4WAY &&
+           !strcmp(session.defence_bssid, "00:11:22:33:44:55") &&
+           !strcmp(session.defence_sta, "AA:BB:CC:DD:EE:FF") &&
+           session.defence_channel == 6 && session.defence_responses == 0);
+    detector_watch_status_line(&session,
+        "[DETECTOR_DEFENCE] trigger=pmkid_probe BSSID=00:11:22:33:44:55 STA=AA:BB:CC:DD:EE:FF RX=6 decision=observe reason=monitor_only");
+    assert(session.defence_state == DETECTOR_DEFENCE_TRIGGERED &&
+           session.defence_decision == DETECTOR_DEFENCE_DECISION_OBSERVE &&
+           session.defence_responses == 0);
+    detector_watch_network_t disconnected_networks[DETECTOR_WATCH_MAX] = {0};
+    memcpy(disconnected_networks, networks, sizeof(disconnected_networks));
+    detector_watch_session_t disconnected = session;
+    disconnected.networks = disconnected_networks;
+    detector_watch_connection_lost(&disconnected);
+    assert(disconnected.remote_state_unknown &&
+           disconnected.defence_state == DETECTOR_DEFENCE_TRIGGERED &&
+           disconnected.defence_decision == DETECTOR_DEFENCE_DECISION_OBSERVE);
+    detector_watch_status_line(&session,
+        "[DETECTOR_DEFENCE] tx=decoy_4way stage=m1_m2 result=ok frames=2 latency_us=899 error=none");
+    assert(session.defence_state == DETECTOR_DEFENCE_TRIGGERED &&
+           session.defence_responses == 0);
+    detector_watch_status_line(&session,
+        "[DETECTOR_DEFENCE] trigger=deauth BSSID=00:11:22:33:44:55 STA=AA:BB:CC:DD:EE:FF RX=6 decision=decoy_4way reason=eligible");
+    detector_watch_status_line(&session,
+        "[DETECTOR_DEFENCE] provisional_bssid=00:11:22:33:44:55 channel=6");
+    assert(session.defence_state == DETECTOR_DEFENCE_PROVISIONAL);
+    detector_watch_status_line(&session,
+        "[DETECTOR_DEFENCE] tx=decoy_4way stage=m1_pmkid result=ok frames=2 latency_us=899 error=none");
+    assert(session.defence_state == DETECTOR_DEFENCE_PROVISIONAL &&
+           session.defence_responses == 0);
+    detector_watch_status_line(&session,
+        "[DETECTOR_DEFENCE] tx=decoy_pmkid stage=m1_pmkid result=ok frames=1 latency_us=899 error=none");
+    assert(session.defence_state == DETECTOR_DEFENCE_PROVISIONAL &&
+           session.defence_responses == 0);
+    detector_watch_status_line(&session,
+        "[DETECTOR_DEFENCE] tx=decoy_4way stage=m1_m2 result=ok frames=2 latency_us=900 error=none");
+    assert(session.defence_state == DETECTOR_DEFENCE_TX_OK &&
+           session.defence_decision == DETECTOR_DEFENCE_DECISION_NONE &&
+           session.defence_response == DETECTOR_DEFENCE_DECISION_DECOY_4WAY &&
+           session.defence_responses == 1 && session.defence_errors == 0);
+    detector_watch_status_line(&session,
+        "[DETECTOR_DEFENCE] tx=decoy_4way stage=m1_m2 result=error frames=1 latency_us=901 error=ESP_FAIL");
+    assert(session.defence_state == DETECTOR_DEFENCE_TX_OK &&
+           session.defence_responses == 1 && session.defence_errors == 0);
+    detector_watch_status_line(&session,
+        "[DETECTOR_DEFENCE] tx=decoy_4way stage=m1_m2 result=error frames=1 latency_us=902 error=ESP_ERR_WIFI_NOT_STARTED");
+    assert(session.defence_state == DETECTOR_DEFENCE_TX_OK &&
+           session.defence_responses == 1 && session.defence_errors == 0);
+    detector_watch_status_line(&session,
+        "[DETECTOR_DEFENCE] suppressed=3 reason=rate_limit BSSID=00:11:22:33:44:55 window_ms=1000");
+    assert(session.defence_suppressed == 3);
+    detector_watch_status_line(&session,
+        "[DETECTOR_DEFENCE] released_bssid=00:11:22:33:44:55 channel=6 reason=idle idle_ms=20000 response=decoy_4way suppressed=3");
+    assert(session.defence_state == DETECTOR_DEFENCE_RELEASED &&
+           session.defence_response == DETECTOR_DEFENCE_DECISION_NONE &&
+           session.defence_channel == 6 && session.defence_suppressed == 3);
+    detector_watch_status_line(&session,
+        "[DETECTOR_DEFENCE] stopped observations=8 tx_pairs=1 pmkid_m1=0 responses=1 satisfied=4 errors=1 dropped=2 outcome=responded");
+    assert(session.defence_observations == 8 && session.defence_tx_pairs == 1 &&
+           session.defence_responses == 1 && session.defence_satisfied == 4 &&
+           session.defence_errors == 1 && session.defence_dropped == 2 &&
+           session.phase == DETECTOR_WATCH_RUNNING);
+
+    detector_watch_begin_stop(&session);
+    detector_watch_status_line(&session, "Deauth Detector stopped.");
+    assert(session.phase == DETECTOR_WATCH_STOPPING && session.running);
+    assert(detector_watch_is_stop_ack_line("All operations stopped.\x1b[0m"));
+    assert(!detector_watch_is_stop_ack_line("All operations stopped.\x1bgarbage"));
+    assert(!detector_watch_is_stop_ack_line("All operations stopped.\x1b[0"));
+    assert(!detector_watch_is_stop_ack_line("All operations stopped. trailing"));
+    detector_watch_stop_unconfirmed(&session);
+    detector_watch_status_line(&session, "All operations stopped.");
+    assert(session.phase == DETECTOR_WATCH_ERROR && !session.running &&
+           !session.remote_state_unknown &&
+           session.defence_state == DETECTOR_DEFENCE_OFF);
+}
+
+static void test_defence_physical_two_response_sequence_preserves_completed_campaign(void)
+{
+    detector_watch_session_t session = {0};
+    detector_watch_network_t networks[DETECTOR_WATCH_MAX] = {0};
+    session.networks = networks;
+    detector_watch_reset(&session);
+    detector_watch_begin_scan(&session, 25);
+    assert(detector_watch_ack_scan(&session,
+        "Background scan started (min: 20 ms, max: 40 ms per channel)"));
+    network(&session, 1, "TP-Link_0E90", "B0:BE:76:70:0E:90", 4);
+    assert(detector_watch_finish_scan(&session, "Scan results printed."));
+    assert(detector_watch_select(&session, 1, true));
+    detector_watch_begin_start_v2_mode(&session, true, true, true, false);
+    detector_watch_status_line(&session,
+        "[DETECTOR_WATCH] count=1 ap=1/1 CH=4 BSSID=B0:BE:76:70:0E:90 SSID=TP-Link_0E90");
+    detector_watch_status_line(&session,
+        "Deauth Detector started - monitoring selected channels for deauth frames...");
+    detector_watch_status_line(&session, "[DETECTOR_INFO] format=deauth_v2");
+    detector_watch_status_line(&session, "[DETECTOR_TRACE] armed");
+
+    detector_watch_status_line(&session,
+        "[DETECTOR_DEFENCE] armed targets=1 trace=fast pmkid=monitor");
+
+    detector_watch_status_line(&session,
+        "[DETECTOR_DEFENCE] trigger=deauth BSSID=B0:BE:76:70:0E:90 STA=- RX=4 decision=decoy_4way reason=selected_wpa2");
+    detector_watch_status_line(&session,
+        "[DETECTOR_DEFENCE] provisional_bssid=B0:BE:76:70:0E:90 channel=4");
+    detector_watch_status_line(&session,
+        "[DETECTOR_DEFENCE] tx=decoy_4way stage=m1_m2 result=ok frames=2 latency_us=9681 error=none");
+    detector_watch_status_line(&session,
+        "[DETECTOR_TRACE] confirming_bssid=B0:BE:76:70:0E:90 first_channel=4 window_ms=1000");
+    detector_watch_status_line(&session,
+        "[DEAUTH_V2] CH: 4 | BSSID: B0:BE:76:70:0E:90 | TX: B0:BE:76:70:0E:90 | DA: 20:2B:20:9D:A8:47 | RSSI: -42 | REASON: 7 | SSID: TP-Link_0E90");
+    detector_watch_status_line(&session, "[DETECTOR_TRACE] locked_channel=4");
+    assert(session.defence_state == DETECTOR_DEFENCE_TX_OK &&
+           session.defence_responses == 1 &&
+           session.trace_state == DETECTOR_TRACE_LOCKED);
+
+    detector_watch_status_line(&session,
+        "[DETECTOR_DEFENCE] released_bssid=B0:BE:76:70:0E:90 channel=4 reason=idle idle_ms=20000 response=decoy_4way suppressed=299");
+    detector_watch_status_line(&session,
+        "[DETECTOR_TRACE] released_channel=4 reason=idle idle_ms=20000");
+    detector_watch_status_line(&session, "[DETECTOR_TRACE] armed");
+    assert(session.defence_state == DETECTOR_DEFENCE_RELEASED &&
+           session.defence_suppressed == 299 &&
+           session.defence_responses == 1);
+
+    detector_watch_status_line(&session,
+        "[DETECTOR_DEFENCE] trigger=pmkid_probe BSSID=B0:BE:76:70:0E:90 STA=02:61:E8:69:3E:4F RX=4 decision=observe reason=pmkid_monitor");
+    assert(session.defence_state == DETECTOR_DEFENCE_RELEASED &&
+           session.defence_decision == DETECTOR_DEFENCE_DECISION_NONE &&
+           session.defence_suppressed == 299 &&
+           session.defence_responses == 1);
+
+    detector_watch_status_line(&session,
+        "[DETECTOR_DEFENCE] trigger=deauth BSSID=B0:BE:76:70:0E:90 STA=- RX=4 decision=decoy_4way reason=selected_wpa2");
+    detector_watch_status_line(&session,
+        "[DETECTOR_DEFENCE] provisional_bssid=B0:BE:76:70:0E:90 channel=4");
+    detector_watch_status_line(&session,
+        "[DETECTOR_DEFENCE] tx=decoy_4way stage=m1_m2 result=ok frames=2 latency_us=9218 error=none");
+    detector_watch_status_line(&session,
+        "[DETECTOR_TRACE] confirming_bssid=B0:BE:76:70:0E:90 first_channel=4 window_ms=1000");
+    detector_watch_status_line(&session,
+        "[DEAUTH_V2] CH: 4 | BSSID: B0:BE:76:70:0E:90 | TX: 02:61:E8:69:3E:4F | DA: B0:BE:76:70:0E:90 | RSSI: -40 | REASON: 3 | SSID: TP-Link_0E90");
+    detector_watch_status_line(&session, "[DETECTOR_TRACE] locked_channel=4");
+    assert(session.defence_state == DETECTOR_DEFENCE_TX_OK &&
+           session.defence_responses == 2 &&
+           session.trace_state == DETECTOR_TRACE_LOCKED);
+
+    detector_watch_status_line(&session,
+        "[DETECTOR_DEFENCE] released_bssid=B0:BE:76:70:0E:90 channel=4 reason=idle idle_ms=20000 response=decoy_4way suppressed=608");
+    detector_watch_status_line(&session,
+        "[DETECTOR_TRACE] released_channel=4 reason=idle idle_ms=20000");
+    detector_watch_status_line(&session, "[DETECTOR_TRACE] armed");
+    detector_watch_status_line(&session,
+        "[DETECTOR_DEFENCE] stopped observations=910 tx_pairs=2 pmkid_m1=0 responses=2 satisfied=907 errors=0 dropped=0 outcome=responded");
+    assert(session.defence_state == DETECTOR_DEFENCE_RELEASED &&
+           session.defence_suppressed == 608 &&
+           session.defence_observations == 910 &&
+           session.defence_tx_pairs == 2 &&
+           session.defence_pmkid_m1 == 0 &&
+           session.defence_responses == 2 &&
+           session.defence_satisfied == 907 &&
+           session.defence_errors == 0 &&
+           session.defence_dropped == 0);
+}
+
+static void test_defence_pmkid_requires_authorized_matching_decision(void)
+{
+    detector_watch_session_t session = {0};
+    detector_watch_network_t networks[DETECTOR_WATCH_MAX] = {0};
+    session.networks = networks;
+    detector_watch_reset(&session);
+    detector_watch_begin_scan(&session, 23);
+    assert(detector_watch_ack_scan(&session,
+        "Background scan started (min: 20 ms, max: 40 ms per channel)"));
+    network(&session, 1, "Office", "00:11:22:33:44:55", 6);
+    assert(detector_watch_finish_scan(&session, "Scan results printed."));
+    assert(detector_watch_select(&session, 1, true));
+    detector_watch_begin_start_v2_mode(&session, true, true, true, true);
+    detector_watch_status_line(&session,
+        "Deauth Detector started - monitoring selected channels for deauth frames...");
+    detector_watch_status_line(&session, "[DETECTOR_INFO] format=deauth_v2");
+    detector_watch_status_line(&session,
+        "[DETECTOR_WATCH] count=1 ap=1/1 CH=6 BSSID=00:11:22:33:44:55 SSID=Office");
+    detector_watch_status_line(&session,
+        "[DETECTOR_DEFENCE] armed targets=1 trace=fast pmkid=decoy");
+    detector_watch_status_line(&session,
+        "[DETECTOR_DEFENCE] trigger=pmkid_probe BSSID=00:11:22:33:44:55 STA=AA:BB:CC:DD:EE:FF RX=6 decision=decoy_pmkid reason=eligible");
+    assert(session.defence_decision == DETECTOR_DEFENCE_DECISION_DECOY_PMKID);
+    detector_watch_status_line(&session,
+        "[DETECTOR_DEFENCE] tx=decoy_pmkid stage=m1_m2 result=ok frames=1 latency_us=700 error=none");
+    assert(session.defence_state == DETECTOR_DEFENCE_TRIGGERED &&
+           session.defence_responses == 0);
+    detector_watch_status_line(&session,
+        "[DETECTOR_DEFENCE] provisional_bssid=00:11:22:33:44:55 channel=6");
+    detector_watch_status_line(&session,
+        "[DETECTOR_DEFENCE] tx=decoy_pmkid stage=m1_pmkid result=ok frames=1 latency_us=701 error=none");
+    assert(session.defence_state == DETECTOR_DEFENCE_TX_OK &&
+           session.defence_decision == DETECTOR_DEFENCE_DECISION_NONE &&
+           session.defence_response == DETECTOR_DEFENCE_DECISION_DECOY_PMKID &&
+           session.defence_responses == 1);
+}
+
+static void test_defence_consumes_tx_and_binds_release_to_trigger_bssid(void)
+{
+    detector_watch_session_t session = {0};
+    detector_watch_network_t networks[DETECTOR_WATCH_MAX] = {0};
+    session.networks = networks;
+    detector_watch_reset(&session);
+    detector_watch_begin_scan(&session, 24);
+    assert(detector_watch_ack_scan(&session,
+        "Background scan started (min: 20 ms, max: 40 ms per channel)"));
+    network(&session, 1, "Office", "00:11:22:33:44:55", 6);
+    network(&session, 2, "Lab", "00:11:22:33:44:66", 11);
+    assert(detector_watch_finish_scan(&session, "Scan results printed."));
+    assert(detector_watch_select(&session, 1, true));
+    assert(detector_watch_select(&session, 2, true));
+    detector_watch_begin_start_v2_mode(&session, true, true, true, false);
+    detector_watch_status_line(&session,
+        "Deauth Detector started - monitoring selected channels for deauth frames...");
+    detector_watch_status_line(&session, "[DETECTOR_INFO] format=deauth_v2");
+    detector_watch_status_line(&session,
+        "[DETECTOR_WATCH] count=2 ap=1/2 CH=6 BSSID=00:11:22:33:44:55 SSID=Office");
+    detector_watch_status_line(&session,
+        "[DETECTOR_WATCH] count=2 ap=2/2 CH=11 BSSID=00:11:22:33:44:66 SSID=Lab");
+    detector_watch_status_line(&session,
+        "[DETECTOR_DEFENCE] armed targets=2 trace=fast pmkid=monitor");
+    detector_watch_status_line(&session,
+        "[DETECTOR_DEFENCE] trigger=deauth BSSID=00:11:22:33:44:55 STA=AA:BB:CC:DD:EE:FF RX=6 decision=decoy_4way reason=eligible");
+    detector_watch_status_line(&session,
+        "[DETECTOR_DEFENCE] released_bssid=00:11:22:33:44:55 channel=6 reason=idle idle_ms=20000 response=decoy_4way suppressed=0");
+    assert(session.defence_state == DETECTOR_DEFENCE_TRIGGERED);
+    detector_watch_status_line(&session,
+        "[DETECTOR_DEFENCE] provisional_bssid=00:11:22:33:44:66 channel=11");
+    assert(session.defence_state == DETECTOR_DEFENCE_TRIGGERED &&
+           !strcmp(session.defence_bssid, "00:11:22:33:44:55"));
+    detector_watch_status_line(&session,
+        "[DETECTOR_DEFENCE] provisional_bssid=00:11:22:33:44:55 channel=6");
+    detector_watch_status_line(&session,
+        "[DETECTOR_DEFENCE] tx=decoy_4way stage=m1_m2 result=ok frames=2 latency_us=800 error=none");
+    assert(session.defence_state == DETECTOR_DEFENCE_TX_OK &&
+           session.defence_decision == DETECTOR_DEFENCE_DECISION_NONE &&
+           session.defence_response == DETECTOR_DEFENCE_DECISION_DECOY_4WAY &&
+           session.defence_responses == 1);
+    detector_watch_status_line(&session,
+        "[DETECTOR_DEFENCE] tx=decoy_4way stage=m1_m2 result=ok frames=2 latency_us=801 error=none");
+    assert(session.defence_responses == 1);
+    detector_watch_status_line(&session,
+        "[DETECTOR_DEFENCE] released_bssid=00:11:22:33:44:66 channel=11 reason=idle idle_ms=20000 response=decoy_4way suppressed=0");
+    assert(session.defence_state == DETECTOR_DEFENCE_TX_OK &&
+           !strcmp(session.defence_bssid, "00:11:22:33:44:55"));
+    detector_watch_status_line(&session,
+        "[DETECTOR_DEFENCE] released_bssid=00:11:22:33:44:55 channel=6 reason=idle idle_ms=20000 response=decoy_4way suppressed=0");
+    assert(session.defence_state == DETECTOR_DEFENCE_RELEASED &&
+           session.defence_response == DETECTOR_DEFENCE_DECISION_NONE);
+    detector_watch_status_line(&session,
+        "[DETECTOR_DEFENCE] released_bssid=00:11:22:33:44:55 channel=6 reason=idle idle_ms=20000 response=decoy_4way suppressed=0");
+    assert(session.defence_state == DETECTOR_DEFENCE_RELEASED);
+
+    detector_watch_status_line(&session,
+        "[DETECTOR_DEFENCE] trigger=deauth BSSID=00:11:22:33:44:66 STA=AA:BB:CC:DD:EE:01 RX=11 decision=decoy_4way reason=eligible");
+    detector_watch_status_line(&session,
+        "[DETECTOR_DEFENCE] provisional_bssid=00:11:22:33:44:66 channel=11");
+    detector_watch_status_line(&session,
+        "[DETECTOR_DEFENCE] tx=decoy_4way stage=m1_m2 result=error frames=0 latency_us=802 error=ESP_FAIL");
+    assert(session.defence_state == DETECTOR_DEFENCE_TX_ERROR &&
+           session.defence_errors == 1 &&
+           session.defence_response == DETECTOR_DEFENCE_DECISION_DECOY_4WAY);
+    detector_watch_status_line(&session,
+        "[DETECTOR_DEFENCE] armed targets=2 trace=fast pmkid=monitor");
+    assert(session.defence_state == DETECTOR_DEFENCE_ARMED &&
+           session.defence_decision == DETECTOR_DEFENCE_DECISION_NONE &&
+           session.defence_response == DETECTOR_DEFENCE_DECISION_NONE);
+    detector_watch_status_line(&session,
+        "[DETECTOR_DEFENCE] tx=decoy_4way stage=m1_m2 result=ok frames=2 latency_us=803 error=none");
+    detector_watch_status_line(&session,
+        "[DETECTOR_DEFENCE] released_bssid=00:11:22:33:44:66 channel=11 reason=idle idle_ms=20000 response=decoy_4way suppressed=0");
+    assert(session.defence_state == DETECTOR_DEFENCE_ARMED &&
+           session.defence_responses == 1 && session.defence_errors == 1);
+}
+
+static void test_defence_rejects_malformed_and_late_records(void)
+{
+    detector_watch_session_t session = {0};
+    detector_watch_network_t networks[DETECTOR_WATCH_MAX] = {0};
+    session.networks = networks;
+    detector_watch_reset(&session);
+    session.count = 1;
+    session.selected_count = 1;
+    session.networks[0].selected = true;
+    snprintf(session.networks[0].bssid, sizeof(session.networks[0].bssid),
+             "%s", "00:11:22:33:44:55");
+    detector_watch_begin_start_v2_mode(&session, true, true, true, false);
+    session.details_confirmed = true;
+    session.start_ack_seen = true;
+    session.watch_verified = true;
+    detector_watch_confirm_start_if_ready(&session);
+    assert(session.phase == DETECTOR_WATCH_RUNNING);
+    detector_watch_status_line(&session,
+        "[DETECTOR_DEFENCE] armed targets=1 trace=fast pmkid=monitor");
+    assert(session.defence_state == DETECTOR_DEFENCE_ARMED);
+
+    const char *bad[] = {
+        "prefix [DETECTOR_DEFENCE] provisional_bssid=00:11:22:33:44:55 channel=6",
+        "[DETECTOR_DEFENCE] armed trace=fast targets=1 pmkid=monitor",
+        "[DETECTOR_DEFENCE] armed targets=1 trace=fast pmkid=monitor extra=x",
+        "[DETECTOR_DEFENCE] provisional_bssid=00:11:22:33:44:ZZ channel=6",
+        "[DETECTOR_DEFENCE] tx=decoy_4way stage=m1_m2 result=ok frames=3 latency_us=1 error=none",
+        "[DETECTOR_DEFENCE] released_bssid=00:11:22:33:44:55 channel=6 reason=idle idle_ms=19999 response=decoy_4way suppressed=0",
+    };
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); ++i) {
+        detector_watch_status_line(&session, bad[i]);
+        assert(session.defence_state == DETECTOR_DEFENCE_ARMED &&
+               session.defence_responses == 0 && session.defence_errors == 0);
+    }
+    detector_watch_begin_stop(&session);
+    detector_watch_status_line(&session, "All operations stopped.");
+    detector_watch_status_line(&session,
+        "[DETECTOR_DEFENCE] armed targets=1 trace=fast pmkid=monitor");
+    assert(session.defence_state == DETECTOR_DEFENCE_OFF);
 }
 
 static void test_trace_command_status_unsupported_fallback_and_stop(void)
@@ -289,7 +723,7 @@ static void test_trace_command_status_unsupported_fallback_and_stop(void)
     assert(detector_watch_is_trace_status_line(
         "> [DETECTOR_TRACE] locked_channel=6"));
     assert(!detector_watch_is_trace_status_line("[DETECTOR_INFO] format=deauth_v2"));
-    detector_watch_begin_start_v2(&session, false, true);
+    detector_watch_begin_start_v2_mode(&session, false, true, false, false);
     assert(session.trace_requested &&
            session.trace_state == DETECTOR_TRACE_WAITING_ARM);
     detector_watch_status_line(&session,
@@ -371,6 +805,8 @@ static void test_trace_command_status_unsupported_fallback_and_stop(void)
     assert(session.trace_state == DETECTOR_TRACE_LOCKED &&
            session.trace_channel == 1);
     detector_watch_status_line(&session, "Deauth Detector stopped.");
+    assert(session.remote_state_unknown);
+    detector_watch_status_line(&session, "All operations stopped.");
     assert(session.trace_state == DETECTOR_TRACE_OFF &&
            session.trace_channel == 0 &&
            session.trace_released_channel == 0 &&
@@ -385,7 +821,7 @@ static void test_trace_command_status_unsupported_fallback_and_stop(void)
     network(&session, 1, "Office", "00:11:22:33:44:55", 6);
     assert(detector_watch_finish_scan(&session, "Scan results printed."));
     assert(detector_watch_select(&session, 1, true));
-    detector_watch_begin_start_v2(&session, true, true);
+    detector_watch_begin_start_v2_mode(&session, true, true, false, false);
     detector_watch_status_line(&session,
         "Deauth Detector started - monitoring selected channels for deauth frames...");
     detector_watch_status_line(&session, "[DETECTOR_INFO] format=deauth_v2");
@@ -407,9 +843,9 @@ static void test_trace_command_status_unsupported_fallback_and_stop(void)
     detector_watch_status_line(&session, "[DETECTOR_TRACE] locked_channel=3");
     assert(session.trace_channel == 6);
     detector_watch_begin_stop(&session);
-    detector_watch_status_line(&session, "Deauth Detector stopped.");
+    detector_watch_status_line(&session, "All operations stopped.");
 
-    detector_watch_begin_start_v2(&session, false, true);
+    detector_watch_begin_start_v2_mode(&session, false, true, false, false);
     detector_watch_status_line(&session,
         "Invalid detector index 'trace' (valid: 1-48). Detector not started.");
     assert(session.phase == DETECTOR_WATCH_ERROR &&
@@ -428,7 +864,7 @@ static void test_trace_command_status_unsupported_fallback_and_stop(void)
     assert(detector_watch_build_v2_command(&session, true, 12, true,
                                            command, sizeof(command)));
     assert(!strcmp(command, "deauth_detector_v2 --only 1 2 trace"));
-    detector_watch_begin_start_v2(&session, true, true);
+    detector_watch_begin_start_v2_mode(&session, true, true, false, false);
     detector_watch_status_line(&session, "Unrecognized command");
     assert(session.legacy_retry_pending && session.trace_requested);
     assert(detector_watch_build_command(&session, true, 12,
@@ -447,7 +883,7 @@ static void test_trace_command_status_unsupported_fallback_and_stop(void)
     network(&session, 1, "Office", "00:11:22:33:44:55", 6);
     assert(detector_watch_finish_scan(&session, "Scan results printed."));
     assert(detector_watch_select(&session, 1, true));
-    detector_watch_begin_start_v2(&session, true, true);
+    detector_watch_begin_start_v2_mode(&session, true, true, false, false);
     detector_watch_status_line(&session,
         "Invalid watch index 'trace' (valid: 1-1). Detector not started.");
     assert(session.trace_state == DETECTOR_TRACE_UNSUPPORTED &&
@@ -462,6 +898,13 @@ int main(void)
     test_watch_proof_requires_exact_bssid_and_ssid_field();
     test_emergency_stop_and_unconfirmed_stop_keep_remote_state_uncertain();
     test_already_active_requires_confirmed_stop_before_new_start();
+    test_defence_commands_state_and_no_legacy_fallback();
+    test_defence_accepts_watch_proof_before_start_ack();
+    test_defence_strict_records_and_exact_final_stop();
+    test_defence_physical_two_response_sequence_preserves_completed_campaign();
+    test_defence_pmkid_requires_authorized_matching_decision();
+    test_defence_consumes_tx_and_binds_release_to_trigger_bssid();
+    test_defence_rejects_malformed_and_late_records();
     test_trace_command_status_unsupported_fallback_and_stop();
     detector_watch_session_t grove = {0}, mbus = {0};
     detector_watch_network_t grove_storage[DETECTOR_WATCH_MAX] = {0};
@@ -532,6 +975,8 @@ int main(void)
     detector_watch_begin_stop(&grove);
     assert(grove.phase == DETECTOR_WATCH_STOPPING);
     detector_watch_status_line(&grove, "I JanOS: Deauth Detector stopped.");
+    assert(grove.phase == DETECTOR_WATCH_STOPPING);
+    detector_watch_status_line(&grove, "I JanOS: All operations stopped.");
     assert(grove.phase == DETECTOR_WATCH_STOPPED && !grove.watch_verified);
 
     detector_watch_begin_scan(&grove, 6);
@@ -559,6 +1004,8 @@ int main(void)
            grove.remote_state_unknown);
     detector_watch_begin_stop(&grove);
     detector_watch_status_line(&grove, "Deauth Detector stopped.");
+    assert(grove.phase == DETECTOR_WATCH_STOPPING && grove.remote_state_unknown);
+    detector_watch_status_line(&grove, "All operations stopped.");
     assert(grove.phase == DETECTOR_WATCH_STOPPED && !grove.remote_state_unknown);
     detector_watch_begin_start(&grove, true);
     detector_watch_status_line(&grove, "Deauth Detector started - monitoring selected channels for deauth frames...");
@@ -578,6 +1025,8 @@ int main(void)
            grove.remote_state_unknown);
     detector_watch_begin_stop(&grove);
     detector_watch_status_line(&grove, "Deauth Detector stopped.");
+    assert(grove.phase == DETECTOR_WATCH_STOPPING);
+    detector_watch_status_line(&grove, "All operations stopped.");
     assert(grove.phase == DETECTOR_WATCH_STOPPED && !grove.running &&
            !grove.remote_state_unknown);
 
